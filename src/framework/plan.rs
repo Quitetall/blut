@@ -413,7 +413,8 @@ impl<A1: Artifact, A2: Artifact, A3: Artifact, B: TrainingBackend> Plan<(A1, A2,
 
 /// Borrow-only access for the executor. Avoids exposing
 /// `nodes` / `edges` / `initial` as `pub` while still letting the
-/// executor walk them.
+/// executor walk them. `pub(crate)` on the struct + fields keeps
+/// the surface fully internal — no accidental external coupling.
 pub(crate) struct ExecView<'a> {
     pub nodes: &'a [PlanNode],
     pub edges: &'a [PlanEdge],

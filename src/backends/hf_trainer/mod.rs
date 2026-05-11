@@ -11,11 +11,10 @@
 //! machinery can name `HfTrainerBackend` at compile time
 //! everywhere it needs to without forward-declaring.
 
-// Future:
-//   pub mod runner;        // subprocess + JSON wire
-//   pub mod venv;          // auto-managed venv at ~/.local/share/blut/hf-venv/
-//   pub mod stages;        // hf_sft_train, hf_dpo_train, hf_distill_train, ...
-//   pub mod python;        // hf_trainer_runner.py + pyproject.toml metadata
+pub mod runner;
+pub mod venv;
+// stages/ + Python integration tests land in BB-5 alongside the
+// first hf_* recipes.
 
-// Nothing public yet — kept module-empty so the backends/mod.rs
-// `pub mod hf_trainer;` compiles cleanly.
+pub use runner::{DpoConfig, HfRunArtifact, HfTrainerJob, HfTrainerRunner, PeftConfig, StatusLine};
+pub use venv::{ensure_venv, venv_root, VenvError};
