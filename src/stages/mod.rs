@@ -28,6 +28,8 @@ pub mod split_train_eval;
 pub mod take_train;
 pub(crate) mod util;
 
+pub mod catalog;
+
 pub use convert_gguf::ConvertGguf;
 pub use distill_train::DistillTrain;
 pub use dpo_train::DpoTrain;

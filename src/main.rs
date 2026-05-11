@@ -90,6 +90,37 @@ enum Command {
         #[command(subcommand)]
         cmd: CacheCommand,
     },
+    /// Run a single stage standalone — Unix-style. Reads erased
+    /// input bytes from stdin (or skipped for graph-input stages),
+    /// writes the produced erased artifact bytes to stdout.
+    /// Pipeable; recipes are just compositions of these.
+    Stage {
+        #[command(subcommand)]
+        cmd: StageCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum StageCommand {
+    /// List the stage catalog.
+    List,
+    /// Execute one stage.
+    Run {
+        /// Stage name (e.g. filter_dataset).
+        name: String,
+        /// Stage args as inline JSON.
+        #[arg(long)]
+        args: String,
+        /// Input source: `-` for stdin (bincode-encoded
+        /// ErasedArtifact), or `:unit` for graph-input stages whose
+        /// input is `()`. Defaults to `:unit`.
+        #[arg(long, default_value = ":unit")]
+        input: String,
+        /// Output sink: `-` for stdout (bincode-encoded
+        /// ErasedArtifact). Defaults to `-`.
+        #[arg(long, default_value = "-")]
+        output: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -307,6 +338,7 @@ async fn main() -> Result<()> {
         Some(Command::Recipe { cmd }) => run_recipe(cmd).await,
         Some(Command::Plan { cmd }) => run_plan_cmd(cmd).await,
         Some(Command::Cache { cmd }) => run_cache_cmd(cmd),
+        Some(Command::Stage { cmd }) => run_stage_cmd(cmd).await,
         None => run_train(cli.train_args).await,
     }
 }
@@ -457,6 +489,98 @@ fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
                 global.display(),
                 cap_gb
             );
+            Ok(())
+        }
+    }
+}
+
+async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
+    use blut::framework::stage::{ErasedArtifact, StageContext};
+    use blut::stages::catalog;
+    use std::io::{Read, Write};
+
+    match cmd {
+        StageCommand::List => {
+            println!("{:<32} {:<20} {:<20} {}", "name", "input_kind", "output_kind", "resources");
+            for n in catalog::names() {
+                let s = catalog::make_stage(n).expect("listed → constructs");
+                println!(
+                    "{:<32} {:<20} {:<20} {:?}",
+                    s.name(),
+                    s.input_kind(),
+                    s.output_kind(),
+                    s.resources(),
+                );
+            }
+            Ok(())
+        }
+        StageCommand::Run { name, args, input, output } => {
+            let stage = catalog::make_stage(&name)
+                .ok_or_else(|| anyhow!("stage '{name}' not in catalog"))?;
+            let args_val: serde_json::Value = serde_json::from_str(&args)
+                .with_context(|| format!("parse --args as JSON: {args}"))?;
+
+            // Read input. `:unit` produces a synthetic () artifact;
+            // `-` reads bincode-encoded ErasedArtifact from stdin;
+            // a path reads from disk.
+            let erased_input: ErasedArtifact = match input.as_str() {
+                ":unit" => ErasedArtifact {
+                    kind: "()".into(),
+                    schema: 1,
+                    payload: bincode::serialize(&())
+                        .map_err(|e| anyhow!("encode unit: {e}"))?,
+                },
+                "-" => {
+                    let mut buf = Vec::new();
+                    std::io::stdin().read_to_end(&mut buf)
+                        .context("read stdin for --input -")?;
+                    bincode::deserialize(&buf)
+                        .map_err(|e| anyhow!("decode stdin ErasedArtifact: {e}"))?
+                }
+                path => {
+                    let buf = std::fs::read(path)
+                        .with_context(|| format!("read input from {path}"))?;
+                    bincode::deserialize(&buf)
+                        .map_err(|e| anyhow!("decode {path}: {e}"))?
+                }
+            };
+
+            // Build a one-shot stage context rooted in a temp dir.
+            // Each `blut stage` invocation gets its own scratch
+            // space; no cross-stage cache hits via this entry point
+            // (use recipes for that).
+            let td = tempfile::tempdir().context("create stage tempdir")?;
+            let stage_dir = td.path().join("stage");
+            std::fs::create_dir_all(&stage_dir)?;
+            let ctx = StageContext::for_test(td.path().to_path_buf(), stage_dir);
+
+            let result = stage
+                .run_erased(&ctx, erased_input, args_val)
+                .await
+                .map_err(|e| anyhow!("stage '{name}' failed: {e}"))?;
+
+            // Write output.
+            let body = bincode::serialize(&result)
+                .map_err(|e| anyhow!("encode output: {e}"))?;
+            match output.as_str() {
+                "-" => {
+                    std::io::stdout()
+                        .write_all(&body)
+                        .context("write stdout")?;
+                }
+                path => {
+                    std::fs::write(path, &body)
+                        .with_context(|| format!("write output to {path}"))?;
+                }
+            }
+
+            // Keep tempdir alive across `result` use; explicit close
+            // returns IO errors that would otherwise be silenced by
+            // the Drop impl. Best-effort — IO errors during teardown
+            // are warnings, not failures.
+            if let Err(e) = td.close() {
+                tracing::warn!("stage tempdir cleanup: {e}");
+            }
             Ok(())
         }
     }
