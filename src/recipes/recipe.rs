@@ -31,6 +31,7 @@ pub struct RecipeDef {
 /// inside its recipe module.
 pub static RECIPES: &[&RecipeDef] = &[
     &crate::recipes::finetune_from_conversations::DEF,
+    &crate::recipes::finetune_from_dataset::DEF,
     &crate::recipes::dpo_from_preferences::DEF,
     &crate::recipes::eval_suite::DEF,
     &crate::recipes::distill_from_teacher::DEF,

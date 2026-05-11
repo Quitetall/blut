@@ -12,6 +12,7 @@ pub fn make_stage(name: &str) -> Option<Box<dyn StageDyn>> {
     use super::*;
     Some(match name {
         "materialize_conversations" => Box::new(MaterializeConversations),
+        "materialize_dataset_path" => Box::new(MaterializeDatasetPath),
         "materialize_for_eval" => Box::new(MaterializeForEval),
         "filter_dataset" => Box::new(FilterDataset),
         "split_train_eval" => Box::new(SplitTrainEval),
@@ -35,6 +36,7 @@ pub fn make_stage(name: &str) -> Option<Box<dyn StageDyn>> {
 pub fn names() -> &'static [&'static str] {
     &[
         "materialize_conversations",
+        "materialize_dataset_path",
         "materialize_for_eval",
         "filter_dataset",
         "split_train_eval",
