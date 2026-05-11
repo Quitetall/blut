@@ -141,6 +141,27 @@ impl Recipe for FinetuneFromDataset {
                 args.method
             )));
         }
+        // R23: numeric arg ranges.
+        if args.output_name.is_empty() {
+            return Err(RecipeError::InvalidArgs("output_name is empty".into()));
+        }
+        if !(args.eval_ratio > 0.0 && args.eval_ratio < 1.0) {
+            return Err(RecipeError::InvalidArgs(format!(
+                "eval_ratio must be in (0, 1); got {}",
+                args.eval_ratio
+            )));
+        }
+        if args.epochs == 0 || args.batch_size == 0 || args.grad_accum == 0 || args.seq_len == 0 {
+            return Err(RecipeError::InvalidArgs(
+                "epochs, batch_size, grad_accum, seq_len must all be > 0".into(),
+            ));
+        }
+        if !(args.lr > 0.0 && args.lr.is_finite()) {
+            return Err(RecipeError::InvalidArgs(format!(
+                "lr must be positive finite; got {}",
+                args.lr
+            )));
+        }
 
         let recipe_args_json = serde_json::to_value(&args)
             .map_err(|e| RecipeError::CompileFailed(format!("serialize args: {e}")))?;

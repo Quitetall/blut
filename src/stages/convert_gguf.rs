@@ -36,6 +36,18 @@ impl Stage for ConvertGguf {
         input: HfCheckpoint,
         args: &Args,
     ) -> Result<GgufModel, StageError> {
+        // R21 pre + R23: args sanity. `name` becomes part of the
+        // output path; reject empty or path-separator-bearing names.
+        if args.name.is_empty() || args.name.contains('/') || args.name.contains('\\') {
+            return Err(StageError::BadInput(format!(
+                "name '{}' must be non-empty and free of path separators",
+                args.name
+            )));
+        }
+        if args.quant.is_empty() {
+            return Err(StageError::BadInput("quant must be non-empty".into()));
+        }
+        debug_assert!(input.path.is_absolute() || input.path.is_relative());
         let gguf_path = convert::convert_to_gguf(&input.path, &args.name, &args.quant)
             .await
             .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;

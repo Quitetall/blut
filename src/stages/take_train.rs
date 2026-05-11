@@ -40,6 +40,13 @@ impl Stage for TakeTrain {
         input: DatasetSplit,
         _args: &Args,
     ) -> Result<DatasetJsonl, StageError> {
+        // R21: structural pre/post on the projection.
+        debug_assert!(input.train.n_examples > 0, "train half must be non-empty");
+        debug_assert!(input.eval.n_examples > 0, "eval half must be non-empty");
+        debug_assert!(
+            input.train.n_examples >= input.eval.n_examples,
+            "train should typically be larger than eval"
+        );
         Ok(input.train)
     }
 }

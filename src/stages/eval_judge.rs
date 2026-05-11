@@ -54,8 +54,15 @@ impl Stage for EvalJudge {
         args: &Args,
     ) -> Result<EvalReport, StageError> {
         let (ckpt, ds) = input;
+        // R21 + R23.
+        debug_assert!(ds.n_examples >= 0, "dataset n_examples cannot be negative");
         if args.judge_model.is_empty() {
             return Err(StageError::BadInput("eval_judge: judge_model is empty".into()));
+        }
+        if args.n_samples == 0 && args.prompts.is_empty() {
+            return Err(StageError::BadInput(
+                "eval_judge: either n_samples > 0 or prompts must be non-empty".into(),
+            ));
         }
         let seed = ckpt.content_hash.0[2] as f32 / 255.0;
         let n = if args.prompts.is_empty() {

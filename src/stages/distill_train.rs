@@ -48,6 +48,25 @@ impl Stage for DistillTrain {
         input: (HfCheckpoint, DatasetJsonl),
         args: &Args,
     ) -> Result<HfCheckpoint, StageError> {
+        // R21 pre + R23.
+        debug_assert!(input.1.n_examples > 0, "distill dataset must have examples");
+        if !(args.kl_weight >= 0.0 && args.kl_weight <= 1.0) {
+            return Err(StageError::BadInput(format!(
+                "kl_weight must be in [0, 1]; got {}",
+                args.kl_weight
+            )));
+        }
+        if args.epochs == 0 || args.batch_size == 0 || args.grad_accum == 0 {
+            return Err(StageError::BadInput(
+                "epochs/batch_size/grad_accum must be > 0".into(),
+            ));
+        }
+        if !(args.lr > 0.0 && args.lr.is_finite()) {
+            return Err(StageError::BadInput(format!(
+                "lr must be positive finite; got {}",
+                args.lr
+            )));
+        }
         let (teacher, dataset) = input;
         let output_dir = ctx.stage_dir.join("checkpoint");
         std::fs::create_dir_all(&output_dir).map_err(|source| StageError::Io {

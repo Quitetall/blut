@@ -46,6 +46,22 @@ impl Stage for RegisterModel {
         input: GgufModel,
         args: &Args,
     ) -> Result<GgufModel, StageError> {
+        // R21 + R23: name must be a safe registry identifier.
+        // The registry's own validator catches this too but
+        // failing here gives a clearer call site.
+        if args.name.is_empty() {
+            return Err(StageError::BadInput("name must be non-empty".into()));
+        }
+        if args.name.contains('/') || args.name.contains('\\') {
+            return Err(StageError::BadInput(format!(
+                "name '{}' must not contain path separators",
+                args.name
+            )));
+        }
+        debug_assert!(
+            input.path.exists() || cfg!(test),
+            "GgufModel path must exist on disk"
+        );
         use crate::registry;
         use crate::registry::{
             BackendType, Capability, ModelEntry, ModelFormat, ModelStatus,

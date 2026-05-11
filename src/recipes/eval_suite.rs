@@ -79,6 +79,28 @@ impl Recipe for EvalSuite {
         if args.judge_model.is_empty() {
             return Err(RecipeError::InvalidArgs("judge_model must be non-empty".into()));
         }
+        // R23: numeric arg ranges.
+        if args.judge_samples == 0 {
+            return Err(RecipeError::InvalidArgs("judge_samples must be > 0".into()));
+        }
+        if args.batch_size == 0 || args.max_seq == 0 {
+            return Err(RecipeError::InvalidArgs(
+                "batch_size + max_seq must be > 0".into(),
+            ));
+        }
+        // R30: reject paths that contain '..' (defensive — these
+        // become PYTHON args + may flow through downstream tooling).
+        for (label, p) in [
+            ("model_path", &args.model_path),
+            ("dataset_path", &args.dataset_path),
+        ] {
+            if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                return Err(RecipeError::InvalidArgs(format!(
+                    "{label} '{}' contains '..' — refusing",
+                    p.display()
+                )));
+            }
+        }
 
         let recipe_args_json = serde_json::to_value(&args)
             .map_err(|e| RecipeError::CompileFailed(format!("serialize args: {e}")))?;

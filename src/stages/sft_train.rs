@@ -59,6 +59,19 @@ impl Stage for SftTrain {
         input: DatasetJsonl,
         args: &Args,
     ) -> Result<HfCheckpoint, StageError> {
+        // R21 pre: arg + input sanity.
+        debug_assert!(input.n_examples > 0, "dataset must have examples");
+        if args.epochs == 0 || args.batch_size == 0 || args.grad_accum == 0 {
+            return Err(StageError::BadInput(
+                "epochs/batch_size/grad_accum must be > 0".into(),
+            ));
+        }
+        if !(args.lr > 0.0 && args.lr.is_finite()) {
+            return Err(StageError::BadInput(format!(
+                "lr must be positive finite; got {}",
+                args.lr
+            )));
+        }
         let output_dir = ctx.stage_dir.join("checkpoint");
         std::fs::create_dir_all(&output_dir).map_err(|source| StageError::Io {
             path: output_dir.clone(),

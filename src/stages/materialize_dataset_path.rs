@@ -52,6 +52,15 @@ impl Stage for MaterializeDatasetPath {
         _input: (),
         args: &Args,
     ) -> Result<DatasetJsonl, StageError> {
+        // R30: reject path traversal on the explicit-path branch.
+        if let Some(p) = &args.path {
+            if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                return Err(StageError::BadInput(format!(
+                    "path '{}' contains '..' — refusing",
+                    p.display()
+                )));
+            }
+        }
         let resolved_path = match (&args.path, &args.registered_name) {
             (Some(p), None) => p.clone(),
             (None, Some(name)) => {

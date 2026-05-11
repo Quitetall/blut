@@ -42,6 +42,17 @@ impl Stage for MaterializeConversations {
         _input: (),
         args: &Args,
     ) -> Result<DatasetJsonl, StageError> {
+        // R21 pre: ctx.stage_dir must be set + writable region.
+        debug_assert!(
+            !ctx.stage_dir.as_os_str().is_empty(),
+            "stage_dir must be non-empty"
+        );
+        // R23: since_seconds == 0 means "everything since epoch" —
+        // valid but worth a debug_assert to catch accidental 0-init.
+        debug_assert!(
+            args.since_seconds > 0,
+            "since_seconds=0 sweeps all-time history; intentional?"
+        );
         let out_path = ctx.stage_dir.join("dataset.jsonl");
         let stats = conversations::dump_to_jsonl(
             Duration::from_secs(args.since_seconds),
@@ -66,10 +77,15 @@ impl Stage for MaterializeConversations {
             source,
         })?;
 
+        // R21 post: emitted artifact has positive example count
+        // (we just rejected n_conversations==0 above; n_turns is
+        // >= n_conversations).
+        let n = stats.n_turns as i64;
+        debug_assert!(n > 0, "n_turns must be > 0 after n_conversations check");
         Ok(DatasetJsonl {
             path: out_path,
             content_hash: hash,
-            n_examples: stats.n_turns as i64,
+            n_examples: n,
         })
     }
 }

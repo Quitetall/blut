@@ -51,6 +51,19 @@ impl Stage for MaterializeForEval {
         _input: (),
         args: &Args,
     ) -> Result<Self::Output, StageError> {
+        // R30: reject path traversal — the kernel reads + may
+        // re-emit these paths into downstream sidecar metadata.
+        for (label, p) in [
+            ("model_path", &args.model_path),
+            ("dataset_path", &args.dataset_path),
+        ] {
+            if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                return Err(StageError::BadInput(format!(
+                    "{label} '{}' contains '..' — refusing",
+                    p.display()
+                )));
+            }
+        }
         if !args.model_path.exists() {
             return Err(StageError::BadInput(format!(
                 "model_path not found: {}",

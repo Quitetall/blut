@@ -49,6 +49,17 @@ impl Stage for DpoTrain {
         input: PreferenceJsonl,
         args: &Args,
     ) -> Result<HfCheckpoint, StageError> {
+        // R21 pre + R23.
+        debug_assert!(input.n_pairs > 0, "dpo input must have preference pairs");
+        if !(args.beta > 0.0 && args.beta.is_finite()) {
+            return Err(StageError::BadInput(format!(
+                "beta must be positive finite; got {}",
+                args.beta
+            )));
+        }
+        if args.epochs == 0 {
+            return Err(StageError::BadInput("epochs must be > 0".into()));
+        }
         let output_dir = ctx.stage_dir.join("checkpoint");
         std::fs::create_dir_all(&output_dir).map_err(|source| StageError::Io {
             path: output_dir.clone(),

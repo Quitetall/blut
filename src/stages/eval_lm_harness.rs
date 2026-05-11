@@ -54,6 +54,8 @@ impl Stage for EvalLmHarness {
         args: &Args,
     ) -> Result<EvalReport, StageError> {
         let (ckpt, _dataset) = input;
+        // R21 + R23.
+        debug_assert!(!ckpt.base_model.is_empty(), "ckpt base_model required");
         if args.tasks.is_empty() {
             return Err(StageError::BadInput(
                 "eval_lm_harness: tasks list must be non-empty".into(),

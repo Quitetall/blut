@@ -54,6 +54,13 @@ impl Stage for EvalLoss {
         input: Self::Input,
         args: &Args,
     ) -> Result<EvalReport, StageError> {
+        // R21 + R23: arg + input sanity.
+        debug_assert!(input.1.n_examples > 0, "eval dataset must have examples");
+        if args.batch_size == 0 || args.max_seq == 0 {
+            return Err(StageError::BadInput(
+                "batch_size + max_seq must be > 0".into(),
+            ));
+        }
         let (ckpt, ds) = input;
         // Synthetic-result fallback (see module doc).
         let seed = ckpt.content_hash.0[0] as f32;

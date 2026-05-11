@@ -52,6 +52,15 @@ impl Stage for MergeLora {
         input: HfCheckpoint,
         _args: &Args,
     ) -> Result<HfCheckpoint, StageError> {
+        // R21 pre: input ckpt has a recognized method_tag.
+        debug_assert!(
+            !input.method_tag.is_empty(),
+            "HfCheckpoint must carry a non-empty method_tag"
+        );
+        debug_assert!(
+            !input.base_model.is_empty(),
+            "HfCheckpoint must record its base_model"
+        );
         // Method-tag-based dispatch keeps the recipe DAG uniform:
         // recipes always call `.then(MergeLora, _)` and this stage
         // figures out whether real work is needed.

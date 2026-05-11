@@ -163,6 +163,25 @@ async fn run_pccp_gate(
             "change_id '{change_id}' must not contain path separators or '..'"
         )));
     }
+    // R30: cap + scrub free-form text.
+    for (label, v) in [
+        ("change_id", change_id),
+        ("description", description),
+        ("author", author),
+        ("change_class", change_class),
+    ] {
+        if v.len() > 512 {
+            return Err(StageError::BadInput(format!(
+                "{label} length {} > 512 byte cap",
+                v.len()
+            )));
+        }
+        if v.chars().any(|c| c.is_control() && c != '\t') {
+            return Err(StageError::BadInput(format!(
+                "{label} contains control characters (only tab allowed)"
+            )));
+        }
+    }
     let mut cmd_args = vec![
         "--candidate".into(),
         candidate.display().to_string(),

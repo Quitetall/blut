@@ -53,6 +53,17 @@ impl Stage for RegisterDataset {
         input: DatasetJsonl,
         args: &Args,
     ) -> Result<DatasetJsonl, StageError> {
+        // R21 + R23: name must be a safe registry identifier.
+        if args.name.is_empty() {
+            return Err(StageError::BadInput("name must be non-empty".into()));
+        }
+        if args.name.contains('/') || args.name.contains('\\') {
+            return Err(StageError::BadInput(format!(
+                "name '{}' must not contain path separators",
+                args.name
+            )));
+        }
+        debug_assert!(input.n_examples >= 0, "input n_examples cannot be negative");
         let rec = datasets_db::record_from_jsonl(
             args.name.clone(),
             &input.path,

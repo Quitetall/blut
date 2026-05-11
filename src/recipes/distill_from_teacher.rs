@@ -95,11 +95,41 @@ impl Recipe for DistillFromTeacher {
     type Args = Args;
 
     fn compile(&self, args: Self::Args) -> Result<Plan<()>, RecipeError> {
+        // R23: arg validation.
         if !(args.kl_weight >= 0.0 && args.kl_weight <= 1.0) {
             return Err(RecipeError::InvalidArgs(format!(
                 "kl_weight must be in [0, 1]; got {}",
                 args.kl_weight
             )));
+        }
+        if args.output_name.is_empty() {
+            return Err(RecipeError::InvalidArgs("output_name is empty".into()));
+        }
+        if args.student_base.is_empty() {
+            return Err(RecipeError::InvalidArgs("student_base is empty".into()));
+        }
+        if !(args.lr > 0.0 && args.lr.is_finite()) {
+            return Err(RecipeError::InvalidArgs(format!(
+                "lr must be positive finite; got {}",
+                args.lr
+            )));
+        }
+        if args.epochs == 0 || args.batch_size == 0 || args.grad_accum == 0 || args.seq_len == 0 {
+            return Err(RecipeError::InvalidArgs(
+                "epochs, batch_size, grad_accum, seq_len must all be > 0".into(),
+            ));
+        }
+        // R30: reject path traversal on teacher_path + dataset_path.
+        for (label, p) in [
+            ("teacher_path", &args.teacher_path),
+            ("dataset_path", &args.dataset_path),
+        ] {
+            if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                return Err(RecipeError::InvalidArgs(format!(
+                    "{label} '{}' contains '..' — refusing",
+                    p.display()
+                )));
+            }
         }
 
         let recipe_args_json = serde_json::to_value(&args)

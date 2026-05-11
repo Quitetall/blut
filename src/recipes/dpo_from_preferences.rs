@@ -105,6 +105,25 @@ impl Recipe for DpoFromPreferences {
     type Args = Args;
 
     fn compile(&self, args: Self::Args) -> Result<Plan<()>, RecipeError> {
+        // R23: arg validation at the recipe boundary.
+        if args.output_name.is_empty() {
+            return Err(RecipeError::InvalidArgs("output_name is empty".into()));
+        }
+        if !(args.beta > 0.0 && args.beta.is_finite()) {
+            return Err(RecipeError::InvalidArgs(format!(
+                "beta must be positive finite; got {}",
+                args.beta
+            )));
+        }
+        if !(args.lr > 0.0 && args.lr.is_finite()) {
+            return Err(RecipeError::InvalidArgs(format!(
+                "lr must be positive finite; got {}",
+                args.lr
+            )));
+        }
+        if args.epochs == 0 {
+            return Err(RecipeError::InvalidArgs("epochs must be > 0".into()));
+        }
         let recipe_args = serde_json::to_value(&args)
             .map_err(|e| RecipeError::CompileFailed(format!("{e}")))?;
         let plan = Plan::new(Self::NAME, recipe_args)

@@ -132,6 +132,27 @@ impl Stage for LamquantPccpGateSnn {
                 args.change_id
             )));
         }
+        // R30: cap free-form text fields + reject control chars.
+        // PCCP gate writes these into CHANGELOG entries; a stray
+        // \r\n could fool a downstream log parser.
+        for (label, v) in [
+            ("change_id", args.change_id.as_str()),
+            ("description", args.description.as_str()),
+            ("author", args.author.as_str()),
+            ("change_class", args.change_class.as_str()),
+        ] {
+            if v.len() > 512 {
+                return Err(StageError::BadInput(format!(
+                    "{label} length {} > 512 byte cap",
+                    v.len()
+                )));
+            }
+            if v.chars().any(|c| c.is_control() && c != '\t') {
+                return Err(StageError::BadInput(format!(
+                    "{label} contains control characters (only tab allowed)"
+                )));
+            }
+        }
 
         let mut cmd_args: Vec<String> = vec![
             "--candidate".into(),
