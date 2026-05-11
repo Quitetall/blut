@@ -225,7 +225,9 @@ impl Recipe for LamquantEncoder {
                 // Insert a passthrough.
                 .then(
                     L3RebindFromMae,
-                    L3RebindArgs {},
+                    L3RebindArgs {
+                        lamquant_home: args.lamquant_home.clone(),
+                    },
                 )
                 .then(crate::stages::LamquantTrainJoint, joint_args)
                 .then(crate::stages::LamquantPccpGateEncoder, gate_args)
@@ -250,18 +252,23 @@ impl Recipe for LamquantEncoder {
 // work. Lives next to the recipe since it's recipe-internal.
 
 use async_trait::async_trait;
-use std::path::PathBuf;
 
 use crate::artifacts::lamquant::stat_fingerprint_dir;
 use crate::artifacts::{L3Cache, MaeCkpt};
 use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
+use crate::stages::lamquant_helpers::resolve_home;
 
 struct L3RebindFromMae;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
-struct L3RebindArgs {}
+struct L3RebindArgs {
+    /// Recipe passes lamquant_home through here so the bridge doesn't
+    /// have to derive it from the MAE ckpt path (which was brittle
+    /// against layout changes).
+    lamquant_home: String,
+}
 
 #[async_trait]
 impl Stage for L3RebindFromMae {
@@ -275,18 +282,10 @@ impl Stage for L3RebindFromMae {
     async fn run(
         &self,
         _ctx: &StageContext,
-        input: MaeCkpt,
-        _args: &L3RebindArgs,
+        _input: MaeCkpt,
+        args: &L3RebindArgs,
     ) -> Result<L3Cache, StageError> {
-        // The MAE ckpt's path is `<lamquant_home>/ai_models/student/pretrained_mae.ckpt`
-        // by convention; walk up three components to get lamquant_home,
-        // then re-fingerprint the L3 cache dir.
-        let mut home = input.path.clone();
-        for _ in 0..3 {
-            if !home.pop() {
-                break;
-            }
-        }
+        let home = resolve_home(&args.lamquant_home)?;
         let l3_dir = home.join("ai_models").join("dataset_sim").join("q31_events");
         if !l3_dir.exists() {
             return Err(StageError::BadInput(format!(
@@ -394,5 +393,3 @@ mod tests {
     }
 }
 
-#[allow(dead_code)]
-fn _path_marker(_p: PathBuf) {}
