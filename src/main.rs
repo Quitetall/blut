@@ -332,7 +332,8 @@ async fn run_plan_cmd(cmd: PlanCommand) -> Result<()> {
     use blut::recipes::recipe::find as find_recipe;
     match cmd {
         PlanCommand::Resume { id, shared_cache } => {
-            let job_id = blut::jobs::resolve_job_id(&id)?;
+            let job_id = blut::jobs::resolve_job_id(&id)
+                .with_context(|| format!("resolve job id '{id}' (ambiguous prefix or missing job)"))?;
             let job_dir = paths::job_dir(&job_id)
                 .with_context(|| format!("resolve job dir for {job_id}"))?;
             let marker = RecipeMarker::read_from(&job_dir)?;
@@ -343,24 +344,49 @@ async fn run_plan_cmd(cmd: PlanCommand) -> Result<()> {
 
             let mut ctx = ExecCtx::new(job_dir.clone());
             if shared_cache {
-                if let Some(global) = CacheHandle::default_global_path() {
-                    std::fs::create_dir_all(&global).with_context(|| {
-                        format!("create global cache dir {}", global.display())
-                    })?;
-                    let cache_handle = (*ctx.cache).clone().with_global(global);
-                    ctx.cache = std::sync::Arc::new(cache_handle);
+                match CacheHandle::default_global_path() {
+                    Some(global) => {
+                        std::fs::create_dir_all(&global).with_context(|| {
+                            format!("create global cache dir {}", global.display())
+                        })?;
+                        let cache_handle = (*ctx.cache).clone().with_global(global);
+                        ctx.cache = std::sync::Arc::new(cache_handle);
+                    }
+                    None => eprintln!(
+                        "warning: --shared-cache requested but no global cache \
+                         path; falling back to job-local."
+                    ),
                 }
             }
 
             blut::jobs::write_state(&job_id, JobState::Running)
                 .with_context(|| format!("write Running state for {job_id}"))?;
 
+            // GPU lock — same arbitration as initial runs. Without
+            // this, two resumes (or a resume + a fresh recipe run)
+            // on the same machine could both touch the GPU.
+            let lock = match scheduler_lock::acquire_exclusive(
+                format!("blut-resume:{job_id}"),
+                LockKind::Training,
+            ) {
+                Ok(l) => l,
+                Err(e) => {
+                    if let Err(se) = blut::jobs::write_state(&job_id, JobState::Failed) {
+                        tracing::warn!("write Failed state for {job_id}: {se}");
+                    }
+                    return Err(anyhow!("acquire_exclusive: {e}"));
+                }
+            };
+
             eprintln!("resuming {} ({})", marker.name, job_id);
             eprintln!("dir      {}", job_dir.display());
+            eprintln!("lock     {}", lock.path().display());
             let result = SequentialExecutor::execute(plan, ctx).await;
+            drop(lock);
             match result {
                 Ok(r) => {
-                    blut::jobs::write_state(&job_id, JobState::Done)?;
+                    blut::jobs::write_state(&job_id, JobState::Done)
+                        .with_context(|| format!("write Done state for {job_id}"))?;
                     eprintln!(
                         "done — {} stages, {} cache hits, {} misses, elapsed {:?}",
                         r.n_stages, r.n_cache_hits, r.n_cache_misses, r.elapsed
@@ -456,7 +482,7 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
                 .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
             let raw: serde_json::Value = serde_json::from_str(&args)
                 .with_context(|| format!("parse --args as JSON: {args}"))?;
-            let plan = (r.compile_fn)(raw)
+            let plan = (r.compile_fn)(raw.clone())
                 .map_err(|e| anyhow!("recipe compile failed: {e}"))?;
 
             let job_id = blut::jobs::new_job_id();
@@ -471,22 +497,54 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
                     ctx.cache = std::sync::Arc::new(cache_handle);
                 }
             }
-            // Mark recipe for plan resume.
-            RecipeMarker {
-                name: name.clone(),
-                args: serde_json::from_str(&args).unwrap_or(serde_json::Value::Null),
-            }
-            .write_to(&job_dir)?;
+            // Mark recipe for plan resume. Reuse the parsed
+            // `raw` rather than re-parsing `args` — re-parse +
+            // unwrap_or would silently swallow malformed JSON
+            // that already failed above.
+            RecipeMarker { name: name.clone(), args: raw }.write_to(&job_dir)?;
+
+            blut::jobs::write_state(&job_id, JobState::Running)
+                .with_context(|| format!("write Running state for {job_id}"))?;
+
+            // Cross-process GPU arbitration — same lock acquisition
+            // pattern as the legacy train path. Recipes that don't
+            // hit GPU still pay the lock cost, which is cheap.
+            let lock = match scheduler_lock::acquire_exclusive(
+                format!("blut-recipe:{job_id}"),
+                LockKind::Training,
+            ) {
+                Ok(l) => l,
+                Err(e) => {
+                    if let Err(se) = blut::jobs::write_state(&job_id, JobState::Failed) {
+                        tracing::warn!("write Failed state for {job_id}: {se}");
+                    }
+                    return Err(anyhow!("acquire_exclusive: {e}"));
+                }
+            };
+
             eprintln!("recipe {name}");
             eprintln!("job    {job_id}");
             eprintln!("dir    {}", job_dir.display());
-            let result = SequentialExecutor::execute(plan, ctx)
-                .await
-                .map_err(|e| anyhow!("plan execution failed: {e}"))?;
-            eprintln!(
-                "done — {} stages, {} cache hits, {} misses, elapsed {:?}",
-                result.n_stages, result.n_cache_hits, result.n_cache_misses, result.elapsed
-            );
+            eprintln!("lock   {}", lock.path().display());
+
+            let result = SequentialExecutor::execute(plan, ctx).await;
+            drop(lock);
+            match result {
+                Ok(r) => {
+                    blut::jobs::write_state(&job_id, JobState::Done)
+                        .with_context(|| format!("write Done state for {job_id}"))?;
+                    eprintln!(
+                        "done — {} stages, {} cache hits, {} misses, elapsed {:?}",
+                        r.n_stages, r.n_cache_hits, r.n_cache_misses, r.elapsed
+                    );
+                }
+                Err(e) => {
+                    if let Err(se) = blut::jobs::write_state(&job_id, JobState::Failed) {
+                        tracing::warn!("write Failed state for {job_id}: {se}");
+                    }
+                    return Err(anyhow!("plan execution failed: {e}"));
+                }
+            }
         }
     }
     Ok(())
