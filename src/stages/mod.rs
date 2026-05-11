@@ -43,6 +43,7 @@ pub mod take_train;
 pub(crate) mod util;
 
 pub mod catalog;
+mod compat_impls;
 
 pub use convert_gguf::ConvertGguf;
 pub use distill_train::DistillTrain;
