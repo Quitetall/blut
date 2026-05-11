@@ -46,12 +46,22 @@ pub struct Args {
     /// Modification class per 01-modifications.md (e.g. "A.1").
     #[serde(default = "default_change_class")]
     pub change_class: String,
-    /// `--dry-run` — evaluate without writing verdict log.
-    #[serde(default)]
+    /// `--dry-run` — evaluate without committing to a PCCP change.
+    /// Default `true`: a recipe that wants real promotion must
+    /// explicitly opt in, matching the safe-by-default contract.
+    /// (The gate still writes the verdict file under
+    /// `pccp/verification_records/` on dry-run; only promotion
+    /// to registry + CHANGELOG is skipped.)
+    #[serde(default = "default_true")]
     pub dry_run: bool,
     /// `--no-promote` — on PASS, skip registry + CHANGELOG writes.
-    #[serde(default)]
+    /// Default `true`: same safe-by-default reason as `dry_run`.
+    #[serde(default = "default_true")]
     pub no_promote: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_change_id() -> String {
@@ -107,6 +117,21 @@ impl Stage for LamquantPccpGateSnn {
                 input.path.display()
             )));
         }
+        // Sanitize change_id — it becomes a path component in
+        // `pccp/verification_records/<id>.json` and is also passed
+        // to the gate script. Reject path separators + `..` to
+        // prevent escape from the records dir.
+        if args.change_id.is_empty()
+            || args.change_id.contains('/')
+            || args.change_id.contains('\\')
+            || args.change_id.split('/').any(|p| p == "..")
+            || args.change_id.contains("..")
+        {
+            return Err(StageError::BadInput(format!(
+                "change_id '{}' must not contain path separators or '..'",
+                args.change_id
+            )));
+        }
 
         let mut cmd_args: Vec<String> = vec![
             "--candidate".into(),
@@ -153,19 +178,28 @@ impl Stage for LamquantPccpGateSnn {
 
         // Resolve the verdict file. The gate writes:
         //   pccp/verification_records/<change_id>.json
-        // If the change_id has unsafe characters we punt to the
-        // most-recently-modified file in the dir (defensive).
+        // Tight retry on the preferred path closes the
+        // backend.run-returned → fs-visible gap on slow filesystems.
+        // Fall back to most-recently-modified *.json only when the
+        // preferred name never appears.
         let records_dir = lamquant_home.join("pccp").join("verification_records");
         let preferred = records_dir.join(format!("{}.json", args.change_id));
-        let verdict_path = if preferred.exists() {
-            preferred
-        } else {
-            most_recent_json(&records_dir)?.ok_or_else(|| {
+        let mut verdict_path: Option<PathBuf> = None;
+        for _ in 0..5 {
+            if preferred.exists() {
+                verdict_path = Some(preferred.clone());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let verdict_path = match verdict_path {
+            Some(p) => p,
+            None => most_recent_json(&records_dir)?.ok_or_else(|| {
                 StageError::Backend(anyhow::anyhow!(
                     "gate ran successfully but no verdict file appeared under {}",
                     records_dir.display()
                 ))
-            })?
+            })?,
         };
 
         let body = std::fs::read_to_string(&verdict_path).map_err(|source| StageError::Io {
@@ -316,6 +350,67 @@ mod tests {
             )
             .await;
         assert!(matches!(r, Err(StageError::BadInput(_))));
+    }
+
+    #[tokio::test]
+    async fn rejects_change_id_with_traversal() {
+        let td = tempfile::tempdir().unwrap();
+        let home = td.path().join("home");
+        std::fs::create_dir_all(home.join("ai_models")).unwrap();
+        std::fs::write(home.join("ai_models").join("pccp_gate.py"), "# stub").unwrap();
+        // Canonicalize: home must exist for the preflight to reach
+        // the change_id sanitization check.
+        let snn = snn(td.path());
+        let r = LamquantPccpGateSnn
+            .run(
+                &ctx(td.path()),
+                snn,
+                &Args {
+                    lamquant_home: home.display().to_string(),
+                    change_id: "../../etc/cron.d/evil".into(),
+                    description: default_description(),
+                    author: default_author(),
+                    change_class: default_change_class(),
+                    dry_run: true,
+                    no_promote: true,
+                },
+            )
+            .await;
+        assert!(matches!(r, Err(StageError::BadInput(_))));
+    }
+
+    #[tokio::test]
+    async fn rejects_change_id_with_slash() {
+        let td = tempfile::tempdir().unwrap();
+        let home = td.path().join("home");
+        std::fs::create_dir_all(home.join("ai_models")).unwrap();
+        std::fs::write(home.join("ai_models").join("pccp_gate.py"), "# stub").unwrap();
+        let snn = snn(td.path());
+        let r = LamquantPccpGateSnn
+            .run(
+                &ctx(td.path()),
+                snn,
+                &Args {
+                    lamquant_home: home.display().to_string(),
+                    change_id: "PCCP/CHG/0001".into(),
+                    description: default_description(),
+                    author: default_author(),
+                    change_class: default_change_class(),
+                    dry_run: true,
+                    no_promote: true,
+                },
+            )
+            .await;
+        assert!(matches!(r, Err(StageError::BadInput(_))));
+    }
+
+    #[test]
+    fn dry_run_defaults_to_true() {
+        // Safe-by-default: the recipe must explicitly opt into a
+        // real promotion run.
+        let args: Args = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(args.dry_run);
+        assert!(args.no_promote);
     }
 
     #[test]
