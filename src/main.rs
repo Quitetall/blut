@@ -928,16 +928,41 @@ async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()>
     // before any training subprocess runs. Released on Drop after
     // execute() returns. `--allow-evict` waits up to 1h for an
     // existing exclusive to release, matching the legacy path.
-    let lock = if args.allow_evict {
-        eprintln!("lock waiting for GPU release (--allow-evict, up to 1h)...");
-        scheduler_lock::await_unlock(Duration::from_secs(3600))
-            .await
-            .context("await_unlock")?;
-        scheduler_lock::acquire_exclusive(format!("lamu-train:{job_id}"), LockKind::Training)
-            .context("acquire_exclusive after wait")?
-    } else {
-        scheduler_lock::acquire_exclusive(format!("lamu-train:{job_id}"), LockKind::Training)
-            .context("acquire_exclusive (use --allow-evict to wait)")?
+    //
+    // Lock acquisition errors must transition the job out of
+    // `Running` so `lamu-train jobs` doesn't show a permanently-
+    // stuck row after a lock timeout / permission failure.
+    let lock = {
+        let acq = async {
+            if args.allow_evict {
+                eprintln!("lock waiting for GPU release (--allow-evict, up to 1h)...");
+                scheduler_lock::await_unlock(Duration::from_secs(3600))
+                    .await
+                    .context("await_unlock")?;
+                scheduler_lock::acquire_exclusive(
+                    format!("lamu-train:{job_id}"),
+                    LockKind::Training,
+                )
+                .context("acquire_exclusive after wait")
+            } else {
+                scheduler_lock::acquire_exclusive(
+                    format!("lamu-train:{job_id}"),
+                    LockKind::Training,
+                )
+                .context("acquire_exclusive (use --allow-evict to wait)")
+            }
+        };
+        match acq.await {
+            Ok(l) => l,
+            Err(e) => {
+                if let Err(state_err) = jobs::write_state(&job_id, JobState::Failed) {
+                    tracing::warn!(
+                        "failed to record Failed state for {job_id} after lock error: {state_err}"
+                    );
+                }
+                return Err(e);
+            }
+        }
     };
     eprintln!("lock acquired ({})", lock.path().display());
 
@@ -946,7 +971,8 @@ async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()>
 
     match result {
         Ok(r) => {
-            jobs::write_state(&job_id, JobState::Done)?;
+            jobs::write_state(&job_id, JobState::Done)
+                .with_context(|| format!("write Done state for {job_id}"))?;
             eprintln!(
                 "done — {} stages, {} cache hits, {} misses, elapsed {:?}",
                 r.n_stages, r.n_cache_hits, r.n_cache_misses, r.elapsed
@@ -954,7 +980,11 @@ async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()>
             Ok(())
         }
         Err(e) => {
-            let _ = jobs::write_state(&job_id, JobState::Failed);
+            if let Err(state_err) = jobs::write_state(&job_id, JobState::Failed) {
+                tracing::warn!(
+                    "failed to record Failed state for {job_id} after plan error: {state_err}"
+                );
+            }
             Err(anyhow!("plan execution failed: {e}"))
         }
     }
