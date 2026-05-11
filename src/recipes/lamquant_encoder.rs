@@ -126,6 +126,30 @@ impl Recipe for LamquantEncoder {
                 args.tier
             )));
         }
+        // R23: numeric arg ranges.
+        if !(args.val_fraction > 0.0 && args.val_fraction < 1.0) {
+            return Err(RecipeError::InvalidArgs(format!(
+                "val_fraction must be in (0, 1); got {}",
+                args.val_fraction
+            )));
+        }
+        if let Some(e) = args.epochs {
+            if e == 0 {
+                return Err(RecipeError::InvalidArgs("epochs must be > 0".into()));
+            }
+        }
+        if let Some(b) = args.batch_size {
+            if b == 0 {
+                return Err(RecipeError::InvalidArgs("batch_size must be > 0".into()));
+            }
+        }
+        if let Some(lr) = args.lr {
+            if !(lr > 0.0 && lr.is_finite()) {
+                return Err(RecipeError::InvalidArgs(format!(
+                    "lr must be positive finite; got {lr}"
+                )));
+            }
+        }
 
         let recipe_args_json = serde_json::to_value(&args)
             .map_err(|e| RecipeError::CompileFailed(format!("serialize args: {e}")))?;

@@ -46,6 +46,10 @@ impl Stage for SplitTrainEval {
         input: DatasetJsonl,
         args: &Args,
     ) -> Result<DatasetSplit, StageError> {
+        // R21 pre + R23: validate args + input invariants. We
+        // return BadInput (graceful) rather than debug_assert!
+        // because malformed args from a recipe are reachable.
+        debug_assert!(input.n_examples >= 0, "n_examples cannot be negative");
         if !(args.eval_ratio > 0.0 && args.eval_ratio < 1.0) {
             return Err(StageError::BadInput(format!(
                 "eval_ratio must be in (0, 1); got {}",
@@ -101,16 +105,25 @@ impl Stage for SplitTrainEval {
             source,
         })?;
 
+        let train_n = train_idx.len() as i64;
+        let eval_n = eval_idx.len() as i64;
+        // R21 post: partition is total + non-empty on both sides.
+        debug_assert_eq!(
+            train_n + eval_n,
+            lines.len() as i64,
+            "split partition must cover every line exactly once"
+        );
+        debug_assert!(train_n > 0 && eval_n > 0, "both halves must be non-empty");
         Ok(DatasetSplit {
             train: DatasetJsonl {
                 path: train_path,
                 content_hash: train_hash,
-                n_examples: train_idx.len() as i64,
+                n_examples: train_n,
             },
             eval: DatasetJsonl {
                 path: eval_path,
                 content_hash: eval_hash,
-                n_examples: eval_idx.len() as i64,
+                n_examples: eval_n,
             },
         })
     }

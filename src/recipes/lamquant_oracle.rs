@@ -90,6 +90,21 @@ impl Recipe for LamquantOracle {
     type Args = Args;
 
     fn compile(&self, args: Self::Args) -> Result<Plan<()>, RecipeError> {
+        // R23: arg validation at the recipe boundary.
+        if !(args.val_fraction > 0.0 && args.val_fraction < 1.0) {
+            return Err(RecipeError::InvalidArgs(format!(
+                "val_fraction must be in (0, 1); got {}",
+                args.val_fraction
+            )));
+        }
+        if !args.logger.is_empty()
+            && !matches!(args.logger.as_str(), "wandb" | "mlflow")
+        {
+            return Err(RecipeError::InvalidArgs(format!(
+                "logger '{}' must be wandb|mlflow or empty",
+                args.logger
+            )));
+        }
         let recipe_args_json = serde_json::to_value(&args)
             .map_err(|e| RecipeError::CompileFailed(format!("serialize args: {e}")))?;
 

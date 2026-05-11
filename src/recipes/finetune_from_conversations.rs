@@ -151,14 +151,50 @@ impl Recipe for FinetuneFromConversations {
     type Args = Args;
 
     fn compile(&self, args: Self::Args) -> Result<Plan<()>, RecipeError> {
+        // R23 (validate both ends): tighten arg range checks at the
+        // recipe boundary before any plumbing runs. Caller bugs
+        // surface here rather than as cryptic Python errors three
+        // hours into training.
+        if args.output_name.is_empty() {
+            return Err(RecipeError::InvalidArgs("output_name is empty".into()));
+        }
         let since_secs = humantime::parse_duration(&args.since)
             .map_err(|e| RecipeError::InvalidArgs(format!("since '{}': {e}", args.since)))?
             .as_secs();
+        if since_secs == 0 {
+            return Err(RecipeError::InvalidArgs(format!(
+                "since '{}' resolves to zero seconds",
+                args.since
+            )));
+        }
         if !matches!(args.method.as_str(), "qlora" | "lora" | "full") {
             return Err(RecipeError::InvalidArgs(format!(
                 "method '{}' must be qlora|lora|full",
                 args.method
             )));
+        }
+        if !(args.eval_ratio > 0.0 && args.eval_ratio < 1.0) {
+            return Err(RecipeError::InvalidArgs(format!(
+                "eval_ratio must be in (0, 1); got {}",
+                args.eval_ratio
+            )));
+        }
+        if args.epochs == 0 {
+            return Err(RecipeError::InvalidArgs("epochs must be > 0".into()));
+        }
+        if args.batch_size == 0 || args.grad_accum == 0 {
+            return Err(RecipeError::InvalidArgs(
+                "batch_size and grad_accum must be > 0".into(),
+            ));
+        }
+        if !(args.lr > 0.0 && args.lr.is_finite()) {
+            return Err(RecipeError::InvalidArgs(format!(
+                "lr must be a positive finite number; got {}",
+                args.lr
+            )));
+        }
+        if args.seq_len == 0 {
+            return Err(RecipeError::InvalidArgs("seq_len must be > 0".into()));
         }
 
         let recipe_args_json = serde_json::to_value(&args)

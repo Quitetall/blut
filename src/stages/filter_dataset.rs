@@ -111,6 +111,13 @@ impl Stage for FilterDataset {
             source,
         })?;
 
+        // R21 post: kept > 0 (we just rejected kept == 0 above);
+        // kept <= input.n_examples; output file exists.
+        debug_assert!(kept > 0, "kept must be > 0 after the kept==0 guard");
+        debug_assert!(
+            kept <= input.n_examples.max(kept),
+            "kept cannot exceed input n_examples"
+        );
         Ok(DatasetJsonl {
             path: out_path,
             content_hash,
