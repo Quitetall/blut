@@ -937,16 +937,13 @@ async fn run_train(args: TrainArgs) -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow!("output-name is required (positional). See `lamu-train --help`."))?;
 
-    // v2 commit 4b: --from-conversations now delegates to the
-    // `finetune_from_conversations` recipe via the typed Plan
-    // executor (9-stage pipeline). The legacy linear path is kept
-    // behind the `LAMU_TRAIN_USE_LEGACY=1` kill-switch so users
-    // hitting regressions can roll back without rebuilding. The
-    // kill-switch is removed in v2 commit 8 once the new path has
-    // been the default through a full release window.
-    if args.from_conversations
-        && std::env::var("LAMU_TRAIN_USE_LEGACY").ok().as_deref() != Some("1")
-    {
+    // v2 commit 8: `--from-conversations` now unconditionally
+    // delegates to the typed-Plan recipe pipeline. The
+    // `LAMU_TRAIN_USE_LEGACY=1` kill-switch shipped in commit 4b
+    // is gone — the recipe path has been the default through a
+    // release window and the legacy linear flow only remains for
+    // `--dataset <path>` runs (no recipe equivalent yet).
+    if args.from_conversations {
         return run_train_via_recipe(&output_name, &args).await;
     }
 
