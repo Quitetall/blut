@@ -47,7 +47,11 @@ impl Stage for ConvertGguf {
         if args.quant.is_empty() {
             return Err(StageError::BadInput("quant must be non-empty".into()));
         }
-        debug_assert!(input.path.is_absolute() || input.path.is_relative());
+        if input.path.as_os_str().is_empty() {
+            return Err(StageError::BadInput(
+                "HfCheckpoint.path must be non-empty".into(),
+            ));
+        }
         let gguf_path = convert::convert_to_gguf(&input.path, &args.name, &args.quant)
             .await
             .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;

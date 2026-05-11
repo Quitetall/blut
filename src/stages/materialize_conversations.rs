@@ -47,12 +47,15 @@ impl Stage for MaterializeConversations {
             !ctx.stage_dir.as_os_str().is_empty(),
             "stage_dir must be non-empty"
         );
-        // R23: since_seconds == 0 means "everything since epoch" —
-        // valid but worth a debug_assert to catch accidental 0-init.
-        debug_assert!(
-            args.since_seconds > 0,
-            "since_seconds=0 sweeps all-time history; intentional?"
-        );
+        // since_seconds==0 means "everything since epoch" — valid;
+        // log instead of panic so it's visible in audit but doesn't
+        // break legitimate full-history sweeps.
+        if args.since_seconds == 0 {
+            tracing::warn!(
+                target: "blut::materialize_conversations",
+                "since_seconds=0; sweeping ALL conversation history"
+            );
+        }
         let out_path = ctx.stage_dir.join("dataset.jsonl");
         let stats = conversations::dump_to_jsonl(
             Duration::from_secs(args.since_seconds),

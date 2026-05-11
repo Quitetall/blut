@@ -54,8 +54,16 @@ impl Stage for EvalJudge {
         args: &Args,
     ) -> Result<EvalReport, StageError> {
         let (ckpt, ds) = input;
-        // R21 + R23.
-        debug_assert!(ds.n_examples >= 0, "dataset n_examples cannot be negative");
+        // R23: hard guards (release-mode too). Negative n_examples
+        // would wrap on the `as u32` cast below; large n_samples
+        // could overflow into negative via `as i64`. Reject both
+        // up front rather than silently producing garbage `n`.
+        if ds.n_examples < 0 {
+            return Err(StageError::BadInput(format!(
+                "eval_judge: dataset n_examples {} is negative",
+                ds.n_examples
+            )));
+        }
         if args.judge_model.is_empty() {
             return Err(StageError::BadInput("eval_judge: judge_model is empty".into()));
         }
@@ -64,6 +72,10 @@ impl Stage for EvalJudge {
                 "eval_judge: either n_samples > 0 or prompts must be non-empty".into(),
             ));
         }
+        // After the ds.n_examples >= 0 + n_samples: u32 checks,
+        // `args.n_samples as i64` is lossless and the min() result
+        // is bounded by u32::MAX, so the `as u32` cast below is
+        // well-defined.
         let seed = ckpt.content_hash.0[2] as f32 / 255.0;
         let n = if args.prompts.is_empty() {
             (args.n_samples as i64).min(ds.n_examples).max(0) as u32

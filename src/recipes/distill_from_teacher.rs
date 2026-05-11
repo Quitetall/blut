@@ -119,11 +119,16 @@ impl Recipe for DistillFromTeacher {
                 "epochs, batch_size, grad_accum, seq_len must all be > 0".into(),
             ));
         }
-        // R30: reject path traversal on teacher_path + dataset_path.
+        // R30: mandatory paths must be non-empty AND traversal-free.
         for (label, p) in [
             ("teacher_path", &args.teacher_path),
             ("dataset_path", &args.dataset_path),
         ] {
+            if p.as_os_str().is_empty() {
+                return Err(RecipeError::InvalidArgs(format!(
+                    "{label} must be non-empty"
+                )));
+            }
             if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
                 return Err(RecipeError::InvalidArgs(format!(
                     "{label} '{}' contains '..' — refusing",

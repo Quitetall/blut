@@ -40,11 +40,20 @@ impl Stage for MergeReports {
         _args: &Args,
     ) -> Result<EvalReport, StageError> {
         let (a, b, c) = input;
-        // R21 pre: each child report has a non-empty evaluator
-        // label (so by_evaluator keys are well-formed).
-        debug_assert!(!a.evaluator.is_empty(), "EvalReport.evaluator must be non-empty");
-        debug_assert!(!b.evaluator.is_empty(), "EvalReport.evaluator must be non-empty");
-        debug_assert!(!c.evaluator.is_empty(), "EvalReport.evaluator must be non-empty");
+        // R23: empty evaluator labels would produce malformed
+        // by_evaluator JSON (duplicate-key or empty-key collisions).
+        // Promoted from debug_assert per V4 Pro retrofit-C review —
+        // release builds need the guard too.
+        for (i, label) in [a.evaluator.as_str(), b.evaluator.as_str(), c.evaluator.as_str()]
+            .iter()
+            .enumerate()
+        {
+            if label.is_empty() {
+                return Err(StageError::BadInput(format!(
+                    "EvalReport[{i}].evaluator must be non-empty"
+                )));
+            }
+        }
         let by_evaluator = serde_json::json!({
             &a.evaluator: a.metrics.clone(),
             &b.evaluator: b.metrics.clone(),

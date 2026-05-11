@@ -40,13 +40,24 @@ impl Stage for TakeTrain {
         input: DatasetSplit,
         _args: &Args,
     ) -> Result<DatasetJsonl, StageError> {
-        // R21: structural pre/post on the projection.
-        debug_assert!(input.train.n_examples > 0, "train half must be non-empty");
-        debug_assert!(input.eval.n_examples > 0, "eval half must be non-empty");
-        debug_assert!(
-            input.train.n_examples >= input.eval.n_examples,
-            "train should typically be larger than eval"
-        );
+        // R23: both halves must be non-empty (split_train_eval
+        // enforces this upstream; promoted from debug_assert per
+        // V4 Pro retrofit-C review so release paths don't trust
+        // empty halves silently).
+        if input.train.n_examples <= 0 {
+            return Err(StageError::BadInput(format!(
+                "take_train: train half has {} examples",
+                input.train.n_examples
+            )));
+        }
+        if input.eval.n_examples <= 0 {
+            return Err(StageError::BadInput(format!(
+                "take_train: eval half has {} examples",
+                input.eval.n_examples
+            )));
+        }
+        // (Removed train >= eval heuristic — a valid recipe could
+        // pick eval > train, e.g. for held-out clinical evaluation.)
         Ok(input.train)
     }
 }

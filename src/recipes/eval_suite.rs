@@ -88,12 +88,16 @@ impl Recipe for EvalSuite {
                 "batch_size + max_seq must be > 0".into(),
             ));
         }
-        // R30: reject paths that contain '..' (defensive — these
-        // become PYTHON args + may flow through downstream tooling).
+        // R30: mandatory paths must be non-empty AND traversal-free.
         for (label, p) in [
             ("model_path", &args.model_path),
             ("dataset_path", &args.dataset_path),
         ] {
+            if p.as_os_str().is_empty() {
+                return Err(RecipeError::InvalidArgs(format!(
+                    "{label} must be non-empty"
+                )));
+            }
             if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
                 return Err(RecipeError::InvalidArgs(format!(
                     "{label} '{}' contains '..' — refusing",
