@@ -28,6 +28,7 @@
 //!   if they ever arise, behave the natural way.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::marker::PhantomData;
 
 use crate::framework::artifact::Artifact;
@@ -38,7 +39,7 @@ pub type NodeId = u32;
 
 pub(crate) struct PlanNode {
     pub id: NodeId,
-    pub stage: Box<dyn StageDyn>,
+    pub stage: Arc<dyn StageDyn>,
     /// JSON-encoded `Stage::Args`. Stored canonical-ish (insertion
     /// order; the cache key path canonicalizes again before hashing).
     pub args: serde_json::Value,
@@ -118,7 +119,7 @@ impl Plan<()> {
             .expect("Stage::Args must serialize to JSON; verify the type's Serialize impl");
         self.nodes.push(PlanNode {
             id,
-            stage: Box::new(stage),
+            stage: Arc::new(stage),
             args: args_json,
         });
         // Graph input: provide () as the input artifact.
@@ -188,7 +189,7 @@ impl<O: Artifact> Plan<O> {
             .expect("Stage::Args must serialize to JSON; verify the type's Serialize impl");
         self.nodes.push(PlanNode {
             id,
-            stage: Box::new(stage),
+            stage: Arc::new(stage),
             args: args_json,
         });
         // Edge from each previous leading node to this one. For
@@ -245,14 +246,14 @@ impl<O: Artifact> Plan<O> {
         let l_args_json = serde_json::to_value(&l_args).expect("Stage::Args serialize");
         self.nodes.push(PlanNode {
             id: l_id,
-            stage: Box::new(left),
+            stage: Arc::new(left),
             args: l_args_json,
         });
         let r_id = self.nodes.len() as NodeId;
         let r_args_json = serde_json::to_value(&r_args).expect("Stage::Args serialize");
         self.nodes.push(PlanNode {
             id: r_id,
-            stage: Box::new(right),
+            stage: Arc::new(right),
             args: r_args_json,
         });
         for &from in &self.leading {
@@ -289,9 +290,9 @@ impl<O: Artifact> Plan<O> {
     {
         let mut new_ids = Vec::with_capacity(3);
         for (stage, args) in [
-            (Box::new(a) as Box<dyn StageDyn>, serde_json::to_value(&a_args).expect("a_args")),
-            (Box::new(b) as Box<dyn StageDyn>, serde_json::to_value(&b_args).expect("b_args")),
-            (Box::new(c) as Box<dyn StageDyn>, serde_json::to_value(&c_args).expect("c_args")),
+            (Arc::new(a) as Arc<dyn StageDyn>, serde_json::to_value(&a_args).expect("a_args")),
+            (Arc::new(b) as Arc<dyn StageDyn>, serde_json::to_value(&b_args).expect("b_args")),
+            (Arc::new(c) as Arc<dyn StageDyn>, serde_json::to_value(&c_args).expect("c_args")),
         ] {
             let id = self.nodes.len() as NodeId;
             self.nodes.push(PlanNode { id, stage, args });
@@ -323,7 +324,7 @@ impl<A: Artifact, B: Artifact> Plan<(A, B)> {
         let args_json = serde_json::to_value(&args).expect("Stage::Args serialize");
         self.nodes.push(PlanNode {
             id,
-            stage: Box::new(stage),
+            stage: Arc::new(stage),
             args: args_json,
         });
         for &from in &self.leading {
@@ -352,7 +353,7 @@ impl<A: Artifact, B: Artifact, C: Artifact> Plan<(A, B, C)> {
         let args_json = serde_json::to_value(&args).expect("Stage::Args serialize");
         self.nodes.push(PlanNode {
             id,
-            stage: Box::new(stage),
+            stage: Arc::new(stage),
             args: args_json,
         });
         for &from in &self.leading {
