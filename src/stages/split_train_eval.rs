@@ -57,16 +57,25 @@ impl Stage for SplitTrainEval {
             path: input.path.clone(),
             source,
         })?;
-        let lines: Vec<String> = std::io::BufReader::new(file)
-            .lines()
-            .filter_map(|l| l.ok())
-            .filter(|l| !l.trim().is_empty())
-            .collect();
+        let mut lines: Vec<String> = Vec::new();
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line.map_err(|source| StageError::Io {
+                path: input.path.clone(),
+                source,
+            })?;
+            if !line.trim().is_empty() {
+                lines.push(line);
+            }
+        }
 
-        if lines.is_empty() {
-            return Err(StageError::BadInput(
-                "split_train_eval: input dataset is empty".into(),
-            ));
+        // Reject early on inputs that can't split into both halves —
+        // catches both the empty case and the 1-line case (which
+        // would otherwise hit `clamp(1, 0)` and panic).
+        if lines.len() < 2 {
+            return Err(StageError::BadInput(format!(
+                "split_train_eval: need ≥2 examples to produce both train + eval, got {}",
+                lines.len()
+            )));
         }
 
         let mut indices: Vec<usize> = (0..lines.len()).collect();
@@ -74,7 +83,8 @@ impl Stage for SplitTrainEval {
         indices.shuffle(&mut rng);
 
         let n_eval = ((lines.len() as f32) * args.eval_ratio).round() as usize;
-        let n_eval = n_eval.clamp(1, lines.len().saturating_sub(1));
+        // lines.len() ≥ 2 here, so the range [1, len-1] is non-empty.
+        let n_eval = n_eval.clamp(1, lines.len() - 1);
         let (eval_idx, train_idx) = indices.split_at(n_eval);
 
         let train_path = ctx.stage_dir.join("train.jsonl");
@@ -234,6 +244,24 @@ mod tests {
             .unwrap();
         assert_eq!(split.train.n_examples + split.eval.n_examples, 100);
         assert_eq!(split.eval.n_examples, 20);
+    }
+
+    #[tokio::test]
+    async fn fails_on_single_example_input() {
+        // Regression: clamp(1, 0) would panic on 1-line input
+        // before the v2-commit-4a review fix.
+        let td = tempfile::tempdir().unwrap();
+        let r = SplitTrainEval
+            .run(
+                &ctx(td.path()),
+                write_n(td.path(), 1),
+                &Args {
+                    eval_ratio: 0.2,
+                    seed: 0,
+                },
+            )
+            .await;
+        assert!(matches!(r, Err(StageError::BadInput(_))));
     }
 
     #[tokio::test]

@@ -66,6 +66,7 @@ impl Stage for FilterDataset {
         let mut writer = BufWriter::new(outfile);
 
         let mut kept: i64 = 0;
+        let mut malformed: i64 = 0;
         for line in reader.lines() {
             let line = line.map_err(|source| StageError::Io {
                 path: input.path.clone(),
@@ -74,24 +75,34 @@ impl Stage for FilterDataset {
             if line.trim().is_empty() {
                 continue;
             }
-            if !keep_example(&line, args) {
-                continue;
+            match classify(&line, args) {
+                Verdict::Keep => {
+                    writeln!(writer, "{line}").map_err(|source| StageError::Io {
+                        path: out_path.clone(),
+                        source,
+                    })?;
+                    kept += 1;
+                }
+                Verdict::DropPredicate => {}
+                Verdict::DropMalformed => malformed += 1,
             }
-            writeln!(writer, "{line}").map_err(|source| StageError::Io {
-                path: out_path.clone(),
-                source,
-            })?;
-            kept += 1;
         }
         writer.flush().map_err(|source| StageError::Io {
             path: out_path.clone(),
             source,
         })?;
 
+        if malformed > 0 {
+            tracing::warn!(
+                "filter_dataset: dropped {malformed} malformed JSONL line(s) from {}",
+                input.path.display()
+            );
+        }
+
         if kept == 0 {
             return Err(StageError::BadInput(format!(
-                "filter_dataset removed all {} examples (min_turns={}, max_msg_bytes={}, drop_errors={})",
-                input.n_examples, args.min_turns, args.max_msg_bytes, args.drop_errors
+                "filter_dataset removed all {} examples (min_turns={}, max_msg_bytes={}, drop_errors={}, malformed={})",
+                input.n_examples, args.min_turns, args.max_msg_bytes, args.drop_errors, malformed
             )));
         }
 
@@ -108,25 +119,34 @@ impl Stage for FilterDataset {
     }
 }
 
+/// Verdict for a single line. `DropMalformed` is distinguished from
+/// `DropPredicate` so the stage can count malformed input separately
+/// — silent drops mask schema drift / upstream bugs.
+enum Verdict {
+    Keep,
+    DropPredicate,
+    DropMalformed,
+}
+
 /// Per-example predicate. Operates on the raw JSONL line so we
 /// don't deserialize into a typed struct (the upstream JSONL schema
 /// may vary across producers — keep this loose).
-fn keep_example(line: &str, args: &Args) -> bool {
+fn classify(line: &str, args: &Args) -> Verdict {
     let v: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(_) => return false,
+        Err(_) => return Verdict::DropMalformed,
     };
     let messages = match v.get("messages").and_then(|m| m.as_array()) {
         Some(m) => m,
-        None => return false,
+        None => return Verdict::DropMalformed,
     };
     if args.min_turns > 0 && (messages.len() as u32) < args.min_turns {
-        return false;
+        return Verdict::DropPredicate;
     }
     for msg in messages {
         let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
         if args.max_msg_bytes > 0 && (content.len() as u32) > args.max_msg_bytes {
-            return false;
+            return Verdict::DropPredicate;
         }
         if args.drop_errors {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
@@ -135,11 +155,11 @@ fn keep_example(line: &str, args: &Args) -> bool {
                     || content.contains("error")
                     || content.contains("Traceback"))
             {
-                return false;
+                return Verdict::DropPredicate;
             }
         }
     }
-    true
+    Verdict::Keep
 }
 
 #[cfg(test)]
