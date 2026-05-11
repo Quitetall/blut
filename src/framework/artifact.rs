@@ -296,9 +296,27 @@ pub trait Artifact:
     /// + stage compatibility checks. Bumping is a breaking change.
     const KIND: &'static str;
 
-    /// Schema version. Bump when on-disk layout changes. Cache
-    /// entries from a different `SCHEMA` are invalidated automatically.
+    /// Schema version. Bump ONLY when the artifact's struct fields
+    /// change in a way that affects downstream semantics — adding
+    /// a new field, renaming, repurposing. Do NOT bump for purely
+    /// internal optimizations (faster impl, better validation,
+    /// etc.) — that just invalidates cache without reason. The
+    /// trade-off is correctness vs cache reuse; bias toward cache
+    /// reuse when the change is internal.
     const SCHEMA: u32;
+
+    /// Whether the artifact's `content_hash()` should walk on-disk
+    /// bytes (true) or use a cheap fingerprint of path + size +
+    /// mtime (false). Default true matches small artifacts where
+    /// the bytes ARE the artifact (dataset.jsonl, eval reports).
+    ///
+    /// Override `false` for large bulk artifacts where content
+    /// equality across reruns is rare and content hashing costs
+    /// minutes (large model checkpoints, multi-GB GGUF files,
+    /// fullband memmaps). Concrete artifacts that pick `false`
+    /// must implement `content_hash()` using a stat-based
+    /// fingerprint instead of bytes.
+    const HASH_CONTENTS: bool = true;
 
     /// Stable content hash. For file-backed artifacts this is the
     /// SHA-256 of the canonical bytes; for composite artifacts a

@@ -203,114 +203,11 @@ impl TrainBackend for PythonTrainBackend {
     }
 }
 
-/// Local clone of `lamu_core::backends::graceful_kill`. SIGTERM,
-/// 10s grace, SIGKILL. Kept here so this crate has no upward
-/// dependency on lamu-core. If both copies drift, the bug is
-/// here — propagate the fix.
-///
-/// Public to the crate so `jobs::cancel_job` can reuse it for
-/// `lamu-train cancel <id>` without re-implementing the timing
-/// + EPERM/ESRCH handling.
-#[cfg(unix)]
-pub(crate) async fn graceful_kill_pid(pid: u32, grace: std::time::Duration) {
-    graceful_kill_inner(pid, grace).await
-}
+/// Re-export for `jobs::cancel_job` callers. The implementation
+/// now lives in `crate::python_kill::graceful_kill_pid` and is
+/// shared with `LamquantBackend` + any future subprocess backend.
+pub(crate) use crate::python_kill::graceful_kill_pid;
 
-#[cfg(not(unix))]
-pub(crate) async fn graceful_kill_pid(_pid: u32, _grace: std::time::Duration) {
-    // No-op on non-Unix; cancel is best-effort.
-}
-
-#[cfg(unix)]
 async fn graceful_kill(pid: u32) {
-    graceful_kill_inner(pid, Duration::from_secs(10)).await
-}
-
-#[cfg(unix)]
-async fn graceful_kill_inner(pid: u32, grace: Duration) {
-    use nix::errno::Errno;
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
-    let raw = Pid::from_raw(pid as i32);
-    match kill(raw, Signal::SIGTERM) {
-        Ok(()) => {}
-        Err(Errno::ESRCH) => {
-            // Already gone before we got here. Done.
-            return;
-        }
-        Err(Errno::EPERM) => {
-            // Process exists but we can't signal it (different user
-            // or capability-restricted namespace). The 10 s grace
-            // would just hang since SIGKILL would also fail. Log
-            // loudly and bail.
-            tracing::error!(
-                "trainer pid {} cannot be signalled (EPERM); cancel is a no-op",
-                pid
-            );
-            return;
-        }
-        Err(e) => {
-            // Unexpected errno (EINVAL, etc.) — the SIGKILL escalation
-            // would fail for the same reason, so don't burn the 10 s
-            // wait. Log and bail.
-            tracing::error!(
-                "SIGTERM trainer pid {} returned unexpected errno: {}; \
-                 skipping grace period (SIGKILL would fail too)",
-                pid,
-                e
-            );
-            return;
-        }
-    }
-    let deadline = Instant::now() + grace;
-    while Instant::now() < deadline {
-        match pid_alive(pid) {
-            PidStatus::Gone => {
-                tracing::debug!("trainer pid {} exited cleanly after SIGTERM", pid);
-                return;
-            }
-            PidStatus::Unsignalable => {
-                tracing::error!("trainer pid {} unreachable mid-wait (EPERM)", pid);
-                return;
-            }
-            PidStatus::Alive => {}
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    tracing::warn!(
-        "trainer pid {} ignored SIGTERM for {:?}, escalating to SIGKILL",
-        pid,
-        grace
-    );
-    let _ = kill(raw, Signal::SIGKILL);
-}
-
-#[cfg(not(unix))]
-async fn graceful_kill(_pid: u32) {
-    // No-op on non-Unix; cancel is best-effort.
-}
-
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PidStatus {
-    Alive,
-    Gone,
-    Unsignalable,
-}
-
-#[cfg(unix)]
-fn pid_alive(pid: u32) -> PidStatus {
-    use nix::errno::Errno;
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
-    // Sending signal 0 returns Ok if the process is alive AND we
-    // have permission. ESRCH means the process is gone. EPERM means
-    // it exists but we can't touch it — caller must treat that as
-    // "give up", not "wait longer".
-    match kill(Pid::from_raw(pid as i32), None) {
-        Ok(()) => PidStatus::Alive,
-        Err(Errno::ESRCH) => PidStatus::Gone,
-        Err(Errno::EPERM) => PidStatus::Unsignalable,
-        Err(_) => PidStatus::Alive,
-    }
+    crate::python_kill::graceful_kill_pid(pid, Duration::from_secs(10)).await
 }

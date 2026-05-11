@@ -187,6 +187,24 @@ pub trait Stage: Send + Sync + 'static {
     const SCHEMA: u32;
     const RESOURCES: &'static [Resource];
 
+    /// Whether re-running this stage with the same input + args
+    /// produces a byte-equal output artifact.
+    ///
+    /// Default `true` matches pure-function stages (filter, split,
+    /// convert). Training stages must override to `false` — model
+    /// weights have stochastic seeds (CUDA nondeterminism, data
+    /// loader shuffle, dropout) so two runs of the same stage
+    /// produce different ckpt bytes even with identical args.
+    ///
+    /// Executor uses this when computing downstream cache keys:
+    /// for `DETERMINISTIC = true`, downstream sees this stage's
+    /// output content_hash (real fingerprint). For
+    /// `DETERMINISTIC = false`, downstream sees a synthesized
+    /// fingerprint = hash(stage_name ‖ schema ‖ args_canon ‖
+    /// input_hash) — stable across re-runs so a downstream stage
+    /// doesn't re-execute just because its upstream was retrained.
+    const DETERMINISTIC: bool = true;
+
     type Input: Artifact;
     type Output: Artifact;
     type Args: serde::Serialize
@@ -213,6 +231,7 @@ pub trait Stage: Send + Sync + 'static {
 pub trait StageDyn: Send + Sync + 'static {
     fn name(&self) -> &'static str;
     fn schema(&self) -> u32;
+    fn deterministic(&self) -> bool;
     fn resources(&self) -> &'static [Resource];
     fn input_kind(&self) -> &'static str;
     fn output_kind(&self) -> &'static str;
@@ -233,6 +252,9 @@ impl<S: Stage> StageDyn for S {
     }
     fn schema(&self) -> u32 {
         S::SCHEMA
+    }
+    fn deterministic(&self) -> bool {
+        S::DETERMINISTIC
     }
     fn resources(&self) -> &'static [Resource] {
         S::RESOURCES

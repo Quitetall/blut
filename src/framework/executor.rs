@@ -128,9 +128,20 @@ impl SequentialExecutor {
         // topo order; each subsequent node looks up its
         // predecessor here.
         let mut outputs: HashMap<NodeId, ErasedArtifact> = HashMap::new();
+        // Logical output hashes, parallel to `outputs`. For
+        // deterministic stages this is the real content hash. For
+        // nondeterministic stages (training) it's a synthesized
+        // fingerprint stable across stochastic re-runs. Downstream
+        // cache keys read this, NOT the real content hash, so a
+        // retrained upstream doesn't force downstream re-execution
+        // when the upstream identity (name+schema+args+input) is
+        // unchanged.
+        let mut logical_outputs: HashMap<NodeId, ContentHash> = HashMap::new();
         // Pre-seed initial inputs (graph inputs).
         for (id, art) in view.initial {
+            let lh = content_hash_from_erased(art);
             outputs.insert(*id, art.clone());
+            logical_outputs.insert(*id, lh);
         }
 
         let mut n_hits = 0usize;
@@ -208,11 +219,46 @@ impl SequentialExecutor {
                 }
             };
 
-            // Cache key. Hash of the canonical-JSON form of the
-            // erased input artifact (kind + schema + sorted-keys
-            // payload). Cheap; the cache lookup is on the hot
-            // path so this needs to be fast.
-            let input_hash = content_hash_from_erased(&input);
+            // Cache key derivation uses LOGICAL hashes of
+            // predecessors, not real content hashes. For all-
+            // deterministic chains these are identical; for chains
+            // containing nondet stages, logical hashes are stable
+            // across stochastic re-runs so downstream's cache key
+            // doesn't drift just because an upstream retrain
+            // produced different ckpt bytes.
+            let input_hash = match preds.as_slice() {
+                [] => *logical_outputs.get(node_id).ok_or_else(|| {
+                    PlanError::Other(format!(
+                        "node {} has no logical input hash",
+                        node_id
+                    ))
+                })?,
+                [single] => *logical_outputs.get(single).ok_or_else(|| {
+                    PlanError::Other(format!(
+                        "node {} predecessor {} missing logical hash",
+                        node_id, single
+                    ))
+                })?,
+                multi => {
+                    // Tuple input: hash the concatenation of child
+                    // logical hashes with arity domain separation.
+                    use sha2::{Digest, Sha256};
+                    let mut h = Sha256::new();
+                    h.update(b"tuple");
+                    h.update([multi.len() as u8]);
+                    for &pid in multi {
+                        let lh = logical_outputs.get(&pid).ok_or_else(|| {
+                            PlanError::Other(format!(
+                                "node {} predecessor {} missing logical hash",
+                                node_id, pid
+                            ))
+                        })?;
+                        h.update(lh.0);
+                    }
+                    let arr: [u8; 32] = h.finalize().into();
+                    ContentHash(arr)
+                }
+            };
 
             // Use precomputed canonical-args bytes from the plan
             // compile pass (opt-5) instead of re-canonicalizing the
@@ -231,7 +277,16 @@ impl SequentialExecutor {
                     stage_name: stage_name.to_string(),
                     cache_key: key,
                 });
+                let logical = compute_logical_output_hash(
+                    &hit.artifact,
+                    node.stage.deterministic(),
+                    stage_name,
+                    node.stage.schema(),
+                    input_hash,
+                    &node.canon_args,
+                );
                 outputs.insert(*node_id, hit.artifact);
+                logical_outputs.insert(*node_id, logical);
                 n_hits += 1;
                 continue;
             }
@@ -341,7 +396,16 @@ impl SequentialExecutor {
                 elapsed: stage_started.elapsed(),
             });
 
+            let logical = compute_logical_output_hash(
+                &output,
+                node.stage.deterministic(),
+                stage_name,
+                node.stage.schema(),
+                input_hash,
+                &node.canon_args,
+            );
             outputs.insert(*node_id, output);
+            logical_outputs.insert(*node_id, logical);
             n_misses += 1;
         }
 
@@ -376,6 +440,36 @@ impl SequentialExecutor {
 /// bytes, not the on-disk payload. Concrete artifact impls of
 /// `content_hash` already account for this by hashing the on-disk
 /// bytes inside their own implementation.
+/// Logical output hash for a stage. Deterministic stages report
+/// the real content hash so downstream sees byte-identical output
+/// after re-runs (used for cache validation + audit). Nondet
+/// stages report a synthesized fingerprint = hash(stage_name ‖
+/// schema ‖ input_hash ‖ args) which is byte-stable across
+/// stochastic re-runs even when the actual ckpt bytes differ.
+fn compute_logical_output_hash(
+    output: &ErasedArtifact,
+    deterministic: bool,
+    stage_name: &str,
+    schema: u32,
+    input_hash: ContentHash,
+    canon_args: &[u8],
+) -> ContentHash {
+    if deterministic {
+        return content_hash_from_erased(output);
+    }
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"blut.nondet.v1");
+    h.update([0u8]);
+    h.update(stage_name.as_bytes());
+    h.update([0u8]);
+    h.update(schema.to_le_bytes());
+    h.update(input_hash.0);
+    h.update(canon_args);
+    let arr: [u8; 32] = h.finalize().into();
+    ContentHash(arr)
+}
+
 fn content_hash_from_erased(art: &ErasedArtifact) -> ContentHash {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
