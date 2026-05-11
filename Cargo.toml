@@ -1,0 +1,58 @@
+[package]
+name = "blut"
+version = "0.1.0"
+edition = "2024"
+authors = ["Brian Lam"]
+license = "MIT"
+repository = "https://github.com/Quitetall/blut"
+rust-version = "1.85"
+description = "BLUT — Brian Lam's Universal Trainer. Stage→Plan→Recipe orchestrator framework for local ML training (SFT, DPO, distillation, eval)."
+readme = "README.md"
+keywords = ["ml", "training", "fine-tune", "lora", "orchestrator"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "blut"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+nix = { version = "0.29", features = ["signal"] }
+dirs = "5"
+parking_lot = "0.12"
+clap = { version = "4", features = ["derive"] }
+humantime = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
+sha2 = "0.10"
+memmap2 = "0.9"
+uuid = { version = "1", features = ["v4"] }
+toml = "0.8"
+schemars = "0.8"
+tokio-util = "0.7"
+rayon = "1"
+which = "6"
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "framework"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

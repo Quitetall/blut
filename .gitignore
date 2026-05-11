@@ -1,0 +1,6 @@
+/target/
+/Cargo.lock.bak
+**/__pycache__/
+*.pyc
+.DS_Store
+*.swp

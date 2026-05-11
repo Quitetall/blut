@@ -1,0 +1,33 @@
+[project]
+name = "lamu-trainer"
+version = "0.1.0"
+description = "Python deps for lamu-train trainer subprocess"
+requires-python = ">=3.10"
+
+# Pinned to versions verified against the lamu-train Rust contract
+# as of 2026-05. Bump deliberately — major-version bumps in unsloth
+# or trl frequently break the TrainerCallback hooks.
+dependencies = [
+    "unsloth>=2025.1,<2026.0",
+    "trl>=0.13,<0.18",
+    "peft>=0.14,<0.18",
+    "bitsandbytes>=0.45",
+    "transformers>=4.48,<5.0",
+    "accelerate>=1.3",
+    "torch>=2.5",
+    "datasets>=3.0",
+]
+
+# APOLLO is wired via two paths in trainer.py:build_optimizer:
+#   1. transformers builtin (post-PR #35225, transformers ≥ ~4.50)
+#   2. fallback to the community `apollo-torch` package
+# Either is acceptable. List it as optional so users who pin
+# transformers older than the PR cut can still get APOLLO.
+[project.optional-dependencies]
+apollo = ["apollo-torch>=0.1"]
+
+[tool.lamu]
+# Self-check mode is dependency-free (only stdlib). Used by Rust
+# integration tests to verify the protocol round-trip without
+# pulling the heavy install.
+self_check_no_deps = true
