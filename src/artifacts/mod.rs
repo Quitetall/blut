@@ -6,8 +6,10 @@
 
 pub mod checkpoint;
 pub mod dataset;
+pub mod eval;
 pub mod preferences;
 
 pub use checkpoint::{GgufModel, HfCheckpoint};
 pub use dataset::{DatasetJsonl, DatasetSplit};
+pub use eval::EvalReport;
 pub use preferences::PreferenceJsonl;
