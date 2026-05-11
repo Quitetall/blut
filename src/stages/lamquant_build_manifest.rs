@@ -149,7 +149,12 @@ impl Stage for LamquantBuildManifest {
             .get("n_windows")
             .and_then(|v| v.as_i64())
             .or_else(|| parsed.get("total_windows").and_then(|v| v.as_i64()))
-            .unwrap_or(0);
+            .ok_or_else(|| {
+                StageError::Backend(anyhow::anyhow!(
+                    "manifest JSON missing required `n_windows` / `total_windows` field at {}",
+                    output_path.display()
+                ))
+            })?;
 
         let content_hash = ContentHash::hash_file(&output_path).map_err(|source| StageError::Io {
             path: output_path.clone(),

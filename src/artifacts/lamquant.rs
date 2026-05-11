@@ -238,34 +238,49 @@ impl Artifact for PccpVerdict {
 
 // ── Helpers shared across stages ────────────────────────────────
 
-/// Stat-based fingerprint over one path: hash(path_bytes ‖
-/// size ‖ mtime_unix_secs). Caller supplies a domain tag so two
-/// artifact types over the same file don't collide.
-pub fn stat_fingerprint(domain: &[u8], path: &Path) -> std::io::Result<ContentHash> {
-    let meta = std::fs::metadata(path)?;
-    let size = meta.len();
-    let mtime = meta
-        .modified()
+fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// Stat-based fingerprint over one path: hash(path_bytes ‖
+/// size ‖ mtime_unix_secs). Caller supplies a domain tag so two
+/// artifact types over the same file don't collide.
+///
+/// Convention: the producing STAGE calls this helper and stores
+/// the result in its artifact's `content_hash` field. The
+/// `Artifact::content_hash()` impl just returns that stored value
+/// — it is NOT a fresh stat on every read (would defeat the
+/// "skip walking bytes" point of `HASH_CONTENTS = false`).
+pub fn stat_fingerprint(domain: &[u8], path: &Path) -> std::io::Result<ContentHash> {
+    let meta = std::fs::metadata(path)?;
     let mut h = Sha256::new();
     h.update(domain);
     h.update([0u8]);
     h.update(path.as_os_str().to_string_lossy().as_bytes());
     h.update([0u8]);
-    h.update(size.to_le_bytes());
-    h.update(mtime.to_le_bytes());
+    h.update(meta.len().to_le_bytes());
+    h.update(mtime_secs(&meta).to_le_bytes());
     let arr: [u8; 32] = h.finalize().into();
     Ok(ContentHash(arr))
 }
 
 /// Stat-based fingerprint over a directory: top-level file
-/// (path, size, mtime) tuples concatenated in sorted order, then
-/// SHA-256. Does NOT recurse — for directories with subdir
-/// structure the producing stage should normalize layout before
-/// emitting the artifact.
+/// (name, size, mtime) tuples concatenated in sorted order, then
+/// SHA-256. Caveats:
+///
+///   - Does NOT recurse. Subdirectories are SKIPPED (not even
+///     counted). If a producing stage writes a subdir inside the
+///     cache dir, the fingerprint won't catch its changes.
+///   - Symlinks are skipped too (the `is_file` check follows
+///     metadata semantics: a dangling symlink fails the check and
+///     is silently dropped). Stages that emit symlinked
+///     checkpoints should resolve them before fingerprinting.
+///   - Same caveats hold even when nominally "all files at top
+///     level" — be explicit when picking this for an artifact.
 pub fn stat_fingerprint_dir(domain: &[u8], dir: &Path) -> std::io::Result<ContentHash> {
     let mut entries: Vec<(String, u64, u64)> = Vec::new();
     for ent in std::fs::read_dir(dir)? {
@@ -274,16 +289,10 @@ pub fn stat_fingerprint_dir(domain: &[u8], dir: &Path) -> std::io::Result<Conten
         if !meta.is_file() {
             continue;
         }
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
         entries.push((
             ent.file_name().to_string_lossy().into_owned(),
             meta.len(),
-            mtime,
+            mtime_secs(&meta),
         ));
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -368,14 +377,14 @@ mod tests {
         for name in ["c", "a", "b"] {
             std::fs::write(td2.path().join(name), name.as_bytes()).unwrap();
         }
-        // Reset mtimes so both dirs have identical fingerprints.
-        // (Different tempdirs have different mtimes by default.)
+        // Different tempdir paths + mtimes => cross-dir hashes
+        // differ; we only assert that the SAME dir produces a
+        // stable hash. (Sort-stability is implicit: any
+        // re-iteration of the same dir hits the same sort order.)
         let h1 = stat_fingerprint_dir(b"test", td1.path()).unwrap();
-        let _h2 = stat_fingerprint_dir(b"test", td2.path()).unwrap();
-        // Path prefix differs across temp dirs, so the full hash
-        // differs — assert structural property instead: same dir
-        // produces same hash.
+        let h2 = stat_fingerprint_dir(b"test", td2.path()).unwrap();
         let h1b = stat_fingerprint_dir(b"test", td1.path()).unwrap();
-        assert_eq!(h1, h1b);
+        assert_eq!(h1, h1b, "stable on same dir");
+        assert_ne!(h1, h2, "different dir paths produce different hashes");
     }
 }
