@@ -12,9 +12,9 @@
 //! everywhere it needs to without forward-declaring.
 
 pub mod runner;
+pub mod stages;
 pub mod venv;
-// stages/ + Python integration tests land in BB-5 alongside the
-// first hf_* recipes.
 
 pub use runner::{DpoConfig, HfRunArtifact, HfTrainerJob, HfTrainerRunner, PeftConfig, StatusLine};
+pub use stages::{HfDpoTrain, HfSftTrain};
 pub use venv::{ensure_venv, venv_root, VenvError};

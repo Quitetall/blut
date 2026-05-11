@@ -56,14 +56,16 @@ impl Compatible<LamuTrainerBackend> for DistillTrain {}
 impl Compatible<LamuTrainerBackend> for ConvertGguf {}
 impl Compatible<LamuTrainerBackend> for RegisterModel {}
 
-// HfTrainer eventually consumes the same dataset materializers /
-// register paths; preserve a path forward by declaring them
-// compatible with HfTrainerBackend too. (Real HF stages land in
-// BB-4; until then, leaving these multi-backend lets future
-// `hf_*` recipes reuse the materialize/register infrastructure
-// without re-tagging.)
+// Multi-backend (lamu + hf_trainer). HF recipes reuse these
+// stages — internals aren't lamu-specific (registries are
+// BLUT-shared, llama.cpp's convert/quantize tools work on any
+// HF-format ckpt). MergeLora is already in the agnostic block
+// above.
 impl Compatible<HfTrainerBackend> for MaterializeDatasetPath {}
+impl Compatible<HfTrainerBackend> for MaterializeConversations {}
 impl Compatible<HfTrainerBackend> for RegisterDataset {}
+impl Compatible<HfTrainerBackend> for ConvertGguf {}
+impl Compatible<HfTrainerBackend> for RegisterModel {}
 
 // ── LAMQUANT-coupled stages ────────────────────────────────────
 //
