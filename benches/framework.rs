@@ -88,13 +88,28 @@ fn bench_cache_key(c: &mut Criterion) {
         "base_model": "Qwen/Qwen3-7B",
         "seq_len": 4096,
     });
-    c.bench_function("cache key_for", |b| {
+    c.bench_function("cache key_for (Value, canonicalizes)", |b| {
         b.iter(|| {
             let k = CacheHandle::key_for(
                 black_box("sft_train"),
                 black_box(1),
                 black_box(input_hash),
                 black_box(&args),
+            );
+            black_box(k);
+        });
+    });
+
+    // Opt-5: cache the canonical bytes once, reuse on every key
+    // derivation. This is the path the executor takes per stage.
+    let canon = CacheHandle::canonical_json_bytes(&args);
+    c.bench_function("cache key_for_canon_bytes (precomputed)", |b| {
+        b.iter(|| {
+            let k = CacheHandle::key_for_canon_bytes(
+                black_box("sft_train"),
+                black_box(1),
+                black_box(input_hash),
+                black_box(&canon),
             );
             black_box(k);
         });

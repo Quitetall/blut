@@ -396,7 +396,11 @@ impl ArtifactMetadata {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let body = serde_json::to_vec_pretty(self).map_err(|e| {
+        // Compact JSON (opt-5): ~2× smaller on disk than pretty,
+        // faster to serialize, and sidecars are read by tools not
+        // humans 99% of the time. Use `jq .` if a human needs to
+        // pretty-print one.
+        let body = serde_json::to_vec(self).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, format!("serialize sidecar: {e}"))
         })?;
         std::fs::write(sidecar_path, body)

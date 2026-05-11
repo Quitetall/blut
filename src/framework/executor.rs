@@ -214,7 +214,15 @@ impl SequentialExecutor {
             // path so this needs to be fast.
             let input_hash = content_hash_from_erased(&input);
 
-            let key = CacheHandle::key_for(stage_name, node.stage.schema(), input_hash, &node.args);
+            // Use precomputed canonical-args bytes from the plan
+            // compile pass (opt-5) instead of re-canonicalizing the
+            // args Value on every stage invocation.
+            let key = CacheHandle::key_for_canon_bytes(
+                stage_name,
+                node.stage.schema(),
+                input_hash,
+                &node.canon_args,
+            );
 
             // Lookup.
             if let Some(hit) = ctx.cache.lookup(key) {

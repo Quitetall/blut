@@ -88,6 +88,20 @@ impl CacheHandle {
         input_hash: ContentHash,
         args: &serde_json::Value,
     ) -> ContentHash {
+        let canon = canonical_json(args);
+        Self::key_for_canon_bytes(stage_name, stage_schema, input_hash, canon.as_bytes())
+    }
+
+    /// Variant that accepts precomputed canonical-JSON bytes. The
+    /// executor uses this on every stage invocation by caching the
+    /// canonical bytes in the `PlanNode` at compile time — avoids
+    /// re-walking the args `Value` tree on every cache lookup.
+    pub fn key_for_canon_bytes(
+        stage_name: &str,
+        stage_schema: u32,
+        input_hash: ContentHash,
+        canon_args: &[u8],
+    ) -> ContentHash {
         const VERSION_TAG: &[u8] = b"blut.cache.v1";
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
@@ -97,10 +111,16 @@ impl CacheHandle {
         hasher.update([0u8]);
         hasher.update(stage_schema.to_le_bytes());
         hasher.update(input_hash.0);
-        let canon = canonical_json(args);
-        hasher.update(canon.as_bytes());
+        hasher.update(canon_args);
         let arr: [u8; 32] = hasher.finalize().into();
         ContentHash(arr)
+    }
+
+    /// Expose `canonical_json` for the executor / plan compiler so
+    /// the canonical bytes can be precomputed once per stage at
+    /// plan-compile time.
+    pub fn canonical_json_bytes(args: &serde_json::Value) -> Vec<u8> {
+        canonical_json(args).into_bytes()
     }
 
     /// Look up a cached output. Returns the parsed
