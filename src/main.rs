@@ -104,6 +104,16 @@ enum PlanCommand {
         #[arg(long, default_value_t = false)]
         shared_cache: bool,
     },
+    /// Compile a recipe + its args into a Plan and print the ASCII
+    /// DAG render. Does NOT execute. Useful for previewing a
+    /// recipe's shape before committing to a run.
+    Inspect {
+        /// Recipe name (e.g. eval_suite).
+        name: String,
+        /// Recipe args as inline JSON.
+        #[arg(long)]
+        args: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -400,6 +410,19 @@ async fn run_plan_cmd(cmd: PlanCommand) -> Result<()> {
                     Err(anyhow!("plan execution failed: {e}"))
                 }
             }
+        }
+        PlanCommand::Inspect { name, args } => {
+            let r = find_recipe(&name)
+                .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+            let raw: serde_json::Value = serde_json::from_str(&args)
+                .with_context(|| format!("parse --args as JSON: {args}"))?;
+            let plan = (r.compile_fn)(raw)
+                .map_err(|e| anyhow!("recipe compile: {e}"))?;
+            let rendered = plan
+                .render_ascii()
+                .map_err(|e| anyhow!("render plan: {e}"))?;
+            print!("{rendered}");
+            Ok(())
         }
     }
 }

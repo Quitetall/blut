@@ -394,6 +394,42 @@ impl Plan<()> {
         self.edges.len()
     }
 
+    /// ASCII DAG render. Walks topo order; each line is
+    /// `<idx> <stage_name>  [from <pred1>, <pred2>, ...]`. Useful
+    /// for `blut plan inspect <recipe> --args ...` to preview a
+    /// plan before running it.
+    ///
+    /// Format is deliberately terse + sort-stable so it diffs
+    /// cleanly across recipe iterations.
+    pub fn render_ascii(&self) -> Result<String, crate::framework::error::PlanError> {
+        let order = self.topo_order()?;
+        let mut out = String::new();
+        out.push_str(&format!("plan: {} ({} nodes, {} edges)\n", self.name, self.nodes.len(), self.edges.len()));
+        for (idx, &node_id) in order.iter().enumerate() {
+            let stage = &self.nodes[node_id as usize].stage;
+            let preds: Vec<u32> = self
+                .edges
+                .iter()
+                .filter(|e| e.to == node_id)
+                .map(|e| e.from)
+                .collect();
+            let preds_str = if preds.is_empty() {
+                String::from("─")
+            } else {
+                preds
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            out.push_str(&format!(
+                "  [{idx:>2}] {:<24} <- {preds_str}\n",
+                stage.name()
+            ));
+        }
+        Ok(out)
+    }
+
     /// Topologically order the nodes via Kahn's algorithm. Errors
     /// with `PlanError::Cycle(first_offender)` if there's a cycle
     /// (impossible to construct via the typed builder — defense
