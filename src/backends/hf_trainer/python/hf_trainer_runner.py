@@ -189,11 +189,19 @@ def run_sft(spec: Dict[str, Any]) -> None:
     )
     train_out = trainer.train()
     trainer.save_model(str(output_dir))
+    # `training_loss` is None when no train step ran (cache hit /
+    # zero-epoch sanity run). Don't choke on that — emit a Done
+    # line with final_loss=None and let the recipe decide.
+    final_loss = (
+        float(train_out.training_loss)
+        if train_out.training_loss is not None
+        else None
+    )
     emit(
         {
             "kind": "done",
             "checkpoint_dir": str(output_dir),
-            "final_loss": float(train_out.training_loss),
+            "final_loss": final_loss,
         }
     )
 
@@ -201,7 +209,7 @@ def run_sft(spec: Dict[str, Any]) -> None:
 def run_dpo(spec: Dict[str, Any]) -> None:
     """DPO via `trl.DPOTrainer`."""
     from datasets import load_dataset
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
     from trl import DPOConfig, DPOTrainer
 
     dpo = spec.get("dpo") or {}
@@ -232,20 +240,61 @@ def run_dpo(spec: Dict[str, Any]) -> None:
         report_to=[],
         bf16=True,
     )
+
+    # DPO progress fan-out — same Step/Saved schema as SFT so the
+    # Rust runner can consume both paths identically.
+    class DpoEmitter(TrainerCallback):
+        def __init__(self) -> None:
+            self.last_loss: Optional[float] = None
+            self.total: int = 0
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            self.total = int(state.max_steps or 0)
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            logs = logs or {}
+            if "loss" in logs:
+                self.last_loss = float(logs["loss"])
+            emit(
+                {
+                    "kind": "step",
+                    "step": int(state.global_step or 0),
+                    "total": self.total,
+                    "loss": self.last_loss,
+                    "lr": float(logs.get("learning_rate", 0.0))
+                    if "learning_rate" in logs
+                    else None,
+                }
+            )
+
+        def on_save(self, args, state, control, **kwargs):
+            emit(
+                {
+                    "kind": "saved",
+                    "path": str(
+                        Path(args.output_dir) / f"checkpoint-{state.global_step}"
+                    ),
+                }
+            )
+
     trainer = DPOTrainer(
         model=model,
         ref_model=None,
         args=cfg,
         train_dataset=train_ds,
         tokenizer=tokenizer,
+        callbacks=[DpoEmitter()],
     )
     out = trainer.train()
     trainer.save_model(str(output_dir))
+    final_loss = (
+        float(out.training_loss) if out.training_loss is not None else None
+    )
     emit(
         {
             "kind": "done",
             "checkpoint_dir": str(output_dir),
-            "final_loss": float(out.training_loss),
+            "final_loss": final_loss,
         }
     )
 

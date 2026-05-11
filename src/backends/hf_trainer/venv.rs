@@ -102,24 +102,54 @@ pub fn ensure_venv() -> Result<PathBuf, VenvError> {
         }
     }
 
-    // Wait for a concurrent provisioner if there is one.
+    // Take the lock atomically. `create_new(true)` returns
+    // AlreadyExists if another process beat us to it — at which
+    // point we wait for the marker (with stale-lock recovery on
+    // top of plain timeout). `create_new` is symlink-safe: the
+    // syscall fails rather than following a pre-existing symlink
+    // that would otherwise let `std::fs::write` overwrite an
+    // attacker-targeted file.
     let lock = lock_path(&root);
-    if lock.exists() {
-        wait_for_marker(&marker, &py, Duration::from_secs(30 * 60))?;
-        return Ok(py);
-    }
-
-    // Take the lock.
     if let Some(parent) = lock.parent() {
         std::fs::create_dir_all(parent).map_err(|source| VenvError::Io {
             path: parent.to_path_buf(),
             source,
         })?;
     }
-    std::fs::write(&lock, std::process::id().to_string()).map_err(|source| VenvError::Io {
-        path: lock.clone(),
-        source,
-    })?;
+    let acquired_lock = match std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&lock)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            let _ = write!(f, "{}", std::process::id());
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(source) => {
+            return Err(VenvError::Io {
+                path: lock.clone(),
+                source,
+            });
+        }
+    };
+    if !acquired_lock {
+        // Someone else is provisioning. If their PID is dead,
+        // break the lock (recover from a crashed prior caller)
+        // and retry once. Otherwise poll for the marker.
+        if pid_in_lock_is_dead(&lock) {
+            tracing::warn!(
+                target: "blut::hf_venv",
+                "stale lock at {} (holder PID dead); breaking and retrying",
+                lock.display()
+            );
+            let _ = std::fs::remove_file(&lock);
+            return ensure_venv();
+        }
+        wait_for_marker(&marker, &py, Duration::from_secs(30 * 60))?;
+        return Ok(py);
+    }
 
     let result = (|| -> Result<(), VenvError> {
         provision(&root)?;
@@ -134,6 +164,40 @@ pub fn ensure_venv() -> Result<PathBuf, VenvError> {
     let _ = std::fs::remove_file(&lock);
     result?;
     Ok(py)
+}
+
+/// Read the PID stored inside the lock file and check whether
+/// that process is still alive. Returns true if the lock can be
+/// reasonably reclaimed (file missing, PID unreadable, or process
+/// gone). On non-Unix targets always returns false — we don't
+/// have a portable cross-platform pid-alive check, so we wait
+/// the full timeout instead of breaking locks blind.
+#[cfg(unix)]
+fn pid_in_lock_is_dead(lock: &Path) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    let body = match std::fs::read_to_string(lock) {
+        Ok(b) => b,
+        Err(_) => return true,
+    };
+    let pid: i32 = match body.trim().parse() {
+        Ok(v) => v,
+        Err(_) => return true,
+    };
+    // Signal 0: probe without delivering. Ok = alive,
+    // ESRCH = gone, EPERM = alive-but-not-ours.
+    match kill(Pid::from_raw(pid), None) {
+        Ok(()) => false,
+        Err(Errno::ESRCH) => true,
+        Err(Errno::EPERM) => false,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn pid_in_lock_is_dead(_lock: &Path) -> bool {
+    false
 }
 
 fn wait_for_marker(

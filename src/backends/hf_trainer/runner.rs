@@ -280,10 +280,14 @@ impl HfTrainerRunner {
             source,
         })?;
         if let Some(h) = stdout_handle {
-            let _ = h.await;
+            if let Err(e) = h.await {
+                tracing::error!(target: "blut::hf_trainer", "stdout reader join failed: {e}");
+            }
         }
         if let Some(h) = stderr_handle {
-            let _ = h.await;
+            if let Err(e) = h.await {
+                tracing::error!(target: "blut::hf_trainer", "stderr reader join failed: {e}");
+            }
         }
         *self.child_pid.lock() = None;
         let elapsed = started.elapsed();
