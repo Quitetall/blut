@@ -84,9 +84,12 @@ pub struct PeftConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DpoConfig {
     pub beta: f32,
-    /// Path to chosen/rejected preference JSONL. Usually =
-    /// `train_dataset_path` for DPO; explicit for clarity.
-    pub preferences_path: PathBuf,
+    /// Optional override for the preferences file. None = fall
+    /// back to `HfTrainerJob.train_dataset_path`, which is the
+    /// common case (DPO trains on the dataset's own
+    /// chosen/rejected pairs).
+    #[serde(default)]
+    pub preferences_path: Option<PathBuf>,
 }
 
 /// One line emitted by the wrapper on stdout.

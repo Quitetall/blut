@@ -315,6 +315,7 @@ impl SequentialExecutor {
             let stage_ctx = StageContext {
                 job_dir: ctx.job_dir.clone(),
                 stage_dir: stage_dir.clone(),
+                node_idx: idx as u32,
                 status_tx: ctx.status_tx.clone(),
                 cancel: ctx.cancel.clone(),
                 cache: ctx.cache.clone(),

@@ -558,6 +558,7 @@ async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
             let ctx = StageContext {
                 job_dir: td.path().to_path_buf(),
                 stage_dir,
+                node_idx: 0,
                 status_tx: blut::framework::status::make_broadcast(),
                 cancel: tokio_util::sync::CancellationToken::new(),
                 cache: Arc::new(CacheHandle::job_local(td.path().join("_cache"))),

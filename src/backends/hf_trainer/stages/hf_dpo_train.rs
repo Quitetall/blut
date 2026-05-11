@@ -63,7 +63,15 @@ impl Stage for HfDpoTrain {
         input: PreferenceJsonl,
         args: &Args,
     ) -> Result<HfCheckpoint, StageError> {
-        debug_assert!(input.n_pairs > 0, "preferences must be non-empty");
+        if input.n_pairs <= 0 {
+            return Err(StageError::BadInput(format!(
+                "preferences must be non-empty (n_pairs = {})",
+                input.n_pairs
+            )));
+        }
+        if args.seq_len == 0 {
+            return Err(StageError::BadInput("seq_len must be > 0".into()));
+        }
         if !(args.beta > 0.0 && args.beta.is_finite()) {
             return Err(StageError::BadInput(format!(
                 "beta must be positive finite; got {}",
@@ -105,15 +113,16 @@ impl Stage for HfDpoTrain {
             peft: None,
             dpo: Some(DpoConfig {
                 beta: args.beta,
-                preferences_path: input.path.clone(),
+                preferences_path: None,
             }),
         };
 
         let status_tx = ctx.status_tx.clone();
+        let node_idx = ctx.node_idx;
         let cb = Box::new(move |s: StatusLine| match s {
             StatusLine::Step { step, total, loss, lr } => {
                 let _ = status_tx.send(StageEvent::StageStep {
-                    node_idx: 0,
+                    node_idx,
                     stage_name: HfDpoTrain::NAME.to_string(),
                     update: serde_json::json!({
                         "kind": "hf_step", "step": step, "total": total,
@@ -123,7 +132,7 @@ impl Stage for HfDpoTrain {
             }
             StatusLine::Saved { path } => {
                 let _ = status_tx.send(StageEvent::StageStep {
-                    node_idx: 0,
+                    node_idx,
                     stage_name: HfDpoTrain::NAME.to_string(),
                     update: serde_json::json!({"kind": "hf_saved", "path": path}),
                 });
@@ -176,6 +185,11 @@ mod tests {
             content_hash: ContentHash::of_bytes(b""),
             n_pairs: 1,
         }
+    }
+
+    #[test]
+    fn deterministic_false() {
+        assert!(!<HfDpoTrain as Stage>::DETERMINISTIC);
     }
 
     #[tokio::test]

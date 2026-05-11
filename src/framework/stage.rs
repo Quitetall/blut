@@ -136,6 +136,11 @@ pub struct StageContext {
     /// `<job_dir>/stages/<idx>-<name>/`. Stage writes its primary
     /// artifact + sidecar metadata here.
     pub stage_dir: PathBuf,
+    /// 0-indexed position of this stage in the executor's topo
+    /// walk. Stages emit `StageStep` events under this node_idx
+    /// so dashboards can route progress correctly when the same
+    /// stage appears at multiple positions in a plan.
+    pub node_idx: u32,
     /// Broadcast sender for status events. Stages emit `StageStep`
     /// for fine-grained progress; framework code emits
     /// Begin/End/Failed/Skipped/Blocked.
@@ -144,19 +149,18 @@ pub struct StageContext {
     /// subprocesses (Python trainer) listen via `is_cancelled`
     /// and SIGTERM their child.
     pub cancel: CancellationToken,
-    /// Cache handle for read/write. v2-2 stub returns `None` on
-    /// every lookup; v2-3 wires real lookup.
+    /// Cache handle for read/write.
     pub cache: Arc<CacheHandle>,
 }
 
 impl StageContext {
-    /// Test-friendly constructor. Production callers use the
-    /// executor's builder (lands commit 3); this is the bare-bones
-    /// version for unit tests in this commit.
+    /// Test-friendly constructor. `node_idx` defaults to 0 since
+    /// most unit tests run a single stage at a time.
     pub fn for_test(job_dir: PathBuf, stage_dir: PathBuf) -> Self {
         Self {
             job_dir,
             stage_dir,
+            node_idx: 0,
             status_tx: crate::framework::status::make_broadcast(),
             cancel: CancellationToken::new(),
             cache: Arc::new(CacheHandle::job_local(PathBuf::from("/tmp/_cache_test"))),

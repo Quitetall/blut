@@ -84,7 +84,17 @@ impl Stage for HfSftTrain {
         input: DatasetJsonl,
         args: &Args,
     ) -> Result<HfCheckpoint, StageError> {
-        debug_assert!(input.n_examples > 0, "dataset must have examples");
+        // R23: empty dataset is a user error, not an internal
+        // invariant — promoted from debug_assert.
+        if input.n_examples <= 0 {
+            return Err(StageError::BadInput(format!(
+                "dataset has no examples (n_examples = {})",
+                input.n_examples
+            )));
+        }
+        if args.seq_len == 0 {
+            return Err(StageError::BadInput("seq_len must be > 0".into()));
+        }
         if !matches!(args.method.as_str(), "qlora" | "lora" | "full") {
             return Err(StageError::BadInput(format!(
                 "method '{}' must be qlora|lora|full",
@@ -148,10 +158,11 @@ impl Stage for HfSftTrain {
         // broadcast. The runner's `StatusLine::Step` carries
         // optional loss + lr; pass them through as `StageStep`.
         let status_tx = ctx.status_tx.clone();
+        let node_idx = ctx.node_idx;
         let cb = Box::new(move |s: StatusLine| match s {
             StatusLine::Step { step, total, loss, lr } => {
                 let _ = status_tx.send(StageEvent::StageStep {
-                    node_idx: 0,
+                    node_idx,
                     stage_name: HfSftTrain::NAME.to_string(),
                     update: serde_json::json!({
                         "kind": "hf_step",
@@ -164,7 +175,7 @@ impl Stage for HfSftTrain {
             }
             StatusLine::Saved { path } => {
                 let _ = status_tx.send(StageEvent::StageStep {
-                    node_idx: 0,
+                    node_idx,
                     stage_name: HfSftTrain::NAME.to_string(),
                     update: serde_json::json!({
                         "kind": "hf_saved",
