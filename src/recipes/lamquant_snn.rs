@@ -61,7 +61,16 @@ pub struct Args {
     #[serde(default)]
     pub export_rel: String,
 
-    // Manifest builder knobs.
+    // Manifest builder knobs. Empty string = builder default
+    // (q31_dir: ai_models/dataset_sim/q31_events; output_rel:
+    // ai_models/dataset_sim/manifest_v3.json; v2_path: alongside
+    // q31_dir). Recipes typically leave these blank.
+    #[serde(default)]
+    pub manifest_q31_dir: String,
+    #[serde(default)]
+    pub manifest_output_rel: String,
+    #[serde(default)]
+    pub manifest_v2_path: String,
     #[serde(default = "default_val_fraction")]
     pub val_fraction: f32,
     #[serde(default = "default_seed")]
@@ -76,9 +85,9 @@ pub struct Args {
     pub pccp_author: String,
     #[serde(default = "default_change_class")]
     pub pccp_change_class: String,
-    #[serde(default = "crate::recipes::lamquant_snn::default_true")]
+    #[serde(default = "default_true")]
     pub pccp_dry_run: bool,
-    #[serde(default = "crate::recipes::lamquant_snn::default_true")]
+    #[serde(default = "default_true")]
     pub pccp_no_promote: bool,
 }
 
@@ -103,7 +112,7 @@ fn default_author() -> String {
 fn default_change_class() -> String {
     "A.1".into()
 }
-pub fn default_true() -> bool {
+fn default_true() -> bool {
     true
 }
 
@@ -131,9 +140,9 @@ impl Recipe for LamquantSnn {
                 LamquantBuildManifest,
                 MfArgs {
                     lamquant_home: args.lamquant_home.clone(),
-                    q31_dir: String::new(),
-                    output_rel: String::new(),
-                    v2_path: String::new(),
+                    q31_dir: args.manifest_q31_dir.clone(),
+                    output_rel: args.manifest_output_rel.clone(),
+                    v2_path: args.manifest_v2_path.clone(),
                     val_fraction: args.val_fraction,
                     seed: args.manifest_seed,
                 },
@@ -213,6 +222,9 @@ mod tests {
             max_windows_per_file: None,
             checkpoint_rel: String::new(),
             export_rel: String::new(),
+            manifest_q31_dir: String::new(),
+            manifest_output_rel: String::new(),
+            manifest_v2_path: String::new(),
             val_fraction: 0.05,
             manifest_seed: 42,
             pccp_change_id: default_change_id(),
