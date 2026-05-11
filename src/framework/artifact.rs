@@ -221,22 +221,11 @@ impl ContentHash {
     /// across platforms; safe to use in path components on every
     /// filesystem we target (POSIX + tmpfs + APFS + NTFS).
     ///
-    /// Performance: writes 32 bytes → 64 hex chars via direct
-    /// nibble lookup (no per-byte format! call). ~4× faster than
-    /// the previous `format!` loop and zero heap re-allocations
-    /// (capacity reserved up front).
+    /// Performance: SIMD-accelerated via faster-hex (SSE 4.1 on
+    /// x86, NEON on ARM; scalar lookup on other targets). The
+    /// crate auto-detects at runtime; no nightly required.
     pub fn to_hex(self) -> String {
-        const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-        let mut out = vec![0u8; 64];
-        for (i, b) in self.0.iter().enumerate() {
-            out[i * 2] = HEX_CHARS[(b >> 4) as usize];
-            out[i * 2 + 1] = HEX_CHARS[(b & 0x0f) as usize];
-        }
-        // The bytes are guaranteed ASCII from HEX_CHARS; the
-        // O(64) UTF-8 validation pass below is dwarfed by the
-        // savings vs 32 separate `format!("{:02x}", b)` calls
-        // each allocating a 2-byte heap string.
-        String::from_utf8(out).expect("HEX_CHARS is ASCII; output is valid UTF-8")
+        faster_hex::hex_string(&self.0)
     }
 
     /// Parse a 64-character hex string. Errors with a clear message

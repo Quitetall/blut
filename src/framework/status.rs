@@ -20,10 +20,13 @@ use serde::{Deserialize, Serialize};
 use crate::framework::artifact::ContentHash;
 use crate::framework::resource::Resource;
 
-/// Default broadcast channel capacity. 256 is generous for a single
-/// pipeline (most plans have <50 events total) and still bounded so
-/// a stuck consumer can't OOM the producer.
-pub const DEFAULT_BROADCAST_CAPACITY: usize = 256;
+/// Default broadcast channel capacity. 4096 sized for chatty
+/// trainers (per-step loss + per-grad-accum logs) so the writer
+/// task can fall behind a few seconds without RecvError::Lagged
+/// dropping events. Still bounded — a stuck consumer can't OOM
+/// the producer indefinitely. Originally 256; bumped after
+/// observing realistic per-step emission rates from trainer.py.
+pub const DEFAULT_BROADCAST_CAPACITY: usize = 4096;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
