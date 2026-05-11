@@ -101,17 +101,23 @@ impl Stage for LamquantTrainMambaSnn {
         input: Manifest,
         args: &Args,
     ) -> Result<SnnCkpt, StageError> {
-        let lamquant_home = if args.lamquant_home.is_empty() {
+        let lamquant_home_raw = if args.lamquant_home.is_empty() {
             default_lamquant_home()
         } else {
             PathBuf::from(&args.lamquant_home)
         };
-        if !lamquant_home.exists() {
-            return Err(StageError::BadInput(format!(
-                "lamquant_home not found: {}",
-                lamquant_home.display()
-            )));
-        }
+        // Canonicalize the repo root so every subsequent path
+        // (script lookup, expected_outputs, traversal check) is
+        // anchored against an absolute path regardless of the
+        // caller's cwd at invocation time. A nonexistent path
+        // surfaces as `BadInput` for a clear preflight message
+        // instead of a low-level Io error.
+        let lamquant_home = std::fs::canonicalize(&lamquant_home_raw).map_err(|e| {
+            StageError::BadInput(format!(
+                "lamquant_home not found or not canonicalizable: {} ({e})",
+                lamquant_home_raw.display()
+            ))
+        })?;
         let python = resolve_lamquant_python(&lamquant_home);
         let script = lamquant_home
             .join("ai_models")
@@ -123,16 +129,20 @@ impl Stage for LamquantTrainMambaSnn {
                 script.display()
             )));
         }
-        if !args.labels_dir.exists() {
+        // Resolve labels_dir / eeg_dir against lamquant_home if
+        // they're relative; existence-check after resolution.
+        let labels_dir = resolve_relative(&lamquant_home, &args.labels_dir);
+        let eeg_dir = resolve_relative(&lamquant_home, &args.eeg_dir);
+        if !labels_dir.exists() {
             return Err(StageError::BadInput(format!(
                 "labels_dir not found: {}",
-                args.labels_dir.display()
+                labels_dir.display()
             )));
         }
-        if !args.eeg_dir.exists() {
+        if !eeg_dir.exists() {
             return Err(StageError::BadInput(format!(
                 "eeg_dir not found: {}",
-                args.eeg_dir.display()
+                eeg_dir.display()
             )));
         }
 
@@ -142,7 +152,7 @@ impl Stage for LamquantTrainMambaSnn {
                 .join("snn")
                 .join("mamba_snn_best.pt")
         } else {
-            lamquant_home.join(&args.checkpoint_rel)
+            safe_join(&lamquant_home, &args.checkpoint_rel)?
         };
         if let Some(parent) = checkpoint_path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| StageError::Io {
@@ -179,8 +189,9 @@ impl Stage for LamquantTrainMambaSnn {
         push_opt_u32(&mut cmd_args, "--max-windows-per-file", args.max_windows_per_file);
 
         if !args.export_rel.is_empty() {
+            let export_path = safe_join(&lamquant_home, &args.export_rel)?;
             cmd_args.push("--export".into());
-            cmd_args.push(lamquant_home.join(&args.export_rel).display().to_string());
+            cmd_args.push(export_path.display().to_string());
         }
 
         // BLUT identity for the RunManifest pre-hook to read.
@@ -242,6 +253,40 @@ impl Stage for LamquantTrainMambaSnn {
             head_size_kb,
             final_loss,
         })
+    }
+}
+
+/// Join a user-supplied relative path onto `base`, rejecting any
+/// component that would escape (`..`) or that supplies an absolute
+/// path. Defense against path traversal in stage args. Returns
+/// `BadInput` rather than silently relocating writes outside the
+/// LamQuant repo root.
+fn safe_join(base: &std::path::Path, rel: &str) -> Result<PathBuf, StageError> {
+    let p = std::path::Path::new(rel);
+    if p.is_absolute() {
+        return Err(StageError::BadInput(format!(
+            "path '{rel}' must be relative to lamquant_home (no absolute paths)"
+        )));
+    }
+    for component in p.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(StageError::BadInput(format!(
+                "path '{rel}' contains '..' — refusing traversal outside lamquant_home"
+            )));
+        }
+    }
+    Ok(base.join(p))
+}
+
+/// Resolve a possibly-relative path against `base`. Unlike
+/// `safe_join`, this allows absolute paths (the caller is
+/// supplying a fully-qualified data directory, not relocating an
+/// output). Used for read-side args (`labels_dir`, `eeg_dir`).
+fn resolve_relative(base: &std::path::Path, p: &std::path::Path) -> PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
     }
 }
 
@@ -374,6 +419,39 @@ mod tests {
             )
             .await;
         assert!(matches!(r, Err(StageError::BadInput(_))));
+    }
+
+    #[test]
+    fn safe_join_rejects_parent_dir() {
+        let base = std::path::Path::new("/tmp/lamquant");
+        let r = safe_join(base, "../../etc/cron.d/evil");
+        assert!(matches!(r, Err(StageError::BadInput(_))));
+    }
+
+    #[test]
+    fn safe_join_rejects_absolute_path() {
+        let base = std::path::Path::new("/tmp/lamquant");
+        let r = safe_join(base, "/etc/cron.d/evil");
+        assert!(matches!(r, Err(StageError::BadInput(_))));
+    }
+
+    #[test]
+    fn safe_join_accepts_normal_relative() {
+        let base = std::path::Path::new("/tmp/lamquant");
+        let r = safe_join(base, "weights/snn/m.pt").unwrap();
+        assert_eq!(r, PathBuf::from("/tmp/lamquant/weights/snn/m.pt"));
+    }
+
+    #[test]
+    fn resolve_relative_handles_absolute_paths() {
+        let base = std::path::Path::new("/tmp/lamquant");
+        let abs = std::path::Path::new("/mnt/4tb/data");
+        let rel = std::path::Path::new("subdir/data");
+        assert_eq!(resolve_relative(base, abs), PathBuf::from("/mnt/4tb/data"));
+        assert_eq!(
+            resolve_relative(base, rel),
+            PathBuf::from("/tmp/lamquant/subdir/data")
+        );
     }
 
     #[test]
