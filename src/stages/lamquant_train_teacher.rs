@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::lamquant::stat_fingerprint;
-use crate::artifacts::{FullbandMemmap, Manifest, TeacherCkpt};
+use crate::artifacts::{FullbandMemmap, TeacherCkpt};
 use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
@@ -50,14 +50,18 @@ impl Stage for LamquantTrainTeacher {
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Gpu];
     const DETERMINISTIC: bool = false;
-    type Input = (Manifest, FullbandMemmap);
+    // Typed input is FullbandMemmap only — Manifest is reached
+    // upstream via path convention in lamquant_home. The Manifest's
+    // identity flows through FullbandMemmap's logical hash since
+    // precompute_fullband consumes Manifest as its input.
+    type Input = FullbandMemmap;
     type Output = TeacherCkpt;
     type Args = Args;
 
     async fn run(
         &self,
         ctx: &StageContext,
-        _input: Self::Input,
+        _input: FullbandMemmap,
         args: &Args,
     ) -> Result<TeacherCkpt, StageError> {
         let home = resolve_home(&args.lamquant_home)?;
@@ -134,13 +138,6 @@ mod tests {
     #[tokio::test]
     async fn rejects_missing_home() {
         let td = tempfile::tempdir().unwrap();
-        let m = Manifest {
-            path: td.path().join("m.json"),
-            content_hash: ContentHash::of_bytes(b""),
-            n_windows: 0,
-            val_fraction: 0.05,
-            seed: 42,
-        };
         let fb = FullbandMemmap {
             train_path: td.path().join("t.dat"),
             val_path: td.path().join("v.dat"),
@@ -150,7 +147,7 @@ mod tests {
         let r = LamquantTrainTeacher
             .run(
                 &ctx(td.path()),
-                (m, fb),
+                fb,
                 &Args {
                     lamquant_home: td.path().join("nope").display().to_string(),
                     headless: true,

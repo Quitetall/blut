@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::lamquant::stat_fingerprint_dir;
-use crate::artifacts::{L3Cache, Manifest};
+use crate::artifacts::{FullbandMemmap, L3Cache};
 use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
@@ -42,14 +42,18 @@ impl Stage for LamquantPrecomputeL3 {
     const NAME: &'static str = "lamquant_precompute_l3";
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Cpu, Resource::Disk];
-    type Input = Manifest;
+    // Typed input is FullbandMemmap so the recipe chain reads
+    // manifest → fullband → l3 in linear topo order. The L3
+    // builder doesn't need fullband; the typed edge exists only
+    // for plan-wiring convenience. n_windows is inherited.
+    type Input = FullbandMemmap;
     type Output = L3Cache;
     type Args = Args;
 
     async fn run(
         &self,
         _ctx: &StageContext,
-        input: Manifest,
+        input: FullbandMemmap,
         args: &Args,
     ) -> Result<L3Cache, StageError> {
         let home = resolve_home(&args.lamquant_home)?;
@@ -122,12 +126,11 @@ mod tests {
         let r = LamquantPrecomputeL3
             .run(
                 &ctx(td.path()),
-                Manifest {
-                    path: td.path().join("m.json"),
-                    content_hash: ContentHash::of_bytes(b""),
+                FullbandMemmap {
+                    train_path: td.path().join("t.dat"),
+                    val_path: td.path().join("v.dat"),
                     n_windows: 0,
-                    val_fraction: 0.05,
-                    seed: 42,
+                    content_hash: ContentHash::of_bytes(b""),
                 },
                 &Args {
                     lamquant_home: td.path().join("nope").display().to_string(),

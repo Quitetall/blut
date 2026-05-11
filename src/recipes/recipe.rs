@@ -36,6 +36,8 @@ pub static RECIPES: &[&RecipeDef] = &[
     &crate::recipes::eval_suite::DEF,
     &crate::recipes::distill_from_teacher::DEF,
     &crate::recipes::lamquant_snn::DEF,
+    &crate::recipes::lamquant_encoder::DEF,
+    &crate::recipes::lamquant_oracle::DEF,
 ];
 
 pub fn find(name: &str) -> Option<&'static RecipeDef> {
