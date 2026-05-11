@@ -881,13 +881,33 @@ async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()>
     let job_id = jobs::new_job_id();
     let job_dir = paths::job_dir(&job_id)
         .with_context(|| format!("create job dir for {job_id}"))?;
+
+    // Match the legacy path's lifecycle so `lamu-train jobs` shows
+    // this run and `lamu-train cancel` can find its pid. Write
+    // state + pid BEFORE acquiring the GPU lock so a lock-wait
+    // failure still leaves a discoverable job record.
+    jobs::write_state(&job_id, JobState::Running)
+        .with_context(|| format!("write initial job state for {job_id}"))?;
+    if let Err(e) = jobs::write_pid(&job_id, std::process::id()) {
+        tracing::warn!("failed to record pid for {job_id}: {e}");
+    }
+
     let mut ctx = ExecCtx::new(job_dir.clone());
     if args.shared_cache {
-        if let Some(global) = CacheHandle::default_global_path() {
-            std::fs::create_dir_all(&global)
-                .with_context(|| format!("create global cache dir {}", global.display()))?;
-            let cache_handle = (*ctx.cache).clone().with_global(global);
-            ctx.cache = std::sync::Arc::new(cache_handle);
+        match CacheHandle::default_global_path() {
+            Some(global) => {
+                std::fs::create_dir_all(&global)
+                    .with_context(|| format!("create global cache dir {}", global.display()))?;
+                let cache_handle = (*ctx.cache).clone().with_global(global);
+                ctx.cache = std::sync::Arc::new(cache_handle);
+            }
+            None => {
+                eprintln!(
+                    "warning: --shared-cache requested but global cache \
+                     path could not be determined (set $LAMU_TRAIN_CACHE_DIR \
+                     or fix $XDG_DATA_HOME); falling back to job-local cache."
+                );
+            }
         }
     }
 
@@ -904,14 +924,40 @@ async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()>
         return Ok(());
     }
 
-    let result = SequentialExecutor::execute(plan, ctx)
-        .await
-        .map_err(|e| anyhow!("plan execution failed: {e}"))?;
-    eprintln!(
-        "done — {} stages, {} cache hits, {} misses, elapsed {:?}",
-        result.n_stages, result.n_cache_hits, result.n_cache_misses, result.elapsed
-    );
-    Ok(())
+    // Acquire the GPU lock — required for cross-process arbitration
+    // before any training subprocess runs. Released on Drop after
+    // execute() returns. `--allow-evict` waits up to 1h for an
+    // existing exclusive to release, matching the legacy path.
+    let lock = if args.allow_evict {
+        eprintln!("lock waiting for GPU release (--allow-evict, up to 1h)...");
+        scheduler_lock::await_unlock(Duration::from_secs(3600))
+            .await
+            .context("await_unlock")?;
+        scheduler_lock::acquire_exclusive(format!("lamu-train:{job_id}"), LockKind::Training)
+            .context("acquire_exclusive after wait")?
+    } else {
+        scheduler_lock::acquire_exclusive(format!("lamu-train:{job_id}"), LockKind::Training)
+            .context("acquire_exclusive (use --allow-evict to wait)")?
+    };
+    eprintln!("lock acquired ({})", lock.path().display());
+
+    let result = SequentialExecutor::execute(plan, ctx).await;
+    drop(lock);
+
+    match result {
+        Ok(r) => {
+            jobs::write_state(&job_id, JobState::Done)?;
+            eprintln!(
+                "done — {} stages, {} cache hits, {} misses, elapsed {:?}",
+                r.n_stages, r.n_cache_hits, r.n_cache_misses, r.elapsed
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let _ = jobs::write_state(&job_id, JobState::Failed);
+            Err(anyhow!("plan execution failed: {e}"))
+        }
+    }
 }
 
 fn build_dataset(args: &TrainArgs) -> Result<DatasetSource> {
