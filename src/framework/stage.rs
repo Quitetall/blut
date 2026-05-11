@@ -273,7 +273,7 @@ impl<S: Stage> StageDyn for S {
         // failures, not silent wrong schemas.
         let mut schema_gen = schemars::r#gen::SchemaGenerator::default();
         let schema = schema_gen.subschema_for::<S::Args>();
-        serde_json::to_value(schema).unwrap_or(serde_json::Value::Null)
+        serde_json::to_value(schema).expect("schemars-derived JsonSchema must serialize cleanly")
     }
 
     async fn run_erased(

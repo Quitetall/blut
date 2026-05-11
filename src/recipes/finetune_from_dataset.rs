@@ -205,7 +205,7 @@ pub static DEF: RecipeDef = RecipeDef {
     args_schema_fn: || {
         let mut g = schemars::r#gen::SchemaGenerator::default();
         let s = g.subschema_for::<Args>();
-        serde_json::to_value(s).unwrap_or(serde_json::Value::Null)
+        serde_json::to_value(s).expect("schemars-derived JsonSchema must serialize cleanly")
     },
     compile_fn: |raw| {
         let args: Args = serde_json::from_value(raw)

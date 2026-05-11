@@ -593,17 +593,36 @@ async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
     }
 }
 
+/// Iterative dir-size walk with a bounded depth limit. Replaces
+/// the prior recursive impl per Brian's Programming Bible Rule 19
+/// (bound or eliminate recursion). The cache root has shallow
+/// structure (`<cache_root>/<hex>/output.bin`); depth 16 is two
+/// orders of magnitude beyond what any sane cache layout produces.
+/// Anything deeper is corruption or a symlink loop and gets
+/// surfaced as an error rather than stack-overflowed.
 fn dir_size_bytes(path: &std::path::Path) -> Result<u64> {
-    let mut total = 0u64;
-    for entry in std::fs::read_dir(path)
-        .with_context(|| format!("read_dir {}", path.display()))?
-    {
-        let entry = entry?;
-        let m = entry.metadata()?;
-        if m.is_dir() {
-            total = total.saturating_add(dir_size_bytes(&entry.path())?);
-        } else {
-            total = total.saturating_add(m.len());
+    const MAX_DEPTH: u32 = 16;
+    let mut total: u64 = 0;
+    let mut stack: Vec<(std::path::PathBuf, u32)> =
+        vec![(path.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        debug_assert!(depth <= MAX_DEPTH, "dir_size_bytes depth invariant");
+        if depth > MAX_DEPTH {
+            return Err(anyhow!(
+                "dir_size_bytes: depth {depth} exceeds MAX_DEPTH {MAX_DEPTH} at {}",
+                dir.display()
+            ));
+        }
+        for entry in std::fs::read_dir(&dir)
+            .with_context(|| format!("read_dir {}", dir.display()))?
+        {
+            let entry = entry?;
+            let m = entry.metadata()?;
+            if m.is_dir() {
+                stack.push((entry.path(), depth + 1));
+            } else {
+                total = total.saturating_add(m.len());
+            }
         }
     }
     Ok(total)
@@ -1293,10 +1312,15 @@ async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()>
         }
     }
 
-    // Mark recipe for plan resume.
+    // Mark recipe for plan resume. recipe_args is a typed Args
+    // struct deriving Serialize cleanly; `serde_json::to_value`
+    // on a well-formed Serialize type cannot fail. Propagate any
+    // failure as a wrapped error rather than silently storing null.
+    let marker_args = serde_json::to_value(&recipe_args)
+        .context("serialize recipe args for marker")?;
     RecipeMarker {
         name: "finetune_from_conversations".into(),
-        args: serde_json::to_value(&recipe_args).unwrap_or(serde_json::Value::Null),
+        args: marker_args,
     }
     .write_to(&job_dir)?;
 

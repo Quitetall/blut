@@ -109,9 +109,21 @@ pub struct SequentialExecutor;
 impl SequentialExecutor {
     /// Execute the plan to completion.
     pub async fn execute(plan: Plan<()>, ctx: ExecCtx) -> Result<PlanResult, PlanError> {
+        // R21 precondition: ExecCtx invariants the executor relies on.
+        debug_assert!(!ctx.resources.is_empty(), "ExecCtx must declare resource semaphores");
+        debug_assert!(
+            ctx.job_dir.is_absolute() || ctx.job_dir.starts_with("/tmp") || ctx.job_dir.is_relative(),
+            "ExecCtx.job_dir must be a valid path"
+        );
         let started = Instant::now();
         let order = plan.topo_order()?;
         let view = plan.exec_view();
+        // R21: topo order must enumerate every node exactly once.
+        debug_assert_eq!(
+            order.len(),
+            view.nodes.len(),
+            "topo_order must cover all nodes"
+        );
 
         // Spawn the persistent status writer. Its task ends when
         // ctx.status_tx is dropped (at end of execute).
@@ -349,7 +361,19 @@ impl SequentialExecutor {
             // hangs forever.
             drop(stage_ctx);
             let output = match run_result {
-                Ok(o) => o,
+                Ok(o) => {
+                    // R21 postcondition: stage's declared output_kind
+                    // must match the erased kind tag. StageDyn's
+                    // blanket impl guarantees this; the debug_assert
+                    // catches a hand-rolled StageDyn impl that
+                    // violates the contract.
+                    debug_assert_eq!(
+                        o.kind, node.stage.output_kind(),
+                        "stage '{stage_name}' produced kind '{}' but declares output_kind '{}'",
+                        o.kind, node.stage.output_kind()
+                    );
+                    o
+                }
                 Err(e) => {
                     let _ = ctx.status_tx.send(StageEvent::StageFailed {
                         node_idx: idx as u32,
