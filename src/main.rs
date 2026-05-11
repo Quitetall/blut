@@ -80,6 +80,43 @@ enum Command {
         #[command(subcommand)]
         cmd: RecipeCommand,
     },
+    /// Plan-level operations: resume a partially-run job.
+    Plan {
+        #[command(subcommand)]
+        cmd: PlanCommand,
+    },
+    /// Inspect / prune the BLUT cache.
+    Cache {
+        #[command(subcommand)]
+        cmd: CacheCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PlanCommand {
+    /// Re-run a job's plan. Cached stages (under the same job-local
+    /// cache dir) hit immediately, so this picks up from the last
+    /// failed/killed stage with no manual surgery.
+    Resume {
+        /// Job id (or unique prefix).
+        id: String,
+        /// Also consult the global cache (--shared-cache semantics).
+        #[arg(long, default_value_t = false)]
+        shared_cache: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CacheCommand {
+    /// Show the global cache path + current size.
+    Show,
+    /// LRU-prune the global cache to fit under `max_gb` (or the
+    /// `LAMU_CACHE_MAX_GB` env var, or 50 GiB by default).
+    Prune {
+        /// Cap in GiB. Overrides `LAMU_CACHE_MAX_GB`.
+        #[arg(long)]
+        max_gb: Option<f64>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -258,8 +295,138 @@ async fn main() -> Result<()> {
         Some(Command::Auto) => run_auto().await,
         Some(Command::Policy { cmd }) => run_policy(cmd),
         Some(Command::Recipe { cmd }) => run_recipe(cmd).await,
+        Some(Command::Plan { cmd }) => run_plan_cmd(cmd).await,
+        Some(Command::Cache { cmd }) => run_cache_cmd(cmd),
         None => run_train(cli.train_args).await,
     }
+}
+
+/// Marker file written next to `args.json` so `plan resume` can
+/// look up which recipe to re-compile. Kept distinct from
+/// `args.json` (which holds the recipe-args payload only) so the
+/// shape stays simple: one record per concern.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RecipeMarker {
+    name: String,
+    args: serde_json::Value,
+}
+
+impl RecipeMarker {
+    fn write_to(&self, job_dir: &std::path::Path) -> Result<()> {
+        let path = job_dir.join("recipe.json");
+        let body = serde_json::to_vec_pretty(self).context("serialize recipe marker")?;
+        std::fs::write(&path, body)
+            .with_context(|| format!("write recipe marker {}", path.display()))?;
+        Ok(())
+    }
+    fn read_from(job_dir: &std::path::Path) -> Result<Self> {
+        let path = job_dir.join("recipe.json");
+        let body = std::fs::read(&path)
+            .with_context(|| format!("read recipe marker {}", path.display()))?;
+        serde_json::from_slice(&body).context("parse recipe marker")
+    }
+}
+
+async fn run_plan_cmd(cmd: PlanCommand) -> Result<()> {
+    use blut::framework::{CacheHandle, ExecCtx, SequentialExecutor};
+    use blut::recipes::recipe::find as find_recipe;
+    match cmd {
+        PlanCommand::Resume { id, shared_cache } => {
+            let job_id = blut::jobs::resolve_job_id(&id)?;
+            let job_dir = paths::job_dir(&job_id)
+                .with_context(|| format!("resolve job dir for {job_id}"))?;
+            let marker = RecipeMarker::read_from(&job_dir)?;
+            let r = find_recipe(&marker.name)
+                .ok_or_else(|| anyhow!("recipe '{}' not in catalog", marker.name))?;
+            let plan = (r.compile_fn)(marker.args.clone())
+                .map_err(|e| anyhow!("recipe compile: {e}"))?;
+
+            let mut ctx = ExecCtx::new(job_dir.clone());
+            if shared_cache {
+                if let Some(global) = CacheHandle::default_global_path() {
+                    std::fs::create_dir_all(&global).with_context(|| {
+                        format!("create global cache dir {}", global.display())
+                    })?;
+                    let cache_handle = (*ctx.cache).clone().with_global(global);
+                    ctx.cache = std::sync::Arc::new(cache_handle);
+                }
+            }
+
+            blut::jobs::write_state(&job_id, JobState::Running)
+                .with_context(|| format!("write Running state for {job_id}"))?;
+
+            eprintln!("resuming {} ({})", marker.name, job_id);
+            eprintln!("dir      {}", job_dir.display());
+            let result = SequentialExecutor::execute(plan, ctx).await;
+            match result {
+                Ok(r) => {
+                    blut::jobs::write_state(&job_id, JobState::Done)?;
+                    eprintln!(
+                        "done — {} stages, {} cache hits, {} misses, elapsed {:?}",
+                        r.n_stages, r.n_cache_hits, r.n_cache_misses, r.elapsed
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    if let Err(se) = blut::jobs::write_state(&job_id, JobState::Failed) {
+                        tracing::warn!("write Failed state for {job_id}: {se}");
+                    }
+                    Err(anyhow!("plan execution failed: {e}"))
+                }
+            }
+        }
+    }
+}
+
+fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
+    use blut::framework::CacheHandle;
+    let global = CacheHandle::default_global_path()
+        .ok_or_else(|| anyhow!("could not determine global cache path"))?;
+    match cmd {
+        CacheCommand::Show => {
+            println!("global cache: {}", global.display());
+            if !global.exists() {
+                println!("(not created yet)");
+                return Ok(());
+            }
+            let size = dir_size_bytes(&global)?;
+            println!("size: {:.2} GiB", size as f64 / 1024.0 / 1024.0 / 1024.0);
+            Ok(())
+        }
+        CacheCommand::Prune { max_gb } => {
+            // Resolution order: --max-gb flag → $LAMU_CACHE_MAX_GB →
+            // 50 GiB default. The default matches the plan's spec.
+            let cap_gb = max_gb
+                .or_else(|| std::env::var("LAMU_CACHE_MAX_GB").ok().and_then(|s| s.parse().ok()))
+                .unwrap_or(50.0);
+            let cap_bytes = (cap_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+            let freed = blut::framework::cache::lru_prune(&global, cap_bytes)
+                .with_context(|| format!("lru_prune {}", global.display()))?;
+            println!(
+                "pruned {:.2} GiB from {} (cap {:.2} GiB)",
+                freed as f64 / 1024.0 / 1024.0 / 1024.0,
+                global.display(),
+                cap_gb
+            );
+            Ok(())
+        }
+    }
+}
+
+fn dir_size_bytes(path: &std::path::Path) -> Result<u64> {
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(path)
+        .with_context(|| format!("read_dir {}", path.display()))?
+    {
+        let entry = entry?;
+        let m = entry.metadata()?;
+        if m.is_dir() {
+            total = total.saturating_add(dir_size_bytes(&entry.path())?);
+        } else {
+            total = total.saturating_add(m.len());
+        }
+    }
+    Ok(total)
 }
 
 async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
@@ -304,6 +471,12 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
                     ctx.cache = std::sync::Arc::new(cache_handle);
                 }
             }
+            // Mark recipe for plan resume.
+            RecipeMarker {
+                name: name.clone(),
+                args: serde_json::from_str(&args).unwrap_or(serde_json::Value::Null),
+            }
+            .write_to(&job_dir)?;
             eprintln!("recipe {name}");
             eprintln!("job    {job_id}");
             eprintln!("dir    {}", job_dir.display());
@@ -910,6 +1083,13 @@ async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()>
             }
         }
     }
+
+    // Mark recipe for plan resume.
+    RecipeMarker {
+        name: "finetune_from_conversations".into(),
+        args: serde_json::to_value(&recipe_args).unwrap_or(serde_json::Value::Null),
+    }
+    .write_to(&job_dir)?;
 
     eprintln!("recipe finetune_from_conversations (v2)");
     eprintln!("job    {job_id}");
