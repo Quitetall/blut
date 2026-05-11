@@ -10,9 +10,13 @@
 //!     across a 50-file checkpoint-shaped tree
 //!   - Cache key computation
 //!   - `ErasedArtifact` round-trip (post-opt-4: bincode)
-//!   - JSON parse: `serde_json` vs `simd-json` on representative
-//!     args-sized payloads (opt-4 bench-driven decision)
 //!   - Cache hit path: write a cache entry + lookup it back
+//!
+//! Opt-4 also benchmarked `simd-json` vs `serde_json` on a ~250 B
+//! recipe-args payload; result: serde 428 ns vs simd 525 ns. simd-json
+//! loses on sub-KB inputs (its SIMD parallelism only wins at multi-KB)
+//! and drags in ~10 transitive deps. Bench + dep dropped; this note
+//! is the audit trail so the question doesn't get reopened.
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 
@@ -139,43 +143,6 @@ fn bench_erased_round_trip(c: &mut Criterion) {
     });
 }
 
-fn bench_json_parse(c: &mut Criterion) {
-    // Representative recipe-args payload — same shape as
-    // `bench_cache_key`'s sft_train args. ~250 bytes once
-    // serialized. The simd-json crate operates on `&mut [u8]`
-    // (destructive parse), so iter_batched clones for each iter.
-    let args = serde_json::json!({
-        "lr": 2e-4,
-        "epochs": 3,
-        "batch_size": 1,
-        "grad_accum": 8,
-        "method": {"kind": "qlora", "rank": 16, "alpha": 32},
-        "base_model": "Qwen/Qwen3-7B",
-        "seq_len": 4096,
-    });
-    let bytes = serde_json::to_vec(&args).unwrap();
-
-    c.bench_function("serde_json parse ~250B args", |b| {
-        b.iter(|| {
-            let v: serde_json::Value =
-                serde_json::from_slice(black_box(&bytes)).unwrap();
-            black_box(v);
-        });
-    });
-
-    c.bench_function("simd_json parse ~250B args", |b| {
-        b.iter_batched(
-            || bytes.clone(),
-            |mut buf| {
-                let v: simd_json::OwnedValue =
-                    simd_json::to_owned_value(black_box(&mut buf)).unwrap();
-                black_box(v);
-            },
-            BatchSize::SmallInput,
-        );
-    });
-}
-
 fn bench_cache_write_then_read(c: &mut Criterion) {
     use serde::{Deserialize, Serialize};
     use std::path::Path;
@@ -229,7 +196,6 @@ criterion_group!(
     bench_cache_key,
     bench_to_hex,
     bench_erased_round_trip,
-    bench_json_parse,
     bench_cache_write_then_read,
 );
 criterion_main!(benches);

@@ -275,7 +275,7 @@ impl<S: Stage> StageDyn for S {
             )),
             ErasedDecodeError::Deserialize(source) => StageError::InputDeserialize {
                 stage: S::NAME,
-                message: source.to_string(),
+                source,
             },
         })?;
 
@@ -299,7 +299,7 @@ impl<S: Stage> StageDyn for S {
         ErasedArtifact::from_typed(&output).map_err(|e| match e {
             ErasedEncodeError::Serialize(source) => StageError::OutputSerialize {
                 stage: S::NAME,
-                message: source.to_string(),
+                source,
             },
         })
     }

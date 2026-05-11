@@ -62,13 +62,13 @@ pub enum StageError {
     /// stage's expected `Input` type even though the kind tag
     /// matched. Schema drift; bump `Artifact::SCHEMA` and the cache
     /// will invalidate downstream. Payload format is bincode at the
-    /// typed boundary (opt-4), hence `String` rather than a typed
-    /// serde error variant — the underlying error is rendered into
-    /// the message.
-    #[error("input deserialize failed for stage '{stage}': {message}")]
+    /// typed boundary (opt-4); the boxed `ErrorKind` is what bincode
+    /// 1.x returns from `deserialize`.
+    #[error("input deserialize failed for stage '{stage}': {source}")]
     InputDeserialize {
         stage: &'static str,
-        message: String,
+        #[source]
+        source: Box<bincode::ErrorKind>,
     },
 
     /// Erased dispatch: args JSON did not deserialize into the
@@ -88,10 +88,11 @@ pub enum StageError {
     /// Erased dispatch: stage produced an output that didn't
     /// serialize. Should be impossible if the output type derives
     /// `Serialize` correctly; here for completeness.
-    #[error("output serialize failed for stage '{stage}': {message}")]
+    #[error("output serialize failed for stage '{stage}': {source}")]
     OutputSerialize {
         stage: &'static str,
-        message: String,
+        #[source]
+        source: Box<bincode::ErrorKind>,
     },
 }
 

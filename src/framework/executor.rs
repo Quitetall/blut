@@ -309,7 +309,7 @@ impl SequentialExecutor {
             // the producing stage has already written the on-disk
             // payload to its `stage_dir`. Write metadata at
             // `<stage_dir>/output.metadata.json`.
-            let output_hash = output_hash_from_erased(&output);
+            let output_hash = input_hash_from_erased(&output);
             let metadata = ArtifactMetadata::new(
                 output.kind.clone(),
                 output.schema,
@@ -376,10 +376,6 @@ fn input_hash_from_erased(art: &ErasedArtifact) -> ContentHash {
     h.update(&art.payload);
     let arr: [u8; 32] = h.finalize().into();
     ContentHash(arr)
-}
-
-fn output_hash_from_erased(art: &ErasedArtifact) -> ContentHash {
-    input_hash_from_erased(art)
 }
 
 #[cfg(test)]
