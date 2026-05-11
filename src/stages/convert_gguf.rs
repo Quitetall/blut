@@ -52,6 +52,16 @@ impl Stage for ConvertGguf {
                 "HfCheckpoint.path must be non-empty".into(),
             ));
         }
+        if input
+            .path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(StageError::BadInput(format!(
+                "HfCheckpoint.path '{}' contains '..' — refusing",
+                input.path.display()
+            )));
+        }
         let gguf_path = convert::convert_to_gguf(&input.path, &args.name, &args.quant)
             .await
             .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
