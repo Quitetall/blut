@@ -30,6 +30,34 @@ impl Artifact for DatasetJsonl {
     }
 }
 
+/// Train/eval split produced by `split_train_eval`. The
+/// primary_path returns the train file; consumers needing the eval
+/// file destructure the struct directly. Content hash is the merkle
+/// of (train_hash ‖ eval_hash) so the cache distinguishes splits
+/// over the same source with different seeds/ratios.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DatasetSplit {
+    pub train: DatasetJsonl,
+    pub eval: DatasetJsonl,
+}
+
+impl Artifact for DatasetSplit {
+    const KIND: &'static str = "dataset.split";
+    const SCHEMA: u32 = 1;
+    fn content_hash(&self) -> ContentHash {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"dataset.split");
+        h.update(self.train.content_hash.0);
+        h.update(self.eval.content_hash.0);
+        let arr: [u8; 32] = h.finalize().into();
+        ContentHash(arr)
+    }
+    fn primary_path(&self) -> &Path {
+        &self.train.path
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

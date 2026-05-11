@@ -1,10 +1,25 @@
 //! Recipe: `finetune_from_conversations`.
 //!
-//! Replicates the legacy `--from-conversations` flow as a typed
-//! Plan: materialize → sft_train → convert_gguf → register_model.
-//! Filter / split / merge_lora are deliberately omitted from this
-//! commit; they ship as separate stages in later commits and the
-//! recipe will gain `.then(filter_dataset)` etc. when they land.
+//! Full v2-commit-4 pipeline as a typed Plan:
+//!
+//!   materialize_conversations
+//!     → filter_dataset
+//!     → register_dataset
+//!     → split_train_eval        (DatasetSplit)
+//!     → take_train (passthrough to DatasetJsonl)
+//!     → sft_train
+//!     → merge_lora
+//!     → convert_gguf
+//!     → register_model
+//!
+//! `split_train_eval` produces `DatasetSplit`, but `sft_train` takes
+//! `DatasetJsonl`. To keep the typed Plan strict + linear, we use a
+//! tiny `take_train` adapter stage (defined in
+//! `stages/take_train.rs`) that projects the split's train half.
+//! When the executor grows real branch support (commit 6), this
+//! becomes a `fork` + selective merge instead — but for the
+//! sequential executor the adapter is the cheapest way to keep the
+//! type lattice clean.
 
 use serde::{Deserialize, Serialize};
 
@@ -13,10 +28,15 @@ use crate::framework::plan::Plan;
 use crate::recipes::recipe::{Recipe, RecipeDef};
 use crate::stages::{
     convert_gguf::{Args as ConvertArgs, ConvertGguf},
+    filter_dataset::{Args as FilterArgs, FilterDataset},
     materialize_conversations::{Args as MatArgs, MaterializeConversations},
+    merge_lora::{Args as MergeArgs, MergeLora},
+    register_dataset::{Args as RegDsArgs, RegisterDataset},
     register_model::{Args as RegArgs, RegisterModel},
     sft_train::{Args as SftArgs, SftTrain},
+    split_train_eval::{Args as SplitArgs, SplitTrainEval},
 };
+use crate::stages::take_train::TakeTrain;
 
 pub struct FinetuneFromConversations;
 
@@ -52,6 +72,22 @@ pub struct Args {
     pub optimizer: String,
     #[serde(default)]
     pub notes: String,
+    /// Eval fraction. Defaults to 0.1 (10%).
+    #[serde(default = "default_eval_ratio")]
+    pub eval_ratio: f32,
+    /// Min messages per example. 0 disables.
+    #[serde(default = "default_min_turns")]
+    pub min_turns: u32,
+    /// Max bytes per message. 0 disables.
+    #[serde(default = "default_max_msg_bytes")]
+    pub max_msg_bytes: u32,
+    #[serde(default = "default_drop_errors")]
+    pub drop_errors: bool,
+    /// Optional dataset registry name. None = skip register_dataset
+    /// stage entirely (still part of the pipeline; recipes can
+    /// configure it to no-op).
+    #[serde(default = "default_register_dataset_name")]
+    pub dataset_registry_name: String,
 }
 
 fn default_base() -> String {
@@ -90,6 +126,21 @@ fn default_alpha() -> u32 {
 fn default_optim() -> String {
     "apollo_mini".into()
 }
+fn default_eval_ratio() -> f32 {
+    0.1
+}
+fn default_min_turns() -> u32 {
+    2
+}
+fn default_max_msg_bytes() -> u32 {
+    65_536
+}
+fn default_drop_errors() -> bool {
+    true
+}
+fn default_register_dataset_name() -> String {
+    String::new()
+}
 
 impl Recipe for FinetuneFromConversations {
     const NAME: &'static str = "finetune_from_conversations";
@@ -113,8 +164,40 @@ impl Recipe for FinetuneFromConversations {
         let recipe_args_json = serde_json::to_value(&args)
             .map_err(|e| RecipeError::CompileFailed(format!("serialize args: {e}")))?;
 
+        let registry_name = if args.dataset_registry_name.is_empty() {
+            // Default to "<output_name>-conversations" so the recipe
+            // self-tags without the user having to invent a name.
+            format!("{}-conversations", args.output_name)
+        } else {
+            args.dataset_registry_name.clone()
+        };
+
         let plan = Plan::new(Self::NAME, recipe_args_json)
             .start(MaterializeConversations, MatArgs { since_seconds: since_secs })
+            .then(
+                FilterDataset,
+                FilterArgs {
+                    min_turns: args.min_turns,
+                    max_msg_bytes: args.max_msg_bytes,
+                    drop_errors: args.drop_errors,
+                },
+            )
+            .then(
+                RegisterDataset,
+                RegDsArgs {
+                    name: registry_name,
+                    kind: "sft".into(),
+                    metadata: None,
+                },
+            )
+            .then(
+                SplitTrainEval,
+                SplitArgs {
+                    eval_ratio: args.eval_ratio,
+                    seed: args.seed,
+                },
+            )
+            .then(TakeTrain, crate::stages::take_train::Args::default())
             .then(
                 SftTrain,
                 SftArgs {
@@ -132,6 +215,7 @@ impl Recipe for FinetuneFromConversations {
                     seed: args.seed,
                 },
             )
+            .then(MergeLora, MergeArgs::default())
             .then(
                 ConvertGguf,
                 ConvertArgs {
@@ -174,7 +258,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compiles_to_4_node_plan() {
+    fn compiles_to_9_node_plan() {
+        // materialize → filter → register_dataset → split → take_train
+        // → sft_train → merge_lora → convert_gguf → register_model
         let args = Args {
             output_name: "demo".into(),
             since: "30d".into(),
@@ -191,12 +277,17 @@ mod tests {
             alpha: default_alpha(),
             optimizer: default_optim(),
             notes: String::new(),
+            eval_ratio: default_eval_ratio(),
+            min_turns: default_min_turns(),
+            max_msg_bytes: default_max_msg_bytes(),
+            drop_errors: default_drop_errors(),
+            dataset_registry_name: default_register_dataset_name(),
         };
         let plan = FinetuneFromConversations.compile(args).unwrap();
-        assert_eq!(plan.n_nodes(), 4);
-        assert_eq!(plan.n_edges(), 3);
+        assert_eq!(plan.n_nodes(), 9);
+        assert_eq!(plan.n_edges(), 8);
         let order = plan.topo_order().unwrap();
-        assert_eq!(order, vec![0, 1, 2, 3]);
+        assert_eq!(order, vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
@@ -223,7 +314,7 @@ mod tests {
             "since": "7d",
         });
         let plan = (DEF.compile_fn)(args).unwrap();
-        assert_eq!(plan.n_nodes(), 4);
+        assert_eq!(plan.n_nodes(), 9);
     }
 
     fn json_args() -> serde_json::Value {
