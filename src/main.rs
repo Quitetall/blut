@@ -495,9 +495,12 @@ fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
 }
 
 async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
+    use blut::framework::artifact::Artifact;
+    use blut::framework::cache::CacheHandle;
     use blut::framework::stage::{ErasedArtifact, StageContext};
     use blut::stages::catalog;
     use std::io::{Read, Write};
+    use std::sync::Arc;
 
     match cmd {
         StageCommand::List => {
@@ -525,8 +528,8 @@ async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
             // a path reads from disk.
             let erased_input: ErasedArtifact = match input.as_str() {
                 ":unit" => ErasedArtifact {
-                    kind: "()".into(),
-                    schema: 1,
+                    kind: <() as Artifact>::KIND.into(),
+                    schema: <() as Artifact>::SCHEMA,
                     payload: bincode::serialize(&())
                         .map_err(|e| anyhow!("encode unit: {e}"))?,
                 },
@@ -545,42 +548,46 @@ async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
                 }
             };
 
-            // Build a one-shot stage context rooted in a temp dir.
             // Each `blut stage` invocation gets its own scratch
-            // space; no cross-stage cache hits via this entry point
-            // (use recipes for that).
+            // tempdir, including a private cache dir. The cache
+            // lives only for this invocation — recipes are the
+            // entry point for cross-stage cache hits.
             let td = tempfile::tempdir().context("create stage tempdir")?;
             let stage_dir = td.path().join("stage");
             std::fs::create_dir_all(&stage_dir)?;
-            let ctx = StageContext::for_test(td.path().to_path_buf(), stage_dir);
+            let ctx = StageContext {
+                job_dir: td.path().to_path_buf(),
+                stage_dir,
+                status_tx: blut::framework::status::make_broadcast(),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                cache: Arc::new(CacheHandle::job_local(td.path().join("_cache"))),
+            };
 
             let result = stage
                 .run_erased(&ctx, erased_input, args_val)
                 .await
                 .map_err(|e| anyhow!("stage '{name}' failed: {e}"))?;
 
-            // Write output.
+            // Write output, then flush so a downstream pipe sees
+            // the bytes immediately rather than waiting for process
+            // exit + OS buffer drain.
             let body = bincode::serialize(&result)
                 .map_err(|e| anyhow!("encode output: {e}"))?;
             match output.as_str() {
                 "-" => {
-                    std::io::stdout()
-                        .write_all(&body)
-                        .context("write stdout")?;
+                    let mut out = std::io::stdout().lock();
+                    out.write_all(&body).context("write stdout")?;
+                    out.flush().context("flush stdout")?;
                 }
                 path => {
                     std::fs::write(path, &body)
                         .with_context(|| format!("write output to {path}"))?;
                 }
             }
-
-            // Keep tempdir alive across `result` use; explicit close
-            // returns IO errors that would otherwise be silenced by
-            // the Drop impl. Best-effort — IO errors during teardown
-            // are warnings, not failures.
-            if let Err(e) = td.close() {
-                tracing::warn!("stage tempdir cleanup: {e}");
-            }
+            // Tempdir is dropped at function exit; we don't call
+            // td.close() because subprocesses (e.g. trainer) that
+            // outlive run_erased can leave open handles in the dir,
+            // and a noisy "cleanup failed" warning isn't actionable.
             Ok(())
         }
     }
