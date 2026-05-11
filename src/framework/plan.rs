@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::marker::PhantomData;
 
 use crate::framework::artifact::Artifact;
+use crate::framework::cache::CacheHandle;
 use crate::framework::stage::{ErasedArtifact, Stage, StageDyn};
 
 /// 0-indexed identifier for nodes inside one plan.
@@ -123,7 +124,7 @@ impl Plan<()> {
         let id = self.nodes.len() as NodeId;
         let args_json = serde_json::to_value(&args)
             .expect("Stage::Args must serialize to JSON; verify the type's Serialize impl");
-        let canon_args = crate::framework::cache::CacheHandle::canonical_json_bytes(&args_json);
+        let canon_args = CacheHandle::canonical_json_bytes(&args_json);
         self.nodes.push(PlanNode {
             id,
             stage: Arc::new(stage),
@@ -195,7 +196,7 @@ impl<O: Artifact> Plan<O> {
         let id = self.nodes.len() as NodeId;
         let args_json = serde_json::to_value(&args)
             .expect("Stage::Args must serialize to JSON; verify the type's Serialize impl");
-        let canon_args = crate::framework::cache::CacheHandle::canonical_json_bytes(&args_json);
+        let canon_args = CacheHandle::canonical_json_bytes(&args_json);
         self.nodes.push(PlanNode {
             id,
             stage: Arc::new(stage),
@@ -254,7 +255,7 @@ impl<O: Artifact> Plan<O> {
     {
         let l_id = self.nodes.len() as NodeId;
         let l_args_json = serde_json::to_value(&l_args).expect("Stage::Args serialize");
-        let l_canon = crate::framework::cache::CacheHandle::canonical_json_bytes(&l_args_json);
+        let l_canon = CacheHandle::canonical_json_bytes(&l_args_json);
         self.nodes.push(PlanNode {
             id: l_id,
             stage: Arc::new(left),
@@ -263,7 +264,7 @@ impl<O: Artifact> Plan<O> {
         });
         let r_id = self.nodes.len() as NodeId;
         let r_args_json = serde_json::to_value(&r_args).expect("Stage::Args serialize");
-        let r_canon = crate::framework::cache::CacheHandle::canonical_json_bytes(&r_args_json);
+        let r_canon = CacheHandle::canonical_json_bytes(&r_args_json);
         self.nodes.push(PlanNode {
             id: r_id,
             stage: Arc::new(right),
@@ -310,7 +311,7 @@ impl<O: Artifact> Plan<O> {
         ] {
             let id = self.nodes.len() as NodeId;
             let canon_args =
-                crate::framework::cache::CacheHandle::canonical_json_bytes(&args);
+                CacheHandle::canonical_json_bytes(&args);
             self.nodes.push(PlanNode {
                 id,
                 stage,
@@ -343,7 +344,7 @@ impl<A: Artifact, B: Artifact> Plan<(A, B)> {
     {
         let id = self.nodes.len() as NodeId;
         let args_json = serde_json::to_value(&args).expect("Stage::Args serialize");
-        let canon_args = crate::framework::cache::CacheHandle::canonical_json_bytes(&args_json);
+        let canon_args = CacheHandle::canonical_json_bytes(&args_json);
         self.nodes.push(PlanNode {
             id,
             stage: Arc::new(stage),
@@ -374,7 +375,7 @@ impl<A: Artifact, B: Artifact, C: Artifact> Plan<(A, B, C)> {
     {
         let id = self.nodes.len() as NodeId;
         let args_json = serde_json::to_value(&args).expect("Stage::Args serialize");
-        let canon_args = crate::framework::cache::CacheHandle::canonical_json_bytes(&args_json);
+        let canon_args = CacheHandle::canonical_json_bytes(&args_json);
         self.nodes.push(PlanNode {
             id,
             stage: Arc::new(stage),
