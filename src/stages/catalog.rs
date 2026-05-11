@@ -12,6 +12,7 @@ pub fn make_stage(name: &str) -> Option<Box<dyn StageDyn>> {
     use super::*;
     Some(match name {
         "lamquant_build_manifest" => Box::new(LamquantBuildManifest),
+        "lamquant_pccp_gate_snn" => Box::new(LamquantPccpGateSnn),
         "lamquant_train_mamba_snn" => Box::new(LamquantTrainMambaSnn),
         "materialize_conversations" => Box::new(MaterializeConversations),
         "materialize_dataset_path" => Box::new(MaterializeDatasetPath),
@@ -38,6 +39,7 @@ pub fn make_stage(name: &str) -> Option<Box<dyn StageDyn>> {
 pub fn names() -> &'static [&'static str] {
     &[
         "lamquant_build_manifest",
+        "lamquant_pccp_gate_snn",
         "lamquant_train_mamba_snn",
         "materialize_conversations",
         "materialize_dataset_path",
