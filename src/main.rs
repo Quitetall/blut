@@ -218,6 +218,12 @@ struct TrainArgs {
     /// Polling interval is 500 ms; default timeout 1 h.
     #[arg(long, default_value_t = false)]
     allow_evict: bool,
+
+    /// Promote this run's stage outputs to the global cache so
+    /// future jobs can hit them. Only honoured by the v2 recipe
+    /// path (--from-conversations without LAMU_TRAIN_USE_LEGACY=1).
+    #[arg(long, default_value_t = false)]
+    shared_cache: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -553,6 +559,19 @@ async fn run_train(args: TrainArgs) -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow!("output-name is required (positional). See `lamu-train --help`."))?;
 
+    // v2 commit 4b: --from-conversations now delegates to the
+    // `finetune_from_conversations` recipe via the typed Plan
+    // executor (9-stage pipeline). The legacy linear path is kept
+    // behind the `LAMU_TRAIN_USE_LEGACY=1` kill-switch so users
+    // hitting regressions can roll back without rebuilding. The
+    // kill-switch is removed in v2 commit 8 once the new path has
+    // been the default through a full release window.
+    if args.from_conversations
+        && std::env::var("LAMU_TRAIN_USE_LEGACY").ok().as_deref() != Some("1")
+    {
+        return run_train_via_recipe(&output_name, &args).await;
+    }
+
     let dataset_src = build_dataset(&args)?;
     let optimizer = pick_optimizer(args.optim, args.method);
     let method = build_method(args.method, args.rank, args.alpha);
@@ -811,6 +830,87 @@ fn run_log(id_query: &str, tail: usize) -> Result<()> {
             println!("{l}");
         }
     }
+    Ok(())
+}
+
+/// Dispatch `--from-conversations` through the v2 typed Plan
+/// pipeline. Builds the recipe Args from the legacy CLI flags so
+/// users don't have to learn a new invocation, then runs the
+/// compiled 9-stage Plan through `SequentialExecutor`.
+async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()> {
+    use blut::framework::{CacheHandle, ExecCtx, SequentialExecutor};
+    use blut::recipes::finetune_from_conversations::{Args as RecipeArgs, DEF};
+
+    let recipe_args = RecipeArgs {
+        output_name: output_name.to_string(),
+        since: humantime::format_duration(args.since).to_string(),
+        base_model: args.base.clone(),
+        method: match args.method {
+            MethodArg::Qlora => "qlora".into(),
+            MethodArg::Lora => "lora".into(),
+            MethodArg::Full => "full".into(),
+        },
+        quant: args.quant.clone(),
+        lr: args.lr,
+        epochs: args.epochs,
+        batch_size: args.batch_size,
+        grad_accum: args.grad_accum,
+        seq_len: args.seq_len,
+        seed: args.seed,
+        rank: args.rank,
+        alpha: args.alpha,
+        optimizer: match pick_optimizer(args.optim, args.method) {
+            blut::spec::Optim::AdamW => "adamw".into(),
+            blut::spec::Optim::AdamW8bit => "adamw8bit".into(),
+            blut::spec::Optim::ApolloRank4 => "apollo".into(),
+            blut::spec::Optim::ApolloMini => "apollo_mini".into(),
+        },
+        notes: String::new(),
+        eval_ratio: 0.1,
+        min_turns: 2,
+        max_msg_bytes: 65_536,
+        drop_errors: true,
+        dataset_registry_name: String::new(),
+    };
+
+    let raw = serde_json::to_value(&recipe_args)
+        .context("serialize recipe args")?;
+    let plan = (DEF.compile_fn)(raw)
+        .map_err(|e| anyhow!("recipe compile failed: {e}"))?;
+
+    let job_id = jobs::new_job_id();
+    let job_dir = paths::job_dir(&job_id)
+        .with_context(|| format!("create job dir for {job_id}"))?;
+    let mut ctx = ExecCtx::new(job_dir.clone());
+    if args.shared_cache {
+        if let Some(global) = CacheHandle::default_global_path() {
+            std::fs::create_dir_all(&global)
+                .with_context(|| format!("create global cache dir {}", global.display()))?;
+            let cache_handle = (*ctx.cache).clone().with_global(global);
+            ctx.cache = std::sync::Arc::new(cache_handle);
+        }
+    }
+
+    eprintln!("recipe finetune_from_conversations (v2)");
+    eprintln!("job    {job_id}");
+    eprintln!("dir    {}", job_dir.display());
+
+    if args.background {
+        eprintln!(
+            "background mode is recognised but real detach lands in a \
+             follow-up. For now, run without --background and use \
+             `lamu-train cancel {job_id}` from another terminal."
+        );
+        return Ok(());
+    }
+
+    let result = SequentialExecutor::execute(plan, ctx)
+        .await
+        .map_err(|e| anyhow!("plan execution failed: {e}"))?;
+    eprintln!(
+        "done — {} stages, {} cache hits, {} misses, elapsed {:?}",
+        result.n_stages, result.n_cache_hits, result.n_cache_misses, result.elapsed
+    );
     Ok(())
 }
 
