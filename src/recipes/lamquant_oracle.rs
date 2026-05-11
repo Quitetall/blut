@@ -82,6 +82,7 @@ fn default_true() -> bool {
 }
 
 impl Recipe for LamquantOracle {
+    type Backend = crate::backends::LamquantBackend;
     const NAME: &'static str = "lamquant_oracle";
     const DESCRIPTION: &'static str =
         "LamQuant teacher pipeline: build_manifest → precompute_fullband → \
@@ -89,7 +90,7 @@ impl Recipe for LamquantOracle {
          ckpt. Safe-by-default.";
     type Args = Args;
 
-    fn compile(&self, args: Self::Args) -> Result<Plan<()>, RecipeError> {
+    fn compile(&self, args: Self::Args) -> Result<Plan<(), Self::Backend>, RecipeError> {
         // R23: arg validation at the recipe boundary.
         if !(args.val_fraction > 0.0 && args.val_fraction < 1.0) {
             return Err(RecipeError::InvalidArgs(format!(
@@ -181,6 +182,8 @@ use crate::framework::stage::{Stage, StageContext};
 
 struct TeacherToJointAdapter;
 
+impl crate::framework::Compatible<crate::backends::LamquantBackend> for TeacherToJointAdapter {}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 struct TeacherToJointArgs {}
 
@@ -213,6 +216,7 @@ impl Stage for TeacherToJointAdapter {
 pub static DEF: RecipeDef = RecipeDef {
     name: LamquantOracle::NAME,
     description: LamquantOracle::DESCRIPTION,
+    backend_id: <crate::backends::LamquantBackend as crate::backends::TrainingBackend>::ID,
     args_schema_fn: || {
         let mut g = schemars::r#gen::SchemaGenerator::default();
         let s = g.subschema_for::<Args>();
@@ -221,7 +225,7 @@ pub static DEF: RecipeDef = RecipeDef {
     compile_fn: |raw| {
         let args: Args = serde_json::from_value(raw)
             .map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
-        LamquantOracle.compile(args)
+        LamquantOracle.compile(args).map(|p| p.into_compiled())
     },
 };
 
@@ -252,7 +256,7 @@ mod tests {
     #[test]
     fn compiles_to_5_node_plan() {
         // build_manifest → fullband → train_teacher → adapter → gate.
-        let plan = LamquantOracle.compile(args()).unwrap();
+        let plan = LamquantOracle.compile(args()).unwrap().into_compiled();
         assert_eq!(plan.n_nodes(), 5);
         assert_eq!(plan.n_edges(), 4);
     }

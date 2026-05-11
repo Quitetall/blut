@@ -20,6 +20,8 @@ use crate::stages::{
 /// hashes it into a `PreferenceJsonl` artifact.
 struct MaterializePreferences;
 
+impl crate::framework::Compatible<crate::backends::LamuTrainerBackend> for MaterializePreferences {}
+
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct MatPrefArgs {
     pub path: std::path::PathBuf,
@@ -99,12 +101,13 @@ fn default_quant() -> String {
 }
 
 impl Recipe for DpoFromPreferences {
+    type Backend = crate::backends::LamuTrainerBackend;
     const NAME: &'static str = "dpo_from_preferences";
     const DESCRIPTION: &'static str =
         "Direct preference optimization from a chosen/rejected JSONL. Stub trainer; full DPO impl pending.";
     type Args = Args;
 
-    fn compile(&self, args: Self::Args) -> Result<Plan<()>, RecipeError> {
+    fn compile(&self, args: Self::Args) -> Result<Plan<(), Self::Backend>, RecipeError> {
         // R23: arg validation at the recipe boundary.
         if args.output_name.is_empty() {
             return Err(RecipeError::InvalidArgs("output_name is empty".into()));
@@ -165,6 +168,7 @@ impl Recipe for DpoFromPreferences {
 pub static DEF: RecipeDef = RecipeDef {
     name: DpoFromPreferences::NAME,
     description: DpoFromPreferences::DESCRIPTION,
+    backend_id: <crate::backends::LamuTrainerBackend as crate::backends::TrainingBackend>::ID,
     args_schema_fn: || {
         let mut g = schemars::r#gen::SchemaGenerator::default();
         let s = g.subschema_for::<Args>();
@@ -173,7 +177,7 @@ pub static DEF: RecipeDef = RecipeDef {
     compile_fn: |raw| {
         let args: Args =
             serde_json::from_value(raw).map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
-        DpoFromPreferences.compile(args)
+        DpoFromPreferences.compile(args).map(|p| p.into_compiled())
     },
 };
 
@@ -193,7 +197,8 @@ mod tests {
                 epochs: default_epochs(),
                 quant: default_quant(),
             })
-            .unwrap();
+            .unwrap()
+            .into_compiled();
         assert_eq!(plan.n_nodes(), 4);
     }
 }

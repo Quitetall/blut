@@ -31,8 +31,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::marker::PhantomData;
 
+use crate::backends::TrainingBackend;
 use crate::framework::artifact::Artifact;
 use crate::framework::cache::CacheHandle;
+use crate::framework::compat::Compatible;
 use crate::framework::stage::{ErasedArtifact, Stage, StageDyn};
 
 /// 0-indexed identifier for nodes inside one plan.
@@ -70,12 +72,18 @@ pub(crate) struct PlanEdge {
     pub to: NodeId,
 }
 
-/// Typed DAG. The `Out` type is the type at the leading edge.
+/// Typed DAG. `Out` is the type at the leading edge; `B` is the
+/// training backend the plan targets. Stages added via
+/// `.then()` / `.fork*` / `.merge*` must satisfy
+/// `Compatible<B>` — a wrong-backend wire becomes a cargo build
+/// error.
 ///
-/// This struct is opaque to executor code; the executor looks at
-/// `nodes`, `edges`, `initial`, and the topological order via
-/// `Plan::compile_for_execution`.
-pub struct Plan<Out> {
+/// At runtime `B` is pure PhantomData; the executor reads
+/// `nodes`/`edges`/`initial` without caring which backend the
+/// plan targets. Erasure at the catalog boundary happens via
+/// `Plan::<(), B>::into_compiled() → CompiledPlan` (lands as part
+/// of BB-3 too).
+pub struct Plan<Out, B: TrainingBackend> {
     pub(crate) name: String,
     pub(crate) nodes: Vec<PlanNode>,
     pub(crate) edges: Vec<PlanEdge>,
@@ -85,10 +93,10 @@ pub struct Plan<Out> {
     /// plan. Persisted for audit; the cache uses per-stage
     /// `args` only.
     pub(crate) recipe_args: serde_json::Value,
-    _phantom: PhantomData<fn() -> Out>,
+    _phantom: PhantomData<(fn() -> Out, B)>,
 }
 
-impl<Out> std::fmt::Debug for Plan<Out> {
+impl<Out, B: TrainingBackend> std::fmt::Debug for Plan<Out, B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Plan")
             .field("name", &self.name)
@@ -99,9 +107,9 @@ impl<Out> std::fmt::Debug for Plan<Out> {
     }
 }
 
-impl Plan<()> {
+impl<B: TrainingBackend> Plan<(), B> {
     /// New, empty plan. `start` is the canonical entry point —
-    /// it appends the first node and produces a `Plan<S::Output>`.
+    /// it appends the first node and produces a `Plan<S::Output, B>`.
     pub fn new(name: impl Into<String>, recipe_args: serde_json::Value) -> Self {
         Self {
             name: name.into(),
@@ -114,12 +122,12 @@ impl Plan<()> {
         }
     }
 
-    /// Append the first stage. Compiler enforces `Input = ()` —
-    /// the empty artifact — so only graph-input stages can start.
-    /// Sets up `initial[node_id] = ErasedArtifact::from_typed(&())`.
-    pub fn start<S>(mut self, stage: S, args: S::Args) -> Plan<S::Output>
+    /// Append the first stage. Compiler enforces `Input = ()` AND
+    /// `Compatible<B>` — only graph-input stages whose backend
+    /// matches the plan's `B` can start.
+    pub fn start<S>(mut self, stage: S, args: S::Args) -> Plan<S::Output, B>
     where
-        S: Stage<Input = ()> + 'static,
+        S: Stage<Input = ()> + Compatible<B> + 'static,
     {
         let id = self.nodes.len() as NodeId;
         let args_json = serde_json::to_value(&args)
@@ -148,10 +156,9 @@ impl Plan<()> {
     }
 }
 
-impl<O: Artifact> Plan<O> {
+impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
     /// Append a stage that consumes the leading edge's output.
-    /// Compiler enforces `S::Input = O`. The new node becomes the
-    /// new leading edge.
+    /// Compiler enforces `S::Input = O` AND `S: Compatible<B>`.
     ///
     /// Wrong wiring is a compile error:
     ///
@@ -189,9 +196,9 @@ impl<O: Artifact> Plan<O> {
     ///     .start(MakeA, E)
     ///     .then(BC, E);  // expected B, got A — compile error
     /// ```
-    pub fn then<S>(mut self, stage: S, args: S::Args) -> Plan<S::Output>
+    pub fn then<S>(mut self, stage: S, args: S::Args) -> Plan<S::Output, B>
     where
-        S: Stage<Input = O> + 'static,
+        S: Stage<Input = O> + Compatible<B> + 'static,
     {
         let id = self.nodes.len() as NodeId;
         let args_json = serde_json::to_value(&args)
@@ -225,7 +232,7 @@ impl<O: Artifact> Plan<O> {
     /// Terminator: erase the leading-edge type. The executor
     /// consumes `Plan<()>` (via `compile_for_execution`); a recipe's
     /// `compile` returns `Plan<()>`.
-    pub fn finish(self) -> Plan<()> {
+    pub fn finish(self) -> Plan<(), B> {
         Plan {
             name: self.name,
             nodes: self.nodes,
@@ -248,10 +255,10 @@ impl<O: Artifact> Plan<O> {
         l_args: L::Args,
         right: R,
         r_args: R::Args,
-    ) -> Plan<(L::Output, R::Output)>
+    ) -> Plan<(L::Output, R::Output), B>
     where
-        L: Stage<Input = O> + 'static,
-        R: Stage<Input = O> + 'static,
+        L: Stage<Input = O> + Compatible<B> + 'static,
+        R: Stage<Input = O> + Compatible<B> + 'static,
     {
         let l_id = self.nodes.len() as NodeId;
         let l_args_json = serde_json::to_value(&l_args).expect("Stage::Args serialize");
@@ -289,19 +296,19 @@ impl<O: Artifact> Plan<O> {
 
     /// 3-way fork. Same shape as `fork` but with three siblings
     /// rejoining via `Plan<(A, B, C)>::merge`.
-    pub fn fork3<A, B, C>(
+    pub fn fork3<SA, SB, SC>(
         mut self,
-        a: A,
-        a_args: A::Args,
-        b: B,
-        b_args: B::Args,
-        c: C,
-        c_args: C::Args,
-    ) -> Plan<(A::Output, B::Output, C::Output)>
+        a: SA,
+        a_args: SA::Args,
+        b: SB,
+        b_args: SB::Args,
+        c: SC,
+        c_args: SC::Args,
+    ) -> Plan<(SA::Output, SB::Output, SC::Output), B>
     where
-        A: Stage<Input = O> + 'static,
-        B: Stage<Input = O> + 'static,
-        C: Stage<Input = O> + 'static,
+        SA: Stage<Input = O> + Compatible<B> + 'static,
+        SB: Stage<Input = O> + Compatible<B> + 'static,
+        SC: Stage<Input = O> + Compatible<B> + 'static,
     {
         let mut new_ids = Vec::with_capacity(3);
         for (stage, args) in [
@@ -336,11 +343,11 @@ impl<O: Artifact> Plan<O> {
     }
 }
 
-impl<A: Artifact, B: Artifact> Plan<(A, B)> {
+impl<A1: Artifact, A2: Artifact, B: TrainingBackend> Plan<(A1, A2), B> {
     /// Merge a forked branch via a stage that consumes the tuple.
-    pub fn merge<S>(mut self, stage: S, args: S::Args) -> Plan<S::Output>
+    pub fn merge<S>(mut self, stage: S, args: S::Args) -> Plan<S::Output, B>
     where
-        S: Stage<Input = (A, B)> + 'static,
+        S: Stage<Input = (A1, A2)> + Compatible<B> + 'static,
     {
         let id = self.nodes.len() as NodeId;
         let args_json = serde_json::to_value(&args).expect("Stage::Args serialize");
@@ -367,11 +374,11 @@ impl<A: Artifact, B: Artifact> Plan<(A, B)> {
     }
 }
 
-impl<A: Artifact, B: Artifact, C: Artifact> Plan<(A, B, C)> {
+impl<A1: Artifact, A2: Artifact, A3: Artifact, B: TrainingBackend> Plan<(A1, A2, A3), B> {
     /// Merge a 3-way forked branch.
-    pub fn merge3<S>(mut self, stage: S, args: S::Args) -> Plan<S::Output>
+    pub fn merge3<S>(mut self, stage: S, args: S::Args) -> Plan<S::Output, B>
     where
-        S: Stage<Input = (A, B, C)> + 'static,
+        S: Stage<Input = (A1, A2, A3)> + Compatible<B> + 'static,
     {
         let id = self.nodes.len() as NodeId;
         let args_json = serde_json::to_value(&args).expect("Stage::Args serialize");
@@ -398,40 +405,74 @@ impl<A: Artifact, B: Artifact, C: Artifact> Plan<(A, B, C)> {
     }
 }
 
-impl Plan<()> {
-    /// Recipe / user args that built this plan. Persisted at
-    /// `<job_dir>/args.json` for audit + by the cache as a
-    /// secondary input to per-stage cache keys (separately —
-    /// recipe-arg invalidation cascades downstream automatically
-    /// because each stage's `args` field is its slice of the
-    /// recipe args).
+// Inspection methods (name/n_nodes/topo_order/render_ascii) and the
+// executor-facing exec_view live on `CompiledPlan` (the erased
+// post-finish form). Use `.into_compiled()` on a `Plan<(), B>` to
+// reach them. Keeping both copies would diverge over time; one
+// source of truth wins.
+
+/// Borrow-only access for the executor. Avoids exposing
+/// `nodes` / `edges` / `initial` as `pub` while still letting the
+/// executor walk them.
+pub(crate) struct ExecView<'a> {
+    pub nodes: &'a [PlanNode],
+    pub edges: &'a [PlanEdge],
+    pub initial: &'a HashMap<NodeId, ErasedArtifact>,
+    pub recipe_args: &'a serde_json::Value,
+}
+
+impl<B: TrainingBackend> Plan<(), B> {
+    /// Erase `B` for catalog storage + heterogeneous dispatch.
+    /// Recipe `DEF.compile_fn` closures call this so a single
+    /// `RecipeDef` slice can hold compile_fns whose typed plans
+    /// span different backends. The runtime `CompiledPlan` carries
+    /// the same internal structure — `B` was only PhantomData.
+    pub fn into_compiled(self) -> CompiledPlan {
+        CompiledPlan {
+            name: self.name,
+            nodes: self.nodes,
+            edges: self.edges,
+            initial: self.initial,
+            recipe_args: self.recipe_args,
+        }
+    }
+}
+
+/// Backend-erased plan, ready for execution. Produced from a
+/// `Plan<(), B>` via `into_compiled()` at the recipe catalog
+/// boundary. Carries every field the executor needs; the only
+/// thing dropped is the compile-time backend witness.
+pub struct CompiledPlan {
+    pub(crate) name: String,
+    pub(crate) nodes: Vec<PlanNode>,
+    pub(crate) edges: Vec<PlanEdge>,
+    pub(crate) initial: HashMap<NodeId, ErasedArtifact>,
+    pub(crate) recipe_args: serde_json::Value,
+}
+
+impl CompiledPlan {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn n_nodes(&self) -> usize {
+        self.nodes.len()
+    }
+    pub fn n_edges(&self) -> usize {
+        self.edges.len()
+    }
     pub fn recipe_args(&self) -> &serde_json::Value {
         &self.recipe_args
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn n_nodes(&self) -> usize {
-        self.nodes.len()
-    }
-
-    pub fn n_edges(&self) -> usize {
-        self.edges.len()
-    }
-
-    /// ASCII DAG render. Walks topo order; each line is
-    /// `<idx> <stage_name>  [from <pred1>, <pred2>, ...]`. Useful
-    /// for `blut plan inspect <recipe> --args ...` to preview a
-    /// plan before running it.
-    ///
-    /// Format is deliberately terse + sort-stable so it diffs
-    /// cleanly across recipe iterations.
     pub fn render_ascii(&self) -> Result<String, crate::framework::error::PlanError> {
         let order = self.topo_order()?;
         let mut out = String::new();
-        out.push_str(&format!("plan: {} ({} nodes, {} edges)\n", self.name, self.nodes.len(), self.edges.len()));
+        out.push_str(&format!(
+            "plan: {} ({} nodes, {} edges)\n",
+            self.name,
+            self.nodes.len(),
+            self.edges.len()
+        ));
         for (idx, &node_id) in order.iter().enumerate() {
             let stage = &self.nodes[node_id as usize].stage;
             let preds: Vec<u32> = self
@@ -457,10 +498,6 @@ impl Plan<()> {
         Ok(out)
     }
 
-    /// Topologically order the nodes via Kahn's algorithm. Errors
-    /// with `PlanError::Cycle(first_offender)` if there's a cycle
-    /// (impossible to construct via the typed builder — defense
-    /// in depth for dynamic plans).
     pub fn topo_order(&self) -> Result<Vec<NodeId>, crate::framework::error::PlanError> {
         let n = self.nodes.len();
         if n == 0 {
@@ -470,7 +507,6 @@ impl Plan<()> {
         for e in &self.edges {
             indeg[e.to as usize] += 1;
         }
-        // Adjacency: outgoing edges per node.
         let mut adj: Vec<Vec<NodeId>> = vec![Vec::new(); n];
         for e in &self.edges {
             adj[e.from as usize].push(e.to);
@@ -490,7 +526,6 @@ impl Plan<()> {
             }
         }
         if order.len() != n {
-            // First node still with indegree > 0 names the cycle.
             let offender = (0..n as NodeId)
                 .find(|&i| indeg[i as usize] > 0)
                 .unwrap_or(0);
@@ -498,19 +533,7 @@ impl Plan<()> {
         }
         Ok(order)
     }
-}
 
-/// Borrow-only access for the executor. Avoids exposing
-/// `nodes` / `edges` / `initial` as `pub` while still letting the
-/// executor walk them.
-pub(crate) struct ExecView<'a> {
-    pub nodes: &'a [PlanNode],
-    pub edges: &'a [PlanEdge],
-    pub initial: &'a HashMap<NodeId, ErasedArtifact>,
-    pub recipe_args: &'a serde_json::Value,
-}
-
-impl Plan<()> {
     pub(crate) fn exec_view(&self) -> ExecView<'_> {
         ExecView {
             nodes: &self.nodes,
@@ -574,10 +597,16 @@ mod tests {
 
     // Toy stages: () → A, A → B, B → C.
 
+    use crate::backends::LamuTrainerBackend;
+    use crate::framework::Compatible;
+
     #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
     struct EmptyArgs;
 
     struct MakeA;
+    impl Compatible<LamuTrainerBackend> for MakeA {}
+    impl Compatible<LamuTrainerBackend> for AToB {}
+    impl Compatible<LamuTrainerBackend> for BToC {}
     #[async_trait]
     impl Stage for MakeA {
         const NAME: &'static str = "make_a";
@@ -636,7 +665,8 @@ mod tests {
 
     #[test]
     fn empty_plan_topo_errors() {
-        let p: Plan<()> = Plan::new("empty", serde_json::json!({}));
+        let p = Plan::<(), LamuTrainerBackend>::new("empty", serde_json::json!({}))
+            .into_compiled();
         let r = p.topo_order();
         assert!(matches!(
             r,
@@ -646,11 +676,11 @@ mod tests {
 
     #[test]
     fn linear_three_stage_plan_compiles_and_orders() {
-        let plan = Plan::new("linear", serde_json::json!({}))
+        let plan = Plan::<(), LamuTrainerBackend>::new("linear", serde_json::json!({}))
             .start(MakeA, EmptyArgs)
             .then(AToB, EmptyArgs)
             .then(BToC, EmptyArgs)
-            .finish();
+            .finish().into_compiled();
         assert_eq!(plan.n_nodes(), 3);
         assert_eq!(plan.n_edges(), 2);
         let order = plan.topo_order().unwrap();
@@ -659,9 +689,9 @@ mod tests {
 
     #[test]
     fn first_node_has_unit_initial_input() {
-        let plan = Plan::new("with_unit", serde_json::json!({}))
+        let plan = Plan::<(), LamuTrainerBackend>::new("with_unit", serde_json::json!({}))
             .start(MakeA, EmptyArgs)
-            .finish();
+            .finish().into_compiled();
         assert_eq!(plan.initial.len(), 1);
         let unit = plan.initial.get(&0).unwrap();
         assert_eq!(unit.kind, "()");
@@ -669,11 +699,11 @@ mod tests {
 
     #[test]
     fn topo_order_visits_each_node_once() {
-        let plan = Plan::new("p", serde_json::json!({}))
+        let plan = Plan::<(), LamuTrainerBackend>::new("p", serde_json::json!({}))
             .start(MakeA, EmptyArgs)
             .then(AToB, EmptyArgs)
             .then(BToC, EmptyArgs)
-            .finish();
+            .finish().into_compiled();
         let order = plan.topo_order().unwrap();
         assert_eq!(order.len(), plan.n_nodes());
         let mut seen = std::collections::HashSet::new();
@@ -685,10 +715,10 @@ mod tests {
     #[test]
     fn fork_creates_two_branches_from_one_input() {
         // MakeA -> [AToB | AToB] -> tuple<2>
-        let plan = Plan::new("forked", serde_json::json!({}))
+        let plan = Plan::<(), LamuTrainerBackend>::new("forked", serde_json::json!({}))
             .start(MakeA, EmptyArgs)
             .fork(AToB, EmptyArgs, AToB, EmptyArgs)
-            .finish();
+            .finish().into_compiled();
         assert_eq!(plan.n_nodes(), 3);
         // 2 edges from MakeA → each branch.
         assert_eq!(plan.n_edges(), 2);
@@ -702,9 +732,9 @@ mod tests {
     #[test]
     fn recipe_args_round_trip_through_finish() {
         let args = serde_json::json!({"output_name": "test", "since": "30d"});
-        let plan = Plan::new("named", args.clone())
+        let plan = Plan::<(), LamuTrainerBackend>::new("named", args.clone())
             .start(MakeA, EmptyArgs)
-            .finish();
+            .finish().into_compiled();
         assert_eq!(plan.recipe_args(), &args);
         assert_eq!(plan.name(), "named");
     }

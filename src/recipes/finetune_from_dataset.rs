@@ -114,6 +114,7 @@ fn default_eval_ratio() -> f32 {
 }
 
 impl Recipe for FinetuneFromDataset {
+    type Backend = crate::backends::LamuTrainerBackend;
     const NAME: &'static str = "finetune_from_dataset";
     const DESCRIPTION: &'static str =
         "SFT from an existing dataset — JSONL path on disk or a registered name. \
@@ -121,7 +122,7 @@ impl Recipe for FinetuneFromDataset {
          source materializer.";
     type Args = Args;
 
-    fn compile(&self, args: Self::Args) -> Result<Plan<()>, RecipeError> {
+    fn compile(&self, args: Self::Args) -> Result<Plan<(), Self::Backend>, RecipeError> {
         match (&args.dataset_path, &args.registered_dataset) {
             (Some(_), Some(_)) => {
                 return Err(RecipeError::InvalidArgs(
@@ -223,6 +224,7 @@ impl Recipe for FinetuneFromDataset {
 pub static DEF: RecipeDef = RecipeDef {
     name: FinetuneFromDataset::NAME,
     description: FinetuneFromDataset::DESCRIPTION,
+    backend_id: <crate::backends::LamuTrainerBackend as crate::backends::TrainingBackend>::ID,
     args_schema_fn: || {
         let mut g = schemars::r#gen::SchemaGenerator::default();
         let s = g.subschema_for::<Args>();
@@ -231,7 +233,7 @@ pub static DEF: RecipeDef = RecipeDef {
     compile_fn: |raw| {
         let args: Args = serde_json::from_value(raw)
             .map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
-        FinetuneFromDataset.compile(args)
+        FinetuneFromDataset.compile(args).map(|p| p.into_compiled())
     },
 };
 
@@ -263,7 +265,7 @@ mod tests {
 
     #[test]
     fn compiles_to_7_node_plan() {
-        let plan = FinetuneFromDataset.compile(args()).unwrap();
+        let plan = FinetuneFromDataset.compile(args()).unwrap().into_compiled();
         assert_eq!(plan.n_nodes(), 7);
         assert_eq!(plan.n_edges(), 6);
     }

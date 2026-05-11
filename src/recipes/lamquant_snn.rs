@@ -117,6 +117,7 @@ fn default_true() -> bool {
 }
 
 impl Recipe for LamquantSnn {
+    type Backend = crate::backends::LamquantBackend;
     const NAME: &'static str = "lamquant_snn";
     const DESCRIPTION: &'static str =
         "Mamba SNN seizure / activity detector end-to-end: build manifest, \
@@ -124,7 +125,7 @@ impl Recipe for LamquantSnn {
          no-promote) — recipes must explicitly opt into real promotion.";
     type Args = Args;
 
-    fn compile(&self, args: Self::Args) -> Result<Plan<()>, RecipeError> {
+    fn compile(&self, args: Self::Args) -> Result<Plan<(), Self::Backend>, RecipeError> {
         // R23: arg-range validation at the recipe boundary.
         if !matches!(args.preset.as_str(), "fast" | "standard" | "production") {
             return Err(RecipeError::InvalidArgs(format!(
@@ -212,6 +213,7 @@ impl Recipe for LamquantSnn {
 pub static DEF: RecipeDef = RecipeDef {
     name: LamquantSnn::NAME,
     description: LamquantSnn::DESCRIPTION,
+    backend_id: <crate::backends::LamquantBackend as crate::backends::TrainingBackend>::ID,
     args_schema_fn: || {
         let mut g = schemars::r#gen::SchemaGenerator::default();
         let s = g.subschema_for::<Args>();
@@ -220,7 +222,7 @@ pub static DEF: RecipeDef = RecipeDef {
     compile_fn: |raw| {
         let args: Args = serde_json::from_value(raw)
             .map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
-        LamquantSnn.compile(args)
+        LamquantSnn.compile(args).map(|p| p.into_compiled())
     },
 };
 
@@ -262,7 +264,7 @@ mod tests {
 
     #[test]
     fn compiles_to_3_node_plan() {
-        let plan = LamquantSnn.compile(args()).unwrap();
+        let plan = LamquantSnn.compile(args()).unwrap().into_compiled();
         assert_eq!(plan.n_nodes(), 3);
         assert_eq!(plan.n_edges(), 2);
         let order = plan.topo_order().unwrap();

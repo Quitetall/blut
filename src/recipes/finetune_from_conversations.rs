@@ -143,6 +143,7 @@ fn default_register_dataset_name() -> String {
 }
 
 impl Recipe for FinetuneFromConversations {
+    type Backend = crate::backends::LamuTrainerBackend;
     const NAME: &'static str = "finetune_from_conversations";
     const DESCRIPTION: &'static str =
         "Fine-tune a base model on the user's recent LAMU conversation history. \
@@ -150,7 +151,7 @@ impl Recipe for FinetuneFromConversations {
          converts to GGUF, registers the result.";
     type Args = Args;
 
-    fn compile(&self, args: Self::Args) -> Result<Plan<()>, RecipeError> {
+    fn compile(&self, args: Self::Args) -> Result<Plan<(), Self::Backend>, RecipeError> {
         // R23 (validate both ends): tighten arg range checks at the
         // recipe boundary before any plumbing runs. Caller bugs
         // surface here rather than as cryptic Python errors three
@@ -277,6 +278,7 @@ impl Recipe for FinetuneFromConversations {
 pub static DEF: RecipeDef = RecipeDef {
     name: FinetuneFromConversations::NAME,
     description: FinetuneFromConversations::DESCRIPTION,
+    backend_id: <crate::backends::LamuTrainerBackend as crate::backends::TrainingBackend>::ID,
     args_schema_fn: || {
         let mut g = schemars::r#gen::SchemaGenerator::default();
         let s = g.subschema_for::<Args>();
@@ -285,7 +287,7 @@ pub static DEF: RecipeDef = RecipeDef {
     compile_fn: |raw| {
         let args: Args = serde_json::from_value(raw)
             .map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
-        FinetuneFromConversations.compile(args)
+        FinetuneFromConversations.compile(args).map(|p| p.into_compiled())
     },
 };
 
@@ -319,7 +321,7 @@ mod tests {
             drop_errors: default_drop_errors(),
             dataset_registry_name: default_register_dataset_name(),
         };
-        let plan = FinetuneFromConversations.compile(args).unwrap();
+        let plan = FinetuneFromConversations.compile(args).unwrap().into_compiled();
         assert_eq!(plan.n_nodes(), 9);
         assert_eq!(plan.n_edges(), 8);
         let order = plan.topo_order().unwrap();

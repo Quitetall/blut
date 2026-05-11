@@ -633,15 +633,16 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
     use blut::recipes::recipe::{find as find_recipe, RECIPES};
     match cmd {
         RecipeCommand::List => {
-            println!("{:<32} {}", "name", "description");
+            println!("{:<32} {:<12} {}", "name", "backend", "description");
             for r in RECIPES {
-                println!("{:<32} {}", r.name, r.description);
+                println!("{:<32} {:<12} {}", r.name, r.backend_id, r.description);
             }
         }
         RecipeCommand::Show { name } => {
             let r = find_recipe(&name)
                 .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
             println!("name        : {}", r.name);
+            println!("backend     : {}", r.backend_id);
             println!("description : {}", r.description);
             let schema = (r.args_schema_fn)();
             println!(

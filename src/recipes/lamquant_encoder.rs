@@ -106,6 +106,7 @@ fn default_true() -> bool {
 }
 
 impl Recipe for LamquantEncoder {
+    type Backend = crate::backends::LamquantBackend;
     const NAME: &'static str = "lamquant_encoder";
     const DESCRIPTION: &'static str =
         "Full LamQuant encoder pipeline: build_manifest → precompute_fullband \
@@ -113,7 +114,7 @@ impl Recipe for LamquantEncoder {
          Safe-by-default PCCP gate.";
     type Args = Args;
 
-    fn compile(&self, args: Self::Args) -> Result<Plan<()>, RecipeError> {
+    fn compile(&self, args: Self::Args) -> Result<Plan<(), Self::Backend>, RecipeError> {
         if !matches!(args.preset.as_str(), "fast" | "medium" | "production") {
             return Err(RecipeError::InvalidArgs(format!(
                 "preset '{}' must be fast|medium|production",
@@ -286,6 +287,8 @@ use crate::stages::lamquant_helpers::resolve_home;
 
 struct L3RebindFromMae;
 
+impl crate::framework::Compatible<crate::backends::LamquantBackend> for L3RebindFromMae {}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 struct L3RebindArgs {
     /// Recipe passes lamquant_home through here so the bridge doesn't
@@ -334,6 +337,7 @@ impl Stage for L3RebindFromMae {
 pub static DEF: RecipeDef = RecipeDef {
     name: LamquantEncoder::NAME,
     description: LamquantEncoder::DESCRIPTION,
+    backend_id: <crate::backends::LamquantBackend as crate::backends::TrainingBackend>::ID,
     args_schema_fn: || {
         let mut g = schemars::r#gen::SchemaGenerator::default();
         let s = g.subschema_for::<Args>();
@@ -342,7 +346,7 @@ pub static DEF: RecipeDef = RecipeDef {
     compile_fn: |raw| {
         let args: Args = serde_json::from_value(raw)
             .map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
-        LamquantEncoder.compile(args)
+        LamquantEncoder.compile(args).map(|p| p.into_compiled())
     },
 };
 
@@ -379,7 +383,7 @@ mod tests {
     fn compiles_without_mae() {
         // build_manifest → precompute_fullband → precompute_l3 →
         // train_joint → pccp_gate_encoder = 5 nodes.
-        let plan = LamquantEncoder.compile(args()).unwrap();
+        let plan = LamquantEncoder.compile(args()).unwrap().into_compiled();
         assert_eq!(plan.n_nodes(), 5);
         assert_eq!(plan.n_edges(), 4);
     }
@@ -390,7 +394,7 @@ mod tests {
         a.mae_pretrain = true;
         // build_manifest → fullband → l3 → pretrain_mae →
         // _l3_rebind_from_mae → train_joint → gate = 7 nodes.
-        let plan = LamquantEncoder.compile(a).unwrap();
+        let plan = LamquantEncoder.compile(a).unwrap().into_compiled();
         assert_eq!(plan.n_nodes(), 7);
         assert_eq!(plan.n_edges(), 6);
     }

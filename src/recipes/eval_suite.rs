@@ -63,6 +63,7 @@ fn default_max_seq() -> u32 {
 }
 
 impl Recipe for EvalSuite {
+    type Backend = crate::backends::LamuTrainerBackend;
     const NAME: &'static str = "eval_suite";
     const DESCRIPTION: &'static str =
         "Three-way evaluation: cross-entropy + lm-eval-harness benchmarks \
@@ -70,7 +71,7 @@ impl Recipe for EvalSuite {
          three sub-reports + a flat summary.";
     type Args = Args;
 
-    fn compile(&self, args: Self::Args) -> Result<Plan<()>, RecipeError> {
+    fn compile(&self, args: Self::Args) -> Result<Plan<(), Self::Backend>, RecipeError> {
         if args.lm_harness_tasks.is_empty() {
             return Err(RecipeError::InvalidArgs(
                 "lm_harness_tasks must be non-empty".into(),
@@ -146,6 +147,7 @@ impl Recipe for EvalSuite {
 pub static DEF: RecipeDef = RecipeDef {
     name: EvalSuite::NAME,
     description: EvalSuite::DESCRIPTION,
+    backend_id: <crate::backends::LamuTrainerBackend as crate::backends::TrainingBackend>::ID,
     args_schema_fn: || {
         let mut g = schemars::r#gen::SchemaGenerator::default();
         let s = g.subschema_for::<Args>();
@@ -154,7 +156,7 @@ pub static DEF: RecipeDef = RecipeDef {
     compile_fn: |raw| {
         let args: Args = serde_json::from_value(raw)
             .map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
-        EvalSuite.compile(args)
+        EvalSuite.compile(args).map(|p| p.into_compiled())
     },
 };
 
@@ -178,7 +180,7 @@ mod tests {
 
     #[test]
     fn compiles_to_branch_plan() {
-        let plan = EvalSuite.compile(args()).unwrap();
+        let plan = EvalSuite.compile(args()).unwrap().into_compiled();
         // 1 materializer + 3 forked evaluators + 1 merge = 5 nodes.
         assert_eq!(plan.n_nodes(), 5);
         // Edges: materializer→3 forks (3), 3 forks→merge (3) = 6.

@@ -1,28 +1,38 @@
 //! Recipe trait + erased catalog (`RECIPES`).
 //!
-//! Each recipe has a typed `Args` struct (serde + JsonSchema) and
-//! a `compile` method that turns those args into a `Plan<()>`.
-//! The static `RECIPES` slice carries an erased entry per recipe
-//! so the CLI / MCP layer can list, schema, and run by name.
+//! Each recipe declares its target backend via `type Backend`,
+//! holds a typed `Args` struct (serde + JsonSchema), and a
+//! `compile` method producing a `Plan<(), Self::Backend>`. The
+//! static `RECIPES` slice stores erased entries so the CLI / MCP
+//! layer can list, schema, and run by name regardless of which
+//! backend each recipe targets — erasure happens at the
+//! `Plan<(), B>::into_compiled() → CompiledPlan` boundary.
 
+use crate::backends::TrainingBackend;
 use crate::framework::error::RecipeError;
-use crate::framework::plan::Plan;
+use crate::framework::plan::{CompiledPlan, Plan};
 
 pub trait Recipe: Send + Sync + 'static {
     const NAME: &'static str;
     const DESCRIPTION: &'static str;
+    type Backend: TrainingBackend;
     type Args: serde::de::DeserializeOwned + schemars::JsonSchema + Send + Sync + 'static;
-    fn compile(&self, args: Self::Args) -> Result<Plan<()>, RecipeError>;
+    fn compile(&self, args: Self::Args)
+        -> Result<Plan<(), Self::Backend>, RecipeError>;
 }
 
 /// Erased registry entry. Stored in the static `RECIPES` slice.
 pub struct RecipeDef {
     pub name: &'static str,
     pub description: &'static str,
+    /// Backend identity (e.g. "lamu", "hf_trainer", "lamquant").
+    /// Set from `<Recipe>::Backend::ID` in each recipe's DEF.
+    pub backend_id: &'static str,
     /// Returns the recipe's args JSON schema.
     pub args_schema_fn: fn() -> serde_json::Value,
-    /// Parse JSON args + compile to a Plan.
-    pub compile_fn: fn(serde_json::Value) -> Result<Plan<()>, RecipeError>,
+    /// Parse JSON args + compile to a backend-erased CompiledPlan.
+    /// Recipe DEFs wrap their `Plan<(), B>` via `.into_compiled()`.
+    pub compile_fn: fn(serde_json::Value) -> Result<CompiledPlan, RecipeError>,
 }
 
 /// Slice of `&RecipeDef` (not `RecipeDef`): RecipeDef contains

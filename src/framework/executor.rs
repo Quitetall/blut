@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use crate::framework::artifact::{ArtifactMetadata, ContentHash};
 use crate::framework::cache::CacheHandle;
 use crate::framework::error::PlanError;
-use crate::framework::plan::{NodeId, Plan};
+use crate::framework::plan::{CompiledPlan, NodeId};
 use crate::framework::stage::{ErasedArtifact, StageContext};
 use crate::framework::status::{spawn_status_writer, StageEvent};
 
@@ -108,7 +108,7 @@ pub struct SequentialExecutor;
 
 impl SequentialExecutor {
     /// Execute the plan to completion.
-    pub async fn execute(plan: Plan<()>, ctx: ExecCtx) -> Result<PlanResult, PlanError> {
+    pub async fn execute(plan: CompiledPlan, ctx: ExecCtx) -> Result<PlanResult, PlanError> {
         // R21 precondition: ExecCtx invariants the executor relies on.
         debug_assert!(!ctx.resources.is_empty(), "ExecCtx must declare resource semaphores");
         debug_assert!(
@@ -507,8 +507,11 @@ fn content_hash_from_erased(art: &ErasedArtifact) -> ContentHash {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::{LamuTrainerBackend, TrainingBackend};
     use crate::framework::artifact::Artifact;
+    use crate::framework::compat::Compatible;
     use crate::framework::error::StageError;
+    use crate::framework::plan::Plan;
     use crate::framework::resource::Resource;
     use crate::framework::stage::Stage;
     use async_trait::async_trait;
@@ -587,6 +590,11 @@ mod tests {
         }
     }
 
+    // Test stages need Compatible<B> for the typed Plan API.
+    // Tag against LamuTrainerBackend (arbitrary; tests pick one B).
+    impl Compatible<LamuTrainerBackend> for MakeOne {}
+    impl Compatible<LamuTrainerBackend> for Increment {}
+
     /// Stage that always returns a backend error. Tests the
     /// failure-propagation path.
     struct AlwaysFail;
@@ -607,6 +615,7 @@ mod tests {
             Err(StageError::BadInput("forced failure".into()))
         }
     }
+    impl Compatible<LamuTrainerBackend> for AlwaysFail {}
 
     fn fresh_ctx() -> (tempfile::TempDir, ExecCtx) {
         let td = tempfile::tempdir().unwrap();
@@ -620,11 +629,11 @@ mod tests {
         MAKE_RUN_COUNT.store(0, Ordering::SeqCst);
         INC_RUN_COUNT.store(0, Ordering::SeqCst);
         let (_td, ctx) = fresh_ctx();
-        let plan = Plan::new("test", serde_json::json!({}))
+        let plan = Plan::<(), LamuTrainerBackend>::new("test", serde_json::json!({}))
             .start(MakeOne, EmptyArgs)
             .then(Increment, EmptyArgs)
             .then(Increment, EmptyArgs)
-            .finish();
+            .finish().into_compiled();
         let result = SequentialExecutor::execute(plan, ctx).await.unwrap();
         assert_eq!(result.n_stages, 3);
         assert_eq!(result.n_cache_misses, 3);
@@ -644,10 +653,10 @@ mod tests {
         let cache = ctx.cache.clone();
 
         // First run: every stage is a miss.
-        let plan = Plan::new("test", serde_json::json!({}))
+        let plan = Plan::<(), LamuTrainerBackend>::new("test", serde_json::json!({}))
             .start(MakeOne, EmptyArgs)
             .then(Increment, EmptyArgs)
-            .finish();
+            .finish().into_compiled();
         let r1 = SequentialExecutor::execute(plan, ctx).await.unwrap();
         assert_eq!(r1.n_cache_misses, 2);
         assert_eq!(MAKE_RUN_COUNT.load(Ordering::SeqCst), 1);
@@ -658,10 +667,10 @@ mod tests {
         let job_dir2 = td_keepalive_for_second_run.path().to_path_buf();
         let ctx2 = ExecCtx::new(job_dir2);
         let ctx2 = ExecCtx { cache, ..ctx2 };
-        let plan2 = Plan::new("test", serde_json::json!({}))
+        let plan2 = Plan::<(), LamuTrainerBackend>::new("test", serde_json::json!({}))
             .start(MakeOne, EmptyArgs)
             .then(Increment, EmptyArgs)
-            .finish();
+            .finish().into_compiled();
         let r2 = SequentialExecutor::execute(plan2, ctx2).await.unwrap();
         assert_eq!(r2.n_cache_hits, 2, "second run should hit cache for both stages");
         assert_eq!(r2.n_cache_misses, 0);
@@ -674,9 +683,9 @@ mod tests {
     async fn stage_failure_propagates_as_plan_error() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (_td, ctx) = fresh_ctx();
-        let plan = Plan::new("failing", serde_json::json!({}))
+        let plan = Plan::<(), LamuTrainerBackend>::new("failing", serde_json::json!({}))
             .start(AlwaysFail, EmptyArgs)
-            .finish();
+            .finish().into_compiled();
         let r = SequentialExecutor::execute(plan, ctx).await;
         match r {
             Err(PlanError::StageFailed { idx, stage, source }) => {
@@ -693,9 +702,9 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (_td, ctx) = fresh_ctx();
         ctx.cancel.cancel();
-        let plan = Plan::new("c", serde_json::json!({}))
+        let plan = Plan::<(), LamuTrainerBackend>::new("c", serde_json::json!({}))
             .start(MakeOne, EmptyArgs)
-            .finish();
+            .finish().into_compiled();
         let r = SequentialExecutor::execute(plan, ctx).await;
         assert!(matches!(r, Err(PlanError::Cancelled)));
     }
@@ -704,10 +713,10 @@ mod tests {
     async fn status_jsonl_persists_to_disk() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (td, ctx) = fresh_ctx();
-        let plan = Plan::new("p", serde_json::json!({}))
+        let plan = Plan::<(), LamuTrainerBackend>::new("p", serde_json::json!({}))
             .start(MakeOne, EmptyArgs)
             .then(Increment, EmptyArgs)
-            .finish();
+            .finish().into_compiled();
         let _ = SequentialExecutor::execute(plan, ctx).await.unwrap();
         let path = td.path().join("status.jsonl");
         assert!(path.exists());
@@ -724,9 +733,9 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (td, ctx) = fresh_ctx();
         let recipe_args = serde_json::json!({"output_name": "test", "since": "30d"});
-        let plan = Plan::new("p", recipe_args.clone())
+        let plan = Plan::<(), LamuTrainerBackend>::new("p", recipe_args.clone())
             .start(MakeOne, EmptyArgs)
-            .finish();
+            .finish().into_compiled();
         let _ = SequentialExecutor::execute(plan, ctx).await.unwrap();
         let body = std::fs::read_to_string(td.path().join("args.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -737,9 +746,9 @@ mod tests {
     async fn sidecar_metadata_written_per_stage() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (td, ctx) = fresh_ctx();
-        let plan = Plan::new("p", serde_json::json!({}))
+        let plan = Plan::<(), LamuTrainerBackend>::new("p", serde_json::json!({}))
             .start(MakeOne, EmptyArgs)
-            .finish();
+            .finish().into_compiled();
         let _ = SequentialExecutor::execute(plan, ctx).await.unwrap();
         let sidecar = td
             .path()

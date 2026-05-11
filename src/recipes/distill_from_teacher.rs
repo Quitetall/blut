@@ -87,6 +87,7 @@ fn default_quant() -> String {
 }
 
 impl Recipe for DistillFromTeacher {
+    type Backend = crate::backends::LamuTrainerBackend;
     const NAME: &'static str = "distill_from_teacher";
     const DESCRIPTION: &'static str =
         "Knowledge-distill a smaller student from a teacher checkpoint over a \
@@ -94,7 +95,7 @@ impl Recipe for DistillFromTeacher {
          tail as the SFT recipe.";
     type Args = Args;
 
-    fn compile(&self, args: Self::Args) -> Result<Plan<()>, RecipeError> {
+    fn compile(&self, args: Self::Args) -> Result<Plan<(), Self::Backend>, RecipeError> {
         // R23: arg validation.
         if !(args.kl_weight >= 0.0 && args.kl_weight <= 1.0) {
             return Err(RecipeError::InvalidArgs(format!(
@@ -187,6 +188,7 @@ impl Recipe for DistillFromTeacher {
 pub static DEF: RecipeDef = RecipeDef {
     name: DistillFromTeacher::NAME,
     description: DistillFromTeacher::DESCRIPTION,
+    backend_id: <crate::backends::LamuTrainerBackend as crate::backends::TrainingBackend>::ID,
     args_schema_fn: || {
         let mut g = schemars::r#gen::SchemaGenerator::default();
         let s = g.subschema_for::<Args>();
@@ -195,7 +197,7 @@ pub static DEF: RecipeDef = RecipeDef {
     compile_fn: |raw| {
         let args: Args = serde_json::from_value(raw)
             .map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
-        DistillFromTeacher.compile(args)
+        DistillFromTeacher.compile(args).map(|p| p.into_compiled())
     },
 };
 
@@ -224,7 +226,7 @@ mod tests {
 
     #[test]
     fn compiles_to_5_node_plan() {
-        let plan = DistillFromTeacher.compile(args()).unwrap();
+        let plan = DistillFromTeacher.compile(args()).unwrap().into_compiled();
         assert_eq!(plan.n_nodes(), 5);
         assert_eq!(plan.n_edges(), 4);
         let order = plan.topo_order().unwrap();
