@@ -33,6 +33,7 @@ pub static RECIPES: &[&RecipeDef] = &[
     &crate::recipes::finetune_from_conversations::DEF,
     &crate::recipes::dpo_from_preferences::DEF,
     &crate::recipes::eval_suite::DEF,
+    &crate::recipes::distill_from_teacher::DEF,
 ];
 
 pub fn find(name: &str) -> Option<&'static RecipeDef> {

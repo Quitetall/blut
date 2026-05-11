@@ -5,11 +5,13 @@
 //! lamu-mcp's `TOOLS` pattern: registering a new recipe is one
 //! block of code with a `name`, `description`, and `compile_fn`.
 
+pub mod distill_from_teacher;
 pub mod dpo_from_preferences;
 pub mod eval_suite;
 pub mod finetune_from_conversations;
 pub mod recipe;
 
+pub use distill_from_teacher::DistillFromTeacher;
 pub use dpo_from_preferences::DpoFromPreferences;
 pub use eval_suite::EvalSuite;
 pub use finetune_from_conversations::FinetuneFromConversations;
