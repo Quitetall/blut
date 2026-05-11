@@ -26,6 +26,7 @@ pub mod register_model;
 pub mod sft_train;
 pub mod split_train_eval;
 pub mod take_train;
+pub(crate) mod util;
 
 pub use convert_gguf::ConvertGguf;
 pub use distill_train::DistillTrain;

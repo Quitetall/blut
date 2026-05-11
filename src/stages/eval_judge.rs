@@ -71,7 +71,7 @@ impl Stage for EvalJudge {
             "synthetic": true,
         });
         let path = ctx.stage_dir.join("eval_judge.json");
-        super::eval_loss::write_report(&path, &metrics)?;
+        super::util::write_report(&path, &metrics)?;
         let content_hash = ContentHash::hash_file(&path).map_err(|source| StageError::Io {
             path: path.clone(),
             source,

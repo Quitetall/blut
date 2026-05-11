@@ -51,7 +51,7 @@ impl Stage for MergeReports {
             "summary": summary,
         });
         let path = ctx.stage_dir.join("eval_summary.json");
-        super::eval_loss::write_report(&path, &metrics)?;
+        super::util::write_report(&path, &metrics)?;
         let content_hash = ContentHash::hash_file(&path).map_err(|source| StageError::Io {
             path: path.clone(),
             source,

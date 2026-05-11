@@ -67,7 +67,7 @@ impl Stage for EvalLoss {
             "synthetic": true,
         });
         let path = ctx.stage_dir.join("eval_loss.json");
-        write_report(&path, &metrics)?;
+        super::util::write_report(&path, &metrics)?;
         let content_hash = ContentHash::hash_file(&path).map_err(|source| StageError::Io {
             path: path.clone(),
             source,
@@ -79,25 +79,6 @@ impl Stage for EvalLoss {
             content_hash,
         })
     }
-}
-
-pub(crate) fn write_report(
-    path: &std::path::Path,
-    metrics: &serde_json::Value,
-) -> Result<(), StageError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| StageError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    let body = serde_json::to_vec_pretty(metrics).map_err(|e| {
-        StageError::Backend(anyhow::anyhow!("serialize eval report: {e}"))
-    })?;
-    std::fs::write(path, body).map_err(|source| StageError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
 }
 
 #[cfg(test)]
