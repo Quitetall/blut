@@ -31,6 +31,7 @@
 
 pub mod artifacts;
 pub mod backend;
+pub mod backends;
 pub mod config;
 pub mod conversations;
 pub mod convert;
@@ -40,15 +41,24 @@ pub mod framework;
 pub mod jobs;
 pub mod paths;
 pub mod policy;
-pub mod lamquant_backend;
 pub mod protocol;
-pub mod python_backend;
 pub mod python_kill;
 pub mod recipes;
 pub mod registry;
 pub mod scheduler_lock;
 pub mod spec;
 pub mod stages;
+
+// Back-compat shims — internal callers + the binary continue
+// importing from the original paths during the BB-1 → BB-5 reorg.
+// The shims are zero-cost (`pub use`); they'll be removed once
+// every caller migrates to the new `backends::*` paths.
+pub mod python_backend {
+    pub use crate::backends::lamu::python_backend::*;
+}
+pub mod lamquant_backend {
+    pub use crate::backends::lamquant::runner::*;
+}
 
 /// Process-wide lock for tests that mutate environment variables.
 /// Multiple test modules touch `LAMU_TRAIN_*` env vars; without a
