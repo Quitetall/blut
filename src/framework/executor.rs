@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::framework::artifact::{ArtifactMetadata, ContentHash};
 use crate::framework::cache::CacheHandle;
-use crate::framework::error::{PlanError, StageError};
+use crate::framework::error::PlanError;
 use crate::framework::plan::{NodeId, Plan};
 use crate::framework::stage::{ErasedArtifact, StageContext};
 use crate::framework::status::{spawn_status_writer, StageEvent};
@@ -173,28 +173,37 @@ impl SequentialExecutor {
                 })?,
                 multi => {
                     // Gather predecessors' outputs as a tuple
-                    // ErasedArtifact. Commit-3 commit message
-                    // promised this lands here. Tuple kind is
-                    // "tuple<N>" where N is the arity; payload is
-                    // [child0, child1, ...] preserving fork order
+                    // ErasedArtifact. Tuple kind is "tuple<N>" where
+                    // N is the arity; payload is the concatenation
+                    // of child bincode bytes, preserving fork order
                     // (the order the predecessors appear in the
-                    // edges Vec, which corresponds to the order
-                    // the recipe author called fork/fork3).
-                    let mut payloads = Vec::with_capacity(multi.len());
+                    // edges Vec, which corresponds to the order the
+                    // recipe author called fork/fork3).
+                    //
+                    // Bincode encodes a tuple `(A, B)` as
+                    // `bincode(A) ++ bincode(B)` with no separator,
+                    // so concatenation is wire-equivalent to
+                    // `bincode::serialize(&(a, b))`. The
+                    // tuple-consuming stage's blanket `into_typed`
+                    // call deserializes the concatenated bytes as
+                    // `(A, B)` correctly.
+                    let mut payload: Vec<u8> = Vec::with_capacity(
+                        multi.iter().filter_map(|p| outputs.get(p).map(|a| a.payload.len())).sum(),
+                    );
                     for &pid in multi {
-                        let art = outputs.get(&pid).cloned().ok_or_else(|| {
+                        let art = outputs.get(&pid).ok_or_else(|| {
                             PlanError::Other(format!(
                                 "node {} predecessor {} produced no output",
                                 node_id, pid
                             ))
                         })?;
-                        payloads.push(art.payload);
+                        payload.extend_from_slice(&art.payload);
                     }
                     let tuple_kind = format!("tuple<{}>", multi.len());
                     ErasedArtifact {
                         kind: tuple_kind,
                         schema: 1,
-                        payload: serde_json::Value::Array(payloads),
+                        payload,
                     }
                 }
             };
@@ -347,30 +356,24 @@ impl SequentialExecutor {
     }
 }
 
-/// Compute the `ContentHash` of an erased artifact's payload by
-/// SHA-256-ing the canonical JSON. Cheap; the cache lookup is the
-/// hot path so this needs to be fast.
+/// Compute the `ContentHash` of an erased artifact directly from
+/// its bincode payload bytes. Bincode is canonical for any given
+/// type (no key reordering, no whitespace), so the byte form is
+/// already a stable digest input — no canonicalization step needed
+/// (this was the prior JSON path's cost).
 ///
 /// Why not call the typed artifact's `content_hash`? Because at
-/// the executor level we've already erased the type. The trade-off:
-/// erased hash is over the JSON metadata blob (handle), not the
-/// on-disk payload. Two artifacts whose JSON differs but whose
-/// on-disk content is identical will get different cache keys —
-/// not a correctness bug (we never claim "same key ⇒ same disk
-/// content", only "same key ⇒ same prior result"), but it's a
-/// missed cache opportunity. Concrete artifact impls of
-/// `content_hash` already account for this by normalizing the
-/// JSON itself before serializing.
+/// the executor level we've already erased the type. Trade-off
+/// unchanged from before: the erased hash addresses the handle
+/// bytes, not the on-disk payload. Concrete artifact impls of
+/// `content_hash` already account for this by hashing the on-disk
+/// bytes inside their own implementation.
 fn input_hash_from_erased(art: &ErasedArtifact) -> ContentHash {
-    // Reuse the canonical-JSON path so reordered fields don't
-    // change the input hash (mirrors cache::canonical_value).
-    let canon = canonical_value(&art.payload);
-    let body = serde_json::to_vec(&canon).unwrap_or_default();
-    let mut h = sha2::Sha256::new();
     use sha2::Digest;
+    let mut h = sha2::Sha256::new();
     h.update(art.kind.as_bytes());
     h.update(art.schema.to_le_bytes());
-    h.update(&body);
+    h.update(&art.payload);
     let arr: [u8; 32] = h.finalize().into();
     ContentHash(arr)
 }
@@ -379,31 +382,11 @@ fn output_hash_from_erased(art: &ErasedArtifact) -> ContentHash {
     input_hash_from_erased(art)
 }
 
-fn canonical_value(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut sorted: std::collections::BTreeMap<String, serde_json::Value> =
-                std::collections::BTreeMap::new();
-            for (k, v) in map {
-                sorted.insert(k.clone(), canonical_value(v));
-            }
-            let mut out = serde_json::Map::new();
-            for (k, v) in sorted {
-                out.insert(k, v);
-            }
-            serde_json::Value::Object(out)
-        }
-        serde_json::Value::Array(a) => {
-            serde_json::Value::Array(a.iter().map(canonical_value).collect())
-        }
-        other => other.clone(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::framework::artifact::Artifact;
+    use crate::framework::error::StageError;
     use crate::framework::resource::Resource;
     use crate::framework::stage::Stage;
     use async_trait::async_trait;

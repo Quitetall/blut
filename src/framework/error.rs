@@ -58,15 +58,17 @@ pub enum StageError {
         got: String,
     },
 
-    /// Erased dispatch: input JSON did not deserialize into the
+    /// Erased dispatch: input payload did not deserialize into the
     /// stage's expected `Input` type even though the kind tag
     /// matched. Schema drift; bump `Artifact::SCHEMA` and the cache
-    /// will invalidate downstream.
-    #[error("input deserialize failed for stage '{stage}': {source}")]
+    /// will invalidate downstream. Payload format is bincode at the
+    /// typed boundary (opt-4), hence `String` rather than a typed
+    /// serde error variant — the underlying error is rendered into
+    /// the message.
+    #[error("input deserialize failed for stage '{stage}': {message}")]
     InputDeserialize {
         stage: &'static str,
-        #[source]
-        source: serde_json::Error,
+        message: String,
     },
 
     /// Erased dispatch: args JSON did not deserialize into the
@@ -74,6 +76,8 @@ pub enum StageError {
     /// so log readers + the CLI can tell "bad artifact" from "bad
     /// recipe args". The latter is usually a recipe bug; the former
     /// is usually a schema mismatch between producer + consumer.
+    /// Args remain JSON (they come from CLI/recipes), so the source
+    /// is still a typed `serde_json::Error`.
     #[error("args deserialize failed for stage '{stage}': {source}")]
     ArgsDeserialize {
         stage: &'static str,
@@ -84,11 +88,10 @@ pub enum StageError {
     /// Erased dispatch: stage produced an output that didn't
     /// serialize. Should be impossible if the output type derives
     /// `Serialize` correctly; here for completeness.
-    #[error("output serialize failed for stage '{stage}': {source}")]
+    #[error("output serialize failed for stage '{stage}': {message}")]
     OutputSerialize {
         stage: &'static str,
-        #[source]
-        source: serde_json::Error,
+        message: String,
     },
 }
 

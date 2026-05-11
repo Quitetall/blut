@@ -45,29 +45,37 @@ use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::status::StageEvent;
 
-/// Erased artifact: a kind-tagged JSON blob that passes between
+/// Erased artifact: a kind-tagged binary blob that passes between
 /// stages at the `StageDyn` boundary. The `kind` field MUST equal
 /// the consuming stage's `Input::KIND` or the stage rejects with
 /// `KindMismatch` before `Stage::run` is called.
+///
+/// `payload` holds the bincode-serialized form of the producing
+/// stage's typed `Output` artifact. Bincode (length-prefixed binary)
+/// beats serde_json for the erased edge because both ends know the
+/// concrete `S::Input`/`S::Output` type — `deserialize_any` (the
+/// reason bincode was rejected for the *cache record* in opt-2) is
+/// not needed at the typed boundary.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ErasedArtifact {
     /// Kind tag from the producing artifact's `Artifact::KIND`.
     pub kind: String,
     /// Schema version from the producing artifact's `Artifact::SCHEMA`.
     pub schema: u32,
-    /// Serialized form of the typed artifact struct.
-    pub payload: serde_json::Value,
+    /// Bincode-serialized form of the typed artifact struct.
+    pub payload: Vec<u8>,
 }
 
 impl ErasedArtifact {
     /// Wrap a concrete typed artifact for transit across the
-    /// `StageDyn` boundary. Cheap — a serde_json round-trip on the
+    /// `StageDyn` boundary. Cheap — a bincode encode on the
     /// metadata-sized handle, not on the on-disk bytes.
-    pub fn from_typed<A: Artifact>(value: &A) -> Result<Self, serde_json::Error> {
+    pub fn from_typed<A: Artifact>(value: &A) -> Result<Self, ErasedEncodeError> {
+        let payload = bincode::serialize(value).map_err(ErasedEncodeError::Serialize)?;
         Ok(Self {
             kind: A::KIND.to_string(),
             schema: A::SCHEMA,
-            payload: serde_json::to_value(value)?,
+            payload,
         })
     }
 
@@ -91,8 +99,14 @@ impl ErasedArtifact {
                 got: self.schema,
             });
         }
-        serde_json::from_value(self.payload).map_err(ErasedDecodeError::Deserialize)
+        bincode::deserialize(&self.payload).map_err(ErasedDecodeError::Deserialize)
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ErasedEncodeError {
+    #[error("bincode serialize: {0}")]
+    Serialize(#[source] Box<bincode::ErrorKind>),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -104,8 +118,8 @@ pub enum ErasedDecodeError {
     },
     #[error("schema mismatch: expected v{expected}, got v{got}")]
     Schema { expected: u32, got: u32 },
-    #[error("deserialize: {0}")]
-    Deserialize(#[from] serde_json::Error),
+    #[error("bincode deserialize: {0}")]
+    Deserialize(#[source] Box<bincode::ErrorKind>),
 }
 
 /// Per-stage execution context. Holds everything `Stage::run`
@@ -261,7 +275,7 @@ impl<S: Stage> StageDyn for S {
             )),
             ErasedDecodeError::Deserialize(source) => StageError::InputDeserialize {
                 stage: S::NAME,
-                source,
+                message: source.to_string(),
             },
         })?;
 
@@ -282,9 +296,11 @@ impl<S: Stage> StageDyn for S {
         let output: S::Output = self.run(ctx, typed_input, &typed_args).await?;
 
         // 4. Re-encode output for the next erased edge.
-        ErasedArtifact::from_typed(&output).map_err(|source| StageError::OutputSerialize {
-            stage: S::NAME,
-            source,
+        ErasedArtifact::from_typed(&output).map_err(|e| match e {
+            ErasedEncodeError::Serialize(source) => StageError::OutputSerialize {
+                stage: S::NAME,
+                message: source.to_string(),
+            },
         })
     }
 }
@@ -398,11 +414,14 @@ mod tests {
 
     #[test]
     fn erased_into_typed_schema_mismatch_errors() {
-        // Hand-craft an ErasedArtifact with mismatched schema.
+        // Hand-craft an ErasedArtifact with mismatched schema. The
+        // payload bytes are still valid bincode of Words; the schema
+        // check fires before deserialize.
+        let payload = bincode::serialize(&Words { text: "x".into() }).unwrap();
         let e = ErasedArtifact {
             kind: "test.words".into(),
             schema: 99,
-            payload: serde_json::json!({"text": "x"}),
+            payload,
         };
         let r: Result<Words, _> = e.into_typed();
         assert!(matches!(r, Err(ErasedDecodeError::Schema { expected: 1, got: 99 })));
@@ -480,11 +499,11 @@ mod tests {
         let ctx = ctx();
         let s: Box<dyn StageDyn> = Box::new(WordCount);
         // Hand-craft an input whose kind matches but whose payload
-        // doesn't deserialize as Words.
+        // doesn't deserialize as Words (garbage bytes).
         let bad_input = ErasedArtifact {
             kind: "test.words".into(),
             schema: 1,
-            payload: serde_json::json!({"text": 12345}),
+            payload: vec![0xFF, 0xFF, 0xFF, 0xFF],
         };
         let good_args = serde_json::json!({"delimiter": " "});
         let r = s.run_erased(&ctx, bad_input, good_args).await;

@@ -9,7 +9,10 @@
 //!   - `ContentHash::hash_dir` (parallel) vs `hash_dir_serial`
 //!     across a 50-file checkpoint-shaped tree
 //!   - Cache key computation
-//!   - ErasedArtifact JSON round-trip
+//!   - `ErasedArtifact` round-trip (post-opt-4: bincode)
+//!   - JSON parse: `serde_json` vs `simd-json` on representative
+//!     args-sized payloads (opt-4 bench-driven decision)
+//!   - Cache hit path: write a cache entry + lookup it back
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 
@@ -136,6 +139,88 @@ fn bench_erased_round_trip(c: &mut Criterion) {
     });
 }
 
+fn bench_json_parse(c: &mut Criterion) {
+    // Representative recipe-args payload — same shape as
+    // `bench_cache_key`'s sft_train args. ~250 bytes once
+    // serialized. The simd-json crate operates on `&mut [u8]`
+    // (destructive parse), so iter_batched clones for each iter.
+    let args = serde_json::json!({
+        "lr": 2e-4,
+        "epochs": 3,
+        "batch_size": 1,
+        "grad_accum": 8,
+        "method": {"kind": "qlora", "rank": 16, "alpha": 32},
+        "base_model": "Qwen/Qwen3-7B",
+        "seq_len": 4096,
+    });
+    let bytes = serde_json::to_vec(&args).unwrap();
+
+    c.bench_function("serde_json parse ~250B args", |b| {
+        b.iter(|| {
+            let v: serde_json::Value =
+                serde_json::from_slice(black_box(&bytes)).unwrap();
+            black_box(v);
+        });
+    });
+
+    c.bench_function("simd_json parse ~250B args", |b| {
+        b.iter_batched(
+            || bytes.clone(),
+            |mut buf| {
+                let v: simd_json::OwnedValue =
+                    simd_json::to_owned_value(black_box(&mut buf)).unwrap();
+                black_box(v);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn bench_cache_write_then_read(c: &mut Criterion) {
+    use serde::{Deserialize, Serialize};
+    use std::path::Path;
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct Toy {
+        path: std::path::PathBuf,
+        n: i64,
+        meta: String,
+    }
+    impl Artifact for Toy {
+        const KIND: &'static str = "test.cache_toy";
+        const SCHEMA: u32 = 1;
+        fn content_hash(&self) -> ContentHash {
+            ContentHash::of_bytes(&self.n.to_le_bytes())
+        }
+        fn primary_path(&self) -> &Path {
+            &self.path
+        }
+    }
+    let toy = Toy {
+        path: "/tmp/x".into(),
+        n: 12345,
+        meta: "lorem ipsum dolor sit amet".repeat(20),
+    };
+    let art = ErasedArtifact::from_typed(&toy).unwrap();
+
+    c.bench_function("cache insert + lookup round trip", |b| {
+        b.iter_batched(
+            || {
+                let td = tempfile::tempdir().unwrap();
+                let h = CacheHandle::job_local(td.path().to_path_buf());
+                let key = ContentHash::of_bytes(b"bench");
+                (td, h, key)
+            },
+            |(_td, h, key)| {
+                h.insert(key, black_box(&art)).unwrap();
+                let hit = h.lookup(key).expect("must hit");
+                black_box(hit);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 criterion_group!(
     benches,
     bench_hash_file_10mib,
@@ -144,5 +229,7 @@ criterion_group!(
     bench_cache_key,
     bench_to_hex,
     bench_erased_round_trip,
+    bench_json_parse,
+    bench_cache_write_then_read,
 );
 criterion_main!(benches);
