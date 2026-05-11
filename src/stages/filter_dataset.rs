@@ -136,9 +136,13 @@ fn classify(line: &str, args: &Args) -> Verdict {
         Ok(v) => v,
         Err(_) => return Verdict::DropMalformed,
     };
+    // Missing `messages` key is schema-mismatch, not malformed.
+    // Only `serde_json::from_str` failure above qualifies as truly
+    // malformed JSON; a valid JSON object that doesn't look like a
+    // conversation belongs in the predicate-drop bucket.
     let messages = match v.get("messages").and_then(|m| m.as_array()) {
         Some(m) => m,
-        None => return Verdict::DropMalformed,
+        None => return Verdict::DropPredicate,
     };
     if args.min_turns > 0 && (messages.len() as u32) < args.min_turns {
         return Verdict::DropPredicate;
