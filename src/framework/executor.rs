@@ -212,7 +212,7 @@ impl SequentialExecutor {
             // erased input artifact (kind + schema + sorted-keys
             // payload). Cheap; the cache lookup is on the hot
             // path so this needs to be fast.
-            let input_hash = input_hash_from_erased(&input);
+            let input_hash = content_hash_from_erased(&input);
 
             let key = CacheHandle::key_for(stage_name, node.stage.schema(), input_hash, &node.args);
 
@@ -309,7 +309,7 @@ impl SequentialExecutor {
             // the producing stage has already written the on-disk
             // payload to its `stage_dir`. Write metadata at
             // `<stage_dir>/output.metadata.json`.
-            let output_hash = input_hash_from_erased(&output);
+            let output_hash = content_hash_from_erased(&output);
             let metadata = ArtifactMetadata::new(
                 output.kind.clone(),
                 output.schema,
@@ -368,7 +368,7 @@ impl SequentialExecutor {
 /// bytes, not the on-disk payload. Concrete artifact impls of
 /// `content_hash` already account for this by hashing the on-disk
 /// bytes inside their own implementation.
-fn input_hash_from_erased(art: &ErasedArtifact) -> ContentHash {
+fn content_hash_from_erased(art: &ErasedArtifact) -> ContentHash {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
     h.update(art.kind.as_bytes());

@@ -12,11 +12,8 @@
 //!   - `ErasedArtifact` round-trip (post-opt-4: bincode)
 //!   - Cache hit path: write a cache entry + lookup it back
 //!
-//! Opt-4 also benchmarked `simd-json` vs `serde_json` on a ~250 B
-//! recipe-args payload; result: serde 428 ns vs simd 525 ns. simd-json
-//! loses on sub-KB inputs (its SIMD parallelism only wins at multi-KB)
-//! and drags in ~10 transitive deps. Bench + dep dropped; this note
-//! is the audit trail so the question doesn't get reopened.
+//! simd-json dropped after opt-4 benchmarks showed serde_json faster
+//! on sub-KB payloads.
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 
