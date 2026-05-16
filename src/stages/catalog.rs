@@ -12,6 +12,11 @@ pub fn make_stage(name: &str) -> Option<Box<dyn StageDyn>> {
     use super::*;
     Some(match name {
         "lamquant_build_manifest" => Box::new(LamquantBuildManifest),
+        "lamquant_convert_lma" => Box::new(LamquantConvertLma),
+        "lamquant_export_firmware" => Box::new(LamquantExportFirmware),
+        "lamquant_generate_snn_labels" => Box::new(LamquantGenerateSnnLabels),
+        "lamquant_harden_artifacts" => Box::new(LamquantHardenArtifacts),
+        "lamquant_train_student" => Box::new(LamquantTrainStudent),
         "lamquant_pccp_gate_decoder" => Box::new(LamquantPccpGateDecoder),
         "lamquant_pccp_gate_encoder" => Box::new(LamquantPccpGateEncoder),
         "lamquant_pccp_gate_snn" => Box::new(LamquantPccpGateSnn),
@@ -49,6 +54,11 @@ pub fn make_stage(name: &str) -> Option<Box<dyn StageDyn>> {
 pub fn names() -> &'static [&'static str] {
     &[
         "lamquant_build_manifest",
+        "lamquant_convert_lma",
+        "lamquant_export_firmware",
+        "lamquant_generate_snn_labels",
+        "lamquant_harden_artifacts",
+        "lamquant_train_student",
         "lamquant_pccp_gate_decoder",
         "lamquant_pccp_gate_encoder",
         "lamquant_pccp_gate_snn",

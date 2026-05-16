@@ -188,6 +188,83 @@ impl Artifact for HardenedCkpt {
     }
 }
 
+// ── LMA corpus / labels / firmware bundle ───────────────────────
+
+/// Per-recording LMA archive directory. Each `<stem>.lma` packs the
+/// LML container + annotation sidecars + label NPZ + provenance
+/// meta.json (subject_id, content_sha256_lml). The training data
+/// path post-2026-05-16 LMA pivot — every train_*.py kernel reads
+/// these via `lamquant_codec.training.LmaL3Dataset` /
+/// `LmaSignalDataset`. See ADR 0017.
+///
+/// `HASH_CONTENTS = false`: archive bodies can run to hundreds of
+/// GB. Content hash is a stat-fingerprint over the corpus root
+/// (file count + total size + per-file mtime sample). Cache cares
+/// about provenance, not byte equality.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LmaCorpus {
+    pub root: PathBuf,
+    pub n_archives: i64,
+    pub content_hash: ContentHash,
+}
+
+impl Artifact for LmaCorpus {
+    const KIND: &'static str = "lamquant.lma_corpus";
+    const SCHEMA: u32 = 1;
+    const HASH_CONTENTS: bool = false;
+    fn content_hash(&self) -> ContentHash {
+        self.content_hash
+    }
+    fn primary_path(&self) -> &Path {
+        &self.root
+    }
+}
+
+/// Per-stem activity-label NPZ directory consumed by
+/// `lamquant_train_mamba_snn`. Produced by
+/// `lamquant_generate_snn_labels` for each EDF dataset.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SnnLabels {
+    pub dir: PathBuf,
+    pub dataset_id: String,
+    pub n_stems: i64,
+    pub content_hash: ContentHash,
+}
+
+impl Artifact for SnnLabels {
+    const KIND: &'static str = "lamquant.snn_labels";
+    const SCHEMA: u32 = 1;
+    const HASH_CONTENTS: bool = false;
+    fn content_hash(&self) -> ContentHash {
+        self.content_hash
+    }
+    fn primary_path(&self) -> &Path {
+        &self.dir
+    }
+}
+
+/// Firmware export output: C headers (encoder + decoder + snn) +
+/// flash-ready `.bin`. Produced by `lamquant_export_firmware`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FirmwareBundle {
+    pub bundle_dir: PathBuf,
+    pub bin_path: PathBuf,
+    pub target: String,
+    pub content_hash: ContentHash,
+}
+
+impl Artifact for FirmwareBundle {
+    const KIND: &'static str = "lamquant.firmware_bundle";
+    const SCHEMA: u32 = 1;
+    const HASH_CONTENTS: bool = false;
+    fn content_hash(&self) -> ContentHash {
+        self.content_hash
+    }
+    fn primary_path(&self) -> &Path {
+        &self.bundle_dir
+    }
+}
+
 /// Mamba SNN checkpoint for seizure / activity detection.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnnCkpt {

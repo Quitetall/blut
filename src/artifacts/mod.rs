@@ -14,7 +14,7 @@ pub use checkpoint::{GgufModel, HfCheckpoint};
 pub use dataset::{DatasetJsonl, DatasetSplit};
 pub use eval::EvalReport;
 pub use lamquant::{
-    FullbandMemmap, HardenedCkpt, JointCkpt, L3Cache, MaeCkpt, Manifest, PccpVerdict, SnnCkpt,
-    TeacherCkpt,
+    FirmwareBundle, FullbandMemmap, HardenedCkpt, JointCkpt, L3Cache, LmaCorpus, MaeCkpt, Manifest,
+    PccpVerdict, SnnCkpt, SnnLabels, TeacherCkpt,
 };
 pub use preferences::PreferenceJsonl;
