@@ -388,6 +388,8 @@ mod tests {
             pccp_change_class: default_change_class(),
             pccp_dry_run: true,
             pccp_no_promote: true,
+            lma_root: String::new(),
+            split_manifest: String::new(),
         }
     }
 

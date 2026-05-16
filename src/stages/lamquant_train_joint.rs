@@ -233,6 +233,8 @@ mod tests {
                     seizure_head: None,
                     infinite_lr: false,
                     resume: String::new(),
+                    lma_root: String::new(),
+                    split_manifest: String::new(),
                 },
             )
             .await;

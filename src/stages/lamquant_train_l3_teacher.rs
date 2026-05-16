@@ -176,6 +176,8 @@ mod tests {
                     max_windows: None,
                     device: String::new(),
                     resume: false,
+                    lma_root: String::new(),
+                    split_manifest: String::new(),
                 },
             )
             .await;

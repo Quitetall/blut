@@ -160,6 +160,8 @@ mod tests {
                     windows_per_epoch: None,
                     max_windows: None,
                     seed: None,
+                    lma_root: String::new(),
+                    split_manifest: String::new(),
                 },
             )
             .await;

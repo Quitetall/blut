@@ -390,6 +390,8 @@ mod tests {
                     max_windows_per_file: None,
                     checkpoint_rel: String::new(),
                     export_rel: String::new(),
+                    lma_root: String::new(),
+                    split_manifest: String::new(),
                 },
             )
             .await;
@@ -431,6 +433,8 @@ mod tests {
                     max_windows_per_file: None,
                     checkpoint_rel: String::new(),
                     export_rel: String::new(),
+                    lma_root: String::new(),
+                    split_manifest: String::new(),
                 },
             )
             .await;
