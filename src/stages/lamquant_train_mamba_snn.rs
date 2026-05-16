@@ -79,6 +79,14 @@ pub struct Args {
     /// `--export` C-header path (optional). Empty = skip.
     #[serde(default)]
     pub export_rel: String,
+
+    /// LMA-direct training root (BLUT canonical, ADR 0017). Empty falls
+    /// back to the legacy NPZ-events pipeline.
+    #[serde(default)]
+    pub lma_root: String,
+    /// JSON split manifest path. Required when ``lma_root`` is set.
+    #[serde(default)]
+    pub split_manifest: String,
 }
 
 fn default_preset() -> String {
@@ -192,6 +200,14 @@ impl Stage for LamquantTrainMambaSnn {
             let export_path = safe_join(&lamquant_home, &args.export_rel)?;
             cmd_args.push("--export".into());
             cmd_args.push(export_path.display().to_string());
+        }
+        if !args.lma_root.is_empty() {
+            cmd_args.push("--lma-root".into());
+            cmd_args.push(args.lma_root.clone());
+        }
+        if !args.split_manifest.is_empty() {
+            cmd_args.push("--split-manifest".into());
+            cmd_args.push(args.split_manifest.clone());
         }
 
         // BLUT identity for the RunManifest pre-hook to read.

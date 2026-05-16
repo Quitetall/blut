@@ -41,6 +41,13 @@ pub struct Args {
     pub device: String,
     #[serde(default)]
     pub resume: bool,
+    /// LMA-direct training root (BLUT canonical, ADR 0017). Empty falls
+    /// back to the deprecated NPZ + L3 precompute path.
+    #[serde(default)]
+    pub lma_root: String,
+    /// JSON split manifest path. Required when ``lma_root`` is set.
+    #[serde(default)]
+    pub split_manifest: String,
 }
 
 #[async_trait]
@@ -88,6 +95,14 @@ impl Stage for LamquantTrainL3Teacher {
         }
         if args.resume {
             cmd_args.push("--resume".into());
+        }
+        if !args.lma_root.is_empty() {
+            cmd_args.push("--lma-root".into());
+            cmd_args.push(args.lma_root.clone());
+        }
+        if !args.split_manifest.is_empty() {
+            cmd_args.push("--split-manifest".into());
+            cmd_args.push(args.split_manifest.clone());
         }
 
         let inv = LamquantInvocation {

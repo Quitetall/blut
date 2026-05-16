@@ -40,6 +40,13 @@ pub struct Args {
     pub max_windows: Option<u32>,
     #[serde(default)]
     pub seed: Option<u32>,
+    /// LMA-direct training root (BLUT canonical, ADR 0017). Empty falls
+    /// back to the deprecated NPZ + L3 precompute path.
+    #[serde(default)]
+    pub lma_root: String,
+    /// JSON split manifest path. Required when ``lma_root`` is set.
+    #[serde(default)]
+    pub split_manifest: String,
 }
 
 #[async_trait]
@@ -82,6 +89,14 @@ impl Stage for LamquantPretrainMae {
         push_opt_u32(&mut cmd_args, "--windows-per-epoch", args.windows_per_epoch);
         push_opt_u32(&mut cmd_args, "--max-windows", args.max_windows);
         push_opt_u32(&mut cmd_args, "--seed", args.seed);
+        if !args.lma_root.is_empty() {
+            cmd_args.push("--lma-root".into());
+            cmd_args.push(args.lma_root.clone());
+        }
+        if !args.split_manifest.is_empty() {
+            cmd_args.push("--split-manifest".into());
+            cmd_args.push(args.split_manifest.clone());
+        }
 
         let inv = LamquantInvocation {
             python,

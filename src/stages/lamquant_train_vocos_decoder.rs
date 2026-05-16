@@ -67,6 +67,13 @@ pub struct Args {
     pub perceptual_weight: Option<f32>,
     #[serde(default)]
     pub dac_init: bool,
+    /// LMA-direct training root (BLUT canonical, ADR 0017). Empty falls
+    /// back to the deprecated NPZ + L3 precompute path.
+    #[serde(default)]
+    pub lma_root: String,
+    /// JSON split manifest path. Required when ``lma_root`` is set.
+    #[serde(default)]
+    pub split_manifest: String,
 }
 
 fn default_tier() -> u32 {
@@ -144,6 +151,14 @@ impl Stage for LamquantTrainVocosDecoder {
         push_opt_f32(&mut cmd_args, "--perceptual-weight", args.perceptual_weight);
         if args.dac_init {
             cmd_args.push("--dac-init".into());
+        }
+        if !args.lma_root.is_empty() {
+            cmd_args.push("--lma-root".into());
+            cmd_args.push(args.lma_root.clone());
+        }
+        if !args.split_manifest.is_empty() {
+            cmd_args.push("--split-manifest".into());
+            cmd_args.push(args.split_manifest.clone());
         }
 
         let inv = LamquantInvocation {

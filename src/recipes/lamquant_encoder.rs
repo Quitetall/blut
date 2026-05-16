@@ -72,6 +72,14 @@ pub struct Args {
     pub pccp_dry_run: bool,
     #[serde(default = "default_true")]
     pub pccp_no_promote: bool,
+    /// LMA-direct training root (BLUT canonical, ADR 0017). Empty falls
+    /// back to the deprecated NPZ + L3 precompute path that the
+    /// upstream lamquant_precompute_* stages build.
+    #[serde(default)]
+    pub lma_root: String,
+    /// JSON split manifest path. Required when ``lma_root`` is set.
+    #[serde(default)]
+    pub split_manifest: String,
 }
 
 fn default_preset() -> String {
@@ -178,6 +186,8 @@ impl Recipe for LamquantEncoder {
             seizure_head: args.seizure_head,
             infinite_lr: args.infinite_lr,
             resume: String::new(),
+            lma_root: args.lma_root.clone(),
+            split_manifest: args.split_manifest.clone(),
         };
         let gate_args = crate::stages::lamquant_pccp_gate_encoder::Args {
             lamquant_home: args.lamquant_home.clone(),
@@ -234,6 +244,8 @@ impl Recipe for LamquantEncoder {
                         windows_per_epoch: None,
                         max_windows: None,
                         seed: Some(args.seed),
+                        lma_root: args.lma_root.clone(),
+                        split_manifest: args.split_manifest.clone(),
                     },
                 )
                 // MaeCkpt → train_joint: the kernel reads MAE init

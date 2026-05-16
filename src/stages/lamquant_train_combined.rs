@@ -56,6 +56,13 @@ pub struct Args {
     pub max_windows: Option<u32>,
     #[serde(default)]
     pub student_checkpoint_rel: String,
+    /// LMA-direct training root (BLUT canonical, ADR 0017). Empty falls
+    /// back to the deprecated NPZ + L3 precompute path.
+    #[serde(default)]
+    pub lma_root: String,
+    /// JSON split manifest path. Required when ``lma_root`` is set.
+    #[serde(default)]
+    pub split_manifest: String,
 }
 
 fn default_decoder_tier() -> u32 {
@@ -126,6 +133,14 @@ impl Stage for LamquantTrainCombined {
             let p = safe_join(&home, &args.student_checkpoint_rel)?;
             cmd_args.push("--student-checkpoint".into());
             cmd_args.push(p.display().to_string());
+        }
+        if !args.lma_root.is_empty() {
+            cmd_args.push("--lma-root".into());
+            cmd_args.push(args.lma_root.clone());
+        }
+        if !args.split_manifest.is_empty() {
+            cmd_args.push("--split-manifest".into());
+            cmd_args.push(args.split_manifest.clone());
         }
 
         let inv = LamquantInvocation {

@@ -89,6 +89,13 @@ pub struct Args {
     pub pccp_dry_run: bool,
     #[serde(default = "default_true")]
     pub pccp_no_promote: bool,
+    /// LMA-direct training root (BLUT canonical, ADR 0017). Empty falls
+    /// back to the legacy NPZ-events pipeline.
+    #[serde(default)]
+    pub lma_root: String,
+    /// JSON split manifest path. Required when ``lma_root`` is set.
+    #[serde(default)]
+    pub split_manifest: String,
 }
 
 fn default_preset() -> String {
@@ -191,6 +198,8 @@ impl Recipe for LamquantSnn {
                     max_windows_per_file: args.max_windows_per_file,
                     checkpoint_rel: args.checkpoint_rel.clone(),
                     export_rel: args.export_rel.clone(),
+                    lma_root: args.lma_root.clone(),
+                    split_manifest: args.split_manifest.clone(),
                 },
             )
             .then(

@@ -53,6 +53,14 @@ pub struct Args {
     /// Optional `--resume <path>` (or "auto"). Empty = no resume.
     #[serde(default)]
     pub resume: String,
+    /// LMA-direct training root (BLUT canonical, ADR 0017). Empty falls
+    /// back to the deprecated NPZ + L3 precompute path the Python kernel
+    /// loads from manifest_v3.json.
+    #[serde(default)]
+    pub lma_root: String,
+    /// JSON split manifest path. Required when ``lma_root`` is set.
+    #[serde(default)]
+    pub split_manifest: String,
 }
 
 fn default_preset() -> String {
@@ -135,6 +143,14 @@ impl Stage for LamquantTrainJoint {
         if !args.resume.is_empty() {
             cmd_args.push("--resume".into());
             cmd_args.push(args.resume.clone());
+        }
+        if !args.lma_root.is_empty() {
+            cmd_args.push("--lma-root".into());
+            cmd_args.push(args.lma_root.clone());
+        }
+        if !args.split_manifest.is_empty() {
+            cmd_args.push("--split-manifest".into());
+            cmd_args.push(args.split_manifest.clone());
         }
 
         let inv = LamquantInvocation {
