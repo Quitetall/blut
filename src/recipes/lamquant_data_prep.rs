@@ -156,4 +156,12 @@ mod tests {
         let r = LamquantDataPrep.compile(a);
         assert!(matches!(r, Err(RecipeError::InvalidArgs(_))));
     }
+
+    #[test]
+    fn rejects_zero_limit() {
+        let mut a = args(PathBuf::from("/tmp/lma_test"));
+        a.limit = Some(0);
+        let r = LamquantDataPrep.compile(a);
+        assert!(matches!(r, Err(RecipeError::InvalidArgs(_))));
+    }
 }
