@@ -45,6 +45,7 @@ pub static RECIPES: &[&RecipeDef] = &[
     &crate::recipes::dpo_from_preferences::DEF,
     &crate::recipes::eval_suite::DEF,
     &crate::recipes::distill_from_teacher::DEF,
+    &crate::recipes::lamquant_data_prep::DEF,
     &crate::recipes::lamquant_snn::DEF,
     &crate::recipes::lamquant_encoder::DEF,
     &crate::recipes::lamquant_oracle::DEF,

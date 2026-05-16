@@ -72,12 +72,17 @@ impl Compatible<HfTrainerBackend> for RegisterModel {}
 // Every `lamquant_*` stage shells out to a LamQuant kernel.
 
 impl Compatible<LamquantBackend> for LamquantBuildManifest {}
+impl Compatible<LamquantBackend> for LamquantConvertLma {}
+impl Compatible<LamquantBackend> for LamquantExportFirmware {}
+impl Compatible<LamquantBackend> for LamquantGenerateSnnLabels {}
+impl Compatible<LamquantBackend> for LamquantHardenArtifacts {}
 impl Compatible<LamquantBackend> for LamquantPrecomputeFullband {}
 impl Compatible<LamquantBackend> for LamquantPrecomputeL3 {}
 impl Compatible<LamquantBackend> for LamquantPretrainMae {}
 impl Compatible<LamquantBackend> for LamquantTrainTeacher {}
 impl Compatible<LamquantBackend> for LamquantTrainL3Teacher {}
 impl Compatible<LamquantBackend> for LamquantTrainJoint {}
+impl Compatible<LamquantBackend> for LamquantTrainStudent {}
 impl Compatible<LamquantBackend> for LamquantTrainVocosDecoder {}
 impl Compatible<LamquantBackend> for LamquantTrainCombined {}
 impl Compatible<LamquantBackend> for LamquantTrainMambaSnn {}
