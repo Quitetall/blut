@@ -233,9 +233,20 @@ impl Stage for LamquantTrainMambaSnn {
         // here pre-ADR-0017 are folded into the new LMA-direct flow.)
 
         // BLUT identity for the RunManifest pre-hook to read.
+        // PYTHONPATH: trainer imports `lamquant_codec` (NOT pip-installed,
+        // lives at the repo root) and `ai_models.*`. Both need the repo
+        // on sys.path. Layer onto any caller-supplied PYTHONPATH instead
+        // of stomping it.
+        let existing_pp = std::env::var("PYTHONPATH").unwrap_or_default();
+        let pp_with_repo = if existing_pp.is_empty() {
+            lamquant_home.display().to_string()
+        } else {
+            format!("{}:{}", lamquant_home.display(), existing_pp)
+        };
         let env = vec![
             ("BLUT_JOB_DIR".into(), ctx.job_dir.display().to_string()),
             ("BLUT_STAGE_NAME".into(), Self::NAME.to_string()),
+            ("PYTHONPATH".into(), pp_with_repo),
         ];
 
         let inv = LamquantInvocation {

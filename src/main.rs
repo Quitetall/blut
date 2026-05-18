@@ -98,6 +98,10 @@ enum Command {
         #[command(subcommand)]
         cmd: StageCommand,
     },
+    /// Open the interactive training cockpit (ratatui). Live view of
+    /// running jobs + log tail + GPU / RAM probes. Keys: ↑↓ select
+    /// job, Enter view log, c cancel selected job, r refresh, q quit.
+    Tui,
 }
 
 #[derive(Subcommand, Debug)]
@@ -339,6 +343,7 @@ async fn main() -> Result<()> {
         Some(Command::Plan { cmd }) => run_plan_cmd(cmd).await,
         Some(Command::Cache { cmd }) => run_cache_cmd(cmd),
         Some(Command::Stage { cmd }) => run_stage_cmd(cmd).await,
+        Some(Command::Tui) => blut::tui::run().await,
         None => run_train(cli.train_args).await,
     }
 }

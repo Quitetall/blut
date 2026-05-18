@@ -48,6 +48,7 @@ pub mod registry;
 pub mod scheduler_lock;
 pub mod spec;
 pub mod stages;
+pub mod tui;
 
 // Back-compat shims — internal callers + the binary continue
 // importing from the original paths during the BB-1 → BB-5 reorg.
