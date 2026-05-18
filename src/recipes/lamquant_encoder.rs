@@ -323,12 +323,26 @@ impl Stage for CorpusRebindFromMae {
                 source,
             },
         )?;
-        // n_archives left at 0 for the bridge; convert_lma's earlier
-        // output had the real count, but the bridge runs in-band
-        // with the cached corpus and doesn't need to re-count.
+        // Count `.lma` entries directly under root. Cheap (one
+        // shallow read_dir) and keeps `n_archives` honest for any
+        // downstream stage that may key on it.
+        let n_archives = std::fs::read_dir(root)
+            .map_err(|source| StageError::Io {
+                path: root.clone(),
+                source,
+            })?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.eq_ignore_ascii_case("lma"))
+                    .unwrap_or(false)
+            })
+            .count() as i64;
         Ok(LmaCorpus {
             root: root.clone(),
-            n_archives: 0,
+            n_archives,
             content_hash,
         })
     }
@@ -439,5 +453,71 @@ mod tests {
         let a: Args = serde_json::from_value(raw).unwrap();
         assert!(a.pccp_dry_run);
         assert!(a.pccp_no_promote);
+    }
+
+    // ── CorpusRebindFromMae bridge tests ──────────────────────
+    //
+    // The bridge is the only point where the typed encoder chain
+    // re-emits an LmaCorpus after the (optional) MAE pretrain. A
+    // silent cache-key bug here would propagate downstream into
+    // train_joint without an obvious failure mode, so the bridge
+    // earns explicit coverage.
+
+    use crate::framework::artifact::ContentHash;
+
+    fn dummy_mae(td: &std::path::Path) -> MaeCkpt {
+        let ckpt = td.join("mae.ckpt");
+        std::fs::write(&ckpt, b"mae").unwrap();
+        MaeCkpt {
+            path: ckpt,
+            content_hash: ContentHash::of_bytes(b"mae"),
+            base_arch: "ternary_mobilenet_v5_subband".into(),
+            final_loss: 0.0,
+        }
+    }
+
+    fn bridge_ctx(td: &std::path::Path) -> StageContext {
+        std::fs::create_dir_all(td.join("stage")).unwrap();
+        StageContext::for_test(td.to_path_buf(), td.join("stage"))
+    }
+
+    #[tokio::test]
+    async fn bridge_rejects_missing_corpus_dir() {
+        let td = tempfile::tempdir().unwrap();
+        let r = CorpusRebindFromMae
+            .run(
+                &bridge_ctx(td.path()),
+                dummy_mae(td.path()),
+                &CorpusRebindArgs {
+                    lma_output_dir: td.path().join("__not_a_dir__"),
+                },
+            )
+            .await;
+        assert!(matches!(r, Err(StageError::BadInput(_))));
+    }
+
+    #[tokio::test]
+    async fn bridge_counts_lma_archives() {
+        let td = tempfile::tempdir().unwrap();
+        let corpus = td.path().join("corpus");
+        std::fs::create_dir_all(&corpus).unwrap();
+        // Two .lma + one .txt — only .lma should count.
+        std::fs::write(corpus.join("a.lma"), b"a").unwrap();
+        std::fs::write(corpus.join("b.lma"), b"b").unwrap();
+        std::fs::write(corpus.join("notes.txt"), b"x").unwrap();
+        let out = CorpusRebindFromMae
+            .run(
+                &bridge_ctx(td.path()),
+                dummy_mae(td.path()),
+                &CorpusRebindArgs {
+                    lma_output_dir: corpus.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.root, corpus);
+        assert_eq!(out.n_archives, 2);
+        // content_hash must be derivable, not zero/sentinel.
+        assert_ne!(out.content_hash, ContentHash::of_bytes(b""));
     }
 }

@@ -207,7 +207,12 @@ impl Recipe for LamquantSnn {
                     max_windows_per_file: args.max_windows_per_file,
                     checkpoint_rel: args.checkpoint_rel.clone(),
                     export_rel: args.export_rel.clone(),
-                    lma_root: String::new(), // empty → derive from upstream LmaCorpus
+                    // Explicit lma_root mirrors lamquant_encoder's
+                    // recipe pattern — passes the resolved output
+                    // dir at compile time rather than relying on
+                    // the stage's runtime fallback to `input.root`.
+                    // Keeps cross-recipe behaviour uniform.
+                    lma_root: args.lma_output_dir.display().to_string(),
                     split_manifest: args.split_manifest.clone(),
                 },
             )
