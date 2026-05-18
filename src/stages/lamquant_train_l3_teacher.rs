@@ -1,12 +1,16 @@
 //! Stage — `lamquant_train_l3_teacher`.
-//! (Manifest, L3Cache) → TeacherCkpt. Wraps
-//! `ai_models/oracle/train_l3_teacher.py`.
+//! LmaCorpus → TeacherCkpt. Wraps `ai_models/oracle/train_l3_teacher.py`.
+//!
+//! Per ADR 0017 (BLUT-canonical + LMA-direct), Input is the LMA
+//! corpus; Manifest path flows via Args.split_manifest forwarded to
+//! the Python kernel. Pre-ADR `(Manifest, L3Cache)` tuple input is
+//! gone.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::lamquant::stat_fingerprint;
-use crate::artifacts::{L3Cache, Manifest, TeacherCkpt};
+use crate::artifacts::{LmaCorpus, TeacherCkpt};
 use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
@@ -56,7 +60,7 @@ impl Stage for LamquantTrainL3Teacher {
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Gpu];
     const DETERMINISTIC: bool = false;
-    type Input = (Manifest, L3Cache);
+    type Input = LmaCorpus;
     type Output = TeacherCkpt;
     type Args = Args;
 
@@ -151,20 +155,11 @@ mod tests {
         let r = LamquantTrainL3Teacher
             .run(
                 &ctx(td.path()),
-                (
-                    Manifest {
-                        path: td.path().join("m.json"),
-                        content_hash: ContentHash::of_bytes(b""),
-                        n_windows: 0,
-                        val_fraction: 0.05,
-                        seed: 42,
-                    },
-                    L3Cache {
-                        dir: td.path().to_path_buf(),
-                        n_windows: 0,
-                        content_hash: ContentHash::of_bytes(b""),
-                    },
-                ),
+                LmaCorpus {
+                    root: td.path().to_path_buf(),
+                    n_archives: 0,
+                    content_hash: ContentHash::of_bytes(b""),
+                },
                 &Args {
                     lamquant_home: td.path().join("nope").display().to_string(),
                     epochs: None,

@@ -1,15 +1,20 @@
 //! Stage — `lamquant_train_joint`.
-//! (Manifest, FullbandMemmap, L3Cache) → JointCkpt. Wraps
-//! `ai_models/student/train_joint.py`. Optional `encoder_init_rel`
-//! arg seeds the encoder from a prior MAE pretrain — the
-//! `lamquant_encoder` recipe wires pretrain_mae upstream and sets
-//! this. Nondeterministic.
+//! LmaCorpus → JointCkpt. Wraps `ai_models/student/train_joint.py`.
+//! Optional `encoder_init_rel` arg seeds the encoder from a prior
+//! MAE pretrain — the `lamquant_encoder` recipe wires pretrain_mae
+//! upstream and sets this. Nondeterministic.
+//!
+//! Per ADR 0017 (BLUT-canonical + LMA-direct), Input is the LMA
+//! corpus directly; Manifest + split paths flow via Args.lma_root +
+//! Args.split_manifest forwarded to the Python kernel. The
+//! pre-ADR `(Manifest, FullbandMemmap, L3Cache)` tuple input is
+//! gone — those artifacts are no longer required.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::lamquant::stat_fingerprint;
-use crate::artifacts::{JointCkpt, L3Cache};
+use crate::artifacts::{JointCkpt, LmaCorpus};
 use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
@@ -79,23 +84,18 @@ impl Stage for LamquantTrainJoint {
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Gpu];
     const DETERMINISTIC: bool = false;
-    // Typed input is L3Cache only — Manifest + FullbandMemmap are
-    // produced upstream in the same lamquant_home and read by the
-    // Python kernel via LamQuant's path conventions
-    // (ai_models/dataset_sim/manifest_v3.json + fullband_*.dat).
-    // Cache correctness relies on upstream stages' logical hashes
-    // flowing through L3Cache's logical hash; if FullbandMemmap
-    // re-runs without L3Cache re-running, train_joint cache still
-    // hits. That's acceptable here — the joint's own scoring is
-    // bottlenecked on the L3 path, not the memmap.
-    type Input = L3Cache;
+    // Typed input is LmaCorpus only (ADR 0017). Manifest + split
+    // paths flow via Args.split_manifest forwarded to the Python
+    // kernel as `--split-manifest`; the LmaCorpus content hash
+    // cascades cache invalidation through the corpus directory.
+    type Input = LmaCorpus;
     type Output = JointCkpt;
     type Args = Args;
 
     async fn run(
         &self,
         ctx: &StageContext,
-        _input: L3Cache,
+        _input: LmaCorpus,
         args: &Args,
     ) -> Result<JointCkpt, StageError> {
         let home = resolve_home(&args.lamquant_home)?;
@@ -215,9 +215,9 @@ mod tests {
         let r = LamquantTrainJoint
             .run(
                 &ctx(td.path()),
-                L3Cache {
-                    dir: td.path().to_path_buf(),
-                    n_windows: 0,
+                LmaCorpus {
+                    root: td.path().to_path_buf(),
+                    n_archives: 0,
                     content_hash: ContentHash::of_bytes(b""),
                 },
                 &Args {

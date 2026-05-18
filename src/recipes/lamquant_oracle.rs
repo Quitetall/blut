@@ -1,15 +1,27 @@
 //! Recipe — `lamquant_oracle`.
 //!
-//! Teacher-only pipeline:
+//! Teacher-only pipeline (LMA-direct per ADR 0017):
 //!
-//!   build_manifest → precompute_fullband → train_teacher → pccp_gate_encoder
+//!   lamquant_convert_lma             () → LmaCorpus
+//!     → lamquant_train_l3_teacher    LmaCorpus → TeacherCkpt
+//!     → _teacher_to_joint_adapter    TeacherCkpt → JointCkpt   [bridge]
+//!     → lamquant_pccp_gate_encoder   JointCkpt → PccpVerdict
+//!
+//! Replaces the pre-ADR `build_manifest → precompute_fullband →
+//! train_teacher → ...` chain. `train_teacher` stays registered as a
+//! standalone helper for legacy callers that still need the
+//! fullband-memmap path, but the canonical oracle pipeline runs
+//! through `train_l3_teacher` which honors the `--lma-root` +
+//! `--split-manifest` flags.
 //!
 //! Uses `LamquantPccpGateEncoder` over the teacher's path-wrapped
-//! JointCkpt-shape (teacher_path stuffed into encoder_path) so the
-//! existing encoder-class gate logic handles it. PCCP gate model
-//! string is still "encoder" here — the gate's `--model` flag is
-//! coupled to the gate.py evaluator table; teacher class will land
-//! when the gate script grows a "teacher" evaluator.
+//! JointCkpt-shape (encoder_path = teacher_path) so the existing
+//! encoder-class gate logic handles it. PCCP gate model string is
+//! still "encoder" — the gate's `--model` flag is coupled to the
+//! gate.py evaluator table; a "teacher" evaluator class will land
+//! when the gate script grows one.
+
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -23,24 +35,47 @@ pub struct LamquantOracle;
 pub struct Args {
     #[serde(default)]
     pub lamquant_home: String,
-    #[serde(default = "default_seed")]
-    pub seed: u32,
-    #[serde(default = "default_true")]
-    pub headless: bool,
+
+    // ── lamquant_convert_lma knobs ────────────────────────────
+    /// LML source root. Empty = packer default.
     #[serde(default)]
-    pub force_batch_size: Option<u32>,
+    pub lml_root: String,
+    /// Labels NPZ dir relative to lamquant_home. Empty = packer default.
     #[serde(default)]
-    pub freq_weighted_loss: bool,
+    pub labels_dir_rel: String,
+    /// Output LMA corpus dir. Required.
+    pub lma_output_dir: PathBuf,
+    /// Packer worker count. None = packer default (cpu_count / 3).
+    #[serde(default)]
+    pub convert_workers: Option<u32>,
+    /// Cap conversion to first N stems (smoke runs).
+    #[serde(default)]
+    pub convert_limit: Option<u32>,
+
+    /// Subject-grouped split manifest JSON path. Required.
+    pub split_manifest: String,
+
+    // ── lamquant_train_l3_teacher knobs ───────────────────────
+    #[serde(default)]
+    pub epochs: Option<u32>,
+    #[serde(default)]
+    pub batch_size: Option<u32>,
+    #[serde(default)]
+    pub lr: Option<f32>,
+    #[serde(default)]
+    pub lr_min: Option<f32>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub windows_per_epoch: Option<u32>,
+    #[serde(default)]
+    pub max_windows: Option<u32>,
+    /// `--device` (default "auto"). Empty = pass nothing.
+    #[serde(default)]
+    pub device: String,
     #[serde(default)]
     pub resume: bool,
-    /// Optional `--logger wandb|mlflow`. Empty = skip.
-    #[serde(default)]
-    pub logger: String,
-    // Manifest knobs.
-    #[serde(default = "default_val_fraction")]
-    pub val_fraction: f32,
-    #[serde(default = "default_seed64")]
-    pub manifest_seed: u64,
+
     // PCCP (safe-by-default).
     #[serde(default = "default_change_id")]
     pub pccp_change_id: String,
@@ -56,15 +91,6 @@ pub struct Args {
     pub pccp_no_promote: bool,
 }
 
-fn default_seed() -> u32 {
-    42
-}
-fn default_seed64() -> u64 {
-    42
-}
-fn default_val_fraction() -> f32 {
-    0.05
-}
 fn default_change_id() -> String {
     "PCCP-CHG-DRYRUN".into()
 }
@@ -85,81 +111,77 @@ impl Recipe for LamquantOracle {
     type Backend = crate::backends::LamquantBackend;
     const NAME: &'static str = "lamquant_oracle";
     const DESCRIPTION: &'static str =
-        "LamQuant teacher pipeline: build_manifest → precompute_fullband → \
-         train_teacher (Gpu, nondet). PCCP gate over the trained teacher \
-         ckpt. Safe-by-default.";
+        "LamQuant teacher pipeline: convert_lma → train_l3_teacher \
+         (Gpu, nondet) → pccp_gate_encoder. LMA-direct per ADR 0017. \
+         Safe-by-default PCCP gate.";
     type Args = Args;
 
     fn compile(&self, args: Self::Args) -> Result<Plan<(), Self::Backend>, RecipeError> {
-        // R23: arg validation at the recipe boundary.
-        if !(args.val_fraction > 0.0 && args.val_fraction < 1.0) {
-            return Err(RecipeError::InvalidArgs(format!(
-                "val_fraction must be in (0, 1); got {}",
-                args.val_fraction
-            )));
+        if let Some(e) = args.epochs {
+            if e == 0 {
+                return Err(RecipeError::InvalidArgs("epochs must be > 0".into()));
+            }
         }
-        if !args.logger.is_empty()
-            && !matches!(args.logger.as_str(), "wandb" | "mlflow")
-        {
-            return Err(RecipeError::InvalidArgs(format!(
-                "logger '{}' must be wandb|mlflow or empty",
-                args.logger
-            )));
+        if let Some(b) = args.batch_size {
+            if b == 0 {
+                return Err(RecipeError::InvalidArgs("batch_size must be > 0".into()));
+            }
         }
+        if args.lma_output_dir.as_os_str().is_empty() {
+            return Err(RecipeError::InvalidArgs(
+                "lma_output_dir is required".into(),
+            ));
+        }
+        if args.split_manifest.is_empty() {
+            return Err(RecipeError::InvalidArgs(
+                "split_manifest is required (LMA-direct teacher training \
+                 cannot operate without a subject-grouped split)"
+                    .into(),
+            ));
+        }
+
         let recipe_args_json = serde_json::to_value(&args)
             .map_err(|e| RecipeError::CompileFailed(format!("serialize args: {e}")))?;
 
-        // After train_teacher, the leading edge is TeacherCkpt. Need
-        // to feed `pccp_gate` which currently has variants typed on
-        // JointCkpt/SnnCkpt. For oracle, we add a tiny passthrough
-        // stage that boxes the teacher ckpt into a JointCkpt shape
-        // (encoder_path = teacher_path) so the existing encoder
-        // gate can score it. Bridges land alongside their recipe.
+        let convert_args = crate::stages::lamquant_convert_lma::Args {
+            lamquant_home: args.lamquant_home.clone(),
+            lml_root: args.lml_root.clone(),
+            labels_dir_rel: args.labels_dir_rel.clone(),
+            output_dir: args.lma_output_dir.clone(),
+            workers: args.convert_workers,
+            limit: args.convert_limit,
+            keep_sources: false,
+            dry_run: false,
+        };
+        let teacher_args = crate::stages::lamquant_train_l3_teacher::Args {
+            lamquant_home: args.lamquant_home.clone(),
+            epochs: args.epochs,
+            batch_size: args.batch_size,
+            lr: args.lr,
+            lr_min: args.lr_min,
+            width: args.width,
+            windows_per_epoch: args.windows_per_epoch,
+            max_windows: args.max_windows,
+            device: args.device.clone(),
+            resume: args.resume,
+            lma_root: args.lma_output_dir.display().to_string(),
+            split_manifest: args.split_manifest.clone(),
+        };
+        let gate_args = crate::stages::lamquant_pccp_gate_encoder::Args {
+            lamquant_home: args.lamquant_home.clone(),
+            change_id: args.pccp_change_id.clone(),
+            description: args.pccp_description.clone(),
+            author: args.pccp_author.clone(),
+            change_class: args.pccp_change_class.clone(),
+            dry_run: args.pccp_dry_run,
+            no_promote: args.pccp_no_promote,
+        };
+
         let plan = Plan::new(Self::NAME, recipe_args_json)
-            .start(
-                crate::stages::LamquantBuildManifest,
-                crate::stages::lamquant_build_manifest::Args {
-                    lamquant_home: args.lamquant_home.clone(),
-                    q31_dir: String::new(),
-                    output_rel: String::new(),
-                    v2_path: String::new(),
-                    val_fraction: args.val_fraction,
-                    seed: args.manifest_seed,
-                },
-            )
-            .then(
-                crate::stages::LamquantPrecomputeFullband,
-                crate::stages::lamquant_precompute_fullband::Args {
-                    lamquant_home: args.lamquant_home.clone(),
-                    out_dir_rel: String::new(),
-                    splits: vec!["train".into(), "val".into()],
-                },
-            )
-            .then(
-                crate::stages::LamquantTrainTeacher,
-                crate::stages::lamquant_train_teacher::Args {
-                    lamquant_home: args.lamquant_home.clone(),
-                    headless: args.headless,
-                    force_batch_size: args.force_batch_size,
-                    seed: args.seed,
-                    resume: args.resume,
-                    logger: args.logger.clone(),
-                    freq_weighted_loss: args.freq_weighted_loss,
-                },
-            )
-            .then(TeacherToJointAdapter, TeacherToJointArgs {})
-            .then(
-                crate::stages::LamquantPccpGateEncoder,
-                crate::stages::lamquant_pccp_gate_encoder::Args {
-                    lamquant_home: args.lamquant_home.clone(),
-                    change_id: args.pccp_change_id.clone(),
-                    description: args.pccp_description.clone(),
-                    author: args.pccp_author.clone(),
-                    change_class: args.pccp_change_class.clone(),
-                    dry_run: args.pccp_dry_run,
-                    no_promote: args.pccp_no_promote,
-                },
-            )
+            .start(crate::stages::LamquantConvertLma, convert_args)
+            .then(crate::stages::LamquantTrainL3Teacher, teacher_args)
+            .then(TeacherToJointAdapter, TeacherToJointArgs::default())
+            .then(crate::stages::LamquantPccpGateEncoder, gate_args)
             .finish();
 
         Ok(plan)
@@ -236,14 +258,21 @@ mod tests {
     fn args() -> Args {
         Args {
             lamquant_home: String::new(),
-            seed: 42,
-            headless: true,
-            force_batch_size: None,
-            freq_weighted_loss: false,
+            lml_root: String::new(),
+            labels_dir_rel: String::new(),
+            lma_output_dir: PathBuf::from("/tmp/lma"),
+            convert_workers: None,
+            convert_limit: None,
+            split_manifest: "/tmp/split.json".into(),
+            epochs: None,
+            batch_size: None,
+            lr: None,
+            lr_min: None,
+            width: None,
+            windows_per_epoch: None,
+            max_windows: None,
+            device: String::new(),
             resume: false,
-            logger: String::new(),
-            val_fraction: 0.05,
-            manifest_seed: 42,
             pccp_change_id: default_change_id(),
             pccp_description: default_description(),
             pccp_author: default_author(),
@@ -254,16 +283,34 @@ mod tests {
     }
 
     #[test]
-    fn compiles_to_5_node_plan() {
-        // build_manifest → fullband → train_teacher → adapter → gate.
+    fn compiles_to_4_node_plan() {
+        // convert_lma → train_l3_teacher → adapter → gate.
         let plan = LamquantOracle.compile(args()).unwrap().into_compiled();
-        assert_eq!(plan.n_nodes(), 5);
-        assert_eq!(plan.n_edges(), 4);
+        assert_eq!(plan.n_nodes(), 4);
+        assert_eq!(plan.n_edges(), 3);
+    }
+
+    #[test]
+    fn rejects_empty_output_dir() {
+        let mut a = args();
+        a.lma_output_dir = PathBuf::new();
+        assert!(matches!(LamquantOracle.compile(a), Err(RecipeError::InvalidArgs(_))));
+    }
+
+    #[test]
+    fn rejects_empty_split_manifest() {
+        let mut a = args();
+        a.split_manifest = String::new();
+        assert!(matches!(LamquantOracle.compile(a), Err(RecipeError::InvalidArgs(_))));
     }
 
     #[test]
     fn safe_pccp_defaults() {
-        let a: Args = serde_json::from_value(serde_json::json!({})).unwrap();
+        let raw = serde_json::json!({
+            "lma_output_dir": "/tmp/lma",
+            "split_manifest": "/tmp/split.json",
+        });
+        let a: Args = serde_json::from_value(raw).unwrap();
         assert!(a.pccp_dry_run);
         assert!(a.pccp_no_promote);
     }

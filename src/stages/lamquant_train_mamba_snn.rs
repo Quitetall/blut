@@ -1,8 +1,14 @@
 //! Stage — `lamquant_train_mamba_snn`.
 //!
-//! Wraps `ai_models/snn/train_mamba_snn.py`. Input is a Manifest
-//! (validated against the actual EEG data dir at runtime); output
-//! is an `SnnCkpt` checkpoint.
+//! Wraps `ai_models/snn/train_mamba_snn.py`. LmaCorpus → SnnCkpt.
+//!
+//! Per ADR 0017 (BLUT-canonical + LMA-direct), Input is the LMA
+//! corpus; the kernel reads it via `--lma-root <input.root>` +
+//! `--split-manifest <args.split_manifest>`. The pre-ADR
+//! `--manifest` legacy random-split path is no longer emitted by
+//! this stage — direct `python train_mamba_snn.py --manifest …`
+//! callers continue to work, but BLUT-driven execution always
+//! uses LMA-direct.
 //!
 //! Nondeterministic. Same args + same data produce slightly
 //! different ckpt bytes due to GPU non-determinism + dataloader
@@ -16,7 +22,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::lamquant::stat_fingerprint;
-use crate::artifacts::{Manifest, SnnCkpt};
+use crate::artifacts::{LmaCorpus, SnnCkpt};
 use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
@@ -80,12 +86,15 @@ pub struct Args {
     #[serde(default)]
     pub export_rel: String,
 
-    /// LMA-direct training root (BLUT canonical, ADR 0017). Empty falls
-    /// back to the legacy NPZ-events pipeline.
+    /// `--lma-root <path>` override. Empty = use `input.root`
+    /// (the LmaCorpus produced by an upstream `convert_lma` stage).
+    /// Non-empty values let the recipe override the corpus location
+    /// without rebuilding the chain.
     #[serde(default)]
     pub lma_root: String,
-    /// JSON split manifest path. Required when ``lma_root`` is set.
-    #[serde(default)]
+    /// `--split-manifest <path>` — subject-grouped JSON split.
+    /// REQUIRED in BLUT-driven execution; the stage rejects empty
+    /// strings at compile time.
     pub split_manifest: String,
 }
 
@@ -99,14 +108,14 @@ impl Stage for LamquantTrainMambaSnn {
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Gpu];
     const DETERMINISTIC: bool = false;
-    type Input = Manifest;
+    type Input = LmaCorpus;
     type Output = SnnCkpt;
     type Args = Args;
 
     async fn run(
         &self,
         ctx: &StageContext,
-        input: Manifest,
+        input: LmaCorpus,
         args: &Args,
     ) -> Result<SnnCkpt, StageError> {
         let lamquant_home_raw = if args.lamquant_home.is_empty() {
@@ -169,13 +178,31 @@ impl Stage for LamquantTrainMambaSnn {
             })?;
         }
 
+        // LMA-direct path: `--lma-root` from input.root (default) or
+        // args.lma_root (override); `--split-manifest` from args.
+        // Pre-ADR-0017 `--manifest` legacy flag is not emitted by
+        // this stage; direct python invocations still support it.
+        if args.split_manifest.is_empty() {
+            return Err(StageError::BadInput(
+                "split_manifest is required (LMA-direct training cannot \
+                 operate without a subject-grouped split)"
+                    .into(),
+            ));
+        }
+        let lma_root = if args.lma_root.is_empty() {
+            input.root.display().to_string()
+        } else {
+            args.lma_root.clone()
+        };
         let mut cmd_args: Vec<String> = vec![
             "--data".into(),
             args.labels_dir.display().to_string(),
             "--eeg-dir".into(),
             args.eeg_dir.display().to_string(),
-            "--manifest".into(),
-            input.path.display().to_string(),
+            "--lma-root".into(),
+            lma_root,
+            "--split-manifest".into(),
+            args.split_manifest.clone(),
             "--config".into(),
             args.preset.clone(),
             "--checkpoint".into(),
@@ -201,14 +228,9 @@ impl Stage for LamquantTrainMambaSnn {
             cmd_args.push("--export".into());
             cmd_args.push(export_path.display().to_string());
         }
-        if !args.lma_root.is_empty() {
-            cmd_args.push("--lma-root".into());
-            cmd_args.push(args.lma_root.clone());
-        }
-        if !args.split_manifest.is_empty() {
-            cmd_args.push("--split-manifest".into());
-            cmd_args.push(args.split_manifest.clone());
-        }
+        // (--lma-root and --split-manifest emitted up-front in the
+        // initial vec[] above; the conditional pushes that lived
+        // here pre-ADR-0017 are folded into the new LMA-direct flow.)
 
         // BLUT identity for the RunManifest pre-hook to read.
         let env = vec![
@@ -354,25 +376,23 @@ mod tests {
         StageContext::for_test(td.to_path_buf(), td.join("stage"))
     }
 
-    fn manifest(p: &std::path::Path) -> Manifest {
-        Manifest {
-            path: p.to_path_buf(),
-            content_hash: ContentHash::of_bytes(b"m"),
-            n_windows: 1000,
-            val_fraction: 0.05,
-            seed: 42,
+    fn corpus(p: &std::path::Path) -> LmaCorpus {
+        LmaCorpus {
+            root: p.to_path_buf(),
+            n_archives: 1,
+            content_hash: ContentHash::of_bytes(b"c"),
         }
     }
 
     #[tokio::test]
     async fn rejects_missing_lamquant_home() {
         let td = tempfile::tempdir().unwrap();
-        let m_path = td.path().join("m.json");
-        std::fs::write(&m_path, "{}").unwrap();
+        let split_path = td.path().join("split.json");
+        std::fs::write(&split_path, "{}").unwrap();
         let r = LamquantTrainMambaSnn
             .run(
                 &ctx(td.path()),
-                manifest(&m_path),
+                corpus(td.path()),
                 &Args {
                     lamquant_home: td.path().join("nope").display().to_string(),
                     labels_dir: td.path().to_path_buf(),
@@ -391,7 +411,7 @@ mod tests {
                     checkpoint_rel: String::new(),
                     export_rel: String::new(),
                     lma_root: String::new(),
-                    split_manifest: String::new(),
+                    split_manifest: split_path.display().to_string(),
                 },
             )
             .await;
@@ -401,8 +421,8 @@ mod tests {
     #[tokio::test]
     async fn rejects_missing_labels_dir() {
         let td = tempfile::tempdir().unwrap();
-        let m_path = td.path().join("m.json");
-        std::fs::write(&m_path, "{}").unwrap();
+        let split_path = td.path().join("split.json");
+        std::fs::write(&split_path, "{}").unwrap();
         // Lay down a fake lamquant_home with the trainer script so
         // we get past the script-exists check + reach labels_dir.
         let home = td.path().join("home");
@@ -415,11 +435,56 @@ mod tests {
         let r = LamquantTrainMambaSnn
             .run(
                 &ctx(td.path()),
-                manifest(&m_path),
+                corpus(td.path()),
                 &Args {
                     lamquant_home: home.display().to_string(),
                     labels_dir: td.path().join("no-labels"),
                     eeg_dir: td.path().to_path_buf(),
+                    preset: "production".into(),
+                    subband: false,
+                    infinite_lr: false,
+                    epochs: None,
+                    lr: None,
+                    batch_size: None,
+                    lambda_spike: None,
+                    d_model: None,
+                    d_state: None,
+                    n_layers: None,
+                    max_windows_per_file: None,
+                    checkpoint_rel: String::new(),
+                    export_rel: String::new(),
+                    lma_root: String::new(),
+                    split_manifest: split_path.display().to_string(),
+                },
+            )
+            .await;
+        assert!(matches!(r, Err(StageError::BadInput(_))));
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_split_manifest() {
+        // BLUT-driven execution requires split_manifest; the stage
+        // refuses to run without it (ADR 0017 LMA-direct contract).
+        let td = tempfile::tempdir().unwrap();
+        let home = td.path().join("home");
+        std::fs::create_dir_all(home.join("ai_models").join("snn")).unwrap();
+        std::fs::write(
+            home.join("ai_models").join("snn").join("train_mamba_snn.py"),
+            "# stub\n",
+        )
+        .unwrap();
+        let labels = home.join("labels");
+        std::fs::create_dir_all(&labels).unwrap();
+        let eeg = home.join("eeg");
+        std::fs::create_dir_all(&eeg).unwrap();
+        let r = LamquantTrainMambaSnn
+            .run(
+                &ctx(td.path()),
+                corpus(td.path()),
+                &Args {
+                    lamquant_home: home.display().to_string(),
+                    labels_dir: labels,
+                    eeg_dir: eeg,
                     preset: "production".into(),
                     subband: false,
                     infinite_lr: false,

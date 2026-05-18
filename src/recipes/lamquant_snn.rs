@@ -1,11 +1,17 @@
 //! Recipe — `lamquant_snn`.
 //!
 //! End-to-end Mamba SNN training pipeline with PCCP promotion gate.
-//! First runnable LamQuant pipeline through the BLUT framework:
+//! Per ADR 0017 (BLUT-canonical + LMA-direct), the chain is:
 //!
-//!   lamquant_build_manifest
-//!     → lamquant_train_mamba_snn
-//!         → lamquant_pccp_gate_snn
+//!   lamquant_convert_lma           () → LmaCorpus
+//!     → lamquant_train_mamba_snn   LmaCorpus → SnnCkpt
+//!         → lamquant_pccp_gate_snn SnnCkpt → PccpVerdict
+//!
+//! Replaces the pre-ADR `lamquant_build_manifest → train_mamba_snn`
+//! chain. The build_manifest stage stays registered + callable as a
+//! standalone helper for tooling that still wants a Manifest
+//! artifact, but the snn pipeline produces and consumes LmaCorpus
+//! end-to-end now.
 //!
 //! PCCP defaults are dry-run + no-promote (safe). Recipes that want
 //! to actually promote on PASS set `pccp_dry_run: false,
@@ -18,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::framework::error::RecipeError;
 use crate::framework::plan::Plan;
 use crate::recipes::recipe::{Recipe, RecipeDef};
-use crate::stages::lamquant_build_manifest::{Args as MfArgs, LamquantBuildManifest};
+use crate::stages::lamquant_convert_lma::{Args as ConvertArgs, LamquantConvertLma};
 use crate::stages::lamquant_pccp_gate_snn::{Args as GateArgs, LamquantPccpGateSnn};
 use crate::stages::lamquant_train_mamba_snn::{Args as SnnArgs, LamquantTrainMambaSnn};
 
@@ -61,20 +67,25 @@ pub struct Args {
     #[serde(default)]
     pub export_rel: String,
 
-    // Manifest builder knobs. Empty string = builder default
-    // (q31_dir: ai_models/dataset_sim/q31_events; output_rel:
-    // ai_models/dataset_sim/manifest_v3.json; v2_path: alongside
-    // q31_dir). Recipes typically leave these blank.
+    // ── lamquant_convert_lma knobs ────────────────────────────
+    /// LML source root. Empty = packer default.
     #[serde(default)]
-    pub manifest_q31_dir: String,
+    pub lml_root: String,
+    /// Labels NPZ dir relative to lamquant_home. Empty = packer default.
     #[serde(default)]
-    pub manifest_output_rel: String,
+    pub labels_dir_rel: String,
+    /// Output LMA corpus dir. Required.
+    pub lma_output_dir: PathBuf,
+    /// Packer worker count. None = packer default (cpu_count / 3).
     #[serde(default)]
-    pub manifest_v2_path: String,
-    #[serde(default = "default_val_fraction")]
-    pub val_fraction: f32,
-    #[serde(default = "default_seed")]
-    pub manifest_seed: u64,
+    pub convert_workers: Option<u32>,
+    /// Cap conversion to first N stems (smoke runs).
+    #[serde(default)]
+    pub convert_limit: Option<u32>,
+
+    /// Subject-grouped split manifest JSON path. Required — BLUT-driven
+    /// SNN training cannot operate without a deterministic split.
+    pub split_manifest: String,
 
     // PCCP gate knobs (safe-by-default).
     #[serde(default = "default_change_id")]
@@ -89,23 +100,10 @@ pub struct Args {
     pub pccp_dry_run: bool,
     #[serde(default = "default_true")]
     pub pccp_no_promote: bool,
-    /// LMA-direct training root (BLUT canonical, ADR 0017). Empty falls
-    /// back to the legacy NPZ-events pipeline.
-    #[serde(default)]
-    pub lma_root: String,
-    /// JSON split manifest path. Required when ``lma_root`` is set.
-    #[serde(default)]
-    pub split_manifest: String,
 }
 
 fn default_preset() -> String {
     "production".into()
-}
-fn default_val_fraction() -> f32 {
-    0.05
-}
-fn default_seed() -> u64 {
-    42
 }
 fn default_change_id() -> String {
     "PCCP-CHG-DRYRUN".into()
@@ -127,9 +125,10 @@ impl Recipe for LamquantSnn {
     type Backend = crate::backends::LamquantBackend;
     const NAME: &'static str = "lamquant_snn";
     const DESCRIPTION: &'static str =
-        "Mamba SNN seizure / activity detector end-to-end: build manifest, \
-         train (Gpu), promote via PCCP gate. Safe-by-default (dry-run + \
-         no-promote) — recipes must explicitly opt into real promotion.";
+        "Mamba SNN seizure / activity detector end-to-end: convert LML \
+         to LMA, train (Gpu), promote via PCCP gate. LMA-direct per \
+         ADR 0017. Safe-by-default (dry-run + no-promote) — recipes \
+         must explicitly opt into real promotion.";
     type Args = Args;
 
     fn compile(&self, args: Self::Args) -> Result<Plan<(), Self::Backend>, RecipeError> {
@@ -138,12 +137,6 @@ impl Recipe for LamquantSnn {
             return Err(RecipeError::InvalidArgs(format!(
                 "preset '{}' must be fast|standard|production",
                 args.preset
-            )));
-        }
-        if !(args.val_fraction > 0.0 && args.val_fraction < 1.0) {
-            return Err(RecipeError::InvalidArgs(format!(
-                "val_fraction must be in (0, 1); got {}",
-                args.val_fraction
             )));
         }
         if let Some(e) = args.epochs {
@@ -163,20 +156,36 @@ impl Recipe for LamquantSnn {
                 return Err(RecipeError::InvalidArgs("batch_size must be > 0".into()));
             }
         }
+        if args.lma_output_dir.as_os_str().is_empty() {
+            return Err(RecipeError::InvalidArgs(
+                "lma_output_dir is required (writable directory for \
+                 the converted LMA corpus)"
+                    .into(),
+            ));
+        }
+        if args.split_manifest.is_empty() {
+            return Err(RecipeError::InvalidArgs(
+                "split_manifest is required (LMA-direct SNN training \
+                 cannot operate without a subject-grouped split)"
+                    .into(),
+            ));
+        }
 
         let recipe_args_json = serde_json::to_value(&args)
             .map_err(|e| RecipeError::CompileFailed(format!("serialize args: {e}")))?;
 
         let plan = Plan::new(Self::NAME, recipe_args_json)
             .start(
-                LamquantBuildManifest,
-                MfArgs {
+                LamquantConvertLma,
+                ConvertArgs {
                     lamquant_home: args.lamquant_home.clone(),
-                    q31_dir: args.manifest_q31_dir.clone(),
-                    output_rel: args.manifest_output_rel.clone(),
-                    v2_path: args.manifest_v2_path.clone(),
-                    val_fraction: args.val_fraction,
-                    seed: args.manifest_seed,
+                    lml_root: args.lml_root.clone(),
+                    labels_dir_rel: args.labels_dir_rel.clone(),
+                    output_dir: args.lma_output_dir.clone(),
+                    workers: args.convert_workers,
+                    limit: args.convert_limit,
+                    keep_sources: false,
+                    dry_run: false,
                 },
             )
             .then(
@@ -198,7 +207,7 @@ impl Recipe for LamquantSnn {
                     max_windows_per_file: args.max_windows_per_file,
                     checkpoint_rel: args.checkpoint_rel.clone(),
                     export_rel: args.export_rel.clone(),
-                    lma_root: args.lma_root.clone(),
+                    lma_root: String::new(), // empty → derive from upstream LmaCorpus
                     split_manifest: args.split_manifest.clone(),
                 },
             )
@@ -257,25 +266,26 @@ mod tests {
             max_windows_per_file: None,
             checkpoint_rel: String::new(),
             export_rel: String::new(),
-            manifest_q31_dir: String::new(),
-            manifest_output_rel: String::new(),
-            manifest_v2_path: String::new(),
-            val_fraction: 0.05,
-            manifest_seed: 42,
+            lml_root: String::new(),
+            labels_dir_rel: String::new(),
+            lma_output_dir: PathBuf::from("/tmp/lma"),
+            convert_workers: None,
+            convert_limit: None,
+            split_manifest: "/tmp/split.json".into(),
             pccp_change_id: default_change_id(),
             pccp_description: default_description(),
             pccp_author: default_author(),
             pccp_change_class: default_change_class(),
             pccp_dry_run: true,
             pccp_no_promote: true,
-            lma_root: String::new(),
-            split_manifest: String::new(),
         }
     }
 
     #[test]
     fn compiles_to_3_node_plan() {
         let plan = LamquantSnn.compile(args()).unwrap().into_compiled();
+        // 3 nodes: convert_lma → train_mamba_snn → pccp_gate_snn
+        // 2 edges. (build_manifest dropped per ADR 0017.)
         assert_eq!(plan.n_nodes(), 3);
         assert_eq!(plan.n_edges(), 2);
         let order = plan.topo_order().unwrap();
@@ -291,12 +301,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_output_dir() {
+        let mut a = args();
+        a.lma_output_dir = PathBuf::new();
+        let r = LamquantSnn.compile(a);
+        assert!(matches!(r, Err(RecipeError::InvalidArgs(_))));
+    }
+
+    #[test]
+    fn rejects_empty_split_manifest() {
+        let mut a = args();
+        a.split_manifest = String::new();
+        let r = LamquantSnn.compile(a);
+        assert!(matches!(r, Err(RecipeError::InvalidArgs(_))));
+    }
+
+    #[test]
     fn safe_defaults_when_pccp_fields_omitted() {
         // Bare minimum args; PCCP fields should default to safe
         // (dry-run + no-promote).
         let raw = serde_json::json!({
             "labels_dir": "/tmp/labels",
             "eeg_dir": "/tmp/eeg",
+            "lma_output_dir": "/tmp/lma",
+            "split_manifest": "/tmp/split.json",
         });
         let a: Args = serde_json::from_value(raw).unwrap();
         assert!(a.pccp_dry_run);

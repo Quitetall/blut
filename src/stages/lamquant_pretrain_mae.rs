@@ -1,11 +1,15 @@
-//! Stage — `lamquant_pretrain_mae`. L3Cache → MaeCkpt.
+//! Stage — `lamquant_pretrain_mae`. LmaCorpus → MaeCkpt.
 //! Wraps `ai_models/student/pretrain_mae.py`. Nondeterministic.
+//!
+//! Per ADR 0017 (BLUT-canonical + LMA-direct), Input is the LMA
+//! corpus; split path flows via Args.split_manifest. Pre-ADR
+//! `L3Cache` input is gone.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::lamquant::stat_fingerprint;
-use crate::artifacts::{L3Cache, MaeCkpt};
+use crate::artifacts::{LmaCorpus, MaeCkpt};
 use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
@@ -55,14 +59,14 @@ impl Stage for LamquantPretrainMae {
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Gpu];
     const DETERMINISTIC: bool = false;
-    type Input = L3Cache;
+    type Input = LmaCorpus;
     type Output = MaeCkpt;
     type Args = Args;
 
     async fn run(
         &self,
         ctx: &StageContext,
-        _input: L3Cache,
+        _input: LmaCorpus,
         args: &Args,
     ) -> Result<MaeCkpt, StageError> {
         let home = resolve_home(&args.lamquant_home)?;
@@ -144,9 +148,9 @@ mod tests {
         let r = LamquantPretrainMae
             .run(
                 &ctx(td.path()),
-                L3Cache {
-                    dir: td.path().to_path_buf(),
-                    n_windows: 0,
+                LmaCorpus {
+                    root: td.path().to_path_buf(),
+                    n_archives: 0,
                     content_hash: ContentHash::of_bytes(b""),
                 },
                 &Args {
