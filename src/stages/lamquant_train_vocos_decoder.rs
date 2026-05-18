@@ -1,8 +1,12 @@
 //! Stage — `lamquant_train_vocos_decoder`.
-//! (Manifest, FullbandMemmap) → JointCkpt (decoder-only —
-//! encoder_path points at the upstream student ckpt referenced by
-//! --student-checkpoint, decoder_path is the newly trained one).
-//! Wraps `ai_models/decoder/train_vocos_decoder.py`.
+//! LmaCorpus → JointCkpt (decoder-only — encoder_path points at
+//! the upstream student ckpt referenced by --student-checkpoint,
+//! decoder_path is the newly trained one). Wraps
+//! `ai_models/decoder/train_vocos_decoder.py`.
+//!
+//! Per ADR 0017 (LMA-direct), the input is the LMA corpus; the
+//! kernel resolves split via Args.split_manifest. Precompute
+//! artifacts are no longer required inputs.
 
 use std::path::PathBuf;
 
@@ -10,7 +14,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::lamquant::stat_fingerprint;
-use crate::artifacts::{FullbandMemmap, JointCkpt, Manifest};
+use crate::artifacts::{JointCkpt, LmaCorpus};
 use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
@@ -86,7 +90,7 @@ impl Stage for LamquantTrainVocosDecoder {
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Gpu];
     const DETERMINISTIC: bool = false;
-    type Input = (Manifest, FullbandMemmap);
+    type Input = LmaCorpus;
     type Output = JointCkpt;
     type Args = Args;
 
@@ -206,17 +210,9 @@ mod tests {
     #[tokio::test]
     async fn rejects_missing_home() {
         let td = tempfile::tempdir().unwrap();
-        let m = Manifest {
-            path: td.path().join("m.json"),
-            content_hash: ContentHash::of_bytes(b""),
-            n_windows: 0,
-            val_fraction: 0.05,
-            seed: 42,
-        };
-        let fb = FullbandMemmap {
-            train_path: td.path().join("t.dat"),
-            val_path: td.path().join("v.dat"),
-            n_windows: 0,
+        let corpus = LmaCorpus {
+            root: td.path().join("lma"),
+            n_archives: 0,
             content_hash: ContentHash::of_bytes(b""),
         };
         let args = Args {
@@ -225,7 +221,7 @@ mod tests {
             ..Default::default()
         };
         let r = LamquantTrainVocosDecoder
-            .run(&ctx(td.path()), (m, fb), &args)
+            .run(&ctx(td.path()), corpus, &args)
             .await;
         assert!(matches!(r, Err(StageError::BadInput(_))));
     }
