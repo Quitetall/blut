@@ -508,7 +508,7 @@ fn content_hash_from_erased(art: &ErasedArtifact) -> ContentHash {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::{LamuTrainerBackend, TrainingBackend};
+    use crate::backends::LamuTrainerBackend;
     use crate::framework::artifact::Artifact;
     use crate::framework::compat::Compatible;
     use crate::framework::error::StageError;

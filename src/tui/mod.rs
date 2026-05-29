@@ -60,7 +60,7 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::Modifier,
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
@@ -70,6 +70,7 @@ use crate::jobs::{self, JobState, JobSummary};
 use crate::recipes::RECIPES;
 
 mod system;
+mod theme;
 mod views;
 
 /// Which surface the single ratatui frame is currently showing.
@@ -116,24 +117,6 @@ enum Overlay {
     None,
     Picker { query: String, cursor: usize },
     Editor { recipe: &'static str, buffer: String },
-}
-
-/// A single row in the left-hand action menu. Mirrors the section /
-/// hotkey / label / action layout of `lamquant-core/src/tui/panels/
-/// cockpit.rs` so users moving from the lml cockpit see a familiar
-/// shape.
-struct MenuItem {
-    section: &'static str,
-    key: char,
-    label: &'static str,
-    action: MenuAction,
-}
-
-enum MenuAction {
-    /// Spawn a built-in recipe with default LamQuant args.
-    Recipe(&'static str),
-    /// Run a built-in app action (refresh / quit / cancel / overlay).
-    Builtin(BuiltinAction),
 }
 
 #[derive(Clone, Copy)]
@@ -621,6 +604,9 @@ impl App {
 
 /// Entrypoint registered as `blut tui`.
 pub async fn run() -> Result<()> {
+    // Detect NO_COLOR / TERM=dumb / locale once before the first draw so
+    // every theme getter returns the right style (matches lamquant).
+    theme::detect("auto", "auto");
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("alt screen")?;
@@ -900,133 +886,149 @@ fn draw(f: &mut Frame<'_>, app: &mut App) {
     draw_overlay(f, app);
 }
 
-/// Cockpit view — the single-column overview (header strip → Pipeline
-/// Status box → Resources block → divider → grouped recipe menu → key
-/// list). Renders as one big Paragraph so layout reflows with width.
+/// Section header for the cockpit menu — a dim-indented heading in the
+/// project's `theme::highlight` style (mirrors lamquant's `section_header`).
+fn section_header(title: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(title.to_string(), theme::highlight()),
+    ])
+}
+
+/// One `[key] Label   description` menu row (mirrors lamquant's `opt`):
+/// the key hint in `theme::key_hint`, the label in `theme::normal`, the
+/// description in `theme::dim`. `key` is `None` for items reachable only
+/// via the `R` recipe picker (shown as `[-]`).
+fn opt_row(key: Option<char>, label: &str, desc: &str) -> Line<'static> {
+    let key_str = match key {
+        Some(c) => format!("[{c}]"),
+        None => "[-]".to_string(),
+    };
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("{key_str:<4}"), theme::key_hint()),
+        Span::raw(" "),
+        Span::styled(format!("{label:<28}"), theme::normal()),
+        Span::styled(desc.to_string(), theme::dim()),
+    ])
+}
+
+/// Cockpit view — the single-column overview, rendered with a vertical
+/// [`Layout`] of proper widgets so the boxes always align and the menu
+/// reflows with terminal width:
+///   * header strip (title + version) — styled [`Paragraph`]
+///   * "Pipeline status" — titled [`Block`] (running jobs)
+///   * "Resources" — titled [`Block`] (GPU/CPU/MEM/Disk)
+///   * grouped recipe/action menu — [`Paragraph`] in the flexible region
+///
+/// No manual `┌`/`│`/`└` box-drawing: every border comes from `Block`,
+/// so the top/bottom/sides can never drift out of alignment (the bug in
+/// the old single-Paragraph implementation).
 fn draw_cockpit_body(f: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let outer = [area];
-    let total_w = outer[0].width as usize;
-    let inner_w = total_w.saturating_sub(4);
-    let dash: String = "─".repeat(inner_w.max(10));
-
-    let mut lines: Vec<Line> = Vec::new();
-    // ── Header ───────────────────────────────────────────────────────
-    lines.push(Line::from(Span::styled(
-        format!("  {dash}"),
-        Style::default().fg(Color::DarkGray),
-    )));
-    let title_left = "BLUT Training Cockpit";
-    let title_right = format!("blut v{}", env!("CARGO_PKG_VERSION"));
-    let pad = inner_w.saturating_sub(title_left.len() + title_right.len() + 1);
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            title_left,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(title_right, Style::default().fg(Color::DarkGray)),
-    ]));
-    lines.push(Line::from(Span::styled(
-        format!("  {dash}"),
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines.push(Line::from(""));
-
-    // ── Pipeline Status box ──────────────────────────────────────────
-    let inner_inner = inner_w.saturating_sub(4);
-    let top = format!("┌─ Pipeline status {}┐", "─".repeat(inner_inner.saturating_sub(17)));
-    let bot = format!("└{}┘", "─".repeat(inner_inner.saturating_sub(1) + 1));
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(top, Style::default().fg(Color::DarkGray)),
-    ]));
+    // Running jobs decide the Pipeline-status box height (1 row per job,
+    // min 1 for the "no jobs" line) + 2 for the Block borders.
     let running: Vec<&JobSummary> = app
         .jobs
         .iter()
         .filter(|j| matches!(j.state, JobState::Running))
         .collect();
-    if running.is_empty() {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled("│", Style::default().fg(Color::DarkGray)),
-            Span::raw("   "),
-            Span::styled(
-                "No training jobs running",
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::raw(" ".repeat(inner_inner.saturating_sub(28))),
-            Span::styled("│", Style::default().fg(Color::DarkGray)),
-        ]));
+    let pipeline_rows = running.len().max(1) as u16;
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),                 // header strip
+            Constraint::Length(pipeline_rows + 2), // Pipeline status (+ borders)
+            Constraint::Length(4),                 // Resources (+ borders)
+            Constraint::Min(0),                    // recipe / action menu
+        ])
+        .split(area);
+
+    // ── Header strip (title left, version right) ─────────────────────
+    let version = format!("blut v{}", env!("CARGO_PKG_VERSION"));
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(" BLUT Training Cockpit", theme::title()),
+        Span::raw("  "),
+        Span::styled(version, theme::key_label()),
+    ]));
+    f.render_widget(header, chunks[0]);
+
+    // Bullet glyph for running jobs — degrade to ASCII when the terminal
+    // can't render Unicode (NO_COLOR / TERM=dumb / non-UTF-8 locale).
+    let bullet = if theme::ascii_only() { "*" } else { "●" };
+
+    // ── Pipeline status (titled Block — borders auto-align) ──────────
+    let pipe_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::dim())
+        .title(Span::styled(" Pipeline status ", theme::heading()));
+    let pipe_inner = pipe_block.inner(chunks[1]);
+    f.render_widget(pipe_block, chunks[1]);
+    let pipe_lines: Vec<Line> = if running.is_empty() {
+        vec![Line::from(Span::styled(
+            "  No training jobs running",
+            theme::dim(),
+        ))]
     } else {
-        for j in &running {
-            let pid = j.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
-            let last = match (j.last_step, j.last_loss) {
-                (Some(step), Some(loss)) => format!("step={step} loss={loss:.4}"),
-                _ => "-".into(),
-            };
-            let line_str = format!(
-                "   ● {} pid {} · {}",
-                j.id,
-                pid,
-                last
-            );
-            let display_len = line_str.chars().count();
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("│", Style::default().fg(Color::DarkGray)),
-                Span::styled(line_str, Style::default().fg(Color::Green)),
-                Span::raw(" ".repeat(inner_inner.saturating_sub(display_len + 1))),
-                Span::styled("│", Style::default().fg(Color::DarkGray)),
-            ]));
-        }
-    }
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(bot, Style::default().fg(Color::DarkGray)),
-    ]));
-    lines.push(Line::from(""));
+        running
+            .iter()
+            .map(|j| {
+                let pid = j.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+                let last = match (j.last_step, j.last_loss) {
+                    (Some(step), Some(loss)) => format!("step={step} loss={loss:.4}"),
+                    _ => "-".into(),
+                };
+                Line::from(Span::styled(
+                    format!("  {bullet} {} pid {pid} · {last}", j.id),
+                    theme::success(),
+                ))
+            })
+            .collect()
+    };
+    f.render_widget(Paragraph::new(pipe_lines), pipe_inner);
 
-    // ── Resources block ──────────────────────────────────────────────
+    // ── Resources (titled Block) ─────────────────────────────────────
+    let res_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::dim())
+        .title(Span::styled(" Resources ", theme::heading()));
+    let res_inner = res_block.inner(chunks[2]);
+    f.render_widget(res_block, chunks[2]);
     let s = &app.system;
-    let gpu_summary = s.gpu_summary();
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            "Resources",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("         "),
-        Span::styled(format!("GPU {}", gpu_summary), Style::default().fg(Color::DarkGray)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::raw("                    "),
-        Span::styled(
-            format!(
-                "CPU load1={:.2}  ·  MEM {:.1}/{:.1} GiB used  ·  Disk {} free",
-                s.load1, s.mem_used_gb, s.mem_total_gb, s.disk_free_human
+    let res_lines = vec![
+        Line::from(vec![
+            Span::styled("  GPU  ", theme::key_hint()),
+            Span::styled(s.gpu_summary(), theme::normal()),
+        ]),
+        Line::from(vec![
+            Span::styled("  CPU  ", theme::key_hint()),
+            Span::styled(
+                format!(
+                    "load1={:.2}  ·  MEM {:.1}/{:.1} GiB used  ·  Disk {} free ({}% used)",
+                    s.load1, s.mem_used_gb, s.mem_total_gb, s.disk_free_human, s.disk_used_pct
+                ),
+                theme::dim(),
             ),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        format!("  {dash}"),
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines.push(Line::from(""));
+        ]),
+    ];
+    f.render_widget(Paragraph::new(res_lines), res_inner);
 
-    // ── Recipe menu, grouped by category ────────────────────────────
+    // ── Grouped recipe / action menu ─────────────────────────────────
+    // Mirrors the lamquant hub cockpit's section convention. Sections:
+    //   DATA PREPARATION / PIPELINE OPERATIONS (= TRAINING + PIPELINE
+    //   recipes) / EVALUATION / EXPORT / DIAGNOSTICS (migrated Views) /
+    //   SYSTEM (built-ins). Every BLUT recipe is reachable by its
+    //   auto-assigned hotkey (or the [R] picker if it ran out of keys);
+    //   every migrated screen is reachable by its capital-letter View key.
     let menu = App::recipe_menu();
+    // Bucket recipes by category, preserving recipe_menu() order within
+    // each bucket and first-seen category order across buckets.
     use std::collections::BTreeMap;
     let mut by_cat: BTreeMap<&'static str, Vec<(Option<char>, &'static crate::recipes::RecipeDef)>> =
         BTreeMap::new();
-    // Preserve the recipe_menu order within each category by using a
-    // Vec value, not a Set.
     for (k, r) in &menu {
         by_cat.entry(r.category.label()).or_default().push((*k, *r));
     }
-    // Render in fixed order matching the menu's natural sort.
     let mut printed_cats: Vec<&'static str> = Vec::new();
     for (_, r) in &menu {
         let cat = r.category.label();
@@ -1034,97 +1036,59 @@ fn draw_cockpit_body(f: &mut Frame<'_>, area: Rect, app: &mut App) {
             printed_cats.push(cat);
         }
     }
+
+    let mut lines: Vec<Line> = Vec::new();
     for cat in &printed_cats {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                *cat,
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-        ]));
+        lines.push(section_header(cat));
         lines.push(Line::from(""));
         for (k, r) in by_cat.get(cat).unwrap() {
-            let key_str = match k {
-                Some(c) => format!("[{c}]"),
-                None => " - ".into(),
-            };
-            // Truncate description to fit comfortably.
-            let max_desc = inner_w.saturating_sub(32 + r.name.len() + 6);
-            let desc: String = r
-                .description
-                .chars()
-                .take(max_desc.max(20))
-                .collect();
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    format!("{key_str:<4}"),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    format!("{:<28}", r.name),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(desc, Style::default().fg(Color::DarkGray)),
-            ]));
+            lines.push(opt_row(*k, r.name, r.description));
         }
         lines.push(Line::from(""));
     }
-    // Built-in keys footer line in the menu (matches the SYSTEM
-    // section of the lamquant-core cockpit).
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            "BUILT-IN",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    lines.push(Line::from(""));
-    for (k, _, label) in App::builtin_keys() {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                format!("[{}] ", k),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(*label),
-        ]));
-    }
 
-    // ── Views navigation (migrated screens) ─────────────────────────
+    // DIAGNOSTICS — the migrated detail/diagnostic Views (parity with the
+    // hub cockpit's DIAGNOSTICS section + the Python cockpit screens).
+    lines.push(section_header("DIAGNOSTICS"));
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            "VIEWS",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    lines.push(Line::from(""));
-    for (key, label) in [
-        ("J", "Jobs (all states)"),
-        ("L", "Log tail (selected job)"),
-        ("Y", "System (GPU/MEM/DISK/CPU)"),
-        ("H", "Run history"),
-        ("B", "Leaderboard (ranked by R)"),
-        ("K", "Checkpoints browser"),
-        ("P", "Presets & hyperparameters"),
-        ("M", "Live metrics tail"),
-        ("X", "Reset / export (maintenance)"),
+    for (key, label, desc) in [
+        ('J', "Jobs", "all jobs, color-coded by state"),
+        ('L', "Log", "status.jsonl tail of selected job"),
+        ('Y', "System", "full GPU / MEM / DISK / CPU probe"),
+        ('H', "Run history", "training_logs/*.csv runs + best R"),
+        ('B', "Leaderboard", "runs ranked by best validation R"),
+        ('K', "Checkpoints", ".ckpt browser grouped by dir"),
+        ('M', "Live metrics", "tail of the newest training CSV"),
     ] {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                format!("[{key}] "),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(label),
-        ]));
+        lines.push(opt_row(Some(key), label, desc));
+    }
+    lines.push(Line::from(""));
+
+    // PLANNING — preset / hyperparameter reference (hub PLANNING parity).
+    lines.push(section_header("PLANNING"));
+    lines.push(Line::from(""));
+    lines.push(opt_row(
+        Some('P'),
+        "Presets & hyperparameters",
+        "preset catalog, decoder tiers, hparam groups",
+    ));
+    lines.push(Line::from(""));
+
+    // SYSTEM — built-in actions + destructive maintenance (hub SYSTEM
+    // parity). The reset/export screen plus the cockpit built-ins.
+    lines.push(section_header("SYSTEM"));
+    lines.push(Line::from(""));
+    lines.push(opt_row(
+        Some('X'),
+        "Reset / export",
+        "kill tmux · clear numba · clear logs · export",
+    ));
+    for (k, _, label) in App::builtin_keys() {
+        lines.push(opt_row(Some(*k), label, ""));
     }
 
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    f.render_widget(para, outer[0]);
+    let menu_para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(menu_para, chunks[3]);
 }
 
 fn centered_rect(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
@@ -1143,7 +1107,11 @@ fn draw_overlay(f: &mut Frame<'_>, app: &App) {
             // Clear by drawing an empty block underneath.
             let bg = Block::default()
                 .borders(Borders::ALL)
-                .title(" pick recipe (type to filter, ↑↓ select, Enter open, Esc cancel) ");
+                .border_style(theme::dim())
+                .title(Span::styled(
+                    " pick recipe (type to filter, ↑↓ select, Enter open, Esc cancel) ",
+                    theme::title(),
+                ));
             f.render_widget(bg.clone(), area);
 
             let inner = Rect {
@@ -1153,9 +1121,9 @@ fn draw_overlay(f: &mut Frame<'_>, app: &App) {
                 height: area.height.saturating_sub(2),
             };
             let query_line = Line::from(vec![
-                Span::styled("> ", Style::default().fg(Color::Yellow)),
-                Span::raw(query.clone()),
-                Span::styled("_", Style::default().fg(Color::DarkGray)),
+                Span::styled("> ", theme::warning()),
+                Span::styled(query.clone(), theme::normal()),
+                Span::styled("_", theme::dim()),
             ]);
             let query_widget = Paragraph::new(query_line);
             let query_area = Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 };
@@ -1173,20 +1141,17 @@ fn draw_overlay(f: &mut Frame<'_>, app: &App) {
                 .enumerate()
                 .map(|(i, &idx)| {
                     let r = RECIPES[idx];
-                    let style = if i == *cursor {
-                        Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+                    let name_style = if i == *cursor {
+                        theme::selected()
                     } else {
-                        Style::default()
+                        theme::heading()
                     };
                     ListItem::new(Line::from(vec![
-                        Span::styled(
-                            format!("{:<32} ", r.name),
-                            style.add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(format!("[{}] ", r.backend_id), Style::default().fg(Color::Cyan)),
+                        Span::styled(format!("{:<32} ", r.name), name_style),
+                        Span::styled(format!("[{}] ", r.backend_id), theme::key_hint()),
                         Span::styled(
                             r.description.chars().take(80).collect::<String>(),
-                            Style::default().fg(Color::DarkGray),
+                            theme::dim(),
                         ),
                     ]))
                 })
@@ -1198,8 +1163,12 @@ fn draw_overlay(f: &mut Frame<'_>, app: &App) {
             let area = centered_rect(f.area(), 70, 70);
             let block = Block::default()
                 .borders(Borders::ALL)
-                .title(format!(
-                    " edit args: {recipe} — type to edit, Backspace, Ctrl+Enter submit, Esc cancel "
+                .border_style(theme::dim())
+                .title(Span::styled(
+                    format!(
+                        " edit args: {recipe} — type to edit, Backspace, Ctrl+Enter submit, Esc cancel "
+                    ),
+                    theme::title(),
                 ));
             let text: Vec<Line> = buffer.lines().map(|l| Line::from(l.to_string())).collect();
             let para = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
@@ -1212,17 +1181,17 @@ fn draw_jobs(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     let items: Vec<ListItem> = if app.jobs.is_empty() {
         vec![ListItem::new(Span::styled(
             "no jobs (yet) — start one with `blut recipe run …`",
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         ))]
     } else {
         app.jobs
             .iter()
             .map(|j| {
-                let state_color = match j.state {
-                    JobState::Running => Color::Green,
-                    JobState::Done => Color::Cyan,
-                    JobState::Failed => Color::Red,
-                    JobState::Cancelled => Color::Yellow,
+                let state_style = match j.state {
+                    JobState::Running => theme::success().add_modifier(Modifier::BOLD),
+                    JobState::Done => theme::highlight(),
+                    JobState::Failed => theme::error().add_modifier(Modifier::BOLD),
+                    JobState::Cancelled => theme::warning().add_modifier(Modifier::BOLD),
                 };
                 let pid = j.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
                 let output = j.output_name.clone().unwrap_or_else(|| "-".into());
@@ -1232,28 +1201,25 @@ fn draw_jobs(f: &mut Frame<'_>, area: Rect, app: &mut App) {
                     _ => "-".into(),
                 };
                 ListItem::new(Line::from(vec![
-                    Span::raw(format!("{:<22} ", j.id)),
-                    Span::styled(
-                        format!("{:<9} ", j.state.as_str()),
-                        Style::default().fg(state_color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!("pid={:<6} ", pid)),
-                    Span::raw(format!("out={:<18} ", output)),
-                    Span::styled(last, Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{:<22} ", j.id), theme::normal()),
+                    Span::styled(format!("{:<9} ", j.state.as_str()), state_style),
+                    Span::styled(format!("pid={:<6} ", pid), theme::normal()),
+                    Span::styled(format!("out={:<18} ", output), theme::normal()),
+                    Span::styled(last, theme::dim()),
                 ]))
             })
             .collect()
     };
     let block = Block::default()
-        .title(format!(" jobs ({}) — ↑↓ select, c cancel, r refresh ", app.jobs.len()))
+        .title(Span::styled(
+            format!(" jobs ({}) — ↑↓ select, c cancel, r refresh ", app.jobs.len()),
+            theme::title(),
+        ))
+        .border_style(theme::dim())
         .borders(Borders::ALL);
     let list = List::new(items)
         .block(block)
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(theme::selected())
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, area, &mut app.selected);
 }
@@ -1263,11 +1229,14 @@ fn draw_log(f: &mut Frame<'_>, area: Rect, app: &App) {
         Some(id) => format!(" log: {id}  (Enter to refresh) "),
         None => " log: (no selection) ".into(),
     };
-    let block = Block::default().title(title).borders(Borders::ALL);
+    let block = Block::default()
+        .title(Span::styled(title, theme::title()))
+        .border_style(theme::dim())
+        .borders(Borders::ALL);
     let text: Vec<Line> = if app.log_lines.is_empty() {
         vec![Line::from(Span::styled(
             "(no status.jsonl yet — job may still be starting)",
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         ))]
     } else {
         // Show the tail that fits in the visible height. Reserve 2
@@ -1276,7 +1245,7 @@ fn draw_log(f: &mut Frame<'_>, area: Rect, app: &App) {
         let start = app.log_lines.len().saturating_sub(visible);
         app.log_lines[start..]
             .iter()
-            .map(|s| Line::from(Span::raw(s.clone())))
+            .map(|s| Line::from(Span::styled(s.clone(), theme::normal())))
             .collect()
     };
     let para = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
@@ -1284,26 +1253,32 @@ fn draw_log(f: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_system(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let block = Block::default().title(" system ").borders(Borders::ALL);
+    let block = Block::default()
+        .title(Span::styled(" system ", theme::title()))
+        .border_style(theme::dim())
+        .borders(Borders::ALL);
     let snap = &app.system;
     let lines: Vec<Line> = vec![
-        Line::from(Span::styled("GPU", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
-        Line::from(Span::raw(snap.gpu_summary())),
+        Line::from(Span::styled("GPU", theme::highlight())),
+        Line::from(Span::styled(snap.gpu_summary(), theme::normal())),
         Line::from(""),
-        Line::from(Span::styled("MEM", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
-        Line::from(Span::raw(format!(
-            "used {:.1}/{:.1} GB  free {:.1} GB",
-            snap.mem_used_gb, snap.mem_total_gb, snap.mem_avail_gb
-        ))),
+        Line::from(Span::styled("MEM", theme::highlight())),
+        Line::from(Span::styled(
+            format!(
+                "used {:.1}/{:.1} GB  free {:.1} GB",
+                snap.mem_used_gb, snap.mem_total_gb, snap.mem_avail_gb
+            ),
+            theme::normal(),
+        )),
         Line::from(""),
-        Line::from(Span::styled("DISK /mnt/4tb", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
-        Line::from(Span::raw(format!(
-            "free {} ({}% used)",
-            snap.disk_free_human, snap.disk_used_pct
-        ))),
+        Line::from(Span::styled("DISK /mnt/4tb", theme::highlight())),
+        Line::from(Span::styled(
+            format!("free {} ({}% used)", snap.disk_free_human, snap.disk_used_pct),
+            theme::normal(),
+        )),
         Line::from(""),
-        Line::from(Span::styled("CPU", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
-        Line::from(Span::raw(format!("load1={:.2}", snap.load1))),
+        Line::from(Span::styled("CPU", theme::highlight())),
+        Line::from(Span::styled(format!("load1={:.2}", snap.load1), theme::normal())),
     ];
     let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     f.render_widget(para, area);
@@ -1312,13 +1287,10 @@ fn draw_system(f: &mut Frame<'_>, area: Rect, app: &App) {
 /// Shared header line for the migrated detail views.
 fn view_header(title: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            title.to_string(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(title.to_string(), theme::title()),
         Span::styled(
             format!("    blut v{}", env!("CARGO_PKG_VERSION")),
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         ),
     ])
 }
@@ -1327,18 +1299,22 @@ fn view_header(title: &str) -> Line<'static> {
 /// + epoch + date, plus a checkpoint summary footer.
 fn draw_history(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
-        .title(format!(" {} (↑↓ move · m mark · C compare · b back) ", View::History.title()))
+        .title(Span::styled(
+            format!(" {} (↑↓ move · m mark · C compare · b back) ", View::History.title()),
+            theme::title(),
+        ))
+        .border_style(theme::dim())
         .borders(Borders::ALL);
     let mut lines: Vec<Line> = vec![view_header("Run History"), Line::from("")];
     if app.runs.is_empty() {
         lines.push(Line::from(Span::styled(
             "No training runs found under training_logs/*.csv.",
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         )));
     } else {
         lines.push(Line::from(Span::styled(
             format!("  {:<42} {:<10} {:<10} {}", "Name", "Best R", "Epoch", "Date"),
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         )));
         for (i, r) in app.runs.iter().enumerate() {
             let marked = app.marked.iter().any(|n| *n == r.name);
@@ -1355,18 +1331,14 @@ fn draw_history(f: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 "—".into()
             };
-            let style = if cursor {
-                Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
+            let style = if cursor { theme::selected() } else { theme::normal() };
             lines.push(Line::from(vec![
-                Span::styled(format!("{prefix}{mark} "), Style::default().fg(Color::Green)),
+                Span::styled(format!("{prefix}{mark} "), theme::success()),
                 Span::styled(
                     format!("{:<42} {:<10} {:<10} ", truncate(&r.name, 42), r_str, ep_str),
                     style,
                 ),
-                Span::styled(r.date.clone(), Style::default().fg(Color::DarkGray)),
+                Span::styled(r.date.clone(), theme::dim()),
             ]));
         }
     }
@@ -1378,18 +1350,22 @@ fn draw_history(f: &mut Frame<'_>, area: Rect, app: &App) {
 /// R descending, gold marker on #1.
 fn draw_leaderboard(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
-        .title(format!(" {} (↑↓ move · m mark · C compare · b back) ", View::Leaderboard.title()))
+        .title(Span::styled(
+            format!(" {} (↑↓ move · m mark · C compare · b back) ", View::Leaderboard.title()),
+            theme::title(),
+        ))
+        .border_style(theme::dim())
         .borders(Borders::ALL);
     let mut lines: Vec<Line> = vec![view_header("Model Leaderboard"), Line::from("")];
     if app.runs.is_empty() {
         lines.push(Line::from(Span::styled(
             "No training logs found. Run some experiments first.",
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         )));
     } else {
         lines.push(Line::from(Span::styled(
             format!("  {:<5} {:<40} {:<10} {:<10} {}", "Rank", "Name", "Best R", "Epoch", "Date"),
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         )));
         for (i, r) in app.runs.iter().enumerate().take(20) {
             let cursor = i == app.list_cursor;
@@ -1406,11 +1382,11 @@ fn draw_leaderboard(f: &mut Frame<'_>, area: Rect, app: &App) {
                 "—".into()
             };
             let style = if cursor {
-                Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+                theme::selected()
             } else if i == 0 {
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                theme::success().add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
+                theme::normal()
             };
             let mark = if marked { "✓" } else { " " };
             lines.push(Line::from(vec![
@@ -1418,13 +1394,13 @@ fn draw_leaderboard(f: &mut Frame<'_>, area: Rect, app: &App) {
                     format!("{mark} {:<5} {:<40} {:<10} {:<10} ", i + 1, truncate(&r.name, 40), r_str, ep_str),
                     style,
                 ),
-                Span::styled(format!("{}{medal}", r.date), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{}{medal}", r.date), theme::dim()),
             ]));
         }
         if app.runs.len() > 20 {
             lines.push(Line::from(Span::styled(
                 format!("  ... {} more runs", app.runs.len() - 20),
-                Style::default().fg(Color::DarkGray),
+                theme::dim(),
             )));
         }
     }
@@ -1436,7 +1412,11 @@ fn draw_leaderboard(f: &mut Frame<'_>, area: Rect, app: &App) {
 /// of the marked runs; the per-row winner is highlighted green.
 fn draw_compare(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
-        .title(format!(" {} (mark runs in History/Leaderboard with m · b back) ", View::Compare.title()))
+        .title(Span::styled(
+            format!(" {} (mark runs in History/Leaderboard with m · b back) ", View::Compare.title()),
+            theme::title(),
+        ))
+        .border_style(theme::dim())
         .borders(Borders::ALL);
     let mut lines: Vec<Line> = vec![view_header("Compare Runs"), Line::from("")];
     let selected: Vec<&views::RunRow> = app
@@ -1447,18 +1427,15 @@ fn draw_compare(f: &mut Frame<'_>, area: Rect, app: &App) {
     if selected.len() < 2 {
         lines.push(Line::from(Span::styled(
             "Mark at least 2 runs (press m on a row in History/Leaderboard) to compare.",
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         )));
     } else {
         // Header row of run names.
-        let mut hdr = vec![Span::styled(
-            format!("  {:<16}", "Metric"),
-            Style::default().fg(Color::DarkGray),
-        )];
+        let mut hdr = vec![Span::styled(format!("  {:<16}", "Metric"), theme::dim())];
         for r in &selected {
             hdr.push(Span::styled(
                 format!("{:<22}", truncate(&r.name, 21)),
-                Style::default().add_modifier(Modifier::BOLD),
+                theme::heading(),
             ));
         }
         lines.push(Line::from(hdr));
@@ -1480,10 +1457,7 @@ fn draw_compare(f: &mut Frame<'_>, area: Rect, app: &App) {
 /// `decimals` controls float formatting.
 fn metric_row(metric: &str, vals: &[f64], highlight_max: bool, decimals: usize) -> Line<'static> {
     let best = vals.iter().cloned().fold(f64::MIN, f64::max);
-    let mut spans = vec![Span::styled(
-        format!("  {:<16}", metric),
-        Style::default().add_modifier(Modifier::BOLD),
-    )];
+    let mut spans = vec![Span::styled(format!("  {:<16}", metric), theme::heading())];
     for v in vals {
         let txt = if decimals == 0 {
             format!("{:<22}", *v as i64)
@@ -1491,9 +1465,9 @@ fn metric_row(metric: &str, vals: &[f64], highlight_max: bool, decimals: usize) 
             format!("{:<22.*}", decimals, v)
         };
         let style = if highlight_max && *v == best && best > 0.0 {
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            theme::success().add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
+            theme::normal()
         };
         spans.push(Span::styled(txt, style));
     }
@@ -1504,38 +1478,35 @@ fn metric_row(metric: &str, vals: &[f64], highlight_max: bool, decimals: usize) 
 /// by directory, with per-dir count + GiB and the newest files.
 fn draw_checkpoints(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
-        .title(format!(" {} (↑↓ move · r refresh · b back) ", View::Checkpoints.title()))
+        .title(Span::styled(
+            format!(" {} (↑↓ move · r refresh · b back) ", View::Checkpoints.title()),
+            theme::title(),
+        ))
+        .border_style(theme::dim())
         .borders(Borders::ALL);
     let mut lines: Vec<Line> = vec![view_header("Checkpoints"), Line::from("")];
     if app.ckpts.is_empty() {
         lines.push(Line::from(Span::styled(
             "No checkpoints found under checkpoints/ or weights/.",
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         )));
     } else {
         let total_gb: f64 = app.ckpts.iter().map(|c| c.size_mb).sum::<f64>() / 1024.0;
         lines.push(Line::from(Span::styled(
             format!("{} checkpoints  ·  {:.1} GiB total", app.ckpts.len(), total_gb),
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         )));
         lines.push(Line::from(""));
         for (i, c) in app.ckpts.iter().enumerate() {
             let cursor = i == app.list_cursor;
             let prefix = if cursor { "▶ " } else { "  " };
-            let style = if cursor {
-                Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
+            let style = if cursor { theme::selected() } else { theme::normal() };
             lines.push(Line::from(vec![
-                Span::styled(prefix.to_string(), Style::default().fg(Color::Green)),
+                Span::styled(prefix.to_string(), theme::success()),
                 Span::styled(format!("{:<40} ", truncate(&c.name, 40)), style),
-                Span::styled(
-                    format!("{:>8.1} MB  ", c.size_mb),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled(format!("{}  ", c.date), Style::default().fg(Color::DarkGray)),
-                Span::styled(c.rel_dir.clone(), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{:>8.1} MB  ", c.size_mb), theme::key_hint()),
+                Span::styled(format!("{}  ", c.date), theme::dim()),
+                Span::styled(c.rel_dir.clone(), theme::dim()),
             ]));
         }
     }
@@ -1548,56 +1519,48 @@ fn draw_checkpoints(f: &mut Frame<'_>, area: Rect, app: &App) {
 /// catalog — the live values live in recipe Args JSON (ADR 0017).
 fn draw_presets(f: &mut Frame<'_>, area: Rect, _app: &App) {
     let block = Block::default()
-        .title(format!(" {} (b back) ", View::Presets.title()))
+        .title(Span::styled(
+            format!(" {} (b back) ", View::Presets.title()),
+            theme::title(),
+        ))
+        .border_style(theme::dim())
         .borders(Borders::ALL);
     let mut lines: Vec<Line> = vec![view_header("Presets & Hyperparameters"), Line::from("")];
-    lines.push(Line::from(Span::styled(
-        "PRESETS",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    )));
+    lines.push(Line::from(Span::styled("PRESETS", theme::highlight())));
     for (name, ep, wpe, est, use_case) in views::PRESETS {
         lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<12}", name),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!("{ep:<12} {wpe:<10} ")),
-            Span::styled(format!("{est:<8}  "), Style::default().fg(Color::Yellow)),
-            Span::styled(use_case.to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("  {:<12}", name), theme::heading()),
+            Span::styled(format!("{ep:<12} {wpe:<10} "), theme::normal()),
+            Span::styled(format!("{est:<8}  "), theme::warning()),
+            Span::styled(use_case.to_string(), theme::dim()),
         ]));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "DECODER TIERS",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    )));
+    lines.push(Line::from(Span::styled("DECODER TIERS", theme::highlight())));
     for (tier, params, note) in views::DECODER_TIERS {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {tier:<10}"), Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(format!("{params:<8} ")),
-            Span::styled(note.to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("  {tier:<10}"), theme::heading()),
+            Span::styled(format!("{params:<8} "), theme::normal()),
+            Span::styled(note.to_string(), theme::dim()),
         ]));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "PRODUCTION-VALIDATED FEATURES",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        theme::highlight(),
     )));
     for feat in views::VALIDATED_FEATURES {
-        lines.push(Line::from(Span::raw(format!("  • {feat}"))));
+        lines.push(Line::from(Span::styled(format!("  • {feat}"), theme::normal())));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "HYPERPARAMETERS (set via recipe Args JSON — ADR 0017)",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        theme::highlight(),
     )));
     for (group, fields) in views::HPARAM_GROUPS {
         lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<16}", group),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(fields.join(", "), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("  {:<16}", group), theme::heading()),
+            Span::styled(fields.join(", "), theme::dim()),
         ]));
     }
     let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
@@ -1608,7 +1571,11 @@ fn draw_presets(f: &mut Frame<'_>, area: Rect, _app: &App) {
 /// the tail of the newest training-log CSV, re-read each tick.
 fn draw_metrics(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
-        .title(format!(" {} (r refresh · b back) ", View::Metrics.title()))
+        .title(Span::styled(
+            format!(" {} (r refresh · b back) ", View::Metrics.title()),
+            theme::title(),
+        ))
+        .border_style(theme::dim())
         .borders(Borders::ALL);
     let n = area.height.saturating_sub(4) as usize;
     let tail = views::metrics_tail(&app.repo_root, n.max(10));
@@ -1616,9 +1583,9 @@ fn draw_metrics(f: &mut Frame<'_>, area: Rect, app: &App) {
         .chain(std::iter::once(Line::from("")))
         .chain(tail.into_iter().map(|s| {
             if s.starts_with('#') {
-                Line::from(Span::styled(s, Style::default().fg(Color::Cyan)))
+                Line::from(Span::styled(s, theme::key_hint()))
             } else {
-                Line::from(Span::raw(s))
+                Line::from(Span::styled(s, theme::normal()))
             }
         }))
         .collect();
@@ -1630,12 +1597,16 @@ fn draw_metrics(f: &mut Frame<'_>, area: Rect, app: &App) {
 /// destructive maintenance actions (two-press Enter confirm) + export.
 fn draw_reset(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
-        .title(format!(" {} (↑↓ move · Enter confirm · e export · b back) ", View::Reset.title()))
+        .title(Span::styled(
+            format!(" {} (↑↓ move · Enter confirm · e export · b back) ", View::Reset.title()),
+            theme::title(),
+        ))
+        .border_style(theme::dim())
         .borders(Borders::ALL);
     let mut lines: Vec<Line> = vec![view_header("Reset Training State"), Line::from("")];
     lines.push(Line::from(Span::styled(
         "Destructive — each action requires a second Enter to confirm.",
-        Style::default().fg(Color::Yellow),
+        theme::warning(),
     )));
     lines.push(Line::from(""));
     for (i, action) in RESET_ROWS.iter().enumerate() {
@@ -1646,25 +1617,25 @@ fn draw_reset(f: &mut Frame<'_>, area: Rect, app: &App) {
             .unwrap_or(false);
         let prefix = if cursor { "▶ " } else { "  " };
         let style = if armed {
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            theme::error().add_modifier(Modifier::BOLD)
         } else if cursor {
-            Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+            theme::selected()
         } else {
-            Style::default()
+            theme::normal()
         };
         let suffix = if armed { "   ← press Enter again to confirm" } else { "" };
         lines.push(Line::from(vec![
-            Span::styled(prefix.to_string(), Style::default().fg(Color::Green)),
+            Span::styled(prefix.to_string(), theme::success()),
             Span::styled(format!("{}{suffix}", action.label()), style),
         ]));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("  [e] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::raw("Export configuration "),
+        Span::styled("  [e] ", theme::key_hint()),
+        Span::styled("Export configuration ", theme::normal()),
         Span::styled(
             "(write recipe Args JSON schemas to repo root)",
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         ),
     ]));
     let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
@@ -1698,11 +1669,241 @@ fn draw_status(f: &mut Frame<'_>, area: Rect, app: &App) {
         View::Metrics => "r refresh • b back • q quit",
         View::Reset => "↑↓ move • Enter confirm (2x) • e export • b back • q quit",
     };
-    let line = if let Some((msg, _)) = &app.status_msg {
-        format!("{msg}    │    {base}")
+    let para = if let Some((msg, _)) = &app.status_msg {
+        // Status message segment in the success-tinted bar style, the
+        // key-hint base in the standard status-bar style (matches the
+        // lamquant status-bar convention).
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" {msg} "), theme::status_msg()),
+            Span::styled(format!(" {base} "), theme::status_bar()),
+        ]))
     } else {
-        base.into()
+        Paragraph::new(Span::styled(format!(" {base} "), theme::status_bar()))
     };
-    let para = Paragraph::new(Span::styled(line, Style::default().fg(Color::DarkGray)));
     f.render_widget(para, area);
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    /// Build a deterministic App for rendering tests: no live jobs, a
+    /// fixed (empty) system snapshot, and a temp repo root so the
+    /// diagnostic views don't scan the real filesystem. Pure in-memory —
+    /// no `probe()` / `pgrep` / `nvidia-smi` calls.
+    fn test_app() -> App {
+        // Force unicode + color on so the alignment test sees `┌`/`│`/`└`
+        // and the section-heading assertions are charset-stable.
+        theme::detect("always", "unicode");
+        let mut app = App::new();
+        // Point the repo root at an empty temp dir so views::* don't pick
+        // up stray training_logs / checkpoints from the dev tree.
+        let tmp = std::env::temp_dir().join(format!("blut-tui-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        app.repo_root = tmp;
+        app
+    }
+
+    /// Render the app's current view to a fresh `TestBackend` of the
+    /// given size and return the resulting buffer. This is the headless
+    /// render path the tests assert against (no real terminal, no raw
+    /// mode) — equivalent to a `tui --check` smoke.
+    fn render_to_test_backend(app: &mut App, w: u16, h: u16) -> Buffer {
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).expect("test terminal");
+        term.draw(|f| draw(f, app)).expect("draw to test backend");
+        term.backend().buffer().clone()
+    }
+
+    /// Flatten the buffer into one big string (cells joined row by row,
+    /// rows separated by `\n`). Used for `contains` content assertions.
+    fn buffer_text(buf: &Buffer) -> String {
+        let area = buf.area();
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Symbol at a cell as an owned `String`.
+    fn sym(buf: &Buffer, x: u16, y: u16) -> String {
+        buf[(x, y)].symbol().to_string()
+    }
+
+    #[test]
+    fn cockpit_renders_aligned_box() {
+        let mut app = test_app();
+        app.view = View::Cockpit;
+        let buf = render_to_test_backend(&mut app, 120, 40);
+        let area = *buf.area();
+
+        // 1. Locate the "Pipeline status" Block. Its title sits on the top
+        //    border row, so find the row containing the title text and the
+        //    `┌` top-left corner on that same row.
+        let mut top_row: Option<u16> = None;
+        let mut left_col: Option<u16> = None;
+        let mut right_col: Option<u16> = None;
+        'outer: for y in 0..area.height {
+            let mut row = String::new();
+            for x in 0..area.width {
+                row.push_str(buf[(x, y)].symbol());
+            }
+            if row.contains("Pipeline status") && row.contains('┌') {
+                top_row = Some(y);
+                for x in 0..area.width {
+                    let s = sym(&buf, x, y);
+                    if s == "┌" {
+                        left_col = Some(x);
+                    }
+                    if s == "┐" {
+                        right_col = Some(x);
+                    }
+                }
+                break 'outer;
+            }
+        }
+        let top_row = top_row.expect("Pipeline status top border row not found");
+        let left_col = left_col.expect("`┌` top-left corner not found");
+        let right_col = right_col.expect("`┐` top-right corner not found");
+        assert!(
+            right_col > left_col,
+            "right border must be to the right of the left border"
+        );
+
+        // 2. Find the matching bottom border: the next row below top_row
+        //    whose left_col cell is `└`.
+        let mut bot_row: Option<u16> = None;
+        for y in (top_row + 1)..area.height {
+            if sym(&buf, left_col, y) == "└" {
+                bot_row = Some(y);
+                break;
+            }
+        }
+        let bot_row = bot_row.expect("`└` bottom-left corner not found below top border");
+
+        // 3. Bottom corners must sit in the SAME columns as the top
+        //    corners — this is the alignment property the old manual
+        //    `└{}┘` (different repeat count) violated.
+        assert_eq!(
+            sym(&buf, left_col, bot_row),
+            "└",
+            "bottom-left corner must align with top-left corner column"
+        );
+        assert_eq!(
+            sym(&buf, right_col, bot_row),
+            "┘",
+            "bottom-right corner `┘` must align with top-right corner `┐` column"
+        );
+
+        // 4. Every interior row of the box must have a `│` at EXACTLY the
+        //    left_col and right_col — the side borders never drift.
+        for y in (top_row + 1)..bot_row {
+            assert_eq!(
+                sym(&buf, left_col, y),
+                "│",
+                "left side border drifted at row {y} (expected `│` at col {left_col})"
+            );
+            assert_eq!(
+                sym(&buf, right_col, y),
+                "│",
+                "right side border drifted at row {y} (expected `│` at col {right_col})"
+            );
+        }
+    }
+
+    #[test]
+    fn cockpit_shows_all_sections() {
+        let mut app = test_app();
+        app.view = View::Cockpit;
+        let buf = render_to_test_backend(&mut app, 120, 60);
+        let text = buffer_text(&buf);
+        // The hub-convention section headings + the BLUT recipe-category
+        // headings must all be present (parity with the lamquant cockpit).
+        for heading in [
+            "DATA PREPARATION",
+            "PIPELINE",
+            "DIAGNOSTICS",
+            "PLANNING",
+            "SYSTEM",
+        ] {
+            assert!(
+                text.contains(heading),
+                "cockpit menu missing section heading `{heading}`"
+            );
+        }
+        // The Pipeline status + Resources boxes are present by title.
+        assert!(text.contains("Pipeline status"), "missing Pipeline status box");
+        assert!(text.contains("Resources"), "missing Resources box");
+    }
+
+    #[test]
+    fn each_view_renders_nonempty() {
+        let views = [
+            View::Cockpit,
+            View::Jobs,
+            View::Log,
+            View::System,
+            View::History,
+            View::Leaderboard,
+            View::Compare,
+            View::Checkpoints,
+            View::Presets,
+            View::Metrics,
+            View::Reset,
+        ];
+        for view in views {
+            let mut app = test_app();
+            app.view = view;
+            let buf = render_to_test_backend(&mut app, 120, 40);
+            let text = buffer_text(&buf);
+            // Non-blank: at least one non-space glyph somewhere.
+            assert!(
+                text.chars().any(|c| !c.is_whitespace()),
+                "view {view:?} rendered a completely blank buffer"
+            );
+            // Each view surfaces a recognizable title/heading. The cockpit
+            // uses its header strip; the detail views use the block title
+            // and/or the view_header line.
+            let needle = match view {
+                View::Cockpit => "BLUT Training Cockpit",
+                View::Jobs => "jobs",
+                View::Log => "log",
+                View::System => "system",
+                View::History => "Run History",
+                View::Leaderboard => "Leaderboard",
+                View::Compare => "Compare Runs",
+                View::Checkpoints => "Checkpoints",
+                View::Presets => "Presets",
+                View::Metrics => "Live Metrics",
+                View::Reset => "Reset",
+            };
+            assert!(
+                text.contains(needle),
+                "view {view:?} buffer missing expected title text `{needle}`\n--- buffer ---\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn cockpit_lists_every_recipe_hotkey() {
+        // Parity guard: every recipe in the catalog must appear by name in
+        // the cockpit menu so no launchable recipe is silently dropped.
+        let mut app = test_app();
+        app.view = View::Cockpit;
+        let buf = render_to_test_backend(&mut app, 160, 80);
+        let text = buffer_text(&buf);
+        for r in RECIPES {
+            assert!(
+                text.contains(r.name),
+                "cockpit menu missing recipe `{}` — parity regression",
+                r.name
+            );
+        }
+    }
 }

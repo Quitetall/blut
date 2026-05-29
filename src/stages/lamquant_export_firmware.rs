@@ -9,8 +9,6 @@
 //! Deterministic per-input-byte-state — outputs are a pure function
 //! of the input checkpoints + target config.
 
-use std::path::PathBuf;
-
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -140,6 +138,7 @@ impl Stage for LamquantExportFirmware {
 mod tests {
     use super::*;
     use crate::framework::artifact::ContentHash;
+    use std::path::PathBuf;
 
     fn ctx(td: &std::path::Path) -> StageContext {
         std::fs::create_dir_all(td.join("stage")).unwrap();

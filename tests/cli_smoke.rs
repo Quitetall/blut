@@ -26,8 +26,15 @@ fn help_prints_top_level() {
         .expect("spawn lamu-train");
     assert!(out.status.success(), "--help must exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("lamu-train"), "missing tool name in help");
-    assert!(stdout.contains("Local fine-tuning"), "missing about line");
+    assert!(stdout.contains("blut"), "missing tool name in help");
+    assert!(
+        stdout.contains("training cockpit"),
+        "missing about line (expected the BLUT cockpit about-text)"
+    );
+    // The top-level command surface must be advertised in --help.
+    for sub in ["train", "jobs", "recipe", "cancel", "tui"] {
+        assert!(stdout.contains(sub), "top-level --help missing subcommand `{sub}`");
+    }
 }
 
 #[test]

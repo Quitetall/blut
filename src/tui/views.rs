@@ -32,7 +32,6 @@ pub struct RunRow {
     pub total_ep: usize,
     pub final_r: f64,
     pub date: String,
-    pub path: PathBuf,
 }
 
 /// One checkpoint file (`.ckpt`) discovered under `checkpoints/` or
@@ -167,7 +166,6 @@ pub fn run_history(root: &Path) -> Vec<RunRow> {
                 total_ep,
                 final_r,
                 date: fmt_date(mt, false),
-                path: p,
             }
         })
         .collect()

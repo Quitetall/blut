@@ -284,7 +284,6 @@ async fn run_pccp_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn ctx(td: &std::path::Path) -> StageContext {
         std::fs::create_dir_all(td.join("stage")).unwrap();

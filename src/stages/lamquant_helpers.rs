@@ -2,7 +2,7 @@
 //!
 //! Cuts boilerplate from the per-stage `run()` bodies: resolving
 //! `lamquant_home`, checking script existence, building progress
-//! fan-out, and the `safe_join` / `resolve_relative` path helpers.
+//! fan-out, and the `safe_join` path helper.
 
 use std::path::{Path, PathBuf};
 
@@ -69,16 +69,6 @@ pub fn safe_join(base: &Path, rel: &str) -> Result<PathBuf, StageError> {
     Ok(base.join(p))
 }
 
-/// Pass-through for absolute paths; join onto `base` for relative.
-/// Used for read-side data dir args.
-pub fn resolve_relative(base: &Path, p: &Path) -> PathBuf {
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        base.join(p)
-    }
-}
-
 /// Build the standard progress fan-out closure used by training
 /// stages. Forwards parsed tqdm progress to the executor's status
 /// broadcast as `StageEvent::StageStep`.
@@ -124,13 +114,6 @@ pub fn push_opt_f32(out: &mut Vec<String>, flag: &str, v: Option<f32>) {
     }
 }
 
-pub fn push_opt_str(out: &mut Vec<String>, flag: &str, v: &str) {
-    if !v.is_empty() {
-        out.push(flag.to_string());
-        out.push(v.to_string());
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,25 +137,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_relative_passes_absolute() {
-        let r = resolve_relative(Path::new("/tmp/x"), Path::new("/data"));
-        assert_eq!(r, PathBuf::from("/data"));
-    }
-
-    #[test]
-    fn resolve_relative_joins_relative() {
-        let r = resolve_relative(Path::new("/tmp/x"), Path::new("sub"));
-        assert_eq!(r, PathBuf::from("/tmp/x/sub"));
-    }
-
-    #[test]
     fn push_opt_appends_when_set() {
         let mut v = Vec::new();
         push_opt_u32(&mut v, "--epochs", Some(5));
         push_opt_f32(&mut v, "--lr", Some(0.1));
-        push_opt_str(&mut v, "--name", "abc");
         push_opt_u32(&mut v, "--noop", None);
-        push_opt_str(&mut v, "--empty", "");
-        assert_eq!(v, vec!["--epochs", "5", "--lr", "0.1", "--name", "abc"]);
+        assert_eq!(v, vec!["--epochs", "5", "--lr", "0.1"]);
     }
 }

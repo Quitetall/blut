@@ -366,16 +366,6 @@ pub fn tail_log(job_id: &str, lines: usize) -> Result<String> {
         .join("\n"))
 }
 
-/// Test-friendly: ensure a job_id round-trips through the file
-/// system. crate-internal — never call from production code.
-#[cfg(test)]
-pub(crate) fn debug_init_job(job_id: &str, spec: &TrainSpec) -> Result<PathBuf> {
-    let dir = paths::job_dir(job_id)?;
-    write_spec(job_id, spec)?;
-    write_state(job_id, JobState::Running)?;
-    Ok(dir)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,7 +580,7 @@ mod tests {
         // 2024-01-01 00:00:00 UTC
         assert_eq!(unix_to_ymdhms(1_704_067_200), (2024, 1, 1, 0, 0, 0));
         // 2026-05-10 12:34:56 UTC = 1_778_412_896
-        let (y, m, d, h, mi, se) = unix_to_ymdhms(1_778_761_896);
+        let (y, m, _d, h, mi, se) = unix_to_ymdhms(1_778_761_896);
         assert_eq!((y, m), (2026, 5));
         assert_eq!((h, mi, se), (12, 31, 36));
     }
