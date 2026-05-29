@@ -163,6 +163,29 @@ impl Stage for LamquantTrainMambaSnn {
             )));
         }
 
+        // FW-2 caveat — writes OUTSIDE `ctx.stage_dir`.
+        //
+        // This stage's checkpoint lands at `lamquant_home/weights/
+        // snn/*.pt` (or `args.checkpoint_rel` under lamquant_home),
+        // NOT under `ctx.stage_dir`. The executor's framework-level
+        // atomicity (run in `.tmp-<key>`, promote-on-Ok, remove-on-
+        // Err) therefore does NOT cover this checkpoint: a mid-train
+        // crash can leave a partial `.pt` behind, and the executor
+        // cannot clean it because it never sees the path.
+        //
+        // This is tolerated rather than fixed here because (a) the
+        // stage is `DETERMINISTIC = false` — its downstream logical
+        // hash is synthesized, not content-derived, so a stale ckpt
+        // can't poison a downstream cache key; (b) the checkpoint is
+        // a stable user-facing weights artifact the operator wants
+        // persisted at a known path across runs, not a throwaway in a
+        // job-scoped stage dir; and (c) the trainer itself writes the
+        // best checkpoint atomically (best-so-far swap) so a partial
+        // `.pt` from a crash is overwritten on the next successful
+        // epoch. The resume oracle (the cache entry) is still only
+        // written by the executor AFTER the stage returns Ok, so a
+        // crashed run never looks complete regardless of the orphan
+        // `.pt`. Documented per FW-2 ("at minimum detect + document").
         let checkpoint_path = if args.checkpoint_rel.is_empty() {
             lamquant_home
                 .join("weights")
@@ -171,6 +194,11 @@ impl Stage for LamquantTrainMambaSnn {
         } else {
             safe_join(&lamquant_home, &args.checkpoint_rel)?
         };
+        debug_assert!(
+            !checkpoint_path.starts_with(&ctx.stage_dir),
+            "FW-2 note assumes ckpt is outside stage_dir; if it moved inside, \
+             drop this caveat and let the framework promote it"
+        );
         if let Some(parent) = checkpoint_path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| StageError::Io {
                 path: parent.to_path_buf(),
