@@ -89,7 +89,17 @@ pub struct LamquantRoots {
     /// Dir containing `pccp/` (registry + verification_records).
     /// Default: wherever `pccp/` is found (currently `ai_models_root`).
     pub pccp_root: PathBuf,
+    /// Dir containing the Lossless submodule that builds the `lml`
+    /// encode/decode binary (`<lossless_root>/target/release/lml`).
+    /// Default `<meta>/LamQuant-Lossless`.
+    pub lossless_root: PathBuf,
 }
+
+/// Path of the `lml` encode/decode binary RELATIVE to `lossless_root`.
+/// The Lossless submodule is a cargo crate; `cargo build --release`
+/// drops the binary here. RCP-2 resolves the path; it does NOT build
+/// the binary (encode is the operator's `cargo build --release` step).
+pub const LML_BINARY_REL: &[&str] = &["target", "release", "lml"];
 
 /// Detect the LamQuant meta-repo root: the directory that owns the
 /// submodules (`blut/`, `LamQuant-Neural/`, …).
@@ -182,11 +192,36 @@ impl LamquantRoots {
         let ai_models_root = resolve_ai_models_root(meta.as_deref())?;
         let scripts_root = resolve_scripts_root(meta.as_deref(), &ai_models_root)?;
         let pccp_root = resolve_pccp_root(meta.as_deref(), &ai_models_root)?;
+        let lossless_root = resolve_lossless_root(meta.as_deref())?;
         Ok(Self {
             ai_models_root,
             scripts_root,
             pccp_root,
+            lossless_root,
         })
+    }
+
+    /// Absolute path to the `lml` encode/decode binary (RCP-2).
+    ///
+    /// Resolution order:
+    ///   1. `$BLUT_LML` — explicit path to the binary itself.
+    ///   2. `<lossless_root>/target/release/lml`.
+    ///
+    /// Unlike `ai_models_script` / `scripts_script`, this does NOT
+    /// existence-check: the release binary is produced by an operator
+    /// `cargo build --release` in the Lossless submodule and may not be
+    /// present in a fresh checkout. Callers (the encode stage) assert
+    /// existence at run-time preflight so the path is always resolvable
+    /// for wiring + tests even before the binary is built.
+    pub fn lml_binary(&self) -> PathBuf {
+        if let Ok(p) = std::env::var("BLUT_LML") {
+            return PathBuf::from(p);
+        }
+        let mut p = self.lossless_root.clone();
+        for c in LML_BINARY_REL {
+            p.push(c);
+        }
+        p
     }
 
     /// Build + existence-check the absolute path to a script under
@@ -274,6 +309,36 @@ fn resolve_pccp_root(meta: Option<&Path>, ai_models_root: &Path) -> Result<PathB
         "pccp/ not found under {:?}; set $BLUT_PCCP",
         candidates
     )))
+}
+
+/// `$BLUT_LOSSLESS` → `<meta>/LamQuant-Lossless` (the sibling submodule
+/// that builds the `lml` binary) → `<meta>` (monorepo fallback, where a
+/// `target/` would sit at root). Validated to be a directory; the
+/// release binary inside it is NOT required to exist at resolve time
+/// (RCP-2: encode is the operator's `cargo build --release` step).
+fn resolve_lossless_root(meta: Option<&Path>) -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("BLUT_LOSSLESS") {
+        let p = PathBuf::from(p);
+        if p.is_dir() {
+            return Ok(p);
+        }
+        return Err(TrainError::other(format!(
+            "$BLUT_LOSSLESS={} is not a directory",
+            p.display()
+        )));
+    }
+    let meta = meta.ok_or_else(|| {
+        TrainError::other(
+            "lossless_root: meta-repo not detected; set $BLUT_LOSSLESS to the dir \
+             that builds the lml binary (holds target/release/lml)",
+        )
+    })?;
+    let lossless = meta.join("LamQuant-Lossless");
+    if lossless.is_dir() {
+        return Ok(lossless);
+    }
+    // Monorepo fallback: the Lossless crate lives at the meta root.
+    Ok(meta.to_path_buf())
 }
 
 /// Validate that `root` holds the `expects` subtree; clean `Err`
@@ -544,6 +609,57 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("LAMU_TRAINER_PY", v),
                 None => std::env::remove_var("LAMU_TRAINER_PY"),
+            }
+        }
+    }
+
+    /// RCP-2: `$BLUT_LML` overrides the computed binary path.
+    #[test]
+    fn lml_binary_respects_env_override() {
+        let _g = lock();
+        let prev = std::env::var("BLUT_LML").ok();
+        unsafe {
+            std::env::set_var("BLUT_LML", "/custom/path/to/lml");
+        }
+        let roots = LamquantRoots {
+            ai_models_root: PathBuf::from("/x"),
+            scripts_root: PathBuf::from("/x"),
+            pccp_root: PathBuf::from("/x"),
+            lossless_root: PathBuf::from("/x/LamQuant-Lossless"),
+        };
+        assert_eq!(roots.lml_binary(), PathBuf::from("/custom/path/to/lml"));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("BLUT_LML", v),
+                None => std::env::remove_var("BLUT_LML"),
+            }
+        }
+    }
+
+    /// Without `$BLUT_LML`, the binary path is
+    /// `<lossless_root>/target/release/lml` (RCP-2). Resolution does
+    /// NOT existence-check — the release binary is the operator's
+    /// `cargo build --release` step.
+    #[test]
+    fn lml_binary_defaults_under_lossless_root() {
+        let _g = lock();
+        let prev = std::env::var("BLUT_LML").ok();
+        unsafe {
+            std::env::remove_var("BLUT_LML");
+        }
+        let roots = LamquantRoots {
+            ai_models_root: PathBuf::from("/meta/LamQuant-Neural"),
+            scripts_root: PathBuf::from("/meta"),
+            pccp_root: PathBuf::from("/meta/LamQuant-Neural"),
+            lossless_root: PathBuf::from("/meta/LamQuant-Lossless"),
+        };
+        assert_eq!(
+            roots.lml_binary(),
+            PathBuf::from("/meta/LamQuant-Lossless/target/release/lml")
+        );
+        unsafe {
+            if let Some(v) = prev {
+                std::env::set_var("BLUT_LML", v);
             }
         }
     }

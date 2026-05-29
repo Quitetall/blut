@@ -96,6 +96,14 @@ fn ai_models_scripts() -> Vec<(&'static str, Vec<&'static str>)> {
             vec!["ai_models", "dataset_sim", "build_manifest.py"],
         ),
         (
+            "lamquant_build_split_manifest",
+            vec![
+                "ai_models",
+                "dataset_sim",
+                "build_seizure_split_manifest.py",
+            ],
+        ),
+        (
             "lamquant_precompute_fullband",
             vec!["ai_models", "dataset_sim", "precompute_fullband_memmap.py"],
         ),
@@ -367,6 +375,86 @@ fn default_labels_dir_is_unified_and_exists() {
         Path::new(DEFAULT_LABELS_DIR).is_dir(),
         "unified labels dir {DEFAULT_LABELS_DIR} must exist (RCP-6)"
     );
+}
+
+/// RCP-2 path contract for the NEW stages' wrapped binary/script:
+///
+///   * `build_seizure_split_manifest.py` (build_split_manifest stage)
+///     is covered by `wrapped_scripts_exist_at_resolved_home` via the
+///     `ai_models_scripts()` table — it MUST exist on disk and that
+///     test asserts so. This test adds the explicit existence check so
+///     the split-manifest script's presence is documented on its own.
+///
+///   * The `lml` encode binary (encode_lma stage) resolves to
+///     `<lossless_root>/target/release/lml`. We assert the RESOLVED
+///     PATH is correct (the resolver computes the right location), but
+///     we do NOT fail the test when the binary is not built: the
+///     release binary is produced by an operator `cargo build
+///     --release` in the Lossless submodule and is intentionally not a
+///     repo artifact. When it IS built (this machine's local layout),
+///     we additionally assert it exists + is a file.
+#[test]
+fn new_stage_script_and_binary_paths_resolve() {
+    let _g = env_guard();
+    let prev = clear_overrides();
+    // BLUT_LML must not leak in from the environment for the
+    // computed-path assertion.
+    let prev_lml = std::env::var("BLUT_LML").ok();
+    unsafe {
+        std::env::remove_var("BLUT_LML");
+    }
+
+    let roots = LamquantRoots::resolve().expect("roots resolve on current layout");
+
+    // build_seizure_split_manifest.py exists under ai_models_root.
+    let split_script = roots
+        .ai_models_script(&[
+            "ai_models",
+            "dataset_sim",
+            "build_seizure_split_manifest.py",
+        ])
+        .expect("build_seizure_split_manifest.py resolves under ai_models_root");
+    assert!(
+        split_script.exists() && split_script.is_file(),
+        "build_seizure_split_manifest.py must exist on disk at {} (RCP-3)",
+        split_script.display()
+    );
+
+    // lml binary: assert the RESOLVED PATH shape is correct.
+    let lml = roots.lml_binary();
+    let expected = roots
+        .lossless_root
+        .join("target")
+        .join("release")
+        .join("lml");
+    assert_eq!(
+        lml, expected,
+        "lml binary should resolve to <lossless_root>/target/release/lml"
+    );
+    // Existence is gated: only assert when the release build is
+    // present. `cargo build --release` in the Lossless submodule
+    // produces it; a fresh checkout legitimately won't have it.
+    if lml.exists() {
+        assert!(
+            lml.is_file(),
+            "resolved lml path {} exists but is not a file",
+            lml.display()
+        );
+    } else {
+        eprintln!(
+            "note: lml binary not built at {} — build it with `cargo build --release` \
+             in the Lossless submodule (encode_lma asserts existence at run-time preflight)",
+            lml.display()
+        );
+    }
+
+    unsafe {
+        match prev_lml {
+            Some(v) => std::env::set_var("BLUT_LML", v),
+            None => std::env::remove_var("BLUT_LML"),
+        }
+    }
+    restore_overrides(prev);
 }
 
 unsafe fn restore(key: &str, prev: Option<String>) {

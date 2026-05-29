@@ -937,8 +937,27 @@ fn opt_row(key: Option<char>, label: &str, desc: &str) -> Line<'static> {
         Span::styled(format!("{key_str:<4}"), theme::key_hint()),
         Span::raw(" "),
         Span::styled(format!("{label:<28}"), theme::normal()),
-        Span::styled(desc.to_string(), theme::dim()),
+        Span::styled(menu_desc(desc), theme::dim()),
     ])
+}
+
+/// Collapse + clip a recipe/action description to a single menu row.
+/// Recipe `DESCRIPTION` constants are paragraph-length (wrapped across
+/// several source lines); rendered verbatim with `Wrap` they each spill
+/// to 2-3 rows and push lower menu sections (SYSTEM) off a short
+/// terminal. Squashing internal whitespace to single spaces + capping
+/// the length keeps every row to exactly one line so all sections stay
+/// reachable. The full text is still shown in the recipe picker/editor.
+fn menu_desc(desc: &str) -> String {
+    const MAX: usize = 76;
+    let collapsed = desc.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= MAX {
+        collapsed
+    } else {
+        let mut out: String = collapsed.chars().take(MAX.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
 }
 
 /// Cockpit view — the single-column overview, rendered with a vertical
@@ -1932,6 +1951,25 @@ mod render_tests {
                 "right side border drifted at row {y} (expected `│` at col {right_col})"
             );
         }
+    }
+
+    #[test]
+    fn menu_desc_collapses_and_clips_to_one_line() {
+        // Multi-line / over-long descriptions squash to a single
+        // ≤76-char row so lower menu sections stay on-screen.
+        let long = "Full LamQuant SNN pipeline end-to-end: EDF→.lma encode (lml) → \
+             patient-level seizure-stratified split manifest → train → gate.";
+        let d = menu_desc(long);
+        assert!(!d.contains('\n'));
+        assert!(d.chars().count() <= 76, "got {} chars", d.chars().count());
+        assert!(
+            d.ends_with('…'),
+            "long desc must be truncated with ellipsis"
+        );
+        // Short single-line descriptions pass through unchanged.
+        assert_eq!(menu_desc("short desc"), "short desc");
+        // Internal newlines/runs collapse to single spaces.
+        assert_eq!(menu_desc("a\n  b\t c"), "a b c");
     }
 
     #[test]

@@ -48,6 +48,39 @@ impl Artifact for Manifest {
     }
 }
 
+// ── SplitManifest ───────────────────────────────────────────────
+
+/// `split_manifest.json` — patient-level, seizure-stratified
+/// train/val split produced by
+/// `ai_models/dataset_sim/build_seizure_split_manifest.py` (RCP-3).
+/// Schema: `{ "subjects": {sid: "train"|"val"}, "stems_by_subject":
+/// {...}, "meta": {...} }`, consumed by `train_mamba_snn.py
+/// --split-manifest`. Small JSON (<a few MB), so we hash bytes —
+/// the split assignment is the cache-relevant content. Distinct
+/// from `Manifest` (the legacy `manifest_v3.json` window manifest):
+/// this one is the subject-grouped split LMA-direct training
+/// requires.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SplitManifest {
+    pub path: PathBuf,
+    pub content_hash: ContentHash,
+    /// Number of subjects assigned to the train split.
+    pub n_train_subjects: i64,
+    /// Number of subjects assigned to the val split.
+    pub n_val_subjects: i64,
+}
+
+impl Artifact for SplitManifest {
+    const KIND: &'static str = "lamquant.split_manifest";
+    const SCHEMA: u32 = 1;
+    fn content_hash(&self) -> ContentHash {
+        self.content_hash
+    }
+    fn primary_path(&self) -> &Path {
+        &self.path
+    }
+}
+
 // ── FullbandMemmap ──────────────────────────────────────────────
 
 /// `fullband_train.npy` + `fullband_val.npy` pair — bulky memmaps

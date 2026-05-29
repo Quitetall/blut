@@ -15,6 +15,6 @@ pub use dataset::{DatasetJsonl, DatasetSplit};
 pub use eval::EvalReport;
 pub use lamquant::{
     FirmwareBundle, FullbandMemmap, HardenedCkpt, JointCkpt, L3Cache, LmaCorpus, MaeCkpt, Manifest,
-    PccpVerdict, SnnCkpt, SnnLabels, TeacherCkpt,
+    PccpVerdict, SnnCkpt, SnnLabels, SplitManifest, TeacherCkpt,
 };
 pub use preferences::PreferenceJsonl;
