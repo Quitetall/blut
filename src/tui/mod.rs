@@ -727,10 +727,17 @@ fn handle_key(app: &mut App, k: event::KeyEvent) {
                 *cursor = cursor.saturating_sub(1)
             }
             KeyCode::Down | KeyCode::Char('j') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                *cursor += 1
+                // TUI-07: clamp to the last filtered row so Down-past-end
+                // stays in range (and Enter never no-ops on a phantom row).
+                let last = App::filter_recipes(query).len().saturating_sub(1);
+                *cursor = (*cursor + 1).min(last);
             }
             KeyCode::Up => *cursor = cursor.saturating_sub(1),
-            KeyCode::Down => *cursor += 1,
+            KeyCode::Down => {
+                // TUI-07: clamp to the last filtered row.
+                let last = App::filter_recipes(query).len().saturating_sub(1);
+                *cursor = (*cursor + 1).min(last);
+            }
             KeyCode::Backspace => {
                 query.pop();
                 *cursor = 0;
@@ -2018,5 +2025,443 @@ mod render_tests {
                 r.name
             );
         }
+    }
+}
+
+/// Pure state-transition tests for the cockpit (§5.9). These drive the
+/// *key handler* + the pure helper functions directly — no terminal, no
+/// raw mode, no live process / filesystem probes. They assert the
+/// in-memory `App` state after each synthetic key, the fuzzy-filter
+/// ordering, the schema→JSON templates, and the recipe-menu hotkey
+/// assignment invariants.
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// A fresh `App` with no overlay, cockpit view, pointed at a temp
+    /// repo root so nothing in these tests touches the dev tree.
+    fn app() -> App {
+        let mut a = App::new();
+        let tmp = std::env::temp_dir().join(format!(
+            "blut-tui-state-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        a.repo_root = tmp;
+        a
+    }
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+    fn code(kc: KeyCode) -> KeyEvent {
+        KeyEvent::new(kc, KeyModifiers::NONE)
+    }
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    // ── Overlay transitions: None → Picker → Editor → Esc → Ctrl-C ──
+
+    #[test]
+    fn overlay_none_to_picker_open() {
+        let mut a = app();
+        assert!(matches!(a.overlay, Overlay::None));
+        // 'R' opens the recipe picker from the cockpit.
+        handle_key(&mut a, key('R'));
+        assert!(
+            matches!(a.overlay, Overlay::Picker { .. }),
+            "R should open the recipe Picker overlay"
+        );
+    }
+
+    #[test]
+    fn overlay_picker_enter_selects_into_editor() {
+        let mut a = app();
+        handle_key(&mut a, key('R'));
+        // Empty query → all recipes; cursor 0 selects the first filtered
+        // recipe. Enter opens the args Editor for it.
+        let first = RECIPES[App::filter_recipes("")[0]];
+        handle_key(&mut a, code(KeyCode::Enter));
+        match &a.overlay {
+            Overlay::Editor { recipe, .. } => {
+                assert_eq!(*recipe, first.name, "Editor should open the cursor recipe");
+            }
+            _ => panic!("Enter in Picker should transition to Editor, got non-Editor overlay"),
+        }
+    }
+
+    #[test]
+    fn overlay_editor_esc_returns_to_none() {
+        let mut a = app();
+        handle_key(&mut a, key('R')); // → Picker
+        handle_key(&mut a, code(KeyCode::Enter)); // → Editor
+        assert!(matches!(a.overlay, Overlay::Editor { .. }));
+        handle_key(&mut a, code(KeyCode::Esc)); // Esc closes the Editor
+        assert!(
+            matches!(a.overlay, Overlay::None),
+            "Esc in Editor should return to the None overlay"
+        );
+    }
+
+    #[test]
+    fn overlay_picker_esc_returns_to_none() {
+        let mut a = app();
+        handle_key(&mut a, key('R'));
+        assert!(matches!(a.overlay, Overlay::Picker { .. }));
+        handle_key(&mut a, code(KeyCode::Esc));
+        assert!(
+            matches!(a.overlay, Overlay::None),
+            "Esc in Picker should return to the None overlay"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_every_overlay() {
+        // Ctrl-C is the global quit, regardless of overlay state.
+        for setup in 0..3 {
+            let mut a = app();
+            match setup {
+                0 => {}                            // None
+                1 => handle_key(&mut a, key('R')), // Picker
+                _ => {
+                    handle_key(&mut a, key('R'));
+                    handle_key(&mut a, code(KeyCode::Enter)); // Editor
+                }
+            }
+            assert!(!a.quit);
+            handle_key(&mut a, ctrl('c'));
+            assert!(a.quit, "Ctrl-C must set quit from overlay setup {setup}");
+        }
+    }
+
+    #[test]
+    fn full_overlay_round_trip() {
+        // None → Picker → Editor → Esc → None → (Ctrl-C) quit.
+        let mut a = app();
+        handle_key(&mut a, key('R'));
+        assert!(matches!(a.overlay, Overlay::Picker { .. }));
+        handle_key(&mut a, code(KeyCode::Enter));
+        assert!(matches!(a.overlay, Overlay::Editor { .. }));
+        handle_key(&mut a, code(KeyCode::Esc));
+        assert!(matches!(a.overlay, Overlay::None));
+        assert!(!a.quit);
+        handle_key(&mut a, ctrl('c'));
+        assert!(a.quit);
+    }
+
+    #[test]
+    fn editor_typing_appends_and_backspaces_buffer() {
+        let mut a = app();
+        handle_key(&mut a, key('R'));
+        handle_key(&mut a, code(KeyCode::Enter)); // → Editor with template
+        // Capture the prefill, type, then backspace once.
+        let Overlay::Editor { buffer, .. } = &a.overlay else {
+            panic!("expected Editor");
+        };
+        let before = buffer.clone();
+        handle_key(&mut a, key('x'));
+        let Overlay::Editor { buffer, .. } = &a.overlay else {
+            panic!("expected Editor");
+        };
+        assert_eq!(*buffer, format!("{before}x"));
+        handle_key(&mut a, code(KeyCode::Backspace));
+        let Overlay::Editor { buffer, .. } = &a.overlay else {
+            panic!("expected Editor");
+        };
+        assert_eq!(*buffer, before, "Backspace should undo the typed char");
+    }
+
+    // ── filter_recipes fuzzy ordering ───────────────────────────────
+
+    #[test]
+    fn filter_recipes_empty_query_returns_all() {
+        let all = App::filter_recipes("");
+        assert_eq!(
+            all.len(),
+            RECIPES.len(),
+            "empty query must surface every recipe"
+        );
+        // Every catalog index appears exactly once.
+        let mut seen = all.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), RECIPES.len(), "no duplicate / missing indices");
+    }
+
+    #[test]
+    fn filter_recipes_subset_query_orders_best_first() {
+        // "lamquant" matches every lamquant_* recipe; the result must be
+        // a non-empty subset and every returned recipe's name must
+        // actually fuzzy-contain the query subsequence.
+        let q = "lamquant";
+        let res = App::filter_recipes(q);
+        assert!(!res.is_empty(), "`{q}` should match the lamquant recipes");
+        for &idx in &res {
+            let name = RECIPES[idx].name;
+            assert!(
+                is_subsequence(q, name),
+                "fuzzy match returned `{name}` which does not contain `{q}` as a subsequence"
+            );
+        }
+        // A more specific query is a strict-or-equal subset of a broader
+        // prefix query.
+        let broad = App::filter_recipes("lam");
+        assert!(
+            res.len() <= broad.len(),
+            "narrower query must not return more rows than a broader one"
+        );
+    }
+
+    #[test]
+    fn filter_recipes_exact_name_ranks_that_recipe_first() {
+        // Querying a full recipe name should rank that recipe at the top.
+        for r in RECIPES {
+            let res = App::filter_recipes(r.name);
+            assert!(!res.is_empty(), "exact name `{}` matched nothing", r.name);
+            assert_eq!(
+                RECIPES[res[0]].name, r.name,
+                "exact-name query `{}` should rank itself first, got `{}`",
+                r.name, RECIPES[res[0]].name
+            );
+        }
+    }
+
+    #[test]
+    fn filter_recipes_no_match_is_empty() {
+        assert!(
+            App::filter_recipes("zzz_definitely_not_a_recipe_zzz").is_empty(),
+            "an impossible query must return no rows"
+        );
+    }
+
+    /// True iff `needle` appears in `hay` as a (not-necessarily-contiguous)
+    /// subsequence — the property a fuzzy matcher guarantees.
+    fn is_subsequence(needle: &str, hay: &str) -> bool {
+        let mut it = hay.chars();
+        needle.chars().all(|nc| it.any(|hc| hc == nc))
+    }
+
+    // ── template_for: schema → JSON (or {} fallback) ────────────────
+
+    #[test]
+    fn template_for_every_recipe_parses_as_json() {
+        for r in RECIPES {
+            let tpl = App::template_for(r);
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(&tpl);
+            assert!(
+                parsed.is_ok(),
+                "template_for(`{}`) produced unparseable JSON:\n{tpl}",
+                r.name
+            );
+            // Whatever it is, the top level must be a JSON object (the
+            // args dict) — never a bare scalar / array.
+            assert!(
+                parsed.unwrap().is_object(),
+                "template_for(`{}`) must be a JSON object",
+                r.name
+            );
+        }
+    }
+
+    #[test]
+    fn open_editor_prefill_parses_for_every_recipe() {
+        // The hotkey path prefills via lamquant_default_args() else the
+        // schema template. Either way the prefill must be valid JSON so
+        // the user starts from a parseable buffer.
+        for r in RECIPES {
+            let mut a = app();
+            a.open_editor(r);
+            let Overlay::Editor { buffer, .. } = &a.overlay else {
+                panic!(
+                    "open_editor must produce an Editor overlay for `{}`",
+                    r.name
+                );
+            };
+            assert!(
+                serde_json::from_str::<serde_json::Value>(buffer).is_ok(),
+                "open_editor(`{}`) prefilled unparseable JSON:\n{buffer}",
+                r.name
+            );
+        }
+    }
+
+    // ── recipe_menu hotkey assignment ───────────────────────────────
+
+    #[test]
+    fn recipe_menu_has_no_duplicate_hotkeys() {
+        let menu = App::recipe_menu();
+        let mut seen = std::collections::HashSet::new();
+        for (key, r) in &menu {
+            if let Some(c) = key {
+                assert!(
+                    seen.insert(*c),
+                    "duplicate hotkey `{c}` assigned (collides on recipe `{}`)",
+                    r.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recipe_menu_never_reuses_reserved_keys() {
+        // The built-in / navigation keys must never be handed to a recipe
+        // hotkey or the recipe would shadow (or be shadowed by) the
+        // built-in. Mirror the reserved set declared in recipe_menu().
+        let reserved: &[char] = &['q', 'Q', 'r', 'R', 'c', 'C', 'j', 'k', 'l'];
+        for (key, r) in App::recipe_menu() {
+            if let Some(c) = key {
+                assert!(
+                    !reserved.contains(&c),
+                    "recipe `{}` was assigned reserved hotkey `{c}`",
+                    r.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recipe_menu_lists_every_recipe_once() {
+        let menu = App::recipe_menu();
+        assert_eq!(
+            menu.len(),
+            RECIPES.len(),
+            "menu must contain every recipe exactly once"
+        );
+        let mut names: Vec<&str> = menu.iter().map(|(_, r)| r.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), RECIPES.len(), "no duplicate recipe rows");
+    }
+
+    // ── View navigation ─────────────────────────────────────────────
+
+    #[test]
+    fn capital_keys_switch_views() {
+        // Each capital View key, pressed from the cockpit, switches to the
+        // matching View. Invalid keys leave the view unchanged.
+        let cases = [
+            ('J', View::Jobs),
+            ('L', View::Log),
+            ('Y', View::System),
+            ('H', View::History),
+            ('B', View::Leaderboard),
+            ('K', View::Checkpoints),
+            ('P', View::Presets),
+            ('M', View::Metrics),
+            ('X', View::Reset),
+        ];
+        for (c, want) in cases {
+            let mut a = app();
+            assert_eq!(a.view, View::Cockpit);
+            handle_key(&mut a, key(c));
+            assert_eq!(a.view, want, "key `{c}` should switch to {want:?}");
+        }
+    }
+
+    #[test]
+    fn esc_or_b_returns_detail_view_to_cockpit() {
+        // From a detail view, both Esc and 'b' go back to the cockpit.
+        for back in [code(KeyCode::Esc), key('b')] {
+            let mut a = app();
+            handle_key(&mut a, key('J')); // → Jobs
+            assert_eq!(a.view, View::Jobs);
+            handle_key(&mut a, back);
+            assert_eq!(a.view, View::Cockpit, "Esc/b should return to Cockpit");
+        }
+    }
+
+    #[test]
+    fn invalid_key_is_a_noop_in_cockpit() {
+        // A key that is neither a view-switch, built-in, nor recipe
+        // hotkey must not change view, overlay, or quit.
+        let mut a = app();
+        // '@' is not in the recipe hotkey pool (1-9,a-z minus reserved),
+        // not a capital view key, and not a built-in.
+        handle_key(&mut a, key('@'));
+        assert_eq!(a.view, View::Cockpit);
+        assert!(matches!(a.overlay, Overlay::None));
+        assert!(!a.quit);
+    }
+
+    #[test]
+    fn q_quits_from_any_view() {
+        // 'q' is a global quit handled in handle_key_main before view
+        // dispatch, so it works from the cockpit and from detail views.
+        let mut a = app();
+        handle_key(&mut a, key('q'));
+        assert!(a.quit, "q should quit from the cockpit");
+
+        let mut a = app();
+        handle_key(&mut a, key('H')); // → History
+        handle_key(&mut a, key('q'));
+        assert!(a.quit, "q should quit from a detail view");
+    }
+
+    // ── TUI-07: picker cursor clamp (the bug fixed in this change) ───
+
+    #[test]
+    fn picker_down_past_end_clamps_in_range() {
+        // Open the picker, narrow to a single match, then press Down many
+        // times. Before the fix the cursor ran unbounded and Enter
+        // no-op'd on a phantom row; after the fix it clamps to the last
+        // filtered index so Enter always selects a real recipe.
+        let mut a = app();
+        handle_key(&mut a, key('R'));
+        // Type a query that matches exactly one recipe.
+        for ch in "lamquant_encoder".chars() {
+            handle_key(&mut a, key(ch));
+        }
+        let filtered = App::filter_recipes("lamquant_encoder");
+        let last = filtered.len().saturating_sub(1);
+        // Hammer Down well past the end.
+        for _ in 0..50 {
+            handle_key(&mut a, code(KeyCode::Down));
+        }
+        let Overlay::Picker { query, cursor } = &a.overlay else {
+            panic!("expected Picker overlay still open");
+        };
+        let live = App::filter_recipes(query);
+        assert!(
+            *cursor <= last,
+            "cursor {cursor} ran past last filtered index {last} (TUI-07 regressed)"
+        );
+        assert!(
+            live.get(*cursor).is_some(),
+            "cursor {cursor} must index a real filtered row (len {})",
+            live.len()
+        );
+        // And Enter on the clamped cursor must actually open the Editor
+        // (not silently no-op as it did before the clamp).
+        handle_key(&mut a, code(KeyCode::Enter));
+        assert!(
+            matches!(a.overlay, Overlay::Editor { .. }),
+            "Enter at the clamped cursor must open the Editor, not no-op"
+        );
+    }
+
+    #[test]
+    fn picker_down_then_up_stays_in_range_on_empty_query() {
+        // With the full list, Down should advance and never exceed the
+        // last index; Up should walk back without underflowing.
+        let mut a = app();
+        handle_key(&mut a, key('R'));
+        let last = App::filter_recipes("").len().saturating_sub(1);
+        for _ in 0..(RECIPES.len() + 20) {
+            handle_key(&mut a, code(KeyCode::Down));
+        }
+        let Overlay::Picker { cursor, .. } = &a.overlay else {
+            panic!("expected Picker");
+        };
+        assert_eq!(*cursor, last, "Down must saturate at the last index");
+        for _ in 0..(RECIPES.len() + 20) {
+            handle_key(&mut a, code(KeyCode::Up));
+        }
+        let Overlay::Picker { cursor, .. } = &a.overlay else {
+            panic!("expected Picker");
+        };
+        assert_eq!(*cursor, 0, "Up must saturate at 0");
     }
 }

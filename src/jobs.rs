@@ -200,7 +200,7 @@ pub fn list_jobs() -> Result<Vec<JobSummary>> {
 }
 
 fn summarize(id: &str) -> JobSummary {
-    let state = read_state(id).unwrap_or(JobState::Running);
+    let on_disk_state = read_state(id).unwrap_or(JobState::Running);
     let pid = read_pid(id).unwrap_or(None);
     let spec = read_spec(id).ok();
     let updates = read_status(id).unwrap_or_default();
@@ -217,6 +217,14 @@ fn summarize(id: &str) -> JobSummary {
             _ => {}
         }
     }
+    // MONITOR-2: the on-disk `state` file only flips to a terminal value
+    // when blut runs the cancel / completion path. A job whose process
+    // crashed or was SIGKILL'd out-of-band (OOM killer, host reboot,
+    // manual `kill -9`) leaves `state=running` on disk forever, so the
+    // cockpit shows it Running indefinitely. Reconcile liveness against
+    // the recorded pid: if a Running job has a real recorded pid that is
+    // *definitively* gone, report it as Failed instead.
+    let state = reconcile_liveness(on_disk_state, pid);
     JobSummary {
         id: id.to_string(),
         state,
@@ -226,6 +234,55 @@ fn summarize(id: &str) -> JobSummary {
         last_step,
         final_loss,
     }
+}
+
+/// MONITOR-2 reconciliation. Given the on-disk job state and the
+/// recorded pid (the child process-group leader written to the `pid`
+/// file at spawn), decide the *reported* state.
+///
+/// Conservative by design — only reclassifies `Running` → `Failed` when
+/// **all** of the following hold, so a just-spawned job is never falsely
+/// reported dead:
+///   * the on-disk state is `Running` (terminal states are authoritative
+///     and never second-guessed),
+///   * a pid was actually recorded (`Some`) — a job that hasn't published
+///     its child pid yet is left Running, and
+///   * that pid is *definitively gone* (`kill(pid,0)` → `ESRCH`).
+///     An `Unsignalable` (EPERM) pid still exists (owned by another user
+///     / reparented to init); we treat "exists but can't signal" as
+///     alive and leave it Running rather than risk a false Failed.
+fn reconcile_liveness(on_disk: JobState, pid: Option<u32>) -> JobState {
+    if on_disk != JobState::Running {
+        return on_disk;
+    }
+    match pid {
+        // A recorded pid that is *definitively* gone → the process tree
+        // crashed; report Failed. `pid_definitely_gone` returns false for
+        // both "alive" and "exists-but-unsignalable", so we never falsely
+        // mark a live (or merely unsignalable) job Failed.
+        Some(pid) if pid_definitely_gone(pid) => JobState::Failed,
+        // Live pid, unsignalable pid, or no recorded pid yet (foreground
+        // job / child not spawned): nothing definitive — leave it Running.
+        _ => JobState::Running,
+    }
+}
+
+/// True iff the recorded pid is *definitively* gone (`kill(pid,0)` →
+/// `ESRCH`). Returns false when the process exists, when it exists but
+/// is unsignalable (EPERM), or when liveness can't be determined (non-
+/// Unix) — i.e. errs on the side of "still alive" so a healthy job is
+/// never reported Failed.
+#[cfg(unix)]
+fn pid_definitely_gone(pid: u32) -> bool {
+    use crate::python_kill::PidStatus;
+    matches!(crate::python_kill::pid_alive(pid), PidStatus::Gone)
+}
+
+#[cfg(not(unix))]
+fn pid_definitely_gone(_pid: u32) -> bool {
+    // No portable cheap liveness probe off-Unix; never false-positive a
+    // crash.
+    false
 }
 
 /// Render a job dir layout summary as plain text — used by the
@@ -586,5 +643,120 @@ mod tests {
         let (y, m, _d, h, mi, se) = unix_to_ymdhms(1_778_761_896);
         assert_eq!((y, m), (2026, 5));
         assert_eq!((h, mi, se), (12, 31, 36));
+    }
+
+    // ── MONITOR-2: JobState liveness reconciliation ─────────────────
+
+    /// The conservative guards on `reconcile_liveness`, exercised
+    /// directly (no process needed): terminal states pass through
+    /// untouched, and a Running job with no recorded pid stays Running.
+    #[test]
+    fn reconcile_liveness_is_conservative() {
+        // Terminal states are authoritative — never second-guessed even
+        // with a definitely-dead pid (pid 1 is init; we pass None to keep
+        // it deterministic, and also a clearly-dead-shaped pid below).
+        assert_eq!(
+            reconcile_liveness(JobState::Done, Some(999_999_999)),
+            JobState::Done
+        );
+        assert_eq!(reconcile_liveness(JobState::Failed, None), JobState::Failed);
+        assert_eq!(
+            reconcile_liveness(JobState::Cancelled, Some(999_999_999)),
+            JobState::Cancelled
+        );
+        // Running with NO recorded pid → left Running (don't false-fail a
+        // just-spawned job that hasn't published its pid yet).
+        assert_eq!(
+            reconcile_liveness(JobState::Running, None),
+            JobState::Running
+        );
+    }
+
+    /// MONITOR-2 core: a job left in `Running` on disk whose recorded pid
+    /// is definitively dead must be REPORTED as `Failed` by the listing
+    /// path (`list_jobs`/`summarize`). We get a guaranteed-dead pid by
+    /// spawning a trivial process, reaping it, and polling until the
+    /// kernel reports it gone.
+    #[cfg(unix)]
+    #[test]
+    fn dead_pid_running_job_reconciled_to_failed() {
+        use crate::python_kill::{PidStatus, pid_alive};
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        // Spawn + reap a short-lived process so its pid is definitively
+        // gone (and reaped → no zombie keeping it "alive").
+        let mut child = Command::new("true").spawn().expect("spawn `true`");
+        let dead_pid = child.id();
+        child.wait().expect("reap `true`");
+        // Poll until the kernel reports the pid gone (ESRCH). If it never
+        // goes (pid reused by an unrelated process within the window),
+        // skip rather than assert a flaky result.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pid_alive(dead_pid) != PidStatus::Gone && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if pid_alive(dead_pid) != PidStatus::Gone {
+            eprintln!("skipping: pid {dead_pid} did not become Gone (reused?)");
+            return;
+        }
+
+        with_jobs_dir(|| {
+            let id = "20260528-120000-000000001";
+            // On-disk state says Running, but the recorded pid is dead.
+            write_state(id, JobState::Running).unwrap();
+            write_pid(id, dead_pid).unwrap();
+
+            let listed = list_jobs().unwrap();
+            let job = listed.iter().find(|j| j.id == id).expect("job listed");
+            assert_eq!(
+                job.state,
+                JobState::Failed,
+                "dead-pid Running job must be reported Failed (MONITOR-2)"
+            );
+            // The on-disk `state` file is left untouched (reconciliation
+            // is report-only here) — the pid is still surfaced.
+            assert_eq!(read_state(id).unwrap(), JobState::Running);
+            assert_eq!(job.pid, Some(dead_pid));
+        });
+    }
+
+    /// A Running job whose recorded pid is a *live* process must stay
+    /// Running — the reconciliation must not false-positive a healthy
+    /// job.
+    #[cfg(unix)]
+    #[test]
+    fn live_pid_running_job_stays_running() {
+        use std::process::Command;
+
+        // A real, live child that outlives the assertion.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn `sleep 30`");
+        let live_pid = child.id();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_jobs_dir(|| {
+                let id = "20260528-120000-000000002";
+                write_state(id, JobState::Running).unwrap();
+                write_pid(id, live_pid).unwrap();
+
+                let listed = list_jobs().unwrap();
+                let job = listed.iter().find(|j| j.id == id).expect("job listed");
+                assert_eq!(
+                    job.state,
+                    JobState::Running,
+                    "live-pid Running job must stay Running (no false Failed)"
+                );
+            });
+        }));
+
+        // Always clean up the live child, even if the assertion panicked.
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Err(p) = result {
+            std::panic::resume_unwind(p);
+        }
     }
 }

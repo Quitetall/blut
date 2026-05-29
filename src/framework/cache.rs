@@ -502,6 +502,85 @@ mod tests {
         assert!(h.lookup(key).is_none());
     }
 
+    /// §5.1 "Cache CORRUPT `.bin`": a `output.bin` that is a *truncated*
+    /// copy of a once-valid bincode `ErasedArtifact` must DOWNGRADE to a
+    /// miss (return `None`, triggering a re-run) — never panic and never
+    /// hand back a garbage / partially-decoded artifact.
+    #[test]
+    fn lookup_downgrades_truncated_valid_entry_to_miss() {
+        let td = tempfile::tempdir().unwrap();
+        let h = CacheHandle::job_local(td.path().to_path_buf());
+        let key = ContentHash::of_bytes(b"truncated");
+        let dir = td.path().join(key.to_hex());
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Serialize a real, well-formed cache entry first…
+        let good = bincode::serialize(&fake_erased(serde_json::json!({"n": 42}))).unwrap();
+        assert!(good.len() > 4, "fixture must be long enough to truncate");
+        // …then write only its first few bytes (the length prefix +
+        // partial payload) so the on-disk record is a torn write.
+        std::fs::write(dir.join("output.bin"), &good[..good.len() / 2]).unwrap();
+
+        // No panic, and the lookup reports a clean miss.
+        assert!(
+            h.lookup(key).is_none(),
+            "truncated bincode must downgrade to a cache miss"
+        );
+    }
+
+    /// §5.1 "Cache CORRUPT `.bin`": pure garbage (not even a valid
+    /// bincode prefix) must also downgrade to a miss without panicking.
+    #[test]
+    fn lookup_downgrades_garbage_entry_to_miss() {
+        let td = tempfile::tempdir().unwrap();
+        let h = CacheHandle::job_local(td.path().to_path_buf());
+        let key = ContentHash::of_bytes(b"garbage");
+        let dir = td.path().join(key.to_hex());
+        std::fs::create_dir_all(&dir).unwrap();
+        // A bincode length prefix claiming a huge string, followed by no
+        // data — the classic "allocator bomb" corrupt-frame shape. The
+        // deserializer must error (not OOM / panic), and lookup returns
+        // None.
+        let mut garbage = Vec::new();
+        garbage.extend_from_slice(&u64::MAX.to_le_bytes()); // bogus length
+        garbage.extend_from_slice(b"\x00not-a-valid-record\xff\xfe");
+        std::fs::write(dir.join("output.bin"), &garbage).unwrap();
+        assert!(
+            h.lookup(key).is_none(),
+            "garbage bytes must downgrade to a cache miss, not panic"
+        );
+
+        // Empty file is also corrupt-shaped (truncated to zero) → miss.
+        std::fs::write(dir.join("output.bin"), b"").unwrap();
+        assert!(
+            h.lookup(key).is_none(),
+            "empty output.bin must downgrade to a cache miss"
+        );
+    }
+
+    /// A *valid* entry written right after a corrupt one was evicted /
+    /// overwritten still hits — i.e. the downgrade-to-miss path doesn't
+    /// poison the key. Guards against a regression where a corrupt read
+    /// might cache a negative result.
+    #[test]
+    fn corrupt_then_valid_entry_hits() {
+        let td = tempfile::tempdir().unwrap();
+        let h = CacheHandle::job_local(td.path().to_path_buf());
+        let key = ContentHash::of_bytes(b"recover");
+        let dir = td.path().join(key.to_hex());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("output.bin"), [0x01u8, 0x02, 0x03]).unwrap();
+        assert!(h.lookup(key).is_none(), "corrupt first read → miss");
+        // Overwrite with a valid record (insert uses atomic rename).
+        h.insert(key, &fake_erased(serde_json::json!({"ok": true})))
+            .unwrap();
+        let hit = h.lookup(key).expect("valid entry must now hit");
+        assert_eq!(
+            decode_payload(&hit.artifact),
+            serde_json::json!({"ok": true})
+        );
+    }
+
     #[test]
     fn shared_cache_writes_go_to_global() {
         let td = tempfile::tempdir().unwrap();
