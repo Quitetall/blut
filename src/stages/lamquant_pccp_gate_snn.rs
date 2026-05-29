@@ -26,8 +26,9 @@ use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
 use crate::lamquant_backend::{
-    default_lamquant_home, resolve_lamquant_python, LamquantBackend, LamquantInvocation,
+    resolve_lamquant_python, LamquantBackend, LamquantInvocation,
 };
+use crate::stages::lamquant_helpers::resolve_home;
 
 pub struct LamquantPccpGateSnn;
 
@@ -92,17 +93,13 @@ impl Stage for LamquantPccpGateSnn {
         input: SnnCkpt,
         args: &Args,
     ) -> Result<PccpVerdict, StageError> {
-        let lamquant_home_raw = if args.lamquant_home.is_empty() {
-            default_lamquant_home()
-        } else {
-            PathBuf::from(&args.lamquant_home)
-        };
-        let lamquant_home = std::fs::canonicalize(&lamquant_home_raw).map_err(|e| {
-            StageError::BadInput(format!(
-                "lamquant_home not found: {} ({e})",
-                lamquant_home_raw.display()
-            ))
-        })?;
+        // RCP-1/RCP-7/RCP-9: empty home → detected `ai_models_root`
+        // (the `LamQuant-Neural` submodule). Both `ai_models/pccp_gate.py`
+        // and the `pccp/verification_records/` tree the gate writes live
+        // under that root post-split, so a single resolved home anchors
+        // the script lookup, the cwd (gate resolves `pccp/` relative to
+        // itself), and the verdict-file read below.
+        let lamquant_home = resolve_home(&args.lamquant_home)?;
         let python = resolve_lamquant_python(&lamquant_home);
         let script = lamquant_home.join("ai_models").join("pccp_gate.py");
         if !script.exists() {

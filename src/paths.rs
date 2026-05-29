@@ -6,7 +6,7 @@
 //! for the bundled trainer.py during dev, XDG `data_local_dir/lamu/`
 //! for everything else).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Result, TrainError};
 
@@ -46,6 +46,274 @@ pub fn data_dir() -> Result<PathBuf> {
         TrainError::other("data_local_dir() unavailable; set $LAMU_TRAIN_DATA_DIR")
     })?;
     Ok(base.join("lamu").join("train-data"))
+}
+
+// ─────────────────────────────────────────────────────────────────
+// LamQuant multi-root resolution (RCP-1 / RCP-7 / RCP-9)
+//
+// The monorepo→submodule split scattered the wrapped python scripts
+// across THREE roots, none of which is `blut`'s own location:
+//
+//   • `ai_models/`  lives in the sibling submodule `LamQuant-Neural/`
+//     (e.g. `LamQuant-Neural/ai_models/snn/train_mamba_snn.py`).
+//   • `scripts/`    lives at the META-repo root
+//     (e.g. `<meta>/scripts/bulk_lml_to_lma.py`).
+//   • `pccp/`       lives wherever the gate script + registry sit
+//     (currently `LamQuant-Neural/pccp/`).
+//
+// A single `lamquant_home` cannot satisfy both `<home>/ai_models/`
+// and `<home>/scripts/` at once, so the old single-root resolution
+// made every LamQuant recipe die at its stage-1 `script.exists()`
+// preflight. `LamquantRoots` resolves each root independently, with
+// an explicit env override per root and a meta-repo auto-detect.
+// ─────────────────────────────────────────────────────────────────
+
+/// Canonical labels NPZ root (RCP-6). The monorepo split left three
+/// drifted label paths (`<home>/ai_models/snn/labels`,
+/// `/mnt/4tb/LamQuant/ai_models/snn/labels`, …); this is the single
+/// source of truth, shared by the convert stage + the wrapped
+/// `bulk_lml_to_lma.py` default. Override per-run via the stage's
+/// `labels_dir_rel` arg or the packer's `--labels-dir`.
+pub const DEFAULT_LABELS_DIR: &str = "/mnt/4tb/data/Training/labels";
+
+/// The three (plus firmware) filesystem roots the LamQuant recipe
+/// stages resolve their wrapped scripts against. Each root is the
+/// directory that *contains* the named subtree (so `ai_models_root`
+/// holds `ai_models/`, not `ai_models/` itself).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LamquantRoots {
+    /// Dir containing `ai_models/`. Default `<meta>/LamQuant-Neural`.
+    pub ai_models_root: PathBuf,
+    /// Dir containing `scripts/`. Default `<meta>` (meta-repo root).
+    pub scripts_root: PathBuf,
+    /// Dir containing `pccp/` (registry + verification_records).
+    /// Default: wherever `pccp/` is found (currently `ai_models_root`).
+    pub pccp_root: PathBuf,
+}
+
+/// Detect the LamQuant meta-repo root: the directory that owns the
+/// submodules (`blut/`, `LamQuant-Neural/`, …).
+///
+/// Detection order:
+///   1. `$BLUT_META_ROOT` (explicit override).
+///   2. Walk up from `$CARGO_MANIFEST_DIR` (dev/cargo-test) then from
+///      `current_exe()` (installed), looking for a dir that both has
+///      a `.gitmodules` AND a `LamQuant-Neural/` child — the
+///      unambiguous meta-repo signature.
+///   3. Sensible default `/mnt/4tb/LamQuant`.
+///
+/// Returns a clean `Err` only if every candidate is unusable AND the
+/// default does not exist, so callers never panic.
+pub fn meta_repo_root() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("BLUT_META_ROOT") {
+        let p = PathBuf::from(p);
+        if p.is_dir() {
+            return Ok(p);
+        }
+        return Err(TrainError::other(format!(
+            "$BLUT_META_ROOT={} is not a directory",
+            p.display()
+        )));
+    }
+
+    let mut starts: Vec<PathBuf> = Vec::new();
+    // CARGO_MANIFEST_DIR points at `<meta>/blut` during dev/test.
+    starts.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            starts.push(dir.to_path_buf());
+        }
+    }
+    for start in &starts {
+        if let Some(meta) = walk_up_for_meta(start) {
+            return Ok(meta);
+        }
+    }
+
+    let default = PathBuf::from("/mnt/4tb/LamQuant");
+    if default.is_dir() {
+        return Ok(default);
+    }
+    Err(TrainError::other(format!(
+        "could not detect the LamQuant meta-repo: no ancestor of {:?} has \
+         both .gitmodules and LamQuant-Neural/, and the default {} does not \
+         exist. Set $BLUT_META_ROOT (or the per-root $BLUT_AI_MODELS / \
+         $BLUT_SCRIPTS / $BLUT_PCCP) to override.",
+        starts,
+        default.display()
+    )))
+}
+
+/// Walk up from `start` looking for the meta-repo signature
+/// (`.gitmodules` + `LamQuant-Neural/`). Returns the first match.
+fn walk_up_for_meta(start: &Path) -> Option<PathBuf> {
+    let mut cur: Option<&Path> = Some(start);
+    while let Some(dir) = cur {
+        let has_gitmodules = dir.join(".gitmodules").is_file();
+        let has_neural = dir.join("LamQuant-Neural").is_dir();
+        if has_gitmodules && has_neural {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+impl LamquantRoots {
+    /// Resolve all roots from env overrides + meta-repo detection.
+    ///
+    /// Per-root env overrides (each takes precedence over detection):
+    ///   • `$BLUT_AI_MODELS` (or `$LAMQUANT_NEURAL`) → `ai_models_root`
+    ///   • `$BLUT_SCRIPTS`                            → `scripts_root`
+    ///   • `$BLUT_PCCP`                               → `pccp_root`
+    ///
+    /// Without overrides:
+    ///   • `ai_models_root` = `<meta>/LamQuant-Neural` if it holds
+    ///     `ai_models/`, else `<meta>` (monorepo fallback).
+    ///   • `scripts_root`   = `<meta>` if it holds `scripts/`, else
+    ///     `ai_models_root` if IT holds `scripts/`.
+    ///   • `pccp_root`      = first of [`ai_models_root`, `<meta>`]
+    ///     that holds `pccp/`.
+    ///
+    /// Each resolved root is validated to contain its named subtree;
+    /// a missing root yields a clean `Err` (never a panic).
+    pub fn resolve() -> Result<Self> {
+        let meta = meta_repo_root().ok();
+        let ai_models_root = resolve_ai_models_root(meta.as_deref())?;
+        let scripts_root = resolve_scripts_root(meta.as_deref(), &ai_models_root)?;
+        let pccp_root = resolve_pccp_root(meta.as_deref(), &ai_models_root)?;
+        Ok(Self {
+            ai_models_root,
+            scripts_root,
+            pccp_root,
+        })
+    }
+
+    /// Build + existence-check the absolute path to a script under
+    /// `ai_models/`. `rel` is the path RELATIVE to `ai_models_root`
+    /// and MUST start with `ai_models` (kept explicit so call sites
+    /// read like the on-disk layout). Clean `Err` if absent.
+    pub fn ai_models_script(&self, rel: &[&str]) -> Result<PathBuf> {
+        join_existing(&self.ai_models_root, rel, "ai_models", "BLUT_AI_MODELS")
+    }
+
+    /// Build + existence-check a script under `scripts/`. `rel` is
+    /// relative to `scripts_root` and MUST start with `scripts`.
+    pub fn scripts_script(&self, rel: &[&str]) -> Result<PathBuf> {
+        join_existing(&self.scripts_root, rel, "scripts", "BLUT_SCRIPTS")
+    }
+}
+
+/// `$BLUT_AI_MODELS` / `$LAMQUANT_NEURAL` → `<meta>/LamQuant-Neural`
+/// (if it holds `ai_models/`) → `<meta>` (monorepo fallback).
+fn resolve_ai_models_root(meta: Option<&Path>) -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("BLUT_AI_MODELS").or_else(|_| std::env::var("LAMQUANT_NEURAL")) {
+        let p = PathBuf::from(p);
+        return validate_holds(p, "ai_models", "$BLUT_AI_MODELS");
+    }
+    let meta = meta.ok_or_else(|| {
+        TrainError::other(
+            "ai_models_root: meta-repo not detected; set $BLUT_AI_MODELS to the dir holding ai_models/",
+        )
+    })?;
+    let neural = meta.join("LamQuant-Neural");
+    if neural.join("ai_models").is_dir() {
+        return Ok(neural);
+    }
+    if meta.join("ai_models").is_dir() {
+        return Ok(meta.to_path_buf());
+    }
+    Err(TrainError::other(format!(
+        "ai_models/ not found under {} or {}; set $BLUT_AI_MODELS",
+        neural.display(),
+        meta.display()
+    )))
+}
+
+/// `$BLUT_SCRIPTS` → `<meta>` (if it holds `scripts/`) → `ai_models_root`.
+fn resolve_scripts_root(meta: Option<&Path>, ai_models_root: &Path) -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("BLUT_SCRIPTS") {
+        let p = PathBuf::from(p);
+        return validate_holds(p, "scripts", "$BLUT_SCRIPTS");
+    }
+    if let Some(meta) = meta {
+        if meta.join("scripts").is_dir() {
+            return Ok(meta.to_path_buf());
+        }
+    }
+    if ai_models_root.join("scripts").is_dir() {
+        return Ok(ai_models_root.to_path_buf());
+    }
+    Err(TrainError::other(format!(
+        "scripts/ not found under the meta-repo or {}; set $BLUT_SCRIPTS",
+        ai_models_root.display()
+    )))
+}
+
+/// `$BLUT_PCCP` → first dir holding `pccp/`, searched in order:
+/// `ai_models_root`, `<meta>/LamQuant-Neural`, `<meta>`. The Neural
+/// submodule is checked explicitly so a `BLUT_AI_MODELS` override (to
+/// a stub) doesn't lose the real `LamQuant-Neural/pccp/` that the gate
+/// stages read.
+fn resolve_pccp_root(meta: Option<&Path>, ai_models_root: &Path) -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("BLUT_PCCP") {
+        let p = PathBuf::from(p);
+        return validate_holds(p, "pccp", "$BLUT_PCCP");
+    }
+    let mut candidates: Vec<PathBuf> = vec![ai_models_root.to_path_buf()];
+    if let Some(meta) = meta {
+        candidates.push(meta.join("LamQuant-Neural"));
+        candidates.push(meta.to_path_buf());
+    }
+    for c in &candidates {
+        if c.join("pccp").is_dir() {
+            return Ok(c.clone());
+        }
+    }
+    Err(TrainError::other(format!(
+        "pccp/ not found under {:?}; set $BLUT_PCCP",
+        candidates
+    )))
+}
+
+/// Validate that `root` holds the `expects` subtree; clean `Err`
+/// naming the env var to set if not.
+fn validate_holds(root: PathBuf, expects: &str, env_name: &str) -> Result<PathBuf> {
+    if root.join(expects).is_dir() {
+        Ok(root)
+    } else {
+        Err(TrainError::other(format!(
+            "{} does not hold {}/ (from {})",
+            root.display(),
+            expects,
+            env_name
+        )))
+    }
+}
+
+/// Join `rel` onto `root`, assert the leading component matches
+/// `expect_first` (guards against call-site drift), and assert the
+/// final path exists. Clean `Err` naming the override env var.
+fn join_existing(root: &Path, rel: &[&str], expect_first: &str, env_name: &str) -> Result<PathBuf> {
+    debug_assert_eq!(
+        rel.first().copied(),
+        Some(expect_first),
+        "ai_models_script/scripts_script rel must start with {expect_first}"
+    );
+    let mut p = root.to_path_buf();
+    for c in rel {
+        p.push(c);
+    }
+    if p.exists() {
+        Ok(p)
+    } else {
+        Err(TrainError::other(format!(
+            "{} not found (root {}; override with ${})",
+            p.display(),
+            root.display(),
+            env_name
+        )))
+    }
 }
 
 /// Resolve the python interpreter to run trainer.py with.

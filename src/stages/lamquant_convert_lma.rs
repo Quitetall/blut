@@ -22,7 +22,8 @@ use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
 use crate::lamquant_backend::{LamquantBackend, LamquantInvocation};
 use crate::stages::lamquant_helpers::{
-    blut_env, progress_forwarder, push_opt_u32, python_for, resolve_home, safe_join,
+    blut_env, progress_forwarder, push_opt_u32, python_for, resolve_home, resolve_roots,
+    safe_join, scripts_script,
 };
 
 pub struct LamquantConvertLma;
@@ -36,7 +37,8 @@ pub struct Args {
     #[serde(default)]
     pub lml_root: String,
     /// Labels NPZ directory (relative to lamquant_home). Empty =
-    /// builder default (`ai_models/snn/labels`).
+    /// the unified canonical labels root
+    /// (`crate::paths::DEFAULT_LABELS_DIR`, RCP-6).
     #[serde(default)]
     pub labels_dir_rel: String,
     /// Output LMA corpus directory. Required.
@@ -77,15 +79,23 @@ impl Stage for LamquantConvertLma {
     ) -> Result<LmaCorpus, StageError> {
         let home = resolve_home(&args.lamquant_home)?;
         let python = python_for(&home);
-        let script = home
-            .join("scripts")
-            .join("bulk_lml_to_lma.py");
-        if !script.exists() {
-            return Err(StageError::BadInput(format!(
-                "bulk_lml_to_lma.py not found: {}",
-                script.display()
-            )));
-        }
+        // RCP-1/RCP-7: `scripts/` lives at the meta-repo root, not
+        // under `ai_models_root`. When the caller pins an explicit
+        // `lamquant_home`, honor it as the scripts root (hermetic
+        // tests lay `scripts/bulk_lml_to_lma.py` under it); otherwise
+        // resolve via the detected multi-root layout.
+        let script = if args.lamquant_home.is_empty() {
+            scripts_script(&resolve_roots()?, &["scripts", "bulk_lml_to_lma.py"])?
+        } else {
+            let s = home.join("scripts").join("bulk_lml_to_lma.py");
+            if !s.exists() {
+                return Err(StageError::BadInput(format!(
+                    "bulk_lml_to_lma.py not found: {}",
+                    s.display()
+                )));
+            }
+            s
+        };
         if args.output_dir.as_os_str().is_empty() {
             return Err(StageError::BadInput(
                 "output_dir is required for lamquant_convert_lma".into(),
@@ -139,8 +149,12 @@ impl Stage for LamquantConvertLma {
             });
         }
 
+        // RCP-6: unify the labels-dir default to the canonical
+        // `/mnt/4tb/data/Training/labels` root (was the dead
+        // monorepo path `<home>/ai_models/snn/labels`). An explicit
+        // relative override still resolves under `home`.
         let labels_dir = if args.labels_dir_rel.is_empty() {
-            home.join("ai_models").join("snn").join("labels")
+            PathBuf::from(crate::paths::DEFAULT_LABELS_DIR)
         } else {
             safe_join(&home, &args.labels_dir_rel)?
         };

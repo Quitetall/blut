@@ -10,8 +10,6 @@
 //! → identical manifest. Holdout patient selection is RNG-driven
 //! but seeded, so `DETERMINISTIC = true` (default).
 
-use std::path::PathBuf;
-
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -21,8 +19,9 @@ use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
 use crate::lamquant_backend::{
-    default_lamquant_home, resolve_lamquant_python, LamquantBackend, LamquantInvocation,
+    resolve_lamquant_python, LamquantBackend, LamquantInvocation,
 };
+use crate::stages::lamquant_helpers::resolve_home;
 
 pub struct LamquantBuildManifest;
 
@@ -71,17 +70,10 @@ impl Stage for LamquantBuildManifest {
         _input: (),
         args: &Args,
     ) -> Result<Manifest, StageError> {
-        let lamquant_home = if args.lamquant_home.is_empty() {
-            default_lamquant_home()
-        } else {
-            PathBuf::from(&args.lamquant_home)
-        };
-        if !lamquant_home.exists() {
-            return Err(StageError::BadInput(format!(
-                "lamquant_home not found: {}",
-                lamquant_home.display()
-            )));
-        }
+        // RCP-1/RCP-7: empty home → detected `ai_models_root`
+        // (the `LamQuant-Neural` submodule holding
+        // `ai_models/dataset_sim/build_manifest.py`).
+        let lamquant_home = resolve_home(&args.lamquant_home)?;
         let python = resolve_lamquant_python(&lamquant_home);
         let script = lamquant_home
             .join("ai_models")

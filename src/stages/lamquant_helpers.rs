@@ -11,12 +11,54 @@ use crate::framework::status::StageEvent;
 use crate::lamquant_backend::{
     default_lamquant_home, resolve_lamquant_python, Progress,
 };
+use crate::paths::LamquantRoots;
+
+/// Resolve the multi-root LamQuant layout (RCP-1 / RCP-7), mapping a
+/// resolution failure into `StageError::BadInput` so a missing root
+/// surfaces as a clear preflight error rather than a low-level panic.
+///
+/// This is the structural fix for the submodule split: `ai_models/`
+/// lives in the `LamQuant-Neural/` sibling submodule while `scripts/`
+/// is at the meta-repo root, so a single `lamquant_home` can no longer
+/// satisfy both. Stages call this once, then resolve their wrapped
+/// script via `roots.ai_models_script(...)` / `roots.scripts_script(...)`.
+pub fn resolve_roots() -> Result<LamquantRoots, StageError> {
+    LamquantRoots::resolve().map_err(|e| StageError::BadInput(e.to_string()))
+}
+
+/// Resolve + existence-check a script under `scripts/` (at the
+/// meta-repo root post-split). `rel` MUST start with `"scripts"`.
+/// `BadInput` on miss.
+///
+/// (The `ai_models/` analogue isn't a separate helper here: the
+/// `ai_models/*` stages keep using `resolve_home` + `script_path`,
+/// where the resolved home already IS `ai_models_root`. Direct
+/// callers / tests use `LamquantRoots::ai_models_script`.)
+pub fn scripts_script(roots: &LamquantRoots, rel: &[&str]) -> Result<PathBuf, StageError> {
+    roots
+        .scripts_script(rel)
+        .map_err(|e| StageError::BadInput(e.to_string()))
+}
 
 /// Canonicalize and validate `lamquant_home`. Returns the absolute
 /// path. `BadInput` if the path is missing or not canonicalizable.
+///
+/// When `raw` is empty the home defaults to the resolved
+/// `ai_models_root` (the `LamQuant-Neural` submodule post-split),
+/// which is where the `ai_models/*` scripts live AND where they write
+/// their checkpoints (`weights/…`, `ai_models/<sub>/…ckpt`). This is
+/// the RCP-1/RCP-7 fix: the old `~/Desktop/LamQuant` default no longer
+/// holds `ai_models/`. An explicit `raw` is still honored verbatim for
+/// hermetic tests + bespoke layouts.
 pub fn resolve_home(raw: &str) -> Result<PathBuf, StageError> {
     let raw_path = if raw.is_empty() {
-        default_lamquant_home()
+        match resolve_roots() {
+            Ok(roots) => roots.ai_models_root,
+            // Fall back to the legacy env/Desktop default so the
+            // error message points at a path the user recognizes
+            // rather than an opaque detection failure.
+            Err(_) => default_lamquant_home(),
+        }
     } else {
         PathBuf::from(raw)
     };

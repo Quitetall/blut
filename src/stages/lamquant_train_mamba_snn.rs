@@ -27,8 +27,9 @@ use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
 use crate::lamquant_backend::{
-    default_lamquant_home, resolve_lamquant_python, LamquantBackend, LamquantInvocation,
+    resolve_lamquant_python, LamquantBackend, LamquantInvocation,
 };
+use crate::stages::lamquant_helpers::resolve_home;
 
 pub struct LamquantTrainMambaSnn;
 
@@ -118,23 +119,13 @@ impl Stage for LamquantTrainMambaSnn {
         input: LmaCorpus,
         args: &Args,
     ) -> Result<SnnCkpt, StageError> {
-        let lamquant_home_raw = if args.lamquant_home.is_empty() {
-            default_lamquant_home()
-        } else {
-            PathBuf::from(&args.lamquant_home)
-        };
-        // Canonicalize the repo root so every subsequent path
-        // (script lookup, expected_outputs, traversal check) is
-        // anchored against an absolute path regardless of the
-        // caller's cwd at invocation time. A nonexistent path
-        // surfaces as `BadInput` for a clear preflight message
-        // instead of a low-level Io error.
-        let lamquant_home = std::fs::canonicalize(&lamquant_home_raw).map_err(|e| {
-            StageError::BadInput(format!(
-                "lamquant_home not found or not canonicalizable: {} ({e})",
-                lamquant_home_raw.display()
-            ))
-        })?;
+        // RCP-1/RCP-7: an empty `lamquant_home` resolves to the
+        // detected `ai_models_root` (the `LamQuant-Neural` submodule),
+        // which holds both `ai_models/snn/train_mamba_snn.py` and the
+        // `weights/` checkpoint tree this stage writes. `resolve_home`
+        // canonicalizes + surfaces a missing root as a clear
+        // `BadInput` preflight error instead of a low-level Io error.
+        let lamquant_home = resolve_home(&args.lamquant_home)?;
         let python = resolve_lamquant_python(&lamquant_home);
         let script = lamquant_home
             .join("ai_models")
