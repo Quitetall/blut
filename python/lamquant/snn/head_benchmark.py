@@ -101,7 +101,7 @@ def run_head(head, backbone, signal_batch, device) -> dict:
     with torch.no_grad():
         for chunk in signal_batch:  # chunk: [21, 2500] float32 tensor
             x = chunk.unsqueeze(0).to(device)              # [1, 21, 2500]
-            logits, _ = backbone(x)                        # [1, 8, T_out]
+            logits = backbone(x)[0]                        # [1, 8, T_out] (B4: 3-tuple)
             if device.type == "cuda":
                 torch.cuda.synchronize()
             t0 = time.perf_counter()

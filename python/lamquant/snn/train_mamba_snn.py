@@ -50,6 +50,9 @@ from snn_training_config import SNN_CONFIGS, SNNConfig
 NUM_CHANNELS, NUM_GROUPS, STRIDE_8 = 21, 8, 8
 T_INPUT, T_LATENT = 2500, 312
 SPATIAL_GROUPS = None
+# L3 subband time dim (preprocess_subband_single output) — used to convert
+# the per-element seizure FPR into FPR/h for threshold calibration (A5).
+L3_T_FOR_FPR = 313
 
 try:
     from generate_validation_split import load_validation_manifest, get_excluded_windows
@@ -292,8 +295,52 @@ def _dwb_weight(target, pred_logits, base_pos_weight=3.0):
         difficulty = (p - target).abs()
         class_w = torch.where(target > 0.5, base_pos_weight, 1.0)
         dwb_w = class_w * (1.0 + difficulty).pow(gamma)
-        dwb_w = dwb_w / (dwb_w.mean() + 1e-8)
+        # A3 (run-2 2026-05-29): the self-normalization
+        #   dwb_w = dwb_w / (dwb_w.mean() + 1e-8)
+        # was REMOVED. Re-centering the weights to mean 1.0 cancelled the
+        # absolute pos_weight (4.67) — the QUIET majority dominates the mean,
+        # so positives ended up barely upweighted and the loss landscape's
+        # global minimum sat at "predict all-QUIET". Keep absolute weights so
+        # the positive class carries its full pos_weight into the gradient.
     return dwb_w
+
+
+def _focal_loss(logits, target, alpha=0.75, gamma=2.0, pos_weight=None):
+    """Binary focal loss (Lin et al. 2017) on the dedicated seizure channel.
+
+    B5 (run-2 2026-05-29). focal = -alpha_t (1 - p_t)^gamma log(p_t), where
+    p_t is the predicted probability of the true class. alpha=0.75 upweights
+    the rare positive (seizure) class; gamma=2 down-weights easy negatives so
+    the gradient is dominated by hard / positive samples — it CANNOT reach
+    L≈0 by predicting all-QUIET the way symmetric BCE can. `pos_weight`
+    (data-derived ~40) multiplies the positive term on top of alpha.
+    """
+    p = torch.sigmoid(logits)
+    # BCE per element (numerically stable via logits).
+    ce = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
+    p_t = p * target + (1.0 - p) * (1.0 - target)
+    alpha_t = alpha * target + (1.0 - alpha) * (1.0 - target)
+    focal = alpha_t * (1.0 - p_t).pow(gamma) * ce
+    if pos_weight is not None:
+        focal = focal * torch.where(target > 0.5, float(pos_weight), 1.0)
+    return focal.mean()
+
+
+def _soft_tversky_loss(logits, target, fp_weight=0.3, fn_weight=0.7, eps=1e-6):
+    """Soft Tversky loss on the seizure channel — 1 - TP/(TP + a*FP + b*FN).
+
+    B5 (run-2). With fn_weight (b=0.7) > fp_weight (a=0.3) the objective
+    penalizes false negatives ~2.3x harder than false positives, so it
+    rewards RECALL (seizure sensitivity is the gated metric). Operates on
+    soft probabilities so it is differentiable and, unlike BCE, has no
+    minimum at the all-QUIET solution when any positive exists in the batch.
+    """
+    p = torch.sigmoid(logits)
+    tp = (p * target).sum()
+    fp = (p * (1.0 - target)).sum()
+    fn = ((1.0 - p) * target).sum()
+    tversky = (tp + eps) / (tp + fp_weight * fp + fn_weight * fn + eps)
+    return 1.0 - tversky
 
 
 def _rss_gb():
@@ -489,21 +536,35 @@ def _augment_eeg(signal, p_channel_drop=0.15, p_amplitude=0.5, p_noise=0.5,
     return signal
 
 
-def train_epoch(model, loader, optimizer, device, lambda_spike=0.01,
-                pos_weight=3.0, augment=True):
-    """Training loop with DWB loss + EEG augmentation.
+def train_epoch(model, loader, optimizer, device, cfg, pos_weight=3.0,
+                seizure_pos_weight=40.0, lr_min=1e-5, augment=True):
+    """Training loop — run-2 stability + recall-favoring seizure objective.
 
-    DWB (Dynamically Weighted Balanced) handles class imbalance via
-    per-sample weighting based on class frequency + prediction difficulty.
-    pos_weight should be computed from data distribution (neg/pos ratio).
+    Changes vs Run #1 (all per snn-improvement-plan-2026-05-29.md):
+      - A4: logit scale from cfg.logit_scale (default 1.0; was hard *3.0).
+      - A3: DWB keeps absolute pos_weight (no self-normalization).
+      - B4: dedicated seizure head trained against (labels==2) with its own
+        data-derived pos_weight (~40), decoupled from the merged activity.
+      - B5: seizure head uses FOCAL (gamma, alpha) + soft TVERSKY (FN>FP) so
+        the objective rewards recall and can't reach L≈0 by predicting QUIET.
+      - A7: active NaN guard — skip the batch AND halve LR + tighten clip to
+        cfg.grad_clip; B1 post-step param clamp re-projects A_log every step.
+
+    Returns (avg_loss, acc, sens, sr, nan_skips, n_steps). `sens` is the
+    train seizure sensitivity measured from the DEDICATED seizure head.
     """
+    from lamquant_neural.models.mamba_ssm_minimal import clamp_ssm_params
+
     model.train()
     total_loss = total_correct = total_samples = 0
     total_seizure_tp = total_seizure_fn = 0
     nan_skips = 0
     n_steps = 0
+    last_spike_rate = float('nan')
 
-    _zero = torch.tensor(0.0, device=device)
+    logit_scale = float(cfg.logit_scale)
+    lambda_spike = float(cfg.lambda_spike)
+    grad_clip = float(cfg.grad_clip)
 
     for signal, labels in loader:
         signal, labels = signal.to(device), labels.to(device)
@@ -511,61 +572,70 @@ def train_epoch(model, loader, optimizer, device, lambda_spike=0.01,
             signal = _augment_eeg(signal)
         optimizer.zero_grad()
 
-        activity_logits, spike_rate = model(signal)
-        # Logit scaling: 3.0 gives moderate sigmoid sharpness.
-        # 5.0 was too sharp — near-binary sigmoid killed gradient signal
-        # on borderline samples and made DWB difficulty weighting erratic.
-        scaled_logits = activity_logits * 3.0
+        activity_logits, spike_rate, seizure_logits = model(signal)
+        # A4 (run-2): no longer the hard *3.0 gradient amplifier that fed the
+        # SSM divergence. cfg.logit_scale defaults to 1.0 (raw logits).
+        scaled_logits = activity_logits * logit_scale
         target_event = (labels >= 1).float()
 
-        # DWB loss: per-sample dynamic weighting (class freq + difficulty)
+        # DWB loss on the merged activity groups (A3: absolute pos_weight).
         dwb_w = _dwb_weight(target_event, scaled_logits, pos_weight)
         bce_unreduced = F.binary_cross_entropy_with_logits(
             scaled_logits, target_event, reduction='none')
         bce_loss = (bce_unreduced * dwb_w).mean()
 
-        # Seizure-specific loss: extra penalty for missing seizures.
-        # Kept at 1.0x — DWB's pos_weight already upweights positive
-        # samples, and the data-derived pos_weight captures the true
-        # class imbalance. The old 2.0x + class_weights(17x) triple-
-        # stacked and caused the model to predict everything as active.
-        seizure_mask = (labels == 2).float()
-        if seizure_mask.sum() > 0:
-            seizure_loss_unreduced = F.binary_cross_entropy_with_logits(
-                scaled_logits, seizure_mask, reduction='none')
-            seizure_loss = (seizure_loss_unreduced * seizure_mask).sum() / (seizure_mask.sum() + 1e-8)
-        else:
-            seizure_loss = _zero
+        # B4 + B5: dedicated seizure-head loss vs (labels==2). The 8 group
+        # labels share the same seizure/active distinction per timestep, so
+        # collapse the group dim to a per-timestep seizure target matching
+        # the head's single-channel output [B, 1, T].
+        seizure_target = (labels == 2).float().amax(dim=1, keepdim=True)  # [B,1,T]
+        sz_logits = seizure_logits * logit_scale
+        focal = _focal_loss(sz_logits, seizure_target,
+                            alpha=cfg.focal_alpha, gamma=cfg.focal_gamma,
+                            pos_weight=seizure_pos_weight)
+        tversky = _soft_tversky_loss(sz_logits, seizure_target,
+                                     fp_weight=cfg.tversky_fp_weight,
+                                     fn_weight=cfg.tversky_fn_weight)
+        seizure_loss = cfg.seizure_loss_weight * (focal + tversky)
 
         loss = bce_loss + seizure_loss + lambda_spike * spike_rate
 
-        # Non-finite-loss guard. A divergent Mamba SSM scan can emit inf/nan
-        # activations as weights grow during the LR warmup ramp; doing
-        # backward()+step() on a non-finite loss permanently poisons EVERY
-        # weight to NaN — the exact failure that collapsed the seizure head
-        # from val[S]=0.888 (ep10) to 0.000 (ep16) and left L=nan for the rest
-        # of the run. Skip the offending batch entirely so params stay clean
-        # and the optimizer trajectory is never stepped on garbage gradients.
+        # A7 (run-2): active non-finite-loss guard. The B1 SSM clamp should
+        # keep the scan finite, but if a batch still diverges we skip it AND
+        # halve the LR (down to lr_min) + keep the tighter clip, so a transient
+        # spike self-corrects instead of compounding. The epoch-level abort
+        # (>50% skipped, or train_sens==0 for 2 epochs) is enforced by the
+        # caller using the returned (nan_skips, n_steps, sens).
         if not torch.isfinite(loss):
             nan_skips += 1
             optimizer.zero_grad(set_to_none=True)
+            for g in optimizer.param_groups:
+                g["lr"] = max(g["lr"] * 0.5, lr_min)
             continue
 
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
+        # B1: re-project A_log into the float32-safe band after the step so it
+        # can never drift back out between forwards.
+        with torch.no_grad():
+            clamp_ssm_params(model)
         n_steps += 1
 
         total_loss += loss.item()
+        last_spike_rate = (spike_rate.item()
+                           if torch.isfinite(spike_rate).all() else float('nan'))
         with torch.no_grad():
             pred = (activity_logits > 0).long()
             actual = (labels >= 1).long()
             total_correct += (pred == actual).sum().item()
             total_samples += labels.numel()
-            sz = (labels == 2)
+            # Train seizure sensitivity from the DEDICATED seizure head.
+            sz = (seizure_target > 0.5)
             if sz.any():
-                total_seizure_tp += ((pred == 1) & sz).sum().item()
-                total_seizure_fn += ((pred == 0) & sz).sum().item()
+                sz_pred = (seizure_logits > 0)
+                total_seizure_tp += (sz_pred & sz).sum().item()
+                total_seizure_fn += (~sz_pred & sz).sum().item()
 
     if nan_skips:
         print(f"  [train_epoch] skipped {nan_skips}/{len(loader)} non-finite-loss "
@@ -573,36 +643,104 @@ def train_epoch(model, loader, optimizer, device, lambda_spike=0.01,
     acc = total_correct / max(total_samples, 1)
     sens = total_seizure_tp / max(total_seizure_tp + total_seizure_fn, 1)
     avg_loss = total_loss / max(n_steps, 1)
-    sr = spike_rate.item() if torch.isfinite(spike_rate).all() else float('nan')
-    return avg_loss, acc, sens, sr
+    return avg_loss, acc, sens, last_spike_rate, nan_skips, n_steps
 
 
-def validate(model, loader, device):
-    """Validation with accuracy, sensitivity, specificity, FNR."""
+def validate(model, loader, device, collect_probs=False):
+    """Validation with accuracy, sensitivity, specificity, FNR.
+
+    Seizure sensitivity/specificity are measured from the DEDICATED seizure
+    head (B4) at its default threshold (logit > 0, i.e. sigmoid p > 0.5).
+    `acc` is the merged-activity accuracy from the 8 group logits.
+
+    When `collect_probs=True`, also returns flat numpy arrays of the
+    per-element seizure sigmoid probabilities and binary targets for the
+    A5 threshold sweep. Returns
+    (acc, sens, spec, fnr) or (acc, sens, spec, fnr, probs, targets).
+    """
     model.eval()
     total_correct = total_samples = 0
     total_seizure_tp = total_seizure_fn = total_quiet_tn = total_quiet_fp = 0
+    probs_chunks: list = []
+    tgt_chunks: list = []
     with torch.no_grad():
         for signal, labels in loader:
             signal, labels = signal.to(device), labels.to(device)
-            logits, _ = model(signal)
+            logits, _, seizure_logits = model(signal)
+            # Merged activity accuracy (unchanged metric).
             pred = (logits > 0).long()
             actual = (labels >= 1).long()
             total_correct += (pred == actual).sum().item()
             total_samples += labels.numel()
-            sz = (labels == 2)
+            # Seizure sens/spec from the dedicated head, target per-timestep.
+            sz_target = (labels == 2).amax(dim=1, keepdim=True)  # [B,1,T] bool
+            sz_pred = (seizure_logits > 0)
+            sz = sz_target
             if sz.any():
-                total_seizure_tp += (pred[sz] == 1).sum().item()
-                total_seizure_fn += (pred[sz] == 0).sum().item()
-            qt = (labels == 0)
-            if qt.any():
-                total_quiet_tn += (pred[qt] == 0).sum().item()
-                total_quiet_fp += (pred[qt] == 1).sum().item()
+                total_seizure_tp += (sz_pred & sz).sum().item()
+                total_seizure_fn += (~sz_pred & sz).sum().item()
+            nz = ~sz_target
+            if nz.any():
+                total_quiet_tn += (~sz_pred & nz).sum().item()
+                total_quiet_fp += (sz_pred & nz).sum().item()
+            if collect_probs:
+                probs_chunks.append(
+                    torch.sigmoid(seizure_logits).flatten().cpu().numpy())
+                tgt_chunks.append(
+                    sz_target.float().flatten().cpu().numpy())
     acc = total_correct / max(total_samples, 1)
     sens = total_seizure_tp / max(total_seizure_tp + total_seizure_fn, 1)
     spec = total_quiet_tn / max(total_quiet_tn + total_quiet_fp, 1)
     fnr = total_seizure_fn / max(total_seizure_tp + total_seizure_fn, 1)
+    if collect_probs:
+        import numpy as _np
+        probs = _np.concatenate(probs_chunks) if probs_chunks else _np.zeros(0)
+        targets = _np.concatenate(tgt_chunks) if tgt_chunks else _np.zeros(0)
+        return acc, sens, spec, fnr, probs, targets
     return acc, sens, spec, fnr
+
+
+def calibrate_seizure_threshold(probs, targets, sens_floor=0.85,
+                                seconds_per_element=None):
+    """A5 (run-2): sweep the seizure-head sigmoid threshold on val.
+
+    Picks the MINIMUM threshold (highest recall is at low thresholds, so we
+    want the largest threshold that still clears the sens floor — that
+    maximizes specificity while meeting sensitivity). Reports spec + FPR/h
+    at the chosen operating point. Returns a dict suitable for persisting
+    into the checkpoint as ``threshold_star``.
+
+    seconds_per_element: wall-clock seconds each scored element represents,
+    for the FPR/h estimate. Each L3 timestep ≈ 10 s / 313 ≈ 0.03195 s.
+    """
+    import numpy as _np
+    if probs.size == 0 or targets.size == 0:
+        return {"threshold": 0.5, "sens": 0.0, "spec": 0.0,
+                "fpr_per_h": None, "meets_floor": False}
+    pos = targets > 0.5
+    neg = ~pos
+    n_pos = int(pos.sum())
+    n_neg = int(neg.sum())
+    if seconds_per_element is None:
+        seconds_per_element = 10.0 / L3_T_FOR_FPR
+
+    best = {"threshold": 0.5, "sens": 0.0, "spec": 0.0,
+            "fpr_per_h": None, "meets_floor": False}
+    # Sweep thresholds; choose the LARGEST threshold whose sens >= floor.
+    for thr in _np.linspace(0.01, 0.99, 99):
+        pred = probs >= thr
+        tp = int((pred & pos).sum())
+        fp = int((pred & neg).sum())
+        sens = tp / max(n_pos, 1)
+        spec = (n_neg - fp) / max(n_neg, 1)
+        fpr_per_h = (fp / max(n_neg, 1)) * (3600.0 / seconds_per_element) \
+            if n_neg > 0 else None
+        if sens >= sens_floor:
+            # keep raising threshold while floor holds -> max spec
+            best = {"threshold": float(thr), "sens": float(sens),
+                    "spec": float(spec), "fpr_per_h": fpr_per_h,
+                    "meets_floor": True}
+    return best
 
 
 # ============================================================
@@ -723,6 +861,14 @@ def export_mamba_weights(model, output_path):
     total_bytes += _emit_int8_array(lines, "mamba_readout_b",
                                     model.readout.bias)
 
+    # B4 (run-2): dedicated seizure head Linear(d_model, 1). Emitted so the
+    # firmware port carries the same seizure channel the gate scores against.
+    if hasattr(model, "seizure_head"):
+        total_bytes += _emit_int8_array(lines, "mamba_seizure_head_w",
+                                        model.seizure_head.weight)
+        total_bytes += _emit_int8_array(lines, "mamba_seizure_head_b",
+                                        model.seizure_head.bias)
+
     lines.append(f"/* Total firmware footprint: {total_bytes} bytes ({total_bytes/1024:.1f} KB) */")
     lines.append("")
     lines.append("#endif /* MAMBA_SNN_WEIGHTS_H */")
@@ -734,24 +880,29 @@ def export_mamba_weights(model, output_path):
     return total_bytes
 
 
-def _checkpoint_score(sens, acc, spec, min_spec=0.60):
+def _checkpoint_score(sens, acc, spec, min_spec=0.60, sens_floor=0.85):
     """Tiered checkpoint metric: sensitivity first, accuracy second.
 
     The SNN drives SNAC compression preset selection — false negatives
     (missing activity) waste clinical signal. False positives (calling
     quiet windows active) just cost bandwidth, not safety.
 
-    Tier 1: sensitivity >= 0.99 — pick by accuracy (no false negatives).
-    Tier 2: sensitivity < 0.99 — pick by sensitivity (still learning).
+    A8 (run-2 2026-05-29): a SUB-FLOOR model is never selectable as "best".
+    Run #1 froze the ep42 ckpt at sens=0.673 — below the 0.85 PCCP floor —
+    because the old score had no sensitivity floor, so a model that never
+    climbed past the gate still got promoted. Return 0.0 when sens < the
+    registry floor (or spec < min_spec) so selection can't pick a model that
+    would fail the gate. The final-epoch artifact is still saved separately
+    for inspection.
 
-    Specificity floor prevents the degenerate "everything is active"
-    solution that would lock SNAC on the lowest compression ratio.
+    Tier 1: sensitivity >= 0.99 — pick by accuracy (no false negatives).
+    Tier 2: floor <= sensitivity < 0.99 — pick by sensitivity (still learning).
     """
-    if spec < min_spec:
+    if spec < min_spec or sens < sens_floor:
         return 0.0
     if sens >= 0.99:
         return 1.0 + acc   # [1.0, 2.0] — always beats tier 2
-    return sens             # [0.0, 0.99)
+    return sens             # [sens_floor, 0.99)
 
 
 # ============================================================
@@ -914,12 +1065,58 @@ def main():
                         default='production', help='Training preset')
     parser.add_argument('--epochs', type=int, default=None)
     parser.add_argument('--lr', type=float, default=None)
+    parser.add_argument('--lr-min', type=float, default=None,
+                        help='LR floor (cosine/WSD min + NaN-guard LR halving floor)')
     parser.add_argument('--batch-size', type=int, default=None)
     parser.add_argument('--lambda-spike', type=float, default=None)
     parser.add_argument('--d-model', type=int, default=None)
     parser.add_argument('--d-state', type=int, default=None)
     parser.add_argument('--n-layers', type=int, default=None)
     parser.add_argument('--max-windows-per-file', type=int, default=None)
+    # --- Run-2 (2026-05-29) flags (snn-improvement-plan-2026-05-29.md) ---
+    # Each wires to the cfg field of the same name; sensible defaults live in
+    # SNNConfig so a bare run is already the improved config.
+    parser.add_argument('--warmup-frac', type=float, default=None,
+                        help='A13: LR warmup fraction (default cfg 0.10)')
+    parser.add_argument('--logit-scale', type=float, default=None,
+                        help='A4: logit gradient scale (default 1.0; was 3.0)')
+    parser.add_argument('--grad-clip', type=float, default=None,
+                        help='A7: grad-norm clip (default 0.5)')
+    parser.add_argument('--seizure-batch-frac', type=float, default=None,
+                        help='B3: target seizure-window fraction per batch at '
+                             'curriculum start (default 0.5)')
+    parser.add_argument('--seizure-frac-anneal-epochs', type=int, default=None,
+                        help='B3: epochs to anneal seizure fraction from start '
+                             'toward natural ~0.18 (default 20)')
+    parser.add_argument('--sens-floor', type=float, default=None,
+                        help='A8: checkpoint-selection sensitivity floor '
+                             '(default 0.85, the PCCP floor)')
+    parser.add_argument('--early-stop-patience', type=int, default=None,
+                        help='A9: stop after N epochs with no best-score '
+                             'improvement (default 30)')
+    parser.add_argument('--no-wd-dynamics', dest='no_wd_dynamics',
+                        action='store_true', default=None,
+                        help='A1: exclude A_log/dt_bias/D/bias/norm from weight '
+                             'decay (default ON)')
+    parser.add_argument('--wd-dynamics', dest='no_wd_dynamics',
+                        action='store_false',
+                        help='Disable A1 (apply uniform weight decay)')
+    parser.add_argument('--abort-on-collapse', dest='abort_on_collapse',
+                        action='store_true', default=None,
+                        help='A7/A8: abort the run if >50%% of an epoch skips or '
+                             'train-seizure-sens==0 for 2 epochs (default ON)')
+    parser.add_argument('--no-abort-on-collapse', dest='abort_on_collapse',
+                        action='store_false', help='Disable collapse abort')
+    parser.add_argument('--no-seizure-balance', dest='seizure_balance',
+                        action='store_false', default=True,
+                        help='Disable the B2/B3 seizure-balanced sampler '
+                             '(default ON for the LMA-direct train loader)')
+    parser.add_argument('--calibrate-threshold', dest='calibrate_threshold',
+                        action='store_true', default=True,
+                        help='A5: sweep the seizure-head threshold on val '
+                             'post-train and persist threshold* (default ON)')
+    parser.add_argument('--no-calibrate-threshold', dest='calibrate_threshold',
+                        action='store_false')
     parser.add_argument('--checkpoint', default=None,
                         help='Path to save best checkpoint (default: weights/snn/mamba_snn_best.pt)')
     parser.add_argument('--export', default=None,
@@ -942,11 +1139,16 @@ def main():
                              'construction so A/B arms differ only in optimizer.')
     args = parser.parse_args()
 
-    # Load preset, then apply CLI overrides
+    # Load preset, then apply CLI overrides. Run-2 fields map 1:1 from the
+    # argparse dest (underscored) to the SNNConfig field of the same name.
     cfg = SNN_CONFIGS[args.config]
     overrides = {}
-    for field in ('epochs', 'lr', 'batch_size', 'lambda_spike',
-                  'd_model', 'd_state', 'n_layers', 'max_windows_per_file'):
+    for field in ('epochs', 'lr', 'lr_min', 'batch_size', 'lambda_spike',
+                  'd_model', 'd_state', 'n_layers', 'max_windows_per_file',
+                  'warmup_frac', 'logit_scale', 'grad_clip',
+                  'seizure_batch_frac', 'seizure_frac_anneal_epochs',
+                  'sens_floor', 'early_stop_patience', 'no_wd_dynamics',
+                  'abort_on_collapse'):
         val = getattr(args, field, None)
         if val is not None:
             overrides[field] = val
@@ -1087,17 +1289,43 @@ def main():
                 generator=torch.Generator().manual_seed(42))
         num_workers = 2
 
-    # LMA-direct path: prefer LmaGroupedSampler over shuffle=True so the
-    # ~5 windows per LMA hit the same on-disk cache file in a row. Random
-    # shuffle re-mmaps a 1.5 MB cache file per window (page-cache bound,
-    # ~50 min/epoch floor); grouped order amortizes one mmap over 5 reads.
+    # LMA-direct path sampler. B2/B3 (run-2 2026-05-29): the
+    # SeizureBalancedSampler is DEFAULT ON — it interleaves seizure-bearing and
+    # background windows so every batch hits a target seizure fraction
+    # (curriculum: cfg.seizure_batch_frac -> natural ~0.18 over
+    # cfg.seizure_frac_anneal_epochs). This guarantees the gated seizure loss
+    # fires every step during the critical early window — the data-side fix for
+    # the QUIET collapse. It sacrifices LMA-group cache locality, so the
+    # on-disk L3 cache (L3_CACHE_DIR) should be warm to offset it. Falls back
+    # to the cache-friendly LmaGroupedSampler when --no-seizure-balance is set.
     train_sampler = None
     if args.lma_root is not None:
-        try:
-            from lamquant.snn.lma_dataset import LmaGroupedSampler
-            train_sampler = LmaGroupedSampler(train_ds, shuffle=True, seed=42)
-        except Exception as e:
-            print(f"[!] LmaGroupedSampler unavailable, falling back to shuffle: {e}")
+        if getattr(args, "seizure_balance", True):
+            try:
+                from lamquant.snn.lma_dataset import SeizureBalancedSampler
+                train_sampler = SeizureBalancedSampler(
+                    train_ds,
+                    start_frac=cfg.seizure_batch_frac,
+                    natural_frac=cfg.seizure_frac_natural,
+                    anneal_epochs=cfg.seizure_frac_anneal_epochs,
+                    seed=args.seed)
+                print(f"[*] Sampler: SeizureBalancedSampler "
+                      f"(start_frac={cfg.seizure_batch_frac}, "
+                      f"natural={cfg.seizure_frac_natural}, "
+                      f"anneal={cfg.seizure_frac_anneal_epochs}ep) — "
+                      f"{len(train_sampler.sz_idx)} seizure / "
+                      f"{len(train_sampler.bg_idx)} bg windows")
+            except Exception as e:
+                print(f"[!] SeizureBalancedSampler unavailable, "
+                      f"falling back to grouped: {e}")
+        if train_sampler is None:
+            try:
+                from lamquant.snn.lma_dataset import LmaGroupedSampler
+                train_sampler = LmaGroupedSampler(train_ds, shuffle=True,
+                                                  seed=args.seed)
+            except Exception as e:
+                print(f"[!] LmaGroupedSampler unavailable, "
+                      f"falling back to shuffle: {e}")
 
     # Worker lifecycle: persistent_workers=True keeps spawned worker
     # subprocesses alive across epochs (re-imports cost ~5-10 s/worker
@@ -1183,17 +1411,93 @@ def main():
         else:
             print(f"[*] pos_weight cache NOT written (scan was capped at {_scan_cap})")
 
+    # B4 (run-2): dedicated seizure-head pos_weight = (#non-seizure elements) /
+    # (#seizure elements) — the SEIZURE-vs-rest ratio, decoupled from the
+    # merged activity pos_weight (~4.67). This is what makes the seizure head
+    # see the true class imbalance (~40) the merged head never did.
+    # SNN_SEIZURE_POS_WEIGHT_OVERRIDE short-circuits the scan. Falls back to
+    # cfg.seizure_pos_weight (40) if no positives are seen.
+    _szpw_override = os.environ.get("SNN_SEIZURE_POS_WEIGHT_OVERRIDE")
+    if _szpw_override:
+        seizure_pos_weight = float(_szpw_override)
+        print(f"[*] Seizure-head pos_weight override={seizure_pos_weight:.2f}")
+    else:
+        # IMPORTANT: a CAPPED scan must NOT set the seizure pos_weight. Seizure
+        # is the rare class and iter_labels_only yields windows in index order
+        # (seizure windows cluster because select_windows front-loads them), so
+        # a capped prefix is wildly unrepresentative (observed: 0.62 vs the
+        # true ~40). Only a FULL pass is trusted; otherwise fall back to the
+        # cfg default. SNN_SEIZURE_POS_WEIGHT_OVERRIDE forces a value when a
+        # full scan is too slow (e.g. the run-2 command / this smoke).
+        _sz_scan_cap = int(os.environ.get("SNN_POS_WEIGHT_SCAN_N", "0") or "0")
+        if _sz_scan_cap:
+            seizure_pos_weight = float(cfg.seizure_pos_weight)
+            print(f"[*] Seizure-head pos_weight: scan is capped "
+                  f"(SNN_POS_WEIGHT_SCAN_N={_sz_scan_cap}) and unreliable for "
+                  f"the rare class — using cfg default {seizure_pos_weight:.2f} "
+                  f"(set SNN_SEIZURE_POS_WEIGHT_OVERRIDE to pin a measured value)")
+        else:
+            sz_pos = sz_neg = 0
+            try:
+                if args.lma_root is not None:
+                    from lamquant.snn.lma_dataset import iter_labels_only as _ilo2
+                    for labels_window in _ilo2(train_ds):
+                        sz = (labels_window == 2)
+                        sz_pos += int(sz.sum())
+                        sz_neg += int((~sz).sum())
+                else:
+                    for signal, labels in train_loader:
+                        sz = (labels == 2)
+                        sz_pos += int(sz.sum().item())
+                        sz_neg += int((~sz).sum().item())
+            except Exception as e:
+                print(f"[!] seizure pos_weight scan failed ({e}) — using cfg default")
+                sz_pos = 0
+            if sz_pos > 0:
+                seizure_pos_weight = sz_neg / sz_pos
+                print(f"[*] Seizure-vs-rest (full scan): {sz_neg:,} non-seizure, "
+                      f"{sz_pos:,} seizure (seizure_pos_weight={seizure_pos_weight:.2f})")
+            else:
+                seizure_pos_weight = float(cfg.seizure_pos_weight)
+                print(f"[!] No seizure elements in scan — seizure_pos_weight="
+                      f"{seizure_pos_weight:.2f} (cfg default)")
+
     # Optimizer factory (#71 COSMOS/SOAP A/B). The A/B arms keep the
     # SAME cfg.lr / cfg.weight_decay so the comparison isolates the
     # optimizer — SOAP's own default lr (3e-3) is deliberately NOT used.
     # WSDScheduler wraps whichever optimizer is built (below).
+    # A1 (run-2 2026-05-29): no-weight-decay param group for the SSM dynamics.
+    # Uniform WD on A_log/dt_bias actively pushes A_log -> 0 (A -> -1) and dt
+    # up, walking the scan toward the float32-overflow regime that the NaN
+    # guard then preferentially discarded. Exclude A_log, dt_bias, D, all
+    # biases, and LayerNorm from decay; keep WD only on the dense projection
+    # weights. Controlled by cfg.no_wd_dynamics (default ON; --no-wd-dynamics
+    # / matching off-switch flips it).
+    def _param_groups(m, wd):
+        if not cfg.no_wd_dynamics:
+            return m.parameters()
+        no_decay, decay = [], []
+        for nm, p in m.named_parameters():
+            if not p.requires_grad:
+                continue
+            if (nm.endswith(("A_log", "dt_bias", "D", "bias"))
+                    or "norm" in nm.lower()):
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        return [
+            {"params": decay, "weight_decay": wd},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+
     if args.optimizer == 'adamw':
-        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
-                                      weight_decay=cfg.weight_decay)
+        optimizer = torch.optim.AdamW(
+            _param_groups(model, cfg.weight_decay), lr=cfg.lr,
+            weight_decay=cfg.weight_decay, betas=(0.9, 0.95))
     elif args.optimizer == 'soap':
         sys.path.insert(0, os.path.join(ROOT_DIR, 'lamquant', 'student'))
         from soap_optimizer import SOAP
-        optimizer = SOAP(model.parameters(), lr=cfg.lr,
+        optimizer = SOAP(_param_groups(model, cfg.weight_decay), lr=cfg.lr,
                          weight_decay=cfg.weight_decay)
     elif args.optimizer == 'cosmos':
         raise NotImplementedError(
@@ -1214,11 +1518,15 @@ def main():
     # SNN and joint pair share one curve.
     sys.path.insert(0, os.path.join(ROOT_DIR, 'lamquant', 'student'))
     from train_joint import WSDScheduler
+    # A13 (run-2): warmup_frac from cfg (default 0.10, was hard 0.05) — a
+    # longer, gentler warmup keeps the SSM out of the divergence regime that
+    # Run #1 hit at ep15 during warmup.
+    _warmup_frac = float(cfg.warmup_frac)
     if args.infinite_lr:
         # WSD∞ — manual decay trigger; production-style continual training.
         scheduler = WSDScheduler(
             optimizer, total_epochs=cfg.epochs, peak_lr=cfg.lr,
-            warmup_frac=0.05, decay_frac=0.0, min_lr=cfg.lr_min,
+            warmup_frac=_warmup_frac, decay_frac=0.0, min_lr=cfg.lr_min,
             warmup_kind="cosine")
         print(f"[*] Schedule: cosine-warmup → WSD∞ stable "
               f"(warmup={scheduler.warmup_epochs}ep, stable=∞)")
@@ -1226,7 +1534,7 @@ def main():
         # Standard WSD with fixed cosine decay at the tail.
         scheduler = WSDScheduler(
             optimizer, total_epochs=cfg.epochs, peak_lr=cfg.lr,
-            warmup_frac=0.05, decay_frac=0.10, min_lr=cfg.lr_min,
+            warmup_frac=_warmup_frac, decay_frac=0.10, min_lr=cfg.lr_min,
             warmup_kind="cosine")
         print(f"[*] Schedule: cosine-warmup → WSD stable → cosine decay "
               f"(warmup={scheduler.warmup_epochs}ep, "
@@ -1238,7 +1546,18 @@ def main():
     if args.resume and os.path.exists(args.resume):
         # Contains non-tensor metadata
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt['model'])
+        # B4 (run-2): old checkpoints predate the dedicated seizure head, so
+        # load non-strict — the seizure_head params keep their fresh init and
+        # are learned from scratch on resume. missing/unexpected keys are
+        # reported so a genuinely broken load is still visible.
+        load_res = model.load_state_dict(ckpt['model'], strict=False)
+        if load_res.missing_keys:
+            print(f"[*] resume: {len(load_res.missing_keys)} missing key(s) "
+                  f"(new since checkpoint, fresh-init): "
+                  f"{load_res.missing_keys[:6]}")
+        if load_res.unexpected_keys:
+            print(f"[*] resume: {len(load_res.unexpected_keys)} unexpected "
+                  f"key(s) ignored: {load_res.unexpected_keys[:6]}")
         start_epoch = ckpt.get('epoch', 0)
         print(f"[*] Resumed from {args.resume} (epoch {start_epoch})")
         try:
@@ -1260,21 +1579,36 @@ def main():
     import time as _time
     n_batches = len(train_loader)
     print(f"[*] Training: {cfg.epochs} epochs x {n_batches} batches (bs={cfg.batch_size})")
+    print(f"[*] Run-2 guards: sens_floor={cfg.sens_floor} grad_clip={cfg.grad_clip} "
+          f"logit_scale={cfg.logit_scale} lambda_spike={cfg.lambda_spike} "
+          f"no_wd_dynamics={cfg.no_wd_dynamics} abort_on_collapse={cfg.abort_on_collapse} "
+          f"early_stop_patience={cfg.early_stop_patience}")
     train_start = _time.time()
+
+    # A7/A8 collapse-abort state.
+    zero_train_sens_streak = 0
+    epochs_since_best = 0
+    aborted = False
 
     for epoch in range(start_epoch, cfg.epochs):
         ep_start = _time.time()
-        loss, acc, sens, sr = train_epoch(
-            model, train_loader, optimizer, device, cfg.lambda_spike,
-            pos_weight=pos_weight)
+        # B3: advance the curriculum so the sampler anneals its seizure
+        # fraction. set_epoch also re-seeds the per-epoch shuffle.
+        if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
+            train_sampler.set_epoch(epoch)
+        loss, acc, sens, sr, nan_skips, n_steps = train_epoch(
+            model, train_loader, optimizer, device, cfg,
+            pos_weight=pos_weight, seizure_pos_weight=seizure_pos_weight,
+            lr_min=cfg.lr_min)
         if hasattr(scheduler, 'step'):
             scheduler.step()
         ep_sec = _time.time() - ep_start
 
-        # Validation every epoch
+        # Validation every epoch (seizure metrics from the dedicated head).
         val_acc, val_sens, val_spec, val_fnr = validate(model, val_loader, device)
 
-        score = _checkpoint_score(val_sens, val_acc, val_spec)
+        score = _checkpoint_score(val_sens, val_acc, val_spec,
+                                  sens_floor=cfg.sens_floor)
         improved = ''
         if score > best_score:
             best_score = score
@@ -1283,6 +1617,7 @@ def main():
             best_spec = val_spec
             best_epoch = epoch + 1
             improved = ' *BEST*'
+            epochs_since_best = 0
             _async_save({
                 'model': _state_dict_to_cpu(model.state_dict()),
                 'optimizer': _state_dict_to_cpu(optimizer.state_dict()),
@@ -1293,7 +1628,10 @@ def main():
                 'fnr': val_fnr,
                 'score': score,
                 'config': cfg.to_dict(),
+                'seizure_pos_weight': seizure_pos_weight,
             }, save_path)
+        else:
+            epochs_since_best += 1
 
         elapsed = _time.time() - train_start
         epochs_done = epoch - start_epoch + 1
@@ -1306,10 +1644,34 @@ def main():
         print(f"E{epoch+1:3d}/{cfg.epochs}  L={loss:.4f}  "
               f"train[A={acc:.3f} S={sens:.3f}]  "
               f"val[A={val_acc:.3f} S={val_sens:.3f} Sp={val_spec:.3f} FNR={val_fnr:.4f}]  "
-              f"sr={sr:.4f}  {ep_sec:.0f}s  RAM={ram:.1f}G  GPU={gpu_mb:.0f}M  "
-              f"ETA={eta_h}h{eta_m:02d}m{improved}")
+              f"sr={sr:.4f}  skips={nan_skips}/{n_batches}  {ep_sec:.0f}s  "
+              f"RAM={ram:.1f}G  GPU={gpu_mb:.0f}M  ETA={eta_h}h{eta_m:02d}m{improved}")
 
-    # Save final with metrics
+        # A7/A8: collapse abort. A frozen run must be CAUGHT, not hidden.
+        zero_train_sens_streak = zero_train_sens_streak + 1 if sens == 0.0 else 0
+        if cfg.abort_on_collapse:
+            if nan_skips > 0.5 * max(n_batches, 1):
+                print(f"[ABORT] {nan_skips}/{n_batches} batches skipped "
+                      f"(>50%) at epoch {epoch+1} — SSM scan is diverging "
+                      f"despite the B1 clamp. Aborting (clean exit) rather "
+                      f"than 'training' a frozen model.")
+                aborted = True
+                break
+            if zero_train_sens_streak >= 2:
+                print(f"[ABORT] train seizure-sensitivity == 0 for 2 "
+                      f"consecutive epochs (through epoch {epoch+1}) — the "
+                      f"seizure head has collapsed to QUIET. Aborting.")
+                aborted = True
+                break
+        # A9: early-stop on no best-score improvement.
+        if (cfg.early_stop_patience and cfg.early_stop_patience > 0
+                and epochs_since_best >= cfg.early_stop_patience):
+            print(f"[*] Early stop: no best-score improvement for "
+                  f"{cfg.early_stop_patience} epochs (best @ ep{best_epoch}, "
+                  f"sens={best_sens:.4f}).")
+            break
+
+    # Save final with metrics (always — even on abort — for inspection).
     final_path = os.path.join(save_dir, f'mamba_snn_{cfg.name}_{cfg.epochs}_completed.pt')
     final_acc, final_sens, final_spec, final_fnr = validate(model, val_loader, device)
     torch.save({
@@ -1320,6 +1682,8 @@ def main():
         'specificity': final_spec,
         'fnr': final_fnr,
         'config': cfg.to_dict(),
+        'seizure_pos_weight': seizure_pos_weight,
+        'aborted': aborted,
     }, final_path)
 
     total_h = (_time.time() - train_start) / 3600
@@ -1331,14 +1695,46 @@ def main():
           f"acc={final_acc:.4f}  sens={final_sens:.4f}  spec={final_spec:.4f}")
     print(f"[*] Saved: {save_path} (best), {final_path} (final)")
 
-    # Auto-export to firmware C header when sensitivity target met
-    export_path = args.export or os.path.join(
-        ROOT_DIR, 'firmware', 'firmware_export', 'mamba_snn_weights.h')
     def _load_best(p):
         try:
             return torch.load(p, map_location='cpu', weights_only=True)
         except Exception:
             return torch.load(p, map_location='cpu', weights_only=False)
+
+    # A5 (run-2): calibrate the seizure-head threshold on val and persist
+    # threshold* into the checkpoint. Sweep sigmoid(seizure_logits), pick the
+    # minimum threshold giving sens >= sens_floor (max spec at that recall),
+    # record spec + FPR/h. Prefer the BEST checkpoint so the calibration
+    # matches the shipped weights; fall back to the FINAL-epoch checkpoint
+    # when no best was promoted (e.g. a sub-floor run under the A8 floor) —
+    # threshold calibration is precisely the step meant to recover a model
+    # whose default-threshold operating point is poor, so it must still run.
+    calib_path = save_path if os.path.exists(save_path) else (
+        final_path if os.path.exists(final_path) else None)
+    if getattr(args, "calibrate_threshold", True) and calib_path is not None:
+        try:
+            cstate = _load_best(calib_path)
+            model.load_state_dict(cstate['model'])
+            _a, _s, _sp, _fnr, probs, targets = validate(
+                model, val_loader, device, collect_probs=True)
+            thr = calibrate_seizure_threshold(
+                probs, targets, sens_floor=cfg.sens_floor)
+            print(f"[*] Threshold calibration (A5) on {os.path.basename(calib_path)}: "
+                  f"threshold*={thr['threshold']:.3f} "
+                  f"sens={thr['sens']:.4f} spec={thr['spec']:.4f} "
+                  f"FPR/h={thr['fpr_per_h'] if thr['fpr_per_h'] is None else round(thr['fpr_per_h'],4)} "
+                  f"meets_floor={thr['meets_floor']}")
+            # Persist threshold* into the checkpoint (re-save with the extra
+            # key; keep all original payload fields).
+            cstate['threshold_star'] = thr
+            torch.save(cstate, calib_path)
+            print(f"[*] threshold* persisted into {calib_path}")
+        except Exception as e:
+            print(f"[!] threshold calibration skipped: {e}")
+
+    # Auto-export to firmware C header when sensitivity target met
+    export_path = args.export or os.path.join(
+        ROOT_DIR, 'firmware', 'firmware_export', 'mamba_snn_weights.h')
 
     if best_sens >= 0.99:
         # Reload best checkpoint for export

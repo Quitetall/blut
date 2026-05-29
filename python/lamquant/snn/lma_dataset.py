@@ -534,6 +534,11 @@ class LmaDataset(Dataset):
         # Build window index per stem in our split.
         # Index tuple: (lma_path, stem, win_idx, lml_internal, label_internal)
         self.index: List[Tuple[Path, str, int, str, str]] = []
+        # Per-window seizure flag, index-aligned with self.index (B2/B3
+        # seizure-balanced sampler). True iff this window's label slice
+        # contains class 2 (seizure). Built in the same pass that already
+        # scans `activity`, so it costs nothing extra.
+        self.seizure_flags: List[bool] = []
         n_seen = n_missing_lma = n_no_labels = 0
         n_seizure_windows = 0
 
@@ -597,10 +602,14 @@ class LmaDataset(Dataset):
                 for wi in selected:
                     lbl_start = wi * LABEL_PER_WINDOW
                     lbl_end = min(lbl_start + L3_T, activity.shape[1])
-                    if lbl_end > lbl_start and np.any(activity[:, lbl_start:lbl_end] == 2):
+                    is_sz = bool(
+                        lbl_end > lbl_start
+                        and np.any(activity[:, lbl_start:lbl_end] == 2)
+                    )
+                    if is_sz:
                         n_seizure_windows += 1
-                for wi in selected:
                     self.index.append((lma_path, stem, wi, lml_internal, label_internal))
+                    self.seizure_flags.append(is_sz)
                 n_seen += 1
 
         self._max_windows_per_file = max_windows_per_file
@@ -782,6 +791,98 @@ class LmaGroupedSampler(Sampler[int]):
             order = range(len(self.groups))
         for gi in order:
             yield from self.groups[gi]
+
+    def __len__(self) -> int:
+        return self._total
+
+
+class SeizureBalancedSampler(Sampler[int]):
+    """Interleave seizure-bearing and background windows to a target fraction.
+
+    B2 + B3 (run-2 2026-05-29). The SNN never got the clinical-style balanced
+    sampler. With the natural ~18% seizure-window rate (and `max_windows`
+    capping background per file), most batches in Run #1 carried few or zero
+    seizure windows, so the gated seizure loss vanished and the optimizer
+    drifted into the QUIET collapse. This sampler guarantees every batch hits
+    a target seizure-window fraction.
+
+    Curriculum (B3): the target fraction starts at `start_frac` (default 0.5)
+    for the warmup phase and anneals linearly toward `natural_frac` (~0.18)
+    over `anneal_epochs`, so val specificity stays calibrated to the real
+    operating distribution once the seizure signal is consolidated. Call
+    `set_epoch(e)` before each epoch (the trainer does).
+
+    Seizure windows are drawn WITH replacement when they would otherwise run
+    out (the rare class), so a high target fraction does not truncate the
+    epoch. Length is fixed to the dataset size so step count per epoch is
+    stable for the LR schedule.
+
+    LMA-grouping (cache locality) is sacrificed for balance per the plan —
+    use the on-disk L3 cache (`L3_CACHE_DIR`) to offset the lost group
+    locality.
+    """
+
+    def __init__(self, dataset: "LmaDataset", start_frac: float = 0.5,
+                 natural_frac: float = 0.18, anneal_epochs: int = 20,
+                 seed: int = 42):
+        if not isinstance(dataset, LmaDataset):
+            raise TypeError(
+                f"SeizureBalancedSampler requires LmaDataset, got "
+                f"{type(dataset).__name__}"
+            )
+        flags = getattr(dataset, "seizure_flags", None)
+        if flags is None or len(flags) != len(dataset):
+            raise ValueError(
+                "LmaDataset.seizure_flags missing or misaligned — rebuild "
+                "the dataset index (expected one flag per window)"
+            )
+        self.dataset = dataset
+        self.start_frac = float(np.clip(start_frac, 0.0, 1.0))
+        self.natural_frac = float(np.clip(natural_frac, 0.0, 1.0))
+        self.anneal_epochs = max(0, int(anneal_epochs))
+        self.seed = seed
+        self.epoch = 0
+
+        flags_arr = np.asarray(flags, dtype=bool)
+        self.sz_idx = np.nonzero(flags_arr)[0]
+        self.bg_idx = np.nonzero(~flags_arr)[0]
+        self._total = len(dataset)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def current_frac(self) -> float:
+        """Target seizure-window fraction for the current epoch (B3 anneal)."""
+        if self.anneal_epochs <= 0 or self.epoch >= self.anneal_epochs:
+            return self.natural_frac
+        t = self.epoch / float(self.anneal_epochs)
+        return self.start_frac + t * (self.natural_frac - self.start_frac)
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        frac = self.current_frac()
+        n = self._total
+        n_sz = int(round(frac * n))
+        n_bg = n - n_sz
+
+        # Degenerate splits: if one class is empty, fall back to sampling the
+        # other (defensive — a val split with zero seizures should never use
+        # this sampler, but never raise mid-epoch).
+        if len(self.sz_idx) == 0:
+            n_sz, n_bg = 0, n
+        if len(self.bg_idx) == 0:
+            n_sz, n_bg = n, 0
+
+        picks = []
+        if n_sz > 0:
+            replace_sz = n_sz > len(self.sz_idx)
+            picks.append(rng.choice(self.sz_idx, size=n_sz, replace=replace_sz))
+        if n_bg > 0:
+            replace_bg = n_bg > len(self.bg_idx)
+            picks.append(rng.choice(self.bg_idx, size=n_bg, replace=replace_bg))
+        order = np.concatenate(picks) if picks else np.arange(n)
+        rng.shuffle(order)
+        yield from (int(i) for i in order)
 
     def __len__(self) -> int:
         return self._total

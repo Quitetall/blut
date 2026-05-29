@@ -130,10 +130,19 @@ def run_snn_on_signal(model, signal, fs, device, window_samples=2500,
                 chunk = np.concatenate([chunk, pad], axis=1)
 
             x = torch.from_numpy(chunk).unsqueeze(0).to(device)  # [1, 21, 2500]
-            logits, _ = model(x)  # [1, 8, T_out]
-
-            # Max activity across 8 spatial groups → single probability
-            prob = torch.sigmoid(logits.max(dim=1).values)  # [1, T_out]
+            out = model(x)
+            # B4 (2026-05-29): MambaSNN.forward now returns a 3-tuple
+            # (activity_logits, spike_rate, seizure_logits). The dedicated
+            # seizure head is the seizure-probability source for the event-level
+            # NEDC eval. Fall back to the merged activity max for a 2-tuple
+            # model loaded via a stale definition (defensive; not expected
+            # post-B4).
+            if isinstance(out, tuple) and len(out) == 3:
+                _logits, _, seizure_logits = out
+                prob = torch.sigmoid(seizure_logits.squeeze(1))  # [1, T_out]
+            else:
+                logits, _ = out
+                prob = torch.sigmoid(logits.max(dim=1).values)  # [1, T_out]
             all_probs.append(prob.cpu().numpy().flatten())
 
     # Concatenate and resample to 1 Hz (one value per second)

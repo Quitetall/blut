@@ -33,8 +33,15 @@ class SNNConfig:
     weight_decay: float = 1e-4
 
     # --- Loss ---
-    lambda_spike: float = 0.01  # spike rate regularization
+    # A2 (run-2 2026-05-29): lambda_spike default 0.0 — the spike penalty is
+    # now a base-rate target (mamba_ssm_minimal.SPIKE_TARGET_RATE) rather than
+    # the old wrong-sign L1 pull, but it is held off by default until the
+    # seizure objective is the sole driver. Set >0 to re-enable.
+    lambda_spike: float = 0.0   # spike rate regularization (run-2: off)
     pos_weight: float = 3.0     # DWB base positive class weight
+    # A4 (run-2): drop the *3.0 logit gradient amplifier that fed the SSM
+    # divergence. 1.0 = use raw logits.
+    logit_scale: float = 1.0
 
     # --- Architecture (must fit ≤64 KB INT8) ---
     d_model: int = 40
@@ -43,6 +50,35 @@ class SNNConfig:
 
     # --- Dataset ---
     max_windows_per_file: int = 5   # L3 windows per q31 file (seizure-aware)
+
+    # --- Run-2 stability / schedule / sampler defaults ---
+    # B3 seizure-balanced curriculum (default ON): target seizure-window
+    # fraction per batch, annealed from `seizure_batch_frac` toward the
+    # natural rate over `seizure_frac_anneal_epochs`.
+    seizure_batch_frac: float = 0.5
+    seizure_frac_anneal_epochs: int = 20
+    # A7 active NaN-guard / clip; A8 sens-floored selection; A9 early-stop.
+    grad_clip: float = 0.5
+    sens_floor: float = 0.85
+    abort_on_collapse: bool = True
+    early_stop_patience: int = 30
+    warmup_frac: float = 0.10
+    # A1 no-WD param group for SSM dynamics (A_log/dt_bias/D/bias/norm).
+    no_wd_dynamics: bool = True
+    # Natural seizure-window fraction the curriculum anneals toward (the
+    # observed train rate; the sampler stops oversampling once reached).
+    seizure_frac_natural: float = 0.18
+
+    # --- Seizure-head loss (B4 + B5) ---
+    # Dedicated seizure-head pos_weight floor. Overridden at runtime by the
+    # data-derived seizure-vs-rest ratio (~40) unless that scan is skipped.
+    seizure_pos_weight: float = 40.0
+    # B5 focal + soft-Tversky knobs for the seizure channel.
+    focal_gamma: float = 2.0
+    focal_alpha: float = 0.75
+    tversky_fn_weight: float = 0.7      # FN penalty (recall-favoring)
+    tversky_fp_weight: float = 0.3
+    seizure_loss_weight: float = 1.5    # >1.0x so seizure can't be drowned
 
     @property
     def param_estimate(self) -> int:
@@ -89,11 +125,12 @@ class SNNConfig:
 SNN_CONFIGS = {
     'fast': SNNConfig(
         name='fast',
-        description='Prototyping — ~1 hour. Sanity checks and architecture experiments.',
+        description='Prototyping — ~1 hour. Sanity checks and architecture experiments. '
+                    'Run-2 stability defaults (gentle 3e-4 peak, 10% warmup).',
         epochs=50,
         batch_size=128,
-        lr=2e-3,
-        lr_min=1e-4,
+        lr=3e-4,
+        lr_min=1e-5,
         max_windows_per_file=2,
     ),
 
