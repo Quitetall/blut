@@ -38,6 +38,37 @@ pub fn scripts_script(roots: &LamquantRoots, rel: &[&str]) -> Result<PathBuf, St
         .map_err(|e| StageError::BadInput(e.to_string()))
 }
 
+/// Resolve a BLUT-owned training/preprocess script under the
+/// `blut_python_root` (`<blut>/python/lamquant/<area>/<file>.py`),
+/// post MOVE-B (2026-05-29). `rel` MUST start with `"python"`.
+/// `BadInput` on miss, naming the `$BLUT_PYTHON` override.
+///
+/// Returns `(script_path, blut_python_dir)` where `blut_python_dir` is
+/// `<blut_python_root>/python` — the directory to put on `PYTHONPATH`
+/// so the moved scripts resolve their `lamquant.*` package imports.
+pub fn blut_python_script(rel: &[&str]) -> Result<(PathBuf, PathBuf), StageError> {
+    let roots = resolve_roots()?;
+    let script = roots
+        .blut_python_script(rel)
+        .map_err(|e| StageError::BadInput(e.to_string()))?;
+    let python_dir = roots.blut_python_root.join("python");
+    Ok((script, python_dir))
+}
+
+/// Build the `PYTHONPATH` value for a BLUT-owned script subprocess:
+/// the `blut/python` dir (so `lamquant.*` resolves) layered ahead of
+/// any caller-supplied `PYTHONPATH`. The PRIVATE `lamquant_neural` and
+/// PUBLIC `lamquant_core` / `lamquant_codec` wheels are pip-installed
+/// in the venv, so only the BLUT python root needs injecting here.
+pub fn blut_pythonpath(python_dir: &Path) -> String {
+    let existing = std::env::var("PYTHONPATH").unwrap_or_default();
+    if existing.is_empty() {
+        python_dir.display().to_string()
+    } else {
+        format!("{}:{}", python_dir.display(), existing)
+    }
+}
+
 /// Canonicalize and validate `lamquant_home`. Returns the absolute
 /// path. `BadInput` if the path is missing or not canonicalizable.
 ///

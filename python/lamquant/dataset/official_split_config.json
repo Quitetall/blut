@@ -1,0 +1,41 @@
+{
+  "description": "Official LamQuant Gen 7.6.1 training split. Includes all Temple University EEG corpora.",
+  "seed": 42,
+  "ratio": 0.05,
+  "datasets": {
+    "chbmit": {
+      "train_subjects": ["chb01","chb02","chb03","chb04","chb05","chb06","chb07","chb08","chb09","chb10","chb11","chb12","chb13","chb14","chb15","chb16","chb17","chb18","chb19","chb20"],
+      "holdout_subjects": ["chb21","chb22","chb23","chb24"]
+    },
+    "tuh_seizure": {
+      "train_subjects": "ALL",
+      "holdout_subjects": []
+    },
+    "tuh_artifact": {
+      "train_subjects": "ALL",
+      "holdout_subjects": []
+    },
+    "tuh_epilepsy": {
+      "train_subjects": "ALL",
+      "holdout_subjects": []
+    },
+    "tuh_events": {
+      "train_subjects": "ALL",
+      "holdout_subjects": []
+    }
+  },
+  "validation_only_datasets": [
+    "siena",
+    "eegmmidb",
+    "mental_arithmetic"
+  ],
+  "snn_training_datasets": [
+    "chbmit",
+    "tuh_seizure",
+    "tuh_artifact"
+  ],
+  "snn_excluded_datasets": [
+    "tuh_epilepsy",
+    "tuh_events"
+  ]
+}

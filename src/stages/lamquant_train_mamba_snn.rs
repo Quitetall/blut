@@ -27,7 +27,7 @@ use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
 use crate::lamquant_backend::{LamquantBackend, LamquantInvocation, resolve_lamquant_python};
-use crate::stages::lamquant_helpers::resolve_home;
+use crate::stages::lamquant_helpers::{blut_python_script, blut_pythonpath, resolve_home};
 
 pub struct LamquantTrainMambaSnn;
 
@@ -123,18 +123,15 @@ impl Stage for LamquantTrainMambaSnn {
         // `weights/` checkpoint tree this stage writes. `resolve_home`
         // canonicalizes + surfaces a missing root as a clear
         // `BadInput` preflight error instead of a low-level Io error.
+        // MOVE-B (2026-05-29): the SNN trainer now lives in the PUBLIC
+        // BLUT submodule at `<blut>/python/lamquant/snn/train_mamba_snn.py`,
+        // resolved via `blut_python_root` ($BLUT_PYTHON). `lamquant_home`
+        // is still resolved for checkpoint output (Neural `weights/`) +
+        // data dirs.
         let lamquant_home = resolve_home(&args.lamquant_home)?;
         let python = resolve_lamquant_python(&lamquant_home);
-        let script = lamquant_home
-            .join("ai_models")
-            .join("snn")
-            .join("train_mamba_snn.py");
-        if !script.exists() {
-            return Err(StageError::BadInput(format!(
-                "train_mamba_snn.py not found: {}",
-                script.display()
-            )));
-        }
+        let (script, python_dir) =
+            blut_python_script(&["python", "lamquant", "snn", "train_mamba_snn.py"])?;
         // Resolve labels_dir / eeg_dir against lamquant_home if
         // they're relative; existence-check after resolution.
         let labels_dir = resolve_relative(&lamquant_home, &args.labels_dir);
@@ -254,26 +251,21 @@ impl Stage for LamquantTrainMambaSnn {
         // here pre-ADR-0017 are folded into the new LMA-direct flow.)
 
         // BLUT identity for the RunManifest pre-hook to read.
-        // PYTHONPATH: trainer imports `lamquant_codec` (NOT pip-installed,
-        // lives at the repo root) and `ai_models.*`. Both need the repo
-        // on sys.path. Layer onto any caller-supplied PYTHONPATH instead
-        // of stomping it.
-        let existing_pp = std::env::var("PYTHONPATH").unwrap_or_default();
-        let pp_with_repo = if existing_pp.is_empty() {
-            lamquant_home.display().to_string()
-        } else {
-            format!("{}:{}", lamquant_home.display(), existing_pp)
-        };
+        // MOVE-B PYTHONPATH: the trainer now imports `lamquant.*`
+        // (BLUT-owned package under blut/python), plus the pip-installed
+        // `lamquant_neural` (model defs) + `lamquant_core`/`lamquant_codec`
+        // (lossless wheels). Only the blut/python package root needs
+        // injecting; layer it onto any caller-supplied PYTHONPATH.
         let env = vec![
             ("BLUT_JOB_DIR".into(), ctx.job_dir.display().to_string()),
             ("BLUT_STAGE_NAME".into(), Self::NAME.to_string()),
-            ("PYTHONPATH".into(), pp_with_repo),
+            ("PYTHONPATH".into(), blut_pythonpath(&python_dir)),
         ];
 
         let inv = LamquantInvocation {
             python,
             script,
-            cwd: lamquant_home,
+            cwd: python_dir.clone(),
             args: cmd_args,
             env,
             expected_outputs: vec![checkpoint_path.clone()],

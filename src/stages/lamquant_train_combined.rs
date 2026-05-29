@@ -21,8 +21,8 @@ use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
 use crate::lamquant_backend::{LamquantBackend, LamquantInvocation};
 use crate::stages::lamquant_helpers::{
+    blut_python_script, blut_pythonpath,
     blut_env, progress_forwarder, push_opt_f32, push_opt_u32, python_for, resolve_home, safe_join,
-    script_path,
 };
 
 pub struct LamquantTrainCombined;
@@ -93,7 +93,8 @@ impl Stage for LamquantTrainCombined {
     ) -> Result<Self::Output, StageError> {
         let home = resolve_home(&args.lamquant_home)?;
         let python = python_for(&home);
-        let script = script_path(&home, &["ai_models", "decoder", "train_combined.py"])?;
+        // MOVE-B: script now under blut/python; resolve via $BLUT_PYTHON.
+        let (script, python_dir) = blut_python_script(&["python", "lamquant", "decoder", "train_combined.py"])?;
 
         // Combined writes a teacher ckpt + a decoder ckpt to the
         // student/ dir per LamQuant convention.
@@ -152,9 +153,13 @@ impl Stage for LamquantTrainCombined {
         let inv = LamquantInvocation {
             python,
             script,
-            cwd: home,
+            cwd: python_dir.clone(),
             args: cmd_args,
-            env: blut_env(&ctx.job_dir, Self::NAME),
+            env: {
+                let mut e = blut_env(&ctx.job_dir, Self::NAME);
+                e.push(("PYTHONPATH".into(), blut_pythonpath(&python_dir)));
+                e
+            },
             expected_outputs: vec![teacher_path.clone(), decoder_path.clone()],
             run_manifest_path: None,
         };

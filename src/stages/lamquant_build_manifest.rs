@@ -19,7 +19,7 @@ use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
 use crate::lamquant_backend::{LamquantBackend, LamquantInvocation, resolve_lamquant_python};
-use crate::stages::lamquant_helpers::resolve_home;
+use crate::stages::lamquant_helpers::{blut_python_script, blut_pythonpath, resolve_home};
 
 pub struct LamquantBuildManifest;
 
@@ -68,26 +68,27 @@ impl Stage for LamquantBuildManifest {
         _input: (),
         args: &Args,
     ) -> Result<Manifest, StageError> {
-        // RCP-1/RCP-7: empty home → detected `ai_models_root`
-        // (the `LamQuant-Neural` submodule holding
-        // `ai_models/dataset_sim/build_manifest.py`).
+        // MOVE-B (2026-05-29): the build_manifest preprocessing script
+        // now lives in the PUBLIC BLUT submodule at
+        // `<blut>/python/lamquant/dataset/build_manifest.py`, resolved
+        // via `blut_python_root` ($BLUT_PYTHON). `lamquant_home` is
+        // still resolved for the (optional) output path that the
+        // operator may anchor relative to the Neural repo.
         let lamquant_home = resolve_home(&args.lamquant_home)?;
         let python = resolve_lamquant_python(&lamquant_home);
-        let script = lamquant_home
-            .join("ai_models")
-            .join("dataset_sim")
-            .join("build_manifest.py");
-        if !script.exists() {
-            return Err(StageError::BadInput(format!(
-                "build_manifest.py not found: {}",
-                script.display()
-            )));
-        }
+        let (script, python_dir) = blut_python_script(&[
+            "python",
+            "lamquant",
+            "dataset",
+            "build_manifest.py",
+        ])?;
 
         let output_path = if args.output_rel.is_empty() {
-            lamquant_home
-                .join("ai_models")
-                .join("dataset_sim")
+            // Builder default: the manifest_v3.json that moved alongside
+            // the script into blut/python/lamquant/dataset/.
+            python_dir
+                .join("lamquant")
+                .join("dataset")
                 .join("manifest_v3.json")
         } else {
             lamquant_home.join(&args.output_rel)
@@ -113,9 +114,9 @@ impl Stage for LamquantBuildManifest {
         let inv = LamquantInvocation {
             python,
             script,
-            cwd: lamquant_home.clone(),
+            cwd: python_dir.clone(),
             args: cmd_args,
-            env: vec![],
+            env: vec![("PYTHONPATH".into(), blut_pythonpath(&python_dir))],
             expected_outputs: vec![output_path.clone()],
             run_manifest_path: None,
         };
@@ -192,8 +193,24 @@ mod tests {
     }
 
     #[tokio::test]
+    // env-serialization guard held across the stage .await on purpose:
+    // $BLUT_PYTHON is process-global; the lock serializes the whole
+    // set/run/restore body against other env-mutating tests (same
+    // pattern as recipe_paths_contract::env_guard).
+    #[allow(clippy::await_holding_lock)]
     async fn rejects_missing_build_script() {
+        // MOVE-B: the build script resolves under `blut_python_root`
+        // ($BLUT_PYTHON), not `lamquant_home`. Point $BLUT_PYTHON at a
+        // dir with no `python/lamquant/dataset/build_manifest.py` so the
+        // resolver returns a clean BadInput.
+        let _g = crate::TEST_ENV_LOCK.lock().unwrap();
         let td = tempfile::tempdir().unwrap();
+        let prev = std::env::var("BLUT_PYTHON").ok();
+        // Lay a `python/` so the root validates but the script is absent.
+        std::fs::create_dir_all(td.path().join("python")).unwrap();
+        unsafe {
+            std::env::set_var("BLUT_PYTHON", td.path());
+        }
         let r = LamquantBuildManifest
             .run(
                 &ctx(td.path()),
@@ -208,6 +225,12 @@ mod tests {
                 },
             )
             .await;
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("BLUT_PYTHON", v),
+                None => std::env::remove_var("BLUT_PYTHON"),
+            }
+        }
         assert!(matches!(r, Err(StageError::BadInput(_))));
     }
 }

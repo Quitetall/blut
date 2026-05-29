@@ -82,71 +82,95 @@ fn restore_overrides(
 /// IS the drift detector: if a stage repoints its wrapped script, the
 /// table must follow or the test fails.
 fn ai_models_scripts() -> Vec<(&'static str, Vec<&'static str>)> {
+    // Post MOVE-B (2026-05-29): only the two PCCP gate stages still
+    // resolve under `ai_models_root` (the LamQuant-Neural submodule) —
+    // PCCP governance (pccp_gate.py) stays in Neural. ALL training +
+    // preprocessing scripts moved to `blut_python_root` and now live in
+    // `blut_python_scripts()` below.
+    vec![
+        ("lamquant_pccp_gate_snn", vec!["ai_models", "pccp_gate.py"]),
+        (
+            "lamquant_pccp_gate_encoder",
+            vec!["ai_models", "pccp_gate.py"],
+        ),
+    ]
+}
+
+/// The training + preprocessing scripts each `lamquant_*` stage wraps,
+/// now resolved under `blut_python_root` ($BLUT_PYTHON →
+/// `<blut>/python/lamquant/<area>/<script>.py`). This is the MOVE-B
+/// analogue of `ai_models_scripts()`: the 14 train/preprocess stages
+/// repointed here when their scripts moved from the PRIVATE Neural
+/// `ai_models/` tree into the PUBLIC BLUT `python/lamquant/` tree. Each
+/// rel path is RELATIVE to `blut_python_root` and MUST start with
+/// `"python"`. This table IS the drift detector for the moved scripts.
+fn blut_python_scripts() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
         (
             "lamquant_train_mamba_snn",
-            vec!["ai_models", "snn", "train_mamba_snn.py"],
+            vec!["python", "lamquant", "snn", "train_mamba_snn.py"],
         ),
         (
             "lamquant_generate_snn_labels",
-            vec!["ai_models", "snn", "generate_activity_labels.py"],
+            vec!["python", "lamquant", "snn", "generate_activity_labels.py"],
         ),
         (
             "lamquant_build_manifest",
-            vec!["ai_models", "dataset_sim", "build_manifest.py"],
+            vec!["python", "lamquant", "dataset", "build_manifest.py"],
         ),
         (
             "lamquant_build_split_manifest",
             vec![
-                "ai_models",
-                "dataset_sim",
+                "python",
+                "lamquant",
+                "dataset",
                 "build_seizure_split_manifest.py",
             ],
         ),
         (
             "lamquant_precompute_fullband",
-            vec!["ai_models", "dataset_sim", "precompute_fullband_memmap.py"],
+            vec![
+                "python",
+                "lamquant",
+                "dataset",
+                "precompute_fullband_memmap.py",
+            ],
         ),
         (
             "lamquant_precompute_l3",
-            vec!["ai_models", "student", "precompute_l3_fast.py"],
+            vec!["python", "lamquant", "student", "precompute_l3_fast.py"],
         ),
         (
             "lamquant_pretrain_mae",
-            vec!["ai_models", "student", "pretrain_mae.py"],
+            vec!["python", "lamquant", "student", "pretrain_mae.py"],
         ),
         (
             "lamquant_train_student",
-            vec!["ai_models", "student", "train_student_subband.py"],
+            vec!["python", "lamquant", "student", "train_student_subband.py"],
         ),
         (
             "lamquant_train_joint",
-            vec!["ai_models", "student", "train_joint.py"],
+            vec!["python", "lamquant", "student", "train_joint.py"],
         ),
         (
             "lamquant_harden_artifacts",
-            vec!["ai_models", "student", "harden_artifacts.py"],
+            vec!["python", "lamquant", "student", "harden_artifacts.py"],
         ),
         (
             "lamquant_train_teacher",
-            vec!["ai_models", "oracle", "train_teacher.py"],
+            vec!["python", "lamquant", "oracle", "train_teacher.py"],
         ),
         (
             "lamquant_train_l3_teacher",
-            vec!["ai_models", "oracle", "train_l3_teacher.py"],
+            vec!["python", "lamquant", "oracle", "train_l3_teacher.py"],
         ),
         (
             "lamquant_train_vocos_decoder",
-            vec!["ai_models", "decoder", "train_vocos_decoder.py"],
+            vec!["python", "lamquant", "decoder", "train_vocos_decoder.py"],
         ),
         (
             "lamquant_train_combined",
-            vec!["ai_models", "decoder", "train_combined.py"],
-        ),
-        ("lamquant_pccp_gate_snn", vec!["ai_models", "pccp_gate.py"]),
-        (
-            "lamquant_pccp_gate_encoder",
-            vec!["ai_models", "pccp_gate.py"],
+            vec!["python", "lamquant", "decoder", "train_combined.py"],
         ),
     ]
 }
@@ -202,6 +226,19 @@ fn wrapped_scripts_exist_at_resolved_home() {
             Ok(p) => assert!(
                 p.exists(),
                 "{stage}: resolver returned {} which does not exist",
+                p.display()
+            ),
+            Err(e) => failures.push(format!("{stage}: {e}")),
+        }
+    }
+    // MOVE-B: the 14 train/preprocess scripts now resolve under
+    // blut_python_root (blut/python/lamquant/<area>/...). Same contract:
+    // the resolved path MUST exist on disk.
+    for (stage, rel) in blut_python_scripts() {
+        match roots.blut_python_script(&rel) {
+            Ok(p) => assert!(
+                p.exists(),
+                "{stage}: blut_python resolver returned {} which does not exist",
                 p.display()
             ),
             Err(e) => failures.push(format!("{stage}: {e}")),
@@ -268,11 +305,20 @@ fn multi_root_resolves_ai_models_and_scripts() {
     let prev = clear_overrides();
     let roots = LamquantRoots::resolve().expect("roots resolve");
 
-    let ai = roots
-        .ai_models_script(&["ai_models", "snn", "train_mamba_snn.py"])
-        .expect("ai_models script resolves under ai_models_root");
-    assert!(ai.starts_with(&roots.ai_models_root));
-    assert!(ai.exists());
+    // MOVE-B: the SNN trainer now resolves under blut_python_root
+    // (blut/python/lamquant/snn/...), NOT ai_models_root. The PCCP gate
+    // (governance) still resolves under ai_models_root (Neural).
+    let snn = roots
+        .blut_python_script(&["python", "lamquant", "snn", "train_mamba_snn.py"])
+        .expect("train_mamba_snn.py resolves under blut_python_root");
+    assert!(snn.starts_with(&roots.blut_python_root));
+    assert!(snn.exists());
+
+    let gate = roots
+        .ai_models_script(&["ai_models", "pccp_gate.py"])
+        .expect("pccp_gate.py resolves under ai_models_root (governance stays in Neural)");
+    assert!(gate.starts_with(&roots.ai_models_root));
+    assert!(gate.exists());
 
     let sc = roots
         .scripts_script(&["scripts", "bulk_lml_to_lma.py"])
@@ -280,14 +326,27 @@ fn multi_root_resolves_ai_models_and_scripts() {
     assert!(sc.starts_with(&roots.scripts_root));
     assert!(sc.exists());
 
-    // The two roots are genuinely distinct in the post-split layout
-    // (Neural submodule vs meta-repo) — that's the whole point of
-    // multi-root resolution. (If a monorepo ever collapses them this
-    // assertion would need revisiting, but the current contract is
-    // the split layout.)
+    // The roots are genuinely distinct in the post-split + MOVE-B
+    // layout: ai_models_root (Neural submodule) vs meta-repo scripts vs
+    // blut_python_root (BLUT submodule). The SNN trainer must NOT
+    // resolve under ai_models_root anymore — that is the whole point of
+    // MOVE-B (training moved out of Neural into BLUT).
     assert_ne!(
         roots.ai_models_root, roots.scripts_root,
         "post-split layout should resolve ai_models_root and scripts_root to distinct dirs"
+    );
+    assert_ne!(
+        roots.ai_models_root, roots.blut_python_root,
+        "MOVE-B: blut_python_root (BLUT) must differ from ai_models_root (Neural)"
+    );
+    assert!(
+        roots.blut_python_root.join("python").is_dir(),
+        "blut_python_root {} must hold python/",
+        roots.blut_python_root.display()
+    );
+    assert!(
+        !snn.starts_with(&roots.ai_models_root),
+        "MOVE-B: train_mamba_snn.py must NOT resolve under ai_models_root anymore"
     );
 
     // pccp_root holds pccp/ (RCP-9 gate context).
@@ -406,17 +465,19 @@ fn new_stage_script_and_binary_paths_resolve() {
 
     let roots = LamquantRoots::resolve().expect("roots resolve on current layout");
 
-    // build_seizure_split_manifest.py exists under ai_models_root.
+    // MOVE-B: build_seizure_split_manifest.py now resolves under
+    // blut_python_root (blut/python/lamquant/dataset/...).
     let split_script = roots
-        .ai_models_script(&[
-            "ai_models",
-            "dataset_sim",
+        .blut_python_script(&[
+            "python",
+            "lamquant",
+            "dataset",
             "build_seizure_split_manifest.py",
         ])
-        .expect("build_seizure_split_manifest.py resolves under ai_models_root");
+        .expect("build_seizure_split_manifest.py resolves under blut_python_root");
     assert!(
         split_script.exists() && split_script.is_file(),
-        "build_seizure_split_manifest.py must exist on disk at {} (RCP-3)",
+        "build_seizure_split_manifest.py must exist on disk at {} (RCP-3 / MOVE-B)",
         split_script.display()
     );
 

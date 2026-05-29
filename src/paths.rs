@@ -93,6 +93,15 @@ pub struct LamquantRoots {
     /// encode/decode binary (`<lossless_root>/target/release/lml`).
     /// Default `<meta>/LamQuant-Lossless`.
     pub lossless_root: PathBuf,
+    /// Dir containing the BLUT-owned python training tree
+    /// (`<blut_python_root>/python/lamquant/...`). After the MOVE-B
+    /// boundary migration, ALL training + preprocessing scripts live
+    /// here (in the PUBLIC `blut/` submodule), NOT under
+    /// `ai_models_root` (the PRIVATE Neural submodule). The two PCCP
+    /// gate stages still resolve `ai_models/pccp_gate.py` under
+    /// `ai_models_root` (governance stays in Neural). Default
+    /// `<meta>/blut` (validated to hold `python/`).
+    pub blut_python_root: PathBuf,
 }
 
 /// Path of the `lml` encode/decode binary RELATIVE to `lossless_root`.
@@ -193,11 +202,13 @@ impl LamquantRoots {
         let scripts_root = resolve_scripts_root(meta.as_deref(), &ai_models_root)?;
         let pccp_root = resolve_pccp_root(meta.as_deref(), &ai_models_root)?;
         let lossless_root = resolve_lossless_root(meta.as_deref())?;
+        let blut_python_root = resolve_blut_python_root(meta.as_deref())?;
         Ok(Self {
             ai_models_root,
             scripts_root,
             pccp_root,
             lossless_root,
+            blut_python_root,
         })
     }
 
@@ -236,6 +247,18 @@ impl LamquantRoots {
     /// relative to `scripts_root` and MUST start with `scripts`.
     pub fn scripts_script(&self, rel: &[&str]) -> Result<PathBuf> {
         join_existing(&self.scripts_root, rel, "scripts", "BLUT_SCRIPTS")
+    }
+
+    /// Build + existence-check a script under the BLUT-owned python
+    /// training tree. `rel` is relative to `blut_python_root` and MUST
+    /// start with `python` (so call sites read like the on-disk layout
+    /// `python/lamquant/<area>/<script>.py`). Clean `Err` if absent.
+    ///
+    /// This is the MOVE-B analogue of `ai_models_script`: after the
+    /// boundary migration, every train/preprocess stage resolves its
+    /// wrapped script here instead of under `ai_models_root`.
+    pub fn blut_python_script(&self, rel: &[&str]) -> Result<PathBuf> {
+        join_existing(&self.blut_python_root, rel, "python", "BLUT_PYTHON")
     }
 }
 
@@ -339,6 +362,36 @@ fn resolve_lossless_root(meta: Option<&Path>) -> Result<PathBuf> {
     }
     // Monorepo fallback: the Lossless crate lives at the meta root.
     Ok(meta.to_path_buf())
+}
+
+/// `$BLUT_PYTHON` → `<meta>/blut` (the public BLUT submodule that owns
+/// the training python tree post MOVE-B) → `<meta>` (monorepo
+/// fallback). Validated to hold `python/`; a missing root yields a
+/// clean `Err` naming the override knob.
+fn resolve_blut_python_root(meta: Option<&Path>) -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("BLUT_PYTHON") {
+        let p = PathBuf::from(p);
+        return validate_holds(p, "python", "$BLUT_PYTHON");
+    }
+    let meta = meta.ok_or_else(|| {
+        TrainError::other(
+            "blut_python_root: meta-repo not detected; set $BLUT_PYTHON to the dir \
+             that holds python/lamquant/ (the BLUT-owned training tree)",
+        )
+    })?;
+    let blut = meta.join("blut");
+    if blut.join("python").is_dir() {
+        return Ok(blut);
+    }
+    // Monorepo fallback: python/ sits at the meta root.
+    if meta.join("python").is_dir() {
+        return Ok(meta.to_path_buf());
+    }
+    Err(TrainError::other(format!(
+        "python/ not found under {} or {}; set $BLUT_PYTHON",
+        blut.display(),
+        meta.display()
+    )))
 }
 
 /// Validate that `root` holds the `expects` subtree; clean `Err`
@@ -626,6 +679,7 @@ mod tests {
             scripts_root: PathBuf::from("/x"),
             pccp_root: PathBuf::from("/x"),
             lossless_root: PathBuf::from("/x/LamQuant-Lossless"),
+            blut_python_root: PathBuf::from("/x/blut"),
         };
         assert_eq!(roots.lml_binary(), PathBuf::from("/custom/path/to/lml"));
         unsafe {
@@ -652,6 +706,7 @@ mod tests {
             scripts_root: PathBuf::from("/meta"),
             pccp_root: PathBuf::from("/meta/LamQuant-Neural"),
             lossless_root: PathBuf::from("/meta/LamQuant-Lossless"),
+            blut_python_root: PathBuf::from("/meta/blut"),
         };
         assert_eq!(
             roots.lml_binary(),

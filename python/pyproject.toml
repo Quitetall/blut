@@ -26,6 +26,36 @@ dependencies = [
 [project.optional-dependencies]
 apollo = ["apollo-torch>=0.1"]
 
+# MOVE-B (2026-05-29): the `lamquant.*` training/preprocessing tree
+# (under python/lamquant/) imports the neural codec MODEL DEFINITIONS
+# from the PRIVATE `lamquant-neural` wheel (encoder / blocks / snn /
+# vocos_decoder / heads) and the PUBLIC `lamquant-core` PyO3 wheel (LMA
+# decode). BLUT is PUBLIC; it declares these only as an OPTIONAL extra
+# so the generic recipes (sft / dpo / distill) still install + run
+# without them. Install the LamQuant recipes with:
+#     pip install 'lamu-trainer[lamquant]'
+# The lamquant.* modules degrade with a clear RuntimeError (see
+# lamquant.require_lamquant_neural) when `lamquant-neural` is absent.
+lamquant = [
+    "lamquant-neural",   # PRIVATE — model defs (LamQuant-Neural repo)
+    "lamquant-core",     # PUBLIC PyO3 — LMA/container decode (LamQuant-Lossless)
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# Ship the MOVE-B training/preprocessing package tree. The legacy
+# top-level trainer modules (trainer.py, trainer_dpo.py, …) are kept as
+# loose py-modules so existing `$LAMU_TRAINER_PY` resolution is intact.
+py-modules = ["trainer", "trainer_dpo", "trainer_distill", "datasets_loader"]
+
+[tool.setuptools.packages.find]
+# Discover the `lamquant` package (lamquant/, lamquant/snn/, …) that
+# MOVE-B added under python/. Excludes the loose top-level modules.
+include = ["lamquant*"]
+
 [tool.lamu]
 # Self-check mode is dependency-free (only stdlib). Used by Rust
 # integration tests to verify the protocol round-trip without

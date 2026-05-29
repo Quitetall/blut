@@ -31,7 +31,7 @@ use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
 use crate::lamquant_backend::{LamquantBackend, LamquantInvocation};
 use crate::stages::lamquant_helpers::{
-    blut_env, progress_forwarder, python_for, resolve_home, script_path,
+    blut_env, blut_python_script, blut_pythonpath, progress_forwarder, python_for, resolve_home,
 };
 
 pub struct LamquantBuildSplitManifest;
@@ -93,18 +93,19 @@ impl Stage for LamquantBuildSplitManifest {
             )));
         }
 
-        // RCP-1/RCP-7: empty home → detected `ai_models_root`
-        // (the `LamQuant-Neural` submodule holding the script).
+        // MOVE-B (2026-05-29): the split-manifest builder now lives in
+        // the PUBLIC BLUT submodule at
+        // `<blut>/python/lamquant/dataset/build_seizure_split_manifest.py`,
+        // resolved via `blut_python_root` ($BLUT_PYTHON). `home` is still
+        // resolved for `python_for` interpreter selection.
         let home = resolve_home(&args.lamquant_home)?;
         let python = python_for(&home);
-        let script = script_path(
-            &home,
-            &[
-                "ai_models",
-                "dataset_sim",
-                "build_seizure_split_manifest.py",
-            ],
-        )?;
+        let (script, python_dir) = blut_python_script(&[
+            "python",
+            "lamquant",
+            "dataset",
+            "build_seizure_split_manifest.py",
+        ])?;
 
         // `--lma-root`: explicit override, else the upstream corpus's
         // root (the LmaCorpus produced by encode_lma / convert_lma).
@@ -143,12 +144,14 @@ impl Stage for LamquantBuildSplitManifest {
             format!("{}", args.val_fraction),
         ];
 
+        let mut env = blut_env(&ctx.job_dir, Self::NAME);
+        env.push(("PYTHONPATH".into(), blut_pythonpath(&python_dir)));
         let inv = LamquantInvocation {
             python,
             script,
-            cwd: home,
+            cwd: python_dir.clone(),
             args: cmd_args,
-            env: blut_env(&ctx.job_dir, Self::NAME),
+            env,
             expected_outputs: vec![args.out.clone()],
             run_manifest_path: None,
         };
@@ -264,9 +267,22 @@ mod tests {
     }
 
     #[tokio::test]
+    // env-serialization guard held across the stage .await on purpose:
+    // $BLUT_PYTHON is process-global; the lock serializes the whole
+    // set/run/restore body against other env-mutating tests (same
+    // pattern as recipe_paths_contract::env_guard).
+    #[allow(clippy::await_holding_lock)]
     async fn rejects_missing_script() {
-        // Home exists + canonicalizes, but holds no ai_models/ script.
+        // MOVE-B: the split-manifest builder resolves under
+        // `blut_python_root` ($BLUT_PYTHON). Point it at a dir that
+        // holds `python/` but not the script → clean BadInput.
+        let _g = crate::TEST_ENV_LOCK.lock().unwrap();
         let td = tempfile::tempdir().unwrap();
+        let prev = std::env::var("BLUT_PYTHON").ok();
+        std::fs::create_dir_all(td.path().join("python")).unwrap();
+        unsafe {
+            std::env::set_var("BLUT_PYTHON", td.path());
+        }
         let r = LamquantBuildSplitManifest
             .run(
                 &ctx(td.path()),
@@ -280,6 +296,12 @@ mod tests {
                 },
             )
             .await;
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("BLUT_PYTHON", v),
+                None => std::env::remove_var("BLUT_PYTHON"),
+            }
+        }
         assert!(matches!(r, Err(StageError::BadInput(_))));
     }
 

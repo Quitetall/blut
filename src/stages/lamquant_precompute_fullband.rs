@@ -14,7 +14,9 @@ use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
 use crate::lamquant_backend::{LamquantBackend, LamquantInvocation};
-use crate::stages::lamquant_helpers::{python_for, resolve_home, safe_join, script_path};
+use crate::stages::lamquant_helpers::{
+    blut_python_script, blut_pythonpath, python_for, resolve_home, safe_join,
+};
 
 pub struct LamquantPrecomputeFullband;
 
@@ -50,15 +52,21 @@ impl Stage for LamquantPrecomputeFullband {
         input: Manifest,
         args: &Args,
     ) -> Result<FullbandMemmap, StageError> {
+        // MOVE-B (2026-05-29): the precompute script moved to the
+        // PUBLIC BLUT submodule at
+        // `<blut>/python/lamquant/dataset/precompute_fullband_memmap.py`.
         let home = resolve_home(&args.lamquant_home)?;
         let python = python_for(&home);
-        let script = script_path(
-            &home,
-            &["ai_models", "dataset_sim", "precompute_fullband_memmap.py"],
-        )?;
+        let (script, python_dir) = blut_python_script(&[
+            "python",
+            "lamquant",
+            "dataset",
+            "precompute_fullband_memmap.py",
+        ])?;
 
         let out_dir = if args.out_dir_rel.is_empty() {
-            home.join("ai_models").join("dataset_sim")
+            // Default alongside the moved script in the BLUT dataset dir.
+            python_dir.join("lamquant").join("dataset")
         } else {
             safe_join(&home, &args.out_dir_rel)?
         };
@@ -86,9 +94,9 @@ impl Stage for LamquantPrecomputeFullband {
         let inv = LamquantInvocation {
             python,
             script,
-            cwd: home,
+            cwd: python_dir.clone(),
             args: cmd_args,
-            env: vec![],
+            env: vec![("PYTHONPATH".into(), blut_pythonpath(&python_dir))],
             expected_outputs: vec![train_path.clone(), val_path.clone()],
             run_manifest_path: None,
         };
@@ -168,9 +176,22 @@ mod tests {
     }
 
     #[tokio::test]
+    // env-serialization guard held across the stage .await on purpose:
+    // $BLUT_PYTHON is process-global; the lock serializes the whole
+    // set/run/restore body against other env-mutating tests (same
+    // pattern as recipe_paths_contract::env_guard).
+    #[allow(clippy::await_holding_lock)]
     async fn rejects_missing_script() {
+        // MOVE-B: the precompute script resolves under
+        // `blut_python_root` ($BLUT_PYTHON). Point it at a dir holding
+        // `python/` but not the script → clean BadInput.
+        let _g = crate::TEST_ENV_LOCK.lock().unwrap();
         let td = tempfile::tempdir().unwrap();
-        // Empty repo — no precompute script in it.
+        let prev = std::env::var("BLUT_PYTHON").ok();
+        std::fs::create_dir_all(td.path().join("python")).unwrap();
+        unsafe {
+            std::env::set_var("BLUT_PYTHON", td.path());
+        }
         let r = LamquantPrecomputeFullband
             .run(
                 &ctx(td.path()),
@@ -182,6 +203,12 @@ mod tests {
                 },
             )
             .await;
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("BLUT_PYTHON", v),
+                None => std::env::remove_var("BLUT_PYTHON"),
+            }
+        }
         assert!(matches!(r, Err(StageError::BadInput(_))));
     }
 }
