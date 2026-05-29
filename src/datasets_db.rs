@@ -23,7 +23,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -116,9 +116,7 @@ pub fn registry_path() -> Result<PathBuf> {
         return Ok(PathBuf::from(p));
     }
     let dir = dirs::data_local_dir()
-        .ok_or_else(|| TrainError::other(
-            "data_local_dir() unavailable; set $LAMU_MEMORY_DB",
-        ))?
+        .ok_or_else(|| TrainError::other("data_local_dir() unavailable; set $LAMU_MEMORY_DB"))?
         .join("lamu");
     std::fs::create_dir_all(&dir).map_err(|e| TrainError::Io {
         path: dir.clone(),
@@ -158,8 +156,7 @@ fn apply_pragma_with_retry(conn: &Connection, sql: &str) {
     use std::time::Duration;
     let mut tries = 0u32;
     loop {
-        let r: rusqlite::Result<rusqlite::types::Value> =
-            conn.query_row(sql, [], |row| row.get(0));
+        let r: rusqlite::Result<rusqlite::types::Value> = conn.query_row(sql, [], |row| row.get(0));
         match r {
             Ok(_) => return,
             Err(rusqlite::Error::SqliteFailure(e, _))
@@ -374,8 +371,7 @@ mod tests {
         let conn = open_at(&td.path().join("test.db")).unwrap();
         let f = td.path().join("data.jsonl");
         make_jsonl(&f, 3);
-        let rec =
-            record_from_jsonl("ds-a", &f, "jsonl", Some("{}".into())).unwrap();
+        let rec = record_from_jsonl("ds-a", &f, "jsonl", Some("{}".into())).unwrap();
         add(&conn, &rec).unwrap();
         let listed = list(&conn).unwrap();
         assert_eq!(listed.len(), 1);

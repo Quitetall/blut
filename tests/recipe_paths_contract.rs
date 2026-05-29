@@ -15,7 +15,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use blut::paths::{LamquantRoots, DEFAULT_LABELS_DIR};
+use blut::paths::{DEFAULT_LABELS_DIR, LamquantRoots};
 
 /// Serializes ALL tests in this file (cargo runs them in one binary
 /// across threads). `BLUT_AI_MODELS` / `LAMQUANT_NEURAL` are
@@ -38,7 +38,12 @@ fn env_guard() -> std::sync::MutexGuard<'static, ()> {
 
 /// Clear any override env so detection runs against the real layout.
 /// Returns the prior values so the caller can restore them.
-fn clear_overrides() -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+fn clear_overrides() -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
     let prev = (
         std::env::var("BLUT_AI_MODELS").ok(),
         std::env::var("LAMQUANT_NEURAL").ok(),
@@ -54,7 +59,14 @@ fn clear_overrides() -> (Option<String>, Option<String>, Option<String>, Option<
     prev
 }
 
-fn restore_overrides(prev: (Option<String>, Option<String>, Option<String>, Option<String>)) {
+fn restore_overrides(
+    prev: (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ),
+) {
     unsafe {
         restore("BLUT_AI_MODELS", prev.0);
         restore("LAMQUANT_NEURAL", prev.1);
@@ -123,10 +135,7 @@ fn ai_models_scripts() -> Vec<(&'static str, Vec<&'static str>)> {
             "lamquant_train_combined",
             vec!["ai_models", "decoder", "train_combined.py"],
         ),
-        (
-            "lamquant_pccp_gate_snn",
-            vec!["ai_models", "pccp_gate.py"],
-        ),
+        ("lamquant_pccp_gate_snn", vec!["ai_models", "pccp_gate.py"]),
         (
             "lamquant_pccp_gate_encoder",
             vec!["ai_models", "pccp_gate.py"],
@@ -219,10 +228,7 @@ fn wrapped_scripts_exist_at_resolved_home() {
             .ai_models_root
             .join("firmware")
             .join("export_firmware.py");
-        let fw_under_pccp = roots
-            .pccp_root
-            .join("firmware")
-            .join("export_firmware.py");
+        let fw_under_pccp = roots.pccp_root.join("firmware").join("export_firmware.py");
         let fw_under_scripts = roots
             .scripts_root
             .join("firmware")
@@ -295,7 +301,11 @@ fn home_env_override_respected() {
 
     let td = tempfile::tempdir().unwrap();
     // Lay a stub ai_models/ tree under the temp override.
-    let stub_script = td.path().join("ai_models").join("snn").join("train_mamba_snn.py");
+    let stub_script = td
+        .path()
+        .join("ai_models")
+        .join("snn")
+        .join("train_mamba_snn.py");
     std::fs::create_dir_all(stub_script.parent().unwrap()).unwrap();
     std::fs::write(&stub_script, "# stub\n").unwrap();
 

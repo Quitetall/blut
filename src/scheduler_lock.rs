@@ -129,7 +129,9 @@ impl Drop for ExclusiveLock {
 /// on first use so callers don't need a setup step.
 pub fn lock_path() -> Result<PathBuf> {
     let dir = dirs::data_local_dir()
-        .ok_or_else(|| Error::Other("data_local_dir() unavailable; cannot place scheduler lock".into()))?
+        .ok_or_else(|| {
+            Error::Other("data_local_dir() unavailable; cannot place scheduler lock".into())
+        })?
         .join("lamu");
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join(LOCK_FILENAME))
@@ -317,7 +319,10 @@ mod tests {
             .expect_err("second acquire must fail");
         let msg = format!("{err}");
         assert!(msg.contains("first"), "msg should name the holder: {msg}");
-        assert!(msg.contains("--allow-evict"), "msg should hint --allow-evict: {msg}");
+        assert!(
+            msg.contains("--allow-evict"),
+            "msg should hint --allow-evict: {msg}"
+        );
     }
 
     #[test]
@@ -344,7 +349,10 @@ mod tests {
             since_unix: 0,
         };
         // Use pid=0xDEAD_BEEF which is well above any real pid_max.
-        let stale = LockInfo { pid: 0xDEAD_BEEF, ..stale };
+        let stale = LockInfo {
+            pid: 0xDEAD_BEEF,
+            ..stale
+        };
         std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
         let lock = acquire_exclusive_at(&path, "fresh", LockKind::Training)
             .expect("stale lock must be replaceable");
@@ -399,9 +407,6 @@ mod tests {
         };
         std::fs::write(&path, serde_json::to_vec(&imposter).unwrap()).unwrap();
         drop(lock);
-        assert!(
-            path.exists(),
-            "Drop must not remove an imposter lock body"
-        );
+        assert!(path.exists(), "Drop must not remove an imposter lock body");
     }
 }

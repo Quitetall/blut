@@ -57,7 +57,9 @@ impl Stage for MaterializeForEval {
             ("model_path", &args.model_path),
             ("dataset_path", &args.dataset_path),
         ] {
-            if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            if p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
                 return Err(StageError::BadInput(format!(
                     "{label} '{}' contains '..' — refusing",
                     p.display()
@@ -93,10 +95,11 @@ impl Stage for MaterializeForEval {
             final_loss: 0.0,
         };
 
-        let ds_hash = ContentHash::hash_file(&args.dataset_path).map_err(|source| StageError::Io {
-            path: args.dataset_path.clone(),
-            source,
-        })?;
+        let ds_hash =
+            ContentHash::hash_file(&args.dataset_path).map_err(|source| StageError::Io {
+                path: args.dataset_path.clone(),
+                source,
+            })?;
         // Cheap line count for the artifact; could be cached but
         // eval datasets are small (typically <50 MB).
         let n_examples = count_lines(&args.dataset_path)?;

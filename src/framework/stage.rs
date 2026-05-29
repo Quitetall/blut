@@ -112,10 +112,7 @@ pub enum ErasedEncodeError {
 #[derive(Debug, thiserror::Error)]
 pub enum ErasedDecodeError {
     #[error("kind mismatch: expected '{expected}', got '{got}'")]
-    Kind {
-        expected: &'static str,
-        got: String,
-    },
+    Kind { expected: &'static str, got: String },
     #[error("schema mismatch: expected v{expected}, got v{got}")]
     Schema { expected: u32, got: u32 },
     #[error("bincode deserialize: {0}")]
@@ -325,7 +322,10 @@ impl<S: Stage> StageDyn for S {
         // artifact (kind `"tuple<N>"`) deliberately won't match a
         // single-output stage's `Output::KIND` and yields `None` —
         // the executor synthesizes the tuple hash itself.
-        art.clone().into_typed::<S::Output>().ok().map(|typed| typed.content_hash())
+        art.clone()
+            .into_typed::<S::Output>()
+            .ok()
+            .map(|typed| typed.content_hash())
     }
 
     fn rebase_output_paths(
@@ -390,12 +390,11 @@ impl<S: Stage> StageDyn for S {
         //    error variant from input deserialization so log
         //    readers can disambiguate "bad recipe args" from "bad
         //    upstream artifact".
-        let typed_args: S::Args = serde_json::from_value(args).map_err(|source| {
-            StageError::ArgsDeserialize {
+        let typed_args: S::Args =
+            serde_json::from_value(args).map_err(|source| StageError::ArgsDeserialize {
                 stage: S::NAME,
                 source,
-            }
-        })?;
+            })?;
 
         // 3. Call the typed run. This is where the stage actually
         //    does work.
@@ -530,7 +529,9 @@ mod tests {
 
     #[test]
     fn erased_round_trip_preserves_kind_and_schema() {
-        let w = Words { text: "a b c".into() };
+        let w = Words {
+            text: "a b c".into(),
+        };
         let e = ErasedArtifact::from_typed(&w).unwrap();
         assert_eq!(e.kind, "test.words");
         assert_eq!(e.schema, 1);
@@ -565,7 +566,13 @@ mod tests {
             payload,
         };
         let r: Result<Words, _> = e.into_typed();
-        assert!(matches!(r, Err(ErasedDecodeError::Schema { expected: 1, got: 99 })));
+        assert!(matches!(
+            r,
+            Err(ErasedDecodeError::Schema {
+                expected: 1,
+                got: 99
+            })
+        ));
     }
 
     // ── Stage typed contract ─────────────────────────────────────
@@ -575,7 +582,15 @@ mod tests {
         let ctx = ctx();
         let s = WordCount;
         let out = s
-            .run(&ctx, Words { text: "a b c".into() }, &WordCountArgs { delimiter: " ".into() })
+            .run(
+                &ctx,
+                Words {
+                    text: "a b c".into(),
+                },
+                &WordCountArgs {
+                    delimiter: " ".into(),
+                },
+            )
             .await
             .unwrap();
         assert_eq!(out.n, 3);
@@ -588,7 +603,10 @@ mod tests {
         let ctx = ctx();
         let s: Box<dyn StageDyn> = Box::new(WordCount);
 
-        let input = ErasedArtifact::from_typed(&Words { text: "alpha,beta,gamma".into() }).unwrap();
+        let input = ErasedArtifact::from_typed(&Words {
+            text: "alpha,beta,gamma".into(),
+        })
+        .unwrap();
         let args = serde_json::json!({"delimiter": ","});
 
         let output = s.run_erased(&ctx, input, args).await.unwrap();
@@ -607,7 +625,11 @@ mod tests {
             .run_erased(&ctx, wrong, serde_json::json!({"delimiter": " "}))
             .await;
         match r {
-            Err(StageError::KindMismatch { stage, expected, got }) => {
+            Err(StageError::KindMismatch {
+                stage,
+                expected,
+                got,
+            }) => {
                 assert_eq!(stage, "word_count");
                 assert_eq!(expected, "test.words");
                 assert_eq!(got, "test.count");
@@ -669,7 +691,10 @@ mod tests {
         // args_schema returns SOMETHING valid (not Null) for a
         // type with JsonSchema.
         let schema = s.args_schema();
-        assert!(schema != serde_json::Value::Null, "args_schema unexpectedly null");
+        assert!(
+            schema != serde_json::Value::Null,
+            "args_schema unexpectedly null"
+        );
     }
 
     // ── StageContext constructible for tests ─────────────────────
@@ -731,14 +756,20 @@ mod tests {
             _input: (),
             _args: &(),
         ) -> Result<PathyOut, StageError> {
-            Ok(PathyOut { content: 9, path: std::path::PathBuf::from("/x") })
+            Ok(PathyOut {
+                content: 9,
+                path: std::path::PathBuf::from("/x"),
+            })
         }
     }
 
     #[test]
     fn output_content_hash_uses_artifact_content_hash_not_handle() {
         let s: Box<dyn StageDyn> = Box::new(MakePathy);
-        let art = PathyOut { content: 9, path: std::path::PathBuf::from("/some/abs/path") };
+        let art = PathyOut {
+            content: 9,
+            path: std::path::PathBuf::from("/some/abs/path"),
+        };
         let erased = ErasedArtifact::from_typed(&art).unwrap();
         // The StageDyn hook must return the artifact's OWN content
         // address (path-independent), not a hash of the bincode
@@ -747,7 +778,10 @@ mod tests {
         assert_eq!(via_dyn, art.content_hash(), "must be the content_hash()");
 
         // A different path with the SAME content → same hook output.
-        let art2 = PathyOut { content: 9, path: std::path::PathBuf::from("/totally/other") };
+        let art2 = PathyOut {
+            content: 9,
+            path: std::path::PathBuf::from("/totally/other"),
+        };
         let erased2 = ErasedArtifact::from_typed(&art2).unwrap();
         assert_eq!(
             s.output_content_hash(&erased2).unwrap(),
@@ -800,11 +834,17 @@ mod tests {
         // A path NOT under `from` (a sibling whose prefix only shares
         // the parent) must NOT be rewritten — guards against the
         // `/a/b` ⊄ `/a/bc` footgun.
-        let art = PathyOut { content: 1, path: std::path::PathBuf::from("/job/stages/.tmp-0-xyz/f") };
+        let art = PathyOut {
+            content: 1,
+            path: std::path::PathBuf::from("/job/stages/.tmp-0-xyz/f"),
+        };
         let erased = ErasedArtifact::from_typed(&art).unwrap();
         let rebased = s.rebase_output_paths(erased, from, to);
         let back: PathyOut = rebased.into_typed().unwrap();
-        assert_eq!(back.path, std::path::PathBuf::from("/job/stages/.tmp-0-xyz/f"));
+        assert_eq!(
+            back.path,
+            std::path::PathBuf::from("/job/stages/.tmp-0-xyz/f")
+        );
     }
 
     #[test]
@@ -824,7 +864,11 @@ mod tests {
         rebase_path_strings(&mut v, &from, &to);
         assert_eq!(v["exact"], json!(format!("{to}")));
         assert_eq!(v["child"], json!(format!("{to}{sep}c{sep}d.txt")));
-        assert_eq!(v["sibling"], json!(format!("{sep}a{sep}bc")), "sibling prefix must not match");
+        assert_eq!(
+            v["sibling"],
+            json!(format!("{sep}a{sep}bc")),
+            "sibling prefix must not match"
+        );
         assert_eq!(v["unrelated"], json!(format!("{sep}x{sep}y")));
         assert_eq!(v["nested"]["p"], json!(format!("{to}{sep}inner")));
         assert_eq!(v["list"][0], json!(format!("{to}{sep}k")));

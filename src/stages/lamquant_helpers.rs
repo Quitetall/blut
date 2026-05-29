@@ -8,9 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::framework::error::StageError;
 use crate::framework::status::StageEvent;
-use crate::lamquant_backend::{
-    default_lamquant_home, resolve_lamquant_python, Progress,
-};
+use crate::lamquant_backend::{Progress, default_lamquant_home, resolve_lamquant_python};
 use crate::paths::LamquantRoots;
 
 /// Resolve the multi-root LamQuant layout (RCP-1 / RCP-7), mapping a
@@ -84,10 +82,7 @@ pub fn script_path(home: &Path, rel: &[&str]) -> Result<PathBuf, StageError> {
         p.push(component);
     }
     if !p.exists() {
-        return Err(StageError::BadInput(format!(
-            "{} not found",
-            p.display()
-        )));
+        return Err(StageError::BadInput(format!("{} not found", p.display())));
     }
     Ok(p)
 }

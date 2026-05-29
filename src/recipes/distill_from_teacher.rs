@@ -89,8 +89,7 @@ fn default_quant() -> String {
 impl Recipe for DistillFromTeacher {
     type Backend = crate::backends::LamuTrainerBackend;
     const NAME: &'static str = "distill_from_teacher";
-    const DESCRIPTION: &'static str =
-        "Knowledge-distill a smaller student from a teacher checkpoint over a \
+    const DESCRIPTION: &'static str = "Knowledge-distill a smaller student from a teacher checkpoint over a \
          supplied dataset. KL-divergence-weighted loss; same merge/convert/register \
          tail as the SFT recipe.";
     type Args = Args;
@@ -130,7 +129,9 @@ impl Recipe for DistillFromTeacher {
                     "{label} must be non-empty"
                 )));
             }
-            if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            if p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
                 return Err(RecipeError::InvalidArgs(format!(
                     "{label} '{}' contains '..' — refusing",
                     p.display()
@@ -198,8 +199,8 @@ pub static DEF: RecipeDef = RecipeDef {
         serde_json::to_value(s).expect("schemars-derived JsonSchema must serialize cleanly")
     },
     compile_fn: |raw| {
-        let args: Args = serde_json::from_value(raw)
-            .map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
+        let args: Args =
+            serde_json::from_value(raw).map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
         DistillFromTeacher.compile(args).map(|p| p.into_compiled())
     },
 };

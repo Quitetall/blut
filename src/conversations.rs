@@ -35,7 +35,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, params};
 use serde::Serialize;
 
 use crate::error::{Result, TrainError};
@@ -73,9 +73,7 @@ pub fn memory_db_path() -> Result<PathBuf> {
         return Ok(PathBuf::from(p));
     }
     let dir = dirs::data_local_dir()
-        .ok_or_else(|| TrainError::other(
-            "data_local_dir() unavailable; set $LAMU_MEMORY_DB",
-        ))?
+        .ok_or_else(|| TrainError::other("data_local_dir() unavailable; set $LAMU_MEMORY_DB"))?
         .join("lamu");
     Ok(dir.join("conversations.db"))
 }
@@ -112,10 +110,9 @@ pub fn dump_with_db(db_path: &Path, cutoff_unix_secs: i64, out_path: &Path) -> R
         db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|e| TrainError::DatasetUnresolvable(format!(
-        "open {} read-only: {e}",
-        db_path.display()
-    )))?;
+    .map_err(|e| {
+        TrainError::DatasetUnresolvable(format!("open {} read-only: {e}", db_path.display()))
+    })?;
 
     let mut stmt = conn
         .prepare(
@@ -157,7 +154,7 @@ pub fn dump_with_db(db_path: &Path, cutoff_unix_secs: i64, out_path: &Path) -> R
     let mut n_dropped_errors = 0usize;
     let mut n_dropped_oversize = 0usize;
 
-    for (_, msgs) in &grouped {
+    for msgs in grouped.values() {
         if msgs.len() < MIN_TURNS_PER_CONVERSATION {
             n_dropped_short += 1;
             continue;
@@ -180,9 +177,7 @@ pub fn dump_with_db(db_path: &Path, cutoff_unix_secs: i64, out_path: &Path) -> R
         }
         let messages: Vec<serde_json::Value> = filtered
             .iter()
-            .map(|(role, content)| {
-                serde_json::json!({"role": role, "content": content})
-            })
+            .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
             .collect();
         let line = serde_json::json!({"messages": messages});
         writeln!(writer, "{line}").map_err(|e| TrainError::Io {
@@ -225,10 +220,9 @@ pub fn count_turns_since_at(db_path: &Path, cutoff_unix_secs: i64) -> Result<i64
         db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|e| TrainError::DatasetUnresolvable(format!(
-        "open {} read-only: {e}",
-        db_path.display()
-    )))?;
+    .map_err(|e| {
+        TrainError::DatasetUnresolvable(format!("open {} read-only: {e}", db_path.display()))
+    })?;
     let n: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM turns WHERE ts >= ?",

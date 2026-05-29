@@ -70,8 +70,13 @@ impl Stage for DpoTrain {
             base_model: args.base_model.clone(),
             output_name: args.output_name.clone(),
             output_dir: output_dir.clone(),
-            method: Method::QLora { rank: 16, alpha: 32 },
-            dataset: DatasetSource::JsonlPath { path: input.path.clone() },
+            method: Method::QLora {
+                rank: 16,
+                alpha: 32,
+            },
+            dataset: DatasetSource::JsonlPath {
+                path: input.path.clone(),
+            },
             optimizer: Optim::AdamW8bit,
             lr: args.lr,
             epochs: args.epochs,
@@ -82,7 +87,8 @@ impl Stage for DpoTrain {
             quant: "Q4_K_M".into(),
             skip_convert: true,
         };
-        spec.validate().map_err(|e| StageError::BadInput(format!("{e}")))?;
+        spec.validate()
+            .map_err(|e| StageError::BadInput(format!("{e}")))?;
 
         let python =
             paths::resolve_python().map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;

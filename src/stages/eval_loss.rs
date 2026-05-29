@@ -88,6 +88,15 @@ impl Stage for EvalLoss {
     }
 }
 
+impl Default for Args {
+    fn default() -> Self {
+        Args {
+            batch_size: default_batch_size(),
+            max_seq: default_max_seq(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,30 +146,13 @@ mod tests {
     async fn loss_varies_with_checkpoint() {
         let td = tempfile::tempdir().unwrap();
         let r1 = EvalLoss
-            .run(
-                &ctx(td.path()),
-                (ckpt(0), ds()),
-                &Args::default(),
-            )
+            .run(&ctx(td.path()), (ckpt(0), ds()), &Args::default())
             .await
             .unwrap();
         let r2 = EvalLoss
-            .run(
-                &ctx(td.path()),
-                (ckpt(64), ds()),
-                &Args::default(),
-            )
+            .run(&ctx(td.path()), (ckpt(64), ds()), &Args::default())
             .await
             .unwrap();
         assert_ne!(r1.metrics["loss"], r2.metrics["loss"]);
-    }
-}
-
-impl Default for Args {
-    fn default() -> Self {
-        Args {
-            batch_size: default_batch_size(),
-            max_seq: default_max_seq(),
-        }
     }
 }

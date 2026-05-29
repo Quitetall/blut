@@ -78,8 +78,13 @@ impl Stage for DistillTrain {
             base_model: args.student_base.clone(),
             output_name: args.output_name.clone(),
             output_dir: output_dir.clone(),
-            method: Method::QLora { rank: 16, alpha: 32 },
-            dataset: DatasetSource::JsonlPath { path: dataset.path.clone() },
+            method: Method::QLora {
+                rank: 16,
+                alpha: 32,
+            },
+            dataset: DatasetSource::JsonlPath {
+                path: dataset.path.clone(),
+            },
             optimizer: Optim::AdamW8bit,
             lr: args.lr,
             epochs: args.epochs,
@@ -90,14 +95,18 @@ impl Stage for DistillTrain {
             quant: "Q4_K_M".into(),
             skip_convert: true,
         };
-        spec.validate().map_err(|e| StageError::BadInput(format!("{e}")))?;
+        spec.validate()
+            .map_err(|e| StageError::BadInput(format!("{e}")))?;
 
         let python =
             paths::resolve_python().map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
         let trainer_script = paths::resolve_trainer_script_named("trainer_distill.py")
             .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
         let mut backend = PythonTrainBackend::new(python, trainer_script)
-            .with_env("LAMU_TEACHER_PATH", teacher.path.to_string_lossy().into_owned())
+            .with_env(
+                "LAMU_TEACHER_PATH",
+                teacher.path.to_string_lossy().into_owned(),
+            )
             .with_env("LAMU_KL_WEIGHT", format!("{}", args.kl_weight));
         let on_status: crate::backend::StatusFn = Box::new(|_u| {});
 

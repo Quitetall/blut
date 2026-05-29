@@ -33,7 +33,10 @@ fn help_prints_top_level() {
     );
     // The top-level command surface must be advertised in --help.
     for sub in ["train", "jobs", "recipe", "cancel", "tui"] {
-        assert!(stdout.contains(sub), "top-level --help missing subcommand `{sub}`");
+        assert!(
+            stdout.contains(sub),
+            "top-level --help missing subcommand `{sub}`"
+        );
     }
 }
 
@@ -46,7 +49,14 @@ fn train_help_lists_critical_flags() {
         .expect("spawn");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for needle in ["--base", "--dataset", "--method", "--optim", "--allow-evict", "--background"] {
+    for needle in [
+        "--base",
+        "--dataset",
+        "--method",
+        "--optim",
+        "--allow-evict",
+        "--background",
+    ] {
         assert!(stdout.contains(needle), "train help missing {needle}");
     }
 }
@@ -64,7 +74,10 @@ fn jobs_subcommand_handles_empty() {
         .expect("spawn");
     assert!(out.status.success(), "jobs on empty dir must succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("no jobs"), "expected no-jobs message, got: {stdout}");
+    assert!(
+        stdout.contains("no jobs"),
+        "expected no-jobs message, got: {stdout}"
+    );
 }
 
 #[test]
@@ -119,7 +132,11 @@ fn data_add_then_list_then_rm() {
         .arg(&jsonl)
         .output()
         .expect("spawn add");
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(String::from_utf8_lossy(&out.stdout).contains("registered 'smoke-ds'"));
 
     let out = Command::new(binary())
@@ -186,7 +203,10 @@ fn auto_disabled_policy_skips_clean() {
         .arg("auto")
         .output()
         .expect("spawn");
-    assert!(out.status.success(), "auto with disabled policy must exit 0");
+    assert!(
+        out.status.success(),
+        "auto with disabled policy must exit 0"
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("disabled"), "stdout: {stdout}");
 }
@@ -252,8 +272,14 @@ fn log_subcommand_renders_status() {
         .expect("spawn");
     assert!(out.status.success(), "log subcommand must succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("step 1/10"), "log must render step lines: {stdout}");
-    assert!(stdout.contains("done"), "log must render done line: {stdout}");
+    assert!(
+        stdout.contains("step 1/10"),
+        "log must render step lines: {stdout}"
+    );
+    assert!(
+        stdout.contains("done"),
+        "log must render done line: {stdout}"
+    );
 
     unsafe {
         match prev {

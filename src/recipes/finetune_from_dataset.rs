@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::framework::error::RecipeError;
 use crate::framework::plan::Plan;
 use crate::recipes::recipe::{Recipe, RecipeDef};
+use crate::stages::take_train::TakeTrain;
 use crate::stages::{
     convert_gguf::{Args as ConvertArgs, ConvertGguf},
     materialize_dataset_path::{Args as MatArgs, MaterializeDatasetPath},
@@ -30,7 +31,6 @@ use crate::stages::{
     sft_train::{Args as SftArgs, SftTrain},
     split_train_eval::{Args as SplitArgs, SplitTrainEval},
 };
-use crate::stages::take_train::TakeTrain;
 
 pub struct FinetuneFromDataset;
 
@@ -116,8 +116,7 @@ fn default_eval_ratio() -> f32 {
 impl Recipe for FinetuneFromDataset {
     type Backend = crate::backends::LamuTrainerBackend;
     const NAME: &'static str = "finetune_from_dataset";
-    const DESCRIPTION: &'static str =
-        "SFT from an existing dataset — JSONL path on disk or a registered name. \
+    const DESCRIPTION: &'static str = "SFT from an existing dataset — JSONL path on disk or a registered name. \
          Tail half identical to finetune_from_conversations; differs only at the \
          source materializer.";
     type Args = Args;
@@ -234,8 +233,8 @@ pub static DEF: RecipeDef = RecipeDef {
         serde_json::to_value(s).expect("schemars-derived JsonSchema must serialize cleanly")
     },
     compile_fn: |raw| {
-        let args: Args = serde_json::from_value(raw)
-            .map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
+        let args: Args =
+            serde_json::from_value(raw).map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
         FinetuneFromDataset.compile(args).map(|p| p.into_compiled())
     },
 };

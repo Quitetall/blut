@@ -26,9 +26,7 @@ use crate::artifacts::{LmaCorpus, SnnCkpt};
 use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
-use crate::lamquant_backend::{
-    resolve_lamquant_python, LamquantBackend, LamquantInvocation,
-};
+use crate::lamquant_backend::{LamquantBackend, LamquantInvocation, resolve_lamquant_python};
 use crate::stages::lamquant_helpers::resolve_home;
 
 pub struct LamquantTrainMambaSnn;
@@ -240,7 +238,11 @@ impl Stage for LamquantTrainMambaSnn {
         push_opt_u32(&mut cmd_args, "--d-model", args.d_model);
         push_opt_u32(&mut cmd_args, "--d-state", args.d_state);
         push_opt_u32(&mut cmd_args, "--n-layers", args.n_layers);
-        push_opt_u32(&mut cmd_args, "--max-windows-per-file", args.max_windows_per_file);
+        push_opt_u32(
+            &mut cmd_args,
+            "--max-windows-per-file",
+            args.max_windows_per_file,
+        );
 
         if !args.export_rel.is_empty() {
             let export_path = safe_join(&lamquant_home, &args.export_rel)?;
@@ -303,12 +305,13 @@ impl Stage for LamquantTrainMambaSnn {
 
         // Stat-based fingerprint for the ckpt (HASH_CONTENTS=false
         // on SnnCkpt — multi-MB to GB file; bytes are stochastic).
-        let content_hash = stat_fingerprint(b"lamquant.ckpt.snn", &checkpoint_path).map_err(
-            |source| StageError::Io {
-                path: checkpoint_path.clone(),
-                source,
-            },
-        )?;
+        let content_hash =
+            stat_fingerprint(b"lamquant.ckpt.snn", &checkpoint_path).map_err(|source| {
+                StageError::Io {
+                    path: checkpoint_path.clone(),
+                    source,
+                }
+            })?;
 
         // head_size_kb + final_loss read from a sidecar JSON if the
         // trainer wrote one alongside the ckpt; both fields are
@@ -458,7 +461,9 @@ mod tests {
         let home = td.path().join("home");
         std::fs::create_dir_all(home.join("ai_models").join("snn")).unwrap();
         std::fs::write(
-            home.join("ai_models").join("snn").join("train_mamba_snn.py"),
+            home.join("ai_models")
+                .join("snn")
+                .join("train_mamba_snn.py"),
             "# stub\n",
         )
         .unwrap();
@@ -499,7 +504,9 @@ mod tests {
         let home = td.path().join("home");
         std::fs::create_dir_all(home.join("ai_models").join("snn")).unwrap();
         std::fs::write(
-            home.join("ai_models").join("snn").join("train_mamba_snn.py"),
+            home.join("ai_models")
+                .join("snn")
+                .join("train_mamba_snn.py"),
             "# stub\n",
         )
         .unwrap();
@@ -580,7 +587,7 @@ mod tests {
 
     #[test]
     fn deterministic_flag_is_false_for_training() {
-        assert!(!<LamquantTrainMambaSnn as Stage>::DETERMINISTIC);
+        const { assert!(!<LamquantTrainMambaSnn as Stage>::DETERMINISTIC) };
     }
 
     #[test]
@@ -597,11 +604,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let ckpt = td.path().join("m.pt");
         let sidecar = ckpt.with_extension("meta.json");
-        std::fs::write(
-            &sidecar,
-            r#"{"head_size_kb": 4.2, "final_loss": 0.123}"#,
-        )
-        .unwrap();
+        std::fs::write(&sidecar, r#"{"head_size_kb": 4.2, "final_loss": 0.123}"#).unwrap();
         let (h, l) = read_snn_sidecar(&ckpt);
         assert!((h - 4.2).abs() < 1e-6);
         assert!((l - 0.123).abs() < 1e-6);

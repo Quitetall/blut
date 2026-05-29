@@ -176,16 +176,20 @@ impl Stage for LamquantTrainVocosDecoder {
         };
         let mut backend = LamquantBackend::new();
         backend
-            .run(inv, Some(progress_forwarder(Self::NAME, ctx.status_tx.clone())))
+            .run(
+                inv,
+                Some(progress_forwarder(Self::NAME, ctx.status_tx.clone())),
+            )
             .await
             .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
 
-        let dec_fp = stat_fingerprint(b"lamquant.ckpt.decoder", &decoder_path).map_err(
-            |source| StageError::Io {
-                path: decoder_path.clone(),
-                source,
-            },
-        )?;
+        let dec_fp =
+            stat_fingerprint(b"lamquant.ckpt.decoder", &decoder_path).map_err(|source| {
+                StageError::Io {
+                    path: decoder_path.clone(),
+                    source,
+                }
+            })?;
         Ok(JointCkpt {
             encoder_path: encoder_ref,
             decoder_path,

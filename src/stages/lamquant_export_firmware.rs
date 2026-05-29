@@ -115,16 +115,20 @@ impl Stage for LamquantExportFirmware {
         };
         let mut backend = LamquantBackend::new();
         backend
-            .run(inv, Some(progress_forwarder(Self::NAME, ctx.status_tx.clone())))
+            .run(
+                inv,
+                Some(progress_forwarder(Self::NAME, ctx.status_tx.clone())),
+            )
             .await
             .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
 
-        let content_hash = stat_fingerprint(b"lamquant.firmware_bundle", &bundle_dir).map_err(
-            |source| StageError::Io {
-                path: bundle_dir.clone(),
-                source,
-            },
-        )?;
+        let content_hash =
+            stat_fingerprint(b"lamquant.firmware_bundle", &bundle_dir).map_err(|source| {
+                StageError::Io {
+                    path: bundle_dir.clone(),
+                    source,
+                }
+            })?;
         Ok(FirmwareBundle {
             bundle_dir,
             bin_path,

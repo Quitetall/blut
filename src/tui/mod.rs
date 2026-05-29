@@ -55,15 +55,15 @@ use std::time::{Duration, Instant};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::Modifier,
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
-    Frame, Terminal,
 };
 
 use crate::jobs::{self, JobState, JobSummary};
@@ -115,8 +115,14 @@ impl View {
 /// text buffer prefilled with the recipe's args JSON template.
 enum Overlay {
     None,
-    Picker { query: String, cursor: usize },
-    Editor { recipe: &'static str, buffer: String },
+    Picker {
+        query: String,
+        cursor: usize,
+    },
+    Editor {
+        recipe: &'static str,
+        buffer: String,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -249,8 +255,8 @@ impl App {
     /// Filtered list of recipes against the picker's fuzzy query.
     /// Returns `(idx_in_RECIPES, score)` pairs sorted by score desc.
     fn filter_recipes(query: &str) -> Vec<usize> {
-        use fuzzy_matcher::skim::SkimMatcherV2;
         use fuzzy_matcher::FuzzyMatcher;
+        use fuzzy_matcher::skim::SkimMatcherV2;
         let matcher = SkimMatcherV2::default();
         let mut scored: Vec<(usize, i64)> = RECIPES
             .iter()
@@ -263,7 +269,10 @@ impl App {
                 }
             })
             .collect();
-        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| RECIPES[a.0].name.cmp(RECIPES[b.0].name)));
+        scored.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| RECIPES[a.0].name.cmp(RECIPES[b.0].name))
+        });
         scored.into_iter().map(|(i, _)| i).collect()
     }
 
@@ -285,9 +294,7 @@ impl App {
             .and_then(|r| r.as_array())
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
-        let props = args_schema
-            .get("properties")
-            .and_then(|p| p.as_object());
+        let props = args_schema.get("properties").and_then(|p| p.as_object());
         let mut out = serde_json::Map::new();
         for field in &required {
             // Try to render a type-aware placeholder so the user
@@ -334,8 +341,8 @@ impl App {
     /// (Previously the hotkey path always used `template_for`, leaving
     /// `lamquant_default_args` dead — this revives it.)
     fn open_editor(&mut self, recipe: &'static crate::recipes::RecipeDef) {
-        let buffer = Self::lamquant_default_args(recipe.name)
-            .unwrap_or_else(|| Self::template_for(recipe));
+        let buffer =
+            Self::lamquant_default_args(recipe.name).unwrap_or_else(|| Self::template_for(recipe));
         self.overlay = Overlay::Editor {
             recipe: recipe.name,
             buffer,
@@ -377,10 +384,16 @@ impl App {
             RecipeCategory::Pipeline,
             RecipeCategory::User,
         ];
-        let mut sorted: Vec<&'static crate::recipes::RecipeDef> = RECIPES.iter().copied().collect();
+        let mut sorted: Vec<&'static crate::recipes::RecipeDef> = RECIPES.to_vec();
         sorted.sort_by(|a, b| {
-            let ai = category_order.iter().position(|c| *c == a.category).unwrap_or(99);
-            let bi = category_order.iter().position(|c| *c == b.category).unwrap_or(99);
+            let ai = category_order
+                .iter()
+                .position(|c| *c == a.category)
+                .unwrap_or(99);
+            let bi = category_order
+                .iter()
+                .position(|c| *c == b.category)
+                .unwrap_or(99);
             ai.cmp(&bi).then_with(|| a.name.cmp(b.name))
         });
         // Reserved keys: q, Q, r, R, c, C, j, k, l (lowercase / uppercase
@@ -483,7 +496,9 @@ impl App {
             self.log_job_id = None;
             return;
         };
-        let Some(job) = self.jobs.get(idx) else { return };
+        let Some(job) = self.jobs.get(idx) else {
+            return;
+        };
         match jobs::read_status(&job.id) {
             Ok(updates) => {
                 let rendered = jobs::render_log(&updates);
@@ -524,21 +539,28 @@ impl App {
             self.set_status("no job selected");
             return;
         };
-        let Some(job) = self.jobs.get(idx) else { return };
+        let Some(job) = self.jobs.get(idx) else {
+            return;
+        };
         if !matches!(job.state, JobState::Running) {
-            self.set_status(format!("job {} is {} — nothing to cancel", job.id, job.state.as_str()));
+            self.set_status(format!(
+                "job {} is {} — nothing to cancel",
+                job.id,
+                job.state.as_str()
+            ));
             return;
         }
         let id = job.id.clone();
         self.set_status(format!("SIGTERM {id} (grace 10s)..."));
         // Spawn detached process so we don't block the UI on grace
         // period; user sees state flip on next refresh.
-        let _ = std::process::Command::new(std::env::current_exe().unwrap_or_else(|_| "blut".into()))
-            .args(["cancel", &id])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        let _ =
+            std::process::Command::new(std::env::current_exe().unwrap_or_else(|_| "blut".into()))
+                .args(["cancel", &id])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
     }
 
     /// Refresh every live data source: jobs, system probes, log tail,
@@ -571,7 +593,10 @@ impl App {
             self.set_status("compare holds at most 3 runs — unmark one first");
         } else {
             self.marked.push(name.clone());
-            self.set_status(format!("marked {name} for compare ({}/3)", self.marked.len()));
+            self.set_status(format!(
+                "marked {name} for compare ({}/3)",
+                self.marked.len()
+            ));
         }
     }
 
@@ -698,14 +723,10 @@ fn handle_key(app: &mut App, k: event::KeyEvent) {
         },
         Overlay::Picker { query, cursor } => match k.code {
             KeyCode::Esc => app.overlay = Overlay::None,
-            KeyCode::Up | KeyCode::Char('k')
-                if k.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
+            KeyCode::Up | KeyCode::Char('k') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 *cursor = cursor.saturating_sub(1)
             }
-            KeyCode::Down | KeyCode::Char('j')
-                if k.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
+            KeyCode::Down | KeyCode::Char('j') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 *cursor += 1
             }
             KeyCode::Up => *cursor = cursor.saturating_sub(1),
@@ -797,7 +818,7 @@ fn handle_key_cockpit(app: &mut App, k: event::KeyEvent) {
             // (or the schema template for non-lamquant recipes).
             let menu = App::recipe_menu();
             if let Some((_, recipe)) = menu.iter().find(|(k, _)| *k == Some(c)) {
-                app.open_editor(*recipe);
+                app.open_editor(recipe);
             }
         }
         _ => {}
@@ -1024,8 +1045,10 @@ fn draw_cockpit_body(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     // Bucket recipes by category, preserving recipe_menu() order within
     // each bucket and first-seen category order across buckets.
     use std::collections::BTreeMap;
-    let mut by_cat: BTreeMap<&'static str, Vec<(Option<char>, &'static crate::recipes::RecipeDef)>> =
-        BTreeMap::new();
+    let mut by_cat: BTreeMap<
+        &'static str,
+        Vec<(Option<char>, &'static crate::recipes::RecipeDef)>,
+    > = BTreeMap::new();
     for (k, r) in &menu {
         by_cat.entry(r.category.label()).or_default().push((*k, *r));
     }
@@ -1096,7 +1119,12 @@ fn centered_rect(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
     let h = area.height.saturating_mul(pct_h) / 100;
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    Rect { x, y, width: w, height: h }
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
 }
 
 fn draw_overlay(f: &mut Frame<'_>, app: &App) {
@@ -1126,7 +1154,12 @@ fn draw_overlay(f: &mut Frame<'_>, app: &App) {
                 Span::styled("_", theme::dim()),
             ]);
             let query_widget = Paragraph::new(query_line);
-            let query_area = Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 };
+            let query_area = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: 1,
+            };
             f.render_widget(query_widget, query_area);
 
             let list_area = Rect {
@@ -1212,7 +1245,10 @@ fn draw_jobs(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     };
     let block = Block::default()
         .title(Span::styled(
-            format!(" jobs ({}) — ↑↓ select, c cancel, r refresh ", app.jobs.len()),
+            format!(
+                " jobs ({}) — ↑↓ select, c cancel, r refresh ",
+                app.jobs.len()
+            ),
             theme::title(),
         ))
         .border_style(theme::dim())
@@ -1273,12 +1309,18 @@ fn draw_system(f: &mut Frame<'_>, area: Rect, app: &App) {
         Line::from(""),
         Line::from(Span::styled("DISK /mnt/4tb", theme::highlight())),
         Line::from(Span::styled(
-            format!("free {} ({}% used)", snap.disk_free_human, snap.disk_used_pct),
+            format!(
+                "free {} ({}% used)",
+                snap.disk_free_human, snap.disk_used_pct
+            ),
             theme::normal(),
         )),
         Line::from(""),
         Line::from(Span::styled("CPU", theme::highlight())),
-        Line::from(Span::styled(format!("load1={:.2}", snap.load1), theme::normal())),
+        Line::from(Span::styled(
+            format!("load1={:.2}", snap.load1),
+            theme::normal(),
+        )),
     ];
     let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     f.render_widget(para, area);
@@ -1300,7 +1342,10 @@ fn view_header(title: &str) -> Line<'static> {
 fn draw_history(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .title(Span::styled(
-            format!(" {} (↑↓ move · m mark · C compare · b back) ", View::History.title()),
+            format!(
+                " {} (↑↓ move · m mark · C compare · b back) ",
+                View::History.title()
+            ),
             theme::title(),
         ))
         .border_style(theme::dim())
@@ -1313,11 +1358,14 @@ fn draw_history(f: &mut Frame<'_>, area: Rect, app: &App) {
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            format!("  {:<42} {:<10} {:<10} {}", "Name", "Best R", "Epoch", "Date"),
+            format!(
+                "  {:<42} {:<10} {:<10} {}",
+                "Name", "Best R", "Epoch", "Date"
+            ),
             theme::dim(),
         )));
         for (i, r) in app.runs.iter().enumerate() {
-            let marked = app.marked.iter().any(|n| *n == r.name);
+            let marked = app.marked.contains(&r.name);
             let cursor = i == app.list_cursor;
             let prefix = if cursor { "▶ " } else { "  " };
             let mark = if marked { "✓" } else { " " };
@@ -1331,18 +1379,29 @@ fn draw_history(f: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 "—".into()
             };
-            let style = if cursor { theme::selected() } else { theme::normal() };
+            let style = if cursor {
+                theme::selected()
+            } else {
+                theme::normal()
+            };
             lines.push(Line::from(vec![
                 Span::styled(format!("{prefix}{mark} "), theme::success()),
                 Span::styled(
-                    format!("{:<42} {:<10} {:<10} ", truncate(&r.name, 42), r_str, ep_str),
+                    format!(
+                        "{:<42} {:<10} {:<10} ",
+                        truncate(&r.name, 42),
+                        r_str,
+                        ep_str
+                    ),
                     style,
                 ),
                 Span::styled(r.date.clone(), theme::dim()),
             ]));
         }
     }
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
 
@@ -1351,7 +1410,10 @@ fn draw_history(f: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_leaderboard(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .title(Span::styled(
-            format!(" {} (↑↓ move · m mark · C compare · b back) ", View::Leaderboard.title()),
+            format!(
+                " {} (↑↓ move · m mark · C compare · b back) ",
+                View::Leaderboard.title()
+            ),
             theme::title(),
         ))
         .border_style(theme::dim())
@@ -1364,12 +1426,15 @@ fn draw_leaderboard(f: &mut Frame<'_>, area: Rect, app: &App) {
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            format!("  {:<5} {:<40} {:<10} {:<10} {}", "Rank", "Name", "Best R", "Epoch", "Date"),
+            format!(
+                "  {:<5} {:<40} {:<10} {:<10} {}",
+                "Rank", "Name", "Best R", "Epoch", "Date"
+            ),
             theme::dim(),
         )));
         for (i, r) in app.runs.iter().enumerate().take(20) {
             let cursor = i == app.list_cursor;
-            let marked = app.marked.iter().any(|n| *n == r.name);
+            let marked = app.marked.contains(&r.name);
             let medal = if i == 0 { " ▸" } else { "" };
             let r_str = if r.best_r > 0.0 {
                 format!("{:.4}", r.best_r)
@@ -1391,7 +1456,13 @@ fn draw_leaderboard(f: &mut Frame<'_>, area: Rect, app: &App) {
             let mark = if marked { "✓" } else { " " };
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("{mark} {:<5} {:<40} {:<10} {:<10} ", i + 1, truncate(&r.name, 40), r_str, ep_str),
+                    format!(
+                        "{mark} {:<5} {:<40} {:<10} {:<10} ",
+                        i + 1,
+                        truncate(&r.name, 40),
+                        r_str,
+                        ep_str
+                    ),
                     style,
                 ),
                 Span::styled(format!("{}{medal}", r.date), theme::dim()),
@@ -1404,7 +1475,9 @@ fn draw_leaderboard(f: &mut Frame<'_>, area: Rect, app: &App) {
             )));
         }
     }
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
 
@@ -1413,7 +1486,10 @@ fn draw_leaderboard(f: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_compare(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .title(Span::styled(
-            format!(" {} (mark runs in History/Leaderboard with m · b back) ", View::Compare.title()),
+            format!(
+                " {} (mark runs in History/Leaderboard with m · b back) ",
+                View::Compare.title()
+            ),
             theme::title(),
         ))
         .border_style(theme::dim())
@@ -1449,7 +1525,9 @@ fn draw_compare(f: &mut Frame<'_>, area: Rect, app: &App) {
         lines.push(metric_row("best_r", &best_r, true, 4));
         lines.push(metric_row("final_r", &final_r, true, 4));
     }
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
 
@@ -1479,7 +1557,10 @@ fn metric_row(metric: &str, vals: &[f64], highlight_max: bool, decimals: usize) 
 fn draw_checkpoints(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .title(Span::styled(
-            format!(" {} (↑↓ move · r refresh · b back) ", View::Checkpoints.title()),
+            format!(
+                " {} (↑↓ move · r refresh · b back) ",
+                View::Checkpoints.title()
+            ),
             theme::title(),
         ))
         .border_style(theme::dim())
@@ -1493,14 +1574,22 @@ fn draw_checkpoints(f: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         let total_gb: f64 = app.ckpts.iter().map(|c| c.size_mb).sum::<f64>() / 1024.0;
         lines.push(Line::from(Span::styled(
-            format!("{} checkpoints  ·  {:.1} GiB total", app.ckpts.len(), total_gb),
+            format!(
+                "{} checkpoints  ·  {:.1} GiB total",
+                app.ckpts.len(),
+                total_gb
+            ),
             theme::dim(),
         )));
         lines.push(Line::from(""));
         for (i, c) in app.ckpts.iter().enumerate() {
             let cursor = i == app.list_cursor;
             let prefix = if cursor { "▶ " } else { "  " };
-            let style = if cursor { theme::selected() } else { theme::normal() };
+            let style = if cursor {
+                theme::selected()
+            } else {
+                theme::normal()
+            };
             lines.push(Line::from(vec![
                 Span::styled(prefix.to_string(), theme::success()),
                 Span::styled(format!("{:<40} ", truncate(&c.name, 40)), style),
@@ -1510,7 +1599,9 @@ fn draw_checkpoints(f: &mut Frame<'_>, area: Rect, app: &App) {
             ]));
         }
     }
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
 
@@ -1536,7 +1627,10 @@ fn draw_presets(f: &mut Frame<'_>, area: Rect, _app: &App) {
         ]));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("DECODER TIERS", theme::highlight())));
+    lines.push(Line::from(Span::styled(
+        "DECODER TIERS",
+        theme::highlight(),
+    )));
     for (tier, params, note) in views::DECODER_TIERS {
         lines.push(Line::from(vec![
             Span::styled(format!("  {tier:<10}"), theme::heading()),
@@ -1550,7 +1644,10 @@ fn draw_presets(f: &mut Frame<'_>, area: Rect, _app: &App) {
         theme::highlight(),
     )));
     for feat in views::VALIDATED_FEATURES {
-        lines.push(Line::from(Span::styled(format!("  • {feat}"), theme::normal())));
+        lines.push(Line::from(Span::styled(
+            format!("  • {feat}"),
+            theme::normal(),
+        )));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -1563,7 +1660,9 @@ fn draw_presets(f: &mut Frame<'_>, area: Rect, _app: &App) {
             Span::styled(fields.join(", "), theme::dim()),
         ]));
     }
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
 
@@ -1589,7 +1688,9 @@ fn draw_metrics(f: &mut Frame<'_>, area: Rect, app: &App) {
             }
         }))
         .collect();
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
 
@@ -1598,7 +1699,10 @@ fn draw_metrics(f: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_reset(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .title(Span::styled(
-            format!(" {} (↑↓ move · Enter confirm · e export · b back) ", View::Reset.title()),
+            format!(
+                " {} (↑↓ move · Enter confirm · e export · b back) ",
+                View::Reset.title()
+            ),
             theme::title(),
         ))
         .border_style(theme::dim())
@@ -1623,7 +1727,11 @@ fn draw_reset(f: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             theme::normal()
         };
-        let suffix = if armed { "   ← press Enter again to confirm" } else { "" };
+        let suffix = if armed {
+            "   ← press Enter again to confirm"
+        } else {
+            ""
+        };
         lines.push(Line::from(vec![
             Span::styled(prefix.to_string(), theme::success()),
             Span::styled(format!("{}{suffix}", action.label()), style),
@@ -1638,7 +1746,9 @@ fn draw_reset(f: &mut Frame<'_>, area: Rect, app: &App) {
             theme::dim(),
         ),
     ]));
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
 
@@ -1838,7 +1948,10 @@ mod render_tests {
             );
         }
         // The Pipeline status + Resources boxes are present by title.
-        assert!(text.contains("Pipeline status"), "missing Pipeline status box");
+        assert!(
+            text.contains("Pipeline status"),
+            "missing Pipeline status box"
+        );
         assert!(text.contains("Resources"), "missing Resources box");
     }
 

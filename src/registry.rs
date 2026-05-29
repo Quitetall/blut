@@ -144,10 +144,11 @@ fn write_registry(entries: &[ModelEntry], path: &Path) -> Result<()> {
             path: tmp.clone(),
             source,
         })?;
-        f.write_all(yaml.as_bytes()).map_err(|source| TrainError::Io {
-            path: tmp.clone(),
-            source,
-        })?;
+        f.write_all(yaml.as_bytes())
+            .map_err(|source| TrainError::Io {
+                path: tmp.clone(),
+                source,
+            })?;
         let _ = f.sync_all();
     }
     if let Err(source) = std::fs::rename(&tmp, path) {

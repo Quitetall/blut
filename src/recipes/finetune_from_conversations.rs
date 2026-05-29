@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::framework::error::RecipeError;
 use crate::framework::plan::Plan;
 use crate::recipes::recipe::{Recipe, RecipeDef};
+use crate::stages::take_train::TakeTrain;
 use crate::stages::{
     convert_gguf::{Args as ConvertArgs, ConvertGguf},
     filter_dataset::{Args as FilterArgs, FilterDataset},
@@ -36,7 +37,6 @@ use crate::stages::{
     sft_train::{Args as SftArgs, SftTrain},
     split_train_eval::{Args as SplitArgs, SplitTrainEval},
 };
-use crate::stages::take_train::TakeTrain;
 
 pub struct FinetuneFromConversations;
 
@@ -145,8 +145,7 @@ fn default_register_dataset_name() -> String {
 impl Recipe for FinetuneFromConversations {
     type Backend = crate::backends::LamuTrainerBackend;
     const NAME: &'static str = "finetune_from_conversations";
-    const DESCRIPTION: &'static str =
-        "Fine-tune a base model on the user's recent LAMU conversation history. \
+    const DESCRIPTION: &'static str = "Fine-tune a base model on the user's recent LAMU conversation history. \
          Pulls turns from conversations.db, runs SFT via the python trainer, \
          converts to GGUF, registers the result.";
     type Args = Args;
@@ -210,7 +209,12 @@ impl Recipe for FinetuneFromConversations {
         };
 
         let plan = Plan::new(Self::NAME, recipe_args_json)
-            .start(MaterializeConversations, MatArgs { since_seconds: since_secs })
+            .start(
+                MaterializeConversations,
+                MatArgs {
+                    since_seconds: since_secs,
+                },
+            )
             .then(
                 FilterDataset,
                 FilterArgs {
@@ -288,9 +292,11 @@ pub static DEF: RecipeDef = RecipeDef {
         serde_json::to_value(s).expect("schemars-derived JsonSchema must serialize cleanly")
     },
     compile_fn: |raw| {
-        let args: Args = serde_json::from_value(raw)
-            .map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
-        FinetuneFromConversations.compile(args).map(|p| p.into_compiled())
+        let args: Args =
+            serde_json::from_value(raw).map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
+        FinetuneFromConversations
+            .compile(args)
+            .map(|p| p.into_compiled())
     },
 };
 
@@ -324,7 +330,10 @@ mod tests {
             drop_errors: default_drop_errors(),
             dataset_registry_name: default_register_dataset_name(),
         };
-        let plan = FinetuneFromConversations.compile(args).unwrap().into_compiled();
+        let plan = FinetuneFromConversations
+            .compile(args)
+            .unwrap()
+            .into_compiled();
         assert_eq!(plan.n_nodes(), 9);
         assert_eq!(plan.n_edges(), 8);
         let order = plan.topo_order().unwrap();

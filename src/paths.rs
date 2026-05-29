@@ -328,9 +328,8 @@ pub fn resolve_python() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("LAMU_TRAIN_PYTHON") {
         return Ok(PathBuf::from(p));
     }
-    let home = dirs::home_dir().ok_or_else(|| {
-        TrainError::other("home_dir() unavailable; set $LAMU_TRAIN_PYTHON")
-    })?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| TrainError::other("home_dir() unavailable; set $LAMU_TRAIN_PYTHON"))?;
     let candidates = [
         home.join("local-llm/.venv/bin/python"),
         home.join(".local/share/lamu/train-venv/bin/python"),
@@ -409,13 +408,16 @@ pub fn resolve_trainer_script() -> Result<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent().and_then(|p| p.parent()) {
             // <prefix>/bin/lamu-train → <prefix>/share/lamu/python/trainer.py
-            candidates.push(dir.join("share").join("lamu").join("python").join("trainer.py"));
+            candidates.push(
+                dir.join("share")
+                    .join("lamu")
+                    .join("python")
+                    .join("trainer.py"),
+            );
         }
     }
     if let Some(home) = dirs::home_dir() {
-        candidates.push(
-            home.join(".local/share/lamu/python/trainer.py"),
-        );
+        candidates.push(home.join(".local/share/lamu/python/trainer.py"));
     }
     for c in &candidates {
         if c.exists() {

@@ -65,8 +65,7 @@ fn default_max_seq() -> u32 {
 impl Recipe for EvalSuite {
     type Backend = crate::backends::LamuTrainerBackend;
     const NAME: &'static str = "eval_suite";
-    const DESCRIPTION: &'static str =
-        "Three-way evaluation: cross-entropy + lm-eval-harness benchmarks \
+    const DESCRIPTION: &'static str = "Three-way evaluation: cross-entropy + lm-eval-harness benchmarks \
          + judge-model scoring. Produces a combined EvalReport with all \
          three sub-reports + a flat summary.";
     type Args = Args;
@@ -78,7 +77,9 @@ impl Recipe for EvalSuite {
             ));
         }
         if args.judge_model.is_empty() {
-            return Err(RecipeError::InvalidArgs("judge_model must be non-empty".into()));
+            return Err(RecipeError::InvalidArgs(
+                "judge_model must be non-empty".into(),
+            ));
         }
         // R23: numeric arg ranges.
         if args.judge_samples == 0 {
@@ -99,7 +100,9 @@ impl Recipe for EvalSuite {
                     "{label} must be non-empty"
                 )));
             }
-            if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            if p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
                 return Err(RecipeError::InvalidArgs(format!(
                     "{label} '{}' contains '..' — refusing",
                     p.display()
@@ -157,8 +160,8 @@ pub static DEF: RecipeDef = RecipeDef {
         serde_json::to_value(s).expect("schemars-derived JsonSchema must serialize cleanly")
     },
     compile_fn: |raw| {
-        let args: Args = serde_json::from_value(raw)
-            .map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
+        let args: Args =
+            serde_json::from_value(raw).map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
         EvalSuite.compile(args).map(|p| p.into_compiled())
     },
 };

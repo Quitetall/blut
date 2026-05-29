@@ -128,7 +128,11 @@ impl Stage for LamquantTrainJoint {
         push_opt_u32(&mut cmd_args, "--batch-size", args.batch_size);
         push_opt_f32(&mut cmd_args, "--lr", args.lr);
         if let Some(gan) = args.gan {
-            cmd_args.push(if gan { "--gan".into() } else { "--no-gan".into() });
+            cmd_args.push(if gan {
+                "--gan".into()
+            } else {
+                "--no-gan".into()
+            });
         }
         if let Some(sh) = args.seizure_head {
             cmd_args.push(if sh {
@@ -164,22 +168,27 @@ impl Stage for LamquantTrainJoint {
         };
         let mut backend = LamquantBackend::new();
         backend
-            .run(inv, Some(progress_forwarder(Self::NAME, ctx.status_tx.clone())))
+            .run(
+                inv,
+                Some(progress_forwarder(Self::NAME, ctx.status_tx.clone())),
+            )
             .await
             .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
 
-        let enc_fp = stat_fingerprint(b"lamquant.ckpt.joint.encoder", &encoder_path).map_err(
-            |source| StageError::Io {
-                path: encoder_path.clone(),
-                source,
-            },
-        )?;
-        let dec_fp = stat_fingerprint(b"lamquant.ckpt.joint.decoder", &decoder_path).map_err(
-            |source| StageError::Io {
-                path: decoder_path.clone(),
-                source,
-            },
-        )?;
+        let enc_fp =
+            stat_fingerprint(b"lamquant.ckpt.joint.encoder", &encoder_path).map_err(|source| {
+                StageError::Io {
+                    path: encoder_path.clone(),
+                    source,
+                }
+            })?;
+        let dec_fp =
+            stat_fingerprint(b"lamquant.ckpt.joint.decoder", &decoder_path).map_err(|source| {
+                StageError::Io {
+                    path: decoder_path.clone(),
+                    source,
+                }
+            })?;
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(b"lamquant.ckpt.joint");
@@ -243,6 +252,6 @@ mod tests {
 
     #[test]
     fn deterministic_false() {
-        assert!(!<LamquantTrainJoint as Stage>::DETERMINISTIC);
+        const { assert!(!<LamquantTrainJoint as Stage>::DETERMINISTIC) };
     }
 }

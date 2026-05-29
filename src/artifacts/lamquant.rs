@@ -13,8 +13,8 @@
 //!     JointCkpt, ...) set `HASH_CONTENTS = false` and implement
 //!     `content_hash()` via a stat-based fingerprint (path + size
 //!     + mtime). Walking ~10 GB of bytes per cache lookup is not
-//!     defensible; the producing stage's identity + the cache key
-//!     already guarantee what we need.
+//!       defensible; the producing stage's identity + the cache key
+//!       already guarantee what we need.
 
 use std::path::{Path, PathBuf};
 
@@ -407,6 +407,11 @@ mod tests {
         assert_eq!(Manifest::KIND, "lamquant.manifest");
     }
 
+    // intentional: these assert the compile-time HASH_CONTENTS contract
+    // (CONST-C3) — each `assert!` on a const associated value documents
+    // and locks the per-artifact hashing policy. A const-block rewrite
+    // would lose the failing-artifact name on a future flip.
+    #[allow(clippy::assertions_on_constants)]
     #[test]
     fn fullband_memmap_skips_content_hashing() {
         assert!(!FullbandMemmap::HASH_CONTENTS);

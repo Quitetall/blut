@@ -160,10 +160,7 @@ impl CacheHandle {
                 },
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    tracing::warn!(
-                        "cache: read {}: {e}; treating as miss",
-                        path.display()
-                    );
+                    tracing::warn!("cache: read {}: {e}; treating as miss", path.display());
                 }
             }
         }
@@ -377,10 +374,7 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp = dest.with_file_name(format!(
-        ".{stem}.tmp.{}.{nanos}",
-        std::process::id()
-    ));
+    let tmp = dest.with_file_name(format!(".{stem}.tmp.{}.{nanos}", std::process::id()));
     let mut f = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -517,7 +511,8 @@ mod tests {
         std::fs::create_dir_all(&global).unwrap();
         let h = CacheHandle::job_local(job).with_global(global.clone());
         let key = ContentHash::of_bytes(b"k");
-        h.insert(key, &fake_erased(serde_json::json!({"x": 1}))).unwrap();
+        h.insert(key, &fake_erased(serde_json::json!({"x": 1})))
+            .unwrap();
         // Entry must exist under the global path.
         assert!(global.join(key.to_hex()).join("output.bin").exists());
     }
@@ -543,7 +538,10 @@ mod tests {
         .unwrap();
         let h = CacheHandle::job_local(job).with_global(global);
         let hit = h.lookup(key).expect("must hit");
-        assert_eq!(decode_payload(&hit.artifact), serde_json::json!({"src": "global"}));
+        assert_eq!(
+            decode_payload(&hit.artifact),
+            serde_json::json!({"src": "global"})
+        );
     }
 
     #[test]
@@ -592,12 +590,11 @@ mod tests {
         let entries: Vec<_> = std::fs::read_dir(td.path().join(key.to_hex()))
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains(".tmp.")
-            })
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
             .collect();
-        assert!(entries.is_empty(), "no tmp files should survive successful insert");
+        assert!(
+            entries.is_empty(),
+            "no tmp files should survive successful insert"
+        );
     }
 }

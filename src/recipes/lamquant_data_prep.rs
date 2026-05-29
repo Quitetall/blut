@@ -55,8 +55,7 @@ pub struct Args {
 impl Recipe for LamquantDataPrep {
     type Backend = crate::backends::LamquantBackend;
     const NAME: &'static str = "lamquant_data_prep";
-    const DESCRIPTION: &'static str =
-        "Pack the LML tree into per-recording .lma archives via \
+    const DESCRIPTION: &'static str = "Pack the LML tree into per-recording .lma archives via \
          bulk_lml_to_lma.py. One-shot data-prep entrypoint for the \
          LMA-direct training pipeline (ADR 0017).";
     type Args = Args;

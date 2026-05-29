@@ -12,8 +12,8 @@
 use std::io::{BufRead, BufWriter, Write};
 
 use async_trait::async_trait;
-use rand::seq::SliceRandom;
 use rand::SeedableRng;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::{DatasetJsonl, DatasetSplit};

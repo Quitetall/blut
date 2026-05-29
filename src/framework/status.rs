@@ -123,8 +123,7 @@ pub fn spawn_status_writer(
     Ok(tokio::spawn(async move {
         let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
         loop {
-            let timeout =
-                tokio::time::sleep(STEP_FLUSH_INTERVAL);
+            let timeout = tokio::time::sleep(STEP_FLUSH_INTERVAL);
             tokio::pin!(timeout);
             tokio::select! {
                 got = rx.recv() => match got {
@@ -136,11 +135,9 @@ pub fn spawn_status_writer(
                                 return;
                             }
                         }
-                        if immediate {
-                            if writer.flush().is_err() {
-                                tracing::warn!("status writer: flush failed, exiting");
-                                return;
-                            }
+                        if immediate && writer.flush().is_err() {
+                            tracing::warn!("status writer: flush failed, exiting");
+                            return;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -202,7 +199,11 @@ mod tests {
         .unwrap();
         let got = rx.recv().await.unwrap();
         match got {
-            StageEvent::StageEnd { node_idx, stage_name, .. } => {
+            StageEvent::StageEnd {
+                node_idx,
+                stage_name,
+                ..
+            } => {
                 assert_eq!(node_idx, 1);
                 assert_eq!(stage_name, "filter_dataset");
             }

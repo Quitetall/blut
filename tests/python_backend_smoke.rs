@@ -65,7 +65,10 @@ fn dummy_spec() -> TrainSpec {
         base_model: "Qwen/Qwen3-7B".into(),
         output_name: "smoke-test".into(),
         output_dir: PathBuf::from("/tmp/lamu-train-smoke"),
-        method: Method::QLora { rank: 16, alpha: 32 },
+        method: Method::QLora {
+            rank: 16,
+            alpha: 32,
+        },
         dataset: DatasetSource::JsonlPath {
             path: PathBuf::from("/tmp/x.jsonl"),
         },
@@ -162,7 +165,9 @@ async fn run_surfaces_trainer_failed_status() {
     assert!(
         msg.contains("missing python deps")
             || msg.contains("trainer.py exited")
-            || updates.iter().any(|u| matches!(u, StatusUpdate::Failed { .. })),
+            || updates
+                .iter()
+                .any(|u| matches!(u, StatusUpdate::Failed { .. })),
         "unexpected error shape: {}",
         msg
     );

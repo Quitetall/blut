@@ -29,4 +29,4 @@ pub use lamquant_data_prep::LamquantDataPrep;
 pub use lamquant_encoder::LamquantEncoder;
 pub use lamquant_oracle::LamquantOracle;
 pub use lamquant_snn::LamquantSnn;
-pub use recipe::{by_category, swap_candidates, Recipe, RecipeCategory, RecipeDef, RECIPES};
+pub use recipe::{RECIPES, Recipe, RecipeCategory, RecipeDef, by_category, swap_candidates};

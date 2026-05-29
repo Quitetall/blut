@@ -10,7 +10,14 @@
 //!   - skip_quantize path (quant == "f16") returns the f16 path
 //!   - failure cases return TrainError::Convert with a useful message
 
-use std::path::PathBuf;
+// intentional: every test holds the process-wide `ENV_LOCK` across the
+// `convert_to_gguf(...).await` because `$BLUT_LLAMACPP_DIR` is global env
+// state that would race between concurrently-scheduled tokio tests. The
+// std guard across an await is the deliberate serialization mechanism, not
+// a bug — there is no real async contention on this lock.
+#![allow(clippy::await_holding_lock)]
+
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use blut::convert::convert_to_gguf;
@@ -19,7 +26,7 @@ use blut::convert::convert_to_gguf;
 // because $BLUT_LLAMACPP_DIR is process-global.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-fn write_executable(path: &PathBuf, body: &str) {
+fn write_executable(path: &Path, body: &str) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::write(path, body).expect("write stub");
     let mut perms = std::fs::metadata(path).expect("stat").permissions();
@@ -61,10 +68,7 @@ async fn happy_path_writes_quantized_and_removes_f16() {
     // quantize stub: copies first arg to second, ignores third (quant
     // type) — just enough to satisfy the "produced a file" check.
     let quantize = bin.join("llama-quantize");
-    write_executable(
-        &quantize,
-        "#!/bin/sh\nset -e\ncp \"$1\" \"$2\"\n",
-    );
+    write_executable(&quantize, "#!/bin/sh\nset -e\ncp \"$1\" \"$2\"\n");
 
     let prev = std::env::var("BLUT_LLAMACPP_DIR").ok();
     unsafe {
@@ -74,8 +78,16 @@ async fn happy_path_writes_quantized_and_removes_f16() {
     let result = convert_to_gguf(&ckpt, "test-model", "Q4_K_M").await;
     let final_path = result.expect("convert_to_gguf must succeed");
 
-    assert!(final_path.exists(), "final file must exist: {}", final_path.display());
-    assert!(final_path.to_string_lossy().ends_with("test-model.Q4_K_M.gguf"));
+    assert!(
+        final_path.exists(),
+        "final file must exist: {}",
+        final_path.display()
+    );
+    assert!(
+        final_path
+            .to_string_lossy()
+            .ends_with("test-model.Q4_K_M.gguf")
+    );
 
     // f16 intermediate must be cleaned up.
     let f16 = ckpt.parent().unwrap().join("test-model.f16.gguf");
@@ -113,7 +125,11 @@ async fn f16_quant_skips_quantize_step() {
 
     let result = convert_to_gguf(&ckpt, "test-model", "f16").await;
     let final_path = result.expect("f16 mode must succeed without quantize");
-    assert!(final_path.to_string_lossy().ends_with("test-model.f16.gguf"));
+    assert!(
+        final_path
+            .to_string_lossy()
+            .ends_with("test-model.f16.gguf")
+    );
     assert!(final_path.exists());
 
     unsafe {

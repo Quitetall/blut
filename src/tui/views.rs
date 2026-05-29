@@ -100,7 +100,7 @@ fn find_logs(root: &Path) -> Vec<PathBuf> {
             (e.path(), mt)
         })
         .collect();
-    logs.sort_by(|a, b| b.1.cmp(&a.1));
+    logs.sort_by_key(|b| std::cmp::Reverse(b.1));
     logs.truncate(20);
     logs.into_iter().map(|(p, _)| p).collect()
 }
@@ -134,7 +134,11 @@ fn parse_log_csv(path: &Path) -> (f64, usize, usize, f64) {
             continue;
         }
         total += 1;
-        if let Some(v) = row.split(',').nth(col_idx).and_then(|s| s.trim().parse::<f64>().ok()) {
+        if let Some(v) = row
+            .split(',')
+            .nth(col_idx)
+            .and_then(|s| s.trim().parse::<f64>().ok())
+        {
             final_r = v;
             if v > best_r {
                 best_r = v;
@@ -174,7 +178,11 @@ pub fn run_history(root: &Path) -> Vec<RunRow> {
 /// `_screen_leaderboard` — runs ranked by best validation R descending.
 pub fn leaderboard(root: &Path) -> Vec<RunRow> {
     let mut rows = run_history(root);
-    rows.sort_by(|a, b| b.best_r.partial_cmp(&a.best_r).unwrap_or(std::cmp::Ordering::Equal));
+    rows.sort_by(|a, b| {
+        b.best_r
+            .partial_cmp(&a.best_r)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     rows
 }
 
@@ -186,7 +194,7 @@ pub fn checkpoints(root: &Path) -> Vec<CkptRow> {
         let base = root.join(sub);
         collect_ckpts(&base, root, &mut out, 0);
     }
-    out.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    out.sort_by_key(|b| std::cmp::Reverse(b.mtime));
     out
 }
 
@@ -277,7 +285,11 @@ pub const VALIDATED_FEATURES: &[&str] = &[
 
 /// Decoder-tier catalog from `_screen_start` (tier, params, note).
 pub const DECODER_TIERS: &[(&str, &str, &str)] = &[
-    ("Tier 3", "3.8M", "baseline — fits in 24 GB with torch.compile"),
+    (
+        "Tier 3",
+        "3.8M",
+        "baseline — fits in 24 GB with torch.compile",
+    ),
     (
         "Tier 7",
         "844M",
@@ -291,10 +303,7 @@ pub const DECODER_TIERS: &[(&str, &str, &str)] = &[
 pub const HPARAM_GROUPS: &[(&str, &[&str])] = &[
     ("Epochs", &["warmup", "quant", "fine"]),
     ("Batch sizes", &["warmup", "quant", "fine"]),
-    (
-        "Learning rate",
-        &["warmup", "quant", "quant_min", "fine"],
-    ),
+    ("Learning rate", &["warmup", "quant", "quant_min", "fine"]),
     ("Loss weights", &["pearson_r", "spectral", "prd"]),
     (
         "Quantization",
@@ -308,7 +317,12 @@ pub const HPARAM_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Data",
-        &["windows_per_epoch", "max_windows", "val_interval", "val_windows"],
+        &[
+            "windows_per_epoch",
+            "max_windows",
+            "val_interval",
+            "val_windows",
+        ],
     ),
     (
         "Architecture",
@@ -375,8 +389,18 @@ pub fn reset(root: &Path, action: ResetAction) -> String {
             }
             let text = String::from_utf8_lossy(&out.stdout);
             let kws = [
-                "teacher", "student", "decoder", "snn", "train", "production",
-                "medium", "fast", "joint", "lamquant", "oracle", "encoder",
+                "teacher",
+                "student",
+                "decoder",
+                "snn",
+                "train",
+                "production",
+                "medium",
+                "fast",
+                "joint",
+                "lamquant",
+                "oracle",
+                "encoder",
             ];
             let sessions: Vec<String> = text
                 .lines()
@@ -400,7 +424,10 @@ pub fn reset(root: &Path, action: ResetAction) -> String {
                     killed += 1;
                 }
             }
-            format!("killed {killed}/{} training tmux session(s)", sessions.len())
+            format!(
+                "killed {killed}/{} training tmux session(s)",
+                sessions.len()
+            )
         }
         ResetAction::ClearNumba => {
             let cache = root.join(".numba_cache");
@@ -420,10 +447,10 @@ pub fn reset(root: &Path, action: ResetAction) -> String {
             let mut removed = 0;
             for e in rd.flatten() {
                 let p = e.path();
-                if p.extension().and_then(|x| x.to_str()).map(|x| x == "csv").unwrap_or(false) {
-                    if std::fs::remove_file(&p).is_ok() {
-                        removed += 1;
-                    }
+                if p.extension().and_then(|x| x.to_str()) == Some("csv")
+                    && std::fs::remove_file(&p).is_ok()
+                {
+                    removed += 1;
                 }
             }
             format!("deleted {removed} training log(s) from training_logs/")
@@ -460,7 +487,10 @@ pub fn export_presets(root: &Path) -> String {
         }
     }
     if errs == 0 {
-        format!("exported {written} recipe args schema(s) to {}", root.display())
+        format!(
+            "exported {written} recipe args schema(s) to {}",
+            root.display()
+        )
     } else {
         format!("exported {written}, {errs} failed (see {})", root.display())
     }
@@ -485,7 +515,11 @@ mod tests {
     #[test]
     fn parse_log_picks_best_and_final() {
         let td = tempfile::tempdir().unwrap();
-        let p = write_log(td.path(), "alpha_trajectory_run1.csv", &[(1, 0.80), (2, 0.92), (3, 0.88)]);
+        let p = write_log(
+            td.path(),
+            "alpha_trajectory_run1.csv",
+            &[(1, 0.80), (2, 0.92), (3, 0.88)],
+        );
         let (best, best_ep, total, final_r) = parse_log_csv(&p);
         assert!((best - 0.92).abs() < 1e-9, "best={best}");
         assert_eq!(best_ep, 2);

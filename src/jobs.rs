@@ -63,7 +63,7 @@ impl JobState {
             Self::Cancelled => "cancelled",
         }
     }
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_label(s: &str) -> Option<Self> {
         match s.trim() {
             "running" => Some(Self::Running),
             "done" => Some(Self::Done),
@@ -100,8 +100,7 @@ pub fn read_spec(job_id: &str) -> Result<TrainSpec> {
         path: path.clone(),
         source: e,
     })?;
-    serde_json::from_slice(&body)
-        .map_err(|e| TrainError::other(format!("parse spec.json: {e}")))
+    serde_json::from_slice(&body).map_err(|e| TrainError::other(format!("parse spec.json: {e}")))
 }
 
 pub fn append_status(job_id: &str, update: &StatusUpdate) -> Result<()> {
@@ -164,8 +163,12 @@ pub fn read_state(job_id: &str) -> Result<JobState> {
         path: path.clone(),
         source: e,
     })?;
-    JobState::from_str(&body).ok_or_else(|| {
-        TrainError::other(format!("unknown state '{}' at {}", body.trim(), path.display()))
+    JobState::parse_label(&body).ok_or_else(|| {
+        TrainError::other(format!(
+            "unknown state '{}' at {}",
+            body.trim(),
+            path.display()
+        ))
     })
 }
 
@@ -395,7 +398,10 @@ mod tests {
             base_model: "Qwen/Qwen3-7B".into(),
             output_name: "test-out".into(),
             output_dir: PathBuf::from("/tmp/lamu-train-test"),
-            method: crate::spec::Method::QLora { rank: 16, alpha: 32 },
+            method: crate::spec::Method::QLora {
+                rank: 16,
+                alpha: 32,
+            },
             dataset: crate::spec::DatasetSource::JsonlPath {
                 path: PathBuf::from("/tmp/x.jsonl"),
             },
@@ -529,10 +535,7 @@ mod tests {
     #[test]
     fn resolve_job_id_by_prefix() {
         with_jobs_dir(|| {
-            for id in [
-                "20260510-100000-000000001",
-                "20260510-110000-000000002",
-            ] {
+            for id in ["20260510-100000-000000001", "20260510-110000-000000002"] {
                 write_state(id, JobState::Done).unwrap();
             }
             assert_eq!(

@@ -63,9 +63,8 @@ impl PythonTrainBackend {
 impl TrainBackend for PythonTrainBackend {
     async fn run(&mut self, spec: TrainSpec, on_status: StatusFn) -> Result<TrainArtifact> {
         spec.validate()?;
-        let spec_json = serde_json::to_string(&spec).map_err(|e| {
-            TrainError::other(format!("serialize TrainSpec for trainer.py: {}", e))
-        })?;
+        let spec_json = serde_json::to_string(&spec)
+            .map_err(|e| TrainError::other(format!("serialize TrainSpec for trainer.py: {}", e)))?;
 
         let mut cmd = Command::new(&self.python);
         cmd.arg(&self.trainer_script).arg(&spec_json);
@@ -107,12 +106,14 @@ impl TrainBackend for PythonTrainBackend {
             crate::python_kill::set_active_child(crate::python_kill::capture_identity(pid));
         }
 
-        let stdout = child.stdout.take().ok_or_else(|| {
-            TrainError::Trainer("trainer subprocess stdout pipe missing".into())
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            TrainError::Trainer("trainer subprocess stderr pipe missing".into())
-        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| TrainError::Trainer("trainer subprocess stdout pipe missing".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| TrainError::Trainer("trainer subprocess stderr pipe missing".into()))?;
 
         let (artifact_tx, artifact_rx) = oneshot::channel();
         let started = Instant::now();
@@ -197,9 +198,7 @@ impl TrainBackend for PythonTrainBackend {
             )));
         }
         let (final_loss, checkpoint_dir) = last_done.ok_or_else(|| {
-            TrainError::Trainer(
-                "trainer.py exited successfully but emitted no Done status".into(),
-            )
+            TrainError::Trainer("trainer.py exited successfully but emitted no Done status".into())
         })?;
 
         Ok(TrainArtifact {

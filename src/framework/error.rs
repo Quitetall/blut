@@ -174,7 +174,9 @@ mod tests {
 
     #[test]
     fn recipe_error_not_found_names_recipe() {
-        let e = RecipeError::NotFound { name: "frobulate".into() };
+        let e = RecipeError::NotFound {
+            name: "frobulate".into(),
+        };
         assert!(format!("{e}").contains("frobulate"));
     }
 }

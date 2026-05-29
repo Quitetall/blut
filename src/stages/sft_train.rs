@@ -79,8 +79,14 @@ impl Stage for SftTrain {
         })?;
 
         let method = match args.method.as_str() {
-            "qlora" => Method::QLora { rank: args.rank, alpha: args.alpha },
-            "lora" => Method::Lora { rank: args.rank, alpha: args.alpha },
+            "qlora" => Method::QLora {
+                rank: args.rank,
+                alpha: args.alpha,
+            },
+            "lora" => Method::Lora {
+                rank: args.rank,
+                alpha: args.alpha,
+            },
             "full" => Method::Full,
             other => {
                 return Err(StageError::BadInput(format!(
@@ -94,9 +100,7 @@ impl Stage for SftTrain {
             "apollo_mini" => Optim::ApolloMini,
             "apollo_rank4" | "apollo" => Optim::ApolloRank4,
             other => {
-                return Err(StageError::BadInput(format!(
-                    "unknown optimizer '{other}'"
-                )));
+                return Err(StageError::BadInput(format!("unknown optimizer '{other}'")));
             }
         };
 
@@ -105,7 +109,9 @@ impl Stage for SftTrain {
             output_name: args.output_name.clone(),
             output_dir: output_dir.clone(),
             method,
-            dataset: DatasetSource::JsonlPath { path: input.path.clone() },
+            dataset: DatasetSource::JsonlPath {
+                path: input.path.clone(),
+            },
             optimizer,
             lr: args.lr,
             epochs: args.epochs,
@@ -119,10 +125,10 @@ impl Stage for SftTrain {
         spec.validate()
             .map_err(|e| StageError::BadInput(format!("{e}")))?;
 
-        let python = paths::resolve_python()
-            .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
-        let trainer_script = paths::resolve_trainer_script()
-            .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
+        let python =
+            paths::resolve_python().map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
+        let trainer_script =
+            paths::resolve_trainer_script().map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
         let mut backend = PythonTrainBackend::new(python, trainer_script);
 
         // Forward StageStep events from trainer.py's per-step

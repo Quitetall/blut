@@ -58,13 +58,12 @@ impl Stage for LamquantPrecomputeL3 {
     ) -> Result<L3Cache, StageError> {
         let home = resolve_home(&args.lamquant_home)?;
         let python = python_for(&home);
-        let script = script_path(
-            &home,
-            &["ai_models", "student", "precompute_l3_fast.py"],
-        )?;
+        let script = script_path(&home, &["ai_models", "student", "precompute_l3_fast.py"])?;
 
         let q31_dir = if args.input_dir.is_empty() {
-            home.join("ai_models").join("dataset_sim").join("q31_events")
+            home.join("ai_models")
+                .join("dataset_sim")
+                .join("q31_events")
         } else {
             PathBuf::from(&args.input_dir)
         };
@@ -96,12 +95,13 @@ impl Stage for LamquantPrecomputeL3 {
             .await
             .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
 
-        let content_hash = stat_fingerprint_dir(b"lamquant.l3_cache", &q31_dir).map_err(
-            |source| StageError::Io {
-                path: q31_dir.clone(),
-                source,
-            },
-        )?;
+        let content_hash =
+            stat_fingerprint_dir(b"lamquant.l3_cache", &q31_dir).map_err(|source| {
+                StageError::Io {
+                    path: q31_dir.clone(),
+                    source,
+                }
+            })?;
         Ok(L3Cache {
             dir: q31_dir,
             n_windows: input.n_windows,

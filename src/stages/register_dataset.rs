@@ -109,7 +109,9 @@ mod tests {
             kind: "sft".into(),
             metadata: None,
         };
-        let out = RegisterDataset.run(&ctx(td.path()), input.clone(), &args).await;
+        let out = RegisterDataset
+            .run(&ctx(td.path()), input.clone(), &args)
+            .await;
         // datasets_db may or may not honour LAMU_REGISTRY_DIR depending
         // on host config; what we can rigorously assert is that on the
         // success path the output is byte-identical to the input.

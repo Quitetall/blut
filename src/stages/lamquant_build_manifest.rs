@@ -18,9 +18,7 @@ use crate::framework::artifact::ContentHash;
 use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
-use crate::lamquant_backend::{
-    resolve_lamquant_python, LamquantBackend, LamquantInvocation,
-};
+use crate::lamquant_backend::{LamquantBackend, LamquantInvocation, resolve_lamquant_python};
 use crate::stages::lamquant_helpers::resolve_home;
 
 pub struct LamquantBuildManifest;
@@ -148,10 +146,11 @@ impl Stage for LamquantBuildManifest {
                 ))
             })?;
 
-        let content_hash = ContentHash::hash_file(&output_path).map_err(|source| StageError::Io {
-            path: output_path.clone(),
-            source,
-        })?;
+        let content_hash =
+            ContentHash::hash_file(&output_path).map_err(|source| StageError::Io {
+                path: output_path.clone(),
+                source,
+            })?;
 
         Ok(Manifest {
             path: output_path,

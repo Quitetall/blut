@@ -17,4 +17,4 @@ pub mod venv;
 
 pub use runner::{DpoConfig, HfRunArtifact, HfTrainerJob, HfTrainerRunner, PeftConfig, StatusLine};
 pub use stages::{HfDpoTrain, HfSftTrain};
-pub use venv::{ensure_venv, venv_root, VenvError};
+pub use venv::{VenvError, ensure_venv, venv_root};

@@ -10,6 +10,6 @@
 pub mod runner;
 
 pub use runner::{
-    default_lamquant_home, resolve_lamquant_python, BackendError, LamquantBackend,
-    LamquantInvocation, LamquantRunArtifact, Progress,
+    BackendError, LamquantBackend, LamquantInvocation, LamquantRunArtifact, Progress,
+    default_lamquant_home, resolve_lamquant_python,
 };

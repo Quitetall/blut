@@ -103,8 +103,7 @@ fn default_quant() -> String {
 impl Recipe for DpoFromPreferences {
     type Backend = crate::backends::LamuTrainerBackend;
     const NAME: &'static str = "dpo_from_preferences";
-    const DESCRIPTION: &'static str =
-        "Direct preference optimization from a chosen/rejected JSONL. Stub trainer; full DPO impl pending.";
+    const DESCRIPTION: &'static str = "Direct preference optimization from a chosen/rejected JSONL. Stub trainer; full DPO impl pending.";
     type Args = Args;
 
     fn compile(&self, args: Self::Args) -> Result<Plan<(), Self::Backend>, RecipeError> {
@@ -127,10 +126,15 @@ impl Recipe for DpoFromPreferences {
         if args.epochs == 0 {
             return Err(RecipeError::InvalidArgs("epochs must be > 0".into()));
         }
-        let recipe_args = serde_json::to_value(&args)
-            .map_err(|e| RecipeError::CompileFailed(format!("{e}")))?;
+        let recipe_args =
+            serde_json::to_value(&args).map_err(|e| RecipeError::CompileFailed(format!("{e}")))?;
         let plan = Plan::new(Self::NAME, recipe_args)
-            .start(MaterializePreferences, MatPrefArgs { path: args.preferences_path.clone() })
+            .start(
+                MaterializePreferences,
+                MatPrefArgs {
+                    path: args.preferences_path.clone(),
+                },
+            )
             .then(
                 DpoTrain,
                 DpoArgs {

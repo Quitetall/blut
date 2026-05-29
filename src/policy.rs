@@ -139,9 +139,7 @@ pub fn policy_path() -> Result<PathBuf> {
         return Ok(PathBuf::from(p));
     }
     let dir = dirs::config_dir()
-        .ok_or_else(|| TrainError::other(
-            "config_dir() unavailable; set $LAMU_TRAIN_POLICY",
-        ))?
+        .ok_or_else(|| TrainError::other("config_dir() unavailable; set $LAMU_TRAIN_POLICY"))?
         .join("lamu");
     Ok(dir.join("train-policy.toml"))
 }
@@ -161,8 +159,7 @@ pub fn load_at(path: &Path) -> Result<TrainPolicy> {
         path: path.into(),
         source: e,
     })?;
-    toml::from_str(&body)
-        .map_err(|e| TrainError::other(format!("parse {}: {e}", path.display())))
+    toml::from_str(&body).map_err(|e| TrainError::other(format!("parse {}: {e}", path.display())))
 }
 
 /// Atomically write the policy. Tmp + rename — same pattern as
@@ -188,10 +185,7 @@ pub fn save_at(path: &Path, policy: &TrainPolicy) -> Result<()> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp = path.with_file_name(format!(
-        ".{stem}.tmp.{}.{nanos}",
-        std::process::id()
-    ));
+    let tmp = path.with_file_name(format!(".{stem}.tmp.{}.{nanos}", std::process::id()));
     std::fs::write(&tmp, body).map_err(|e| TrainError::Io {
         path: tmp.clone(),
         source: e,
@@ -221,7 +215,9 @@ pub fn decide(
     inference_lock_held: bool,
 ) -> Decision {
     if !policy.enabled {
-        return Decision::Skip("auto-trigger disabled (run `lamu-train policy enable` to opt in)".into());
+        return Decision::Skip(
+            "auto-trigger disabled (run `lamu-train policy enable` to opt in)".into(),
+        );
     }
     let (start, end) = match parse_quiet_hours(&policy.quiet_hours) {
         Ok(p) => p,
@@ -251,9 +247,7 @@ pub fn decide(
         ));
     }
     if inference_lock_held {
-        return Decision::Skip(
-            "GPU held by inference; will retry next tick".into(),
-        );
+        return Decision::Skip("GPU held by inference; will retry next tick".into());
     }
     Decision::Run {
         base: policy.base.clone(),
@@ -316,7 +310,7 @@ pub fn validate(policy: &TrainPolicy) -> Result<()> {
             policy.base
         )));
     }
-    parse_quiet_hours(&policy.quiet_hours).map_err(|e| TrainError::other(e))?;
+    parse_quiet_hours(&policy.quiet_hours).map_err(TrainError::other)?;
     let since = humantime::parse_duration(&policy.since_window)
         .map_err(|e| TrainError::other(format!("since_window '{}': {e}", policy.since_window)))?;
     if since.as_secs() > MAX_SINCE_SECS {
@@ -326,9 +320,7 @@ pub fn validate(policy: &TrainPolicy) -> Result<()> {
         )));
     }
     if policy.threshold_new_turns < 0 {
-        return Err(TrainError::other(
-            "threshold_new_turns must be >= 0",
-        ));
+        return Err(TrainError::other("threshold_new_turns must be >= 0"));
     }
     Ok(())
 }
@@ -454,7 +446,11 @@ mod tests {
         let p = run_policy();
         let d = decide(&p, 0, at_3am(), 9999, false);
         match d {
-            Decision::Run { base, method, since } => {
+            Decision::Run {
+                base,
+                method,
+                since,
+            } => {
                 assert_eq!(base, "Qwen/Qwen3-7B");
                 assert_eq!(method, "qlora");
                 assert_eq!(since, "30d");
@@ -506,12 +502,14 @@ mod tests {
     fn save_and_load_round_trip() {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("policy.toml");
-        let mut p = TrainPolicy::default();
-        p.enabled = true;
-        p.last_train_ts = 1_700_000_000;
+        let p = TrainPolicy {
+            enabled: true,
+            last_train_ts: 1_700_000_000,
+            ..Default::default()
+        };
         save_at(&path, &p).unwrap();
         let back = load_at(&path).unwrap();
-        assert_eq!(back.enabled, true);
+        assert!(back.enabled);
         assert_eq!(back.last_train_ts, 1_700_000_000);
         assert_eq!(back.base, "Qwen/Qwen3-7B");
     }
@@ -521,35 +519,43 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("nonexistent.toml");
         let p = load_at(&path).unwrap();
-        assert_eq!(p.enabled, false);
+        assert!(!p.enabled);
         assert_eq!(p.threshold_new_turns, 500);
     }
 
     #[test]
     fn validate_rejects_bad_method() {
-        let mut p = TrainPolicy::default();
-        p.method = "rlhf".into();
+        let p = TrainPolicy {
+            method: "rlhf".into(),
+            ..Default::default()
+        };
         assert!(validate(&p).is_err());
     }
 
     #[test]
     fn validate_rejects_bad_base() {
-        let mut p = TrainPolicy::default();
-        p.base = "no-slash".into();
+        let p = TrainPolicy {
+            base: "no-slash".into(),
+            ..Default::default()
+        };
         assert!(validate(&p).is_err());
     }
 
     #[test]
     fn validate_rejects_oversize_window() {
-        let mut p = TrainPolicy::default();
-        p.since_window = "100y".into();
+        let p = TrainPolicy {
+            since_window: "100y".into(),
+            ..Default::default()
+        };
         assert!(validate(&p).is_err());
     }
 
     #[test]
     fn validate_rejects_negative_threshold() {
-        let mut p = TrainPolicy::default();
-        p.threshold_new_turns = -1;
+        let p = TrainPolicy {
+            threshold_new_turns: -1,
+            ..Default::default()
+        };
         assert!(validate(&p).is_err());
     }
 

@@ -63,9 +63,7 @@ impl Stage for RegisterModel {
             "GgufModel path must exist on disk"
         );
         use crate::registry;
-        use crate::registry::{
-            BackendType, Capability, ModelEntry, ModelFormat, ModelStatus,
-        };
+        use crate::registry::{BackendType, Capability, ModelEntry, ModelFormat, ModelStatus};
 
         let registry_path = crate::config::registry_path();
         let entry = ModelEntry {

@@ -65,7 +65,9 @@ impl Stage for EvalJudge {
             )));
         }
         if args.judge_model.is_empty() {
-            return Err(StageError::BadInput("eval_judge: judge_model is empty".into()));
+            return Err(StageError::BadInput(
+                "eval_judge: judge_model is empty".into(),
+            ));
         }
         if args.n_samples == 0 && args.prompts.is_empty() {
             return Err(StageError::BadInput(

@@ -25,9 +25,7 @@ use crate::framework::artifact::ContentHash;
 use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
-use crate::lamquant_backend::{
-    resolve_lamquant_python, LamquantBackend, LamquantInvocation,
-};
+use crate::lamquant_backend::{LamquantBackend, LamquantInvocation, resolve_lamquant_python};
 use crate::stages::lamquant_helpers::resolve_home;
 
 pub struct LamquantPccpGateSnn;
@@ -245,12 +243,11 @@ impl Stage for LamquantPccpGateSnn {
             .unwrap_or(&args.change_id)
             .to_string();
 
-        let content_hash = ContentHash::hash_file(&verdict_path).map_err(|source| {
-            StageError::Io {
+        let content_hash =
+            ContentHash::hash_file(&verdict_path).map_err(|source| StageError::Io {
                 path: verdict_path.clone(),
                 source,
-            }
-        })?;
+            })?;
 
         Ok(PccpVerdict {
             gate_json_path: verdict_path,
@@ -273,7 +270,7 @@ fn most_recent_json(dir: &std::path::Path) -> Result<Option<PathBuf>, StageError
             return Err(StageError::Io {
                 path: dir.to_path_buf(),
                 source,
-            })
+            });
         }
     };
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
@@ -291,7 +288,7 @@ fn most_recent_json(dir: &std::path::Path) -> Result<Option<PathBuf>, StageError
             source,
         })?;
         let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        if best.as_ref().map_or(true, |(t, _)| mtime > *t) {
+        if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
             best = Some((mtime, p));
         }
     }

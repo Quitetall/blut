@@ -120,7 +120,10 @@ impl Stage for LamquantGenerateSnnLabels {
         };
         let mut backend = LamquantBackend::new();
         backend
-            .run(inv, Some(progress_forwarder(Self::NAME, ctx.status_tx.clone())))
+            .run(
+                inv,
+                Some(progress_forwarder(Self::NAME, ctx.status_tx.clone())),
+            )
             .await
             .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
 
@@ -137,12 +140,13 @@ impl Stage for LamquantGenerateSnnLabels {
                 }
             }
         }
-        let content_hash = stat_fingerprint(b"lamquant.snn_labels", &output_dir).map_err(
-            |source| StageError::Io {
-                path: output_dir.clone(),
-                source,
-            },
-        )?;
+        let content_hash =
+            stat_fingerprint(b"lamquant.snn_labels", &output_dir).map_err(|source| {
+                StageError::Io {
+                    path: output_dir.clone(),
+                    source,
+                }
+            })?;
         Ok(SnnLabels {
             dir: output_dir,
             dataset_id: args.dataset_id.clone(),

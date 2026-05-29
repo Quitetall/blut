@@ -2,9 +2,9 @@
 //! runner. Companion to `PythonTrainBackend` (which expects the
 //! `trainer.py` wire format: TrainSpec JSON in, StatusUpdate lines
 //! out). LamQuant kernels (`train_joint.py`, `train_mamba_snn.py`,
-//! `train_teacher.py`, etc.) are argparse-driven, use tqdm + wandb
-//! + `RunManifest` for their own observability, and write
-//! checkpoints to known paths.
+//! `train_teacher.py`, etc.) are argparse-driven, use tqdm + wandb +
+//! `RunManifest` for their own observability, and write checkpoints
+//! to known paths.
 //!
 //! Behavior contract:
 //!
@@ -291,6 +291,33 @@ fn parse_tqdm_progress(line: &str) -> Option<Progress> {
     None
 }
 
+/// Resolve `$LAMQUANT_HOME` with a default. Stage Args pass an
+/// explicit path; this helper exists for tests + as the env-fallback
+/// hint when a stage's `lamquant_home` field is left empty.
+pub fn default_lamquant_home() -> PathBuf {
+    if let Ok(p) = std::env::var("LAMQUANT_HOME") {
+        return PathBuf::from(p);
+    }
+    let mut p = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    p.push("Desktop");
+    p.push("LamQuant");
+    p
+}
+
+/// Resolve `$LAMQUANT_PYTHON` with a fallback: an `LAMQUANT_PYTHON`
+/// env var, then `<lamquant_home>/.venv/bin/python`, then system
+/// `python3`. Match the pattern in `paths::resolve_python`.
+pub fn resolve_lamquant_python(lamquant_home: &Path) -> PathBuf {
+    if let Ok(p) = std::env::var("LAMQUANT_PYTHON") {
+        return PathBuf::from(p);
+    }
+    let venv = lamquant_home.join(".venv").join("bin").join("python");
+    if venv.exists() {
+        return venv;
+    }
+    PathBuf::from("python3")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,14 +326,26 @@ mod tests {
     fn parses_canonical_tqdm_line() {
         let line = "42%|████      | 42/100 [00:05<00:07,  8.40it/s]";
         let p = parse_tqdm_progress(line).unwrap();
-        assert_eq!(p, Progress { current: 42, total: 100 });
+        assert_eq!(
+            p,
+            Progress {
+                current: 42,
+                total: 100
+            }
+        );
     }
 
     #[test]
     fn parses_compact_tqdm_line() {
         let line = "epoch 3/10 [00:01<00:00, 1.5it/s]";
         let p = parse_tqdm_progress(line).unwrap();
-        assert_eq!(p, Progress { current: 3, total: 10 });
+        assert_eq!(
+            p,
+            Progress {
+                current: 3,
+                total: 10
+            }
+        );
     }
 
     #[test]
@@ -314,7 +353,13 @@ mod tests {
         let line = "[ 2026-05-11 ] training 7/9 [steps 70/100, loss=0.42]";
         let p = parse_tqdm_progress(line).unwrap();
         // Picks the first <int>/<int> followed by whitespace + '['.
-        assert_eq!(p, Progress { current: 7, total: 9 });
+        assert_eq!(
+            p,
+            Progress {
+                current: 7,
+                total: 9
+            }
+        );
     }
 
     #[test]
@@ -394,42 +439,19 @@ mod tests {
             script: PathBuf::from("-c"),
             cwd: std::env::temp_dir(),
             // Emit a tqdm-shaped line and exit.
-            args: vec![
-                r#"printf '50%%|####    | 50/100 [00:01<00:01, 50it/s]\n'"#.into(),
-            ],
+            args: vec![r#"printf '50%%|####    | 50/100 [00:01<00:01, 50it/s]\n'"#.into()],
             env: vec![],
             expected_outputs: vec![],
             run_manifest_path: None,
         };
         let _ = be.run(inv, Some(tx)).await.unwrap();
         let got = progress_collected.lock().clone();
-        assert_eq!(got, vec![Progress { current: 50, total: 100 }]);
+        assert_eq!(
+            got,
+            vec![Progress {
+                current: 50,
+                total: 100
+            }]
+        );
     }
-}
-
-/// Resolve `$LAMQUANT_HOME` with a default. Stage Args pass an
-/// explicit path; this helper exists for tests + as the env-fallback
-/// hint when a stage's `lamquant_home` field is left empty.
-pub fn default_lamquant_home() -> PathBuf {
-    if let Ok(p) = std::env::var("LAMQUANT_HOME") {
-        return PathBuf::from(p);
-    }
-    let mut p = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    p.push("Desktop");
-    p.push("LamQuant");
-    p
-}
-
-/// Resolve `$LAMQUANT_PYTHON` with a fallback: an `LAMQUANT_PYTHON`
-/// env var, then `<lamquant_home>/.venv/bin/python`, then system
-/// `python3`. Match the pattern in `paths::resolve_python`.
-pub fn resolve_lamquant_python(lamquant_home: &Path) -> PathBuf {
-    if let Ok(p) = std::env::var("LAMQUANT_PYTHON") {
-        return PathBuf::from(p);
-    }
-    let venv = lamquant_home.join(".venv").join("bin").join("python");
-    if venv.exists() {
-        return venv;
-    }
-    PathBuf::from("python3")
 }

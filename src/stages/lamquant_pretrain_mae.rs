@@ -73,7 +73,9 @@ impl Stage for LamquantPretrainMae {
         let python = python_for(&home);
         let script = script_path(&home, &["ai_models", "student", "pretrain_mae.py"])?;
         let output_path = if args.output_rel.is_empty() {
-            home.join("ai_models").join("student").join("pretrained_mae.ckpt")
+            home.join("ai_models")
+                .join("student")
+                .join("pretrained_mae.ckpt")
         } else {
             safe_join(&home, &args.output_rel)?
         };
@@ -113,16 +115,20 @@ impl Stage for LamquantPretrainMae {
         };
         let mut backend = LamquantBackend::new();
         backend
-            .run(inv, Some(progress_forwarder(Self::NAME, ctx.status_tx.clone())))
+            .run(
+                inv,
+                Some(progress_forwarder(Self::NAME, ctx.status_tx.clone())),
+            )
             .await
             .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
 
-        let content_hash = stat_fingerprint(b"lamquant.ckpt.mae", &output_path).map_err(
-            |source| StageError::Io {
-                path: output_path.clone(),
-                source,
-            },
-        )?;
+        let content_hash =
+            stat_fingerprint(b"lamquant.ckpt.mae", &output_path).map_err(|source| {
+                StageError::Io {
+                    path: output_path.clone(),
+                    source,
+                }
+            })?;
         Ok(MaeCkpt {
             path: output_path,
             content_hash,
@@ -174,6 +180,6 @@ mod tests {
 
     #[test]
     fn deterministic_false() {
-        assert!(!<LamquantPretrainMae as Stage>::DETERMINISTIC);
+        const { assert!(!<LamquantPretrainMae as Stage>::DETERMINISTIC) };
     }
 }

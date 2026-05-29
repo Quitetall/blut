@@ -110,8 +110,7 @@ fn default_true() -> bool {
 impl Recipe for LamquantOracle {
     type Backend = crate::backends::LamquantBackend;
     const NAME: &'static str = "lamquant_oracle";
-    const DESCRIPTION: &'static str =
-        "LamQuant teacher pipeline: convert_lma → train_l3_teacher \
+    const DESCRIPTION: &'static str = "LamQuant teacher pipeline: convert_lma → train_l3_teacher \
          (Gpu, nondet) → pccp_gate_encoder. LMA-direct per ADR 0017. \
          Safe-by-default PCCP gate.";
     type Args = Args;
@@ -248,8 +247,8 @@ pub static DEF: RecipeDef = RecipeDef {
         serde_json::to_value(s).expect("schemars-derived JsonSchema must serialize cleanly")
     },
     compile_fn: |raw| {
-        let args: Args = serde_json::from_value(raw)
-            .map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
+        let args: Args =
+            serde_json::from_value(raw).map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
         LamquantOracle.compile(args).map(|p| p.into_compiled())
     },
 };
@@ -297,14 +296,20 @@ mod tests {
     fn rejects_empty_output_dir() {
         let mut a = args();
         a.lma_output_dir = PathBuf::new();
-        assert!(matches!(LamquantOracle.compile(a), Err(RecipeError::InvalidArgs(_))));
+        assert!(matches!(
+            LamquantOracle.compile(a),
+            Err(RecipeError::InvalidArgs(_))
+        ));
     }
 
     #[test]
     fn rejects_empty_split_manifest() {
         let mut a = args();
         a.split_manifest = String::new();
-        assert!(matches!(LamquantOracle.compile(a), Err(RecipeError::InvalidArgs(_))));
+        assert!(matches!(
+            LamquantOracle.compile(a),
+            Err(RecipeError::InvalidArgs(_))
+        ));
     }
 
     #[test]

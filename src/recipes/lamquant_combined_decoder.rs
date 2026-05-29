@@ -121,8 +121,7 @@ fn default_true() -> bool {
 impl Recipe for LamquantCombinedDecoder {
     type Backend = crate::backends::LamquantBackend;
     const NAME: &'static str = "lamquant_combined_decoder";
-    const DESCRIPTION: &'static str =
-        "End-to-end decoder pipeline (combined teacher + decoder \
+    const DESCRIPTION: &'static str = "End-to-end decoder pipeline (combined teacher + decoder \
          joint training): convert_lma → train_combined → \
          pccp_gate_decoder. Replaces the legacy sequential \
          teacher-then-decoder chain (~40% faster wall-time). \
@@ -210,7 +209,7 @@ impl Recipe for LamquantCombinedDecoder {
         let plan = Plan::new(Self::NAME, recipe_args_json)
             .start(crate::stages::LamquantConvertLma, convert_args)
             .then(crate::stages::LamquantTrainCombined, combined_args)
-            .then(TakeJointCkpt, TakeJointCkptArgs::default())
+            .then(TakeJointCkpt, TakeJointCkptArgs)
             .then(crate::stages::LamquantPccpGateDecoder, gate_args)
             .finish();
         Ok(plan)
@@ -364,7 +363,7 @@ mod tests {
         std::fs::create_dir_all(td.path().join("stage")).unwrap();
         let ctx = StageContext::for_test(td.path().to_path_buf(), td.path().join("stage"));
         let out = TakeJointCkpt
-            .run(&ctx, (teacher, joint.clone()), &TakeJointCkptArgs::default())
+            .run(&ctx, (teacher, joint.clone()), &TakeJointCkptArgs)
             .await
             .unwrap();
         assert_eq!(out.decoder_path, joint.decoder_path);

@@ -44,9 +44,13 @@ impl Stage for MergeReports {
         // by_evaluator JSON (duplicate-key or empty-key collisions).
         // Promoted from debug_assert per V4 Pro retrofit-C review —
         // release builds need the guard too.
-        for (i, label) in [a.evaluator.as_str(), b.evaluator.as_str(), c.evaluator.as_str()]
-            .iter()
-            .enumerate()
+        for (i, label) in [
+            a.evaluator.as_str(),
+            b.evaluator.as_str(),
+            c.evaluator.as_str(),
+        ]
+        .iter()
+        .enumerate()
         {
             if label.is_empty() {
                 return Err(StageError::BadInput(format!(
@@ -134,9 +138,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.evaluator, "merge_reports");
-        assert_eq!(r.metrics["summary"]["eval_loss.loss"], serde_json::json!(0.42));
-        assert_eq!(r.metrics["summary"]["eval_judge.mean_score"], serde_json::json!(0.55));
-        let mean_acc = r.metrics["summary"]["eval_lm_harness.mean_acc"].as_f64().unwrap();
+        assert_eq!(
+            r.metrics["summary"]["eval_loss.loss"],
+            serde_json::json!(0.42)
+        );
+        assert_eq!(
+            r.metrics["summary"]["eval_judge.mean_score"],
+            serde_json::json!(0.55)
+        );
+        let mean_acc = r.metrics["summary"]["eval_lm_harness.mean_acc"]
+            .as_f64()
+            .unwrap();
         assert!((mean_acc - 0.65).abs() < 1e-9);
     }
 }

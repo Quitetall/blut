@@ -149,7 +149,7 @@ impl ContentHash {
         for (rel, child) in &entries {
             hasher.update(rel.as_bytes());
             hasher.update([0u8]); // separator (NUL — can't appear in path)
-            hasher.update(&child.0);
+            hasher.update(child.0);
         }
         let arr: [u8; 32] = hasher.finalize().into();
         Ok(Self(arr))
@@ -166,7 +166,7 @@ impl ContentHash {
         for (rel, child) in &entries {
             hasher.update(rel.as_bytes());
             hasher.update([0u8]);
-            hasher.update(&child.0);
+            hasher.update(child.0);
         }
         let arr: [u8; 32] = hasher.finalize().into();
         Ok(Self(arr))
@@ -288,9 +288,7 @@ impl<'de> Deserialize<'de> for ContentHash {
 /// `Input` / `Output` associated types must satisfy. Tuple impls
 /// (below) handle multi-input merge stages (e.g. `distill_train`
 /// takes `(HfCheckpoint, DatasetJsonl)`).
-pub trait Artifact:
-    Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static
-{
+pub trait Artifact: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static {
     /// Stable kind tag (e.g. `"dataset.jsonl"`). Must be unique
     /// across the catalog; used in cache keys + sidecar metadata
     /// + stage compatibility checks. Bumping is a breaking change.
@@ -419,7 +417,10 @@ impl ArtifactMetadata {
         // humans 99% of the time. Use `jq .` if a human needs to
         // pretty-print one.
         let body = serde_json::to_vec(self).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("serialize sidecar: {e}"))
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("serialize sidecar: {e}"),
+            )
         })?;
         std::fs::write(sidecar_path, body)
     }
@@ -427,7 +428,10 @@ impl ArtifactMetadata {
     pub fn read_from(sidecar_path: &Path) -> std::io::Result<Self> {
         let body = std::fs::read(sidecar_path)?;
         serde_json::from_slice(&body).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse sidecar: {e}"))
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("parse sidecar: {e}"),
+            )
         })
     }
 
@@ -655,7 +659,10 @@ mod tests {
         assert_eq!(back.kind, "dataset.jsonl");
         assert_eq!(back.schema, 1);
         assert_eq!(back.content_hash, md.content_hash);
-        assert_eq!(back.produced_by_stage.as_deref(), Some("materialize_conversations"));
+        assert_eq!(
+            back.produced_by_stage.as_deref(),
+            Some("materialize_conversations")
+        );
         assert_eq!(back.extra.get("n_examples"), Some(&serde_json::json!(42)));
     }
 
@@ -697,8 +704,14 @@ mod tests {
 
     #[test]
     fn tuple2_content_hash_is_deterministic() {
-        let a = TestArt { byte: 1, path: PathBuf::from("/a") };
-        let b = TestArt { byte: 2, path: PathBuf::from("/b") };
+        let a = TestArt {
+            byte: 1,
+            path: PathBuf::from("/a"),
+        };
+        let b = TestArt {
+            byte: 2,
+            path: PathBuf::from("/b"),
+        };
         let pair = (a.clone(), b.clone());
         let h1 = pair.content_hash();
         let h2 = (a.clone(), b.clone()).content_hash();
@@ -707,8 +720,14 @@ mod tests {
 
     #[test]
     fn tuple2_content_hash_is_order_sensitive() {
-        let a = TestArt { byte: 1, path: PathBuf::from("/a") };
-        let b = TestArt { byte: 2, path: PathBuf::from("/b") };
+        let a = TestArt {
+            byte: 1,
+            path: PathBuf::from("/a"),
+        };
+        let b = TestArt {
+            byte: 2,
+            path: PathBuf::from("/b"),
+        };
         let h_ab = (a.clone(), b.clone()).content_hash();
         let h_ba = (b, a).content_hash();
         assert_ne!(h_ab, h_ba);
@@ -716,20 +735,38 @@ mod tests {
 
     #[test]
     fn tuple2_primary_path_returns_first() {
-        let a = TestArt { byte: 1, path: PathBuf::from("/first") };
-        let b = TestArt { byte: 2, path: PathBuf::from("/second") };
+        let a = TestArt {
+            byte: 1,
+            path: PathBuf::from("/first"),
+        };
+        let b = TestArt {
+            byte: 2,
+            path: PathBuf::from("/second"),
+        };
         let pair = (a, b);
         assert_eq!(pair.primary_path(), Path::new("/first"));
     }
 
     #[test]
     fn tuple3_content_hash_includes_all_children() {
-        let a = TestArt { byte: 1, path: PathBuf::from("/a") };
-        let b = TestArt { byte: 2, path: PathBuf::from("/b") };
-        let c = TestArt { byte: 3, path: PathBuf::from("/c") };
+        let a = TestArt {
+            byte: 1,
+            path: PathBuf::from("/a"),
+        };
+        let b = TestArt {
+            byte: 2,
+            path: PathBuf::from("/b"),
+        };
+        let c = TestArt {
+            byte: 3,
+            path: PathBuf::from("/c"),
+        };
         let h_full = (a.clone(), b.clone(), c.clone()).content_hash();
         // Replacing the third element should change the hash.
-        let c2 = TestArt { byte: 99, path: PathBuf::from("/c2") };
+        let c2 = TestArt {
+            byte: 99,
+            path: PathBuf::from("/c2"),
+        };
         let h_diff = (a, b, c2).content_hash();
         assert_ne!(h_full, h_diff);
     }
@@ -747,7 +784,7 @@ mod tests {
         assert_eq!(h, ContentHash::of_bytes(&[]));
         assert_eq!(<() as Artifact>::KIND, "()");
         // serde round trip
-        let json = serde_json::to_value(&()).unwrap();
+        let json = serde_json::to_value(()).unwrap();
         let _: () = serde_json::from_value(json).unwrap();
     }
 
@@ -756,7 +793,10 @@ mod tests {
         // 2-tuple of (a, a) and 3-tuple of (a, a, a) must produce
         // distinct hashes even when child hashes are identical —
         // the arity byte in the domain prefix prevents collisions.
-        let a = TestArt { byte: 7, path: PathBuf::from("/a") };
+        let a = TestArt {
+            byte: 7,
+            path: PathBuf::from("/a"),
+        };
         let h2 = (a.clone(), a.clone()).content_hash();
         let h3 = (a.clone(), a.clone(), a.clone()).content_hash();
         assert_ne!(h2, h3, "tuple arity must affect hash");

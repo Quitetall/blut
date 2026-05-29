@@ -71,11 +71,7 @@ pub fn ascii_only() -> bool {
 /// `Style::default()` (no ANSI) otherwise.
 #[inline]
 fn maybe(s: Style) -> Style {
-    if color_enabled() {
-        s
-    } else {
-        Style::default()
-    }
+    if color_enabled() { s } else { Style::default() }
 }
 
 pub fn title() -> Style {

@@ -189,7 +189,7 @@ pub async fn graceful_kill_group(
     grace: Duration,
 ) {
     use nix::errno::Errno;
-    use nix::sys::signal::{killpg, Signal};
+    use nix::sys::signal::{Signal, killpg};
     use nix::unistd::Pid;
 
     // KILL-4: refuse to signal a recycled pid. If the leader's pid is
@@ -271,7 +271,7 @@ pub async fn graceful_kill_group(
 /// parent, so a failed waitpid here is expected and ignored.
 #[cfg(unix)]
 fn reap_if_child(expected: Option<ChildIdentity>, pgid: u32) {
-    use nix::sys::wait::{waitpid, WaitPidFlag};
+    use nix::sys::wait::{WaitPidFlag, waitpid};
     use nix::unistd::Pid;
     let pid = expected.map(|e| e.pid).unwrap_or(pgid);
     // WNOHANG: never block. If it's not our child, ECHILD → ignore.

@@ -17,8 +17,7 @@ pub trait Recipe: Send + Sync + 'static {
     const DESCRIPTION: &'static str;
     type Backend: TrainingBackend;
     type Args: serde::de::DeserializeOwned + schemars::JsonSchema + Send + Sync + 'static;
-    fn compile(&self, args: Self::Args)
-        -> Result<Plan<(), Self::Backend>, RecipeError>;
+    fn compile(&self, args: Self::Args) -> Result<Plan<(), Self::Backend>, RecipeError>;
 }
 
 /// Category bucket the BLUT Training Cockpit menu groups by.
@@ -103,9 +102,10 @@ pub fn swap_candidates(of: &'static RecipeDef) -> impl Iterator<Item = &'static 
     let want_in = of.input_kinds;
     let want_out = of.output_kind;
     let name = of.name;
-    RECIPES.iter().copied().filter(move |r| {
-        r.name != name && r.input_kinds == want_in && r.output_kind == want_out
-    })
+    RECIPES
+        .iter()
+        .copied()
+        .filter(move |r| r.name != name && r.input_kinds == want_in && r.output_kind == want_out)
 }
 
 /// Slice of `&RecipeDef` (not `RecipeDef`): RecipeDef contains

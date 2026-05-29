@@ -57,11 +57,9 @@ impl Stage for MaterializeConversations {
             );
         }
         let out_path = ctx.stage_dir.join("dataset.jsonl");
-        let stats = conversations::dump_to_jsonl(
-            Duration::from_secs(args.since_seconds),
-            &out_path,
-        )
-        .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
+        let stats =
+            conversations::dump_to_jsonl(Duration::from_secs(args.since_seconds), &out_path)
+                .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
 
         if stats.n_conversations == 0 {
             return Err(StageError::BadInput(format!(

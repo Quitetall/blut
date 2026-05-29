@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::{HfCheckpoint, PreferenceJsonl};
-use crate::backends::hf_trainer::{DpoConfig, HfTrainerJob, HfTrainerRunner, StatusLine};
 use crate::backends::HfTrainerBackend;
+use crate::backends::hf_trainer::{DpoConfig, HfTrainerJob, HfTrainerRunner, StatusLine};
 use crate::framework::artifact::ContentHash;
 use crate::framework::compat::Compatible;
 use crate::framework::error::StageError;
@@ -120,7 +120,12 @@ impl Stage for HfDpoTrain {
         let status_tx = ctx.status_tx.clone();
         let node_idx = ctx.node_idx;
         let cb = Box::new(move |s: StatusLine| match s {
-            StatusLine::Step { step, total, loss, lr } => {
+            StatusLine::Step {
+                step,
+                total,
+                loss,
+                lr,
+            } => {
                 let _ = status_tx.send(StageEvent::StageStep {
                     node_idx,
                     stage_name: HfDpoTrain::NAME.to_string(),
@@ -138,8 +143,7 @@ impl Stage for HfDpoTrain {
                 });
             }
             _ => {}
-        })
-            as Box<dyn Fn(StatusLine) + Send + Sync>;
+        }) as Box<dyn Fn(StatusLine) + Send + Sync>;
 
         let mut runner = HfTrainerRunner::new();
         let result = runner
@@ -147,12 +151,11 @@ impl Stage for HfDpoTrain {
             .await
             .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
 
-        let content_hash = ContentHash::hash_dir(&result.checkpoint_dir).map_err(|source| {
-            StageError::Io {
+        let content_hash =
+            ContentHash::hash_dir(&result.checkpoint_dir).map_err(|source| StageError::Io {
                 path: result.checkpoint_dir.clone(),
                 source,
-            }
-        })?;
+            })?;
 
         Ok(HfCheckpoint {
             path: result.checkpoint_dir,
@@ -175,11 +178,7 @@ mod tests {
 
     fn prefs(td: &std::path::Path) -> PreferenceJsonl {
         let p = td.join("prefs.jsonl");
-        std::fs::write(
-            &p,
-            r#"{"prompt":"p","chosen":"c","rejected":"r"}"#,
-        )
-        .unwrap();
+        std::fs::write(&p, r#"{"prompt":"p","chosen":"c","rejected":"r"}"#).unwrap();
         PreferenceJsonl {
             path: p,
             content_hash: ContentHash::of_bytes(b""),
@@ -189,7 +188,7 @@ mod tests {
 
     #[test]
     fn deterministic_false() {
-        assert!(!<HfDpoTrain as Stage>::DETERMINISTIC);
+        const { assert!(!<HfDpoTrain as Stage>::DETERMINISTIC) };
     }
 
     #[tokio::test]

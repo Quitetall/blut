@@ -16,8 +16,7 @@ use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
 use crate::lamquant_backend::{LamquantBackend, LamquantInvocation};
 use crate::stages::lamquant_helpers::{
-    blut_env, progress_forwarder, push_opt_f32, push_opt_u32, python_for, resolve_home,
-    script_path,
+    blut_env, progress_forwarder, push_opt_f32, push_opt_u32, python_for, resolve_home, script_path,
 };
 
 pub struct LamquantTrainL3Teacher;
@@ -120,16 +119,20 @@ impl Stage for LamquantTrainL3Teacher {
         };
         let mut backend = LamquantBackend::new();
         backend
-            .run(inv, Some(progress_forwarder(Self::NAME, ctx.status_tx.clone())))
+            .run(
+                inv,
+                Some(progress_forwarder(Self::NAME, ctx.status_tx.clone())),
+            )
             .await
             .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
 
-        let content_hash = stat_fingerprint(b"lamquant.ckpt.teacher_l3", &output_path).map_err(
-            |source| StageError::Io {
-                path: output_path.clone(),
-                source,
-            },
-        )?;
+        let content_hash =
+            stat_fingerprint(b"lamquant.ckpt.teacher_l3", &output_path).map_err(|source| {
+                StageError::Io {
+                    path: output_path.clone(),
+                    source,
+                }
+            })?;
         Ok(TeacherCkpt {
             path: output_path,
             content_hash,

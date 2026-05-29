@@ -3,15 +3,17 @@
 //! End-to-end LamQuant encoder pipeline. Per ADR 0017 (BLUT-canonical
 //! + LMA-direct), the chain is:
 //!
-//!   lamquant_convert_lma              () → LmaCorpus
-//!     → (optional) pretrain_mae       LmaCorpus → MaeCkpt
-//!     → (optional) _corpus_rebind_from_mae  MaeCkpt → LmaCorpus  [bridge]
-//!     → lamquant_train_joint          LmaCorpus → JointCkpt
-//!     → lamquant_pccp_gate_encoder    JointCkpt → PccpVerdict
+//! ```text
+//! lamquant_convert_lma              () → LmaCorpus
+//!   → (optional) pretrain_mae       LmaCorpus → MaeCkpt
+//!   → (optional) _corpus_rebind_from_mae  MaeCkpt → LmaCorpus  [bridge]
+//!   → lamquant_train_joint          LmaCorpus → JointCkpt
+//!   → lamquant_pccp_gate_encoder    JointCkpt → PccpVerdict
+//! ```
 //!
 //! Replaces the pre-ADR `build_manifest → precompute_fullband →
 //! precompute_l3 → ...` chain. The precompute stages stay registered
-//! + callable as standalone helpers for legacy tooling, but the
+//! and callable as standalone helpers for legacy tooling, but the
 //! encoder pipeline produces and consumes LmaCorpus end-to-end now.
 //!
 //! `_corpus_rebind_from_mae` is the typed bridge that lets the linear
@@ -126,8 +128,7 @@ fn default_true() -> bool {
 impl Recipe for LamquantEncoder {
     type Backend = crate::backends::LamquantBackend;
     const NAME: &'static str = "lamquant_encoder";
-    const DESCRIPTION: &'static str =
-        "LamQuant encoder pipeline: convert_lma → (optional pretrain_mae \
+    const DESCRIPTION: &'static str = "LamQuant encoder pipeline: convert_lma → (optional pretrain_mae \
          → bridge) → train_joint → pccp_gate_encoder. LMA-direct per \
          ADR 0017. Safe-by-default PCCP gate.";
     type Args = Args;
@@ -317,12 +318,13 @@ impl Stage for CorpusRebindFromMae {
                 root.display()
             )));
         }
-        let content_hash = stat_fingerprint_dir(b"lamquant.lma_corpus", root).map_err(
-            |source| StageError::Io {
-                path: root.clone(),
-                source,
-            },
-        )?;
+        let content_hash =
+            stat_fingerprint_dir(b"lamquant.lma_corpus", root).map_err(|source| {
+                StageError::Io {
+                    path: root.clone(),
+                    source,
+                }
+            })?;
         // Count `.lma` entries directly under root. Cheap (one
         // shallow read_dir) and keeps `n_archives` honest for any
         // downstream stage that may key on it.
@@ -361,8 +363,8 @@ pub static DEF: RecipeDef = RecipeDef {
         serde_json::to_value(s).expect("schemars-derived JsonSchema must serialize cleanly")
     },
     compile_fn: |raw| {
-        let args: Args = serde_json::from_value(raw)
-            .map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
+        let args: Args =
+            serde_json::from_value(raw).map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
         LamquantEncoder.compile(args).map(|p| p.into_compiled())
     },
 };
@@ -423,28 +425,40 @@ mod tests {
     fn rejects_invalid_tier() {
         let mut a = args();
         a.tier = 99;
-        assert!(matches!(LamquantEncoder.compile(a), Err(RecipeError::InvalidArgs(_))));
+        assert!(matches!(
+            LamquantEncoder.compile(a),
+            Err(RecipeError::InvalidArgs(_))
+        ));
     }
 
     #[test]
     fn rejects_invalid_preset() {
         let mut a = args();
         a.preset = "garbage".into();
-        assert!(matches!(LamquantEncoder.compile(a), Err(RecipeError::InvalidArgs(_))));
+        assert!(matches!(
+            LamquantEncoder.compile(a),
+            Err(RecipeError::InvalidArgs(_))
+        ));
     }
 
     #[test]
     fn rejects_empty_output_dir() {
         let mut a = args();
         a.lma_output_dir = PathBuf::new();
-        assert!(matches!(LamquantEncoder.compile(a), Err(RecipeError::InvalidArgs(_))));
+        assert!(matches!(
+            LamquantEncoder.compile(a),
+            Err(RecipeError::InvalidArgs(_))
+        ));
     }
 
     #[test]
     fn rejects_empty_split_manifest() {
         let mut a = args();
         a.split_manifest = String::new();
-        assert!(matches!(LamquantEncoder.compile(a), Err(RecipeError::InvalidArgs(_))));
+        assert!(matches!(
+            LamquantEncoder.compile(a),
+            Err(RecipeError::InvalidArgs(_))
+        ));
     }
 
     #[test]

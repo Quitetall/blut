@@ -160,22 +160,27 @@ impl Stage for LamquantTrainCombined {
         };
         let mut backend = LamquantBackend::new();
         backend
-            .run(inv, Some(progress_forwarder(Self::NAME, ctx.status_tx.clone())))
+            .run(
+                inv,
+                Some(progress_forwarder(Self::NAME, ctx.status_tx.clone())),
+            )
             .await
             .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
 
-        let teacher_fp = stat_fingerprint(b"lamquant.ckpt.teacher", &teacher_path).map_err(
-            |source| StageError::Io {
-                path: teacher_path.clone(),
-                source,
-            },
-        )?;
-        let decoder_fp = stat_fingerprint(b"lamquant.ckpt.decoder", &decoder_path).map_err(
-            |source| StageError::Io {
-                path: decoder_path.clone(),
-                source,
-            },
-        )?;
+        let teacher_fp =
+            stat_fingerprint(b"lamquant.ckpt.teacher", &teacher_path).map_err(|source| {
+                StageError::Io {
+                    path: teacher_path.clone(),
+                    source,
+                }
+            })?;
+        let decoder_fp =
+            stat_fingerprint(b"lamquant.ckpt.decoder", &decoder_path).map_err(|source| {
+                StageError::Io {
+                    path: decoder_path.clone(),
+                    source,
+                }
+            })?;
         Ok((
             TeacherCkpt {
                 path: teacher_path,

@@ -28,8 +28,8 @@
 //!   if they ever arise, behave the natural way.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::backends::TrainingBackend;
 use crate::framework::artifact::Artifact;
@@ -140,8 +140,7 @@ impl<B: TrainingBackend> Plan<(), B> {
             canon_args,
         });
         // Graph input: provide () as the input artifact.
-        let unit = ErasedArtifact::from_typed(&())
-            .expect("() always serializes");
+        let unit = ErasedArtifact::from_typed(&()).expect("() always serializes");
         self.initial.insert(id, unit);
         self.leading = vec![id];
         Plan {
@@ -155,6 +154,17 @@ impl<B: TrainingBackend> Plan<(), B> {
         }
     }
 }
+
+/// Output plan type of a 3-way [`Plan::fork3`]: the three siblings'
+/// outputs rejoined into a single `(A, B, C)` tuple artifact.
+type Fork3Plan<SA, SB, SC, B> = Plan<
+    (
+        <SA as Stage>::Output,
+        <SB as Stage>::Output,
+        <SC as Stage>::Output,
+    ),
+    B,
+>;
 
 impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
     /// Append a stage that consumes the leading edge's output.
@@ -304,7 +314,7 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
         b_args: SB::Args,
         c: SC,
         c_args: SC::Args,
-    ) -> Plan<(SA::Output, SB::Output, SC::Output), B>
+    ) -> Fork3Plan<SA, SB, SC, B>
     where
         SA: Stage<Input = O> + Compatible<B> + 'static,
         SB: Stage<Input = O> + Compatible<B> + 'static,
@@ -312,13 +322,21 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
     {
         let mut new_ids = Vec::with_capacity(3);
         for (stage, args) in [
-            (Arc::new(a) as Arc<dyn StageDyn>, serde_json::to_value(&a_args).expect("a_args")),
-            (Arc::new(b) as Arc<dyn StageDyn>, serde_json::to_value(&b_args).expect("b_args")),
-            (Arc::new(c) as Arc<dyn StageDyn>, serde_json::to_value(&c_args).expect("c_args")),
+            (
+                Arc::new(a) as Arc<dyn StageDyn>,
+                serde_json::to_value(&a_args).expect("a_args"),
+            ),
+            (
+                Arc::new(b) as Arc<dyn StageDyn>,
+                serde_json::to_value(&b_args).expect("b_args"),
+            ),
+            (
+                Arc::new(c) as Arc<dyn StageDyn>,
+                serde_json::to_value(&c_args).expect("c_args"),
+            ),
         ] {
             let id = self.nodes.len() as NodeId;
-            let canon_args =
-                CacheHandle::canonical_json_bytes(&args);
+            let canon_args = CacheHandle::canonical_json_bytes(&args);
             self.nodes.push(PlanNode {
                 id,
                 stage,
@@ -549,8 +567,8 @@ impl CompiledPlan {
 mod tests {
     use super::*;
     use crate::framework::artifact::ContentHash;
-    use crate::framework::resource::Resource;
     use crate::framework::error::StageError;
+    use crate::framework::resource::Resource;
     use crate::framework::stage::StageContext;
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
@@ -666,13 +684,9 @@ mod tests {
 
     #[test]
     fn empty_plan_topo_errors() {
-        let p = Plan::<(), LamuTrainerBackend>::new("empty", serde_json::json!({}))
-            .into_compiled();
+        let p = Plan::<(), LamuTrainerBackend>::new("empty", serde_json::json!({})).into_compiled();
         let r = p.topo_order();
-        assert!(matches!(
-            r,
-            Err(crate::framework::error::PlanError::Empty)
-        ));
+        assert!(matches!(r, Err(crate::framework::error::PlanError::Empty)));
     }
 
     #[test]
@@ -681,7 +695,8 @@ mod tests {
             .start(MakeA, EmptyArgs)
             .then(AToB, EmptyArgs)
             .then(BToC, EmptyArgs)
-            .finish().into_compiled();
+            .finish()
+            .into_compiled();
         assert_eq!(plan.n_nodes(), 3);
         assert_eq!(plan.n_edges(), 2);
         let order = plan.topo_order().unwrap();
@@ -692,7 +707,8 @@ mod tests {
     fn first_node_has_unit_initial_input() {
         let plan = Plan::<(), LamuTrainerBackend>::new("with_unit", serde_json::json!({}))
             .start(MakeA, EmptyArgs)
-            .finish().into_compiled();
+            .finish()
+            .into_compiled();
         assert_eq!(plan.initial.len(), 1);
         let unit = plan.initial.get(&0).unwrap();
         assert_eq!(unit.kind, "()");
@@ -704,7 +720,8 @@ mod tests {
             .start(MakeA, EmptyArgs)
             .then(AToB, EmptyArgs)
             .then(BToC, EmptyArgs)
-            .finish().into_compiled();
+            .finish()
+            .into_compiled();
         let order = plan.topo_order().unwrap();
         assert_eq!(order.len(), plan.n_nodes());
         let mut seen = std::collections::HashSet::new();
@@ -719,7 +736,8 @@ mod tests {
         let plan = Plan::<(), LamuTrainerBackend>::new("forked", serde_json::json!({}))
             .start(MakeA, EmptyArgs)
             .fork(AToB, EmptyArgs, AToB, EmptyArgs)
-            .finish().into_compiled();
+            .finish()
+            .into_compiled();
         assert_eq!(plan.n_nodes(), 3);
         // 2 edges from MakeA → each branch.
         assert_eq!(plan.n_edges(), 2);
@@ -735,7 +753,8 @@ mod tests {
         let args = serde_json::json!({"output_name": "test", "since": "30d"});
         let plan = Plan::<(), LamuTrainerBackend>::new("named", args.clone())
             .start(MakeA, EmptyArgs)
-            .finish().into_compiled();
+            .finish()
+            .into_compiled();
         assert_eq!(plan.recipe_args(), &args);
         assert_eq!(plan.name(), "named");
     }

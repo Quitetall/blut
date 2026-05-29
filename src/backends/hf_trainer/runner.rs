@@ -8,10 +8,10 @@
 //!     than argv) so the spec can carry long fields (prompts,
 //!     paths, hyperparams) without bumping ARG_MAX.
 //!   - Stdout: one JSON line per status event. Schema:
-//!       `{"kind": "step", "step": int, "total": int, "loss": f}`
-//!       `{"kind": "saved", "path": str}`
-//!       `{"kind": "done", "checkpoint_dir": str, "final_loss": f}`
-//!       `{"kind": "failed", "error": str}`
+//!     `{"kind": "step", "step": int, "total": int, "loss": f}`
+//!     `{"kind": "saved", "path": str}`
+//!     `{"kind": "done", "checkpoint_dir": str, "final_loss": f}`
+//!     `{"kind": "failed", "error": str}`
 //!   - Stderr: free-form. Captured to tracing::warn.
 //!
 //! The wrapper script lives at
@@ -31,7 +31,7 @@ use tokio::process::Command;
 
 use crate::python_kill::graceful_kill_pid;
 
-use super::venv::{ensure_venv, VenvError};
+use super::venv::{VenvError, ensure_venv};
 
 /// Typed job spec the Rust side hands the Python wrapper. Mirrors
 /// `transformers.TrainingArguments` for the canonical fields +
@@ -170,7 +170,7 @@ impl HfTrainerRunner {
             .await
             .map_err(|e| RunError::Io {
                 path: PathBuf::from("ensure_venv-join"),
-                source: std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")),
+                source: std::io::Error::other(format!("{e}")),
             })??;
 
         // Write job spec to a tempfile so the wrapper can read it
@@ -192,14 +192,12 @@ impl HfTrainerRunner {
             Some(p) if p.exists() => p,
             _ => {
                 return Err(RunError::Io {
-                    path: PathBuf::from(
-                        "src/backends/hf_trainer/python/hf_trainer_runner.py",
-                    ),
+                    path: PathBuf::from("src/backends/hf_trainer/python/hf_trainer_runner.py"),
                     source: std::io::Error::new(
                         std::io::ErrorKind::NotFound,
                         "wrapper script missing; expected alongside the binary",
                     ),
-                })
+                });
             }
         };
 
@@ -279,16 +277,14 @@ impl HfTrainerRunner {
             None
         };
 
-        let stderr_handle = if let Some(stderr) = stderr {
-            Some(tokio::spawn(async move {
+        let stderr_handle = stderr.map(|stderr| {
+            tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     tracing::warn!(target: "blut::hf_trainer_stderr", "{}", line);
                 }
-            }))
-        } else {
-            None
-        };
+            })
+        });
 
         let exit = child.wait().await.map_err(|source| RunError::Io {
             path: PathBuf::from("hf-trainer-wait"),

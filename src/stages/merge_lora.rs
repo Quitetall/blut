@@ -28,7 +28,7 @@ use crate::framework::stage::{Stage, StageContext};
 
 pub struct MergeLora;
 
-#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Args {
     /// When false, attempt a real merge subprocess. When true, only
     /// relabel the method_tag (useful for tests + for already-merged
@@ -140,13 +140,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.method_tag, "qlora_merged");
-    }
-}
-
-impl Default for Args {
-    fn default() -> Self {
-        Args {
-            passthrough_only: false,
-        }
     }
 }

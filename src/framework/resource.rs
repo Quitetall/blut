@@ -69,7 +69,12 @@ mod tests {
     #[test]
     fn all_variants_present() {
         assert_eq!(Resource::all().len(), 4);
-        for r in [Resource::Gpu, Resource::Cpu, Resource::Network, Resource::Disk] {
+        for r in [
+            Resource::Gpu,
+            Resource::Cpu,
+            Resource::Network,
+            Resource::Disk,
+        ] {
             assert!(Resource::all().contains(&r));
         }
     }
@@ -84,7 +89,12 @@ mod tests {
 
     #[test]
     fn serde_round_trips_via_snake_case() {
-        for r in [Resource::Gpu, Resource::Cpu, Resource::Network, Resource::Disk] {
+        for r in [
+            Resource::Gpu,
+            Resource::Cpu,
+            Resource::Network,
+            Resource::Disk,
+        ] {
             let s = serde_json::to_string(&r).unwrap();
             assert!(s.starts_with('"'));
             assert!(s.contains(r.tag()), "serde tag for {r:?}: {s}");

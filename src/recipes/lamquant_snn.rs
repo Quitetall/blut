@@ -124,8 +124,7 @@ fn default_true() -> bool {
 impl Recipe for LamquantSnn {
     type Backend = crate::backends::LamquantBackend;
     const NAME: &'static str = "lamquant_snn";
-    const DESCRIPTION: &'static str =
-        "Mamba SNN seizure / activity detector end-to-end: convert LML \
+    const DESCRIPTION: &'static str = "Mamba SNN seizure / activity detector end-to-end: convert LML \
          to LMA, train (Gpu), promote via PCCP gate. LMA-direct per \
          ADR 0017. Safe-by-default (dry-run + no-promote) — recipes \
          must explicitly opt into real promotion.";
@@ -246,8 +245,8 @@ pub static DEF: RecipeDef = RecipeDef {
         serde_json::to_value(s).expect("schemars-derived JsonSchema must serialize cleanly")
     },
     compile_fn: |raw| {
-        let args: Args = serde_json::from_value(raw)
-            .map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
+        let args: Args =
+            serde_json::from_value(raw).map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
         LamquantSnn.compile(args).map(|p| p.into_compiled())
     },
 };

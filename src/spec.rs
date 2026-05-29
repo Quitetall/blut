@@ -27,7 +27,10 @@ pub enum Method {
 
 impl Method {
     pub fn default_qlora() -> Self {
-        Self::QLora { rank: 16, alpha: 32 }
+        Self::QLora {
+            rank: 16,
+            alpha: 32,
+        }
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -222,16 +225,12 @@ impl TrainSpec {
             }
             DatasetSource::Conversations { since_ts } => {
                 if *since_ts < 0 {
-                    return Err(TrainError::invalid_spec(
-                        "dataset.since_ts must be >= 0",
-                    ));
+                    return Err(TrainError::invalid_spec("dataset.since_ts must be >= 0"));
                 }
             }
             DatasetSource::Registered { name } => {
                 if name.trim().is_empty() {
-                    return Err(TrainError::invalid_spec(
-                        "dataset.name is empty",
-                    ));
+                    return Err(TrainError::invalid_spec("dataset.name is empty"));
                 }
             }
         }

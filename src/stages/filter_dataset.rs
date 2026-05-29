@@ -242,7 +242,10 @@ mod tests {
     async fn fails_when_all_filtered() {
         let td = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(td.path().join("stage")).unwrap();
-        let p = write_jsonl(td.path(), &[r#"{"messages":[{"role":"user","content":"a"}]}"#]);
+        let p = write_jsonl(
+            td.path(),
+            &[r#"{"messages":[{"role":"user","content":"a"}]}"#],
+        );
         let input = DatasetJsonl {
             path: p,
             content_hash: ContentHash::of_bytes(b""),

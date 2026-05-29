@@ -200,11 +200,7 @@ fn pid_in_lock_is_dead(_lock: &Path) -> bool {
     false
 }
 
-fn wait_for_marker(
-    marker: &Path,
-    py: &Path,
-    timeout: Duration,
-) -> Result<(), VenvError> {
+fn wait_for_marker(marker: &Path, py: &Path, timeout: Duration) -> Result<(), VenvError> {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         if marker.exists() && py.exists() {

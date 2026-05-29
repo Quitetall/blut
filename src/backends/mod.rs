@@ -57,8 +57,7 @@ pub trait TrainingBackend: Send + Sync + 'static {
 pub struct HfTrainerBackend;
 impl TrainingBackend for HfTrainerBackend {
     const ID: &'static str = "hf_trainer";
-    const DESCRIPTION: &'static str =
-        "HuggingFace Trainer (transformers + trl). Auto-managed venv. Default for SFT/DPO/distillation.";
+    const DESCRIPTION: &'static str = "HuggingFace Trainer (transformers + trl). Auto-managed venv. Default for SFT/DPO/distillation.";
 }
 
 /// LAMU's `trainer.py` wire. The original BLUT backend — emits

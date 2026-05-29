@@ -16,12 +16,12 @@ use crate::framework::error::RecipeError;
 use crate::framework::plan::Plan;
 use crate::recipes::recipe::{Recipe, RecipeDef};
 use crate::stages::{
+    TakeTrain,
     convert_gguf::{Args as ConvertArgs, ConvertGguf},
     materialize_dataset_path::{Args as MatArgs, MaterializeDatasetPath},
     merge_lora::{Args as MergeArgs, MergeLora},
     register_model::{Args as RegArgs, RegisterModel},
     split_train_eval::{Args as SplitArgs, SplitTrainEval},
-    TakeTrain,
 };
 
 pub struct HfFinetuneFromDataset;
@@ -104,8 +104,7 @@ fn default_eval_ratio() -> f32 {
 impl Recipe for HfFinetuneFromDataset {
     type Backend = crate::backends::HfTrainerBackend;
     const NAME: &'static str = "hf_finetune_from_dataset";
-    const DESCRIPTION: &'static str =
-        "HuggingFace Trainer SFT from an existing dataset (JSONL path or registered name). \
+    const DESCRIPTION: &'static str = "HuggingFace Trainer SFT from an existing dataset (JSONL path or registered name). \
          Auto-managed venv via transformers.Trainer + PEFT LoRA/QLoRA + bitsandbytes.";
     type Args = Args;
 
@@ -220,9 +219,11 @@ pub static DEF: RecipeDef = RecipeDef {
         serde_json::to_value(s).expect("schemars-derived JsonSchema must serialize cleanly")
     },
     compile_fn: |raw| {
-        let args: Args = serde_json::from_value(raw)
-            .map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
-        HfFinetuneFromDataset.compile(args).map(|p| p.into_compiled())
+        let args: Args =
+            serde_json::from_value(raw).map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
+        HfFinetuneFromDataset
+            .compile(args)
+            .map(|p| p.into_compiled())
     },
 };
 
@@ -254,7 +255,10 @@ mod tests {
 
     #[test]
     fn compiles_to_7_node_plan() {
-        let plan = HfFinetuneFromDataset.compile(args()).unwrap().into_compiled();
+        let plan = HfFinetuneFromDataset
+            .compile(args())
+            .unwrap()
+            .into_compiled();
         assert_eq!(plan.n_nodes(), 7);
         assert_eq!(plan.n_edges(), 6);
     }

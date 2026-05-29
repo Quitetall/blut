@@ -42,7 +42,11 @@ impl SystemSnapshot {
     }
 
     pub(super) fn gpu_summary(&self) -> String {
-        match (self.gpu_mem_used_mib, self.gpu_mem_total_mib, self.gpu_util_pct) {
+        match (
+            self.gpu_mem_used_mib,
+            self.gpu_mem_total_mib,
+            self.gpu_util_pct,
+        ) {
             (Some(u), Some(t), Some(util)) => format!(
                 "{} {} / {} MiB  util {}%",
                 self.gpu_name.clone().unwrap_or_else(|| "GPU".into()),
@@ -67,7 +71,10 @@ fn probe_gpu_field(field: &str) -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout);
-    s.lines().next().map(|l| l.trim().to_string()).filter(|l| !l.is_empty())
+    s.lines()
+        .next()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
 }
 
 fn probe_meminfo_kib(prefix: &str) -> f64 {

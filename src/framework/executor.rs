@@ -36,7 +36,7 @@ use crate::framework::cache::CacheHandle;
 use crate::framework::error::{PlanError, StageError};
 use crate::framework::plan::{CompiledPlan, NodeId};
 use crate::framework::stage::{ErasedArtifact, StageContext};
-use crate::framework::status::{spawn_status_writer, StageEvent};
+use crate::framework::status::{StageEvent, spawn_status_writer};
 
 /// Caller-supplied execution context. Threaded through every
 /// `StageContext`. Lives for the duration of one `execute` call.
@@ -49,7 +49,10 @@ pub struct ExecCtx {
     /// their `RESOURCES` slice before `run` is called. Default
     /// limits: Gpu=1 (single-card), Cpu=num_cpus, Network=4,
     /// Disk=2. Override via ExecCtx::with_resource_limit.
-    pub resources: std::collections::HashMap<crate::framework::resource::Resource, Arc<tokio::sync::Semaphore>>,
+    pub resources: std::collections::HashMap<
+        crate::framework::resource::Resource,
+        Arc<tokio::sync::Semaphore>,
+    >,
 }
 
 impl ExecCtx {
@@ -110,9 +113,14 @@ impl SequentialExecutor {
     /// Execute the plan to completion.
     pub async fn execute(plan: CompiledPlan, ctx: ExecCtx) -> Result<PlanResult, PlanError> {
         // R21 precondition: ExecCtx invariants the executor relies on.
-        debug_assert!(!ctx.resources.is_empty(), "ExecCtx must declare resource semaphores");
         debug_assert!(
-            ctx.job_dir.is_absolute() || ctx.job_dir.starts_with("/tmp") || ctx.job_dir.is_relative(),
+            !ctx.resources.is_empty(),
+            "ExecCtx must declare resource semaphores"
+        );
+        debug_assert!(
+            ctx.job_dir.is_absolute()
+                || ctx.job_dir.starts_with("/tmp")
+                || ctx.job_dir.is_relative(),
             "ExecCtx.job_dir must be a valid path"
         );
         let started = Instant::now();
@@ -211,7 +219,10 @@ impl SequentialExecutor {
                     // call deserializes the concatenated bytes as
                     // `(A, B)` correctly.
                     let mut payload: Vec<u8> = Vec::with_capacity(
-                        multi.iter().filter_map(|p| outputs.get(p).map(|a| a.payload.len())).sum(),
+                        multi
+                            .iter()
+                            .filter_map(|p| outputs.get(p).map(|a| a.payload.len()))
+                            .sum(),
                     );
                     for &pid in multi {
                         let art = outputs.get(&pid).ok_or_else(|| {
@@ -240,10 +251,7 @@ impl SequentialExecutor {
             // produced different ckpt bytes.
             let input_hash = match preds.as_slice() {
                 [] => *logical_outputs.get(node_id).ok_or_else(|| {
-                    PlanError::Other(format!(
-                        "node {} has no logical input hash",
-                        node_id
-                    ))
+                    PlanError::Other(format!("node {} has no logical input hash", node_id))
                 })?,
                 [single] => *logical_outputs.get(single).ok_or_else(|| {
                     PlanError::Other(format!(
@@ -398,9 +406,11 @@ impl SequentialExecutor {
                     // catches a hand-rolled StageDyn impl that
                     // violates the contract.
                     debug_assert_eq!(
-                        o.kind, node.stage.output_kind(),
+                        o.kind,
+                        node.stage.output_kind(),
                         "stage '{stage_name}' produced kind '{}' but declares output_kind '{}'",
-                        o.kind, node.stage.output_kind()
+                        o.kind,
+                        node.stage.output_kind()
                     );
                     // A cancel observed during the run (the stage
                     // returned Ok but the token fired mid-work) must
@@ -471,9 +481,9 @@ impl SequentialExecutor {
             // output handle; re-point them at the promoted final dir
             // so downstream stages (and a cache hit on a later run)
             // read the files where they now live.
-            let output =
-                node.stage
-                    .rebase_output_paths(output, &tmp_stage_dir, &final_stage_dir);
+            let output = node
+                .stage
+                .rebase_output_paths(output, &tmp_stage_dir, &final_stage_dir);
             let stage_dir = final_stage_dir;
 
             // Persist sidecar metadata next to the artifact's
@@ -483,12 +493,8 @@ impl SequentialExecutor {
             // payload to its `stage_dir`. Write metadata at
             // `<stage_dir>/output.metadata.json`.
             let output_hash = content_hash_from_erased(&output);
-            let metadata = ArtifactMetadata::new(
-                output.kind.clone(),
-                output.schema,
-                output_hash,
-            )
-            .with_stage(stage_name.to_string());
+            let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, output_hash)
+                .with_stage(stage_name.to_string());
             let _ = metadata.write_to(&stage_dir.join("output.metadata.json"));
 
             // Insert into cache for resumes — ONLY after the atomic
@@ -613,6 +619,13 @@ fn content_hash_from_erased(art: &ErasedArtifact) -> ContentHash {
     ContentHash(arr)
 }
 
+// intentional (BLD-C2): the executor tests serialize on a process-wide
+// `TEST_LOCK` std Mutex held across `.await` to stop concurrent tests from
+// racing on the shared content cache / job dirs. A std guard across an await
+// is exactly the pattern clippy flags, but here it is the deliberate
+// serialization mechanism — the guard is never contended by real async work,
+// only by the test harness, so it cannot deadlock the runtime.
+#[allow(clippy::await_holding_lock)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,7 +755,8 @@ mod tests {
             .start(MakeOne, EmptyArgs)
             .then(Increment, EmptyArgs)
             .then(Increment, EmptyArgs)
-            .finish().into_compiled();
+            .finish()
+            .into_compiled();
         let result = SequentialExecutor::execute(plan, ctx).await.unwrap();
         assert_eq!(result.n_stages, 3);
         assert_eq!(result.n_cache_misses, 3);
@@ -765,7 +779,8 @@ mod tests {
         let plan = Plan::<(), LamuTrainerBackend>::new("test", serde_json::json!({}))
             .start(MakeOne, EmptyArgs)
             .then(Increment, EmptyArgs)
-            .finish().into_compiled();
+            .finish()
+            .into_compiled();
         let r1 = SequentialExecutor::execute(plan, ctx).await.unwrap();
         assert_eq!(r1.n_cache_misses, 2);
         assert_eq!(MAKE_RUN_COUNT.load(Ordering::SeqCst), 1);
@@ -779,9 +794,13 @@ mod tests {
         let plan2 = Plan::<(), LamuTrainerBackend>::new("test", serde_json::json!({}))
             .start(MakeOne, EmptyArgs)
             .then(Increment, EmptyArgs)
-            .finish().into_compiled();
+            .finish()
+            .into_compiled();
         let r2 = SequentialExecutor::execute(plan2, ctx2).await.unwrap();
-        assert_eq!(r2.n_cache_hits, 2, "second run should hit cache for both stages");
+        assert_eq!(
+            r2.n_cache_hits, 2,
+            "second run should hit cache for both stages"
+        );
         assert_eq!(r2.n_cache_misses, 0);
         // Run counters didn't increment.
         assert_eq!(MAKE_RUN_COUNT.load(Ordering::SeqCst), 1);
@@ -794,7 +813,8 @@ mod tests {
         let (_td, ctx) = fresh_ctx();
         let plan = Plan::<(), LamuTrainerBackend>::new("failing", serde_json::json!({}))
             .start(AlwaysFail, EmptyArgs)
-            .finish().into_compiled();
+            .finish()
+            .into_compiled();
         let r = SequentialExecutor::execute(plan, ctx).await;
         match r {
             Err(PlanError::StageFailed { idx, stage, source }) => {
@@ -813,7 +833,8 @@ mod tests {
         ctx.cancel.cancel();
         let plan = Plan::<(), LamuTrainerBackend>::new("c", serde_json::json!({}))
             .start(MakeOne, EmptyArgs)
-            .finish().into_compiled();
+            .finish()
+            .into_compiled();
         let r = SequentialExecutor::execute(plan, ctx).await;
         assert!(matches!(r, Err(PlanError::Cancelled)));
     }
@@ -825,7 +846,8 @@ mod tests {
         let plan = Plan::<(), LamuTrainerBackend>::new("p", serde_json::json!({}))
             .start(MakeOne, EmptyArgs)
             .then(Increment, EmptyArgs)
-            .finish().into_compiled();
+            .finish()
+            .into_compiled();
         let _ = SequentialExecutor::execute(plan, ctx).await.unwrap();
         let path = td.path().join("status.jsonl");
         assert!(path.exists());
@@ -844,7 +866,8 @@ mod tests {
         let recipe_args = serde_json::json!({"output_name": "test", "since": "30d"});
         let plan = Plan::<(), LamuTrainerBackend>::new("p", recipe_args.clone())
             .start(MakeOne, EmptyArgs)
-            .finish().into_compiled();
+            .finish()
+            .into_compiled();
         let _ = SequentialExecutor::execute(plan, ctx).await.unwrap();
         let body = std::fs::read_to_string(td.path().join("args.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -857,12 +880,15 @@ mod tests {
         let (td, ctx) = fresh_ctx();
         let plan = Plan::<(), LamuTrainerBackend>::new("p", serde_json::json!({}))
             .start(MakeOne, EmptyArgs)
-            .finish().into_compiled();
+            .finish()
+            .into_compiled();
         let _ = SequentialExecutor::execute(plan, ctx).await.unwrap();
-        let sidecar = td
-            .path()
-            .join("stages/0-make_one/output.metadata.json");
-        assert!(sidecar.exists(), "expected sidecar at {}", sidecar.display());
+        let sidecar = td.path().join("stages/0-make_one/output.metadata.json");
+        assert!(
+            sidecar.exists(),
+            "expected sidecar at {}",
+            sidecar.display()
+        );
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
         assert_eq!(parsed["kind"], "test.counter");
@@ -961,7 +987,9 @@ mod tests {
             input: PathArt,
             _args: &EmptyArgs,
         ) -> Result<Counter, StageError> {
-            Ok(Counter { n: input.content as u32 })
+            Ok(Counter {
+                n: input.content as u32,
+            })
         }
     }
     impl Compatible<LamuTrainerBackend> for ConsumePathArt {}
@@ -978,7 +1006,10 @@ mod tests {
         let plan = Plan::<(), LamuTrainerBackend>::new("fw1", serde_json::json!({}))
             .start(
                 MakePathArt,
-                PathArtArgs { abs_path: abs_path.to_string(), content },
+                PathArtArgs {
+                    abs_path: abs_path.to_string(),
+                    content,
+                },
             )
             .then(ConsumePathArt, EmptyArgs)
             .finish()
@@ -987,7 +1018,12 @@ mod tests {
         // Drain events; the downstream stage is node_idx 1.
         let mut found = None;
         while let Ok(evt) = rx.try_recv() {
-            if let StageEvent::StageBegin { node_idx: 1, input_hash, .. } = evt {
+            if let StageEvent::StageBegin {
+                node_idx: 1,
+                input_hash,
+                ..
+            } = evt
+            {
                 found = Some(input_hash);
             }
         }
@@ -1024,7 +1060,10 @@ mod tests {
         let content = 42u8;
         let observed = downstream_input_hash(abs, content).await;
 
-        let art = PathArt { content, path: PathBuf::from(abs) };
+        let art = PathArt {
+            content,
+            path: PathBuf::from(abs),
+        };
         let want = art.content_hash();
         assert_eq!(
             observed, want,
@@ -1152,7 +1191,10 @@ mod tests {
             .finish()
             .into_compiled();
         let r = SequentialExecutor::execute(plan, ctx).await;
-        assert!(matches!(r, Err(PlanError::StageFailed { .. })), "stage must fail");
+        assert!(
+            matches!(r, Err(PlanError::StageFailed { .. })),
+            "stage must fail"
+        );
 
         // No partial under the FINAL stage_dir.
         let final_dir = write_then_final_dir(&job_dir);
@@ -1163,7 +1205,10 @@ mod tests {
         );
         // No orphan tmp working dir.
         let tmp = leftover_tmp_dirs(&job_dir);
-        assert!(tmp.is_empty(), "FW-2: tmp working dir must be removed on error, found {tmp:?}");
+        assert!(
+            tmp.is_empty(),
+            "FW-2: tmp working dir must be removed on error, found {tmp:?}"
+        );
 
         // The cache must hold NO entry for this stage, so a resume
         // re-runs it instead of falsely skipping.
@@ -1181,7 +1226,12 @@ mod tests {
         let job_dir = td.path().to_path_buf();
         let ctx = ExecCtx::new(job_dir.clone());
         let plan = Plan::<(), LamuTrainerBackend>::new("fw2-cancel", serde_json::json!({}))
-            .start(WriteThen, WriteThenArgs { mode: "cancel".into() })
+            .start(
+                WriteThen,
+                WriteThenArgs {
+                    mode: "cancel".into(),
+                },
+            )
             .finish()
             .into_compiled();
         let r = SequentialExecutor::execute(plan, ctx).await;
@@ -1196,7 +1246,10 @@ mod tests {
             "FW-2: cancelled stage must leave NO partial under final stage_dir"
         );
         let tmp = leftover_tmp_dirs(&job_dir);
-        assert!(tmp.is_empty(), "FW-2: tmp working dir must be removed on cancel, found {tmp:?}");
+        assert!(
+            tmp.is_empty(),
+            "FW-2: tmp working dir must be removed on cancel, found {tmp:?}"
+        );
 
         assert_eq!(
             cache_entry_count(&job_dir),
@@ -1222,13 +1275,19 @@ mod tests {
         // Output present under the FINAL stage_dir (promoted), and the
         // tmp working dir is gone (renamed away).
         let final_dir = write_then_final_dir(&job_dir);
-        assert!(final_dir.join("partial.txt").exists(), "promoted output file must be present");
+        assert!(
+            final_dir.join("partial.txt").exists(),
+            "promoted output file must be present"
+        );
         assert!(
             final_dir.join("output.metadata.json").exists(),
             "sidecar metadata must be written into the promoted final dir"
         );
         let tmp = leftover_tmp_dirs(&job_dir);
-        assert!(tmp.is_empty(), "no tmp working dir should survive a successful promote, found {tmp:?}");
+        assert!(
+            tmp.is_empty(),
+            "no tmp working dir should survive a successful promote, found {tmp:?}"
+        );
 
         // Cached after promote: exactly one entry, and a second run
         // against the SAME cache hits (re-uses, doesn't re-run).
@@ -1244,7 +1303,10 @@ mod tests {
             .finish()
             .into_compiled();
         let res2 = SequentialExecutor::execute(plan2, ctx2).await.unwrap();
-        assert_eq!(res2.n_cache_hits, 1, "second run must hit the promoted cache entry");
+        assert_eq!(
+            res2.n_cache_hits, 1,
+            "second run must hit the promoted cache entry"
+        );
         assert_eq!(res2.n_cache_misses, 0);
     }
 
@@ -1270,7 +1332,10 @@ mod tests {
             .into_compiled();
         SequentialExecutor::execute(plan, ctx).await.unwrap();
 
-        assert!(final_dir.join("partial.txt").exists(), "fresh output present");
+        assert!(
+            final_dir.join("partial.txt").exists(),
+            "fresh output present"
+        );
         assert!(
             !final_dir.join("orphan.txt").exists(),
             "FW-2: stale orphan from a prior crashed run must not survive into the promoted dir"

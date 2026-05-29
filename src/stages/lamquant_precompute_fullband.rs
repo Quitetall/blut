@@ -99,16 +99,19 @@ impl Stage for LamquantPrecomputeFullband {
             .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
 
         // Fingerprint over BOTH .dat files combined (domain-tagged).
-        let train_fp = stat_fingerprint(b"lamquant.fullband.train", &train_path)
-            .map_err(|source| StageError::Io {
-                path: train_path.clone(),
-                source,
+        let train_fp =
+            stat_fingerprint(b"lamquant.fullband.train", &train_path).map_err(|source| {
+                StageError::Io {
+                    path: train_path.clone(),
+                    source,
+                }
             })?;
-        let val_fp = stat_fingerprint(b"lamquant.fullband.val", &val_path)
-            .map_err(|source| StageError::Io {
+        let val_fp = stat_fingerprint(b"lamquant.fullband.val", &val_path).map_err(|source| {
+            StageError::Io {
                 path: val_path.clone(),
                 source,
-            })?;
+            }
+        })?;
         // Merkle of the two halves.
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();

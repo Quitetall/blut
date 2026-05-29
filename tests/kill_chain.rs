@@ -14,6 +14,12 @@
 //! never weakened.
 
 #![cfg(unix)]
+// intentional: every test holds the process-wide `GLOBAL_LOCK` across
+// `graceful_kill_group(...).await` to serialize the process-global job
+// binding + `$LAMU_TRAIN_JOBS_DIR` env state across concurrently-scheduled
+// tokio tests. The std guard across an await is the deliberate
+// serialization mechanism, not a bug.
+#![allow(clippy::await_holding_lock)]
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -90,7 +96,7 @@ fn spawn_tree() -> (u32, u32, u32) {
 /// Best-effort SIGKILL of a whole group so a failed assertion never
 /// leaks a 300s sleep tree onto the CI box.
 fn cleanup_group(pgid: u32) {
-    use nix::sys::signal::{killpg, Signal};
+    use nix::sys::signal::{Signal, killpg};
     use nix::unistd::Pid;
     let _ = killpg(Pid::from_raw(pgid as i32), Signal::SIGKILL);
 }
@@ -209,7 +215,7 @@ async fn blut_cancel_cli_kills_recorded_group() {
     // reports ESRCH rather than seeing a lingering zombie. The
     // grandchild is reparented to init and reaped there.
     let reap = || {
-        use nix::sys::wait::{waitpid, WaitPidFlag};
+        use nix::sys::wait::{WaitPidFlag, waitpid};
         use nix::unistd::Pid;
         let _ = waitpid(Pid::from_raw(child as i32), Some(WaitPidFlag::WNOHANG));
     };

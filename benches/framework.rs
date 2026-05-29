@@ -15,7 +15,7 @@
 //! simd-json dropped after opt-4 benchmarks showed serde_json faster
 //! on sub-KB payloads.
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 
 use blut::framework::{Artifact, CacheHandle, ContentHash, ErasedArtifact};
 

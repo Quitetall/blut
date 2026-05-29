@@ -35,11 +35,11 @@ pub mod stage;
 pub mod status;
 
 pub use artifact::{Artifact, ArtifactMetadata, ContentHash};
-pub use cache::{lru_prune, CacheHandle, CacheHit};
+pub use cache::{CacheHandle, CacheHit, lru_prune};
 pub use compat::Compatible;
 pub use error::{PlanError, RecipeError, StageError};
 pub use executor::{ExecCtx, PlanResult, SequentialExecutor};
 pub use plan::{CompiledPlan, NodeId, Plan};
 pub use resource::Resource;
 pub use stage::{ErasedArtifact, ErasedDecodeError, Stage, StageContext, StageDyn};
-pub use status::{make_broadcast, spawn_status_writer, StageEvent};
+pub use status::{StageEvent, make_broadcast, spawn_status_writer};

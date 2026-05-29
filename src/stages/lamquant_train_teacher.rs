@@ -106,16 +106,20 @@ impl Stage for LamquantTrainTeacher {
         };
         let mut backend = LamquantBackend::new();
         backend
-            .run(inv, Some(progress_forwarder(Self::NAME, ctx.status_tx.clone())))
+            .run(
+                inv,
+                Some(progress_forwarder(Self::NAME, ctx.status_tx.clone())),
+            )
             .await
             .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
 
-        let content_hash = stat_fingerprint(b"lamquant.ckpt.teacher", &output_path).map_err(
-            |source| StageError::Io {
-                path: output_path.clone(),
-                source,
-            },
-        )?;
+        let content_hash =
+            stat_fingerprint(b"lamquant.ckpt.teacher", &output_path).map_err(|source| {
+                StageError::Io {
+                    path: output_path.clone(),
+                    source,
+                }
+            })?;
         Ok(TeacherCkpt {
             path: output_path,
             content_hash,

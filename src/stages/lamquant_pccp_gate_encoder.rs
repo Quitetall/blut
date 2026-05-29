@@ -236,8 +236,9 @@ async fn run_pccp_gate(
                     let p = ent.path();
                     if p.extension().and_then(|e| e.to_str()) == Some("json") {
                         if let Ok(meta) = ent.metadata() {
-                            let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                            if best.as_ref().map_or(true, |(t, _)| mtime > *t) {
+                            let mtime =
+                                meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                            if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
                                 best = Some((mtime, p));
                             }
                         }

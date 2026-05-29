@@ -100,7 +100,13 @@ mod tests {
     // the bound, these `fn _f<...>()` lines fail to compile —
     // exactly the auditing property we want.
 
-    fn _agnostic_witness<S: Stage + Compatible<HfTrainerBackend> + Compatible<LamuTrainerBackend> + Compatible<LamquantBackend>>() {}
+    fn _agnostic_witness<
+        S: Stage
+            + Compatible<HfTrainerBackend>
+            + Compatible<LamuTrainerBackend>
+            + Compatible<LamquantBackend>,
+    >() {
+    }
     fn _lamu_witness<S: Stage + Compatible<LamuTrainerBackend>>() {}
     fn _lamquant_witness<S: Stage + Compatible<LamquantBackend>>() {}
 

@@ -15,15 +15,15 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::artifacts::lamquant::stat_fingerprint;
 use crate::artifacts::LmaCorpus;
+use crate::artifacts::lamquant::stat_fingerprint;
 use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
 use crate::lamquant_backend::{LamquantBackend, LamquantInvocation};
 use crate::stages::lamquant_helpers::{
-    blut_env, progress_forwarder, push_opt_u32, python_for, resolve_home, resolve_roots,
-    safe_join, scripts_script,
+    blut_env, progress_forwarder, push_opt_u32, python_for, resolve_home, resolve_roots, safe_join,
+    scripts_script,
 };
 
 pub struct LamquantConvertLma;
@@ -137,10 +137,12 @@ impl Stage for LamquantConvertLma {
         }
         if found_lma {
             let n_archives = count_lma_archives(&args.output_dir);
-            let content_hash = stat_fingerprint(b"lamquant.lma_corpus", &args.output_dir)
-                .map_err(|source| StageError::Io {
-                    path: args.output_dir.clone(),
-                    source,
+            let content_hash =
+                stat_fingerprint(b"lamquant.lma_corpus", &args.output_dir).map_err(|source| {
+                    StageError::Io {
+                        path: args.output_dir.clone(),
+                        source,
+                    }
                 })?;
             return Ok(LmaCorpus {
                 root: args.output_dir.clone(),
@@ -189,18 +191,22 @@ impl Stage for LamquantConvertLma {
         };
         let mut backend = LamquantBackend::new();
         backend
-            .run(inv, Some(progress_forwarder(Self::NAME, ctx.status_tx.clone())))
+            .run(
+                inv,
+                Some(progress_forwarder(Self::NAME, ctx.status_tx.clone())),
+            )
             .await
             .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
 
         // Count .lma archives under output_dir; build provenance hash.
         let n_archives = count_lma_archives(&args.output_dir);
-        let content_hash = stat_fingerprint(b"lamquant.lma_corpus", &args.output_dir).map_err(
-            |source| StageError::Io {
-                path: args.output_dir.clone(),
-                source,
-            },
-        )?;
+        let content_hash =
+            stat_fingerprint(b"lamquant.lma_corpus", &args.output_dir).map_err(|source| {
+                StageError::Io {
+                    path: args.output_dir.clone(),
+                    source,
+                }
+            })?;
         Ok(LmaCorpus {
             root: args.output_dir.clone(),
             n_archives,

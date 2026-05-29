@@ -13,11 +13,10 @@
 //! that window. Pass `--allow-evict` to wait if the lock is already
 //! held by an inference exclusive instead of erroring.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use anyhow::{Context, Result, anyhow};
 use blut::scheduler_lock::{self, LockKind};
 use blut::{
     backend::{StatusFn, TrainBackend},
@@ -28,6 +27,7 @@ use blut::{
     python_backend::PythonTrainBackend,
     spec::{DatasetSource, Method, Optim, TrainSpec},
 };
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -210,13 +210,9 @@ enum DataCommand {
     },
     /// Remove a registered dataset (deletes the registry row only,
     /// not the JSONL file on disk).
-    Rm {
-        name: String,
-    },
+    Rm { name: String },
     /// Print metadata for one dataset as JSON.
-    Show {
-        name: String,
-    },
+    Show { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -388,15 +384,16 @@ async fn run_plan_cmd(cmd: PlanCommand) -> Result<()> {
     use blut::recipes::recipe::find as find_recipe;
     match cmd {
         PlanCommand::Resume { id, shared_cache } => {
-            let job_id = blut::jobs::resolve_job_id(&id)
-                .with_context(|| format!("resolve job id '{id}' (ambiguous prefix or missing job)"))?;
-            let job_dir = paths::job_dir(&job_id)
-                .with_context(|| format!("resolve job dir for {job_id}"))?;
+            let job_id = blut::jobs::resolve_job_id(&id).with_context(|| {
+                format!("resolve job id '{id}' (ambiguous prefix or missing job)")
+            })?;
+            let job_dir =
+                paths::job_dir(&job_id).with_context(|| format!("resolve job dir for {job_id}"))?;
             let marker = RecipeMarker::read_from(&job_dir)?;
             let r = find_recipe(&marker.name)
                 .ok_or_else(|| anyhow!("recipe '{}' not in catalog", marker.name))?;
-            let plan = (r.compile_fn)(marker.args.clone())
-                .map_err(|e| anyhow!("recipe compile: {e}"))?;
+            let plan =
+                (r.compile_fn)(marker.args.clone()).map_err(|e| anyhow!("recipe compile: {e}"))?;
 
             let mut ctx = ExecCtx::new(job_dir.clone());
             if shared_cache {
@@ -458,12 +455,10 @@ async fn run_plan_cmd(cmd: PlanCommand) -> Result<()> {
             }
         }
         PlanCommand::Inspect { name, args } => {
-            let r = find_recipe(&name)
-                .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+            let r = find_recipe(&name).ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
             let raw: serde_json::Value = serde_json::from_str(&args)
                 .with_context(|| format!("parse --args as JSON: {args}"))?;
-            let plan = (r.compile_fn)(raw)
-                .map_err(|e| anyhow!("recipe compile: {e}"))?;
+            let plan = (r.compile_fn)(raw).map_err(|e| anyhow!("recipe compile: {e}"))?;
             let rendered = plan
                 .render_ascii()
                 .map_err(|e| anyhow!("render plan: {e}"))?;
@@ -492,7 +487,11 @@ fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
             // Resolution order: --max-gb flag → $LAMU_CACHE_MAX_GB →
             // 50 GiB default. The default matches the plan's spec.
             let cap_gb = max_gb
-                .or_else(|| std::env::var("LAMU_CACHE_MAX_GB").ok().and_then(|s| s.parse().ok()))
+                .or_else(|| {
+                    std::env::var("LAMU_CACHE_MAX_GB")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                })
                 .unwrap_or(50.0);
             let cap_bytes = (cap_gb * 1024.0 * 1024.0 * 1024.0) as u64;
             let freed = blut::framework::cache::lru_prune(&global, cap_bytes)
@@ -518,7 +517,10 @@ async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
 
     match cmd {
         StageCommand::List => {
-            println!("{:<32} {:<20} {:<20} {}", "name", "input_kind", "output_kind", "resources");
+            println!(
+                "{:<32} {:<20} {:<20} resources",
+                "name", "input_kind", "output_kind"
+            );
             for n in catalog::names() {
                 let s = catalog::make_stage(n).expect("listed → constructs");
                 println!(
@@ -531,7 +533,12 @@ async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
             }
             Ok(())
         }
-        StageCommand::Run { name, args, input, output } => {
+        StageCommand::Run {
+            name,
+            args,
+            input,
+            output,
+        } => {
             let stage = catalog::make_stage(&name)
                 .ok_or_else(|| anyhow!("stage '{name}' not in catalog"))?;
             let args_val: serde_json::Value = serde_json::from_str(&args)
@@ -544,21 +551,20 @@ async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
                 ":unit" => ErasedArtifact {
                     kind: <() as Artifact>::KIND.into(),
                     schema: <() as Artifact>::SCHEMA,
-                    payload: bincode::serialize(&())
-                        .map_err(|e| anyhow!("encode unit: {e}"))?,
+                    payload: bincode::serialize(&()).map_err(|e| anyhow!("encode unit: {e}"))?,
                 },
                 "-" => {
                     let mut buf = Vec::new();
-                    std::io::stdin().read_to_end(&mut buf)
+                    std::io::stdin()
+                        .read_to_end(&mut buf)
                         .context("read stdin for --input -")?;
                     bincode::deserialize(&buf)
                         .map_err(|e| anyhow!("decode stdin ErasedArtifact: {e}"))?
                 }
                 path => {
-                    let buf = std::fs::read(path)
-                        .with_context(|| format!("read input from {path}"))?;
-                    bincode::deserialize(&buf)
-                        .map_err(|e| anyhow!("decode {path}: {e}"))?
+                    let buf =
+                        std::fs::read(path).with_context(|| format!("read input from {path}"))?;
+                    bincode::deserialize(&buf).map_err(|e| anyhow!("decode {path}: {e}"))?
                 }
             };
 
@@ -586,8 +592,7 @@ async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
             // Write output, then flush so a downstream pipe sees
             // the bytes immediately rather than waiting for process
             // exit + OS buffer drain.
-            let body = bincode::serialize(&result)
-                .map_err(|e| anyhow!("encode output: {e}"))?;
+            let body = bincode::serialize(&result).map_err(|e| anyhow!("encode output: {e}"))?;
             match output.as_str() {
                 "-" => {
                     let mut out = std::io::stdout().lock();
@@ -618,8 +623,7 @@ async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
 fn dir_size_bytes(path: &std::path::Path) -> Result<u64> {
     const MAX_DEPTH: u32 = 16;
     let mut total: u64 = 0;
-    let mut stack: Vec<(std::path::PathBuf, u32)> =
-        vec![(path.to_path_buf(), 0)];
+    let mut stack: Vec<(std::path::PathBuf, u32)> = vec![(path.to_path_buf(), 0)];
     while let Some((dir, depth)) = stack.pop() {
         debug_assert!(depth <= MAX_DEPTH, "dir_size_bytes depth invariant");
         if depth > MAX_DEPTH {
@@ -628,8 +632,8 @@ fn dir_size_bytes(path: &std::path::Path) -> Result<u64> {
                 dir.display()
             ));
         }
-        for entry in std::fs::read_dir(&dir)
-            .with_context(|| format!("read_dir {}", dir.display()))?
+        for entry in
+            std::fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))?
         {
             let entry = entry?;
             let m = entry.metadata()?;
@@ -645,14 +649,13 @@ fn dir_size_bytes(path: &std::path::Path) -> Result<u64> {
 
 async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
     use blut::framework::{ExecCtx, SequentialExecutor};
-    use blut::recipes::recipe::{find as find_recipe, RECIPES};
+    use blut::recipes::recipe::{RECIPES, find as find_recipe};
     match cmd {
         RecipeCommand::List => {
             // Sort by (category label, name) so the catalog reads
             // top-down like the BLUT Training Cockpit menu (DATA →
             // TRAINING → EVAL → EXPORT → PIPELINE → USER).
-            let mut sorted: Vec<&'static blut::recipes::recipe::RecipeDef> =
-                RECIPES.iter().copied().collect();
+            let mut sorted: Vec<&'static blut::recipes::recipe::RecipeDef> = RECIPES.to_vec();
             sorted.sort_by(|a, b| {
                 a.category
                     .label()
@@ -660,8 +663,8 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
                     .then_with(|| a.name.cmp(b.name))
             });
             println!(
-                "{:<32} {:<14} {:<12} {:<24} → {}",
-                "name", "category", "backend", "inputs", "output"
+                "{:<32} {:<14} {:<12} {:<24} → output",
+                "name", "category", "backend", "inputs"
             );
             for r in sorted {
                 let inputs = if r.input_kinds.is_empty() {
@@ -680,16 +683,18 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
             }
         }
         RecipeCommand::Show { name } => {
-            let r = find_recipe(&name)
-                .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+            let r = find_recipe(&name).ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
             println!("name        : {}", r.name);
             println!("category    : {}", r.category.label());
             println!("backend     : {}", r.backend_id);
-            println!("input kinds : {}", if r.input_kinds.is_empty() {
-                "(graph-input)".into()
-            } else {
-                r.input_kinds.join(", ")
-            });
+            println!(
+                "input kinds : {}",
+                if r.input_kinds.is_empty() {
+                    "(graph-input)".into()
+                } else {
+                    r.input_kinds.join(", ")
+                }
+            );
             println!("output kind : {}", r.output_kind);
             println!("description : {}", r.description);
             let schema = (r.args_schema_fn)();
@@ -699,22 +704,24 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
                     .unwrap_or_else(|e| format!("(serialize error: {e})"))
             );
         }
-        RecipeCommand::Run { name, args, shared_cache } => {
-            let r = find_recipe(&name)
-                .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+        RecipeCommand::Run {
+            name,
+            args,
+            shared_cache,
+        } => {
+            let r = find_recipe(&name).ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
             let raw: serde_json::Value = serde_json::from_str(&args)
                 .with_context(|| format!("parse --args as JSON: {args}"))?;
-            let plan = (r.compile_fn)(raw.clone())
-                .map_err(|e| anyhow!("recipe compile failed: {e}"))?;
+            let plan =
+                (r.compile_fn)(raw.clone()).map_err(|e| anyhow!("recipe compile failed: {e}"))?;
 
             let job_id = blut::jobs::new_job_id();
             let job_dir = blut::paths::job_dir(&job_id)?;
             let mut ctx = ExecCtx::new(job_dir.clone());
             if shared_cache {
                 if let Some(global) = blut::framework::CacheHandle::default_global_path() {
-                    std::fs::create_dir_all(&global).with_context(|| {
-                        format!("create global cache dir {}", global.display())
-                    })?;
+                    std::fs::create_dir_all(&global)
+                        .with_context(|| format!("create global cache dir {}", global.display()))?;
                     let cache_handle = (*ctx.cache).clone().with_global(global);
                     ctx.cache = std::sync::Arc::new(cache_handle);
                 }
@@ -723,7 +730,11 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
             // `raw` rather than re-parsing `args` — re-parse +
             // unwrap_or would silently swallow malformed JSON
             // that already failed above.
-            RecipeMarker { name: name.clone(), args: raw }.write_to(&job_dir)?;
+            RecipeMarker {
+                name: name.clone(),
+                args: raw,
+            }
+            .write_to(&job_dir)?;
 
             blut::jobs::write_state(&job_id, JobState::Running)
                 .with_context(|| format!("write Running state for {job_id}"))?;
@@ -809,20 +820,26 @@ async fn run_auto() -> Result<()> {
             println!("auto: {reason}");
             return Ok(());
         }
-        policy::Decision::Run { base, method, since } => {
+        policy::Decision::Run {
+            base,
+            method,
+            since,
+        } => {
             println!(
                 "auto: triggering training (new_turns={new_turns}, threshold={})",
                 pol.threshold_new_turns
             );
-            let bin = std::env::current_exe()
-                .context("locate own binary for auto-spawn")?;
+            let bin = std::env::current_exe().context("locate own binary for auto-spawn")?;
             let auto_name = format!("auto-{}", blut::jobs::new_job_id());
             let mut cmd = tokio::process::Command::new(&bin);
             cmd.arg(&auto_name)
                 .arg("--from-conversations")
-                .arg("--since").arg(&since)
-                .arg("--base").arg(&base)
-                .arg("--method").arg(&method)
+                .arg("--since")
+                .arg(&since)
+                .arg("--base")
+                .arg(&base)
+                .arg("--method")
+                .arg(&method)
                 .arg("--background")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
@@ -831,9 +848,7 @@ async fn run_auto() -> Result<()> {
             match cmd.spawn() {
                 Ok(mut child) => {
                     let pid = child.id().unwrap_or(0);
-                    println!(
-                        "auto: spawned lamu-train pid={pid} as '{auto_name}'"
-                    );
+                    println!("auto: spawned lamu-train pid={pid} as '{auto_name}'");
                     // Update last_train_ts at spawn time. Failed
                     // runs still count toward cooldown — better
                     // than retrying immediately on every cron tick
@@ -851,19 +866,13 @@ async fn run_auto() -> Result<()> {
                     tokio::spawn(async move {
                         match child.wait().await {
                             Ok(status) if !status.success() => {
-                                tracing::warn!(
-                                    "auto-train (pid={pid}) exited with {status}"
-                                );
+                                tracing::warn!("auto-train (pid={pid}) exited with {status}");
                             }
                             Ok(status) => {
-                                tracing::info!(
-                                    "auto-train (pid={pid}) exited cleanly: {status}"
-                                );
+                                tracing::info!("auto-train (pid={pid}) exited cleanly: {status}");
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "auto-train (pid={pid}) wait failed: {e}"
-                                );
+                                tracing::warn!("auto-train (pid={pid}) wait failed: {e}");
                             }
                         }
                     });
@@ -882,8 +891,7 @@ fn run_policy(cmd: PolicyCommand) -> Result<()> {
             let p = policy::load().context("load policy")?;
             print!(
                 "{}",
-                toml::to_string_pretty(&p)
-                    .map_err(|e| anyhow!("serialize policy: {e}"))?
+                toml::to_string_pretty(&p).map_err(|e| anyhow!("serialize policy: {e}"))?
             );
             let path = policy::policy_path()?;
             eprintln!("# loaded from: {}", path.display());
@@ -907,10 +915,7 @@ fn run_policy(cmd: PolicyCommand) -> Result<()> {
                 .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
                 .join("lamu")
                 .join("train-auto.log");
-            println!(
-                "*/30 * * * * {exe} auto >> {} 2>&1",
-                log_path.display()
-            );
+            println!("*/30 * * * * {exe} auto >> {} 2>&1", log_path.display());
         }
         PolicyCommand::Disable => {
             let mut p = policy::load().context("load policy")?;
@@ -933,8 +938,8 @@ fn run_data(cmd: DataCommand) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<24} {:<12} {:>10} {:<16} {}",
-                "name", "kind", "examples", "sha256[:8]", "path"
+                "{:<24} {:<12} {:>10} {:<16} path",
+                "name", "kind", "examples", "sha256[:8]"
             );
             for r in rows {
                 println!(
@@ -948,8 +953,7 @@ fn run_data(cmd: DataCommand) -> Result<()> {
             }
         }
         DataCommand::Add { name, path, kind } => {
-            let rec =
-                datasets_db::record_from_jsonl(&name, &path, &kind, None)?;
+            let rec = datasets_db::record_from_jsonl(&name, &path, &kind, None)?;
             datasets_db::add(&conn, &rec)?;
             println!(
                 "registered '{name}' ({} examples, sha256={})",
@@ -964,18 +968,16 @@ fn run_data(cmd: DataCommand) -> Result<()> {
                 return Err(anyhow!("no dataset named '{name}'"));
             }
         }
-        DataCommand::Show { name } => {
-            match datasets_db::get_by_name(&conn, &name)? {
-                Some(rec) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&rec)
-                            .unwrap_or_else(|e| format!("serialize error: {e}"))
-                    );
-                }
-                None => return Err(anyhow!("no dataset named '{name}'")),
+        DataCommand::Show { name } => match datasets_db::get_by_name(&conn, &name)? {
+            Some(rec) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rec)
+                        .unwrap_or_else(|e| format!("serialize error: {e}"))
+                );
             }
-        }
+            None => return Err(anyhow!("no dataset named '{name}'")),
+        },
     }
     Ok(())
 }
@@ -983,12 +985,7 @@ fn run_data(cmd: DataCommand) -> Result<()> {
 /// Register a JSONL dataset in the datasets registry. Best-effort:
 /// callers handle failure by logging + continuing. Used by
 /// auto-registration after `--from-conversations` materialization.
-fn register_dataset(
-    name: &str,
-    path: &PathBuf,
-    kind: &str,
-    metadata: Option<String>,
-) -> Result<()> {
+fn register_dataset(name: &str, path: &Path, kind: &str, metadata: Option<String>) -> Result<()> {
     let conn = blut::datasets_db::open()?;
     let rec = blut::datasets_db::record_from_jsonl(name, path, kind, metadata)?;
     blut::datasets_db::add(&conn, &rec)?;
@@ -1009,7 +1006,7 @@ fn truncate_for_col(s: &str, max: usize) -> String {
 }
 
 fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt};
     let _ = fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -1041,8 +1038,8 @@ async fn run_train(args: TrainArgs) -> Result<()> {
     let method = build_method(args.method, args.rank, args.alpha);
 
     let job_id = jobs::new_job_id();
-    let job_dir = paths::job_dir(&job_id)
-        .with_context(|| format!("create job dir for {job_id}"))?;
+    let job_dir =
+        paths::job_dir(&job_id).with_context(|| format!("create job dir for {job_id}"))?;
     let output_dir = job_dir.join("checkpoint");
     std::fs::create_dir_all(&output_dir)
         .with_context(|| format!("create checkpoint dir {}", output_dir.display()))?;
@@ -1057,11 +1054,8 @@ async fn run_train(args: TrainArgs) -> Result<()> {
             std::fs::create_dir_all(&data_dir)
                 .with_context(|| format!("create {}", data_dir.display()))?;
             let out_path = data_dir.join(format!("{job_id}.jsonl"));
-            let stats = blut::conversations::dump_to_jsonl(
-                args.since,
-                &out_path,
-            )
-            .context("dump conversations to JSONL")?;
+            let stats = blut::conversations::dump_to_jsonl(args.since, &out_path)
+                .context("dump conversations to JSONL")?;
             eprintln!(
                 "dataset materialized: {} conversations, {} turns → {}",
                 stats.n_conversations,
@@ -1182,15 +1176,15 @@ async fn run_train(args: TrainArgs) -> Result<()> {
         // the run — losing status history is bad but losing the
         // training job mid-flight is worse.
         if let Err(e) = jobs::append_status(&job_id_for_cb, &u) {
-            tracing::warn!(
-                "failed to persist status to {}: {}",
-                job_id_for_cb,
-                e
-            );
+            tracing::warn!("failed to persist status to {}: {}", job_id_for_cb, e);
         }
         match &u {
             StatusUpdate::Step {
-                step, total, loss, lr, vram_mb,
+                step,
+                total,
+                loss,
+                lr,
+                vram_mb,
             } => eprintln!("step {step}/{total}  loss={loss:.4}  lr={lr:.2e}  vram={vram_mb}MB"),
             StatusUpdate::Eval { step, eval_loss } => {
                 eprintln!("eval @{step}  loss={eval_loss:.4}")
@@ -1210,7 +1204,7 @@ async fn run_train(args: TrainArgs) -> Result<()> {
     let result = backend.run(spec.clone(), on_status).await;
 
     drop(lock); // release GPU before convert + register; convert is
-                // CPU-bound and llama.cpp tools don't need the card.
+    // CPU-bound and llama.cpp tools don't need the card.
 
     match result {
         Ok(artifact) => {
@@ -1224,18 +1218,20 @@ async fn run_train(args: TrainArgs) -> Result<()> {
 
             if !args.no_convert {
                 eprintln!("converting to GGUF ({})...", args.quant);
-                let gguf = convert::convert_to_gguf(
-                    &artifact.checkpoint_dir,
-                    &output_name,
-                    &args.quant,
-                )
-                .await
-                .context("convert_to_gguf")?;
+                let gguf =
+                    convert::convert_to_gguf(&artifact.checkpoint_dir, &output_name, &args.quant)
+                        .await
+                        .context("convert_to_gguf")?;
                 eprintln!("gguf  {}", gguf.display());
                 register_in_registry(&output_name, &gguf, &spec)?;
-                eprintln!("registry updated; `mcp__local-llm__query model={output_name}` should work.");
+                eprintln!(
+                    "registry updated; `mcp__local-llm__query model={output_name}` should work."
+                );
             } else {
-                eprintln!("--no-convert: HF checkpoint left at {}", artifact.checkpoint_dir.display());
+                eprintln!(
+                    "--no-convert: HF checkpoint left at {}",
+                    artifact.checkpoint_dir.display()
+                );
             }
         }
         Err(e) => {
@@ -1252,7 +1248,10 @@ fn run_jobs() -> Result<()> {
         println!("no jobs.");
         return Ok(());
     }
-    println!("{:<24} {:<10} {:<6} {:<24} {}", "id", "state", "pid", "output", "last");
+    println!(
+        "{:<24} {:<10} {:<6} {:<24} last",
+        "id", "state", "pid", "output"
+    );
     for j in jobs {
         let last = match (j.last_step, j.last_loss, j.final_loss) {
             (_, _, Some(fl)) => format!("final_loss={fl:.4}"),
@@ -1337,14 +1336,12 @@ async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()>
         dataset_registry_name: String::new(),
     };
 
-    let raw = serde_json::to_value(&recipe_args)
-        .context("serialize recipe args")?;
-    let plan = (DEF.compile_fn)(raw)
-        .map_err(|e| anyhow!("recipe compile failed: {e}"))?;
+    let raw = serde_json::to_value(&recipe_args).context("serialize recipe args")?;
+    let plan = (DEF.compile_fn)(raw).map_err(|e| anyhow!("recipe compile failed: {e}"))?;
 
     let job_id = jobs::new_job_id();
-    let job_dir = paths::job_dir(&job_id)
-        .with_context(|| format!("create job dir for {job_id}"))?;
+    let job_dir =
+        paths::job_dir(&job_id).with_context(|| format!("create job dir for {job_id}"))?;
 
     // Match the legacy path's lifecycle so `lamu-train jobs` shows
     // this run and `lamu-train cancel` can find its pid.
@@ -1382,8 +1379,8 @@ async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()>
     // struct deriving Serialize cleanly; `serde_json::to_value`
     // on a well-formed Serialize type cannot fail. Propagate any
     // failure as a wrapped error rather than silently storing null.
-    let marker_args = serde_json::to_value(&recipe_args)
-        .context("serialize recipe args for marker")?;
+    let marker_args =
+        serde_json::to_value(&recipe_args).context("serialize recipe args for marker")?;
     RecipeMarker {
         name: "finetune_from_conversations".into(),
         args: marker_args,
@@ -1492,7 +1489,7 @@ fn install_cancel_handler(cancel: tokio_util::sync::CancellationToken) {
         let term = async {
             #[cfg(unix)]
             {
-                use tokio::signal::unix::{signal, SignalKind};
+                use tokio::signal::unix::{SignalKind, signal};
                 if let Ok(mut s) = signal(SignalKind::terminate()) {
                     s.recv().await;
                 }
@@ -1509,12 +1506,8 @@ fn install_cancel_handler(cancel: tokio_util::sync::CancellationToken) {
         eprintln!("\nsignal received — cancelling job + killing trainer group...");
         cancel.cancel();
         if let Some(id) = blut::python_kill::active_child() {
-            blut::python_kill::graceful_kill_group(
-                id.pgid,
-                Some(id),
-                Duration::from_secs(10),
-            )
-            .await;
+            blut::python_kill::graceful_kill_group(id.pgid, Some(id), Duration::from_secs(10))
+                .await;
         }
     });
 }
@@ -1533,9 +1526,10 @@ fn build_dataset(args: &TrainArgs) -> Result<DatasetSource> {
             .unwrap_or(0);
         Ok(DatasetSource::Conversations { since_ts: cutoff })
     } else {
-        let path = args.dataset.clone().ok_or_else(|| {
-            anyhow!("--dataset is required unless --from-conversations is set")
-        })?;
+        let path = args
+            .dataset
+            .clone()
+            .ok_or_else(|| anyhow!("--dataset is required unless --from-conversations is set"))?;
         Ok(DatasetSource::JsonlPath { path })
     }
 }
@@ -1565,23 +1559,17 @@ fn pick_optimizer(opt: Option<OptimArg>, method: MethodArg) -> Optim {
     }
 }
 
-fn register_in_registry(
-    name: &str,
-    gguf_path: &PathBuf,
-    spec: &TrainSpec,
-) -> Result<()> {
+fn register_in_registry(name: &str, gguf_path: &Path, spec: &TrainSpec) -> Result<()> {
     use blut::registry;
-    use blut::registry::{
-        BackendType, Capability, ModelEntry, ModelFormat, ModelStatus,
-    };
+    use blut::registry::{BackendType, Capability, ModelEntry, ModelFormat, ModelStatus};
     let registry_path = blut::config::registry_path();
     let entry = ModelEntry {
         name: name.into(),
-        path: gguf_path.clone(),
+        path: gguf_path.to_path_buf(),
         format: ModelFormat::Gguf,
         backend: BackendType::LlamaCpp,
         arch: "trained".into(), // refined post-conversion in a future step
-        params_b: 0.0,           // unknown until we parse GGUF
+        params_b: 0.0,          // unknown until we parse GGUF
         quant: spec.quant.clone(),
         vram_mb: 0,
         context_max: spec.seq_len,
@@ -1592,4 +1580,3 @@ fn register_in_registry(
     registry::add_entry(entry, &registry_path, true)
         .map_err(|e| anyhow!("registry update failed: {e}"))
 }
-

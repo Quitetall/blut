@@ -29,11 +29,7 @@ use crate::error::{Result, TrainError};
 /// the HF and GGUF artifacts at the same directory level so the
 /// registry can reference one cleanly while leaving the other on
 /// disk for re-quantization.
-pub async fn convert_to_gguf(
-    checkpoint_dir: &Path,
-    name: &str,
-    quant: &str,
-) -> Result<PathBuf> {
+pub async fn convert_to_gguf(checkpoint_dir: &Path, name: &str, quant: &str) -> Result<PathBuf> {
     if !is_safe_filename(name) {
         return Err(TrainError::Convert(format!(
             "name '{name}' must be a non-empty bare filename \
@@ -64,12 +60,7 @@ pub async fn convert_to_gguf(
         .arg(&f16_path)
         .status()
         .await
-        .map_err(|e| {
-            TrainError::Convert(format!(
-                "spawn python3 {}: {e}",
-                convert.display()
-            ))
-        })?;
+        .map_err(|e| TrainError::Convert(format!("spawn python3 {}: {e}", convert.display())))?;
     if !convert_status.success() {
         return Err(TrainError::Convert(format!(
             "convert_hf_to_gguf.py exited with {convert_status}"
@@ -95,9 +86,7 @@ pub async fn convert_to_gguf(
         .arg(quant)
         .status()
         .await
-        .map_err(|e| {
-            TrainError::Convert(format!("spawn {}: {e}", quantize.display()))
-        })?;
+        .map_err(|e| TrainError::Convert(format!("spawn {}: {e}", quantize.display())))?;
     if !q_status.success() {
         return Err(TrainError::Convert(format!(
             "llama-quantize exited with {q_status}; \

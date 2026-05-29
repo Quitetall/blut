@@ -87,23 +87,24 @@ mod tests {
 
     #[test]
     fn is_terminal_marks_done_and_failed() {
-        assert!(StatusUpdate::Done {
-            final_loss: 0.0,
-            checkpoint_dir: PathBuf::new()
-        }
-        .is_terminal());
-        assert!(StatusUpdate::Failed {
-            error: "x".into()
-        }
-        .is_terminal());
-        assert!(!StatusUpdate::Step {
-            step: 1,
-            total: 1,
-            loss: 0.0,
-            lr: 0.0,
-            vram_mb: 0
-        }
-        .is_terminal());
+        assert!(
+            StatusUpdate::Done {
+                final_loss: 0.0,
+                checkpoint_dir: PathBuf::new()
+            }
+            .is_terminal()
+        );
+        assert!(StatusUpdate::Failed { error: "x".into() }.is_terminal());
+        assert!(
+            !StatusUpdate::Step {
+                step: 1,
+                total: 1,
+                loss: 0.0,
+                lr: 0.0,
+                vram_mb: 0
+            }
+            .is_terminal()
+        );
     }
 
     #[test]
