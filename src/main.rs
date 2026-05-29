@@ -728,6 +728,18 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
             blut::jobs::write_state(&job_id, JobState::Running)
                 .with_context(|| format!("write Running state for {job_id}"))?;
 
+            // KILL-2/KILL-3: bind this job so backend spawns mirror
+            // the python child's PROCESS GROUP id into the job pid
+            // file (not blut's own pid). A separate `blut cancel <id>`
+            // reads that pgid and killpg's the whole tree.
+            blut::python_kill::bind_current_job(job_id.clone());
+
+            // KILL-3: trap SIGTERM/ctrl-c. On signal, cancel the
+            // executor token AND killpg the live child group, then
+            // let the function return so `lock` Drops (RAII unlocks
+            // the scheduler — fixes the stale-lock-on-SIGTERM case).
+            install_cancel_handler(ctx.cancel.clone());
+
             // Cross-process GPU arbitration — same lock acquisition
             // pattern as the legacy train path. Recipes that don't
             // hit GPU still pay the lock cost, which is cheap.
@@ -737,6 +749,7 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
             ) {
                 Ok(l) => l,
                 Err(e) => {
+                    blut::python_kill::unbind_current_job();
                     if let Err(se) = blut::jobs::write_state(&job_id, JobState::Failed) {
                         tracing::warn!("write Failed state for {job_id}: {se}");
                     }
@@ -751,6 +764,7 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
 
             let result = SequentialExecutor::execute(plan, ctx).await;
             drop(lock);
+            blut::python_kill::unbind_current_job();
             match result {
                 Ok(r) => {
                     blut::jobs::write_state(&job_id, JobState::Done)
@@ -1333,14 +1347,17 @@ async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()>
         .with_context(|| format!("create job dir for {job_id}"))?;
 
     // Match the legacy path's lifecycle so `lamu-train jobs` shows
-    // this run and `lamu-train cancel` can find its pid. Write
-    // state + pid BEFORE acquiring the GPU lock so a lock-wait
-    // failure still leaves a discoverable job record.
+    // this run and `lamu-train cancel` can find its pid.
     jobs::write_state(&job_id, JobState::Running)
         .with_context(|| format!("write initial job state for {job_id}"))?;
-    if let Err(e) = jobs::write_pid(&job_id, std::process::id()) {
-        tracing::warn!("failed to record pid for {job_id}: {e}");
-    }
+    // KILL-3: DO NOT write blut's own pid here. The pid file must
+    // hold the python child's PROCESS GROUP id so `blut cancel <id>`
+    // SIGTERMs the trainer tree, not blut (which has no handler and
+    // would just die, orphaning the GPU child). The child pgid is
+    // mirrored into the pid file by the backend spawn once we bind
+    // the job below; until then the job has no pid (cancel no-ops
+    // safely rather than killing the wrong process).
+    blut::python_kill::bind_current_job(job_id.clone());
 
     let mut ctx = ExecCtx::new(job_dir.clone());
     if args.shared_cache {
@@ -1417,6 +1434,7 @@ async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()>
         match acq.await {
             Ok(l) => l,
             Err(e) => {
+                blut::python_kill::unbind_current_job();
                 if let Err(state_err) = jobs::write_state(&job_id, JobState::Failed) {
                     tracing::warn!(
                         "failed to record Failed state for {job_id} after lock error: {state_err}"
@@ -1428,8 +1446,13 @@ async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()>
     };
     eprintln!("lock acquired ({})", lock.path().display());
 
+    // KILL-3: trap SIGTERM/ctrl-c → cancel token + killpg the child
+    // group, then return so `lock` Drops (RAII unlocks the scheduler).
+    install_cancel_handler(ctx.cancel.clone());
+
     let result = SequentialExecutor::execute(plan, ctx).await;
     drop(lock);
+    blut::python_kill::unbind_current_job();
 
     match result {
         Ok(r) => {
@@ -1450,6 +1473,50 @@ async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()>
             Err(anyhow!("plan execution failed: {e}"))
         }
     }
+}
+
+/// Install a one-shot SIGTERM + ctrl-c handler for an in-process
+/// training run (KILL-3). On either signal it:
+///   1. cancels the executor's `CancellationToken` so the running
+///      stage's `tokio::select!` sees the cancel and returns,
+///   2. `killpg`s the live python child group (the trainer tree),
+///   3. drops the guard so RAII unlocks the scheduler lock cleanly.
+///
+/// Spawned as a detached task; it observes the *first* signal, kills,
+/// and exits. The main task continues — `execute()` returns
+/// `Cancelled`, the lock Drops, the process exits via the normal
+/// `Err` path. We deliberately do NOT `process::exit()` so Drop glue
+/// (lock unlink) runs.
+fn install_cancel_handler(cancel: tokio_util::sync::CancellationToken) {
+    tokio::spawn(async move {
+        let term = async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                if let Ok(mut s) = signal(SignalKind::terminate()) {
+                    s.recv().await;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term => {}
+        }
+        eprintln!("\nsignal received — cancelling job + killing trainer group...");
+        cancel.cancel();
+        if let Some(id) = blut::python_kill::active_child() {
+            blut::python_kill::graceful_kill_group(
+                id.pgid,
+                Some(id),
+                Duration::from_secs(10),
+            )
+            .await;
+        }
+    });
 }
 
 fn build_dataset(args: &TrainArgs) -> Result<DatasetSource> {

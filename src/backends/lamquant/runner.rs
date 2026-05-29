@@ -125,6 +125,16 @@ impl LamquantBackend {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // KILL-1: new session/process group — see python_kill::pre_exec_setsid.
+        #[cfg(unix)]
+        {
+            // tokio's Command exposes `pre_exec` inherently.
+            // SAFETY: setsid is async-signal-safe and allocates nothing.
+            #[allow(unsafe_code)]
+            unsafe {
+                cmd.pre_exec(crate::python_kill::pre_exec_setsid);
+            }
+        }
 
         let mut child = cmd.spawn().map_err(|source| BackendError::Spawn {
             python: inv.python.display().to_string(),
@@ -132,6 +142,8 @@ impl LamquantBackend {
         })?;
         if let Some(pid) = child.id() {
             *self.child_pid.lock() = Some(pid);
+            // KILL-2: publish for in-process + cross-process cancel.
+            crate::python_kill::set_active_child(crate::python_kill::capture_identity(pid));
         }
 
         let stdout = child.stdout.take();
@@ -183,6 +195,7 @@ impl LamquantBackend {
             let _ = h.await;
         }
         *self.child_pid.lock() = None;
+        crate::python_kill::clear_active_child();
 
         if !exit_status.success() {
             return Err(BackendError::Failed {

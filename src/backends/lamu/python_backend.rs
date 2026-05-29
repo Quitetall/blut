@@ -76,6 +76,20 @@ impl TrainBackend for PythonTrainBackend {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // KILL-1: new session/process group so cancel can killpg the
+        // whole tree (DataLoader workers, torchrun ranks) — not just
+        // this direct child.
+        #[cfg(unix)]
+        {
+            // tokio::process::Command exposes `pre_exec` inherently
+            // (no std CommandExt import needed).
+            // SAFETY: setsid is async-signal-safe; pre_exec_setsid
+            // allocates nothing. Sound to run between fork and exec.
+            #[allow(unsafe_code)]
+            unsafe {
+                cmd.pre_exec(crate::python_kill::pre_exec_setsid);
+            }
+        }
 
         let mut child = cmd.spawn().map_err(|e| {
             TrainError::Trainer(format!(
@@ -87,6 +101,10 @@ impl TrainBackend for PythonTrainBackend {
         })?;
         if let Some(pid) = child.id() {
             *self.child_pid.lock() = Some(pid);
+            // KILL-2: publish the child's identity so the in-process
+            // cancel handler + a cross-process `blut cancel` (via the
+            // job pid file) can reach the whole group.
+            crate::python_kill::set_active_child(crate::python_kill::capture_identity(pid));
         }
 
         let stdout = child.stdout.take().ok_or_else(|| {
@@ -162,6 +180,7 @@ impl TrainBackend for PythonTrainBackend {
         let _ = stderr_reader.await;
 
         *self.child_pid.lock() = None;
+        crate::python_kill::clear_active_child();
         let elapsed = started.elapsed();
 
         let (last_done, last_failed) = artifact_rx
