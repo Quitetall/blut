@@ -104,6 +104,9 @@ pub static DEF: RecipeDef = RecipeDef {
     name: LamquantDataPrep::NAME,
     description: LamquantDataPrep::DESCRIPTION,
     backend_id: <crate::backends::LamquantBackend as crate::backends::TrainingBackend>::ID,
+    category: crate::recipes::recipe::RecipeCategory::DataPrep,
+    input_kinds: &[],
+    output_kind: "lamquant.lma_corpus",
     args_schema_fn: || {
         let mut g = schemars::r#gen::SchemaGenerator::default();
         let s = g.subschema_for::<Args>();

@@ -290,6 +290,13 @@ fn unix_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     (y as u32, m as u32, d as u32, h, mi, se)
 }
 
+/// Public wrapper over [`unix_to_ymdhms`] for sibling modules (the
+/// TUI views formatter reuses the same dependency-free civil-from-days
+/// conversion rather than pulling in chrono just to print a date).
+pub fn unix_to_ymdhms_pub(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    unix_to_ymdhms(secs)
+}
+
 /// Look up a job by exact id OR by unique prefix. Used so the user
 /// can type `lamu-train cancel 20260510` instead of pasting the
 /// full id. Errors when zero or multiple matches.

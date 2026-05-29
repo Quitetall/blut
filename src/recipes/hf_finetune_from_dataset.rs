@@ -211,6 +211,9 @@ pub static DEF: RecipeDef = RecipeDef {
     name: HfFinetuneFromDataset::NAME,
     description: HfFinetuneFromDataset::DESCRIPTION,
     backend_id: <crate::backends::HfTrainerBackend as crate::backends::TrainingBackend>::ID,
+    category: crate::recipes::recipe::RecipeCategory::Train,
+    input_kinds: &["dataset.jsonl"],
+    output_kind: "checkpoint.hf",
     args_schema_fn: || {
         let mut g = schemars::r#gen::SchemaGenerator::default();
         let s = g.subschema_for::<Args>();

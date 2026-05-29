@@ -96,6 +96,49 @@ impl Stage for LamquantConvertLma {
             source,
         })?;
 
+        // Idempotent skip: when output_dir already holds at least one
+        // .lma archive (flat or one level deep under <source>/), treat
+        // it as already-converted and skip the EDF→LML→LMA subprocess.
+        // This matches the post-Phase-M corpus shape: per-dataset LMAs
+        // live at Archive/lma/<source>/<corpus>.lma; the LML mirror tree
+        // is no longer kept on disk (regen via Archive/edf/<source>/install.sh).
+        let mut found_lma = false;
+        if let Ok(rd) = std::fs::read_dir(&args.output_dir) {
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("lma") {
+                    found_lma = true;
+                    break;
+                }
+                if path.is_dir() {
+                    if let Ok(rd2) = std::fs::read_dir(&path) {
+                        for e2 in rd2.flatten() {
+                            if e2.path().extension().and_then(|s| s.to_str()) == Some("lma") {
+                                found_lma = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if found_lma {
+                    break;
+                }
+            }
+        }
+        if found_lma {
+            let n_archives = count_lma_archives(&args.output_dir);
+            let content_hash = stat_fingerprint(b"lamquant.lma_corpus", &args.output_dir)
+                .map_err(|source| StageError::Io {
+                    path: args.output_dir.clone(),
+                    source,
+                })?;
+            return Ok(LmaCorpus {
+                root: args.output_dir.clone(),
+                n_archives,
+                content_hash,
+            });
+        }
+
         let labels_dir = if args.labels_dir_rel.is_empty() {
             home.join("ai_models").join("snn").join("labels")
         } else {
@@ -137,14 +180,7 @@ impl Stage for LamquantConvertLma {
             .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
 
         // Count .lma archives under output_dir; build provenance hash.
-        let mut n_archives: i64 = 0;
-        if let Ok(rd) = std::fs::read_dir(&args.output_dir) {
-            for e in rd.flatten() {
-                if e.path().extension().and_then(|s| s.to_str()) == Some("lma") {
-                    n_archives += 1;
-                }
-            }
-        }
+        let n_archives = count_lma_archives(&args.output_dir);
         let content_hash = stat_fingerprint(b"lamquant.lma_corpus", &args.output_dir).map_err(
             |source| StageError::Io {
                 path: args.output_dir.clone(),
@@ -157,6 +193,31 @@ impl Stage for LamquantConvertLma {
             content_hash,
         })
     }
+}
+
+/// Count `.lma` files under `root`, scanning both root itself and one
+/// level deep (matches Archive/lma/<source>/<corpus>.lma).
+fn count_lma_archives(root: &std::path::Path) -> i64 {
+    let mut n: i64 = 0;
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("lma") {
+                n += 1;
+                continue;
+            }
+            if path.is_dir() {
+                if let Ok(rd2) = std::fs::read_dir(&path) {
+                    for e2 in rd2.flatten() {
+                        if e2.path().extension().and_then(|s| s.to_str()) == Some("lma") {
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    n
 }
 
 #[cfg(test)]

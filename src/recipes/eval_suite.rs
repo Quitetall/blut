@@ -148,6 +148,9 @@ pub static DEF: RecipeDef = RecipeDef {
     name: EvalSuite::NAME,
     description: EvalSuite::DESCRIPTION,
     backend_id: <crate::backends::LamuTrainerBackend as crate::backends::TrainingBackend>::ID,
+    category: crate::recipes::recipe::RecipeCategory::Eval,
+    input_kinds: &["checkpoint.hf"],
+    output_kind: "eval.report",
     args_schema_fn: || {
         let mut g = schemars::r#gen::SchemaGenerator::default();
         let s = g.subschema_for::<Args>();

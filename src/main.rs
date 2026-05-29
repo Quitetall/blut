@@ -30,7 +30,11 @@ use blut::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "lamu-train", version, about = "Local fine-tuning")]
+#[command(
+    name = "blut",
+    version,
+    about = "BLUT — interactive training cockpit (bare `blut` opens the TUI). Subcommands: train, jobs, log, cancel, recipe, plan, cache, stage, data, auto, policy, tui."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -98,9 +102,12 @@ enum Command {
         #[command(subcommand)]
         cmd: StageCommand,
     },
-    /// Open the interactive training cockpit (ratatui). Live view of
-    /// running jobs + log tail + GPU / RAM probes. Keys: ↑↓ select
-    /// job, Enter view log, c cancel selected job, r refresh, q quit.
+    /// Open the canonical interactive training cockpit (ratatui). The
+    /// single, complete cockpit: recipe launcher + live jobs/log/system
+    /// panels + run history / leaderboard / compare / checkpoints /
+    /// presets / live-metrics / reset views (superset of the retired
+    /// hub + Python cockpits). Keys: ↑↓ select, Enter log, c cancel,
+    /// R recipe picker, J/L/Y/H/B/K/P/M/X switch views, q quit.
     Tui,
 }
 
@@ -344,7 +351,9 @@ async fn main() -> Result<()> {
         Some(Command::Cache { cmd }) => run_cache_cmd(cmd),
         Some(Command::Stage { cmd }) => run_stage_cmd(cmd).await,
         Some(Command::Tui) => blut::tui::run().await,
-        None => run_train(cli.train_args).await,
+        // Bare `blut` opens the interactive cockpit (T-track). Use
+        // `blut train …` for explicit CLI training.
+        None => blut::tui::run().await,
     }
 }
 
@@ -639,16 +648,49 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
     use blut::recipes::recipe::{find as find_recipe, RECIPES};
     match cmd {
         RecipeCommand::List => {
-            println!("{:<32} {:<12} {}", "name", "backend", "description");
-            for r in RECIPES {
-                println!("{:<32} {:<12} {}", r.name, r.backend_id, r.description);
+            // Sort by (category label, name) so the catalog reads
+            // top-down like the BLUT Training Cockpit menu (DATA →
+            // TRAINING → EVAL → EXPORT → PIPELINE → USER).
+            let mut sorted: Vec<&'static blut::recipes::recipe::RecipeDef> =
+                RECIPES.iter().copied().collect();
+            sorted.sort_by(|a, b| {
+                a.category
+                    .label()
+                    .cmp(b.category.label())
+                    .then_with(|| a.name.cmp(b.name))
+            });
+            println!(
+                "{:<32} {:<14} {:<12} {:<24} → {}",
+                "name", "category", "backend", "inputs", "output"
+            );
+            for r in sorted {
+                let inputs = if r.input_kinds.is_empty() {
+                    "(graph-input)".to_string()
+                } else {
+                    r.input_kinds.join(",")
+                };
+                println!(
+                    "{:<32} {:<14} {:<12} {:<24} → {}",
+                    r.name,
+                    r.category.label(),
+                    r.backend_id,
+                    inputs,
+                    r.output_kind,
+                );
             }
         }
         RecipeCommand::Show { name } => {
             let r = find_recipe(&name)
                 .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
             println!("name        : {}", r.name);
+            println!("category    : {}", r.category.label());
             println!("backend     : {}", r.backend_id);
+            println!("input kinds : {}", if r.input_kinds.is_empty() {
+                "(graph-input)".into()
+            } else {
+                r.input_kinds.join(", ")
+            });
+            println!("output kind : {}", r.output_kind);
             println!("description : {}", r.description);
             let schema = (r.args_schema_fn)();
             println!(

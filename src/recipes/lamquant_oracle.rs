@@ -239,6 +239,9 @@ pub static DEF: RecipeDef = RecipeDef {
     name: LamquantOracle::NAME,
     description: LamquantOracle::DESCRIPTION,
     backend_id: <crate::backends::LamquantBackend as crate::backends::TrainingBackend>::ID,
+    category: crate::recipes::recipe::RecipeCategory::Pipeline,
+    input_kinds: &[],
+    output_kind: "lamquant.pccp_verdict",
     args_schema_fn: || {
         let mut g = schemars::r#gen::SchemaGenerator::default();
         let s = g.subschema_for::<Args>();
