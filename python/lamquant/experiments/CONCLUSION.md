@@ -80,6 +80,6 @@ superior on all metrics. INR adds complexity without benefit.
 ## Final Status
 
 - Mode 4 (INR): **CANCELLED**
-- SIREN code: kept in `lamquant_codec/models/siren.py` for reference
-- Experiments: kept in `ai_models/experiments/` for documentation
+- SIREN code: kept in `lamquant_neural/models/siren.py` for reference
+- Experiments: kept in `blut/python/lamquant/experiments/` for documentation
 - No further development planned

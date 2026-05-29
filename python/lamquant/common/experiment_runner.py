@@ -89,7 +89,7 @@ class ExperimentRunner:
                  log_path: Optional[str] = None):
         from data_types import DatasetManifest
         self._manifest_path = str(manifest_path or (
-            _REPO / 'lamquant' / 'dataset_sim' / 'manifest_v3.json'))
+            _REPO / 'lamquant' / 'dataset' / 'manifest_v3.json'))
         self._manifest = DatasetManifest.load(self._manifest_path)
         if log_path:
             from experiment_log import set_log_path

@@ -223,7 +223,7 @@ def split_by_manifest(npz_files, manifest_path=None):
     from data_types import DatasetManifest, Split
 
     manifest = DatasetManifest.load(
-        Path(__file__).parent.parent / 'dataset_sim' / 'manifest_v3.json')
+        Path(__file__).parent.parent / 'dataset' / 'manifest_v3.json')
     train_files = [str(p) for p in manifest.get_files(Split.TRAIN)]
     val_files = [str(p) for p in manifest.get_files(Split.VAL)]
     return train_files, val_files

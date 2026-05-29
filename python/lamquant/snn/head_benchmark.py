@@ -49,8 +49,11 @@ import numpy as np
 import torch
 
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+# snn_to_nedc_eval.py is a sibling in lamquant/snn/ (moved here from the
+# meta-repo scripts/ in the 2026-05-29 boundary migration). Keep its dir
+# on sys.path so the bare import below resolves when this file is run as
+# a launched script (its own dir is on sys.path then anyway).
 sys.path.insert(0, str(ROOT_DIR / "lamquant" / "snn"))
-sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 from lamquant_neural.models.mamba_ssm_minimal import MambaSNN
 from lamquant_neural.models.heads import build_head, HEAD_REGISTRY

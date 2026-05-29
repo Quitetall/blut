@@ -147,7 +147,7 @@ def main():
                 decoder_raw_dataset, batch_size=args.batch_size, shuffle=False,
                 num_workers=0, pin_memory=(device.type == 'cuda'))
     else:
-        q31_dir = os.path.join(ROOT_DIR, 'ai_models/dataset_sim/q31_events')
+        q31_dir = os.path.join(ROOT_DIR, 'lamquant/dataset/q31_events')
         all_files = sorted(glob.glob(os.path.join(q31_dir, '*.npz')))
         if not all_files:
             print(f"[!] No Q31 files in {q31_dir}"); sys.exit(1)
