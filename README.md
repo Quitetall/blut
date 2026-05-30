@@ -4,6 +4,8 @@ Rust framework for orchestrating local ML training: SFT, DPO,
 distillation, eval. Compile-time DAG via typed stages; recipes
 compose stages into reusable workflows.
 
+**API reference:** [API.md](API.md) (WIP — stabilizing post-refactor).
+
 ## Why
 
 ML training pipelines accumulate ad-hoc shell scripts: dump some
