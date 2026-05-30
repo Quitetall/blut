@@ -172,8 +172,13 @@ def main() -> None:
                         help="Required event-sensitivity (PCCP floor 0.85)")
     parser.add_argument("--sec-per-step", type=float, default=SEC_PER_STEP_L3,
                         help="Seconds per L3 timestep (default 10/313)")
-    parser.add_argument("--max-windows-per-file", type=int, default=None,
-                        help="Override LmaDataset window cap (default: cfg)")
+    parser.add_argument("--max-windows-per-file", type=int, default=100000,
+                        help="Per-recording window cap. Event-level FPR/h needs "
+                             "FULL recordings, so the default is effectively "
+                             "uncapped (100000). The 5-window training cap would "
+                             "truncate each recording to ~50 s and produce a "
+                             "meaningless FPR/h denominator — do not lower this "
+                             "for a clinical eval.")
     args = parser.parse_args()
 
     import torch
@@ -229,6 +234,12 @@ def main() -> None:
     total_seconds = total_steps * args.sec_per_step
     print(f"[*] reconstructed {n_rec} recordings "
           f"({total_steps} timesteps, {total_seconds/3600:.2f} h total)")
+    if total_seconds < 3600.0:
+        print(f"[!] WARNING: only {total_seconds/3600:.2f} h of recording "
+              f"reconstructed — FPR/h denominator is tiny and the rate will be "
+              f"unreliable. This usually means --max-windows-per-file is capping "
+              f"each recording (event-level eval needs FULL recordings). "
+              f"Current cap = {args.max_windows_per_file}.")
 
     op = calibrate_event_operating_point(
         seqs, sens_floor=args.sens_floor, sec_per_step=args.sec_per_step)
