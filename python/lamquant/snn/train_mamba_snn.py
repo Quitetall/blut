@@ -905,6 +905,29 @@ def _checkpoint_score(sens, acc, spec, min_spec=0.60, sens_floor=0.85):
     return sens             # [sens_floor, 0.99)
 
 
+def _checkpoint_score_calibrated(cal):
+    """Run-3 (2026-05-29): score the CALIBRATED operating point, not the
+    fixed-0.5-threshold metrics.
+
+    Run-2's early-stop froze "best" at ep0 (score 0) and stopped at ep30/250
+    because the old _checkpoint_score demanded sens>=0.85 AND spec>=0.60
+    SIMULTANEOUSLY at the 0.5 threshold — which never co-occurred — even
+    though the model reached sens=0.851 at its calibrated threshold (0.30).
+    Selection/early-stop must track the DEPLOYMENT operating point: the
+    largest threshold that still holds sens>=floor, scored by the
+    specificity (lowest FPR) achievable there.
+
+    cal = calibrate_seizure_threshold(...) dict
+      {threshold, sens, spec, fpr_per_h, meets_floor}.
+    Returns 0.0 if the floor is unreachable at any threshold; else
+    1.0 + spec in [1.0, 2.0] so any floor-meeting model beats a sub-floor
+    one and higher specificity (lower FPR @ fixed recall) wins.
+    """
+    if not cal.get('meets_floor'):
+        return 0.0
+    return 1.0 + float(cal.get('spec', 0.0))
+
+
 # ============================================================
 # Async checkpoint saver (O5)
 # ============================================================
@@ -1049,11 +1072,17 @@ def main():
                         help='Directory with Q31 .npz or .edf files (legacy path)')
     parser.add_argument('--manifest', type=str, default=None,
                         help='Validation manifest (legacy random-split path)')
-    parser.add_argument('--lma-root', type=Path, default=None,
-                        help='LMA-direct: per-stem .lma archive root (one .lma '
-                             'per recording bundling LML + sidecars + labels). '
-                             'When set with --split-manifest, takes precedence '
-                             'over --data/--eeg-dir.')
+    parser.add_argument('--lma-root', type=Path, default=None, nargs='+',
+                        help='LMA-direct: one or more LMA roots. Each root is '
+                             'either a per-corpus .lma file, OR a directory of '
+                             '.lma archives (globbed one + two levels deep, e.g. '
+                             'Archive/lma/<source>/<corpus>.lma), OR a legacy '
+                             'per-recording dir (Training/lma/<corpus>/*.lma). '
+                             'Multiple roots are unioned, so per-corpus '
+                             'source-of-truth archives and legacy per-recording '
+                             'archives can be mixed in one run. When set with '
+                             '--split-manifest, takes precedence over '
+                             '--data/--eeg-dir.')
     parser.add_argument('--split-manifest', type=Path, default=None,
                         help='LMA-direct: subject-grouped split manifest from '
                              'build_snn_train_val_split.py. Required with '
@@ -1204,15 +1233,38 @@ def main():
                 "returns L3 [21, 313], not raw 2500-sample windows)"
             )
         from lamquant.snn.lma_dataset import LmaDataset
-        print(f"[*] LMA-direct path: lma_root={args.lma_root}")
+        # Union every root into one explicit .lma list so per-corpus
+        # source-of-truth archives (Archive/lma/<source>/<corpus>.lma) and
+        # legacy per-recording dirs (Training/lma/<corpus>/*.lma) can be
+        # mixed in a single run. A root that is itself a .lma file is used
+        # directly; a directory is globbed two-then-one level deep.
+        roots = args.lma_root if isinstance(args.lma_root, (list, tuple)) \
+            else [args.lma_root]
+        lma_paths: list = []
+        for r in roots:
+            r = Path(r)
+            if r.is_file() and r.suffix == ".lma":
+                lma_paths.append(r)
+                continue
+            if not r.is_dir():
+                raise FileNotFoundError(f"--lma-root not found: {r}")
+            found = sorted(r.glob("*/*.lma")) or sorted(r.glob("*.lma"))
+            if not found:
+                raise RuntimeError(f"no .lma archives under {r}")
+            lma_paths.extend(found)
+        # De-dup preserving order (a corpus could be named by both a file
+        # root and a dir root).
+        seen: set = set()
+        lma_paths = [p for p in lma_paths if not (str(p) in seen or seen.add(str(p)))]
+        print(f"[*] LMA-direct path: {len(roots)} root(s) -> {len(lma_paths)} .lma archive(s)")
         print(f"[*] split_manifest={args.split_manifest}")
         train_ds = LmaDataset(
-            lma_root=args.lma_root, split="train",
+            lma_paths=lma_paths, split="train",
             split_manifest_path=args.split_manifest,
             max_windows_per_file=cfg.max_windows_per_file,
         )
         val_ds = LmaDataset(
-            lma_root=args.lma_root, split="val",
+            lma_paths=lma_paths, split="val",
             split_manifest_path=args.split_manifest,
             max_windows_per_file=cfg.max_windows_per_file,
         )
@@ -1605,10 +1657,13 @@ def main():
         ep_sec = _time.time() - ep_start
 
         # Validation every epoch (seizure metrics from the dedicated head).
-        val_acc, val_sens, val_spec, val_fnr = validate(model, val_loader, device)
-
-        score = _checkpoint_score(val_sens, val_acc, val_spec,
-                                  sens_floor=cfg.sens_floor)
+        # Run-3: collect probs + calibrate the threshold each epoch so best /
+        # early-stop track the DEPLOYMENT operating point, not the 0.5 default.
+        val_acc, val_sens, val_spec, val_fnr, val_probs, val_targets = validate(
+            model, val_loader, device, collect_probs=True)
+        val_cal = calibrate_seizure_threshold(
+            val_probs, val_targets, sens_floor=cfg.sens_floor)
+        score = _checkpoint_score_calibrated(val_cal)
         improved = ''
         if score > best_score:
             best_score = score
@@ -1627,6 +1682,7 @@ def main():
                 'specificity': val_spec,
                 'fnr': val_fnr,
                 'score': score,
+                'threshold_star': val_cal,
                 'config': cfg.to_dict(),
                 'seizure_pos_weight': seizure_pos_weight,
             }, save_path)
@@ -1641,9 +1697,12 @@ def main():
 
         ram = _rss_gb()
         gpu_mb = torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
+        _fprh = val_cal['fpr_per_h'] if val_cal.get('fpr_per_h') is not None else -1.0
         print(f"E{epoch+1:3d}/{cfg.epochs}  L={loss:.4f}  "
               f"train[A={acc:.3f} S={sens:.3f}]  "
               f"val[A={val_acc:.3f} S={val_sens:.3f} Sp={val_spec:.3f} FNR={val_fnr:.4f}]  "
+              f"cal[thr={val_cal['threshold']:.2f} S={val_cal['sens']:.3f} "
+              f"Sp={val_cal['spec']:.3f} FPRh={_fprh:.1f} floor={'Y' if val_cal['meets_floor'] else 'N'}]  "
               f"sr={sr:.4f}  skips={nan_skips}/{n_batches}  {ep_sec:.0f}s  "
               f"RAM={ram:.1f}G  GPU={gpu_mb:.0f}M  ETA={eta_h}h{eta_m:02d}m{improved}")
 

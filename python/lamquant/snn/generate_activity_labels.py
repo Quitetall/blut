@@ -310,6 +310,199 @@ def find_chbmit_summaries(input_dir):
 
 
 # =====================================================================
+# Siena Scalp EEG — seizure-list parser
+# =====================================================================
+#
+# The Siena Scalp EEG Database (physionet.org/content/siena-scalp-eeg)
+# ships one 'Seizures-list-PNxx.txt' per subject directory. Unlike
+# CHB-MIT, seizure times are given as wall-clock HH.MM.SS times, NOT
+# offsets into the recording. Each seizure block carries:
+#
+#     Seizure n 1
+#     File name: PN00-1.edf
+#     Registration start time: 19.39.33
+#     Registration end time:  20.22.58
+#     Seizure start time: 19.58.36
+#     Seizure end time: 19.59.46
+#
+# The seizure interval (seconds-into-EDF) is therefore:
+#     start_sec = wallclock(seizure_start) - wallclock(registration_start)
+#     end_sec   = wallclock(seizure_end)   - wallclock(registration_start)
+#
+# Like CHB-MIT, Siena only annotates seizures — everything else is
+# QUIET — so the derived (start_sec, end_sec) intervals route straight
+# through chbmit_seizures_to_labels() (the {0,2} mapping).
+#
+# Format quirks observed across the real corpus (PN00, PN01, PN03,
+# PN05, PN06, PN12, ...):
+#   * Time separator is usually '.' but sometimes ':' and even mixed
+#     within one stamp (PN12 'Seizure start time: 16:13.23').
+#   * Field labels vary: 'Seizure start time' vs bare 'Start time'
+#     (PN01); 'Seizure n 1', 'Seizure n1', 'Seizure n 2:' all appear.
+#   * File-name typos: PN06 lists 'PNO6-1.edf' (letter O) while the
+#     EDF on disk is 'PN06-1.edf' — resolved against actual EDFs.
+#   * A seizure block may omit 'Registration start time' when it shares
+#     an EDF with the previous block (PN12 'PN12-1.2.edf') — the last
+#     registration-start seen for that file is carried forward.
+#   * Recordings cross midnight (PN01: reg 19:00:44, seizure 07:53:17
+#     next day) — a negative offset is wrapped by +24h.
+#   * A leading 'File name' / 'Registration start time' header (with no
+#     'Seizure n' marker) can describe the EDF for the seizures that
+#     follow (PN01) — tracked as the current file/registration context.
+
+_SIENA_TIME_RE = re.compile(r'(\d{1,2})[.:](\d{1,2})[.:](\d{1,2})')
+
+_SECONDS_PER_DAY = 24 * 60 * 60
+
+
+def _parse_siena_clock(value):
+    """Parse a Siena HH.MM.SS (or HH:MM:SS, or mixed) clock string.
+
+    Returns seconds-since-midnight as an int, or None if unparseable.
+    """
+    if value is None:
+        return None
+    m = _SIENA_TIME_RE.search(value)
+    if not m:
+        return None
+    try:
+        h, mn, s = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    except (ValueError, IndexError):
+        return None
+    if not (0 <= h < 24 and 0 <= mn < 60 and 0 <= s < 60):
+        return None
+    return h * 3600 + mn * 60 + s
+
+
+def _normalize_siena_filename(fname):
+    """Strip trailing whitespace from a listed Siena EDF file name.
+
+    Filename typos (e.g. 'PNO6-1.edf' vs on-disk 'PN06-1.edf') are
+    resolved later against the actual EDFs in the directory; here we
+    only trim and keep the basename.
+    """
+    return os.path.basename(fname.strip())
+
+
+def parse_siena(list_path):
+    """Parse a Siena 'Seizures-list-PNxx.txt' for seizure annotations.
+
+    Derives per-EDF seizure intervals from wall-clock times:
+        offset = wallclock(seizure) - wallclock(registration_start)
+    wrapping negative offsets across midnight (+24h).
+
+    Field labels are matched tolerantly ('Seizure start time' or bare
+    'Start time'); the time separator may be '.', ':' or mixed.
+
+    Returns dict: {edf_basename: [(start_sec, end_sec), ...]}.
+    """
+    seizures = defaultdict(list)
+    current_file = None
+    # Last registration-start (seconds-since-midnight) seen per file,
+    # so blocks that omit it can inherit the value (PN12 shared EDF).
+    reg_start_by_file = {}
+    cur_reg_start = None
+    cur_sz_start = None
+    cur_sz_end = None
+
+    def flush():
+        if (current_file is not None
+                and cur_sz_start is not None
+                and cur_sz_end is not None
+                and cur_reg_start is not None):
+            start = (cur_sz_start - cur_reg_start) % _SECONDS_PER_DAY
+            end = (cur_sz_end - cur_reg_start) % _SECONDS_PER_DAY
+            if end >= start:
+                seizures[current_file].append((float(start), float(end)))
+
+    with open(list_path, 'r', errors='replace') as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            low = line.lower()
+
+            # New seizure block boundary: 'Seizure n 1', 'Seizure n1', etc.
+            if re.match(r'seizure\s*n', low):
+                flush()
+                cur_sz_start = None
+                cur_sz_end = None
+                # current_file / cur_reg_start persist (may be inherited)
+                continue
+
+            m_file = re.match(r'file\s*name\s*:?\s*(\S+)', low)
+            if m_file:
+                # Re-match against the original line to preserve case.
+                orig = re.match(r'(?i)file\s*name\s*:?\s*(\S+)', line)
+                current_file = _normalize_siena_filename(orig.group(1))
+                cur_reg_start = reg_start_by_file.get(current_file)
+                continue
+
+            if low.startswith('registration start time'):
+                secs = _parse_siena_clock(line[len('registration start time'):])
+                if secs is not None:
+                    cur_reg_start = secs
+                    if current_file is not None:
+                        reg_start_by_file[current_file] = secs
+                continue
+
+            # 'Registration end time' is informational only — skip.
+            if low.startswith('registration end time'):
+                continue
+
+            # Seizure start: 'Seizure start time' or bare 'Start time'.
+            if low.startswith('seizure start time') or low.startswith('start time'):
+                secs = _parse_siena_clock(line)
+                if secs is not None:
+                    cur_sz_start = secs
+                continue
+
+            # Seizure end: 'Seizure end time' or bare 'End time'.
+            if low.startswith('seizure end time') or low.startswith('end time'):
+                secs = _parse_siena_clock(line)
+                if secs is not None:
+                    cur_sz_end = secs
+                continue
+
+    flush()
+    return dict(seizures)
+
+
+def find_siena_seizures(input_dir):
+    """Find all Siena 'Seizures-list-*.txt' files and merge annotations.
+
+    Resolves listed EDF file names against the actual EDFs in the
+    seizure-list's directory (handles 'PNO6'→'PN06' typos and case)
+    and keys the result by absolute EDF path, mirroring
+    find_chbmit_summaries().
+    """
+    all_seizures = {}
+    for list_path in glob.glob(os.path.join(input_dir, '**', 'Seizures-list-*.txt'),
+                               recursive=True):
+        if not os.path.isfile(list_path):
+            continue
+        subj_dir = os.path.dirname(list_path)
+        # Index actual EDFs by lowercased basename for typo-tolerant match.
+        on_disk = {}
+        for edf in glob.glob(os.path.join(subj_dir, '*.edf')):
+            on_disk[os.path.basename(edf).lower()] = edf
+        seizures = parse_siena(list_path)
+        for fname, intervals in seizures.items():
+            if not intervals:
+                continue
+            resolved = on_disk.get(fname.lower())
+            if resolved is None:
+                # Typo fallback: treat 'O' (letter) as '0' (digit).
+                alt = fname.lower().replace('o', '0')
+                resolved = on_disk.get(alt)
+            if resolved is None:
+                resolved = os.path.join(subj_dir, fname)
+            all_seizures.setdefault(resolved, [])
+            all_seizures[resolved].extend(intervals)
+    return all_seizures
+
+
+# =====================================================================
 # Label computation — annotations only, no statistics
 # =====================================================================
 
@@ -459,6 +652,16 @@ def main():
     chbmit_all = find_chbmit_summaries(args.input)
     if chbmit_all:
         print(f"[*] CHB-MIT summaries: {len(chbmit_all)} files with seizure annotations")
+
+    # Check for Siena Scalp EEG seizure lists. Siena, like CHB-MIT, has only
+    # seizure annotations, so its derived (start_sec, end_sec) intervals share
+    # the same seizure-interval channel and chbmit_seizures_to_labels() mapping.
+    siena_all = find_siena_seizures(args.input)
+    if siena_all:
+        print(f"[*] Siena seizure lists: {len(siena_all)} files with seizure annotations")
+        for full, intervals in siena_all.items():
+            chbmit_all.setdefault(full, [])
+            chbmit_all[full].extend(intervals)
 
     if args.max_files > 0:
         edf_files = edf_files[:args.max_files]
