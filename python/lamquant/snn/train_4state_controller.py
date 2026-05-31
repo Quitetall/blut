@@ -34,10 +34,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
 from pathlib import Path
+
+LOG = logging.getLogger("lamquant.snn.train_4state_controller")
 from typing import Optional
 
 import numpy as np
@@ -192,6 +195,7 @@ def _iter_index_labels(dataset: LmaDataset):
         label_internal = entry[4] if len(entry) >= 5 else entry[3]
         by_lma[(str(lma_path), label_internal)].append((idx, win_idx, stem))
 
+    n_label_load_fail = 0
     for (lma_path, label_internal), items in by_lma.items():
         stem_for_cache = items[0][2]
         cached = (label_cache / f"{stem_for_cache}_labels.npz") if label_cache else None
@@ -203,7 +207,14 @@ def _iter_index_labels(dataset: LmaDataset):
                 lb = _lc.lma_read_entry(lma_path, label_internal)
                 with np.load(io.BytesIO(lb), allow_pickle=True) as ld:
                     activity = np.asarray(ld["activity_labels"])
-        except Exception:
+        except (OSError, ValueError, KeyError, RuntimeError) as e:
+            # Don't silently bias the StateBalancedSampler: a zero-label
+            # fallback marks the window as having NO rare state, so a corrupt
+            # NPZ would quietly down-weight real INTERESTING/CRITICAL windows.
+            # Count + warn so data-pipeline breakage is visible (MiMo a04bc8e).
+            n_label_load_fail += 1
+            LOG.warning("4state rare-flag scan: label load failed for %s (%s): %s",
+                        stem_for_cache, label_internal, e)
             activity = np.zeros((NUM_GROUPS, L3_T), dtype=np.int64)
         for idx, win_idx, _stem in items:
             lbl_start = win_idx * LABEL_PER_WINDOW
@@ -215,6 +226,10 @@ def _iter_index_labels(dataset: LmaDataset):
                 if n < L3_T:
                     w[:, n:] = w[:, n - 1:n]
             yield idx, w
+    if n_label_load_fail:
+        LOG.warning("4state rare-flag scan: %d label group(s) failed to load "
+                    "and were treated as all-QUIET — sampler balance may be "
+                    "biased; check the data.", n_label_load_fail)
 
 
 # ===========================================================================
@@ -471,8 +486,17 @@ def _state_dict_to_cpu(sd):
     return out
 
 
+def _atomic_torch_save(payload: dict, path: str) -> None:
+    """torch.save to a temp file in the same dir, then atomic rename — a
+    mid-write kill leaves the prior checkpoint intact rather than a truncated
+    one (MiMo a04bc8e)."""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
 def _async_save(payload: dict, path: str):
-    _ensure_save_executor().submit(torch.save, payload, path)
+    _ensure_save_executor().submit(_atomic_torch_save, payload, path)
 
 
 # ===========================================================================
@@ -593,11 +617,16 @@ def main():
 
     # ---- Calibrate quiet threshold ONCE on train; cache next to ckpt. ----
     thr_cache = Path(os.path.splitext(save_path)[0] + "_quiet_thr.json")
-    if thr_cache.exists():
-        quiet_thr = float(json.loads(thr_cache.read_text())["quiet_rms_threshold"])
+    _cached = json.loads(thr_cache.read_text()) if thr_cache.exists() else None
+    if _cached is not None and _cached.get("split_manifest") == str(args.split_manifest):
+        quiet_thr = float(_cached["quiet_rms_threshold"])
         print(f"[4state] loaded cached quiet_rms_threshold={quiet_thr:.6g} "
               f"from {thr_cache}")
     else:
+        if _cached is not None:
+            print(f"[4state] stale threshold cache (manifest "
+                  f"{_cached.get('split_manifest')!r} != {str(args.split_manifest)!r}) "
+                  f"— recalibrating")
         print(f"[4state] calibrating quiet_rms_threshold on {args.calib_windows} "
               f"train windows ...")
         quiet_thr = calibrate_quiet_threshold(train_ds, n_windows=args.calib_windows,
