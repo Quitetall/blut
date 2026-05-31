@@ -71,6 +71,22 @@ from lamquant.snn.four_state import (  # noqa: E402
     TARGET_DIST_4,
 )
 
+# ---------------------------------------------------------------------------
+# ADR-0027 upgrade modules. Each is imported eagerly so an --init/--distill/
+# --spectral/--ordinal typo fails fast at startup, not deep in the loop. They
+# are pure-function / nn.Module helpers — importing them is side-effect-free
+# (no checkpoint load, no GPU) so the baseline path pays nothing.
+# ---------------------------------------------------------------------------
+from lamquant.snn.spectral import (  # noqa: E402
+    build_augmented_input,
+    AUGMENTED_IN_CHANNELS,
+)
+from lamquant.snn.ordinal_loss import constrained_loss  # noqa: E402
+from lamquant.snn.distill_teacher import (  # noqa: E402
+    TeacherDistiller,
+    RECOMMENDED_LAMBDA_DISTILL,
+)
+
 # Geometry — L3 latent time dim (preprocess_subband_single output).
 L3_T = 313
 NUM_GROUPS = 8
@@ -395,7 +411,9 @@ def combined_score(m: dict) -> float:
 # ===========================================================================
 
 def train_epoch(model, head, loader, optimizer, device, quiet_thr,
-                target_T, class_weights, head_kind, lambda_spike, grad_clip):
+                target_T, class_weights, head_kind, lambda_spike, grad_clip,
+                use_spectral=False, use_ordinal=False, crit_floor=0.88,
+                distiller=None, lambda_distill=0.0):
     model.train()
     head.train()
     total_loss = 0.0
@@ -408,15 +426,38 @@ def train_epoch(model, head, loader, optimizer, device, quiet_thr,
         l3, labels = l3.to(device), labels.to(device)
         optimizer.zero_grad(set_to_none=True)
 
-        activity_logits, spike_rate, _seizure = model(l3)   # [B,8,T], scalar, _
+        # --spectral: widen the backbone input with band-power features. The
+        # 4-state TARGET still derives from the RAW L3 RMS (derive_batch_targets
+        # below is passed `l3`, NOT `x`) — only the backbone sees the augmented
+        # channels.
+        if use_spectral:
+            x = build_augmented_input(l3)                   # [B,105,T]
+        else:
+            x = l3                                          # [B,21,T]
+        activity_logits, spike_rate, _seizure = model(x)    # [B,8,T], scalar, _
         states, class_logits = head(activity_logits, target_T)  # [B,Tout],[B,4,Tout]
         target = derive_batch_targets(labels, l3, quiet_thr, target_T)  # [B,Tout]
 
         if head_kind == "crf":
+            # CRF path is unaffected by --ordinal (the ordinal/constrained
+            # objective replaces the FLAT softmax CE, not the CRF NLL).
             loss_main = head.neg_log_likelihood(class_logits, target)
+        elif use_ordinal:
+            # ADR-0027 #4: ordinal + constrained objective (drop-in for the
+            # weighted CE). escalation/ramp args stay at their module defaults.
+            loss_main = constrained_loss(class_logits, target, weight=cw,
+                                         crit_floor=crit_floor)
         else:
             loss_main = F.cross_entropy(class_logits, target, weight=cw)
         loss = loss_main + lambda_spike * spike_rate
+
+        # ADR-0027 #3: foundation-teacher feature distillation. The teacher is
+        # frozen + runs under no_grad inside teacher_features; only student_proj
+        # (an optimizer param group added in main) + the backbone receive grad.
+        if distiller is not None:
+            teacher_feat = distiller.teacher_features(l3)        # [B,200] detached
+            loss = loss + lambda_distill * distiller.distill_loss(
+                activity_logits, teacher_feat)
 
         if not torch.isfinite(loss):
             nan_skips += 1
@@ -442,13 +483,17 @@ def train_epoch(model, head, loader, optimizer, device, quiet_thr,
 
 
 @torch.no_grad()
-def validate(model, head, loader, device, quiet_thr, target_T):
+def validate(model, head, loader, device, quiet_thr, target_T,
+             use_spectral=False):
     model.eval()
     head.eval()
     cm = np.zeros((NUM_STATES, NUM_STATES), dtype=np.int64)
     for l3, labels in loader:
         l3, labels = l3.to(device), labels.to(device)
-        activity_logits, _, _ = model(l3)
+        # Mirror train_epoch: augmented backbone input under --spectral, raw L3
+        # for the target (derive_batch_targets gets the original `l3`).
+        x = build_augmented_input(l3) if use_spectral else l3
+        activity_logits, _, _ = model(x)
         _states, class_logits = head(activity_logits, target_T)
         target = derive_batch_targets(labels, l3, quiet_thr, target_T)
         pred = class_logits.argmax(dim=1)
@@ -569,6 +614,33 @@ def main():
     p.add_argument("--device", default="auto")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--checkpoint", default=None)
+
+    # ---- ADR-0027 upgrade toggles. ALL default OFF / inert so the existing
+    #      run-20 baseline command is byte-for-byte unchanged in behaviour. ----
+    p.add_argument("--spectral", action="store_true",
+                   help="ADR-0027 #2: augment the backbone input with per-band "
+                        "power features (in_channels 21 -> 105). The 4-state "
+                        "TARGET still uses raw-L3 RMS.")
+    p.add_argument("--ordinal", action="store_true",
+                   help="ADR-0027 #4: ordinal + constrained objective "
+                        "(constrained_loss) in place of weighted CE. No effect "
+                        "on the CRF head.")
+    p.add_argument("--crit-floor", type=float, default=0.88,
+                   help="soft CRITICAL-recall floor for --ordinal "
+                        "constrained_loss (default 0.88)")
+    p.add_argument("--init-backbone", type=Path, default=None,
+                   help="ADR-0027 #1: SSL-pretrained backbone-init checkpoint "
+                        "(.pt from pretrain_ssl_tueg.py). Loaded strict=False "
+                        "for the backbone keys; head + seizure head keep their "
+                        "fresh init.")
+    p.add_argument("--distill", default=None,
+                   choices=["labram"],
+                   help="ADR-0027 #3: foundation teacher for feature "
+                        "distillation (currently only 'labram').")
+    p.add_argument("--lambda-distill", type=float,
+                   default=RECOMMENDED_LAMBDA_DISTILL,
+                   help=f"weight on the distillation loss when --distill is set "
+                        f"(default {RECOMMENDED_LAMBDA_DISTILL})")
     args = p.parse_args()
 
     if args.device == "auto":
@@ -592,13 +664,73 @@ def main():
         f"{STATE_NAMES[k]}->L{LEVEL_TABLE_4[k]}(CR{CR_TABLE_4[k]:.0f})"
         for k in range(NUM_STATES)))
 
+    # ---- Upgrade-flag banner (ADR-0027). Empty ⇒ this IS the run-20 baseline. ----
+    upgrades = []
+    if args.spectral:
+        upgrades.append("spectral")
+    if args.ordinal:
+        upgrades.append("ordinal")
+    if args.init_backbone is not None:
+        upgrades.append("init-backbone")
+    if args.distill is not None:
+        upgrades.append(f"distill:{args.distill}")
+    print(f"[4state] ADR-0027 upgrades: "
+          f"{', '.join(upgrades) if upgrades else 'NONE (run-20 baseline)'}")
+
     # ---- Model: backbone (subband path) + 4-state head. ----
-    model = MambaSNN(in_channels=21, d_model=args.d_model, d_state=args.d_state,
-                     n_layers=args.n_layers, use_subband=True).to(device)
+    # --spectral widens the backbone input to AUGMENTED_IN_CHANNELS (=105); the
+    # only constructor change is in_channels — spatial_mix auto-widens to
+    # Linear(105 -> d_model). Everything downstream is shape-identical.
+    in_channels = AUGMENTED_IN_CHANNELS if args.spectral else 21
+    model = MambaSNN(in_channels=in_channels, d_model=args.d_model,
+                     d_state=args.d_state, n_layers=args.n_layers,
+                     use_subband=True).to(device)
     head = build_head(args.head, K=NUM_STATES).to(device)
+
+    # ---- ADR-0027 #1: SSL-pretrained backbone init (strict=False). ----
+    # pretrain_ssl_tueg.py saves a backbone-only state_dict under the "backbone"
+    # key (seizure_head.* dropped). strict=False so: (a) the controller's own
+    # 4-state head + seizure head keep their fresh init (they're `missing`), and
+    # (b) under --spectral the widened spatial_mix.{weight,bias} shape-mismatches
+    # and is simply skipped (left freshly-init) — warned, not a hard error.
+    if args.init_backbone is not None:
+        ck = torch.load(str(args.init_backbone), map_location=device,
+                        weights_only=False)
+        if isinstance(ck, dict) and "backbone" in ck:
+            sd = ck["backbone"]
+        else:
+            sd = ck
+        if args.spectral:
+            # Drop the 21-ch spatial_mix so load_state_dict doesn't raise on the
+            # 105-vs-21 shape mismatch; the widened layer stays freshly-init.
+            dropped = [k for k in list(sd.keys()) if k.startswith("spatial_mix.")]
+            for k in dropped:
+                sd.pop(k)
+            if dropped:
+                print(f"[4state] WARNING --init-backbone + --spectral: "
+                      f"dropped {dropped} from the SSL init (21-ch spatial_mix "
+                      f"!= 105-ch); widened spatial_mix stays freshly-init.")
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        matched = len(set(sd.keys()) & set(model.state_dict().keys()))
+        print(f"[4state] --init-backbone {args.init_backbone}: "
+              f"matched={matched} missing={len(missing)} "
+              f"unexpected={len(unexpected)}")
+        if unexpected:
+            print(f"[4state]   unexpected (NOT in MambaSNN): {sorted(unexpected)}")
+
     n_params = sum(p.numel() for p in model.parameters()) + \
         sum(p.numel() for p in head.parameters())
     print(f"[4state] params: backbone+head = {n_params:,}")
+
+    # ---- ADR-0027 #3: foundation teacher (built ONCE, frozen). ----
+    distiller = None
+    if args.distill is not None:
+        distiller = TeacherDistiller(args.distill).to(device)
+        n_teacher = sum(p.numel() for p in distiller.teacher.parameters())
+        n_proj = sum(p.numel() for p in distiller.student_proj.parameters())
+        print(f"[4state] --distill {args.distill}: teacher={n_teacher:,} "
+              f"(frozen) student_proj={n_proj:,} (trainable) "
+              f"lambda_distill={args.lambda_distill}")
 
     # ---- Data. ----
     lma_paths = expand_lma_roots(args.lma_root)
@@ -694,6 +826,14 @@ def main():
               "weight_decay": args.weight_decay}],
             lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
 
+    # ---- ADR-0027 #3: register the distiller's student_proj as a trainable
+    #      param group (the teacher stays frozen + out of the optimizer). For
+    #      ESOAP this lands as a plain AdamW group (a 2-D Linear without an
+    #      ESOAP-routed suffix → AdamW semantics, matching the rest). ----
+    if distiller is not None:
+        optimizer.add_param_group(
+            {"params": list(distiller.student_proj.parameters())})
+
     # ---- Schedule: WSD∞ (warmup→constant peak) or WSD with decay tail. ----
     from train_joint import WSDScheduler
     if args.infinite_lr:
@@ -728,10 +868,14 @@ def main():
 
         avg_loss, tr_cm, nan_skips, n_steps = train_epoch(
             model, head, train_loader, optimizer, device, quiet_thr,
-            target_T, class_weights, args.head, args.lambda_spike, args.grad_clip)
+            target_T, class_weights, args.head, args.lambda_spike, args.grad_clip,
+            use_spectral=args.spectral, use_ordinal=args.ordinal,
+            crit_floor=args.crit_floor, distiller=distiller,
+            lambda_distill=args.lambda_distill)
         scheduler.step()
 
-        val_cm = validate(model, head, val_loader, device, quiet_thr, target_T)
+        val_cm = validate(model, head, val_loader, device, quiet_thr, target_T,
+                          use_spectral=args.spectral)
         m = four_state_metrics(val_cm)
         score = combined_score(m)
 
@@ -746,6 +890,8 @@ def main():
                 "head": _state_dict_to_cpu(head.state_dict()),
                 "head_kind": args.head,
                 "num_states": NUM_STATES,
+                "in_channels": in_channels,
+                "upgrades": upgrades,
                 "quiet_rms_threshold": quiet_thr,
                 "level_table": list(LEVEL_TABLE_4),
                 "cr_table": list(CR_TABLE_4),
@@ -768,6 +914,7 @@ def main():
                 "model": _state_dict_to_cpu(model.state_dict()),
                 "head": _state_dict_to_cpu(head.state_dict()),
                 "head_kind": args.head, "num_states": NUM_STATES,
+                "in_channels": in_channels, "upgrades": upgrades,
                 "quiet_rms_threshold": quiet_thr, "epoch": epoch + 1,
                 "metrics": m,
             }, snap)
