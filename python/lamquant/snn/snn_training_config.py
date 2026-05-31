@@ -155,4 +155,36 @@ SNN_CONFIGS = {
         lr_min=1e-5,
         max_windows_per_file=5,
     ),
+    # run-10 (2026-05-31): SPECIFICITY-rebalanced production. Root cause of the
+    # flooding (time_spec ~0.35 at sens=1.0) is the over-prediction PRIOR: the
+    # sampler hyper-exposes the seizure head to a 50%→18% seizure fraction when
+    # true seizure is ~1% of time, and the loss (tversky fn>>fp, focal) rewards
+    # any positive. ROC diagnostic on run-9: max time_spec @ sens≥0.99 = 0.405
+    # => must RETRAIN for discrimination, not re-threshold. This preset stops
+    # teaching "seizures are everywhere" (sampler → ~natural rate) and penalises
+    # false-positive TIME (tversky_fp up, fn down). Pair with --optimizer esoap
+    # + the base-rate seizure-head bias init (mamba_ssm_minimal). sens has huge
+    # margin (1.0) so trading a little recall for specificity is safe.
+    'production_spec': SNNConfig(
+        name='production_spec',
+        description='run-10 — specificity-rebalanced: sampler→natural prior + '
+                    'tversky penalises FP-time. Target sens~1.0 & time_spec≥0.90.',
+        epochs=250,
+        batch_size=128,
+        lr=1e-3,
+        lr_min=1e-5,
+        max_windows_per_file=5,
+        early_stop_patience=40,
+        # --- rebalance: stop the over-prediction prior (ranks 1-3) ---
+        seizure_batch_frac=0.05,        # was 0.5 — the dominant lever
+        seizure_frac_natural=0.02,      # was 0.18 — anneal target near true rate
+        seizure_frac_anneal_epochs=8,   # was 20 — don't bake in the early flood
+        # --- loss: penalise false-positive TIME (ranks 4-6) ---
+        tversky_fp_weight=0.6,          # was 0.3
+        tversky_fn_weight=0.5,          # was 0.7 (recall-favoring) → balanced
+        seizure_loss_weight=1.0,        # was 1.5 — don't let seizure head monopolise
+        # --- focal: damp the positive over-emphasis (ranks 8-9) ---
+        focal_alpha=0.55,               # was 0.75
+        focal_gamma=1.5,                # was 2.0
+    ),
 }
