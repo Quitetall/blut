@@ -271,4 +271,36 @@ SNN_CONFIGS = {
         focal_alpha=0.6,
         focal_gamma=1.5,
     ),
+    # run-14 (2026-05-31): BIG model. Runs 9-13 capped the frontier at ~0.66-0.70
+    # sens@time_spec>=0.90 across all three lever classes (rebalance, capacity,
+    # regularisation) with a FIXED 57K arch (d_model 40, n_layers 2, d_state 16).
+    # The 57K size was a firmware-budget self-constraint, NOT part of the
+    # accuracy goal. Scale the model ~10x (d_model 96, n_layers 3, d_state 32 ->
+    # ~500K params) to test whether the ceiling is capacity-bound. Paired with
+    # heavy regularisation (wd 1e-2 + SNN_AUG_HEAVY) so the extra capacity
+    # generalises instead of overfitting (run-12's MLP head overfit WITHOUT heavy
+    # reg). Breaks the MCU budget — re-quantise/distil later if it clears 0.90.
+    'production_big': SNNConfig(
+        name='production_big',
+        description='run-14 — 10x model (d_model 96, n_layers 3, d_state 32) + '
+                    'heavy reg; test if the ~0.70 frontier is capacity-bound.',
+        epochs=200,
+        batch_size=96,
+        lr=8e-4,
+        lr_min=1e-5,
+        max_windows_per_file=5,
+        early_stop_patience=60,
+        d_model=96,
+        n_layers=3,
+        d_state=32,
+        weight_decay=1e-2,
+        seizure_batch_frac=0.15,
+        seizure_frac_natural=0.06,
+        seizure_frac_anneal_epochs=12,
+        tversky_fp_weight=0.5,
+        tversky_fn_weight=0.55,
+        seizure_loss_weight=1.1,
+        focal_alpha=0.6,
+        focal_gamma=1.5,
+    ),
 }
