@@ -419,20 +419,89 @@ def calibrate_event_operating_point(
                     if best is None or _better(candidate, best):
                         best = candidate
 
-    if best is not None:
-        return best
-    # No grid point met the floor — return the honest best-effort point.
-    if fallback is not None:
-        return fallback
-    # seqs was empty.
+    # Pick the result: floor-meeting best, else honest fallback, else empty.
+    result = best if best is not None else fallback
+    if result is None:
+        result = {
+            "threshold": float(threshold_grid[0]) if len(threshold_grid) else 0.5,
+            "min_event_sec": float(min_event_sec_grid[0]),
+            "merge_gap_sec": float(merge_gap_sec_grid[0]),
+            "refractory_sec": float(refractory_sec_grid[0]),
+            "event_sens": 0.0,
+            "event_fpr_per_h": 0.0,
+            "meets_floor": False,
+        }
+    # Attach specificity at the chosen operating point (clinical sens/spec pair).
+    if norm_seqs:
+        result.update(specificity_at_operating_point(
+            norm_seqs, result, sec_per_step=sec_per_step))
+    else:
+        result.update({"time_specificity": 0.0, "timestep_specificity": 0.0})
+    return result
+
+
+def _predicted_positive_mask(
+    events: Sequence[Event], n_steps: int, sec_per_step: float
+) -> np.ndarray:
+    """Boolean per-timestep mask of which steps fall inside any predicted event.
+
+    An event ``[start_s, end_s)`` covers timesteps ``[floor(start/dt),
+    ceil(end/dt))`` (clamped to ``[0, n_steps)``).
+    """
+    m = np.zeros(n_steps, dtype=bool)
+    for s, e in events:
+        i0 = max(0, int(np.floor(s / sec_per_step)))
+        i1 = min(n_steps, int(np.ceil(e / sec_per_step)))
+        if i1 > i0:
+            m[i0:i1] = True
+    return m
+
+
+def specificity_at_operating_point(
+    norm_seqs: Sequence[Tuple[np.ndarray, np.ndarray]],
+    op: Dict[str, object],
+    sec_per_step: float = SEC_PER_STEP_L3,
+) -> Dict[str, float]:
+    """Specificity of a calibrated operating point, two granularities.
+
+    Both answer "of the truly-non-seizure portion, how much did we correctly
+    leave un-flagged?" — the clinical complement to event-sensitivity.
+
+    * ``time_specificity`` — uses the POST-PROCESSED predicted events (the same
+      min-duration / merge / refractory the operating point selected). This is
+      the clinically meaningful number: 1 − (non-seizure time covered by an
+      accepted predicted event) / (total non-seizure time). It rewards the
+      post-processing that collapses spurious bursts.
+    * ``timestep_specificity`` — RAW per-timestep at the operating threshold,
+      BEFORE event post-processing: TN / (TN + FP). Always ≤ time_specificity;
+      reported for reference / comparison with per-epoch literature.
+    """
+    thr = float(op["threshold"])
+    min_ev = float(op["min_event_sec"])
+    merge_gap = float(op["merge_gap_sec"])
+    refr = float(op["refractory_sec"])
+
+    neg_total = 0          # timesteps with target == 0 (true negative universe)
+    fp_time = 0            # neg timesteps covered by an accepted predicted event
+    raw_fp = 0             # neg timesteps with prob >= thr (pre post-proc)
+    for p, t in norm_seqs:
+        neg = ~t
+        n_neg = int(neg.sum())
+        if n_neg == 0:
+            continue
+        neg_total += n_neg
+        pred_events = events_from_probs(
+            p, threshold=thr, sec_per_step=sec_per_step,
+            min_event_sec=min_ev, merge_gap_sec=merge_gap, refractory_sec=refr)
+        pred_mask = _predicted_positive_mask(pred_events, p.shape[0], sec_per_step)
+        fp_time += int((pred_mask & neg).sum())
+        raw_fp += int(((p >= thr) & neg).sum())
+
+    if neg_total == 0:
+        return {"time_specificity": 1.0, "timestep_specificity": 1.0}
     return {
-        "threshold": float(threshold_grid[0]) if len(threshold_grid) else 0.5,
-        "min_event_sec": float(min_event_sec_grid[0]),
-        "merge_gap_sec": float(merge_gap_sec_grid[0]),
-        "refractory_sec": float(refractory_sec_grid[0]),
-        "event_sens": 0.0,
-        "event_fpr_per_h": 0.0,
-        "meets_floor": False,
+        "time_specificity": float(1.0 - fp_time / neg_total),
+        "timestep_specificity": float(1.0 - raw_fp / neg_total),
     }
 
 

@@ -170,6 +170,10 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--sens-floor", type=float, default=0.85,
                         help="Required event-sensitivity (PCCP floor 0.85)")
+    parser.add_argument("--spec-target", type=float, default=0.90,
+                        help="Clinical time-specificity target (default 0.90). "
+                             "Reported as OK/LOW; does not gate the operating "
+                             "point (selection still minimizes FPR/h).")
     parser.add_argument("--sec-per-step", type=float, default=SEC_PER_STEP_L3,
                         help="Seconds per L3 timestep (default 10/313)")
     parser.add_argument("--max-windows-per-file", type=int, default=100000,
@@ -244,15 +248,26 @@ def main() -> None:
     op = calibrate_event_operating_point(
         seqs, sens_floor=args.sens_floor, sec_per_step=args.sec_per_step)
 
+    time_spec = float(op.get("time_specificity", float("nan")))
+    step_spec = float(op.get("timestep_specificity", float("nan")))
     print("\n[*] Clinical operating point (NEDC OVLP, event-level):")
     print(f"    threshold       = {op['threshold']:.3f}")
     print(f"    min_event_sec   = {op['min_event_sec']:.1f}")
     print(f"    merge_gap_sec   = {op['merge_gap_sec']:.1f}")
     print(f"    refractory_sec  = {op['refractory_sec']:.1f}")
     print(f"    event_sens      = {op['event_sens']:.4f}")
+    print(f"    time_spec       = {time_spec:.4f}  "
+          f"(non-seizure time left un-flagged; clinical specificity)")
+    print(f"    timestep_spec   = {step_spec:.4f}  (raw per-step, pre-postproc)")
     print(f"    event_FPR/h     = {op['event_fpr_per_h']:.4f}")
     print(f"    meets_floor     = {op['meets_floor']} "
-          f"(floor={args.sens_floor})")
+          f"(sens_floor={args.sens_floor})")
+    # Clinical target: sens ~1.0 AND specificity >= 0.90.
+    sens_ok = op["event_sens"] >= args.sens_floor
+    spec_ok = time_spec >= args.spec_target
+    print(f"    TARGET sens~1.0 & spec>={args.spec_target:.2f}: "
+          f"sens={'OK' if sens_ok else 'LOW'} "
+          f"time_spec={'OK' if spec_ok else 'LOW'}")
 
 
 if __name__ == "__main__":
