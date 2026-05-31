@@ -403,7 +403,10 @@ def calibrate_event_operating_point(
                         pooled_false += sc["n_false_pred"]
                         # Time-based FP: fraction of non-seizure TIME a predicted
                         # event covers. Robust to the long-event gaming of FPR/h.
-                        neg = ~t
+                        # (t == 0) not ~t — bulletproof if t is int-typed (~int
+                        # is bitwise NOT, not logical); norm_seqs casts to bool
+                        # already, but be explicit.
+                        neg = (t == 0)
                         n_neg = int(neg.sum())
                         if n_neg:
                             neg_total += n_neg
@@ -460,6 +463,8 @@ def calibrate_event_operating_point(
             "refractory_sec": float(refractory_sec_grid[0]),
             "event_sens": 0.0,
             "event_fpr_per_h": 0.0,
+            "time_specificity": 0.0,
+            "cost": float(fn_weight) + 1.0,
             "meets_floor": False,
         }
     # Attach specificity at the chosen operating point (clinical sens/spec pair).
@@ -516,7 +521,7 @@ def specificity_at_operating_point(
     fp_time = 0            # neg timesteps covered by an accepted predicted event
     raw_fp = 0             # neg timesteps with prob >= thr (pre post-proc)
     for p, t in norm_seqs:
-        neg = ~t
+        neg = (t == 0)
         n_neg = int(neg.sum())
         if n_neg == 0:
             continue

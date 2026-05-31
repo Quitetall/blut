@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Rank SNN checkpoints by the weighted clinical cost J.
 
-J = w_fn * (1 - event_sens) + event_FPR_per_h   (lower = better)
+J = w_fn * (1 - event_sens) + (1 - time_specificity)   (lower = better)
 
-w_fn is how many false-alarms/hour a missed seizure is worth (default 100).
-Parses the per-model event-eval logs written by eval_event_fpr.py and prints a
-ranked table. Robust to logs that predate the in-eval COST line — it recomputes
-J from the reported event_sens + event_FPR/h.
+Both terms are fractions; w_fn (default 100) weights a missed seizure ~w_fn x a
+unit of false-positive TIME. (1 - time_spec) is used, NOT event-FPR/h, because
+FPR/h is gameable by one long flooding event. Parses the per-model event-eval
+logs from eval_event_fpr.py. Logs that predate time_spec fall back to FPR/h and
+are flagged as not-comparable (their J is on a different scale).
 """
 from __future__ import annotations
 
@@ -62,14 +63,16 @@ def main() -> None:
     done = [(n, d) for n, d in rows if d is not None]
     done.sort(key=lambda r: r[1]["J"])
 
-    print(f"=== Leaderboard (J = {args.fn_weight:g}*FNR + FPR/h, lower=better) ===")
+    print(f"=== Leaderboard (J = {args.fn_weight:g}*FNR + (1-time_spec), "
+          f"lower=better) ===")
     print(f"{'rank':<5}{'model':<22}{'sens':>7}{'FNR':>8}{'FPR/h':>9}"
-          f"{'time_spec':>11}{'hours':>8}{'J':>10}")
+          f"{'time_spec':>11}{'hours':>8}{'J':>10}  note")
     for i, (name, d) in enumerate(done, 1):
         ts = d.get("time_spec", float("nan"))
         hr = d.get("hours", float("nan"))
+        note = d.get("J_note", "")
         print(f"{i:<5}{name:<22}{d['event_sens']:>7.4f}{d['fnr']:>8.4f}"
-              f"{d['fpr']:>9.3f}{ts:>11.4f}{hr:>8.1f}{d['J']:>10.3f}")
+              f"{d['fpr']:>9.3f}{ts:>11.4f}{hr:>8.1f}{d['J']:>10.3f}  {note}")
     pending = [n for n, d in rows if d is None]
     if pending:
         print(f"\npending/unparsed: {', '.join(pending)}")
