@@ -75,11 +75,22 @@ def main() -> None:
     corpora: Dict[str, Dict[str, dict]] = {}
     for a in args.archive:
         name = a.stem  # chbmit.lma -> chbmit
-        corpora[name] = build_lma_entry_index([str(a)])
+        try:
+            corpora[name] = build_lma_entry_index([str(a)])
+        except Exception as e:  # noqa: BLE001
+            print(f"[!] index failed for {name}: {str(e)[:160]}; skipping")
     for d in args.recording_dir:
         name = d.name
-        # A dir of per-recording .lma: index unions them under one corpus.
-        corpora[name] = build_lma_entry_index([str(d)])
+        # A dir of per-recording .lma: glob the files (two-then-one level,
+        # mirroring the trainer's union) and index them under one corpus.
+        found = sorted(d.glob("*/*.lma")) or sorted(d.glob("*.lma"))
+        if not found:
+            print(f"[!] no .lma under {d}; skipping")
+            continue
+        try:
+            corpora[name] = build_lma_entry_index([str(p) for p in found])
+        except Exception as e:  # noqa: BLE001
+            print(f"[!] index failed for {name}: {str(e)[:160]}; skipping")
 
     report: Dict[str, dict] = {}
     for corpus, index in corpora.items():
