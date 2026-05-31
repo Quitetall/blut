@@ -116,7 +116,12 @@ def _sinksoaph_direction(
     """
     G = grad.float()
 
-    # First-order momentum EMA + optional Nesterov blend.
+    # A non-finite grad would permanently poison the Gram/momentum EMAs (the
+    # eigenbasis never recovers); skip this matrix's update instead.
+    if not torch.isfinite(G).all():
+        return torch.zeros_like(G)
+
+    # First-order momentum EMA + optional Nesterov-style (Muon-convention) blend.
     momentum.lerp_(G, 1.0 - mu)
     M = G.lerp(momentum, mu) if nesterov else momentum.clone()
 
@@ -268,7 +273,9 @@ class SinkSOAPH(torch.optim.Optimizer):
                 if method == "sinksoaph":
                     if len(state) == 0:
                         m, n = p.shape
-                        state["momentum"] = torch.zeros_like(p)
+                        # float32 momentum (matches grams) — no bf16 EMA drift.
+                        state["momentum"] = torch.zeros_like(
+                            p, dtype=torch.float32)
                         state["left_gram"] = torch.zeros(
                             (m, m), device=p.device, dtype=torch.float32)
                         state["right_gram"] = torch.zeros(

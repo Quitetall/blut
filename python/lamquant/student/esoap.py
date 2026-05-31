@@ -61,8 +61,10 @@ def _newton_schulz5(G: Tensor, steps: int, eps: float) -> Tensor:
     a, b, c = 3.4445, -4.7750, 2.0315
     X = G.float()
     norm = X.norm()
-    if float(norm) == 0.0:
-        return X
+    # Threshold, not == 0: a subnormal-but-nonzero norm would make X/(norm+eps)
+    # explode to O(1e8) and the quintic NS iterations then diverge to NaN.
+    if float(norm) < eps:
+        return torch.zeros_like(X)
     X = X / (norm + eps)
     transpose = X.shape[0] > X.shape[1]
     if transpose:
@@ -97,8 +99,17 @@ def _esoap_direction(
     """
     G = grad.float()
     m, n = G.shape
+    assert v_lead.shape[1] == max(1, min(rank, n)), (
+        f"v_lead width {v_lead.shape[1]} != rank {rank} (rank_frac changed "
+        "mid-training? state shape is fixed at init)")
 
-    # First-order momentum + Nesterov blend.
+    # A non-finite grad would poison the Gram/v_lead/momentum EMAs permanently
+    # (the eigenbasis never recovers). Skip the update on this matrix instead.
+    if not torch.isfinite(G).all():
+        return torch.zeros_like(G)
+
+    # First-order momentum + Nesterov-style (Muon-convention) blend: this is the
+    # Muon momentum mix, not textbook Nesterov lookahead.
     momentum.lerp_(G, 1.0 - mu)
     M = G.lerp(momentum, mu) if nesterov else momentum.clone()
 
@@ -221,7 +232,11 @@ class ESOAP(torch.optim.Optimizer):
                     r = max(1, round(n * group["rank_frac"]))
                     r = min(r, n)
                     if len(state) == 0:
-                        state["momentum"] = torch.zeros_like(p)
+                        # All EMA state in float32 (momentum included) so a
+                        # future bf16/half run can't accumulate truncation error
+                        # in the momentum tracker — matches gram/v_lead + Muon.
+                        state["momentum"] = torch.zeros_like(
+                            p, dtype=torch.float32)
                         state["gram"] = torch.zeros(
                             (n, n), device=p.device, dtype=torch.float32)
                         state["v_lead"] = torch.zeros(
