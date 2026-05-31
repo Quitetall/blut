@@ -1157,7 +1157,8 @@ def main():
     parser.add_argument('--resume', type=str, default=None,
                         help='Resume from checkpoint (loads model + optimizer)')
     parser.add_argument('--optimizer',
-                        choices=['adamw', 'soap', 'sinksoaph', 'cosmos'],
+                        choices=['adamw', 'soap', 'sinksoaph', 'esoap',
+                                 'cosmos'],
                         default='adamw',
                         help='Optimizer for the optimizer A/B (#71). '
                              "'adamw' (default) preserves current behavior. "
@@ -1580,6 +1581,34 @@ def main():
             [
                 {"params": sink_linear, "method": "sinksoaph",
                  "weight_decay": 0.0},
+                {"params": adamw_rest, "method": "adamw",
+                 "weight_decay": cfg.weight_decay},
+            ],
+            lr=cfg.lr, betas=(0.9, 0.95), weight_decay=cfg.weight_decay)
+    elif args.optimizer == 'esoap':
+        # CLEAN-ROOM COSMOS-principle arm: SOAP/Adam on the leading column
+        # eigensubspace + Muon orthogonalization on the tail, on the same 13
+        # hidden linear matrices; AdamW on SSM dynamics + heads + non-2D.
+        # Implemented from arXiv:2502.17410's stated principle only — no upstream
+        # COSMOS code used; `--optimizer cosmos` stays hard-gated below.
+        sys.path.insert(0, os.path.join(ROOT_DIR, 'lamquant', 'student'))
+        from esoap import ESOAP
+        _linear_suffixes = ('in_proj.weight', 'x_proj.weight',
+                            'out_proj.weight', 'spatial_mix.weight')
+        esoap_linear, adamw_rest = [], []
+        for nm, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim == 2 and nm.endswith(_linear_suffixes):
+                esoap_linear.append(p)
+            else:
+                adamw_rest.append(p)
+        print(f"[*] ESOAP grouping: {len(esoap_linear)} linear matrices "
+              f"-> SOAP-lead+Muon-tail; {len(adamw_rest)} params -> AdamW")
+        optimizer = ESOAP(
+            [
+                {"params": esoap_linear, "method": "esoap",
+                 "weight_decay": cfg.weight_decay},
                 {"params": adamw_rest, "method": "adamw",
                  "weight_decay": cfg.weight_decay},
             ],
