@@ -1235,8 +1235,19 @@ def main():
     print(f"[*] Parameters: {n_params:,}")
     print(f"[*] Firmware size: {model.param_size_kb(bits=8):.1f} KB (INT8), "
           f"{model.param_size_kb(bits=2):.1f} KB (W2A8)")
-    assert model.param_size_kb(bits=8) <= 64, \
-        f"Model exceeds 64 KB budget at INT8: {model.param_size_kb(bits=8):.1f} KB"
+    _size_kb = model.param_size_kb(bits=8)
+    if _size_kb > 64:
+        # The 64 KB INT8 ceiling is the MCU firmware budget, NOT an accuracy
+        # constraint. Capacity-ceiling experiments (run-14+) deliberately exceed
+        # it to test whether the discrimination frontier is capacity-bound; such
+        # a model is NOT firmware-deployable and must be opted in explicitly.
+        if os.environ.get("SNN_ALLOW_BIG") != "1":
+            raise AssertionError(
+                f"Model exceeds 64 KB budget at INT8: {_size_kb:.1f} KB. "
+                f"Set SNN_ALLOW_BIG=1 to train a non-firmware (research) model."
+            )
+        print(f"[!] SNN_ALLOW_BIG=1 — {_size_kb:.1f} KB > 64 KB MCU budget; "
+              f"this checkpoint is NOT firmware-deployable.")
 
     # ---- Train/val split ----
     excluded = None
