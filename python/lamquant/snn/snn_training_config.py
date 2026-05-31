@@ -216,4 +216,31 @@ SNN_CONFIGS = {
         focal_alpha=0.6,
         focal_gamma=1.5,
     ),
+    # run-12 (2026-05-31): MODERATE rebalance, paired with the deeper MLP seizure
+    # head (LayerNorm+2-layer+dropout) and a softer -0.5 head bias. The rebalance
+    # frontier climbed 0.453->0.596->0.695 sens@time_spec>=0.90 (runs 9-11) but
+    # decelerated and none could reach sens>=0.99 (too skeptical to catch hard
+    # seizures). The MLP head adds the discrimination capacity to push the
+    # frontier; this preset eases the sampler/loss skepticism so sens=1.0 stays
+    # reachable. Run with SNN_SEIZURE_HEAD=mlp (default), SNN_SEIZURE_BIAS=-0.5,
+    # SNN_SNAPSHOT_EVERY=20.
+    'production_spec3': SNNConfig(
+        name='production_spec3',
+        description='run-12 — moderate rebalance + deep MLP seizure head; push '
+                    'the discrimination frontier toward the sens~1.0/spec 0.90 corner.',
+        epochs=250,
+        batch_size=128,
+        lr=1e-3,
+        lr_min=1e-5,
+        max_windows_per_file=5,
+        early_stop_patience=70,
+        seizure_batch_frac=0.18,        # run-11 0.12 -> 0.18 (more seizure signal)
+        seizure_frac_natural=0.06,
+        seizure_frac_anneal_epochs=12,
+        tversky_fp_weight=0.45,         # run-11 0.5 -> 0.45 (ease FP suppression)
+        tversky_fn_weight=0.6,
+        seizure_loss_weight=1.1,
+        focal_alpha=0.6,
+        focal_gamma=1.5,
+    ),
 }
