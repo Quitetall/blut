@@ -76,6 +76,11 @@ _TUEV_STEM_RE = re.compile(r"^(?P<subject>[A-Za-z]+)_\d{8}$")
 _CHBMIT_STEM_RE = re.compile(r"^(?P<subject>chb\d+)_\d+$")
 _SIENA_STEM_RE = re.compile(r"^(?P<subject>PN\d+)[-_]\d+", re.IGNORECASE)
 _HELSINKI_STEM_RE = re.compile(r"^(?P<subject>helsinki_eeg\d+)$")
+#   TUEV events:     <class>_<NNN>_<x>_  (gped_009_a_) -> subject <class>_<NNN>
+#                    (each class/session excerpt is its own recording; group by
+#                    class+session so the patient-split keeps a session's
+#                    excerpts together).
+_TUEV_EVENT_STEM_RE = re.compile(r"^(?P<subject>[a-z]+_\d+)_")
 
 SPLITS = ("train", "val", "test", "external_test")
 
@@ -83,7 +88,7 @@ SPLITS = ("train", "val", "test", "external_test")
 def subject_of(stem: str) -> str:
     """Extract the patient/subject id from a stem across all supported corpora."""
     for rx in (_STEM_RE, _TUEV_STEM_RE, _CHBMIT_STEM_RE, _SIENA_STEM_RE,
-               _HELSINKI_STEM_RE):
+               _HELSINKI_STEM_RE, _TUEV_EVENT_STEM_RE):
         m = rx.match(stem)
         if m:
             return m.group("subject")
