@@ -299,8 +299,20 @@ def calibrate_event_operating_point(
     min_event_sec_grid: Sequence[float] = (2.0, 5.0, 10.0),
     merge_gap_sec_grid: Sequence[float] = (2.0, 5.0, 10.0),
     refractory_sec_grid: Sequence[float] = (0.0, 5.0, 10.0),
+    select_by: str = "cost",
+    fn_weight: float = 100.0,
 ) -> Dict[str, object]:
     """Sweep the post-processing grid for the best clinical operating point.
+
+    ``select_by`` chooses the objective minimized over the grid:
+      * ``"cost"`` (default): J = ``fn_weight``·(1−event_sens) + (1−time_spec).
+        Both terms are fractions; FN is weighted ``fn_weight``× a unit of
+        false-positive TIME. This is the clinically honest objective — it
+        cannot be gamed by a single long "event" the way event-FPR/h can
+        (flooding drives time_spec→0 → cost explodes). Each grid point's
+        ``time_spec`` is computed from the post-processed predicted events.
+      * ``"fpr"``: legacy — among points with event_sens ≥ ``sens_floor``,
+        minimize event-FPR/h. Gameable; kept for back-compat / comparison.
 
     The events MUST be found within each contiguous recording — never across
     a flattened val set — because an event that "spans" the boundary between
@@ -376,7 +388,9 @@ def calibrate_event_operating_point(
                     pooled_true = 0
                     pooled_true_detected = 0
                     pooled_false = 0
-                    for (p, _t), true_events in zip(norm_seqs, true_events_per_rec):
+                    fp_time = 0          # neg timesteps inside a predicted event
+                    neg_total = 0        # total neg timesteps (time-spec denom)
+                    for (p, t), true_events in zip(norm_seqs, true_events_per_rec):
                         pred_events = events_from_probs(
                             p, threshold=float(thr), sec_per_step=sec_per_step,
                             min_event_sec=float(min_ev),
@@ -387,12 +401,23 @@ def calibrate_event_operating_point(
                         pooled_true += sc["n_true"]
                         pooled_true_detected += sc["n_true_detected"]
                         pooled_false += sc["n_false_pred"]
+                        # Time-based FP: fraction of non-seizure TIME a predicted
+                        # event covers. Robust to the long-event gaming of FPR/h.
+                        neg = ~t
+                        n_neg = int(neg.sum())
+                        if n_neg:
+                            neg_total += n_neg
+                            pmask = _predicted_positive_mask(
+                                pred_events, p.shape[0], sec_per_step)
+                            fp_time += int((pmask & neg).sum())
 
                     event_sens = (
                         pooled_true_detected / pooled_true
                         if pooled_true > 0 else 0.0
                     )
                     event_fpr_h = event_fpr_per_hour(pooled_false, total_seconds)
+                    time_spec = (1.0 - fp_time / neg_total) if neg_total else 1.0
+                    cost = fn_weight * (1.0 - event_sens) + (1.0 - time_spec)
                     candidate = {
                         "threshold": float(thr),
                         "min_event_sec": float(min_ev),
@@ -400,22 +425,28 @@ def calibrate_event_operating_point(
                         "refractory_sec": float(refr),
                         "event_sens": float(event_sens),
                         "event_fpr_per_h": float(event_fpr_h),
+                        "time_specificity": float(time_spec),
+                        "cost": float(cost),
                         "meets_floor": bool(event_sens >= sens_floor),
                     }
 
-                    # Fallback: keep the highest-sensitivity point seen so a
-                    # run that never clears the floor still reports its best.
+                    if select_by == "cost":
+                        # Minimize J = fn_weight*FNR + (1-time_spec). Ties ->
+                        # higher time_spec, then higher sens, then higher thr
+                        # (less permissive = safer against flooding).
+                        if best is None or _better_cost(candidate, best):
+                            best = candidate
+                        continue
+
+                    # Legacy FPR-min path (select_by == "fpr").
                     if (fallback is None
                             or candidate["event_sens"] > fallback["event_sens"]
                             or (candidate["event_sens"] == fallback["event_sens"]
                                 and candidate["event_fpr_per_h"]
                                 < fallback["event_fpr_per_h"])):
                         fallback = candidate
-
                     if not candidate["meets_floor"]:
                         continue
-                    # Floor-meeting: minimize FPR/h, then maximize sens,
-                    # then prefer the lower (more permissive) threshold.
                     if best is None or _better(candidate, best):
                         best = candidate
 
@@ -503,6 +534,20 @@ def specificity_at_operating_point(
         "time_specificity": float(1.0 - fp_time / neg_total),
         "timestep_specificity": float(1.0 - raw_fp / neg_total),
     }
+
+
+def _better_cost(cand: Dict[str, object], cur: Dict[str, object]) -> bool:
+    """Ranking for select_by='cost'. Lower J wins; ties -> higher time_spec,
+    then higher sens, then HIGHER threshold (less permissive = safer)."""
+    if cand["cost"] < cur["cost"]:
+        return True
+    if cand["cost"] > cur["cost"]:
+        return False
+    if cand["time_specificity"] != cur["time_specificity"]:
+        return cand["time_specificity"] > cur["time_specificity"]
+    if cand["event_sens"] != cur["event_sens"]:
+        return cand["event_sens"] > cur["event_sens"]
+    return cand["threshold"] > cur["threshold"]
 
 
 def _better(cand: Dict[str, object], cur: Dict[str, object]) -> bool:

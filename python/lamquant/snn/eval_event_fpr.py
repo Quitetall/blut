@@ -174,6 +174,11 @@ def main() -> None:
                         help="Clinical time-specificity target (default 0.90). "
                              "Reported as OK/LOW; does not gate the operating "
                              "point (selection still minimizes FPR/h).")
+    parser.add_argument("--fn-weight", type=float, default=100.0,
+                        help="False-negative weight w_fn for the ranking cost "
+                             "J = w_fn*(1-event_sens) + FPR/h. Default 100: a "
+                             "missed seizure is weighted ~100 false-alarms/h. "
+                             "Lower J = better. At sens=1.0, J == FPR/h.")
     parser.add_argument("--sec-per-step", type=float, default=SEC_PER_STEP_L3,
                         help="Seconds per L3 timestep (default 10/313)")
     parser.add_argument("--max-windows-per-file", type=int, default=100000,
@@ -246,7 +251,8 @@ def main() -> None:
               f"Current cap = {args.max_windows_per_file}.")
 
     op = calibrate_event_operating_point(
-        seqs, sens_floor=args.sens_floor, sec_per_step=args.sec_per_step)
+        seqs, sens_floor=args.sens_floor, sec_per_step=args.sec_per_step,
+        select_by="cost", fn_weight=args.fn_weight)
 
     time_spec = float(op.get("time_specificity", float("nan")))
     step_spec = float(op.get("timestep_specificity", float("nan")))
@@ -268,6 +274,14 @@ def main() -> None:
     print(f"    TARGET sens~1.0 & spec>={args.spec_target:.2f}: "
           f"sens={'OK' if sens_ok else 'LOW'} "
           f"time_spec={'OK' if spec_ok else 'LOW'}")
+    # Single rankable cost (the operating point was SELECTED to minimize it):
+    # J = w_fn*FNR + (1 - time_spec). Both fractions; FN weighted w_fn-times a
+    # unit of false-positive TIME. Immune to the long-event gaming of FPR/h.
+    fnr = 1.0 - float(op["event_sens"])
+    J = float(op.get("cost", args.fn_weight * fnr + (1.0 - time_spec)))
+    print(f"    COST J          = {J:.4f}  "
+          f"(w_fn={args.fn_weight:g}*FNR[{fnr:.4f}] + (1-time_spec)[{1.0-time_spec:.4f}]; "
+          f"lower=better)")
 
 
 if __name__ == "__main__":
