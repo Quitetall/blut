@@ -285,7 +285,7 @@ SNN_CONFIGS = {
         description='run-14 — 10x model (d_model 96, n_layers 3, d_state 32) + '
                     'heavy reg; test if the ~0.70 frontier is capacity-bound.',
         epochs=200,
-        batch_size=96,
+        batch_size=48,  # bs96 OOMs: scan tensor [B,T,D,N] @ d_inner=192 peaks ~16 GB
         lr=8e-4,
         lr_min=1e-5,
         max_windows_per_file=5,
