@@ -66,17 +66,24 @@ import numpy as np
 #   TUEV events:     <subject>_<8-digit session id>
 #   CHB-MIT:         chbNN_NN  -> subject chbNN
 #   Siena:           PNNN-N    -> subject PNNN
+#   Helsinki:        helsinki_eegN -> subject helsinki_eegN (one recording per
+#                    neonate; each eegN is a distinct individual, so the whole
+#                    stem IS the subject. Without this the generic fallback
+#                    collapses all 79 neonates to subject "helsinki" -> a single
+#                    split, leaking every neonate into one bucket.)
 _STEM_RE = re.compile(r"^(?P<subject>[A-Za-z0-9]+)_s\d+_t\d+$")
 _TUEV_STEM_RE = re.compile(r"^(?P<subject>[A-Za-z]+)_\d{8}$")
 _CHBMIT_STEM_RE = re.compile(r"^(?P<subject>chb\d+)_\d+$")
 _SIENA_STEM_RE = re.compile(r"^(?P<subject>PN\d+)[-_]\d+", re.IGNORECASE)
+_HELSINKI_STEM_RE = re.compile(r"^(?P<subject>helsinki_eeg\d+)$")
 
 SPLITS = ("train", "val", "test", "external_test")
 
 
 def subject_of(stem: str) -> str:
     """Extract the patient/subject id from a stem across all supported corpora."""
-    for rx in (_STEM_RE, _TUEV_STEM_RE, _CHBMIT_STEM_RE, _SIENA_STEM_RE):
+    for rx in (_STEM_RE, _TUEV_STEM_RE, _CHBMIT_STEM_RE, _SIENA_STEM_RE,
+               _HELSINKI_STEM_RE):
         m = rx.match(stem)
         if m:
             return m.group("subject")
