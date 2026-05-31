@@ -243,4 +243,32 @@ SNN_CONFIGS = {
         focal_alpha=0.6,
         focal_gamma=1.5,
     ),
+    # run-13 (2026-05-31): GENERALISATION attack. runs 9-12 plateaued the
+    # frontier at ~0.70 sens@time_spec>=0.90 with a severe train/val sensitivity
+    # gap (train ~0.75, val ~0.38) — the model MEMORISES train seizures and does
+    # not transfer to val subjects. Capacity (run-12 MLP head) made it worse
+    # (overfit). The fix for a generalisation gap is regularisation, not more
+    # knobs: 100x weight decay + heavy subject-variability augmentation
+    # (SNN_AUG_HEAVY=1) + the simpler single-Linear head (SNN_SEIZURE_HEAD=linear,
+    # the MLP overfit). Same run-11 centered rebalance otherwise.
+    'production_spec4': SNNConfig(
+        name='production_spec4',
+        description='run-13 — heavy regularisation (wd 1e-2 + strong aug) to '
+                    'close the train/val seizure-generalisation gap.',
+        epochs=250,
+        batch_size=128,
+        lr=1e-3,
+        lr_min=1e-5,
+        max_windows_per_file=5,
+        early_stop_patience=70,
+        weight_decay=1e-2,              # was 1e-4 — 100x, fight memorisation
+        seizure_batch_frac=0.15,
+        seizure_frac_natural=0.06,
+        seizure_frac_anneal_epochs=12,
+        tversky_fp_weight=0.5,
+        tversky_fn_weight=0.55,
+        seizure_loss_weight=1.1,
+        focal_alpha=0.6,
+        focal_gamma=1.5,
+    ),
 }

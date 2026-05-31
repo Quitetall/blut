@@ -505,32 +505,44 @@ def _augment_eeg(signal, p_channel_drop=0.15, p_amplitude=0.5, p_noise=0.5,
     """In-place EEG augmentation for SNN training.
 
     Applied per-batch on GPU. Does not modify labels (label-preserving).
-      - Channel dropout: zero out 1-3 random channels (simulates bad electrodes)
-      - Amplitude scaling: per-channel scale 0.7-1.3x (simulates gain variation)
-      - Gaussian noise: additive noise at 5% signal std (simulates ADC noise)
+      - Channel dropout: zero out random channels (simulates bad electrodes)
+      - Amplitude scaling: per-channel scale (simulates gain variation)
+      - Gaussian noise: additive noise (simulates ADC noise)
       - Time shift: circular shift ±50 samples (simulates onset jitter)
+
+    run-13 (2026-05-31): SNN_AUG_HEAVY=1 cranks every knob to attack the
+    train/val generalisation gap (train sens ~0.75 vs val ~0.38) that capped the
+    discrimination frontier at ~0.70 sens@90%-spec. Heavier subject-variability
+    augmentation should force seizure features that transfer across subjects.
     """
+    import os as _os
+    heavy = _os.environ.get("SNN_AUG_HEAVY") == "1"
+    if heavy:
+        p_channel_drop, p_amplitude, p_noise, p_time_shift = 0.4, 0.7, 0.7, 0.5
+        max_drop, amp_lo, amp_span, noise_frac, shift_max = 6, 0.5, 1.0, 0.10, 100
+    else:
+        max_drop, amp_lo, amp_span, noise_frac, shift_max = 4, 0.7, 0.6, 0.05, 50
     B, C, T = signal.shape
 
-    # Channel dropout: zero 1-3 channels per sample
+    # Channel dropout: zero random channels per batch
     if torch.rand(1).item() < p_channel_drop:
-        n_drop = torch.randint(1, 4, (1,)).item()
+        n_drop = torch.randint(1, max_drop, (1,)).item()
         drop_idx = torch.randperm(C)[:n_drop]
         signal[:, drop_idx, :] = 0.0
 
     # Amplitude scaling: per-channel, per-sample
     if torch.rand(1).item() < p_amplitude:
-        scale = 0.7 + 0.6 * torch.rand(B, C, 1, device=signal.device)
+        scale = amp_lo + amp_span * torch.rand(B, C, 1, device=signal.device)
         signal = signal * scale
 
     # Gaussian noise
     if torch.rand(1).item() < p_noise:
-        std = signal.std() * 0.05
+        std = signal.std() * noise_frac
         signal = signal + torch.randn_like(signal) * std
 
-    # Time shift: circular shift ±50 samples
+    # Time shift: circular shift ± shift_max samples
     if torch.rand(1).item() < p_time_shift:
-        shift = torch.randint(-50, 51, (1,)).item()
+        shift = torch.randint(-shift_max, shift_max + 1, (1,)).item()
         signal = torch.roll(signal, shifts=shift, dims=-1)
 
     return signal
