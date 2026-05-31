@@ -187,4 +187,33 @@ SNN_CONFIGS = {
         focal_alpha=0.55,               # was 0.75
         focal_gamma=1.5,                # was 2.0
     ),
+    # run-11 (2026-05-31): CENTERED rebalance. run-10 (production_spec) proved
+    # the direction is right — the discrimination frontier improved (max sens @
+    # time_spec>=0.90 went 0.453 (run-9) -> 0.596 (run-10), sens 0.90 ↔ spec
+    # 0.63 -> 0.78) — but it OVER-corrected (could not reach sens>=0.99, maxed
+    # 0.978) AND the saved checkpoint was epoch 16 (undertrained; the window-
+    # spec-at-floor selection rewards early skeptical epochs). run-11 backs the
+    # knobs partway toward run-9 so sensitivity recovers to ~1.0 while keeping
+    # most of the specificity gain, pairs with the softened -1.0 head bias, and
+    # is meant to TRAIN FULLY (no early kill) with periodic checkpoints so the
+    # real best epoch is chosen by the event-level eval, not the window proxy.
+    'production_spec2': SNNConfig(
+        name='production_spec2',
+        description='run-11 — centered rebalance: recover sens to ~1.0 while '
+                    'holding the run-10 specificity-frontier gain.',
+        epochs=250,
+        batch_size=128,
+        lr=1e-3,
+        lr_min=1e-5,
+        max_windows_per_file=5,
+        early_stop_patience=60,         # looser — skeptical init learns slowly
+        seizure_batch_frac=0.12,        # run-10 0.05 -> 0.12 (recover sens)
+        seizure_frac_natural=0.05,      # run-10 0.02 -> 0.05
+        seizure_frac_anneal_epochs=10,
+        tversky_fp_weight=0.5,          # run-10 0.6 -> 0.5 (less FP suppression)
+        tversky_fn_weight=0.55,         # run-10 0.5 -> 0.55 (a bit more recall)
+        seizure_loss_weight=1.1,
+        focal_alpha=0.6,
+        focal_gamma=1.5,
+    ),
 }

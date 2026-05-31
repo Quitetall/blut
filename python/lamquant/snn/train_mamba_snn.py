@@ -1751,6 +1751,23 @@ def main():
         else:
             epochs_since_best += 1
 
+        # Periodic snapshots (run-11 2026-05-31): the window-spec-at-floor
+        # "best" selection rewards undertrained early-skeptical epochs (run-10
+        # saved ep16). Save a snapshot every `snapshot_every` epochs + the final
+        # epoch so the REAL best can be chosen post-hoc by the event-level eval.
+        _snap_every = int(os.environ.get("SNN_SNAPSHOT_EVERY", "0"))
+        if _snap_every > 0 and (
+                (epoch + 1) % _snap_every == 0 or epoch + 1 == cfg.epochs):
+            _snap_path = f"{os.path.splitext(save_path)[0]}_ep{epoch+1}.pt"
+            _async_save({
+                'model': _state_dict_to_cpu(model.state_dict()),
+                'epoch': epoch + 1,
+                'sensitivity': val_sens,
+                'specificity': val_spec,
+                'config': cfg.to_dict(),
+                'seizure_pos_weight': seizure_pos_weight,
+            }, _snap_path)
+
         elapsed = _time.time() - train_start
         epochs_done = epoch - start_epoch + 1
         remaining = elapsed / max(epochs_done, 1) * (cfg.epochs - epoch - 1)
