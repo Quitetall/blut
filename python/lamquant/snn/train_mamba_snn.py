@@ -1129,6 +1129,12 @@ def main():
     parser.add_argument('--seizure-frac-anneal-epochs', type=int, default=None,
                         help='B3: epochs to anneal seizure fraction from start '
                              'toward natural ~0.18 (default 20)')
+    parser.add_argument('--seizure-frac-natural', type=float, default=None,
+                        help='B3: seizure-window fraction the curriculum anneals '
+                             'TO. Set == --seizure-batch-frac to disable the '
+                             'down-anneal (constant fraction) — prevents the '
+                             'seizure head atrophying into a background-predictor '
+                             'after the anneal completes (scarce-seizure regime).')
     parser.add_argument('--sens-floor', type=float, default=None,
                         help='A8: checkpoint-selection sensitivity floor '
                              '(default 0.85, the PCCP floor)')
@@ -1193,6 +1199,7 @@ def main():
                   'd_model', 'd_state', 'n_layers', 'max_windows_per_file',
                   'warmup_frac', 'logit_scale', 'grad_clip',
                   'seizure_batch_frac', 'seizure_frac_anneal_epochs',
+                  'seizure_frac_natural',
                   'sens_floor', 'early_stop_patience', 'no_wd_dynamics',
                   'abort_on_collapse'):
         val = getattr(args, field, None)
