@@ -1,0 +1,778 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 LamQuant authors.
+#
+# train_4state_controller.py — train the LamQuant SNN's ACTUAL job:
+# a 4-state "needs-precision" compression-tier controller.
+#
+# Each EEG latent timestep is mapped to one of four SNAC compression tiers
+#
+#     QUIET=0       → FSQ level 2   → CR ~525:1
+#     BASELINE=1    → FSQ level 3   → CR ~134:1
+#     INTERESTING=2 → FSQ level 4   → CR ~82:1
+#     CRITICAL=3    → FSQ level 5   → CR ~63:1
+#
+# This REPLACES the drifted seizure-only objective. Seizure becomes one
+# trigger of CRITICAL (the seizure-safety tier), not the training target.
+#
+# Reuses (imports, never reimplements):
+#   * MambaSNN backbone        (lamquant_neural.models.mamba_ssm_minimal)
+#   * build_head K=4           (lamquant_neural.models.heads)
+#   * LmaDataset / iter_labels (lamquant.snn.lma_dataset)
+#   * WSDScheduler             (lamquant.student.train_joint)
+#   * ESOAP                    (lamquant.student.esoap)
+#   * derive_4state_target / calibrate_quiet_threshold (lamquant.snn.four_state)
+#
+# The backbone is loaded with the same SNN_SEIZURE_HEAD / SNN_SEIZURE_BIAS env
+# the production seizure runs use (so checkpoints stay load-compatible), but
+# the seizure head is NOT optimized as the objective — only activity_logits
+# feed the 4-state head.
+#
+# Programming-Bible style: contract assertions, no silent fallback, typed.
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Sampler
+
+# ---------------------------------------------------------------------------
+# Path plumbing — mirror train_mamba_snn.py so the cross-area imports resolve.
+# ---------------------------------------------------------------------------
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+for _sub in ("snn", "student", "dataset", "common"):
+    _p = os.path.join(ROOT_DIR, "lamquant", _sub)
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from lamquant_neural.models.mamba_ssm_minimal import MambaSNN, clamp_ssm_params  # noqa: E402
+from lamquant_neural.models.heads import build_head  # noqa: E402
+from lamquant.snn.lma_dataset import LmaDataset  # noqa: E402
+from lamquant.snn.four_state import (  # noqa: E402
+    derive_4state_target,
+    calibrate_quiet_threshold,
+    NUM_STATES,
+    STATE_NAMES,
+    LEVEL_TABLE_4,
+    CR_TABLE_4,
+    TARGET_DIST_4,
+)
+
+# Geometry — L3 latent time dim (preprocess_subband_single output).
+L3_T = 313
+NUM_GROUPS = 8
+
+
+# ===========================================================================
+# State-balanced sampler — oversample windows with any rare state (>= 2).
+# ===========================================================================
+
+class StateBalancedSampler(Sampler[int]):
+    """Oversample windows that contain any INTERESTING or CRITICAL timestep.
+
+    Adapted from ``SeizureBalancedSampler`` but keyed on "has rare state"
+    (a per-timestep 4-state target >= 2) instead of "has seizure". The
+    rare-window fraction is CONSTANT (``rare_frac``) — NO down-anneal. The
+    seizure-run anneal was proven to atrophy the head (it drifts into a
+    background-predictor once the rare signal thins out), so this sampler
+    holds the rare fraction fixed for the whole run.
+
+    Rare windows are drawn WITH replacement when they would otherwise run
+    out, so a high target fraction never truncates the epoch. Length is
+    fixed to the dataset size for a stable per-epoch step count.
+
+    The per-window "has rare state" flag is precomputed once at construction
+    by deriving the 4-state target for every window's labels + L3 (cheap:
+    the L3 cache is warm and only the RMS is needed).
+    """
+
+    def __init__(self, dataset: LmaDataset, quiet_rms_threshold: float,
+                 rare_frac: float = 0.4, seed: int = 1337):
+        if not isinstance(dataset, LmaDataset):
+            raise TypeError(
+                f"StateBalancedSampler requires LmaDataset, got "
+                f"{type(dataset).__name__}")
+        if not 0.0 <= rare_frac <= 1.0:
+            raise ValueError(f"rare_frac must be in [0,1], got {rare_frac}")
+        self.dataset = dataset
+        self.rare_frac = float(rare_frac)
+        self.seed = int(seed)
+        self.epoch = 0
+        self._total = len(dataset)
+        assert self._total > 0, "dataset is empty"
+
+        rare_flags = compute_rare_flags(dataset, quiet_rms_threshold)
+        assert len(rare_flags) == self._total, \
+            "rare_flags length must equal dataset length"
+        flags = np.asarray(rare_flags, dtype=bool)
+        self.rare_idx = np.nonzero(flags)[0]
+        self.common_idx = np.nonzero(~flags)[0]
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        n = self._total
+        n_rare = int(round(self.rare_frac * n))
+        n_common = n - n_rare
+
+        # Degenerate splits: if one class is empty, draw the other.
+        if self.rare_idx.size == 0:
+            n_rare, n_common = 0, n
+        if self.common_idx.size == 0:
+            n_rare, n_common = n, 0
+
+        picks = []
+        if n_rare > 0:
+            replace = n_rare > self.rare_idx.size
+            picks.append(rng.choice(self.rare_idx, size=n_rare, replace=replace))
+        if n_common > 0:
+            replace = n_common > self.common_idx.size
+            picks.append(rng.choice(self.common_idx, size=n_common, replace=replace))
+        order = np.concatenate(picks) if picks else np.arange(n)
+        rng.shuffle(order)
+        yield from (int(i) for i in order)
+
+    def __len__(self) -> int:
+        return self._total
+
+
+def compute_rare_flags(dataset: LmaDataset,
+                       quiet_rms_threshold: float) -> np.ndarray:
+    """Per-window boolean: does the window contain any rare state (>= 2)?
+
+    "Rare" = INTERESTING (2) or CRITICAL (3). Uses the LABELS only (a rare
+    state never comes from the RMS split — RMS only separates QUIET vs
+    BASELINE), so this avoids touching the L3 cache: a window has a rare
+    state iff its 3-class labels contain a 1 (active) or 2 (seizure) in any
+    group at any timestep. ``quiet_rms_threshold`` is accepted for interface
+    symmetry but is not needed here.
+
+    ``_iter_index_labels`` reads each label NPZ once (grouped by LMA) but
+    yields the DATASET INDEX with each window, so the returned flag array is
+    positionally aligned with ``__getitem__`` / the sampler.
+    """
+    flags = np.zeros(len(dataset), dtype=bool)
+    for i, lbl in _iter_index_labels(dataset):
+        # Any active (1) or seizure (2) in any group/timestep ⇒ rare.
+        flags[i] = bool((lbl >= 1).any())
+    return flags
+
+
+def _iter_index_labels(dataset: LmaDataset):
+    """Yield (index, labels[8, L3_T]) in dataset.index order, label-only.
+
+    Groups index entries by (lma_path, label_internal) so each label NPZ is
+    read once, then yields the per-window slice for every index pointing into
+    it. Mirrors iter_labels_only but preserves the dataset INDEX so the
+    sampler's flags align positionally with __getitem__.
+    """
+    import io
+    from collections import defaultdict
+    import lamquant_core as _lc
+    from lamquant.snn.lma_dataset import (
+        _label_cache_dir, LABEL_PER_WINDOW, _lazy_imports,
+    )
+    _lazy_imports()
+    label_cache = _label_cache_dir()
+    by_lma: dict = defaultdict(list)
+    for idx, entry in enumerate(dataset.index):
+        lma_path, stem, win_idx = entry[0], entry[1], entry[2]
+        label_internal = entry[4] if len(entry) >= 5 else entry[3]
+        by_lma[(str(lma_path), label_internal)].append((idx, win_idx, stem))
+
+    for (lma_path, label_internal), items in by_lma.items():
+        stem_for_cache = items[0][2]
+        cached = (label_cache / f"{stem_for_cache}_labels.npz") if label_cache else None
+        try:
+            if cached is not None and cached.exists():
+                with np.load(cached, allow_pickle=True) as ld:
+                    activity = np.asarray(ld["activity_labels"])
+            else:
+                lb = _lc.lma_read_entry(lma_path, label_internal)
+                with np.load(io.BytesIO(lb), allow_pickle=True) as ld:
+                    activity = np.asarray(ld["activity_labels"])
+        except Exception:
+            activity = np.zeros((NUM_GROUPS, L3_T), dtype=np.int64)
+        for idx, win_idx, _stem in items:
+            lbl_start = win_idx * LABEL_PER_WINDOW
+            lbl_end = min(lbl_start + L3_T, activity.shape[1])
+            w = np.zeros((NUM_GROUPS, L3_T), dtype=np.int64)
+            if lbl_end > lbl_start:
+                n = lbl_end - lbl_start
+                w[:, :n] = activity[:, lbl_start:lbl_end].astype(np.int64)
+                if n < L3_T:
+                    w[:, n:] = w[:, n - 1:n]
+            yield idx, w
+
+
+# ===========================================================================
+# Target derivation on a batch (labels + l3 → 4-state target pooled to Tout).
+# ===========================================================================
+
+def _pool_states_to_T(states: np.ndarray, target_T: int) -> np.ndarray:
+    """Nearest-neighbour pool a [T] integer state array to [target_T].
+
+    Class labels can't be averaged, so we pick, for each output bin, the
+    state at the bin centre's nearest input index. No-op when T == target_T.
+    """
+    T = states.shape[0]
+    if T == target_T:
+        return states
+    # Map each output position to the nearest input index.
+    src = np.round(np.linspace(0, T - 1, target_T)).astype(np.int64)
+    return states[src]
+
+
+def derive_batch_targets(labels: torch.Tensor, l3: torch.Tensor,
+                         quiet_rms_threshold: float,
+                         target_T: int) -> torch.Tensor:
+    """Per-batch 4-state targets, pooled to ``target_T``.
+
+    Args:
+        labels: ``[B, 8, T]`` int64 3-class labels.
+        l3: ``[B, 21, T_l3]`` float L3.
+        quiet_rms_threshold: QUIET/BASELINE RMS cut.
+        target_T: head output time resolution.
+
+    Returns:
+        ``[B, target_T]`` int64 in {0..3}, on the same device as ``labels``.
+    """
+    assert labels.dim() == 3 and labels.shape[1] == NUM_GROUPS, \
+        f"labels must be [B,8,T], got {tuple(labels.shape)}"
+    assert l3.dim() == 3 and l3.shape[1] == 21, \
+        f"l3 must be [B,21,T_l3], got {tuple(l3.shape)}"
+    B = labels.shape[0]
+    lbl_np = labels.detach().cpu().numpy()
+    l3_np = l3.detach().cpu().numpy()
+    out = np.empty((B, target_T), dtype=np.int64)
+    for b in range(B):
+        tgt = derive_4state_target(lbl_np[b], l3_np[b], quiet_rms_threshold)
+        out[b] = _pool_states_to_T(tgt, target_T)
+    t = torch.from_numpy(out).to(labels.device)
+    assert t.shape == (B, target_T) and t.dtype == torch.long
+    return t
+
+
+# ===========================================================================
+# Loss — class-weighted CE (inverse-freq + hard CRITICAL floor) or CRF NLL.
+# ===========================================================================
+
+def compute_class_weights(dataset: LmaDataset, quiet_rms_threshold: float,
+                          n_windows: int, critical_floor: float = 2.0,
+                          seed: int = 1337) -> torch.Tensor:
+    """Inverse-frequency class weights with a hard CRITICAL floor.
+
+    Samples windows, derives 4-state targets, counts each state, and returns
+    inverse-frequency weights normalised to mean 1.0 (so the absolute loss
+    scale is stable). CRITICAL is then multiplied by ``critical_floor`` AFTER
+    normalisation so it always carries the highest weight — missing the
+    seizure-safety tier is the worst error.
+
+    Returns: ``[4]`` float32 tensor.
+    """
+    n_total = len(dataset)
+    assert n_total > 0, "dataset empty"
+    n_sample = min(n_windows, n_total)
+    rng = np.random.default_rng(seed)
+    idxs = rng.choice(n_total, size=n_sample, replace=False)
+    counts = np.zeros(NUM_STATES, dtype=np.float64)
+    for i in idxs:
+        l3_t, lab_t = dataset[int(i)]
+        tgt = derive_4state_target(lab_t.numpy(), l3_t.numpy(), quiet_rms_threshold)
+        counts += np.bincount(tgt, minlength=NUM_STATES)[:NUM_STATES]
+    # Smooth so an empty state doesn't blow up (no silent /0).
+    counts = counts + 1.0
+    inv = counts.sum() / counts             # inverse frequency
+    inv = inv / inv.mean()                  # normalise to mean 1.0
+    inv[NUM_STATES - 1] *= float(critical_floor)  # hard CRITICAL floor
+    w = torch.tensor(inv, dtype=torch.float32)
+    assert w.shape == (NUM_STATES,) and torch.isfinite(w).all()
+    return w
+
+
+# ===========================================================================
+# Per-epoch 4-state metrics.
+# ===========================================================================
+
+def _confusion(pred: np.ndarray, tgt: np.ndarray) -> np.ndarray:
+    """4x4 confusion matrix, rows = true state, cols = predicted state."""
+    cm = np.zeros((NUM_STATES, NUM_STATES), dtype=np.int64)
+    np.add.at(cm, (tgt, pred), 1)
+    return cm
+
+
+def four_state_metrics(cm: np.ndarray) -> dict:
+    """Derive accuracy / per-state P-R / CRITICAL recall / specificity / CR.
+
+    cm: 4x4 confusion (true rows, pred cols).
+    Returns a dict of the per-epoch logged numbers.
+    """
+    assert cm.shape == (NUM_STATES, NUM_STATES)
+    total = cm.sum()
+    acc = float(np.trace(cm) / max(total, 1))
+
+    precision = np.zeros(NUM_STATES)
+    recall = np.zeros(NUM_STATES)
+    for k in range(NUM_STATES):
+        tp = cm[k, k]
+        precision[k] = tp / max(cm[:, k].sum(), 1)
+        recall[k] = tp / max(cm[k, :].sum(), 1)
+
+    # CRITICAL recall = the seizure-safety floor (most important number).
+    critical_recall = float(recall[NUM_STATES - 1])
+
+    # QUIET+BASELINE specificity: of all timesteps whose TRUE state is QUIET
+    # or BASELINE, the fraction NOT escalated to a high-fidelity tier
+    # (INTERESTING/CRITICAL). Over-escalating low tiers wastes bandwidth.
+    low_rows = cm[:2, :]                       # true QUIET/BASELINE
+    low_total = low_rows.sum()
+    low_escalated = low_rows[:, 2:].sum()       # predicted INTERESTING/CRITICAL
+    quiet_specificity = float((low_total - low_escalated) / max(low_total, 1))
+
+    # Implied average CR. Predicted-state CR vs true-label CR.
+    cr = np.array(CR_TABLE_4)
+    pred_counts = cm.sum(axis=0).astype(np.float64)   # by predicted state
+    true_counts = cm.sum(axis=1).astype(np.float64)   # by true state
+    pred_cr = float((pred_counts * cr).sum() / max(pred_counts.sum(), 1))
+    true_cr = float((true_counts * cr).sum() / max(true_counts.sum(), 1))
+
+    return {
+        "acc": acc,
+        "precision": precision.tolist(),
+        "recall": recall.tolist(),
+        "critical_recall": critical_recall,
+        "quiet_specificity": quiet_specificity,
+        "pred_cr": pred_cr,
+        "true_cr": true_cr,
+    }
+
+
+def combined_score(m: dict) -> float:
+    """Selection score — maximise CRITICAL recall while keeping low-tier
+    specificity high, penalising over-escalation. NOT seizure sens/spec.
+
+        score = critical_recall + 0.5*quiet_specificity − escalation_penalty
+
+    escalation_penalty grows when the controller compresses LESS than the
+    label distribution implies (pred_cr << true_cr ⇒ over-escalation).
+    """
+    cr_ratio = m["pred_cr"] / max(m["true_cr"], 1e-6)
+    # Penalise compressing too little (pred_cr below true_cr). Cap at 0 when
+    # the controller compresses at least as hard as the labels.
+    escalation_penalty = max(0.0, 1.0 - cr_ratio)
+    return m["critical_recall"] + 0.5 * m["quiet_specificity"] - escalation_penalty
+
+
+# ===========================================================================
+# Train / validate.
+# ===========================================================================
+
+def train_epoch(model, head, loader, optimizer, device, quiet_thr,
+                target_T, class_weights, head_kind, lambda_spike, grad_clip):
+    model.train()
+    head.train()
+    total_loss = 0.0
+    n_steps = 0
+    nan_skips = 0
+    cm = np.zeros((NUM_STATES, NUM_STATES), dtype=np.int64)
+    cw = class_weights.to(device)
+
+    for l3, labels in loader:
+        l3, labels = l3.to(device), labels.to(device)
+        optimizer.zero_grad(set_to_none=True)
+
+        activity_logits, spike_rate, _seizure = model(l3)   # [B,8,T], scalar, _
+        states, class_logits = head(activity_logits, target_T)  # [B,Tout],[B,4,Tout]
+        target = derive_batch_targets(labels, l3, quiet_thr, target_T)  # [B,Tout]
+
+        if head_kind == "crf":
+            loss_main = head.neg_log_likelihood(class_logits, target)
+        else:
+            loss_main = F.cross_entropy(class_logits, target, weight=cw)
+        loss = loss_main + lambda_spike * spike_rate
+
+        if not torch.isfinite(loss):
+            nan_skips += 1
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            list(model.parameters()) + list(head.parameters()), grad_clip)
+        optimizer.step()
+        with torch.no_grad():
+            clamp_ssm_params(model)
+        n_steps += 1
+        total_loss += float(loss.item())
+
+        with torch.no_grad():
+            pred = class_logits.argmax(dim=1)  # [B,Tout]
+            cm += _confusion(pred.cpu().numpy().ravel(),
+                             target.cpu().numpy().ravel())
+
+    avg_loss = total_loss / max(n_steps, 1)
+    return avg_loss, cm, nan_skips, n_steps
+
+
+@torch.no_grad()
+def validate(model, head, loader, device, quiet_thr, target_T):
+    model.eval()
+    head.eval()
+    cm = np.zeros((NUM_STATES, NUM_STATES), dtype=np.int64)
+    for l3, labels in loader:
+        l3, labels = l3.to(device), labels.to(device)
+        activity_logits, _, _ = model(l3)
+        _states, class_logits = head(activity_logits, target_T)
+        target = derive_batch_targets(labels, l3, quiet_thr, target_T)
+        pred = class_logits.argmax(dim=1)
+        cm += _confusion(pred.cpu().numpy().ravel(),
+                         target.cpu().numpy().ravel())
+    return cm
+
+
+# ===========================================================================
+# Async checkpoint save (reuse the simple pattern from train_mamba_snn).
+# ===========================================================================
+
+import threading as _threading  # noqa: E402
+import atexit as _atexit  # noqa: E402
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor  # noqa: E402
+
+_SAVE_EXECUTOR: Optional[_ThreadPoolExecutor] = None
+_SAVE_LOCK = _threading.Lock()
+
+
+def _ensure_save_executor():
+    global _SAVE_EXECUTOR
+    with _SAVE_LOCK:
+        if _SAVE_EXECUTOR is None:
+            _SAVE_EXECUTOR = _ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="snn4-ckpt")
+            _atexit.register(_SAVE_EXECUTOR.shutdown, wait=True)
+    return _SAVE_EXECUTOR
+
+
+def _state_dict_to_cpu(sd):
+    out = {}
+    for k, v in sd.items():
+        out[k] = v.detach().to("cpu", copy=True) if hasattr(v, "detach") else v
+    return out
+
+
+def _async_save(payload: dict, path: str):
+    _ensure_save_executor().submit(torch.save, payload, path)
+
+
+# ===========================================================================
+# LMA root expansion (mirror train_mamba_snn).
+# ===========================================================================
+
+def expand_lma_roots(roots) -> list[Path]:
+    lma_paths: list[Path] = []
+    for r in roots:
+        r = Path(r)
+        if r.is_file() and r.suffix == ".lma":
+            lma_paths.append(r)
+            continue
+        if not r.is_dir():
+            raise FileNotFoundError(f"--lma-root not found: {r}")
+        found = sorted(r.glob("*/*.lma")) or sorted(r.glob("*.lma"))
+        if not found:
+            raise RuntimeError(f"no .lma archives under {r}")
+        lma_paths.extend(found)
+    seen: set = set()
+    return [p for p in lma_paths if not (str(p) in seen or seen.add(str(p)))]
+
+
+# ===========================================================================
+# Main.
+# ===========================================================================
+
+def main():
+    import multiprocessing as _mp
+    try:
+        _mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
+    p = argparse.ArgumentParser(
+        description="Train the 4-state needs-precision CR controller.")
+    p.add_argument("--lma-root", type=Path, nargs="+", required=True)
+    p.add_argument("--split-manifest", type=Path, required=True)
+    p.add_argument("--head", default="attention_softmax",
+                   choices=["attention_softmax", "crf"])
+    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr-min", type=float, default=1e-5)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--d-model", type=int, default=40)
+    p.add_argument("--d-state", type=int, default=16)
+    p.add_argument("--n-layers", type=int, default=2)
+    p.add_argument("--max-windows-per-file", type=int, default=5)
+    p.add_argument("--target-T", type=int, default=L3_T,
+                   help="head output time resolution (default 313 = latent T)")
+    p.add_argument("--rare-frac", type=float, default=0.4,
+                   help="CONSTANT fraction of rare-state windows per epoch "
+                        "(no anneal)")
+    p.add_argument("--critical-weight-floor", type=float, default=2.0,
+                   help="extra multiplier on the CRITICAL class weight after "
+                        "inverse-freq normalisation (safety tier)")
+    p.add_argument("--lambda-spike", type=float, default=0.01,
+                   help="small spike-rate regularizer from the backbone")
+    p.add_argument("--grad-clip", type=float, default=0.5)
+    p.add_argument("--warmup-frac", type=float, default=0.10)
+    p.add_argument("--infinite-lr", action="store_true",
+                   help="WSD∞: warmup then constant peak LR (continual)")
+    p.add_argument("--optimizer", default="esoap",
+                   choices=["adamw", "esoap"])
+    p.add_argument("--early-stop-patience", type=int, default=60)
+    p.add_argument("--calib-windows", type=int, default=2000,
+                   help="windows sampled for threshold + class-weight calibration")
+    p.add_argument("--num-workers", type=int, default=None)
+    p.add_argument("--device", default="auto")
+    p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--checkpoint", default=None)
+    args = p.parse_args()
+
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+
+    import random as _random
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    _random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    print(f"[4state] device={device} head={args.head} optimizer={args.optimizer}")
+    print(f"[4state] states: " + " ".join(
+        f"{STATE_NAMES[k]}->L{LEVEL_TABLE_4[k]}(CR{CR_TABLE_4[k]:.0f})"
+        for k in range(NUM_STATES)))
+
+    # ---- Model: backbone (subband path) + 4-state head. ----
+    model = MambaSNN(in_channels=21, d_model=args.d_model, d_state=args.d_state,
+                     n_layers=args.n_layers, use_subband=True).to(device)
+    head = build_head(args.head, K=NUM_STATES).to(device)
+    n_params = sum(p.numel() for p in model.parameters()) + \
+        sum(p.numel() for p in head.parameters())
+    print(f"[4state] params: backbone+head = {n_params:,}")
+
+    # ---- Data. ----
+    lma_paths = expand_lma_roots(args.lma_root)
+    print(f"[4state] {len(lma_paths)} .lma archive(s)")
+    train_ds = LmaDataset(lma_paths=lma_paths, split="train",
+                          split_manifest_path=args.split_manifest,
+                          max_windows_per_file=args.max_windows_per_file)
+    val_ds = LmaDataset(lma_paths=lma_paths, split="val",
+                        split_manifest_path=args.split_manifest,
+                        max_windows_per_file=args.max_windows_per_file)
+    print(f"[4state] train={len(train_ds)} val={len(val_ds)}")
+
+    save_dir = os.path.join(ROOT_DIR, "weights", "snn")
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = args.checkpoint or os.path.join(save_dir, "snn_4state_best.pt")
+
+    # ---- Calibrate quiet threshold ONCE on train; cache next to ckpt. ----
+    thr_cache = Path(os.path.splitext(save_path)[0] + "_quiet_thr.json")
+    if thr_cache.exists():
+        quiet_thr = float(json.loads(thr_cache.read_text())["quiet_rms_threshold"])
+        print(f"[4state] loaded cached quiet_rms_threshold={quiet_thr:.6g} "
+              f"from {thr_cache}")
+    else:
+        print(f"[4state] calibrating quiet_rms_threshold on {args.calib_windows} "
+              f"train windows ...")
+        quiet_thr = calibrate_quiet_threshold(train_ds, n_windows=args.calib_windows,
+                                              seed=args.seed)
+        thr_cache.write_text(json.dumps(
+            {"quiet_rms_threshold": quiet_thr,
+             "calib_windows": args.calib_windows,
+             "split_manifest": str(args.split_manifest)}, indent=2))
+        print(f"[4state] quiet_rms_threshold={quiet_thr:.6g} (cached -> {thr_cache})")
+
+    # ---- Class weights (inverse-freq + CRITICAL floor). ----
+    class_weights = compute_class_weights(
+        train_ds, quiet_thr, n_windows=args.calib_windows,
+        critical_floor=args.critical_weight_floor, seed=args.seed)
+    print("[4state] class weights: " + ", ".join(
+        f"{STATE_NAMES[k]}={class_weights[k]:.3f}" for k in range(NUM_STATES)))
+
+    # ---- Sampler: state-balanced, CONSTANT rare fraction (no anneal). ----
+    print(f"[4state] building StateBalancedSampler (rare_frac={args.rare_frac}, "
+          f"no anneal) ...")
+    train_sampler = StateBalancedSampler(train_ds, quiet_thr,
+                                         rare_frac=args.rare_frac, seed=args.seed)
+    print(f"[4state]   {train_sampler.rare_idx.size} rare / "
+          f"{train_sampler.common_idx.size} common windows")
+
+    _default_workers = 4 if os.environ.get("L3_CACHE_DIR") else 2
+    num_workers = args.num_workers if args.num_workers is not None else \
+        int(os.environ.get("LMA_NUM_WORKERS", str(_default_workers)))
+    _dl_kwargs = {}
+    if num_workers > 0:
+        _dl_kwargs["persistent_workers"] = True
+        _dl_kwargs["prefetch_factor"] = int(os.environ.get("LMA_PREFETCH_FACTOR", "4"))
+    pin = device.type == "cuda" and num_workers > 0
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                              sampler=train_sampler, num_workers=num_workers,
+                              pin_memory=pin, **_dl_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=pin, **_dl_kwargs)
+
+    # ---- Optimizer. ----
+    params = list(model.named_parameters()) + \
+        [(f"head.{n}", q) for n, q in head.named_parameters()]
+    if args.optimizer == "adamw":
+        optimizer = torch.optim.AdamW(
+            [q for _n, q in params if q.requires_grad],
+            lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
+    else:  # esoap
+        from esoap import ESOAP
+        _linear_suffixes = ("in_proj.weight", "x_proj.weight",
+                            "out_proj.weight", "spatial_mix.weight")
+        esoap_linear, adamw_rest = [], []
+        for nm, q in params:
+            if not q.requires_grad:
+                continue
+            if q.ndim == 2 and nm.endswith(_linear_suffixes):
+                esoap_linear.append(q)
+            else:
+                adamw_rest.append(q)
+        print(f"[4state] ESOAP: {len(esoap_linear)} linear matrices -> "
+              f"SOAP-lead+Muon-tail; {len(adamw_rest)} -> AdamW")
+        optimizer = ESOAP(
+            [{"params": esoap_linear, "method": "esoap",
+              "weight_decay": args.weight_decay},
+             {"params": adamw_rest, "method": "adamw",
+              "weight_decay": args.weight_decay}],
+            lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+
+    # ---- Schedule: WSD∞ (warmup→constant peak) or WSD with decay tail. ----
+    from train_joint import WSDScheduler
+    if args.infinite_lr:
+        scheduler = WSDScheduler(optimizer, total_epochs=args.epochs,
+                                 peak_lr=args.lr, warmup_frac=args.warmup_frac,
+                                 decay_frac=0.0, min_lr=args.lr_min,
+                                 warmup_kind="cosine")
+        print(f"[4state] schedule: cosine-warmup -> WSD∞ stable "
+              f"(warmup={scheduler.warmup_epochs}ep)")
+    else:
+        scheduler = WSDScheduler(optimizer, total_epochs=args.epochs,
+                                 peak_lr=args.lr, warmup_frac=args.warmup_frac,
+                                 decay_frac=0.10, min_lr=args.lr_min,
+                                 warmup_kind="cosine")
+        print(f"[4state] schedule: cosine-warmup -> WSD -> cosine decay "
+              f"(warmup={scheduler.warmup_epochs}ep)")
+
+    target_T = int(args.target_T)
+    snap_every = int(os.environ.get("SNN_SNAPSHOT_EVERY", "0"))
+
+    best_score = -1e9
+    best_epoch = 0
+    epochs_since_best = 0
+    train_start = time.time()
+    print(f"[4state] training {args.epochs} epochs x {len(train_loader)} batches "
+          f"(bs={args.batch_size}, target_T={target_T})")
+
+    for epoch in range(args.epochs):
+        ep_start = time.time()
+        if hasattr(train_sampler, "set_epoch"):
+            train_sampler.set_epoch(epoch)
+
+        avg_loss, tr_cm, nan_skips, n_steps = train_epoch(
+            model, head, train_loader, optimizer, device, quiet_thr,
+            target_T, class_weights, args.head, args.lambda_spike, args.grad_clip)
+        scheduler.step()
+
+        val_cm = validate(model, head, val_loader, device, quiet_thr, target_T)
+        m = four_state_metrics(val_cm)
+        score = combined_score(m)
+
+        improved = ""
+        if score > best_score:
+            best_score = score
+            best_epoch = epoch + 1
+            epochs_since_best = 0
+            improved = " *BEST*"
+            _async_save({
+                "model": _state_dict_to_cpu(model.state_dict()),
+                "head": _state_dict_to_cpu(head.state_dict()),
+                "head_kind": args.head,
+                "num_states": NUM_STATES,
+                "quiet_rms_threshold": quiet_thr,
+                "level_table": list(LEVEL_TABLE_4),
+                "cr_table": list(CR_TABLE_4),
+                "class_weights": class_weights.tolist(),
+                "optimizer": _state_dict_to_cpu(optimizer.state_dict()),
+                "epoch": epoch + 1,
+                "score": score,
+                "metrics": m,
+                "config": vars(args) | {"lma_root": [str(x) for x in args.lma_root],
+                                        "split_manifest": str(args.split_manifest),
+                                        "checkpoint": str(save_path)},
+            }, save_path)
+        else:
+            epochs_since_best += 1
+
+        if snap_every > 0 and ((epoch + 1) % snap_every == 0
+                               or epoch + 1 == args.epochs):
+            snap = f"{os.path.splitext(save_path)[0]}_ep{epoch+1}.pt"
+            _async_save({
+                "model": _state_dict_to_cpu(model.state_dict()),
+                "head": _state_dict_to_cpu(head.state_dict()),
+                "head_kind": args.head, "num_states": NUM_STATES,
+                "quiet_rms_threshold": quiet_thr, "epoch": epoch + 1,
+                "metrics": m,
+            }, snap)
+
+        # Per-epoch log — CRITICAL recall + avg CR are the headline numbers.
+        prec = m["precision"]; rec = m["recall"]
+        ep_sec = time.time() - ep_start
+        gpu_mb = torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
+        print(
+            f"E{epoch+1:3d}/{args.epochs} L={avg_loss:.4f} "
+            f"acc={m['acc']:.3f} "
+            f"CRIT_rec={m['critical_recall']:.3f} "
+            f"QB_spec={m['quiet_specificity']:.3f} "
+            f"CR[pred={m['pred_cr']:.0f} true={m['true_cr']:.0f}] "
+            f"score={score:.3f} "
+            f"skips={nan_skips}/{len(train_loader)} {ep_sec:.0f}s "
+            f"GPU={gpu_mb:.0f}M{improved}")
+        # Per-state P/R + compact confusion every epoch.
+        print("        P/R: " + " ".join(
+            f"{STATE_NAMES[k][:4]}[{prec[k]:.2f}/{rec[k]:.2f}]"
+            for k in range(NUM_STATES)))
+        print("        confusion(true rows -> pred cols): " +
+              " | ".join(",".join(str(int(x)) for x in row) for row in val_cm))
+
+        if (args.early_stop_patience and args.early_stop_patience > 0
+                and epochs_since_best >= args.early_stop_patience):
+            print(f"[4state] early stop: no improvement for "
+                  f"{args.early_stop_patience} epochs (best @ ep{best_epoch}).")
+            break
+
+    total_h = (time.time() - train_start) / 3600
+    print(f"\n[4state] done in {total_h:.2f}h. best @ ep{best_epoch} "
+          f"score={best_score:.3f}. saved: {save_path}")
+
+
+if __name__ == "__main__":
+    main()
