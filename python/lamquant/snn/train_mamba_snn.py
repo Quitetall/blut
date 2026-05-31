@@ -1156,12 +1156,16 @@ def main():
                              'manually. For continual training.')
     parser.add_argument('--resume', type=str, default=None,
                         help='Resume from checkpoint (loads model + optimizer)')
-    parser.add_argument('--optimizer', choices=['adamw', 'soap', 'cosmos'],
+    parser.add_argument('--optimizer',
+                        choices=['adamw', 'soap', 'sinksoaph', 'cosmos'],
                         default='adamw',
-                        help='Optimizer for the COSMOS/SOAP A/B (#71). '
+                        help='Optimizer for the optimizer A/B (#71). '
                              "'adamw' (default) preserves current behavior. "
                              "'soap' uses the vendored SOAP "
-                             '(ai_models/student/soap_optimizer.py). '
+                             '(lamquant/student/soap_optimizer.py). '
+                             "'sinksoaph' = Gram-Sinkhorn + hyperball on the "
+                             'hidden linear matrices only, AdamW on the rest '
+                             '(lamquant/student/sinksoaph.py). '
                              "'cosmos' is license-gated and not yet vendored.")
     parser.add_argument('--seed', type=int, default=1337,
                         help='RNG seed (torch+numpy+random) set before model '
@@ -1551,6 +1555,35 @@ def main():
         from soap_optimizer import SOAP
         optimizer = SOAP(_param_groups(model, cfg.weight_decay), lr=cfg.lr,
                          weight_decay=cfg.weight_decay)
+    elif args.optimizer == 'sinksoaph':
+        # Gram-Sinkhorn + hyperball on the genuine hidden LINEAR weight
+        # matrices only (in_proj / x_proj / out_proj / spatial_mix). The SSM
+        # dynamics (A_log), the readout + seizure heads (FPR-critical), and
+        # every non-2-D param (D, dt_bias, conv1d, norms, biases) go to AdamW.
+        # This mirrors the marin "controlled swap": the ONLY delta vs the
+        # adamw baseline is the matrix-group optimizer.
+        sys.path.insert(0, os.path.join(ROOT_DIR, 'lamquant', 'student'))
+        from sinksoaph import SinkSOAPH
+        _linear_suffixes = ('in_proj.weight', 'x_proj.weight',
+                            'out_proj.weight', 'spatial_mix.weight')
+        sink_linear, adamw_rest = [], []
+        for nm, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim == 2 and nm.endswith(_linear_suffixes):
+                sink_linear.append(p)
+            else:
+                adamw_rest.append(p)
+        print(f"[*] SinkSOAPH grouping: {len(sink_linear)} linear matrices "
+              f"-> Gram-Sinkhorn+hyperball; {len(adamw_rest)} params -> AdamW")
+        optimizer = SinkSOAPH(
+            [
+                {"params": sink_linear, "method": "sinksoaph",
+                 "weight_decay": 0.0},
+                {"params": adamw_rest, "method": "adamw",
+                 "weight_decay": cfg.weight_decay},
+            ],
+            lr=cfg.lr, betas=(0.9, 0.95), weight_decay=cfg.weight_decay)
     elif args.optimizer == 'cosmos':
         raise NotImplementedError(
             "COSMOS optimizer is license-gated and NOT vendored. To enable "
