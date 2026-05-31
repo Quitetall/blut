@@ -139,6 +139,10 @@ def main() -> None:
     ap.add_argument("--test-fraction", type=float, default=0.10)
     ap.add_argument("--external-test-corpus", type=str, action="append", default=[],
                     help="corpus dir name held ENTIRELY out as external_test (cross-site); repeatable")
+    ap.add_argument("--allowlist", type=Path, default=None,
+                    help="JSON {corpus: [conformant stems]} from vet_montage. "
+                         "When given, stems NOT in the union of these lists are "
+                         "dropped (montage-nonconformant exclusion).")
     args = ap.parse_args()
     assert 0.0 <= args.val_fraction < 1.0 and 0.0 <= args.test_fraction < 1.0
     assert args.val_fraction + args.test_fraction < 1.0, "val+test must leave a train set"
@@ -177,10 +181,24 @@ def main() -> None:
     print(f"[*] encoded stems: {len(encoded_stems)} across {len(args.lma_root)} "
           f"root(s) ({n_per_corpus} per-corpus archives enumerated)")
 
-    usable = sorted(encoded_stems & set(label_files))
+    usable = encoded_stems & set(label_files)
     print(f"[*] usable stems (encoded ∩ labeled): {len(usable)}")
+    if args.allowlist is not None:
+        allow_raw = json.loads(args.allowlist.read_text())
+        if not isinstance(allow_raw, dict):
+            raise SystemExit(
+                f"--allowlist must be a JSON object {{corpus: [stems]}}, got "
+                f"{type(allow_raw).__name__}")
+        # Flatten to one set. Safe because stems are corpus-unique (tusz aaaaa*,
+        # chbmit chb*, eegmmidb S*, ...), so the union == per-corpus filtering.
+        allow = {s for stems in allow_raw.values() for s in stems}
+        before = len(usable)
+        usable = usable & allow
+        print(f"[*] allow-list (montage-conformant): {len(allow)} stems; "
+              f"dropped {before - len(usable)} nonconformant -> {len(usable)} usable")
+    usable = sorted(usable)
     if not usable:
-        raise SystemExit("no usable stems — check --lma-root / --labels")
+        raise SystemExit("no usable stems — check --lma-root / --labels / --allowlist")
 
     # 3. Group by subject; classify subject as seizure-bearing if ANY stem is;
     #    track corpus per subject (a subject is single-corpus).
