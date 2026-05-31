@@ -38,14 +38,24 @@ for _sub in ("snn", "dataset", "common"):
         sys.path.insert(0, _p)
 
 
-def _vet_one(lc, cr, lma_path: str, entry: str) -> Tuple[bool, List[str], int]:
-    """Vet one recording. Returns (conformant, missing_required, n_present)."""
+def _vet_one(lc, cr, lma_path: str, entry: str,
+             lenient: bool = False) -> Tuple[bool, List[str], int]:
+    """Vet one recording. Returns (conformant, missing_required, n_present).
+
+    Strict (default): conformant iff EVERY required 10-20 channel resolves.
+    Lenient (``--lenient``): conformant iff the resolver returns a usable
+    mapping at all — i.e. >= ``MIN_REQUIRED_CHANNELS`` (16) channels resolve and
+    the LmaDataset loader will zero-fill the few missing ones into its fixed
+    21-slot input. This matches what the MODEL actually tolerates; the strict
+    criterion needlessly quarantines recordings (e.g. TUSZ missing only Fz+Pz)
+    the trainer can use.
+    """
     lml_bytes = lc.lma_read_entry(lma_path, entry)
     meta_json, _n_ch, _n_win, _total, _ws = lc.container_metadata(lml_bytes)
     channels = json.loads(meta_json).get("channels", [])
     mapping, missing = cr.select_channels(channels)
     n_present = 0 if mapping is None else len(mapping)
-    conformant = (len(missing) == 0)
+    conformant = (mapping is not None) if lenient else (len(missing) == 0)
     return conformant, list(missing), n_present
 
 
@@ -61,6 +71,12 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0,
                     help="vet at most N recordings per corpus (0 = all; for a "
                          "quick probe)")
+    ap.add_argument("--lenient", action="store_true",
+                    help="conformant iff the resolver returns a usable mapping "
+                         "(>=MIN_REQUIRED_CHANNELS resolve; loader zero-fills the "
+                         "rest) — matches the model's real tolerance, recovers "
+                         "recordings missing only a channel or two (e.g. TUSZ "
+                         "missing Fz+Pz).")
     args = ap.parse_args()
 
     import lamquant_core as lc
@@ -106,7 +122,8 @@ def main() -> None:
             lma_path = info["lma"]
             entry = info.get("lml") or f"{stem}.lml"
             try:
-                ok, missing, n_present = _vet_one(lc, cr, lma_path, entry)
+                ok, missing, n_present = _vet_one(lc, cr, lma_path, entry,
+                                                  lenient=args.lenient)
             except Exception as e:  # noqa: BLE001 — hostile archive entry
                 errors.append({"stem": stem, "error": str(e)[:200]})
                 continue
