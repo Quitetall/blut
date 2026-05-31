@@ -72,15 +72,25 @@ def _sinkhorn_energy_balance(A: Tensor, steps: int, eps: float) -> Tensor:
     A = A.float()
     m, n = A.shape
 
-    B = A.square() + eps
+    B = A.square()
+    # Scale-RELATIVE smoothing. `eps` is a relative factor (not absolute): the
+    # floor is `eps · mean(A²)`. A near-dead row/column (energy → 0) would
+    # otherwise be amplified by ~√(1/eps_abs) and — because the hyperball
+    # post-step renormalises the whole direction — that one row would hijack the
+    # entire update. Tying the floor to the matrix's own mean energy bounds the
+    # amplification relative to the matrix scale, while staying negligible for
+    # well-conditioned A (so the balanced marginals are unchanged in the common
+    # case). The +1e-30 guards an all-zero A (step 0, zero grad).
+    smooth = eps * B.mean().clamp_min(1e-12) + 1e-30
+    B = B + smooth
     target_r = torch.full((m,), 1.0 / m, device=A.device, dtype=torch.float32)
     target_c = torch.full((n,), 1.0 / n, device=A.device, dtype=torch.float32)
     r = torch.ones(m, device=A.device, dtype=torch.float32)
     c = torch.ones(n, device=A.device, dtype=torch.float32)
 
     for _ in range(steps):
-        r = target_r / (B @ c + eps)
-        c = target_c / (B.T @ r + eps)
+        r = target_r / (B @ c + smooth)
+        c = target_c / (B.T @ r + smooth)
 
     A_bal = r.sqrt()[:, None] * A * c.sqrt()[None, :]
     return A_bal.to(out_dtype)
@@ -96,6 +106,7 @@ def _sinksoaph_direction(
     nesterov: bool,
     sinkhorn_steps: int,
     eps: float,
+    sinkhorn_eps: float,
 ) -> Tensor:
     """Compute the (unscaled) SinkSOAP update direction for one 2-D matrix.
 
@@ -117,7 +128,8 @@ def _sinksoaph_direction(
     U = _gram_eigenbasis(left_gram, eps)
     V = _gram_eigenbasis(right_gram, eps)
     A = U.T @ M @ V
-    A_bal = _sinkhorn_energy_balance(A, steps=sinkhorn_steps, eps=eps).float()
+    A_bal = _sinkhorn_energy_balance(
+        A, steps=sinkhorn_steps, eps=sinkhorn_eps).float()
     return U @ A_bal @ V.T
 
 
@@ -135,7 +147,10 @@ def _hyperball_apply_(p: Tensor, direction: Tensor, lr: float, eps: float) -> No
     hyperball group.
     """
     p_norm = p.norm()
-    if float(p_norm) == 0.0:
+    # Skip the sphere step for a (near-)zero parameter: re-projecting to a tiny
+    # radius would amplify numerical noise. Unreachable in practice (hyperball
+    # preserves ||p|| from init), but cheap to guard.
+    if float(p_norm) < eps:
         return
     d = direction.float()
     d_norm = d.norm().clamp_min(eps)
@@ -202,6 +217,7 @@ class SinkSOAPH(torch.optim.Optimizer):
         nesterov: bool = True,
         betas: tuple[float, float] = (0.9, 0.95),
         eps: float = 1e-8,
+        sinkhorn_eps: float = 1e-6,
         weight_decay: float = 0.0,
     ):
         if lr <= 0.0:
@@ -211,6 +227,7 @@ class SinkSOAPH(torch.optim.Optimizer):
         defaults = dict(
             lr=lr, method="adamw", mu=mu, gram_beta=gram_beta,
             sinkhorn_steps=sinkhorn_steps, nesterov=nesterov, betas=betas,
+            sinkhorn_eps=sinkhorn_eps,
             eps=eps, weight_decay=weight_decay,
         )
         super().__init__(params, defaults)
@@ -266,6 +283,7 @@ class SinkSOAPH(torch.optim.Optimizer):
                         nesterov=group["nesterov"],
                         sinkhorn_steps=group["sinkhorn_steps"],
                         eps=eps,
+                        sinkhorn_eps=group["sinkhorn_eps"],
                     )
                     _hyperball_apply_(p, direction, lr=lr, eps=eps)
                 else:  # adamw
