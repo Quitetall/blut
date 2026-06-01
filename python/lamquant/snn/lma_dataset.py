@@ -509,6 +509,7 @@ class LmaDataset(Dataset):
                  max_seizure_windows_per_file: int = MAX_SEIZURE_WINDOWS_PER_FILE,
                  min_background_per_file: int = MIN_BACKGROUND_PER_FILE,
                  seq_windows: int = 1,
+                 derive_labels_from_lma: bool = True,
                  require_meta_subject_match: bool = True):  # noqa: arg unused (back-compat)
         """LMA-direct training dataset (Phase M per-dataset layout).
 
@@ -542,6 +543,11 @@ class LmaDataset(Dataset):
         self.seq_windows = int(seq_windows)
         if self.seq_windows < 1:
             raise ValueError(f"seq_windows must be >= 1, got {seq_windows}")
+        # Derive labels on the fly from the annotation bundled in the LMA
+        # (.csv_bi/.tse/.rec) when no precomputed <stem>_labels.npz exists —
+        # verified byte-exact + pyedflib-cross-checked (verify_lma_annotations).
+        # Removes the NPZ/disk-cache dependency.
+        self._derive_labels_from_lma = bool(derive_labels_from_lma)
 
         # Resolve LMA paths.
         if lma_paths is None and (lma_dir is not None or lma_root is not None):
@@ -625,6 +631,10 @@ class LmaDataset(Dataset):
                 if (_idx_label_cache is not None
                         and (_idx_label_cache / f"{stem}_labels.npz").exists()):
                     label_internal = f"__diskcache__/{stem}_labels.npz"
+                elif self._derive_labels_from_lma:
+                    # No precomputed NPZ — derive from the LMA's bundled
+                    # annotation at load time (or all-quiet if none).
+                    label_internal = "__lma_annotation__"
                 else:
                     n_no_labels += 1
                     continue
@@ -637,7 +647,24 @@ class LmaDataset(Dataset):
                 # Prefer disk-staged label NPZ over lma_read_entry round-trip.
                 cached = (label_cache / f"{stem}_labels.npz") if label_cache else None
                 try:
-                    if cached is not None and cached.exists():
+                    if label_internal == "__lma_annotation__":
+                        # On-the-fly: parse the annotation bundled in the LMA.
+                        from lamquant.snn.lma_annotations import (
+                            lma_activity_labels, lma_window_count)
+                        activity = lma_activity_labels(lma_str, stem)
+                        if activity is None:
+                            # No annotation -> background-only recording.
+                            # Size all-quiet from the LML HEADER window count
+                            # (~7 ms, no decode — critical for 70 K TUEG stems).
+                            nw = lma_window_count(lma_str, lml_internal)
+                            if nw is None:
+                                n_no_labels += 1
+                                continue
+                            activity = np.zeros((8, nw * LABEL_PER_WINDOW),
+                                                dtype=np.uint8)
+                        else:
+                            activity = np.asarray(activity)
+                    elif cached is not None and cached.exists():
                         with np.load(cached, allow_pickle=True) as ld:
                             activity = np.asarray(ld["activity_labels"])
                     else:
@@ -750,7 +777,11 @@ class LmaDataset(Dataset):
         # same `(lma_path, label_internal)` shows up 5x in a row; cache
         # the activity array so 4 of those 5 hits skip the
         # lma_read_entry + NPZ decompress (~5x fewer disk hits).
-        lbl_key = (str(lma_path), label_internal)
+        # Include `stem`: the on-the-fly sentinel label_internal
+        # ("__lma_annotation__") is identical across every stem in a corpus, so
+        # keying on (lma_path, label_internal) alone would return one stem's
+        # labels for another (cross-stem contamination).
+        lbl_key = (str(lma_path), label_internal, stem)
         activity = _LABEL_CACHE.get(lbl_key)
         if activity is not None:
             _LABEL_CACHE.move_to_end(lbl_key)
@@ -758,7 +789,17 @@ class LmaDataset(Dataset):
             label_cache = _label_cache_dir()
             cached = (label_cache / f"{stem}_labels.npz") if label_cache else None
             try:
-                if cached is not None and cached.exists():
+                if label_internal == "__lma_annotation__":
+                    # On-the-fly: parse the annotation bundled in the LMA
+                    # (None -> background-only recording -> all-quiet).
+                    from lamquant.snn.lma_annotations import lma_activity_labels
+                    activity = lma_activity_labels(str(lma_path), stem)
+                    if activity is None:
+                        activity = np.zeros((8, (win_idx + K) * LABEL_PER_WINDOW),
+                                            dtype=np.uint8)
+                    else:
+                        activity = np.asarray(activity)
+                elif cached is not None and cached.exists():
                     with np.load(cached, allow_pickle=True) as ld:
                         activity = np.asarray(ld["activity_labels"])
                 else:

@@ -144,8 +144,15 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--lma-root", type=str, action="append", required=True,
                     help="dir of <corpus>/<stem>.lma archives; repeatable")
-    ap.add_argument("--labels", type=Path, required=True,
-                    help="dir of <stem>_labels.npz files")
+    ap.add_argument("--labels", type=Path, required=False, default=None,
+                    help="dir of <stem>_labels.npz files. Omit with --no-labels "
+                         "for a label-free split (codec reconstruction: no seizure "
+                         "stratification, plain sha1 split over all encoded stems).")
+    ap.add_argument("--no-labels", action="store_true",
+                    help="label-free: use ALL encoded stems, no seizure stratification.")
+    ap.add_argument("--exclude-corpus", type=str, action="append", default=[],
+                    help="corpus name (dir or .lma stem) to drop entirely, e.g. "
+                         "cap_sleep / sleep_edf (2-ch montage). Repeatable.")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--val-fraction", type=float, default=0.10)
     ap.add_argument("--test-fraction", type=float, default=0.10)
@@ -167,13 +174,17 @@ def main() -> None:
     assert args.val_fraction + args.test_fraction < 1.0, "val+test must leave a train set"
     ext_corpora = set(args.external_test_corpus)
     train_only_corpora = set(args.train_only_corpus)
+    exclude_corpora = set(args.exclude_corpus)
+    no_labels = bool(args.no_labels) or args.labels is None
 
     # 1. Label stems FIRST — the authoritative recording-stem universe. Also
     #    lets us tell a per-recording archive (filename == a labeled stem) from
     #    a per-corpus `lml archive` (filename is the corpus; recordings inside).
-    label_files = {os.path.basename(f)[:-len("_labels.npz")]: f
-                   for f in glob.glob(str(args.labels / "*_labels.npz"))}
-    print(f"[*] label NPZs: {len(label_files)}")
+    #    --no-labels (codec) skips this entirely; the universe is all encoded stems.
+    label_files = ({os.path.basename(f)[:-len("_labels.npz")]: f
+                    for f in glob.glob(str(args.labels / "*_labels.npz"))}
+                   if not no_labels else {})
+    print(f"[*] label NPZs: {len(label_files)}" + ("  (LABEL-FREE codec split)" if no_labels else ""))
 
     # 2. Encoded stems across ALL roots (intersection guard) + corpus map.
     #    Per-recording (Training/lma/<corpus>/<stem>.lma): filename IS the
@@ -192,6 +203,11 @@ def main() -> None:
     # real seizure patient whose every stem also lives in TUEG gets misclassified
     # as pure-background and forced out of val/test. So order train-only-corpus
     # per-recording paths LAST; labeled corpora claim the overlap stem first.
+    if exclude_corpora:
+        lma_paths = [p for p in lma_paths
+                     if Path(p).stem not in exclude_corpora
+                     and Path(p).parent.name not in exclude_corpora]
+        print(f"[*] excluded corpora {sorted(exclude_corpora)}")
     lma_paths = sorted(set(lma_paths),
                        key=lambda p: (Path(p).parent.name in train_only_corpora, p))
     stem_corpus: dict[str, str] = {}
@@ -208,8 +224,8 @@ def main() -> None:
     print(f"[*] encoded stems: {len(encoded_stems)} across {len(args.lma_root)} "
           f"root(s) ({n_per_corpus} per-corpus archives enumerated)")
 
-    usable = encoded_stems & set(label_files)
-    print(f"[*] usable stems (encoded ∩ labeled): {len(usable)}")
+    usable = set(encoded_stems) if no_labels else (encoded_stems & set(label_files))
+    print(f"[*] usable stems ({'all encoded' if no_labels else 'encoded ∩ labeled'}): {len(usable)}")
     if args.allowlist is not None:
         allow_raw = json.loads(args.allowlist.read_text())
         if not isinstance(allow_raw, dict):
@@ -237,7 +253,7 @@ def main() -> None:
         subj = subject_of(stem)
         stems_by_subject[subj].append(stem)
         subject_corpus.setdefault(subj, stem_corpus[stem])
-        if stem_is_seizure(label_files[stem]):
+        if (not no_labels) and stem in label_files and stem_is_seizure(label_files[stem]):
             subject_has_seizure[subj] = True
             n_seiz_stems += 1
     print(f"[*] subjects: {len(stems_by_subject)} "

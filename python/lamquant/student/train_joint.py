@@ -396,7 +396,10 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         int8_bridge: bool = False,
         resume: str = None,
         lma_root: Optional[str] = None,
-        split_manifest: Optional[str] = None):
+        split_manifest: Optional[str] = None,
+        detail_bands: str = 'none',
+        max_windows_per_file: Optional[int] = None,
+        soap_max_precond_dim: int = 10000):
     """Run joint training with the given TrainingConfig.
 
     Speedup knobs:
@@ -439,10 +442,24 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
 
     # ---- Build model ----
     # Enable gradient checkpointing for large decoders (Tier 5+) to fit in 24 GB
+    # --- input bands (l3_detail vs full experiment) -----------------------
+    # Encoder input = L3 (21ch) + optional detail bands. The dataset stacks
+    # them per SNN_DETAIL_BANDS; the decoder ALWAYS reconstructs the 21-ch
+    # fullband target. Set the env BEFORE the dataset is built below.
+    _BANDS = {'none': '', 'l3_detail': 'l3_detail',
+              'all': 'l3_detail,l2_detail,l1_detail'}
+    if detail_bands not in _BANDS:
+        raise ValueError(f"--detail-bands must be one of {list(_BANDS)}, got {detail_bands!r}")
+    os.environ['SNN_DETAIL_BANDS'] = _BANDS[detail_bands]
+    n_in = 21 * (1 + len([b for b in _BANDS[detail_bands].split(',') if b]))
+    print(f"[*] Input bands: {detail_bands}  -> encoder in_channels={n_in}, "
+          f"decoder out_channels=21 (fullband)")
+
     use_grad_ckpt = vocos_tier >= 5
     encoder_kernels = tuple(int(k) for k in cfg.encoder_kernels.split(','))
     codec = build_default_joint(latent_dim=32, encoder_width=cfg.encoder_width,
-                                 vocos_tier=vocos_tier,
+                                 vocos_tier=vocos_tier, in_channels=n_in,
+                                 decoder_channels=21,
                                  gradient_checkpointing=use_grad_ckpt,
                                  encoder_blocks=cfg.encoder_blocks,
                                  encoder_kernels=encoder_kernels).to(device)
@@ -467,27 +484,34 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     # Data directory: configurable, defaults to repo's dataset_sim/
     data_dir = cfg.data_dir if cfg.data_dir else os.path.join(
         ROOT_DIR, 'lamquant', 'dataset')
-    manifest_path = os.path.join(data_dir, 'manifest_v3.json')
-    manifest = DatasetManifest.load(manifest_path)   # validate() runs here
-    print(f"[*] Loaded manifest_v3: {manifest.train_files:,} train files, "
-          f"{manifest.val_files:,} val files "
-          f"({manifest.val_windows:,} val windows across "
-          f"{len(manifest.datasets)} datasets)")
+    # The legacy manifest_v3 + FileEntry path feeds ONLY the PrecomputedL3Dataset
+    # branch below. Skip it entirely for LMA-direct — manifest_v3.json and the
+    # Q31 NPZ corpus it indexes were deleted (q31_lml), so loading it crashes.
+    train_entries = val_entries = None
+    manifest = None
+    manifest_path = str(split_manifest) if lma_root is not None else None
+    if lma_root is None:
+        manifest_path = os.path.join(data_dir, 'manifest_v3.json')
+        manifest = DatasetManifest.load(manifest_path)   # validate() runs here
+        print(f"[*] Loaded manifest_v3: {manifest.train_files:,} train files, "
+              f"{manifest.val_files:,} val files "
+              f"({manifest.val_windows:,} val windows across "
+              f"{len(manifest.datasets)} datasets)")
 
-    train_entries = manifest.get_file_entries(Split.TRAIN)
-    val_entries = manifest.get_file_entries(Split.VAL)
+        train_entries = manifest.get_file_entries(Split.TRAIN)
+        val_entries = manifest.get_file_entries(Split.VAL)
 
-    # Cap files when max_windows is set. Stratified by dataset so the
-    # subset is representative (alphabetical order would bias toward
-    # whichever dataset sorts first — CHB-MIT before TUH).
-    if cfg.max_windows is not None:
-        import random as _rng
-        _rng.Random(cfg.seed).shuffle(train_entries)
-        max_files = max(50, cfg.max_windows // 800)
-        train_entries = train_entries[:max_files]
-    val_entries = val_entries[:20]
+        # Cap files when max_windows is set. Stratified by dataset so the
+        # subset is representative (alphabetical order would bias toward
+        # whichever dataset sorts first — CHB-MIT before TUH).
+        if cfg.max_windows is not None:
+            import random as _rng
+            _rng.Random(cfg.seed).shuffle(train_entries)
+            max_files = max(50, cfg.max_windows // 800)
+            train_entries = train_entries[:max_files]
+        val_entries = val_entries[:20]
 
-    print(f"[*] Train files: {len(train_entries)}  Val files: {len(val_entries)}")
+        print(f"[*] Train files: {len(train_entries)}  Val files: {len(val_entries)}")
 
     # Tier 3+ decoders use iSTFT and emit fullband [B, 21, 2500] directly.
     # Loading the raw fullband target lets joint_loss compare against the
@@ -546,6 +570,7 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         want_fullband = (use_fullband_mode != 'off')
         print(f"[*] LMA-direct (typed adapter): root={lma_root}, "
               f"manifest={split_manifest}, return_fullband={want_fullband}")
+        _mwpf = {} if max_windows_per_file is None else {"max_windows_per_file": max_windows_per_file}
         train_ds = LmaTypedL3Dataset(
             lma_root=lma_root,
             split="train",
@@ -553,6 +578,7 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
             windows_per_epoch=cfg.windows_per_epoch,
             return_fullband=want_fullband,
             seed=seed,
+            **_mwpf,
         )
         val_ds = LmaTypedL3Dataset(
             lma_root=lma_root,
@@ -561,6 +587,7 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
             windows_per_epoch=cfg.val_windows,
             return_fullband=want_fullband,
             seed=seed + 1,
+            **_mwpf,
         )
     else:
         train_ds = PrecomputedL3Dataset(
@@ -817,9 +844,9 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     )
     run_id = f'joint_{cfg.name}_t{vocos_tier}_{int(time.time())}'
     provenance = {
-        'manifest_hash':         manifest.hash(),
+        'manifest_hash':         manifest.hash() if manifest is not None else f'lma-direct:{manifest_path}',
         'manifest_path':         manifest_path,
-        'manifest_version':      manifest.version,
+        'manifest_version':      manifest.version if manifest is not None else 'lma-direct',
         'training_config_hash':  cfg_for_provenance.hash(),
         'training_config':       cfg_for_provenance.to_dict(),
         'run_id':                run_id,
@@ -1092,8 +1119,16 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         all_params = []
         for g in enc_groups + [dec_group]:
             all_params.extend(g['params'])
+        # max_precond_dim bounds the per-layer full-matrix preconditioner: any
+        # tensor dim above it falls back to diagonal (Adam-like). The default
+        # 10000 eigendecomposes 10000x10000 GG matrices on the big decoder
+        # layers — O(d^3) compute + GBs of eigh workspace — which OOMs a 24 GB
+        # card for Tier 5+ decoders at the first precondition step. Bounding to
+        # a few thousand keeps full preconditioning where it helps (encoder +
+        # small layers) and is strictly faster + lighter on the wide layers.
         optimizer = SOAP(all_params, lr=cfg.lr_quant, weight_decay=cfg.wd_quant,
-                         precondition_frequency=10)
+                         precondition_frequency=10,
+                         max_precond_dim=soap_max_precond_dim)
         # Wrap SOAP in WSD for warmup + optional decay
         scheduler = WSDScheduler(
             optimizer, total_epochs=cfg.epochs_quant,
@@ -1667,9 +1702,52 @@ def main():
     parser.add_argument('--split-manifest', type=str, default=None,
                         help='JSON split manifest (subjects + stems_by_subject). '
                              'Required when --lma-root is set.')
+    parser.add_argument('--detail-bands', choices=['none', 'l3_detail', 'all'],
+                        default='none',
+                        help='Encoder input bands: none=L3 (21ch, MCU-deployable), '
+                             'l3_detail=+15.6-31.25Hz LVFA (42ch, deployable arm), '
+                             'all=+all detail bands (84ch, ceiling). Decoder always '
+                             'reconstructs the 21-ch fullband target.')
+    parser.add_argument('--encoder-width', type=int, default=None,
+                        help='Override preset encoder width (e.g. 256 research).')
+    parser.add_argument('--encoder-blocks', type=int, default=None,
+                        help='Override preset encoder depth / n_blocks (e.g. 12).')
+    parser.add_argument('--encoder-kernels', type=str, default=None,
+                        help='Override per-block kernels, comma-sep, len==blocks.')
+    parser.add_argument('--batch-size', type=int, default=None,
+                        help='Override preset batch size (drop for big tier-7 decoder).')
+    parser.add_argument('--epochs-warmup', type=int, default=None,
+                        help='Override preset FP32 warmup epochs.')
+    parser.add_argument('--epochs-quant', type=int, default=None,
+                        help='Override preset QAT epochs.')
+    parser.add_argument('--windows-per-epoch', type=int, default=None,
+                        help='Override windows sampled per epoch (raise for ceiling).')
+    parser.add_argument('--soap-max-precond-dim', type=int, default=10000,
+                        help='SOAP full-matrix preconditioner dim cap; tensors '
+                        'wider than this fall back to diagonal. Default 10000 '
+                        '(back-compat). Lower (e.g. 2048) to fit big Tier 5+ '
+                        'decoders — the 10000-dim eigh OOMs a 24 GB card.')
+    parser.add_argument('--max-windows-per-file', type=int, default=None,
+                        help='Cap windows per recording in the base index (raise to '
+                             'use more of long recordings; default ~5).')
     args = parser.parse_args()
 
     cfg = CONFIGS[args.config]
+    import dataclasses as _dc
+    _ov = {}
+    if args.encoder_width is not None:   _ov['encoder_width'] = args.encoder_width
+    if args.encoder_blocks is not None:  _ov['encoder_blocks'] = args.encoder_blocks
+    if args.encoder_kernels is not None: _ov['encoder_kernels'] = args.encoder_kernels
+    if args.batch_size is not None:
+        for f in ('batch_size', 'batch_size_warmup', 'batch_size_quant', 'batch_size_fine'):
+            if hasattr(cfg, f):
+                _ov[f] = args.batch_size
+    if args.epochs_warmup is not None: _ov['epochs_warmup'] = args.epochs_warmup
+    if args.epochs_quant is not None:  _ov['epochs_quant'] = args.epochs_quant
+    if args.windows_per_epoch is not None: _ov['windows_per_epoch'] = args.windows_per_epoch
+    if _ov:
+        cfg = _dc.replace(cfg, **_ov)
+        print(f"[*] config overrides: {_ov}")
     tier = args.tier if args.tier is not None else DEPLOYMENT_TIERS[args.deployment]
     result = run(cfg, vocos_tier=tier, seed=args.seed,
                  fullband_mode=args.fullband_mode,
@@ -1690,7 +1768,10 @@ def main():
                  int8_bridge=args.int8_bridge,
                  resume=args.resume,
                  lma_root=args.lma_root,
-                 split_manifest=args.split_manifest)
+                 split_manifest=args.split_manifest,
+                 detail_bands=args.detail_bands,
+                 max_windows_per_file=args.max_windows_per_file,
+                 soap_max_precond_dim=args.soap_max_precond_dim)
     return 0 if result['best_val_r'] > 0 else 1
 
 

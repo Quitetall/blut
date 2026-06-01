@@ -210,7 +210,16 @@ class LmaTypedL3Dataset:
             activity = None
             cached = (label_cache / f"{stem}_labels.npz") if label_cache else None
             try:
-                if cached is not None and cached.exists():
+                if label_internal == "__lma_annotation__":
+                    # On-the-fly sentinel: not a real archive entry. Derive the
+                    # seizure flag from the LMA's bundled annotation (None ->
+                    # background-only recording -> all windows stay False).
+                    from lamquant.snn.lma_annotations import lma_activity_labels
+                    activity = lma_activity_labels(lma_str, stem)
+                    if activity is None:
+                        continue  # no annotation -> no seizures -> leave False
+                    activity = np.asarray(activity)
+                elif cached is not None and cached.exists():
                     with np.load(cached, allow_pickle=True) as ld:
                         activity = np.asarray(ld["activity_labels"])
                 else:
@@ -291,7 +300,11 @@ class LmaTypedL3Dataset:
 
         lma_path, stem, win_idx, _lml, _lbl = self._base.index[base_idx]
         from lamquant_codec.training import decode_lma_signal
-        signal = decode_lma_signal(str(lma_path), stem)
+        # Propagate the resolved internal entry (e.g. 'S001/S001R01.edf' for
+        # `lml archive` corpora). Without it decode_lma_signal defaults to the
+        # legacy '<stem>.lml' name, which does not exist in per-corpus archives
+        # -> signal None -> fullband_target None -> GAN trains with no target.
+        signal = decode_lma_signal(str(lma_path), stem, lml_entry_name=_lml)
         if signal is None:
             fb = torch.zeros(TARGET_CHANNELS, WINDOW_SAMPLES, dtype=torch.float32)
             return l3, fb

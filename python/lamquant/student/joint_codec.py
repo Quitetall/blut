@@ -218,6 +218,7 @@ def build_default_joint(latent_dim: int = 32,
                          encoder_width: int = 128,
                          vocos_tier: int = 3,
                          in_channels: int = 21,
+                         decoder_channels: int = None,
                          target_len: int = 313,
                          gradient_checkpointing: bool = False,
                          encoder_blocks: int = 3,
@@ -256,13 +257,20 @@ def build_default_joint(latent_dim: int = 32,
     from lamquant_neural.models.encoder import TernaryMobileNetV5_Subband
     from lamquant_neural.models.vocos_decoder import VocosDecoder
 
+    # Encoder ingests in_channels (21 = L3, 42 = +l3_detail, 84 = +all details);
+    # the 32-dim latent bottleneck decouples encoder input from decoder output.
+    # Band-sweep callers (train_joint) pass decoder_channels=21 so the decoder
+    # reconstructs the 21-ch fullband target regardless of input bands. When
+    # decoder_channels is None the fallback is in_channels (NOT 21), preserving
+    # the pre-band-sweep symmetric in==out behavior.
+    dec_ch = decoder_channels if decoder_channels is not None else in_channels
     encoder = TernaryMobileNetV5_Subband(
         in_ch=in_channels, latent_dim=latent_dim, width=encoder_width,
         n_blocks=encoder_blocks, kernel_sizes=encoder_kernels,
     )
     decoder = VocosDecoder(
         tier=vocos_tier, latent_dim=latent_dim,
-        n_channels=in_channels, target_len=target_len,
+        n_channels=dec_ch, target_len=target_len,
         gradient_checkpointing=gradient_checkpointing,
     )
     return JointCodec(encoder, decoder)
