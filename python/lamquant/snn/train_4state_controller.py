@@ -406,6 +406,35 @@ def combined_score(m: dict) -> float:
     return m["critical_recall"] + 0.5 * m["quiet_specificity"] - escalation_penalty
 
 
+def selection_key(m: dict, alpha: float) -> tuple:
+    """Lexicographic feasibility-first checkpoint selection (ADR 0029).
+
+    Replaces ``combined_score`` for selection. The weighted sum made safety
+    FUNGIBLE with compression and *rewarded* the operating-point slide
+    (CRIT_rec 0.90->0.49 traded for QB_spec while loss fell). This key is a
+    tuple compared lexicographically, so safety can never be purchased with
+    compression:
+
+      * feasible  (CRIT_rec >= alpha): key = (1, quiet_specificity)
+            among SAFE checkpoints, prefer the one that compresses the boring
+            (true QUIET/BASELINE) content hardest.
+      * infeasible (CRIT_rec <  alpha): key = (0, critical_recall)
+            none safe yet (or the data frontier cannot reach alpha): prefer
+            the LEAST-slid checkpoint. This degenerates to "max CRIT_rec"
+            exactly when the safe region is unreachable -- the correct
+            fail-safe (keep the high-recall / low-CR checkpoint, never ship a
+            slid one).
+
+    A feasible checkpoint ALWAYS outranks an infeasible one: (1, x) > (0, y)
+    for any x, y in [0, 1]. ``alpha`` is the TRAINING-FEASIBILITY floor
+    (~= 1.0 - label-noise), NOT a clinical guarantee -- the clinical floor is
+    the end-to-end sensitivity-degradation bound (ADR 0029 addendum).
+    """
+    if m["critical_recall"] >= alpha:
+        return (1, m["quiet_specificity"])
+    return (0, m["critical_recall"])
+
+
 # ===========================================================================
 # Train / validate.
 # ===========================================================================
@@ -628,6 +657,23 @@ def main():
     p.add_argument("--crit-floor", type=float, default=0.88,
                    help="soft CRITICAL-recall floor for --ordinal "
                         "constrained_loss (default 0.88)")
+    p.add_argument("--crit-alpha", type=float, default=0.95,
+                   help="ADR-0029: feasibility-first CRITICAL-recall floor for "
+                        "checkpoint SELECTION (training-feasibility pre-gate, NOT "
+                        "a clinical guarantee). Feasible epochs (CRIT_rec>=alpha) "
+                        "always outrank infeasible ones; among feasible, max "
+                        "QB_spec. If the data frontier cannot reach alpha, "
+                        "selection degenerates to max-CRIT_rec (the fail-safe). "
+                        "Replaces the deprecated combined_score selection.")
+    p.add_argument("--crit-dual-eta", type=float, default=0.5,
+                   help="ADR-0029: dual-ascent step for the Lagrangian "
+                        "multiplier mu on the CRITICAL class weight. mu grows "
+                        "when val CRIT_rec < crit-alpha (pushes recall up), "
+                        "relaxes when the floor holds (lets QB_spec/CR improve). "
+                        "0 disables the dual (static class weights).")
+    p.add_argument("--crit-dual-mu-max", type=float, default=8.0,
+                   help="ADR-0029: cap on the dual multiplier mu, so the "
+                        "CRITICAL class weight cannot explode.")
     p.add_argument("--init-backbone", type=Path, default=None,
                    help="ADR-0027 #1: SSL-pretrained backbone-init checkpoint "
                         "(.pt from pretrain_ssl_tueg.py). Loaded strict=False "
@@ -776,6 +822,12 @@ def main():
     print("[4state] class weights: " + ", ".join(
         f"{STATE_NAMES[k]}={class_weights[k]:.3f}" for k in range(NUM_STATES)))
 
+    # ADR-0029 dual ascent: the inverse-freq weights are the BASE; the
+    # CRITICAL entry is scaled each epoch by (1 + mu), a slow Lagrangian
+    # multiplier that rises while val CRIT_rec sits below --crit-alpha.
+    base_class_weights = class_weights.clone()
+    mu = 0.0
+
     # ---- Sampler: state-balanced, CONSTANT rare fraction (no anneal). ----
     print(f"[4state] building StateBalancedSampler (rare_frac={args.rare_frac}, "
           f"no anneal) ...")
@@ -854,7 +906,8 @@ def main():
     target_T = int(args.target_T)
     snap_every = int(os.environ.get("SNN_SNAPSHOT_EVERY", "0"))
 
-    best_score = -1e9
+    best_key = (-1, -1e9)        # ADR-0029 lexicographic feasibility-first
+    best_metrics = None
     best_epoch = 0
     epochs_since_best = 0
     train_start = time.time()
@@ -866,9 +919,13 @@ def main():
         if hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
 
+        # ADR-0029: scale the CRITICAL class weight by the dual multiplier mu.
+        epoch_weights = base_class_weights.clone()
+        epoch_weights[NUM_STATES - 1] *= (1.0 + mu)
+
         avg_loss, tr_cm, nan_skips, n_steps = train_epoch(
             model, head, train_loader, optimizer, device, quiet_thr,
-            target_T, class_weights, args.head, args.lambda_spike, args.grad_clip,
+            target_T, epoch_weights, args.head, args.lambda_spike, args.grad_clip,
             use_spectral=args.spectral, use_ordinal=args.ordinal,
             crit_floor=args.crit_floor, distiller=distiller,
             lambda_distill=args.lambda_distill)
@@ -877,11 +934,17 @@ def main():
         val_cm = validate(model, head, val_loader, device, quiet_thr, target_T,
                           use_spectral=args.spectral)
         m = four_state_metrics(val_cm)
+        # ADR-0029: lexicographic feasibility-first selection. combined_score
+        # is still logged for continuity but NO LONGER selects (it rewarded the
+        # safety->compression slide).
+        key = selection_key(m, args.crit_alpha)
         score = combined_score(m)
+        feasible = m["critical_recall"] >= args.crit_alpha
 
         improved = ""
-        if score > best_score:
-            best_score = score
+        if key > best_key:
+            best_key = key
+            best_metrics = m
             best_epoch = epoch + 1
             epochs_since_best = 0
             improved = " *BEST*"
@@ -895,10 +958,14 @@ def main():
                 "quiet_rms_threshold": quiet_thr,
                 "level_table": list(LEVEL_TABLE_4),
                 "cr_table": list(CR_TABLE_4),
-                "class_weights": class_weights.tolist(),
+                "class_weights": epoch_weights.tolist(),
                 "optimizer": _state_dict_to_cpu(optimizer.state_dict()),
                 "epoch": epoch + 1,
                 "score": score,
+                "selection_key": list(key),
+                "feasible": bool(feasible),
+                "crit_alpha": args.crit_alpha,
+                "mu": mu,
                 "metrics": m,
                 "config": vars(args) | {"lma_root": [str(x) for x in args.lma_root],
                                         "split_manifest": str(args.split_manifest),
@@ -906,6 +973,14 @@ def main():
             }, save_path)
         else:
             epochs_since_best += 1
+
+        # ADR-0029 dual ascent (slow timescale, on the HARD-argmax val CRIT_rec):
+        # mu rises while the floor is violated, relaxes when it holds. This is
+        # the rigorous version of the static CRITICAL weight floor.
+        if args.crit_dual_eta > 0.0:
+            mu = float(min(args.crit_dual_mu_max,
+                           max(0.0, mu + args.crit_dual_eta
+                               * (args.crit_alpha - m["critical_recall"]))))
 
         if snap_every > 0 and ((epoch + 1) % snap_every == 0
                                or epoch + 1 == args.epochs):
@@ -929,7 +1004,7 @@ def main():
             f"CRIT_rec={m['critical_recall']:.3f} "
             f"QB_spec={m['quiet_specificity']:.3f} "
             f"CR[pred={m['pred_cr']:.0f} true={m['true_cr']:.0f}] "
-            f"score={score:.3f} "
+            f"score={score:.3f} feas={'Y' if feasible else 'n'} mu={mu:.2f} "
             f"skips={nan_skips}/{len(train_loader)} {ep_sec:.0f}s "
             f"GPU={gpu_mb:.0f}M{improved}")
         # Per-state P/R + compact confusion every epoch.
@@ -946,8 +1021,15 @@ def main():
             break
 
     total_h = (time.time() - train_start) / 3600
-    print(f"\n[4state] done in {total_h:.2f}h. best @ ep{best_epoch} "
-          f"score={best_score:.3f}. saved: {save_path}")
+    if best_metrics is not None:
+        _bf = "feasible" if best_metrics["critical_recall"] >= args.crit_alpha else "INFEASIBLE(fail-safe)"
+        print(f"\n[4state] done in {total_h:.2f}h. best @ ep{best_epoch} "
+              f"[{_bf}] CRIT_rec={best_metrics['critical_recall']:.3f} "
+              f"QB_spec={best_metrics['quiet_specificity']:.3f} "
+              f"(alpha={args.crit_alpha}). saved: {save_path}")
+    else:
+        print(f"\n[4state] done in {total_h:.2f}h. no checkpoint saved. "
+              f"saved: {save_path}")
 
 
 if __name__ == "__main__":

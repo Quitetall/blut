@@ -166,6 +166,51 @@ def derive_4state_target(labels_3class: np.ndarray,
     return target
 
 
+def apply_energy_failsafe(states: np.ndarray,
+                          l3: np.ndarray,
+                          hi_rms_threshold: float) -> np.ndarray:
+    """Deterministic high-amplitude fail-safe override (ADR 0029 addendum §3).
+
+    Deploy-time STRUCTURAL guarantee: any timestep whose pooled L3 RMS exceeds
+    ``hi_rms_threshold`` is FORCED to CRITICAL (max tier / max FSQ level / max
+    bits), regardless of the learned controller's prediction. It binds on the
+    HARD argmax decision the deployed codec uses, so the guarantee cannot leak
+    through a soft policy. Over-firing only OVER-codes (bounded extra bits);
+    it can never under-code — the asymmetric-cost-safe direction.
+
+    SCOPE (read carefully): structural ONLY for the HIGH-AMPLITUDE critical
+    subset. CRITICAL content is seizure-annotated, and many seizures are
+    LOW-amplitude electrographic — those carry no deterministic deploy-time
+    signal and are NOT caught here. Covering them is the job of the learned
+    conservative seizure-suspicion gate, whose sensitivity is DATA-BOUND (~0.70
+    frontier). This override is a supplement to that gate, not a replacement,
+    and must NOT be marketed as a full seizure guarantee.
+
+    Args:
+        states: ``[T]`` int array in {0,1,2,3} — the controller's per-timestep
+            tier decision (hard argmax).
+        l3: ``[21, T_l3]`` float L3 subband signal (energy source). Pooled to
+            the state resolution ``T`` internally.
+        hi_rms_threshold: RMS above which a timestep is forced to CRITICAL. A
+            CONSERVATIVE high percentile (fire on the loud stuff).
+
+    Returns:
+        ``[T]`` int64 — ``states`` with high-RMS timesteps raised to CRITICAL.
+        Never lowers a tier.
+    """
+    states = np.asarray(states)
+    assert states.ndim == 1, f"states must be [T], got {states.shape}"
+    assert isinstance(l3, np.ndarray) and l3.ndim == 2 and l3.shape[0] == 21, \
+        f"l3 must be [21, T_l3], got shape {getattr(l3, 'shape', None)}"
+    assert np.isfinite(hi_rms_threshold), \
+        f"hi_rms_threshold must be finite, got {hi_rms_threshold!r}"
+    T = states.shape[0]
+    rms = _l3_rms_pooled(l3, T)                      # [T], aligned to states
+    out = states.astype(np.int64, copy=True)
+    out[rms > hi_rms_threshold] = len(STATE_NAMES) - 1   # force CRITICAL (max tier)
+    return out
+
+
 # ----------------------------------------------------------------------
 # Deliverable 1 (cont.) — calibrate the QUIET/BASELINE threshold.
 # ----------------------------------------------------------------------
