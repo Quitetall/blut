@@ -346,11 +346,11 @@ def main() -> None:
     p = argparse.ArgumentParser(
         description="Masked-reconstruction SSL pretrain of the MambaSNN "
                     "backbone on the unlabeled LMA corpus.")
-    # action="append" (NOT nargs="+") to match train_4state_controller and the
-    # metric scripts: repeated `--lma-root A --lma-root B` accumulates. With
-    # nargs="+" the repeated flag silently kept only the LAST root, so multi-root
-    # SSL pretrains (the whole point — diverse corpora) trained on one corpus.
-    p.add_argument("--lma-root", type=Path, action="append", required=True)
+    # nargs="+" (the convention shared by train_4state_controller + snn_metrics):
+    # pass ALL roots after ONE flag, space-separated — `--lma-root A B C`.
+    # NOT repeated `--lma-root A --lma-root B` (nargs keeps only the LAST flag's
+    # values), which silently collapses to one corpus.
+    p.add_argument("--lma-root", type=Path, nargs="+", required=True)
     p.add_argument("--split-manifest", type=Path, required=True)
     p.add_argument("--split", default="train", choices=["train", "val"],
                    help="LMA split to pretrain on (default train; labels ignored)")
