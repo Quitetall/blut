@@ -169,7 +169,10 @@ def main() -> None:
                 n_skip += 1
             else:
                 n_fail += 1
-                key = status.split(":")[0]
+                # status is "err:<ClassName>:<msg>"; key on the class so the
+                # breakdown is meaningful (split[0] was always the literal "err").
+                parts = status.split(":")
+                key = parts[1] if len(parts) > 2 and parts[0] == "err" else status
                 errs[key] = errs.get(key, 0) + 1
                 if shown_err < 5:        # full first failures for diagnosis
                     print(f"  [FAIL] {stem}: {status}", flush=True)
