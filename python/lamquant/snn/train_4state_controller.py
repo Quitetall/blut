@@ -944,7 +944,7 @@ def main():
         improved = ""
         if key > best_key:
             best_key = key
-            best_metrics = m
+            best_metrics = dict(m)   # snapshot; m is rebound each epoch
             best_epoch = epoch + 1
             epochs_since_best = 0
             improved = " *BEST*"
@@ -958,7 +958,11 @@ def main():
                 "quiet_rms_threshold": quiet_thr,
                 "level_table": list(LEVEL_TABLE_4),
                 "cr_table": list(CR_TABLE_4),
-                "class_weights": epoch_weights.tolist(),
+                # Preserve the original contract: class_weights = the BASE
+                # inverse-freq weights; effective_class_weights = the
+                # mu-scaled weights actually used this epoch (with mu).
+                "class_weights": base_class_weights.tolist(),
+                "effective_class_weights": epoch_weights.tolist(),
                 "optimizer": _state_dict_to_cpu(optimizer.state_dict()),
                 "epoch": epoch + 1,
                 "score": score,
@@ -974,9 +978,16 @@ def main():
         else:
             epochs_since_best += 1
 
-        # ADR-0029 dual ascent (slow timescale, on the HARD-argmax val CRIT_rec):
-        # mu rises while the floor is violated, relaxes when it holds. This is
-        # the rigorous version of the static CRITICAL weight floor.
+        # ADR-0029 dual ascent (slow timescale, on the HARD-argmax val CRIT_rec
+        # from the confusion matrix). mu rises while the floor is violated,
+        # relaxes when it holds — the rigorous version of the static CRITICAL
+        # weight floor. The step is symmetric-additive but the GAP is not:
+        # violations (alpha - crit_rec large) push mu up hard, satisfaction
+        # (gap ~ 0 near the floor) relaxes it slowly. If the data frontier
+        # cannot reach alpha, mu pins at --crit-dual-mu-max and the model
+        # over-weights CRITICAL -> high recall / low CR. That is the INTENDED
+        # fail-safe (ADR 0029 addendum: infeasible -> fail-safe to max tier,
+        # CR drops), bounded so the weight cannot explode.
         if args.crit_dual_eta > 0.0:
             mu = float(min(args.crit_dual_mu_max,
                            max(0.0, mu + args.crit_dual_eta
