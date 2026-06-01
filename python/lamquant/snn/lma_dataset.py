@@ -668,7 +668,10 @@ class LmaDataset(Dataset):
                     sz_slots, bg_slots = [], []
                     for w in range(0, n_win - K + 1, stride):
                         s = w * LABEL_PER_WINDOW
-                        e = min((w + K - 1) * LABEL_PER_WINDOW + L3_T, activity.shape[1])
+                        # span of K windows in label space; activity is 3-class
+                        # (0 bg / 1 active / 2 SEIZURE), matching derive_4state_target
+                        # max3==2 -> CRITICAL and the per-window path below.
+                        e = min((w + K) * LABEL_PER_WINDOW, activity.shape[1])
                         is_sz = bool(e > s and np.any(activity[:, s:e] == 2))
                         (sz_slots if is_sz else bg_slots).append(w)
                     bg_budget = max(min_background_per_file,
