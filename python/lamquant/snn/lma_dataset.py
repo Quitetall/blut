@@ -180,6 +180,56 @@ def _fadvise_hint(path: Path) -> None:
         pass  # FS doesn't support fadvise — silent fallback
 
 
+def _detail_bands_cfg() -> Tuple[str, ...]:
+    """Detail subband channels to append to L3, from the SNN_DETAIL_BANDS env.
+
+    Empty (default) -> L3 only, behaviour identical to before. Set to e.g.
+    "l3_detail" (the 15.6-31.25 Hz LVFA band) or
+    "l3_detail,l2_detail,l1_detail" (full >15 Hz reconstruction basis) to
+    append those bands as extra input channels, pooled to the L3 313 grid.
+    Used by the oracle ceiling probe and the L3+details deployable arm.
+    """
+    raw = os.environ.get("SNN_DETAIL_BANDS", "").strip()
+    return tuple(b for b in (s.strip() for s in raw.split(",")) if b)
+
+
+def _stack_detail_bands(l3: np.ndarray, subs: list) -> np.ndarray:
+    """Append env-selected detail subbands to L3 as extra channels.
+
+    Args:
+        l3: ``[21, 313]`` level-3 DWT approximation (<=15.6 Hz).
+        subs: list of 21 per-channel dicts with detail bands ('l3_detail'
+            15.6-31.25, 'l2_detail' 31.25-62.5, 'l1_detail' 62.5-125 Hz),
+            as returned by ``preprocess_subband_single``.
+
+    Returns:
+        ``[21*(1+k), 313]`` float32, k = number of selected bands. With no
+        bands selected (default) returns the bare ``[21, 313]`` L3 — identical
+        to the prior behaviour, so existing callers are unaffected.
+    """
+    l3 = np.asarray(l3, dtype=np.float32)
+    bands = _detail_bands_cfg()
+    if not bands:
+        return l3
+    T = l3.shape[1]
+    out = [l3]
+    for band in bands:
+        mat = np.empty((len(subs), T), dtype=np.float32)
+        for c, d in enumerate(subs):
+            v = np.asarray(d[band], dtype=np.float32)
+            if v.shape[0] == T:
+                mat[c] = v
+            else:
+                # resample the band coefficients onto the 313 grid (linear)
+                mat[c] = np.interp(
+                    np.linspace(0.0, 1.0, T, dtype=np.float64),
+                    np.linspace(0.0, 1.0, v.shape[0], dtype=np.float64),
+                    v.astype(np.float64),
+                ).astype(np.float32)
+        out.append(mat)
+    return np.concatenate(out, axis=0)
+
+
 def _compute_l3_stack(lma_path: str, stem: str,
                       lml_internal: Optional[str] = None) -> Optional[np.ndarray]:
     """Decode + preprocess signal then run preprocess_subband_single
@@ -200,15 +250,15 @@ def _compute_l3_stack(lma_path: str, stem: str,
         # Recording shorter than one window — pad and emit one window.
         window = np.zeros((TARGET_CHANNELS, WINDOW_SAMPLES), dtype=np.float32)
         window[:, :T] = signal[:, :T]
-        l3, _, _ = _preprocess_subband_single(window, order=8, autocorr_len=256)
-        return np.expand_dims(np.asarray(l3, dtype=np.float32), 0)
+        l3, _, subs = _preprocess_subband_single(window, order=8, autocorr_len=256)
+        return np.expand_dims(_stack_detail_bands(l3, subs), 0)
     l3_list = []
     for w in range(n_full):
         s = w * WINDOW_SAMPLES
         e = s + WINDOW_SAMPLES
         window = signal[:, s:e].astype(np.float32)
-        l3, _, _ = _preprocess_subband_single(window, order=8, autocorr_len=256)
-        l3_list.append(np.asarray(l3, dtype=np.float32))
+        l3, _, subs = _preprocess_subband_single(window, order=8, autocorr_len=256)
+        l3_list.append(_stack_detail_bands(l3, subs))
     return np.stack(l3_list, axis=0)
 
 
@@ -458,6 +508,7 @@ class LmaDataset(Dataset):
                  max_windows_per_file: int = MAX_WINDOWS_PER_FILE,
                  max_seizure_windows_per_file: int = MAX_SEIZURE_WINDOWS_PER_FILE,
                  min_background_per_file: int = MIN_BACKGROUND_PER_FILE,
+                 seq_windows: int = 1,
                  require_meta_subject_match: bool = True):  # noqa: arg unused (back-compat)
         """LMA-direct training dataset (Phase M per-dataset layout).
 
@@ -487,6 +538,10 @@ class LmaDataset(Dataset):
             raise ValueError(
                 f"split must be 'train' or 'val', got {split!r}"
             )
+
+        self.seq_windows = int(seq_windows)
+        if self.seq_windows < 1:
+            raise ValueError(f"seq_windows must be >= 1, got {seq_windows}")
 
         # Resolve LMA paths.
         if lma_paths is None and (lma_dir is not None or lma_root is not None):
@@ -599,6 +654,36 @@ class LmaDataset(Dataset):
                     max_seizure_windows=max_seizure_windows_per_file,
                     min_background=min_background_per_file,
                 )
+                if self.seq_windows > 1:
+                    # Cross-window sequence slots: K CONSECUTIVE windows so the
+                    # SSM scan carries state across the 10 s window boundaries
+                    # (ADR-0027 temporal-context lever). win_idx stores the START
+                    # window; __getitem__ concatenates [start, start+K).
+                    K = self.seq_windows
+                    n_win = activity.shape[1] // LABEL_PER_WINDOW
+                    if n_win < K:
+                        n_seen += 1
+                        continue
+                    stride = max(1, K // 2)              # 50% overlap for coverage
+                    sz_slots, bg_slots = [], []
+                    for w in range(0, n_win - K + 1, stride):
+                        s = w * LABEL_PER_WINDOW
+                        e = min((w + K - 1) * LABEL_PER_WINDOW + L3_T, activity.shape[1])
+                        is_sz = bool(e > s and np.any(activity[:, s:e] == 2))
+                        (sz_slots if is_sz else bg_slots).append(w)
+                    bg_budget = max(min_background_per_file,
+                                    max_windows_per_file // K)
+                    if len(bg_slots) > bg_budget:
+                        keep = np.linspace(0, len(bg_slots) - 1, bg_budget, dtype=int)
+                        bg_slots = [bg_slots[i] for i in keep]
+                    for w in sorted(set(sz_slots) | set(bg_slots)):
+                        is_sz = w in set(sz_slots)
+                        if is_sz:
+                            n_seizure_windows += 1
+                        self.index.append((lma_path, stem, w, lml_internal, label_internal))
+                        self.seizure_flags.append(is_sz)
+                    n_seen += 1
+                    continue
                 for wi in selected:
                     lbl_start = wi * LABEL_PER_WINDOW
                     lbl_end = min(lbl_start + L3_T, activity.shape[1])
@@ -639,12 +724,24 @@ class LmaDataset(Dataset):
         # stem (corpus-unique under the per-dataset layout), so existing
         # on-disk `<stem>.npy` files in Training/l3_cache/ stay valid.
         l3_stack = _cached_l3_stack(str(lma_path), stem, lml_internal=lml_internal)
-        if l3_stack is None:
-            l3 = np.zeros((TARGET_CHANNELS, L3_T), dtype=np.float32)
-        elif win_idx >= l3_stack.shape[0]:
-            l3 = np.zeros((TARGET_CHANNELS, L3_T), dtype=np.float32)
+        K = self.seq_windows
+        ch = l3_stack.shape[1] if l3_stack is not None else TARGET_CHANNELS
+        if K == 1:
+            if l3_stack is None or win_idx >= l3_stack.shape[0]:
+                l3 = np.zeros((ch, L3_T), dtype=np.float32)
+            else:
+                l3 = np.asarray(l3_stack[win_idx], dtype=np.float32)
         else:
-            l3 = np.asarray(l3_stack[win_idx], dtype=np.float32)
+            # Cross-window: concatenate K CONSECUTIVE windows -> [ch, K*L3_T].
+            # win_idx is the START window; the SSM scans the whole span so its
+            # state carries across the 10 s boundaries.
+            l3 = np.zeros((ch, L3_T * K), dtype=np.float32)
+            if l3_stack is not None:
+                for k in range(K):
+                    wk = win_idx + k
+                    if wk < l3_stack.shape[0]:
+                        l3[:, k * L3_T:(k + 1) * L3_T] = np.asarray(
+                            l3_stack[wk], dtype=np.float32)
 
         # Read labels NPZ for this window. With LmaGroupedSampler the
         # same `(lma_path, label_internal)` shows up 5x in a row; cache
@@ -672,14 +769,18 @@ class LmaDataset(Dataset):
             if len(_LABEL_CACHE) > LABEL_CACHE_CAP:
                 _LABEL_CACHE.popitem(last=False)
 
-        lbl_start = win_idx * LABEL_PER_WINDOW
-        lbl_end = min(lbl_start + L3_T, activity.shape[1])
-        labels_window = np.zeros((8, L3_T), dtype=np.int64)
-        if lbl_end > lbl_start:
-            lbl_len = lbl_end - lbl_start
-            labels_window[:, :lbl_len] = activity[:, lbl_start:lbl_end].astype(np.int64)
-            if lbl_len < L3_T:
-                labels_window[:, lbl_len:] = labels_window[:, lbl_len - 1:lbl_len]
+        labels_window = np.zeros((8, L3_T * K), dtype=np.int64)
+        for k in range(K):
+            wk = win_idx + k
+            lbl_start = wk * LABEL_PER_WINDOW
+            lbl_end = min(lbl_start + L3_T, activity.shape[1])
+            o = k * L3_T
+            if lbl_end > lbl_start:
+                lbl_len = lbl_end - lbl_start
+                labels_window[:, o:o + lbl_len] = activity[:, lbl_start:lbl_end].astype(np.int64)
+                if lbl_len < L3_T:
+                    labels_window[:, o + lbl_len:o + L3_T] = \
+                        labels_window[:, o + lbl_len - 1:o + lbl_len]
 
         return torch.from_numpy(l3), torch.from_numpy(labels_window)
 

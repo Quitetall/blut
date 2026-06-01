@@ -622,6 +622,13 @@ def main():
     p.add_argument("--max-windows-per-file", type=int, default=5)
     p.add_argument("--target-T", type=int, default=L3_T,
                    help="head output time resolution (default 313 = latent T)")
+    p.add_argument("--seq-windows", type=int, default=1,
+                   help="ADR-0027 temporal-context lever: train the SSM on K "
+                        "CONSECUTIVE 10 s windows (state carries across the "
+                        "boundaries -> the model sees the seizure's evolution, "
+                        "not one isolated 10 s slice). K=1 = current per-window "
+                        "behaviour. Deploys as streaming state-carry (O(d_state) "
+                        "on the MCU, no SRAM blowup).")
     p.add_argument("--rare-frac", type=float, default=0.4,
                    help="CONSTANT fraction of rare-state windows per epoch "
                         "(no anneal)")
@@ -783,11 +790,14 @@ def main():
     print(f"[4state] {len(lma_paths)} .lma archive(s)")
     train_ds = LmaDataset(lma_paths=lma_paths, split="train",
                           split_manifest_path=args.split_manifest,
-                          max_windows_per_file=args.max_windows_per_file)
+                          max_windows_per_file=args.max_windows_per_file,
+                          seq_windows=args.seq_windows)
     val_ds = LmaDataset(lma_paths=lma_paths, split="val",
                         split_manifest_path=args.split_manifest,
-                        max_windows_per_file=args.max_windows_per_file)
-    print(f"[4state] train={len(train_ds)} val={len(val_ds)}")
+                        max_windows_per_file=args.max_windows_per_file,
+                        seq_windows=args.seq_windows)
+    print(f"[4state] train={len(train_ds)} val={len(val_ds)} "
+          f"(seq_windows={args.seq_windows})")
 
     save_dir = os.path.join(ROOT_DIR, "weights", "snn")
     os.makedirs(save_dir, exist_ok=True)
@@ -903,7 +913,9 @@ def main():
         print(f"[4state] schedule: cosine-warmup -> WSD -> cosine decay "
               f"(warmup={scheduler.warmup_epochs}ep)")
 
-    target_T = int(args.target_T)
+    # Cross-window: the head emits K*L3_T states so the SSM scans the full
+    # K-window span (state carries across the 10 s boundaries). K=1 unchanged.
+    target_T = int(args.target_T) * args.seq_windows
     snap_every = int(os.environ.get("SNN_SNAPSHOT_EVERY", "0"))
 
     best_key = (-1, -1e9)        # ADR-0029 lexicographic feasibility-first
