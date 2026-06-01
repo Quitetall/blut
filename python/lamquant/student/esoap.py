@@ -143,16 +143,29 @@ def _esoap_direction(
 def _adamw_apply_(
     p: Tensor, grad: Tensor, exp_avg: Tensor, exp_avg_sq: Tensor, step: int,
     lr: float, beta1: float, beta2: float, eps: float, weight_decay: float,
+    cautious_wd: bool = False,
 ) -> None:
-    """Standard AdamW step (in place) — for the non-esoap group."""
-    if weight_decay != 0.0:
-        p.mul_(1.0 - lr * weight_decay)
+    """Standard AdamW step (in place) — for the non-esoap group.
+
+    ``cautious_wd`` (ADR 0030, SPECULATIVE, default off): decay only entries
+    where the AdamW update already agrees in sign with the param. WD on ``p``
+    is independent of the EMA/denom computation, so the plain path below is
+    byte-identical to applying decay first.
+    """
     exp_avg.lerp_(grad, 1.0 - beta1)
     exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
     bias1 = 1.0 - beta1 ** step
     bias2 = 1.0 - beta2 ** step
     denom = (exp_avg_sq.sqrt() / (bias2 ** 0.5)).add_(eps)
-    p.addcdiv_(exp_avg, denom, value=-lr / bias1)
+    if weight_decay != 0.0 and cautious_wd:
+        update = (exp_avg / denom).mul_(lr / bias1)
+        mask = (update * p) > 0
+        update.add_(p * mask, alpha=lr * weight_decay)
+        p.add_(update, alpha=-1.0)
+    else:
+        if weight_decay != 0.0:
+            p.mul_(1.0 - lr * weight_decay)
+        p.addcdiv_(exp_avg, denom, value=-lr / bias1)
 
 
 class ESOAP(torch.optim.Optimizer):
@@ -180,6 +193,7 @@ class ESOAP(torch.optim.Optimizer):
         nesterov: bool = True,
         eps: float = 1e-8,
         weight_decay: float = 0.0,
+        cautious_wd: bool = False,
     ):
         if lr <= 0.0:
             raise ValueError(f"lr must be > 0, got {lr}")
@@ -191,6 +205,7 @@ class ESOAP(torch.optim.Optimizer):
             lr=lr, method="adamw", rank_frac=rank_frac, mu=mu,
             gram_beta=gram_beta, betas=betas, ns_steps=ns_steps,
             nesterov=nesterov, eps=eps, weight_decay=weight_decay,
+            cautious_wd=cautious_wd,
         )
         super().__init__(params, defaults)
         for group in self.param_groups:
@@ -255,9 +270,19 @@ class ESOAP(torch.optim.Optimizer):
                         ns_steps=group["ns_steps"],
                         eps=eps,
                     )
-                    if wd != 0.0:
-                        p.mul_(1.0 - lr * wd)
-                    p.add_(direction.to(p.dtype), alpha=-lr)
+                    direction_p = direction.to(p.dtype)
+                    if wd != 0.0 and group.get("cautious_wd", False):
+                        # Cautious decoupled WD (ADR 0030, SPECULATIVE, default
+                        # off): decay only where the step agrees in sign with
+                        # the param, so it never fights the update. A/B-gated.
+                        upd = direction_p.mul(lr)
+                        mask = (upd * p) > 0
+                        upd.add_(p * mask, alpha=lr * wd)
+                        p.add_(upd, alpha=-1.0)
+                    else:
+                        if wd != 0.0:
+                            p.mul_(1.0 - lr * wd)
+                        p.add_(direction_p, alpha=-lr)
                 else:  # adamw
                     if len(state) == 0:
                         state["step"] = 0
@@ -269,6 +294,7 @@ class ESOAP(torch.optim.Optimizer):
                         p, grad, exp_avg=state["exp_avg"],
                         exp_avg_sq=state["exp_avg_sq"], step=state["step"],
                         lr=lr, beta1=beta1, beta2=beta2, eps=eps,
-                        weight_decay=wd)
+                        weight_decay=wd,
+                        cautious_wd=group.get("cautious_wd", False))
 
         return loss

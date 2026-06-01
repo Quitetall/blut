@@ -34,14 +34,15 @@ class SOAP(optim.Optimizer):
                  shampoo_beta=-1, eps=1e-8, weight_decay=0.01,
                  precondition_frequency=10, max_precond_dim=10000,
                  merge_dims=False, precondition_1d=False,
-                 correct_bias=True):
+                 correct_bias=True, cautious_wd=False):
         defaults = dict(lr=lr, betas=betas, shampoo_beta=shampoo_beta,
                         eps=eps, weight_decay=weight_decay,
                         precondition_frequency=precondition_frequency,
                         max_precond_dim=max_precond_dim,
                         merge_dims=merge_dims,
                         precondition_1d=precondition_1d,
-                        correct_bias=correct_bias)
+                        correct_bias=correct_bias,
+                        cautious_wd=cautious_wd)
         super().__init__(params, defaults)
         self._data_format = "channels_first"
 
@@ -124,10 +125,22 @@ class SOAP(optim.Optimizer):
                     merge_dims=group["merge_dims"],
                     max_precond_dim=group['max_precond_dim'])
 
-                p.add_(norm_grad, alpha=-step_size)
-
-                if group["weight_decay"] > 0.0:
-                    p.add_(p, alpha=(-group["lr"] * group["weight_decay"]))
+                wd = group["weight_decay"]
+                if wd > 0.0 and group.get("cautious_wd", False):
+                    # Cautious decoupled WD (ADR 0030, SPECULATIVE, flag-gated,
+                    # default off). Fold the decoupled decay lr*wd*p into the
+                    # update only on entries where the update already agrees in
+                    # sign with the param (update*p > 0), so decay never fights
+                    # the step. Must clear an end-to-end A/B before adoption.
+                    update = norm_grad.mul(step_size)
+                    mask = (update * p) > 0
+                    update.add_(p * mask, alpha=group["lr"] * wd)
+                    p.add_(update, alpha=-1.0)
+                else:
+                    # Plain decoupled WD path — byte-identical to pre-0030.
+                    p.add_(norm_grad, alpha=-step_size)
+                    if wd > 0.0:
+                        p.add_(p, alpha=(-group["lr"] * wd))
 
                 self.update_preconditioner(
                     grad, state,

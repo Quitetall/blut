@@ -82,4 +82,50 @@ if __name__ == "__main__":
     test_newton_schulz_orthogonalizes()
     test_esoap_direction_is_rms_normalized_and_finite()
     test_esoap_two_step_smoke_on_real_snn()
+    test_cautious_wd_mask_identity()
     print("\nALL ESOAP TESTS PASSED")
+
+
+def _run_k(make_opt, p0, grads):
+    p = torch.nn.Parameter(p0.clone())
+    opt = make_opt([p])
+    for g in grads:
+        p.grad = g.clone()
+        opt.step()
+    return p.detach().clone()
+
+
+def test_cautious_wd_mask_identity():
+    """Cautious WD (ADR 0030, flag-gated) obeys the per-entry fold identity
+    ``p_cautious = where((p0-p_nowd)*p0 > 0, p_plain, p_nowd)`` on all three
+    optimizer paths (SOAP, ESOAP-esoap, ESOAP-adamw), and is non-vacuous:
+    it differs from BOTH plain-WD and no-WD. Default off stays plain-WD.
+    """
+    from soap_optimizer import SOAP  # noqa: E402
+
+    factories = {
+        "SOAP": lambda ps, wd, c: SOAP(ps, lr=0.1, weight_decay=wd, cautious_wd=c),
+        "ESOAP-esoap": lambda ps, wd, c: ESOAP(
+            [{"params": ps, "method": "esoap"}], lr=0.1,
+            weight_decay=wd, cautious_wd=c),
+        "ESOAP-adamw": lambda ps, wd, c: ESOAP(
+            [{"params": ps, "method": "adamw"}], lr=0.1,
+            weight_decay=wd, cautious_wd=c),
+    }
+    WD, K = 0.2, 5
+    for name, factory in factories.items():
+        torch.manual_seed(0)
+        p0 = torch.randn(8, 6) * 0.5
+        grads = [torch.randn(8, 6) for _ in range(K)]
+        nowd = _run_k(lambda ps: factory(ps, 0.0, False), p0, grads)
+        plain = _run_k(lambda ps: factory(ps, WD, False), p0, grads)
+        caut = _run_k(lambda ps: factory(ps, WD, True), p0, grads)
+        # WD path actually executed (not vacuous like SOAP's skipped step 1).
+        assert not torch.allclose(plain, nowd, atol=1e-5), \
+            f"{name}: WD inert — test vacuous"
+        # Cautious differs from both plain and no-WD (mask is partial).
+        assert not torch.allclose(caut, plain, atol=1e-6), \
+            f"{name}: cautious == plain (mask all-true?)"
+        assert not torch.allclose(caut, nowd, atol=1e-6), \
+            f"{name}: cautious == nowd (mask all-false?)"
+        print(f"[ok] cautious-WD non-vacuous + bracketed on {name}")
