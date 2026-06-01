@@ -151,6 +151,13 @@ def main() -> None:
     ap.add_argument("--test-fraction", type=float, default=0.10)
     ap.add_argument("--external-test-corpus", type=str, action="append", default=[],
                     help="corpus dir name held ENTIRELY out as external_test (cross-site); repeatable")
+    ap.add_argument("--train-only-corpus", type=str, action="append", default=[],
+                    help="corpus dir name whose PURE-background subjects (every "
+                         "stem in a train-only corpus) are forced to the train "
+                         "split, keeping val/test restricted to the labeled "
+                         "seizure corpora. Mixed subjects (also present in a "
+                         "labeled corpus) follow the normal hash. Repeatable. "
+                         "Use for unlabeled bulk negatives (e.g. TUEG).")
     ap.add_argument("--allowlist", type=Path, default=None,
                     help="JSON {corpus: [conformant stems]} from vet_montage. "
                          "When given, stems NOT in the union of these lists are "
@@ -159,6 +166,7 @@ def main() -> None:
     assert 0.0 <= args.val_fraction < 1.0 and 0.0 <= args.test_fraction < 1.0
     assert args.val_fraction + args.test_fraction < 1.0, "val+test must leave a train set"
     ext_corpora = set(args.external_test_corpus)
+    train_only_corpora = set(args.train_only_corpus)
 
     # 1. Label stems FIRST — the authoritative recording-stem universe. Also
     #    lets us tell a per-recording archive (filename == a labeled stem) from
@@ -178,7 +186,14 @@ def main() -> None:
     for root in args.lma_root:
         lma_paths += glob.glob(os.path.join(root, "*", "*.lma"))
         lma_paths += glob.glob(os.path.join(root, "*.lma"))
-    lma_paths = sorted(set(lma_paths))
+    # Attribution is FIRST-WINS (setdefault). A recording duplicated across
+    # corpora (TUSZ/TUEP/TUEV are subsets of TUEG, same stem, same bytes) must
+    # be attributed to its LABELED corpus, not the train-only bulk — otherwise a
+    # real seizure patient whose every stem also lives in TUEG gets misclassified
+    # as pure-background and forced out of val/test. So order train-only-corpus
+    # per-recording paths LAST; labeled corpora claim the overlap stem first.
+    lma_paths = sorted(set(lma_paths),
+                       key=lambda p: (Path(p).parent.name in train_only_corpora, p))
     stem_corpus: dict[str, str] = {}
     n_per_corpus = 0
     for p in lma_paths:
@@ -234,11 +249,25 @@ def main() -> None:
     #    proportional seizure cohort.
     subjects: dict[str, str] = {}
     internal = []
+    n_forced_train = 0
     for subj in sorted(stems_by_subject):
         if subject_corpus[subj] in ext_corpora:
             subjects[subj] = "external_test"
+        elif (train_only_corpora
+              and all(stem_corpus[s] in train_only_corpora
+                      for s in stems_by_subject[subj])):
+            # Pure train-only-corpus subject (e.g. unlabeled TUEG background):
+            # force train so val/test stay restricted to the labeled seizure
+            # corpora. Leakage-safe — every stem of this subject lands in train,
+            # and these subjects are non-seizure so they don't perturb the
+            # seizure stratification / starvation repair below.
+            subjects[subj] = "train"
+            n_forced_train += 1
         else:
             internal.append(subj)
+    if train_only_corpora:
+        print(f"[*] train-only corpora {sorted(train_only_corpora)}: "
+              f"forced {n_forced_train} pure-background subjects -> train")
     seiz = sorted(s for s in internal if subject_has_seizure[s])
     nonseiz = sorted(s for s in internal if not subject_has_seizure[s])
     for bucket in (seiz, nonseiz):
@@ -295,6 +324,7 @@ def main() -> None:
             "test_fraction": args.test_fraction,
             "split_method": "patient-level, seizure-stratified, sha1(subject)%1000, 3-way + corpus-level cross-site external_test",
             "external_test_corpora": sorted(ext_corpora),
+            "train_only_corpora": sorted(train_only_corpora),
             "lma_roots": [str(r) for r in args.lma_root],
             "labels": str(args.labels),
             "corpora": sorted({subject_corpus[s] for s in stems_by_subject}),
