@@ -120,7 +120,9 @@ def build_recording_streams(model, head, ds, use_spectral, quiet_thr, in_ch,
         probs_parts, true_parts = [], []
         for w in range(n_win):
             l3 = np.asarray(stack[w], dtype=np.float32)
-            if l3.shape[0] != in_ch:
+            # stack is raw L3 (21 ch); spectral build_augmented_input expands it
+            # to the model's in_ch (105) below — so check against 21, NOT in_ch.
+            if l3.shape[0] != TARGET_CHANNELS:
                 continue
             t = torch.from_numpy(l3).unsqueeze(0).to(device)
             x = build_augmented_input(t) if use_spectral else t
