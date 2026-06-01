@@ -70,57 +70,122 @@ def load_model(ckpt_path, device):
 
 def build_recording_streams(model, head, ds, use_spectral, quiet_thr, in_ch,
                             device, max_recordings=None):
-    """Per-recording (crit_prob_1d, true_crit_mask_1d) from the 4-state head."""
+    """Per-recording CONTINUOUS (crit_prob_1d, true_crit_mask_1d).
+
+    CRITICAL: streams the FULL recording (every window in order via the full L3
+    stack), NOT the trainer's seizure-SELECTED windows — otherwise the base rate
+    is inverted (seizure-enriched) and event-F1/FA/h are meaningless. True
+    CRITICAL = (3-class activity == 2).any over groups, per window slice
+    (matches four_state.derive_4state_target max3==2 -> CRITICAL).
+    """
+    import io
+    from lamquant.snn.lma_dataset import (
+        _cached_l3_stack, _label_cache_dir, _lazy_imports,
+        LABEL_PER_WINDOW, TARGET_CHANNELS,
+    )
+    import lamquant_core as _lc
+    _lazy_imports()
     if use_spectral:
         from lamquant.snn.spectral import build_augmented_input
-    by_stem = defaultdict(list)
-    for i, entry in enumerate(ds.index):
-        by_stem[entry[1]].append((entry[2], i))   # stem -> [(win_idx, ds_idx)]
-    stems = sorted(by_stem)
+
+    # stem -> (lma_path, lml_internal, label_internal) from any index entry
+    info = {}
+    for e in ds.index:
+        info.setdefault(e[1], (str(e[0]), e[3], e[4]))
+    stems = sorted(info)
     if max_recordings:
         stems = stems[:max_recordings]
+    label_dir = _label_cache_dir()
+
+    def _load_activity(stem, lma_path, label_internal):
+        cached = (label_dir / f"{stem}_labels.npz") if label_dir else None
+        try:
+            if cached is not None and cached.exists():
+                with np.load(cached, allow_pickle=True) as ld:
+                    return np.asarray(ld["activity_labels"])
+            b = _lc.lma_read_entry(lma_path, label_internal)
+            with np.load(io.BytesIO(b), allow_pickle=True) as ld:
+                return np.asarray(ld["activity_labels"])
+        except Exception:
+            return None
+
     streams = []
     for stem in stems:
-        order = sorted(by_stem[stem])              # by win_idx -> contiguous timeline
+        lma_path, lml_internal, label_internal = info[stem]
+        stack = _cached_l3_stack(lma_path, stem, lml_internal=lml_internal)
+        act = _load_activity(stem, lma_path, label_internal)
+        if stack is None or act is None:
+            continue
+        n_win = stack.shape[0]
         probs_parts, true_parts = [], []
-        for _wi, di in order:
-            sig, lab = ds[di]
-            sig = sig.unsqueeze(0).float().to(device)
-            lab = lab.unsqueeze(0).to(device)
-            if sig.shape[1] != in_ch:
+        for w in range(n_win):
+            l3 = np.asarray(stack[w], dtype=np.float32)
+            if l3.shape[0] != in_ch:
                 continue
-            x = build_augmented_input(sig) if use_spectral else sig
+            t = torch.from_numpy(l3).unsqueeze(0).to(device)
+            x = build_augmented_input(t) if use_spectral else t
             with torch.no_grad():
-                act, _, _ = model(x)
-                _s, cl = head(act, L3_T)
-                p = torch.softmax(cl, dim=1)[0, CRIT].cpu().numpy()   # [313]
-            tgt = derive_batch_targets(lab, sig, quiet_thr, L3_T)[0].cpu().numpy()
+                a, _, _ = model(x)
+                _s, cl = head(a, L3_T)
+                p = torch.softmax(cl, dim=1)[0, CRIT].cpu().numpy()
+            s = w * LABEL_PER_WINDOW
+            e = min(s + L3_T, act.shape[1])
+            tw = np.zeros(L3_T, dtype=np.int8)
+            if e > s:
+                seg = (act[:, s:e] == 2).any(axis=0).astype(np.int8)
+                tw[:e - s] = seg
+                if e - s < L3_T:
+                    tw[e - s:] = tw[e - s - 1]
             probs_parts.append(p.astype(np.float64))
-            true_parts.append((tgt == CRIT).astype(np.int8))
+            true_parts.append(tw)
         if probs_parts:
             streams.append((np.concatenate(probs_parts),
                             np.concatenate(true_parts)))
     return streams
 
 
-def event_curve(streams, thresholds):
-    """Sweep thresholds -> pooled (event_sens, FA/h) curve + window arrays."""
+# SzCORE event conventions (Dan et al., SzCORE 2025): any-overlap matching with
+# a 30 s pre-ictal / 60 s post-ictal tolerance, events <90 s apart merged.
+SZCORE_PRE_S = 30.0
+SZCORE_POST_S = 60.0
+SZCORE_MERGE_S = 90.0
+
+
+def _pad_events(events, pre, post):
+    return [(max(0.0, s - pre), e + post) for (s, e) in events]
+
+
+def event_curve(streams, thresholds, szcore=True):
+    """Sweep thresholds -> pooled (event_sens, precision, event_F1, FA/h) curve.
+
+    SzCORE mode: true events get a [-30 s, +60 s] tolerance pad before OVLP
+    matching, and both true + predicted events are merged when <90 s apart.
+    event_F1 (the SzCORE PRIMARY metric) = 2*TP / (2*TP + FP + FN).
+    """
+    merge = SZCORE_MERGE_S if szcore else 0.0
+    pre, post = (SZCORE_PRE_S, SZCORE_POST_S) if szcore else (0.0, 0.0)
     total_secs = sum(len(p) for p, _ in streams) * SEC_PER_STEP_L3
-    # true events fixed across thresholds
-    true_events = [events_from_binary(t.astype(bool)) for _, t in streams]
+    true_events = [events_from_binary(t.astype(bool), merge_gap_sec=merge)
+                   for _, t in streams]
+    true_padded = [_pad_events(te, pre, post) for te in true_events]
     n_true_total = sum(len(e) for e in true_events)
     curve = []
     for th in thresholds:
         det = fp = 0
-        for (probs, _t), te in zip(streams, true_events):
-            pe = events_from_probs(probs, float(th))
-            sc = ovlp_score(pe, te)
+        for (probs, _t), tep in zip(streams, true_padded):
+            pe = events_from_probs(probs, float(th), merge_gap_sec=merge)
+            sc = ovlp_score(pe, tep)
             det += int(sc["n_true_detected"])
             fp += int(sc["n_false_pred"])
+        fn = n_true_total - det
         sens = det / n_true_total if n_true_total else 0.0
+        prec = det / (det + fp) if (det + fp) else 0.0
+        f1 = (2 * det) / (2 * det + fp + fn) if (2 * det + fp + fn) else 0.0
         fa_h = event_fpr_per_hour(fp, total_secs)
         curve.append({"threshold": round(float(th), 3),
                       "event_sens": round(sens, 4),
+                      "precision": round(prec, 4),
+                      "event_f1": round(f1, 4),
                       "fa_per_h": round(fa_h, 4),
                       "fa_per_day": round(fa_h * 24, 3)})
     return curve, n_true_total, total_secs / 3600.0
@@ -193,11 +258,17 @@ def main():
 
     # ---- event-level vector ----
     thresholds = np.round(np.linspace(0.05, 0.95, 19), 3)
-    curve, n_events, hours = event_curve(streams, thresholds)
+    curve, n_events, hours = event_curve(streams, thresholds, szcore=True)
+    best_f1 = max(curve, key=lambda c: c["event_f1"]) if curve else {}
     ev = {
-        "scoring": "NEDC OVLP any-overlap, 4-state CRITICAL softmax prob",
+        "scoring": ("SzCORE-aligned event OVLP (30s pre / 60s post tolerance, "
+                    "merge <90s), 4-state CRITICAL softmax prob. PRIMARY metric "
+                    "= event_F1; report sensitivity ONLY with its FA/h."),
         "n_events": n_events,
         "hours": round(hours, 2),
+        "best_event_f1": round(best_f1.get("event_f1", 0.0), 4),
+        "at_best_f1": {k: best_f1.get(k) for k in
+                       ("threshold", "event_sens", "precision", "fa_per_day")},
         "sens_at_fa": {
             "1_per_h": sens_at_fa(curve, 1.0),
             "6_per_day": sens_at_fa(curve, 6.0 / 24),
@@ -227,6 +298,10 @@ def main():
     print(f"  recordings={len(streams)}  events={n_events}  hours={hours:.1f}  "
           f"crit_prev={win['crit_prevalence']}")
     print(f"  WINDOW   ROC-AUC={win.get('roc_auc','n/a')}  PR-AUC={win.get('pr_auc','n/a')}")
+    bf = ev["at_best_f1"]
+    print(f"  EVENT-F1 (SzCORE primary) best={ev['best_event_f1']}  "
+          f"@ sens={bf.get('event_sens')} prec={bf.get('precision')} "
+          f"FP/day={bf.get('fa_per_day')}  [bar: SzCORE-winner 0.32, Encevis 0.44]")
     print(f"  EVENT    sens@1/h={ev['sens_at_fa']['1_per_h']}  "
           f"sens@6/day={ev['sens_at_fa']['6_per_day']}  "
           f"sens@1/day={ev['sens_at_fa']['1_per_day']}  "
