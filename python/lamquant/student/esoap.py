@@ -36,6 +36,8 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from cautious_wd import cautious_decoupled_wd_
+
 __all__ = ["ESOAP"]
 
 
@@ -159,9 +161,7 @@ def _adamw_apply_(
     denom = (exp_avg_sq.sqrt() / (bias2 ** 0.5)).add_(eps)
     if weight_decay != 0.0 and cautious_wd:
         update = (exp_avg / denom).mul_(lr / bias1)
-        mask = (update * p) > 0
-        update.add_(p * mask, alpha=lr * weight_decay)
-        p.add_(update, alpha=-1.0)
+        cautious_decoupled_wd_(p, update, lr, weight_decay)
     else:
         if weight_decay != 0.0:
             p.mul_(1.0 - lr * weight_decay)
@@ -276,9 +276,7 @@ class ESOAP(torch.optim.Optimizer):
                         # off): decay only where the step agrees in sign with
                         # the param, so it never fights the update. A/B-gated.
                         upd = direction_p.mul(lr)
-                        mask = (upd * p) > 0
-                        upd.add_(p * mask, alpha=lr * wd)
-                        p.add_(upd, alpha=-1.0)
+                        cautious_decoupled_wd_(p, upd, lr, wd)
                     else:
                         if wd != 0.0:
                             p.mul_(1.0 - lr * wd)

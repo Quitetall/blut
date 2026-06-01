@@ -55,6 +55,8 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from lamquant.snn.lma_annotations import LMA_ANNOTATION_SENTINEL
+
 # MOVE-B (2026-05-29): now at blut/python/lamquant/student/. Put the
 # lamquant package root (blut/python) + the common DTO dir on sys.path
 # so `from data_types import ...` and `from lamquant.snn.lma_dataset
@@ -210,7 +212,7 @@ class LmaTypedL3Dataset:
             activity = None
             cached = (label_cache / f"{stem}_labels.npz") if label_cache else None
             try:
-                if label_internal == "__lma_annotation__":
+                if label_internal == LMA_ANNOTATION_SENTINEL:
                     # On-the-fly sentinel: not a real archive entry. Derive the
                     # seizure flag from the LMA's bundled annotation (None ->
                     # background-only recording -> all windows stay False).

@@ -13,10 +13,11 @@ Annotation bytes read from the LMA are byte-identical to the on-disk source
 """
 from __future__ import annotations
 
+import functools
 import os
 import re
 import tempfile
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -24,11 +25,31 @@ import numpy as np
 _ANN_EXT = (".csv_bi", ".tse_bi", ".csv", ".tse", ".rec")
 _DUR_RE = re.compile(r"#\s*duration\s*=\s*([0-9.]+)")
 
+# Sentinel `label_internal`: derive labels on the fly from the LMA's bundled
+# annotation instead of reading a precomputed NPZ entry. Shared by the dataset
+# index/__getitem__ paths and the typed adapter's seizure-flag precompute so
+# the dispatch sites cannot drift on a typo'd literal.
+LMA_ANNOTATION_SENTINEL = "__lma_annotation__"
+
+
+@functools.lru_cache(maxsize=16)
+def _entries_cached(lma_path: str) -> Tuple[str, ...]:
+    """Memoized entry list for an archive, keyed by path.
+
+    `list_lma_entries` spawns a `lml ls` subprocess that parses the whole
+    archive footer (~hundreds of ms on a 70 K-entry TUEG `.lma`). Without this
+    cache, indexing the label-free codec manifest would re-list the SAME
+    archive once per stem — tens of thousands of subprocess spawns, hours per
+    index build. LMAs are read-only during training, so per-path memoization
+    is safe.
+    """
+    from lamquant_codec.training.lma_dataset import list_lma_entries
+    return tuple(list_lma_entries(lma_path))
+
 
 def annotation_entry_for(lma_path: str, stem: str) -> Tuple[Optional[str], Optional[str]]:
     """Find the annotation entry for `stem` inside the LMA. Returns (entry, ext)."""
-    from lamquant_codec.training.lma_dataset import list_lma_entries
-    entries = list_lma_entries(lma_path)
+    entries = _entries_cached(lma_path)
     for ext in _ANN_EXT:
         suffix = f"{stem}{ext}"
         for e in entries:
@@ -47,6 +68,30 @@ def _duration_from_header(text: str) -> Optional[float]:
     return float(m.group(1)) if m else None
 
 
+def _parse_annotation_text(text: str, ext: str) -> List[Tuple]:
+    """Parse annotation `text` (extension `ext`) into ``(start, stop, label,
+    channel)`` event tuples.
+
+    The canonical `generate_activity_labels` parsers take a file path and
+    `open()` it, so write one tempfile here — keeping the mapping bit-identical
+    to the offline pipeline while factoring the tempfile + format dispatch out
+    of every caller.
+    """
+    from lamquant.snn import generate_activity_labels as G
+    fmt = "csv" if ext in (".csv", ".csv_bi") else ("rec" if ext == ".rec" else "tse")
+    with tempfile.NamedTemporaryFile("w", suffix=ext, delete=False) as tf:
+        tmp = tf.name           # bind before write so the finally-unlink is safe
+        tf.write(text)
+    try:
+        if fmt == "csv":
+            return G.parse_csv_annotation(tmp)
+        if fmt == "rec":
+            return G.parse_rec(tmp)
+        return G.parse_tse(tmp)
+    finally:
+        os.unlink(tmp)
+
+
 def lma_activity_labels(lma_path: str, stem: str,
                         duration_sec: Optional[float] = None) -> Optional[np.ndarray]:
     """Derive [8, T_latent] uint8 activity labels from the LMA's bundled
@@ -58,26 +103,12 @@ def lma_activity_labels(lma_path: str, stem: str,
         return None
     text = _read_entry_text(lma_path, entry)
     dur = duration_sec if duration_sec is not None else _duration_from_header(text)
-    # reuse the canonical parsers (they take a file path) via a tempfile, so the
-    # mapping is bit-identical to the offline generate_activity_labels pipeline.
     from lamquant.snn import generate_activity_labels as G
-    fmt = "csv" if ext in (".csv", ".csv_bi") else ("rec" if ext == ".rec" else "tse")
-    with tempfile.NamedTemporaryFile("w", suffix=ext, delete=False) as tf:
-        tf.write(text)
-        tmp = tf.name
-    try:
-        if fmt == "csv":
-            events = G.parse_csv_annotation(tmp)
-        elif fmt == "rec":
-            events = G.parse_rec(tmp)
-        else:
-            events = G.parse_tse(tmp)
-        if dur is None:
-            # fall back to the last annotated stop time
-            dur = max((e[1] for e in events), default=0.0) or 1.0
-        return G.events_to_labels(events, dur)
-    finally:
-        os.unlink(tmp)
+    events = _parse_annotation_text(text, ext)
+    if dur is None:
+        # fall back to the last annotated stop time
+        dur = max((e[1] for e in events), default=0.0) or 1.0
+    return G.events_to_labels(events, dur)
 
 
 def lma_window_count(lma_path: str, lml_internal: str) -> Optional[int]:
@@ -101,19 +132,12 @@ def lma_window_count(lma_path: str, lml_internal: str) -> Optional[int]:
         return None
 
 
-def seizure_intervals_ours(lma_path: str, stem: str):
+def seizure_intervals_ours(lma_path: str, stem: str) -> List[Tuple[float, float]]:
     """Our parser's seizure (start,stop) intervals — for verification."""
     entry, ext = annotation_entry_for(lma_path, stem)
     if entry is None:
         return []
     text = _read_entry_text(lma_path, entry)
     from lamquant.snn import generate_activity_labels as G
-    fmt = "csv" if ext in (".csv", ".csv_bi") else ("rec" if ext == ".rec" else "tse")
-    with tempfile.NamedTemporaryFile("w", suffix=ext, delete=False) as tf:
-        tf.write(text); tmp = tf.name
-    try:
-        ev = (G.parse_csv_annotation(tmp) if fmt == "csv"
-              else G.parse_rec(tmp) if fmt == "rec" else G.parse_tse(tmp))
-    finally:
-        os.unlink(tmp)
-    return sorted((s, e) for (s, e, lbl, _c) in ev if G.map_label(lbl) == 2)
+    events = _parse_annotation_text(text, ext)
+    return sorted((s, e) for (s, e, lbl, _c) in events if G.map_label(lbl) == 2)

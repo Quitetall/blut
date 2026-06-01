@@ -11,6 +11,8 @@ import torch
 import torch.optim as optim
 from itertools import chain
 
+from cautious_wd import cautious_decoupled_wd_
+
 
 class SOAP(optim.Optimizer):
     """
@@ -133,9 +135,7 @@ class SOAP(optim.Optimizer):
                     # sign with the param (update*p > 0), so decay never fights
                     # the step. Must clear an end-to-end A/B before adoption.
                     update = norm_grad.mul(step_size)
-                    mask = (update * p) > 0
-                    update.add_(p * mask, alpha=group["lr"] * wd)
-                    p.add_(update, alpha=-1.0)
+                    cautious_decoupled_wd_(p, update, group["lr"], wd)
                 else:
                     # Plain decoupled WD path — byte-identical to pre-0030.
                     p.add_(norm_grad, alpha=-step_size)

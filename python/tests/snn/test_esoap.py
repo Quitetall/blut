@@ -78,14 +78,6 @@ def test_esoap_two_step_smoke_on_real_snn():
     print("[ok] 2-step SNN smoke: finite, esoap + adamw groups both moved")
 
 
-if __name__ == "__main__":
-    test_newton_schulz_orthogonalizes()
-    test_esoap_direction_is_rms_normalized_and_finite()
-    test_esoap_two_step_smoke_on_real_snn()
-    test_cautious_wd_mask_identity()
-    print("\nALL ESOAP TESTS PASSED")
-
-
 def _run_k(make_opt, p0, grads):
     p = torch.nn.Parameter(p0.clone())
     opt = make_opt([p])
@@ -129,3 +121,11 @@ def test_cautious_wd_mask_identity():
         assert not torch.allclose(caut, nowd, atol=1e-6), \
             f"{name}: cautious == nowd (mask all-false?)"
         print(f"[ok] cautious-WD non-vacuous + bracketed on {name}")
+
+
+if __name__ == "__main__":
+    test_newton_schulz_orthogonalizes()
+    test_esoap_direction_is_rms_normalized_and_finite()
+    test_esoap_two_step_smoke_on_real_snn()
+    test_cautious_wd_mask_identity()
+    print("\nALL ESOAP TESTS PASSED")

@@ -35,6 +35,8 @@ import torch
 from collections import defaultdict
 from torch.utils.data import Dataset, Sampler
 
+from lamquant.snn.lma_annotations import LMA_ANNOTATION_SENTINEL
+
 # Lazy imports inside __init__ to keep `import lma_dataset` light.
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -634,7 +636,7 @@ class LmaDataset(Dataset):
                 elif self._derive_labels_from_lma:
                     # No precomputed NPZ — derive from the LMA's bundled
                     # annotation at load time (or all-quiet if none).
-                    label_internal = "__lma_annotation__"
+                    label_internal = LMA_ANNOTATION_SENTINEL
                 else:
                     n_no_labels += 1
                     continue
@@ -647,7 +649,7 @@ class LmaDataset(Dataset):
                 # Prefer disk-staged label NPZ over lma_read_entry round-trip.
                 cached = (label_cache / f"{stem}_labels.npz") if label_cache else None
                 try:
-                    if label_internal == "__lma_annotation__":
+                    if label_internal == LMA_ANNOTATION_SENTINEL:
                         # On-the-fly: parse the annotation bundled in the LMA.
                         from lamquant.snn.lma_annotations import (
                             lma_activity_labels, lma_window_count)
@@ -789,7 +791,7 @@ class LmaDataset(Dataset):
             label_cache = _label_cache_dir()
             cached = (label_cache / f"{stem}_labels.npz") if label_cache else None
             try:
-                if label_internal == "__lma_annotation__":
+                if label_internal == LMA_ANNOTATION_SENTINEL:
                     # On-the-fly: parse the annotation bundled in the LMA
                     # (None -> background-only recording -> all-quiet).
                     from lamquant.snn.lma_annotations import lma_activity_labels
