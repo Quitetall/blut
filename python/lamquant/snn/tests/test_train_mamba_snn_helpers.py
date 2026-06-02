@@ -8,10 +8,12 @@ import numpy as np
 import pytest
 import torch
 
-# Import via the canonical path. Module is at
-# blut/python/lamquant/snn/train_mamba_snn.py (also on sys.path via
-# blut/python/conftest.py; this insert keeps the file self-contained).
+# Import via the canonical path. train_mamba_snn was ARCHIVED (legacy
+# seizure trainer; SOT is train_4state_controller.py) — it now lives at
+# blut/python/lamquant/snn/archive/train_mamba_snn.py (area dirs also on
+# sys.path via blut/python/conftest.py; this keeps the file self-contained).
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lamquant" / "snn"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lamquant" / "snn" / "archive"))
 
 import train_mamba_snn as tms
 
