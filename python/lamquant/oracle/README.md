@@ -1,21 +1,23 @@
-# Oracle / teacher — training (source-of-truth index)
+# Oracle / teacher — training (NO current source of truth)
 
-Trains the high-capacity FP32 teacher used as the distillation target for
-hardening the ternary student encoder.
+The oracle trains the high-capacity FP32 teacher used as the distillation
+target for hardening the ternary student encoder.
 
-## ✅ Source of truth
+## ⚠ No SOT yet — slated for rewrite
 
-| Purpose | File |
+There is **no designated source-of-truth trainer** for the oracle at this
+time. The existing trainers below are prior-generation and are **not** canon;
+the oracle is to be rewritten. Do not treat either as the standard.
+
+| File | What it is (neither is SOT) |
 |---|---|
-| **Trainer (SOT)** | **`train_l3_teacher.py`** — Gen-7.5 L3-native teacher. FP32 autoencoder on L3 subband [21, 313] → latent [32, 79], matching the student exactly so hardening measures only the cost of ternarization. (~8.3M params, width 512.) |
+| `train_l3_teacher.py` | Gen-7.5 L3-native teacher (most recent of the two). FP32 autoencoder on L3 subband [21, 313] → latent [32, 79] matching the student. The least-stale starting point, but not adopted as canon. |
+| `train_teacher.py` | Gen-6 FP32 oracle teacher. Older; superseded by the L3-native attempt. |
 
-## 🗄️ Legacy (superseded)
+When the rewrite lands, designate its trainer here as the SOT and move the
+above into `archive/`.
 
-| File | Why |
-|---|---|
-| `train_teacher.py` | Gen-6 FP32 oracle teacher trainer. Superseded by the L3-native Gen-7.5 teacher above (different latent contract). Kept for reference. |
-
-## Supporting modules (not entry points)
+## Supporting modules
 
 - **Model:** `teacher_arch.py` (teacher architecture, formerly `architectures/teacher.py`)
 - **Data:** `streaming_dataset.py`, `dataset_with_manifest_filter.py`
