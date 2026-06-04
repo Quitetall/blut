@@ -332,20 +332,22 @@ class LmaTypedL3Dataset:
         self._fb_min_free = int(float(os.environ.get("FB_CACHE_MIN_FREE_GB", "40")) * 1e9)
         self._stem_groups = None   # lazily built grouped index (sampler)
 
-    def _fb_disk_path(self, stem: str, lma_path) -> "Optional[str]":
-        """Disk-cache path for (lma_path, stem). The lma_path hash disambiguates
-        the same stem across corpora — the in-mem key is (lma_path, stem, lml);
-        a stem-only filename would cross-contaminate two corpora sharing a stem."""
+    def _fb_disk_path(self, stem: str, lma_path, lml) -> "Optional[str]":
+        """Disk-cache path keyed on the FULL in-mem identity (lma_path, stem,
+        lml). Hashing lma_path+lml into the filename matches the in-memory key's
+        specificity: stem-only would cross-contaminate two corpora sharing a
+        stem, and lma_path-only would miss the (rare) case of one (lma,stem)
+        resolving to a different lml entry."""
         if self._fb_disk_dir is None:
             return None
         import hashlib
-        h = hashlib.sha1(str(lma_path).encode()).hexdigest()[:10]
+        h = hashlib.sha1(f"{lma_path}\x00{lml}".encode()).hexdigest()[:10]
         return os.path.join(self._fb_disk_dir, f"{h}_{stem}__fb.npy")
 
-    def _fb_disk_load(self, stem: str, lma_path):
+    def _fb_disk_load(self, stem: str, lma_path, lml):
         """mmap the disk-cached decoded fullband signal, or None on miss / no
         cache dir / load error (caller then decodes + saves)."""
-        p = self._fb_disk_path(stem, lma_path)
+        p = self._fb_disk_path(stem, lma_path, lml)
         if p and os.path.exists(p):
             try:
                 return np.load(p, mmap_mode="r")
@@ -353,13 +355,13 @@ class LmaTypedL3Dataset:
                 return None
         return None
 
-    def _fb_disk_save(self, stem: str, lma_path, signal) -> None:
+    def _fb_disk_save(self, stem: str, lma_path, lml, signal) -> None:
         """Persist a decoded fullband signal (best-effort, atomic, disk-safe).
         Never raises — the cache is an optimization, not a correctness path.
 
         HARD disk-fill guard via statvfs free-space (fork-worker-proof, unlike a
         per-process byte counter): stop writing when free < FB_CACHE_MIN_FREE_GB."""
-        p = self._fb_disk_path(stem, lma_path)
+        p = self._fb_disk_path(stem, lma_path, lml)
         if p is None or signal is None:
             return
         try:
@@ -438,7 +440,7 @@ class LmaTypedL3Dataset:
         cache_key = (str(lma_path), stem, _lml)
         signal = self._fb_sig_cache.get(cache_key, _CACHE_MISS)
         if signal is _CACHE_MISS:
-            signal = self._fb_disk_load(stem, lma_path)   # cross-epoch disk tier (mmap)
+            signal = self._fb_disk_load(stem, lma_path, _lml)   # cross-epoch disk tier (mmap)
             if signal is None:
                 from lamquant_codec.training import decode_lma_signal
                 # Propagate the resolved internal entry (e.g. 'S001/S001R01.edf'
@@ -446,7 +448,7 @@ class LmaTypedL3Dataset:
                 # defaults to the legacy '<stem>.lml' name, absent in per-corpus
                 # archives -> signal None -> fullband_target None.
                 signal = decode_lma_signal(str(lma_path), stem, lml_entry_name=_lml)
-                self._fb_disk_save(stem, lma_path, signal)   # persist for next epoch
+                self._fb_disk_save(stem, lma_path, _lml, signal)   # persist for next epoch
             self._fb_sig_cache[cache_key] = signal
             if len(self._fb_sig_cache) > self._fb_sig_cache_cap:
                 self._fb_sig_cache.popitem(last=False)
