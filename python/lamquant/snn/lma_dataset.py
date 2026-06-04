@@ -236,7 +236,10 @@ def detail_stack_in_channels(bands, mode: str = "interp",
         if not b:
             continue
         if mode == "fold":
-            groups += math.ceil(_BAND_NATIVE_LEN[b] / T)
+            # .get(b, T) mirrors _stack_detail_bands' fallback: an unknown band
+            # folds to a single block (interp-equivalent) instead of KeyError, so
+            # encoder sizing never crashes on a band the stacker would accept.
+            groups += math.ceil(_BAND_NATIVE_LEN.get(b, T) / T)
         else:
             groups += 1
     return base_ch * groups

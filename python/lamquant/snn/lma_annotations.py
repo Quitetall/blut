@@ -80,8 +80,15 @@ def annotation_entry_for(lma_path: str, stem: str) -> Tuple[Optional[str], Optio
 
     O(1) via the memoized :func:`_annotation_index` (one O(entries) build per
     archive), down from a per-stem O(entries × exts) scan.
+
+    The index keys by entry basename-minus-ext; normalize a path-qualified
+    ``stem`` ("sess/leaf") to its leaf the same way, so it resolves to the leaf
+    entry — matching the old ``endswith(stem+ext)`` for the unique-basename case
+    (every real manifest stem is already a bare basename; this is insurance, not
+    an identity transform for arbitrary suffix stems).
     """
-    return _annotation_index(lma_path).get(stem, (None, None))
+    key = stem.rsplit("/", 1)[-1]
+    return _annotation_index(lma_path).get(key, (None, None))
 
 
 def _read_entry_text(lma_path: str, entry: str) -> str:
