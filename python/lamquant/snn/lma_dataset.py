@@ -221,6 +221,22 @@ def _detail_stack_mode_cfg() -> str:
     return raw if raw in ("interp", "fold") else "interp"
 
 
+def _detail_cache_sig() -> str:
+    """L3-cache-key suffix distinguishing detail-band-stacked L3 from bare L3.
+
+    Empty string for L3-only (preserves the existing ``<stem>.npy`` cache files
+    untouched); otherwise ``__<bands>_<mode>`` so a detail-stacked [168,313]
+    stack never collides with a bare [21,313] stack (or a different band set) in
+    either the in-memory LRU or the on-disk cache. Without this, a prior
+    ``--detail-bands none`` run's cached [21,313] would be served to a
+    ``--detail-bands all`` run -> shape mismatch / silently wrong input.
+    """
+    bands = _detail_bands_cfg()
+    if not bands:
+        return ""
+    return "__" + "_".join(bands) + "_" + _detail_stack_mode_cfg()
+
+
 def detail_stack_in_channels(bands, mode: str = "interp",
                              base_ch: int = TARGET_CHANNELS,
                              T: int = L3_T) -> int:
@@ -389,7 +405,8 @@ def _cached_l3_stack(lma_path: str, stem: str,
     Only non-None results are cached at either tier (V4 Pro 2026-05-16
     poisoning fix).
     """
-    key = (lma_path, stem)
+    _sig = _detail_cache_sig()   # "" for L3-only; "__<bands>_<mode>" for stacked
+    key = (lma_path, stem, _sig)
     cached = _L3_CACHE.get(key)
     if cached is not None:
         _L3_CACHE.move_to_end(key)
@@ -399,7 +416,7 @@ def _cached_l3_stack(lma_path: str, stem: str,
     disk_dir = _l3_cache_dir()
     disk_path: Optional[Path] = None
     if disk_dir is not None:
-        disk_path = disk_dir / f"{stem}.npy"
+        disk_path = disk_dir / f"{stem}{_sig}.npy"
         if disk_path.exists():
             try:
                 # O4 (reverted 2026-05-19) — posix_fadvise hint here

@@ -896,7 +896,7 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         ckpt_dir=ckpt_dir / 'recovery',
         device=device,
         provenance=provenance,
-        smoke_input=lambda: torch.randn(1, 21, 313, device=device),
+        smoke_input=lambda: torch.randn(1, n_in, 313, device=device),
         alpha_log_csv=alpha_csv,
         guard=GuardConfig(
             r_plateau_patience=10**6,    # Joint is exploratory; main loop manages
@@ -958,7 +958,7 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     # memory. Without this, the calibration measures free VRAM before the
     # model runs, then the first real shard OOMs.
     with torch.no_grad():
-        _dummy = codec(torch.randn(cfg.batch_size_warmup, 21, 313, device=device),
+        _dummy = codec(torch.randn(cfg.batch_size_warmup, n_in, 313, device=device),
                         quantize=False)
         del _dummy
     torch.cuda.empty_cache()
