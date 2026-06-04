@@ -47,15 +47,41 @@ def _entries_cached(lma_path: str) -> Tuple[str, ...]:
     return tuple(list_lma_entries(lma_path))
 
 
+@functools.lru_cache(maxsize=16)
+def _annotation_index(lma_path: str) -> dict:
+    """``stem -> (entry, ext)`` map for the archive's annotation entries, built
+    in ONE O(entries) pass and memoized per path.
+
+    Replaces the per-stem O(entries × exts) scan that ``annotation_entry_for``
+    used to run: on a 70 K-entry TUEG ``.lma`` indexed against ~63 K train stems
+    (all background-only → every lookup scanned the full list and returned None)
+    that was ~13 billion ``endswith`` ops ≈ 12 min of construction. The index
+    makes it O(entries + stems).
+
+    Semantics preserved exactly: ``_ANN_EXT`` priority (a stem with both
+    ``.csv_bi`` and ``.csv`` keeps ``.csv_bi`` — earliest in ``_ANN_EXT``) and
+    the first-in-entry-list tiebreak for a repeated (stem, ext).
+    """
+    rank = {ext: i for i, ext in enumerate(_ANN_EXT)}
+    idx: dict = {}
+    for e in _entries_cached(lma_path):
+        for ext in _ANN_EXT:
+            if e.endswith(ext):
+                stem = e[: -len(ext)].rsplit("/", 1)[-1]
+                prev = idx.get(stem)
+                if prev is None or rank[ext] < rank[prev[1]]:
+                    idx[stem] = (e, ext)
+                break  # an entry matches at most one ext (no _ANN_EXT is a suffix of another)
+    return idx
+
+
 def annotation_entry_for(lma_path: str, stem: str) -> Tuple[Optional[str], Optional[str]]:
-    """Find the annotation entry for `stem` inside the LMA. Returns (entry, ext)."""
-    entries = _entries_cached(lma_path)
-    for ext in _ANN_EXT:
-        suffix = f"{stem}{ext}"
-        for e in entries:
-            if e.endswith(suffix):
-                return e, ext
-    return None, None
+    """Find the annotation entry for `stem` inside the LMA. Returns (entry, ext).
+
+    O(1) via the memoized :func:`_annotation_index` (one O(entries) build per
+    archive), down from a per-stem O(entries × exts) scan.
+    """
+    return _annotation_index(lma_path).get(stem, (None, None))
 
 
 def _read_entry_text(lma_path: str, entry: str) -> str:
@@ -111,6 +137,24 @@ def lma_activity_labels(lma_path: str, stem: str,
     return G.events_to_labels(events, dur)
 
 
+# Ranged-header prefix size for the fast window-count path (#229). The LML
+# container header carries `duration_s` inside its metadata JSON. 64 KiB
+# comfortably covers the observed metadata sizes on real corpora (TUEG max
+# ~30 KB incl. the base64'd zstd EDF header + non-EEG channels) while reading
+# ~100x less than the full ~6.67 MB entry. Entries whose metadata exceeds this
+# (or non-raw tiers) trigger the full-read fallback below — correctness holds
+# either way.
+_HEADER_PREFIX_BYTES = 65536
+
+
+def _window_count_from_container(meta_json: str) -> Optional[int]:
+    """duration_s (s) -> training window count (10 s windows). None if absent."""
+    import json
+    j = json.loads(meta_json)
+    dur = j.get("duration_s") or j.get("duration_sec") or j.get("duration")
+    return max(1, int(dur) // 10) if dur else None
+
+
 def lma_window_count(lma_path: str, lml_internal: str) -> Optional[int]:
     """Window count for a recording from the LML header (NO decode).
 
@@ -119,17 +163,70 @@ def lma_window_count(lma_path: str, lml_internal: str) -> Optional[int]:
     n_windows = duration_s // 10. Lets background-only recordings (e.g. TUEG,
     no annotation) be indexed/all-quiet-labelled without a per-stem L3 decode
     (which is 3-40 s each -> days over the 70 K TUEG corpus).
+
+    #229: fast path reads only a 64 KiB PREFIX of the entry via the batch
+    ranged-header API (`lma_entry_headers`) and parses the container header
+    from that. If the prefix is too short (metadata > 64 KiB) the parse raises
+    and we FALL BACK to the full `lma_read_entry` read — we must not swallow
+    that into None, or big-metadata recordings would be silently dropped.
     """
-    import json
     import lamquant_core as lc
+    # Fast path: 64 KiB prefix, parse-once index amortised by the batch API.
+    try:
+        hdrs = lc.lma_entry_headers(lma_path, [lml_internal], _HEADER_PREFIX_BYTES)
+        hdr = hdrs[0] if hdrs else None
+        if hdr is not None:
+            m = lc.container_metadata(bytes(hdr))
+            meta = m[0] if isinstance(m, (tuple, list)) else m
+            return _window_count_from_container(meta)
+    except Exception:
+        # Prefix too short, or new API unavailable, or transient — fall
+        # through to the full read. Do NOT return None here.
+        pass
+    # Fallback: full entry read (original behaviour).
     try:
         b = lc.lma_read_entry(lma_path, lml_internal)
         m = lc.container_metadata(b)
-        j = json.loads(m[0] if isinstance(m, (tuple, list)) else m)
-        dur = j.get("duration_s") or j.get("duration_sec") or j.get("duration")
-        return max(1, int(dur) // 10) if dur else None
+        meta = m[0] if isinstance(m, (tuple, list)) else m
+        return _window_count_from_container(meta)
     except Exception:
         return None
+
+
+def lma_window_counts(lma_path: str,
+                      lml_internals: List[str]) -> List[Optional[int]]:
+    """Batched window counts for many recordings in ONE LMA archive (#229).
+
+    Parses the archive footer manifest exactly ONCE (via `lma_entry_headers`),
+    then reads only a 64 KiB prefix per entry instead of the full ~6.67 MB.
+    On the 70 K-entry TUEG LMA this turns ~700 GB of reads + per-call manifest
+    re-parsing (~2.6 h) into one parse + N small prefix reads.
+
+    Returns a list aligned 1:1 with `lml_internals`. Any entry whose prefix is
+    too short (metadata > 64 KiB), is missing, or is a non-raw tier falls back
+    to a per-entry full read so the count is never silently wrong.
+    """
+    import lamquant_core as lc
+    n = len(lml_internals)
+    out: List[Optional[int]] = [None] * n
+    try:
+        hdrs = lc.lma_entry_headers(lma_path, list(lml_internals),
+                                    _HEADER_PREFIX_BYTES)
+    except Exception:
+        # API unavailable / archive open failure -> per-entry fallback.
+        return [lma_window_count(lma_path, n_) for n_ in lml_internals]
+    for i, hdr in enumerate(hdrs):
+        if hdr is not None:
+            try:
+                m = lc.container_metadata(bytes(hdr))
+                meta = m[0] if isinstance(m, (tuple, list)) else m
+                out[i] = _window_count_from_container(meta)
+                continue
+            except Exception:
+                pass  # prefix too short -> per-entry full-read fallback below
+        # Missing entry, non-raw tier, or truncated prefix: full read.
+        out[i] = lma_window_count(lma_path, lml_internals[i])
+    return out
 
 
 def seizure_intervals_ours(lma_path: str, stem: str) -> List[Tuple[float, float]]:

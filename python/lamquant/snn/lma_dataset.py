@@ -25,6 +25,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -182,6 +183,14 @@ def _fadvise_hint(path: Path) -> None:
         pass  # FS doesn't support fadvise — silent fallback
 
 
+# Native coefficient lengths of each detail band for a WINDOW_SAMPLES=2500
+# residual through `forward_3level_int` (verified: l3_detail=312, l2_detail=625,
+# l1_detail=1250; together with l3_approx[313] they sum to 2500 = a complete
+# invertible representation of the residual). Used by the FOLD stack mode to
+# size the encoder without losing temporal resolution.
+_BAND_NATIVE_LEN = {"l3_detail": 312, "l2_detail": 625, "l1_detail": 1250}
+
+
 def _detail_bands_cfg() -> Tuple[str, ...]:
     """Detail subband channels to append to L3, from the SNN_DETAIL_BANDS env.
 
@@ -195,6 +204,44 @@ def _detail_bands_cfg() -> Tuple[str, ...]:
     return tuple(b for b in (s.strip() for s in raw.split(",")) if b)
 
 
+def _detail_stack_mode_cfg() -> str:
+    """How detail bands are stacked onto L3, from SNN_DETAIL_STACK_MODE env.
+
+    - ``interp`` (default, legacy): each band is linearly resampled onto the
+      313 grid as ONE extra channel-block. **Lossy** — l1_detail (1250) and
+      l2_detail (625) are downsampled, discarding 4x / 2x of their temporal
+      resolution. Preserves the legacy [21*(1+k),313] shape.
+    - ``fold`` (ADR 0031): each band is zero-padded to a multiple of T and
+      reshaped into ceil(len/T) channel-blocks. **Information-preserving** — no
+      coefficient is dropped, so the experiment measures whether the detail
+      bands carry transmissible information, not whether interp threw it away.
+      A null result under ``fold`` cannot be blamed on the stacking.
+    """
+    raw = os.environ.get("SNN_DETAIL_STACK_MODE", "interp").strip().lower()
+    return raw if raw in ("interp", "fold") else "interp"
+
+
+def detail_stack_in_channels(bands, mode: str = "interp",
+                             base_ch: int = TARGET_CHANNELS,
+                             T: int = L3_T) -> int:
+    """Encoder ``in_channels`` for a band selection + stack mode.
+
+    L3 approx is always 1 block of ``base_ch``. Under ``interp`` each band adds
+    1 block; under ``fold`` each band adds ``ceil(native_len/T)`` blocks. Kept
+    in lock-step with `_stack_detail_bands` so train_joint can size the encoder
+    before the first batch.
+    """
+    groups = 1  # l3_approx
+    for b in bands:
+        if not b:
+            continue
+        if mode == "fold":
+            groups += math.ceil(_BAND_NATIVE_LEN[b] / T)
+        else:
+            groups += 1
+    return base_ch * groups
+
+
 def _stack_detail_bands(l3: np.ndarray, subs: list) -> np.ndarray:
     """Append env-selected detail subbands to L3 as extra channels.
 
@@ -205,30 +252,45 @@ def _stack_detail_bands(l3: np.ndarray, subs: list) -> np.ndarray:
             as returned by ``preprocess_subband_single``.
 
     Returns:
-        ``[21*(1+k), 313]`` float32, k = number of selected bands. With no
-        bands selected (default) returns the bare ``[21, 313]`` L3 — identical
-        to the prior behaviour, so existing callers are unaffected.
+        ``[base_ch*groups, 313]`` float32. With no bands selected (default)
+        returns the bare ``[21, 313]`` L3 — identical to the prior behaviour, so
+        existing callers are unaffected. ``groups`` per `detail_stack_in_channels`
+        for the active SNN_DETAIL_STACK_MODE (interp: 1/band; fold: ceil(len/T)).
     """
     l3 = np.asarray(l3, dtype=np.float32)
     bands = _detail_bands_cfg()
     if not bands:
         return l3
+    mode = _detail_stack_mode_cfg()
     T = l3.shape[1]
     out = [l3]
     for band in bands:
-        mat = np.empty((len(subs), T), dtype=np.float32)
-        for c, d in enumerate(subs):
-            v = np.asarray(d[band], dtype=np.float32)
-            if v.shape[0] == T:
-                mat[c] = v
-            else:
-                # resample the band coefficients onto the 313 grid (linear)
-                mat[c] = np.interp(
-                    np.linspace(0.0, 1.0, T, dtype=np.float64),
-                    np.linspace(0.0, 1.0, v.shape[0], dtype=np.float64),
-                    v.astype(np.float64),
-                ).astype(np.float32)
-        out.append(mat)
+        if mode == "fold":
+            # Information-preserving: zero-pad each channel's coefficients to a
+            # multiple of T, then split into ceil(len/T) blocks of [base_ch, T]
+            # (block-major so the 21-channel structure is preserved per group).
+            native_len = _BAND_NATIVE_LEN.get(band)
+            m = math.ceil((native_len if native_len else T) / T)
+            padded = np.zeros((len(subs), m * T), dtype=np.float32)
+            for c, d in enumerate(subs):
+                v = np.asarray(d[band], dtype=np.float32)
+                padded[c, : v.shape[0]] = v
+            for g in range(m):
+                out.append(padded[:, g * T:(g + 1) * T])
+        else:
+            mat = np.empty((len(subs), T), dtype=np.float32)
+            for c, d in enumerate(subs):
+                v = np.asarray(d[band], dtype=np.float32)
+                if v.shape[0] == T:
+                    mat[c] = v
+                else:
+                    # resample the band coefficients onto the 313 grid (linear)
+                    mat[c] = np.interp(
+                        np.linspace(0.0, 1.0, T, dtype=np.float64),
+                        np.linspace(0.0, 1.0, v.shape[0], dtype=np.float64),
+                        v.astype(np.float64),
+                    ).astype(np.float32)
+            out.append(mat)
     return np.concatenate(out, axis=0)
 
 
@@ -643,22 +705,40 @@ class LmaDataset(Dataset):
             by_lma[info["lma"]].append((stem, info["lml"], label_internal))
 
         label_cache = _label_cache_dir()
+        from lamquant.snn.lma_annotations import (
+            lma_activity_labels, lma_window_counts)
         for lma_str, items in by_lma.items():
             lma_path = Path(lma_str)
+            # #229: batch the LML header window-count read for every
+            # sentinel (derive-from-annotation) stem in THIS archive in ONE
+            # call. `lma_window_counts` parses the (up to 70 K-entry) footer
+            # manifest exactly once and reads only a 64 KiB prefix per entry,
+            # instead of the old per-stem full ~6.67 MB read + per-call
+            # manifest re-parse (~700 GB / ~2.6 h on TUEG). Counts are only
+            # consumed for background-only recordings below; computing them
+            # for annotated sentinel stems too is cheap (prefix reads) and
+            # keeps the single-parse amortisation intact.
+            _sentinel_lml = [
+                lml for (_st, lml, lbl) in items
+                if lbl == LMA_ANNOTATION_SENTINEL
+            ]
+            _wc_by_lml: dict = {}
+            if _sentinel_lml:
+                _counts = lma_window_counts(lma_str, _sentinel_lml)
+                _wc_by_lml = dict(zip(_sentinel_lml, _counts))
             for stem, lml_internal, label_internal in items:
                 # Prefer disk-staged label NPZ over lma_read_entry round-trip.
                 cached = (label_cache / f"{stem}_labels.npz") if label_cache else None
                 try:
                     if label_internal == LMA_ANNOTATION_SENTINEL:
                         # On-the-fly: parse the annotation bundled in the LMA.
-                        from lamquant.snn.lma_annotations import (
-                            lma_activity_labels, lma_window_count)
                         activity = lma_activity_labels(lma_str, stem)
                         if activity is None:
                             # No annotation -> background-only recording.
                             # Size all-quiet from the LML HEADER window count
-                            # (~7 ms, no decode — critical for 70 K TUEG stems).
-                            nw = lma_window_count(lma_str, lml_internal)
+                            # (batched + prefix-read above; no decode — critical
+                            # for 70 K TUEG stems).
+                            nw = _wc_by_lml.get(lml_internal)
                             if nw is None:
                                 n_no_labels += 1
                                 continue
