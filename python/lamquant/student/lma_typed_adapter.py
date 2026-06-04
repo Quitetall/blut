@@ -48,12 +48,14 @@ See ADR 0017 (BLUT canonical trainer + LMA-direct).
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+from torch.utils.data import Dataset as _MapDatasetBase
 
 from lamquant.snn.lma_annotations import LMA_ANNOTATION_SENTINEL
 
@@ -73,6 +75,42 @@ L3_T = 313
 WINDOW_SAMPLES = 2500          # 10 s @ 250 Hz
 LABEL_PER_WINDOW = 312         # 2500 // 8 (stride-8 label grid)
 SEIZURE_CLASS = 2              # activity_labels value meaning "seizure"
+
+# Distinct sentinel for the fullband-signal LRU: decode_lma_signal legitimately
+# returns None (decode failure) and we cache that too, so we cannot use None or
+# .get(key) to mean "absent" — a cached-None must hit, not re-decode.
+_CACHE_MISS = object()
+
+
+class _TypedWindowMapDataset(_MapDatasetBase):
+    """Map-style view over one epoch's window indices, for DataLoader workers.
+
+    Used only when ``num_workers > 0``. Each fork-worker process inherits the
+    adapter's wrapped ``LmaDataset`` + its index/caches via copy-on-write and
+    decodes independently; the on-disk L3 cache (``L3_CACHE_DIR``) is shared
+    through the filesystem. ``__getitem__`` returns the exact per-window row the
+    synchronous path builds, so the assembled ``TrainingBatch`` is identical
+    regardless of worker count — only the decode is parallelised.
+    """
+
+    def __init__(self, adapter: "LmaTypedL3Dataset", epoch_idx: Sequence[int]):
+        self._a = adapter
+        self._idx = epoch_idx
+
+    def __len__(self) -> int:
+        return len(self._idx)
+
+    def __getitem__(self, i: int):
+        return self._a._window_row(int(self._idx[i]))
+
+
+def _identity_collate(rows):
+    """Keep the per-window rows as a plain list. Workers already produced the
+    (l3, fb, has_seizure, pid, dataset) tuples; the main process does the single
+    stack + pinned H2D copy per batch (in ``prefetch_typed_batches._emit``).
+    torch's default ``pin_memory`` still recurses this list/tuple structure and
+    pins the contained tensors."""
+    return rows
 
 
 def _import_training_batch():
@@ -129,6 +167,7 @@ class LmaTypedL3Dataset:
         windows_per_epoch: int = 50_000,
         return_fullband: bool = False,
         seed: int = 0,
+        num_workers: int = 0,
         **lma_kwargs,
     ):
         from snn.lma_dataset import LmaDataset
@@ -142,6 +181,15 @@ class LmaTypedL3Dataset:
         self.windows_per_epoch = int(windows_per_epoch)
         self._return_fullband = bool(return_fullband)
         self._rng = np.random.default_rng(seed)
+        # Parallel decode workers. The per-window decode (canonical Rust
+        # decode_lma_signal + numpy/scipy L3 DWT) is CPU-bound and was the
+        # GPU-starvation bottleneck (util ~30%). >0 routes prefetch through a
+        # torch DataLoader with that many fork-worker processes, each with its
+        # own in-process caches + the shared on-disk L3 cache, overlapping
+        # decode with GPU compute. Env LMA_NUM_WORKERS overrides; default 0
+        # keeps the legacy synchronous path (no behaviour change unless asked).
+        _envw = os.environ.get("LMA_NUM_WORKERS")
+        self._num_workers = int(_envw) if _envw not in (None, "") else int(num_workers)
 
         # The seizure-aware dataset owns: decode, L3, label NPZ, subject map,
         # and seizure-aware per-file window selection. We delegate all of it.
@@ -258,6 +306,18 @@ class LmaTypedL3Dataset:
         # is one batch, already bounded by batch_size.
         self._shard_max = self.windows_per_epoch
 
+        # Per-(lma,stem) decoded fullband-signal LRU. decode_lma_signal decodes
+        # the ENTIRE recording (a TUEG file can be hours -> seconds per call);
+        # without this, every fetched window re-decoded the whole recording
+        # (7+ h/epoch on TUEG). With stem-grouped sampling (below) a stem's
+        # windows arrive consecutively, so a tiny LRU collapses N per-window
+        # decodes into 1 per stem. Signals are large (~hundreds of MB for long
+        # recordings) so the cap is deliberately small.
+        from collections import OrderedDict as _OrderedDict
+        self._fb_sig_cache: "_OrderedDict" = _OrderedDict()
+        self._fb_sig_cache_cap = 3
+        self._stem_groups = None   # lazily built grouped index (sampler)
+
     def _sample_epoch_indices(
         self, n_total: int, sampler: Optional[Sequence[int]]
     ) -> List[int]:
@@ -273,16 +333,28 @@ class LmaTypedL3Dataset:
             it = iter(sampler)
             idx = [int(next(it)) for _ in range(n_total)]
             return [min(max(i, 0), self._n_base - 1) for i in idx]
-        if self.windows_per_epoch >= self._n_base:
-            # Enumerate the full index, then top up with random draws so the
-            # epoch length is exactly windows_per_epoch (matches the
-            # with-replacement semantics of select_random_windows).
-            base = list(range(self._n_base))
-            extra = n_total - len(base)
-            if extra > 0:
-                base += [int(self._rng.integers(0, self._n_base)) for _ in range(extra)]
-            return base[:n_total]
-        return [int(self._rng.integers(0, self._n_base)) for _ in range(n_total)]
+        # Stem-grouped epoch: shuffle stems, emit each stem's contiguous base
+        # indices together. The base index is built stem-by-stem so a stem's
+        # windows are already contiguous; grouping preserves that locality so
+        # the per-stem fullband-signal LRU in _fetch_window hits — 1 full
+        # recording decode per stem instead of one per window (the dominant
+        # cost on long TUEG recordings). Random PER-WINDOW draws over a huge
+        # index gave every fetch a fresh stem -> 0% cache hit -> 7 h/epoch.
+        if self._stem_groups is None:
+            from collections import OrderedDict as _OD
+            groups: "_OD" = _OD()
+            for i in range(self._n_base):
+                e = self._base.index[i]
+                groups.setdefault((str(e[0]), e[1]), []).append(i)
+            self._stem_groups = list(groups.values())
+        n_groups = len(self._stem_groups)
+        order = self._rng.permutation(n_groups) if n_groups else []
+        out: List[int] = []
+        gi = 0
+        while len(out) < n_total and n_groups:
+            out.extend(self._stem_groups[int(order[gi % n_groups])])
+            gi += 1
+        return out[:n_total]
 
     def _fetch_window(self, base_idx: int) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Return (l3 [21,313] float32 cpu, fullband [21,2500] or None).
@@ -301,12 +373,24 @@ class LmaTypedL3Dataset:
             return l3, None
 
         lma_path, stem, win_idx, _lml, _lbl = self._base.index[base_idx]
-        from lamquant_codec.training import decode_lma_signal
-        # Propagate the resolved internal entry (e.g. 'S001/S001R01.edf' for
-        # `lml archive` corpora). Without it decode_lma_signal defaults to the
-        # legacy '<stem>.lml' name, which does not exist in per-corpus archives
-        # -> signal None -> fullband_target None -> GAN trains with no target.
-        signal = decode_lma_signal(str(lma_path), stem, lml_entry_name=_lml)
+        # Per-(lma,stem) LRU: decode_lma_signal decodes the WHOLE recording, so
+        # without caching every window re-decoded its (often multi-hour) parent
+        # -> 7+ h/epoch on TUEG. Stem-grouped sampling delivers a stem's windows
+        # consecutively, so this tiny cache collapses them into one decode.
+        cache_key = (str(lma_path), stem, _lml)
+        signal = self._fb_sig_cache.get(cache_key, _CACHE_MISS)
+        if signal is _CACHE_MISS:
+            from lamquant_codec.training import decode_lma_signal
+            # Propagate the resolved internal entry (e.g. 'S001/S001R01.edf' for
+            # `lml archive` corpora). Without it decode_lma_signal defaults to
+            # the legacy '<stem>.lml' name, absent in per-corpus archives ->
+            # signal None -> fullband_target None -> GAN trains with no target.
+            signal = decode_lma_signal(str(lma_path), stem, lml_entry_name=_lml)
+            self._fb_sig_cache[cache_key] = signal
+            if len(self._fb_sig_cache) > self._fb_sig_cache_cap:
+                self._fb_sig_cache.popitem(last=False)
+        else:
+            self._fb_sig_cache.move_to_end(cache_key)
         if signal is None:
             fb = torch.zeros(TARGET_CHANNELS, WINDOW_SAMPLES, dtype=torch.float32)
             return l3, fb
@@ -322,6 +406,20 @@ class LmaTypedL3Dataset:
         fb = torch.from_numpy(np.ascontiguousarray(window))
         return l3, fb
 
+    def _window_row(self, bi: int):
+        """One window's row: (l3[21,313], fb[21,2500] or None, has_seizure,
+        patient_id, dataset_tag). Shared by the synchronous and worker-pool
+        prefetch paths so the assembled batch is identical either way."""
+        l3, fb = self._fetch_window(bi)
+        _lma_path, stem, _wi, _lml, _lbl = self._base.index[bi]
+        return (
+            l3,
+            fb if self._return_fullband else None,
+            bool(self._win_has_seizure[bi]),
+            self._subject_by_stem.get(stem, stem),
+            _dataset_tag_from_stem(stem),
+        )
+
     def prefetch_typed_batches(self, batch_size, device, sampler=None):
         """Yield ``TrainingBatch`` instances, l3_approx already on device.
 
@@ -332,6 +430,11 @@ class LmaTypedL3Dataset:
           - splits is all-``self.split`` so assert_no_leakage is meaningful,
           - has_seizure is the real per-window flag,
           - provenance arrays (datasets, patient_ids) are populated.
+
+        When ``self._num_workers > 0`` the per-window decode is parallelised
+        across that many DataLoader fork-workers (decode is CPU-bound and was
+        starving the GPU); the assembled ``TrainingBatch`` is byte-identical to
+        the synchronous path — only the decode is overlapped with GPU compute.
         """
         TrainingBatch, _Split = _import_training_batch()
         dev = torch.device(device) if isinstance(device, str) else device
@@ -339,37 +442,46 @@ class LmaTypedL3Dataset:
         n_total = (self.windows_per_epoch // batch_size) * batch_size
         epoch_idx = self._sample_epoch_indices(n_total, sampler)
 
-        for start in range(0, n_total, batch_size):
-            chunk = epoch_idx[start:start + batch_size]
-            l3_rows: List[torch.Tensor] = []
-            fb_rows: List[torch.Tensor] = []
-            has_sz: List[bool] = []
-            pids: List[str] = []
-            dsets: List[str] = []
-            for bi in chunk:
-                l3, fb = self._fetch_window(bi)
-                l3_rows.append(l3)
-                if self._return_fullband:
-                    fb_rows.append(fb)
-                has_sz.append(bool(self._win_has_seizure[bi]))
-                _lma_path, stem, _wi, _lml, _lbl = self._base.index[bi]
-                pids.append(self._subject_by_stem.get(stem, stem))
-                dsets.append(_dataset_tag_from_stem(stem))
-
-            l3_batch = torch.stack(l3_rows, dim=0).to(dev, non_blocking=True)
+        def _emit(rows):
+            l3_batch = torch.stack([r[0] for r in rows], dim=0).to(dev, non_blocking=True)
             fb_batch = (
-                torch.stack(fb_rows, dim=0).to(dev, non_blocking=True)
+                torch.stack([r[1] for r in rows], dim=0).to(dev, non_blocking=True)
                 if self._return_fullband else None
             )
-            n = l3_batch.shape[0]
-            clin = ["seizure" if s else "normal" for s in has_sz]
-            yield TrainingBatch(
+            has_sz = [bool(r[2]) for r in rows]
+            n = len(rows)
+            return TrainingBatch(
                 l3_approx=l3_batch,
                 fullband_target=fb_batch,
-                datasets=dsets,
-                patient_ids=pids,
+                datasets=[r[4] for r in rows],
+                patient_ids=[r[3] for r in rows],
                 splits=[self.split] * n,
                 has_seizure=has_sz,
                 event_types=[""] * n,
-                clinical_categories=clin,
+                clinical_categories=["seizure" if s else "normal" for s in has_sz],
             )
+
+        if self._num_workers and self._num_workers > 0:
+            # Parallel decode path. shuffle=False: epoch_idx is already
+            # stem-grouped by _sample_epoch_indices, so contiguous worker chunks
+            # keep the per-stem decode/L3 cache hits. drop_last matches the
+            # n_total flooring above.
+            from torch.utils.data import DataLoader
+            loader = DataLoader(
+                _TypedWindowMapDataset(self, epoch_idx),
+                batch_size=batch_size,
+                shuffle=False,
+                drop_last=True,
+                num_workers=self._num_workers,
+                collate_fn=_identity_collate,
+                pin_memory=(dev.type == "cuda"),
+                prefetch_factor=4,
+                persistent_workers=False,
+            )
+            for rows in loader:
+                yield _emit(rows)
+            return
+
+        for start in range(0, n_total, batch_size):
+            rows = [self._window_row(bi) for bi in epoch_idx[start:start + batch_size]]
+            yield _emit(rows)

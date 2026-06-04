@@ -398,6 +398,7 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         lma_root: Optional[str] = None,
         split_manifest: Optional[str] = None,
         detail_bands: str = 'none',
+        detail_stack_mode: str = 'interp',
         max_windows_per_file: Optional[int] = None,
         soap_max_precond_dim: int = 10000):
     """Run joint training with the given TrainingConfig.
@@ -433,6 +434,13 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     print(f"[*] Joint training on {device}")
     print(f"[*] Preset: {cfg.name}  (epochs warm/QAT/fine = "
           f"{cfg.epochs_warmup}/{cfg.epochs_quant}/{cfg.epochs_fine})")
+    # Clamp val_interval so validation fires at least ~twice per phase even on
+    # short runs. Default 10 with epochs_quant=4 means QAT validation NEVER runs
+    # -> no best-checkpoint tracking (best_val_r stays -inf). No-op for long runs.
+    _vi = max(1, min(cfg.val_interval, max(1, cfg.epochs_warmup), max(1, cfg.epochs_quant)))
+    if _vi != cfg.val_interval:
+        print(f"[*] val_interval {cfg.val_interval} -> {_vi} (short-run clamp so QAT validates)")
+        object.__setattr__(cfg, 'val_interval', _vi)   # cfg is a frozen dataclass
     print(f"[*] Decoder tier: {vocos_tier}  (8=mobile-200M, 2=clinical-400M, 3=research-800M)")
 
     ckpt_dir = Path(ckpt_dir or os.path.join(ROOT_DIR, 'lamquant', 'student'))
@@ -450,10 +458,17 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
               'all': 'l3_detail,l2_detail,l1_detail'}
     if detail_bands not in _BANDS:
         raise ValueError(f"--detail-bands must be one of {list(_BANDS)}, got {detail_bands!r}")
+    if detail_stack_mode not in ('interp', 'fold'):
+        raise ValueError(f"--detail-stack-mode must be 'interp' or 'fold', got {detail_stack_mode!r}")
     os.environ['SNN_DETAIL_BANDS'] = _BANDS[detail_bands]
-    n_in = 21 * (1 + len([b for b in _BANDS[detail_bands].split(',') if b]))
-    print(f"[*] Input bands: {detail_bands}  -> encoder in_channels={n_in}, "
-          f"decoder out_channels=21 (fullband)")
+    os.environ['SNN_DETAIL_STACK_MODE'] = detail_stack_mode
+    # n_in must track _stack_detail_bands exactly: interp adds 1 block/band,
+    # fold adds ceil(len/313) blocks/band (information-preserving, ADR 0031).
+    from lamquant.snn.lma_dataset import detail_stack_in_channels
+    _bands_list = [b for b in _BANDS[detail_bands].split(',') if b]
+    n_in = detail_stack_in_channels(_bands_list, mode=detail_stack_mode)
+    print(f"[*] Input bands: {detail_bands} (stack={detail_stack_mode})  -> "
+          f"encoder in_channels={n_in}, decoder out_channels=21 (fullband)")
 
     use_grad_ckpt = vocos_tier >= 5
     encoder_kernels = tuple(int(k) for k in cfg.encoder_kernels.split(','))
@@ -1054,13 +1069,31 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     # QAT R values are on a different scale (ternary), but starting
     # from the warm best ensures the first QAT save must actually
     # improve over the warm-phase peak — not just beat -inf.
-    if best_warm_r > 0:
-        cm.best_val_r = best_warm_r
-        cm.best_epoch = cfg.epochs_warmup
-        print(f"  [CM] Seeded QAT tracker with warm best R={best_warm_r:.4f}")
+    # Seed unconditionally (was `if best_warm_r > 0`, which left best_val_r at
+    # -inf on short/degenerate warms so QAT best-checkpoint tracking never had a
+    # baseline). Even a 0.0 warm best gives QAT a real bar to beat.
+    cm.best_val_r = best_warm_r
+    cm.best_epoch = cfg.epochs_warmup
+    print(f"  [CM] Seeded QAT tracker with warm best R={best_warm_r:.4f}")
 
     # ---- Phase 2: QAT (encoder ternary, decoder still FP32) ----
     print(f"\n[*] Phase 2: QAT ({cfg.epochs_quant} ep, encoder ternary STE, decoder FP32)")
+
+    # CALIBRATE lsq_alpha at the warm->QAT boundary (the fix for the grad
+    # explosion). During WARM the LSQ path is bypassed, so lsq_alpha stays at its
+    # 0.1 init; with warm-converged weights (mean|W|~0.056) that sends most
+    # weights to 0 at QAT onset -> latent collapse -> exploding decoder grads
+    # (the measured 50k-214k / val R 0.01 / PRD 188% failure). _init_alpha sets
+    # alpha = (2/3)*mean|W| per channel — the data-driven LSQ-style init that
+    # every reference quantizer (LSQ/BitNet/TTQ/ParetoQ) performs and ours
+    # uniquely omitted (see docs/QAT_REFERENCE_COMPARISON.md). Force it on every
+    # ternary/INT8 module regardless of the per-module init flag.
+    _n_cal = 0
+    for _m in codec.encoder.modules():
+        if hasattr(_m, '_init_alpha') and hasattr(_m, 'clamp_alpha'):
+            _m._init_alpha(); _m.clamp_alpha(); _n_cal += 1
+    print(f"  [QAT calib] data-driven alpha init on {_n_cal} quantized modules "
+          f"(warm->QAT collapse fix)")
 
     # Reset optimizer with QAT learning rate.
     enc_groups = make_param_groups(
@@ -1301,6 +1334,14 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
 
             optimizer.zero_grad()
             g_loss.backward()
+            # Per-COORDINATE grad clamp BEFORE the norm clip. SOAP (and any
+            # Adam-family optimizer) is invariant to a global gradient rescale,
+            # so clip_grad_norm_ is a no-op on the SOAP step (it cancels in
+            # exp_avg/sqrt(exp_avg_sq)) — which let QAT diverge (grads -> 1e15
+            # over ~50 steps even after alpha calibration fixed the onset). A
+            # value clamp changes the gradient DIRECTION per coordinate, so SOAP
+            # cannot cancel it; this is what actually bounds the QAT step.
+            torch.nn.utils.clip_grad_value_(codec.parameters(), 1.0)
             _gnorm_qat = torch.nn.utils.clip_grad_norm_(codec.parameters(), cfg.grad_clip_quant)
             optimizer.step()
             # Hard alpha safety net AFTER optimizer step. Clamping after
@@ -1705,9 +1746,19 @@ def main():
     parser.add_argument('--detail-bands', choices=['none', 'l3_detail', 'all'],
                         default='none',
                         help='Encoder input bands: none=L3 (21ch, MCU-deployable), '
-                             'l3_detail=+15.6-31.25Hz LVFA (42ch, deployable arm), '
-                             'all=+all detail bands (84ch, ceiling). Decoder always '
-                             'reconstructs the 21-ch fullband target.')
+                             'l3_detail=+15.6-31.25Hz LVFA, all=+all detail bands '
+                             '(the >15Hz reconstruction basis). Channel count depends '
+                             'on --detail-stack-mode. Decoder always reconstructs the '
+                             '21-ch fullband target.')
+    parser.add_argument('--detail-stack-mode', choices=['interp', 'fold'],
+                        default='interp',
+                        help='How detail bands stack onto L3 (ADR 0031). '
+                             'interp (default, legacy): each band linearly resampled '
+                             'to the 313 grid as 1 block (LOSSY — l1/l2 downsampled; '
+                             'all=84ch). fold: zero-pad+reshape, information-preserving, '
+                             'no coefficient dropped (all=168ch). Use fold for the '
+                             'ADR-0031 input-limitation test so a null cannot be blamed '
+                             'on the stacking.')
     parser.add_argument('--encoder-width', type=int, default=None,
                         help='Override preset encoder width (e.g. 256 research).')
     parser.add_argument('--encoder-blocks', type=int, default=None,
@@ -1770,6 +1821,7 @@ def main():
                  lma_root=args.lma_root,
                  split_manifest=args.split_manifest,
                  detail_bands=args.detail_bands,
+                 detail_stack_mode=args.detail_stack_mode,
                  max_windows_per_file=args.max_windows_per_file,
                  soap_max_precond_dim=args.soap_max_precond_dim)
     return 0 if result['best_val_r'] > 0 else 1
