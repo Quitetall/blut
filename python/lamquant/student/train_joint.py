@@ -1352,7 +1352,15 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
             # them to clamped values, fighting the clamp every step.
             with torch.no_grad():
                 for m in _alpha_modules:
-                    m.lsq_alpha.data.clamp_(min=1e-4, max=20.0)
+                    # DATA-DRIVEN alpha clamp [0.5*std(W), 2*std(W)] per channel,
+                    # not a fixed [1e-4, 20]. The fixed-20 ceiling let the learned
+                    # LSQ alpha drift to ~20 while weights stayed ~0.06, so
+                    # round(w/alpha)=round(0.003)=0 zeroed the entire focal_mid
+                    # encoder body -> R capped at 0.34 (dissection 2026-06-03).
+                    if hasattr(m, 'clamp_alpha'):
+                        m.clamp_alpha()
+                    else:
+                        m.lsq_alpha.data.clamp_(min=1e-4, max=20.0)
             if ema_model is not None:
                 ema_model.update_parameters(codec)
             loss_acc += g_loss.detach(); n += 1  # accumulate on GPU, no sync
