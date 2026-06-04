@@ -5,3 +5,14 @@
 .DS_Store
 *.swp
 /data
+
+# Training checkpoints — too large for GitHub (100MB/file limit).
+# Regenerable from training; persist via local backup or external storage.
+*.ckpt
+*.pt
+*.pth
+python/lamquant/student/recovery/
+
+# Training run logs (high-volume CSV)
+python/training_logs/
+training_logs/
