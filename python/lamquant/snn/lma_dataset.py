@@ -451,16 +451,20 @@ def _cached_l3_stack(lma_path: str, stem: str,
     if disk_path is not None:
         try:
             disk_path.parent.mkdir(parents=True, exist_ok=True)
-            # np.save auto-appends `.npy` when the filename doesn't
-            # end in it, so a tmp like `<x>.npy.tmp` ends up written
-            # as `<x>.npy.tmp.npy` and the rename target vanishes.
-            # Sandwich `.tmp` between the stem and the `.npy` suffix.
-            tmp = disk_path.with_name(disk_path.stem + ".tmp.npy")
-            # Storage dtype controlled by L3_CACHE_DTYPE env var
-            # (default float16, halves disk footprint vs float32).
-            # See `_l3_cache_dtype` docstring for guidance.
-            np.save(tmp, result.astype(_l3_cache_dtype()))
-            tmp.replace(disk_path)
+            # DISK-FILL GUARD (statvfs free-space) — mirrors the fullband cache.
+            # The L3 cache was unbounded and (with the fullband cache) nearly
+            # filled the disk on 2026-06-04. Skip the disk write when free space
+            # is low; the in-mem LRU below still serves this stem.
+            import os as _os
+            _free = (lambda s: s.f_bavail * s.f_frsize)(_os.statvfs(disk_path.parent))
+            _min_free = int(float(_os.environ.get("L3_CACHE_MIN_FREE_GB", "40")) * 1e9)
+            if _free >= _min_free:
+                # np.save auto-appends `.npy`; sandwich `.tmp` before the suffix
+                # so the rename target exists. Storage dtype via L3_CACHE_DTYPE
+                # (default float16, halves footprint).
+                tmp = disk_path.with_name(disk_path.stem + ".tmp.npy")
+                np.save(tmp, result.astype(_l3_cache_dtype()))
+                tmp.replace(disk_path)
         except Exception as e:
             LOG.warning("L3 disk-cache save failed for %s: %s — in-memory only",
                         stem, e)
