@@ -107,6 +107,12 @@ class JointCodec(nn.Module):
             latent = self.encoder.encode(x, quantize=quantize,
                                          coords=coords, ch_mask=ch_mask)
             return self.decoder(latent, coords=coords, ch_mask=ch_mask)
+        # Legacy path: coords/ch_mask have no effect — fail loud rather than
+        # silently dropping them (a non-CA codec built by mistake).
+        if coords is not None or ch_mask is not None:
+            raise ValueError(
+                "coords/ch_mask require a channel_agnostic codec; build with "
+                "build_default_joint(channel_agnostic=True)")
         latent = self.encoder.encode(x, quantize=quantize)
         return self.decoder(latent)
 
