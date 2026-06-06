@@ -107,6 +107,68 @@ def prd_torch(original, reconstructed, eps: float = 1e-12,
     return torch.clamp(prd, max=max_prd)
 
 
+def masked_pearson_r_torch(pred, target, ch_mask=None, eps: float = 1e-8):
+    """Channel-masked differentiable Pearson R (scalar tensor).
+
+    Identical to `pearson_r_torch(pred, target)` when ch_mask is None — same
+    flatten-and-pool-per-sample semantics — so existing call sites are a no-op.
+
+    With ch_mask [B, N] (True = real channel), padded channels are excluded
+    from BOTH the per-sample mean and the correlation sums. This is the fix for
+    the variable-N validation bug: zero-padded channels otherwise pollute R
+    (a flat-zero channel correlates as NaN/0 against any target).
+
+    pred/target: [B, N, T]. ch_mask: [B, N] bool/float or None.
+    """
+    import torch
+    p = pred.flatten(1)         # [B, N*T]
+    t = target.flatten(1)
+    if ch_mask is None:
+        pc = p - p.mean(dim=-1, keepdim=True)
+        tc = t - t.mean(dim=-1, keepdim=True)
+    else:
+        T = pred.shape[-1]
+        m = ch_mask.to(p.dtype).unsqueeze(-1).expand(-1, -1, T).flatten(1)  # [B,N*T]
+        cnt = m.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        pm = (p * m).sum(dim=-1, keepdim=True) / cnt
+        tm = (t * m).sum(dim=-1, keepdim=True) / cnt
+        pc = (p - pm) * m          # padded elements → exactly 0
+        tc = (t - tm) * m
+    num = (pc * tc).sum(dim=-1)
+    den = torch.sqrt((pc ** 2).sum(dim=-1)) * torch.sqrt((tc ** 2).sum(dim=-1)) + eps
+    return (num / den).mean()
+
+
+def masked_pearson_r_batch(pred, target, ch_mask=None) -> float:
+    """Float (non-grad) channel-masked Pearson R for monitoring.
+
+    `.item()` of `masked_pearson_r_torch`; matches `pearson_r_batch`
+    (training_utils, the validate path) bit-for-bit when ch_mask is None.
+    """
+    return float(masked_pearson_r_torch(pred, target, ch_mask=ch_mask).item())
+
+
+def masked_prd_torch(original, reconstructed, ch_mask=None,
+                     eps: float = 1e-12, max_prd: float = 200.0):
+    """Channel-masked differentiable PRD (scalar tensor).
+
+    Identical to `prd_torch(original, reconstructed)` when ch_mask is None.
+    With ch_mask [B, N], padded channels are excluded from the noise/signal
+    energy sums (m ∈ {0,1} so m² == m).
+    """
+    import torch
+    noise = original - reconstructed
+    if ch_mask is None:
+        num = torch.sum(noise ** 2)
+        den = torch.sum(original ** 2) + eps
+    else:
+        m = ch_mask.to(original.dtype).unsqueeze(-1)        # [B,N,1] broadcast over T
+        num = torch.sum((noise ** 2) * m)
+        den = torch.sum((original ** 2) * m) + eps
+    prd = 100.0 * torch.sqrt(num / den)
+    return torch.clamp(prd, max=max_prd)
+
+
 def pearson_r_numpy(original: np.ndarray, reconstructed: np.ndarray,
                      eps: float = 1e-12) -> float:
     """Pearson R over the whole array, single scalar. For diagnostic use."""

@@ -80,19 +80,33 @@ class JointCodec(nn.Module):
     # Forward
     # ------------------------------------------------------------
 
-    def forward(self, x: torch.Tensor, *, quantize: bool = True) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, quantize: bool = True,
+                coords=None, ch_mask=None) -> torch.Tensor:
         """End-to-end: encode → quantize → decode.
 
         Args:
-            x:        [B, 21, 313] L3 approximation (or whatever the
-                      encoder takes).
+            x:        [B, N, 313] L3 approximation (N=21 for the legacy path,
+                      any channel count for the channel_agnostic path).
             quantize: If True, the encoder applies its ternary QAT path.
                       Set False during the warm-up phase before QAT.
+            coords:   [B, N, 3] electrode positions (channel_agnostic only).
+                      None → encoder/decoder default to canonical 10-20 (N=21).
+            ch_mask:  [B, N] real-channel mask (channel_agnostic only).
 
         Returns:
-            [B, 21, T] reconstruction (T matches decoder.target_len for
+            [B, N, T] reconstruction (T matches decoder.target_len for
             Tier 1-2; matches raw EEG length for Tier 3+).
         """
+        ca = getattr(self.encoder, 'channel_agnostic', False)
+        if ca:
+            # The decoder cannot infer N from the [B,32,79] latent, so it must
+            # receive the SAME coords the encoder used. Materialize the N=21
+            # canonical default once here when the caller omits coords.
+            if coords is None:
+                coords = self.encoder.default_coords(x)
+            latent = self.encoder.encode(x, quantize=quantize,
+                                         coords=coords, ch_mask=ch_mask)
+            return self.decoder(latent, coords=coords, ch_mask=ch_mask)
         latent = self.encoder.encode(x, quantize=quantize)
         return self.decoder(latent)
 
@@ -222,7 +236,8 @@ def build_default_joint(latent_dim: int = 32,
                          target_len: int = 313,
                          gradient_checkpointing: bool = False,
                          encoder_blocks: int = 3,
-                         encoder_kernels: tuple = (3, 5, 7)) -> JointCodec:
+                         encoder_kernels: tuple = (3, 5, 7),
+                         channel_agnostic: bool = False) -> JointCodec:
     """Build the production joint codec with sensible defaults.
 
     Args:
@@ -231,6 +246,12 @@ def build_default_joint(latent_dim: int = 32,
             Must have exactly encoder_blocks entries. First block gets
             stride=2 (with ZeroPadShortcut), last block gets stride=2,
             middle blocks get stride=1.
+        channel_agnostic: If True, build the channel-count-agnostic codec —
+            per-channel tokenization + position-conditioned attention front-end
+            (any N channels, any montage) and a FiLM position-conditioned
+            decoder head. Requires an iSTFT (fullband) tier. `in_channels` /
+            `decoder_channels` then only set the N=21 warm-start default; the
+            model accepts arbitrary N at runtime via coords/ch_mask.
 
     Tier roles (deployment plan):
 
@@ -267,11 +288,13 @@ def build_default_joint(latent_dim: int = 32,
     encoder = TernaryMobileNetV5_Subband(
         in_ch=in_channels, latent_dim=latent_dim, width=encoder_width,
         n_blocks=encoder_blocks, kernel_sizes=encoder_kernels,
+        channel_agnostic=channel_agnostic,
     )
     decoder = VocosDecoder(
         tier=vocos_tier, latent_dim=latent_dim,
         n_channels=dec_ch, target_len=target_len,
         gradient_checkpointing=gradient_checkpointing,
+        channel_agnostic=channel_agnostic,
     )
     return JointCodec(encoder, decoder)
 
