@@ -449,7 +449,8 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         channel_agnostic: bool = False,
         variable_n: bool = False,
         ca_decoder_legacy: bool = False,
-        n_range: tuple = (8, 21)):
+        n_range: tuple = (8, 21),
+        diagnostics: bool = True):
     """Run joint training with the given TrainingConfig.
 
     Speedup knobs:
@@ -1052,6 +1053,43 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     torch.cuda.empty_cache()
     train_ds.calibrate_shard_budget(device)
     val_ds.calibrate_shard_budget(device)
+
+    # ---- Pre-flight diagnostics gate — catch broken wiring (dead-grad term,
+    # shape contract, NaN data, coords misrouting) BEFORE the GPU run burns
+    # hours. Halts only on hard structural FAIL (data/shape/grad); never blocks
+    # a run on a diagnostics-internal error. Disable with --no-diagnostics.
+    if diagnostics:
+        try:
+            from training_diagnostics import TrainingDiagnostics, DiagReport
+            _pf = next(iter(train_ds.prefetch_typed_batches(
+                batch_size=min(4, cfg.batch_size_warmup), device=device,
+                sampler=train_sampler)))
+            _xin, _fbt, _co, _cm = _ca_inputs(
+                _pf.l3_approx, _pf.fullband_target, channel_agnostic, variable_n, n_range)
+            _diag = TrainingDiagnostics(
+                codec,
+                loss_fn=lambda r, l, fullband=None, ch_mask=None: joint_loss(
+                    r, l, fullband_target=fullband, ch_mask=ch_mask, return_parts=False),
+                channel_agnostic=channel_agnostic, device=str(device))
+            _rep = DiagReport()
+            _rep.add(_diag.check_data_sanity(_xin, _fbt))
+            _rep.add(_diag.check_shape_contract(_xin, _co, _cm))
+            _rep.add(_diag.check_gradient_flow(_xin, _fbt, _co, _cm))
+            _rep.add(_diag.check_masked_invariant())
+            if channel_agnostic and _co is not None:
+                _rep.add(_diag.check_coords_routing(_xin, _co, _cm))
+            print("\n[*] PRE-FLIGHT DIAGNOSTICS\n" + _rep.summary() + "\n")
+            _hard = [r for r in _rep.failed
+                     if r.name.startswith(("data.", "shape.", "grad."))]
+            if _hard:
+                raise RuntimeError(
+                    "pre-flight diagnostics FAILED (broken wiring — fix before "
+                    "training): " + ", ".join(r.name for r in _hard))
+            codec.zero_grad(set_to_none=True)  # clear preflight grads
+        except RuntimeError:
+            raise
+        except Exception as _e:  # diagnostics must never block a run on its own bug
+            print(f"[!] pre-flight diagnostics skipped (non-fatal): {_e}")
 
     best_warm_r = 0.0
     _n_batches_warm = max(cfg.windows_per_epoch // max(cfg.batch_size_warmup, 1), 1)
@@ -1909,6 +1947,9 @@ def main():
                              'N=21 only; incompatible with --variable-n.')
     parser.add_argument('--n-min', type=int, default=8, help='variable-N min channels')
     parser.add_argument('--n-max', type=int, default=21, help='variable-N max channels')
+    parser.add_argument('--no-diagnostics', dest='diagnostics', action='store_false',
+                        default=True, help='skip the pre-flight diagnostics gate '
+                        '(data/shape/grad/coords sanity on the first batch).')
     args = parser.parse_args()
 
     cfg = CONFIGS[args.config]
@@ -1955,7 +1996,8 @@ def main():
                  channel_agnostic=args.channel_agnostic,
                  variable_n=args.variable_n,
                  ca_decoder_legacy=args.ca_decoder_legacy,
-                 n_range=(args.n_min, args.n_max))
+                 n_range=(args.n_min, args.n_max),
+                 diagnostics=args.diagnostics)
     return 0 if result['best_val_r'] > 0 else 1
 
 
