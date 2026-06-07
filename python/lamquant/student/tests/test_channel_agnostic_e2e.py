@@ -198,6 +198,33 @@ def test_composition_coords_routed_per_channel():
     torch.testing.assert_close(out_a[0, 2:], out_b[0, 2:], atol=1e-6, rtol=1e-5)
 
 
+# -------- .lmq montage round-trip (encode -> file -> off-device decode) --------
+
+def test_lmq_montage_roundtrip_off_device():
+    """A channel-agnostic .lmq round-trips off-device using ONLY its own montage:
+    encode(l3, coords) -> .lmq (carries coords+names) -> decode -> [N,2500].
+    No external montage handed to decode — coords travel in the file."""
+    import tempfile, os
+    import numpy as np
+    from lamquant.student.ca_lmq_io import encode_to_lmq, decode_from_lmq
+    codec = _build_ca()
+    for N in (8, 21, 64):
+        x = torch.randn(1, N, 313)
+        coords = _coords(1, N)
+        chans = [f"EEG E{i}-REF" for i in range(N)]
+        path = os.path.join(tempfile.mkdtemp(), "w.lmq")
+        encode_to_lmq(codec, x, coords, chans, path)
+        recon, meta = decode_from_lmq(codec, path)
+        assert recon.shape == (1, N, 2500) and torch.isfinite(recon).all()
+        assert meta["n_channels"] == N and meta["channels"] == chans
+        np.testing.assert_array_equal(meta["coords"], coords[0].numpy())  # coords bit-exact in file
+        # decode-from-file matches a direct decode of the same window (fp16-latent tol)
+        codec.train(False)
+        with torch.no_grad():
+            direct = codec(x, quantize=True, coords=coords)
+        torch.testing.assert_close(recon, direct, atol=2e-2, rtol=2e-2)
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
