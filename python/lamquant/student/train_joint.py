@@ -50,6 +50,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# torch.compile(mode='reduce-overhead') DONATES backward buffers, which is
+# incompatible with retain_graph=True. Two paths backward the SAME loss twice:
+# the first-batch _gradient_health_check (backward(retain_graph=True) so the main
+# loop can backward again) and the pre-flight diagnostics gate. Disable donated
+# buffers so both double-backward paths are safe on the compiled decoder — costs
+# a little activation memory, no speed change. (Caught when the CA parity run
+# crashed at epoch 3: "compiled with non-empty donated buffers requires
+# retain_graph=False".) Guarded for torch versions without the flag.
+try:
+    import torch._functorch.config as _functorch_config
+    _functorch_config.donated_buffer = False
+except Exception:
+    pass
+
 # torch.compile(mode='reduce-overhead') captures CUDA graphs per
 # distinct input shape. Joint training has 4-9 distinct shapes
 # (warm batch / QAT batch / val batch / last-partial-batch / shard
