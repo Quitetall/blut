@@ -50,31 +50,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# torch.compile(mode='reduce-overhead') DONATES backward buffers, which is
-# incompatible with retain_graph=True. Two paths backward the SAME loss twice:
-# the first-batch _gradient_health_check (backward(retain_graph=True) so the main
-# loop can backward again) and the pre-flight diagnostics gate. Disable donated
-# buffers so both double-backward paths are safe on the compiled decoder — costs
-# a little activation memory, no speed change. (Caught when the CA parity run
-# crashed at epoch 3: "compiled with non-empty donated buffers requires
-# retain_graph=False".) Guarded for torch versions without the flag.
-# Module scope (not run()) is deliberate + harmless: the flag is a no-op unless
-# torch.compile is actually invoked, and setting it before any compile avoids a
-# decorator-time-compile race. (The surgical alternative — torch.compiler.disable
-# on _gradient_health_check — was rejected: the health check backwards the SAME
-# compiled decoder the main loop does, so disabling compile there does not
-# decouple the donated-buffer backward graph.)
-try:
-    import torch._functorch.config as _functorch_config
-    _functorch_config.donated_buffer = False
-except (ImportError, AttributeError) as _e:
-    # Narrow catch + warn so a future torch that renames/removes the flag makes
-    # the inert guard VISIBLE (the retain_graph double-backward crash would
-    # otherwise silently return) instead of being swallowed.
-    import logging as _logging
-    _logging.getLogger(__name__).warning(
-        "torch._functorch.config.donated_buffer unavailable (%s); torch.compile "
-        "+ retain_graph double-backward may crash", _e)
+# NOTE (#255): No donated_buffer=False workaround here. torch.compile
+# (reduce-overhead) DONATES backward buffers, which forbids retain_graph=True /
+# create_graph=True (a second backward through an already-freed graph). The only
+# retain_graph double-backward in this file was the first-batch
+# _gradient_health_check; it now reads grad norms from the main loop's SINGLE
+# backward instead of running its own (see _gradient_health_check + its warm-loop
+# call site). No other path double-backwards one graph: warm = one backward;
+# diagnostics overfit/grad-flow each backward their OWN fresh forward; GAN d_loss
+# uses disc(fake.detach()) and g_loss uses a fresh disc(fake) + real_feats
+# .detach() (discriminator.py:261, adv uses fake_scores only), so g never
+# re-traverses the freed disc(real) graph. All single-backward → safe with
+# donated buffers, so reduce-overhead + CUDA graphs run at full speed.
 
 # torch.compile(mode='reduce-overhead') captures CUDA graphs per
 # distinct input shape. Joint training has 4-9 distinct shapes
@@ -936,15 +923,18 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
                     print(f'  [skip] {name}: disabled (0.0)')
                 else:
                     print(f'  [WARN] {name}: Python scalar {val} (no gradient)')
-        # Quick grad norm check
-        loss_total.backward(retain_graph=True)
+        # Grad-norm check reads the grads from the caller's SINGLE backward
+        # (this is now called AFTER loss.backward(), before clip/step). NO second
+        # backward here: a retain_graph=True double-backward of the same loss is
+        # incompatible with torch.compile(reduce-overhead) donated buffers and was
+        # crashing the run (task #255). Do NOT zero_grad — the caller's
+        # clip_grad_norm_ + optimizer.step() need these grads.
         enc_gnorm = torch.sqrt(sum(p.grad.norm() ** 2
                         for p in model.encoder.parameters()
                         if p.grad is not None)).item()  # single sync
         dec_gnorm = torch.sqrt(sum(p.grad.norm() ** 2
                         for p in model.decoder.parameters()
                         if p.grad is not None)).item()  # single sync
-        model.zero_grad()
         print(f'  encoder grad_norm: {enc_gnorm:.4f}')
         print(f'  decoder grad_norm: {dec_gnorm:.4f}')
         if enc_gnorm < 1e-8:
@@ -1143,10 +1133,13 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
                                           fullband_target=_fb,
                                           ch_mask=_cmask,
                                           return_parts=need_check)
-            if need_check:
-                _gradient_health_check(loss, parts, codec)
             optimizer.zero_grad()
             loss.backward()
+            if need_check:
+                # AFTER backward, BEFORE clip/step: reads grad norms from the
+                # caller's single backward (no retain_graph double-backward —
+                # see #255 / _gradient_health_check). Grads stay live for clip+step.
+                _gradient_health_check(loss, parts, codec)
             _gnorm_warm = torch.nn.utils.clip_grad_norm_(codec.parameters(), cfg.grad_clip_warmup)
             optimizer.step()
             if ema_model is not None:
