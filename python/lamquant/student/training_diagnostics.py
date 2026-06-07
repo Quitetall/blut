@@ -243,6 +243,7 @@ class TrainingDiagnostics:
                 losses.append(loss.item())
         finally:
             self.codec.load_state_dict(state)
+            self.codec.zero_grad(set_to_none=True)  # load_state_dict leaves stale .grad
             self.codec.train(was_training)
         l0, lN = losses[0], min(losses[-5:])
         drop = (l0 - lN) / (abs(l0) + 1e-8)
@@ -274,8 +275,9 @@ class TrainingDiagnostics:
             return DiagResult("coords_routing", PASS, "n/a (not channel-agnostic)")
         head = getattr(self.codec.decoder, "head", None)
         pos_mlp = getattr(head, "pos_mlp", None)
-        if pos_mlp is None:
-            return DiagResult("coords_routing", WARN, "decoder head has no pos_mlp")
+        if pos_mlp is None or not hasattr(pos_mlp[-1], "weight"):
+            return DiagResult("coords_routing", WARN,
+                              "decoder head has no weight-bearing pos_mlp last layer")
         self.codec.train(False)
         saved = {k: v.clone() for k, v in head.state_dict().items()}
         try:
@@ -306,7 +308,7 @@ class TrainingDiagnostics:
         self.codec.train(False)
         with torch.no_grad():
             out_full = self._forward(x_l3[:, :n_real], coords[:, :n_real],
-                                     torch.ones(B, n_real, dtype=torch.bool))
+                                     torch.ones(B, n_real, dtype=torch.bool, device=x_l3.device))
             out_pad = self._forward(x_l3, coords, mask_pad)
         d = (out_full - out_pad[:, :n_real]).abs().max().item()
         return DiagResult("padded_leak", PASS if d < 1e-4 else FAIL,
