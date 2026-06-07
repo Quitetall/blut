@@ -58,11 +58,23 @@ import torch.nn.functional as F
 # a little activation memory, no speed change. (Caught when the CA parity run
 # crashed at epoch 3: "compiled with non-empty donated buffers requires
 # retain_graph=False".) Guarded for torch versions without the flag.
+# Module scope (not run()) is deliberate + harmless: the flag is a no-op unless
+# torch.compile is actually invoked, and setting it before any compile avoids a
+# decorator-time-compile race. (The surgical alternative — torch.compiler.disable
+# on _gradient_health_check — was rejected: the health check backwards the SAME
+# compiled decoder the main loop does, so disabling compile there does not
+# decouple the donated-buffer backward graph.)
 try:
     import torch._functorch.config as _functorch_config
     _functorch_config.donated_buffer = False
-except Exception:
-    pass
+except (ImportError, AttributeError) as _e:
+    # Narrow catch + warn so a future torch that renames/removes the flag makes
+    # the inert guard VISIBLE (the retain_graph double-backward crash would
+    # otherwise silently return) instead of being swallowed.
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "torch._functorch.config.donated_buffer unavailable (%s); torch.compile "
+        "+ retain_graph double-backward may crash", _e)
 
 # torch.compile(mode='reduce-overhead') captures CUDA graphs per
 # distinct input shape. Joint training has 4-9 distinct shapes
