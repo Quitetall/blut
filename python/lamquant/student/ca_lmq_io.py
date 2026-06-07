@@ -49,12 +49,17 @@ def encode_to_lmq(codec, x_l3, coords, channels: Optional[Sequence[str]],
     if x_l3.dim() == 2:
         x_l3 = x_l3.unsqueeze(0)
     c = coords if coords.dim() == 3 else coords.unsqueeze(0)
+    if x_l3.shape[1] != c.shape[1]:
+        raise ValueError(
+            f"channel count mismatch: x_l3 has {x_l3.shape[1]} channels, "
+            f"coords has {c.shape[1]} — would write a self-inconsistent .lmq")
     with _eval_mode(codec), torch.no_grad():
         latent = codec.encoder.encode(x_l3, quantize=True, coords=c)   # [1,32,79]
     lat = latent[0].detach().cpu().numpy()                             # [32,79]
-    payload = np.ascontiguousarray(lat, dtype=np.float16).tobytes()
-    coords_flat = [float(v) for v in np.ascontiguousarray(
-        c[0].detach().cpu().numpy(), dtype=np.float32).reshape(-1)]
+    # explicit little-endian fp16 — matches the Rust LE wire on any host.
+    payload = np.ascontiguousarray(lat, dtype="<f2").tobytes()
+    coords_flat = np.ascontiguousarray(
+        c[0].detach().cpu().numpy(), dtype=np.float32).reshape(-1).tolist()
     n = c.shape[1]
     chans = list(channels) if channels is not None else None
     _lc.write_ca_lmq(path, n, int(lat.shape[0]), int(lat.shape[1]),
