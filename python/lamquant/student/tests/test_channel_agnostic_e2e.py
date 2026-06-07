@@ -80,6 +80,24 @@ def test_ca_rejects_direct_tier():
         build_default_joint(vocos_tier=1, channel_agnostic=True)   # tier 1 = direct
 
 
+def test_ca_decoder_legacy_isolation_build():
+    """CA encoder + LEGACY decoder head (warm-start parity isolation, ADR-0036).
+    The decoder ignores coords (channel_agnostic=False) and emits fixed 21ch."""
+    codec = build_default_joint(vocos_tier=TIER, encoder_width=32,
+                                channel_agnostic=True, ca_decoder=False).train(False)
+    assert codec.encoder.channel_agnostic is True
+    assert codec.decoder.channel_agnostic is False
+    out = codec(torch.randn(2, 21, 313), quantize=False)   # coords default → canonical-21
+    assert out.shape == (2, 21, 2500) and torch.isfinite(out).all()
+
+
+def test_ca_decoder_defaults_to_encoder_flag():
+    """ca_decoder=None (default) follows channel_agnostic -> both CA."""
+    codec = build_default_joint(vocos_tier=TIER, encoder_width=32,
+                                channel_agnostic=True).train(False)
+    assert codec.encoder.channel_agnostic and codec.decoder.channel_agnostic
+
+
 # ---------------- masked metric anchors (no-op-default proof) ----------------
 
 def test_masked_metrics_equal_unmasked_when_all_real():

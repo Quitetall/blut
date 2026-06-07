@@ -113,7 +113,9 @@ from seizure_head import SeizureHead
 
 def validate_joint(model: JointCodec, val_ds, device, quantize=True,
                     batch_size: int = 64, per_band_sample: int = 512,
-                    amp: bool = True, per_category: bool = False):
+                    amp: bool = True, per_category: bool = False,
+                    channel_agnostic: bool = False, variable_n: bool = False,
+                    n_range: tuple = (8, 21)):
     """End-to-end joint validation. Returns (val_r, val_prd, per_band_prd_dict)
     or (val_r, val_prd, per_band_prd_dict, category_metrics) if per_category=True.
 
@@ -133,7 +135,8 @@ def validate_joint(model: JointCodec, val_ds, device, quantize=True,
     """
     sys.path.insert(0, os.path.join(ROOT_DIR, 'lamquant'))
     from data_types import Split as _Split
-    from metrics import prd_torch, per_band_prd as _per_band_prd
+    from metrics import (prd_torch, per_band_prd as _per_band_prd,
+                         masked_pearson_r_batch, masked_prd_torch)
 
     # Accept either a string ('cpu', 'cuda') or a torch.device — old
     # tests pass strings and we promised backward compat.
@@ -159,11 +162,15 @@ def validate_joint(model: JointCodec, val_ds, device, quantize=True,
         for batch in val_ds.prefetch_typed_batches(batch_size=batch_size, device=device):
             batch.assert_no_leakage(_Split.VAL)   # safety net
             x_l3 = batch.l3_approx
-            recon = model(x_l3, quantize=quantize)
+            # CA: subset channels (variable-N) or pass through (N=21 parity);
+            # coords/ch_mask = None on the parity path -> identical to legacy.
+            x_l3, _fb_v, _coords_v, _cmask_v = _ca_inputs(
+                x_l3, batch.fullband_target, channel_agnostic, variable_n, n_range)
+            recon = model(x_l3, quantize=quantize, coords=_coords_v, ch_mask=_cmask_v)
             # Auto-detect domain: if the decoder emits fullband-shaped
             # output AND the dataset provides fullband targets, validate
             # against fullband. Otherwise fall back to L3.
-            fb_target = batch.fullband_target
+            fb_target = _fb_v                     # subset fullband (CA) or original
             use_fullband = (fb_target is not None
                             and abs(recon.shape[-1] - fb_target.shape[-1]) <= 8)
             if use_fullband:
@@ -174,8 +181,8 @@ def validate_joint(model: JointCodec, val_ds, device, quantize=True,
             T = min(recon.shape[-1], target.shape[-1])
             r_crop = recon[..., :T].float()      # promote BF16→FP32 for stable
             x_crop = target[..., :T].float()     # numpy export + R/PRD math
-            batch_r = pearson_r_batch(r_crop, x_crop)
-            batch_prd = float(prd_torch(x_crop, r_crop))
+            batch_r = masked_pearson_r_batch(r_crop, x_crop, _cmask_v)
+            batch_prd = float(masked_prd_torch(x_crop, r_crop, _cmask_v))
             _bs = r_crop.shape[0]
             rs.append((batch_r, _bs))
             prds.append((batch_prd, _bs))
@@ -193,7 +200,11 @@ def validate_joint(model: JointCodec, val_ds, device, quantize=True,
                     sample_prd = float(torch.sqrt((diff * diff).sum() / (s_x * s_x).sum().clamp(min=1e-12)) * 100)
                     cat_r_acc.setdefault(cat, []).append(sample_r)
                     cat_prd_acc.setdefault(cat, []).append(sample_prd)
-            if cpu_collected < per_band_sample:
+            # Per-band CPU accumulation needs a CONSISTENT channel count across
+            # batches (np.concatenate). variable-N yields a different k per batch
+            # → skip per-band there (a mixed-montage per-band PRD isn't meaningful
+            # anyway; run the codec bench on a fixed holdout for that).
+            if not variable_n and cpu_collected < per_band_sample:
                 n = min(x_crop.shape[0], per_band_sample - cpu_collected)
                 cpu_orig_chunks.append(x_crop[:n].detach().cpu().numpy())
                 cpu_recon_chunks.append(r_crop[:n].detach().cpu().numpy())
@@ -375,6 +386,40 @@ class WSDScheduler:
 
 
 # ============================================================
+# Channel-agnostic input transform (CA-6)
+# ============================================================
+
+def _ca_inputs(x_l3, fullband, channel_agnostic, variable_n, n_range=(8, 21)):
+    """Map a 21-ch batch to channel-agnostic (l3, fullband, coords, ch_mask).
+
+    - not channel_agnostic           -> (x_l3, fullband, None, None) [legacy].
+    - channel_agnostic, not variable -> (x_l3, fullband, None, None); the model
+      defaults coords to canonical-21 at N=21 (warm-start parity path).
+    - channel_agnostic + variable_n  -> per-batch uniform k in [n_min,n_max],
+      per-SAMPLE random channel subset. l3, fullband AND coords are gathered
+      with the SAME index per sample (alignment invariant), so output channel i
+      of all three refers to the same electrode. Uniform k => no padding =>
+      ch_mask=None (all real). Returns (l3_sub, fb_sub, coords[B,k,3], None).
+    """
+    if not channel_agnostic or not variable_n:
+        return x_l3, fullband, None, None
+    from lamquant_neural.positions import canonical_21_coords
+    B, Nfull, T = x_l3.shape
+    lo, hi = n_range
+    k = int(torch.randint(lo, min(hi, Nfull) + 1, (1,)).item())
+    # per-sample random permutation -> first k indices  [B,k]
+    idx = torch.argsort(torch.rand(B, Nfull, device=x_l3.device), dim=1)[:, :k]
+    x_sub = torch.gather(x_l3, 1, idx.unsqueeze(-1).expand(B, k, T))
+    fb_sub = (torch.gather(fullband, 1,
+                           idx.unsqueeze(-1).expand(B, k, fullband.shape[-1]))
+              if fullband is not None else None)
+    coords_full = torch.as_tensor(canonical_21_coords(),
+                                  dtype=x_l3.dtype, device=x_l3.device)  # [Nfull,3]
+    coords = coords_full[idx]                                           # [B,k,3] SAME idx
+    return x_sub, fb_sub, coords, None
+
+
+# ============================================================
 # Main training loop
 # ============================================================
 
@@ -400,7 +445,11 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         detail_bands: str = 'none',
         detail_stack_mode: str = 'interp',
         max_windows_per_file: Optional[int] = None,
-        soap_max_precond_dim: int = 10000):
+        soap_max_precond_dim: int = 10000,
+        channel_agnostic: bool = False,
+        variable_n: bool = False,
+        ca_decoder_legacy: bool = False,
+        n_range: tuple = (8, 21)):
     """Run joint training with the given TrainingConfig.
 
     Speedup knobs:
@@ -472,12 +521,47 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
 
     use_grad_ckpt = vocos_tier >= 5
     encoder_kernels = tuple(int(k) for k in cfg.encoder_kernels.split(','))
+    # Channel-agnostic guards (CA-6). variable-N changes the channel count, so
+    # it is incompatible with the 21-ch-assuming augmentor / GAN disc / seizure
+    # head; the legacy decoder head is fixed-21ch so cannot run variable-N.
+    if channel_agnostic and n_in != 21:
+        raise ValueError(
+            f"--channel-agnostic needs raw 21-ch L3 input (n_in={n_in}); the CA "
+            "front-end consumes per-electrode L3, so detail-band channel stacking "
+            "is incompatible (CA detail-conditioning is a follow-on). Use --detail-bands none.")
+    if ca_decoder_legacy and not channel_agnostic:
+        raise ValueError("--ca-decoder-legacy requires --channel-agnostic")
+    if variable_n:
+        if not channel_agnostic:
+            raise ValueError("--variable-n requires --channel-agnostic")
+        if ca_decoder_legacy:
+            raise ValueError("--variable-n needs the CA decoder head (drop --ca-decoder-legacy)")
+        if augment not in (None, 'none'):
+            raise ValueError("--variable-n is incompatible with augmentation (assumes 21ch); use --augment none")
+        if gan:
+            raise ValueError("--variable-n is incompatible with the GAN disc (assumes 21ch); use --no-gan")
+        if seizure_head:
+            raise ValueError("--variable-n is incompatible with the seizure head (assumes 21ch); use --no-seizure-head")
+        # Validate the subset bounds here (clean argparse-time-style failure)
+        # rather than letting torch.randint raise a cryptic error on the first
+        # batch. channel_agnostic already pins n_in==21, so Nfull is always 21.
+        _lo, _hi = n_range
+        if not (1 <= _lo <= _hi <= 21):
+            raise ValueError(
+                f"--n-min/--n-max must satisfy 1 <= n_min <= n_max <= 21, got ({_lo},{_hi})")
     codec = build_default_joint(latent_dim=32, encoder_width=cfg.encoder_width,
                                  vocos_tier=vocos_tier, in_channels=n_in,
                                  decoder_channels=21,
                                  gradient_checkpointing=use_grad_ckpt,
                                  encoder_blocks=cfg.encoder_blocks,
-                                 encoder_kernels=encoder_kernels).to(device)
+                                 encoder_kernels=encoder_kernels,
+                                 channel_agnostic=channel_agnostic,
+                                 ca_decoder=(channel_agnostic and not ca_decoder_legacy)).to(device)
+    if channel_agnostic:
+        _dec_kind = 'legacy-21ch' if ca_decoder_legacy else 'position-conditioned'
+        print(f"[*] channel-agnostic: encoder=CA front-end, decoder={_dec_kind}, "
+              f"variable_n={variable_n} (N∈{n_range})" if variable_n else
+              f"[*] channel-agnostic: encoder=CA front-end, decoder={_dec_kind}, N=21 (parity)")
     # Optionally init encoder from pretrained weights (MAE, prior run, etc.)
     if encoder_init is not None:
         enc_state = _safe_load(encoder_init, map_location=device)
@@ -728,6 +812,7 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     #   - decoder output is L3-scale (Tier 1-2, 'direct' output mode)
     sys.path.insert(0, os.path.join(ROOT_DIR, 'lamquant'))
     from metrics import (prd_torch, pearson_r_torch,
+                          masked_pearson_r_torch, masked_prd_torch,
                           asymmetric_eeg_loss as _asym_env,
                           band_aware_asymmetric_loss as _asym_band)
     spectral_loss = make_spectral_loss(device)
@@ -740,7 +825,10 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         print(f"[*] Asymmetric loss: {asymmetric_kind}, weight={ASYM_W}")
 
     def joint_loss(recon, l3_target, fullband_target=None,
-                    return_parts: bool = True):
+                    ch_mask=None, return_parts: bool = True):
+        # ch_mask [B,N] (channel-agnostic padded batches): excludes padded
+        # channels from the R/PRD terms. None (the default + the variable-N
+        # uniform-k path, which never pads) == the legacy unmasked behavior.
         # Decide which target the decoder output matches in length.
         # Tier 3+ → recon.shape[-1] ≈ 2500; Tier 1-2 → ≈ 313.
         if fullband_target is not None and abs(
@@ -754,11 +842,11 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         recon_c = recon[..., :T]
         target_c = target[..., :T]
         l_mse = F.mse_loss(recon_c, target_c)
-        l_r = 1.0 - pearson_r_torch(recon_c, target_c)        # 1 − R loss (differentiable)
+        l_r = 1.0 - masked_pearson_r_torch(recon_c, target_c, ch_mask)  # 1 − R loss (differentiable)
         # PRD/100 lands in [0, 1]ish so the weight is comparable to
         # the other terms. Don't divide inside prd_torch — keep it as
         # a percentage at the metric level.
-        l_prd = prd_torch(target_c, recon_c) / 100.0 if PRD_W > 0 else 0.0
+        l_prd = masked_prd_torch(target_c, recon_c, ch_mask) / 100.0 if PRD_W > 0 else 0.0
         # Asymmetric / clinically-weighted MSE — only active when
         # asymmetric_weight > 0. Operates on the SAME (target, recon)
         # pair as MSE, just with a per-sample weight derived from the
@@ -983,10 +1071,13 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
             # representations. Augmenting here and comparing recon to
             # original creates an impossible objective (invert augmentation).
             need_check = not _grad_checked[0]
+            _xin, _fb, _coords, _cmask = _ca_inputs(
+                x_l3, batch.fullband_target, channel_agnostic, variable_n, n_range)
             with amp_ctx:
-                recon = codec(x_l3, quantize=False)
-                loss, parts = joint_loss(recon, x_l3,
-                                          fullband_target=batch.fullband_target,
+                recon = codec(_xin, quantize=False, coords=_coords, ch_mask=_cmask)
+                loss, parts = joint_loss(recon, _xin,
+                                          fullband_target=_fb,
+                                          ch_mask=_cmask,
                                           return_parts=need_check)
             if need_check:
                 _gradient_health_check(loss, parts, codec)
@@ -1019,7 +1110,9 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         _saved = False
         if ep % cfg.val_interval == 0:
             val_r, val_prd, _ = validate_joint(codec, val_ds, device,
-                                                 quantize=False, amp=amp)
+                                                 quantize=False, amp=amp,
+                                                 channel_agnostic=channel_agnostic,
+                                                 variable_n=variable_n, n_range=n_range)
             dash.update_val(val_r=val_r, best_r=max(best_warm_r, val_r))
             if val_r > best_warm_r:
                 best_warm_r = val_r
@@ -1279,14 +1372,20 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
             batch.assert_no_leakage(Split.TRAIN)   # safety net
             x_l3 = batch.l3_approx
             x_aug = augmentor(x_l3) if augmentor is not None else x_l3
+            # CA: subset channels (variable-N) or pass through (N=21 parity).
+            # variable_n is guarded off when augmentor is set, so x_aug==x_l3
+            # there and the channel subset stays aligned with the fullband.
+            x_aug, _fb, _coords, _cmask = _ca_inputs(
+                x_aug, batch.fullband_target, channel_agnostic, variable_n, n_range)
             with amp_ctx:
-                recon = codec(x_aug, quantize=True)
+                recon = codec(x_aug, quantize=True, coords=_coords, ch_mask=_cmask)
                 # QAT: compare recon to AUGMENTED input, not original.
                 # The encoder saw x_aug, so the loss should measure how
                 # well it reconstructed what it saw — not how well it
                 # inverted the augmentation (which caps R at ~0.93).
                 g_loss, _ = joint_loss(recon, x_aug,
-                                        fullband_target=batch.fullband_target,
+                                        fullband_target=_fb,
+                                        ch_mask=_cmask,
                                         return_parts=False)
 
             # ---- Multi-task: seizure detection from latent ----
@@ -1394,13 +1493,15 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
             if use_schedule_free:
                 optimizer.eval()
             val_r, val_prd, per_band = validate_joint(
-                codec, val_ds, device, quantize=True, amp=amp)
+                codec, val_ds, device, quantize=True, amp=amp,
+                channel_agnostic=channel_agnostic, variable_n=variable_n, n_range=n_range)
             # EMA validation: if EMA beats live model, use EMA R for
             # checkpoint selection. Free +0.003-0.01 R at no training cost.
             _ema_is_best = False
             if ema_model is not None:
                 ema_r, ema_prd, _ = validate_joint(
-                    ema_model, val_ds, device, quantize=True, amp=amp)
+                    ema_model, val_ds, device, quantize=True, amp=amp,
+                    channel_agnostic=channel_agnostic, variable_n=variable_n, n_range=n_range)
                 if ema_r > val_r:
                     print(f"           EMA R={ema_r:.4f} > live R={val_r:.4f}, using EMA")
                     val_r, val_prd = ema_r, ema_prd
@@ -1517,14 +1618,16 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         optimizer.eval()
     print(f"\n[*] Final validation (per-category metrics)...")
     _final_r, _final_prd, _final_band, final_cat_metrics = validate_joint(
-        codec, val_ds, device, quantize=True, amp=amp, per_category=True)
+        codec, val_ds, device, quantize=True, amp=amp, per_category=True,
+        channel_agnostic=channel_agnostic, variable_n=variable_n, n_range=n_range)
 
     # ---- EMA evaluation ----
     ema_val_r, ema_val_prd = 0.0, 100.0
     if ema_model is not None:
         print(f"[*] Evaluating EMA model (decay={ema_decay})...")
         ema_val_r, ema_val_prd, _ = validate_joint(
-            ema_model, val_ds, device, quantize=True, amp=amp)
+            ema_model, val_ds, device, quantize=True, amp=amp,
+            channel_agnostic=channel_agnostic, variable_n=variable_n, n_range=n_range)
         print(f"    EMA R={ema_val_r:.4f}  PRD={ema_val_prd:.1f}%  "
               f"(vs best R={cm.best_val_r:.4f}  delta={ema_val_r - cm.best_val_r:+.4f})")
 
@@ -1789,6 +1892,23 @@ def main():
     parser.add_argument('--max-windows-per-file', type=int, default=None,
                         help='Cap windows per recording in the base index (raise to '
                              'use more of long recordings; default ~5).')
+    # ---- Channel-agnostic codec (CA-6) ----
+    parser.add_argument('--channel-agnostic', action='store_true', default=False,
+                        help='Build the channel-count-agnostic codec (position-'
+                             'conditioned attention front-end + FiLM decoder head). '
+                             'At N=21 with no --variable-n this is the warm-start '
+                             'parity path (coords default to canonical 10-20).')
+    parser.add_argument('--variable-n', action='store_true', default=False,
+                        help='Random channel-subset augmentation (N∈[--n-min,--n-max]) '
+                             'per batch. Requires --channel-agnostic; incompatible '
+                             'with augmentation / GAN / seizure-head (all assume 21ch) '
+                             '— use --augment none --no-gan --no-seizure-head.')
+    parser.add_argument('--ca-decoder-legacy', action='store_true', default=False,
+                        help='CA encoder + LEGACY fixed-21ch decoder head — the '
+                             'warm-start isolation config (vary only the front-end). '
+                             'N=21 only; incompatible with --variable-n.')
+    parser.add_argument('--n-min', type=int, default=8, help='variable-N min channels')
+    parser.add_argument('--n-max', type=int, default=21, help='variable-N max channels')
     args = parser.parse_args()
 
     cfg = CONFIGS[args.config]
@@ -1831,7 +1951,11 @@ def main():
                  detail_bands=args.detail_bands,
                  detail_stack_mode=args.detail_stack_mode,
                  max_windows_per_file=args.max_windows_per_file,
-                 soap_max_precond_dim=args.soap_max_precond_dim)
+                 soap_max_precond_dim=args.soap_max_precond_dim,
+                 channel_agnostic=args.channel_agnostic,
+                 variable_n=args.variable_n,
+                 ca_decoder_legacy=args.ca_decoder_legacy,
+                 n_range=(args.n_min, args.n_max))
     return 0 if result['best_val_r'] > 0 else 1
 
 

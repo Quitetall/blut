@@ -243,7 +243,8 @@ def build_default_joint(latent_dim: int = 32,
                          gradient_checkpointing: bool = False,
                          encoder_blocks: int = 3,
                          encoder_kernels: tuple = (3, 5, 7),
-                         channel_agnostic: bool = False) -> JointCodec:
+                         channel_agnostic: bool = False,
+                         ca_decoder: bool = None) -> JointCodec:
     """Build the production joint codec with sensible defaults.
 
     Args:
@@ -258,6 +259,12 @@ def build_default_joint(latent_dim: int = 32,
             decoder head. Requires an iSTFT (fullband) tier. `in_channels` /
             `decoder_channels` then only set the N=21 warm-start default; the
             model accepts arbitrary N at runtime via coords/ch_mask.
+        ca_decoder: Decoder channel-agnostic override. Defaults to
+            `channel_agnostic`. Set False with `channel_agnostic=True` to build
+            a CA *encoder* + LEGACY (fixed-21ch) decoder head — the warm-start
+            parity isolation config (vary only the front-end; see ADR-0036 /
+            the channel-agnostic plan). Only valid at N=21 (legacy head is
+            fixed channel count).
 
     Tier roles (deployment plan):
 
@@ -291,6 +298,7 @@ def build_default_joint(latent_dim: int = 32,
     # decoder_channels is None the fallback is in_channels (NOT 21), preserving
     # the pre-band-sweep symmetric in==out behavior.
     dec_ch = decoder_channels if decoder_channels is not None else in_channels
+    dec_ca = channel_agnostic if ca_decoder is None else ca_decoder
     encoder = TernaryMobileNetV5_Subband(
         in_ch=in_channels, latent_dim=latent_dim, width=encoder_width,
         n_blocks=encoder_blocks, kernel_sizes=encoder_kernels,
@@ -300,7 +308,7 @@ def build_default_joint(latent_dim: int = 32,
         tier=vocos_tier, latent_dim=latent_dim,
         n_channels=dec_ch, target_len=target_len,
         gradient_checkpointing=gradient_checkpointing,
-        channel_agnostic=channel_agnostic,
+        channel_agnostic=dec_ca,
     )
     return JointCodec(encoder, decoder)
 
