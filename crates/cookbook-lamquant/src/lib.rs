@@ -19,7 +19,7 @@ pub mod paths;
 pub mod recipes;
 pub mod stages;
 
-pub use blut::framework::{Cookbook, LamuCookbook, Registry};
+pub use blut::framework::{Cookbook, Registry};
 pub use recipes::LAMQUANT_RECIPES;
 
 use blut::recipes::recipe::RecipeDef;
