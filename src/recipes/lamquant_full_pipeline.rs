@@ -8,7 +8,7 @@
 //! ```text
 //! lamquant_encode_lma              () → LmaCorpus            (RCP-2)
 //!   → lamquant_build_split_manifest  LmaCorpus → SplitManifest (RCP-3)
-//!   → _corpus_rebind_from_split      SplitManifest → LmaCorpus [bridge]
+//!   → _corpus_rebind_from_split      SplitManifest → LmaCorpus (bridge)
 //!   → lamquant_train_mamba_snn       LmaCorpus → SnnCkpt
 //!   → lamquant_pccp_gate_snn         SnnCkpt → PccpVerdict
 //! ```

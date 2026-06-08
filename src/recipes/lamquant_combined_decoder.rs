@@ -5,7 +5,7 @@
 //!
 //!   lamquant_convert_lma           () → LmaCorpus
 //!     → lamquant_train_combined    LmaCorpus → (TeacherCkpt, JointCkpt)
-//!     → _take_joint_ckpt           (TeacherCkpt, JointCkpt) → JointCkpt   [bridge]
+//!     → _take_joint_ckpt           (TeacherCkpt, JointCkpt) → JointCkpt   (bridge)
 //!     → lamquant_pccp_gate_decoder JointCkpt → PccpVerdict
 //!
 //! The `_take_joint_ckpt` bridge is a tiny recipe-internal stage that

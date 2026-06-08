@@ -4,7 +4,7 @@
 //!
 //!   lamquant_convert_lma             () → LmaCorpus
 //!     → lamquant_train_l3_teacher    LmaCorpus → TeacherCkpt
-//!     → _teacher_to_joint_adapter    TeacherCkpt → JointCkpt   [bridge]
+//!     → _teacher_to_joint_adapter    TeacherCkpt → JointCkpt   (bridge)
 //!     → lamquant_pccp_gate_encoder   JointCkpt → PccpVerdict
 //!
 //! Replaces the pre-ADR `build_manifest → precompute_fullband →

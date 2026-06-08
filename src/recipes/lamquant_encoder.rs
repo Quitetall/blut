@@ -6,7 +6,7 @@
 //! ```text
 //! lamquant_convert_lma              () → LmaCorpus
 //!   → (optional) pretrain_mae       LmaCorpus → MaeCkpt
-//!   → (optional) _corpus_rebind_from_mae  MaeCkpt → LmaCorpus  [bridge]
+//!   → (optional) _corpus_rebind_from_mae  MaeCkpt → LmaCorpus  (bridge)
 //!   → lamquant_train_joint          LmaCorpus → JointCkpt
 //!   → lamquant_pccp_gate_encoder    JointCkpt → PccpVerdict
 //! ```
