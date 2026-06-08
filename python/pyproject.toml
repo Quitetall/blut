@@ -40,6 +40,13 @@ lamquant = [
     "lamquant-neural",   # PRIVATE — model defs (LamQuant-Neural repo)
     "lamquant-core",     # PUBLIC PyO3 — LMA/container decode (LamQuant-Lossless)
 ]
+# Reviewer-readable metric stream (Parquet) + optional W&B tracking. Both are
+# OPTIONAL — metric_log degrades to a CSV stream when pyarrow is absent, and
+# train_joint --logger defaults to 'none' so wandb is opt-in.
+observability = [
+    "pyarrow>=15,<19",
+    "wandb>=0.16,<0.19",
+]
 
 [build-system]
 requires = ["setuptools>=61"]

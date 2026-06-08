@@ -463,7 +463,8 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         variable_n: bool = False,
         ca_decoder_legacy: bool = False,
         n_range: tuple = (8, 21),
-        diagnostics: bool = True):
+        diagnostics: bool = True,
+        logger_backend: str = 'none'):
     """Run joint training with the given TrainingConfig.
 
     Speedup knobs:
@@ -981,6 +982,48 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     logger = TrainingLogger(run_id=run_id, log_dir=log_dir)
     print(f"[*] Epoch log:             {logger.epoch_csv}")
 
+    # Reviewer-readable metric stream (ALWAYS on; Parquet via pyarrow, CSV
+    # fallback) — a complete valid file after every epoch (read mid-run). Plus
+    # optional Weights & Biases under --logger wandb (offline by default).
+    from lamquant.common.metric_log import MetricLog
+    metric_log = MetricLog(run_id=run_id, log_dir=log_dir)
+    print(f"[*] Metric stream:         {metric_log.path}  (backend={metric_log._backend})")
+    wandb_run = None
+    if logger_backend == 'wandb':
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project=os.environ.get('WANDB_PROJECT', 'lamquant'),
+                name=run_id,
+                config=provenance['training_config'],
+                tags=['joint', 'student', f'tier{vocos_tier}', cfg.name],
+                mode=os.environ.get('WANDB_MODE', 'offline'),
+                dir=str(log_dir))
+            print(f"[*] wandb:                 mode={os.environ.get('WANDB_MODE', 'offline')} "
+                  f"project={os.environ.get('WANDB_PROJECT', 'lamquant')}")
+        except Exception as e:
+            print(f"[!] --logger wandb requested but wandb unavailable ({e}); continuing without it")
+            wandb_run = None
+
+    def _emit(report):
+        """Log one epoch to the TrainingLogger + the reviewer metric stream +
+        (optional) wandb. Each sink is independently guarded — logging must
+        never crash a run, and one sink failing must not starve the others."""
+        try:
+            logger.log_epoch(report)
+        except Exception as e:
+            print(f"[!] epoch logger failed (non-fatal): {e}")
+        try:
+            d = report.to_dict()
+            d.pop('alpha_per_layer', None)   # mirror TrainingLogger's CSV exclude
+            metric_log.append(d)
+            if wandb_run is not None:
+                scalars = {k: v for k, v in d.items()
+                           if isinstance(v, (int, float)) and not isinstance(v, bool)}
+                wandb_run.log(scalars, step=report.global_epoch)
+        except Exception as e:
+            print(f"[!] metric stream/wandb emit failed (non-fatal): {e}")
+
     dash = TrainingDashboard(
         model_name='LamQuant Joint',
         gen='7.7',
@@ -1181,7 +1224,7 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
                     ckpt_dir / f'decoder_warm_{cfg.name}.ckpt',
                     provenance={**provenance, 'phase': 'warm', 'epoch': ep})
 
-        logger.log_epoch(EpochReport(
+        _emit(EpochReport(
             run_id=run_id, script='train_joint', phase='warm',
             epoch=ep, global_epoch=ep, total_epochs=_total_eps,
             train_loss=avg_loss, val_r=val_r, val_prd=val_prd,
@@ -1576,7 +1619,7 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
                 )
                 print(f"           per-band PRD: {band_str}")
 
-        logger.log_epoch(EpochReport(
+        _emit(EpochReport(
             run_id=run_id, script='train_joint',
             phase=f'qat[{_wsd_phase}]' if _wsd_phase else 'qat',
             epoch=ep, global_epoch=ep_total, total_epochs=_total_eps,
@@ -1783,6 +1826,17 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         # Logging failures must NEVER take down a training run.
         print(f'[!] Failed to write experiment log entry: {e!s}')
 
+    # Close the reviewer metric stream + finish wandb (both non-fatal).
+    try:
+        metric_log.close()
+    except Exception:
+        pass
+    if wandb_run is not None:
+        try:
+            wandb_run.finish()
+        except Exception:
+            pass
+
     return {
         'best_val_r': cm.best_val_r,
         'best_val_prd': best_val_prd_at_best_r,
@@ -1969,6 +2023,10 @@ def main():
     parser.add_argument('--no-diagnostics', dest='diagnostics', action='store_false',
                         default=True, help='skip the pre-flight diagnostics gate '
                         '(data/shape/grad/coords sanity on the first batch).')
+    parser.add_argument('--logger', choices=['none', 'wandb'], default='none',
+                        help='Experiment tracker for live metrics. none (default): '
+                        'the parquet/csv metric stream only. wandb: also log to '
+                        'Weights & Biases (offline by default; WANDB_MODE=online to sync).')
     args = parser.parse_args()
 
     cfg = CONFIGS[args.config]
@@ -2016,7 +2074,8 @@ def main():
                  variable_n=args.variable_n,
                  ca_decoder_legacy=args.ca_decoder_legacy,
                  n_range=(args.n_min, args.n_max),
-                 diagnostics=args.diagnostics)
+                 diagnostics=args.diagnostics,
+                 logger_backend=args.logger)
     return 0 if result['best_val_r'] > 0 else 1
 
 
