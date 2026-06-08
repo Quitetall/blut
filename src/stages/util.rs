@@ -24,3 +24,24 @@ pub(crate) fn write_report(
         source,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::write_report;
+
+    #[test]
+    fn write_report_creates_parent_and_writes_pretty_json() {
+        let dir = std::env::temp_dir().join(format!("blut_util_test_{}", std::process::id()));
+        let path = dir.join("nested").join("report.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let metrics = serde_json::json!({"r": 0.5, "prd": 94.4});
+        write_report(&path, &metrics).expect("write_report should succeed");
+        assert!(path.exists(), "report not written");
+        let back: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(back, metrics, "round-trip mismatch");
+        // pretty-printed → multi-line
+        assert!(std::fs::read_to_string(&path).unwrap().contains('\n'));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
