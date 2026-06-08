@@ -122,6 +122,7 @@ pub static RECIPES: &[&RecipeDef] = &[
     &crate::recipes::lamquant_combined_decoder::DEF,
     &crate::recipes::lamquant_snn::DEF,
     &crate::recipes::lamquant_encoder::DEF,
+    &crate::recipes::lamquant_joint_codec::DEF,
     &crate::recipes::lamquant_oracle::DEF,
     &crate::recipes::lamquant_full_pipeline::DEF,
     &crate::recipes::hf_finetune_from_dataset::DEF,

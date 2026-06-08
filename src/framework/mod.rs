@@ -27,6 +27,7 @@
 pub mod artifact;
 pub mod cache;
 pub mod compat;
+pub mod cookbook;
 pub mod error;
 pub mod executor;
 pub mod plan;
@@ -37,6 +38,7 @@ pub mod status;
 pub use artifact::{Artifact, ArtifactMetadata, ContentHash};
 pub use cache::{CacheHandle, CacheHit, lru_prune};
 pub use compat::Compatible;
+pub use cookbook::{ArtifactDescriptor, BuiltinCookbook, Cookbook, Registry, StageDescriptor};
 pub use error::{PlanError, RecipeError, StageError};
 pub use executor::{ExecCtx, PlanResult, SequentialExecutor};
 pub use plan::{CompiledPlan, NodeId, Plan};

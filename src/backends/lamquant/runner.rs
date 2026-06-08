@@ -89,12 +89,18 @@ pub enum BackendError {
 
 pub struct LamquantBackend {
     child_pid: Arc<Mutex<Option<u32>>>,
+    /// Transient systemd `--user` unit name when the run is contained
+    /// (env `BLUT_CONTAINED=1`). `None` for the default bare-spawn
+    /// path. Set alongside `child_pid` so `cancel()` can `systemctl
+    /// --user stop` the unit mid-run.
+    contained_unit: Arc<Mutex<Option<String>>>,
 }
 
 impl LamquantBackend {
     pub fn new() -> Self {
         Self {
             child_pid: Arc::new(Mutex::new(None)),
+            contained_unit: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -112,15 +118,38 @@ impl LamquantBackend {
     ) -> Result<LamquantRunArtifact, BackendError> {
         let started = Instant::now();
 
-        let mut cmd = Command::new(&inv.python);
-        cmd.arg(&inv.script);
-        for a in &inv.args {
-            cmd.arg(a);
-        }
-        cmd.current_dir(&inv.cwd);
-        for (k, v) in &inv.env {
-            cmd.env(k, v);
-        }
+        // BLUT_CONTAINED=1 wraps the kernel in a transient,
+        // memory-capped systemd `--user` unit (OOM containment +
+        // session-SIGTERM survival). Default-off: when unset, the
+        // bare-spawn path below is byte-identical to the legacy
+        // behaviour. Idiom matches `LAMU_TRAIN_USE_LEGACY`.
+        let contained = matches!(std::env::var("BLUT_CONTAINED").as_deref(), Ok("1"));
+        let unit = if contained {
+            contained_unit_name(&inv.env)
+        } else {
+            None
+        };
+
+        let mut cmd = match &unit {
+            // Contained path: cwd + env cross the unit boundary via
+            // `--working-directory=` / `--setenv=`, so they must NOT
+            // be applied to the systemd-run client process here.
+            Some(u) => build_contained_command(&inv, u),
+            // Bare-spawn path: identical to the pre-seam behaviour.
+            None => {
+                let mut c = Command::new(&inv.python);
+                c.arg(&inv.script);
+                for a in &inv.args {
+                    c.arg(a);
+                }
+                c.current_dir(&inv.cwd);
+                for (k, v) in &inv.env {
+                    c.env(k, v);
+                }
+                c
+            }
+        };
+
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -140,6 +169,9 @@ impl LamquantBackend {
             python: inv.python.display().to_string(),
             source,
         })?;
+        // Publish the unit name (if any) BEFORE awaiting exit so a
+        // concurrent cancel() can tear the unit down mid-run.
+        *self.contained_unit.lock() = unit;
         if let Some(pid) = child.id() {
             *self.child_pid.lock() = Some(pid);
             // KILL-2: publish for in-process + cross-process cancel.
@@ -195,6 +227,7 @@ impl LamquantBackend {
             let _ = h.await;
         }
         *self.child_pid.lock() = None;
+        *self.contained_unit.lock() = None;
         crate::python_kill::clear_active_child();
 
         if !exit_status.success() {
@@ -219,7 +252,25 @@ impl LamquantBackend {
     /// SIGTERM-then-SIGKILL the running subprocess if any. Safe to
     /// call concurrently; atomic take() ensures the kill sequence
     /// fires once.
+    ///
+    /// When the run is contained (`BLUT_CONTAINED=1`), the captured
+    /// `child_pid` is the systemd-run CLIENT pid, not the reparented
+    /// python process inside the unit cgroup — so `systemctl --user
+    /// stop <unit>` is the real teardown (verified: status=15/TERM,
+    /// client unblocks). We stop the unit FIRST, then still fall
+    /// through to graceful_kill_pid as belt-and-suspenders.
     pub async fn cancel(&mut self) {
+        // Take the unit name out FIRST, dropping the (non-async) guard
+        // before any await — never hold a parking_lot lock across .await.
+        let unit = self.contained_unit.lock().take();
+        if let Some(unit) = unit {
+            let _ = Command::new("systemctl")
+                .arg("--user")
+                .arg("stop")
+                .arg(format!("{unit}.service"))
+                .status()
+                .await;
+        }
         let pid = match self.child_pid.lock().take() {
             Some(p) => p,
             None => return,
@@ -232,6 +283,109 @@ impl Default for LamquantBackend {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Sanitize one string to the systemd unit-name charset
+/// (`[A-Za-z0-9_-]`). Any other byte becomes `_`. Empty input maps to
+/// `_` so the derived unit name is always non-empty.
+fn sanitize_unit_part(s: &str) -> String {
+    let out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        "_".into()
+    } else {
+        out
+    }
+}
+
+/// Derive the transient unit name from the invocation env.
+///
+/// Reads `BLUT_JOB_DIR` + `BLUT_STAGE_NAME` (set by `blut_env`). When
+/// both are present, returns `Some("blut-<job>-<stage>")` where
+/// `<job>` is the sanitized last path component of the job dir —
+/// deterministic so `cancel()` can target the same unit. Returns
+/// `None` when either key is absent (tests / direct callers), which
+/// forces the bare-spawn fallback even if `BLUT_CONTAINED=1`.
+fn contained_unit_name(env: &[(String, String)]) -> Option<String> {
+    let mut job_dir: Option<&str> = None;
+    let mut stage: Option<&str> = None;
+    for (k, v) in env {
+        match k.as_str() {
+            "BLUT_JOB_DIR" => job_dir = Some(v),
+            "BLUT_STAGE_NAME" => stage = Some(v),
+            _ => {}
+        }
+    }
+    let (job_dir, stage) = (job_dir?, stage?);
+    let job_leaf = Path::new(job_dir)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(job_dir);
+    Some(format!(
+        "blut-{}-{}",
+        sanitize_unit_part(job_leaf),
+        sanitize_unit_part(stage)
+    ))
+}
+
+/// Build the `systemd-run --user --pipe --wait` command that runs the
+/// kernel inside a transient, memory-capped unit. Mirrors the policy
+/// in `tools/run_contained.sh` (the source of truth for the memory
+/// knobs) but stays SYNCHRONOUS (`--pipe --wait`) so the runner's
+/// stream → await exit → map-nonzero contract is preserved — unlike
+/// the script, which is detached (`--collect`, no `--wait`).
+///
+/// cwd + env cross the unit boundary via `--working-directory=` /
+/// `--setenv=` (verified on this box). `PATH` + `HOME` are propagated
+/// from the caller because `--user` units otherwise run in the user
+/// manager's minimal env; `PYTHONPATH` (in `inv.env`) MUST cross or
+/// `lamquant.*` imports fail.
+fn build_contained_command(inv: &LamquantInvocation, unit: &str) -> Command {
+    // Memory knobs: same env vars + defaults as run_contained.sh.
+    let memmax = std::env::var("MEMMAX").unwrap_or_else(|_| "44G".into());
+    let memhigh = std::env::var("MEMHIGH").unwrap_or_else(|_| "40G".into());
+    let swapmax = std::env::var("SWAPMAX").unwrap_or_else(|_| "12G".into());
+
+    let mut c = Command::new("systemd-run");
+    c.arg("--user")
+        .arg("--pipe")
+        .arg("--wait")
+        .arg("--collect")
+        .arg(format!("--unit={unit}"))
+        .arg("-p")
+        .arg("MemoryAccounting=yes")
+        .arg("-p")
+        .arg(format!("MemoryMax={memmax}"))
+        .arg("-p")
+        .arg(format!("MemoryHigh={memhigh}"))
+        .arg("-p")
+        .arg(format!("MemorySwapMax={swapmax}"))
+        .arg(format!("--working-directory={}", inv.cwd.display()));
+    // Propagate PATH + HOME (minimal --user env otherwise).
+    if let Ok(path) = std::env::var("PATH") {
+        c.arg(format!("--setenv=PATH={path}"));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        c.arg(format!("--setenv=HOME={home}"));
+    }
+    // Cross the invocation env (incl. PYTHONPATH + BLUT_* identity).
+    for (k, v) in &inv.env {
+        c.arg(format!("--setenv={k}={v}"));
+    }
+    // Terminator, then the actual kernel command.
+    c.arg("--").arg(&inv.python).arg(&inv.script);
+    for a in &inv.args {
+        c.arg(a);
+    }
+    c
 }
 
 /// Progress events parsed off the tqdm stream.
@@ -453,5 +607,90 @@ mod tests {
                 total: 100
             }]
         );
+    }
+
+    // ── BLUT_CONTAINED systemd seam (pure-function tests) ─────
+    //
+    // These assert the DERIVED unit name + the BUILT argv without
+    // touching the process-global `BLUT_CONTAINED` env var (which the
+    // 9 tests above don't lock) — `contained_unit_name` /
+    // `build_contained_command` are pure of that flag; only `run()`
+    // reads it. The off-path stays covered by `spawns_and_captures_*`.
+
+    #[test]
+    fn contained_unit_name_derives_from_env() {
+        let env = vec![
+            ("BLUT_JOB_DIR".to_string(), "/var/blut/jobs/job42".to_string()),
+            ("BLUT_STAGE_NAME".to_string(), "train_joint".to_string()),
+        ];
+        assert_eq!(
+            contained_unit_name(&env).as_deref(),
+            Some("blut-job42-train_joint")
+        );
+        // Missing either key → None (forces bare-spawn fallback).
+        let only_job = vec![("BLUT_JOB_DIR".to_string(), "/x/y".to_string())];
+        assert!(contained_unit_name(&only_job).is_none());
+        let only_stage = vec![("BLUT_STAGE_NAME".to_string(), "s".to_string())];
+        assert!(contained_unit_name(&only_stage).is_none());
+        assert!(contained_unit_name(&[]).is_none());
+    }
+
+    #[test]
+    fn contained_unit_name_sanitizes() {
+        let env = vec![
+            (
+                "BLUT_JOB_DIR".to_string(),
+                "/jobs/run #3 (x)".to_string(),
+            ),
+            ("BLUT_STAGE_NAME".to_string(), "weird/stage:name".to_string()),
+        ];
+        let unit = contained_unit_name(&env).unwrap();
+        // Every char must be in the systemd unit charset + the prefix.
+        assert!(
+            unit.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "unit '{unit}' has non-charset chars"
+        );
+        assert!(unit.starts_with("blut-"));
+    }
+
+    #[test]
+    fn build_contained_command_includes_setenv_pythonpath() {
+        let inv = LamquantInvocation {
+            python: PathBuf::from("/venv/bin/python"),
+            script: PathBuf::from("train.py"),
+            cwd: PathBuf::from("/work/dir"),
+            args: vec!["--config".into(), "fast".into()],
+            env: vec![("PYTHONPATH".to_string(), "/x".to_string())],
+            expected_outputs: vec![],
+            run_manifest_path: None,
+        };
+        let cmd = build_contained_command(&inv, "blut-job-stage");
+        let std_cmd = cmd.as_std();
+        assert_eq!(std_cmd.get_program(), "systemd-run");
+        let argv: Vec<String> = std_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        // Synchronous streaming + containment flags.
+        assert!(argv.iter().any(|a| a == "--pipe"), "missing --pipe: {argv:?}");
+        assert!(argv.iter().any(|a| a == "--wait"), "missing --wait: {argv:?}");
+        assert!(
+            argv.iter().any(|a| a == "--working-directory=/work/dir"),
+            "missing --working-directory: {argv:?}"
+        );
+        // PYTHONPATH must cross the unit boundary.
+        assert!(
+            argv.iter().any(|a| a == "--setenv=PYTHONPATH=/x"),
+            "missing --setenv=PYTHONPATH=/x: {argv:?}"
+        );
+        // Trailing `-- <python> <script> <args...>`.
+        let dash = argv.iter().position(|a| a == "--").expect("missing --");
+        assert_eq!(&argv[dash + 1..], &[
+            "/venv/bin/python".to_string(),
+            "train.py".to_string(),
+            "--config".to_string(),
+            "fast".to_string(),
+        ]);
     }
 }
