@@ -119,14 +119,16 @@ pub fn swap_candidates(of: &'static RecipeDef) -> impl Iterator<Item = &'static 
 /// the [`crate::framework::Registry`] and this slice goes away. The TUI
 /// + several tests still index it positionally, so it stays for now.
 pub static RECIPES: &[&RecipeDef] = &[
-    // ── blut-lamu cookbook (generic LLM: lamu + hf_trainer backends) ──
+    // ── blut-lamu cookbook (generic LLM: lamu + hf_trainer backends);
+    //    canonical members in LAMU_RECIPES. ORDER PRESERVED verbatim
+    //    (hf_finetune stays LAST) so the TUI's positional indices into
+    //    RECIPES are unchanged until the TUI is rewired off the slice. ──
     &crate::recipes::finetune_from_conversations::DEF,
     &crate::recipes::finetune_from_dataset::DEF,
     &crate::recipes::dpo_from_preferences::DEF,
     &crate::recipes::eval_suite::DEF,
     &crate::recipes::distill_from_teacher::DEF,
-    &crate::recipes::hf_finetune_from_dataset::DEF,
-    // ── blut-lamquant cookbook (neural EEG codec) ──
+    // ── blut-lamquant cookbook (neural EEG codec); see LAMQUANT_RECIPES ──
     &crate::recipes::lamquant_data_prep::DEF,
     &crate::recipes::lamquant_combined_decoder::DEF,
     &crate::recipes::lamquant_snn::DEF,
@@ -134,6 +136,10 @@ pub static RECIPES: &[&RecipeDef] = &[
     &crate::recipes::lamquant_joint_codec::DEF,
     &crate::recipes::lamquant_oracle::DEF,
     &crate::recipes::lamquant_full_pipeline::DEF,
+    // hf_finetune is a blut-lamu recipe but kept LAST here to preserve the
+    // pre-C1 positional order (TUI stability). It is grouped with lamu in
+    // LAMU_RECIPES — RECIPES order ≠ cookbook membership.
+    &crate::recipes::hf_finetune_from_dataset::DEF,
 ];
 
 /// Recipes owned by the **blut-lamu** cookbook (generic LLM: lamu +

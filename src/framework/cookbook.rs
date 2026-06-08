@@ -101,10 +101,11 @@ impl Cookbook for LamuCookbook {
     }
 }
 
-/// Runtime registry that ingests cookbooks. SKELETON: holds boxed
-/// cookbooks and exposes `find` / `by_category` / `all` over their
-/// union. NOT yet wired into the CLI (`main.rs` still calls
-/// `recipe::find`) — that swap is a follow-up lane.
+/// Runtime registry that ingests cookbooks: holds boxed cookbooks and
+/// exposes `find` / `by_category` / `all` over their union. This is the
+/// live catalog source for the CLI (`main.rs` builds one via
+/// [`default_registry`] per command); the TUI still indexes the static
+/// `RECIPES` slice (rewire is a follow-up lane).
 pub struct Registry {
     cookbooks: Vec<Box<dyn Cookbook>>,
 }
@@ -218,11 +219,16 @@ mod tests {
         let reg = default_registry();
         let composed: BTreeSet<&str> = reg.all().map(|r| r.name).collect();
         let union: BTreeSet<&str> = RECIPES.iter().map(|r| r.name).collect();
+        // The set comparison is the DISJOINTNESS guard: a name duplicated
+        // across both sub-slices collapses in `composed` but not in the
+        // length sum, so set-equality would fail.
         assert_eq!(composed, union, "cookbooks must cover RECIPES exactly");
+        // The length sum is the COMPLETENESS guard (no recipe in a
+        // sub-slice that's missing from RECIPES, and vice-versa).
         assert_eq!(
             recipe::LAMU_RECIPES.len() + recipe::LAMQUANT_RECIPES.len(),
             RECIPES.len(),
-            "LAMU + LAMQUANT must partition RECIPES (disjoint, complete)"
+            "LAMU + LAMQUANT must partition RECIPES (disjoint + complete)"
         );
         // Cookbook identities resolve.
         assert_eq!(LamquantCookbook.name(), "lamquant");
