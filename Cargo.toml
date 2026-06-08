@@ -1,15 +1,13 @@
-# BLUT is becoming a cargo WORKSPACE: the `blut` package (here) is the
-# domain-agnostic engine; each cookbook is a member crate that depends on
-# it. In-tree members are TRANSITIONAL — they split to their own repos
-# (blut-lamquant, blut-lamu) at C2c. See [[project_blut_cookbook_split]].
-[workspace]
-members = [".", "crates/cookbook-lamquant", "crates/cookbook-lamu"]
-resolver = "3"
-# blut is now lib-only (the domain-agnostic engine). The user-facing
-# `blut` binary lives in the cookbook crate that composes the registry,
-# so a bare `cargo run`/`build` at the workspace root targets it.
-default-members = ["crates/cookbook-lamquant"]
-
+# blut — the domain-agnostic BLUT engine, a lib-only crate. Ships ZERO
+# recipes and ZERO concrete cookbooks: only the framework (Stage / Plan /
+# Recipe / Registry / Cookbook trait), the CLI / TUI orchestration, and
+# the generic LLM stage / backend primitives. The cookbooks that supply
+# recipes + the user-facing binaries are now SEPARATE repos depending on
+# this crate (C2c): `blut-lamquant` (binary `blut`, neural EEG codec) and
+# `blut-lamu` (binary `blut-lamu`, generic LLM). This crate still hosts
+# the LamQuant python payload at `python/lamquant/` transitionally — it
+# moves to blut-lamquant in migration #2, once the oracle frees it. See
+# [[project_blut_cookbook_split]].
 [package]
 name = "blut"
 version = "0.1.0"
