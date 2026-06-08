@@ -1,12 +1,17 @@
-//! Recipe trait + erased catalog (`RECIPES`).
+//! Recipe trait + erased catalog entry (`RecipeDef`).
 //!
 //! Each recipe declares its target backend via `type Backend`,
 //! holds a typed `Args` struct (serde + JsonSchema), and a
-//! `compile` method producing a `Plan<(), Self::Backend>`. The
-//! static `RECIPES` slice stores erased entries so the CLI / MCP
-//! layer can list, schema, and run by name regardless of which
-//! backend each recipe targets — erasure happens at the
-//! `Plan<(), B>::into_compiled() → CompiledPlan` boundary.
+//! `compile` method producing a `Plan<(), Self::Backend>`. The erased
+//! [`RecipeDef`] lets the CLI / MCP layer list, schema, and run a recipe
+//! by name regardless of which backend it targets — erasure happens at
+//! the `Plan<(), B>::into_compiled() → CompiledPlan` boundary.
+//!
+//! blut-core ships ZERO concrete recipes: the static catalog + lookup
+//! helpers moved to the cookbook crates (`cookbook-lamu` at C2b,
+//! `cookbook-lamquant` at C2a). Recipes are composed at runtime via
+//! [`crate::framework::Registry`] (find / by_category / all over the
+//! union of registered cookbooks).
 
 use crate::backends::TrainingBackend;
 use crate::framework::error::RecipeError;
@@ -90,111 +95,48 @@ pub struct RecipeDef {
     pub compile_fn: fn(serde_json::Value) -> Result<CompiledPlan, RecipeError>,
 }
 
-/// Return all recipes whose category matches.
-pub fn by_category(cat: RecipeCategory) -> impl Iterator<Item = &'static RecipeDef> {
-    RECIPES.iter().copied().filter(move |r| r.category == cat)
-}
-
-/// Return all recipes whose (input_kinds, output_kind) tuple matches
-/// the given recipe's — i.e. drop-in swap candidates. Excludes the
-/// recipe itself. Empty iterator when no swap-candidates exist.
-pub fn swap_candidates(of: &'static RecipeDef) -> impl Iterator<Item = &'static RecipeDef> {
-    let want_in = of.input_kinds;
-    let want_out = of.output_kind;
-    let name = of.name;
-    RECIPES
-        .iter()
-        .copied()
-        .filter(move |r| r.name != name && r.input_kinds == want_in && r.output_kind == want_out)
-}
-
-/// Slice of `&RecipeDef` (not `RecipeDef`): RecipeDef contains
-/// fn-pointers that can't be Copy-moved into an array initializer.
-/// Each entry is a reference to the `pub static DEF` defined
-/// inside its recipe module.
-/// blut-core's built-in catalog: the lamu recipes (see `LAMU_RECIPES`).
-/// This is the transitional in-crate source for blut-core's own
-/// cookbook; domain cookbooks (e.g. `cookbook-lamquant`, moved out at
-/// C2a) register their recipes separately and the catalog is composed
-/// at runtime by the [`crate::framework::Registry`]. Several tests still
-/// index this slice, so it stays until the lamu recipes move (C2b).
-pub static RECIPES: &[&RecipeDef] = &[
-    // ── blut-lamu cookbook (generic LLM: lamu + hf_trainer backends);
-    //    canonical members mirror LAMU_RECIPES. The lamquant cookbook's
-    //    recipes moved to the `cookbook-lamquant` crate at C2a; blut-core
-    //    now ships only the lamu recipes. hf_finetune stays LAST. ──
-    &crate::recipes::finetune_from_conversations::DEF,
-    &crate::recipes::finetune_from_dataset::DEF,
-    &crate::recipes::dpo_from_preferences::DEF,
-    &crate::recipes::eval_suite::DEF,
-    &crate::recipes::distill_from_teacher::DEF,
-    &crate::recipes::hf_finetune_from_dataset::DEF,
-];
-
-/// Recipes owned by the **blut-lamu** cookbook (generic LLM: lamu +
-/// hf_trainer backends). Transitional in-crate home — moves to the
-/// `blut-lamu` cookbook crate/repo (C2b). See
-/// `[[project_blut_cookbook_split]]`.
-pub static LAMU_RECIPES: &[&RecipeDef] = &[
-    &crate::recipes::finetune_from_conversations::DEF,
-    &crate::recipes::finetune_from_dataset::DEF,
-    &crate::recipes::dpo_from_preferences::DEF,
-    &crate::recipes::eval_suite::DEF,
-    &crate::recipes::distill_from_teacher::DEF,
-    &crate::recipes::hf_finetune_from_dataset::DEF,
-];
-
-pub fn find(name: &str) -> Option<&'static RecipeDef> {
-    RECIPES.iter().copied().find(|r| r.name == name)
-}
+// blut-core ships NO static recipe catalog and NO by-name lookup over
+// one. Concrete recipes live in cookbook crates; the
+// [`crate::framework::Registry`] composes the live catalog (find /
+// by_category / all) over the union of registered cookbooks. The old
+// free-fn lookups + the static catalog slices moved out with the recipes
+// (C2a/C2b).
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A neutral, domain-free `RecipeDef` fixture so the erased-catalog
+    /// invariants (non-empty metadata, schema serializes) can be checked
+    /// without any concrete cookbook in scope. blut-core owns the
+    /// machinery, not the recipes.
+    static FIXTURE: RecipeDef = RecipeDef {
+        name: "fixture_recipe",
+        description: "test-only RecipeDef for engine invariants",
+        backend_id: "fixture",
+        category: RecipeCategory::Train,
+        input_kinds: &["dataset.jsonl"],
+        output_kind: "checkpoint.hf",
+        args_schema_fn: || serde_json::json!({"type": "object", "properties": {}}),
+        compile_fn: |_raw| Err(RecipeError::CompileFailed("fixture not runnable".into())),
+    };
+
     #[test]
-    fn finetune_from_conversations_in_catalog() {
-        let r = find("finetune_from_conversations").expect("missing recipe");
-        assert!(!r.description.is_empty());
-        let schema = (r.args_schema_fn)();
+    fn recipe_def_metadata_is_well_formed() {
+        // U1 invariant: a RecipeDef must declare non-empty name /
+        // description / output_kind and a schema that serializes.
+        assert!(!FIXTURE.name.is_empty(), "recipe missing name");
+        assert!(!FIXTURE.description.is_empty(), "empty description");
+        assert!(!FIXTURE.output_kind.is_empty(), "empty output_kind");
+        let schema = (FIXTURE.args_schema_fn)();
         assert!(schema != serde_json::Value::Null);
+        assert!(schema.is_object());
+        let _ = FIXTURE.category;
     }
 
     #[test]
-    fn missing_recipe_returns_none() {
-        assert!(find("definitely-not-here").is_none());
-    }
-
-    #[test]
-    fn recipe_metadata_complete() {
-        // U1 gate: every catalog entry must declare non-empty
-        // category + output_kind so the cockpit can group / swap.
-        for r in RECIPES {
-            assert!(!r.name.is_empty(), "recipe missing name");
-            assert!(!r.description.is_empty(), "{}: empty description", r.name);
-            assert!(
-                !r.output_kind.is_empty(),
-                "{}: empty output_kind — set to the Plan's final stage output Kind",
-                r.name
-            );
-            // category enum has no Default, so its presence in the
-            // RecipeDef literal is enforced by the type system at
-            // compile time; this test is the runtime backstop in
-            // case someone introduces an Option<RecipeCategory>
-            // wrapper later.
-            let _ = r.category;
-        }
-    }
-
-    #[test]
-    fn swap_candidates_excludes_self() {
-        // No recipe should ever appear in its own swap-candidate list.
-        for r in RECIPES {
-            assert!(
-                !swap_candidates(r).any(|c| c.name == r.name),
-                "{} appears in its own swap_candidates",
-                r.name
-            );
-        }
+    fn category_label_is_stable() {
+        assert_eq!(RecipeCategory::Train.label(), "TRAINING");
+        assert_eq!(RecipeCategory::DataPrep.label(), "DATA PREPARATION");
     }
 }

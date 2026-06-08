@@ -1,21 +1,18 @@
-//! Cookbook seam (C1 — registry is the live catalog source).
+//! Cookbook seam (the engine's recipe-registry mechanism).
 //!
 //! A "cookbook" is the unit a domain hands BLUT (ADR 0034 / ADR 0037):
-//! a bundle of recipes plus the stages / artifacts they reference. The
-//! CLI now reads its recipe catalog from [`default_registry`] (the
-//! union of the registered cookbooks), NOT the static `RECIPES` slice
-//! directly. blut-core ships the [`LamuCookbook`] (its built-in lamu
-//! recipes); domain cookbooks (e.g. `cookbook-lamquant`, moved out at
-//! C2a) register their own recipes at runtime via [`Registry`].
-//! [`BuiltinCookbook`] (wrapping the static slice) is retained for the
-//! TUI + back-compat parity tests until the lamu recipes move out too.
+//! a bundle of recipes plus the stages / artifacts they reference.
+//! blut-core ships ZERO concrete cookbooks and ZERO recipes — it owns
+//! only the [`Cookbook`] trait + the [`Registry`] that composes the live
+//! catalog. The cookbook crates (`cookbook-lamu`, moved out at C2b;
+//! `cookbook-lamquant`, moved out at C2a) define concrete `Cookbook`
+//! impls and register their recipes at runtime; the binary in each
+//! cookbook crate builds the registry and hands it to [`crate::cli::run`].
 //!
-//! Remaining lanes (`[[project_blut_cookbook_split]]`): move each
-//! cookbook (recipes + stages + artifacts + backend + python) to its
-//! own crate/repo (`blut-lamquant`, `blut-lamu`) so blut-core has ZERO
-//! domain symbols; populate [`Cookbook::stages`] / [`Cookbook::artifacts`]
-//! (today DESCRIPTORS only — name / kind / schema, not executable
-//! handles); rewire the TUI off the static `RECIPES` indices.
+//! Remaining lanes (`[[project_blut_cookbook_split]]`): split each
+//! cookbook crate to its own repo (C2c); populate [`Cookbook::stages`] /
+//! [`Cookbook::artifacts`] (today DESCRIPTORS only — name / kind /
+//! schema, not executable handles).
 
 use crate::recipes::recipe::{RecipeCategory, RecipeDef};
 
@@ -40,7 +37,8 @@ pub struct ArtifactDescriptor {
 
 /// A cookbook is a self-contained bundle of recipes (plus the stages /
 /// artifacts they reference). The seam for ADR-0034 "BLUT owns
-/// recipes / artifacts".
+/// recipes / artifacts". blut-core defines the trait; concrete impls
+/// live in cookbook crates.
 pub trait Cookbook: Send + Sync + 'static {
     fn name(&self) -> &'static str;
     fn recipes(&self) -> &'static [&'static RecipeDef];
@@ -64,40 +62,11 @@ pub trait Cookbook: Send + Sync + 'static {
     }
 }
 
-/// The built-in cookbook: wraps the existing static `RECIPES`
-/// verbatim. Zero behaviour change — `recipe::find` / `by_category`
-/// still read the static slice today; this is the SEAM they CAN
-/// delegate to later.
-pub struct BuiltinCookbook;
-
-impl Cookbook for BuiltinCookbook {
-    fn name(&self) -> &'static str {
-        "builtin"
-    }
-    fn recipes(&self) -> &'static [&'static RecipeDef] {
-        crate::recipes::recipe::RECIPES
-    }
-}
-
-/// The lamu cookbook (generic LLM: SFT / DPO / distill / eval over the
-/// lamu + hf_trainer backends). TRANSITIONAL in-crate home — moves to
-/// the `blut-lamu` crate/repo (C2b).
-pub struct LamuCookbook;
-
-impl Cookbook for LamuCookbook {
-    fn name(&self) -> &'static str {
-        "lamu"
-    }
-    fn recipes(&self) -> &'static [&'static RecipeDef] {
-        crate::recipes::recipe::LAMU_RECIPES
-    }
-}
-
 /// Runtime registry that ingests cookbooks: holds boxed cookbooks and
 /// exposes `find` / `by_category` / `all` over their union. This is the
-/// live catalog source for the CLI (`main.rs` builds one via
-/// [`default_registry`] per command); the TUI still indexes the static
-/// `RECIPES` slice (rewire is a follow-up lane).
+/// live catalog source for the CLI (the cookbook binary builds one and
+/// passes it to [`crate::cli::run`]) and the TUI (which indexes the
+/// composed catalog, not any static slice).
 pub struct Registry {
     cookbooks: Vec<Box<dyn Cookbook>>,
 }
@@ -107,13 +76,6 @@ impl Registry {
         Self {
             cookbooks: Vec::new(),
         }
-    }
-
-    /// Seed with the built-in cookbook.
-    pub fn with_builtin() -> Self {
-        let mut r = Self::new();
-        r.register(Box::new(BuiltinCookbook));
-        r
     }
 
     pub fn register(&mut self, c: Box<dyn Cookbook>) {
@@ -147,89 +109,116 @@ impl Registry {
 
 impl Default for Registry {
     fn default() -> Self {
-        Self::with_builtin()
+        Self::new()
     }
-}
-
-/// The cookbooks this binary ships with — the CLI reads the recipe
-/// catalog from here, not the static `RECIPES` slice. TODAY both
-/// cookbooks live in-crate (transitional); once they move to their own
-/// crates (C2a/C2b) the binary composes this by registering each
-/// compiled-in cookbook, and a bare blut-core binary ships an EMPTY
-/// registry (the pure engine). Registration order = catalog order
-/// before the CLI's own sort.
-pub fn default_registry() -> Registry {
-    let mut r = Registry::new();
-    r.register(Box::new(LamuCookbook));
-    r
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recipes::recipe::{self, RECIPES};
 
-    #[test]
-    fn builtin_lists_all_static_recipes() {
-        assert_eq!(BuiltinCookbook.recipes().len(), RECIPES.len());
+    /// A test-only `RecipeDef` fixture (domain-free) so the registry
+    /// composition logic can be exercised without any concrete cookbook.
+    static FIXTURE_A: RecipeDef = RecipeDef {
+        name: "alpha_train",
+        description: "fixture train recipe",
+        backend_id: "fixture",
+        category: RecipeCategory::Train,
+        input_kinds: &["dataset.jsonl"],
+        output_kind: "checkpoint.hf",
+        args_schema_fn: || serde_json::json!({"type": "object", "properties": {}}),
+        compile_fn: |_| {
+            Err(crate::framework::error::RecipeError::CompileFailed(
+                "fixture".into(),
+            ))
+        },
+    };
+    static FIXTURE_B: RecipeDef = RecipeDef {
+        name: "beta_eval",
+        description: "fixture eval recipe",
+        backend_id: "fixture",
+        category: RecipeCategory::Eval,
+        input_kinds: &["checkpoint.hf"],
+        output_kind: "eval.report",
+        args_schema_fn: || serde_json::json!({"type": "object", "properties": {}}),
+        compile_fn: |_| {
+            Err(crate::framework::error::RecipeError::CompileFailed(
+                "fixture".into(),
+            ))
+        },
+    };
+    static FIXTURES: &[&RecipeDef] = &[&FIXTURE_A, &FIXTURE_B];
+
+    /// A test-only cookbook wrapping the fixture recipes. blut-core ships
+    /// no concrete cookbook, so the registry tests bring their own.
+    struct FixtureCookbook;
+    impl Cookbook for FixtureCookbook {
+        fn name(&self) -> &'static str {
+            "fixture"
+        }
+        fn recipes(&self) -> &'static [&'static RecipeDef] {
+            FIXTURES
+        }
+    }
+
+    fn registry() -> Registry {
+        let mut r = Registry::new();
+        r.register(Box::new(FixtureCookbook));
+        r
     }
 
     #[test]
-    fn registry_with_builtin_finds_known() {
-        let r = Registry::with_builtin();
-        assert!(r.find("finetune_from_dataset").is_some());
+    fn empty_registry_has_no_recipes() {
+        let r = Registry::new();
+        assert_eq!(r.all().count(), 0, "blut-core ships no recipes");
+        assert!(r.find("anything").is_none());
+    }
+
+    #[test]
+    fn registry_finds_registered_recipe() {
+        let r = registry();
+        assert!(r.find("alpha_train").is_some());
         assert!(r.find("nope").is_none());
     }
 
     #[test]
     fn registry_by_category_filters() {
-        // Train category must include the standalone finetune recipe.
-        let r = Registry::with_builtin();
+        let r = registry();
         assert!(
             r.by_category(RecipeCategory::Train)
-                .any(|r| r.name == "finetune_from_dataset")
+                .any(|r| r.name == "alpha_train")
+        );
+        assert!(
+            r.by_category(RecipeCategory::Eval)
+                .any(|r| r.name == "beta_eval")
+        );
+        assert!(
+            !r.by_category(RecipeCategory::Eval)
+                .any(|r| r.name == "alpha_train")
         );
     }
 
     #[test]
-    fn registry_find_matches_static_find() {
-        // Non-lossy seam parity: for every catalog entry, the registry
-        // resolves the same RecipeDef that `recipe::find` does.
-        let reg = Registry::with_builtin();
-        for r in RECIPES {
-            let via_reg = reg.find(r.name).expect("registry must find catalog entry");
-            let via_static = recipe::find(r.name).expect("recipe::find must find catalog entry");
-            assert_eq!(via_reg.name, r.name);
-            assert_eq!(via_reg.name, via_static.name);
-        }
+    fn registry_all_composes_union() {
+        use std::collections::BTreeSet;
+        let r = registry();
+        let composed: BTreeSet<&str> = r.all().map(|r| r.name).collect();
+        let expected: BTreeSet<&str> = FIXTURES.iter().map(|r| r.name).collect();
+        assert_eq!(composed, expected);
     }
 
     #[test]
     fn descriptors_default_empty() {
         // Documents the deferred stage/artifact extraction.
-        assert!(BuiltinCookbook.stages().is_empty());
-        assert!(BuiltinCookbook.artifacts().is_empty());
+        assert!(FixtureCookbook.stages().is_empty());
+        assert!(FixtureCookbook.artifacts().is_empty());
     }
 
     #[test]
-    fn default_registry_composes_full_catalog() {
-        use std::collections::BTreeSet;
-        // blut-core's default registry holds exactly its built-in lamu
-        // cookbook — which must compose to exactly the static `RECIPES`
-        // slice (the lamquant cookbook moved to `cookbook-lamquant` at
-        // C2a; the full lamu+lamquant partition invariant now lives at
-        // the binary/workspace tier, where both cookbooks are visible).
-        let reg = default_registry();
-        let composed: BTreeSet<&str> = reg.all().map(|r| r.name).collect();
-        let union: BTreeSet<&str> = RECIPES.iter().map(|r| r.name).collect();
-        assert_eq!(composed, union, "lamu cookbook must cover RECIPES exactly");
-        // Completeness guard: blut-core's RECIPES == LAMU_RECIPES now.
-        assert_eq!(
-            recipe::LAMU_RECIPES.len(),
-            RECIPES.len(),
-            "LAMU cookbook must cover RECIPES exactly (domain cookbooks moved out at C2a)"
-        );
-        // Cookbook identity resolves.
-        assert_eq!(LamuCookbook.name(), "lamu");
+    fn default_args_defaults_to_none() {
+        // A cookbook with no override returns None (TUI falls back to the
+        // schemars template).
+        let r = registry();
+        assert!(r.default_args("alpha_train").is_none());
     }
 }

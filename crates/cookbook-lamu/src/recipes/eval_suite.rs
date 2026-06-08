@@ -13,10 +13,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::framework::error::RecipeError;
-use crate::framework::plan::Plan;
-use crate::recipes::recipe::{Recipe, RecipeDef};
-use crate::stages::{
+use blut::framework::error::RecipeError;
+use blut::framework::plan::Plan;
+use blut::recipes::recipe::{Recipe, RecipeDef};
+use blut::stages::{
     eval_judge::{Args as JudgeArgs, EvalJudge},
     eval_lm_harness::{Args as HarnessArgs, EvalLmHarness},
     eval_loss::{Args as LossArgs, EvalLoss},
@@ -63,7 +63,7 @@ fn default_max_seq() -> u32 {
 }
 
 impl Recipe for EvalSuite {
-    type Backend = crate::backends::LamuTrainerBackend;
+    type Backend = blut::backends::LamuTrainerBackend;
     const NAME: &'static str = "eval_suite";
     const DESCRIPTION: &'static str = "Three-way evaluation: cross-entropy + lm-eval-harness benchmarks \
          + judge-model scoring. Produces a combined EvalReport with all \
@@ -150,8 +150,8 @@ impl Recipe for EvalSuite {
 pub static DEF: RecipeDef = RecipeDef {
     name: EvalSuite::NAME,
     description: EvalSuite::DESCRIPTION,
-    backend_id: <crate::backends::LamuTrainerBackend as crate::backends::TrainingBackend>::ID,
-    category: crate::recipes::recipe::RecipeCategory::Eval,
+    backend_id: <blut::backends::LamuTrainerBackend as blut::backends::TrainingBackend>::ID,
+    category: blut::recipes::recipe::RecipeCategory::Eval,
     input_kinds: &["checkpoint.hf"],
     output_kind: "eval.report",
     args_schema_fn: || {

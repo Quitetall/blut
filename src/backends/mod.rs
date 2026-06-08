@@ -61,8 +61,8 @@ impl TrainingBackend for HfTrainerBackend {
 
 /// LAMU's `trainer.py` wire. The original BLUT backend — emits
 /// `StatusUpdate` JSON lines, expects a `TrainSpec` blob on argv.
-/// Kept for back-compat with the existing finetune_from_*
-/// recipes; new recipes should prefer `HfTrainerBackend`.
+/// Kept for back-compat with the lamu cookbook's SFT recipes; new
+/// recipes should prefer `HfTrainerBackend`.
 pub struct LamuTrainerBackend;
 impl TrainingBackend for LamuTrainerBackend {
     const ID: &'static str = "lamu";

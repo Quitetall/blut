@@ -1,22 +1,13 @@
-//! Recipes — saved compositions of stages.
+//! Recipe machinery — the engine seam domain cookbooks build against.
 //!
-//! Each recipe takes typed args and compiles to a `Plan<()>`. The
-//! catalog is a `static RECIPES: &[RecipeDef]` mirroring
-//! lamu-mcp's `TOOLS` pattern: registering a new recipe is one
-//! block of code with a `name`, `description`, and `compile_fn`.
+//! blut-core ships ZERO recipe DEFs. The `Recipe` trait, `RecipeDef`
+//! (erased catalog entry), and `RecipeCategory` live here; concrete
+//! recipes live in cookbook crates (`cookbook-lamu`, `cookbook-lamquant`)
+//! that depend on this crate and register their recipes at runtime via
+//! [`crate::framework::Registry`]. The lamu recipes moved to
+//! `cookbook-lamu` at C2b, the lamquant recipes to `cookbook-lamquant`
+//! at C2a. See `[[project_blut_cookbook_split]]`.
 
-pub mod distill_from_teacher;
-pub mod dpo_from_preferences;
-pub mod eval_suite;
-pub mod finetune_from_conversations;
-pub mod finetune_from_dataset;
-pub mod hf_finetune_from_dataset;
 pub mod recipe;
 
-pub use distill_from_teacher::DistillFromTeacher;
-pub use dpo_from_preferences::DpoFromPreferences;
-pub use eval_suite::EvalSuite;
-pub use finetune_from_conversations::FinetuneFromConversations;
-pub use finetune_from_dataset::FinetuneFromDataset;
-pub use hf_finetune_from_dataset::HfFinetuneFromDataset;
-pub use recipe::{RECIPES, Recipe, RecipeCategory, RecipeDef, by_category, swap_candidates};
+pub use recipe::{Recipe, RecipeCategory, RecipeDef};

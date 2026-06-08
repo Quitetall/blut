@@ -68,10 +68,94 @@ use ratatui::{
 
 use crate::jobs::{self, JobState, JobSummary};
 // The TUI sources its recipe catalog from the injected Registry
-// (App.catalog), not the static slice. RECIPES is still referenced by
-// the in-module tests until it's deleted at C2a Step 3.
+// (App.catalog) — blut-core ships NO recipes. The in-module tests bring
+// their own domain-free fixture catalog (`test_fixtures`) so the generic
+// catalog / filter / menu logic is exercised without any concrete
+// cookbook (those moved to the cookbook crates at C2a / C2b).
 #[cfg(test)]
-use crate::recipes::RECIPES;
+use test_fixtures::{FIXTURE, test_registry};
+
+/// Domain-free recipe fixtures for the TUI tests. blut-core is a generic
+/// engine with zero recipes, so its TUI tests run against synthetic
+/// `RecipeDef`s wrapped in a test cookbook — exactly the shape a real
+/// cookbook crate registers at runtime. Names are neutral (no real recipe
+/// names) and avoid the reserved-hotkey first chars.
+#[cfg(test)]
+mod test_fixtures {
+    use crate::framework::{Cookbook, Registry};
+    use crate::recipes::recipe::{RecipeCategory, RecipeDef};
+
+    fn empty_object_schema() -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+
+    pub(super) static TRAIN_ALPHA: RecipeDef = RecipeDef {
+        name: "train_alpha",
+        description: "fixture training recipe alpha",
+        backend_id: "fixture",
+        category: RecipeCategory::Train,
+        input_kinds: &["dataset.jsonl"],
+        output_kind: "checkpoint.hf",
+        args_schema_fn: empty_object_schema,
+        compile_fn: |_| {
+            Err(crate::framework::error::RecipeError::CompileFailed(
+                "fixture".into(),
+            ))
+        },
+    };
+    pub(super) static TRAIN_BETA: RecipeDef = RecipeDef {
+        name: "train_beta",
+        description: "fixture training recipe beta",
+        backend_id: "fixture",
+        category: RecipeCategory::Train,
+        input_kinds: &["dataset.jsonl"],
+        output_kind: "checkpoint.hf",
+        args_schema_fn: empty_object_schema,
+        compile_fn: |_| {
+            Err(crate::framework::error::RecipeError::CompileFailed(
+                "fixture".into(),
+            ))
+        },
+    };
+    pub(super) static EVAL_GAMMA: RecipeDef = RecipeDef {
+        name: "eval_gamma",
+        description: "fixture evaluation recipe gamma",
+        backend_id: "fixture",
+        category: RecipeCategory::Eval,
+        input_kinds: &["checkpoint.hf"],
+        output_kind: "eval.report",
+        args_schema_fn: empty_object_schema,
+        compile_fn: |_| {
+            Err(crate::framework::error::RecipeError::CompileFailed(
+                "fixture".into(),
+            ))
+        },
+    };
+
+    /// The fixture catalog the TUI tests index (stands in for the recipes
+    /// a real cookbook crate registers at runtime). Train + Eval
+    /// categories exercise the category-grouped cockpit/menu paths.
+    pub(super) static FIXTURE: &[&RecipeDef] = &[&TRAIN_ALPHA, &TRAIN_BETA, &EVAL_GAMMA];
+
+    struct FixtureCookbook;
+    impl Cookbook for FixtureCookbook {
+        fn name(&self) -> &'static str {
+            "fixture"
+        }
+        fn recipes(&self) -> &'static [&'static RecipeDef] {
+            FIXTURE
+        }
+    }
+
+    /// A registry holding exactly the fixture cookbook — what the TUI
+    /// tests build their `App` from (stands in for a real cookbook crate's
+    /// `registry()`).
+    pub(super) fn test_registry() -> Registry {
+        let mut r = Registry::new();
+        r.register(Box::new(FixtureCookbook));
+        r
+    }
+}
 
 mod system;
 mod theme;
@@ -173,8 +257,8 @@ struct App {
     reset_armed: Option<(usize, Instant)>,
     /// The cookbook registry this session was launched with (the binary
     /// composes it). Source of the recipe catalog + per-recipe default
-    /// args — replaces the old static `RECIPES` slice so the TUI is
-    /// domain-agnostic. [[project_blut_cookbook_split]]
+    /// args — the TUI indexes the composed catalog, not any static slice,
+    /// so it is domain-agnostic. [[project_blut_cookbook_split]]
     registry: crate::framework::Registry,
     /// Flat recipe catalog (union of the registry's cookbooks), collected
     /// once at startup. `filter_recipes` / `recipe_menu` index into this.
@@ -396,7 +480,7 @@ impl App {
     }
 
     /// Auto-assigned recipe hotkeys. Builds the menu dynamically from
-    /// `RECIPES` (sorted by category + name), assigning hotkeys from
+    /// the injected catalog (sorted by category + name), assigning hotkeys from
     /// the pool `1..9, then a..z` skipping the reserved keys (q quit,
     /// r refresh, c cancel, R custom-recipe-picker, j/k vi navigation,
     /// l reserved for U3 log toggle). Recipes beyond the available
@@ -1822,7 +1906,7 @@ mod render_tests {
         // Force unicode + color on so the alignment test sees `┌`/`│`/`└`
         // and the section-heading assertions are charset-stable.
         theme::detect("always", "unicode");
-        let mut app = App::new(crate::framework::default_registry());
+        let mut app = App::new(test_registry());
         // Point the repo root at an empty temp dir so views::* don't pick
         // up stray training_logs / checkpoints from the dev tree.
         let tmp = std::env::temp_dir().join(format!("blut-tui-test-{}", std::process::id()));
@@ -2052,7 +2136,7 @@ mod render_tests {
         app.view = View::Cockpit;
         let buf = render_to_test_backend(&mut app, 160, 80);
         let text = buffer_text(&buf);
-        for r in RECIPES {
+        for r in FIXTURE {
             assert!(
                 text.contains(r.name),
                 "cockpit menu missing recipe `{}` — parity regression",
@@ -2076,7 +2160,7 @@ mod state_tests {
     /// A fresh `App` with no overlay, cockpit view, pointed at a temp
     /// repo root so nothing in these tests touches the dev tree.
     fn app() -> App {
-        let mut a = App::new(crate::framework::default_registry());
+        let mut a = App::new(test_registry());
         let tmp = std::env::temp_dir().join(format!(
             "blut-tui-state-{}-{:?}",
             std::process::id(),
@@ -2117,7 +2201,7 @@ mod state_tests {
         handle_key(&mut a, key('R'));
         // Empty query → all recipes; cursor 0 selects the first filtered
         // recipe. Enter opens the args Editor for it.
-        let first = RECIPES[App::filter_recipes(RECIPES, "")[0]];
+        let first = FIXTURE[App::filter_recipes(FIXTURE, "")[0]];
         handle_key(&mut a, code(KeyCode::Enter));
         match &a.overlay {
             Overlay::Editor { recipe, .. } => {
@@ -2212,29 +2296,29 @@ mod state_tests {
 
     #[test]
     fn filter_recipes_empty_query_returns_all() {
-        let all = App::filter_recipes(RECIPES, "");
+        let all = App::filter_recipes(FIXTURE, "");
         assert_eq!(
             all.len(),
-            RECIPES.len(),
+            FIXTURE.len(),
             "empty query must surface every recipe"
         );
         // Every catalog index appears exactly once.
         let mut seen = all.clone();
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), RECIPES.len(), "no duplicate / missing indices");
+        assert_eq!(seen.len(), FIXTURE.len(), "no duplicate / missing indices");
     }
 
     #[test]
     fn filter_recipes_subset_query_orders_best_first() {
-        // "finetune" matches every finetune_* recipe; the result must be
+        // "train" matches every train_* fixture recipe; the result must be
         // a non-empty subset and every returned recipe's name must
         // actually fuzzy-contain the query subsequence.
-        let q = "finetune";
-        let res = App::filter_recipes(RECIPES, q);
-        assert!(!res.is_empty(), "`{q}` should match the finetune recipes");
+        let q = "train";
+        let res = App::filter_recipes(FIXTURE, q);
+        assert!(!res.is_empty(), "`{q}` should match the train_* recipes");
         for &idx in &res {
-            let name = RECIPES[idx].name;
+            let name = FIXTURE[idx].name;
             assert!(
                 is_subsequence(q, name),
                 "fuzzy match returned `{name}` which does not contain `{q}` as a subsequence"
@@ -2242,7 +2326,7 @@ mod state_tests {
         }
         // A more specific query is a strict-or-equal subset of a broader
         // prefix query.
-        let broad = App::filter_recipes(RECIPES, "fine");
+        let broad = App::filter_recipes(FIXTURE, "tra");
         assert!(
             res.len() <= broad.len(),
             "narrower query must not return more rows than a broader one"
@@ -2252,13 +2336,13 @@ mod state_tests {
     #[test]
     fn filter_recipes_exact_name_ranks_that_recipe_first() {
         // Querying a full recipe name should rank that recipe at the top.
-        for r in RECIPES {
-            let res = App::filter_recipes(RECIPES, r.name);
+        for r in FIXTURE {
+            let res = App::filter_recipes(FIXTURE, r.name);
             assert!(!res.is_empty(), "exact name `{}` matched nothing", r.name);
             assert_eq!(
-                RECIPES[res[0]].name, r.name,
+                FIXTURE[res[0]].name, r.name,
                 "exact-name query `{}` should rank itself first, got `{}`",
-                r.name, RECIPES[res[0]].name
+                r.name, FIXTURE[res[0]].name
             );
         }
     }
@@ -2266,7 +2350,7 @@ mod state_tests {
     #[test]
     fn filter_recipes_no_match_is_empty() {
         assert!(
-            App::filter_recipes(RECIPES, "zzz_definitely_not_a_recipe_zzz").is_empty(),
+            App::filter_recipes(FIXTURE, "zzz_definitely_not_a_recipe_zzz").is_empty(),
             "an impossible query must return no rows"
         );
     }
@@ -2282,7 +2366,7 @@ mod state_tests {
 
     #[test]
     fn template_for_every_recipe_parses_as_json() {
-        for r in RECIPES {
+        for r in FIXTURE {
             let tpl = App::template_for(r);
             let parsed: Result<serde_json::Value, _> = serde_json::from_str(&tpl);
             assert!(
@@ -2305,7 +2389,7 @@ mod state_tests {
         // The hotkey path prefills via lamquant_default_args() else the
         // schema template. Either way the prefill must be valid JSON so
         // the user starts from a parseable buffer.
-        for r in RECIPES {
+        for r in FIXTURE {
             let mut a = app();
             a.open_editor(r);
             let Overlay::Editor { buffer, .. } = &a.overlay else {
@@ -2326,7 +2410,7 @@ mod state_tests {
 
     #[test]
     fn recipe_menu_has_no_duplicate_hotkeys() {
-        let menu = App::recipe_menu(RECIPES);
+        let menu = App::recipe_menu(FIXTURE);
         let mut seen = std::collections::HashSet::new();
         for (key, r) in &menu {
             if let Some(c) = key {
@@ -2345,7 +2429,7 @@ mod state_tests {
         // hotkey or the recipe would shadow (or be shadowed by) the
         // built-in. Mirror the reserved set declared in recipe_menu().
         let reserved: &[char] = &['q', 'Q', 'r', 'R', 'c', 'C', 'j', 'k', 'l'];
-        for (key, r) in App::recipe_menu(RECIPES) {
+        for (key, r) in App::recipe_menu(FIXTURE) {
             if let Some(c) = key {
                 assert!(
                     !reserved.contains(&c),
@@ -2358,16 +2442,16 @@ mod state_tests {
 
     #[test]
     fn recipe_menu_lists_every_recipe_once() {
-        let menu = App::recipe_menu(RECIPES);
+        let menu = App::recipe_menu(FIXTURE);
         assert_eq!(
             menu.len(),
-            RECIPES.len(),
+            FIXTURE.len(),
             "menu must contain every recipe exactly once"
         );
         let mut names: Vec<&str> = menu.iter().map(|(_, r)| r.name).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), RECIPES.len(), "no duplicate recipe rows");
+        assert_eq!(names.len(), FIXTURE.len(), "no duplicate recipe rows");
     }
 
     // ── View navigation ─────────────────────────────────────────────
@@ -2445,10 +2529,10 @@ mod state_tests {
         let mut a = app();
         handle_key(&mut a, key('R'));
         // Type a query that matches exactly one recipe.
-        for ch in "finetune_from_dataset".chars() {
+        for ch in "train_alpha".chars() {
             handle_key(&mut a, key(ch));
         }
-        let filtered = App::filter_recipes(RECIPES, "finetune_from_dataset");
+        let filtered = App::filter_recipes(FIXTURE, "train_alpha");
         let last = filtered.len().saturating_sub(1);
         // Hammer Down well past the end.
         for _ in 0..50 {
@@ -2457,7 +2541,7 @@ mod state_tests {
         let Overlay::Picker { query, cursor } = &a.overlay else {
             panic!("expected Picker overlay still open");
         };
-        let live = App::filter_recipes(RECIPES, query);
+        let live = App::filter_recipes(FIXTURE, query);
         assert!(
             *cursor <= last,
             "cursor {cursor} ran past last filtered index {last} (TUI-07 regressed)"
@@ -2482,15 +2566,15 @@ mod state_tests {
         // last index; Up should walk back without underflowing.
         let mut a = app();
         handle_key(&mut a, key('R'));
-        let last = App::filter_recipes(RECIPES, "").len().saturating_sub(1);
-        for _ in 0..(RECIPES.len() + 20) {
+        let last = App::filter_recipes(FIXTURE, "").len().saturating_sub(1);
+        for _ in 0..(FIXTURE.len() + 20) {
             handle_key(&mut a, code(KeyCode::Down));
         }
         let Overlay::Picker { cursor, .. } = &a.overlay else {
             panic!("expected Picker");
         };
         assert_eq!(*cursor, last, "Down must saturate at the last index");
-        for _ in 0..(RECIPES.len() + 20) {
+        for _ in 0..(FIXTURE.len() + 20) {
             handle_key(&mut a, code(KeyCode::Up));
         }
         let Overlay::Picker { cursor, .. } = &a.overlay else {

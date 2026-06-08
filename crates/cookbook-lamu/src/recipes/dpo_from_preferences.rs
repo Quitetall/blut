@@ -3,14 +3,14 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::artifacts::PreferenceJsonl;
-use crate::framework::artifact::ContentHash;
-use crate::framework::error::{RecipeError, StageError};
-use crate::framework::plan::Plan;
-use crate::framework::resource::Resource;
-use crate::framework::stage::{Stage, StageContext};
-use crate::recipes::recipe::{Recipe, RecipeDef};
-use crate::stages::{
+use blut::artifacts::PreferenceJsonl;
+use blut::framework::artifact::ContentHash;
+use blut::framework::error::{RecipeError, StageError};
+use blut::framework::plan::Plan;
+use blut::framework::resource::Resource;
+use blut::framework::stage::{Stage, StageContext};
+use blut::recipes::recipe::{Recipe, RecipeDef};
+use blut::stages::{
     convert_gguf::{Args as ConvertArgs, ConvertGguf},
     dpo_train::{Args as DpoArgs, DpoTrain},
     register_model::{Args as RegArgs, RegisterModel},
@@ -20,7 +20,7 @@ use crate::stages::{
 /// hashes it into a `PreferenceJsonl` artifact.
 struct MaterializePreferences;
 
-impl crate::framework::Compatible<crate::backends::LamuTrainerBackend> for MaterializePreferences {}
+impl blut::framework::Compatible<blut::backends::LamuTrainerBackend> for MaterializePreferences {}
 
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct MatPrefArgs {
@@ -101,7 +101,7 @@ fn default_quant() -> String {
 }
 
 impl Recipe for DpoFromPreferences {
-    type Backend = crate::backends::LamuTrainerBackend;
+    type Backend = blut::backends::LamuTrainerBackend;
     const NAME: &'static str = "dpo_from_preferences";
     const DESCRIPTION: &'static str = "Direct preference optimization from a chosen/rejected JSONL. Stub trainer; full DPO impl pending.";
     type Args = Args;
@@ -172,8 +172,8 @@ impl Recipe for DpoFromPreferences {
 pub static DEF: RecipeDef = RecipeDef {
     name: DpoFromPreferences::NAME,
     description: DpoFromPreferences::DESCRIPTION,
-    backend_id: <crate::backends::LamuTrainerBackend as crate::backends::TrainingBackend>::ID,
-    category: crate::recipes::recipe::RecipeCategory::Train,
+    backend_id: <blut::backends::LamuTrainerBackend as blut::backends::TrainingBackend>::ID,
+    category: blut::recipes::recipe::RecipeCategory::Train,
     input_kinds: &["dataset.preferences"],
     output_kind: "model.gguf",
     args_schema_fn: || {

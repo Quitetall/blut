@@ -1,46 +1,36 @@
-//! Recipe — `finetune_from_dataset`.
+//! Recipe — `hf_finetune_from_dataset`.
 //!
-//! SFT from an existing JSONL dataset (path on disk or a name
-//! registered in `datasets_db`). Mirrors recipe 1's tail half;
-//! differs only at the materializer:
+//! HF Trainer parallel to `finetune_from_dataset` (lamu). Plan
+//! shape identical; differs only in the train step (HfSftTrain
+//! vs SftTrain) and the typed backend.
 //!
-//!   materialize_dataset_path
-//!     → split_train_eval
-//!     → take_train
-//!     → sft_train
-//!     → merge_lora
-//!     → convert_gguf
-//!     → register_model
+//!   materialize_dataset_path → split_train_eval → take_train →
+//!   hf_sft_train → merge_lora → convert_gguf → register_model
 //!
-//! No `filter_dataset` / `register_dataset` stage: the dataset is
-//! pre-existing (either a registered curated set or a one-off path
-//! the user takes responsibility for). Recipe 1 owns the
-//! conversations-→-curated pipeline.
+//! Backend: HfTrainerBackend (auto-managed venv + transformers.Trainer).
 
 use serde::{Deserialize, Serialize};
 
-use crate::framework::error::RecipeError;
-use crate::framework::plan::Plan;
-use crate::recipes::recipe::{Recipe, RecipeDef};
-use crate::stages::take_train::TakeTrain;
-use crate::stages::{
+use blut::backends::hf_trainer::HfSftTrain;
+use blut::framework::error::RecipeError;
+use blut::framework::plan::Plan;
+use blut::recipes::recipe::{Recipe, RecipeDef};
+use blut::stages::{
+    TakeTrain,
     convert_gguf::{Args as ConvertArgs, ConvertGguf},
     materialize_dataset_path::{Args as MatArgs, MaterializeDatasetPath},
     merge_lora::{Args as MergeArgs, MergeLora},
     register_model::{Args as RegArgs, RegisterModel},
-    sft_train::{Args as SftArgs, SftTrain},
     split_train_eval::{Args as SplitArgs, SplitTrainEval},
 };
 
-pub struct FinetuneFromDataset;
+pub struct HfFinetuneFromDataset;
 
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Args {
     pub output_name: String,
-    /// Path to a JSONL dataset. Exclusive with `registered_dataset`.
     #[serde(default)]
     pub dataset_path: Option<std::path::PathBuf>,
-    /// Registered dataset name. Exclusive with `dataset_path`.
     #[serde(default)]
     pub registered_dataset: Option<String>,
     #[serde(default = "default_base")]
@@ -65,10 +55,11 @@ pub struct Args {
     pub rank: u32,
     #[serde(default = "default_alpha")]
     pub alpha: u32,
-    #[serde(default = "default_optim")]
-    pub optimizer: String,
     #[serde(default = "default_eval_ratio")]
     pub eval_ratio: f32,
+    /// `TrainingArguments` overrides forwarded to `transformers.Trainer`.
+    #[serde(default)]
+    pub hf_extra: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
     pub notes: String,
 }
@@ -106,19 +97,15 @@ fn default_rank() -> u32 {
 fn default_alpha() -> u32 {
     32
 }
-fn default_optim() -> String {
-    "apollo_mini".into()
-}
 fn default_eval_ratio() -> f32 {
     0.1
 }
 
-impl Recipe for FinetuneFromDataset {
-    type Backend = crate::backends::LamuTrainerBackend;
-    const NAME: &'static str = "finetune_from_dataset";
-    const DESCRIPTION: &'static str = "SFT from an existing dataset — JSONL path on disk or a registered name. \
-         Tail half identical to finetune_from_conversations; differs only at the \
-         source materializer.";
+impl Recipe for HfFinetuneFromDataset {
+    type Backend = blut::backends::HfTrainerBackend;
+    const NAME: &'static str = "hf_finetune_from_dataset";
+    const DESCRIPTION: &'static str = "HuggingFace Trainer SFT from an existing dataset (JSONL path or registered name). \
+         Auto-managed venv via transformers.Trainer + PEFT LoRA/QLoRA + bitsandbytes.";
     type Args = Args;
 
     fn compile(&self, args: Self::Args) -> Result<Plan<(), Self::Backend>, RecipeError> {
@@ -141,7 +128,6 @@ impl Recipe for FinetuneFromDataset {
                 args.method
             )));
         }
-        // R23: numeric arg ranges.
         if args.output_name.is_empty() {
             return Err(RecipeError::InvalidArgs("output_name is empty".into()));
         }
@@ -166,7 +152,7 @@ impl Recipe for FinetuneFromDataset {
         let recipe_args_json = serde_json::to_value(&args)
             .map_err(|e| RecipeError::CompileFailed(format!("serialize args: {e}")))?;
 
-        let plan = Plan::new(Self::NAME, recipe_args_json)
+        let plan = Plan::<(), Self::Backend>::new(Self::NAME, recipe_args_json)
             .start(
                 MaterializeDatasetPath,
                 MatArgs {
@@ -181,22 +167,22 @@ impl Recipe for FinetuneFromDataset {
                     seed: args.seed,
                 },
             )
-            .then(TakeTrain, crate::stages::take_train::Args::default())
+            .then(TakeTrain, blut::stages::take_train::Args::default())
             .then(
-                SftTrain,
-                SftArgs {
+                HfSftTrain,
+                blut::backends::hf_trainer::stages::hf_sft_train::Args {
                     base_model: args.base_model.clone(),
-                    output_name: args.output_name.clone(),
                     method: args.method.clone(),
                     rank: args.rank,
                     alpha: args.alpha,
-                    optimizer: args.optimizer.clone(),
                     lr: args.lr,
                     epochs: args.epochs,
                     batch_size: args.batch_size,
                     grad_accum: args.grad_accum,
                     seq_len: args.seq_len,
                     seed: args.seed,
+                    eval_dataset_path: String::new(),
+                    extra: args.hf_extra.clone(),
                 },
             )
             .then(MergeLora, MergeArgs::default())
@@ -212,7 +198,7 @@ impl Recipe for FinetuneFromDataset {
                 RegArgs {
                     name: args.output_name.clone(),
                     notes: args.notes.clone(),
-                    arch: "trained".into(),
+                    arch: "trained-hf".into(),
                 },
             )
             .finish();
@@ -221,12 +207,12 @@ impl Recipe for FinetuneFromDataset {
 }
 
 pub static DEF: RecipeDef = RecipeDef {
-    name: FinetuneFromDataset::NAME,
-    description: FinetuneFromDataset::DESCRIPTION,
-    backend_id: <crate::backends::LamuTrainerBackend as crate::backends::TrainingBackend>::ID,
-    category: crate::recipes::recipe::RecipeCategory::Train,
+    name: HfFinetuneFromDataset::NAME,
+    description: HfFinetuneFromDataset::DESCRIPTION,
+    backend_id: <blut::backends::HfTrainerBackend as blut::backends::TrainingBackend>::ID,
+    category: blut::recipes::recipe::RecipeCategory::Train,
     input_kinds: &["dataset.jsonl"],
-    output_kind: "model.gguf",
+    output_kind: "checkpoint.hf",
     args_schema_fn: || {
         let mut g = schemars::r#gen::SchemaGenerator::default();
         let s = g.subschema_for::<Args>();
@@ -235,7 +221,9 @@ pub static DEF: RecipeDef = RecipeDef {
     compile_fn: |raw| {
         let args: Args =
             serde_json::from_value(raw).map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
-        FinetuneFromDataset.compile(args).map(|p| p.into_compiled())
+        HfFinetuneFromDataset
+            .compile(args)
+            .map(|p| p.into_compiled())
     },
 };
 
@@ -259,41 +247,35 @@ mod tests {
             seed: default_seed(),
             rank: default_rank(),
             alpha: default_alpha(),
-            optimizer: default_optim(),
             eval_ratio: default_eval_ratio(),
+            hf_extra: serde_json::Map::new(),
             notes: String::new(),
         }
     }
 
     #[test]
     fn compiles_to_7_node_plan() {
-        let plan = FinetuneFromDataset.compile(args()).unwrap().into_compiled();
+        let plan = HfFinetuneFromDataset
+            .compile(args())
+            .unwrap()
+            .into_compiled();
         assert_eq!(plan.n_nodes(), 7);
         assert_eq!(plan.n_edges(), 6);
-    }
-
-    #[test]
-    fn rejects_both_dataset_specifiers() {
-        let mut a = args();
-        a.registered_dataset = Some("foo".into());
-        let r = FinetuneFromDataset.compile(a);
-        assert!(matches!(r, Err(RecipeError::InvalidArgs(_))));
-    }
-
-    #[test]
-    fn rejects_neither_dataset_specifier() {
-        let mut a = args();
-        a.dataset_path = None;
-        a.registered_dataset = None;
-        let r = FinetuneFromDataset.compile(a);
-        assert!(matches!(r, Err(RecipeError::InvalidArgs(_))));
     }
 
     #[test]
     fn rejects_invalid_method() {
         let mut a = args();
         a.method = "rlhf".into();
-        let r = FinetuneFromDataset.compile(a);
+        let r = HfFinetuneFromDataset.compile(a);
+        assert!(matches!(r, Err(RecipeError::InvalidArgs(_))));
+    }
+
+    #[test]
+    fn rejects_both_dataset_specifiers() {
+        let mut a = args();
+        a.registered_dataset = Some("foo".into());
+        let r = HfFinetuneFromDataset.compile(a);
         assert!(matches!(r, Err(RecipeError::InvalidArgs(_))));
     }
 }

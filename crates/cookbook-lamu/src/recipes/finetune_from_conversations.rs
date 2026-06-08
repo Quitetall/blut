@@ -23,11 +23,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::framework::error::RecipeError;
-use crate::framework::plan::Plan;
-use crate::recipes::recipe::{Recipe, RecipeDef};
-use crate::stages::take_train::TakeTrain;
-use crate::stages::{
+use blut::framework::error::RecipeError;
+use blut::framework::plan::Plan;
+use blut::recipes::recipe::{Recipe, RecipeDef};
+use blut::stages::take_train::TakeTrain;
+use blut::stages::{
     convert_gguf::{Args as ConvertArgs, ConvertGguf},
     filter_dataset::{Args as FilterArgs, FilterDataset},
     materialize_conversations::{Args as MatArgs, MaterializeConversations},
@@ -143,7 +143,7 @@ fn default_register_dataset_name() -> String {
 }
 
 impl Recipe for FinetuneFromConversations {
-    type Backend = crate::backends::LamuTrainerBackend;
+    type Backend = blut::backends::LamuTrainerBackend;
     const NAME: &'static str = "finetune_from_conversations";
     const DESCRIPTION: &'static str = "Fine-tune a base model on the user's recent LAMU conversation history. \
          Pulls turns from conversations.db, runs SFT via the python trainer, \
@@ -238,7 +238,7 @@ impl Recipe for FinetuneFromConversations {
                     seed: args.seed,
                 },
             )
-            .then(TakeTrain, crate::stages::take_train::Args::default())
+            .then(TakeTrain, blut::stages::take_train::Args::default())
             .then(
                 SftTrain,
                 SftArgs {
@@ -282,8 +282,8 @@ impl Recipe for FinetuneFromConversations {
 pub static DEF: RecipeDef = RecipeDef {
     name: FinetuneFromConversations::NAME,
     description: FinetuneFromConversations::DESCRIPTION,
-    backend_id: <crate::backends::LamuTrainerBackend as crate::backends::TrainingBackend>::ID,
-    category: crate::recipes::recipe::RecipeCategory::Train,
+    backend_id: <blut::backends::LamuTrainerBackend as blut::backends::TrainingBackend>::ID,
+    category: blut::recipes::recipe::RecipeCategory::Train,
     input_kinds: &[],
     output_kind: "model.gguf",
     args_schema_fn: || {

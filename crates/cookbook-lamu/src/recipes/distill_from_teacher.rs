@@ -16,10 +16,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::framework::error::RecipeError;
-use crate::framework::plan::Plan;
-use crate::recipes::recipe::{Recipe, RecipeDef};
-use crate::stages::{
+use blut::framework::error::RecipeError;
+use blut::framework::plan::Plan;
+use blut::recipes::recipe::{Recipe, RecipeDef};
+use blut::stages::{
     convert_gguf::{Args as ConvertArgs, ConvertGguf},
     distill_train::{Args as DistillArgs, DistillTrain},
     materialize_for_eval::{Args as MatArgs, MaterializeForEval},
@@ -87,7 +87,7 @@ fn default_quant() -> String {
 }
 
 impl Recipe for DistillFromTeacher {
-    type Backend = crate::backends::LamuTrainerBackend;
+    type Backend = blut::backends::LamuTrainerBackend;
     const NAME: &'static str = "distill_from_teacher";
     const DESCRIPTION: &'static str = "Knowledge-distill a smaller student from a teacher checkpoint over a \
          supplied dataset. KL-divergence-weighted loss; same merge/convert/register \
@@ -189,8 +189,8 @@ impl Recipe for DistillFromTeacher {
 pub static DEF: RecipeDef = RecipeDef {
     name: DistillFromTeacher::NAME,
     description: DistillFromTeacher::DESCRIPTION,
-    backend_id: <crate::backends::LamuTrainerBackend as crate::backends::TrainingBackend>::ID,
-    category: crate::recipes::recipe::RecipeCategory::Train,
+    backend_id: <blut::backends::LamuTrainerBackend as blut::backends::TrainingBackend>::ID,
+    category: blut::recipes::recipe::RecipeCategory::Train,
     input_kinds: &["dataset.jsonl"],
     output_kind: "model.gguf",
     args_schema_fn: || {

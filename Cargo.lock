@@ -388,7 +388,14 @@ dependencies = [
 name = "cookbook-lamu"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "blut",
+ "humantime",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

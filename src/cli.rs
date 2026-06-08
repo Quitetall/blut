@@ -150,7 +150,7 @@ enum PlanCommand {
     /// DAG render. Does NOT execute. Useful for previewing a
     /// recipe's shape before committing to a run.
     Inspect {
-        /// Recipe name (e.g. eval_suite).
+        /// Recipe name (as listed by `recipe list`).
         name: String,
         /// Recipe args as inline JSON.
         #[arg(long)]
@@ -177,7 +177,7 @@ enum RecipeCommand {
     List,
     /// Print one recipe's args JSON schema.
     Show {
-        /// Recipe name (e.g. finetune_from_conversations).
+        /// Recipe name (as listed by `recipe list`).
         name: String,
     },
     /// Execute a recipe with given args.
@@ -339,7 +339,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Train(args)) => run_train(args).await,
+        Some(Command::Train(args)) => run_train(&reg, args).await,
         Some(Command::Jobs) => run_jobs(),
         Some(Command::Cancel { id, grace }) => run_cancel(&id, grace).await,
         Some(Command::Log { id, tail }) => run_log(&id, tail),
@@ -1025,7 +1025,7 @@ fn init_tracing() {
         .try_init();
 }
 
-async fn run_train(args: TrainArgs) -> Result<()> {
+async fn run_train(reg: &crate::framework::Registry, args: TrainArgs) -> Result<()> {
     let output_name = args
         .output_name
         .clone()
@@ -1038,7 +1038,7 @@ async fn run_train(args: TrainArgs) -> Result<()> {
     // release window and the legacy linear flow only remains for
     // `--dataset <path>` runs (no recipe equivalent yet).
     if args.from_conversations {
-        return run_train_via_recipe(&output_name, &args).await;
+        return run_train_via_recipe(reg, &output_name, &args).await;
     }
 
     let dataset_src = build_dataset(&args)?;
@@ -1308,44 +1308,57 @@ fn run_log(id_query: &str, tail: usize) -> Result<()> {
 /// pipeline. Builds the recipe Args from the legacy CLI flags so
 /// users don't have to learn a new invocation, then runs the
 /// compiled 9-stage Plan through `SequentialExecutor`.
-async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()> {
+async fn run_train_via_recipe(
+    reg: &crate::framework::Registry,
+    output_name: &str,
+    args: &TrainArgs,
+) -> Result<()> {
     use crate::framework::{CacheHandle, ExecCtx, SequentialExecutor};
-    use crate::recipes::finetune_from_conversations::{Args as RecipeArgs, DEF};
 
-    let recipe_args = RecipeArgs {
-        output_name: output_name.to_string(),
-        since: humantime::format_duration(args.since).to_string(),
-        base_model: args.base.clone(),
-        method: match args.method {
-            MethodArg::Qlora => "qlora".into(),
-            MethodArg::Lora => "lora".into(),
-            MethodArg::Full => "full".into(),
-        },
-        quant: args.quant.clone(),
-        lr: args.lr,
-        epochs: args.epochs,
-        batch_size: args.batch_size,
-        grad_accum: args.grad_accum,
-        seq_len: args.seq_len,
-        seed: args.seed,
-        rank: args.rank,
-        alpha: args.alpha,
-        optimizer: match pick_optimizer(args.optim, args.method) {
-            crate::spec::Optim::AdamW => "adamw".into(),
-            crate::spec::Optim::AdamW8bit => "adamw8bit".into(),
-            crate::spec::Optim::ApolloRank4 => "apollo".into(),
-            crate::spec::Optim::ApolloMini => "apollo_mini".into(),
-        },
-        notes: String::new(),
-        eval_ratio: 0.1,
-        min_turns: 2,
-        max_msg_bytes: 65_536,
-        drop_errors: true,
-        dataset_registry_name: String::new(),
+    // The recipe now lives in the lamu cookbook crate (C2b); blut-core
+    // can't name its typed `Args`, so we build the args JSON directly and
+    // resolve the erased `RecipeDef` by name through the caller-supplied
+    // cookbook registry. Field names MUST match the recipe's serde
+    // contract (validated at runtime inside `compile_fn`). Fields whose
+    // value equals the recipe's serde default are omitted (notes,
+    // eval_ratio, min_turns, max_msg_bytes, drop_errors,
+    // dataset_registry_name).
+    let method: &str = match args.method {
+        MethodArg::Qlora => "qlora",
+        MethodArg::Lora => "lora",
+        MethodArg::Full => "full",
     };
+    let optimizer: &str = match pick_optimizer(args.optim, args.method) {
+        crate::spec::Optim::AdamW => "adamw",
+        crate::spec::Optim::AdamW8bit => "adamw8bit",
+        crate::spec::Optim::ApolloRank4 => "apollo",
+        crate::spec::Optim::ApolloMini => "apollo_mini",
+    };
+    let recipe_args = serde_json::json!({
+        "output_name": output_name,
+        "since": humantime::format_duration(args.since).to_string(),
+        "base_model": args.base,
+        "method": method,
+        "quant": args.quant,
+        "lr": args.lr,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "grad_accum": args.grad_accum,
+        "seq_len": args.seq_len,
+        "seed": args.seed,
+        "rank": args.rank,
+        "alpha": args.alpha,
+        "optimizer": optimizer,
+    });
 
-    let raw = serde_json::to_value(&recipe_args).context("serialize recipe args")?;
-    let plan = (DEF.compile_fn)(raw).map_err(|e| anyhow!("recipe compile failed: {e}"))?;
+    let def = reg.find("finetune_from_conversations").ok_or_else(|| {
+        anyhow!(
+            "recipe `finetune_from_conversations` is not registered in this binary \
+             (it belongs to the lamu cookbook — run via the `blut-lamu` binary)"
+        )
+    })?;
+    let plan =
+        (def.compile_fn)(recipe_args.clone()).map_err(|e| anyhow!("recipe compile failed: {e}"))?;
 
     let job_id = jobs::new_job_id();
     let job_dir =
@@ -1383,15 +1396,12 @@ async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()>
         }
     }
 
-    // Mark recipe for plan resume. recipe_args is a typed Args
-    // struct deriving Serialize cleanly; `serde_json::to_value`
-    // on a well-formed Serialize type cannot fail. Propagate any
-    // failure as a wrapped error rather than silently storing null.
-    let marker_args =
-        serde_json::to_value(&recipe_args).context("serialize recipe args for marker")?;
+    // Mark recipe for plan resume. recipe_args is already the args JSON
+    // value built above (reused verbatim so the marker matches what was
+    // compiled).
     RecipeMarker {
         name: "finetune_from_conversations".into(),
-        args: marker_args,
+        args: recipe_args,
     }
     .write_to(&job_dir)?;
 
