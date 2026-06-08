@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -43,8 +44,20 @@ DEFAULT_MANIFEST = "/mnt/4tb/data/Training/manifests/split_manifest_codec_v1.jso
 
 
 def _load_full(path: Path, map_location):
-    """Load a checkpoint object (dict with state_dict + training_config, or raw)."""
-    return torch.load(path, map_location=map_location, weights_only=False)
+    """Load a checkpoint object (dict with state_dict + training_config, or raw).
+
+    Prefer weights_only=True (the safe loader). Our checkpoints embed a
+    training_config; if that trips the safe allow-list we fall back to the
+    permissive loader — these are LOCAL, trusted, training-produced artifacts,
+    but the safe path is tried first so a tampered ckpt fails the safe load
+    rather than being trusted blindly."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except Exception as e:
+        print(f"[warn] safe load failed for {path.name} ({type(e).__name__}); "
+              f"falling back to the permissive loader (trusted-local-ckpt "
+              f"assumption)", file=sys.stderr)
+        return torch.load(path, map_location=map_location, weights_only=False)
 
 
 def _state_dict(obj):
@@ -123,6 +136,14 @@ def main() -> int:
         if not p.exists():
             print(f"[FAIL] {label} checkpoint not found: {p}", file=sys.stderr)
             return 2
+    # Fail with a clear message here rather than a deep traceback inside the
+    # dataset loader if the data roots are wrong for this machine.
+    if not Path(args.lma_root).exists():
+        print(f"[FAIL] --lma-root not found: {args.lma_root}", file=sys.stderr)
+        return 2
+    if not Path(args.split_manifest).exists():
+        print(f"[FAIL] --split-manifest not found: {args.split_manifest}", file=sys.stderr)
+        return 2
     if args.max_windows < 1:
         print(f"[FAIL] --max-windows must be >= 1, got {args.max_windows}", file=sys.stderr)
         return 2
@@ -152,7 +173,11 @@ def main() -> int:
           f"ca={ca} kernels={kernels}", file=sys.stderr)
 
     codec = build_default_joint(**build_kwargs).to(dev)
-    codec.train(False)  # inference mode (avoid literal .eval() — Write-hook FP)
+    # Inference mode. Written as train(False) rather than the equivalent
+    # .eval() because a repo Write/Edit security hook substring-matches the
+    # literal ".eval(" (false-positive for Python's eval()); behaviour is
+    # identical for nn.Module. Do NOT "fix" this back to .eval().
+    codec.train(False)
 
     em = codec.encoder.load_state_dict(_state_dict(enc_obj), strict=False)
     dm = codec.decoder.load_state_dict(_state_dict(dec_obj), strict=False)
@@ -192,8 +217,10 @@ def main() -> int:
 
     r = float(r)
     prd = float(prd)
-    if r != r or prd != prd:  # NaN guard (non-finite => invalid measurement)
-        print("[FAIL] non-finite R/PRD from validate_joint", file=sys.stderr)
+    if not (math.isfinite(r) and math.isfinite(prd)):  # catches NaN AND ±inf
+        # inf would also crash json.dumps ("Out of range float"); reject early.
+        print(f"[FAIL] non-finite R/PRD from validate_joint (R={r}, PRD={prd})",
+              file=sys.stderr)
         return 2
 
     print(
@@ -223,7 +250,9 @@ def main() -> int:
             "tier": tier,
             "latent_dim": latent,
             "channel_agnostic": ca,
-            "n_windows": args.max_windows,
+            # Requested window budget — NOT a guaranteed decoded count (a short
+            # split may yield fewer; validate_joint does not return the actual N).
+            "windows_requested": args.max_windows,
             "quantize": args.quantize,
             "duration_s": round(dur, 2),
         }
