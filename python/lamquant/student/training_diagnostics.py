@@ -191,23 +191,32 @@ class TrainingDiagnostics:
         return out
 
     def check_shape_contract(self, x_l3, coords=None, ch_mask=None,
-                             expect_out: Optional[int] = None) -> List[DiagResult]:
+                             expect_out: Optional[int] = None,
+                             fullband=None) -> List[DiagResult]:
         self.codec.train(False)
         out = []
         with torch.no_grad():
             lat = (self.codec.encoder.encode(x_l3, quantize=False, coords=coords)
                    if self.channel_agnostic else
                    self.codec.encoder.encode(x_l3, quantize=False))
-        N = x_l3.shape[1]
         out.append(DiagResult("shape.latent", PASS if lat.shape[1:] == (32, 79)
                               else FAIL, f"encode→{tuple(lat.shape)} (want [*,32,79])"))
         with torch.no_grad():
             recon = self._forward(x_l3, coords, ch_mask, quantize=False)
-        ok = recon.shape[0] == x_l3.shape[0] and recon.shape[1] == N
-        if expect_out is not None:
-            ok = ok and abs(recon.shape[-1] - expect_out) <= 8
+        # Recon channels must match the RECONSTRUCTION TARGET, not the encoder
+        # input: they differ when the encoder is fed the full residual
+        # (in_ch=168, --detail-bands all) while the decoder emits the fullband
+        # montage (out_ch=21). Fall back to the input channel count only when
+        # no fullband target is supplied (L3-domain, in_ch==out_ch).
+        want_ch = fullband.shape[1] if fullband is not None else x_l3.shape[1]
+        ok = recon.shape[0] == x_l3.shape[0] and recon.shape[1] == want_ch
+        # Time length: prefer an explicit expectation, else the fullband target.
+        want_t = expect_out if expect_out is not None else (
+            fullband.shape[-1] if fullband is not None else None)
+        if want_t is not None:
+            ok = ok and abs(recon.shape[-1] - want_t) <= 8
         out.append(DiagResult("shape.recon", PASS if ok else FAIL,
-                              f"decode→{tuple(recon.shape)} (want [B,{N},*])"))
+                              f"decode→{tuple(recon.shape)} (want [B,{want_ch},*])"))
         return out
 
     def overfit_one_batch(self, x_l3, fullband=None, coords=None, ch_mask=None,

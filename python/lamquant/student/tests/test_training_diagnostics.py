@@ -130,6 +130,37 @@ def test_shape_contract_latent_n_invariant():
         assert _status_in(res, "shape.recon") == PASS
 
 
+def test_shape_contract_residual_in_neq_out():
+    """Full-residual config (E1, --detail-bands all): encoder in_ch=168 but the
+    decoder emits the fullband montage out_ch=21. shape.recon must compare recon
+    channels to the FULLBAND TARGET (21), not the encoder input (168).
+    Regression for the E1 preflight false-FAIL (2026-06-08). A minimal fake codec
+    isolates the shape-contract logic from the encoder's width>=in_ch build
+    constraint (the real residual encoder uses width=256 >= 168)."""
+    class _FakeEnc:
+        def encode(self, x, quantize=False, coords=None, ch_mask=None):
+            return torch.zeros(x.shape[0], 32, 79)
+
+    class _FakeResidualCodec(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = _FakeEnc()
+
+        def forward(self, x, quantize=False, coords=None, ch_mask=None):
+            return torch.zeros(x.shape[0], 21, 2500)  # fullband montage output
+
+    diag = TrainingDiagnostics(_FakeResidualCodec(), channel_agnostic=False)
+    x = torch.randn(2, 168, 313)    # full residual input (168 ch)
+    fb = torch.randn(2, 21, 2500)   # fullband target (21-ch montage)
+    # WITH the fullband target → expect 21 output channels → PASS
+    res = diag.check_shape_contract(x, fullband=fb)
+    assert _status_in(res, "shape.recon") == PASS, [r.detail for r in res]
+    # WITHOUT it → falls back to input channels (168) → FAIL (proves the fix
+    # discriminates, not a blanket pass).
+    res_nofb = diag.check_shape_contract(x)
+    assert _status_in(res_nofb, "shape.recon") == FAIL
+
+
 def test_report_ok_and_summary():
     diag = TrainingDiagnostics(_ca_codec(), channel_agnostic=True)
     x, fb, coords = _batch()
