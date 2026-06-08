@@ -67,6 +67,10 @@ use ratatui::{
 };
 
 use crate::jobs::{self, JobState, JobSummary};
+// The TUI sources its recipe catalog from the injected Registry
+// (App.catalog), not the static slice. RECIPES is still referenced by
+// the in-module tests until it's deleted at C2a Step 3.
+#[cfg(test)]
 use crate::recipes::RECIPES;
 
 mod system;
@@ -167,6 +171,14 @@ struct App {
     /// Reset view: which destructive action is armed (two-press confirm).
     reset_cursor: usize,
     reset_armed: Option<(usize, Instant)>,
+    /// The cookbook registry this session was launched with (the binary
+    /// composes it). Source of the recipe catalog + per-recipe default
+    /// args — replaces the old static `RECIPES` slice so the TUI is
+    /// domain-agnostic. [[project_blut_cookbook_split]]
+    registry: crate::framework::Registry,
+    /// Flat recipe catalog (union of the registry's cookbooks), collected
+    /// once at startup. `filter_recipes` / `recipe_menu` index into this.
+    catalog: Vec<&'static crate::recipes::RecipeDef>,
 }
 
 /// Two-press confirm window for the destructive Reset actions, matching
@@ -182,9 +194,13 @@ const RESET_ROWS: &[views::ResetAction] = &[
 ];
 
 impl App {
-    fn new() -> Self {
+    fn new(registry: crate::framework::Registry) -> Self {
         let mut selected = ListState::default();
         selected.select(Some(0));
+        // Collect the catalog once: the union of the registered cookbooks'
+        // recipes. Elements are `&'static`, so the Vec owns no borrow of
+        // `registry` and `App` can hold both without a self-referential tie.
+        let catalog: Vec<&'static crate::recipes::RecipeDef> = registry.all().collect();
         Self {
             jobs: Vec::new(),
             selected,
@@ -203,6 +219,8 @@ impl App {
             marked: Vec::new(),
             reset_cursor: 0,
             reset_armed: None,
+            registry,
+            catalog,
         }
     }
 
@@ -253,12 +271,16 @@ impl App {
     }
 
     /// Filtered list of recipes against the picker's fuzzy query.
-    /// Returns `(idx_in_RECIPES, score)` pairs sorted by score desc.
-    fn filter_recipes(query: &str) -> Vec<usize> {
+    /// Returns `(idx_in_catalog, score)` pairs sorted by score desc —
+    /// indices into the supplied `catalog`. Takes the catalog as a param
+    /// (rather than `&self`) so callers can pass `&self.catalog` as a
+    /// disjoint-field borrow alongside a `&mut self.overlay` in the
+    /// picker handler.
+    fn filter_recipes(catalog: &[&'static crate::recipes::RecipeDef], query: &str) -> Vec<usize> {
         use fuzzy_matcher::FuzzyMatcher;
         use fuzzy_matcher::skim::SkimMatcherV2;
         let matcher = SkimMatcherV2::default();
-        let mut scored: Vec<(usize, i64)> = RECIPES
+        let mut scored: Vec<(usize, i64)> = catalog
             .iter()
             .enumerate()
             .filter_map(|(i, r)| {
@@ -271,7 +293,7 @@ impl App {
             .collect();
         scored.sort_by(|a, b| {
             b.1.cmp(&a.1)
-                .then_with(|| RECIPES[a.0].name.cmp(RECIPES[b.0].name))
+                .then_with(|| catalog[a.0].name.cmp(catalog[b.0].name))
         });
         scored.into_iter().map(|(i, _)| i).collect()
     }
@@ -341,8 +363,13 @@ impl App {
     /// (Previously the hotkey path always used `template_for`, leaving
     /// `lamquant_default_args` dead — this revives it.)
     fn open_editor(&mut self, recipe: &'static crate::recipes::RecipeDef) {
-        let buffer =
-            Self::lamquant_default_args(recipe.name).unwrap_or_else(|| Self::template_for(recipe));
+        // Prefill with the owning cookbook's pre-baked default args (domain
+        // data, supplied via Cookbook::default_args), else the schemars
+        // template. Keeps blut-core domain-agnostic — no hardcoded paths.
+        let buffer = self
+            .registry
+            .default_args(recipe.name)
+            .unwrap_or_else(|| Self::template_for(recipe));
         self.overlay = Overlay::Editor {
             recipe: recipe.name,
             buffer,
@@ -374,7 +401,9 @@ impl App {
     /// r refresh, c cancel, R custom-recipe-picker, j/k vi navigation,
     /// l reserved for U3 log toggle). Recipes beyond the available
     /// hotkeys still show in the menu but require `R` to launch.
-    fn recipe_menu() -> Vec<(Option<char>, &'static crate::recipes::RecipeDef)> {
+    fn recipe_menu(
+        catalog: &[&'static crate::recipes::RecipeDef],
+    ) -> Vec<(Option<char>, &'static crate::recipes::RecipeDef)> {
         use crate::recipes::RecipeCategory;
         let category_order = [
             RecipeCategory::DataPrep,
@@ -384,7 +413,7 @@ impl App {
             RecipeCategory::Pipeline,
             RecipeCategory::User,
         ];
-        let mut sorted: Vec<&'static crate::recipes::RecipeDef> = RECIPES.to_vec();
+        let mut sorted: Vec<&'static crate::recipes::RecipeDef> = catalog.to_vec();
         sorted.sort_by(|a, b| {
             let ai = category_order
                 .iter()
@@ -418,55 +447,6 @@ impl App {
             ('c', BuiltinAction::Cancel, "cancel job"),
             ('R', BuiltinAction::OpenPicker, "custom recipe"),
         ]
-    }
-
-    /// Pre-baked args JSON for the four LamQuant training recipes.
-    /// Points at the corpus paths the rest of the repo uses by
-    /// default. Override via the `R` custom-recipe overlay.
-    fn lamquant_default_args(name: &str) -> Option<String> {
-        let lma = "/mnt/4tb/data/lma";
-        let split = "/mnt/4tb/LamQuant/data/manifests/snn_train_val_split.json";
-        let labels = "/mnt/4tb/LamQuant/ai_models/snn/labels";
-        let eeg = "/mnt/4tb/data/lml/edf.lml";
-        Some(match name {
-            "lamquant_data_prep" => format!(
-                r#"{{
-  "lml_root": "{eeg}",
-  "output_dir": "{lma}"
-}}"#
-            ),
-            "lamquant_snn" => format!(
-                r#"{{
-  "labels_dir": "{labels}",
-  "eeg_dir": "{eeg}",
-  "preset": "production",
-  "subband": true,
-  "epochs": 5,
-  "lma_output_dir": "{lma}",
-  "convert_limit": 1,
-  "split_manifest": "{split}"
-}}"#
-            ),
-            "lamquant_encoder" => format!(
-                r#"{{
-  "lma_output_dir": "{lma}",
-  "split_manifest": "{split}"
-}}"#
-            ),
-            "lamquant_combined_decoder" => format!(
-                r#"{{
-  "lma_output_dir": "{lma}",
-  "split_manifest": "{split}"
-}}"#
-            ),
-            "lamquant_oracle" => format!(
-                r#"{{
-  "lma_output_dir": "{lma}",
-  "split_manifest": "{split}"
-}}"#
-            ),
-            _ => return None,
-        })
     }
 
     fn refresh_jobs(&mut self) {
@@ -627,8 +607,10 @@ impl App {
     }
 }
 
-/// Entrypoint registered as `blut tui`.
-pub async fn run() -> Result<()> {
+/// Entrypoint registered as `blut tui`. The caller (the cookbook binary)
+/// supplies the composed cookbook [`Registry`]; the cockpit's recipe
+/// catalog comes from it, not a static slice.
+pub async fn run(registry: crate::framework::Registry) -> Result<()> {
     // Detect NO_COLOR / TERM=dumb / locale once before the first draw so
     // every theme getter returns the right style (matches lamquant).
     theme::detect("auto", "auto");
@@ -638,7 +620,7 @@ pub async fn run() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut term = Terminal::new(backend).context("terminal")?;
 
-    let result = run_app(&mut term).await;
+    let result = run_app(&mut term, registry).await;
 
     // Always restore the terminal, even on error.
     disable_raw_mode().ok();
@@ -652,8 +634,11 @@ pub async fn run() -> Result<()> {
     result
 }
 
-async fn run_app<B: ratatui::backend::Backend>(term: &mut Terminal<B>) -> Result<()> {
-    let mut app = App::new();
+async fn run_app<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    registry: crate::framework::Registry,
+) -> Result<()> {
+    let mut app = App::new(registry);
     app.refresh_jobs();
     app.refresh_system();
     app.refresh_log();
@@ -729,13 +714,17 @@ fn handle_key(app: &mut App, k: event::KeyEvent) {
             KeyCode::Down | KeyCode::Char('j') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 // TUI-07: clamp to the last filtered row so Down-past-end
                 // stays in range (and Enter never no-ops on a phantom row).
-                let last = App::filter_recipes(query).len().saturating_sub(1);
+                let last = App::filter_recipes(&app.catalog, query)
+                    .len()
+                    .saturating_sub(1);
                 *cursor = (*cursor + 1).min(last);
             }
             KeyCode::Up => *cursor = cursor.saturating_sub(1),
             KeyCode::Down => {
                 // TUI-07: clamp to the last filtered row.
-                let last = App::filter_recipes(query).len().saturating_sub(1);
+                let last = App::filter_recipes(&app.catalog, query)
+                    .len()
+                    .saturating_sub(1);
                 *cursor = (*cursor + 1).min(last);
             }
             KeyCode::Backspace => {
@@ -747,9 +736,9 @@ fn handle_key(app: &mut App, k: event::KeyEvent) {
                 *cursor = 0;
             }
             KeyCode::Enter => {
-                let filtered = App::filter_recipes(query);
+                let filtered = App::filter_recipes(&app.catalog, query);
                 if let Some(idx) = filtered.get(*cursor) {
-                    let recipe = RECIPES[*idx];
+                    let recipe = app.catalog[*idx];
                     app.open_editor(recipe);
                 }
             }
@@ -823,7 +812,7 @@ fn handle_key_cockpit(app: &mut App, k: event::KeyEvent) {
             // Recipe hotkeys (auto-assigned per category order). Opens
             // the args editor prefilled with pre-baked LamQuant defaults
             // (or the schema template for non-lamquant recipes).
-            let menu = App::recipe_menu();
+            let menu = App::recipe_menu(&app.catalog);
             if let Some((_, recipe)) = menu.iter().find(|(k, _)| *k == Some(c)) {
                 app.open_editor(recipe);
             }
@@ -1067,7 +1056,7 @@ fn draw_cockpit_body(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     //   SYSTEM (built-ins). Every BLUT recipe is reachable by its
     //   auto-assigned hotkey (or the [R] picker if it ran out of keys);
     //   every migrated screen is reachable by its capital-letter View key.
-    let menu = App::recipe_menu();
+    let menu = App::recipe_menu(&app.catalog);
     // Bucket recipes by category, preserving recipe_menu() order within
     // each bucket and first-seen category order across buckets.
     use std::collections::BTreeMap;
@@ -1194,12 +1183,12 @@ fn draw_overlay(f: &mut Frame<'_>, app: &App) {
                 width: inner.width,
                 height: inner.height.saturating_sub(2),
             };
-            let filtered = App::filter_recipes(query);
+            let filtered = App::filter_recipes(&app.catalog, query);
             let items: Vec<ListItem> = filtered
                 .iter()
                 .enumerate()
                 .map(|(i, &idx)| {
-                    let r = RECIPES[idx];
+                    let r = app.catalog[idx];
                     let name_style = if i == *cursor {
                         theme::selected()
                     } else {
@@ -1833,7 +1822,7 @@ mod render_tests {
         // Force unicode + color on so the alignment test sees `┌`/`│`/`└`
         // and the section-heading assertions are charset-stable.
         theme::detect("always", "unicode");
-        let mut app = App::new();
+        let mut app = App::new(crate::framework::default_registry());
         // Point the repo root at an empty temp dir so views::* don't pick
         // up stray training_logs / checkpoints from the dev tree.
         let tmp = std::env::temp_dir().join(format!("blut-tui-test-{}", std::process::id()));
@@ -2080,7 +2069,7 @@ mod state_tests {
     /// A fresh `App` with no overlay, cockpit view, pointed at a temp
     /// repo root so nothing in these tests touches the dev tree.
     fn app() -> App {
-        let mut a = App::new();
+        let mut a = App::new(crate::framework::default_registry());
         let tmp = std::env::temp_dir().join(format!(
             "blut-tui-state-{}-{:?}",
             std::process::id(),
@@ -2121,7 +2110,7 @@ mod state_tests {
         handle_key(&mut a, key('R'));
         // Empty query → all recipes; cursor 0 selects the first filtered
         // recipe. Enter opens the args Editor for it.
-        let first = RECIPES[App::filter_recipes("")[0]];
+        let first = RECIPES[App::filter_recipes(RECIPES, "")[0]];
         handle_key(&mut a, code(KeyCode::Enter));
         match &a.overlay {
             Overlay::Editor { recipe, .. } => {
@@ -2216,7 +2205,7 @@ mod state_tests {
 
     #[test]
     fn filter_recipes_empty_query_returns_all() {
-        let all = App::filter_recipes("");
+        let all = App::filter_recipes(RECIPES, "");
         assert_eq!(
             all.len(),
             RECIPES.len(),
@@ -2235,7 +2224,7 @@ mod state_tests {
         // a non-empty subset and every returned recipe's name must
         // actually fuzzy-contain the query subsequence.
         let q = "lamquant";
-        let res = App::filter_recipes(q);
+        let res = App::filter_recipes(RECIPES, q);
         assert!(!res.is_empty(), "`{q}` should match the lamquant recipes");
         for &idx in &res {
             let name = RECIPES[idx].name;
@@ -2246,7 +2235,7 @@ mod state_tests {
         }
         // A more specific query is a strict-or-equal subset of a broader
         // prefix query.
-        let broad = App::filter_recipes("lam");
+        let broad = App::filter_recipes(RECIPES, "lam");
         assert!(
             res.len() <= broad.len(),
             "narrower query must not return more rows than a broader one"
@@ -2257,7 +2246,7 @@ mod state_tests {
     fn filter_recipes_exact_name_ranks_that_recipe_first() {
         // Querying a full recipe name should rank that recipe at the top.
         for r in RECIPES {
-            let res = App::filter_recipes(r.name);
+            let res = App::filter_recipes(RECIPES, r.name);
             assert!(!res.is_empty(), "exact name `{}` matched nothing", r.name);
             assert_eq!(
                 RECIPES[res[0]].name, r.name,
@@ -2270,7 +2259,7 @@ mod state_tests {
     #[test]
     fn filter_recipes_no_match_is_empty() {
         assert!(
-            App::filter_recipes("zzz_definitely_not_a_recipe_zzz").is_empty(),
+            App::filter_recipes(RECIPES, "zzz_definitely_not_a_recipe_zzz").is_empty(),
             "an impossible query must return no rows"
         );
     }
@@ -2330,7 +2319,7 @@ mod state_tests {
 
     #[test]
     fn recipe_menu_has_no_duplicate_hotkeys() {
-        let menu = App::recipe_menu();
+        let menu = App::recipe_menu(RECIPES);
         let mut seen = std::collections::HashSet::new();
         for (key, r) in &menu {
             if let Some(c) = key {
@@ -2349,7 +2338,7 @@ mod state_tests {
         // hotkey or the recipe would shadow (or be shadowed by) the
         // built-in. Mirror the reserved set declared in recipe_menu().
         let reserved: &[char] = &['q', 'Q', 'r', 'R', 'c', 'C', 'j', 'k', 'l'];
-        for (key, r) in App::recipe_menu() {
+        for (key, r) in App::recipe_menu(RECIPES) {
             if let Some(c) = key {
                 assert!(
                     !reserved.contains(&c),
@@ -2362,7 +2351,7 @@ mod state_tests {
 
     #[test]
     fn recipe_menu_lists_every_recipe_once() {
-        let menu = App::recipe_menu();
+        let menu = App::recipe_menu(RECIPES);
         assert_eq!(
             menu.len(),
             RECIPES.len(),
@@ -2452,7 +2441,7 @@ mod state_tests {
         for ch in "lamquant_encoder".chars() {
             handle_key(&mut a, key(ch));
         }
-        let filtered = App::filter_recipes("lamquant_encoder");
+        let filtered = App::filter_recipes(RECIPES, "lamquant_encoder");
         let last = filtered.len().saturating_sub(1);
         // Hammer Down well past the end.
         for _ in 0..50 {
@@ -2461,7 +2450,7 @@ mod state_tests {
         let Overlay::Picker { query, cursor } = &a.overlay else {
             panic!("expected Picker overlay still open");
         };
-        let live = App::filter_recipes(query);
+        let live = App::filter_recipes(RECIPES, query);
         assert!(
             *cursor <= last,
             "cursor {cursor} ran past last filtered index {last} (TUI-07 regressed)"
@@ -2486,7 +2475,7 @@ mod state_tests {
         // last index; Up should walk back without underflowing.
         let mut a = app();
         handle_key(&mut a, key('R'));
-        let last = App::filter_recipes("").len().saturating_sub(1);
+        let last = App::filter_recipes(RECIPES, "").len().saturating_sub(1);
         for _ in 0..(RECIPES.len() + 20) {
             handle_key(&mut a, code(KeyCode::Down));
         }

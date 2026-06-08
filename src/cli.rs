@@ -350,10 +350,10 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Plan { cmd }) => run_plan_cmd(&reg, cmd).await,
         Some(Command::Cache { cmd }) => run_cache_cmd(cmd),
         Some(Command::Stage { cmd }) => run_stage_cmd(cmd).await,
-        Some(Command::Tui) => crate::tui::run().await,
+        Some(Command::Tui) => crate::tui::run(reg).await,
         // Bare `blut` opens the interactive cockpit (T-track). Use
         // `blut train …` for explicit CLI training.
-        None => crate::tui::run().await,
+        None => crate::tui::run(reg).await,
     }
 }
 

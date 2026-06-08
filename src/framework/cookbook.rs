@@ -53,6 +53,14 @@ pub trait Cookbook: Send + Sync + 'static {
     fn artifacts(&self) -> &'static [ArtifactDescriptor] {
         &[]
     }
+    /// Pre-baked args JSON for one of this cookbook's recipes (domain
+    /// data — e.g. default corpus paths), used to prefill the TUI args
+    /// editor. Default `None` so non-domain cookbooks need no impl; the
+    /// TUI falls back to the schemars template. Keeps domain paths OUT of
+    /// blut-core (they live with the cookbook).
+    fn default_args(&self, _recipe: &str) -> Option<String> {
+        None
+    }
 }
 
 /// The built-in cookbook: wraps the existing static `RECIPES`
@@ -84,6 +92,43 @@ impl Cookbook for LamquantCookbook {
     }
     fn recipes(&self) -> &'static [&'static RecipeDef] {
         crate::recipes::recipe::LAMQUANT_RECIPES
+    }
+    /// Pre-baked args JSON for the LamQuant training recipes, pointing at
+    /// the corpus paths the rest of the repo uses by default. (Moved here
+    /// from the TUI so blut-core holds no domain paths.) Overridable via
+    /// the `R` custom-recipe overlay.
+    fn default_args(&self, recipe: &str) -> Option<String> {
+        let lma = "/mnt/4tb/data/lma";
+        let split = "/mnt/4tb/LamQuant/data/manifests/snn_train_val_split.json";
+        let labels = "/mnt/4tb/LamQuant/ai_models/snn/labels";
+        let eeg = "/mnt/4tb/data/lml/edf.lml";
+        Some(match recipe {
+            "lamquant_data_prep" => format!(
+                r#"{{
+  "lml_root": "{eeg}",
+  "output_dir": "{lma}"
+}}"#
+            ),
+            "lamquant_snn" => format!(
+                r#"{{
+  "labels_dir": "{labels}",
+  "eeg_dir": "{eeg}",
+  "preset": "production",
+  "subband": true,
+  "epochs": 5,
+  "lma_output_dir": "{lma}",
+  "convert_limit": 1,
+  "split_manifest": "{split}"
+}}"#
+            ),
+            "lamquant_encoder" | "lamquant_combined_decoder" | "lamquant_oracle" => format!(
+                r#"{{
+  "lma_output_dir": "{lma}",
+  "split_manifest": "{split}"
+}}"#
+            ),
+            _ => return None,
+        })
     }
 }
 
@@ -143,6 +188,13 @@ impl Registry {
         cat: RecipeCategory,
     ) -> impl Iterator<Item = &'static RecipeDef> + '_ {
         self.all().filter(move |r| r.category == cat)
+    }
+
+    /// Pre-baked args JSON for a recipe, from whichever registered
+    /// cookbook owns it (first match wins). `None` if no cookbook
+    /// supplies defaults — the caller falls back to the schema template.
+    pub fn default_args(&self, recipe: &str) -> Option<String> {
+        self.cookbooks.iter().find_map(|c| c.default_args(recipe))
     }
 }
 
