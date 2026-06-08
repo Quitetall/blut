@@ -197,6 +197,12 @@ def validate_joint(model: JointCodec, val_ds, device, quantize=True,
             batch_r = masked_pearson_r_batch(r_crop, x_crop, _cmask_v)
             batch_prd = float(masked_prd_torch(x_crop, r_crop, _cmask_v))
             _bs = r_crop.shape[0]
+            if os.environ.get('LAMQUANT_VAL_DEBUG') and not rs:
+                print(f"[VAL_DEBUG] batch0: x_l3={tuple(x_l3.shape)} "
+                      f"recon={tuple(recon.shape)} "
+                      f"fb_target={None if fb_target is None else tuple(fb_target.shape)} "
+                      f"use_fullband={use_fullband} batch_r={batch_r:.4f} "
+                      f"batch_prd={batch_prd:.2f}", flush=True)
             rs.append((batch_r, _bs))
             prds.append((batch_prd, _bs))
             # Per-category metrics: accumulate R/PRD grouped by clinical category
@@ -223,6 +229,9 @@ def validate_joint(model: JointCodec, val_ds, device, quantize=True,
                 cpu_recon_chunks.append(r_crop[:n].detach().cpu().numpy())
                 cpu_collected += n
 
+    if os.environ.get('LAMQUANT_VAL_DEBUG'):
+        print(f"[VAL_DEBUG] total val batches={len(rs)} "
+              f"total_samples={sum(b for _, b in rs)}", flush=True)
     if not rs:
         empty = (0.0, 0.0, {}, {}) if per_category else (0.0, 0.0, {})
         return empty
@@ -1257,6 +1266,27 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
 
     print(f"  [WARM] best ValR = {best_warm_r:.4f} (FP32, diagnostic only)")
 
+    # Warm-only runs (epochs_quant == 0 — e.g. the E1 FP32 full-residual
+    # probe) never enter the QAT loop where the joint export
+    # (enc_path / dec_path) is written, so without this the run reports those
+    # paths but never creates them and the BLUT stage fails "expected output
+    # missing after success" (ADR 0044). The warm-best IS the final model, so
+    # promote it to the joint export names. (For epochs_quant > 0 this is a
+    # no-op; QAT writes enc_path/dec_path itself.)
+    if cfg.epochs_quant == 0:
+        import shutil
+        _warm_enc = ckpt_dir / f'student_encoder_warm_{cfg.name}.ckpt'
+        _warm_dec = ckpt_dir / f'decoder_warm_{cfg.name}.ckpt'
+        if _warm_enc.exists():
+            shutil.copy2(_warm_enc, enc_path)
+        else:
+            codec.save_encoder(enc_path, provenance={**provenance, 'phase': 'warm-final'})
+        if _warm_dec.exists():
+            shutil.copy2(_warm_dec, dec_path)
+        else:
+            codec.save_decoder(dec_path, provenance={**provenance, 'phase': 'warm-final'})
+        print(f"  [WARM-ONLY] promoted warm best → {enc_path.name} + {dec_path.name}")
+
     # Seed CheckpointManager with warm-phase best so QAT doesn't
     # overwrite a good warm checkpoint with a worse QAT epoch 1.
     # QAT R values are on a different scale (ternary), but starting
@@ -1996,6 +2026,12 @@ def main():
                         help='Override preset QAT epochs.')
     parser.add_argument('--windows-per-epoch', type=int, default=None,
                         help='Override windows sampled per epoch (raise for ceiling).')
+    parser.add_argument('--ckpt-dir', type=str, default=None,
+                        help='Directory for the output checkpoints (enc/dec '
+                             'student_*_{config}.ckpt). Default ROOT_DIR/lamquant/'
+                             'student. BLUT passes a run-id-stamped dir so '
+                             'concurrent same-preset runs do not clobber (ADR 0044 '
+                             '#257); the stage stats exactly these files.')
     parser.add_argument('--soap-max-precond-dim', type=int, default=10000,
                         help='SOAP full-matrix preconditioner dim cap; tensors '
                         'wider than this fall back to diagonal. Default 10000 '
@@ -2048,6 +2084,7 @@ def main():
         print(f"[*] config overrides: {_ov}")
     tier = args.tier if args.tier is not None else DEPLOYMENT_TIERS[args.deployment]
     result = run(cfg, vocos_tier=tier, seed=args.seed,
+                 ckpt_dir=args.ckpt_dir,
                  fullband_mode=args.fullband_mode,
                  amp=args.amp, compile_decoder=args.compile_decoder,
                  asymmetric_weight=args.asymmetric_weight,
@@ -2077,7 +2114,15 @@ def main():
                  n_range=(args.n_min, args.n_max),
                  diagnostics=args.diagnostics,
                  logger_backend=args.logger)
-    return 0 if result['best_val_r'] > 0 else 1
+    # Exit 0 = training RAN TO COMPLETION (ADR 0044). Quality (R/PRD/LQS)
+    # is reported above and enforced by the PCCP gate stage downstream — it
+    # is NOT the trainer's job to gate via the process exit code. The old
+    # `0 if best_val_r > 0 else 1` made a completed probe whose R legitimately
+    # starts at/near 0 (e.g. E1 early epochs, or a from-scratch warm-only run)
+    # look like a subprocess FAILURE to the BLUT backend, failing the recipe
+    # even though the checkpoints were written. A genuine crash raises and
+    # propagates a nonzero exit on its own.
+    return 0
 
 
 if __name__ == '__main__':
