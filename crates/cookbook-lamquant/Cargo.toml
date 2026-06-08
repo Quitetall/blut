@@ -1,0 +1,18 @@
+# blut-lamquant cookbook (TRANSITIONAL in-tree workspace member).
+# Splits to its own repo `blut-lamquant` at C2c. Depends on the blut
+# framework crate; will own the LamQuant recipes / stages / artifacts /
+# backend + the python/lamquant payload once the atomic move (C2a) lands.
+[package]
+name = "cookbook-lamquant"
+version = "0.1.0"
+edition = "2024"
+authors = ["Brian Lam"]
+license = "MIT"
+description = "LamQuant cookbook for BLUT — neural EEG codec training (encoder/oracle/SNN/decoder/joint) → PCCP gate."
+rust-version = "1.85"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+blut = { path = "../.." }

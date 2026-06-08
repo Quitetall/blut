@@ -1,0 +1,18 @@
+# blut-lamu cookbook (TRANSITIONAL in-tree workspace member).
+# Splits to its own repo `blut-lamu` at C2c. The lamu tool's cookbook:
+# generic-LLM training (SFT / DPO / distillation / eval) over the lamu +
+# hf_trainer backends. Depends on the blut framework crate.
+[package]
+name = "cookbook-lamu"
+version = "0.1.0"
+edition = "2024"
+authors = ["Brian Lam"]
+license = "MIT"
+description = "lamu cookbook for BLUT — generic LLM training (SFT/DPO/distill/eval) over llama.cpp + HuggingFace Trainer backends."
+rust-version = "1.85"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+blut = { path = "../.." }

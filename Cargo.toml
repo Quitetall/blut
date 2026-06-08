@@ -1,3 +1,11 @@
+# BLUT is becoming a cargo WORKSPACE: the `blut` package (here) is the
+# domain-agnostic engine; each cookbook is a member crate that depends on
+# it. In-tree members are TRANSITIONAL — they split to their own repos
+# (blut-lamquant, blut-lamu) at C2c. See [[project_blut_cookbook_split]].
+[workspace]
+members = [".", "crates/cookbook-lamquant", "crates/cookbook-lamu"]
+resolver = "3"
+
 [package]
 name = "blut"
 version = "0.1.0"
