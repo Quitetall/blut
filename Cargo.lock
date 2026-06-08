@@ -368,11 +368,20 @@ name = "cookbook-lamquant"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "blut",
+ "dirs",
  "nix",
+ "parking_lot",
+ "schemars",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
+ "tracing",
+ "which",
 ]
 
 [[package]]

@@ -8,9 +8,9 @@
 //! Two flavors:
 //!
 //!   - **Backend-coupled**: a stage that shells out to one
-//!     specific backend (e.g. `LamquantTrainMambaSnn` only makes
-//!     sense via `LamquantBackend`). Provide a single
-//!     `impl Compatible<LamquantBackend> for LamquantTrainMambaSnn`.
+//!     specific backend (e.g. an SFT stage only makes sense via
+//!     `LamuTrainerBackend`). Provide a single
+//!     `impl Compatible<LamuTrainerBackend> for SftTrain`.
 //!
 //!   - **Backend-agnostic**: pure-data stages (filter, split,
 //!     projection) work in any plan. Provide a blanket

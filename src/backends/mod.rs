@@ -1,9 +1,9 @@
 //! Backend abstraction.
 //!
 //! BLUT is an orchestrator. Concrete training engines (HuggingFace
-//! Trainer, the LAMU `trainer.py` wire, the LamQuant kernel
-//! catalog) implement `TrainingBackend` and live in submodules
-//! under `backends/`. Each backend brings its own subprocess
+//! Trainer, the LAMU `trainer.py` wire, plus domain backends supplied
+//! by cookbook crates) implement `TrainingBackend` and live in
+//! submodules under `backends/`. Each backend brings its own subprocess
 //! runner, its own typed stages (under `backends/<id>/stages/`),
 //! and — most importantly — its own identity.
 //!
@@ -30,7 +30,6 @@
 //! `AgnosticStage` and slot into any plan via a blanket impl.
 
 pub mod hf_trainer;
-pub mod lamquant;
 pub mod lamu;
 
 /// Marker trait for training backend identity. Every concrete
@@ -71,18 +70,8 @@ impl TrainingBackend for LamuTrainerBackend {
         "LAMU trainer.py (TrainSpec JSON / StatusUpdate wire). Original backend.";
 }
 
-/// LamQuant kernel catalog. Each kernel is a bespoke argparse
-/// Python script (train_joint, train_mamba_snn, train_teacher,
-/// etc). The runner streams stdout + parses tqdm progress.
-/// Stages are NOT interchangeable with HF / LAMU — LamQuant
-/// kernels are domain-specific (seizure detection, EEG encoder
-/// quantization). Recipes under this backend stay bespoke.
-pub struct LamquantBackend;
-impl TrainingBackend for LamquantBackend {
-    const ID: &'static str = "lamquant";
-    const DESCRIPTION: &'static str =
-        "LamQuant argparse kernels (EEG encoder / decoder / SNN / teacher). Bespoke per-paradigm.";
-}
+// The LamQuant kernel backend (marker + argparse runner) lives in the
+// `cookbook-lamquant` crate (C2a) — blut-core ships no domain backend.
 
 #[cfg(test)]
 mod tests {
@@ -90,11 +79,7 @@ mod tests {
 
     #[test]
     fn backend_ids_are_unique() {
-        let ids = [
-            HfTrainerBackend::ID,
-            LamuTrainerBackend::ID,
-            LamquantBackend::ID,
-        ];
+        let ids = [HfTrainerBackend::ID, LamuTrainerBackend::ID];
         let unique: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(ids.len(), unique.len(), "backend IDs must be unique");
     }
@@ -106,6 +91,5 @@ mod tests {
         // renames here.
         assert_eq!(HfTrainerBackend::ID, "hf_trainer");
         assert_eq!(LamuTrainerBackend::ID, "lamu");
-        assert_eq!(LamquantBackend::ID, "lamquant");
     }
 }

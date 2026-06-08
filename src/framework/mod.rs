@@ -39,8 +39,8 @@ pub use artifact::{Artifact, ArtifactMetadata, ContentHash};
 pub use cache::{CacheHandle, CacheHit, lru_prune};
 pub use compat::Compatible;
 pub use cookbook::{
-    ArtifactDescriptor, BuiltinCookbook, Cookbook, LamquantCookbook, LamuCookbook, Registry,
-    StageDescriptor, default_registry,
+    ArtifactDescriptor, BuiltinCookbook, Cookbook, LamuCookbook, Registry, StageDescriptor,
+    default_registry,
 };
 pub use error::{PlanError, RecipeError, StageError};
 pub use executor::{ExecCtx, PlanResult, SequentialExecutor};

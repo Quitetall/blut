@@ -20,11 +20,12 @@
 //!     `materialize_conversations`, `materialize_dataset_path`
 //!     all touch lamu surface area; tagged LAMU.
 //!
-//!   - **LAMQUANT-coupled**: every `lamquant_*` stage shells out
-//!     to a LamQuant kernel script under `$LAMQUANT_HOME`.
-//!     Always backend = LamquantBackend.
+//! Domain-backend stages (e.g. the LamQuant kernel stages) carry their
+//! own `Compatible<...>` impls in their owning cookbook crate (orphan
+//! rule: the stage types + backend are local there), so they are NOT
+//! listed here.
 
-use crate::backends::{HfTrainerBackend, LamquantBackend, LamuTrainerBackend, TrainingBackend};
+use crate::backends::{HfTrainerBackend, LamuTrainerBackend, TrainingBackend};
 use crate::framework::Compatible;
 
 use crate::stages::*;
@@ -67,31 +68,6 @@ impl Compatible<HfTrainerBackend> for RegisterDataset {}
 impl Compatible<HfTrainerBackend> for ConvertGguf {}
 impl Compatible<HfTrainerBackend> for RegisterModel {}
 
-// ── LAMQUANT-coupled stages ────────────────────────────────────
-//
-// Every `lamquant_*` stage shells out to a LamQuant kernel.
-
-impl Compatible<LamquantBackend> for LamquantBuildManifest {}
-impl Compatible<LamquantBackend> for LamquantBuildSplitManifest {}
-impl Compatible<LamquantBackend> for LamquantConvertLma {}
-impl Compatible<LamquantBackend> for LamquantEncodeLma {}
-impl Compatible<LamquantBackend> for LamquantExportFirmware {}
-impl Compatible<LamquantBackend> for LamquantGenerateSnnLabels {}
-impl Compatible<LamquantBackend> for LamquantHardenArtifacts {}
-impl Compatible<LamquantBackend> for LamquantPrecomputeFullband {}
-impl Compatible<LamquantBackend> for LamquantPrecomputeL3 {}
-impl Compatible<LamquantBackend> for LamquantPretrainMae {}
-impl Compatible<LamquantBackend> for LamquantTrainTeacher {}
-impl Compatible<LamquantBackend> for LamquantTrainL3Teacher {}
-impl Compatible<LamquantBackend> for LamquantTrainJoint {}
-impl Compatible<LamquantBackend> for LamquantTrainStudent {}
-impl Compatible<LamquantBackend> for LamquantTrainVocosDecoder {}
-impl Compatible<LamquantBackend> for LamquantTrainCombined {}
-impl Compatible<LamquantBackend> for LamquantTrainMambaSnn {}
-impl Compatible<LamquantBackend> for LamquantPccpGateSnn {}
-impl Compatible<LamquantBackend> for LamquantPccpGateEncoder {}
-impl Compatible<LamquantBackend> for LamquantPccpGateDecoder {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,14 +79,10 @@ mod tests {
     // exactly the auditing property we want.
 
     fn _agnostic_witness<
-        S: Stage
-            + Compatible<HfTrainerBackend>
-            + Compatible<LamuTrainerBackend>
-            + Compatible<LamquantBackend>,
+        S: Stage + Compatible<HfTrainerBackend> + Compatible<LamuTrainerBackend>,
     >() {
     }
     fn _lamu_witness<S: Stage + Compatible<LamuTrainerBackend>>() {}
-    fn _lamquant_witness<S: Stage + Compatible<LamquantBackend>>() {}
 
     #[test]
     fn agnostic_compose_witnesses() {
@@ -126,13 +98,5 @@ mod tests {
         _lamu_witness::<DistillTrain>();
         _lamu_witness::<ConvertGguf>();
         _lamu_witness::<RegisterModel>();
-    }
-
-    #[test]
-    fn lamquant_witnesses() {
-        _lamquant_witness::<LamquantBuildManifest>();
-        _lamquant_witness::<LamquantTrainMambaSnn>();
-        _lamquant_witness::<LamquantTrainJoint>();
-        _lamquant_witness::<LamquantPccpGateSnn>();
     }
 }

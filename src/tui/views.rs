@@ -458,24 +458,20 @@ pub fn reset(root: &Path, action: ResetAction) -> String {
     }
 }
 
-/// `_screen_export` — write each built-in preset to a YAML/JSON file at
+/// `_screen_export` — write each recipe's args schema to a JSON file at
 /// the repo root for reproducible setup capture. Since the recipe Args
 /// are the source of truth now (ADR 0017), we export the recipe-args
-/// JSON schema templates for the four LamQuant training recipes.
-pub fn export_presets(root: &Path) -> String {
-    use crate::recipes::recipe::find;
-    let recipes = [
-        "lamquant_data_prep",
-        "lamquant_encoder",
-        "lamquant_snn",
-        "lamquant_oracle",
-    ];
+/// JSON schema templates for every recipe in the injected catalog
+/// (domain-agnostic: the catalog is composed from the registered
+/// cookbooks, so this covers whatever recipes are loaded).
+pub fn export_presets(
+    root: &Path,
+    catalog: &[&'static crate::recipes::recipe::RecipeDef],
+) -> String {
     let mut written = 0;
     let mut errs = 0;
-    for name in recipes {
-        let Some(r) = find(name) else {
-            continue;
-        };
+    for r in catalog {
+        let name = r.name;
         let schema = (r.args_schema_fn)();
         let out_path = root.join(format!("recipe_args_{name}.json"));
         match serde_json::to_string_pretty(&schema)

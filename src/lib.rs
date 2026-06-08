@@ -58,9 +58,6 @@ pub mod tui;
 pub mod python_backend {
     pub use crate::backends::lamu::python_backend::*;
 }
-pub mod lamquant_backend {
-    pub use crate::backends::lamquant::runner::*;
-}
 
 /// Process-wide lock for tests that mutate environment variables.
 /// Multiple test modules touch `LAMU_TRAIN_*` env vars; without a

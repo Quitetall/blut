@@ -31,8 +31,8 @@ pub trait Recipe: Send + Sync + 'static {
 #[serde(rename_all = "snake_case")]
 pub enum RecipeCategory {
     /// Recipes that prepare / convert / index raw input → typed
-    /// artifacts (e.g. `lamquant_data_prep` packs an LML tree into
-    /// `LmaCorpus`).
+    /// artifacts (e.g. a data-prep recipe packs a corpus into a typed
+    /// artifact).
     DataPrep,
     /// Recipes that consume artifacts + produce checkpoints
     /// (`SnnCkpt`, `JointCkpt`, `HfCheckpoint`, etc.).
@@ -42,8 +42,8 @@ pub enum RecipeCategory {
     /// Recipes that take a checkpoint + materialize a deployable
     /// artifact (`HardenedCkpt`, `FirmwareBundle`, `GgufModel`).
     Export,
-    /// Recipes that chain multiple categories end-to-end (e.g.
-    /// `lamquant_snn` = data prep → train → PCCP gate).
+    /// Recipes that chain multiple categories end-to-end (e.g. a
+    /// pipeline recipe = data prep → train → gate).
     Pipeline,
     /// User-authored recipes from `blut/src/recipes/user/`.
     User,
@@ -112,33 +112,22 @@ pub fn swap_candidates(of: &'static RecipeDef) -> impl Iterator<Item = &'static 
 /// fn-pointers that can't be Copy-moved into an array initializer.
 /// Each entry is a reference to the `pub static DEF` defined
 /// inside its recipe module.
-/// The full catalog = the union of every cookbook's recipes. Grouped
-/// by owning cookbook (see `LAMU_RECIPES` / `LAMQUANT_RECIPES`). This
-/// union is the transitional in-crate source; once the cookbooks move
-/// to their own crates (C2a/C2b) the catalog is composed at runtime by
-/// the [`crate::framework::Registry`] and this slice goes away. The TUI
-/// + several tests still index it positionally, so it stays for now.
+/// blut-core's built-in catalog: the lamu recipes (see `LAMU_RECIPES`).
+/// This is the transitional in-crate source for blut-core's own
+/// cookbook; domain cookbooks (e.g. `cookbook-lamquant`, moved out at
+/// C2a) register their recipes separately and the catalog is composed
+/// at runtime by the [`crate::framework::Registry`]. Several tests still
+/// index this slice, so it stays until the lamu recipes move (C2b).
 pub static RECIPES: &[&RecipeDef] = &[
     // ── blut-lamu cookbook (generic LLM: lamu + hf_trainer backends);
-    //    canonical members in LAMU_RECIPES. ORDER PRESERVED verbatim
-    //    (hf_finetune stays LAST) so the TUI's positional indices into
-    //    RECIPES are unchanged until the TUI is rewired off the slice. ──
+    //    canonical members mirror LAMU_RECIPES. The lamquant cookbook's
+    //    recipes moved to the `cookbook-lamquant` crate at C2a; blut-core
+    //    now ships only the lamu recipes. hf_finetune stays LAST. ──
     &crate::recipes::finetune_from_conversations::DEF,
     &crate::recipes::finetune_from_dataset::DEF,
     &crate::recipes::dpo_from_preferences::DEF,
     &crate::recipes::eval_suite::DEF,
     &crate::recipes::distill_from_teacher::DEF,
-    // ── blut-lamquant cookbook (neural EEG codec); see LAMQUANT_RECIPES ──
-    &crate::recipes::lamquant_data_prep::DEF,
-    &crate::recipes::lamquant_combined_decoder::DEF,
-    &crate::recipes::lamquant_snn::DEF,
-    &crate::recipes::lamquant_encoder::DEF,
-    &crate::recipes::lamquant_joint_codec::DEF,
-    &crate::recipes::lamquant_oracle::DEF,
-    &crate::recipes::lamquant_full_pipeline::DEF,
-    // hf_finetune is a blut-lamu recipe but kept LAST here to preserve the
-    // pre-C1 positional order (TUI stability). It is grouped with lamu in
-    // LAMU_RECIPES — RECIPES order ≠ cookbook membership.
     &crate::recipes::hf_finetune_from_dataset::DEF,
 ];
 
@@ -153,19 +142,6 @@ pub static LAMU_RECIPES: &[&RecipeDef] = &[
     &crate::recipes::eval_suite::DEF,
     &crate::recipes::distill_from_teacher::DEF,
     &crate::recipes::hf_finetune_from_dataset::DEF,
-];
-
-/// Recipes owned by the **blut-lamquant** cookbook (neural EEG codec).
-/// Transitional in-crate home — moves to the `blut-lamquant` cookbook
-/// crate/repo (C2a).
-pub static LAMQUANT_RECIPES: &[&RecipeDef] = &[
-    &crate::recipes::lamquant_data_prep::DEF,
-    &crate::recipes::lamquant_combined_decoder::DEF,
-    &crate::recipes::lamquant_snn::DEF,
-    &crate::recipes::lamquant_encoder::DEF,
-    &crate::recipes::lamquant_joint_codec::DEF,
-    &crate::recipes::lamquant_oracle::DEF,
-    &crate::recipes::lamquant_full_pipeline::DEF,
 ];
 
 pub fn find(name: &str) -> Option<&'static RecipeDef> {

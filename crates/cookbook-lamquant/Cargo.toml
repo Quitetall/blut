@@ -24,9 +24,25 @@ path = "src/main.rs"
 blut = { path = "../.." }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
+# Deps used by the moved LamQuant recipes / stages / artifacts /
+# backend (versions match the blut crate). serde + schemars: typed Args
+# (Serialize / Deserialize / JsonSchema). serde_json: manifest +
+# RunManifest parsing. async-trait: the Stage impls. thiserror: stage
+# error enums. tracing: stage progress. parking_lot: runner child-pid
+# mutex. dirs: home-dir fallbacks. sha2: artifact fingerprints. which:
+# script preflight.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+thiserror = "1"
+tracing = "0.1"
+async-trait = "0.1"
+parking_lot = "0.12"
+dirs = "5"
+sha2 = "0.10"
+which = "6"
 
 [dev-dependencies]
 # tokio is already a normal dependency (the bin uses it); tests inherit it.
 tempfile = "3"
-serde_json = "1"
 nix = { version = "0.29", features = ["signal", "process"] }

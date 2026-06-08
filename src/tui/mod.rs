@@ -867,7 +867,7 @@ fn handle_key_detail(app: &mut App, k: event::KeyEvent) {
         }
         // Export config (Python cockpit [e]) — only on the Reset view.
         KeyCode::Char('e') if app.view == View::Reset => {
-            let msg = views::export_presets(&app.repo_root);
+            let msg = views::export_presets(&app.repo_root, &app.catalog);
             app.set_status(msg);
         }
         _ => {}
@@ -1967,18 +1967,25 @@ mod render_tests {
         app.view = View::Cockpit;
         let buf = render_to_test_backend(&mut app, 120, 60);
         let text = buffer_text(&buf);
-        // The hub-convention section headings + the BLUT recipe-category
-        // headings must all be present (parity with the lamquant cockpit).
-        for heading in [
-            "DATA PREPARATION",
-            "PIPELINE",
-            "DIAGNOSTICS",
-            "PLANNING",
-            "SYSTEM",
-        ] {
+        // The always-present (non-recipe-driven) section headings must
+        // render regardless of which cookbooks are registered. The
+        // recipe-category headings (DATA PREPARATION / PIPELINE / …) are
+        // data-driven off the injected catalog — blut-core's default
+        // registry is lamu-only (no DataPrep/Pipeline recipes; those live
+        // in cookbook-lamquant since C2a), so they are asserted in the
+        // cookbook crate's TUI tests, not here.
+        for heading in ["DIAGNOSTICS", "PLANNING", "SYSTEM"] {
             assert!(
                 text.contains(heading),
                 "cockpit menu missing section heading `{heading}`"
+            );
+        }
+        // The lamu catalog's own categories must still render their
+        // headings (proves the recipe-category section path works).
+        for heading in ["TRAINING", "EVALUATION"] {
+            assert!(
+                text.contains(heading),
+                "cockpit menu missing lamu recipe-category heading `{heading}`"
             );
         }
         // The Pipeline status + Resources boxes are present by title.
@@ -2220,12 +2227,12 @@ mod state_tests {
 
     #[test]
     fn filter_recipes_subset_query_orders_best_first() {
-        // "lamquant" matches every lamquant_* recipe; the result must be
+        // "finetune" matches every finetune_* recipe; the result must be
         // a non-empty subset and every returned recipe's name must
         // actually fuzzy-contain the query subsequence.
-        let q = "lamquant";
+        let q = "finetune";
         let res = App::filter_recipes(RECIPES, q);
-        assert!(!res.is_empty(), "`{q}` should match the lamquant recipes");
+        assert!(!res.is_empty(), "`{q}` should match the finetune recipes");
         for &idx in &res {
             let name = RECIPES[idx].name;
             assert!(
@@ -2235,7 +2242,7 @@ mod state_tests {
         }
         // A more specific query is a strict-or-equal subset of a broader
         // prefix query.
-        let broad = App::filter_recipes(RECIPES, "lam");
+        let broad = App::filter_recipes(RECIPES, "fine");
         assert!(
             res.len() <= broad.len(),
             "narrower query must not return more rows than a broader one"
@@ -2438,10 +2445,10 @@ mod state_tests {
         let mut a = app();
         handle_key(&mut a, key('R'));
         // Type a query that matches exactly one recipe.
-        for ch in "lamquant_encoder".chars() {
+        for ch in "finetune_from_dataset".chars() {
             handle_key(&mut a, key(ch));
         }
-        let filtered = App::filter_recipes(RECIPES, "lamquant_encoder");
+        let filtered = App::filter_recipes(RECIPES, "finetune_from_dataset");
         let last = filtered.len().saturating_sub(1);
         // Hammer Down well past the end.
         for _ in 0..50 {

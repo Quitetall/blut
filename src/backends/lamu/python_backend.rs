@@ -223,7 +223,8 @@ impl TrainBackend for PythonTrainBackend {
 
 /// Re-export for `jobs::cancel_job` callers. The implementation
 /// now lives in `crate::python_kill::graceful_kill_pid` and is
-/// shared with `LamquantBackend` + any future subprocess backend.
+/// shared with the cookbook subprocess runners + any future
+/// subprocess backend.
 pub(crate) use crate::python_kill::graceful_kill_pid;
 
 async fn graceful_kill(pid: u32) {

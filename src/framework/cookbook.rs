@@ -4,10 +4,11 @@
 //! a bundle of recipes plus the stages / artifacts they reference. The
 //! CLI now reads its recipe catalog from [`default_registry`] (the
 //! union of the registered cookbooks), NOT the static `RECIPES` slice
-//! directly. Two real cookbooks are registered — [`LamuCookbook`] and
-//! [`LamquantCookbook`] — both still living in-crate (TRANSITIONAL).
-//! [`BuiltinCookbook`] (wrapping the full static slice) is retained for
-//! the TUI + back-compat parity tests until the cookbooks move out.
+//! directly. blut-core ships the [`LamuCookbook`] (its built-in lamu
+//! recipes); domain cookbooks (e.g. `cookbook-lamquant`, moved out at
+//! C2a) register their own recipes at runtime via [`Registry`].
+//! [`BuiltinCookbook`] (wrapping the static slice) is retained for the
+//! TUI + back-compat parity tests until the lamu recipes move out too.
 //!
 //! Remaining lanes (`[[project_blut_cookbook_split]]`): move each
 //! cookbook (recipes + stages + artifacts + backend + python) to its
@@ -75,60 +76,6 @@ impl Cookbook for BuiltinCookbook {
     }
     fn recipes(&self) -> &'static [&'static RecipeDef] {
         crate::recipes::recipe::RECIPES
-    }
-}
-
-/// The LamQuant cookbook (neural EEG codec): the 7 `lamquant_*` recipes.
-/// TRANSITIONAL in-crate home — the real cookbook (recipes + stages +
-/// artifacts + backend + `python/lamquant/`) moves to the dedicated
-/// `blut-lamquant` crate/repo (C2a), at which point this struct and its
-/// recipe references leave blut-core entirely. See
-/// `[[project_blut_cookbook_split]]`.
-pub struct LamquantCookbook;
-
-impl Cookbook for LamquantCookbook {
-    fn name(&self) -> &'static str {
-        "lamquant"
-    }
-    fn recipes(&self) -> &'static [&'static RecipeDef] {
-        crate::recipes::recipe::LAMQUANT_RECIPES
-    }
-    /// Pre-baked args JSON for the LamQuant training recipes, pointing at
-    /// the corpus paths the rest of the repo uses by default. (Moved here
-    /// from the TUI so blut-core holds no domain paths.) Overridable via
-    /// the `R` custom-recipe overlay.
-    fn default_args(&self, recipe: &str) -> Option<String> {
-        let lma = "/mnt/4tb/data/lma";
-        let split = "/mnt/4tb/LamQuant/data/manifests/snn_train_val_split.json";
-        let labels = "/mnt/4tb/LamQuant/ai_models/snn/labels";
-        let eeg = "/mnt/4tb/data/lml/edf.lml";
-        Some(match recipe {
-            "lamquant_data_prep" => format!(
-                r#"{{
-  "lml_root": "{eeg}",
-  "output_dir": "{lma}"
-}}"#
-            ),
-            "lamquant_snn" => format!(
-                r#"{{
-  "labels_dir": "{labels}",
-  "eeg_dir": "{eeg}",
-  "preset": "production",
-  "subband": true,
-  "epochs": 5,
-  "lma_output_dir": "{lma}",
-  "convert_limit": 1,
-  "split_manifest": "{split}"
-}}"#
-            ),
-            "lamquant_encoder" | "lamquant_combined_decoder" | "lamquant_oracle" => format!(
-                r#"{{
-  "lma_output_dir": "{lma}",
-  "split_manifest": "{split}"
-}}"#
-            ),
-            _ => return None,
-        })
     }
 }
 
@@ -214,7 +161,6 @@ impl Default for Registry {
 pub fn default_registry() -> Registry {
     let mut r = Registry::new();
     r.register(Box::new(LamuCookbook));
-    r.register(Box::new(LamquantCookbook));
     r
 }
 
@@ -231,17 +177,17 @@ mod tests {
     #[test]
     fn registry_with_builtin_finds_known() {
         let r = Registry::with_builtin();
-        assert!(r.find("lamquant_encoder").is_some());
+        assert!(r.find("finetune_from_dataset").is_some());
         assert!(r.find("nope").is_none());
     }
 
     #[test]
     fn registry_by_category_filters() {
-        // Train category must include the standalone joint-codec recipe.
+        // Train category must include the standalone finetune recipe.
         let r = Registry::with_builtin();
         assert!(
             r.by_category(RecipeCategory::Train)
-                .any(|r| r.name == "lamquant_joint_codec")
+                .any(|r| r.name == "finetune_from_dataset")
         );
     }
 
@@ -268,26 +214,22 @@ mod tests {
     #[test]
     fn default_registry_composes_full_catalog() {
         use std::collections::BTreeSet;
-        // The two real cookbooks (lamu + lamquant) must compose to
-        // exactly the full static catalog — same names, no overlap, no
-        // gap. This is the C1 invariant: the catalog = union of
-        // registered cookbooks.
+        // blut-core's default registry holds exactly its built-in lamu
+        // cookbook — which must compose to exactly the static `RECIPES`
+        // slice (the lamquant cookbook moved to `cookbook-lamquant` at
+        // C2a; the full lamu+lamquant partition invariant now lives at
+        // the binary/workspace tier, where both cookbooks are visible).
         let reg = default_registry();
         let composed: BTreeSet<&str> = reg.all().map(|r| r.name).collect();
         let union: BTreeSet<&str> = RECIPES.iter().map(|r| r.name).collect();
-        // The set comparison is the DISJOINTNESS guard: a name duplicated
-        // across both sub-slices collapses in `composed` but not in the
-        // length sum, so set-equality would fail.
-        assert_eq!(composed, union, "cookbooks must cover RECIPES exactly");
-        // The length sum is the COMPLETENESS guard (no recipe in a
-        // sub-slice that's missing from RECIPES, and vice-versa).
+        assert_eq!(composed, union, "lamu cookbook must cover RECIPES exactly");
+        // Completeness guard: blut-core's RECIPES == LAMU_RECIPES now.
         assert_eq!(
-            recipe::LAMU_RECIPES.len() + recipe::LAMQUANT_RECIPES.len(),
+            recipe::LAMU_RECIPES.len(),
             RECIPES.len(),
-            "LAMU + LAMQUANT must partition RECIPES (disjoint + complete)"
+            "LAMU cookbook must cover RECIPES exactly (domain cookbooks moved out at C2a)"
         );
-        // Cookbook identities resolve.
-        assert_eq!(LamquantCookbook.name(), "lamquant");
+        // Cookbook identity resolves.
         assert_eq!(LamuCookbook.name(), "lamu");
     }
 }
