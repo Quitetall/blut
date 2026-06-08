@@ -16,9 +16,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
-use blut::scheduler_lock::{self, LockKind};
-use blut::{
+use crate::scheduler_lock::{self, LockKind};
+use crate::{
     backend::{StatusFn, TrainBackend},
     convert,
     jobs::{self, JobState},
@@ -27,6 +26,7 @@ use blut::{
     python_backend::PythonTrainBackend,
     spec::{DatasetSource, Method, Optim, TrainSpec},
 };
+use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
@@ -330,8 +330,12 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| format!("{e}"))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// BLUT CLI entrypoint. The recipe catalog is supplied by the caller as
+/// a composed [`Registry`] (the binary — in a cookbook crate — registers
+/// the cookbooks it ships and passes them here). This is the lib seam
+/// that lets blut-core stay domain-agnostic: a bare blut engine binary
+/// would pass an empty registry; the cookbook binaries pass theirs.
+pub async fn run(reg: crate::framework::Registry) -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     match cli.command {
@@ -342,14 +346,14 @@ async fn main() -> Result<()> {
         Some(Command::Data { cmd }) => run_data(cmd),
         Some(Command::Auto) => run_auto().await,
         Some(Command::Policy { cmd }) => run_policy(cmd),
-        Some(Command::Recipe { cmd }) => run_recipe(cmd).await,
-        Some(Command::Plan { cmd }) => run_plan_cmd(cmd).await,
+        Some(Command::Recipe { cmd }) => run_recipe(&reg, cmd).await,
+        Some(Command::Plan { cmd }) => run_plan_cmd(&reg, cmd).await,
         Some(Command::Cache { cmd }) => run_cache_cmd(cmd),
         Some(Command::Stage { cmd }) => run_stage_cmd(cmd).await,
-        Some(Command::Tui) => blut::tui::run().await,
+        Some(Command::Tui) => crate::tui::run().await,
         // Bare `blut` opens the interactive cockpit (T-track). Use
         // `blut train …` for explicit CLI training.
-        None => blut::tui::run().await,
+        None => crate::tui::run().await,
     }
 }
 
@@ -379,13 +383,12 @@ impl RecipeMarker {
     }
 }
 
-async fn run_plan_cmd(cmd: PlanCommand) -> Result<()> {
-    use blut::framework::{CacheHandle, ExecCtx, SequentialExecutor, default_registry};
-    // C1: resolve recipes via the cookbook registry (not the static slice).
-    let reg = default_registry();
+async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Result<()> {
+    use crate::framework::{CacheHandle, ExecCtx, SequentialExecutor};
+    // Recipes resolve via the caller-supplied cookbook registry.
     match cmd {
         PlanCommand::Resume { id, shared_cache } => {
-            let job_id = blut::jobs::resolve_job_id(&id).with_context(|| {
+            let job_id = crate::jobs::resolve_job_id(&id).with_context(|| {
                 format!("resolve job id '{id}' (ambiguous prefix or missing job)")
             })?;
             let job_dir =
@@ -414,7 +417,7 @@ async fn run_plan_cmd(cmd: PlanCommand) -> Result<()> {
                 }
             }
 
-            blut::jobs::write_state(&job_id, JobState::Running)
+            crate::jobs::write_state(&job_id, JobState::Running)
                 .with_context(|| format!("write Running state for {job_id}"))?;
 
             // GPU lock — same arbitration as initial runs. Without
@@ -426,7 +429,7 @@ async fn run_plan_cmd(cmd: PlanCommand) -> Result<()> {
             ) {
                 Ok(l) => l,
                 Err(e) => {
-                    if let Err(se) = blut::jobs::write_state(&job_id, JobState::Failed) {
+                    if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
                         tracing::warn!("write Failed state for {job_id}: {se}");
                     }
                     return Err(anyhow!("acquire_exclusive: {e}"));
@@ -440,7 +443,7 @@ async fn run_plan_cmd(cmd: PlanCommand) -> Result<()> {
             drop(lock);
             match result {
                 Ok(r) => {
-                    blut::jobs::write_state(&job_id, JobState::Done)
+                    crate::jobs::write_state(&job_id, JobState::Done)
                         .with_context(|| format!("write Done state for {job_id}"))?;
                     eprintln!(
                         "done — {} stages, {} cache hits, {} misses, elapsed {:?}",
@@ -449,7 +452,7 @@ async fn run_plan_cmd(cmd: PlanCommand) -> Result<()> {
                     Ok(())
                 }
                 Err(e) => {
-                    if let Err(se) = blut::jobs::write_state(&job_id, JobState::Failed) {
+                    if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
                         tracing::warn!("write Failed state for {job_id}: {se}");
                     }
                     Err(anyhow!("plan execution failed: {e}"))
@@ -473,7 +476,7 @@ async fn run_plan_cmd(cmd: PlanCommand) -> Result<()> {
 }
 
 fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
-    use blut::framework::CacheHandle;
+    use crate::framework::CacheHandle;
     let global = CacheHandle::default_global_path()
         .ok_or_else(|| anyhow!("could not determine global cache path"))?;
     match cmd {
@@ -498,7 +501,7 @@ fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
                 })
                 .unwrap_or(50.0);
             let cap_bytes = (cap_gb * 1024.0 * 1024.0 * 1024.0) as u64;
-            let freed = blut::framework::cache::lru_prune(&global, cap_bytes)
+            let freed = crate::framework::cache::lru_prune(&global, cap_bytes)
                 .with_context(|| format!("lru_prune {}", global.display()))?;
             println!(
                 "pruned {:.2} GiB from {} (cap {:.2} GiB)",
@@ -512,10 +515,10 @@ fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
 }
 
 async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
-    use blut::framework::artifact::Artifact;
-    use blut::framework::cache::CacheHandle;
-    use blut::framework::stage::{ErasedArtifact, StageContext};
-    use blut::stages::catalog;
+    use crate::framework::artifact::Artifact;
+    use crate::framework::cache::CacheHandle;
+    use crate::framework::stage::{ErasedArtifact, StageContext};
+    use crate::stages::catalog;
     use std::io::{Read, Write};
     use std::sync::Arc;
 
@@ -583,7 +586,7 @@ async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
                 job_dir: td.path().to_path_buf(),
                 stage_dir,
                 node_idx: 0,
-                status_tx: blut::framework::status::make_broadcast(),
+                status_tx: crate::framework::status::make_broadcast(),
                 cancel: tokio_util::sync::CancellationToken::new(),
                 cache: Arc::new(CacheHandle::job_local(td.path().join("_cache"))),
             };
@@ -651,19 +654,16 @@ fn dir_size_bytes(path: &std::path::Path) -> Result<u64> {
     Ok(total)
 }
 
-async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
-    use blut::framework::{ExecCtx, SequentialExecutor, default_registry};
-    // C1: the recipe catalog comes from the registered cookbooks, not
-    // the static RECIPES slice. `reg` owns the boxed cookbooks for this
-    // command; the `&'static RecipeDef`s it yields outlive it.
-    let reg = default_registry();
+async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Result<()> {
+    use crate::framework::{ExecCtx, SequentialExecutor};
+    // The recipe catalog comes from the caller-supplied cookbook registry.
     let find_recipe = |name: &str| reg.find(name);
     match cmd {
         RecipeCommand::List => {
             // Sort by (category label, name) so the catalog reads
             // top-down like the BLUT Training Cockpit menu (DATA →
             // TRAINING → EVAL → EXPORT → PIPELINE → USER).
-            let mut sorted: Vec<&'static blut::recipes::recipe::RecipeDef> = reg.all().collect();
+            let mut sorted: Vec<&'static crate::recipes::recipe::RecipeDef> = reg.all().collect();
             sorted.sort_by(|a, b| {
                 a.category
                     .label()
@@ -723,11 +723,11 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
             let plan =
                 (r.compile_fn)(raw.clone()).map_err(|e| anyhow!("recipe compile failed: {e}"))?;
 
-            let job_id = blut::jobs::new_job_id();
-            let job_dir = blut::paths::job_dir(&job_id)?;
+            let job_id = crate::jobs::new_job_id();
+            let job_dir = crate::paths::job_dir(&job_id)?;
             let mut ctx = ExecCtx::new(job_dir.clone());
             if shared_cache {
-                if let Some(global) = blut::framework::CacheHandle::default_global_path() {
+                if let Some(global) = crate::framework::CacheHandle::default_global_path() {
                     std::fs::create_dir_all(&global)
                         .with_context(|| format!("create global cache dir {}", global.display()))?;
                     let cache_handle = (*ctx.cache).clone().with_global(global);
@@ -744,14 +744,14 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
             }
             .write_to(&job_dir)?;
 
-            blut::jobs::write_state(&job_id, JobState::Running)
+            crate::jobs::write_state(&job_id, JobState::Running)
                 .with_context(|| format!("write Running state for {job_id}"))?;
 
             // KILL-2/KILL-3: bind this job so backend spawns mirror
             // the python child's PROCESS GROUP id into the job pid
             // file (not blut's own pid). A separate `blut cancel <id>`
             // reads that pgid and killpg's the whole tree.
-            blut::python_kill::bind_current_job(job_id.clone());
+            crate::python_kill::bind_current_job(job_id.clone());
 
             // KILL-3: trap SIGTERM/ctrl-c. On signal, cancel the
             // executor token AND killpg the live child group, then
@@ -768,8 +768,8 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
             ) {
                 Ok(l) => l,
                 Err(e) => {
-                    blut::python_kill::unbind_current_job();
-                    if let Err(se) = blut::jobs::write_state(&job_id, JobState::Failed) {
+                    crate::python_kill::unbind_current_job();
+                    if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
                         tracing::warn!("write Failed state for {job_id}: {se}");
                     }
                     return Err(anyhow!("acquire_exclusive: {e}"));
@@ -783,10 +783,10 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
 
             let result = SequentialExecutor::execute(plan, ctx).await;
             drop(lock);
-            blut::python_kill::unbind_current_job();
+            crate::python_kill::unbind_current_job();
             match result {
                 Ok(r) => {
-                    blut::jobs::write_state(&job_id, JobState::Done)
+                    crate::jobs::write_state(&job_id, JobState::Done)
                         .with_context(|| format!("write Done state for {job_id}"))?;
                     eprintln!(
                         "done — {} stages, {} cache hits, {} misses, elapsed {:?}",
@@ -794,7 +794,7 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
                     );
                 }
                 Err(e) => {
-                    if let Err(se) = blut::jobs::write_state(&job_id, JobState::Failed) {
+                    if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
                         tracing::warn!("write Failed state for {job_id}: {se}");
                     }
                     return Err(anyhow!("plan execution failed: {e}"));
@@ -806,11 +806,11 @@ async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
 }
 
 async fn run_auto() -> Result<()> {
-    use blut::{conversations, policy};
+    use crate::{conversations, policy};
 
     let pol = policy::load().context("load policy")?;
     let (now_unix, now_local_min) = policy::current_clock();
-    let lock_held = blut::scheduler_lock::check_unlocked().is_err();
+    let lock_held = crate::scheduler_lock::check_unlocked().is_err();
     let new_turns = match conversations::count_turns_since(pol.last_train_ts) {
         Ok(n) => n,
         Err(e) => {
@@ -838,7 +838,7 @@ async fn run_auto() -> Result<()> {
                 pol.threshold_new_turns
             );
             let bin = std::env::current_exe().context("locate own binary for auto-spawn")?;
-            let auto_name = format!("auto-{}", blut::jobs::new_job_id());
+            let auto_name = format!("auto-{}", crate::jobs::new_job_id());
             let mut cmd = tokio::process::Command::new(&bin);
             cmd.arg(&auto_name)
                 .arg("--from-conversations")
@@ -893,7 +893,7 @@ async fn run_auto() -> Result<()> {
 }
 
 fn run_policy(cmd: PolicyCommand) -> Result<()> {
-    use blut::policy;
+    use crate::policy;
     match cmd {
         PolicyCommand::Show => {
             let p = policy::load().context("load policy")?;
@@ -936,7 +936,7 @@ fn run_policy(cmd: PolicyCommand) -> Result<()> {
 }
 
 fn run_data(cmd: DataCommand) -> Result<()> {
-    use blut::datasets_db;
+    use crate::datasets_db;
     let conn = datasets_db::open()?;
     match cmd {
         DataCommand::List => {
@@ -994,9 +994,9 @@ fn run_data(cmd: DataCommand) -> Result<()> {
 /// callers handle failure by logging + continuing. Used by
 /// auto-registration after `--from-conversations` materialization.
 fn register_dataset(name: &str, path: &Path, kind: &str, metadata: Option<String>) -> Result<()> {
-    let conn = blut::datasets_db::open()?;
-    let rec = blut::datasets_db::record_from_jsonl(name, path, kind, metadata)?;
-    blut::datasets_db::add(&conn, &rec)?;
+    let conn = crate::datasets_db::open()?;
+    let rec = crate::datasets_db::record_from_jsonl(name, path, kind, metadata)?;
+    crate::datasets_db::add(&conn, &rec)?;
     Ok(())
 }
 
@@ -1062,7 +1062,7 @@ async fn run_train(args: TrainArgs) -> Result<()> {
             std::fs::create_dir_all(&data_dir)
                 .with_context(|| format!("create {}", data_dir.display()))?;
             let out_path = data_dir.join(format!("{job_id}.jsonl"));
-            let stats = blut::conversations::dump_to_jsonl(args.since, &out_path)
+            let stats = crate::conversations::dump_to_jsonl(args.since, &out_path)
                 .context("dump conversations to JSONL")?;
             eprintln!(
                 "dataset materialized: {} conversations, {} turns → {}",
@@ -1309,8 +1309,8 @@ fn run_log(id_query: &str, tail: usize) -> Result<()> {
 /// users don't have to learn a new invocation, then runs the
 /// compiled 9-stage Plan through `SequentialExecutor`.
 async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()> {
-    use blut::framework::{CacheHandle, ExecCtx, SequentialExecutor};
-    use blut::recipes::finetune_from_conversations::{Args as RecipeArgs, DEF};
+    use crate::framework::{CacheHandle, ExecCtx, SequentialExecutor};
+    use crate::recipes::finetune_from_conversations::{Args as RecipeArgs, DEF};
 
     let recipe_args = RecipeArgs {
         output_name: output_name.to_string(),
@@ -1331,10 +1331,10 @@ async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()>
         rank: args.rank,
         alpha: args.alpha,
         optimizer: match pick_optimizer(args.optim, args.method) {
-            blut::spec::Optim::AdamW => "adamw".into(),
-            blut::spec::Optim::AdamW8bit => "adamw8bit".into(),
-            blut::spec::Optim::ApolloRank4 => "apollo".into(),
-            blut::spec::Optim::ApolloMini => "apollo_mini".into(),
+            crate::spec::Optim::AdamW => "adamw".into(),
+            crate::spec::Optim::AdamW8bit => "adamw8bit".into(),
+            crate::spec::Optim::ApolloRank4 => "apollo".into(),
+            crate::spec::Optim::ApolloMini => "apollo_mini".into(),
         },
         notes: String::new(),
         eval_ratio: 0.1,
@@ -1362,7 +1362,7 @@ async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()>
     // mirrored into the pid file by the backend spawn once we bind
     // the job below; until then the job has no pid (cancel no-ops
     // safely rather than killing the wrong process).
-    blut::python_kill::bind_current_job(job_id.clone());
+    crate::python_kill::bind_current_job(job_id.clone());
 
     let mut ctx = ExecCtx::new(job_dir.clone());
     if args.shared_cache {
@@ -1439,7 +1439,7 @@ async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()>
         match acq.await {
             Ok(l) => l,
             Err(e) => {
-                blut::python_kill::unbind_current_job();
+                crate::python_kill::unbind_current_job();
                 if let Err(state_err) = jobs::write_state(&job_id, JobState::Failed) {
                     tracing::warn!(
                         "failed to record Failed state for {job_id} after lock error: {state_err}"
@@ -1457,7 +1457,7 @@ async fn run_train_via_recipe(output_name: &str, args: &TrainArgs) -> Result<()>
 
     let result = SequentialExecutor::execute(plan, ctx).await;
     drop(lock);
-    blut::python_kill::unbind_current_job();
+    crate::python_kill::unbind_current_job();
 
     match result {
         Ok(r) => {
@@ -1513,8 +1513,8 @@ fn install_cancel_handler(cancel: tokio_util::sync::CancellationToken) {
         }
         eprintln!("\nsignal received — cancelling job + killing trainer group...");
         cancel.cancel();
-        if let Some(id) = blut::python_kill::active_child() {
-            blut::python_kill::graceful_kill_group(id.pgid, Some(id), Duration::from_secs(10))
+        if let Some(id) = crate::python_kill::active_child() {
+            crate::python_kill::graceful_kill_group(id.pgid, Some(id), Duration::from_secs(10))
                 .await;
         }
     });
@@ -1568,9 +1568,9 @@ fn pick_optimizer(opt: Option<OptimArg>, method: MethodArg) -> Optim {
 }
 
 fn register_in_registry(name: &str, gguf_path: &Path, spec: &TrainSpec) -> Result<()> {
-    use blut::registry;
-    use blut::registry::{BackendType, Capability, ModelEntry, ModelFormat, ModelStatus};
-    let registry_path = blut::config::registry_path();
+    use crate::registry;
+    use crate::registry::{BackendType, Capability, ModelEntry, ModelFormat, ModelStatus};
+    let registry_path = crate::config::registry_path();
     let entry = ModelEntry {
         name: name.into(),
         path: gguf_path.to_path_buf(),

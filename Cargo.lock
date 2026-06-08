@@ -367,7 +367,12 @@ dependencies = [
 name = "cookbook-lamquant"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "blut",
+ "nix",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

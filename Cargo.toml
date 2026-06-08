@@ -5,6 +5,10 @@
 [workspace]
 members = [".", "crates/cookbook-lamquant", "crates/cookbook-lamu"]
 resolver = "3"
+# blut is now lib-only (the domain-agnostic engine). The user-facing
+# `blut` binary lives in the cookbook crate that composes the registry,
+# so a bare `cargo run`/`build` at the workspace root targets it.
+default-members = ["crates/cookbook-lamquant"]
 
 [package]
 name = "blut"
@@ -21,10 +25,6 @@ categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 path = "src/lib.rs"
-
-[[bin]]
-name = "blut"
-path = "src/main.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

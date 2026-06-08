@@ -38,7 +38,11 @@ pub struct ResolvedConfig {
 /// The defaults-list merge, group=config selection, dotted overrides and
 /// `+`/`~` semantics are all handled by lerna's `load_config`; we do not
 /// reimplement them.
-pub fn compose(config_dir: &str, config_name: &str, overrides: &[String]) -> Result<ResolvedConfig> {
+pub fn compose(
+    config_dir: &str,
+    config_name: &str,
+    overrides: &[String],
+) -> Result<ResolvedConfig> {
     let loader = ConfigLoader::from_config_dir(config_dir);
     let value = loader
         .load_config(Some(config_name), overrides)

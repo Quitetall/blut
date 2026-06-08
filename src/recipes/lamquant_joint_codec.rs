@@ -30,16 +30,16 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::artifacts::lamquant::stat_fingerprint_dir;
 use crate::artifacts::LmaCorpus;
+use crate::artifacts::lamquant::stat_fingerprint_dir;
+use crate::framework::Compatible;
 use crate::framework::error::{RecipeError, StageError};
 use crate::framework::plan::Plan;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
-use crate::framework::Compatible;
 use crate::recipes::recipe::{Recipe, RecipeCategory, RecipeDef};
 use crate::stages::{
-    lamquant_pccp_gate_encoder, lamquant_train_joint, LamquantPccpGateEncoder, LamquantTrainJoint,
+    LamquantPccpGateEncoder, LamquantTrainJoint, lamquant_pccp_gate_encoder, lamquant_train_joint,
 };
 
 pub struct LamquantJointCodec;
@@ -263,9 +263,11 @@ impl Stage for LmaCorpusSource {
             )));
         }
         let content_hash =
-            stat_fingerprint_dir(b"lamquant.lma_corpus", root).map_err(|source| StageError::Io {
-                path: root.clone(),
-                source,
+            stat_fingerprint_dir(b"lamquant.lma_corpus", root).map_err(|source| {
+                StageError::Io {
+                    path: root.clone(),
+                    source,
+                }
             })?;
         // Count `.lma` entries directly under root. Cheap (one shallow
         // read_dir) and keeps `n_archives` honest for any downstream

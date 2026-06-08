@@ -7,7 +7,7 @@
 
 use lerna::expand_simple_sweeps;
 
-use crate::config::{compose, ResolvedConfig};
+use crate::config::{ResolvedConfig, compose};
 use crate::error::Result;
 use crate::framework::artifact::ContentHash;
 

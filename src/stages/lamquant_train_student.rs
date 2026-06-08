@@ -20,8 +20,8 @@ use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
 use crate::lamquant_backend::{LamquantBackend, LamquantInvocation};
 use crate::stages::lamquant_helpers::{
-    blut_python_script, blut_pythonpath,
-    blut_env, progress_forwarder, push_opt_f32, push_opt_u32, python_for, resolve_home,
+    blut_env, blut_python_script, blut_pythonpath, progress_forwarder, push_opt_f32, push_opt_u32,
+    python_for, resolve_home,
 };
 
 pub struct LamquantTrainStudent;
@@ -73,7 +73,8 @@ impl Stage for LamquantTrainStudent {
         let home = resolve_home(&args.lamquant_home)?;
         let python = python_for(&home);
         // MOVE-B: script now under blut/python; resolve via $BLUT_PYTHON.
-        let (script, python_dir) = blut_python_script(&["python", "lamquant", "student", "train_student_subband.py"])?;
+        let (script, python_dir) =
+            blut_python_script(&["python", "lamquant", "student", "train_student_subband.py"])?;
 
         let weights_dir = home.join("weights");
         std::fs::create_dir_all(&weights_dir).map_err(|source| StageError::Io {

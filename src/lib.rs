@@ -32,6 +32,7 @@
 pub mod artifacts;
 pub mod backend;
 pub mod backends;
+pub mod cli;
 pub mod config;
 pub mod conversations;
 pub mod convert;

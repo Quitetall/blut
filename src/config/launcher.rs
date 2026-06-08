@@ -85,7 +85,11 @@ mod tests {
         let cmd = LocalSystemd::default()
             .build_command(
                 "unit-x",
-                &["python".to_string(), "-u".to_string(), "train.py".to_string()],
+                &[
+                    "python".to_string(),
+                    "-u".to_string(),
+                    "train.py".to_string(),
+                ],
             )
             .expect("build_command should resolve the script");
         assert_eq!(cmd.get_program(), "bash");

@@ -18,7 +18,8 @@ use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
 use crate::lamquant_backend::{LamquantBackend, LamquantInvocation};
 use crate::stages::lamquant_helpers::{
-    blut_python_script, blut_pythonpath,python_for, resolve_home};
+    blut_python_script, blut_pythonpath, python_for, resolve_home,
+};
 
 pub struct LamquantPrecomputeL3;
 
@@ -60,7 +61,8 @@ impl Stage for LamquantPrecomputeL3 {
         let home = resolve_home(&args.lamquant_home)?;
         let python = python_for(&home);
         // MOVE-B: script now under blut/python; resolve via $BLUT_PYTHON.
-        let (script, python_dir) = blut_python_script(&["python", "lamquant", "student", "precompute_l3_fast.py"])?;
+        let (script, python_dir) =
+            blut_python_script(&["python", "lamquant", "student", "precompute_l3_fast.py"])?;
 
         let q31_dir = if args.input_dir.is_empty() {
             home.join("ai_models")

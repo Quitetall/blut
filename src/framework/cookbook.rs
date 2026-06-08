@@ -138,7 +138,10 @@ impl Registry {
         self.all().find(|r| r.name == name)
     }
 
-    pub fn by_category(&self, cat: RecipeCategory) -> impl Iterator<Item = &'static RecipeDef> + '_ {
+    pub fn by_category(
+        &self,
+        cat: RecipeCategory,
+    ) -> impl Iterator<Item = &'static RecipeDef> + '_ {
         self.all().filter(move |r| r.category == cat)
     }
 }
@@ -184,9 +187,10 @@ mod tests {
     fn registry_by_category_filters() {
         // Train category must include the standalone joint-codec recipe.
         let r = Registry::with_builtin();
-        assert!(r
-            .by_category(RecipeCategory::Train)
-            .any(|r| r.name == "lamquant_joint_codec"));
+        assert!(
+            r.by_category(RecipeCategory::Train)
+                .any(|r| r.name == "lamquant_joint_codec")
+        );
     }
 
     #[test]

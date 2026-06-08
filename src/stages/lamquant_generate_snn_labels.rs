@@ -18,8 +18,8 @@ use crate::framework::resource::Resource;
 use crate::framework::stage::{Stage, StageContext};
 use crate::lamquant_backend::{LamquantBackend, LamquantInvocation};
 use crate::stages::lamquant_helpers::{
-    blut_python_script, blut_pythonpath,
-    blut_env, progress_forwarder, python_for, resolve_home, safe_join,
+    blut_env, blut_python_script, blut_pythonpath, progress_forwarder, python_for, resolve_home,
+    safe_join,
 };
 
 pub struct LamquantGenerateSnnLabels;
@@ -72,7 +72,8 @@ impl Stage for LamquantGenerateSnnLabels {
         let home = resolve_home(&args.lamquant_home)?;
         let python = python_for(&home);
         // MOVE-B: script now under blut/python; resolve via $BLUT_PYTHON.
-        let (script, python_dir) = blut_python_script(&["python", "lamquant", "snn", "generate_activity_labels.py"])?;
+        let (script, python_dir) =
+            blut_python_script(&["python", "lamquant", "snn", "generate_activity_labels.py"])?;
 
         let input_dir = if args.input_rel.is_empty() {
             home.join("ai_models")

@@ -76,12 +76,8 @@ impl Stage for LamquantBuildManifest {
         // operator may anchor relative to the Neural repo.
         let lamquant_home = resolve_home(&args.lamquant_home)?;
         let python = resolve_lamquant_python(&lamquant_home);
-        let (script, python_dir) = blut_python_script(&[
-            "python",
-            "lamquant",
-            "dataset",
-            "build_manifest.py",
-        ])?;
+        let (script, python_dir) =
+            blut_python_script(&["python", "lamquant", "dataset", "build_manifest.py"])?;
 
         let output_path = if args.output_rel.is_empty() {
             // Builder default: the manifest_v3.json that moved alongside

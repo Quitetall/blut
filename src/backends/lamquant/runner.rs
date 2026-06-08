@@ -319,11 +319,7 @@ fn sanitize_unit_part(s: &str) -> String {
             }
         })
         .collect();
-    if out.is_empty() {
-        "_".into()
-    } else {
-        out
-    }
+    if out.is_empty() { "_".into() } else { out }
 }
 
 /// Derive the transient unit name from the invocation env.
@@ -640,7 +636,10 @@ mod tests {
     #[test]
     fn contained_unit_name_derives_from_env() {
         let env = vec![
-            ("BLUT_JOB_DIR".to_string(), "/var/blut/jobs/job42".to_string()),
+            (
+                "BLUT_JOB_DIR".to_string(),
+                "/var/blut/jobs/job42".to_string(),
+            ),
             ("BLUT_STAGE_NAME".to_string(), "train_joint".to_string()),
         ];
         assert_eq!(
@@ -658,11 +657,11 @@ mod tests {
     #[test]
     fn contained_unit_name_sanitizes() {
         let env = vec![
+            ("BLUT_JOB_DIR".to_string(), "/jobs/run #3 (x)".to_string()),
             (
-                "BLUT_JOB_DIR".to_string(),
-                "/jobs/run #3 (x)".to_string(),
+                "BLUT_STAGE_NAME".to_string(),
+                "weird/stage:name".to_string(),
             ),
-            ("BLUT_STAGE_NAME".to_string(), "weird/stage:name".to_string()),
         ];
         let unit = contained_unit_name(&env).unwrap();
         // Every char must be in the systemd unit charset + the prefix.
@@ -693,8 +692,14 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         // Synchronous streaming + containment flags.
-        assert!(argv.iter().any(|a| a == "--pipe"), "missing --pipe: {argv:?}");
-        assert!(argv.iter().any(|a| a == "--wait"), "missing --wait: {argv:?}");
+        assert!(
+            argv.iter().any(|a| a == "--pipe"),
+            "missing --pipe: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "--wait"),
+            "missing --wait: {argv:?}"
+        );
         assert!(
             argv.iter().any(|a| a == "--working-directory=/work/dir"),
             "missing --working-directory: {argv:?}"
@@ -706,11 +711,14 @@ mod tests {
         );
         // Trailing `-- <python> <script> <args...>`.
         let dash = argv.iter().position(|a| a == "--").expect("missing --");
-        assert_eq!(&argv[dash + 1..], &[
-            "/venv/bin/python".to_string(),
-            "train.py".to_string(),
-            "--config".to_string(),
-            "fast".to_string(),
-        ]);
+        assert_eq!(
+            &argv[dash + 1..],
+            &[
+                "/venv/bin/python".to_string(),
+                "train.py".to_string(),
+                "--config".to_string(),
+                "fast".to_string(),
+            ]
+        );
     }
 }
