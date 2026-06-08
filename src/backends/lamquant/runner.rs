@@ -129,6 +129,15 @@ impl LamquantBackend {
         } else {
             None
         };
+        if contained && unit.is_none() {
+            // Operator asked for containment but the env to derive a unit name
+            // (BLUT_JOB_DIR/BLUT_STAGE_NAME) is absent — fall back to bare spawn
+            // LOUDLY so nobody believes they're memory-capped when they aren't.
+            tracing::warn!(
+                "BLUT_CONTAINED=1 but BLUT_JOB_DIR/BLUT_STAGE_NAME missing; \
+                 falling back to bare spawn (NO memory containment)"
+            );
+        }
 
         let mut cmd = match &unit {
             // Contained path: cwd + env cross the unit boundary via
@@ -264,12 +273,23 @@ impl LamquantBackend {
         // before any await — never hold a parking_lot lock across .await.
         let unit = self.contained_unit.lock().take();
         if let Some(unit) = unit {
-            let _ = Command::new("systemctl")
+            // Best-effort: a failure here (unit already exited under --wait,
+            // systemd absent, etc.) is non-fatal — graceful_kill_pid below is
+            // the belt-and-suspenders fallback — but log it so a stuck unit is
+            // visible rather than silently swallowed.
+            match Command::new("systemctl")
                 .arg("--user")
                 .arg("stop")
                 .arg(format!("{unit}.service"))
                 .status()
-                .await;
+                .await
+            {
+                Ok(s) if !s.success() => {
+                    tracing::warn!("systemctl --user stop {unit}.service exited {s}")
+                }
+                Err(e) => tracing::warn!("systemctl --user stop {unit}.service failed: {e}"),
+                _ => {}
+            }
         }
         let pid = match self.child_pid.lock().take() {
             Some(p) => p,

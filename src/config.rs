@@ -72,7 +72,12 @@ fn config_to_json(v: &ConfigValue) -> serde_json::Value {
         ConfigValue::Bool(b) => Value::Bool(*b),
         ConfigValue::Int(i) => Value::Number((*i).into()),
         ConfigValue::Float(f) => {
-            serde_json::Number::from_f64(*f).map_or(Value::Null, Value::Number)
+            // JSON has no NaN/Inf. Map non-finite floats to their STRING form
+            // (e.g. "inf", "NaN") rather than Null — collapsing to Null would
+            // make a non-finite float collide with ConfigValue::Null in the
+            // frozen JSON AND the fingerprint (distinct configs, same hash).
+            serde_json::Number::from_f64(*f)
+                .map_or_else(|| Value::String(f.to_string()), Value::Number)
         }
         ConfigValue::String(s) | ConfigValue::Interpolation(s) => Value::String(s.clone()),
         ConfigValue::List(l) => Value::Array(l.iter().map(config_to_json).collect()),
