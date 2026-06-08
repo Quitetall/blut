@@ -112,12 +112,21 @@ pub fn swap_candidates(of: &'static RecipeDef) -> impl Iterator<Item = &'static 
 /// fn-pointers that can't be Copy-moved into an array initializer.
 /// Each entry is a reference to the `pub static DEF` defined
 /// inside its recipe module.
+/// The full catalog = the union of every cookbook's recipes. Grouped
+/// by owning cookbook (see `LAMU_RECIPES` / `LAMQUANT_RECIPES`). This
+/// union is the transitional in-crate source; once the cookbooks move
+/// to their own crates (C2a/C2b) the catalog is composed at runtime by
+/// the [`crate::framework::Registry`] and this slice goes away. The TUI
+/// + several tests still index it positionally, so it stays for now.
 pub static RECIPES: &[&RecipeDef] = &[
+    // ── blut-lamu cookbook (generic LLM: lamu + hf_trainer backends) ──
     &crate::recipes::finetune_from_conversations::DEF,
     &crate::recipes::finetune_from_dataset::DEF,
     &crate::recipes::dpo_from_preferences::DEF,
     &crate::recipes::eval_suite::DEF,
     &crate::recipes::distill_from_teacher::DEF,
+    &crate::recipes::hf_finetune_from_dataset::DEF,
+    // ── blut-lamquant cookbook (neural EEG codec) ──
     &crate::recipes::lamquant_data_prep::DEF,
     &crate::recipes::lamquant_combined_decoder::DEF,
     &crate::recipes::lamquant_snn::DEF,
@@ -125,7 +134,32 @@ pub static RECIPES: &[&RecipeDef] = &[
     &crate::recipes::lamquant_joint_codec::DEF,
     &crate::recipes::lamquant_oracle::DEF,
     &crate::recipes::lamquant_full_pipeline::DEF,
+];
+
+/// Recipes owned by the **blut-lamu** cookbook (generic LLM: lamu +
+/// hf_trainer backends). Transitional in-crate home — moves to the
+/// `blut-lamu` cookbook crate/repo (C2b). See
+/// `[[project_blut_cookbook_split]]`.
+pub static LAMU_RECIPES: &[&RecipeDef] = &[
+    &crate::recipes::finetune_from_conversations::DEF,
+    &crate::recipes::finetune_from_dataset::DEF,
+    &crate::recipes::dpo_from_preferences::DEF,
+    &crate::recipes::eval_suite::DEF,
+    &crate::recipes::distill_from_teacher::DEF,
     &crate::recipes::hf_finetune_from_dataset::DEF,
+];
+
+/// Recipes owned by the **blut-lamquant** cookbook (neural EEG codec).
+/// Transitional in-crate home — moves to the `blut-lamquant` cookbook
+/// crate/repo (C2a).
+pub static LAMQUANT_RECIPES: &[&RecipeDef] = &[
+    &crate::recipes::lamquant_data_prep::DEF,
+    &crate::recipes::lamquant_combined_decoder::DEF,
+    &crate::recipes::lamquant_snn::DEF,
+    &crate::recipes::lamquant_encoder::DEF,
+    &crate::recipes::lamquant_joint_codec::DEF,
+    &crate::recipes::lamquant_oracle::DEF,
+    &crate::recipes::lamquant_full_pipeline::DEF,
 ];
 
 pub fn find(name: &str) -> Option<&'static RecipeDef> {

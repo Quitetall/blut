@@ -380,8 +380,9 @@ impl RecipeMarker {
 }
 
 async fn run_plan_cmd(cmd: PlanCommand) -> Result<()> {
-    use blut::framework::{CacheHandle, ExecCtx, SequentialExecutor};
-    use blut::recipes::recipe::find as find_recipe;
+    use blut::framework::{CacheHandle, ExecCtx, SequentialExecutor, default_registry};
+    // C1: resolve recipes via the cookbook registry (not the static slice).
+    let reg = default_registry();
     match cmd {
         PlanCommand::Resume { id, shared_cache } => {
             let job_id = blut::jobs::resolve_job_id(&id).with_context(|| {
@@ -390,7 +391,8 @@ async fn run_plan_cmd(cmd: PlanCommand) -> Result<()> {
             let job_dir =
                 paths::job_dir(&job_id).with_context(|| format!("resolve job dir for {job_id}"))?;
             let marker = RecipeMarker::read_from(&job_dir)?;
-            let r = find_recipe(&marker.name)
+            let r = reg
+                .find(&marker.name)
                 .ok_or_else(|| anyhow!("recipe '{}' not in catalog", marker.name))?;
             let plan =
                 (r.compile_fn)(marker.args.clone()).map_err(|e| anyhow!("recipe compile: {e}"))?;
@@ -455,7 +457,9 @@ async fn run_plan_cmd(cmd: PlanCommand) -> Result<()> {
             }
         }
         PlanCommand::Inspect { name, args } => {
-            let r = find_recipe(&name).ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+            let r = reg
+                .find(&name)
+                .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
             let raw: serde_json::Value = serde_json::from_str(&args)
                 .with_context(|| format!("parse --args as JSON: {args}"))?;
             let plan = (r.compile_fn)(raw).map_err(|e| anyhow!("recipe compile: {e}"))?;
@@ -648,14 +652,18 @@ fn dir_size_bytes(path: &std::path::Path) -> Result<u64> {
 }
 
 async fn run_recipe(cmd: RecipeCommand) -> Result<()> {
-    use blut::framework::{ExecCtx, SequentialExecutor};
-    use blut::recipes::recipe::{RECIPES, find as find_recipe};
+    use blut::framework::{ExecCtx, SequentialExecutor, default_registry};
+    // C1: the recipe catalog comes from the registered cookbooks, not
+    // the static RECIPES slice. `reg` owns the boxed cookbooks for this
+    // command; the `&'static RecipeDef`s it yields outlive it.
+    let reg = default_registry();
+    let find_recipe = |name: &str| reg.find(name);
     match cmd {
         RecipeCommand::List => {
             // Sort by (category label, name) so the catalog reads
             // top-down like the BLUT Training Cockpit menu (DATA →
             // TRAINING → EVAL → EXPORT → PIPELINE → USER).
-            let mut sorted: Vec<&'static blut::recipes::recipe::RecipeDef> = RECIPES.to_vec();
+            let mut sorted: Vec<&'static blut::recipes::recipe::RecipeDef> = reg.all().collect();
             sorted.sort_by(|a, b| {
                 a.category
                     .label()

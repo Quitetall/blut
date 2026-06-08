@@ -1,18 +1,20 @@
-//! Cookbook seam (SKELETON).
+//! Cookbook seam (C1 — registry is the live catalog source).
 //!
-//! The runtime-registry boundary that the static `RECIPES` catalog
-//! (`recipes/recipe.rs`) will eventually populate FROM. Today: one
-//! [`BuiltinCookbook`] wrapping the existing static slice, plus a
-//! [`Registry`] that ingests cookbooks. Stage / artifact extraction
-//! is DEFERRED — this module designs the seam, not the move.
+//! A "cookbook" is the unit a domain hands BLUT (ADR 0034 / ADR 0037):
+//! a bundle of recipes plus the stages / artifacts they reference. The
+//! CLI now reads its recipe catalog from [`default_registry`] (the
+//! union of the registered cookbooks), NOT the static `RECIPES` slice
+//! directly. Two real cookbooks are registered — [`LamuCookbook`] and
+//! [`LamquantCookbook`] — both still living in-crate (TRANSITIONAL).
+//! [`BuiltinCookbook`] (wrapping the full static slice) is retained for
+//! the TUI + back-compat parity tests until the cookbooks move out.
 //!
-//! Per ADR 0034 (BLUT owns recipes / artifacts), a "cookbook" is the
-//! unit a domain hands BLUT: a bundle of recipes plus the stages /
-//! artifacts they reference. The [`Cookbook::stages`] /
-//! [`Cookbook::artifacts`] methods return DESCRIPTORS only (name /
-//! kind / schema) — they are not yet executable handles. Making them
-//! dispatchable, and swapping the CLI from `recipe::find` to
-//! `Registry::find`, are follow-up lanes.
+//! Remaining lanes (`[[project_blut_cookbook_split]]`): move each
+//! cookbook (recipes + stages + artifacts + backend + python) to its
+//! own crate/repo (`blut-lamquant`, `blut-lamu`) so blut-core has ZERO
+//! domain symbols; populate [`Cookbook::stages`] / [`Cookbook::artifacts`]
+//! (today DESCRIPTORS only — name / kind / schema, not executable
+//! handles); rewire the TUI off the static `RECIPES` indices.
 
 use crate::recipes::recipe::{RecipeCategory, RecipeDef};
 
@@ -68,6 +70,37 @@ impl Cookbook for BuiltinCookbook {
     }
 }
 
+/// The LamQuant cookbook (neural EEG codec): the 7 `lamquant_*` recipes.
+/// TRANSITIONAL in-crate home — the real cookbook (recipes + stages +
+/// artifacts + backend + `python/lamquant/`) moves to the dedicated
+/// `blut-lamquant` crate/repo (C2a), at which point this struct and its
+/// recipe references leave blut-core entirely. See
+/// `[[project_blut_cookbook_split]]`.
+pub struct LamquantCookbook;
+
+impl Cookbook for LamquantCookbook {
+    fn name(&self) -> &'static str {
+        "lamquant"
+    }
+    fn recipes(&self) -> &'static [&'static RecipeDef] {
+        crate::recipes::recipe::LAMQUANT_RECIPES
+    }
+}
+
+/// The lamu cookbook (generic LLM: SFT / DPO / distill / eval over the
+/// lamu + hf_trainer backends). TRANSITIONAL in-crate home — moves to
+/// the `blut-lamu` crate/repo (C2b).
+pub struct LamuCookbook;
+
+impl Cookbook for LamuCookbook {
+    fn name(&self) -> &'static str {
+        "lamu"
+    }
+    fn recipes(&self) -> &'static [&'static RecipeDef] {
+        crate::recipes::recipe::LAMU_RECIPES
+    }
+}
+
 /// Runtime registry that ingests cookbooks. SKELETON: holds boxed
 /// cookbooks and exposes `find` / `by_category` / `all` over their
 /// union. NOT yet wired into the CLI (`main.rs` still calls
@@ -115,6 +148,20 @@ impl Default for Registry {
     }
 }
 
+/// The cookbooks this binary ships with — the CLI reads the recipe
+/// catalog from here, not the static `RECIPES` slice. TODAY both
+/// cookbooks live in-crate (transitional); once they move to their own
+/// crates (C2a/C2b) the binary composes this by registering each
+/// compiled-in cookbook, and a bare blut-core binary ships an EMPTY
+/// registry (the pure engine). Registration order = catalog order
+/// before the CLI's own sort.
+pub fn default_registry() -> Registry {
+    let mut r = Registry::new();
+    r.register(Box::new(LamuCookbook));
+    r.register(Box::new(LamquantCookbook));
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +206,26 @@ mod tests {
         // Documents the deferred stage/artifact extraction.
         assert!(BuiltinCookbook.stages().is_empty());
         assert!(BuiltinCookbook.artifacts().is_empty());
+    }
+
+    #[test]
+    fn default_registry_composes_full_catalog() {
+        use std::collections::BTreeSet;
+        // The two real cookbooks (lamu + lamquant) must compose to
+        // exactly the full static catalog — same names, no overlap, no
+        // gap. This is the C1 invariant: the catalog = union of
+        // registered cookbooks.
+        let reg = default_registry();
+        let composed: BTreeSet<&str> = reg.all().map(|r| r.name).collect();
+        let union: BTreeSet<&str> = RECIPES.iter().map(|r| r.name).collect();
+        assert_eq!(composed, union, "cookbooks must cover RECIPES exactly");
+        assert_eq!(
+            recipe::LAMU_RECIPES.len() + recipe::LAMQUANT_RECIPES.len(),
+            RECIPES.len(),
+            "LAMU + LAMQUANT must partition RECIPES (disjoint, complete)"
+        );
+        // Cookbook identities resolve.
+        assert_eq!(LamquantCookbook.name(), "lamquant");
+        assert_eq!(LamuCookbook.name(), "lamu");
     }
 }
