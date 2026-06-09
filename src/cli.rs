@@ -674,7 +674,7 @@ fn recipe_footprint(raw: &serde_json::Value) -> crate::broker::Footprint {
     let u32_or = |key: &str, default: u32| -> u32 {
         raw.get(key)
             .and_then(|v| v.as_u64())
-            .map(|n| n as u32)
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))  // saturate, never wrap-to-0 (would under-bill)
             .unwrap_or(default)
     };
     // `workers` is env-only in the cookbook (LMA_NUM_WORKERS) so the
