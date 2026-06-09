@@ -94,6 +94,16 @@ def test_checkpoint_roundtrip_and_corruption(tmp_path):
         checkpoint.load(tmp_path / "absent.pt")
 
 
+def test_checkpoint_load_without_sidecar_warns_but_loads(tmp_path, capsys):
+    torch = pytest.importorskip("torch")
+    path = tmp_path / "ckpt.pt"
+    checkpoint.save({"model": {"w": torch.tensor([1.0])}, "step": 3}, path)
+    path.with_suffix(".pt.sha256").unlink()                # simulate crash-before-sidecar
+    loaded = checkpoint.load(path)                          # loads, but warns
+    assert loaded["step"] == 3
+    assert "integrity unverified" in capsys.readouterr().err
+
+
 def test_checkpoint_contract_enforced_on_save(tmp_path):
     pytest.importorskip("torch")
     with pytest.raises(checkpoint.CheckpointError):

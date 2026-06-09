@@ -34,8 +34,11 @@ def emit(kind: str, *, job_dir: Optional[Path] = None, to_stdout: bool = True,
     rec: Dict[str, Any] = {"kind": kind, **fields}
     line = json.dumps(rec)
     if to_stdout:
-        sys.stdout.write(line + "\n")
-        sys.stdout.flush()
+        try:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+        except OSError:
+            pass  # stdout closed (broken pipe in a detached pipeline); the file append still runs
     jd = Path(job_dir) if job_dir is not None else runctx.job_dir()
     try:
         jd.mkdir(parents=True, exist_ok=True)
