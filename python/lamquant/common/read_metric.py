@@ -35,6 +35,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -94,6 +95,7 @@ def read_csv_metrics(path: Path, keys: List[str], last: Optional[int]) -> Dict[s
             path = alt
         else:
             return _result("csv", sel, errors=[f"no file: {path} (and no {alt.name} sibling)"])
+    rows: List[Dict[str, Any]] = []
     if path.suffix == ".parquet":
         try:
             import pyarrow.parquet as pq  # lazy
@@ -101,14 +103,19 @@ def read_csv_metrics(path: Path, keys: List[str], last: Optional[int]) -> Dict[s
         except ImportError:
             csv_sib = path.with_suffix(".csv")
             if csv_sib.exists():
-                path = csv_sib
+                path = csv_sib  # fall through to the CSV branch below
             else:
                 return _result("parquet", sel, errors=[
                     f"{path} is parquet but pyarrow is absent and no .csv sibling exists"])
-    rows: List[Dict[str, Any]]
+        except Exception as e:  # corrupt/unreadable parquet -> structured error, not a traceback
+            return _result("parquet", sel, errors=[
+                f"failed to read parquet {path}: {type(e).__name__}: {e}"])
     if path.suffix == ".csv":
         with path.open(newline="") as f:
             rows = list(csv.DictReader(f))
+    elif path.suffix != ".parquet":
+        return _result("csv", sel, errors=[
+            f"unsupported extension {path.suffix!r} for {path}; expected .csv or .parquet"])
     available = list(rows[0].keys()) if rows else []
     if last is not None:
         rows = rows[-last:]
@@ -145,9 +152,16 @@ def read_journald(unit: str, kind: Optional[str], last: Optional[int]) -> Dict[s
     sel = f"journald:{unit}"
     if not unit.endswith(".service"):
         unit = unit + ".service"
+    # Validate before handing to subprocess (journalctl -u isn't a shell, but
+    # keep the arg to a known-safe charset rather than trusting CLI input).
+    if not re.fullmatch(r"[A-Za-z0-9_@.\-]+", unit):
+        return _result("journald", sel, errors=[f"invalid unit name: {unit!r}"])
+    # Cap the fetch: a long-lived unit's journal can be huge. --last trims
+    # post-fetch; --lines bounds what journalctl returns (newest N).
+    lines = str(last if (last is not None and last > 0) else 10000)
     try:
         out = subprocess.run(
-            ["journalctl", "--user", "-u", unit, "-o", "json", "--no-pager"],
+            ["journalctl", "--user", "-u", unit, "-o", "json", "--no-pager", "--lines", lines],
             capture_output=True, text=True, timeout=30)
     except FileNotFoundError:
         return _result("journald", sel, errors=["journalctl not found on PATH"])

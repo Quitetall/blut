@@ -71,6 +71,16 @@ def test_no_file_errors(tmp_path):
     assert res["errors"] and "no file" in res["errors"][0]
 
 
+def test_unknown_extension_errors_not_crash(tmp_path):
+    # an existing non-csv/non-parquet file must yield a structured error,
+    # never an UnboundLocalError / traceback.
+    f = tmp_path / "metrics.txt"
+    f.write_text("not a metrics file\n")
+    res = rm.read_csv_metrics(f, ["val_r"], None)
+    assert res["rows"] == []
+    assert res["errors"] and "unsupported extension" in res["errors"][0]
+
+
 def test_status_jsonl_kind_filter_and_verbatim(tmp_path):
     sj = tmp_path / "status.jsonl"
     sj.write_text(
