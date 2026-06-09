@@ -16,3 +16,8 @@ python/lamquant/student/recovery/
 # Training run logs (high-volume CSV)
 python/training_logs/
 training_logs/
+
+# generated run artifacts (ADR 0044 P10 — runs write here, not code)
+python/lamquant/outputs/
+python/wandb/
+wandb/
