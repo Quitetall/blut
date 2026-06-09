@@ -650,6 +650,10 @@ def main():
     p.add_argument("--device", default="auto")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--checkpoint", default=None)
+    p.add_argument("--logger", choices=["none", "wandb"], default="none",
+                   help="metric sink: the MetricLog CSV is ALWAYS on; 'wandb' "
+                        "adds W&B (mode via WANDB_MODE env, default offline; set "
+                        "WANDB_MODE=online to stream live).")
 
     # ---- ADR-0027 upgrade toggles. ALL default OFF / inert so the existing
     #      run-20 baseline command is byte-for-byte unchanged in behaviour. ----
@@ -926,6 +930,35 @@ def main():
     print(f"[4state] training {args.epochs} epochs x {len(train_loader)} batches "
           f"(bs={args.batch_size}, target_T={target_T})")
 
+    # Metric sinks (mirror train_joint): the MetricLog CSV/Parquet is ALWAYS on
+    # — a complete, reviewer-readable file after every epoch, read live with
+    # `python -m lamquant.common.read_metric --run <run_id>` (verbatim, no LLM).
+    # wandb is optional (--logger wandb; WANDB_MODE=online to stream).
+    run_id = f"snn4state_{args.head}_{int(train_start)}"
+    metric_log_dir = Path(ROOT_DIR) / "training_logs"
+    from lamquant.common.metric_log import MetricLog
+    metric_log = MetricLog(run_id=run_id, log_dir=metric_log_dir)
+    print(f"[4state] metric stream: {metric_log.path} "
+          f"(backend={metric_log._backend}) run_id={run_id}")
+    wandb_run = None
+    if args.logger == "wandb":
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "lamquant"),
+                name=run_id,
+                config=vars(args) | {"lma_root": [str(x) for x in args.lma_root],
+                                     "split_manifest": str(args.split_manifest)},
+                tags=["snn", "4state", args.head, args.optimizer],
+                mode=os.environ.get("WANDB_MODE", "offline"),
+                dir=str(metric_log_dir))
+            print(f"[4state] wandb: mode={os.environ.get('WANDB_MODE', 'offline')} "
+                  f"project={os.environ.get('WANDB_PROJECT', 'lamquant')}")
+        except Exception as e:
+            print(f"[4state] --logger wandb requested but unavailable ({e}); "
+                  f"continuing without it")
+            wandb_run = None
+
     for epoch in range(args.epochs):
         ep_start = time.time()
         if hasattr(train_sampler, "set_epoch"):
@@ -1037,11 +1070,41 @@ def main():
         print("        confusion(true rows -> pred cols): " +
               " | ".join(",".join(str(int(x)) for x in row) for row in val_cm))
 
+        # Verbatim metric sink (always) + optional wandb. Guarded: logging
+        # must never crash a run. Only flat scalars (per-state P/R vectors are
+        # excluded — already printed above).
+        try:
+            d = {"run_id": run_id, "script": "train_4state_controller",
+                 "epoch": epoch + 1, "global_epoch": epoch + 1,
+                 "total_epochs": args.epochs, "timestamp": time.time(),
+                 "train_loss": float(avg_loss),
+                 "lr": float(optimizer.param_groups[0]["lr"]),
+                 "score": float(score), "feasible": bool(feasible),
+                 "mu": float(mu), "best_epoch": best_epoch,
+                 "nan_skips": int(nan_skips), "secs_per_epoch": float(ep_sec),
+                 "gpu_mb": float(gpu_mb),
+                 **{k: float(v) for k, v in m.items()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)}}
+            metric_log.append(d)
+            if wandb_run is not None:
+                scalars = {k: v for k, v in d.items()
+                           if isinstance(v, (int, float)) and not isinstance(v, bool)}
+                wandb_run.log(scalars, step=epoch + 1)
+        except Exception as e:
+            print(f"[4state] metric/wandb emit failed (non-fatal): {e}")
+
         if (args.early_stop_patience and args.early_stop_patience > 0
                 and epochs_since_best >= args.early_stop_patience):
             print(f"[4state] early stop: no improvement for "
                   f"{args.early_stop_patience} epochs (best @ ep{best_epoch}).")
             break
+
+    metric_log.close()
+    if wandb_run is not None:
+        try:
+            wandb_run.finish()
+        except Exception:
+            pass
 
     total_h = (time.time() - train_start) / 3600
     if best_metrics is not None:
