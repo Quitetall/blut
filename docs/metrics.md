@@ -24,7 +24,7 @@ key / file / unit yields an explicit `error` — **a value is never synthesized*
 **Invoke** (from `blut/python`, or with it on `PYTHONPATH`):
 
 ```bash
-python -m lamquant.common.read_metric <source> [selectors]
+python -m blut_core.read_metric <source> [selectors]
 ```
 
 ### Sources (exactly one required)
@@ -69,27 +69,27 @@ python -m lamquant.common.read_metric <source> [selectors]
 cd blut/python
 
 # last 3 val_r values for a run, verbatim
-python -m lamquant.common.read_metric --run joint_fast_t6_1780898543 --key val_r --last 3
+python -m blut_core.read_metric --run joint_fast_t6_1780898543 --key val_r --last 3
 
 # multiple keys at once
-python -m lamquant.common.read_metric --run <RUN_ID> --key val_r --key train_loss --key lr
+python -m blut_core.read_metric --run <RUN_ID> --key val_r --key train_loss --key lr
 
 # discover available keys: ask for a bogus one; the error lists them all
-python -m lamquant.common.read_metric --run <RUN_ID> --key __list__   # -> errors:[...available...]
+python -m blut_core.read_metric --run <RUN_ID> --key __list__   # -> errors:[...available...]
 
 # a live systemd training unit's journald
-python -m lamquant.common.read_metric --unit blut-20260608-235824-737923340-lamquant_train_joint --last 5
+python -m blut_core.read_metric --unit blut-20260608-235824-737923340-lamquant_train_joint --last 5
 
 # a lamu-train job's status.jsonl, only failures
-python -m lamquant.common.read_metric --job 20260510-120046-475802379 --kind failed
+python -m blut_core.read_metric --job 20260510-120046-475802379 --kind failed
 
 # run provenance
-python -m lamquant.common.read_metric --run <RUN_ID> --manifest
+python -m blut_core.read_metric --run <RUN_ID> --manifest
 
 # from wandb (after a run with --logger wandb).
 # <entity> = your wandb entity (run `wandb whoami`, or read it off the run URL);
 # project defaults to WANDB_PROJECT (=lamquant).
-python -m lamquant.common.read_metric --wandb <entity>/lamquant/<run_id> --key val_r
+python -m blut_core.read_metric --wandb <entity>/lamquant/<run_id> --key val_r
 ```
 
 Pipe to `jq` for shaping, e.g. `... --key val_r --last 1 | jq -r '.rows[0].val_r'`.
@@ -100,12 +100,12 @@ Pipe to `jq` for shaping, e.g. `... --key val_r --last 1 | jq -r '.rows[0].val_r
 
 ### MetricLog (always on)
 
-`lamquant.common.metric_log.MetricLog` writes `metrics_<run_id>.csv`
+`blut_core.metric_log.MetricLog` writes `metrics_<run_id>.csv`
 (or `.parquet` if pyarrow is present), **rewritten atomically every epoch** so a
 reader always sees a complete, valid file mid-run.
 
 ```python
-from lamquant.common.metric_log import MetricLog
+from blut_core.metric_log import MetricLog
 mlog = MetricLog(run_id=run_id, log_dir=Path(ROOT_DIR) / "training_logs")
 mlog.append({"epoch": e, "val_r": r, "train_loss": loss, ...})  # never raises
 mlog.close()
@@ -157,7 +157,33 @@ After a wandb run, pull it back verbatim with `read_metric --wandb`.
   `done` {final_loss,checkpoint_dir}, `failed` {error}. Defined in
   `blut/src/protocol.rs`; mirror it exactly if you add a parser.
 
-## 5. ADR alignment
+## 5. `blut_core` — the core-cookbook primitives
+
+`blut_core` (at `blut/python/blut_core/`) holds the domain-agnostic,
+implement-once building blocks every training run needs — reusable by ANY
+cookbook (lamquant, lamu), no EEG/LamQuant coupling. `torch` is lazy-imported
+only inside `checkpoint`/`sysgauge`, so `import blut_core` is cheap.
+
+| Primitive | Use | Contract |
+|---|---|---|
+| `runctx` | `runctx.job_dir(fallback)` / `runctx.resolve(run_id)` | resolves the `$BLUT_JOB_DIR`-or-`training_logs` anchor ONCE (ADR 0044 P10) |
+| `MetricLog` | `from blut_core import MetricLog` | atomic per-epoch CSV/Parquet metric writer |
+| `read_metric` | `python -m blut_core.read_metric …` | verbatim reader (§1) |
+| `status` | `status.step(...)`, `.eval_pass(...)`, `.saved/.done/.failed` | emit a flushed `StatusUpdate` JSON line → stdout **+** `status.jsonl` (defeats block-buffered stdout; ADR 0044 P4) |
+| `RunManifest` | `from blut_core import RunManifest` | run provenance (git_sha/config/hw/ckpt SHA), written even on crash |
+| `checkpoint` | `checkpoint.save(payload, path, contract=…)` / `.load(path)` | atomic save (tmp+fsync+rename) + sidecar SHA + free-space preflight + resume-payload contract; corrupt → `CheckpointError`, never silent garbage (ADR 0044 P7) |
+| `sysgauge` | `sysgauge.snapshot()` | best-effort GPU/host gauges as a dict; a missing source is **omitted, never fabricated** (ADR 0044 P10) |
+
+```python
+from blut_core import runctx, status, MetricLog, checkpoint, sysgauge
+
+mlog = MetricLog(run_id, log_dir=runctx.job_dir(fallback))
+mlog.append({"epoch": e, "val_r": r, **sysgauge.snapshot()})
+status.eval_pass(step, eval_loss=v)                       # live event to journald + status.jsonl
+checkpoint.save(payload, ckpt_path, contract=checkpoint.RESUME_CONTRACT)
+```
+
+## 6. ADR alignment
 
 - **ADR 0038 (metric discipline)** — this tool IS the mandated mechanical
   defense: verify every metric against the raw source; LLM poller prose is
@@ -170,6 +196,7 @@ After a wandb run, pull it back verbatim with `read_metric --wandb`.
   honor it (fall back to `training_logs` standalone). NOT yet done for
   `train_joint` or the Rust `find_logs` (csv-only) — owner's Phase E lane.
 
-_Source: `blut/python/lamquant/common/read_metric.py` (+ tests in
-`common/tests/test_read_metric.py`), `metric_log.py`, `src/protocol.rs`;
-decisions/0038, 0044._
+_Source: `blut/python/blut_core/` (`runctx.py`, `metric_log.py`,
+`read_metric.py`, `status.py`, `run_manifest.py`, `checkpoint.py`,
+`sysgauge.py`; tests in `blut_core/tests/`), `blut/src/protocol.rs`;
+decisions/0037, 0038, 0044._

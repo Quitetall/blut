@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # blut/python
-from lamquant.common import read_metric as rm  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # blut/python
+from blut_core import read_metric as rm  # noqa: E402
 
 
 def _write_csv(p: Path) -> Path:

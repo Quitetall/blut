@@ -994,7 +994,7 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     # Reviewer-readable metric stream (ALWAYS on; Parquet via pyarrow, CSV
     # fallback) — a complete valid file after every epoch (read mid-run). Plus
     # optional Weights & Biases under --logger wandb (offline by default).
-    from lamquant.common.metric_log import MetricLog
+    from blut_core.metric_log import MetricLog
     metric_log = MetricLog(run_id=run_id, log_dir=log_dir)
     print(f"[*] Metric stream:         {metric_log.path}  (backend={metric_log._backend})")
     wandb_run = None

@@ -1,4 +1,4 @@
-"""Tests for lamquant.common.metric_log.MetricLog — the reviewer-readable,
+"""Tests for blut_core.metric_log.MetricLog — the reviewer-readable,
 crash-safe, live per-epoch metric stream (BLUT L1 observability).
 
 Run: cd blut/python && python -m pytest tests/test_metric_log.py -q
@@ -12,7 +12,7 @@ import os
 
 import pytest
 
-from lamquant.common.metric_log import MetricLog
+from blut_core.metric_log import MetricLog
 
 _HAS_PYARROW = importlib.util.find_spec("pyarrow") is not None
 

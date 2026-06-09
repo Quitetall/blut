@@ -41,23 +41,18 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from . import runctx
+
 # Index columns surfaced alongside any --key selection so a value always has
 # its step/epoch/time context. Mirrors metric_log.py's common row fields.
 _INDEX_KEYS = ("run_id", "epoch", "global_epoch", "step", "phase", "timestamp")
 
 
 def _default_log_dir() -> Path:
-    # ADR 0044 P10: metric/log writes anchor to the per-job BLUT_JOB_DIR (set
-    # by blut-lamquant's runner via systemd --setenv) when a run is launched as
-    # a BLUT stage; the reader honors the same anchor so it finds the metrics
-    # wherever the stage put them. Standalone runs (no BLUT_JOB_DIR) fall back
-    # to the repo-local training_logs.
-    # this file: blut/python/lamquant/common/read_metric.py
-    # parents[2] == blut/python  ->  blut/python/training_logs
-    job_dir = os.environ.get("BLUT_JOB_DIR")
-    if job_dir:
-        return Path(job_dir)
-    return Path(__file__).resolve().parents[2] / "training_logs"
+    # Single source of the BLUT_JOB_DIR-or-training_logs convention (ADR 0044
+    # P10): the reader resolves the same anchor the writers use, via runctx, so
+    # it finds metrics wherever a BLUT stage put them.
+    return runctx.job_dir()
 
 
 def _result(source: str, selector: str, *, keys: Optional[List[str]] = None,

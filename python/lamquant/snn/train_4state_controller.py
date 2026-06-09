@@ -932,16 +932,14 @@ def main():
 
     # Metric sinks (mirror train_joint): the MetricLog CSV/Parquet is ALWAYS on
     # — a complete, reviewer-readable file after every epoch, read live with
-    # `python -m lamquant.common.read_metric --run <run_id>` (verbatim, no LLM).
+    # `python -m blut_core.read_metric --run <run_id>` (verbatim, no LLM).
     # wandb is optional (--logger wandb; WANDB_MODE=online to stream).
     run_id = f"snn4state_{args.head}_{int(train_start)}"
-    # ADR 0044 P10: anchor metric writes to the per-job BLUT_JOB_DIR (set by
-    # the BLUT runner via systemd --setenv) when launched as a stage; fall back
-    # to repo-local training_logs for standalone runs. (train_joint + the Rust
-    # find_logs still carry the __file__-relative path — owner's Phase E lane.)
-    _job_dir = os.environ.get("BLUT_JOB_DIR")
-    metric_log_dir = Path(_job_dir) if _job_dir else (Path(ROOT_DIR) / "training_logs")
-    from lamquant.common.metric_log import MetricLog
+    # ADR 0044 P10: the BLUT_JOB_DIR-or-training_logs anchor is resolved ONCE in
+    # the core primitive (blut_core.runctx), not re-derived here.
+    from blut_core import runctx
+    from blut_core.metric_log import MetricLog
+    metric_log_dir = runctx.job_dir(Path(ROOT_DIR) / "training_logs")
     metric_log = MetricLog(run_id=run_id, log_dir=metric_log_dir)
     print(f"[4state] metric stream: {metric_log.path} "
           f"(backend={metric_log._backend}) run_id={run_id}")

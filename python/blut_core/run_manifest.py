@@ -15,7 +15,7 @@ manifest under `ai_models/training_logs/<run_id>/RUN_MANIFEST.json` with:
 
 Usage from a training entry point:
 
-    from lamquant.common.run_manifest import RunManifest
+    from blut_core.run_manifest import RunManifest
 
     with RunManifest.start(out_dir="ai_models/training_logs",
                            argv=sys.argv,
