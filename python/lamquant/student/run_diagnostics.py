@@ -62,7 +62,12 @@ def recalibrate_cdf(model, val_files, device, max_files=16, max_windows=64):
     for c in range(C):
         ch_vals = all_lat[:, c, :].flatten().sort().values
         indices = (quantile_fracs * (len(ch_vals) - 1)).long()
-        model.cdf_breakpoints.data[c] = ch_vals[indices].to(device)
+        # ×100: encode() returns the POST-CDF latent; the wide linspace(-100,100)
+        # ramp makes _cdf_forward linear (uniform = z/100), so the collected
+        # quantiles are quantiles(z)/100 and must be scaled back by the ramp
+        # half-width to land in raw-latent space. Omitting this leaves the
+        # breakpoints 100× too tight and saturates the encoder.
+        model.cdf_breakpoints.data[c] = (ch_vals[indices] * 100.0).to(device)
     print(f"  CDF recalibrated: {C} channels × {N_CDF} entries")
     bp = model.cdf_breakpoints
     print(f"  Breakpoint ranges: min=[{bp[:, 0].min():.3f}, {bp[:, 0].max():.3f}], "

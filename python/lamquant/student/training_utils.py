@@ -433,7 +433,11 @@ def run(cfg=None, epochs_warmup=50, epochs_quant=200, epochs_fine=300, batch_siz
                     ch_vals = _all_lat[:, c, :].flatten().sort().values
                     # Compute quantiles at evenly spaced fractions
                     indices = (quantile_fracs * (len(ch_vals) - 1)).long()
-                    student.cdf_breakpoints[c] = ch_vals[indices]
+                    # ×100: encode() returns POST-CDF latent; the linspace(-100,100)
+                    # ramp makes _cdf_forward linear (uniform = z/100), so quantiles
+                    # are quantiles(z)/100 — scale back by the ramp half-width to land
+                    # in raw-latent space (else breakpoints are 100× too tight).
+                    student.cdf_breakpoints[c] = ch_vals[indices] * 100.0
                 bp = student.cdf_breakpoints
                 print(f"    CDF table: {C} channels × {N_CDF} breakpoints = "
                       f"{C * N_CDF * 2} bytes (INT16)")

@@ -473,6 +473,8 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         variable_n: bool = False,
         ca_decoder_legacy: bool = False,
         n_range: tuple = (8, 21),
+        recalibrate_cdf: bool = False,
+        cdf_recal_epoch: Optional[int] = None,
         diagnostics: bool = True,
         logger_backend: str = 'none'):
     """Run joint training with the given TrainingConfig.
@@ -1185,8 +1187,104 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     _warm_start = _resume_epoch + 1 if _resume_phase == 'warm' else 1
     if _resume_phase == 'qat':
         _warm_start = cfg.epochs_warmup + 1  # skip warm entirely
+    # One-shot per-channel CDF recalibration (opt-in A/B lever; default off).
+    # cdf_breakpoints ships uncalibrated (linspace(-3,3)); without this the
+    # encoder adapts to a dead linear quantile map. Recompute it ONCE from the
+    # encoder's own latent distribution after a few warm epochs, then freeze so
+    # the encoder adapts to a well-matched fixed target (the design intent —
+    # encoder.py cdf_breakpoints "computed once, frozen forever"). Non-CA only.
+    _cdf_recal_done = [False]
+    _recal_ep = (cdf_recal_epoch if cdf_recal_epoch is not None
+                 else max(2, cfg.epochs_warmup // 4))
+    # Clamp into the warm window so recal lands with epochs left to re-adapt
+    # (a recal at/after the last warm epoch can't be learned through).
+    _recal_ep = max(1, min(_recal_ep, max(1, cfg.epochs_warmup - 1)))
+
+    # Ramp half-width for the recal trick (see below). The encoder's encode()
+    # returns the POST-CDF latent (encoder.py _cdf_forward maps the breakpoint
+    # span -> uniform [-1,1]); a wide symmetric ramp [-R, R] makes that map
+    # exactly linear (uniform = z / R for |z| < R), so collected quantiles are
+    # quantiles(z) / R and must be multiplied back by R to land in raw-latent
+    # space. The ×R correction is LOAD-BEARING — without it the breakpoints come
+    # out R× too tight and ~all latents saturate to ±1. (The reference
+    # run_diagnostics.recalibrate_cdf / training_utils init path OMIT this and
+    # are silently broken; this is the corrected version.)
+    _CDF_RAMP = 100.0
+
+    def _recalibrate_cdf_now():
+        enc = codec.encoder
+        if not hasattr(enc, 'cdf_breakpoints'):
+            return False
+        _N = enc.cdf_breakpoints.shape[1]
+        _saved_bp = enc.cdf_breakpoints.detach().clone()
+        enc.cdf_breakpoints.copy_(
+            torch.linspace(-_CDF_RAMP, _CDF_RAMP, _N, device=device)
+            .unsqueeze(0).expand_as(enc.cdf_breakpoints))
+        # RNG-neutral: snapshot the dataset RNG (+ torch RNG) so the extra data
+        # pull does NOT shift the training window stream — keeps the recal-ON vs
+        # recal-OFF A/B isolated to the single CDF variable.
+        _ds_rng = getattr(train_ds, '_rng', None)
+        _ds_state = _ds_rng.bit_generator.state if _ds_rng is not None else None
+        _t_state = torch.get_rng_state()
+        _cu_state = (torch.cuda.get_rng_state_all()
+                     if torch.cuda.is_available() else None)
+        _was_train = codec.training
+        codec.train(False)                         # inference mode for collection
+        _lats, _nb = [], 0
+        with torch.no_grad():
+            for _b in train_ds.prefetch_typed_batches(
+                    batch_size=cfg.batch_size_warmup, device=device,
+                    sampler=train_sampler):
+                _xi, _, _, _ = _ca_inputs(_b.l3_approx, _b.fullband_target,
+                                          channel_agnostic, variable_n, n_range)
+                _lats.append(enc.encode(_xi, quantize=False).float().cpu())
+                _nb += 1
+                if _nb >= 8:
+                    break
+        codec.train(_was_train)                    # restore prior mode
+        if _ds_state is not None:
+            train_ds._rng.bit_generator.state = _ds_state
+        torch.set_rng_state(_t_state)
+        if _cu_state is not None:
+            torch.cuda.set_rng_state_all(_cu_state)
+        if not _lats:
+            enc.cdf_breakpoints.copy_(_saved_bp)   # abort: restore init
+            return False
+        _all = torch.cat(_lats, dim=0)             # [N, C, T]
+        _C = _all.shape[1]
+        _qf = torch.linspace(0.0, 1.0, _N)
+        for _c in range(_C):
+            _vals = _all[:, _c, :].flatten().sort().values
+            _idx = (_qf * (len(_vals) - 1)).long()
+            enc.cdf_breakpoints.data[_c] = (_vals[_idx] * _CDF_RAMP).to(device)
+        _bp = enc.cdf_breakpoints
+        print(f"  [CDF] post-recal breakpoint span: "
+              f"first=[{_bp[:, 0].min():.3f},{_bp[:, 0].max():.3f}] "
+              f"last=[{_bp[:, -1].min():.3f},{_bp[:, -1].max():.3f}] "
+              f"(want raw-latent scale, NOT ~±0.05)")
+        return True
+
     for ep in range(_warm_start, cfg.epochs_warmup + 1):
         codec.train()
+        if recalibrate_cdf and ep == _recal_ep and not _cdf_recal_done[0]:
+            if channel_agnostic:
+                print("  [CDF] recalibration skipped (channel-agnostic unsupported)")
+            else:
+                _ok = _recalibrate_cdf_now()
+                print(f"  [CDF] one-shot per-channel recalibration at ep{ep}: "
+                      f"{'done' if _ok else 'no-data -> skipped'}")
+                if _ok:
+                    # Force the next validation to checkpoint so the saved warm
+                    # artifact carries the recalibrated breakpoints even if val R
+                    # dips transiently while the encoder re-adapts (else the
+                    # best-R ckpt could predate recal and ship the dead map).
+                    best_warm_r = 0.0
+                    # AveragedModel(use_buffers=False) froze EMA buffers at
+                    # construction → sync the recalibrated map into it too.
+                    if ema_model is not None:
+                        ema_model.module.encoder.cdf_breakpoints.copy_(
+                            codec.encoder.cdf_breakpoints)
+            _cdf_recal_done[0] = True
         loss_acc, n = 0.0, 0
         _bi = 0
         for batch in train_ds.prefetch_typed_batches(
@@ -2067,6 +2165,14 @@ def main():
     parser.add_argument('--max-windows-per-file', type=int, default=None,
                         help='Cap windows per recording in the base index (raise to '
                              'use more of long recordings; default ~5).')
+    parser.add_argument('--recalibrate-cdf', action='store_true', default=False,
+                        help='Opt-in: recompute the per-channel CDF-LUT breakpoints '
+                             'ONCE from the encoder latent distribution mid-warm, '
+                             'then freeze. Default off => the buffer stays at its '
+                             'linspace(-3,3) init (byte-equal baseline). Non-CA only.')
+    parser.add_argument('--cdf-recal-epoch', type=int, default=None,
+                        help='Warm epoch at which to do the one-shot CDF '
+                             'recalibration (default max(1, epochs_warmup//5)).')
     # ---- Channel-agnostic codec (CA-6) ----
     parser.add_argument('--channel-agnostic', action='store_true', default=False,
                         help='Build the channel-count-agnostic codec (position-'
@@ -2140,6 +2246,8 @@ def main():
                  variable_n=args.variable_n,
                  ca_decoder_legacy=args.ca_decoder_legacy,
                  n_range=(args.n_min, args.n_max),
+                 recalibrate_cdf=args.recalibrate_cdf,
+                 cdf_recal_epoch=args.cdf_recal_epoch,
                  diagnostics=args.diagnostics,
                  logger_backend=args.logger)
     # Exit 0 = training RAN TO COMPLETION (ADR 0044). Quality (R/PRD/LQS)
