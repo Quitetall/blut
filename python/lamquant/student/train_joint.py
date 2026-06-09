@@ -446,7 +446,8 @@ def _ca_inputs(x_l3, fullband, channel_agnostic, variable_n, n_range=(8, 21)):
 # ============================================================
 
 def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
-        seed: int = 0, fullband_mode: str = 'auto',
+        seed: int = 0, latent_dim: Optional[int] = None,
+        fullband_mode: str = 'auto',
         amp: bool = True, compile_decoder: bool = True,
         asymmetric_weight: float = 0.0,
         asymmetric_kind: str = 'envelope',
@@ -573,7 +574,18 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         if not (1 <= _lo <= _hi <= 21):
             raise ValueError(
                 f"--n-min/--n-max must satisfy 1 <= n_min <= n_max <= 21, got ({_lo},{_hi})")
-    codec = build_default_joint(latent_dim=32, encoder_width=cfg.encoder_width,
+    # ADR 0045 latent-preset knob. None -> 32 (MONITOR preset; byte-identical
+    # to the frozen default). Grow (64/96/128) for the CLINICAL/LQS-C teacher.
+    _ld = latent_dim if latent_dim is not None else 32
+    if _ld != 32:
+        if seizure_head:
+            raise ValueError(
+                f"--latent-dim {_ld} is incompatible with the seizure head "
+                "(SeizureHead is fixed at latent_dim=32). Re-run with "
+                "--no-seizure-head (codec runs use --no-seizure-head anyway).")
+        print(f"[*] latent_dim override: {_ld} (ADR 0045 CLINICAL preset; "
+              "MONITOR default is 32)")
+    codec = build_default_joint(latent_dim=_ld, encoder_width=cfg.encoder_width,
                                  vocos_tier=vocos_tier, in_channels=n_in,
                                  decoder_channels=21,
                                  gradient_checkpointing=use_grad_ckpt,
@@ -785,7 +797,15 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     # ---- Multi-task seizure detection head ----
     sz_head = None
     if seizure_head:
-        sz_head = SeizureHead(latent_dim=32).to(device)
+        # _ld is guaranteed == 32 here: the seizure_head + latent_dim!=32
+        # combination is rejected at startup (see the guard at the
+        # build_default_joint call). Assert the invariant so a future reorder
+        # that moves this block above the guard fails fast instead of silently
+        # building a mismatched [B,_ld,79]->SeizureHead(32) head.
+        assert _ld == 32, (
+            f"SeizureHead is fixed at latent_dim=32 but _ld={_ld}; the "
+            "latent_dim!=32 + seizure-head guard must run before this block")
+        sz_head = SeizureHead(latent_dim=_ld).to(device)
         # Add seizure head params to the generator optimizer so they
         # co-train with the encoder. The head is tiny (33 params).
         optimizer.add_param_group({
@@ -2018,6 +2038,12 @@ def main():
                         help='Override preset encoder depth / n_blocks (e.g. 12).')
     parser.add_argument('--encoder-kernels', type=str, default=None,
                         help='Override per-block kernels, comma-sep, len==blocks.')
+    parser.add_argument('--latent-dim', type=int, default=None,
+                        help='Latent channel dim (ADR 0045 latent-preset knob). '
+                             'None -> 32 (MONITOR preset, byte-identical default). '
+                             'Grow (64/96/128) for the CLINICAL/LQS-C teacher. '
+                             'Requires --no-seizure-head when != 32 (the seizure '
+                             'head is fixed at latent_dim=32).')
     parser.add_argument('--batch-size', type=int, default=None,
                         help='Override preset batch size (drop for big tier-7 decoder).')
     parser.add_argument('--epochs-warmup', type=int, default=None,
@@ -2084,6 +2110,7 @@ def main():
         print(f"[*] config overrides: {_ov}")
     tier = args.tier if args.tier is not None else DEPLOYMENT_TIERS[args.deployment]
     result = run(cfg, vocos_tier=tier, seed=args.seed,
+                 latent_dim=args.latent_dim,
                  ckpt_dir=args.ckpt_dir,
                  fullband_mode=args.fullband_mode,
                  amp=args.amp, compile_decoder=args.compile_decoder,
