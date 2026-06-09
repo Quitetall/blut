@@ -1161,7 +1161,8 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
                 channel_agnostic=channel_agnostic, device=str(device))
             _rep = DiagReport()
             _rep.add(_diag.check_data_sanity(_xin, _fbt))
-            _rep.add(_diag.check_shape_contract(_xin, _co, _cm, fullband=_fbt))
+            _rep.add(_diag.check_shape_contract(_xin, _co, _cm, fullband=_fbt,
+                                                expect_latent=_ld))
             _rep.add(_diag.check_gradient_flow(_xin, _fbt, _co, _cm))
             _rep.add(_diag.check_masked_invariant())
             if channel_agnostic and _co is not None:

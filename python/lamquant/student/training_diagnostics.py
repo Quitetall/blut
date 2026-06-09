@@ -192,15 +192,19 @@ class TrainingDiagnostics:
 
     def check_shape_contract(self, x_l3, coords=None, ch_mask=None,
                              expect_out: Optional[int] = None,
-                             fullband=None) -> List[DiagResult]:
+                             fullband=None, expect_latent: int = 32) -> List[DiagResult]:
+        # `expect_latent` = the CONFIGURED latent_dim (ADR 0045 knob). The check
+        # is latent-preset-agnostic: it verifies the encoder emits its configured
+        # channel count, not a literal 32. Time stays 79 (stride unchanged).
         self.codec.train(False)
         out = []
         with torch.no_grad():
             lat = (self.codec.encoder.encode(x_l3, quantize=False, coords=coords)
                    if self.channel_agnostic else
                    self.codec.encoder.encode(x_l3, quantize=False))
-        out.append(DiagResult("shape.latent", PASS if lat.shape[1:] == (32, 79)
-                              else FAIL, f"encode→{tuple(lat.shape)} (want [*,32,79])"))
+        out.append(DiagResult("shape.latent",
+                              PASS if lat.shape[1:] == (expect_latent, 79) else FAIL,
+                              f"encode→{tuple(lat.shape)} (want [*,{expect_latent},79])"))
         with torch.no_grad():
             recon = self._forward(x_l3, coords, ch_mask, quantize=False)
         # Recon channels must match the RECONSTRUCTION TARGET, not the encoder
@@ -324,10 +328,12 @@ class TrainingDiagnostics:
                           f"real-channel Δ with vs without padding = {d:.2e}", d)
 
     def run_preflight(self, x_l3, fullband=None, coords=None, ch_mask=None,
-                      expect_out: Optional[int] = None, overfit_steps: int = 60) -> DiagReport:
+                      expect_out: Optional[int] = None, overfit_steps: int = 60,
+                      expect_latent: int = 32) -> DiagReport:
         rep = DiagReport()
         rep.add(self.check_data_sanity(x_l3, fullband))
-        rep.add(self.check_shape_contract(x_l3, coords, ch_mask, expect_out))
+        rep.add(self.check_shape_contract(x_l3, coords, ch_mask, expect_out,
+                                          expect_latent=expect_latent))
         rep.add(self.check_gradient_flow(x_l3, fullband, coords, ch_mask))
         rep.add(self.check_masked_invariant())
         if self.channel_agnostic and coords is not None:
