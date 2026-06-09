@@ -114,6 +114,14 @@ def test_manifest_verbatim(tmp_path):
     assert set(res["available_keys"]) == {"run_id", "git_sha", "exit_code"}
 
 
+def test_default_log_dir_honors_blut_job_dir(tmp_path, monkeypatch):
+    # ADR 0044 P10: when BLUT_JOB_DIR is set, the default metrics dir is it.
+    monkeypatch.setenv("BLUT_JOB_DIR", str(tmp_path))
+    assert rm._default_log_dir() == tmp_path
+    monkeypatch.delenv("BLUT_JOB_DIR", raising=False)
+    assert rm._default_log_dir().name == "training_logs"
+
+
 def test_main_exit_codes(tmp_path, capsys):
     _write_csv(tmp_path / "metrics_r1.csv")
     assert rm.main(["--run", "r1", "--log-dir", str(tmp_path), "--key", "val_r"]) == 0

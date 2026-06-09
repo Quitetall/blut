@@ -46,7 +46,7 @@ python -m lamquant.common.read_metric <source> [selectors]
 | `--key K` | exact column/field name; **repeatable**. On a miss → error listing available keys. CSV/wandb only. |
 | `--kind K` | filter `status.jsonl`/journald by `StatusUpdate` kind (`step`/`eval`/`saved`/`done`/`failed`). |
 | `--last N` | only the last N rows. For `--unit`, also caps the journald fetch. |
-| `--log-dir DIR` | metrics dir (default `blut/python/training_logs`). |
+| `--log-dir DIR` | metrics dir. Default: `$BLUT_JOB_DIR` if set (ADR 0044 P10), else `blut/python/training_logs`. |
 
 ### Output contract
 
@@ -137,7 +137,7 @@ After a wandb run, pull it back verbatim with `read_metric --wandb`.
 
 | Artifact | Path |
 |---|---|
-| MetricLog CSV/Parquet | `blut/python/training_logs/metrics_<run_id>.csv` |
+| MetricLog CSV/Parquet | `$BLUT_JOB_DIR/metrics_<run_id>.csv` (BLUT stage) or `blut/python/training_logs/metrics_<run_id>.csv` (standalone) |
 | Run provenance | `training_logs/<run_id>/RUN_MANIFEST.json` |
 | Job status stream | `~/.local/share/lamu/train-jobs/<job_id>/status.jsonl` |
 | systemd unit journal | `journalctl --user -u blut-<ts>-<id>-<recipe>.service` |
@@ -157,5 +157,19 @@ After a wandb run, pull it back verbatim with `read_metric --wandb`.
   `done` {final_loss,checkpoint_dir}, `failed` {error}. Defined in
   `blut/src/protocol.rs`; mirror it exactly if you add a parser.
 
+## 5. ADR alignment
+
+- **ADR 0038 (metric discipline)** — this tool IS the mandated mechanical
+  defense: verify every metric against the raw source; LLM poller prose is
+  liveness-only, never a quantitative trajectory. Codec quality = **fullband
+  R/PRD** only (not latent/distill proxies); graded against the LQS floors in
+  `Eagle/lqs/src/levels.rs` (M = R≥0.85, ADR 0043).
+- **ADR 0044 P10 (observability)** — metric/log writes anchor to
+  `$BLUT_JOB_DIR` (the per-job dir BLUT `--setenv`s across the systemd unit
+  boundary) when run as a stage; `read_metric` + `train_4state_controller`
+  honor it (fall back to `training_logs` standalone). NOT yet done for
+  `train_joint` or the Rust `find_logs` (csv-only) — owner's Phase E lane.
+
 _Source: `blut/python/lamquant/common/read_metric.py` (+ tests in
-`common/tests/test_read_metric.py`), `metric_log.py`, `src/protocol.rs`._
+`common/tests/test_read_metric.py`), `metric_log.py`, `src/protocol.rs`;
+decisions/0038, 0044._

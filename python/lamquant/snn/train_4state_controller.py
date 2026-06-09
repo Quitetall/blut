@@ -935,7 +935,12 @@ def main():
     # `python -m lamquant.common.read_metric --run <run_id>` (verbatim, no LLM).
     # wandb is optional (--logger wandb; WANDB_MODE=online to stream).
     run_id = f"snn4state_{args.head}_{int(train_start)}"
-    metric_log_dir = Path(ROOT_DIR) / "training_logs"
+    # ADR 0044 P10: anchor metric writes to the per-job BLUT_JOB_DIR (set by
+    # the BLUT runner via systemd --setenv) when launched as a stage; fall back
+    # to repo-local training_logs for standalone runs. (train_joint + the Rust
+    # find_logs still carry the __file__-relative path — owner's Phase E lane.)
+    _job_dir = os.environ.get("BLUT_JOB_DIR")
+    metric_log_dir = Path(_job_dir) if _job_dir else (Path(ROOT_DIR) / "training_logs")
     from lamquant.common.metric_log import MetricLog
     metric_log = MetricLog(run_id=run_id, log_dir=metric_log_dir)
     print(f"[4state] metric stream: {metric_log.path} "
