@@ -654,6 +654,51 @@ fn dir_size_bytes(path: &std::path::Path) -> Result<u64> {
     Ok(total)
 }
 
+/// Estimate a job's RAM footprint from the recipe's raw args JSON
+/// (ADR 0046 slice-1). Best-effort + recipe-agnostic: blut can't see
+/// the cookbook's typed Args, so it reads the well-known cost-driver
+/// keys directly off the JSON, defaulting CONSERVATIVELY when absent so
+/// a recipe that omits them still gates oversubscription rather than
+/// admitting blind. The dominant term is `workers` (dataloader
+/// prefetch); since the train stage caps uncalibrated workers at 4 and
+/// blut can't read that cap here, we mirror the cap as the default.
+///
+/// The scaling formula itself lives in `broker::footprint` so the cli
+/// admission gate and the cookbook's train stage share ONE source of
+/// truth.
+fn recipe_footprint(raw: &serde_json::Value) -> crate::broker::Footprint {
+    // Conservative defaults shared with the train stage so admission's
+    // `need` and the stage's `cap = need + 2G` are computed from the
+    // SAME inputs: cap workers at 4 (the train stage's uncalibrated
+    // cap), batch = broker DEFAULT_BATCH, tier 3, latent 256.
+    let u32_or = |key: &str, default: u32| -> u32 {
+        raw.get(key)
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32)
+            .unwrap_or(default)
+    };
+    // `workers` is env-only in the cookbook (LMA_NUM_WORKERS) so the
+    // JSON rarely carries it; default to the 4-worker cap. `batch_size`
+    // / `tier` ARE typed recipe args.
+    let workers = u32_or("workers", 4).clamp(1, 4);
+    let batch = u32_or("batch_size", crate::broker::footprint::DEFAULT_BATCH);
+    let tier = u32_or("tier", 3);
+    // latent width may ride in extra_args as "--encoder-width N"; parse
+    // it best-effort so a wide-encoder probe is billed correctly.
+    let latent = raw
+        .get("extra_args")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .position(|x| x.as_str() == Some("--encoder-width"))
+                .and_then(|i| arr.get(i + 1))
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse::<u32>().ok())
+        })
+        .unwrap_or(0);
+    crate::broker::footprint::estimate(workers, batch, tier, latent)
+}
+
 async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Result<()> {
     use crate::framework::{ExecCtx, SequentialExecutor};
     // The recipe catalog comes from the caller-supplied cookbook registry.
@@ -722,6 +767,10 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                 .with_context(|| format!("parse --args as JSON: {args}"))?;
             let plan =
                 (r.compile_fn)(raw.clone()).map_err(|e| anyhow!("recipe compile failed: {e}"))?;
+            // ADR 0046 slice-1: resolve the RAM footprint from the args
+            // BEFORE `raw` is consumed by the RecipeMarker below; the
+            // admission gate (after the job state is written) reuses it.
+            let footprint = recipe_footprint(&raw);
 
             let job_id = crate::jobs::new_job_id();
             let job_dir = crate::paths::job_dir(&job_id)?;
@@ -758,6 +807,39 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
             // let the function return so `lock` Drops (RAII unlocks
             // the scheduler — fixes the stale-lock-on-SIGTERM case).
             install_cancel_handler(ctx.cancel.clone());
+
+            // ADR 0046 slice-1 (item 4): RAM-refuse admission gate,
+            // placed BEFORE the scheduler lock. The review verified the
+            // lock already serializes blut-vs-blut GPU jobs (fail-fast),
+            // so this is a pure single-job over-subscription guard — if
+            // the conservative-high footprint can't fit free RAM (or the
+            // box at all), refuse CLEANLY here: no launch, no transient
+            // unit, no OOM. Cross-job queuing stays the lock's job; we do
+            // NOT build a poll-queue. Best-effort: a recipe whose args
+            // carry no cost drivers falls back to the conservative
+            // default footprint, which still gates oversubscription.
+            {
+                let fp = footprint;
+                let snap = crate::broker::ResourceSnapshot::probe();
+                // mem_total_gb == 0 means /proc/meminfo was unreadable
+                // (non-Linux / sandbox) — skip the gate rather than
+                // refuse every job on a probe miss.
+                if snap.mem_total_gb > 0.0 {
+                    if let crate::broker::AdmitDecision::Refuse { reason } = crate::broker::decide(
+                        &snap,
+                        &fp,
+                        crate::broker::admission::DEFAULT_FLOOR_GIB,
+                    ) {
+                        crate::python_kill::unbind_current_job();
+                        if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
+                            tracing::warn!("write Failed state for {job_id}: {se}");
+                        }
+                        return Err(anyhow!(
+                            "resource admission refused: {reason} (recipe '{name}')"
+                        ));
+                    }
+                }
+            }
 
             // Cross-process GPU arbitration — same lock acquisition
             // pattern as the legacy train path. Recipes that don't
