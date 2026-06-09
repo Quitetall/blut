@@ -2171,8 +2171,9 @@ def main():
                              'then freeze. Default off => the buffer stays at its '
                              'linspace(-3,3) init (byte-equal baseline). Non-CA only.')
     parser.add_argument('--cdf-recal-epoch', type=int, default=None,
-                        help='Warm epoch at which to do the one-shot CDF '
-                             'recalibration (default max(1, epochs_warmup//5)).')
+                        help='Warm epoch for the one-shot CDF recalibration '
+                             '(default max(2, epochs_warmup//4), clamped into '
+                             'the warm window).')
     # ---- Channel-agnostic codec (CA-6) ----
     parser.add_argument('--channel-agnostic', action='store_true', default=False,
                         help='Build the channel-count-agnostic codec (position-'

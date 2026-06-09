@@ -41,9 +41,12 @@ def load_model(ckpt_path, device, cdf_entries=32):
 def recalibrate_cdf(model, val_files, device, max_files=16, max_windows=64):
     """Recompute CDF-LUT breakpoints from current encoder's latent distribution."""
     N_CDF = model.cdf_breakpoints.shape[1]
-    # Set wide ramp so encode ≈ identity
+    # Wide ramp makes _cdf_forward linear (encode() returns the POST-CDF latent
+    # = z/_RAMP), so the collected quantiles below are scaled back by _RAMP. The
+    # ramp width and the correction are coupled through this single constant.
+    _RAMP = 100.0
     model.cdf_breakpoints.copy_(
-        torch.linspace(-100, 100, N_CDF).unsqueeze(0).expand_as(model.cdf_breakpoints).to(device))
+        torch.linspace(-_RAMP, _RAMP, N_CDF).unsqueeze(0).expand_as(model.cdf_breakpoints).to(device))
     latents = []
     for f in val_files[:max_files]:
         d = np.load(f)
@@ -62,12 +65,10 @@ def recalibrate_cdf(model, val_files, device, max_files=16, max_windows=64):
     for c in range(C):
         ch_vals = all_lat[:, c, :].flatten().sort().values
         indices = (quantile_fracs * (len(ch_vals) - 1)).long()
-        # ×100: encode() returns the POST-CDF latent; the wide linspace(-100,100)
-        # ramp makes _cdf_forward linear (uniform = z/100), so the collected
-        # quantiles are quantiles(z)/100 and must be scaled back by the ramp
-        # half-width to land in raw-latent space. Omitting this leaves the
-        # breakpoints 100× too tight and saturates the encoder.
-        model.cdf_breakpoints.data[c] = (ch_vals[indices] * 100.0).to(device)
+        # Scale back by _RAMP: the wide ramp made encode() return z/_RAMP, so the
+        # collected quantiles are quantiles(z)/_RAMP — multiply to land in raw-
+        # latent space (else breakpoints are _RAMP× too tight => encoder saturates).
+        model.cdf_breakpoints.data[c] = (ch_vals[indices] * _RAMP).to(device)
     print(f"  CDF recalibrated: {C} channels × {N_CDF} entries")
     bp = model.cdf_breakpoints
     print(f"  Breakpoint ranges: min=[{bp[:, 0].min():.3f}, {bp[:, 0].max():.3f}], "
