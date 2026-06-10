@@ -205,6 +205,18 @@ pub trait Stage: Send + Sync + 'static {
     /// doesn't re-execute just because its upstream was retrained.
     const DETERMINISTIC: bool = true;
 
+    /// Retry policy for this stage (D1). Default: no retry. Override for
+    /// stages whose failures are often transient (network downloads,
+    /// OOM-prone trainers). A plan can override per-node via
+    /// `Plan::with_retry`.
+    const RETRY: crate::framework::retry::RetryPolicy = crate::framework::retry::RetryPolicy::NONE;
+
+    /// Soft/hard timeout for one attempt of this stage (D2). Default:
+    /// none. Override (or `Plan::with_timeout`) to bound a stage that
+    /// can hang.
+    const TIMEOUT: crate::framework::retry::StageTimeout =
+        crate::framework::retry::StageTimeout::NONE;
+
     type Input: Artifact;
     type Output: Artifact;
     type Args: serde::Serialize
@@ -236,6 +248,8 @@ pub trait StageDyn: Send + Sync + 'static {
     fn input_kind(&self) -> &'static str;
     fn output_kind(&self) -> &'static str;
     fn args_schema(&self) -> serde_json::Value;
+    fn retry(&self) -> crate::framework::retry::RetryPolicy;
+    fn timeout(&self) -> crate::framework::retry::StageTimeout;
 
     /// Stable content address of an erased output produced by THIS
     /// stage. Deserializes the erased payload back to the typed
@@ -292,6 +306,12 @@ impl<S: Stage> StageDyn for S {
     }
     fn resources(&self) -> &'static [Resource] {
         S::RESOURCES
+    }
+    fn retry(&self) -> crate::framework::retry::RetryPolicy {
+        S::RETRY
+    }
+    fn timeout(&self) -> crate::framework::retry::StageTimeout {
+        S::TIMEOUT
     }
     fn input_kind(&self) -> &'static str {
         <S::Input as Artifact>::KIND

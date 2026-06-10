@@ -52,6 +52,11 @@ pub(crate) struct PlanNode {
     /// `args` is still used as the JSON payload passed to
     /// `StageDyn::run_erased` and persisted in `args.json`.
     pub canon_args: Vec<u8>,
+    /// Per-node retry/timeout overrides (D1/D2). `None` = use the
+    /// stage's `RETRY`/`TIMEOUT` const. Set via `Plan::with_retry` /
+    /// `Plan::with_timeout`, which apply to the current leading node(s).
+    pub retry: Option<crate::framework::retry::RetryPolicy>,
+    pub timeout: Option<crate::framework::retry::StageTimeout>,
 }
 
 impl std::fmt::Debug for PlanNode {
@@ -138,6 +143,8 @@ impl<B: TrainingBackend> Plan<(), B> {
             stage: Arc::new(stage),
             args: args_json,
             canon_args,
+            retry: None,
+            timeout: None,
         });
         // Graph input: provide () as the input artifact.
         let unit = ErasedArtifact::from_typed(&()).expect("() always serializes");
@@ -219,6 +226,8 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
             stage: Arc::new(stage),
             args: args_json,
             canon_args,
+            retry: None,
+            timeout: None,
         });
         // Edge from each previous leading node to this one. For
         // linear chains this is always one edge; commit 6's
@@ -254,6 +263,25 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
         }
     }
 
+    /// Override the retry policy (D1) for the CURRENT leading node(s) —
+    /// the stage(s) just added by `start`/`then`/`fork`/`merge`. Chains
+    /// after any of them: `.then(Download, args).with_retry(policy)`.
+    pub fn with_retry(mut self, policy: crate::framework::retry::RetryPolicy) -> Self {
+        for &id in &self.leading {
+            self.nodes[id as usize].retry = Some(policy);
+        }
+        self
+    }
+
+    /// Override the soft/hard timeout (D2) for the current leading
+    /// node(s). Chains like `with_retry`.
+    pub fn with_timeout(mut self, timeout: crate::framework::retry::StageTimeout) -> Self {
+        for &id in &self.leading {
+            self.nodes[id as usize].timeout = Some(timeout);
+        }
+        self
+    }
+
     /// Branch into two siblings consuming `O`. Both stages take
     /// the leading edge as input; their outputs land in a typed
     /// tuple at the new leading edge. Rejoin via `Plan<(L::Output,
@@ -278,6 +306,8 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
             stage: Arc::new(left),
             args: l_args_json,
             canon_args: l_canon,
+            retry: None,
+            timeout: None,
         });
         let r_id = self.nodes.len() as NodeId;
         let r_args_json = serde_json::to_value(&r_args).expect("Stage::Args serialize");
@@ -287,6 +317,8 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
             stage: Arc::new(right),
             args: r_args_json,
             canon_args: r_canon,
+            retry: None,
+            timeout: None,
         });
         for &from in &self.leading {
             self.edges.push(PlanEdge { from, to: l_id });
@@ -342,6 +374,8 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
                 stage,
                 args,
                 canon_args,
+                retry: None,
+                timeout: None,
             });
             for &from in &self.leading {
                 self.edges.push(PlanEdge { from, to: id });
@@ -375,6 +409,8 @@ impl<A1: Artifact, A2: Artifact, B: TrainingBackend> Plan<(A1, A2), B> {
             stage: Arc::new(stage),
             args: args_json,
             canon_args,
+            retry: None,
+            timeout: None,
         });
         for &from in &self.leading {
             self.edges.push(PlanEdge { from, to: id });
@@ -406,6 +442,8 @@ impl<A1: Artifact, A2: Artifact, A3: Artifact, B: TrainingBackend> Plan<(A1, A2,
             stage: Arc::new(stage),
             args: args_json,
             canon_args,
+            retry: None,
+            timeout: None,
         });
         for &from in &self.leading {
             self.edges.push(PlanEdge { from, to: id });

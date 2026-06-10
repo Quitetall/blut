@@ -89,6 +89,16 @@ pub enum StageEvent {
     /// reader sees the gap instead of a silently-short stream. Generated
     /// by the writer, never emitted via [`StatusHub::emit`].
     StepGap { dropped: u64 },
+    /// A stage attempt failed with a retryable error and will be retried
+    /// (D1). `attempt` is the one that just failed (1-based).
+    StageRetrying {
+        node_idx: u32,
+        stage_name: String,
+        attempt: u32,
+        max_attempts: u32,
+        error: String,
+        backoff_ms: u64,
+    },
 }
 
 impl StageEvent {

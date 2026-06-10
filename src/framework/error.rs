@@ -45,6 +45,21 @@ pub enum StageError {
     #[error("resource '{0}' acquisition timed out")]
     ResourceTimeout(Resource),
 
+    /// A per-stage soft/hard timeout (D2) fired. `limit` is the bound
+    /// that was exceeded; `elapsed` is how long the attempt actually
+    /// ran. Transient — composes with retry (per attempt).
+    #[error("stage timed out after {elapsed:?} (limit {limit:?})")]
+    Timeout {
+        limit: std::time::Duration,
+        elapsed: std::time::Duration,
+    },
+
+    /// Out-of-memory: a CUDA OOM surfaced by the trainer, or a cgroup
+    /// kill. A transient class the broker can escalate (raise the next
+    /// memory cap) before a retry. `detail` is the diagnostic line.
+    #[error("out of memory: {detail}")]
+    OutOfMemory { detail: String },
+
     /// Erased dispatch: input artifact arrived with the wrong
     /// `KIND` tag for what this stage expects. Should be unreachable
     /// when stages are wired through the typed `Plan` builder; can
@@ -111,6 +126,10 @@ pub enum PlanError {
     },
     #[error("plan cancelled")]
     Cancelled,
+    /// The plan-level deadline (`ExecCtx.deadline`) elapsed before the
+    /// plan finished. In-flight stages are cancelled.
+    #[error("plan deadline exceeded after {elapsed:?}")]
+    DeadlineExceeded { elapsed: std::time::Duration },
     #[error("plan io: {0}")]
     Io(#[from] std::io::Error),
     #[error("plan: {0}")]

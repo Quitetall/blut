@@ -72,6 +72,13 @@ pub struct ExecCtx {
     pub resources: std::collections::HashMap<Resource, Arc<tokio::sync::Semaphore>>,
     /// Max concurrently-spawned node tasks (parallel executor only).
     pub max_in_flight: usize,
+    /// Optional plan-level deadline (D2). When `Instant::now()` reaches
+    /// it the executor cancels and returns `PlanError::DeadlineExceeded`.
+    pub deadline: Option<Instant>,
+    /// Optional retry hook (D1). Invoked when a stage attempt fails with
+    /// a retryable error, BEFORE the backoff. The cookbook wires the
+    /// broker's OOM-escalation here; the framework stays broker-agnostic.
+    pub on_retry: Option<crate::framework::retry::RetryHook>,
 }
 
 impl ExecCtx {
@@ -97,6 +104,8 @@ impl ExecCtx {
             cancel,
             resources,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            deadline: None,
+            on_retry: None,
         }
     }
 
@@ -108,6 +117,19 @@ impl ExecCtx {
 
     pub fn with_max_in_flight(mut self, n: usize) -> Self {
         self.max_in_flight = n.max(1);
+        self
+    }
+
+    pub fn with_deadline(mut self, after: std::time::Duration) -> Self {
+        self.deadline = Some(Instant::now() + after);
+        self
+    }
+
+    pub fn with_retry_hook(
+        mut self,
+        hook: crate::framework::retry::RetryHook,
+    ) -> Self {
+        self.on_retry = Some(hook);
         self
     }
 }
@@ -138,6 +160,7 @@ struct NodeEnv {
     cancel: CancellationToken,
     resources: HashMap<Resource, Arc<tokio::sync::Semaphore>>,
     recipe_name: String,
+    on_retry: Option<crate::framework::retry::RetryHook>,
 }
 
 /// Everything one node needs to run, snapshotted by the coordinator
@@ -154,6 +177,9 @@ struct NodeTask {
     input: ErasedArtifact,
     input_hash: ContentHash,
     key: ContentHash,
+    /// Resolved retry policy + timeout (node override, else stage const).
+    retry: crate::framework::retry::RetryPolicy,
+    timeout: crate::framework::retry::StageTimeout,
 }
 
 /// A node's result, fed back to the coordinator to advance scheduling.
@@ -225,110 +251,193 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
     // atomically rename it to the final name and ONLY THEN insert the
     // cache entry (the sole resume oracle). No promote ⇒ no cache ⇒
     // re-run. Tmp name is key-scoped so two positions of the same stage
-    // (or a re-run with different args) never collide.
+    // (or a re-run with different args) never collide. The attempt loop
+    // (D1) recreates the tmp dir + reacquires permits per attempt, so
+    // FW-2 holds for EACH attempt; the cache insert is still strictly
+    // post-promote (below the loop, on success).
     let stages_root = env.job_dir.join("stages");
     let final_stage_dir = stages_root.join(format!("{idx}-{stage_name}"));
     let tmp_stage_dir = stages_root.join(format!(".tmp-{idx}-{stage_name}-{}", task.key.to_hex()));
-    let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-    if let Err(e) = std::fs::create_dir_all(&tmp_stage_dir) {
-        return Err(NodeFailure::Stage {
-            idx,
-            stage: stage_name,
-            source: StageError::Io {
-                path: tmp_stage_dir,
-                source: e,
-            },
-        });
-    }
 
-    let stage_ctx = StageContext {
-        job_dir: env.job_dir.clone(),
-        stage_dir: tmp_stage_dir.clone(),
-        node_idx: idx,
-        status_tx: env.status.broadcast_sender(),
-        cancel: env.cancel.clone(),
-        cache: env.cache.clone(),
-        recipe_name: env.recipe_name.clone(),
-    };
-
-    // ── Resource permits ────────────────────────────────────────────
-    // Acquire in canonical (sorted) order so two concurrent stages can
-    // never deadlock on the same pair in opposite orders. `try_acquire`
-    // first; only emit `StageBlocked` on ACTUAL contention.
-    let mut sorted_resources: Vec<Resource> = task.stage.resources().to_vec();
-    sorted_resources.sort();
-    let mut permits = Vec::new();
-    for resource in sorted_resources {
-        let Some(sem) = env.resources.get(&resource) else {
-            continue;
-        };
-        let permit = match sem.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => {
-                env.status.emit(StageEvent::StageBlocked {
-                    node_idx: idx,
-                    stage_name: stage_name.clone(),
-                    resource,
-                });
-                match sem.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => {
-                        let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-                        return Err(NodeFailure::Other(format!(
-                            "resource '{resource}' semaphore closed"
-                        )));
+    let mut attempt = 0u32;
+    let (output, run_elapsed) = loop {
+        attempt += 1;
+        // Backoff before a re-attempt — cancellable (a backing-off stage
+        // must drop the GPU/permits, which it already has by here).
+        if attempt > 1 {
+            let backoff = task.retry.backoff_before(attempt);
+            if !backoff.is_zero() {
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = env.cancel.cancelled() => {
+                        env.status.emit(StageEvent::StageFailed {
+                            node_idx: idx,
+                            stage_name: stage_name.clone(),
+                            error: "plan cancelled during retry backoff".into(),
+                        });
+                        return Err(NodeFailure::Cancelled);
                     }
                 }
             }
-        };
-        permits.push(permit);
-    }
-
-    let stage_started = Instant::now();
-    let run_result = task
-        .stage
-        .run_erased(&stage_ctx, task.input, task.args.clone())
-        .await;
-    // Permits drop here, releasing the resource for queued stages.
-    drop(permits);
-    // Drop the stage_ctx (its status_tx clone) before any await so it
-    // can't keep the broadcast channel open.
-    drop(stage_ctx);
-
-    let output = match run_result {
-        Ok(o) => {
-            debug_assert_eq!(
-                o.kind,
-                task.stage.output_kind(),
-                "stage '{stage_name}' produced kind '{}' but declares output_kind '{}'",
-                o.kind,
-                task.stage.output_kind()
-            );
-            // A cancel observed during the run must NOT be promoted /
-            // cached — discard the tmp output, report Cancelled.
-            if env.cancel.is_cancelled() {
-                let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-                env.status.emit(StageEvent::StageFailed {
-                    node_idx: idx,
-                    stage_name,
-                    error: "plan cancelled during stage".into(),
-                });
-                return Err(NodeFailure::Cancelled);
-            }
-            o
         }
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+        if env.cancel.is_cancelled() {
             env.status.emit(StageEvent::StageFailed {
                 node_idx: idx,
                 stage_name: stage_name.clone(),
-                error: format!("{e}"),
+                error: "plan cancelled before stage attempt".into(),
             });
+            return Err(NodeFailure::Cancelled);
+        }
+
+        // Clean tmp per attempt — each attempt starts from an empty dir.
+        let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+        if let Err(e) = std::fs::create_dir_all(&tmp_stage_dir) {
             return Err(NodeFailure::Stage {
                 idx,
                 stage: stage_name,
-                source: e,
+                source: StageError::Io {
+                    path: tmp_stage_dir,
+                    source: e,
+                },
             });
+        }
+
+        // A child cancel token so a SOFT timeout (D2) can wind THIS stage
+        // down cooperatively without touching the plan token / siblings;
+        // a plan cancel still propagates (child tokens fire on parent).
+        let stage_cancel = env.cancel.child_token();
+        let stage_ctx = StageContext {
+            job_dir: env.job_dir.clone(),
+            stage_dir: tmp_stage_dir.clone(),
+            node_idx: idx,
+            status_tx: env.status.broadcast_sender(),
+            cancel: stage_cancel.clone(),
+            cache: env.cache.clone(),
+            recipe_name: env.recipe_name.clone(),
+        };
+
+        // ── Resource permits ────────────────────────────────────────
+        // Acquire in canonical (sorted) order so two concurrent stages
+        // can never deadlock on the same pair in opposite orders.
+        // `try_acquire` first; only emit `StageBlocked` on contention.
+        let mut sorted_resources: Vec<Resource> = task.stage.resources().to_vec();
+        sorted_resources.sort();
+        let mut permits = Vec::new();
+        for resource in sorted_resources {
+            let Some(sem) = env.resources.get(&resource) else {
+                continue;
+            };
+            let permit = match sem.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    env.status.emit(StageEvent::StageBlocked {
+                        node_idx: idx,
+                        stage_name: stage_name.clone(),
+                        resource,
+                    });
+                    match sem.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+                            return Err(NodeFailure::Other(format!(
+                                "resource '{resource}' semaphore closed"
+                            )));
+                        }
+                    }
+                }
+            };
+            permits.push(permit);
+        }
+
+        let stage_started = Instant::now();
+        let run_fut =
+            task.stage
+                .run_erased(&stage_ctx, task.input.clone(), task.args.clone());
+        let run_result = run_with_timeout(
+            run_fut,
+            &stage_cancel,
+            task.timeout.soft,
+            task.timeout.hard,
+            stage_started,
+        )
+        .await;
+        // Permits drop here, releasing the resource for queued stages
+        // (including during a backoff before the next attempt).
+        drop(permits);
+        drop(stage_ctx);
+
+        match run_result {
+            Ok(o) => {
+                debug_assert_eq!(
+                    o.kind,
+                    task.stage.output_kind(),
+                    "stage '{stage_name}' produced kind '{}' but declares output_kind '{}'",
+                    o.kind,
+                    task.stage.output_kind()
+                );
+                // A cancel observed during the run must NOT be promoted /
+                // cached — discard, report Cancelled. Check the STAGE
+                // token: it fires both on a plan cancel (child inherits
+                // the parent) AND on a stage's own cooperative cancel.
+                if stage_cancel.is_cancelled() {
+                    let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+                    env.status.emit(StageEvent::StageFailed {
+                        node_idx: idx,
+                        stage_name,
+                        error: "cancelled during stage".into(),
+                    });
+                    return Err(NodeFailure::Cancelled);
+                }
+                // StageEnd reports the SUCCESSFUL attempt's wall time;
+                // failed attempts + backoff are visible as StageRetrying
+                // events, not folded into this duration.
+                break (o, stage_started.elapsed());
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+                let plan_cancelled = env.cancel.is_cancelled();
+                let retry = attempt < task.retry.max_attempts
+                    && !plan_cancelled
+                    && crate::framework::retry::is_retryable(&e, task.retry.retry_on);
+                if retry {
+                    // OOM-escalation / observability hook (broker wiring).
+                    if let Some(hook) = &env.on_retry {
+                        hook(&crate::framework::retry::RetryEvent {
+                            stage_name: stage_name.clone(),
+                            recipe_name: env.recipe_name.clone(),
+                            attempt,
+                            max_attempts: task.retry.max_attempts,
+                            was_oom: matches!(e, StageError::OutOfMemory { .. }),
+                            error: format!("{e}"),
+                        });
+                    }
+                    let next_backoff = task.retry.backoff_before(attempt + 1);
+                    env.status.emit(StageEvent::StageRetrying {
+                        node_idx: idx,
+                        stage_name: stage_name.clone(),
+                        attempt,
+                        max_attempts: task.retry.max_attempts,
+                        error: format!("{e}"),
+                        backoff_ms: next_backoff.as_millis() as u64,
+                    });
+                    continue;
+                }
+                // Terminal failure.
+                let cancelled = plan_cancelled || matches!(e, StageError::Cancelled);
+                env.status.emit(StageEvent::StageFailed {
+                    node_idx: idx,
+                    stage_name: stage_name.clone(),
+                    error: format!("{e}"),
+                });
+                if cancelled {
+                    return Err(NodeFailure::Cancelled);
+                }
+                return Err(NodeFailure::Stage {
+                    idx,
+                    stage: stage_name,
+                    source: e,
+                });
+            }
         }
     };
 
@@ -377,7 +486,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         node_idx: idx,
         stage_name: stage_name.clone(),
         output_hash,
-        elapsed: stage_started.elapsed(),
+        elapsed: run_elapsed,
     });
 
     let logical = compute_logical_output_hash(
@@ -395,6 +504,59 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         logical,
         cache_hit: false,
     })
+}
+
+/// Bound one stage attempt by an optional soft/hard timeout (D2). With
+/// neither set, awaits the run directly. The SOFT deadline fires
+/// `stage_cancel` (cooperative wind-down — a Python trainer SIGTERMs its
+/// child); a run that then returns is FAILED with `Timeout` (its output
+/// exceeded budget and must not be promoted). The HARD deadline drops
+/// the run future (its `kill_on_drop` subprocess is reaped) and returns
+/// `Timeout`.
+async fn run_with_timeout(
+    run_fut: impl std::future::Future<Output = Result<ErasedArtifact, StageError>>,
+    stage_cancel: &CancellationToken,
+    soft: Option<std::time::Duration>,
+    hard: Option<std::time::Duration>,
+    started: Instant,
+) -> Result<ErasedArtifact, StageError> {
+    if soft.is_none() && hard.is_none() {
+        return run_fut.await;
+    }
+    tokio::pin!(run_fut);
+    let soft_at = soft.map(|d| started + d);
+    let hard_at = hard.map(|d| started + d);
+    let mut soft_fired = false;
+    loop {
+        tokio::select! {
+            res = &mut run_fut => {
+                return if soft_fired {
+                    Err(StageError::Timeout { limit: soft.unwrap(), elapsed: started.elapsed() })
+                } else {
+                    res
+                };
+            }
+            _ = sleep_until_opt(soft_at), if soft_at.is_some() && !soft_fired => {
+                soft_fired = true;
+                stage_cancel.cancel();
+            }
+            _ = sleep_until_opt(hard_at), if hard_at.is_some() => {
+                return Err(StageError::Timeout {
+                    limit: hard.unwrap(),
+                    elapsed: started.elapsed(),
+                });
+            }
+        }
+    }
+}
+
+/// Sleep until `at`, or never (pending) when `None` — lets a
+/// `tokio::select!` branch be a no-op for an unset deadline.
+async fn sleep_until_opt(at: Option<Instant>) {
+    match at {
+        Some(t) => tokio::time::sleep_until(tokio::time::Instant::from_std(t)).await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// Predecessor node ids of `node_id`, in edge order (which preserves
@@ -511,6 +673,9 @@ fn build_task(
         input_hash,
         &node.canon_args,
     );
+    // Resolve retry/timeout: a per-node override wins over the stage const.
+    let retry = node.retry.unwrap_or_else(|| node.stage.retry());
+    let timeout = node.timeout.unwrap_or_else(|| node.stage.timeout());
     Ok(NodeTask {
         node_id: node.id,
         node_idx,
@@ -520,6 +685,8 @@ fn build_task(
         input,
         input_hash,
         key,
+        retry,
+        timeout,
     })
 }
 
@@ -581,6 +748,7 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
         cancel: ctx.cancel,
         resources: ctx.resources,
         recipe_name: plan.name().to_string(),
+        on_retry: ctx.on_retry,
     });
 
     Ok(Prelude {
@@ -633,6 +801,7 @@ impl SequentialExecutor {
             "topo_order must cover all nodes"
         );
 
+        let deadline = ctx.deadline;
         let Prelude {
             writer_handle,
             env,
@@ -644,6 +813,17 @@ impl SequentialExecutor {
         let mut n_misses = 0usize;
 
         for (idx, node_id) in order.iter().enumerate() {
+            // Plan-level deadline (D2): coarse between-stage check; a
+            // stage mid-run is bounded by its own hard timeout instead.
+            if let Some(dl) = deadline {
+                if Instant::now() >= dl {
+                    env.cancel.cancel();
+                    finish_writer(env, writer_handle).await;
+                    return Err(PlanError::DeadlineExceeded {
+                        elapsed: started.elapsed(),
+                    });
+                }
+            }
             if env.cancel.is_cancelled() {
                 env.status.emit(StageEvent::StageFailed {
                     node_idx: idx as u32,
@@ -744,6 +924,7 @@ impl ParallelExecutor {
         }
 
         let max_in_flight = ctx.max_in_flight;
+        let deadline = ctx.deadline;
         let Prelude {
             writer_handle,
             env,
@@ -789,6 +970,20 @@ impl ParallelExecutor {
         }
 
         loop {
+            // Plan-level deadline (D2): once past it, stop spawning new
+            // nodes, cancel + drain the in-flight ones, report
+            // DeadlineExceeded (a stage mid-run is bounded by its own
+            // hard timeout).
+            if first_error.is_none() {
+                if let Some(dl) = deadline {
+                    if Instant::now() >= dl {
+                        first_error = Some(PlanError::DeadlineExceeded {
+                            elapsed: started.elapsed(),
+                        });
+                        env.cancel.cancel();
+                    }
+                }
+            }
             // Spawn ready nodes up to the in-flight cap (unless we're
             // already failing — then stop spawning and just drain).
             if first_error.is_none() {
@@ -1714,5 +1909,166 @@ mod tests {
             "parallel run must hit the sequential run's cache for every stage (identical keys)"
         );
         assert_eq!(par.n_cache_misses, 0);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // D1 retry + D2 timeout.
+    // ════════════════════════════════════════════════════════════════
+
+    use crate::framework::retry::{Backoff, RetryOn, RetryPolicy, StageTimeout};
+
+    static FLAKY_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+    static FLAKY_FAILS: AtomicU32 = AtomicU32::new(0);
+
+    /// Fails its first `FLAKY_FAILS` attempts (transient Backend error),
+    /// then succeeds.
+    struct Flaky;
+    #[async_trait]
+    impl Stage for Flaky {
+        const NAME: &'static str = "flaky";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        const RETRY: RetryPolicy = RetryPolicy {
+            max_attempts: 4,
+            backoff: Backoff::None,
+            retry_on: RetryOn::Transient,
+        };
+        type Input = ();
+        type Output = Counter;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            _input: (),
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            let n = FLAKY_ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+            if n <= FLAKY_FAILS.load(Ordering::SeqCst) {
+                Err(StageError::Backend(anyhow::anyhow!("transient blip #{n}")))
+            } else {
+                Ok(Counter { n })
+            }
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for Flaky {}
+
+    #[tokio::test]
+    async fn retry_succeeds_after_transient_failures() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        FLAKY_ATTEMPTS.store(0, Ordering::SeqCst);
+        FLAKY_FAILS.store(2, Ordering::SeqCst); // fail twice, succeed on #3
+        let td = tempfile::tempdir().unwrap();
+        let job_dir = td.path().to_path_buf();
+        let ctx = ExecCtx::new(job_dir.clone());
+        let mut rx = ctx.status.subscribe();
+        let plan = Plan::<(), LamuTrainerBackend>::new("retry", serde_json::json!({}))
+            .start(Flaky, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let r = SequentialExecutor::execute(plan, ctx).await.unwrap();
+        assert_eq!(FLAKY_ATTEMPTS.load(Ordering::SeqCst), 3, "ran 3 attempts");
+        assert_eq!(r.n_cache_misses, 1);
+        assert_eq!(cache_entry_count(&job_dir), 1, "only the successful attempt is cached");
+        let mut retrying = 0;
+        while let Ok(evt) = rx.try_recv() {
+            if matches!(evt, StageEvent::StageRetrying { .. }) {
+                retrying += 1;
+            }
+        }
+        assert_eq!(retrying, 2, "two retry events for two transient failures");
+    }
+
+    static DET_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+
+    /// Always fails with a DETERMINISTIC error (BadInput) — must NOT be
+    /// retried even under `AllErrors` with `max_attempts=5`.
+    struct DeterministicFail;
+    #[async_trait]
+    impl Stage for DeterministicFail {
+        const NAME: &'static str = "deterministic_fail";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        const RETRY: RetryPolicy = RetryPolicy {
+            max_attempts: 5,
+            backoff: Backoff::None,
+            retry_on: RetryOn::AllErrors,
+        };
+        type Input = ();
+        type Output = Counter;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            _input: (),
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            DET_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+            Err(StageError::BadInput("nope".into()))
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for DeterministicFail {}
+
+    #[tokio::test]
+    async fn deterministic_error_not_retried() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        DET_ATTEMPTS.store(0, Ordering::SeqCst);
+        let (_td, ctx) = fresh_ctx();
+        let plan = Plan::<(), LamuTrainerBackend>::new("det", serde_json::json!({}))
+            .start(DeterministicFail, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let r = SequentialExecutor::execute(plan, ctx).await;
+        assert!(matches!(r, Err(PlanError::StageFailed { .. })));
+        assert_eq!(
+            DET_ATTEMPTS.load(Ordering::SeqCst),
+            1,
+            "a deterministic BadInput must run exactly once despite max_attempts=5"
+        );
+    }
+
+    /// Sleeps far longer than its hard timeout — tests the HARD timeout.
+    struct SleepForever;
+    #[async_trait]
+    impl Stage for SleepForever {
+        const NAME: &'static str = "sleep_forever";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        const TIMEOUT: StageTimeout = StageTimeout {
+            soft: None,
+            hard: Some(std::time::Duration::from_millis(100)),
+        };
+        type Input = ();
+        type Output = Counter;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            _input: (),
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok(Counter { n: 1 })
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for SleepForever {}
+
+    #[tokio::test]
+    async fn hard_timeout_fails_a_hung_stage() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_td, ctx) = fresh_ctx();
+        let plan = Plan::<(), LamuTrainerBackend>::new("to", serde_json::json!({}))
+            .start(SleepForever, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let fut = SequentialExecutor::execute(plan, ctx);
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+            .await
+            .expect("hard timeout must fire well before the test's 5s guard");
+        match r {
+            Err(PlanError::StageFailed { source, .. }) => {
+                assert!(matches!(source, StageError::Timeout { .. }), "got {source:?}");
+            }
+            other => panic!("expected StageFailed(Timeout), got {other:?}"),
+        }
     }
 }

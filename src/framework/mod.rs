@@ -32,6 +32,7 @@ pub mod error;
 pub mod executor;
 pub mod plan;
 pub mod resource;
+pub mod retry;
 pub mod stage;
 pub mod status;
 
@@ -41,6 +42,7 @@ pub use compat::Compatible;
 pub use cookbook::{ArtifactDescriptor, Cookbook, Registry, StageDescriptor};
 pub use error::{PlanError, RecipeError, StageError};
 pub use executor::{ExecCtx, ParallelExecutor, PlanResult, SequentialExecutor, execute_plan};
+pub use retry::{Backoff, RetryEvent, RetryHook, RetryOn, RetryPolicy, StageTimeout};
 pub use plan::{CompiledPlan, NodeId, Plan};
 pub use resource::Resource;
 pub use stage::{ErasedArtifact, ErasedDecodeError, Stage, StageContext, StageDyn};
