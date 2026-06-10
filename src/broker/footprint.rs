@@ -32,19 +32,20 @@ pub const GIB: u64 = 1024 * 1024 * 1024;
 /// under-sized for an unspecified batch.
 pub const DEFAULT_BATCH: u32 = 32;
 
-/// Per-DataLoader-worker LMA prefetch RAM.
+/// Per-DataLoader-worker LMA prefetch RAM (CoW fork + decode buffers +
+/// per-worker L3/FB LRU).
 ///
-/// Measured envelope on the 62 GiB box: a tier-3 run at workers=4 peaks
-/// ~22-23 GiB RESIDENT total (base + dataloader + model), and a
-/// workers=2 decoder run peaks ~16-20 GiB. Billing 2 GiB/worker
-/// reproduces that envelope (base 6 + 4×2 + tier 6 + … ≈ 23 GiB) —
-/// the prior 3.5 GiB pushed the tier-3 estimate to ~35 GiB, ~50% over
-/// the measured peak, which OVER-REFUSED on a busy box. Still an upper
-/// bound at the historical worker count; the calibration store
-/// (slice-2) replaces it with the per-key measured peak after one run,
-/// and a cgroup cap (estimate + headroom) hard-bounds any under-shoot
-/// to a unit kill, never a box OOM.
-const PREFETCH_PER_WORKER_BYTES: u64 = 2 * GIB;
+/// MEASURED (2026-06-10): a tier-3 warm run at workers=4 peaks ~23 GiB
+/// RESIDENT *plus ~9 GiB swap* under a 25 GiB cgroup cap — i.e. its true
+/// working set is ~32 GiB, the cap forced the overflow to swap and it
+/// OOM-killed under any added pressure. So ~3.7-6 GiB/worker is the real
+/// envelope; the earlier 2.0 GiB UNDER-sized it (the cap then sat at the
+/// peak with no headroom → OOM-on-pressure). 4.0 GiB/worker is the honest
+/// upper-mid, so a workers=2 run (the new default cap) bills ~23 GiB /
+/// caps ~25 GiB over a ~20 GiB real demand — real headroom, no swap. The
+/// calibration store refines per key; a cgroup cap (estimate + headroom)
+/// hard-bounds any under-shoot to a unit kill, never a box OOM.
+const PREFETCH_PER_WORKER_BYTES: u64 = 4 * GIB;
 
 /// Base RSS floor: python + torch + CUDA context + framework overhead,
 /// independent of workers/batch. Conservative-high.
@@ -381,7 +382,7 @@ mod tests {
         let lo = estimate_ram_bytes(2, 16, 3, 256);
         let hi = estimate_ram_bytes(8, 16, 3, 256);
         assert!(hi > lo, "workers must increase RAM: {lo} !< {hi}");
-        // workers dominate: +6 workers × 2 GiB = +12 GiB
+        // workers dominate: +6 workers × 4 GiB = +24 GiB
         assert_eq!(hi - lo, 6 * PREFETCH_PER_WORKER_BYTES);
     }
 
@@ -434,8 +435,8 @@ mod tests {
         // (capped workers ≤ 4) is conservative-high but still fits ONE
         // train on the 62 GiB box with the 6 GiB floor.
         let fp = estimate(4, 16, 3, 256);
-        // 6 + 4×2 + 3×2 + 1 + 16×64MiB = 6+8+6+1+1 = 22 GiB
-        assert_eq!(fp.ram_bytes, 22 * GIB);
+        // 6 + 4×4 + 3×2 + 1 + 16×64MiB = 6+16+6+1+1 = 30 GiB
+        assert_eq!(fp.ram_bytes, 30 * GIB);
         assert!(fp.ram_bytes < (62 - 6) * GIB, "must fit one train on 62G box");
     }
 

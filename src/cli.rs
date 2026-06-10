@@ -689,7 +689,10 @@ fn recipe_footprint_drivers(raw: &serde_json::Value) -> (u32, u32, u32, u32) {
             .map(|n| u32::try_from(n).unwrap_or(u32::MAX)) // saturate, never wrap-to-0 (would under-bill)
             .unwrap_or(default)
     };
-    let workers = u32_or("workers", 4).clamp(1, 4);
+    // Default 2 (matches the stage's UNCALIBRATED_WORKER_CAP for key parity);
+    // a recipe MAY request up to 4 explicitly. The RESOLVE-side default here
+    // and the RECORD-side cap MUST stay equal or the calibration key never hits.
+    let workers = u32_or("workers", 2).clamp(1, 4);
     let batch = u32_or("batch_size", crate::broker::footprint::DEFAULT_BATCH);
     let tier = u32_or("tier", 3);
     let latent = raw
@@ -1722,13 +1725,13 @@ mod footprint_resolve_tests {
     fn joint_codec_default_drivers() {
         let raw = serde_json::json!({});
         let (workers, batch, tier, latent) = recipe_footprint_drivers(&raw);
-        assert_eq!(workers, 4, "uncalibrated worker cap");
+        assert_eq!(workers, 2, "uncalibrated worker cap (robustness default)");
         assert_eq!(batch, crate::broker::footprint::DEFAULT_BATCH);
         assert_eq!(tier, 3, "joint recipe default tier");
         assert_eq!(latent, 0, "no --encoder-width ⇒ default latent");
         // The exact key the cli RESOLVES under for the joint default run.
         let key = crate::broker::footprint_key("lamquant_joint_codec", workers, batch, tier);
-        assert_eq!(key.flat(), "lamquant_joint_codec|3|32|4");
+        assert_eq!(key.flat(), "lamquant_joint_codec|3|32|2");
     }
 
     /// Explicit tier/batch flow through to the key (so a tier-6 fullband
@@ -1737,8 +1740,8 @@ mod footprint_resolve_tests {
     fn explicit_tier_batch_flow_to_key() {
         let raw = serde_json::json!({ "tier": 6, "batch_size": 16 });
         let (workers, batch, tier, _latent) = recipe_footprint_drivers(&raw);
-        assert_eq!((workers, batch, tier), (4, 16, 6));
+        assert_eq!((workers, batch, tier), (2, 16, 6));
         let key = crate::broker::footprint_key("lamquant_joint_codec", workers, batch, tier);
-        assert_eq!(key.flat(), "lamquant_joint_codec|6|16|4");
+        assert_eq!(key.flat(), "lamquant_joint_codec|6|16|2");
     }
 }
