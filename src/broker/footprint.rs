@@ -68,6 +68,24 @@ const PER_LATENT256_BYTES: u64 = GIB;
 /// worker term) and inflated batch-32 to a spurious 8 GiB.
 const PER_BATCH_BYTES: u64 = GIB / 16; // 64 MiB / batch unit
 
+// ── OOM-correction growth (R2 / ADR 0046 slice-3) ────────────────────────
+// An `OomCorrected` entry stores the cgroup cap that was HIT on an OOM — a
+// known LOWER bound on the true need, not the true need itself. `resolve`
+// must therefore return a cap STRICTLY ABOVE the stored bound, so a retry
+// never sits back down on the same OOMing cap (the perpetual-OOM bug).
+// Growth is multiplicative (scales with job size) with an additive floor
+// (guarantees a meaningful bump for a small bound); `resolve` takes the
+// MAX of the two so small jobs use the step and large jobs use the factor.
+const OOM_GROWTH_NUM: u64 = 5; // ×5/4 = +25% per observed OOM
+const OOM_GROWTH_DEN: u64 = 4;
+const OOM_GROWTH_STEP_BYTES: u64 = 4 * GIB;
+/// Secondary runaway guard on the escalated cap. The AUTHORITATIVE box-fit
+/// refusal lives in `admission.rs` (it refuses when the footprint would
+/// leave < the free-RAM floor); this clamp only stops a pathological
+/// repeated-OOM key from walking the cap to an absurd value before
+/// admission gets to refuse. Sized above any single-box train cap.
+const OOM_RESOLVE_CEILING_BYTES: u64 = 64 * GIB;
+
 /// A resolved footprint estimate. Slice-1 tracks RAM only as a hard
 /// number; VRAM is carried for the (deferred) VRAM courtesy pre-check
 /// but never gates the box-survival guarantee.
@@ -271,13 +289,32 @@ impl FootprintStore {
         self.entries.is_empty()
     }
 
-    /// Resolve a footprint for `key`: the calibrated RAM (Measured /
-    /// OomCorrected) if present, else the conservative `hint`. VRAM is
-    /// DEFERRED — we keep the hint's VRAM regardless (RAM is the
+    /// Resolve a footprint for `key`:
+    ///   * `Measured` (clean-exit cgroup peak) → the calibrated RAM verbatim
+    ///     (it is the true need, monotone-up via record's max-merge).
+    ///   * `OomCorrected` (a cap that was HIT on OOM) → a cap ESCALATED
+    ///     strictly above the stored lower bound (R2), never below the
+    ///     conservative `hint`, clamped by the runaway guard. This is the
+    ///     self-heal: an OOM grows the next cap instead of re-sitting on it.
+    ///   * `Default` / absent → the conservative `hint` verbatim.
+    /// VRAM is DEFERRED — we keep the hint's VRAM regardless (RAM is the
     /// over-refuse constraint; recording VRAM peaks is a later slice).
     pub fn resolve(&self, key: &FootprintKey, hint: Footprint) -> Footprint {
         match self.entries.get(&key.flat()) {
-            Some(e) if e.source != FootprintSource::Default => Footprint {
+            Some(e) if e.source == FootprintSource::OomCorrected => {
+                // Grow strictly above the OOMing lower bound; never below
+                // the conservative hint; clamped (admission does box-fit).
+                let grown = (e
+                    .ram_bytes
+                    .saturating_mul(OOM_GROWTH_NUM)
+                    / OOM_GROWTH_DEN)
+                    .max(e.ram_bytes.saturating_add(OOM_GROWTH_STEP_BYTES));
+                Footprint {
+                    ram_bytes: grown.max(hint.ram_bytes).min(OOM_RESOLVE_CEILING_BYTES),
+                    vram_mib: hint.vram_mib,
+                }
+            }
+            Some(e) if e.source == FootprintSource::Measured => Footprint {
                 ram_bytes: e.ram_bytes,
                 // DEFER VRAM: keep the conservative estimate.
                 vram_mib: hint.vram_mib,
@@ -440,6 +477,21 @@ mod tests {
         assert!(fp.ram_bytes < (62 - 6) * GIB, "must fit one train on 62G box");
     }
 
+    #[test]
+    fn cold_tier3_cap_exceeds_measured_workers2_demand() {
+        // R3 regression pin: at the capped worker count (UNCALIBRATED_WORKER_CAP
+        // = 2 in blut-lamquant), the COLD tier-3 cap must exceed the MEASURED
+        // workers=2 true working set (~16-20 GiB, DEV_LOG 2026-06-10 db39698),
+        // so a cold run never OOMs at the cap. A future constant tweak that
+        // re-under-sizes the hint (the 51bcc43 bug) trips this test.
+        let cold_cap = estimate(2, 32, 3, 256).memmax_bytes();
+        // 6 + 2×4 + 3×2 + 1 + 32×64MiB = 23 GiB estimate, +2 GiB headroom = 25 GiB.
+        assert!(
+            cold_cap >= 20 * GIB,
+            "cold tier-3 workers-2 cap {cold_cap} must exceed the ~20 GiB measured demand"
+        );
+    }
+
     // ── calibration store (ADR 0046 slice-2) ──────────────────────────
 
     fn key() -> FootprintKey {
@@ -518,6 +570,66 @@ mod tests {
         let r = s.resolve(&key(), hint);
         assert_eq!(r.ram_bytes, 20 * GIB, "calibrated RAM admits at the measured ~20G");
         assert_eq!(r.vram_mib, hint.vram_mib, "VRAM stays the conservative estimate");
+    }
+
+    #[test]
+    fn resolve_escalates_oom_corrected_above_bound() {
+        // R2: an OOM at 24G is a LOWER bound; resolve must return a cap
+        // STRICTLY ABOVE it so a retry doesn't re-sit on the OOMing cap.
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("footprints.json");
+        let mut s = FootprintStore::load_from(path);
+        let hint = estimate(2, 16, 3, 256); // conservative cold hint
+        s.record(&key(), 24 * GIB, 0, FootprintSource::OomCorrected)
+            .unwrap();
+        let r = s.resolve(&key(), hint);
+        // max(24×5/4=30, 24+4=28) = 30 GiB, above the 24G bound.
+        assert_eq!(r.ram_bytes, 30 * GIB, "OOM bound must grow, not re-sit");
+        assert!(r.ram_bytes > 24 * GIB, "escalated cap must exceed the OOMing cap");
+    }
+
+    #[test]
+    fn resolve_oom_corrected_never_below_hint() {
+        // A small OOM bound must never resolve below the conservative hint.
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("footprints.json");
+        let mut s = FootprintStore::load_from(path);
+        let hint = estimate(2, 16, 3, 256);
+        s.record(&key(), 8 * GIB, 0, FootprintSource::OomCorrected)
+            .unwrap();
+        let r = s.resolve(&key(), hint);
+        assert!(r.ram_bytes >= hint.ram_bytes, "never below the cold hint");
+    }
+
+    #[test]
+    fn resolve_oom_corrected_clamped_to_ceiling() {
+        // A pathological large OOM bound clamps at the runaway guard so the
+        // number stays sane; admission.rs makes the box-fit refusal.
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("footprints.json");
+        let mut s = FootprintStore::load_from(path);
+        let hint = estimate(2, 16, 3, 256);
+        s.record(&key(), 60 * GIB, 0, FootprintSource::OomCorrected)
+            .unwrap();
+        let r = s.resolve(&key(), hint);
+        assert_eq!(r.ram_bytes, OOM_RESOLVE_CEILING_BYTES, "clamped at the guard");
+    }
+
+    #[test]
+    fn resolve_monotone_after_repeated_oom() {
+        // Each OOM at a higher cap raises the stored bound (max-merge) and
+        // resolve always grows above it — strictly non-decreasing, no loop.
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("footprints.json");
+        let mut s = FootprintStore::load_from(path);
+        let hint = estimate(2, 16, 3, 256);
+        s.record(&key(), 24 * GIB, 0, FootprintSource::OomCorrected)
+            .unwrap();
+        let r1 = s.resolve(&key(), hint).ram_bytes; // 30G
+        // A retry OOMs at the escalated 30G cap → record it.
+        s.record(&key(), r1, 0, FootprintSource::OomCorrected).unwrap();
+        let r2 = s.resolve(&key(), hint).ram_bytes; // max(30×5/4=37.5, 30+4=34)=37.5G
+        assert!(r2 > r1, "repeated OOM must keep escalating: {r1} !< {r2}");
     }
 
     #[test]
