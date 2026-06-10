@@ -820,27 +820,12 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
             // NOT build a poll-queue. Best-effort: a recipe whose args
             // carry no cost drivers falls back to the conservative
             // default footprint, which still gates oversubscription.
-            {
-                let fp = footprint;
-                let snap = crate::broker::ResourceSnapshot::probe();
-                // mem_total_gb == 0 means /proc/meminfo was unreadable
-                // (non-Linux / sandbox) — skip the gate rather than
-                // refuse every job on a probe miss.
-                if snap.mem_total_gb > 0.0 {
-                    if let crate::broker::AdmitDecision::Refuse { reason } = crate::broker::decide(
-                        &snap,
-                        &fp,
-                        crate::broker::admission::DEFAULT_FLOOR_GIB,
-                    ) {
-                        crate::python_kill::unbind_current_job();
-                        if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                            tracing::warn!("write Failed state for {job_id}: {se}");
-                        }
-                        return Err(anyhow!(
-                            "resource admission refused: {reason} (recipe '{name}')"
-                        ));
-                    }
+            if let Err(reason) = crate::broker::gate(&format!("recipe '{name}'"), &footprint) {
+                crate::python_kill::unbind_current_job();
+                if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
+                    tracing::warn!("write Failed state for {job_id}: {se}");
                 }
+                return Err(anyhow!("{reason}"));
             }
 
             // Cross-process GPU arbitration — same lock acquisition
@@ -941,15 +926,18 @@ async fn run_auto() -> Result<()> {
                 Ok(mut child) => {
                     let pid = child.id().unwrap_or(0);
                     println!("auto: spawned lamu-train pid={pid} as '{auto_name}'");
-                    // Update last_train_ts at spawn time. Failed
-                    // runs still count toward cooldown — better
-                    // than retrying immediately on every cron tick
-                    // when something's broken.
+                    // Stamp the ATTEMPT (not last_train_ts) at spawn — keeps
+                    // the cron from double-spawning a live run, while leaving
+                    // `last_train_ts` (the cooldown anchor) to advance ONLY on
+                    // a real completion. The child run (output_name `auto-*`)
+                    // records the outcome via `record_auto_outcome`: success
+                    // advances last_train_ts + clears the failure counter,
+                    // failure increments it (driving the backoff).
                     let mut updated = pol.clone();
-                    updated.last_train_ts = now_unix;
+                    updated.last_attempt_ts = now_unix;
                     updated.last_train_n_turns = new_turns;
                     if let Err(e) = policy::save(&updated) {
-                        tracing::warn!("failed to update last_train_ts: {e}");
+                        tracing::warn!("failed to update last_attempt_ts: {e}");
                     }
                     // Reap the zombie when training finishes; the
                     // cron-driven `auto` exits while the child runs.
@@ -1244,6 +1232,27 @@ async fn run_train(reg: &crate::framework::Registry, args: TrainArgs) -> Result<
     eprintln!("python {}", python.display());
     eprintln!("trainer {}", trainer_script.display());
 
+    // Admission gate BEFORE the lock (ADR 0046) — the legacy bare-spawn
+    // path was previously un-gated and could OOM the box. Bill a
+    // conservative legacy footprint (cap workers, the spec's batch, the
+    // smallest model tier) so admission's `need` never under-counts. A
+    // probe miss admits; a refusal fails the job cleanly with no lock.
+    // (Stopgap: this path is slated for replacement by `systemd-run`.)
+    {
+        let drivers = crate::broker::Drivers::new(
+            crate::broker::UNCALIBRATED_WORKER_CAP,
+            spec.batch_size,
+            1,
+            0,
+        );
+        if let Err(reason) = crate::broker::gate(&format!("train:{job_id}"), &drivers.estimate()) {
+            if let Err(se) = jobs::write_state(&job_id, JobState::Failed) {
+                tracing::warn!("write Failed state for {job_id}: {se}");
+            }
+            return Err(anyhow!("{reason}"));
+        }
+    }
+
     // Acquire the GPU lock. --allow-evict waits for an existing
     // inference exclusive to release; otherwise hard error.
     let lock = if args.allow_evict {
@@ -1302,6 +1311,9 @@ async fn run_train(reg: &crate::framework::Registry, args: TrainArgs) -> Result<
     match result {
         Ok(artifact) => {
             jobs::write_state(&job_id, JobState::Done)?;
+            // Advance the auto cooldown + clear the failure backoff only on
+            // a real completion (no-op for non-`auto-*` runs).
+            crate::policy::record_auto_outcome(&output_name, true);
             eprintln!(
                 "trained in {:?}, final_loss={:.4}, ckpt={}",
                 artifact.elapsed,
@@ -1329,6 +1341,8 @@ async fn run_train(reg: &crate::framework::Registry, args: TrainArgs) -> Result<
         }
         Err(e) => {
             jobs::write_state(&job_id, JobState::Failed)?;
+            // Grow the auto failure backoff (no-op for non-`auto-*` runs).
+            crate::policy::record_auto_outcome(&output_name, false);
             return Err(anyhow!(e));
         }
     }

@@ -97,6 +97,27 @@ pub fn decide(snap: &ResourceSnapshot, fp: &Footprint, floor_gib: f64) -> AdmitD
     }
 }
 
+/// Probe the live box and decide whether `fp` may launch. `Ok(())` =
+/// admit; `Err(reason)` = refuse (operator-facing). A probe miss
+/// (`mem_total_gb == 0`, e.g. non-Linux / sandbox where `/proc/meminfo`
+/// is unreadable) admits rather than refusing every job. `label` names
+/// the job for the refusal message.
+///
+/// THE single admission entry point for every launch path (recipe AND
+/// the legacy bare-spawn train path) so neither can launch un-gated.
+pub fn gate(label: &str, fp: &Footprint) -> Result<(), String> {
+    let snap = ResourceSnapshot::probe();
+    if snap.mem_total_gb <= 0.0 {
+        return Ok(()); // probe miss — don't refuse on missing data
+    }
+    match decide(&snap, fp, DEFAULT_FLOOR_GIB) {
+        AdmitDecision::Admit { .. } => Ok(()),
+        AdmitDecision::Refuse { reason } => {
+            Err(format!("resource admission refused: {reason} ({label})"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

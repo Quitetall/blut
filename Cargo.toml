@@ -50,6 +50,10 @@ schemars = "0.8"
 tokio-util = "0.7"
 rayon = "1"
 which = "6"
+# Local-time quiet-hours (honours host TZ + DST). Minimal: no default
+# features (drops the heavy `oldtime`/`serde`/`wasm` baggage), `clock`
+# pulls only the local-tz lookup.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 bincode = "1.3"
 rand = "0.8"
 ratatui = "0.30"

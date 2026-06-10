@@ -103,9 +103,54 @@ pub fn read_spec(job_id: &str) -> Result<TrainSpec> {
     serde_json::from_slice(&body).map_err(|e| TrainError::other(format!("parse spec.json: {e}")))
 }
 
+/// `status.jsonl` rotation threshold in bytes. `LAMU_STATUS_MAX_MB`
+/// overrides the 64 MiB default (0 disables rotation). A long training
+/// run's per-step spam can otherwise grow the log unbounded.
+pub fn status_max_bytes() -> u64 {
+    std::env::var("LAMU_STATUS_MAX_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(64)
+        .saturating_mul(1024 * 1024)
+}
+
+/// Roll `status.jsonl` over to `status.jsonl.1` (single generation,
+/// prior `.1` overwritten) when it reaches the cap. Best-effort: a
+/// rename failure is logged, never propagated — losing rotation must
+/// not fail a job. Returns `true` if a rotation happened. Readers
+/// (`read_status`, the TUI tail, the lineage scanner) read `.1` then
+/// the current file so no history is lost across one rollover.
+pub fn rotate_status_if_needed(path: &std::path::Path) -> bool {
+    rotate_status_with_cap(path, status_max_bytes())
+}
+
+/// Cap-parameterized core of [`rotate_status_if_needed`] (env-free, so it
+/// is unit-testable without touching the process-global `LAMU_STATUS_MAX_MB`).
+fn rotate_status_with_cap(path: &std::path::Path, cap: u64) -> bool {
+    if cap == 0 {
+        return false;
+    }
+    let len = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(_) => return false, // not yet created
+    };
+    if len < cap {
+        return false;
+    }
+    // `with_extension` replaces the last component: `status.jsonl` ->
+    // `status.jsonl.1` (callers always pass the `status.jsonl` path).
+    let rolled = path.with_extension("jsonl.1");
+    if let Err(e) = std::fs::rename(path, &rolled) {
+        tracing::warn!("status rotation rename failed for {}: {e}", path.display());
+        return false;
+    }
+    true
+}
+
 pub fn append_status(job_id: &str, update: &StatusUpdate) -> Result<()> {
     use std::io::Write;
     let path = paths::job_dir(job_id)?.join("status.jsonl");
+    rotate_status_if_needed(&path);
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -124,18 +169,24 @@ pub fn append_status(job_id: &str, update: &StatusUpdate) -> Result<()> {
 
 pub fn read_status(job_id: &str) -> Result<Vec<StatusUpdate>> {
     let path = paths::job_dir(job_id)?.join("status.jsonl");
-    if !path.exists() {
-        return Ok(Vec::new());
+    // Read the rolled-over generation first (older), then the current
+    // file, so a rotation mid-run doesn't truncate the visible history.
+    let mut out = Vec::new();
+    for p in [path.with_extension("jsonl.1"), path] {
+        if !p.exists() {
+            continue;
+        }
+        let body = std::fs::read_to_string(&p).map_err(|e| TrainError::Io {
+            path: p.clone(),
+            source: e,
+        })?;
+        out.extend(
+            body.lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| serde_json::from_str(l).ok()),
+        );
     }
-    let body = std::fs::read_to_string(&path).map_err(|e| TrainError::Io {
-        path: path.clone(),
-        source: e,
-    })?;
-    Ok(body
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect())
+    Ok(out)
 }
 
 pub fn write_pid(job_id: &str, pid: u32) -> Result<()> {
@@ -429,7 +480,47 @@ pub fn tail_log(job_id: &str, lines: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::path::PathBuf;
+
+    #[test]
+    fn rotate_rolls_over_at_cap_and_preserves_history() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("status.jsonl");
+
+        // Under cap: no rotation.
+        std::fs::write(&path, b"a\nb\n").unwrap();
+        assert!(!rotate_status_with_cap(&path, 1024));
+        assert!(!path.with_extension("jsonl.1").exists());
+
+        // At/over cap: rotate to .1, original gone.
+        assert!(rotate_status_with_cap(&path, 4));
+        assert!(path.with_extension("jsonl.1").exists());
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(path.with_extension("jsonl.1")).unwrap(), "a\nb\n");
+
+        // Fresh writes land in a new current file; both generations readable.
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        writeln!(f, "c").unwrap();
+        // read_status order = .1 (older) then current (newer).
+        let combined = {
+            let mut out = String::new();
+            for p in [path.with_extension("jsonl.1"), path.clone()] {
+                out.push_str(&std::fs::read_to_string(&p).unwrap());
+            }
+            out
+        };
+        assert_eq!(combined, "a\nb\nc\n");
+    }
+
+    #[test]
+    fn rotate_cap_zero_disables() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("status.jsonl");
+        std::fs::write(&path, vec![0u8; 1_000_000]).unwrap();
+        assert!(!rotate_status_with_cap(&path, 0));
+        assert!(path.exists());
+    }
 
     fn with_jobs_dir<F: FnOnce()>(f: F) {
         let _g = crate::TEST_ENV_LOCK.lock().unwrap();

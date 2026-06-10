@@ -122,6 +122,14 @@ pub fn spawn_status_writer(
     let mut rx = tx.subscribe();
     Ok(tokio::spawn(async move {
         let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
+        // Reopen the (possibly rotated) status file in append mode.
+        let reopen = |p: &std::path::Path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .map(|f| std::io::BufWriter::with_capacity(64 * 1024, f))
+        };
         loop {
             let timeout = tokio::time::sleep(STEP_FLUSH_INTERVAL);
             tokio::pin!(timeout);
@@ -149,8 +157,23 @@ pub fn spawn_status_writer(
                     }
                 },
                 _ = &mut timeout => {
-                    // Periodic flush of buffered StageStep events.
+                    // Periodic flush of buffered StageStep events, then
+                    // roll the log over if it has grown past the cap (the
+                    // high-volume StageStep path is what blows it up).
                     let _ = writer.flush();
+                    // Reopen if we rotated, OR if the file vanished out from
+                    // under us (defensive against an external rotation) — so
+                    // the writer can never get stuck appending to a renamed
+                    // inode.
+                    if crate::jobs::rotate_status_if_needed(&path) || !path.exists() {
+                        match reopen(&path) {
+                            Ok(w) => writer = w,
+                            Err(e) => {
+                                tracing::warn!("status writer: reopen after rotate failed: {e}");
+                                return;
+                            }
+                        }
+                    }
                 }
             }
         }

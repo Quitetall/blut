@@ -73,15 +73,33 @@ pub struct TrainPolicy {
     #[serde(default = "default_since_window")]
     pub since_window: String,
 
-    /// UNIX seconds. Updated atomically after a successful spawn.
-    /// Zero on first run.
+    /// UNIX seconds. Updated atomically after a successful train
+    /// COMPLETION (not spawn) so a failed run never advances the
+    /// cooldown. Zero on first run.
     #[serde(default)]
     pub last_train_ts: i64,
 
     /// Number of turns the last training run consumed. Diagnostic.
     #[serde(default)]
     pub last_train_n_turns: i64,
+
+    /// UNIX seconds of the last auto SPAWN (success or failure).
+    /// Drives the failure backoff window below. Distinct from
+    /// `last_train_ts` (which only advances on success).
+    #[serde(default)]
+    pub last_attempt_ts: i64,
+
+    /// Consecutive auto-run failures. Each failure doubles the backoff
+    /// window (`BACKOFF_BASE_SECS * 2^failures`, capped at
+    /// `cooldown_days`); a success resets it to 0. Stops a perpetually
+    /// failing trainer from re-spawning every cron tick.
+    #[serde(default)]
+    pub consecutive_failures: u32,
 }
+
+/// Base failure-backoff window: 1 hour. Doubles per consecutive
+/// failure, capped at `cooldown_days`. Internal to `decide()`.
+const BACKOFF_BASE_SECS: i64 = 3600;
 
 impl Default for TrainPolicy {
     fn default() -> Self {
@@ -95,6 +113,8 @@ impl Default for TrainPolicy {
             since_window: default_since_window(),
             last_train_ts: 0,
             last_train_n_turns: 0,
+            last_attempt_ts: 0,
+            consecutive_failures: 0,
         }
     }
 }
@@ -240,6 +260,25 @@ pub fn decide(
             ));
         }
     }
+    // Failure backoff: after consecutive auto-run failures, wait an
+    // exponentially growing window from the last ATTEMPT (capped at the
+    // cooldown) before retrying — so a perpetually failing trainer can't
+    // re-spawn every cron tick.
+    if policy.consecutive_failures > 0 && policy.last_attempt_ts > 0 {
+        let cooldown_cap = (policy.cooldown_days.max(1) as i64) * 86400;
+        let backoff = BACKOFF_BASE_SECS
+            .saturating_mul(1i64 << policy.consecutive_failures.min(20))
+            .min(cooldown_cap);
+        let since_attempt = now_unix_secs - policy.last_attempt_ts;
+        if since_attempt < backoff {
+            let mins_left = (backoff - since_attempt + 59) / 60;
+            return Decision::Skip(format!(
+                "in failure backoff after {} consecutive failure(s); \
+                 {} min remaining",
+                policy.consecutive_failures, mins_left
+            ));
+        }
+    }
     if new_turns_since_last < policy.threshold_new_turns {
         return Decision::Skip(format!(
             "only {} new turns since last train; threshold is {}",
@@ -325,23 +364,51 @@ pub fn validate(policy: &TrainPolicy) -> Result<()> {
     Ok(())
 }
 
+/// Record the outcome of an auto-triggered training run so the cooldown
+/// and failure backoff stay honest. No-op unless `output_name` starts
+/// with `auto-` (manual runs don't touch the auto policy). A success
+/// advances `last_train_ts` to now and clears `consecutive_failures`; a
+/// failure increments `consecutive_failures` (growing the backoff
+/// window). Best-effort — a load/save failure is logged, never
+/// propagated, so it can be called from a job's terminal path without
+/// masking the real outcome.
+pub fn record_auto_outcome(output_name: &str, success: bool) {
+    if !output_name.starts_with("auto-") {
+        return;
+    }
+    // load → modify → save is not file-locked. Concurrent auto completions
+    // could lose one update (last-writer-wins), but the ≥1h failure backoff
+    // makes overlapping auto runs vanishingly unlikely on a single box, and
+    // a lost increment only shortens one backoff window — acceptable.
+    let mut p = match load() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("record_auto_outcome: load policy failed: {e}");
+            return;
+        }
+    };
+    if success {
+        let (now, _) = current_clock();
+        p.last_train_ts = now;
+        p.consecutive_failures = 0;
+    } else {
+        p.consecutive_failures = p.consecutive_failures.saturating_add(1);
+    }
+    if let Err(e) = save(&p) {
+        tracing::warn!("record_auto_outcome: save policy failed: {e}");
+    }
+}
+
 /// Helper for the production `auto` CLI: returns now() in UNIX
 /// seconds + local minutes-of-day. Pure side-effect-free wrapper
 /// so the decision function can be tested with synthetic clocks.
 pub fn current_clock() -> (i64, u32) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs_unix = now.as_secs() as i64;
-    // Local minutes-of-day. We can't get a robust local-tz
-    // conversion without `chrono::Local` and we don't want the
-    // chrono dep here. Approximation: use UTC. Users can override
-    // quiet_hours to UTC values explicitly.
-    //
-    // TODO: when chrono lands as a workspace dep, swap this for
-    // chrono::Local::now().num_seconds_from_midnight() / 60.
-    let secs_into_day = (secs_unix.rem_euclid(86400)) as u32;
-    let minutes = secs_into_day / 60;
+    use chrono::{Local, Timelike};
+    let now = Local::now();
+    let secs_unix = now.timestamp();
+    // True local minutes-of-day (honours the host timezone + DST), so
+    // `quiet_hours` mean what the user wrote regardless of UTC offset.
+    let minutes = now.hour() * 60 + now.minute();
     (secs_unix, minutes)
 }
 
@@ -360,6 +427,8 @@ mod tests {
             since_window: "30d".into(),
             last_train_ts: 0,
             last_train_n_turns: 0,
+            last_attempt_ts: 0,
+            consecutive_failures: 0,
         }
     }
 
@@ -562,5 +631,61 @@ mod tests {
     #[test]
     fn validate_accepts_default_policy() {
         validate(&TrainPolicy::default()).unwrap();
+    }
+
+    #[test]
+    fn failure_backoff_skips_within_window() {
+        let mut p = run_policy();
+        p.last_train_ts = 0; // no cooldown
+        p.consecutive_failures = 2; // backoff = 1h * 4 = 4h
+        p.last_attempt_ts = 1_000_000;
+        // 1h after the attempt — still inside the 4h backoff window.
+        let now = p.last_attempt_ts + 3600;
+        let d = decide(&p, now, at_3am(), 10_000, false);
+        match d {
+            Decision::Skip(r) => assert!(r.contains("failure backoff"), "{r}"),
+            other => panic!("expected backoff skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failure_backoff_clears_after_window() {
+        let mut p = run_policy();
+        p.last_train_ts = 0;
+        p.consecutive_failures = 2; // 4h window
+        p.last_attempt_ts = 1_000_000;
+        // 5h later — past the 4h window → runs.
+        let now = p.last_attempt_ts + 5 * 3600;
+        assert!(matches!(
+            decide(&p, now, at_3am(), 10_000, false),
+            Decision::Run { .. }
+        ));
+    }
+
+    #[test]
+    fn backoff_capped_at_cooldown() {
+        let mut p = run_policy();
+        p.last_train_ts = 0;
+        p.cooldown_days = 1; // cap = 24h
+        p.consecutive_failures = 20; // raw 1h<<20 ≫ 24h → capped at 24h
+        p.last_attempt_ts = 1_000_000;
+        // 25h later — past the 24h cap → runs (not stuck forever).
+        let now = p.last_attempt_ts + 25 * 3600;
+        assert!(matches!(
+            decide(&p, now, at_3am(), 10_000, false),
+            Decision::Run { .. }
+        ));
+    }
+
+    #[test]
+    fn zero_failures_no_backoff() {
+        let mut p = run_policy();
+        p.last_train_ts = 0;
+        p.consecutive_failures = 0;
+        p.last_attempt_ts = 1_000_000;
+        assert!(matches!(
+            decide(&p, p.last_attempt_ts + 1, at_3am(), 10_000, false),
+            Decision::Run { .. }
+        ));
     }
 }
