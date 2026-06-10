@@ -53,9 +53,23 @@ class CacheLayout:
 
 
 def data_root() -> str:
-    """The single canonical data root: LAMQUANT_DATA_ROOT or the default."""
-    r = os.environ.get(DATA_ROOT_ENV, "").strip() or DEFAULT_DATA_ROOT
-    return os.path.abspath(r)
+    """The single canonical data root: LAMQUANT_DATA_ROOT, else the default.
+
+    Fail-CLOSED: if the env var is unset AND the hardcoded default does not
+    exist on this machine, raise rather than silently creating cache dirs at a
+    machine-specific absolute path that may be wrong (the whole point is that
+    caches are never created in the wrong place)."""
+    explicit = os.environ.get(DATA_ROOT_ENV, "").strip()
+    if explicit:
+        return os.path.abspath(explicit)
+    root = os.path.abspath(DEFAULT_DATA_ROOT)
+    if not os.path.isdir(root):
+        raise RuntimeError(
+            f"cache data root {root!r} does not exist and {DATA_ROOT_ENV} is "
+            f"unset. Set {DATA_ROOT_ENV}=<dir holding Archive/ + Training/> so "
+            f"the decode caches are never created in the wrong place."
+        )
+    return root
 
 
 def resolve(create: bool = True) -> CacheLayout:

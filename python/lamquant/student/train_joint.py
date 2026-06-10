@@ -712,12 +712,9 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         #                   NOT whole-recording — see lma_typed_adapter).
         from lamquant.common.cache_paths import apply_env as _apply_cache_env
         _cache = _apply_cache_env()
-        try:
-            _nw = int(os.environ.get('LMA_NUM_WORKERS', '0'))
-        except ValueError:
-            _nw = 0
-        if _nw < 1:
-            os.environ['LMA_NUM_WORKERS'] = '4'
+        # Default the decode-worker count only when UNSET — preserve an explicit
+        # LMA_NUM_WORKERS=0 (serial decode, for debugging) instead of forcing 4.
+        os.environ.setdefault('LMA_NUM_WORKERS', '4')
         print(f"[*] MANDATORY caches @ data_root={_cache.data_root}: "
               f"L3={_cache.l3_cache_dir} FB={_cache.fb_cache_dir} "
               f"MEMMAP={_cache.memmap_dir} LMA_NUM_WORKERS={os.environ['LMA_NUM_WORKERS']}")

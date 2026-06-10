@@ -30,6 +30,14 @@ def test_default_root_when_unset(monkeypatch):
     assert cp.data_root() == os.path.abspath(cp.DEFAULT_DATA_ROOT)
 
 
+def test_default_root_fail_closed_when_missing(monkeypatch):
+    # env unset AND default doesn't exist → raise, never silently makedirs junk.
+    monkeypatch.delenv(cp.DATA_ROOT_ENV, raising=False)
+    monkeypatch.setattr(cp, "DEFAULT_DATA_ROOT", "/nonexistent/lamquant/dataroot")
+    with pytest.raises(RuntimeError):
+        cp.data_root()
+
+
 def test_apply_env_forces_consistency_over_hostile_values(tmp_path, monkeypatch):
     # an operator set the three to inconsistent off-root junk — apply_env must
     # OVERWRITE all three from the single root (no scenario where they survive).

@@ -452,12 +452,17 @@ class LmaTypedL3Dataset:
         cached_win = self._fb_win_load(wpath)
         if cached_win is not None:
             window = np.asarray(cached_win, dtype=np.float32)
-            if window.shape != (TARGET_CHANNELS, WINDOW_SAMPLES):
-                fb = torch.zeros(TARGET_CHANNELS, WINDOW_SAMPLES, dtype=torch.float32)
-                fb[:, :window.shape[1]] = torch.from_numpy(
-                    np.ascontiguousarray(window[:, :WINDOW_SAMPLES]))
-                return l3, fb
-            return l3, torch.from_numpy(np.ascontiguousarray(window))
+            if window.shape == (TARGET_CHANNELS, WINDOW_SAMPLES):
+                return l3, torch.from_numpy(np.ascontiguousarray(window))
+            # Stale / wrong-shaped cache entry (e.g. WINDOW_SAMPLES changed
+            # between runs). Do NOT silently zero-pad it into the loss target —
+            # drop the file and fall through to a fresh decode (which re-saves
+            # the correct window below).
+            try:
+                if wpath:
+                    os.remove(wpath)
+            except OSError:
+                pass
 
         # Miss: decode the WHOLE recording once (in-RAM LRU cap 3 amortises the
         # other windows of this stem WITHIN epoch 1 — stem-grouped sampling
