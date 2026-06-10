@@ -218,8 +218,9 @@ enum ScheduleCommand {
         /// Recipe name (as listed by `recipe list`).
         recipe: String,
         /// systemd `OnCalendar` expression, e.g. "daily", "Mon *-*-* 02:00:00".
+        /// Omit to use the recipe's built-in `SCHEDULE` (if it declares one).
         #[arg(long)]
-        calendar: String,
+        calendar: Option<String>,
         /// Recipe args as inline JSON. Defaults to `{}`.
         #[arg(long, default_value = "{}")]
         args: String,
@@ -765,9 +766,18 @@ fn run_schedule_cmd(reg: &crate::framework::Registry, cmd: ScheduleCommand) -> R
         } => {
             // Validate the recipe exists + the args parse before touching
             // systemd, so a typo doesn't leave a broken unit behind.
-            if reg.find(&recipe).is_none() {
-                return Err(anyhow!("recipe '{recipe}' not in catalog"));
-            }
+            let def = reg
+                .find(&recipe)
+                .ok_or_else(|| anyhow!("recipe '{recipe}' not in catalog"))?;
+            // `--calendar` wins; otherwise fall back to the recipe's built-in
+            // SCHEDULE (E1↔E5). Neither present → hard error (no silent default).
+            let calendar = calendar
+                .or_else(|| def.schedule.map(str::to_string))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "recipe '{recipe}' has no built-in SCHEDULE; pass --calendar <OnCalendar>"
+                    )
+                })?;
             let _: serde_json::Value = serde_json::from_str(&args)
                 .with_context(|| format!("parse --args as JSON: {args}"))?;
             schedule::install(&recipe, &calendar, &args).map_err(|e| anyhow!("{e}"))?;

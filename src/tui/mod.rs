@@ -96,6 +96,7 @@ mod test_fixtures {
         category: RecipeCategory::Train,
         input_kinds: &["dataset.jsonl"],
         output_kind: "checkpoint.hf",
+        schedule: None,
         args_schema_fn: empty_object_schema,
         compile_fn: |_| {
             Err(crate::framework::error::RecipeError::CompileFailed(
@@ -110,6 +111,7 @@ mod test_fixtures {
         category: RecipeCategory::Train,
         input_kinds: &["dataset.jsonl"],
         output_kind: "checkpoint.hf",
+        schedule: None,
         args_schema_fn: empty_object_schema,
         compile_fn: |_| {
             Err(crate::framework::error::RecipeError::CompileFailed(
@@ -124,6 +126,7 @@ mod test_fixtures {
         category: RecipeCategory::Eval,
         input_kinds: &["checkpoint.hf"],
         output_kind: "eval.report",
+        schedule: None,
         args_schema_fn: empty_object_schema,
         compile_fn: |_| {
             Err(crate::framework::error::RecipeError::CompileFailed(

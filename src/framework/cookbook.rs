@@ -126,6 +126,7 @@ mod tests {
         category: RecipeCategory::Train,
         input_kinds: &["dataset.jsonl"],
         output_kind: "checkpoint.hf",
+        schedule: None,
         args_schema_fn: || serde_json::json!({"type": "object", "properties": {}}),
         compile_fn: |_| {
             Err(crate::framework::error::RecipeError::CompileFailed(
@@ -140,6 +141,7 @@ mod tests {
         category: RecipeCategory::Eval,
         input_kinds: &["checkpoint.hf"],
         output_kind: "eval.report",
+        schedule: None,
         args_schema_fn: || serde_json::json!({"type": "object", "properties": {}}),
         compile_fn: |_| {
             Err(crate::framework::error::RecipeError::CompileFailed(

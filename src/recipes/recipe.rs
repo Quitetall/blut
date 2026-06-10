@@ -20,9 +20,98 @@ use crate::framework::plan::{CompiledPlan, Plan};
 pub trait Recipe: Send + Sync + 'static {
     const NAME: &'static str;
     const DESCRIPTION: &'static str;
+    /// Cockpit menu bucket (`blut recipe list --category`, TUI sections).
+    /// Defaulted so the trait extension stays additive; every shipped
+    /// recipe overrides it via [`register_recipe!`].
+    const CATEGORY: RecipeCategory = RecipeCategory::User;
+    /// Artifact `Kind` IDs the first stage consumes. Default none
+    /// (graph-input recipe, `Input = ()`).
+    const INPUT_KINDS: &'static [&'static str] = &[];
+    /// Artifact `Kind` ID the last stage produces. Default `""`; real
+    /// recipes override it (the macro copies it into `RecipeDef`).
+    const OUTPUT_KIND: &'static str = "";
+    /// Optional default `systemd` `OnCalendar` for `blut schedule install`
+    /// when no `--calendar` is given. `None` = no built-in schedule.
+    const SCHEDULE: Option<&'static str> = None;
     type Backend: TrainingBackend;
     type Args: serde::de::DeserializeOwned + schemars::JsonSchema + Send + Sync + 'static;
     fn compile(&self, args: Self::Args) -> Result<Plan<(), Self::Backend>, RecipeError>;
+}
+
+/// Build the args JSON schema for a recipe's `Args` type. This is the body
+/// every recipe's `RecipeDef.args_schema_fn` used to hand-inline; the macro
+/// references it so the schemars-gen call lives in exactly one place.
+///
+/// `subschema_for` emits `{"$ref":"#/definitions/Args"}` and parks the actual
+/// definition(s) in the generator. The hand-DEFs forgot to attach them, so the
+/// schema was a dangling `$ref` and every `definitions`-walking consumer
+/// (`blut tui` template prefill, E2's `args_template`) silently fell back to
+/// `{}`. Centralizing here lets us attach `take_definitions()` once, fixing
+/// that for every recipe.
+pub fn schema_of<A: schemars::JsonSchema>() -> serde_json::Value {
+    let mut g = schemars::r#gen::SchemaGenerator::default();
+    let root = g.subschema_for::<A>();
+    let mut v =
+        serde_json::to_value(root).expect("schemars-derived JsonSchema must serialize cleanly");
+    let defs = g.take_definitions();
+    if let (serde_json::Value::Object(map), Ok(defs_val)) =
+        (&mut v, serde_json::to_value(&defs))
+    {
+        if !defs.is_empty() {
+            map.insert("definitions".to_string(), defs_val);
+        }
+    }
+    v
+}
+
+/// Parse JSON args and compile a recipe to a backend-erased [`CompiledPlan`].
+/// This is the body every recipe's `RecipeDef.compile_fn` used to hand-inline.
+/// Requires `Default` to construct the (unit-struct) recipe instance — the
+/// macro adds `#[derive(Default)]` expectations to migrated recipes.
+pub fn compile_erased<R: Recipe + Default>(
+    raw: serde_json::Value,
+) -> Result<CompiledPlan, RecipeError> {
+    let args: R::Args =
+        serde_json::from_value(raw).map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
+    R::default().compile(args).map(|p| p.into_compiled())
+}
+
+/// Emit a recipe's `pub static DEF: RecipeDef` from its [`Recipe`] impl.
+///
+/// Every field is derived from trait consts + associated types, so
+/// `backend_id`/`schema`/`compile`/`category` can never drift from the impl.
+/// Invoke at module level in a recipe file, after the `impl Recipe`:
+///
+/// ```ignore
+/// #[derive(Default)]
+/// pub struct MyRecipe;
+/// impl Recipe for MyRecipe { /* … CATEGORY, OUTPUT_KIND, … */ }
+/// blut::register_recipe!(MyRecipe);   // → pub static DEF
+/// ```
+///
+/// `$crate` keeps every path resolved against `blut` regardless of the
+/// invoking cookbook crate.
+#[macro_export]
+macro_rules! register_recipe {
+    ($ty:ty) => {
+        pub static DEF: $crate::recipes::recipe::RecipeDef =
+            $crate::recipes::recipe::RecipeDef {
+                name: <$ty as $crate::recipes::recipe::Recipe>::NAME,
+                description: <$ty as $crate::recipes::recipe::Recipe>::DESCRIPTION,
+                backend_id: <<$ty as $crate::recipes::recipe::Recipe>::Backend
+                    as $crate::backends::TrainingBackend>::ID,
+                category: <$ty as $crate::recipes::recipe::Recipe>::CATEGORY,
+                input_kinds: <$ty as $crate::recipes::recipe::Recipe>::INPUT_KINDS,
+                output_kind: <$ty as $crate::recipes::recipe::Recipe>::OUTPUT_KIND,
+                schedule: <$ty as $crate::recipes::recipe::Recipe>::SCHEDULE,
+                args_schema_fn: || {
+                    $crate::recipes::recipe::schema_of::<
+                        <$ty as $crate::recipes::recipe::Recipe>::Args,
+                    >()
+                },
+                compile_fn: |raw| $crate::recipes::recipe::compile_erased::<$ty>(raw),
+            };
+    };
 }
 
 /// Category bucket the BLUT Training Cockpit menu groups by.
@@ -88,6 +177,10 @@ pub struct RecipeDef {
     /// stage's `Output::KIND`). Used by `blut tui` to surface
     /// swap-candidate recipes (those with matching I/O kinds).
     pub output_kind: &'static str,
+    /// Optional default `systemd` `OnCalendar` expression. When set,
+    /// `blut schedule install <recipe>` uses it if no `--calendar` is
+    /// given. `None` = the recipe ships no built-in schedule (E1↔E5).
+    pub schedule: Option<&'static str>,
     /// Returns the recipe's args JSON schema.
     pub args_schema_fn: fn() -> serde_json::Value,
     /// Parse JSON args + compile to a backend-erased CompiledPlan.
@@ -117,6 +210,7 @@ mod tests {
         category: RecipeCategory::Train,
         input_kinds: &["dataset.jsonl"],
         output_kind: "checkpoint.hf",
+        schedule: None,
         args_schema_fn: || serde_json::json!({"type": "object", "properties": {}}),
         compile_fn: |_raw| Err(RecipeError::CompileFailed("fixture not runnable".into())),
     };
@@ -132,6 +226,31 @@ mod tests {
         assert!(schema != serde_json::Value::Null);
         assert!(schema.is_object());
         let _ = FIXTURE.category;
+    }
+
+    #[test]
+    fn schema_of_builds_an_object_schema() {
+        // `schema_of` is the body every `RecipeDef.args_schema_fn` now
+        // references through `register_recipe!`. The full macro expansion +
+        // `compile_erased` are exercised end-to-end by each cookbook's recipe
+        // tests (they build real Plans); here we pin the standalone helper.
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Args {
+            lr: f64,
+            epochs: u32,
+        }
+        let schema = schema_of::<Args>();
+        assert!(schema.is_object(), "args schema must be a JSON object");
+        // The fix: definitions are now attached (was a dangling $ref), so the
+        // TUI/registry can resolve `#/definitions/Args` → properties.
+        let props = schema
+            .get("definitions")
+            .and_then(|d| d.get("Args"))
+            .and_then(|a| a.get("properties"))
+            .and_then(|p| p.as_object())
+            .expect("schema must carry definitions/Args/properties");
+        assert!(props.contains_key("lr") && props.contains_key("epochs"));
     }
 
     #[test]
