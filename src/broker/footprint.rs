@@ -434,7 +434,7 @@ mod tests {
         // (capped workers ≤ 4) is conservative-high but still fits ONE
         // train on the 62 GiB box with the 6 GiB floor.
         let fp = estimate(4, 16, 3, 256);
-        // 6 + 4×2 + 3×2 + 1 + 16×(1/16) = 6+8+6+1+1 = 22 GiB
+        // 6 + 4×2 + 3×2 + 1 + 16×64MiB = 6+8+6+1+1 = 22 GiB
         assert_eq!(fp.ram_bytes, 22 * GIB);
         assert!(fp.ram_bytes < (62 - 6) * GIB, "must fit one train on 62G box");
     }
