@@ -40,6 +40,12 @@ pub struct PythonTrainBackend {
     pub trainer_script: PathBuf,
     /// Extra env passed to the trainer subprocess (PYTHONPATH, etc.).
     pub env: Vec<(String, String)>,
+    /// D3 liveness watchdog: if `Some`, a trainer that emits NO status
+    /// line (Step/Eval/Saved/Heartbeat) AND NO stderr line for this long
+    /// is presumed hung and SIGTERM'd. `None` (default) = no watchdog,
+    /// so a chatty-or-heartbeating trainer is never falsely killed and
+    /// old trainers (no heartbeats) are unaffected.
+    pub liveness_timeout: Option<Duration>,
     child_pid: Arc<Mutex<Option<u32>>>,
 }
 
@@ -49,12 +55,19 @@ impl PythonTrainBackend {
             python,
             trainer_script,
             env: Vec::new(),
+            liveness_timeout: None,
             child_pid: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Enable the D3 liveness watchdog with the given idle timeout.
+    pub fn with_liveness_timeout(mut self, timeout: Duration) -> Self {
+        self.liveness_timeout = Some(timeout);
         self
     }
 }
@@ -119,10 +132,18 @@ impl TrainBackend for PythonTrainBackend {
         let started = Instant::now();
         let on_status: Arc<StatusFn> = Arc::new(on_status);
 
+        // D3 liveness: every status line AND every stderr line refreshes
+        // `last_activity`; the watchdog kills a trainer that goes silent
+        // on BOTH for `liveness_timeout`.
+        let last_activity = Arc::new(Mutex::new(Instant::now()));
+        let watchdog_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
         // Stdout reader: forwards every parsed StatusUpdate to the
         // caller's callback. Captures the terminal Done/Failed and
-        // ships an artifact down the oneshot channel.
+        // ships an artifact down the oneshot channel. Heartbeats (D4)
+        // refresh liveness but are SWALLOWED (no status.jsonl noise).
         let on_status_for_reader = Arc::clone(&on_status);
+        let activity_stdout = Arc::clone(&last_activity);
         let stdout_reader = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             let mut last_done: Option<(f32, PathBuf)> = None;
@@ -134,6 +155,10 @@ impl TrainBackend for PythonTrainBackend {
                 }
                 match serde_json::from_str::<StatusUpdate>(line) {
                     Ok(u) => {
+                        *activity_stdout.lock() = Instant::now();
+                        if matches!(u, StatusUpdate::Heartbeat { .. }) {
+                            continue; // liveness only — don't forward
+                        }
                         if let StatusUpdate::Done {
                             final_loss,
                             checkpoint_dir,
@@ -161,18 +186,66 @@ impl TrainBackend for PythonTrainBackend {
         });
 
         // Stderr drain. Forward to tracing so a buggy trainer's
-        // python traceback doesn't disappear into a closed pipe.
+        // python traceback doesn't disappear into a closed pipe. Stderr
+        // chatter (e.g. tqdm) is also a liveness signal.
+        let activity_stderr = Arc::clone(&last_activity);
         let stderr_reader = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                *activity_stderr.lock() = Instant::now();
                 tracing::info!(target: "blut::trainer_stderr", "{}", line);
             }
+        });
+
+        // D3 watchdog task (only when configured). Ticks at min(timeout/4,
+        // 30s); on idle > timeout it SIGTERMs the child group and records
+        // a reason. Aborted below once the child exits.
+        let watchdog = self.liveness_timeout.map(|timeout| {
+            let activity = Arc::clone(&last_activity);
+            let pid_handle = Arc::clone(&self.child_pid);
+            let reason = Arc::clone(&watchdog_reason);
+            tokio::spawn(async move {
+                let tick = std::cmp::min(timeout / 4, Duration::from_secs(30))
+                    .max(Duration::from_millis(100));
+                loop {
+                    tokio::time::sleep(tick).await;
+                    let idle = activity.lock().elapsed();
+                    if idle <= timeout {
+                        continue;
+                    }
+                    // Idle past the limit — record the reason (always) and
+                    // kill the child group if we have its pid, then stop.
+                    *reason.lock() = Some(format!(
+                        "liveness watchdog: no output for {idle:?} (limit {timeout:?})"
+                    ));
+                    // Bind the Copy pid (drop the guard) before the await.
+                    let pid = *pid_handle.lock();
+                    match pid {
+                        Some(pid) => {
+                            tracing::warn!(
+                                "liveness watchdog: no trainer output for {idle:?} (> {timeout:?}); \
+                                 killing pid {pid}"
+                            );
+                            crate::python_kill::graceful_kill_pid(pid, Duration::from_secs(10)).await;
+                        }
+                        None => tracing::warn!(
+                            "liveness watchdog: idle {idle:?} but no child pid to kill"
+                        ),
+                    }
+                    return;
+                }
+            })
         });
 
         let exit_status = child
             .wait()
             .await
             .map_err(|e| TrainError::Trainer(format!("wait for trainer.py: {}", e)))?;
+
+        // Child exited — stop the watchdog if it's still ticking.
+        if let Some(w) = &watchdog {
+            w.abort();
+        }
 
         // Reader tasks finish once their pipes hit EOF (they always
         // do once the child exits). Awaiting here serializes the
@@ -184,6 +257,12 @@ impl TrainBackend for PythonTrainBackend {
             crate::python_kill::unregister_child(pid);
         }
         let elapsed = started.elapsed();
+
+        // If the watchdog killed the trainer, surface THAT (a hang), not
+        // the generic "exited with no Done" — it's the actionable cause.
+        if let Some(reason) = watchdog_reason.lock().take() {
+            return Err(TrainError::Trainer(reason));
+        }
 
         let (last_done, last_failed) = artifact_rx
             .await
@@ -230,4 +309,103 @@ pub(crate) use crate::python_kill::graceful_kill_pid;
 
 async fn graceful_kill(pid: u32) {
     crate::python_kill::graceful_kill_pid(pid, Duration::from_secs(10)).await
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::backend::StatusFn;
+    use crate::spec::{DatasetSource, Method, Optim, TrainSpec};
+
+    fn python3() -> Option<PathBuf> {
+        which::which("python3").ok()
+    }
+
+    fn spec() -> TrainSpec {
+        TrainSpec {
+            base_model: "org/m".into(),
+            output_name: "wd-test".into(),
+            output_dir: PathBuf::from("/tmp/blut-wd-test"),
+            method: Method::QLora { rank: 16, alpha: 32 },
+            dataset: DatasetSource::JsonlPath {
+                path: PathBuf::from("/tmp/x.jsonl"),
+            },
+            optimizer: Optim::AdamW8bit,
+            lr: 2e-4,
+            epochs: 1,
+            batch_size: 1,
+            grad_accum: 1,
+            seq_len: 512,
+            seed: 42,
+            quant: "Q4_K_M".into(),
+            skip_convert: true,
+            dpo_beta: None,
+        }
+    }
+
+    /// Write a python script that prints one Step line, then runs the
+    /// given tail (`silent` = sleep forever; `heartbeat` = ping then Done).
+    fn trainer_script(td: &std::path::Path, tail: &str) -> PathBuf {
+        let body = format!(
+            "import json,sys,time\n\
+             print(json.dumps({{'kind':'step','step':1,'total':10,'loss':1.0,'lr':0.0,'vram_mb':0}}),flush=True)\n\
+             {tail}\n"
+        );
+        let p = td.join("fake_trainer.py");
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn liveness_watchdog_kills_a_silent_trainer() {
+        let Some(py) = python3() else {
+            eprintln!("skip: python3 not found");
+            return;
+        };
+        let td = tempfile::tempdir().unwrap();
+        // Prints one Step, then goes silent for 60s — the watchdog must
+        // kill it well before that.
+        let script = trainer_script(td.path(), "time.sleep(60)");
+        let mut backend = PythonTrainBackend::new(py, script)
+            .with_liveness_timeout(Duration::from_millis(500));
+        let on_status: StatusFn = Box::new(|_u| {});
+        let fut = backend.run(spec(), on_status);
+        let r = tokio::time::timeout(Duration::from_secs(10), fut)
+            .await
+            .expect("watchdog must fire long before the 10s guard");
+        match r {
+            Err(TrainError::Trainer(msg)) => {
+                assert!(msg.contains("liveness watchdog"), "got: {msg}");
+            }
+            other => panic!("expected a liveness-watchdog error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeating_trainer_survives_the_watchdog() {
+        let Some(py) = python3() else {
+            eprintln!("skip: python3 not found");
+            return;
+        };
+        let td = tempfile::tempdir().unwrap();
+        let ckpt = td.path().join("ckpt");
+        std::fs::create_dir_all(&ckpt).unwrap();
+        // Heartbeats every 100ms for ~1.5s (keeping liveness fresh under
+        // a 500ms timeout), then Done.
+        let tail = format!(
+            "for _ in range(15):\n\
+             \x20 print(json.dumps({{'kind':'heartbeat','phase':'load'}}),flush=True)\n\
+             \x20 time.sleep(0.1)\n\
+             print(json.dumps({{'kind':'done','final_loss':0.5,'checkpoint_dir':'{}'}}),flush=True)",
+            ckpt.display()
+        );
+        let script = trainer_script(td.path(), &tail);
+        let mut backend = PythonTrainBackend::new(py, script)
+            .with_liveness_timeout(Duration::from_millis(500));
+        let on_status: StatusFn = Box::new(|_u| {});
+        let r = tokio::time::timeout(Duration::from_secs(10), backend.run(spec(), on_status))
+            .await
+            .expect("must complete");
+        assert!(r.is_ok(), "heartbeats must keep the trainer alive: {r:?}");
+    }
 }

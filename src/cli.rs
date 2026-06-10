@@ -1355,6 +1355,11 @@ async fn run_train(reg: &crate::framework::Registry, args: TrainArgs) -> Result<
                 checkpoint_dir.display()
             ),
             StatusUpdate::Failed { error } => eprintln!("FAILED: {error}"),
+            StatusUpdate::Heartbeat { phase, .. } => {
+                if let Some(p) = phase {
+                    eprintln!("… {p}");
+                }
+            }
         }
     });
 

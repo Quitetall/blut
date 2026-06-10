@@ -372,6 +372,11 @@ pub fn render_log(updates: &[StatusUpdate]) -> String {
             StatusUpdate::Failed { error } => {
                 out.push_str(&format!("FAILED: {error}\n"));
             }
+            StatusUpdate::Heartbeat { phase, .. } => {
+                if let Some(p) = phase {
+                    out.push_str(&format!("… {p}\n"));
+                }
+            }
         }
     }
     out

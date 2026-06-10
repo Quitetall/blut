@@ -44,6 +44,18 @@ pub enum StatusUpdate {
     /// emitting this. `error` is a human-readable explanation; do not
     /// parse it.
     Failed { error: String },
+    /// Liveness ping (D4). Carries no training semantics — it only
+    /// refreshes the backend's liveness watchdog (D3). Trainers SHOULD
+    /// emit one every ≤30s during legitimately silent phases (model
+    /// load, tokenization, checkpoint save) so the watchdog doesn't
+    /// mistake a busy-but-quiet trainer for a hang. Optional `phase`
+    /// labels the current phase (surfaced to the TUI on change).
+    Heartbeat {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vram_mb: Option<u32>,
+    },
 }
 
 impl StatusUpdate {
@@ -119,5 +131,21 @@ mod tests {
         let bad = "{\"kind\": \"telemetry\", \"foo\": 1}";
         let r: serde_json::Result<StatusUpdate> = serde_json::from_str(bad);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn heartbeat_round_trips_and_is_not_terminal() {
+        let h = StatusUpdate::Heartbeat {
+            phase: Some("loading_model".into()),
+            vram_mb: Some(1024),
+        };
+        let json = serde_json::to_string(&h).unwrap();
+        assert!(json.contains("\"kind\":\"heartbeat\""));
+        let back: StatusUpdate = serde_json::from_str(&json).unwrap();
+        assert_eq!(h, back);
+        assert!(!back.is_terminal());
+        // Bare heartbeat (both optionals omitted) still parses.
+        let bare: StatusUpdate = serde_json::from_str("{\"kind\":\"heartbeat\"}").unwrap();
+        assert_eq!(bare, StatusUpdate::Heartbeat { phase: None, vram_mb: None });
     }
 }
