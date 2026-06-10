@@ -283,17 +283,41 @@ enum RecipeCommand {
         /// Recipe name (as listed by `recipe list`).
         name: String,
     },
-    /// Execute a recipe with given args.
+    /// Execute a recipe, or a config-driven sweep over it.
     Run {
         /// Recipe name.
         name: String,
-        /// Args as inline JSON.
-        #[arg(long)]
+        /// Args as inline JSON. Ignored in config mode (--config-dir).
+        #[arg(long, default_value = "{}")]
         args: String,
         /// Promote this run's outputs to the global cache for
         /// future re-use. Default: per-job cache only.
         #[arg(long, default_value_t = false)]
         shared_cache: bool,
+        /// Hydra-style config dir (enables config mode). The composed config's
+        /// top-level keys must match the recipe's flat Args fields.
+        #[arg(long)]
+        config_dir: Option<String>,
+        /// Config name within --config-dir (required in config mode).
+        #[arg(long)]
+        config_name: Option<String>,
+        /// Top-level config key whose subtree is the recipe's Args (default:
+        /// the recipe name). Nest Args under this key so `--set`/`--sweep` can
+        /// target them with dotted paths, e.g. `<key>.epochs=2`.
+        #[arg(long)]
+        config_key: Option<String>,
+        /// Base override(s) applied to the composed config, e.g.
+        /// `--set lr=1e-3 --set epochs=5` (repeatable).
+        #[arg(long = "set", value_name = "KEY=VAL")]
+        set: Vec<String>,
+        /// Sweep axis/axes, e.g. `--sweep "lr=1e-3,1e-4" --sweep "bs=8,16"`
+        /// → cartesian product (repeatable). Requires --config-dir/--config-name.
+        #[arg(long, value_name = "KEY=V1,V2")]
+        sweep: Vec<String>,
+        /// Print the expanded combos (fingerprint + skip status) without
+        /// running anything.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
 }
 
@@ -1062,10 +1086,25 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
             name,
             args,
             shared_cache,
+            config_dir,
+            config_name,
+            config_key,
+            set,
+            sweep,
+            dry_run,
         } => {
-            let raw: serde_json::Value = serde_json::from_str(&args)
-                .with_context(|| format!("parse --args as JSON: {args}"))?;
-            run_one_recipe(reg, &name, raw, None, shared_cache).await?;
+            let config_mode = config_dir.is_some() || config_name.is_some() || !sweep.is_empty();
+            if config_mode {
+                run_recipe_sweep(
+                    reg, &name, config_dir, config_name, config_key, &set, &sweep, dry_run,
+                    shared_cache,
+                )
+                .await?;
+            } else {
+                let raw: serde_json::Value = serde_json::from_str(&args)
+                    .with_context(|| format!("parse --args as JSON: {args}"))?;
+                run_one_recipe(reg, &name, raw, None, shared_cache).await?;
+            }
         }
     }
     Ok(())
@@ -1198,7 +1237,10 @@ fn record_sweep_completion(fp: crate::framework::ContentHash, job_id: &str) {
             return;
         }
     };
-    let Some(rec) = recs.last() else {
+    // Pick the TERMINAL stage by numeric node-idx. scan_artifacts sorts
+    // sidecar paths LEXICALLY, so `.last()` would pick stage "9" over "10" for
+    // a ≥10-stage plan — anchor liveness on the real final stage instead.
+    let Some(rec) = recs.iter().max_by_key(|r| stage_idx_of(&r.sidecar_path)) else {
         tracing::warn!("sweep completion {job_id}: no artifacts to anchor liveness");
         return;
     };
@@ -1209,6 +1251,133 @@ fn record_sweep_completion(fp: crate::framework::ContentHash, job_id: &str) {
         rec.sidecar_path.clone(),
     ) {
         tracing::warn!("sweep completion {job_id}: record: {e}");
+    }
+}
+
+/// Numeric stage index from a sidecar path whose parent dir is
+/// `<idx>-<stage_name>`. Returns 0 if unparseable (so a malformed dir never
+/// wins the terminal-stage `max_by_key`).
+fn stage_idx_of(sidecar: &std::path::Path) -> u32 {
+    sidecar
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.split('-').next())
+        .and_then(|d| d.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Config-driven recipe run: compose a base config from `--config-dir` /
+/// `--config-name` + `--set` overrides, cartesian-expand `--sweep` axes into
+/// combos, then run each through [`run_one_recipe`] (admission-gated, scheduler-
+/// lock serialized). Combos already complete in the sweep-index are skipped;
+/// a failed combo is tallied and reported, never aborting the rest.
+#[allow(clippy::too_many_arguments)]
+async fn run_recipe_sweep(
+    reg: &crate::framework::Registry,
+    name: &str,
+    config_dir: Option<String>,
+    config_name: Option<String>,
+    config_key: Option<String>,
+    set: &[String],
+    sweep: &[String],
+    dry_run: bool,
+    shared_cache: bool,
+) -> Result<()> {
+    // Fail on a bad recipe name before composing anything.
+    if reg.find(name).is_none() {
+        return Err(anyhow!("recipe '{name}' not in catalog"));
+    }
+    let dir = config_dir.ok_or_else(|| anyhow!("--config-dir is required in config/sweep mode"))?;
+    let cfg_name =
+        config_name.ok_or_else(|| anyhow!("--config-name is required in config/sweep mode"))?;
+    // Args subtree key (default = recipe name). Overrides/sweeps must be dotted
+    // paths INTO this subtree; dot-less keys are consumed by lerna as
+    // defaults-list group selections and silently never reach a config value.
+    let key = config_key.unwrap_or_else(|| name.to_string());
+    warn_dotless_overrides(set, "--set");
+    warn_dotless_overrides(sweep, "--sweep");
+
+    let entries = crate::config::expand_and_fingerprint(&dir, &cfg_name, set, sweep)
+        .map_err(|e| anyhow!("config compose/expand: {e}"))?;
+    if entries.is_empty() {
+        return Err(anyhow!("sweep expanded to 0 combos"));
+    }
+    let total = entries.len();
+    eprintln!("sweep: {total} combo(s) for recipe '{name}'");
+
+    if dry_run {
+        eprintln!("args subtree key: '{key}'");
+        for (i, e) in entries.iter().enumerate() {
+            eprintln!(
+                "[{i}] fp={} skip={} overrides={:?}",
+                e.fingerprint.to_hex(),
+                e.cache_skip,
+                e.overrides,
+            );
+        }
+        return Ok(());
+    }
+
+    let (mut ran, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+    for (i, entry) in entries.into_iter().enumerate() {
+        let fp = entry.fingerprint;
+        if entry.cache_skip {
+            eprintln!(
+                "[{}/{total}] skip — already complete (fp={})",
+                i + 1,
+                fp.to_hex()
+            );
+            skipped += 1;
+            continue;
+        }
+        eprintln!("[{}/{total}] run (fp={})", i + 1, fp.to_hex());
+        let args = project_args(entry.config.json, &key);
+        match run_one_recipe(reg, name, args, Some(fp), shared_cache).await {
+            Ok(()) => ran += 1,
+            Err(e) => {
+                eprintln!("[{}/{total}] FAILED: {e}", i + 1);
+                failed += 1;
+            }
+        }
+    }
+    eprintln!("sweep done — ran {ran}, skipped {skipped}, failed {failed}");
+    if failed > 0 {
+        return Err(anyhow!("{failed}/{total} sweep combo(s) failed"));
+    }
+    Ok(())
+}
+
+/// Project the recipe's flat Args out of a composed config: when the config
+/// nests them under `key` (the recipe name by default) as an object, return
+/// that subtree — so `--set`/`--sweep` dotted paths `<key>.field=v` reach the
+/// Args. Otherwise (a flat config with no such subtree) return the whole config
+/// as-is (it feeds the Args directly, but top-level overrides can't apply — a
+/// lerna limitation; `warn_dotless_overrides` surfaces it).
+fn project_args(mut config: serde_json::Value, key: &str) -> serde_json::Value {
+    if let serde_json::Value::Object(map) = &mut config {
+        if let Some(sub) = map.get_mut(key) {
+            if sub.is_object() {
+                return sub.take();
+            }
+        }
+    }
+    config
+}
+
+/// Warn about `key=val` overrides whose key has no `.` — lerna treats those as
+/// defaults-list group selections, NOT config-value overrides, so they silently
+/// don't change a value (and the sweep would collapse to identical fingerprints).
+fn warn_dotless_overrides(items: &[String], flag: &str) {
+    for it in items {
+        let key = it.split('=').next().unwrap_or(it);
+        if !key.contains('.') {
+            eprintln!(
+                "warning: {flag} '{it}' key is dot-less — lerna treats it as a \
+                 defaults-list group selection, not a value override; nest Args under \
+                 the recipe name and use a dotted path (e.g. '<recipe>.{key}=…')."
+            );
+        }
     }
 }
 
@@ -2118,5 +2287,35 @@ mod footprint_resolve_tests {
         let d = crate::broker::Drivers::from_args_json(&raw);
         assert_eq!(d.workers, crate::broker::UNCALIBRATED_WORKER_CAP);
         assert_eq!(d.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|3|32|2");
+    }
+}
+
+#[cfg(test)]
+mod sweep_projection_tests {
+    use super::project_args;
+    use serde_json::json;
+
+    #[test]
+    fn projects_named_subtree() {
+        // Args nested under the recipe name → that subtree is the Args.
+        let cfg = json!({"lamquant_snn": {"epochs": 2, "preset": "fast"}, "other": 9});
+        let args = project_args(cfg, "lamquant_snn");
+        assert_eq!(args, json!({"epochs": 2, "preset": "fast"}));
+    }
+
+    #[test]
+    fn flat_config_passes_through() {
+        // No subtree under the key → whole config feeds Args verbatim.
+        let cfg = json!({"epochs": 1, "labels_dir": "/x"});
+        let args = project_args(cfg.clone(), "lamquant_snn");
+        assert_eq!(args, cfg);
+    }
+
+    #[test]
+    fn non_object_subtree_is_not_projected() {
+        // A scalar under the key is not a subtree → fall back to whole config.
+        let cfg = json!({"lamquant_snn": 5, "epochs": 1});
+        let args = project_args(cfg.clone(), "lamquant_snn");
+        assert_eq!(args, cfg);
     }
 }

@@ -143,4 +143,58 @@ mod tests {
         // `sweep_index::tests`.)
         assert!(!cache_skip(ContentHash([0x5a; 32])));
     }
+
+    #[test]
+    fn expand_cache_skip_reflects_the_live_index() {
+        // End-to-end: compose → expand reads the GLOBAL sweep-index, so a combo
+        // recorded as complete (with a live sidecar) flips to cache_skip=true
+        // while its sweep siblings still run. Points the index root at a tempdir
+        // via $LAMU_TRAIN_CACHE_DIR (serialized by TEST_ENV_LOCK).
+        use crate::config::sweep_index;
+        use crate::framework::artifact::{ArtifactMetadata, ContentHash};
+
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let cache = tempfile::tempdir().unwrap();
+        let prev = std::env::var("LAMU_TRAIN_CACHE_DIR").ok();
+        // SAFETY: TEST_ENV_LOCK serializes env mutation; restored below.
+        unsafe {
+            std::env::set_var("LAMU_TRAIN_CACHE_DIR", cache.path());
+        }
+
+        let cfg = tempfile::tempdir().unwrap();
+        write_config(cfg.path(), "config.yaml", "opt:\n  lr: 0.1\n");
+        let dir = cfg.path().to_str().unwrap();
+        let sweep = ["opt.lr=1e-3,1e-4".to_string()];
+
+        let before = expand(dir, "config", &[], &sweep).unwrap();
+        assert_eq!(before.len(), 2);
+        assert!(before.iter().all(|e| !e.cache_skip), "nothing recorded yet");
+        let fp0 = before[0].fingerprint;
+
+        // Record combo[0] complete with a live sidecar (hash must match).
+        let sidecar = cache.path().join("out.metadata.json");
+        ArtifactMetadata::new("ckpt", 1, ContentHash([9u8; 32]))
+            .write_to(&sidecar)
+            .unwrap();
+        sweep_index::record_completion(fp0, "job-x", ContentHash([9u8; 32]), sidecar).unwrap();
+
+        let after = expand(dir, "config", &[], &sweep).unwrap();
+        let skip0 = after.iter().find(|e| e.fingerprint.0 == fp0.0).unwrap().cache_skip;
+        assert!(skip0, "recorded combo must now skip");
+        assert_eq!(
+            after.iter().filter(|e| !e.cache_skip).count(),
+            1,
+            "the sweep sibling still runs"
+        );
+
+        // SAFETY: restore under the same lock.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("LAMU_TRAIN_CACHE_DIR", v),
+                None => std::env::remove_var("LAMU_TRAIN_CACHE_DIR"),
+            }
+        }
+    }
 }
