@@ -91,15 +91,28 @@ def save(payload: Dict[str, Any], path, *, contract: Optional[Iterable[str]] = N
             os.fsync(f.fileno())
         sha = _sha256(tmp)
         os.replace(tmp, path)
-        # fsync the sidecar too — the durability contract above promises the
-        # SHA is persisted, but write_text() leaves it in the page cache.
+        # Sidecar: write to a tmp, fsync, then atomic rename — write_text() left
+        # the SHA in the page cache (no fsync), and a non-atomic overwrite could
+        # leave a .sha256 pointing at the PREVIOUS checkpoint after a crash.
         sha_path = path.with_suffix(path.suffix + ".sha256")
-        sfd = os.open(str(sha_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        sha_tmp = sha_path.with_suffix(sha_path.suffix + ".tmp")
+        payload_bytes = (sha + "\n").encode("utf-8")
         try:
-            os.write(sfd, (sha + "\n").encode("utf-8"))
-            os.fsync(sfd)
-        finally:
-            os.close(sfd)
+            sfd = os.open(str(sha_tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            try:
+                n = os.write(sfd, payload_bytes)
+                if n != len(payload_bytes):  # never short on a local FS at this size
+                    raise OSError(f"short sidecar write: {n}/{len(payload_bytes)}")
+                os.fsync(sfd)
+            finally:
+                os.close(sfd)
+            os.replace(sha_tmp, sha_path)
+        except Exception:
+            try:
+                sha_tmp.unlink()
+            except OSError:
+                pass
+            raise
     except Exception:
         try:
             tmp.unlink()

@@ -142,6 +142,9 @@ def read_edf_channels(filepath: str, target_fs: int = 250) -> Optional[Tuple[np.
         # Resample to target_fs if needed, but keep the NATIVE rate to return.
         native_fs = fs
         if fs != target_fs:
+            # scipy.signal.resample returns EXACTLY num_samples (length is an
+            # explicit arg), so the floor here is safe — unlike resample_poly,
+            # which computes ceil(N*up/down) and must be allocated with ceil.
             num_samples = int(data.shape[1] * target_fs / fs)
             from scipy.signal import resample
             data_resampled = np.zeros((data.shape[0], num_samples), dtype=data.dtype)

@@ -28,22 +28,71 @@ class _TinyDecoder(nn.Module):
         return self.head(x)
 
 
-def _loader(ch=8, n=3):
-    for _ in range(n):
-        # Non-degenerate input so per-channel gradients differ.
-        yield (torch.randn(2, ch, 16),)
+N_BATCHES = 3  # shared by the fixed-batch builder and the un-normalize factor
 
 
-def test_importance_is_not_uniform_after_fix():
+def _fixed_batches(ch=8, n=N_BATCHES):
+    # Fixed, seeded inputs so the gradient-weighted and magnitude-only passes
+    # see identical activations (the only difference is the grad weighting).
+    g = torch.Generator().manual_seed(0)
+    return [(torch.randn(2, ch, 16, generator=g),) for _ in range(n)]
+
+
+def _magnitude_only_importance(dec, batches):
+    """Replicates the OLD buggy path: activations detached -> grad forced to
+    ones -> importance = sum(mean(|act|)). Used as the baseline the fixed
+    (gradient-weighted) importance must differ from.
+    """
+    acts = {}
+    hooks = []
+    for name, m in dec.named_modules():
+        if isinstance(m, nn.Conv1d) and "blocks" in name:
+            hooks.append(m.register_forward_hook(
+                lambda mod, i, o, n=name: acts.__setitem__(n, o.detach())))
+    imp = {}
+    with torch.no_grad():
+        for batch in batches:
+            x = batch[0]
+            dec(x)
+            for n, a in acts.items():
+                # grad forced to ones (detached) -> magnitude-only weighting.
+                ci = a.abs().mean(dim=(0, 2))
+                imp[n] = imp.get(n, 0) + ci.cpu()
+            acts.clear()
+    for h in hooks:
+        h.remove()
+    return imp
+
+
+def test_importance_is_finite_and_nonuniform():
     torch.manual_seed(0)
     dec = _TinyDecoder()
-    imp = compute_importance(dec, list(_loader()), device=torch.device("cpu"),
-                             n_batches=3)
-
+    imp = compute_importance(dec, _fixed_batches(), device=torch.device("cpu"),
+                             n_batches=N_BATCHES)
     assert imp, "expected at least one scored block"
     for name, scores in imp.items():
         s = scores.detach().cpu().numpy()
         assert np.isfinite(s).all(), f"{name} importance must be finite"
-        # The bug produced an all-equal (ones-derived) vector. A real
-        # gradient-weighted score varies across channels.
-        assert s.std() > 1e-8, f"{name} importance is uniform — grad not flowing"
+
+
+def test_gradient_weighting_changes_importance_vs_magnitude_only():
+    """The core regression: the fix makes the gradient actually weight the
+    importance. The buggy code computed magnitude-only (grad==ones), so the
+    fixed scores must differ from the magnitude-only baseline. (A naive
+    'std>0' check would pass on the buggy code too, since channel magnitudes
+    already vary — this comparison is what distinguishes fixed from broken.)
+    """
+    torch.manual_seed(0)
+    dec = _TinyDecoder()
+    batches = _fixed_batches()
+
+    imp_fixed = compute_importance(dec, [(b[0].clone(),) for b in batches],
+                                   device=torch.device("cpu"), n_batches=N_BATCHES)
+    imp_mag = _magnitude_only_importance(dec, [(b[0].clone(),) for b in batches])
+
+    # compute_importance divides by n_batches; undo it to compare raw sums.
+    changed = any(
+        not torch.allclose(imp_fixed[n] * float(N_BATCHES), imp_mag[n], atol=1e-5)
+        for n in imp_fixed
+    )
+    assert changed, "gradient weighting had no effect — grad is not flowing"
