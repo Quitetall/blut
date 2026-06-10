@@ -86,6 +86,8 @@ impl Stage for DpoTrain {
             seed: args.seed,
             quant: "Q4_K_M".into(),
             skip_convert: true,
+            // Thread the DPO temperature through to the trainer (was dropped).
+            dpo_beta: Some(args.beta),
         };
         spec.validate()
             .map_err(|e| StageError::BadInput(format!("{e}")))?;
@@ -97,10 +99,8 @@ impl Stage for DpoTrain {
         let mut backend = PythonTrainBackend::new(python, trainer_script);
         let on_status: crate::backend::StatusFn = Box::new(|_u| {});
 
-        // Pass beta via spec extension (not yet first-class on
-        // TrainSpec). For now beta is propagated through
-        // RUST_LOG-discoverable env or future TrainSpec field.
-        let _ = args.beta;
+        // beta is now carried on the spec (spec.dpo_beta) and serialized to
+        // the trainer verbatim — no out-of-band channel.
 
         let artifact = backend
             .run(spec.clone(), on_status)

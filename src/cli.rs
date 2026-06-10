@@ -1240,6 +1240,7 @@ async fn run_train(reg: &crate::framework::Registry, args: TrainArgs) -> Result<
         seed: args.seed,
         quant: args.quant.clone(),
         skip_convert: args.no_convert,
+        dpo_beta: None,
     };
     spec.validate().context("TrainSpec validation")?;
     jobs::write_spec(&job_id, &spec)?;

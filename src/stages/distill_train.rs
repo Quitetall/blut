@@ -94,6 +94,7 @@ impl Stage for DistillTrain {
             seed: args.seed,
             quant: "Q4_K_M".into(),
             skip_convert: true,
+            dpo_beta: None,
         };
         spec.validate()
             .map_err(|e| StageError::BadInput(format!("{e}")))?;

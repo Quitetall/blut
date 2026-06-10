@@ -19,7 +19,29 @@ def emit_failed(error: str) -> None:
     print(json.dumps({"kind": "failed", "error": error}), flush=True)
 
 
-def self_check() -> int:
+def read_spec(argv: list[str]) -> dict | None:
+    """Best-effort parse of the TrainSpec JSON passed as an argv token.
+
+    The Rust backend invokes us as `trainer_dpo.py <spec_json>`; the
+    `--self-check` smoke path may also carry a spec. Return the first token
+    that parses as a JSON object, else None.
+    """
+    for tok in argv[1:]:
+        tok = tok.strip()
+        if tok.startswith("{"):
+            try:
+                obj = json.loads(tok)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                return obj
+    return None
+
+
+def self_check(spec: dict | None = None) -> int:
+    # Echo the DPO temperature we received so the end-to-end thread
+    # (Rust Args -> TrainSpec.dpo_beta -> JSON -> here) is testable.
+    beta = spec.get("dpo_beta") if spec else None
     print(
         json.dumps(
             {
@@ -29,6 +51,7 @@ def self_check() -> int:
                 "loss": 1.0,
                 "lr": 0.0,
                 "vram_mb": 0,
+                "dpo_beta": beta,
             }
         ),
         flush=True,
@@ -39,6 +62,7 @@ def self_check() -> int:
                 "kind": "done",
                 "final_loss": 1.0,
                 "checkpoint_dir": "/tmp/lamu-dpo-self-check",
+                "dpo_beta": beta,
             }
         ),
         flush=True,
@@ -47,12 +71,16 @@ def self_check() -> int:
 
 
 def main(argv: list[str]) -> int:
+    spec = read_spec(argv)
     if len(argv) >= 2 and argv[1] == "--self-check":
-        return self_check()
+        return self_check(spec)
+    # Stub: no gradient step yet (trl.DPOTrainer integration pending), but the
+    # DPO temperature is now threaded through and surfaced so the contract is
+    # observably wired end-to-end.
+    beta = spec.get("dpo_beta") if spec else None
     emit_failed(
-        "trainer_dpo.py is a stub. Full DPO implementation pending. "
-        "Track progress in unified-launching-quill.md commit 7 follow-up. "
-        "Use --self-check for protocol smoke."
+        "trainer_dpo.py is a stub. Full DPO implementation pending "
+        f"(received dpo_beta={beta}). Use --self-check for protocol smoke."
     )
     return 1
 

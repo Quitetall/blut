@@ -135,6 +135,13 @@ pub struct TrainSpec {
     /// who only want the HF checkpoint (e.g. uploading elsewhere).
     #[serde(default)]
     pub skip_convert: bool,
+
+    /// DPO temperature (β). Only meaningful for the DPO method; `None` for
+    /// SFT/distill runs (omitted from the spec JSON so non-DPO specs are
+    /// byte-identical). Smaller β = stronger preference signal. The Python
+    /// DPO trainer reads this verbatim from the spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpo_beta: Option<f32>,
 }
 
 impl TrainSpec {
@@ -162,6 +169,7 @@ impl TrainSpec {
             seed: 42,
             quant: "Q4_K_M".into(),
             skip_convert: false,
+            dpo_beta: None,
         }
     }
 
@@ -257,6 +265,13 @@ impl TrainSpec {
                 "quant '{}' is not supported (try Q4_K_M, Q5_K_M, Q8_0, f16)",
                 self.quant
             )));
+        }
+        if let Some(beta) = self.dpo_beta {
+            if !(beta > 0.0 && beta.is_finite()) {
+                return Err(TrainError::invalid_spec(format!(
+                    "dpo_beta must be positive finite; got {beta}"
+                )));
+            }
         }
         Ok(())
     }
@@ -561,6 +576,40 @@ mod tests {
     fn dataset_registered_empty_name_rejected() {
         let mut s = good_spec();
         s.dataset = DatasetSource::Registered { name: "".into() };
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn dpo_beta_none_validates_and_is_omitted() {
+        let s = good_spec();
+        assert_eq!(s.dpo_beta, None);
+        s.validate().expect("None dpo_beta must validate");
+        // Omitted from JSON so non-DPO specs stay byte-identical.
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("dpo_beta"), "got: {json}");
+    }
+
+    #[test]
+    fn dpo_beta_some_round_trips_and_validates() {
+        let mut s = good_spec();
+        s.dpo_beta = Some(0.1);
+        s.validate().expect("positive finite dpo_beta must validate");
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"dpo_beta\":0.1"), "got: {json}");
+        let back: TrainSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.dpo_beta, Some(0.1));
+    }
+
+    #[test]
+    fn dpo_beta_non_positive_or_nonfinite_rejected() {
+        let mut s = good_spec();
+        s.dpo_beta = Some(0.0);
+        assert!(s.validate().is_err());
+        s.dpo_beta = Some(-0.1);
+        assert!(s.validate().is_err());
+        s.dpo_beta = Some(f32::NAN);
+        assert!(s.validate().is_err());
+        s.dpo_beta = Some(f32::INFINITY);
         assert!(s.validate().is_err());
     }
 }

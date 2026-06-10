@@ -81,6 +81,7 @@ fn dummy_spec() -> TrainSpec {
         seed: 42,
         quant: "Q4_K_M".into(),
         skip_convert: false,
+        dpo_beta: None,
     }
 }
 

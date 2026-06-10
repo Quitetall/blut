@@ -307,6 +307,7 @@ impl FootprintStore {
     ///     conservative `hint`, clamped by the runaway guard. This is the
     ///     self-heal: an OOM grows the next cap instead of re-sitting on it.
     ///   * `Default` / absent → the conservative `hint` verbatim.
+    ///
     /// VRAM is DEFERRED — we keep the hint's VRAM regardless (RAM is the
     /// over-refuse constraint; recording VRAM peaks is a later slice).
     pub fn resolve(&self, key: &FootprintKey, hint: Footprint) -> Footprint {
@@ -391,7 +392,7 @@ impl FootprintStore {
         {
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(body.as_bytes())?;
-            let _ = f.sync_all();
+            f.sync_all()?;
         }
         if let Err(e) = std::fs::rename(&tmp, &self.path) {
             let _ = std::fs::remove_file(&tmp);
