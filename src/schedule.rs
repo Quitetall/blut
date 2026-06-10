@@ -31,6 +31,26 @@ fn unit_stem(recipe: &str) -> String {
     format!("{UNIT_PREFIX}{slug}")
 }
 
+/// Reject recipe names that are not unit-safe. Registry recipe names are
+/// compile-time `[a-z_]` identifiers and always pass; enforcing the charset
+/// here guarantees the unit *file name* (`unit_stem`) and the `ExecStart`
+/// *command arg* never desync (a name like `a/b` would map both `a/b` and
+/// `a_b` onto the same `blut-a_b.timer` while still running `recipe run a/b`),
+/// and closes any systemd/shell metacharacter injection into `ExecStart`.
+fn validate_recipe_name(recipe: &str) -> Result<()> {
+    let ok = !recipe.is_empty()
+        && recipe
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(TrainError::other(format!(
+            "recipe name '{recipe}' is not unit-safe (allowed chars: A-Za-z0-9 . _ -)"
+        )))
+    }
+}
+
 /// Validate an `OnCalendar` expression via `systemd-analyze calendar`.
 /// Returns the normalized form on success.
 pub fn validate_calendar(expr: &str) -> Result<()> {
@@ -52,6 +72,7 @@ pub fn validate_calendar(expr: &str) -> Result<()> {
 /// Install (or replace) a timer that runs `blut recipe run <recipe>` on
 /// `calendar`. `args_json` is the recipe args (defaults to `{}`).
 pub fn install(recipe: &str, calendar: &str, args_json: &str) -> Result<()> {
+    validate_recipe_name(recipe)?;
     validate_calendar(calendar)?;
     let exe = std::env::current_exe()
         .map_err(|e| TrainError::other(format!("locate own binary: {e}")))?;
@@ -141,5 +162,15 @@ mod tests {
     fn unit_stem_sanitizes() {
         assert_eq!(unit_stem("lamquant_joint_codec"), "blut-lamquant_joint_codec");
         assert_eq!(unit_stem("a/b c"), "blut-a_b_c");
+    }
+
+    #[test]
+    fn validate_recipe_name_rejects_unsafe() {
+        assert!(validate_recipe_name("lamquant_joint_codec").is_ok());
+        assert!(validate_recipe_name("eval-v2.1").is_ok());
+        assert!(validate_recipe_name("").is_err());
+        assert!(validate_recipe_name("a/b").is_err());
+        assert!(validate_recipe_name("foo; rm -rf /").is_err());
+        assert!(validate_recipe_name("a b").is_err());
     }
 }
