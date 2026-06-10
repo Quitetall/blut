@@ -1093,8 +1093,20 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
             sweep,
             dry_run,
         } => {
-            let config_mode = config_dir.is_some() || config_name.is_some() || !sweep.is_empty();
+            // Any of these put us in config mode — so a stray --set / --config-key
+            // can't be silently dropped (run_recipe_sweep then errors cleanly if
+            // --config-dir/--config-name are missing).
+            let config_mode = config_dir.is_some()
+                || config_name.is_some()
+                || config_key.is_some()
+                || !set.is_empty()
+                || !sweep.is_empty();
             if config_mode {
+                if args != "{}" {
+                    eprintln!(
+                        "warning: --args is ignored in config mode (args come from the config)"
+                    );
+                }
                 run_recipe_sweep(
                     reg, &name, config_dir, config_name, config_key, &set, &sweep, dry_run,
                     shared_cache,
@@ -1295,8 +1307,8 @@ async fn run_recipe_sweep(
     // paths INTO this subtree; dot-less keys are consumed by lerna as
     // defaults-list group selections and silently never reach a config value.
     let key = config_key.unwrap_or_else(|| name.to_string());
-    warn_dotless_overrides(set, "--set");
-    warn_dotless_overrides(sweep, "--sweep");
+    warn_dotless_overrides(set, "--set", &key);
+    warn_dotless_overrides(sweep, "--sweep", &key);
 
     let entries = crate::config::expand_and_fingerprint(&dir, &cfg_name, set, sweep)
         .map_err(|e| anyhow!("config compose/expand: {e}"))?;
@@ -1368,14 +1380,15 @@ fn project_args(mut config: serde_json::Value, key: &str) -> serde_json::Value {
 /// Warn about `key=val` overrides whose key has no `.` — lerna treats those as
 /// defaults-list group selections, NOT config-value overrides, so they silently
 /// don't change a value (and the sweep would collapse to identical fingerprints).
-fn warn_dotless_overrides(items: &[String], flag: &str) {
+/// `subtree_key` is the Args subtree the override should target.
+fn warn_dotless_overrides(items: &[String], flag: &str, subtree_key: &str) {
     for it in items {
-        let key = it.split('=').next().unwrap_or(it);
+        let key = it.split_once('=').map_or(it.as_str(), |(k, _)| k);
         if !key.contains('.') {
             eprintln!(
                 "warning: {flag} '{it}' key is dot-less — lerna treats it as a \
                  defaults-list group selection, not a value override; nest Args under \
-                 the recipe name and use a dotted path (e.g. '<recipe>.{key}=…')."
+                 '{subtree_key}:' and use a dotted path (e.g. '{subtree_key}.{key}=…')."
             );
         }
     }
