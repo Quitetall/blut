@@ -49,6 +49,22 @@ impl RetryPolicy {
         }
     }
 
+    /// `n` attempts retrying ONLY `OutOfMemory`, exponential backoff. For
+    /// contained train stages: each retry re-resolves the broker cap (escalated
+    /// above the OomCorrected bound the prior attempt recorded), so an undersize
+    /// cap self-heals within ONE `recipe run` instead of dying.
+    pub const fn on_oom(max_attempts: u32, base: Duration) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            backoff: Backoff::Exponential {
+                base,
+                mult_x100: 200,
+                cap: Duration::from_secs(300),
+            },
+            retry_on: RetryOn::OutOfMemoryOnly,
+        }
+    }
+
     /// Backoff `Duration` BEFORE attempt number `attempt` (1-based; the
     /// first attempt has no backoff). `Exponential` grows `base ×
     /// (mult/100)^(attempt-2)`, capped.
@@ -97,6 +113,11 @@ pub enum RetryOn {
     Transient,
     /// Any error except `Cancelled` (a cancel always wins).
     AllErrors,
+    /// ONLY `OutOfMemory`. For contained train stages where a retry is
+    /// meaningful *only* because the broker escalates the cgroup cap on the
+    /// next attempt — a non-OOM failure reproduces identically, so retrying it
+    /// would just waste the (expensive) train startup.
+    OutOfMemoryOnly,
 }
 
 /// Is `err` worth retrying under `policy`? `Cancelled` is never
@@ -126,7 +147,13 @@ pub fn is_retryable(err: &StageError, policy: RetryOn) -> bool {
             | StageError::Timeout { .. }
             | StageError::OutOfMemory { .. }
     );
-    transient || matches!(policy, RetryOn::AllErrors)
+    match policy {
+        // Self-heal only the OOM (the next attempt's cap is escalated);
+        // everything else reproduces identically, so don't waste a retry.
+        RetryOn::OutOfMemoryOnly => matches!(err, StageError::OutOfMemory { .. }),
+        RetryOn::Transient => transient,
+        RetryOn::AllErrors => true,
+    }
 }
 
 /// Per-stage soft/hard timeout (D2). `soft` fires the stage's
@@ -226,6 +253,23 @@ mod tests {
                 detail: "cuda".into()
             },
             RetryOn::Transient
+        ));
+    }
+
+    #[test]
+    fn oom_only_retries_oom_not_other_transients() {
+        let oom = StageError::OutOfMemory { detail: "cgroup".into() };
+        let backend = StageError::Backend(anyhow::anyhow!("crashed"));
+        // OutOfMemoryOnly: the OOM self-heals (escalated cap next attempt);
+        // a non-OOM backend crash reproduces, so it must NOT retry.
+        assert!(is_retryable(&oom, RetryOn::OutOfMemoryOnly));
+        assert!(!is_retryable(&backend, RetryOn::OutOfMemoryOnly));
+        // Transient still retries both; OutOfMemoryOnly never retries a
+        // deterministic error.
+        assert!(is_retryable(&backend, RetryOn::Transient));
+        assert!(!is_retryable(
+            &StageError::Cancelled,
+            RetryOn::OutOfMemoryOnly
         ));
     }
 }
