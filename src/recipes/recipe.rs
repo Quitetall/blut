@@ -79,8 +79,11 @@ pub fn schema_of<A: schemars::JsonSchema>() -> serde_json::Value {
 pub fn compile_erased<R: Recipe + Default>(
     raw: serde_json::Value,
 ) -> Result<CompiledPlan, RecipeError> {
-    let args: R::Args =
-        serde_json::from_value(raw).map_err(|e| RecipeError::InvalidArgs(format!("{e}")))?;
+    // Prefix the recipe name so a bad-args error names the culprit. This was
+    // hand-done in only 2 of the migrated recipes; centralizing here gives the
+    // prefix to every recipe uniformly.
+    let args: R::Args = serde_json::from_value(raw)
+        .map_err(|e| RecipeError::InvalidArgs(format!("{}: {e}", R::NAME)))?;
     R::default().compile(args).map(|p| p.into_compiled())
 }
 
