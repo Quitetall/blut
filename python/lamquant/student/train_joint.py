@@ -1426,6 +1426,19 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         else:
             codec.save_decoder(dec_path, provenance={**provenance, 'phase': 'warm-final'})
         print(f"  [WARM-ONLY] promoted warm best → {enc_path.name} + {dec_path.name}")
+        # R5 defense-in-depth: a warm-only run MUST NOT exit 0 without its
+        # promised joint exports. If the promotion above somehow didn't land
+        # the files (disk full, a save_* that silently no-op'd), fail LOUD
+        # with a non-zero exit here — never let the BLUT stage see a clean
+        # exit with the output missing (the confusing "expected output
+        # missing after success" that masquerades as an orchestration bug).
+        _missing = [str(p) for p in (enc_path, dec_path) if not p.exists()]
+        if _missing:
+            raise RuntimeError(
+                f"warm-only promotion did not produce the joint export(s): "
+                f"{_missing} — refusing to exit 0 without the promised outputs "
+                f"(R5: a kernel that can't write its contract must fail, not "
+                f"silently succeed)")
 
     # Seed CheckpointManager with warm-phase best so QAT doesn't
     # overwrite a good warm checkpoint with a worse QAT epoch 1.
