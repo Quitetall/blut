@@ -189,6 +189,25 @@ pub fn registry_path() -> PathBuf {
         .join("registry.yaml")
 }
 
+/// Path to the footprint calibration store (ADR 0046 slice-2).
+///
+/// JSON map of `FootprintKey.flat()` → measured peak RAM/VRAM, so the
+/// admission gate can resolve a CALIBRATED footprint (the real ~20G a
+/// tier-3 train uses) instead of the conservative-high estimate (~35G)
+/// that over-refuses legit runs.
+///
+/// Default: `~/.config/blut/footprints.json`
+/// Override: `$BLUT_FOOTPRINT_PATH`
+pub fn footprint_store_path() -> PathBuf {
+    if let Ok(p) = std::env::var("BLUT_FOOTPRINT_PATH") {
+        return PathBuf::from(p);
+    }
+    dirs::config_dir()
+        .unwrap_or_default()
+        .join("blut")
+        .join("footprints.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

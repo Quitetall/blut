@@ -20,8 +20,16 @@
 //!      serializes blut-vs-blut GPU jobs (fail-fast), so admission is
 //!      a single-job over-subscription guard placed BEFORE the lock.
 //!
-//! DEFERRED to later slices (NOT built here): calibration store, VRAM
-//! byte-ledger / per-GPU iteration, OOM-detect+retry, auto-tune-up.
+//! SLICE-2 adds the [`footprint::FootprintStore`] calibration store:
+//! measured cgroup-attributed peak RAM (recorded at job exit by the
+//! cookbook runner) MAX-merged per `(recipe,tier,batch,workers)` key, so
+//! `resolve()` admits a calibrated key at its real ~20G instead of the
+//! conservative ~35G estimate that over-refuses legit runs.
+//!
+//! DEFERRED to later slices (NOT built here): VRAM byte-ledger /
+//! per-GPU iteration, OOM-detect+retry, auto-tune-up. The store carries
+//! a `vram_mib` field but `resolve()` keeps the conservative VRAM
+//! estimate (RAM is the over-refuse constraint).
 //!
 //! The HARD floor — "the box never goes down" — is the cgroup
 //! `MemoryMax` containment applied on the train path (see
@@ -35,5 +43,8 @@ pub mod footprint;
 pub mod probe;
 
 pub use admission::{AdmitDecision, decide};
-pub use footprint::{Footprint, GIB, estimate_ram_bytes};
+pub use footprint::{
+    Footprint, FootprintEntry, FootprintKey, FootprintSource, FootprintStore, GIB,
+    estimate_ram_bytes, footprint_key,
+};
 pub use probe::ResourceSnapshot;

@@ -148,6 +148,14 @@ pub struct StageContext {
     pub cancel: CancellationToken,
     /// Cache handle for read/write.
     pub cache: Arc<CacheHandle>,
+    /// Name of the RECIPE this plan was compiled from (ADR 0046
+    /// slice-2). Threaded from the plan so a train stage can build the
+    /// SAME `broker::FootprintKey` the cli admission gate resolves under
+    /// — keying the calibration store by recipe (not stage) name keeps
+    /// the engine cli from needing to know cookbook stage names. Empty
+    /// for `for_test` contexts (a calibration miss → conservative hint,
+    /// which is benign).
+    pub recipe_name: String,
 }
 
 impl StageContext {
@@ -161,6 +169,7 @@ impl StageContext {
             status_tx: crate::framework::status::make_broadcast(),
             cancel: CancellationToken::new(),
             cache: Arc::new(CacheHandle::job_local(PathBuf::from("/tmp/_cache_test"))),
+            recipe_name: String::new(),
         }
     }
 }

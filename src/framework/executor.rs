@@ -125,6 +125,10 @@ impl SequentialExecutor {
         );
         let started = Instant::now();
         let order = plan.topo_order()?;
+        // ADR 0046 slice-2: the recipe name threads into every
+        // StageContext so a train stage records its measured footprint
+        // under the SAME key the cli admission gate resolves on.
+        let recipe_name = plan.name().to_string();
         let view = plan.exec_view();
         // R21: topo order must enumerate every node exactly once.
         debug_assert_eq!(
@@ -354,6 +358,7 @@ impl SequentialExecutor {
                 status_tx: ctx.status_tx.clone(),
                 cancel: ctx.cancel.clone(),
                 cache: ctx.cache.clone(),
+                recipe_name: recipe_name.clone(),
             };
 
             // Acquire resource permits in declared order. We keep
