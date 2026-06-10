@@ -315,7 +315,15 @@ class LmaTypedL3Dataset:
         # recordings) so the cap is deliberately small.
         from collections import OrderedDict as _OrderedDict
         self._fb_sig_cache: "_OrderedDict" = _OrderedDict()
-        self._fb_sig_cache_cap = 3
+        # Resident whole-signal cap. Stem-grouped sampling (below) delivers a
+        # stem's windows consecutively within a worker's CONTIGUOUS chunk, so
+        # the cache is already decode-once-per-stem at cap 1 — a larger cap only
+        # raises peak per-worker RSS (the OOM driver: a decoded multi-hour
+        # recording is ~0.5-1 GiB + transient decode buffers), never the decode
+        # COUNT, so it costs memory for no speed. Default 1 (minimal); env-tunable
+        # (FB_SIG_CACHE_CAP) so the broker footprint model can pin it. Phase-2
+        # precompute removes the decode path entirely, after which this stays empty.
+        self._fb_sig_cache_cap = max(1, int(os.environ.get("FB_SIG_CACHE_CAP", "1")))
         # Cross-epoch DISK cache for the decoded fullband WINDOWS (the loss
         # TARGET). decode_lma_signal re-decodes the lossless recording every
         # epoch — the residual dataload bottleneck after the L3 input cache
@@ -567,7 +575,10 @@ class LmaTypedL3Dataset:
                 num_workers=self._num_workers,
                 collate_fn=_identity_collate,
                 pin_memory=(dev.type == "cuda"),
-                prefetch_factor=4,
+                # Each in-flight prefetched batch pins host buffers + forces the
+                # worker to decode ahead; 4 was the per-worker RSS multiplier.
+                # Default 2 (one batch of GPU/decode overlap) — env-tunable.
+                prefetch_factor=max(1, int(os.environ.get("LMA_PREFETCH_FACTOR", "2"))),
                 persistent_workers=False,
             )
             for rows in loader:
