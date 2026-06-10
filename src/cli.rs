@@ -418,7 +418,7 @@ impl RecipeMarker {
 }
 
 async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Result<()> {
-    use crate::framework::{CacheHandle, ExecCtx, SequentialExecutor};
+    use crate::framework::{CacheHandle, ExecCtx};
     // Recipes resolve via the caller-supplied cookbook registry.
     match cmd {
         PlanCommand::Resume { id, shared_cache } => {
@@ -473,7 +473,7 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             eprintln!("resuming {} ({})", marker.name, job_id);
             eprintln!("dir      {}", job_dir.display());
             eprintln!("lock     {}", lock.path().display());
-            let result = SequentialExecutor::execute(plan, ctx).await;
+            let result = crate::framework::execute_plan(plan, ctx).await;
             drop(lock);
             match result {
                 Ok(r) => {
@@ -736,7 +736,7 @@ fn recipe_footprint(name: &str, raw: &serde_json::Value) -> crate::broker::Footp
 }
 
 async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Result<()> {
-    use crate::framework::{ExecCtx, SequentialExecutor};
+    use crate::framework::ExecCtx;
     // The recipe catalog comes from the caller-supplied cookbook registry.
     let find_recipe = |name: &str| reg.find(name);
     match cmd {
@@ -905,7 +905,7 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
             eprintln!("dir    {}", job_dir.display());
             eprintln!("lock   {}", lock.path().display());
 
-            let result = SequentialExecutor::execute(plan, ctx).await;
+            let result = crate::framework::execute_plan(plan, ctx).await;
             drop(lock);
             crate::python_kill::unbind_current_job();
             match result {
@@ -1502,7 +1502,7 @@ async fn run_train_via_recipe(
     output_name: &str,
     args: &TrainArgs,
 ) -> Result<()> {
-    use crate::framework::{CacheHandle, ExecCtx, SequentialExecutor};
+    use crate::framework::{CacheHandle, ExecCtx};
 
     // The recipe now lives in the lamu cookbook crate (C2b); blut-core
     // can't name its typed `Args`, so we build the args JSON directly and
@@ -1654,7 +1654,7 @@ async fn run_train_via_recipe(
     // group, then return so `lock` Drops (RAII unlocks the scheduler).
     install_cancel_handler(ctx.cancel.clone());
 
-    let result = SequentialExecutor::execute(plan, ctx).await;
+    let result = crate::framework::execute_plan(plan, ctx).await;
     drop(lock);
     crate::python_kill::unbind_current_job();
 
@@ -1710,9 +1710,11 @@ fn install_cancel_handler(cancel: tokio_util::sync::CancellationToken) {
             _ = tokio::signal::ctrl_c() => {}
             _ = term => {}
         }
-        eprintln!("\nsignal received — cancelling job + killing trainer group...");
+        eprintln!("\nsignal received — cancelling job + killing trainer group(s)...");
         cancel.cancel();
-        if let Some(id) = crate::python_kill::active_child() {
+        // Kill EVERY registered child group — the parallel executor may
+        // have more than one subprocess stage live at once.
+        for id in crate::python_kill::active_children() {
             crate::python_kill::graceful_kill_group(id.pgid, Some(id), Duration::from_secs(10))
                 .await;
         }

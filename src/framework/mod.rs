@@ -40,7 +40,7 @@ pub use cache::{CacheHandle, CacheHit, lru_prune};
 pub use compat::Compatible;
 pub use cookbook::{ArtifactDescriptor, Cookbook, Registry, StageDescriptor};
 pub use error::{PlanError, RecipeError, StageError};
-pub use executor::{ExecCtx, PlanResult, SequentialExecutor};
+pub use executor::{ExecCtx, ParallelExecutor, PlanResult, SequentialExecutor, execute_plan};
 pub use plan::{CompiledPlan, NodeId, Plan};
 pub use resource::Resource;
 pub use stage::{ErasedArtifact, ErasedDecodeError, Stage, StageContext, StageDyn};

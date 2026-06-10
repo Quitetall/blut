@@ -446,11 +446,13 @@ pub async fn cancel_job(job_id: &str, grace: std::time::Duration) -> Result<()> 
         crate::python_backend::graceful_kill_pid(pid, grace).await;
     }
     let _ = write_state(job_id, JobState::Cancelled);
-    let _ = write_pid_clear(job_id);
+    let _ = clear_pid(job_id);
     Ok(())
 }
 
-fn write_pid_clear(job_id: &str) -> Result<()> {
+/// Remove a job's `pid` file (called when the job's last live child
+/// exits, or on cancel) so a stale/reused pgid can't be signalled later.
+pub fn clear_pid(job_id: &str) -> Result<()> {
     let path = paths::job_dir(job_id)?.join("pid");
     let _ = std::fs::remove_file(path);
     Ok(())

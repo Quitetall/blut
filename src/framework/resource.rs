@@ -15,7 +15,13 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+/// `Ord` derives from declaration order (Gpu < Cpu < Network < Disk).
+/// The ParallelExecutor sorts a stage's declared resources by this order
+/// before acquiring their semaphores, so two concurrent stages can never
+/// acquire the same pair in opposite orders (lock-order-inversion
+/// deadlock). The specific order is irrelevant — only that it is total
+/// and stable.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Resource {
     /// Stage holds the GPU. Acquires `lamu_core::scheduler_lock`

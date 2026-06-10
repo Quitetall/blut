@@ -225,7 +225,7 @@ impl HfTrainerRunner {
         if let Some(pid) = child.id() {
             *self.child_pid.lock() = Some(pid);
             // KILL-2: publish for in-process + cross-process cancel.
-            crate::python_kill::set_active_child(crate::python_kill::capture_identity(pid));
+            crate::python_kill::register_child(crate::python_kill::capture_identity(pid));
         }
 
         let started = Instant::now();
@@ -300,8 +300,9 @@ impl HfTrainerRunner {
                 tracing::error!(target: "blut::hf_trainer", "stderr reader join failed: {e}");
             }
         }
-        *self.child_pid.lock() = None;
-        crate::python_kill::clear_active_child();
+        if let Some(pid) = self.child_pid.lock().take() {
+            crate::python_kill::unregister_child(pid);
+        }
         let elapsed = started.elapsed();
 
         let mut collected = collected.lock();

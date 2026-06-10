@@ -20,7 +20,7 @@
 //!      spawned deep inside a backend stage, but `blut cancel <id>`
 //!      runs in a *separate* process and can only reach that child
 //!      through the job's `pid` file. Backends therefore publish the
-//!      child pid+pgid via [`set_active_child`] / [`clear_active_child`];
+//!      child pid+pgid via [`register_child`] / [`unregister_child`];
 //!      when a job id has been bound for the current process
 //!      ([`bind_current_job`]) those calls mirror the pgid into the
 //!      job's `pid` file so cross-process cancel can find it.
@@ -34,6 +34,7 @@
 //!     so no `<defunct>` survives.
 //!   - On non-Unix targets this is a best-effort no-op.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -58,12 +59,18 @@ pub struct ChildIdentity {
 /// spawns can mirror their child pgid into the right job pid file.
 static CURRENT_JOB: Mutex<Option<String>> = Mutex::new(None);
 
-/// The live training child of *this* process, if any. Used by the
-/// in-process cancel handler (SIGTERM/ctrl-c) to kill the group, and
-/// by tests to observe what was spawned.
-static ACTIVE_CHILD: Mutex<Option<ChildIdentity>> = Mutex::new(None);
+/// Live training children of *this* process, keyed by pid. A REGISTRY
+/// (not a single slot): the ParallelExecutor can run two subprocess
+/// stages at once, and the in-process cancel handler (SIGTERM/ctrl-c)
+/// must reach EVERY live group, not just the last one registered.
+static ACTIVE_CHILDREN: Mutex<Option<HashMap<u32, ChildIdentity>>> = Mutex::new(None);
 
-/// Bind a job id to this process so subsequent [`set_active_child`]
+fn with_children<R>(f: impl FnOnce(&mut HashMap<u32, ChildIdentity>) -> R) -> R {
+    let mut g = ACTIVE_CHILDREN.lock().expect("ACTIVE_CHILDREN poisoned");
+    f(g.get_or_insert_with(HashMap::new))
+}
+
+/// Bind a job id to this process so subsequent [`register_child`]
 /// calls mirror the child pgid into that job's `pid` file. The recipe
 /// run path calls this right after creating the job dir.
 pub fn bind_current_job(job_id: impl Into<String>) {
@@ -75,12 +82,14 @@ pub fn unbind_current_job() {
     *CURRENT_JOB.lock().expect("CURRENT_JOB poisoned") = None;
 }
 
-/// Record the live training child. Backends call this immediately
-/// after a successful spawn. When a job is bound, the child's **pgid**
-/// (not blut's own pid — KILL-3) is written to the job pid file so a
-/// separate `blut cancel <id>` process can `killpg` the whole tree.
-pub fn set_active_child(id: ChildIdentity) {
-    *ACTIVE_CHILD.lock().expect("ACTIVE_CHILD poisoned") = Some(id);
+/// Record a live training child. Backends call this immediately after a
+/// successful spawn. When a job is bound, the child's **pgid** (not
+/// blut's own pid — KILL-3) is written to the job pid file so a separate
+/// `blut cancel <id>` process can `killpg` the whole tree.
+pub fn register_child(id: ChildIdentity) {
+    with_children(|m| {
+        m.insert(id.pid, id);
+    });
     if let Some(job_id) = CURRENT_JOB.lock().expect("CURRENT_JOB poisoned").clone() {
         // Mirror the GROUP id, so cross-process cancel kills the
         // whole tree, not just the leader.
@@ -90,17 +99,29 @@ pub fn set_active_child(id: ChildIdentity) {
     }
 }
 
-/// Clear the live training child (called on child exit). Also clears
-/// the job pid file so a stale pid can't be cancelled into a reused
-/// pid later.
-pub fn clear_active_child() {
-    *ACTIVE_CHILD.lock().expect("ACTIVE_CHILD poisoned") = None;
+/// Remove a live training child by pid (called on that child's exit).
+/// When the LAST child of a bound job exits, also clear that job's pid
+/// file so a later `blut cancel <id>` can't `killpg` a now-stale (and
+/// possibly reused) pgid. (KILL-4 start-time validation is the deeper
+/// guard against reuse; this just keeps the file honest.)
+pub fn unregister_child(pid: u32) {
+    let now_empty = with_children(|m| {
+        m.remove(&pid);
+        m.is_empty()
+    });
+    if now_empty {
+        if let Some(job_id) = CURRENT_JOB.lock().expect("CURRENT_JOB poisoned").clone() {
+            if let Err(e) = crate::jobs::clear_pid(&job_id) {
+                tracing::debug!("clear pid file for {job_id} after last child exit: {e}");
+            }
+        }
+    }
 }
 
-/// Snapshot the currently-recorded live child, if any. Used by the
-/// in-process signal handler and by tests.
-pub fn active_child() -> Option<ChildIdentity> {
-    *ACTIVE_CHILD.lock().expect("ACTIVE_CHILD poisoned")
+/// Snapshot every currently-registered live child. Used by the
+/// in-process signal handler (to kill ALL groups) and by tests.
+pub fn active_children() -> Vec<ChildIdentity> {
+    with_children(|m| m.values().copied().collect())
 }
 
 // ── Spawn helper (KILL-1) ───────────────────────────────────────────
@@ -498,5 +519,37 @@ mod tests {
             return;
         }
         graceful_kill_group(probe, None, Duration::from_millis(100)).await;
+    }
+
+    #[test]
+    fn registry_tracks_multiple_children() {
+        // KILL-2 registry: two concurrent subprocess stages register
+        // distinct pids; the signal handler must see BOTH (the old
+        // single-slot would have lost the first). Uses synthetic,
+        // unique pids so it doesn't touch real processes; these test
+        // pids are far above any other test's so there's no collision.
+        let a = ChildIdentity {
+            pid: 3_900_000_001,
+            pgid: 3_900_000_001,
+            start_time: Some(1),
+        };
+        let b = ChildIdentity {
+            pid: 3_900_000_002,
+            pgid: 3_900_000_002,
+            start_time: Some(2),
+        };
+        register_child(a);
+        register_child(b);
+        let live = active_children();
+        assert!(live.contains(&a) && live.contains(&b), "both children registered: {live:?}");
+
+        unregister_child(a.pid);
+        let live = active_children();
+        assert!(!live.contains(&a), "a removed");
+        assert!(live.contains(&b), "b still live");
+
+        unregister_child(b.pid);
+        let live = active_children();
+        assert!(!live.contains(&a) && !live.contains(&b), "both cleared");
     }
 }

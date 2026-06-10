@@ -103,7 +103,7 @@ impl TrainBackend for PythonTrainBackend {
             // KILL-2: publish the child's identity so the in-process
             // cancel handler + a cross-process `blut cancel` (via the
             // job pid file) can reach the whole group.
-            crate::python_kill::set_active_child(crate::python_kill::capture_identity(pid));
+            crate::python_kill::register_child(crate::python_kill::capture_identity(pid));
         }
 
         let stdout = child
@@ -180,8 +180,9 @@ impl TrainBackend for PythonTrainBackend {
         let _ = stdout_reader.await;
         let _ = stderr_reader.await;
 
-        *self.child_pid.lock() = None;
-        crate::python_kill::clear_active_child();
+        if let Some(pid) = self.child_pid.lock().take() {
+            crate::python_kill::unregister_child(pid);
+        }
         let elapsed = started.elapsed();
 
         let (last_done, last_failed) = artifact_rx
