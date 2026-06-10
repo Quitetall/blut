@@ -32,13 +32,19 @@ pub const GIB: u64 = 1024 * 1024 * 1024;
 /// under-sized for an unspecified batch.
 pub const DEFAULT_BATCH: u32 = 32;
 
-/// Per-DataLoader-worker LMA prefetch RAM, conservative-high.
+/// Per-DataLoader-worker LMA prefetch RAM.
 ///
-/// Measured envelope on the 62 GiB box: ~23 GiB total dataloader RSS
-/// at the historical default worker count. We bill each worker a fat
-/// ~3.5 GiB so the sum stays an UPPER bound (over-reserve, never
-/// under). Tunable later by the calibration store (deferred slice 2).
-const PREFETCH_PER_WORKER_BYTES: u64 = 7 * GIB / 2; // 3.5 GiB
+/// Measured envelope on the 62 GiB box: a tier-3 run at workers=4 peaks
+/// ~22-23 GiB RESIDENT total (base + dataloader + model), and a
+/// workers=2 decoder run peaks ~16-20 GiB. Billing 2 GiB/worker
+/// reproduces that envelope (base 6 + 4×2 + tier 6 + … ≈ 23 GiB) —
+/// the prior 3.5 GiB pushed the tier-3 estimate to ~35 GiB, ~50% over
+/// the measured peak, which OVER-REFUSED on a busy box. Still an upper
+/// bound at the historical worker count; the calibration store
+/// (slice-2) replaces it with the per-key measured peak after one run,
+/// and a cgroup cap (estimate + headroom) hard-bounds any under-shoot
+/// to a unit kill, never a box OOM.
+const PREFETCH_PER_WORKER_BYTES: u64 = 2 * GIB;
 
 /// Base RSS floor: python + torch + CUDA context + framework overhead,
 /// independent of workers/batch. Conservative-high.
@@ -53,8 +59,13 @@ const PER_TIER_BYTES: u64 = 2 * GIB;
 const PER_LATENT256_BYTES: u64 = GIB;
 
 /// Host-side RAM that scales with the live mini-batch (pinned buffers,
-/// collation staging), per unit of batch. Small vs the worker term.
-const PER_BATCH_BYTES: u64 = GIB / 4; // 256 MiB / batch unit
+/// collation staging), per unit of batch. Small vs the worker term —
+/// the actual batch tensors live on the GPU; only the CPU collation /
+/// pinned-staging buffers for a handful of EEG windows are host RAM, so
+/// 64 MiB/unit (batch 32 ⇒ 2 GiB) is realistic. The prior 256 MiB/unit
+/// double-counted the dataloader's own batch staging (already in the
+/// worker term) and inflated batch-32 to a spurious 8 GiB.
+const PER_BATCH_BYTES: u64 = GIB / 16; // 64 MiB / batch unit
 
 /// A resolved footprint estimate. Slice-1 tracks RAM only as a hard
 /// number; VRAM is carried for the (deferred) VRAM courtesy pre-check
@@ -370,7 +381,7 @@ mod tests {
         let lo = estimate_ram_bytes(2, 16, 3, 256);
         let hi = estimate_ram_bytes(8, 16, 3, 256);
         assert!(hi > lo, "workers must increase RAM: {lo} !< {hi}");
-        // workers dominate: +6 workers × 3.5 GiB = +21 GiB
+        // workers dominate: +6 workers × 2 GiB = +12 GiB
         assert_eq!(hi - lo, 6 * PREFETCH_PER_WORKER_BYTES);
     }
 
@@ -423,8 +434,8 @@ mod tests {
         // (capped workers ≤ 4) is conservative-high but still fits ONE
         // train on the 62 GiB box with the 6 GiB floor.
         let fp = estimate(4, 16, 3, 256);
-        // 6 + 4×3.5 + 3×2 + 1 + 16×0.25 = 6+14+6+1+4 = 31 GiB
-        assert_eq!(fp.ram_bytes, 31 * GIB);
+        // 6 + 4×2 + 3×2 + 1 + 16×(1/16) = 6+8+6+1+1 = 22 GiB
+        assert_eq!(fp.ram_bytes, 22 * GIB);
         assert!(fp.ram_bytes < (62 - 6) * GIB, "must fit one train on 62G box");
     }
 
