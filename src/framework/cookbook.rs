@@ -105,6 +105,29 @@ impl Registry {
     pub fn default_args(&self, recipe: &str) -> Option<String> {
         self.cookbooks.iter().find_map(|c| c.default_args(recipe))
     }
+
+    /// The best starting-point args JSON for a recipe (E2): the schema-derived
+    /// template (every `#[serde(default)]` value + a `<TODO>` for each required
+    /// field) with the owning cookbook's `default_args` overlay merged ON TOP
+    /// (domain paths + curated non-default starts win). This makes the serde
+    /// defaults the single source — a cookbook overlay no longer duplicates
+    /// them, so they can't drift. Pretty-printed; `"{}"` if the recipe is
+    /// unknown and no overlay exists.
+    pub fn prefill_args(&self, recipe: &str) -> String {
+        use serde_json::Value;
+        let mut merged = match self.find(recipe).map(crate::recipes::recipe::args_template) {
+            Some(Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        if let Some(overlay) = self.default_args(recipe) {
+            if let Ok(Value::Object(ov)) = serde_json::from_str::<Value>(&overlay) {
+                for (k, v) in ov {
+                    merged.insert(k, v); // overlay wins
+                }
+            }
+        }
+        serde_json::to_string_pretty(&Value::Object(merged)).unwrap_or_else(|_| "{}".into())
+    }
 }
 
 impl Default for Registry {
@@ -197,6 +220,64 @@ mod tests {
         assert!(
             !r.by_category(RecipeCategory::Eval)
                 .any(|r| r.name == "alpha_train")
+        );
+    }
+
+    #[test]
+    fn prefill_args_merges_schema_template_then_overlay() {
+        // E2: schema defaults (single source) ⊕ cookbook domain overlay,
+        // overlay wins. Proves `preset` no longer needs hand-duplicating and
+        // that a curated non-default (`subband: true`) overrides the type
+        // default (`false`).
+        fn dfp() -> String {
+            "production".into()
+        }
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct PrefillArgs {
+            #[serde(default = "dfp")]
+            preset: String,
+            #[serde(default)]
+            subband: bool, // type default false
+            lma_root: String, // required → <TODO> in template, overlaid below
+        }
+        static DEF: RecipeDef = RecipeDef {
+            name: "prefill_recipe",
+            description: "d",
+            backend_id: "b",
+            category: RecipeCategory::Train,
+            input_kinds: &[],
+            output_kind: "k",
+            schedule: None,
+            args_schema_fn: || crate::recipes::recipe::schema_of::<PrefillArgs>(),
+            compile_fn: |_| {
+                Err(crate::framework::error::RecipeError::CompileFailed("x".into()))
+            },
+        };
+        static DEFS: &[&RecipeDef] = &[&DEF];
+        struct PrefillCookbook;
+        impl Cookbook for PrefillCookbook {
+            fn name(&self) -> &'static str {
+                "prefill"
+            }
+            fn recipes(&self) -> &'static [&'static RecipeDef] {
+                DEFS
+            }
+            fn default_args(&self, recipe: &str) -> Option<String> {
+                (recipe == "prefill_recipe")
+                    .then(|| r#"{"lma_root":"/data/lma","subband":true}"#.to_string())
+            }
+        }
+        let mut r = Registry::new();
+        r.register(Box::new(PrefillCookbook));
+        let v: serde_json::Value =
+            serde_json::from_str(&r.prefill_args("prefill_recipe")).unwrap();
+        assert_eq!(v["preset"], serde_json::json!("production"), "template default");
+        assert_eq!(v["lma_root"], serde_json::json!("/data/lma"), "overlay path");
+        assert_eq!(
+            v["subband"],
+            serde_json::json!(true),
+            "overlay must win over the template's type default (false)"
         );
     }
 

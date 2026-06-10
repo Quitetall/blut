@@ -385,47 +385,6 @@ impl App {
         scored.into_iter().map(|(i, _)| i).collect()
     }
 
-    /// Build a minimal JSON template from a recipe's schemars schema.
-    /// Top-level required fields get `"<TODO>"`; optional fields are
-    /// omitted (caller can add post-edit). Falls back to `{}` on any
-    /// schema-parse error.
-    fn template_for(recipe: &'static crate::recipes::RecipeDef) -> String {
-        let schema = (recipe.args_schema_fn)();
-        let Some(defs) = schema.get("definitions").and_then(|d| d.as_object()) else {
-            return "{}".into();
-        };
-        // Args is referenced via "$ref": "#/definitions/Args".
-        let Some(args_schema) = defs.get("Args").and_then(|a| a.as_object()) else {
-            return "{}".into();
-        };
-        let required: Vec<&str> = args_schema
-            .get("required")
-            .and_then(|r| r.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
-        let props = args_schema.get("properties").and_then(|p| p.as_object());
-        let mut out = serde_json::Map::new();
-        for field in &required {
-            // Try to render a type-aware placeholder so the user
-            // doesn't have to guess.
-            let placeholder = props
-                .and_then(|p| p.get(*field))
-                .and_then(|s| s.get("type"))
-                .and_then(|t| t.as_str())
-                .map(|ty| match ty {
-                    "string" => serde_json::Value::String("<TODO>".into()),
-                    "number" | "integer" => serde_json::Value::Number(0.into()),
-                    "boolean" => serde_json::Value::Bool(false),
-                    "array" => serde_json::Value::Array(vec![]),
-                    "object" => serde_json::Value::Object(serde_json::Map::new()),
-                    _ => serde_json::Value::String("<TODO>".into()),
-                })
-                .unwrap_or_else(|| serde_json::Value::String("<TODO>".into()));
-            out.insert((*field).to_string(), placeholder);
-        }
-        serde_json::to_string_pretty(&serde_json::Value::Object(out))
-            .unwrap_or_else(|_| "{}".into())
-    }
 
     fn open_picker(&mut self) {
         self.overlay = Overlay::Picker {
@@ -450,13 +409,11 @@ impl App {
     /// (Previously the hotkey path always used `template_for`, leaving
     /// `lamquant_default_args` dead — this revives it.)
     fn open_editor(&mut self, recipe: &'static crate::recipes::RecipeDef) {
-        // Prefill with the owning cookbook's pre-baked default args (domain
-        // data, supplied via Cookbook::default_args), else the schemars
-        // template. Keeps blut-core domain-agnostic — no hardcoded paths.
-        let buffer = self
-            .registry
-            .default_args(recipe.name)
-            .unwrap_or_else(|| Self::template_for(recipe));
+        // Prefill = schema-default template ⊕ the owning cookbook's domain
+        // overlay (E2). The serde defaults are the single source; the overlay
+        // only adds domain paths + curated non-default starts on top. Keeps
+        // blut-core domain-agnostic — no hardcoded paths.
+        let buffer = self.registry.prefill_args(recipe.name);
         self.overlay = Overlay::Editor {
             recipe: recipe.name,
             buffer,
@@ -2365,23 +2322,17 @@ mod state_tests {
         needle.chars().all(|nc| it.any(|hc| hc == nc))
     }
 
-    // ── template_for: schema → JSON (or {} fallback) ────────────────
+    // ── args_template: schema → defaults/placeholders object ────────
 
     #[test]
-    fn template_for_every_recipe_parses_as_json() {
+    fn args_template_is_an_object_for_every_recipe() {
         for r in FIXTURE {
-            let tpl = App::template_for(r);
-            let parsed: Result<serde_json::Value, _> = serde_json::from_str(&tpl);
+            let tpl = crate::recipes::recipe::args_template(r);
+            // The top level must be a JSON object (the args dict) — never a
+            // bare scalar / array, even for a schema-less fixture (→ `{}`).
             assert!(
-                parsed.is_ok(),
-                "template_for(`{}`) produced unparseable JSON:\n{tpl}",
-                r.name
-            );
-            // Whatever it is, the top level must be a JSON object (the
-            // args dict) — never a bare scalar / array.
-            assert!(
-                parsed.unwrap().is_object(),
-                "template_for(`{}`) must be a JSON object",
+                tpl.is_object(),
+                "args_template(`{}`) must be a JSON object, got {tpl}",
                 r.name
             );
         }

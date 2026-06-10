@@ -87,6 +87,73 @@ pub fn compile_erased<R: Recipe + Default>(
     R::default().compile(args).map(|p| p.into_compiled())
 }
 
+/// Resolve the root args object of a `schema_of`-shaped schema
+/// (`{"$ref":"#/definitions/<Name>","definitions":{...}}`) to the `<Name>`
+/// definition object. Falls back to the conventional `"Args"` key.
+fn schema_root(schema: &serde_json::Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    let defs = schema.get("definitions")?.as_object()?;
+    let name = schema
+        .get("$ref")
+        .and_then(|r| r.as_str())
+        .and_then(|r| r.rsplit('/').next())
+        .unwrap_or("Args");
+    defs.get(name)
+        .or_else(|| defs.get("Args"))
+        .and_then(|d| d.as_object())
+}
+
+/// Type-aware placeholder for a required field that declares no default.
+fn placeholder_for(prop: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    let ty = prop.get("type").and_then(|t| t.as_str());
+    match ty {
+        Some("number") | Some("integer") => Value::Number(0.into()),
+        Some("boolean") => Value::Bool(false),
+        Some("array") => Value::Array(vec![]),
+        Some("object") => Value::Object(serde_json::Map::new()),
+        // string + unknown (incl. Option-typed `["string","null"]`) → TODO.
+        _ => Value::String("<TODO>".into()),
+    }
+}
+
+/// Build a starting-point args object for a recipe straight from its schema
+/// (E2): every field with a non-null `default` (the `#[serde(default=…)]`
+/// source-of-truth schemars embeds) gets that default; every REQUIRED field
+/// without a default gets a type-aware `<TODO>` placeholder. This is the
+/// single defaults source — cookbooks no longer hand-duplicate them; a
+/// cookbook's `default_args` overlay only adds domain paths + curated
+/// non-default starts on top (see `Registry::prefill_args`).
+pub fn args_template(def: &RecipeDef) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    let schema = (def.args_schema_fn)();
+    let Some(root) = schema_root(&schema) else {
+        return Value::Object(Map::new());
+    };
+    let required: std::collections::HashSet<&str> = root
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let mut out = Map::new();
+    if let Some(props) = root.get("properties").and_then(|p| p.as_object()) {
+        for (k, v) in props {
+            match v.get("default") {
+                Some(d) if !d.is_null() => {
+                    out.insert(k.clone(), d.clone());
+                }
+                // A required field never carries a serde default (they're
+                // mutually exclusive), so this only fires for genuinely
+                // user-supplied fields (the domain paths).
+                _ if required.contains(k.as_str()) => {
+                    out.insert(k.clone(), placeholder_for(v));
+                }
+                _ => {}
+            }
+        }
+    }
+    Value::Object(out)
+}
+
 /// Emit a recipe's `pub static DEF: RecipeDef` from its [`Recipe`] impl.
 ///
 /// Every field is derived from trait consts + associated types, so
@@ -291,6 +358,37 @@ mod tests {
             .and_then(|p| p.as_object())
             .expect("definitions/Flat/properties must resolve the $ref");
         assert!(flat.contains_key("name") && flat.contains_key("enabled"));
+    }
+
+    #[test]
+    fn args_template_harvests_defaults_and_placeholders() {
+        fn default_preset() -> String {
+            "production".into()
+        }
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Args {
+            #[serde(default = "default_preset")]
+            preset: String,
+            #[serde(default)]
+            epochs: Option<u32>, // null default → omitted (noise)
+            lma_root: String,    // required, no default → placeholder
+        }
+        static D: RecipeDef = RecipeDef {
+            name: "t",
+            description: "d",
+            backend_id: "b",
+            category: RecipeCategory::Train,
+            input_kinds: &[],
+            output_kind: "k",
+            schedule: None,
+            args_schema_fn: || schema_of::<Args>(),
+            compile_fn: |_| Err(RecipeError::CompileFailed("x".into())),
+        };
+        let t = args_template(&D);
+        assert_eq!(t["preset"], serde_json::json!("production"));
+        assert_eq!(t["lma_root"], serde_json::json!("<TODO>"));
+        assert!(t.get("epochs").is_none(), "null defaults are omitted as noise");
     }
 
     #[test]
