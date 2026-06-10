@@ -47,6 +47,7 @@ pub mod protocol;
 pub mod python_kill;
 pub mod recipes;
 pub mod registry;
+pub mod runs;
 pub mod scheduler_lock;
 pub mod spec;
 pub mod stages;

@@ -48,7 +48,11 @@ enum Command {
     /// Run a fine-tune (also the default when invoked without a subcommand).
     Train(TrainArgs),
     /// List training jobs (running + completed).
-    Jobs,
+    Jobs {
+        /// Emit the job list as a JSON array (for scripts/agents).
+        #[arg(long)]
+        json: bool,
+    },
     /// SIGTERM a running training job.
     Cancel {
         /// Job id (or unique prefix).
@@ -64,6 +68,14 @@ enum Command {
         /// How many lines to tail. 0 = all.
         #[arg(long, default_value_t = 0)]
         tail: usize,
+        /// Emit the raw status stream as JSON lines (for scripts/agents).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare two runs: spec/args provenance diff + one-line outcomes.
+    Runs {
+        #[command(subcommand)]
+        cmd: RunsCommand,
     },
     /// Manage the datasets registry.
     Data {
@@ -172,9 +184,30 @@ enum CacheCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum RunsCommand {
+    /// Diff two jobs' recipe/args provenance + show each outcome.
+    Diff {
+        /// First job id (or unique prefix).
+        id1: String,
+        /// Second job id (or unique prefix).
+        id2: String,
+        /// Show identical keys too (default elides them).
+        #[arg(long)]
+        all: bool,
+        /// Emit the diff as JSON (for scripts/agents).
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum RecipeCommand {
     /// List the recipe catalog.
-    List,
+    List {
+        /// Emit the catalog as JSON (for scripts/agents).
+        #[arg(long)]
+        json: bool,
+    },
     /// Print one recipe's args JSON schema.
     Show {
         /// Recipe name (as listed by `recipe list`).
@@ -340,9 +373,10 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Train(args)) => run_train(&reg, args).await,
-        Some(Command::Jobs) => run_jobs(),
+        Some(Command::Jobs { json }) => run_jobs(json),
         Some(Command::Cancel { id, grace }) => run_cancel(&id, grace).await,
-        Some(Command::Log { id, tail }) => run_log(&id, tail),
+        Some(Command::Log { id, tail, json }) => run_log(&id, tail, json),
+        Some(Command::Runs { cmd }) => run_runs_cmd(cmd),
         Some(Command::Data { cmd }) => run_data(cmd),
         Some(Command::Auto) => run_auto().await,
         Some(Command::Policy { cmd }) => run_policy(cmd),
@@ -706,7 +740,7 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
     // The recipe catalog comes from the caller-supplied cookbook registry.
     let find_recipe = |name: &str| reg.find(name);
     match cmd {
-        RecipeCommand::List => {
+        RecipeCommand::List { json } => {
             // Sort by (category label, name) so the catalog reads
             // top-down like the BLUT Training Cockpit menu (DATA →
             // TRAINING → EVAL → EXPORT → PIPELINE → USER).
@@ -717,6 +751,27 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                     .cmp(b.category.label())
                     .then_with(|| a.name.cmp(b.name))
             });
+            if json {
+                let arr: Vec<_> = sorted
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "name": r.name,
+                            "category": r.category.label(),
+                            "backend": r.backend_id,
+                            "input_kinds": r.input_kinds,
+                            "output_kind": r.output_kind,
+                            "description": r.description,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&arr)
+                        .map_err(|e| anyhow!("serialize recipes: {e}"))?
+                );
+                return Ok(());
+            }
             println!(
                 "{:<32} {:<14} {:<12} {:<24} → output",
                 "name", "category", "backend", "inputs"
@@ -1349,8 +1404,16 @@ async fn run_train(reg: &crate::framework::Registry, args: TrainArgs) -> Result<
     Ok(())
 }
 
-fn run_jobs() -> Result<()> {
+fn run_jobs(json: bool) -> Result<()> {
     let jobs = jobs::list_jobs()?;
+    if json {
+        // JobSummary derives Serialize — emit the array verbatim so a
+        // script/agent gets the same data the table renders.
+        let out = serde_json::to_string_pretty(&jobs)
+            .map_err(|e| anyhow!("serialize jobs: {e}"))?;
+        println!("{out}");
+        return Ok(());
+    }
     if jobs.is_empty() {
         println!("no jobs.");
         return Ok(());
@@ -1379,6 +1442,17 @@ fn run_jobs() -> Result<()> {
     Ok(())
 }
 
+fn run_runs_cmd(cmd: RunsCommand) -> Result<()> {
+    match cmd {
+        RunsCommand::Diff {
+            id1,
+            id2,
+            all,
+            json,
+        } => crate::runs::diff(&id1, &id2, all, json).map_err(|e| anyhow!("{e}")),
+    }
+}
+
 async fn run_cancel(id_query: &str, grace: Duration) -> Result<()> {
     let id = jobs::resolve_job_id(id_query)?;
     eprintln!("cancelling {id} (grace {grace:?})...");
@@ -1387,9 +1461,25 @@ async fn run_cancel(id_query: &str, grace: Duration) -> Result<()> {
     Ok(())
 }
 
-fn run_log(id_query: &str, tail: usize) -> Result<()> {
+fn run_log(id_query: &str, tail: usize, json: bool) -> Result<()> {
     let id = jobs::resolve_job_id(id_query)?;
     let updates = jobs::read_status(&id)?;
+    if json {
+        // Raw status stream as JSON lines (one StatusUpdate per line),
+        // tail-trimmed like the rendered view.
+        let start = if tail == 0 {
+            0
+        } else {
+            updates.len().saturating_sub(tail)
+        };
+        for u in &updates[start..] {
+            println!(
+                "{}",
+                serde_json::to_string(u).map_err(|e| anyhow!("serialize status: {e}"))?
+            );
+        }
+        return Ok(());
+    }
     let rendered = jobs::render_log(&updates);
     if tail == 0 {
         print!("{rendered}");
@@ -1700,8 +1790,6 @@ fn register_in_registry(name: &str, gguf_path: &Path, spec: &TrainSpec) -> Resul
 
 #[cfg(test)]
 mod footprint_resolve_tests {
-    use super::*;
-
     /// RESOLVE-side cost-driver extraction for `lamquant_joint_codec`
     /// DEFAULTS (`tier`/`batch_size` absent) — the over-refuse target the
     /// slice fixes. The tuple here MUST equal the RECORD-side
