@@ -59,6 +59,9 @@ pub fn record_to(index_path: &Path, rec: &SweepRecord) -> Result<()> {
     let mut line = serde_json::to_string(rec)
         .map_err(|e| TrainError::other(format!("encode sweep record: {e}")))?;
     line.push('\n');
+    // No fsync: a record lost to a crash just causes a re-run (the skip is an
+    // optimization, never a correctness gate), and the scheduler lock prevents
+    // interleaved writers — so the durability cost isn't worth paying here.
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -92,8 +95,10 @@ pub fn record_completion(
 
 /// Read all records, last-writer-wins per fingerprint. Tolerant: an empty,
 /// torn, or malformed line is skipped (append-only crash safety). A missing
-/// file yields an empty map (no completions recorded yet).
-fn load_latest(index_path: &Path) -> std::collections::HashMap<String, SweepRecord> {
+/// file yields an empty map (no completions recorded yet). Load this ONCE and
+/// reuse it across a whole sweep — every combo's check is then a map lookup,
+/// not a re-parse of the index.
+pub fn load_index(index_path: &Path) -> std::collections::HashMap<String, SweepRecord> {
     let mut latest = std::collections::HashMap::new();
     let Ok(body) = std::fs::read_to_string(index_path) else {
         return latest;
@@ -110,19 +115,23 @@ fn load_latest(index_path: &Path) -> std::collections::HashMap<String, SweepReco
     latest
 }
 
-/// Is this combo already complete in `index_path`? True only when the
-/// fingerprint is recorded AND its output sidecar still exists with the same
-/// `content_hash` we recorded — a pruned output or a path reused by a
-/// different run both correctly read as NOT complete (re-run).
-pub fn is_complete_in(index_path: &Path, fingerprint: ContentHash) -> bool {
-    let fp = fingerprint.to_hex();
-    let Some(rec) = load_latest(index_path).remove(&fp) else {
-        return false;
-    };
+/// Does a record's output still exist on disk with the content hash we
+/// recorded? A pruned output or a path reused by a different run both read as
+/// `false` (re-run).
+pub fn is_record_live(rec: &SweepRecord) -> bool {
     match ArtifactMetadata::read_from(&rec.sidecar_path) {
         Ok(meta) => meta.content_hash.to_hex() == rec.final_output_hash,
         Err(_) => false,
     }
+}
+
+/// Is this combo already complete in `index_path`? True only when the
+/// fingerprint is recorded AND `is_record_live`.
+pub fn is_complete_in(index_path: &Path, fingerprint: ContentHash) -> bool {
+    let fp = fingerprint.to_hex();
+    load_index(index_path)
+        .get(&fp)
+        .is_some_and(is_record_live)
 }
 
 /// `is_complete_in` against the default global index. Resolves to `false`

@@ -49,15 +49,24 @@ pub fn expand(
     base_overrides: &[String],
     sweep_overrides: &[String],
 ) -> Result<Vec<SweepEntry>> {
+    use crate::config::sweep_index;
+    // Load the completion index ONCE for the whole sweep — every combo's skip
+    // check is then a map lookup + sidecar stat, not a re-parse of the JSONL.
+    let index = sweep_index::default_index_path()
+        .map(|p| sweep_index::load_index(&p))
+        .unwrap_or_default();
     let mut entries = Vec::new();
     for combo in cartesian(sweep_overrides) {
         let mut merged = base_overrides.to_vec();
         merged.extend(combo);
         let config = compose(config_dir, config_name, &merged)?;
         let fingerprint = config.fingerprint;
+        let cache_skip = index
+            .get(&fingerprint.to_hex())
+            .is_some_and(sweep_index::is_record_live);
         entries.push(SweepEntry {
             overrides: merged,
-            cache_skip: cache_skip(fingerprint),
+            cache_skip,
             fingerprint,
             config,
         });
@@ -69,6 +78,10 @@ pub fn expand(
 /// global sweep-completion index (see [`crate::config::sweep_index`]). Returns
 /// `false` (re-run) when the fingerprint was never recorded OR its recorded
 /// output sidecar is gone / content-mismatched.
+///
+/// Single-fingerprint convenience — re-reads the index each call. [`expand`]
+/// loads the index once and checks all combos against it; prefer that for a
+/// whole sweep.
 ///
 /// Wiring the SKIP into a run loop is still OUT OF LANE (the sweep engine is
 /// not hooked into `framework::executor` / `jobs.rs`), and the index is only
