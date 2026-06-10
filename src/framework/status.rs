@@ -13,9 +13,11 @@
 //! at the front so the same parser handles live broadcast streams
 //! and post-hoc `status.jsonl` reads.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::{broadcast, mpsc};
 
 use crate::framework::artifact::ContentHash;
 use crate::framework::resource::Resource;
@@ -26,6 +28,12 @@ use crate::framework::resource::Resource;
 /// dropping events. Still bounded — a stuck consumer can't OOM
 /// the producer indefinitely. Originally 256; bumped after
 /// observing realistic per-step emission rates from trainer.py.
+///
+/// Note: lifecycle events (everything but `StageStep`) DO NOT ride this
+/// lossy channel to the writer — they go through the [`StatusHub`]'s
+/// separate lossless mpsc, so a writer that falls behind on Step spam
+/// can never drop a `StageBegin`/`StageEnd`/`StageFailed` from the
+/// audit trail. The broadcast is for the live UI only.
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 4096;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -76,6 +84,70 @@ pub enum StageEvent {
         stage_name: String,
         update: serde_json::Value,
     },
+    /// The lossy broadcast lagged: `dropped` `StageStep` events were
+    /// lost before the writer drained them. Recorded so a status.jsonl
+    /// reader sees the gap instead of a silently-short stream. Generated
+    /// by the writer, never emitted via [`StatusHub::emit`].
+    StepGap { dropped: u64 },
+}
+
+impl StageEvent {
+    /// Lifecycle events — the structurally important audit trail
+    /// (begin/end/skipped/failed/blocked). These ride the LOSSLESS
+    /// channel; `StageStep` (and the writer-generated `StepGap`) are
+    /// the lossy, high-volume class.
+    pub fn is_lifecycle(&self) -> bool {
+        !matches!(self, StageEvent::StageStep { .. } | StageEvent::StepGap { .. })
+    }
+}
+
+/// Fan-out hub for stage status. A single [`emit`](StatusHub::emit)
+/// choke point stamps a process-wide sequence number and routes each
+/// event:
+///   * lifecycle events → BOTH the lossless mpsc (the writer, so the
+///     audit trail never has gaps) AND the lossy broadcast (live UI);
+///   * `StageStep` → the lossy broadcast only (batched by the writer).
+///
+/// The lifecycle mpsc preserves emit order (FIFO), so status.jsonl reads
+/// lifecycle events in the order they were emitted across concurrent
+/// stages.
+pub struct StatusHub {
+    broadcast: broadcast::Sender<StageEvent>,
+    lifecycle_tx: mpsc::UnboundedSender<StageEvent>,
+}
+
+impl StatusHub {
+    /// Build a hub + the lifecycle receiver the writer drains. The
+    /// caller hands the receiver to [`spawn_status_writer`].
+    pub fn new() -> (Arc<StatusHub>, mpsc::UnboundedReceiver<StageEvent>) {
+        let (broadcast, _rx) = broadcast::channel(DEFAULT_BROADCAST_CAPACITY);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+        let hub = Arc::new(StatusHub {
+            broadcast,
+            lifecycle_tx,
+        });
+        (hub, lifecycle_rx)
+    }
+
+    /// Emit one event. Lifecycle events go to the lossless writer
+    /// channel as well as the broadcast; steps go to the broadcast only.
+    pub fn emit(&self, ev: StageEvent) {
+        if ev.is_lifecycle() {
+            let _ = self.lifecycle_tx.send(ev.clone());
+        }
+        let _ = self.broadcast.send(ev);
+    }
+
+    /// A broadcast sender clone — for `StageContext`, which only emits
+    /// `StageStep` (lossy is fine).
+    pub fn broadcast_sender(&self) -> broadcast::Sender<StageEvent> {
+        self.broadcast.clone()
+    }
+
+    /// Subscribe a live receiver (TUI / CLI renderer).
+    pub fn subscribe(&self) -> broadcast::Receiver<StageEvent> {
+        self.broadcast.subscribe()
+    }
 }
 
 /// Make a fresh broadcast channel sized at
@@ -93,23 +165,23 @@ pub fn make_broadcast() -> tokio::sync::broadcast::Sender<StageEvent> {
 /// immediately regardless.
 const STEP_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Spawn a background task that subscribes to `tx` and appends each
-/// received `StageEvent` as one JSON line to `<job_dir>/status.jsonl`.
+/// Spawn the background task that appends every `StageEvent` as one
+/// JSON line to `<job_dir>/status.jsonl`. It drains TWO sources:
 ///
-/// Performance: writes are buffered with a 64 KiB BufWriter.
-/// Lifecycle events (StageBegin/End/Failed/Skipped/Blocked) trigger
-/// an immediate flush so a `kill -9` mid-run preserves the
-/// structurally important audit trail. High-volume `StageStep`
-/// events (per-training-step loss) are batched — flushed on the
-/// next lifecycle event OR every `STEP_FLUSH_INTERVAL`, whichever
-/// first. This drops syscall count by ~100× on a long training
-/// without sacrificing crash recovery for the events that matter.
+///   * `lifecycle_rx` (LOSSLESS mpsc): begin/end/skipped/failed/blocked
+///     /retrying — written and flushed IMMEDIATELY, in `seq` order, so
+///     a `kill -9` mid-run preserves the structurally important audit
+///     trail and it can never be dropped under Step backpressure.
+///   * the hub's broadcast (LOSSY): `StageStep` spam, batched and
+///     flushed every `STEP_FLUSH_INTERVAL`. On `Lagged(n)` the writer
+///     records a `StepGap { dropped: n }` line so the gap is visible.
 ///
-/// The task ends when the broadcast sender is dropped (RecvError::
-/// Closed) or when an unrecoverable I/O error occurs on the file.
-/// Lagged receivers are tolerated; the gap is logged.
+/// The task ends once the lifecycle channel closes (the last
+/// `StatusHub` dropped) — it then drains any remaining broadcast Steps
+/// and returns.
 pub fn spawn_status_writer(
-    tx: &tokio::sync::broadcast::Sender<StageEvent>,
+    hub: &Arc<StatusHub>,
+    mut lifecycle_rx: mpsc::UnboundedReceiver<StageEvent>,
     job_dir: &std::path::Path,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
     use std::io::Write;
@@ -119,10 +191,9 @@ pub fn spawn_status_writer(
         .create(true)
         .append(true)
         .open(&path)?;
-    let mut rx = tx.subscribe();
+    let mut brx = hub.subscribe();
     Ok(tokio::spawn(async move {
         let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
-        // Reopen the (possibly rotated) status file in append mode.
         let reopen = |p: &std::path::Path| {
             std::fs::OpenOptions::new()
                 .create(true)
@@ -130,41 +201,72 @@ pub fn spawn_status_writer(
                 .open(p)
                 .map(|f| std::io::BufWriter::with_capacity(64 * 1024, f))
         };
+        // Write one event line; returns false on an unrecoverable I/O
+        // error (caller exits). `flush` forces the line to disk now.
+        macro_rules! write_event {
+            ($ev:expr, $flush:expr) => {{
+                let mut ok = true;
+                match serde_json::to_string(&$ev) {
+                    Ok(line) => {
+                        if writeln!(writer, "{line}").is_err() {
+                            tracing::warn!("status writer: write failed, exiting");
+                            ok = false;
+                        }
+                    }
+                    Err(e) => tracing::error!("status writer: serialize event failed: {e}"),
+                }
+                if ok && $flush && writer.flush().is_err() {
+                    tracing::warn!("status writer: flush failed, exiting");
+                    ok = false;
+                }
+                ok
+            }};
+        }
         loop {
             let timeout = tokio::time::sleep(STEP_FLUSH_INTERVAL);
             tokio::pin!(timeout);
             tokio::select! {
-                got = rx.recv() => match got {
-                    Ok(event) => {
-                        let immediate = !matches!(event, StageEvent::StageStep { .. });
-                        if let Ok(line) = serde_json::to_string(&event) {
-                            if writeln!(writer, "{line}").is_err() {
-                                tracing::warn!("status writer: write failed, exiting");
-                                return;
+                // Lossless lifecycle — immediate flush, seq-ordered.
+                got = lifecycle_rx.recv() => match got {
+                    Some(event) => {
+                        if !write_event!(event, true) { return; }
+                    }
+                    None => {
+                        // Last StatusHub dropped → run is finishing. Drain
+                        // any remaining broadcast Steps, then exit.
+                        let _ = writer.flush();
+                        while let Ok(event) = brx.try_recv() {
+                            if matches!(event, StageEvent::StageStep { .. }) {
+                                let _ = write_event!(event, false);
                             }
                         }
-                        if immediate && writer.flush().is_err() {
-                            tracing::warn!("status writer: flush failed, exiting");
-                            return;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         let _ = writer.flush();
                         return;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("status writer: lagged by {n} events");
+                },
+                // Lossy Step spam — batched.
+                got = brx.recv() => match got {
+                    Ok(event) => {
+                        // Lifecycle events also arrive here (broadcast), but
+                        // the lossless path already wrote them — skip to avoid
+                        // duplicates; only Steps are writer-owned on this path.
+                        if matches!(event, StageEvent::StageStep { .. })
+                            && !write_event!(event, false)
+                        {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Broadcast closed but lifecycle may still be open;
+                        // keep looping on lifecycle.
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("status writer: broadcast lagged by {n} steps");
+                        let _ = write_event!(StageEvent::StepGap { dropped: n }, false);
                     }
                 },
                 _ = &mut timeout => {
-                    // Periodic flush of buffered StageStep events, then
-                    // roll the log over if it has grown past the cap (the
-                    // high-volume StageStep path is what blows it up).
                     let _ = writer.flush();
-                    // Reopen if we rotated, OR if the file vanished out from
-                    // under us (defensive against an external rotation) — so
-                    // the writer can never get stuck appending to a renamed
-                    // inode.
                     if crate::jobs::rotate_status_if_needed(&path) || !path.exists() {
                         match reopen(&path) {
                             Ok(w) => writer = w,
@@ -234,8 +336,71 @@ mod tests {
         }
     }
 
-    // PathBuf is used in commit-3 status writer; quiet the unused
-    // import if the writer isn't here yet.
+    #[test]
+    fn lifecycle_classification() {
+        assert!(StageEvent::StageBegin {
+            node_idx: 0,
+            stage_name: "s".into(),
+            input_hash: ContentHash::of_bytes(b""),
+        }
+        .is_lifecycle());
+        assert!(!StageEvent::StageStep {
+            node_idx: 0,
+            stage_name: "s".into(),
+            update: serde_json::json!({}),
+        }
+        .is_lifecycle());
+        assert!(!StageEvent::StepGap { dropped: 3 }.is_lifecycle());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_events_are_lossless_under_step_flood() {
+        // The lossless guarantee: lifecycle events (begin/end) reach
+        // status.jsonl even buried in a flood of Step spam far exceeding
+        // the broadcast capacity. Steps may be dropped (lossy, fine);
+        // lifecycle never is.
+        let td = tempfile::tempdir().unwrap();
+        let (hub, lifecycle_rx) = StatusHub::new();
+        let writer = spawn_status_writer(&hub, lifecycle_rx, td.path()).unwrap();
+
+        hub.emit(StageEvent::StageBegin {
+            node_idx: 0,
+            stage_name: "flooded".into(),
+            input_hash: ContentHash::of_bytes(b"in"),
+        });
+        // Flood far more Steps than the broadcast can hold (4096).
+        for i in 0..20_000u32 {
+            hub.emit(StageEvent::StageStep {
+                node_idx: 0,
+                stage_name: "flooded".into(),
+                update: serde_json::json!({ "step": i }),
+            });
+        }
+        hub.emit(StageEvent::StageEnd {
+            node_idx: 0,
+            stage_name: "flooded".into(),
+            output_hash: ContentHash::of_bytes(b"out"),
+            elapsed: Duration::from_millis(1),
+        });
+
+        // Drop the hub → lifecycle channel closes → writer drains + exits.
+        drop(hub);
+        let _ = writer.await;
+
+        let body = std::fs::read_to_string(td.path().join("status.jsonl")).unwrap();
+        assert_eq!(
+            body.matches("\"kind\":\"stage_begin\"").count(),
+            1,
+            "lifecycle StageBegin must survive the flood"
+        );
+        assert_eq!(
+            body.matches("\"kind\":\"stage_end\"").count(),
+            1,
+            "lifecycle StageEnd must survive the flood"
+        );
+    }
+
+    // PathBuf retained for older call sites that build paths in tests.
     #[allow(dead_code)]
     fn _path_marker() -> PathBuf {
         PathBuf::new()

@@ -44,4 +44,4 @@ pub use executor::{ExecCtx, ParallelExecutor, PlanResult, SequentialExecutor, ex
 pub use plan::{CompiledPlan, NodeId, Plan};
 pub use resource::Resource;
 pub use stage::{ErasedArtifact, ErasedDecodeError, Stage, StageContext, StageDyn};
-pub use status::{StageEvent, make_broadcast, spawn_status_writer};
+pub use status::{StageEvent, StatusHub, make_broadcast, spawn_status_writer};

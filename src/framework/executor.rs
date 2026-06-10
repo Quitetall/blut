@@ -36,7 +36,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::framework::artifact::{ArtifactMetadata, ContentHash};
@@ -45,7 +45,7 @@ use crate::framework::error::{PlanError, StageError};
 use crate::framework::plan::{CompiledPlan, NodeId};
 use crate::framework::resource::Resource;
 use crate::framework::stage::{ErasedArtifact, StageContext, StageDyn};
-use crate::framework::status::{StageEvent, spawn_status_writer};
+use crate::framework::status::{StageEvent, StatusHub, spawn_status_writer};
 
 /// Default bound on concurrently-spawned node tasks in the parallel
 /// executor. The real throttle is the per-`Resource` semaphores; this
@@ -58,7 +58,12 @@ pub const DEFAULT_MAX_IN_FLIGHT: usize = 8;
 pub struct ExecCtx {
     pub job_dir: PathBuf,
     pub cache: Arc<CacheHandle>,
-    pub status_tx: broadcast::Sender<StageEvent>,
+    /// Status fan-out hub. Subscribe a live receiver via
+    /// `ctx.status.subscribe()`; the executor emits through it.
+    pub status: Arc<StatusHub>,
+    /// The lossless lifecycle receiver, handed to the status writer by
+    /// the executor's prelude. `None` once taken (after one execute).
+    lifecycle_rx: Option<mpsc::UnboundedReceiver<StageEvent>>,
     pub cancel: CancellationToken,
     /// Per-resource semaphores. Stages acquire all permits in
     /// their `RESOURCES` slice before `run` is called. Default
@@ -74,7 +79,7 @@ impl ExecCtx {
     /// responsible for creating `job_dir` if it doesn't exist.
     pub fn new(job_dir: PathBuf) -> Self {
         let cache = Arc::new(CacheHandle::job_local(job_dir.join("_cache")));
-        let status_tx = crate::framework::status::make_broadcast();
+        let (status, lifecycle_rx) = StatusHub::new();
         let cancel = CancellationToken::new();
         let mut resources = std::collections::HashMap::new();
         let cpu_n = std::thread::available_parallelism()
@@ -87,7 +92,8 @@ impl ExecCtx {
         Self {
             job_dir,
             cache,
-            status_tx,
+            status,
+            lifecycle_rx: Some(lifecycle_rx),
             cancel,
             resources,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
@@ -128,7 +134,7 @@ pub struct PlanResult {
 struct NodeEnv {
     job_dir: PathBuf,
     cache: Arc<CacheHandle>,
-    status_tx: broadcast::Sender<StageEvent>,
+    status: Arc<StatusHub>,
     cancel: CancellationToken,
     resources: HashMap<Resource, Arc<tokio::sync::Semaphore>>,
     recipe_name: String,
@@ -178,7 +184,7 @@ enum NodeFailure {
 /// Run ONE node: cache lookup → tmp dir → resource permits → run →
 /// (cancel check) → atomic promote → rebase → sidecar → cache insert →
 /// events. The single home of the FW-2 atomicity contract. Emits
-/// lifecycle events via `env.status_tx`; never manages the status
+/// lifecycle events via `env.status`; never manages the status
 /// writer's lifecycle (the coordinator owns that).
 async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, NodeFailure> {
     let idx = task.node_idx;
@@ -186,7 +192,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
 
     // ── Cache lookup ────────────────────────────────────────────────
     if let Some(hit) = env.cache.lookup(task.key) {
-        let _ = env.status_tx.send(StageEvent::StageSkipped {
+        env.status.emit(StageEvent::StageSkipped {
             node_idx: idx,
             stage_name: stage_name.clone(),
             cache_key: task.key,
@@ -209,7 +215,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
     }
 
     // ── Miss → run ──────────────────────────────────────────────────
-    let _ = env.status_tx.send(StageEvent::StageBegin {
+    env.status.emit(StageEvent::StageBegin {
         node_idx: idx,
         stage_name: stage_name.clone(),
         input_hash: task.input_hash,
@@ -239,7 +245,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         job_dir: env.job_dir.clone(),
         stage_dir: tmp_stage_dir.clone(),
         node_idx: idx,
-        status_tx: env.status_tx.clone(),
+        status_tx: env.status.broadcast_sender(),
         cancel: env.cancel.clone(),
         cache: env.cache.clone(),
         recipe_name: env.recipe_name.clone(),
@@ -259,7 +265,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         let permit = match sem.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                let _ = env.status_tx.send(StageEvent::StageBlocked {
+                env.status.emit(StageEvent::StageBlocked {
                     node_idx: idx,
                     stage_name: stage_name.clone(),
                     resource,
@@ -302,7 +308,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
             // cached — discard the tmp output, report Cancelled.
             if env.cancel.is_cancelled() {
                 let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-                let _ = env.status_tx.send(StageEvent::StageFailed {
+                env.status.emit(StageEvent::StageFailed {
                     node_idx: idx,
                     stage_name,
                     error: "plan cancelled during stage".into(),
@@ -313,7 +319,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         }
         Err(e) => {
             let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-            let _ = env.status_tx.send(StageEvent::StageFailed {
+            env.status.emit(StageEvent::StageFailed {
                 node_idx: idx,
                 stage_name: stage_name.clone(),
                 error: format!("{e}"),
@@ -332,7 +338,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
     let _ = std::fs::remove_dir_all(&final_stage_dir);
     if let Err(e) = std::fs::rename(&tmp_stage_dir, &final_stage_dir) {
         let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-        let _ = env.status_tx.send(StageEvent::StageFailed {
+        env.status.emit(StageEvent::StageFailed {
             node_idx: idx,
             stage_name: stage_name.clone(),
             error: format!("promote stage output: {e}"),
@@ -367,7 +373,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         tracing::warn!("executor: cache insert for stage '{stage_name}' failed: {e}; continuing");
     }
 
-    let _ = env.status_tx.send(StageEvent::StageEnd {
+    env.status.emit(StageEvent::StageEnd {
         node_idx: idx,
         stage_name: stage_name.clone(),
         output_hash,
@@ -526,11 +532,11 @@ fn plan_error_of(f: NodeFailure) -> PlanError {
 }
 
 /// Shared coordinator setup: validate, spawn the status writer, persist
-/// args.json, and seed the initial outputs. CONSUMES `ctx`, MOVING its
-/// single status sender into the `NodeEnv` — there must be exactly one
-/// live `Sender` (inside the one `NodeEnv`), or the writer's channel
-/// never closes and `finish_writer` hangs. The writer holds only a
-/// `Receiver` (via `subscribe()`), never a `Sender`.
+/// args.json, and seed the initial outputs. CONSUMES `ctx`, MOVING the
+/// `StatusHub` into the one `NodeEnv` — when the last `Arc<NodeEnv>`
+/// drops, the hub (and its lifecycle Sender) drop, the writer's
+/// lifecycle channel closes, and the writer exits. The lossless
+/// lifecycle receiver is handed to the writer here.
 struct Prelude {
     writer_handle: tokio::task::JoinHandle<()>,
     env: Arc<NodeEnv>,
@@ -538,14 +544,19 @@ struct Prelude {
     logical_outputs: HashMap<NodeId, ContentHash>,
 }
 
-fn prelude(ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> {
+fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> {
     debug_assert!(
         !ctx.resources.is_empty(),
         "ExecCtx must declare resource semaphores"
     );
     std::fs::create_dir_all(&ctx.job_dir)?;
-    // Subscribe the writer (Receiver) BEFORE moving the Sender into env.
-    let writer_handle = spawn_status_writer(&ctx.status_tx, &ctx.job_dir)?;
+    // Hand the writer the lossless lifecycle receiver + a broadcast
+    // subscription (taken inside spawn_status_writer).
+    let lifecycle_rx = ctx
+        .lifecycle_rx
+        .take()
+        .ok_or_else(|| PlanError::Other("ExecCtx.lifecycle_rx already consumed".into()))?;
+    let writer_handle = spawn_status_writer(&ctx.status, lifecycle_rx, &ctx.job_dir)?;
 
     let view = plan.exec_view();
     let args_path = ctx.job_dir.join("args.json");
@@ -561,12 +572,11 @@ fn prelude(ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> {
         logical_outputs.insert(*id, lh);
     }
 
-    // MOVE ctx's fields into env — no extra Sender clone survives. After
-    // this, `ctx` is consumed, so the only live Sender is env's.
+    // MOVE ctx's fields into env — the hub Arc lives only here now.
     let env = Arc::new(NodeEnv {
         job_dir: ctx.job_dir,
         cache: ctx.cache,
-        status_tx: ctx.status_tx,
+        status: ctx.status,
         cancel: ctx.cancel,
         resources: ctx.resources,
         recipe_name: plan.name().to_string(),
@@ -634,7 +644,7 @@ impl SequentialExecutor {
 
         for (idx, node_id) in order.iter().enumerate() {
             if env.cancel.is_cancelled() {
-                let _ = env.status_tx.send(StageEvent::StageFailed {
+                env.status.emit(StageEvent::StageFailed {
                     node_idx: idx as u32,
                     stage_name: "<cancelled>".into(),
                     error: "plan cancelled before stage".into(),
@@ -768,7 +778,7 @@ impl ParallelExecutor {
 
         // Pre-cancel: honour a token already fired before the first spawn.
         if env.cancel.is_cancelled() {
-            let _ = env.status_tx.send(StageEvent::StageFailed {
+            env.status.emit(StageEvent::StageFailed {
                 node_idx: 0,
                 stage_name: "<cancelled>".into(),
                 error: "plan cancelled before stage".into(),
@@ -795,7 +805,7 @@ impl ParallelExecutor {
                                 // Surface the failure on the status channel
                                 // (in-flight siblings keep emitting, so a
                                 // silent build error would be conspicuous).
-                                let _ = env.status_tx.send(StageEvent::StageFailed {
+                                env.status.emit(StageEvent::StageFailed {
                                     node_idx,
                                     stage_name: node.stage.name().to_string(),
                                     error: format!("{e}"),
@@ -1288,7 +1298,7 @@ mod tests {
     async fn downstream_input_hash(abs_path: &str, content: u8) -> CH {
         let td = tempfile::tempdir().unwrap();
         let ctx = ExecCtx::new(td.path().to_path_buf());
-        let mut rx = ctx.status_tx.subscribe();
+        let mut rx = ctx.status.subscribe();
         let plan = Plan::<(), LamuTrainerBackend>::new("fw1", serde_json::json!({}))
             .start(
                 MakePathArt,
