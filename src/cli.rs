@@ -981,7 +981,6 @@ fn recipe_footprint(name: &str, raw: &serde_json::Value) -> crate::broker::Footp
 }
 
 async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Result<()> {
-    use crate::framework::ExecCtx;
     // The recipe catalog comes from the caller-supplied cookbook registry.
     let find_recipe = |name: &str| reg.find(name);
     match cmd {
@@ -1064,114 +1063,153 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
             args,
             shared_cache,
         } => {
-            let r = find_recipe(&name).ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
             let raw: serde_json::Value = serde_json::from_str(&args)
                 .with_context(|| format!("parse --args as JSON: {args}"))?;
-            let plan =
-                (r.compile_fn)(raw.clone()).map_err(|e| anyhow!("recipe compile failed: {e}"))?;
-            // ADR 0046 slice-1: resolve the RAM footprint from the args
-            // BEFORE `raw` is consumed by the RecipeMarker below; the
-            // admission gate (after the job state is written) reuses it.
-            let footprint = recipe_footprint(&name, &raw);
-
-            let job_id = crate::jobs::new_job_id();
-            let job_dir = crate::paths::job_dir(&job_id)?;
-            let mut ctx = ExecCtx::new(job_dir.clone());
-            if shared_cache {
-                if let Some(global) = crate::framework::CacheHandle::default_global_path() {
-                    std::fs::create_dir_all(&global)
-                        .with_context(|| format!("create global cache dir {}", global.display()))?;
-                    let cache_handle = (*ctx.cache).clone().with_global(global);
-                    ctx.cache = std::sync::Arc::new(cache_handle);
-                }
-            }
-            // Mark recipe for plan resume. Reuse the parsed
-            // `raw` rather than re-parsing `args` — re-parse +
-            // unwrap_or would silently swallow malformed JSON
-            // that already failed above.
-            RecipeMarker {
-                name: name.clone(),
-                args: raw,
-            }
-            .write_to(&job_dir)?;
-
-            crate::jobs::write_state(&job_id, JobState::Running)
-                .with_context(|| format!("write Running state for {job_id}"))?;
-
-            // KILL-2/KILL-3: bind this job so backend spawns mirror
-            // the python child's PROCESS GROUP id into the job pid
-            // file (not blut's own pid). A separate `blut cancel <id>`
-            // reads that pgid and killpg's the whole tree.
-            crate::python_kill::bind_current_job(job_id.clone());
-
-            // KILL-3: trap SIGTERM/ctrl-c. On signal, cancel the
-            // executor token AND killpg the live child group, then
-            // let the function return so `lock` Drops (RAII unlocks
-            // the scheduler — fixes the stale-lock-on-SIGTERM case).
-            install_cancel_handler(ctx.cancel.clone());
-
-            // ADR 0046 slice-1 (item 4): RAM-refuse admission gate,
-            // placed BEFORE the scheduler lock. The review verified the
-            // lock already serializes blut-vs-blut GPU jobs (fail-fast),
-            // so this is a pure single-job over-subscription guard — if
-            // the conservative-high footprint can't fit free RAM (or the
-            // box at all), refuse CLEANLY here: no launch, no transient
-            // unit, no OOM. Cross-job queuing stays the lock's job; we do
-            // NOT build a poll-queue. Best-effort: a recipe whose args
-            // carry no cost drivers falls back to the conservative
-            // default footprint, which still gates oversubscription.
-            if let Err(reason) = crate::broker::gate(&format!("recipe '{name}'"), &footprint) {
-                crate::python_kill::unbind_current_job();
-                if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                    tracing::warn!("write Failed state for {job_id}: {se}");
-                }
-                return Err(anyhow!("{reason}"));
-            }
-
-            // Cross-process GPU arbitration — same lock acquisition
-            // pattern as the legacy train path. Recipes that don't
-            // hit GPU still pay the lock cost, which is cheap.
-            let lock = match scheduler_lock::acquire_exclusive(
-                format!("blut-recipe:{job_id}"),
-                LockKind::Training,
-            ) {
-                Ok(l) => l,
-                Err(e) => {
-                    crate::python_kill::unbind_current_job();
-                    if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                        tracing::warn!("write Failed state for {job_id}: {se}");
-                    }
-                    return Err(anyhow!("acquire_exclusive: {e}"));
-                }
-            };
-
-            eprintln!("recipe {name}");
-            eprintln!("job    {job_id}");
-            eprintln!("dir    {}", job_dir.display());
-            eprintln!("lock   {}", lock.path().display());
-
-            let result = crate::framework::execute_plan(plan, ctx).await;
-            drop(lock);
-            crate::python_kill::unbind_current_job();
-            match result {
-                Ok(r) => {
-                    crate::jobs::write_state(&job_id, JobState::Done)
-                        .with_context(|| format!("write Done state for {job_id}"))?;
-                    eprintln!(
-                        "done — {} stages, {} cache hits, {} misses, elapsed {:?}",
-                        r.n_stages, r.n_cache_hits, r.n_cache_misses, r.elapsed
-                    );
-                }
-                Err(e) => {
-                    if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                        tracing::warn!("write Failed state for {job_id}: {se}");
-                    }
-                    return Err(anyhow!("plan execution failed: {e}"));
-                }
-            }
+            run_one_recipe(reg, &name, raw, None, shared_cache).await?;
         }
     }
     Ok(())
+}
+
+/// Run ONE recipe invocation end-to-end: compile → job dir → admission gate →
+/// scheduler lock → execute → Done/Failed. Extracted from the `recipe run`
+/// handler so the sweep runner can call it per combo. `sweep_fp` ties a combo
+/// to the sweep-completion index: on success it records the final output so a
+/// re-run can skip this combo (best-effort — recording never fails the run).
+async fn run_one_recipe(
+    reg: &crate::framework::Registry,
+    name: &str,
+    args: serde_json::Value,
+    sweep_fp: Option<crate::framework::ContentHash>,
+    shared_cache: bool,
+) -> Result<()> {
+    use crate::framework::ExecCtx;
+
+    let r = reg
+        .find(name)
+        .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+    let plan = (r.compile_fn)(args.clone()).map_err(|e| anyhow!("recipe compile failed: {e}"))?;
+    // ADR 0046 slice-1: resolve the RAM footprint from the args BEFORE `args`
+    // is consumed by the RecipeMarker below; the admission gate (after the job
+    // state is written) reuses it.
+    let footprint = recipe_footprint(name, &args);
+
+    let job_id = crate::jobs::new_job_id();
+    let job_dir = crate::paths::job_dir(&job_id)?;
+    let mut ctx = ExecCtx::new(job_dir.clone());
+    if shared_cache {
+        if let Some(global) = crate::framework::CacheHandle::default_global_path() {
+            std::fs::create_dir_all(&global)
+                .with_context(|| format!("create global cache dir {}", global.display()))?;
+            let cache_handle = (*ctx.cache).clone().with_global(global);
+            ctx.cache = std::sync::Arc::new(cache_handle);
+        }
+    }
+    // Mark recipe for plan resume (consumes `args`).
+    RecipeMarker {
+        name: name.to_string(),
+        args,
+    }
+    .write_to(&job_dir)?;
+
+    crate::jobs::write_state(&job_id, JobState::Running)
+        .with_context(|| format!("write Running state for {job_id}"))?;
+
+    // KILL-2/KILL-3: bind this job so backend spawns mirror the python child's
+    // PROCESS GROUP id into the job pid file (not blut's own pid). A separate
+    // `blut cancel <id>` reads that pgid and killpg's the whole tree.
+    crate::python_kill::bind_current_job(job_id.clone());
+
+    // KILL-3: trap SIGTERM/ctrl-c. On signal, cancel the executor token AND
+    // killpg the live child group, then let the function return so `lock`
+    // Drops (RAII unlocks the scheduler — fixes the stale-lock-on-SIGTERM case).
+    install_cancel_handler(ctx.cancel.clone());
+
+    // ADR 0046 slice-1 (item 4): RAM-refuse admission gate, BEFORE the lock.
+    // The lock already serializes blut-vs-blut GPU jobs (fail-fast), so this is
+    // a pure single-job over-subscription guard — if the conservative-high
+    // footprint can't fit free RAM, refuse CLEANLY: no launch, no transient
+    // unit, no OOM. Best-effort: args with no cost drivers fall back to the
+    // conservative default footprint, which still gates oversubscription.
+    if let Err(reason) = crate::broker::gate(&format!("recipe '{name}'"), &footprint) {
+        crate::python_kill::unbind_current_job();
+        if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
+            tracing::warn!("write Failed state for {job_id}: {se}");
+        }
+        return Err(anyhow!("{reason}"));
+    }
+
+    // Cross-process GPU arbitration — recipes that don't hit GPU still pay the
+    // (cheap) lock cost.
+    let lock = match scheduler_lock::acquire_exclusive(
+        format!("blut-recipe:{job_id}"),
+        LockKind::Training,
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            crate::python_kill::unbind_current_job();
+            if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
+                tracing::warn!("write Failed state for {job_id}: {se}");
+            }
+            return Err(anyhow!("acquire_exclusive: {e}"));
+        }
+    };
+
+    eprintln!("recipe {name}");
+    eprintln!("job    {job_id}");
+    eprintln!("dir    {}", job_dir.display());
+    eprintln!("lock   {}", lock.path().display());
+
+    let result = crate::framework::execute_plan(plan, ctx).await;
+    drop(lock);
+    crate::python_kill::unbind_current_job();
+    match result {
+        Ok(r) => {
+            crate::jobs::write_state(&job_id, JobState::Done)
+                .with_context(|| format!("write Done state for {job_id}"))?;
+            eprintln!(
+                "done — {} stages, {} cache hits, {} misses, elapsed {:?}",
+                r.n_stages, r.n_cache_hits, r.n_cache_misses, r.elapsed
+            );
+            if let Some(fp) = sweep_fp {
+                record_sweep_completion(fp, &job_id);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
+                tracing::warn!("write Failed state for {job_id}: {se}");
+            }
+            Err(anyhow!("plan execution failed: {e}"))
+        }
+    }
+}
+
+/// Best-effort: record a finished sweep combo into the global sweep-completion
+/// index (fingerprint → final-stage output hash + sidecar), so a later sweep
+/// re-run skips it. The final stage is the last `output.metadata.json` sidecar
+/// (lineage scans stage dirs in order). A failure here must NOT fail the run —
+/// the index is a skip optimization, never a correctness gate.
+fn record_sweep_completion(fp: crate::framework::ContentHash, job_id: &str) {
+    let recs = match crate::framework::lineage::scan_artifacts(job_id) {
+        Ok(recs) => recs,
+        Err(e) => {
+            tracing::warn!("sweep completion {job_id}: scan artifacts: {e}");
+            return;
+        }
+    };
+    let Some(rec) = recs.last() else {
+        tracing::warn!("sweep completion {job_id}: no artifacts to anchor liveness");
+        return;
+    };
+    if let Err(e) = crate::config::sweep_index::record_completion(
+        fp,
+        job_id,
+        rec.meta.content_hash,
+        rec.sidecar_path.clone(),
+    ) {
+        tracing::warn!("sweep completion {job_id}: record: {e}");
+    }
 }
 
 async fn run_auto() -> Result<()> {
