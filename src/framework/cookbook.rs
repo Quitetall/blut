@@ -120,10 +120,18 @@ impl Registry {
             _ => serde_json::Map::new(),
         };
         if let Some(overlay) = self.default_args(recipe) {
-            if let Ok(Value::Object(ov)) = serde_json::from_str::<Value>(&overlay) {
-                for (k, v) in ov {
-                    merged.insert(k, v); // overlay wins
+            // Shallow merge (top-level keys only) — args are flat today; a
+            // future nested-arg recipe would need a deep merge here.
+            match serde_json::from_str::<Value>(&overlay) {
+                Ok(Value::Object(ov)) => {
+                    for (k, v) in ov {
+                        merged.insert(k, v); // overlay wins
+                    }
                 }
+                other => tracing::warn!(
+                    "cookbook overlay for '{recipe}' is not a JSON object ({other:?}); \
+                     using schema template only"
+                ),
             }
         }
         serde_json::to_string_pretty(&Value::Object(merged)).unwrap_or_else(|_| "{}".into())

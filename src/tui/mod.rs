@@ -385,7 +385,6 @@ impl App {
         scored.into_iter().map(|(i, _)| i).collect()
     }
 
-
     fn open_picker(&mut self) {
         self.overlay = Overlay::Picker {
             query: String::new(),
