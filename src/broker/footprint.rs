@@ -118,6 +118,11 @@ impl FootprintKey {
     /// Flat string form used as the JSON map key. Pipe-delimited so it
     /// round-trips unambiguously (recipe names never contain `|`).
     pub fn flat(&self) -> String {
+        // `|` is the delimiter — a recipe name containing it would collide two
+        // distinct keys (e.g. `a|b`+tier1 vs `a`+tier`b|1`). Recipe names are
+        // internal identifiers (never user free-text), so a debug_assert catches
+        // a violation at test time without a release-path cost.
+        debug_assert!(!self.recipe.contains('|'), "recipe name must not contain '|'");
         format!("{}|{}|{}|{}", self.recipe, self.tier, self.batch, self.workers)
     }
 }
