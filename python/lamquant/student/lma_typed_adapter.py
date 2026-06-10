@@ -104,6 +104,18 @@ class _TypedWindowMapDataset(_MapDatasetBase):
         return self._a._window_row(int(self._idx[i]))
 
 
+def _env_int(key: str, default: int) -> int:
+    """Tolerant int env read for operator knobs: an empty or malformed value
+    degrades to ``default`` rather than crashing a multi-hour run on a typo."""
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(float(raw))
+    except (ValueError, TypeError):
+        return default
+
+
 def _identity_collate(rows):
     """Keep the per-window rows as a plain list. Workers already produced the
     (l3, fb, has_seizure, pid, dataset) tuples; the main process does the single
@@ -323,7 +335,7 @@ class LmaTypedL3Dataset:
         # COUNT, so it costs memory for no speed. Default 1 (minimal); env-tunable
         # (FB_SIG_CACHE_CAP) so the broker footprint model can pin it. Phase-2
         # precompute removes the decode path entirely, after which this stays empty.
-        self._fb_sig_cache_cap = max(1, int(os.environ.get("FB_SIG_CACHE_CAP", "1")))
+        self._fb_sig_cache_cap = max(1, _env_int("FB_SIG_CACHE_CAP", 1))
         # Cross-epoch DISK cache for the decoded fullband WINDOWS (the loss
         # TARGET). decode_lma_signal re-decodes the lossless recording every
         # epoch — the residual dataload bottleneck after the L3 input cache
@@ -578,7 +590,7 @@ class LmaTypedL3Dataset:
                 # Each in-flight prefetched batch pins host buffers + forces the
                 # worker to decode ahead; 4 was the per-worker RSS multiplier.
                 # Default 2 (one batch of GPU/decode overlap) — env-tunable.
-                prefetch_factor=max(1, int(os.environ.get("LMA_PREFETCH_FACTOR", "2"))),
+                prefetch_factor=max(1, _env_int("LMA_PREFETCH_FACTOR", 2)),
                 persistent_workers=False,
             )
             for rows in loader:
