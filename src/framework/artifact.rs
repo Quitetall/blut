@@ -326,6 +326,50 @@ pub trait Artifact: Send + Sync + serde::Serialize + serde::de::DeserializeOwned
     /// location (job dir or content-addressed cache); never a
     /// tmpfile that might disappear.
     fn primary_path(&self) -> &Path;
+
+    /// Encode to the erased wire form for transit across the `StageDyn`
+    /// boundary (and as a merge-tuple member). Default: bincode-of-self
+    /// tagged with `KIND`/`SCHEMA`. The tuple impls override this to a
+    /// per-child envelope so each member is independently validated on
+    /// decode.
+    fn encode_erased(
+        &self,
+    ) -> Result<crate::framework::stage::ErasedArtifact, crate::framework::stage::ErasedEncodeError>
+    {
+        use crate::framework::stage::{ErasedArtifact, ErasedEncodeError};
+        Ok(ErasedArtifact {
+            kind: Self::KIND.to_string(),
+            schema: Self::SCHEMA,
+            payload: bincode::serialize(self).map_err(ErasedEncodeError::Serialize)?,
+        })
+    }
+
+    /// Decode from the erased wire form, validating kind + schema.
+    /// Default: bincode-of-self. The tuple impls override to unpack the
+    /// per-child envelope and recursively decode each member — so a
+    /// wrong child kind surfaces the ACTUAL child kind, not an opaque
+    /// bincode error blamed on the merge stage.
+    fn decode_erased(
+        e: crate::framework::stage::ErasedArtifact,
+    ) -> Result<Self, crate::framework::stage::ErasedDecodeError>
+    where
+        Self: Sized,
+    {
+        use crate::framework::stage::ErasedDecodeError;
+        if e.kind != Self::KIND {
+            return Err(ErasedDecodeError::Kind {
+                expected: Self::KIND,
+                got: e.kind,
+            });
+        }
+        if e.schema != Self::SCHEMA {
+            return Err(ErasedDecodeError::Schema {
+                expected: Self::SCHEMA,
+                got: e.schema,
+            });
+        }
+        bincode::deserialize(&e.payload).map_err(ErasedDecodeError::Deserialize)
+    }
 }
 
 /// Sidecar metadata.json next to every materialized artifact.
@@ -492,7 +536,7 @@ const TUPLE_DOMAIN: &[u8] = b"tuple";
 
 impl<A: Artifact, B: Artifact> Artifact for (A, B) {
     const KIND: &'static str = "tuple<2>";
-    const SCHEMA: u32 = 1;
+    const SCHEMA: u32 = crate::framework::stage::TUPLE_ENVELOPE_SCHEMA;
 
     fn content_hash(&self) -> ContentHash {
         let mut hasher = Sha256::new();
@@ -509,11 +553,35 @@ impl<A: Artifact, B: Artifact> Artifact for (A, B) {
         // address members individually via destructuring.
         self.0.primary_path()
     }
+
+    fn encode_erased(
+        &self,
+    ) -> Result<crate::framework::stage::ErasedArtifact, crate::framework::stage::ErasedEncodeError>
+    {
+        use crate::framework::stage::{ErasedArtifact, ErasedEncodeError};
+        let children = vec![self.0.encode_erased()?, self.1.encode_erased()?];
+        Ok(ErasedArtifact {
+            kind: Self::KIND.to_string(),
+            schema: Self::SCHEMA,
+            payload: bincode::serialize(&children).map_err(ErasedEncodeError::Serialize)?,
+        })
+    }
+
+    fn decode_erased(
+        e: crate::framework::stage::ErasedArtifact,
+    ) -> Result<Self, crate::framework::stage::ErasedDecodeError> {
+        decode_tuple_children::<2>(e, Self::KIND, Self::SCHEMA).and_then(|mut c| {
+            // SAFETY: decode_tuple_children::<2> guarantees exactly 2 children.
+            let b = B::decode_erased(c.pop().unwrap())?;
+            let a = A::decode_erased(c.pop().unwrap())?;
+            Ok((a, b))
+        })
+    }
 }
 
 impl<A: Artifact, B: Artifact, C: Artifact> Artifact for (A, B, C) {
     const KIND: &'static str = "tuple<3>";
-    const SCHEMA: u32 = 1;
+    const SCHEMA: u32 = crate::framework::stage::TUPLE_ENVELOPE_SCHEMA;
 
     fn content_hash(&self) -> ContentHash {
         let mut hasher = Sha256::new();
@@ -529,6 +597,67 @@ impl<A: Artifact, B: Artifact, C: Artifact> Artifact for (A, B, C) {
     fn primary_path(&self) -> &Path {
         self.0.primary_path()
     }
+
+    fn encode_erased(
+        &self,
+    ) -> Result<crate::framework::stage::ErasedArtifact, crate::framework::stage::ErasedEncodeError>
+    {
+        use crate::framework::stage::{ErasedArtifact, ErasedEncodeError};
+        let children = vec![
+            self.0.encode_erased()?,
+            self.1.encode_erased()?,
+            self.2.encode_erased()?,
+        ];
+        Ok(ErasedArtifact {
+            kind: Self::KIND.to_string(),
+            schema: Self::SCHEMA,
+            payload: bincode::serialize(&children).map_err(ErasedEncodeError::Serialize)?,
+        })
+    }
+
+    fn decode_erased(
+        e: crate::framework::stage::ErasedArtifact,
+    ) -> Result<Self, crate::framework::stage::ErasedDecodeError> {
+        decode_tuple_children::<3>(e, Self::KIND, Self::SCHEMA).and_then(|mut c| {
+            // SAFETY: decode_tuple_children::<3> guarantees exactly 3 children.
+            let cc = C::decode_erased(c.pop().unwrap())?;
+            let b = B::decode_erased(c.pop().unwrap())?;
+            let a = A::decode_erased(c.pop().unwrap())?;
+            Ok((a, b, cc))
+        })
+    }
+}
+
+/// Validate a `tuple<N>` envelope's kind, schema, and arity, returning
+/// the `N` child `ErasedArtifact`s for per-member recursive decode.
+fn decode_tuple_children<const N: usize>(
+    e: crate::framework::stage::ErasedArtifact,
+    kind: &'static str,
+    schema: u32,
+) -> Result<Vec<crate::framework::stage::ErasedArtifact>, crate::framework::stage::ErasedDecodeError>
+{
+    use crate::framework::stage::ErasedDecodeError;
+    if e.kind != kind {
+        return Err(ErasedDecodeError::Kind {
+            expected: kind,
+            got: e.kind,
+        });
+    }
+    if e.schema != schema {
+        return Err(ErasedDecodeError::Schema {
+            expected: schema,
+            got: e.schema,
+        });
+    }
+    let children: Vec<crate::framework::stage::ErasedArtifact> =
+        bincode::deserialize(&e.payload).map_err(ErasedDecodeError::Deserialize)?;
+    if children.len() != N {
+        return Err(ErasedDecodeError::Arity {
+            expected: N,
+            got: children.len(),
+        });
+    }
+    Ok(children)
 }
 
 #[cfg(test)]
@@ -700,6 +829,86 @@ mod tests {
         fn primary_path(&self) -> &Path {
             &self.path
         }
+    }
+
+    /// A second artifact type with a DIFFERENT kind, for the
+    /// wrong-child-kind envelope test.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct OtherArt {
+        word: String,
+    }
+    impl Artifact for OtherArt {
+        const KIND: &'static str = "test.other";
+        const SCHEMA: u32 = 1;
+        fn content_hash(&self) -> ContentHash {
+            ContentHash::of_bytes(self.word.as_bytes())
+        }
+        fn primary_path(&self) -> &Path {
+            Path::new("/other")
+        }
+    }
+
+    #[test]
+    fn tuple_envelope_round_trips() {
+        use crate::framework::stage::TUPLE_ENVELOPE_SCHEMA;
+        let a = TestArt {
+            byte: 7,
+            path: PathBuf::from("/a"),
+        };
+        let b = OtherArt { word: "hi".into() };
+        let env = (a.clone(), b.clone()).encode_erased().unwrap();
+        assert_eq!(env.kind, "tuple<2>");
+        assert_eq!(env.schema, TUPLE_ENVELOPE_SCHEMA);
+        let (ra, rb): (TestArt, OtherArt) =
+            <(TestArt, OtherArt)>::decode_erased(env).unwrap();
+        assert_eq!(ra.byte, 7);
+        assert_eq!(rb.word, "hi");
+    }
+
+    #[test]
+    fn tuple_envelope_wrong_child_kind_names_actual_kind() {
+        use crate::framework::stage::{ErasedArtifact, ErasedDecodeError, TUPLE_ENVELOPE_SCHEMA};
+        // Build an envelope whose SECOND child is the wrong kind
+        // (OtherArt) where the consumer expects (TestArt, TestArt).
+        let good = ErasedArtifact::from_typed(&TestArt {
+            byte: 1,
+            path: PathBuf::from("/a"),
+        })
+        .unwrap();
+        let wrong = ErasedArtifact::from_typed(&OtherArt { word: "x".into() }).unwrap();
+        let children = vec![good, wrong];
+        let env = ErasedArtifact {
+            kind: "tuple<2>".into(),
+            schema: TUPLE_ENVELOPE_SCHEMA,
+            payload: bincode::serialize(&children).unwrap(),
+        };
+        match <(TestArt, TestArt)>::decode_erased(env) {
+            Err(ErasedDecodeError::Kind { expected, got }) => {
+                assert_eq!(expected, "test.art");
+                assert_eq!(got, "test.other", "must name the ACTUAL child kind");
+            }
+            other => panic!("expected a per-child Kind error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tuple_envelope_arity_mismatch_detected() {
+        use crate::framework::stage::{ErasedArtifact, ErasedDecodeError, TUPLE_ENVELOPE_SCHEMA};
+        // A 1-child envelope decoded as a 2-tuple → Arity error.
+        let one = vec![ErasedArtifact::from_typed(&TestArt {
+            byte: 1,
+            path: PathBuf::from("/a"),
+        })
+        .unwrap()];
+        let env = ErasedArtifact {
+            kind: "tuple<2>".into(),
+            schema: TUPLE_ENVELOPE_SCHEMA,
+            payload: bincode::serialize(&one).unwrap(),
+        };
+        assert!(matches!(
+            <(TestArt, TestArt)>::decode_erased(env),
+            Err(ErasedDecodeError::Arity { expected: 2, got: 1 })
+        ));
     }
 
     #[test]

@@ -426,30 +426,31 @@ fn gather_input(
             ))
         }),
         multi => {
-            // Merge: a `tuple<N>` ErasedArtifact. Payload is the
-            // concatenation of child bincode bytes in edge (fork-call)
-            // order. Bincode encodes a tuple `(A, B)` as
-            // `bincode(A) ++ bincode(B)` with no separator, so the
-            // concatenation is wire-equivalent to
-            // `bincode::serialize(&(a, b))` and the tuple-consuming
-            // stage's blanket `into_typed` decodes it correctly.
-            let mut payload: Vec<u8> = Vec::with_capacity(
-                multi
-                    .iter()
-                    .filter_map(|p| outputs.get(p).map(|a| a.payload.len()))
-                    .sum(),
-            );
+            // Merge: a `tuple<N>` envelope (B4). Payload is a
+            // length-prefixed `bincode(Vec<ErasedArtifact>)` of the
+            // children in edge (fork-call) order — each child keeps its
+            // own kind+schema, so the tuple-consuming stage's
+            // `decode_erased` validates every member recursively (a
+            // wrong child kind names the ACTUAL kind, not an opaque
+            // concat-decode error).
+            // Collect child references (no clone) — serde serializes
+            // `Vec<&ErasedArtifact>` byte-identically to `Vec<ErasedArtifact>`,
+            // which the consumer's `decode_erased` reads as owned.
+            let mut children: Vec<&ErasedArtifact> = Vec::with_capacity(multi.len());
             for &pid in multi {
                 let art = outputs.get(&pid).ok_or_else(|| {
                     PlanError::Other(format!(
                         "node {node_id} predecessor {pid} produced no output"
                     ))
                 })?;
-                payload.extend_from_slice(&art.payload);
+                children.push(art);
             }
+            let payload = bincode::serialize(&children).map_err(|e| {
+                PlanError::Other(format!("encode tuple<{}> input: {e}", multi.len()))
+            })?;
             Ok(ErasedArtifact {
                 kind: format!("tuple<{}>", multi.len()),
-                schema: 1,
+                schema: crate::framework::stage::TUPLE_ENVELOPE_SCHEMA,
                 payload,
             })
         }

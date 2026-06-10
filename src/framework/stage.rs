@@ -66,40 +66,28 @@ pub struct ErasedArtifact {
     pub payload: Vec<u8>,
 }
 
+/// Wire-format version of the `tuple<N>` merge envelope. Bumped from 1
+/// (the old bincode-concat form) to 2 (a length-prefixed
+/// `Vec<ErasedArtifact>` carrying each child's kind+schema, validated
+/// per-child on decode). The `(A, B)` / `(A, B, C)` `Artifact` impls use
+/// this as their `SCHEMA`, and the executor stamps the same value on the
+/// envelopes it builds — keep them equal.
+pub const TUPLE_ENVELOPE_SCHEMA: u32 = 2;
+
 impl ErasedArtifact {
     /// Wrap a concrete typed artifact for transit across the
-    /// `StageDyn` boundary. Cheap — a bincode encode on the
-    /// metadata-sized handle, not on the on-disk bytes.
+    /// `StageDyn` boundary. Delegates to [`Artifact::encode_erased`]
+    /// (default = bincode-of-self; tuples override to a per-child
+    /// envelope).
     pub fn from_typed<A: Artifact>(value: &A) -> Result<Self, ErasedEncodeError> {
-        let payload = bincode::serialize(value).map_err(ErasedEncodeError::Serialize)?;
-        Ok(Self {
-            kind: A::KIND.to_string(),
-            schema: A::SCHEMA,
-            payload,
-        })
+        value.encode_erased()
     }
 
-    /// Reverse: typed artifact out, with strong checks. The
-    /// caller (a `StageDyn::run_erased` impl) reports `KindMismatch`
-    /// if the kind tag doesn't match the expected `Input::KIND`.
+    /// Reverse: typed artifact out, with strong checks. Delegates to
+    /// [`Artifact::decode_erased`], which reports `Kind`/`Schema`
+    /// mismatches (and, for tuples, validates each child recursively).
     pub fn into_typed<A: Artifact>(self) -> Result<A, ErasedDecodeError> {
-        if self.kind != A::KIND {
-            return Err(ErasedDecodeError::Kind {
-                expected: A::KIND,
-                got: self.kind,
-            });
-        }
-        // Schema mismatch is downgraded to a deserialize error
-        // (returns `Schema`) — the producer's SCHEMA may legitimately
-        // exceed ours if a newer producer is paired with an older
-        // consumer. Cache invalidation handles the common case.
-        if self.schema != A::SCHEMA {
-            return Err(ErasedDecodeError::Schema {
-                expected: A::SCHEMA,
-                got: self.schema,
-            });
-        }
-        bincode::deserialize(&self.payload).map_err(ErasedDecodeError::Deserialize)
+        A::decode_erased(self)
     }
 }
 
@@ -115,6 +103,8 @@ pub enum ErasedDecodeError {
     Kind { expected: &'static str, got: String },
     #[error("schema mismatch: expected v{expected}, got v{got}")]
     Schema { expected: u32, got: u32 },
+    #[error("tuple arity mismatch: expected {expected} children, got {got}")]
+    Arity { expected: usize, got: usize },
     #[error("bincode deserialize: {0}")]
     Deserialize(#[source] Box<bincode::ErrorKind>),
 }
@@ -386,6 +376,10 @@ impl<S: Stage> StageDyn for S {
             },
             ErasedDecodeError::Schema { expected, got } => StageError::BadInput(format!(
                 "input schema for stage '{}' expected v{expected}, got v{got}",
+                S::NAME
+            )),
+            ErasedDecodeError::Arity { expected, got } => StageError::BadInput(format!(
+                "merge input for stage '{}' expected {expected} tuple children, got {got}",
                 S::NAME
             )),
             ErasedDecodeError::Deserialize(source) => StageError::InputDeserialize {
