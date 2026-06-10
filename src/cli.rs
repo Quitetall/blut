@@ -682,50 +682,22 @@ fn dir_size_bytes(path: &std::path::Path) -> Result<u64> {
 ///   * `tier` — `tier` JSON field or 3 (matches the joint recipe default).
 ///   * `latent` — `--encoder-width N` in `extra_args` (folded into the
 ///     estimate, NOT the key).
-fn recipe_footprint_drivers(raw: &serde_json::Value) -> (u32, u32, u32, u32) {
-    let u32_or = |key: &str, default: u32| -> u32 {
-        raw.get(key)
-            .and_then(|v| v.as_u64())
-            .map(|n| u32::try_from(n).unwrap_or(u32::MAX)) // saturate, never wrap-to-0 (would under-bill)
-            .unwrap_or(default)
-    };
-    // Default 2 (matches the stage's UNCALIBRATED_WORKER_CAP for key parity);
-    // a recipe MAY request up to 4 explicitly. The RESOLVE-side default here
-    // and the RECORD-side cap MUST stay equal or the calibration key never hits.
-    let workers = u32_or("workers", 2).clamp(1, 4);
-    let batch = u32_or("batch_size", crate::broker::footprint::DEFAULT_BATCH);
-    let tier = u32_or("tier", 3);
-    let latent = raw
-        .get("extra_args")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| {
-            arr.iter()
-                .position(|x| x.as_str() == Some("--encoder-width"))
-                .and_then(|i| arr.get(i + 1))
-                .and_then(|x| x.as_str())
-                .and_then(|s| s.parse::<u32>().ok())
-        })
-        .unwrap_or(0);
-    (workers, batch, tier, latent)
-}
-
 fn recipe_footprint(name: &str, raw: &serde_json::Value) -> crate::broker::Footprint {
-    // Conservative defaults shared with the train stage so admission's
-    // `need` and the stage's `cap = need + 2G` are computed from the
-    // SAME inputs: cap workers at 4 (the train stage's uncalibrated
-    // cap), batch = broker DEFAULT_BATCH, tier 3, latent 256.
-    let (workers, batch, tier, latent) = recipe_footprint_drivers(raw);
+    // THE single shared extraction (RESOLVE side). `Drivers::from_args_json`
+    // clamps workers to `UNCALIBRATED_WORKER_CAP` and resolves batch/tier the
+    // same way the train stage's `train_containment` does (RECORD side), so
+    // the calibration key built below is byte-identical to the one the stage
+    // records under — the prior copy here clamped `1..=4` while the stage
+    // capped at 2, so an explicit `workers:4` config never calibrated.
+    let drivers = crate::broker::Drivers::from_args_json(raw);
     // The conservative-high estimate (over-refuses) — the fallback when
     // no calibration exists for this key.
-    let hint = crate::broker::footprint::estimate(workers, batch, tier, latent);
+    let hint = drivers.estimate();
     // ADR 0046 slice-2: if a MEASURED peak exists for this exact
     // (recipe,tier,batch,workers) key, resolve admits at the real
-    // footprint (~20G) instead of the conservative hint (~35G). The key
-    // here MUST be byte-identical to the one the train stage RECORDS
-    // under — both go through `broker::footprint_key(name, workers,
-    // batch, tier)` with the SAME workers/batch/tier extraction. A miss
+    // footprint (~20G) instead of the conservative hint (~35G). A miss
     // is benign: `resolve` returns the hint, so admission stays safe.
-    let key = crate::broker::footprint_key(name, workers, batch, tier);
+    let key = drivers.key(name);
     crate::broker::FootprintStore::load().resolve(&key, hint)
 }
 
@@ -1725,14 +1697,13 @@ mod footprint_resolve_tests {
     #[test]
     fn joint_codec_default_drivers() {
         let raw = serde_json::json!({});
-        let (workers, batch, tier, latent) = recipe_footprint_drivers(&raw);
-        assert_eq!(workers, 2, "uncalibrated worker cap (robustness default)");
-        assert_eq!(batch, crate::broker::footprint::DEFAULT_BATCH);
-        assert_eq!(tier, 3, "joint recipe default tier");
-        assert_eq!(latent, 0, "no --encoder-width ⇒ default latent");
+        let d = crate::broker::Drivers::from_args_json(&raw);
+        assert_eq!(d.workers, 2, "uncalibrated worker cap (robustness default)");
+        assert_eq!(d.batch, crate::broker::footprint::DEFAULT_BATCH);
+        assert_eq!(d.tier, 3, "joint recipe default tier");
+        assert_eq!(d.latent, 0, "no --encoder-width ⇒ default latent");
         // The exact key the cli RESOLVES under for the joint default run.
-        let key = crate::broker::footprint_key("lamquant_joint_codec", workers, batch, tier);
-        assert_eq!(key.flat(), "lamquant_joint_codec|3|32|2");
+        assert_eq!(d.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|3|32|2");
     }
 
     /// Explicit tier/batch flow through to the key (so a tier-6 fullband
@@ -1740,9 +1711,20 @@ mod footprint_resolve_tests {
     #[test]
     fn explicit_tier_batch_flow_to_key() {
         let raw = serde_json::json!({ "tier": 6, "batch_size": 16 });
-        let (workers, batch, tier, _latent) = recipe_footprint_drivers(&raw);
-        assert_eq!((workers, batch, tier), (2, 16, 6));
-        let key = crate::broker::footprint_key("lamquant_joint_codec", workers, batch, tier);
-        assert_eq!(key.flat(), "lamquant_joint_codec|6|16|2");
+        let d = crate::broker::Drivers::from_args_json(&raw);
+        assert_eq!((d.workers, d.batch, d.tier), (2, 16, 6));
+        assert_eq!(d.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|6|16|2");
+    }
+
+    /// THE parity-bug regression: an explicit `workers:4` must clamp to the
+    /// cap (2) on the RESOLVE side, so it keys identically to the RECORD
+    /// side (which always launches `UNCALIBRATED_WORKER_CAP`). Before the
+    /// fix the cli clamped `1..=4` → keyed under workers=4, a permanent miss.
+    #[test]
+    fn explicit_workers_clamps_to_cap_for_key_parity() {
+        let raw = serde_json::json!({ "workers": 4, "tier": 3, "batch_size": 32 });
+        let d = crate::broker::Drivers::from_args_json(&raw);
+        assert_eq!(d.workers, crate::broker::UNCALIBRATED_WORKER_CAP);
+        assert_eq!(d.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|3|32|2");
     }
 }

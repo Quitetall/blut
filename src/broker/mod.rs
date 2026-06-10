@@ -44,7 +44,7 @@ pub mod probe;
 
 pub use admission::{AdmitDecision, decide};
 pub use footprint::{
-    Footprint, FootprintEntry, FootprintKey, FootprintSource, FootprintStore, GIB,
-    estimate_ram_bytes, footprint_key,
+    Drivers, Footprint, FootprintEntry, FootprintKey, FootprintSource, FootprintStore, GIB,
+    UNCALIBRATED_WORKER_CAP, estimate_ram_bytes, footprint_key,
 };
 pub use probe::ResourceSnapshot;

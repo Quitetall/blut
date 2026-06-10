@@ -32,6 +32,102 @@ pub const GIB: u64 = 1024 * 1024 * 1024;
 /// under-sized for an unspecified batch.
 pub const DEFAULT_BATCH: u32 = 32;
 
+/// Conservative DataLoader worker cap for a train-shaped stage (ADR 0046
+/// slice-1 item 5). Each fork-worker is a CoW copy of the ~6 GiB parent
+/// plus decode buffers + per-worker L3/FB LRU, so RAM scales ~linearly
+/// with workers. MEASURED (2026-06-10): workers=4 peaked ~23 GiB RSS +
+/// ~9 GiB swap under a 25 GiB cap and OOM-killed under added pressure.
+/// Cap at **2**: ~20 GiB real demand, under the cap with headroom.
+///
+/// THE cross-crate contract: the cli admission gate (RESOLVE) clamps its
+/// `workers` driver to `1..=UNCALIBRATED_WORKER_CAP` and the cookbook
+/// train stage (RECORD) launches exactly this many — if the two ever
+/// disagreed, the calibration key would never hit and the broker would
+/// over-refuse forever. Lives here (the shared crate) so neither side
+/// can drift from it (the prior copy lived in the cookbook and the cli
+/// hard-coded a different `1..=4` clamp — a live parity bug).
+pub const UNCALIBRATED_WORKER_CAP: u32 = 2;
+
+/// The footprint cost drivers for a train-shaped recipe/stage, plus THE
+/// single extraction from a recipe's args JSON. Both the cli admission
+/// gate (RESOLVE) and the cookbook train stage (RECORD) build their
+/// calibration key from this so the keys are byte-identical.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Drivers {
+    /// DataLoader workers (the dominant RAM term), clamped
+    /// `1..=UNCALIBRATED_WORKER_CAP`.
+    pub workers: u32,
+    /// Live mini-batch size (resolved default applied).
+    pub batch: u32,
+    /// Decoder tier (1..=8); larger ⇒ more model/optimizer RAM.
+    pub tier: u32,
+    /// Encoder latent width (0 ⇒ billed as the 256-wide default).
+    /// Folded into the estimate, NOT the calibration key.
+    pub latent: u32,
+}
+
+impl Drivers {
+    /// Extract the cost drivers from a recipe's args JSON. Workers
+    /// defaults to and is clamped by [`UNCALIBRATED_WORKER_CAP`] (the
+    /// value the train stage actually launches), `batch` to
+    /// [`DEFAULT_BATCH`], `tier` to 3 (the joint-recipe default), and
+    /// `latent` is parsed from a `--encoder-width N` token in
+    /// `extra_args` (0 = unspecified).
+    pub fn from_args_json(raw: &serde_json::Value) -> Self {
+        let u32_or = |key: &str, default: u32| -> u32 {
+            raw.get(key)
+                .and_then(|v| v.as_u64())
+                // saturate, never wrap-to-0 (would under-bill)
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+                .unwrap_or(default)
+        };
+        let workers = u32_or("workers", UNCALIBRATED_WORKER_CAP).clamp(1, UNCALIBRATED_WORKER_CAP);
+        let batch = u32_or("batch_size", DEFAULT_BATCH);
+        let tier = u32_or("tier", 3);
+        let latent = raw
+            .get("extra_args")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .position(|x| x.as_str() == Some("--encoder-width"))
+                    .and_then(|i| arr.get(i + 1))
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| s.parse::<u32>().ok())
+            })
+            .unwrap_or(0);
+        Self {
+            workers,
+            batch,
+            tier,
+            latent,
+        }
+    }
+
+    /// Build directly from the resolved drivers a train stage launches
+    /// with (RECORD side). Clamps `workers` to the cap so a stage that
+    /// passes a raw count still keys identically to the cli.
+    pub fn new(workers: u32, batch: u32, tier: u32, latent: u32) -> Self {
+        Self {
+            workers: workers.clamp(1, UNCALIBRATED_WORKER_CAP),
+            batch,
+            tier,
+            latent,
+        }
+    }
+
+    /// The conservative-high RAM/VRAM estimate for these drivers.
+    pub fn estimate(&self) -> Footprint {
+        estimate(self.workers, self.batch, self.tier, self.latent)
+    }
+
+    /// The calibration key for these drivers under `recipe`. Latent is
+    /// folded into the estimate, not the key (it rarely varies and would
+    /// fragment the calibration).
+    pub fn key(&self, recipe: &str) -> FootprintKey {
+        footprint_key(recipe, self.workers, self.batch, self.tier)
+    }
+}
+
 /// Per-DataLoader-worker LMA prefetch RAM (CoW fork + decode buffers +
 /// per-worker L3/FB LRU).
 ///
