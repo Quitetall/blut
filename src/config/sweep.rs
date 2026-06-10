@@ -57,7 +57,7 @@ pub fn expand(
         let fingerprint = config.fingerprint;
         entries.push(SweepEntry {
             overrides: merged,
-            cache_skip: cache_skip_stub(fingerprint),
+            cache_skip: cache_skip(fingerprint),
             fingerprint,
             config,
         });
@@ -65,14 +65,18 @@ pub fn expand(
     Ok(entries)
 }
 
-/// STUB — always re-runs (returns false).
+/// Whether this combo's output is already complete + still on disk, per the
+/// global sweep-completion index (see [`crate::config::sweep_index`]). Returns
+/// `false` (re-run) when the fingerprint was never recorded OR its recorded
+/// output sidecar is gone / content-mismatched.
 ///
-/// The real implementation checks `framework::cache::CacheHandle::lookup(fp)`
-/// against the global train-cache. Wiring the skip into the run loop is OUT OF
-/// LANE (the `framework::executor` + `jobs.rs` seam); nobody should assume the
-/// sweep engine is hooked into execution yet.
-pub fn cache_skip_stub(_fp: ContentHash) -> bool {
-    false
+/// Wiring the SKIP into a run loop is still OUT OF LANE (the sweep engine is
+/// not hooked into `framework::executor` / `jobs.rs`), and the index is only
+/// populated once a sweep runner calls `sweep_index::record_completion` on
+/// Done — until then this is always `false`, same observable behavior as the
+/// old stub, but now backed by a real, tested index.
+pub fn cache_skip(fp: ContentHash) -> bool {
+    crate::config::sweep_index::is_complete(fp)
 }
 
 #[cfg(test)]
@@ -120,7 +124,10 @@ mod tests {
     }
 
     #[test]
-    fn cache_skip_stub_false() {
-        assert!(!cache_skip_stub(ContentHash([7u8; 32])));
+    fn cache_skip_false_for_unrecorded_fingerprint() {
+        // A fresh random fingerprint is never in the global index → re-run.
+        // (Full skip semantics — record + sidecar liveness — are covered in
+        // `sweep_index::tests`.)
+        assert!(!cache_skip(ContentHash([0x5a; 32])));
     }
 }

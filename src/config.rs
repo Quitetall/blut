@@ -9,6 +9,7 @@ use crate::error::{Result, TrainError};
 
 pub mod launcher;
 pub mod sweep;
+pub mod sweep_index;
 
 // Explicit imports ONLY — never `use lerna::*`: lerna re-exports its own
 // `Launcher`/`BasicLauncher` at crate root, which would collide with the
