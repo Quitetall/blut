@@ -21,8 +21,9 @@ pub trait Recipe: Send + Sync + 'static {
     const NAME: &'static str;
     const DESCRIPTION: &'static str;
     /// Cockpit menu bucket (`blut recipe list --category`, TUI sections).
-    /// Defaulted so the trait extension stays additive; every shipped
-    /// recipe overrides it via [`register_recipe!`].
+    /// Defaulted so the trait extension stays additive; every shipped recipe
+    /// overrides it in its `impl Recipe` ([`register_recipe!`] just copies it
+    /// into the `RecipeDef`).
     const CATEGORY: RecipeCategory = RecipeCategory::User;
     /// Artifact `Kind` IDs the first stage consumes. Default none
     /// (graph-input recipe, `Input = ()`).
@@ -51,13 +52,20 @@ pub trait Recipe: Send + Sync + 'static {
 pub fn schema_of<A: schemars::JsonSchema>() -> serde_json::Value {
     let mut g = schemars::r#gen::SchemaGenerator::default();
     let root = g.subschema_for::<A>();
-    let mut v =
-        serde_json::to_value(root).expect("schemars-derived JsonSchema must serialize cleanly");
+    let mut v = serde_json::to_value(root).unwrap_or_else(|e| {
+        panic!("schema for {} must serialize: {e}", std::any::type_name::<A>())
+    });
+    // A `#[derive(JsonSchema)]` struct/enum is *referenceable*, so
+    // `subschema_for::<A>()` always parks A's own schema in the generator under
+    // its name and returns `{"$ref":"#/definitions/<A>"}`. Attach the collected
+    // definitions so that `$ref` resolves (the bug the hand-DEFs left dangling).
+    // `expect`, not swallow — dropping defs here would re-create the dangling ref.
     let defs = g.take_definitions();
-    if let (serde_json::Value::Object(map), Ok(defs_val)) =
-        (&mut v, serde_json::to_value(&defs))
-    {
-        if !defs.is_empty() {
+    if !defs.is_empty() {
+        let defs_val = serde_json::to_value(&defs).unwrap_or_else(|e| {
+            panic!("definitions for {} must serialize: {e}", std::any::type_name::<A>())
+        });
+        if let serde_json::Value::Object(map) = &mut v {
             map.insert("definitions".to_string(), defs_val);
         }
     }
@@ -91,6 +99,10 @@ pub fn compile_erased<R: Recipe + Default>(
 ///
 /// `$crate` keeps every path resolved against `blut` regardless of the
 /// invoking cookbook crate.
+///
+/// One recipe per module: the macro emits an unnamespaced `pub static DEF`, so
+/// a second invocation in the same module is a duplicate-symbol error. This
+/// matches the cookbook layout (one recipe file = one `DEF`).
 #[macro_export]
 macro_rules! register_recipe {
     ($ty:ty) => {
@@ -251,6 +263,31 @@ mod tests {
             .and_then(|p| p.as_object())
             .expect("schema must carry definitions/Args/properties");
         assert!(props.contains_key("lr") && props.contains_key("epochs"));
+    }
+
+    #[test]
+    fn schema_of_attaches_definitions_even_for_primitive_only_struct() {
+        // Refutes the "flat struct → no definitions → dangling $ref" concern:
+        // a `#[derive(JsonSchema)]` struct is itself referenceable, so it lands
+        // in definitions regardless of whether its FIELDS are primitives.
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Flat {
+            name: String,
+            enabled: bool,
+            count: i32,
+        }
+        let schema = schema_of::<Flat>();
+        let defs = schema
+            .get("definitions")
+            .and_then(|d| d.as_object())
+            .expect("definitions must be attached for a referenceable struct");
+        let flat = defs
+            .get("Flat")
+            .and_then(|a| a.get("properties"))
+            .and_then(|p| p.as_object())
+            .expect("definitions/Flat/properties must resolve the $ref");
+        assert!(flat.contains_key("name") && flat.contains_key("enabled"));
     }
 
     #[test]
