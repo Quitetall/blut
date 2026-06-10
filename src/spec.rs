@@ -269,7 +269,7 @@ impl TrainSpec {
         if let Some(beta) = self.dpo_beta {
             if !(beta > 0.0 && beta.is_finite()) {
                 return Err(TrainError::invalid_spec(format!(
-                    "dpo_beta must be positive finite; got {beta}"
+                    "dpo_beta must be a positive (non-zero), finite number; got {beta}"
                 )));
             }
         }

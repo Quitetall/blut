@@ -389,16 +389,19 @@ impl FootprintStore {
         let body = serde_json::to_string_pretty(&self.entries)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let tmp = self.path.with_extension("json.tmp");
-        {
+        // Write+sync+rename in one fallible step; clean up the tmp on ANY
+        // failure (now that sync_all propagates, a sync error must not leave
+        // an orphaned .json.tmp behind, same as a rename error).
+        let result = (|| -> std::io::Result<()> {
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(body.as_bytes())?;
             f.sync_all()?;
-        }
-        if let Err(e) = std::fs::rename(&tmp, &self.path) {
+            std::fs::rename(&tmp, &self.path)
+        })();
+        if result.is_err() {
             let _ = std::fs::remove_file(&tmp);
-            return Err(e);
         }
-        Ok(())
+        result
     }
 }
 
