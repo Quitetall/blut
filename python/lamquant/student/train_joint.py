@@ -697,6 +697,30 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     # deprecated PrecomputedL3Dataset path otherwise so existing
     # experiments stay reproducible.
     if lma_root is not None and split_manifest is not None:
+        # MANDATORY + STANDARDIZED decode caches (no skip, no misconfig). The
+        # LMA-direct path re-decodes the lossless recording every epoch — which
+        # starves the GPU (dataload-bound, ~0% util) AND grows RAM unboundedly
+        # as the in-RAM L3 cache fills (OOM at epoch 2). The canonical resolver
+        # FORCES L3_CACHE_DIR / FB_CACHE_DIR / MEMMAP_DIR from a SINGLE data root
+        # (LAMQUANT_DATA_ROOT or the canonical default) into fixed, auto-created,
+        # mutually-consistent subpaths — there is no scenario where they
+        # disagree, point off-root, or are unset (owner directive 2026-06-10).
+        # Set before the DataLoader forks so workers inherit the dirs.
+        #   L3_CACHE_DIR  — per-stem L3 stack [n,21,313] (wrapped LmaDataset).
+        #   FB_CACHE_DIR  — per-WINDOW fullband [21,2500] fp16 (the adapter);
+        #                   ~46 GB full-manifest, a few GB per A/B (window-level,
+        #                   NOT whole-recording — see lma_typed_adapter).
+        from lamquant.common.cache_paths import apply_env as _apply_cache_env
+        _cache = _apply_cache_env()
+        try:
+            _nw = int(os.environ.get('LMA_NUM_WORKERS', '0'))
+        except ValueError:
+            _nw = 0
+        if _nw < 1:
+            os.environ['LMA_NUM_WORKERS'] = '4'
+        print(f"[*] MANDATORY caches @ data_root={_cache.data_root}: "
+              f"L3={_cache.l3_cache_dir} FB={_cache.fb_cache_dir} "
+              f"MEMMAP={_cache.memmap_dir} LMA_NUM_WORKERS={os.environ['LMA_NUM_WORKERS']}")
         # Neural-side typed-batch adapter (NOT the canonical codec
         # LmaL3Dataset, which is a bare map-style Dataset lacking the
         # streaming surface — calibrate_shard_budget / prefetch_typed_batches

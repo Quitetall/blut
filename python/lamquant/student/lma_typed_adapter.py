@@ -316,15 +316,25 @@ class LmaTypedL3Dataset:
         from collections import OrderedDict as _OrderedDict
         self._fb_sig_cache: "_OrderedDict" = _OrderedDict()
         self._fb_sig_cache_cap = 3
-        # Cross-epoch DISK cache for the decoded fullband signal (the loss
+        # Cross-epoch DISK cache for the decoded fullband WINDOWS (the loss
         # TARGET). decode_lma_signal re-decodes the lossless recording every
         # epoch — the residual dataload bottleneck after the L3 input cache
-        # (E1 2026-06-04: GPU ~10% even with L3 cached). Persisting it makes
-        # epochs 2+ a mmap slice instead of a full decode. Enabled by
-        # FB_CACHE_DIR; fp16 (FB_CACHE_DTYPE) halves disk. The disk-fill guard
-        # is a statvfs FREE-SPACE check, NOT a per-process byte counter — each
-        # DataLoader fork-worker would reset such a counter to 0, so N workers
-        # x budget could fill a near-full disk; free-space is shared truth.
+        # (E1 2026-06-04: GPU ~10% even with L3 cached). Persisting makes
+        # epochs 2+ a mmap window-load instead of a full decode.
+        #
+        # WINDOW-level, NOT whole-signal: a recording is multi-hour but the
+        # trainer uses only `max_windows_per_file` (≤6) scattered windows of
+        # it — caching the whole [21,T] signal stored ~100x more than used
+        # (~600 GB for the 73k-stem manifest). Caching just the used [21,2500]
+        # windows is ~46 GB full-manifest / a few GB for an A/B subset, and
+        # epochs 2+ never re-decode the parent recording (so the in-RAM
+        # signal LRU stays empty after epoch 1 → bounded RAM, the OOM fix).
+        #
+        # Enabled by FB_CACHE_DIR; fp16 (FB_CACHE_DTYPE) halves disk. The
+        # disk-fill guard is a statvfs FREE-SPACE check, NOT a per-process
+        # byte counter — each DataLoader fork-worker would reset such a
+        # counter to 0, so N workers x budget could fill a near-full disk;
+        # free-space is shared truth.
         _fbd = os.environ.get("FB_CACHE_DIR", "").strip()
         self._fb_disk_dir = _fbd or None
         self._fb_disk_dtype = np.float16 if os.environ.get(
@@ -332,49 +342,48 @@ class LmaTypedL3Dataset:
         self._fb_min_free = int(float(os.environ.get("FB_CACHE_MIN_FREE_GB", "40")) * 1e9)
         self._stem_groups = None   # lazily built grouped index (sampler)
 
-    def _fb_disk_path(self, stem: str, lma_path, lml) -> "Optional[str]":
-        """Disk-cache path keyed on the FULL in-mem identity (lma_path, stem,
-        lml). Hashing lma_path+lml into the filename matches the in-memory key's
-        specificity: stem-only would cross-contaminate two corpora sharing a
-        stem, and lma_path-only would miss the (rare) case of one (lma,stem)
-        resolving to a different lml entry."""
+    def _fb_win_path(self, stem: str, lma_path, lml, win_idx: int) -> "Optional[str]":
+        """Disk-cache path for ONE decoded fullband window, keyed on the FULL
+        in-mem identity (lma_path, stem, lml) PLUS win_idx. Hashing lma_path+lml
+        matches the in-memory key's specificity (stem-only would cross-contaminate
+        two corpora sharing a stem); win_idx in the name caches only the windows
+        the trainer actually fetches, not the whole multi-hour recording."""
         if self._fb_disk_dir is None:
             return None
         import hashlib
         h = hashlib.sha1(f"{lma_path}\x00{lml}".encode()).hexdigest()[:10]
-        return os.path.join(self._fb_disk_dir, f"{h}_{stem}__fb.npy")
+        return os.path.join(self._fb_disk_dir, f"{h}_{stem}_w{int(win_idx)}__fbw.npy")
 
-    def _fb_disk_load(self, stem: str, lma_path, lml):
-        """mmap the disk-cached decoded fullband signal, or None on miss / no
-        cache dir / load error (caller then decodes + saves)."""
-        p = self._fb_disk_path(stem, lma_path, lml)
-        if p and os.path.exists(p):
+    def _fb_win_load(self, wpath: "Optional[str]"):
+        """mmap one disk-cached [21,2500] fullband window, or None on miss / no
+        cache dir / load error (caller then decodes the parent + saves)."""
+        if wpath and os.path.exists(wpath):
             try:
-                return np.load(p, mmap_mode="r")
+                return np.load(wpath, mmap_mode="r")
             except Exception:
                 return None
         return None
 
-    def _fb_disk_save(self, stem: str, lma_path, lml, signal) -> None:
-        """Persist a decoded fullband signal (best-effort, atomic, disk-safe).
-        Never raises — the cache is an optimization, not a correctness path.
+    def _fb_win_save(self, wpath: "Optional[str]", window) -> None:
+        """Persist ONE decoded [21,2500] fullband window (best-effort, atomic,
+        disk-safe). Never raises — the cache is an optimization, not a
+        correctness path.
 
         HARD disk-fill guard via statvfs free-space (fork-worker-proof, unlike a
         per-process byte counter): stop writing when free < FB_CACHE_MIN_FREE_GB."""
-        p = self._fb_disk_path(stem, lma_path, lml)
-        if p is None or signal is None:
+        if wpath is None or window is None:
             return
         try:
             os.makedirs(self._fb_disk_dir, exist_ok=True)
             st = os.statvfs(self._fb_disk_dir)
             if st.f_bavail * st.f_frsize < self._fb_min_free:
                 return  # hard guard: too little free disk -> stop caching
-            if os.path.exists(p):
+            if os.path.exists(wpath):
                 return
-            arr = np.asarray(signal, dtype=self._fb_disk_dtype)
-            tmp = f"{p}.{os.getpid()}.tmp.npy"   # pid-unique tmp (no fork-worker collision)
+            arr = np.asarray(window, dtype=self._fb_disk_dtype)
+            tmp = f"{wpath}.{os.getpid()}.tmp.npy"   # pid-unique tmp (no fork-worker collision)
             np.save(tmp, arr)
-            os.replace(tmp, p)
+            os.replace(tmp, wpath)
         except Exception:
             pass
 
@@ -433,22 +442,36 @@ class LmaTypedL3Dataset:
             return l3, None
 
         lma_path, stem, win_idx, _lml, _lbl = self._base.index[base_idx]
-        # Per-(lma,stem) LRU: decode_lma_signal decodes the WHOLE recording, so
-        # without caching every window re-decoded its (often multi-hour) parent
-        # -> 7+ h/epoch on TUEG. Stem-grouped sampling delivers a stem's windows
-        # consecutively, so this tiny cache collapses them into one decode.
+
+        # Cross-epoch WINDOW disk tier FIRST: if this exact [21,2500] window is
+        # already on disk, mmap-load it and skip the parent-recording decode
+        # entirely. After epoch 1 every used window is cached, so the in-RAM
+        # signal LRU below stays EMPTY in epochs 2+ → RAM stays bounded (the
+        # OOM fix) and the multi-hour recording is never re-decoded.
+        wpath = self._fb_win_path(stem, lma_path, _lml, win_idx)
+        cached_win = self._fb_win_load(wpath)
+        if cached_win is not None:
+            window = np.asarray(cached_win, dtype=np.float32)
+            if window.shape != (TARGET_CHANNELS, WINDOW_SAMPLES):
+                fb = torch.zeros(TARGET_CHANNELS, WINDOW_SAMPLES, dtype=torch.float32)
+                fb[:, :window.shape[1]] = torch.from_numpy(
+                    np.ascontiguousarray(window[:, :WINDOW_SAMPLES]))
+                return l3, fb
+            return l3, torch.from_numpy(np.ascontiguousarray(window))
+
+        # Miss: decode the WHOLE recording once (in-RAM LRU cap 3 amortises the
+        # other windows of this stem WITHIN epoch 1 — stem-grouped sampling
+        # delivers them consecutively), slice this window, then persist JUST the
+        # window (not the whole signal — ~100x less disk).
         cache_key = (str(lma_path), stem, _lml)
         signal = self._fb_sig_cache.get(cache_key, _CACHE_MISS)
         if signal is _CACHE_MISS:
-            signal = self._fb_disk_load(stem, lma_path, _lml)   # cross-epoch disk tier (mmap)
-            if signal is None:
-                from lamquant_codec.training import decode_lma_signal
-                # Propagate the resolved internal entry (e.g. 'S001/S001R01.edf'
-                # for `lml archive` corpora). Without it decode_lma_signal
-                # defaults to the legacy '<stem>.lml' name, absent in per-corpus
-                # archives -> signal None -> fullband_target None.
-                signal = decode_lma_signal(str(lma_path), stem, lml_entry_name=_lml)
-                self._fb_disk_save(stem, lma_path, _lml, signal)   # persist for next epoch
+            from lamquant_codec.training import decode_lma_signal
+            # Propagate the resolved internal entry (e.g. 'S001/S001R01.edf'
+            # for `lml archive` corpora). Without it decode_lma_signal
+            # defaults to the legacy '<stem>.lml' name, absent in per-corpus
+            # archives -> signal None -> fullband_target None.
+            signal = decode_lma_signal(str(lma_path), stem, lml_entry_name=_lml)
             self._fb_sig_cache[cache_key] = signal
             if len(self._fb_sig_cache) > self._fb_sig_cache_cap:
                 self._fb_sig_cache.popitem(last=False)
@@ -466,6 +489,7 @@ class LmaTypedL3Dataset:
                 window[:, :avail] = signal[:, start:start + avail]
         else:
             window = np.asarray(signal[:, start:end], dtype=np.float32)
+        self._fb_win_save(wpath, window)   # persist just this [21,2500] window
         fb = torch.from_numpy(np.ascontiguousarray(window))
         return l3, fb
 
