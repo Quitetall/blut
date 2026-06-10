@@ -90,6 +90,11 @@ enum Command {
         #[command(subcommand)]
         cmd: ArtifactCommand,
     },
+    /// Manage recipe schedules (systemd --user timers; no daemon).
+    Schedule {
+        #[command(subcommand)]
+        cmd: ScheduleCommand,
+    },
     /// Manage the datasets registry.
     Data {
         #[command(subcommand)]
@@ -201,6 +206,28 @@ enum CacheCommand {
         /// Emit as JSON.
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ScheduleCommand {
+    /// List installed blut recipe timers.
+    List,
+    /// Install (or replace) a timer that runs a recipe on a schedule.
+    Install {
+        /// Recipe name (as listed by `recipe list`).
+        recipe: String,
+        /// systemd `OnCalendar` expression, e.g. "daily", "Mon *-*-* 02:00:00".
+        #[arg(long)]
+        calendar: String,
+        /// Recipe args as inline JSON. Defaults to `{}`.
+        #[arg(long, default_value = "{}")]
+        args: String,
+    },
+    /// Remove a recipe's timer + service.
+    Uninstall {
+        /// Recipe name.
+        recipe: String,
     },
 }
 
@@ -421,6 +448,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Runs { cmd }) => run_runs_cmd(cmd),
         Some(Command::Lineage { id, json }) => run_lineage(&id, json),
         Some(Command::Artifact { cmd }) => run_artifact_cmd(cmd),
+        Some(Command::Schedule { cmd }) => run_schedule_cmd(&reg, cmd),
         Some(Command::Data { cmd }) => run_data(cmd),
         Some(Command::Auto) => run_auto().await,
         Some(Command::Policy { cmd }) => run_policy(cmd),
@@ -711,6 +739,46 @@ fn run_artifact_cmd(cmd: ArtifactCommand) -> Result<()> {
                     Err(anyhow!("give a longer prefix"))
                 }
             }
+        }
+    }
+}
+
+fn run_schedule_cmd(reg: &crate::framework::Registry, cmd: ScheduleCommand) -> Result<()> {
+    use crate::schedule;
+    match cmd {
+        ScheduleCommand::List => {
+            let recipes = schedule::list().map_err(|e| anyhow!("{e}"))?;
+            if recipes.is_empty() {
+                println!("no blut schedules installed.");
+            } else {
+                println!("installed recipe timers:");
+                for r in recipes {
+                    println!("  {r}");
+                }
+            }
+            Ok(())
+        }
+        ScheduleCommand::Install {
+            recipe,
+            calendar,
+            args,
+        } => {
+            // Validate the recipe exists + the args parse before touching
+            // systemd, so a typo doesn't leave a broken unit behind.
+            if reg.find(&recipe).is_none() {
+                return Err(anyhow!("recipe '{recipe}' not in catalog"));
+            }
+            let _: serde_json::Value = serde_json::from_str(&args)
+                .with_context(|| format!("parse --args as JSON: {args}"))?;
+            schedule::install(&recipe, &calendar, &args).map_err(|e| anyhow!("{e}"))?;
+            eprintln!("installed timer blut-{recipe}.timer (OnCalendar={calendar})");
+            eprintln!("inspect: systemctl --user list-timers | grep {recipe}");
+            Ok(())
+        }
+        ScheduleCommand::Uninstall { recipe } => {
+            schedule::uninstall(&recipe).map_err(|e| anyhow!("{e}"))?;
+            eprintln!("removed timer for {recipe}");
+            Ok(())
         }
     }
 }
