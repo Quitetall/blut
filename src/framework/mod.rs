@@ -30,6 +30,7 @@ pub mod compat;
 pub mod cookbook;
 pub mod error;
 pub mod executor;
+pub mod lineage;
 pub mod plan;
 pub mod resource;
 pub mod retry;

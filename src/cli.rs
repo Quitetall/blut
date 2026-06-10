@@ -77,6 +77,19 @@ enum Command {
         #[command(subcommand)]
         cmd: RunsCommand,
     },
+    /// Show a job's stage lineage (input→output hashes, cache hits).
+    Lineage {
+        /// Job id (or unique prefix).
+        id: String,
+        /// Emit as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect materialized artifacts via their sidecars.
+    Artifact {
+        #[command(subcommand)]
+        cmd: ArtifactCommand,
+    },
     /// Manage the datasets registry.
     Data {
         #[command(subcommand)]
@@ -180,6 +193,35 @@ enum CacheCommand {
         /// Cap in GiB. Overrides `LAMU_CACHE_MAX_GB`.
         #[arg(long)]
         max_gb: Option<f64>,
+    },
+    /// Per-stage cache hit/miss tally for a job (from its status.jsonl).
+    Stats {
+        /// Job id (or unique prefix).
+        id: String,
+        /// Emit as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ArtifactCommand {
+    /// List a job's output artifacts (kind, hash, stage).
+    Ls {
+        /// Job id (or unique prefix).
+        id: String,
+        /// Emit as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the full sidecar of an artifact by content-hash prefix
+    /// (searches all jobs).
+    Inspect {
+        /// Content-hash prefix (>= 6 hex chars recommended).
+        hash: String,
+        /// Emit as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -377,6 +419,8 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Cancel { id, grace }) => run_cancel(&id, grace).await,
         Some(Command::Log { id, tail, json }) => run_log(&id, tail, json),
         Some(Command::Runs { cmd }) => run_runs_cmd(cmd),
+        Some(Command::Lineage { id, json }) => run_lineage(&id, json),
+        Some(Command::Artifact { cmd }) => run_artifact_cmd(cmd),
         Some(Command::Data { cmd }) => run_data(cmd),
         Some(Command::Auto) => run_auto().await,
         Some(Command::Policy { cmd }) => run_policy(cmd),
@@ -544,6 +588,129 @@ fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
                 cap_gb
             );
             Ok(())
+        }
+        CacheCommand::Stats { id, json } => {
+            let stats = crate::framework::lineage::cache_stats(&id).map_err(|e| anyhow!("{e}"))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&stats).map_err(|e| anyhow!("{e}"))?
+                );
+                return Ok(());
+            }
+            let (th, tm) = stats.totals();
+            println!("{:<32} {:>6} {:>6} {:>7}", "stage", "hits", "miss", "hit%");
+            for (stage, (h, m)) in &stats.per_stage {
+                let pct = if h + m == 0 {
+                    0.0
+                } else {
+                    *h as f64 * 100.0 / (*h + *m) as f64
+                };
+                println!("{stage:<32} {h:>6} {m:>6} {pct:>6.1}%");
+            }
+            let tpct = if th + tm == 0 {
+                0.0
+            } else {
+                th as f64 * 100.0 / (th + tm) as f64
+            };
+            println!("{:<32} {th:>6} {tm:>6} {tpct:>6.1}%", "TOTAL");
+            Ok(())
+        }
+    }
+}
+
+fn run_lineage(id_query: &str, json: bool) -> Result<()> {
+    let nodes = crate::framework::lineage::job_lineage(id_query).map_err(|e| anyhow!("{e}"))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&nodes).map_err(|e| anyhow!("{e}"))?
+        );
+        return Ok(());
+    }
+    if nodes.is_empty() {
+        println!("no stage lineage (job has no framework status events).");
+        return Ok(());
+    }
+    for n in &nodes {
+        let inp = n.input_hash.as_deref().unwrap_or("-");
+        let out = n.output_hash.as_deref().unwrap_or("-");
+        let short = |h: &str| h.chars().take(12).collect::<String>();
+        if n.cached {
+            println!("  {:>2} {:<28} [CACHE HIT {}]", n.node_idx, n.stage, short(out));
+        } else {
+            let took = n
+                .elapsed
+                .map(|e| format!("{e:?}"))
+                .unwrap_or_else(|| "-".into());
+            println!(
+                "  {:>2} {:<28} in={} → out={}  {}",
+                n.node_idx,
+                n.stage,
+                short(inp),
+                short(out),
+                took
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_artifact_cmd(cmd: ArtifactCommand) -> Result<()> {
+    use crate::framework::lineage;
+    match cmd {
+        ArtifactCommand::Ls { id, json } => {
+            let recs = lineage::scan_artifacts(&id).map_err(|e| anyhow!("{e}"))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&recs).map_err(|e| anyhow!("{e}"))?
+                );
+                return Ok(());
+            }
+            if recs.is_empty() {
+                println!("no artifacts (job has no materialized stage outputs).");
+                return Ok(());
+            }
+            println!("{:<24} {:<14} {:<10} stage", "kind", "hash", "schema");
+            for r in &recs {
+                let hash = r.meta.content_hash.to_hex().chars().take(12).collect::<String>();
+                let stage = r.meta.produced_by_stage.as_deref().unwrap_or("-");
+                println!("{:<24} {:<14} v{:<9} {stage}", r.meta.kind, hash, r.meta.schema);
+            }
+            Ok(())
+        }
+        ArtifactCommand::Inspect { hash, json } => {
+            if hash.len() < 4 {
+                return Err(anyhow!("hash prefix too short — give at least 4 hex chars"));
+            }
+            let recs = lineage::find_by_hash_prefix(&hash).map_err(|e| anyhow!("{e}"))?;
+            match recs.as_slice() {
+                [] => Err(anyhow!("no artifact with content hash prefix '{hash}'")),
+                [r] => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&r).map_err(|e| anyhow!("{e}"))?
+                        );
+                        return Ok(());
+                    }
+                    println!("sidecar: {}", r.sidecar_path.display());
+                    println!("job:     {}", r.job_id);
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&r.meta).map_err(|e| anyhow!("{e}"))?
+                    );
+                    Ok(())
+                }
+                many => {
+                    eprintln!("ambiguous prefix '{hash}' — {} matches:", many.len());
+                    for r in many {
+                        eprintln!("  {} ({})", r.meta.content_hash.to_hex(), r.job_id);
+                    }
+                    Err(anyhow!("give a longer prefix"))
+                }
+            }
         }
     }
 }

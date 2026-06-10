@@ -168,9 +168,19 @@ pub fn append_status(job_id: &str, update: &StatusUpdate) -> Result<()> {
 }
 
 pub fn read_status(job_id: &str) -> Result<Vec<StatusUpdate>> {
+    Ok(read_status_lines(job_id)?
+        .iter()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect())
+}
+
+/// Raw `status.jsonl` lines (rotation-aware: `.1` generation then the
+/// current file). The base for both the legacy `StatusUpdate` reader
+/// (above) and the framework `StageEvent` lineage reader — status.jsonl
+/// can hold EITHER format depending on the launch path, so consumers
+/// parse tolerantly.
+pub fn read_status_lines(job_id: &str) -> Result<Vec<String>> {
     let path = paths::job_dir(job_id)?.join("status.jsonl");
-    // Read the rolled-over generation first (older), then the current
-    // file, so a rotation mid-run doesn't truncate the visible history.
     let mut out = Vec::new();
     for p in [path.with_extension("jsonl.1"), path] {
         if !p.exists() {
@@ -180,11 +190,7 @@ pub fn read_status(job_id: &str) -> Result<Vec<StatusUpdate>> {
             path: p.clone(),
             source: e,
         })?;
-        out.extend(
-            body.lines()
-                .filter(|l| !l.trim().is_empty())
-                .filter_map(|l| serde_json::from_str(l).ok()),
-        );
+        out.extend(body.lines().filter(|l| !l.trim().is_empty()).map(String::from));
     }
     Ok(out)
 }
