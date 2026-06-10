@@ -43,7 +43,12 @@ def compute_importance(decoder, dataloader, device, n_batches=50):
     for name, module in decoder.named_modules():
         if isinstance(module, nn.Conv1d) and 'blocks' in name:
             def hook_fn(mod, inp, out, name=name):
-                activations[name] = out.detach()
+                # Keep the activation IN the graph and ask autograd to populate
+                # its .grad on backward. Detaching here (or relying on a second
+                # autograd.grad after loss.backward() has already freed the
+                # graph) collapses importance to a uniform ones() vector.
+                out.retain_grad()
+                activations[name] = out
             hooks.append(module.register_forward_hook(hook_fn))
 
     # Accumulate importance across batches
@@ -53,19 +58,22 @@ def compute_importance(decoder, dataloader, device, n_batches=50):
         x_l3 = x_l3.to(device)
         x_l3.requires_grad_(True)
 
-        # Forward + backward to get gradients
+        # Forward + single backward; retain_grad() makes each block's
+        # non-leaf activation expose .grad after this pass.
+        decoder.zero_grad(set_to_none=True)
         out = decoder(x_l3)
         loss = out.abs().mean()
         loss.backward()
 
-        # Score each captured activation
+        # Score each captured activation by gradient-weighted magnitude.
         for name, act in activations.items():
-            if act.grad_fn is not None:
-                grad = torch.autograd.grad(loss, act, retain_graph=True)[0]
-            else:
+            grad = act.grad
+            if grad is None:
+                # No gradient reached this activation (e.g. detached subgraph);
+                # fall back to magnitude-only so the channel still ranks.
                 grad = torch.ones_like(act)
             # Per-channel importance: mean over batch and time
-            channel_imp = (act.abs() * grad.abs()).mean(dim=(0, 2))  # [dim]
+            channel_imp = (act.detach().abs() * grad.abs()).mean(dim=(0, 2))  # [dim]
             if name not in importance:
                 importance[name] = channel_imp.cpu()
             else:

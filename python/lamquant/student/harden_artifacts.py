@@ -119,7 +119,9 @@ def train_stage(student, teacher_model, dataloader, device, optimizer, epochs,
                 best_r, subband_mode=False, l3_teacher=False):
     for epoch in range(1, epochs + 1):
         student.train()
-        beta = beta_start + (beta_end - beta_start) * (epoch / epochs)
+        # epoch is 1-based; use (epoch-1)/epochs so the first epoch starts at
+        # beta_start exactly (the old epoch/epochs began one step in).
+        beta = beta_start + (beta_end - beta_start) * ((epoch - 1) / epochs)
 
         losses, recon_l, lat_l, r_scores = [], [], [], []
         for x, *rest in dataloader:

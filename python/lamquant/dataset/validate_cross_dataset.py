@@ -115,7 +115,9 @@ from lamquant_codec.channel_resolver import (
 def read_edf_channels(filepath: str, target_fs: int = 250) -> Optional[Tuple[np.ndarray, int, List[str]]]:
     """
     Read an EDF file and extract available 10-20 channels.
-    Returns: (data [21, samples], sample_rate, channel_names) or None
+    Returns: (data [21, samples], native_sample_rate, channel_names) or None.
+    `data` is resampled to target_fs; the returned rate is the file's NATIVE
+    sample rate (read from the header), so callers can record true provenance.
     """
     try:
         if HAS_MNE:
@@ -137,7 +139,8 @@ def read_edf_channels(filepath: str, target_fs: int = 250) -> Optional[Tuple[np.
         if data is None:
             return None
 
-        # Resample to target_fs if needed
+        # Resample to target_fs if needed, but keep the NATIVE rate to return.
+        native_fs = fs
         if fs != target_fs:
             num_samples = int(data.shape[1] * target_fs / fs)
             from scipy.signal import resample
@@ -145,9 +148,8 @@ def read_edf_channels(filepath: str, target_fs: int = 250) -> Optional[Tuple[np.
             for ch in range(data.shape[0]):
                 data_resampled[ch] = resample(data[ch], num_samples)
             data = data_resampled
-            fs = target_fs
 
-        return data, fs, TARGET_CHANNELS
+        return data, native_fs, TARGET_CHANNELS
 
     except Exception as e:
         return None
@@ -184,10 +186,12 @@ def run_codec_pipeline(
     num_channels: int = 21,
     window_len: int = 2500,
     fsq_levels: int = 16,
+    sample_rate: int = 250,
 ) -> List[WindowResult]:
     """
     Run the full LamQuant codec pipeline on a multi-channel signal.
     signal: [channels, total_samples]
+    sample_rate: native rate to record on each WindowResult (provenance).
     Returns list of WindowResult per window.
     """
     results = []
@@ -260,7 +264,7 @@ def run_codec_pipeline(
         results.append(WindowResult(
             file="", window_idx=w, r=r, prd=prd, snr_db=snr,
             cr=float(cr), channels_used=channels,
-            sample_rate_orig=250
+            sample_rate_orig=sample_rate
         ))
     
     return results
@@ -310,7 +314,7 @@ def validate_chbmit_holdout(data_dir: str, model, quick: bool = False) -> Datase
             files_processed += 1
             
             if model is not None:
-                windows = run_codec_pipeline(data, model)
+                windows = run_codec_pipeline(data, model, sample_rate=fs)
                 for w in windows:
                     w.file = os.path.basename(edf_file)
                 all_windows.extend(windows)
@@ -395,7 +399,7 @@ def validate_siena(data_dir: str, model, quick: bool = False) -> DatasetResult:
             files_processed += 1
             
             if model is not None:
-                windows = run_codec_pipeline(data, model)
+                windows = run_codec_pipeline(data, model, sample_rate=fs)
                 for w in windows:
                     w.file = os.path.basename(edf_file)
                 all_windows.extend(windows)
@@ -485,10 +489,9 @@ def validate_eegmmidb(data_dir: str, model, quick: bool = False) -> DatasetResul
             files_processed += 1
             
             if model is not None:
-                windows = run_codec_pipeline(data, model)
+                windows = run_codec_pipeline(data, model, sample_rate=fs)
                 for w in windows:
                     w.file = os.path.basename(edf_file)
-                    w.sample_rate_orig = 160
                 all_windows.extend(windows)
                 subject_rs.extend([w.r for w in windows])
         
@@ -560,10 +563,9 @@ def validate_mental_arithmetic(data_dir: str, model, quick: bool = False) -> Dat
         files_processed += 1
         
         if model is not None:
-            windows = run_codec_pipeline(data, model)
+            windows = run_codec_pipeline(data, model, sample_rate=fs)
             for w in windows:
                 w.file = os.path.basename(edf_file)
-                w.sample_rate_orig = 500
             all_windows.extend(windows)
             
             if subject not in per_subject:

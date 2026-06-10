@@ -71,6 +71,28 @@ def find_new_files(existing_basenames):
     return new_files
 
 
+def _rsync_running():
+    """True if any process has 'rsync' in its cmdline (download in progress).
+
+    Reads each /proc/<pid>/cmdline under a context manager so no file
+    descriptor leaks across the daemon's poll loop. Non-Linux (no /proc) is
+    treated as 'running' (conservative — keep polling).
+    """
+    if not os.path.exists('/proc'):
+        return True
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f'/proc/{pid}/cmdline', 'rb') as fh:
+                if b'rsync' in fh.read():
+                    return True
+        except OSError:
+            # Process exited between listdir and open, or no permission.
+            continue
+    return False
+
+
 def preprocess_one_edf(edf_path, annotations, target_sr=250.0):
     """Convert one EDF to Q31 NPZ. Returns result string."""
     from edf_to_events import convert_edf_to_q31
@@ -148,12 +170,10 @@ def main():
         new_files = find_new_files(existing)
 
         if not new_files:
-            # Check if download is still running
-            rsync_running = any(
-                'rsync' in open(f'/proc/{pid}/cmdline', 'rb').read().decode('utf-8', errors='ignore')
-                for pid in os.listdir('/proc')
-                if pid.isdigit() and os.path.exists(f'/proc/{pid}/cmdline')
-            ) if os.path.exists('/proc') else True
+            # Check if download is still running. The old generator opened
+            # /proc/<pid>/cmdline without closing the handle, leaking an fd per
+            # PID on every poll — fatal for a long-lived daemon. Use `with`.
+            rsync_running = _rsync_running()
 
             if not rsync_running and total_processed > 0:
                 print(f'[stream] No new files and rsync not running. '

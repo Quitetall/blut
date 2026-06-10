@@ -293,7 +293,7 @@ def run(cfg=None, epochs_warmup=50, epochs_quant=200, epochs_fine=300, batch_siz
     if cfg is None:
         cfg = TrainingConfig(
             epochs_warmup=epochs_warmup, epochs_quant=epochs_quant,
-            epochs_fine=epochs_fine, batch_size=cfg.batch_size)
+            epochs_fine=epochs_fine, batch_size=batch_size)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"[*] Gen 7.1 Subband Student Training on {device}")
@@ -417,14 +417,14 @@ def run(cfg=None, epochs_warmup=50, epochs_quant=200, epochs_fine=300, batch_siz
         if _sample_files:
             _latents = []
             for _sf in _sample_files:
-                _sd = np.load(_sf)
-                if 'l3' in _sd.files:
-                    _l3_sample = torch.from_numpy(_sd['l3'][:64]).float().to(device)
-                    with torch.no_grad():
-                        _lat = student.encode(_l3_sample, quantize=False)
-                    _latents.append(_lat.cpu())
-                    del _l3_sample
-                del _sd
+                # `with` so the .npz handle is released even if encode() raises.
+                with np.load(_sf) as _sd:
+                    if 'l3' in _sd.files:
+                        _l3_sample = torch.from_numpy(_sd['l3'][:64]).float().to(device)
+                        with torch.no_grad():
+                            _lat = student.encode(_l3_sample, quantize=False)
+                        _latents.append(_lat.cpu())
+                        del _l3_sample
             if _latents:
                 _all_lat = torch.cat(_latents, dim=0)  # [N, 32, 79]
                 C = _all_lat.shape[1]

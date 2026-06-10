@@ -919,6 +919,13 @@ def main():
 
     # Cross-window: the head emits K*L3_T states so the SSM scans the full
     # K-window span (state carries across the 10 s boundaries). K=1 unchanged.
+    # Bound the product — an unchecked --seq-windows multiplies target_T without
+    # limit and OOMs the head / breaks downstream shapes.
+    if not (1 <= args.seq_windows <= 32):
+        raise ValueError(
+            f"--seq-windows must be in [1, 32]; got {args.seq_windows} "
+            f"(target_T would be {int(args.target_T)} * {args.seq_windows} = "
+            f"{int(args.target_T) * args.seq_windows}, risking OOM)")
     target_T = int(args.target_T) * args.seq_windows
     snap_every = int(os.environ.get("SNN_SNAPSHOT_EVERY", "0"))
 

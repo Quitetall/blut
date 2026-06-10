@@ -1490,6 +1490,11 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
             all_params = []
             for g in enc_groups + [dec_group]:
                 all_params.extend(g['params'])
+            # Schedule-Free needs all params at construction (the re-add below
+            # is skipped for use_schedule_free), so include the seizure head
+            # here or it never trains in QAT/fine.
+            if sz_head is not None:
+                all_params.extend(sz_head.parameters())
             optimizer = schedulefree.AdamWScheduleFree(
                 all_params, lr=cfg.lr_quant, weight_decay=cfg.wd_quant,
                 warmup_steps=100)

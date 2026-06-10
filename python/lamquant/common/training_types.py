@@ -278,8 +278,7 @@ class TrainingLogger:
     def _write_epoch_csv(self, r: EpochReport) -> None:
         """One CSV row per epoch with all fields (except per-layer alpha)."""
         cols = _csv_columns()
-        row = {k: v for k, v in asdict(r).items() if k in _EPOCH_CSV_EXCLUDE.__class__()
-               or k not in _EPOCH_CSV_EXCLUDE}
+        row = {k: v for k, v in asdict(r).items() if k not in _EPOCH_CSV_EXCLUDE}
         # Filter to the column set; force ordering.
         row = {c: row.get(c, '') for c in cols}
         if not self._epoch_csv_initialized:

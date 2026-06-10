@@ -39,11 +39,11 @@ import os
 import numpy as np
 import torch
 
-# MambaSNN is the inference-time model definition, now owned by the
-# private LamQuant-Neural wheel (lamquant_neural.models). This eval
-# driver lives in BLUT (training/eval tooling) per the Neural/BLUT/
-# Lossless boundary migration (2026-05-29).
-from lamquant_neural.models.mamba_ssm_minimal import MambaSNN
+# MambaSNN is the inference-time model definition, owned by the private
+# LamQuant-Neural wheel (lamquant_neural.models). This eval driver lives in
+# BLUT (training/eval tooling) per the Neural/BLUT/Lossless boundary migration
+# (2026-05-29). Imported lazily in load_model() so the pure pooling/windowing
+# helpers (and their tests) don't require the wheel to be installed.
 
 # Default checkpoint root. The trained SNN weights live in the Neural
 # repo (LamQuant-Neural/weights/snn/). After MOVE-B this driver lives in
@@ -106,6 +106,32 @@ def load_edf_signal(edf_path, target_fs=250.0):
     return signal, duration, fs
 
 
+def _count_windows(T, window_samples, stride_samples):
+    """Number of windows needed to cover a length-T signal.
+
+    ceil so a trailing partial window (final < stride samples) is still
+    counted — plain floor division dropped it. The t1>T clamp in the caller
+    slides the last window back so the tail is scored.
+    """
+    return max(1, int(np.ceil((T - window_samples) / stride_samples)) + 1)
+
+
+def _pool_probs_to_1hz(probs, n_seconds):
+    """Pool a per-step prob vector to one value per second (max-pool).
+
+    Proportional binning (i*L//n .. (i+1)*L//n) covers EVERY sample. A fixed
+    `len//n_seconds` block drops the trailing samples; a ceil block would
+    leave the final bins empty (.max() on an empty slice raises). When there
+    are fewer steps than seconds, interpolate up instead.
+    """
+    L = len(probs)
+    if L >= n_seconds:
+        return np.array([probs[i * L // n_seconds:(i + 1) * L // n_seconds].max()
+                         for i in range(n_seconds)])
+    return np.interp(
+        np.arange(n_seconds), np.linspace(0, n_seconds, L), probs)
+
+
 def run_snn_on_signal(model, signal, fs, device, window_samples=2500,
                       stride_samples=2500):
     """Run Mamba SNN on a full-length signal.
@@ -114,7 +140,7 @@ def run_snn_on_signal(model, signal, fs, device, window_samples=2500,
     """
     model.eval()
     C, T = signal.shape
-    n_windows = max(1, (T - window_samples) // stride_samples + 1)
+    n_windows = _count_windows(T, window_samples, stride_samples)
 
     all_probs = []
     with torch.no_grad():
@@ -151,15 +177,7 @@ def run_snn_on_signal(model, signal, fs, device, window_samples=2500,
     probs = np.concatenate(all_probs)
     duration_sec = T / fs
     n_seconds = max(1, int(duration_sec))
-    # Pool to 1 Hz
-    if len(probs) >= n_seconds:
-        block = len(probs) // n_seconds
-        probs_1hz = np.array([probs[i * block:(i + 1) * block].max()
-                              for i in range(n_seconds)])
-    else:
-        probs_1hz = np.interp(
-            np.arange(n_seconds), np.linspace(0, n_seconds, len(probs)), probs)
-    return probs_1hz
+    return _pool_probs_to_1hz(probs, n_seconds)
 
 
 def probs_to_segments(probs_1hz, duration_sec, seiz_threshold=0.90,
@@ -265,7 +283,9 @@ def main():
     else:
         device = torch.device(args.device)
 
-    # Load model
+    # Load model (wheel-backed definition; imported here so the module's pure
+    # helpers stay importable without lamquant_neural).
+    from lamquant_neural.models.mamba_ssm_minimal import MambaSNN
     model = MambaSNN(in_channels=21, d_model=args.d_model, d_state=args.d_state,
                      n_layers=args.n_layers).to(device)
     # Contains non-tensor metadata (model, sensitivity, accuracy)

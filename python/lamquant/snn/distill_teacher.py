@@ -446,9 +446,14 @@ class TeacherDistiller(nn.Module):
         x = student_feat
         if x.dim() == 1:           # [8] -> [1, 8]
             x = x.unsqueeze(0)
-        elif x.dim() == 2 and x.shape[0] == STUDENT_GROUPS and x.shape[1] != STUDENT_GROUPS:
-            # ambiguous [8, T] unbatched: treat as single-sample [8, T].
-            x = x.unsqueeze(0)     # [1, 8, T]
+        elif x.dim() == 2:
+            # 2-D is ambiguous; resolve deterministically:
+            #   [B, 8]  (shape[1]==G)            -> already-pooled batch, keep
+            #   [8, T]  (shape[0]==G, shape[1]!=G) -> unbatched, add batch dim
+            # A square [8, 8] is taken as the batched [B=8, G=8] case (shape[1]
+            # == G wins), which the assert below accepts — no crash.
+            if x.shape[0] == STUDENT_GROUPS and x.shape[1] != STUDENT_GROUPS:
+                x = x.unsqueeze(0)     # [8, T] -> [1, 8, T]
         if x.dim() == 3:           # [B, 8, T] -> pool over T -> [B, 8]
             assert x.shape[1] == STUDENT_GROUPS, \
                 f"3-D student_feat must be [B,{STUDENT_GROUPS},T], got {tuple(x.shape)}"

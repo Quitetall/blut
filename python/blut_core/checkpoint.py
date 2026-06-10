@@ -91,7 +91,15 @@ def save(payload: Dict[str, Any], path, *, contract: Optional[Iterable[str]] = N
             os.fsync(f.fileno())
         sha = _sha256(tmp)
         os.replace(tmp, path)
-        path.with_suffix(path.suffix + ".sha256").write_text(sha + "\n")
+        # fsync the sidecar too — the durability contract above promises the
+        # SHA is persisted, but write_text() leaves it in the page cache.
+        sha_path = path.with_suffix(path.suffix + ".sha256")
+        sfd = os.open(str(sha_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            os.write(sfd, (sha + "\n").encode("utf-8"))
+            os.fsync(sfd)
+        finally:
+            os.close(sfd)
     except Exception:
         try:
             tmp.unlink()

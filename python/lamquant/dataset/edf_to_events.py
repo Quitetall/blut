@@ -519,7 +519,11 @@ def convert_edf_to_q31(edf_path, output_dir, target_sr, dataset_type,
                 data_resampled[ch] = resample(data[ch], new_len)
             data = data_resampled
         else:
-            data_resampled = np.zeros((21, int(data.shape[1] * up / down)), dtype=np.float64)
+            # resample_poly returns ceil(N*up/down) samples; allocating with
+            # floor (int(...)) leaves the buffer 1 sample short whenever
+            # (N*up) % down != 0 (e.g. 256->250 Hz), raising a broadcast error.
+            out_len = int(np.ceil(data.shape[1] * up / down))
+            data_resampled = np.zeros((21, out_len), dtype=np.float64)
             for ch in range(21):
                 data_resampled[ch] = resample_poly(data[ch], up, down)
             data = data_resampled

@@ -609,7 +609,11 @@ def find_edf_files(input_path: str, recursive: bool = True) -> List[str]:
 def detect_dataset(edf_path: str) -> str:
     """Auto-detect dataset type from path."""
     p = edf_path.lower()
-    if 'chb' in p and 'mit' in p or '/chb' in p:
+    # Require BOTH 'chb' and 'mit' — the old `... or '/chb' in p` matched any
+    # path with a /chb directory (operator precedence: the `or` bound loosely),
+    # misclassifying unrelated datasets. Real CHB-MIT paths always carry 'mit'
+    # (e.g. chb-mit-scalp-eeg-database, chbmit/).
+    if 'chb' in p and 'mit' in p:
         return 'chbmit'
     if 'tueg' in p or 'tuh_eeg' in p:
         return 'tuh'
