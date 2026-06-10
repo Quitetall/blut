@@ -76,14 +76,24 @@ const PER_BATCH_BYTES: u64 = GIB / 16; // 64 MiB / batch unit
 // Growth is multiplicative (scales with job size) with an additive floor
 // (guarantees a meaningful bump for a small bound); `resolve` takes the
 // MAX of the two so small jobs use the step and large jobs use the factor.
+// NUM/DEN MUST stay 5/4 (=1.25) — change BOTH or neither.
 const OOM_GROWTH_NUM: u64 = 5; // ×5/4 = +25% per observed OOM
 const OOM_GROWTH_DEN: u64 = 4;
-const OOM_GROWTH_STEP_BYTES: u64 = 4 * GIB;
+/// Additive growth floor: 8 GiB so a single OOM cycle converges for the
+/// common mid-range under-estimate (e.g. a 25G cap that truly needs ~32G:
+/// 25+8=33G clears it in ONE retry, vs +4G→31G which would OOM again and
+/// take two cycles — each cycle is a wasted, expensive training run, so a
+/// medical-grade self-heal converges fast). The `.max(hint)` floor and the
+/// box-fit admission gate keep this from over-refusing small jobs.
+const OOM_GROWTH_STEP_BYTES: u64 = 8 * GIB;
 /// Secondary runaway guard on the escalated cap. The AUTHORITATIVE box-fit
 /// refusal lives in `admission.rs` (it refuses when the footprint would
 /// leave < the free-RAM floor); this clamp only stops a pathological
 /// repeated-OOM key from walking the cap to an absurd value before
-/// admission gets to refuse. Sized above any single-box train cap.
+/// admission gets to refuse. 64 GiB (not the plan's ~44G) so it covers a
+/// future larger box; on a 62G box the clamp returns 64G and admission
+/// refuses (the intended fail-closed exit). At/above the ceiling the cap
+/// stops growing — admission's box-fit refusal is then the only exit.
 const OOM_RESOLVE_CEILING_BYTES: u64 = 64 * GIB;
 
 /// A resolved footprint estimate. Slice-1 tracks RAM only as a hard
@@ -303,7 +313,9 @@ impl FootprintStore {
         match self.entries.get(&key.flat()) {
             Some(e) if e.source == FootprintSource::OomCorrected => {
                 // Grow strictly above the OOMing lower bound; never below
-                // the conservative hint; clamped (admission does box-fit).
+                // the conservative hint; clamped by OOM_RESOLVE_CEILING_BYTES
+                // (a runaway guard) — admission.rs is the authoritative
+                // box-fit refusal.
                 let grown = (e
                     .ram_bytes
                     .saturating_mul(OOM_GROWTH_NUM)
@@ -486,9 +498,13 @@ mod tests {
         // re-under-sizes the hint (the 51bcc43 bug) trips this test.
         let cold_cap = estimate(2, 32, 3, 256).memmax_bytes();
         // 6 + 2×4 + 3×2 + 1 + 32×64MiB = 23 GiB estimate, +2 GiB headroom = 25 GiB.
+        // Pin the ACTUAL cap (24G threshold = the 25G cap with 1G slack), not
+        // a loose ">demand" floor — a constant tweak that drops the cold cap
+        // below the measured ~20G workers-2 demand (the 51bcc43 bug) trips this.
         assert!(
-            cold_cap >= 20 * GIB,
-            "cold tier-3 workers-2 cap {cold_cap} must exceed the ~20 GiB measured demand"
+            cold_cap >= 24 * GIB,
+            "cold tier-3 workers-2 cap {cold_cap} must hold the ~25G right-sized value \
+             (>> the ~20G measured demand)"
         );
     }
 
@@ -583,8 +599,8 @@ mod tests {
         s.record(&key(), 24 * GIB, 0, FootprintSource::OomCorrected)
             .unwrap();
         let r = s.resolve(&key(), hint);
-        // max(24×5/4=30, 24+4=28) = 30 GiB, above the 24G bound.
-        assert_eq!(r.ram_bytes, 30 * GIB, "OOM bound must grow, not re-sit");
+        // max(24×5/4=30, 24+8=32) = 32 GiB, above the 24G bound.
+        assert_eq!(r.ram_bytes, 32 * GIB, "OOM bound must grow, not re-sit");
         assert!(r.ram_bytes > 24 * GIB, "escalated cap must exceed the OOMing cap");
     }
 
@@ -625,10 +641,10 @@ mod tests {
         let hint = estimate(2, 16, 3, 256);
         s.record(&key(), 24 * GIB, 0, FootprintSource::OomCorrected)
             .unwrap();
-        let r1 = s.resolve(&key(), hint).ram_bytes; // 30G
-        // A retry OOMs at the escalated 30G cap → record it.
+        let r1 = s.resolve(&key(), hint).ram_bytes; // max(30, 32)=32G
+        // A retry OOMs at the escalated 32G cap → record it.
         s.record(&key(), r1, 0, FootprintSource::OomCorrected).unwrap();
-        let r2 = s.resolve(&key(), hint).ram_bytes; // max(30×5/4=37.5, 30+4=34)=37.5G
+        let r2 = s.resolve(&key(), hint).ram_bytes; // max(32×5/4=40, 32+8=40)=40G
         assert!(r2 > r1, "repeated OOM must keep escalating: {r1} !< {r2}");
     }
 
