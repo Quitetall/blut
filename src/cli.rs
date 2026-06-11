@@ -394,6 +394,11 @@ struct TrainArgs {
     #[arg(long, default_value_t = false)]
     from_conversations: bool,
 
+    /// Where to place the trainer: local (default, this box) | slurm | ray.
+    /// Cluster config is read from env (BLUT_SLURM_* / RAY_ADDRESS).
+    #[arg(long, default_value = "local")]
+    launcher: String,
+
     /// Window for --from-conversations.
     #[arg(long, default_value = "30d", value_parser = parse_duration)]
     since: Duration,
@@ -1921,7 +1926,12 @@ async fn run_train(reg: &crate::framework::Registry, args: TrainArgs) -> Result<
     };
     eprintln!("lock acquired ({})", lock.path().display());
 
-    let mut backend = PythonTrainBackend::new(python, trainer_script);
+    let launch_target: crate::config::launcher::LaunchTarget =
+        args.launcher.parse().map_err(|e| anyhow!("{e}"))?;
+    if !matches!(launch_target, crate::config::launcher::LaunchTarget::Local) {
+        eprintln!("launcher {} — placing the trainer on the cluster", args.launcher);
+    }
+    let mut backend = PythonTrainBackend::new(python, trainer_script).with_launch_target(launch_target);
 
     let job_id_for_cb = job_id.clone();
     let on_status: StatusFn = Box::new(move |u: StatusUpdate| {

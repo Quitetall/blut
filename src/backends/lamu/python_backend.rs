@@ -46,6 +46,11 @@ pub struct PythonTrainBackend {
     /// so a chatty-or-heartbeating trainer is never falsely killed and
     /// old trainers (no heartbeats) are unaffected.
     pub liveness_timeout: Option<Duration>,
+    /// Where to place the trainer (#3). `Local` (default) spawns it directly
+    /// here (byte-identical to the original behavior); `Slurm`/`Ray` wrap the
+    /// `python script spec` invocation via the matching launcher so the SAME
+    /// streaming/cancel path runs against a cluster-placed job.
+    launch_target: crate::config::launcher::LaunchTarget,
     child_pid: Arc<Mutex<Option<u32>>>,
 }
 
@@ -56,6 +61,7 @@ impl PythonTrainBackend {
             trainer_script,
             env: Vec::new(),
             liveness_timeout: None,
+            launch_target: crate::config::launcher::LaunchTarget::Local,
             child_pid: Arc::new(Mutex::new(None)),
         }
     }
@@ -70,6 +76,12 @@ impl PythonTrainBackend {
         self.liveness_timeout = Some(timeout);
         self
     }
+
+    /// Place the trainer on `target` (#3). `Local` = direct spawn here.
+    pub fn with_launch_target(mut self, target: crate::config::launcher::LaunchTarget) -> Self {
+        self.launch_target = target;
+        self
+    }
 }
 
 #[async_trait]
@@ -79,8 +91,33 @@ impl TrainBackend for PythonTrainBackend {
         let spec_json = serde_json::to_string(&spec)
             .map_err(|e| TrainError::other(format!("serialize TrainSpec for trainer.py: {}", e)))?;
 
-        let mut cmd = Command::new(&self.python);
-        cmd.arg(&self.trainer_script).arg(&spec_json);
+        // Local spawns the trainer directly (byte-identical to the original);
+        // Slurm/Ray wrap `python script spec` via the launcher (program/argv/env
+        // are launcher data) but keep the SAME streaming + cancel path below.
+        use crate::config::launcher::{launcher_for, LaunchTarget};
+        let mut cmd = match self.launch_target {
+            LaunchTarget::Local => {
+                let mut c = Command::new(&self.python);
+                c.arg(&self.trainer_script).arg(&spec_json);
+                c
+            }
+            target => {
+                let inner = vec![
+                    self.python.display().to_string(),
+                    self.trainer_script.display().to_string(),
+                    spec_json.clone(),
+                ];
+                let w = launcher_for(target)
+                    .wrap("blut-train", &inner)
+                    .map_err(|e| TrainError::other(format!("launcher wrap: {e}")))?;
+                let mut c = Command::new(&w.program);
+                c.args(&w.args);
+                for (k, v) in &w.env {
+                    c.env(k, v);
+                }
+                c
+            }
+        };
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
