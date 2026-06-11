@@ -150,6 +150,14 @@ pub struct StageContext {
     /// a launcher-aware backend submits to Slurm/Ray when set. Threaded from
     /// the CLI `--launcher` flag via `ExecCtx`.
     pub launch_target: crate::config::launcher::LaunchTarget,
+    /// Never-OOM Phase 3: was the fullband disk cache warmed upstream? A train
+    /// stage threads this into its broker footprint (lower per-worker term +
+    /// the `|w` calibration key). Carried on the CONTEXT (not the stage Args)
+    /// on purpose — warm does NOT change the trained output, so it must not
+    /// enter the stage's cache key (a warm and a cold run share the checkpoint
+    /// cache). Set by the CLI from the recipe's `warm_fb_cache` arg via
+    /// `ExecCtx`, so the RECORD side and the cli RESOLVE side read ONE source.
+    pub fb_warm: bool,
 }
 
 impl StageContext {
@@ -165,6 +173,7 @@ impl StageContext {
             cache: Arc::new(CacheHandle::job_local(PathBuf::from("/tmp/_cache_test"))),
             recipe_name: String::new(),
             launch_target: crate::config::launcher::LaunchTarget::Local,
+            fb_warm: false,
         }
     }
 }

@@ -106,6 +106,14 @@ pub struct ExecCtx {
     /// `BLUT_KILL_ON_NAN=1` (or call `with_control`) to wire the built-in
     /// `KillOnNaN`.
     pub control: Option<Arc<dyn ControlPolicy>>,
+    /// Never-OOM Phase 3: was the fullband disk cache warmed upstream? Threaded
+    /// into every `StageContext` so a train stage bills the warm (lower)
+    /// per-worker footprint + the `|w` calibration key. Set by the CLI from the
+    /// recipe's `warm_fb_cache` arg (the SAME source the admission gate reads),
+    /// so RECORD and RESOLVE never disagree. Default false (cold). NOT a stage
+    /// Arg — warm doesn't change the trained output, so it stays out of the
+    /// checkpoint cache key.
+    pub fb_warm: bool,
 }
 
 impl ExecCtx {
@@ -139,12 +147,20 @@ impl ExecCtx {
             memory_budget_gib: UNLIMITED_MEM_GIB,
             launch_target: crate::config::launcher::LaunchTarget::Local,
             control: None,
+            fb_warm: false,
         }
     }
 
     /// Place stages on `target` (#3). Default `Local`.
     pub fn with_launch_target(mut self, target: crate::config::launcher::LaunchTarget) -> Self {
         self.launch_target = target;
+        self
+    }
+
+    /// Mark the fullband cache as warmed upstream (Phase 3). Threaded into every
+    /// `StageContext.fb_warm` so a train stage bills the warm footprint.
+    pub fn with_fb_warm(mut self, warm: bool) -> Self {
+        self.fb_warm = warm;
         self
     }
 
@@ -219,6 +235,7 @@ struct NodeEnv {
     memory: Arc<tokio::sync::Semaphore>,
     memory_budget_gib: u32,
     launch_target: crate::config::launcher::LaunchTarget,
+    fb_warm: bool,
     recipe_name: String,
     on_retry: Option<crate::framework::retry::RetryHook>,
 }
@@ -408,6 +425,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
             cache: env.cache.clone(),
             recipe_name: env.recipe_name.clone(),
             launch_target: env.launch_target,
+            fb_warm: env.fb_warm,
         };
 
         // ── Resource permits ────────────────────────────────────────
@@ -875,6 +893,7 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
         memory: ctx.memory,
         memory_budget_gib: ctx.memory_budget_gib,
         launch_target: ctx.launch_target,
+        fb_warm: ctx.fb_warm,
         recipe_name: plan.name().to_string(),
         on_retry: ctx.on_retry,
     });

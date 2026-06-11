@@ -1019,6 +1019,9 @@ async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
                 cache: Arc::new(CacheHandle::job_local(td.path().join("_cache"))),
                 recipe_name: String::new(),
                 launch_target: crate::config::launcher::LaunchTarget::Local,
+                // `blut stage` runs one stage standalone (no recipe warm
+                // context) — bill the conservative cold footprint.
+                fb_warm: false,
             };
 
             let result = stage
@@ -1301,6 +1304,13 @@ async fn run_one_recipe(
     // built by the executor carries it → a lamquant train stage routes to the
     // cluster. `Local` (default) is a no-op vs the pre-launcher behaviour.
     ctx = ctx.with_launch_target(launch_target);
+    // Phase 3: thread the warm flag from the recipe's DEFAULTED args (the SAME
+    // source `recipe_footprint` reads above) into every StageContext, so a
+    // train stage's footprint RECORD keys identically to the admission RESOLVE.
+    // Carried on the context (not a stage Arg) so warm never enters the
+    // checkpoint cache key — a warm and a cold run share the trained output.
+    let fb_warm = crate::broker::Drivers::from_args_json(plan.exec_view().recipe_args).warm;
+    ctx = ctx.with_fb_warm(fb_warm);
     if shared_cache {
         if let Some(global) = crate::framework::CacheHandle::default_global_path() {
             std::fs::create_dir_all(&global)

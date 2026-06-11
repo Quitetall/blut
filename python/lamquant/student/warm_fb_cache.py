@@ -50,7 +50,10 @@ def _free_gb(path: str) -> float:
         st = os.statvfs(path)
         return st.f_bavail * st.f_frsize / 1e9
     except OSError:
-        return float("inf")
+        # FAIL-CLOSED: an unknowable free-space state must trip the safety guard
+        # (refuse to warm), never bypass it. Returning inf would let a genuinely
+        # full / inaccessible disk silently produce a partial cache.
+        return 0.0
 
 
 def warm_split(
@@ -59,11 +62,11 @@ def warm_split(
     split_manifest_path: str,
     seed: int,
     max_windows: int | None,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """Warm every (or the first ``max_windows``) base window of one split.
 
-    Returns (windows_processed, windows_in_split). Drives the trainer's
-    adapter so the disk-cache keys match exactly.
+    Returns (windows_processed, windows_in_split, windows_failed). Drives the
+    trainer's adapter so the disk-cache keys match exactly.
     """
     # Bare import (matches train_joint.py): this script lives in student/ next
     # to lma_typed_adapter.py, so student/ is sys.path[0] when it runs.
@@ -79,6 +82,13 @@ def warm_split(
         return_fullband=True,
         seed=seed,
     )
+    # CRITICAL: the disk-cache attributes (_fb_disk_dir / _fb_sig_cache /
+    # _fb_disk_dtype / _fb_min_free) are initialized in calibrate_shard_budget,
+    # NOT __init__ — the trainer calls it post-construction (train_joint.py).
+    # Without it, _fetch_window → _fb_win_path raises AttributeError on
+    # self._fb_disk_dir and the warm silently writes NOTHING. "cpu" because the
+    # decode is CPU-bound; the device is only recorded, not used for the decode.
+    ds.calibrate_shard_budget("cpu")
     n_base = int(ds._n_base)
     total = n_base if max_windows is None else min(n_base, int(max_windows))
     _eprint(
@@ -86,25 +96,34 @@ def warm_split(
         f"warming={total} seed={seed}"
     )
     if total == 0:
-        return 0, n_base
+        return 0, n_base, 0
 
     # The base index is built stem-by-stem (contiguous per stem), so iterating
     # 0..n_base hits the adapter's in-proc per-stem LRU — one whole-recording
     # decode per stem, not one per window (the dominant cost on long TUEG
     # recordings). _fetch_window persists each [21,2500] window via _fb_win_save.
     log_every = max(1, total // 100)  # ~1% granularity
+    failed = 0
     t0 = time.time()
     for i in range(total):
+        # NOTE: `except Exception` does NOT catch KeyboardInterrupt (a
+        # BaseException) — Ctrl-C during a multi-hour warm still propagates.
         try:
             ds._fetch_window(i)
-        except Exception as e:  # noqa: BLE001 — never abort the whole warm on one bad window
-            _eprint(f"[warm_fb_cache] window {i} failed (skipping): {e}")
+        except Exception as e:  # noqa: BLE001 — one bad window must not abort the warm
+            failed += 1
+            # Log the FIRST few in full (a systemic setup error — e.g. a missing
+            # adapter attribute — would repeat; surface it, don't bury it).
+            if failed <= 5:
+                _eprint(f"[warm_fb_cache] window {i} failed: {e!r}")
         if (i + 1) % log_every == 0 or (i + 1) == total:
             # tqdm-shaped "<done>/<total> [" so the BLUT runner's progress
             # parser (parse_tqdm_progress) forwards it as a StageStep.
             rate = (i + 1) / max(1e-6, time.time() - t0)
             _eprint(f"{i + 1}/{total} [warm_fb_cache split={split} {rate:.0f} win/s]")
-    return total, n_base
+    if failed:
+        _eprint(f"[warm_fb_cache] split={split}: {failed}/{total} windows FAILED")
+    return total, n_base, failed
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -185,17 +204,19 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     grand_total = 0
+    grand_failed = 0
     t0 = time.time()
     for s in splits:
         seed = args.seed if s == "train" else args.seed + 1
         try:
-            done, n_base = warm_split(
+            done, n_base, failed = warm_split(
                 args.lma_root, s, args.split_manifest, seed, args.max_windows
             )
         except Exception as e:  # noqa: BLE001 — a split that can't even construct is fatal
-            _eprint(f"[warm_fb_cache] FATAL: split {s} failed to warm: {e}")
+            _eprint(f"[warm_fb_cache] FATAL: split {s} failed to warm: {e!r}")
             return 4
         grand_total += done
+        grand_failed += failed
         # Re-check free disk after each split; if the guard tripped, the cache
         # is partial — surface it as a failure, not a silent success.
         free_after = _free_gb(fb_dir)
@@ -213,10 +234,30 @@ def main(argv: list[str] | None = None) -> int:
         n_files = sum(1 for f in os.scandir(fb_dir) if f.name.endswith("__fbw.npy"))
     except OSError:
         pass
+
+    # Catch a SILENT systemic failure: if we attempted windows but NOTHING
+    # landed on disk, the warm achieved nothing (e.g. a setup error skipped
+    # every window) — the trainer would re-decode + risk OOM under the
+    # warm-tightened footprint. Fail loudly rather than report a false success.
+    if grand_total > 0 and n_files == 0:
+        _eprint(
+            f"[warm_fb_cache] FATAL: attempted {grand_total} windows but 0 "
+            f"__fbw.npy files exist at {fb_dir} — the warm wrote NOTHING "
+            f"({grand_failed} window failures). The trainer would re-decode + "
+            f"risk OOM. Aborting (do NOT report success)."
+        )
+        return 5
+    # A high failure fraction means a partial cache — warn loudly (the trainer
+    # self-heals via FB_SIG_CACHE_CAP=1 + the broker, but the operator should know).
+    if grand_total > 0 and grand_failed * 100 > grand_total * 5:
+        _eprint(
+            f"[warm_fb_cache] WARNING: {grand_failed}/{grand_total} windows failed "
+            f"(> 5%) — the cache is PARTIAL; the trainer will decode the gaps."
+        )
     _eprint(
-        f"[warm_fb_cache] DONE: warmed {grand_total} windows across {splits} in "
-        f"{elapsed:.0f}s; {n_files} __fbw.npy files at {fb_dir} "
-        f"({_free_gb(fb_dir):.0f} GB free)."
+        f"[warm_fb_cache] DONE: warmed {grand_total - grand_failed}/{grand_total} "
+        f"windows across {splits} in {elapsed:.0f}s; {n_files} __fbw.npy files at "
+        f"{fb_dir} ({_free_gb(fb_dir):.0f} GB free)."
     )
     return 0
 
