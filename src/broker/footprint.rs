@@ -303,8 +303,9 @@ impl FootprintKey {
         debug_assert!(!self.recipe.contains('|'), "recipe name must not contain '|'");
         // `warm` is the trailing segment (`w`/`c`) so the key partitions warm vs
         // cold calibration. NOTE: this changes the flat format — pre-Phase-3
-        // entries (4 segments) become unreachable, a deliberate one-time reset
-        // (their cold-regime peaks are invalid for the re-modeled warm worker).
+        // entries (4-segment, no warm/cold suffix) become unreachable, a
+        // deliberate one-time reset (their cold-regime peaks are invalid for the
+        // re-modeled warm worker; `load_from` debug-logs the count).
         format!(
             "{}|{}|{}|{}|{}",
             self.recipe,
@@ -445,6 +446,20 @@ impl FootprintStore {
             .ok()
             .and_then(|body| serde_json::from_str::<HashMap<String, FootprintEntry>>(&body).ok())
             .unwrap_or_default();
+        // Phase 3: a pre-warm-key entry has 4 pipe-delimited segments (no
+        // trailing `w`/`c`); the warm-aware key has 5. Such entries no longer
+        // resolve, so their calibration is IGNORED until a new run re-measures
+        // under the warm/cold key. This is SAFE (the fallback is the
+        // conservative estimate, which the cgroup cap + OOM self-heal backstop)
+        // — debug-log it so an operator wondering why calibration "reset" can
+        // see it, without spamming the warn channel on every load.
+        let stale = entries.keys().filter(|k| k.matches('|').count() == 3).count();
+        if stale > 0 {
+            tracing::debug!(
+                "footprint store: {stale} pre-Phase-3 entries (no warm/cold key suffix) \
+                 are ignored — re-calibration needed for those configs"
+            );
+        }
         Self { path, entries }
     }
 
@@ -706,6 +721,9 @@ mod tests {
         let warm_cap = estimate(2, 32, 3, 256, true).memmax_bytes();
         let cold_cap = estimate(2, 32, 3, 256, false).memmax_bytes();
         assert!(warm_cap < cold_cap, "warm cap must be tighter: {warm_cap} !< {cold_cap}");
+        // Pin the EXACT cap so a future constant drift is caught concretely:
+        // 6 + 2×3 + 3×2 + 1 + 32×64MiB = 21 GiB estimate, +2 GiB headroom = 23.
+        assert_eq!(warm_cap, 23 * GIB, "warm tier-3 workers-2 cap must be exactly 23G");
         assert!(
             warm_cap >= 22 * GIB,
             "warm cap {warm_cap} must still hold the ~20G warm demand with headroom"
