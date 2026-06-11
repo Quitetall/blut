@@ -1236,11 +1236,21 @@ async fn run_one_recipe(
             if let Some(fp) = sweep_fp {
                 record_sweep_completion(fp, &job_id);
             }
+            // LineageDB index (fail-soft — the sidecars/status.jsonl are
+            // canonical, the DB is a rebuildable index; a failure must not fail
+            // a successful run).
+            if let Err(e) = crate::lineage_db::ingest_job(&job_id, name, "done") {
+                tracing::warn!("lineage index {job_id}: {e}");
+            }
             Ok(())
         }
         Err(e) => {
             if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
                 tracing::warn!("write Failed state for {job_id}: {se}");
+            }
+            // Index the failure too (OOM/cache history) — best-effort.
+            if let Err(ie) = crate::lineage_db::ingest_job(&job_id, name, "failed") {
+                tracing::debug!("lineage index (failed) {job_id}: {ie}");
             }
             Err(anyhow!("plan execution failed: {e}"))
         }

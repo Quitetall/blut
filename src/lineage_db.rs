@@ -314,6 +314,84 @@ impl LineageDb {
     }
 }
 
+/// Ingest a COMPLETED job into the index: run provenance (git SHA, hardware,
+/// outcome, timestamp) + its artifacts (from the sidecars) + its lineage edges
+/// (from `status.jsonl`). Idempotent — re-ingesting (a `reindex`) is safe.
+/// Reads the content-addressed filesystem; the DB is the derived index.
+pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
+    let db = LineageDb::open()?;
+    let snap = crate::broker::ResourceSnapshot::probe();
+    db.record_run(&RunRow {
+        job_id: job_id.to_string(),
+        recipe: recipe.to_string(),
+        config_fingerprint: None, // (sweep/config path supplies this when present)
+        git_sha: git_head_sha(),
+        started_unix: None,
+        ended_unix: Some(chrono::Utc::now().timestamp()),
+        outcome: Some(outcome.to_string()),
+        host: read_hostname(),
+        gpu_name: None,
+        ram_gib: Some(snap.mem_total_gb as i64),
+        vram_mib: snap.vram_total_mib.map(|v| v as i64),
+    })?;
+    for rec in crate::framework::lineage::scan_artifacts(job_id)?.into_iter() {
+        db.record_artifact(&ArtifactRow {
+            job_id: job_id.to_string(),
+            stage_idx: stage_idx_of(&rec.sidecar_path) as i64,
+            stage_name: rec.meta.produced_by_stage.clone().unwrap_or_default(),
+            content_hash: rec.meta.content_hash.to_hex(),
+            kind: rec.meta.kind.clone(),
+            schema_ver: rec.meta.schema as i64,
+            sidecar_path: Some(rec.sidecar_path.display().to_string()),
+            produced_unix: Some(rec.meta.produced_at_unix_secs as i64),
+        })?;
+    }
+    for node in crate::framework::lineage::job_lineage(job_id)?.into_iter() {
+        if let (Some(input), Some(output)) = (node.input_hash, node.output_hash) {
+            db.record_edge(&EdgeRow {
+                job_id: job_id.to_string(),
+                to_idx: node.node_idx as i64,
+                input_hash: input,
+                output_hash: output,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort `git rev-parse HEAD` of the working tree (None if not a repo).
+fn git_head_sha() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+/// Best-effort hostname for hardware provenance (None if unreadable).
+fn read_hostname() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+}
+
+/// Numeric stage index from a sidecar path whose parent dir is `<idx>-<name>`.
+fn stage_idx_of(sidecar: &Path) -> u32 {
+    sidecar
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.split('-').next())
+        .and_then(|d| d.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
 fn row_to_run(row: &rusqlite::Row) -> rusqlite::Result<RunRow> {
     Ok(RunRow {
         job_id: row.get(0)?,
@@ -445,6 +523,13 @@ mod tests {
         let hashes: Vec<&str> = chain.iter().map(|s| s.artifact.content_hash.as_str()).collect();
         assert_eq!(hashes, vec!["gatehash", "trainhash", "corpushash"], "upstream order");
         assert!(chain[0].run.is_some(), "trace annotates each hop with its run");
+    }
+
+    #[test]
+    fn stage_idx_parsed_from_sidecar_path() {
+        assert_eq!(stage_idx_of(Path::new("/j/stages/0-make/output.metadata.json")), 0);
+        assert_eq!(stage_idx_of(Path::new("/j/stages/12-train_joint/output.metadata.json")), 12);
+        assert_eq!(stage_idx_of(Path::new("/j/stages/garbage/output.metadata.json")), 0);
     }
 
     #[test]
