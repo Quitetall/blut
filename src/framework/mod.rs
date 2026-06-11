@@ -27,6 +27,7 @@
 pub mod artifact;
 pub mod cache;
 pub mod compat;
+pub mod control;
 pub mod cookbook;
 pub mod error;
 pub mod executor;

@@ -36,11 +36,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::framework::artifact::{ArtifactMetadata, ContentHash};
 use crate::framework::cache::CacheHandle;
+use crate::framework::control::{Control, ControlPolicy, StepMetrics};
 use crate::framework::error::{PlanError, StageError};
 use crate::framework::plan::{CompiledPlan, NodeId};
 use crate::framework::resource::Resource;
@@ -97,6 +98,14 @@ pub struct ExecCtx {
     /// launcher-aware backend reads this from `StageContext` to submit to
     /// Slurm/Ray instead. Set by the CLI `--launcher` flag.
     pub launch_target: crate::config::launcher::LaunchTarget,
+    /// Runtime DAG control policy (#4). `None` (default) = the static plan
+    /// runs unchanged — the executor never watches the metric stream, so the
+    /// behaviour is byte-identical to the pre-control path. `Some(policy)`
+    /// (parallel executor only) consults the policy against each live
+    /// `StageStep` and may `KillBranch` a diverged node. Set the env
+    /// `BLUT_KILL_ON_NAN=1` (or call `with_control`) to wire the built-in
+    /// `KillOnNaN`.
+    pub control: Option<Arc<dyn ControlPolicy>>,
 }
 
 impl ExecCtx {
@@ -129,12 +138,21 @@ impl ExecCtx {
             memory: Arc::new(tokio::sync::Semaphore::new(UNLIMITED_MEM_GIB as usize)),
             memory_budget_gib: UNLIMITED_MEM_GIB,
             launch_target: crate::config::launcher::LaunchTarget::Local,
+            control: None,
         }
     }
 
     /// Place stages on `target` (#3). Default `Local`.
     pub fn with_launch_target(mut self, target: crate::config::launcher::LaunchTarget) -> Self {
         self.launch_target = target;
+        self
+    }
+
+    /// Wire a runtime DAG control policy (#4). With a policy set, the
+    /// PARALLEL executor watches the live step stream and can prune a
+    /// diverged branch. `None` (default) = static plan, no watching.
+    pub fn with_control(mut self, policy: Arc<dyn ControlPolicy>) -> Self {
+        self.control = Some(policy);
         self
     }
 
@@ -222,6 +240,12 @@ struct NodeTask {
     /// Resolved retry policy + timeout (node override, else stage const).
     retry: crate::framework::retry::RetryPolicy,
     timeout: crate::framework::retry::StageTimeout,
+    /// Per-node cancellation token (#4). A CHILD of the plan token, so a
+    /// plan-wide cancel still propagates here, but the coordinator can ALSO
+    /// fire it alone to kill THIS node's branch (KILL-on-NaN) without
+    /// touching siblings. With no control policy it only ever fires via the
+    /// parent → behaviour is identical to the pre-#4 single-token path.
+    node_cancel: CancellationToken,
 }
 
 /// A node's result, fed back to the coordinator to advance scheduling.
@@ -239,6 +263,12 @@ enum NodeFailure {
     /// The plan token fired (before or during the stage). Output, if
     /// any, was discarded; nothing was cached.
     Cancelled,
+    /// This node's OWN token fired while the plan token did NOT (#4): a
+    /// targeted KILL-on-NaN, not a plan-wide cancel. The coordinator prunes
+    /// this node's descendants and continues other branches — it is NOT a
+    /// plan failure. Carries the node id so the coordinator knows which
+    /// subtree to prune. Output discarded, nothing cached (FW-2 cleanup).
+    Killed { node_id: NodeId },
     /// The stage (or its promote) failed.
     Stage {
         idx: u32,
@@ -247,6 +277,22 @@ enum NodeFailure {
     },
     /// An executor-internal failure (e.g. a closed semaphore).
     Other(String),
+}
+
+/// Classify a cancel observed inside `run_node`: a targeted KILL (this
+/// node's token fired but the plan token did NOT) vs a plan-wide cancel.
+/// The distinction is what lets the coordinator prune one branch on a kill
+/// instead of failing the whole plan.
+fn cancel_failure(
+    node_id: NodeId,
+    node_cancel: &CancellationToken,
+    plan_cancel: &CancellationToken,
+) -> NodeFailure {
+    if node_cancel.is_cancelled() && !plan_cancel.is_cancelled() {
+        NodeFailure::Killed { node_id }
+    } else {
+        NodeFailure::Cancelled
+    }
 }
 
 /// Run ONE node: cache lookup → tmp dir → resource permits → run →
@@ -309,26 +355,28 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         if attempt > 1 {
             let backoff = task.retry.backoff_before(attempt);
             if !backoff.is_zero() {
+                // Wake on EITHER a plan cancel or a targeted kill (the node
+                // token is a child of the plan token, so it fires on both).
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
-                    _ = env.cancel.cancelled() => {
+                    _ = task.node_cancel.cancelled() => {
                         env.status.emit(StageEvent::StageFailed {
                             node_idx: idx,
                             stage_name: stage_name.clone(),
-                            error: "plan cancelled during retry backoff".into(),
+                            error: "cancelled during retry backoff".into(),
                         });
-                        return Err(NodeFailure::Cancelled);
+                        return Err(cancel_failure(task.node_id, &task.node_cancel, &env.cancel));
                     }
                 }
             }
         }
-        if env.cancel.is_cancelled() {
+        if task.node_cancel.is_cancelled() {
             env.status.emit(StageEvent::StageFailed {
                 node_idx: idx,
                 stage_name: stage_name.clone(),
-                error: "plan cancelled before stage attempt".into(),
+                error: "cancelled before stage attempt".into(),
             });
-            return Err(NodeFailure::Cancelled);
+            return Err(cancel_failure(task.node_id, &task.node_cancel, &env.cancel));
         }
 
         // Clean tmp per attempt — each attempt starts from an empty dir.
@@ -347,7 +395,10 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         // A child cancel token so a SOFT timeout (D2) can wind THIS stage
         // down cooperatively without touching the plan token / siblings;
         // a plan cancel still propagates (child tokens fire on parent).
-        let stage_cancel = env.cancel.child_token();
+        // Rooted at the PER-NODE token (#4), so a targeted KILL-on-NaN fires
+        // it via that parent exactly as a plan cancel would — the stage's own
+        // cancel handling is unchanged.
+        let stage_cancel = task.node_cancel.child_token();
         let stage_ctx = StageContext {
             job_dir: env.job_dir.clone(),
             stage_dir: tmp_stage_dir.clone(),
@@ -447,7 +498,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
                         stage_name,
                         error: "cancelled during stage".into(),
                     });
-                    return Err(NodeFailure::Cancelled);
+                    return Err(cancel_failure(task.node_id, &task.node_cancel, &env.cancel));
                 }
                 // StageEnd reports the SUCCESSFUL attempt's wall time;
                 // failed attempts + backoff are visible as StageRetrying
@@ -456,9 +507,13 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
             }
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-                let plan_cancelled = env.cancel.is_cancelled();
+                // The node token fired on EITHER a plan cancel or a targeted
+                // kill — a killed node must never retry (it would re-run the
+                // doomed work), so gate retry on the node token, not just the
+                // plan token (the node token is a superset).
+                let token_fired = task.node_cancel.is_cancelled();
                 let retry = attempt < task.retry.max_attempts
-                    && !plan_cancelled
+                    && !token_fired
                     && crate::framework::retry::is_retryable(&e, task.retry.retry_on);
                 if retry {
                     // OOM-escalation / observability hook (broker wiring).
@@ -484,14 +539,16 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
                     continue;
                 }
                 // Terminal failure.
-                let cancelled = plan_cancelled || matches!(e, StageError::Cancelled);
+                let cancelled = token_fired || matches!(e, StageError::Cancelled);
                 env.status.emit(StageEvent::StageFailed {
                     node_idx: idx,
                     stage_name: stage_name.clone(),
                     error: format!("{e}"),
                 });
                 if cancelled {
-                    return Err(NodeFailure::Cancelled);
+                    // Targeted kill → Killed (prune branch); plan cancel or a
+                    // bare Cancelled error → Cancelled (fail-fast).
+                    return Err(cancel_failure(task.node_id, &task.node_cancel, &env.cancel));
                 }
                 return Err(NodeFailure::Stage {
                     idx,
@@ -724,6 +781,7 @@ fn build_task(
     edges: &[crate::framework::plan::PlanEdge],
     outputs: &HashMap<NodeId, ErasedArtifact>,
     logical_outputs: &HashMap<NodeId, ContentHash>,
+    node_cancel: CancellationToken,
 ) -> Result<NodeTask, PlanError> {
     let preds = predecessors(edges, node.id);
     let input = gather_input(node.id, &preds, outputs)?;
@@ -748,6 +806,7 @@ fn build_task(
         key,
         retry,
         timeout,
+        node_cancel,
     })
 }
 
@@ -755,6 +814,11 @@ fn build_task(
 fn plan_error_of(f: NodeFailure) -> PlanError {
     match f {
         NodeFailure::Cancelled => PlanError::Cancelled,
+        // A `Killed` reaching here means a control policy fired on a path
+        // that doesn't special-case it (the sequential executor, which wires
+        // no policy, so this is unreachable there). Map to Cancelled — a
+        // pruned branch is a caller-requested stop, never a stage error.
+        NodeFailure::Killed { .. } => PlanError::Cancelled,
         NodeFailure::Stage { idx, stage, source } => PlanError::StageFailed { idx, stage, source },
         NodeFailure::Other(s) => PlanError::Other(s),
     }
@@ -836,10 +900,21 @@ async fn finish_writer(env: Arc<NodeEnv>, writer_handle: tokio::task::JoinHandle
 /// [`SequentialExecutor`] (the debugging-friendly, burn-in-stable
 /// path); set `BLUT_EXECUTOR=parallel` to opt into [`ParallelExecutor`].
 /// One seam so the CLI/TUI launch sites don't each branch on the env.
-pub async fn execute_plan(plan: CompiledPlan, ctx: ExecCtx) -> Result<PlanResult, PlanError> {
-    let parallel = std::env::var("BLUT_EXECUTOR")
-        .map(|v| v.eq_ignore_ascii_case("parallel"))
-        .unwrap_or(false);
+pub async fn execute_plan(plan: CompiledPlan, mut ctx: ExecCtx) -> Result<PlanResult, PlanError> {
+    // #4: `BLUT_KILL_ON_NAN=1` wires the built-in KillOnNaN policy (unless a
+    // caller already set one). Runtime control needs the live step watcher,
+    // which only the PARALLEL executor runs — so a policy forces parallel.
+    if ctx.control.is_none()
+        && std::env::var("BLUT_KILL_ON_NAN")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    {
+        ctx = ctx.with_control(Arc::new(crate::framework::control::KillOnNaN));
+    }
+    let parallel = ctx.control.is_some()
+        || std::env::var("BLUT_EXECUTOR")
+            .map(|v| v.eq_ignore_ascii_case("parallel"))
+            .unwrap_or(false);
     if parallel {
         ParallelExecutor::execute(plan, ctx).await
     } else {
@@ -899,7 +974,18 @@ impl SequentialExecutor {
             }
 
             let node = &view.nodes[*node_id as usize];
-            let task = match build_task(node, idx as u32, view.edges, &outputs, &logical_outputs) {
+            // Per-node child token (#4). Sequential wires no control policy, so
+            // it only ever fires via the plan token → identical to the prior
+            // single-token behaviour.
+            let node_cancel = env.cancel.child_token();
+            let task = match build_task(
+                node,
+                idx as u32,
+                view.edges,
+                &outputs,
+                &logical_outputs,
+                node_cancel,
+            ) {
                 Ok(t) => t,
                 Err(e) => {
                     finish_writer(env, writer_handle).await;
@@ -989,12 +1075,27 @@ impl ParallelExecutor {
 
         let max_in_flight = ctx.max_in_flight;
         let deadline = ctx.deadline;
+        // #4: pull the control policy out BEFORE prelude consumes ctx. `None`
+        // → the watcher is never subscribed and the loop is byte-identical to
+        // the pre-control path.
+        let control = ctx.control.clone();
         let Prelude {
             writer_handle,
             env,
             mut outputs,
             mut logical_outputs,
         } = prelude(ctx, &plan)?;
+
+        // #4 runtime control state. `control_rx` is the live step stream the
+        // coordinator watches between joins; `node_tokens` maps an in-flight
+        // node to its kill token; `pruned` is the set of nodes a kill removed
+        // from the schedule (the killed node + its descendants); they plus
+        // `completed` must cover every node at the end.
+        let mut control_rx: Option<broadcast::Receiver<StageEvent>> =
+            control.as_ref().map(|_| env.status.subscribe());
+        let mut node_tokens: HashMap<NodeId, CancellationToken> = HashMap::new();
+        let mut pruned: HashSet<NodeId> = HashSet::new();
+        let mut pruned_or_killed = 0usize;
 
         // Ready set = in-degree-0 nodes, ascending NodeId for
         // deterministic spawn order.
@@ -1056,10 +1157,26 @@ impl ParallelExecutor {
                         break;
                     };
                     ready.remove(&node_id);
+                    // #4: a node pruned by a KILL-on-NaN upstream must never be
+                    // scheduled — its input can't materialize. (A pruned node
+                    // can land in `ready` if it was already there when the kill
+                    // happened; skip it here.)
+                    if pruned.contains(&node_id) {
+                        continue;
+                    }
                     let node = &view.nodes[node_id as usize];
                     let node_idx = node_idx_of[&node_id];
-                    let task =
-                        match build_task(node, node_idx, view.edges, &outputs, &logical_outputs) {
+                    // Per-node kill token: a child of the plan token, retained
+                    // in `node_tokens` so the control watcher can fire it alone.
+                    let node_cancel = env.cancel.child_token();
+                    let task = match build_task(
+                        node,
+                        node_idx,
+                        view.edges,
+                        &outputs,
+                        &logical_outputs,
+                        node_cancel.clone(),
+                    ) {
                             Ok(t) => t,
                             Err(e) => {
                                 // Surface the failure on the status channel
@@ -1083,6 +1200,10 @@ impl ParallelExecutor {
                     }
                     inflight_keys.insert(task.key);
                     node_key_of.insert(node_id, task.key);
+                    // Retain the kill token only for an actually-spawned node
+                    // (a deferred node `continue`s above; its token is dropped
+                    // and a fresh one is built when it re-enters `ready`).
+                    node_tokens.insert(node_id, node_cancel);
                     let env_c = env.clone();
                     join.spawn(async move { run_node(task, env_c).await });
                     in_flight += 1;
@@ -1093,8 +1214,65 @@ impl ParallelExecutor {
                 break; // nothing running and nothing spawnable → done
             }
 
-            // Await the next completed node.
-            let joined = join.join_next().await;
+            // Await the next completed node. With a control policy set (#4),
+            // concurrently watch the live StageStep stream and apply runtime
+            // graph control (KILL-on-NaN) on the SAME coordinator thread, so a
+            // kill decision can never race the FW-2 promote / scheduler state.
+            // With no policy, this is a plain `join_next` → byte-identical.
+            let joined = match control_rx.as_mut() {
+                None => join.join_next().await,
+                Some(rx) => {
+                    loop {
+                        tokio::select! {
+                            // `biased`: always make scheduling progress first —
+                            // a completed node takes priority over a step event.
+                            biased;
+                            j = join.join_next() => break j,
+                            ev = rx.recv() => {
+                                match ev {
+                                    Ok(StageEvent::StageStep { node_idx, stage_name, update }) => {
+                                        if let Some(policy) = control.as_ref() {
+                                            let m = StepMetrics {
+                                                node_idx,
+                                                stage_name: &stage_name,
+                                                update: &update,
+                                            };
+                                            if matches!(policy.on_step(&m), Control::KillBranch) {
+                                                // Target the EMITTING node:
+                                                // topo idx → node id → its token.
+                                                if let Some(&nid) = order.get(node_idx as usize) {
+                                                    if let Some(tok) = node_tokens.get(&nid) {
+                                                        if !tok.is_cancelled() {
+                                                            tracing::warn!(
+                                                                "control policy KILL on node {node_idx} \
+                                                                 ({stage_name}): non-finite step metric"
+                                                            );
+                                                            tok.cancel();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Lifecycle echoes + step-gap markers: ignored
+                                    // by the watcher (the writer owns those).
+                                    Ok(_) => {}
+                                    // Dropped step spam under load is fine — a kill
+                                    // signal that matters repeats on the next step.
+                                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                                    // The hub Sender lives in `env` for the whole
+                                    // run, so Closed cannot occur before the drain
+                                    // below; treat defensively as "stop watching".
+                                    Err(broadcast::error::RecvError::Closed) => {
+                                        break join.join_next().await;
+                                    }
+                                }
+                                // Loop back to keep awaiting a completed node.
+                            }
+                        }
+                    }
+                }
+            };
             in_flight -= 1;
             let res = match joined {
                 Some(Ok(r)) => r,
@@ -1117,6 +1295,8 @@ impl ParallelExecutor {
                     } else {
                         n_misses += 1;
                     }
+                    // Token no longer needed once the node is done (#4).
+                    node_tokens.remove(&outcome.node_id);
                     // O(1) reverse lookup of the key this node ran under.
                     let key = node_key_of.remove(&outcome.node_id);
                     outputs.insert(outcome.node_id, outcome.output);
@@ -1147,6 +1327,41 @@ impl ParallelExecutor {
                         }
                     }
                 }
+                Err(NodeFailure::Killed { node_id }) => {
+                    // #4 KILL-on-NaN: an INTENTIONAL branch prune, NOT a plan
+                    // failure — other branches keep running. The killed node's
+                    // GPU/memory permits already dropped when run_node returned.
+                    node_tokens.remove(&node_id);
+                    // Free its single-flight key. Same-key deferred waiters are
+                    // duplicate-COMPUTATION siblings (not descendants — a
+                    // descendant folds this output into a DIFFERENT key); the
+                    // kill left no cacheable output, so release them to run on
+                    // their own (the policy will kill them too if they diverge).
+                    if let Some(k) = node_key_of.remove(&node_id) {
+                        inflight_keys.remove(&k);
+                        if let Some(waiters) = deferred.remove(&k) {
+                            for w in waiters {
+                                if !pruned.contains(&w) {
+                                    ready.insert(w);
+                                }
+                            }
+                        }
+                    }
+                    // Prune the killed node + every node reachable from it
+                    // (their input can never materialize). A pruned node already
+                    // in `ready` is removed here; one re-added later by a
+                    // completing OTHER parent is skipped at spawn (pruned check).
+                    let mut stack = vec![node_id];
+                    while let Some(d) = stack.pop() {
+                        if pruned.insert(d) {
+                            pruned_or_killed += 1;
+                            ready.remove(&d);
+                            if let Some(ss) = succs.get(&d) {
+                                stack.extend(ss.iter().copied());
+                            }
+                        }
+                    }
+                }
                 Err(NodeFailure::Cancelled) => {
                     // A sibling cancelled (or this node observed the token
                     // after a peer failed). Never the PRIMARY error — only
@@ -1173,11 +1388,17 @@ impl ParallelExecutor {
             return Err(err);
         }
 
+        // On the success path every node is either completed OR pruned by a
+        // KILL-on-NaN (#4); a real failure returns above via `first_error`, so
+        // a Cancelled node can't reach here uncounted.
         debug_assert_eq!(
-            completed,
+            completed + pruned_or_killed,
             order.len(),
-            "parallel executor must complete every node on success"
+            "parallel executor must account for every node (completed + pruned) on success"
         );
+        // If the terminal node was pruned, there is no final output — a killed
+        // branch legitimately changed the graph (the caller sees the missing
+        // output + the StageFailed events in status.jsonl).
         let final_output = order.last().and_then(|id| outputs.remove(id));
         finish_writer(env, writer_handle).await;
 
@@ -2194,5 +2415,186 @@ mod tests {
             }
             other => panic!("expected StageFailed(Timeout), got {other:?}"),
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // #4 dynamic runtime DAG mutation — KILL-on-NaN.
+    // ════════════════════════════════════════════════════════════════
+
+    static DIVERGER_RAN: AtomicU32 = AtomicU32::new(0);
+    static NAN_OK_RAN: AtomicU32 = AtomicU32::new(0);
+
+    /// Emits a NON-FINITE step metric, then PARKS on its own cancel token
+    /// (which the control watcher fires on a KILL-on-NaN). Declares `Gpu` so a
+    /// freed-permit assertion after the kill is meaningful — the node holds the
+    /// single GPU permit the entire time it is parked.
+    struct Diverger;
+    #[async_trait]
+    impl Stage for Diverger {
+        const NAME: &'static str = "diverger";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Gpu];
+        type Input = Counter;
+        type Output = Counter;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            ctx: &StageContext,
+            _input: Counter,
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            DIVERGER_RAN.fetch_add(1, Ordering::SeqCst);
+            // A diverged step — KillOnNaN must fire on this.
+            let _ = ctx.status_tx.send(StageEvent::StageStep {
+                node_idx: ctx.node_idx,
+                stage_name: Self::NAME.to_string(),
+                update: serde_json::json!({ "loss": "nan", "step": 1 }),
+            });
+            // Park until the coordinator kills THIS node (its stage cancel
+            // fires). Guarded by the test's outer timeout if the kill never
+            // arrives (which would itself be the failure).
+            ctx.cancel.cancelled().await;
+            Err(StageError::Cancelled)
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for Diverger {}
+
+    /// Emits a non-finite step then returns Ok immediately. With NO control
+    /// policy the metric is inert data — the stage completes normally, proving
+    /// the watcher is truly off by default (byte-identical to pre-#4).
+    struct NanThenOk;
+    #[async_trait]
+    impl Stage for NanThenOk {
+        const NAME: &'static str = "nan_then_ok";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = Counter;
+        type Output = Counter;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            ctx: &StageContext,
+            input: Counter,
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            NAN_OK_RAN.fetch_add(1, Ordering::SeqCst);
+            let _ = ctx.status_tx.send(StageEvent::StageStep {
+                node_idx: ctx.node_idx,
+                stage_name: Self::NAME.to_string(),
+                update: serde_json::json!({ "loss": "nan" }),
+            });
+            Ok(Counter { n: input.n })
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for NanThenOk {}
+
+    #[tokio::test]
+    async fn kill_on_nan_prunes_branch_and_frees_gpu() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        DIVERGER_RAN.store(0, Ordering::SeqCst);
+        INC_RUN_COUNT.store(0, Ordering::SeqCst);
+        let td = tempfile::tempdir().unwrap();
+        let job_dir = td.path().to_path_buf();
+        let ctx = ExecCtx::new(job_dir.clone())
+            .with_control(std::sync::Arc::new(crate::framework::control::KillOnNaN));
+        // Clone the GPU semaphore Arc so we can assert the permit is returned
+        // after the killed node drops it.
+        let gpu = ctx.resources[&Resource::Gpu].clone();
+
+        // MakeOne(Cpu) → Diverger(Gpu, diverges) → Increment(Cpu, downstream).
+        // The kill must prune Increment (its input never materializes).
+        let plan = Plan::<(), LamuTrainerBackend>::new("kill", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .then(Diverger, EmptyArgs)
+            .then(Increment, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let fut = ParallelExecutor::execute(plan, ctx);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+            .await
+            .expect("KILL-on-NaN must fire — a parked Diverger would otherwise hang")
+            .expect("a killed branch is NOT a plan failure → execute returns Ok");
+
+        assert_eq!(DIVERGER_RAN.load(Ordering::SeqCst), 1, "diverger ran once");
+        assert_eq!(
+            INC_RUN_COUNT.load(Ordering::SeqCst),
+            0,
+            "downstream Increment must be PRUNED (never scheduled)"
+        );
+        assert!(
+            result.final_output.is_none(),
+            "terminal node was pruned → no final output"
+        );
+        assert_eq!(
+            gpu.available_permits(),
+            1,
+            "the killed node's GPU permit must be freed"
+        );
+        // FW-2: a killed node is NOT promoted → no `<idx>-diverger` stage dir
+        // and no leftover tmp.
+        let stages = job_dir.join("stages");
+        if stages.is_dir() {
+            for entry in std::fs::read_dir(&stages).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                assert!(
+                    !name.contains("diverger"),
+                    "killed node left a stage dir: {name}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_on_nan_lets_sibling_branch_finish() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        DIVERGER_RAN.store(0, Ordering::SeqCst);
+        INC_RUN_COUNT.store(0, Ordering::SeqCst);
+        let (_td, base) = fresh_ctx();
+        let ctx = base.with_control(std::sync::Arc::new(crate::framework::control::KillOnNaN));
+
+        // MakeOne → fork(Diverger[Gpu], Increment[Cpu]) → merge(SumTwo).
+        // Diverger is killed; the Increment SIBLING must still complete; the
+        // merge (a descendant of Diverger) is pruned.
+        let plan = Plan::<(), LamuTrainerBackend>::new("kill_fork", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .fork(Diverger, EmptyArgs, Increment, EmptyArgs)
+            .merge(SumTwo, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let fut = ParallelExecutor::execute(plan, ctx);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+            .await
+            .expect("sibling must finish + kill must fire")
+            .expect("a killed branch is NOT a plan failure → Ok");
+
+        assert_eq!(
+            INC_RUN_COUNT.load(Ordering::SeqCst),
+            1,
+            "the sibling Increment branch must run to completion despite the kill"
+        );
+        assert!(
+            result.final_output.is_none(),
+            "the merge (descendant of the killed node) is pruned → no final output"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_control_policy_is_byte_identical_nan_ignored() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        NAN_OK_RAN.store(0, Ordering::SeqCst);
+        let (_td, ctx) = fresh_ctx(); // no control policy
+
+        // With no watcher, a non-finite step metric is inert: the stage
+        // completes and the plan produces its final output exactly as before.
+        let plan = Plan::<(), LamuTrainerBackend>::new("noop", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .then(NanThenOk, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let result = ParallelExecutor::execute(plan, ctx).await.unwrap();
+        assert_eq!(NAN_OK_RAN.load(Ordering::SeqCst), 1);
+        let counter: Counter = result.final_output.unwrap().into_typed().unwrap();
+        assert_eq!(counter.n, 1, "plan completes normally; NaN metric ignored");
+        assert_eq!(result.n_cache_misses, 2);
     }
 }
