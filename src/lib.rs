@@ -41,6 +41,7 @@ pub mod datasets_db;
 pub mod error;
 pub mod framework;
 pub mod jobs;
+pub mod lineage_db;
 pub mod paths;
 pub mod policy;
 pub mod protocol;
