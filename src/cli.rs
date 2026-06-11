@@ -1148,6 +1148,17 @@ async fn run_one_recipe(
     let job_id = crate::jobs::new_job_id();
     let job_dir = crate::paths::job_dir(&job_id)?;
     let mut ctx = ExecCtx::new(job_dir.clone());
+    // Phase 5: size the executor's memory admission to box-fit (MemTotal −
+    // floor) so the parallel executor can't stack concurrent stages past the
+    // box. Sequential runs one stage at a time, so this is a no-op there.
+    {
+        let snap = crate::broker::ResourceSnapshot::probe();
+        if snap.mem_total_gb > 0.0 {
+            let box_fit =
+                (snap.mem_total_gb - crate::broker::admission::DEFAULT_FLOOR_GIB).max(1.0) as u32;
+            ctx = ctx.with_memory_budget(box_fit);
+        }
+    }
     if shared_cache {
         if let Some(global) = crate::framework::CacheHandle::default_global_path() {
             std::fs::create_dir_all(&global)

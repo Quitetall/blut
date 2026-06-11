@@ -53,6 +53,12 @@ use crate::framework::status::{StageEvent, StatusHub, spawn_status_writer};
 /// thousands of futures at once.
 pub const DEFAULT_MAX_IN_FLIGHT: usize = 8;
 
+/// Default memory-admission budget (GiB): effectively unlimited, so a stage's
+/// `MEMORY_GIB` reservation never blocks until the CLI sizes the budget to
+/// box-fit. Picked large enough to never gate, small enough to stay a valid
+/// `tokio::Semaphore` permit count.
+pub const UNLIMITED_MEM_GIB: u32 = 1_000_000;
+
 /// Caller-supplied execution context. Threaded through every
 /// `StageContext`. Lives for the duration of one `execute` call.
 pub struct ExecCtx {
@@ -79,6 +85,14 @@ pub struct ExecCtx {
     /// a retryable error, BEFORE the backoff. The cookbook wires the
     /// broker's OOM-escalation here; the framework stays broker-agnostic.
     pub on_retry: Option<crate::framework::retry::RetryHook>,
+    /// Capacity-aware memory admission (Phase 5). A stage holds
+    /// `Stage::MEMORY_GIB` permits from this for its whole run; the budget is
+    /// the box-fit GiB (`MemTotal − floor`). Concurrent stages can't acquire
+    /// more than the budget in total → never-OOM-the-BOX under the parallel
+    /// executor. Default budget is effectively unlimited (no gating); the CLI
+    /// sizes it to box-fit via `with_memory_budget`.
+    pub memory: Arc<tokio::sync::Semaphore>,
+    pub memory_budget_gib: u32,
 }
 
 impl ExecCtx {
@@ -106,12 +120,26 @@ impl ExecCtx {
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             deadline: None,
             on_retry: None,
+            // Effectively unlimited until the CLI sizes it to box-fit; a stage
+            // requesting MEMORY_GIB ≪ this never blocks, so default = no gating.
+            memory: Arc::new(tokio::sync::Semaphore::new(UNLIMITED_MEM_GIB as usize)),
+            memory_budget_gib: UNLIMITED_MEM_GIB,
         }
     }
 
     pub fn with_resource_limit(mut self, resource: Resource, permits: usize) -> Self {
         self.resources
             .insert(resource, Arc::new(tokio::sync::Semaphore::new(permits)));
+        self
+    }
+
+    /// Size the memory admission budget to `gib` (box-fit = `MemTotal − floor`).
+    /// A stage's `MEMORY_GIB` is clamped to this, so a stage needing the whole
+    /// box runs alone rather than deadlocking.
+    pub fn with_memory_budget(mut self, gib: u32) -> Self {
+        let gib = gib.max(1);
+        self.memory_budget_gib = gib;
+        self.memory = Arc::new(tokio::sync::Semaphore::new(gib as usize));
         self
     }
 
@@ -159,6 +187,8 @@ struct NodeEnv {
     status: Arc<StatusHub>,
     cancel: CancellationToken,
     resources: HashMap<Resource, Arc<tokio::sync::Semaphore>>,
+    memory: Arc<tokio::sync::Semaphore>,
+    memory_budget_gib: u32,
     recipe_name: String,
     on_retry: Option<crate::framework::retry::RetryHook>,
 }
@@ -348,6 +378,24 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
             };
             permits.push(permit);
         }
+
+        // ── Memory admission (Phase 5) ──────────────────────────────
+        // Hold MEMORY_GIB permits from the box-fit budget for the whole run, so
+        // the SUM of concurrent stages can't exceed the box (never-OOM-the-BOX
+        // under the parallel executor). Clamp to the budget so a stage needing
+        // the whole box runs alone instead of deadlocking. `0` = no reservation.
+        let mem_want = task.stage.memory_gib().min(env.memory_budget_gib);
+        let _mem_permit = if mem_want > 0 {
+            match env.memory.clone().acquire_many_owned(mem_want).await {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+                    return Err(NodeFailure::Other("memory semaphore closed".into()));
+                }
+            }
+        } else {
+            None
+        };
 
         let stage_started = Instant::now();
         let run_fut =
@@ -747,6 +795,8 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
         status: ctx.status,
         cancel: ctx.cancel,
         resources: ctx.resources,
+        memory: ctx.memory,
+        memory_budget_gib: ctx.memory_budget_gib,
         recipe_name: plan.name().to_string(),
         on_retry: ctx.on_retry,
     });
@@ -1835,6 +1885,66 @@ mod tests {
             .expect("parallel CPU stages must overlap (barrier would deadlock if serialized)")
             .unwrap();
         assert_eq!(peak.load(Ordering::SeqCst), 2, "two CPU stages must run concurrently");
+        let _ = result;
+    }
+
+    /// Records peak concurrency; declares `MEMORY_GIB = 4` so the memory
+    /// admission can serialize two of these under a tight budget even though
+    /// CPU permits would allow overlap. No hard barrier (that would deadlock if
+    /// serialized) — a short sleep makes any overlap observable.
+    struct MemHog {
+        peak: Arc<std::sync::atomic::AtomicU32>,
+        live: Arc<std::sync::atomic::AtomicU32>,
+    }
+    #[async_trait]
+    impl Stage for MemHog {
+        const NAME: &'static str = "mem_hog";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        const MEMORY_GIB: u32 = 4;
+        type Input = Counter;
+        type Output = Counter;
+        type Args = BarrierArgs;
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            input: Counter,
+            _args: &BarrierArgs,
+        ) -> Result<Counter, StageError> {
+            let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            Ok(Counter { n: input.n })
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for MemHog {}
+
+    #[tokio::test]
+    async fn memory_budget_serializes_when_sum_exceeds_box_fit() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        // CPU permits allow 2 concurrent; the memory budget (4) fits only ONE
+        // MEMORY_GIB=4 stage → the two must serialize despite being a fork.
+        let peak = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let live = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ctx = ExecCtx::new(td.path().to_path_buf())
+            .with_resource_limit(Resource::Cpu, 4)
+            .with_memory_budget(4);
+        let h1 = MemHog { peak: peak.clone(), live: live.clone() };
+        let h2 = MemHog { peak: peak.clone(), live: live.clone() };
+        let plan = Plan::<(), LamuTrainerBackend>::new("memgate", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .fork(h1, BarrierArgs { id: 0 }, h2, BarrierArgs { id: 1 })
+            .merge(SumTwo, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let result = ParallelExecutor::execute(plan, ctx).await.unwrap();
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "memory budget (4) must serialize two MEMORY_GIB=4 stages (sum 8 > budget)"
+        );
         let _ = result;
     }
 

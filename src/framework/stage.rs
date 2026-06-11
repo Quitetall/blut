@@ -187,6 +187,15 @@ pub trait Stage: Send + Sync + 'static {
     const SCHEMA: u32;
     const RESOURCES: &'static [Resource];
 
+    /// Conservative peak RAM this stage holds while running, in GiB. `0`
+    /// (default) = no memory reservation. The parallel executor gates the SUM
+    /// of in-flight stages' `MEMORY_GIB` against a box-fit budget (`MemTotal −
+    /// floor`), so concurrent stages can't stack past the box — never-OOM-the-
+    /// BOX under the parallel executor (the per-`Resource` type tags above only
+    /// serialize by KIND, not by capacity). Heavy stages (training) set a
+    /// conservative upper bound; light stages leave it `0`.
+    const MEMORY_GIB: u32 = 0;
+
     /// Whether re-running this stage with the same input + args
     /// produces a byte-equal output artifact.
     ///
@@ -245,6 +254,7 @@ pub trait StageDyn: Send + Sync + 'static {
     fn schema(&self) -> u32;
     fn deterministic(&self) -> bool;
     fn resources(&self) -> &'static [Resource];
+    fn memory_gib(&self) -> u32;
     fn input_kind(&self) -> &'static str;
     fn output_kind(&self) -> &'static str;
     fn args_schema(&self) -> serde_json::Value;
@@ -306,6 +316,9 @@ impl<S: Stage> StageDyn for S {
     }
     fn resources(&self) -> &'static [Resource] {
         S::RESOURCES
+    }
+    fn memory_gib(&self) -> u32 {
+        S::MEMORY_GIB
     }
     fn retry(&self) -> crate::framework::retry::RetryPolicy {
         S::RETRY
