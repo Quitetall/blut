@@ -28,6 +28,15 @@ fills gaps. Deterministic: the codec decode is lossless + the fp16 cast is the
 trainer's, so a warm-written window is byte-identical to what a train worker
 would have written.
 
+WINDOW-SELECTION CONTRACT (cache-hit correctness): the per-window cache key
+embeds ``win_idx``, which the dataset's ``select_windows`` derives from
+``max_windows_per_file``. This script does NOT pass that knob, so it warms the
+SAME windows the trainer reads BY DEFAULT (both fall through to the dataset's
+``MAX_WINDOWS_PER_FILE``). If you OVERRIDE ``--max-windows-per-file`` on
+``train_joint`` you MUST warm with the same value (or the warmed window set will
+not match what the trainer fetches → a partial cache → re-decode + re-OOM under
+the warm-tightened broker footprint).
+
 Usage:
     python warm_fb_cache.py --lma-root <dir> --split-manifest <json> \\
         [--splits train val] [--seed 42] [--max-windows N] [--min-free-gb 40]
