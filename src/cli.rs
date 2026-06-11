@@ -77,13 +77,10 @@ enum Command {
         #[command(subcommand)]
         cmd: RunsCommand,
     },
-    /// Show a job's stage lineage (input→output hashes, cache hits).
+    /// Query the lineage index: per-job view, reproducibility trace, reindex.
     Lineage {
-        /// Job id (or unique prefix).
-        id: String,
-        /// Emit as JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(subcommand)]
+        cmd: LineageCommand,
     },
     /// Inspect materialized artifacts via their sidecars.
     Artifact {
@@ -207,6 +204,30 @@ enum CacheCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum LineageCommand {
+    /// Show a job's stage lineage (input→output hashes, cache hits).
+    Show {
+        /// Job id (or unique prefix).
+        id: String,
+        /// Emit as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Trace a checkpoint's full UPSTREAM provenance by content-hash prefix:
+    /// the git SHA, hardware, and input-hash chain that produced it.
+    Trace {
+        /// Output content-hash prefix (≥ 6 hex chars recommended).
+        hash: String,
+        /// Emit as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rebuild the lineage index from the job dirs (the DB is a derived index —
+    /// safe to delete + reindex).
+    Reindex,
 }
 
 #[derive(Subcommand, Debug)]
@@ -471,7 +492,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Cancel { id, grace }) => run_cancel(&id, grace).await,
         Some(Command::Log { id, tail, json }) => run_log(&id, tail, json),
         Some(Command::Runs { cmd }) => run_runs_cmd(cmd),
-        Some(Command::Lineage { id, json }) => run_lineage(&id, json),
+        Some(Command::Lineage { cmd }) => run_lineage_cmd(cmd),
         Some(Command::Artifact { cmd }) => run_artifact_cmd(cmd),
         Some(Command::Schedule { cmd }) => run_schedule_cmd(&reg, cmd),
         Some(Command::Data { cmd }) => run_data(cmd),
@@ -706,6 +727,94 @@ fn run_lineage(id_query: &str, json: bool) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+fn run_lineage_cmd(cmd: LineageCommand) -> Result<()> {
+    match cmd {
+        LineageCommand::Show { id, json } => run_lineage(&id, json),
+        LineageCommand::Trace { hash, json } => run_lineage_trace(&hash, json),
+        LineageCommand::Reindex => run_lineage_reindex(),
+    }
+}
+
+/// Reproducibility query: the full upstream provenance chain that produced a
+/// checkpoint, by content-hash prefix, from the LineageDB.
+fn run_lineage_trace(hash: &str, json: bool) -> Result<()> {
+    let db = crate::lineage_db::LineageDb::open().map_err(|e| anyhow!("{e}"))?;
+    let matches = db.find_artifacts(hash).map_err(|e| anyhow!("{e}"))?;
+    let target = match matches.first() {
+        None => {
+            return Err(anyhow!(
+                "no indexed artifact with content-hash prefix '{hash}' \
+                 (older runs predate the index — `blut lineage reindex`)"
+            ));
+        }
+        Some(a) => {
+            if matches.len() > 1 {
+                eprintln!("note: {} artifacts match '{hash}'; tracing the most recent", matches.len());
+            }
+            a.content_hash.clone()
+        }
+    };
+    let chain = db.trace(&target).map_err(|e| anyhow!("{e}"))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&chain).map_err(|e| anyhow!("serialize trace: {e}"))?
+        );
+        return Ok(());
+    }
+    let short = |h: &str| h.get(..16).unwrap_or(h).to_string();
+    println!("provenance trace for {} — {} hop(s), upstream:", short(&target), chain.len());
+    for (i, step) in chain.iter().enumerate() {
+        let a = &step.artifact;
+        println!("  [{i}] {} :: {} = {}", a.stage_name, a.kind, short(&a.content_hash));
+        if let Some(run) = &step.run {
+            println!(
+                "      job={} recipe={} git={} ram={}G vram={}M outcome={}",
+                run.job_id,
+                run.recipe,
+                run.git_sha.as_deref().unwrap_or("?"),
+                run.ram_gib.unwrap_or(0),
+                run.vram_mib.unwrap_or(0),
+                run.outcome.as_deref().unwrap_or("?"),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Rebuild the lineage index from the job dirs. The DB is a DERIVED index, so
+/// this is always safe (idempotent ingest); use it after deleting `lineage.db`
+/// or to backfill runs that predate the index.
+fn run_lineage_reindex() -> Result<()> {
+    let jobs_root = crate::paths::jobs_dir()?;
+    let (mut indexed, mut skipped) = (0u32, 0u32);
+    if let Ok(rd) = std::fs::read_dir(&jobs_root) {
+        for e in rd.flatten() {
+            let Some(job_id) = e.file_name().to_str().map(String::from) else {
+                continue;
+            };
+            // Recipe identity comes from the run marker; legacy/bare-spawn jobs
+            // have none → skip (nothing to attribute the run to).
+            let Ok(marker) = RecipeMarker::read_from(&e.path()) else {
+                skipped += 1;
+                continue;
+            };
+            let outcome = crate::jobs::read_state(&job_id)
+                .map(|s| format!("{s:?}").to_lowercase())
+                .unwrap_or_else(|_| "unknown".into());
+            match crate::lineage_db::ingest_job(&job_id, &marker.name, &outcome) {
+                Ok(()) => indexed += 1,
+                Err(err) => {
+                    tracing::warn!("reindex {job_id}: {err}");
+                    skipped += 1;
+                }
+            }
+        }
+    }
+    eprintln!("reindexed {indexed} run(s), skipped {skipped}");
     Ok(())
 }
 
