@@ -477,10 +477,66 @@ def band_aware_asymmetric_loss(original, reconstructed,
     return (err * weight).mean()
 
 
+def per_band_relative_loss(reconstructed, original, fs: float = 250.0,
+                           eps: float = 1e-6):
+    """Per-band RELATIVE reconstruction loss — the allocation fix.
+
+    Splits recon + target into the canonical EEG bands (differentiable FFT
+    mask), computes the relative L2 error ``||recon_b − orig_b|| / ||orig_b||``
+    per band, and averages over bands with **EQUAL weight**. Because each
+    band's error is normalised by THAT band's own energy, the low-amplitude
+    high-frequency bands (beta / gamma — the >15 Hz detail the encoder is
+    otherwise blind to) drive as much gradient as the high-amplitude
+    low-frequency bulk.
+
+    Without this, a global time-domain / MSE / R loss on ~1/f EEG is
+    low-frequency-dominated, so the network UNDER-ALLOCATES capacity to the
+    fast morphology (spikes, LVFA) the detail bands were added to preserve —
+    a width sweep would then plateau on global R and be misread as
+    "latent too small" when the real failure is allocation, not capacity.
+
+    Mirrors `per_band_prd` (the validation metric) so train and eval agree
+    in DIRECTION. NOTE the band split here is a rectangular FFT mask
+    (differentiable) whereas `per_band_prd` uses scipy `sosfiltfilt`
+    (Butterworth); the rectangular mask has edge leakage, so the training
+    loss VALUE will not numerically track the validation per-band PRD — only
+    the gradient direction (allocate to the low-energy high-freq bands) is
+    shared. The per-band ratio is clamped so a near-silent band cannot
+    explode the gradient.
+
+    Returns a torch scalar in ``[0, ~RATIO_CAP]`` (lower = better).
+    """
+    import torch
+    r = reconstructed.float()
+    o = original.float()
+    n = o.shape[-1]
+    freqs = torch.fft.rfftfreq(n, d=1.0 / fs, device=o.device)
+    R = torch.fft.rfft(r, dim=-1)
+    O = torch.fft.rfft(o, dim=-1)
+    nyq = fs / 2.0
+    terms = []
+    for _, (lo, hi) in EEG_BANDS.items():
+        hi = min(hi, nyq)
+        if lo >= hi:
+            continue
+        mask = ((freqs >= lo) & (freqs < hi)).to(O.dtype)
+        r_b = torch.fft.irfft(R * mask, n=n, dim=-1)
+        o_b = torch.fft.irfft(O * mask, n=n, dim=-1)
+        num = torch.sqrt(((r_b - o_b) ** 2).sum(dim=-1) + eps)
+        den = torch.sqrt((o_b ** 2).sum(dim=-1) + eps)
+        # Clamp the relative error so a near-silent target band (den ≈ √eps)
+        # cannot blow up the gradient (cf. band_aware's weight clamp).
+        terms.append((num / den).clamp(max=4.0).mean())
+    if not terms:
+        return r.new_zeros(())
+    return torch.stack(terms).mean()
+
+
 __all__ = [
     'EEG_BANDS',
     'prd_numpy', 'prd_torch', 'pearson_r_numpy', 'pearson_r_torch',
     'per_band_prd', 'per_band_r',
     'lqs_compliance', 'lqs_pretty',
     'asymmetric_eeg_loss', 'band_aware_asymmetric_loss',
+    'per_band_relative_loss',
 ]

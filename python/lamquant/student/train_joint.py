@@ -451,12 +451,14 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         amp: bool = True, compile_decoder: bool = True,
         asymmetric_weight: float = 0.0,
         asymmetric_kind: str = 'envelope',
+        band_loss_weight: float = 0.5,
         augment: str = 'moderate',
         ema: bool = True, ema_decay: float = 0.999,
         gan: bool = True, gan_weight: float = 1.0,
         feat_match_weight: float = 2.0,
         seizure_head: bool = True, seizure_weight: float = 0.1,
         encoder_init: str = None,
+        freeze_encoder: bool = False,
         clinical_sampling: bool = True,
         lr_schedule: str = 'soap',
         decay_frac: float = 0.10,
@@ -465,8 +467,8 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         resume: str = None,
         lma_root: Optional[str] = None,
         split_manifest: Optional[str] = None,
-        detail_bands: str = 'none',
-        detail_stack_mode: str = 'interp',
+        detail_bands: str = 'all',
+        detail_stack_mode: str = 'fold',
         max_windows_per_file: Optional[int] = None,
         soap_max_precond_dim: int = 10000,
         channel_agnostic: bool = False,
@@ -607,6 +609,24 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
             enc_state = enc_state['state_dict']
         codec.encoder.load_state_dict(enc_state, strict=False)
         print(f"[*] Encoder init: loaded from {encoder_init}")
+    # Decoder-solo: freeze the encoder so ONLY the decoder learns to invert a
+    # FIXED latent (cascade stage 2). The optimizer below excludes the encoder
+    # groups and the warm loop sets the encoder to eval() each epoch. QAT
+    # mutates the encoder's lsq_alpha, so freezing is restricted to FP warm-only
+    # runs (epochs_quant == 0); the unfrozen joint fine-tune does the QAT.
+    if freeze_encoder:
+        if encoder_init is None:
+            raise SystemExit("--freeze-encoder requires --encoder-init (freezing a "
+                             "randomly initialised encoder is meaningless)")
+        if cfg.epochs_quant:
+            raise SystemExit(f"--freeze-encoder requires --epochs-quant 0 (got "
+                             f"{cfg.epochs_quant}); QAT trains the encoder, which "
+                             "contradicts freezing it. Run the QAT in the unfrozen "
+                             "joint fine-tune stage.")
+        for p in codec.encoder.parameters():
+            p.requires_grad = False
+        codec.encoder.eval()
+        print("[*] Encoder FROZEN (decoder-solo): requires_grad=False, eval mode")
     n_enc = sum(p.numel() for p in codec.encoder.parameters())
     n_dec = sum(p.numel() for p in codec.decoder.parameters())
     print(f"[*] Encoder params: {n_enc:>12,}  (ternary, MCU)")
@@ -777,7 +797,9 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         print(f"[*] Clinical sampling: off")
 
     # ---- Optimizer with two parameter groups (encoder alphas separate) ----
-    enc_groups = make_param_groups(
+    # Decoder-solo (freeze_encoder) drops the encoder groups entirely so the
+    # optimizer only steps the decoder against the fixed latent.
+    enc_groups = [] if freeze_encoder else make_param_groups(
         codec.encoder, lr=cfg.lr_warmup,
         weight_decay=cfg.wd_warmup, alpha_weight_decay=1e-3,
     )
@@ -881,12 +903,19 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     from metrics import (prd_torch, pearson_r_torch,
                           masked_pearson_r_torch, masked_prd_torch,
                           asymmetric_eeg_loss as _asym_env,
-                          band_aware_asymmetric_loss as _asym_band)
+                          band_aware_asymmetric_loss as _asym_band,
+                          per_band_relative_loss as _per_band_rel)
     spectral_loss = make_spectral_loss(device)
     R_W = cfg.pearson_r_weight
     SP_W = cfg.spectral_weight
     PRD_W = cfg.prd_weight
     ASYM_W = float(asymmetric_weight)
+    # Per-band relative loss (the allocation fix, default ON for the
+    # full-residual fullband default): forces each EEG band's RELATIVE
+    # fidelity to drive gradient, so the low-amplitude >15 Hz detail the
+    # encoder now ingests is actually reconstructed (de-confounds the
+    # capacity-vs-allocation question — see ADR 0049 + the band-loss note).
+    BAND_W = float(band_loss_weight)
     if ASYM_W > 0:
         asym_fn = _asym_band if asymmetric_kind == 'band' else _asym_env
         print(f"[*] Asymmetric loss: {asymmetric_kind}, weight={ASYM_W}")
@@ -926,7 +955,16 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
                 l_sp = spectral_loss(recon_c.float(), target_c.float())
         else:
             l_sp = 0.0
-        total = l_mse + R_W * l_r + PRD_W * l_prd + SP_W * l_sp + ASYM_W * l_asym
+        # Per-band RELATIVE loss — only meaningful on the fullband target
+        # (the EEG bands need fs=250 Hz; the L3 domain at ~31 Hz has no
+        # beta/gamma). FP32 (FFT bandpass) outside the bf16 autocast.
+        if BAND_W > 0 and domain == 'fullband':
+            with torch.amp.autocast(device_type=device.type, enabled=False):
+                l_band = _per_band_rel(recon_c.float(), target_c.float(), fs=250.0)
+        else:
+            l_band = 0.0
+        total = (l_mse + R_W * l_r + PRD_W * l_prd + SP_W * l_sp
+                 + ASYM_W * l_asym + BAND_W * l_band)
         # Detach before scalar conversion — these dict entries are diagnostic
         # only, not part of the autograd graph. Without .detach() torch warns
         # about converting requires_grad tensors directly to floats and (more
@@ -946,6 +984,8 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
                          if isinstance(l_sp, torch.Tensor) else l_sp),
             'asym': (l_asym.detach().item()
                      if isinstance(l_asym, torch.Tensor) else l_asym),
+            'band': (l_band.detach().item()
+                     if isinstance(l_band, torch.Tensor) else l_band),
             'loss_domain': domain,
         }
 
@@ -1287,6 +1327,12 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
 
     for ep in range(_warm_start, cfg.epochs_warmup + 1):
         codec.train()
+        if freeze_encoder:
+            # Re-freeze: codec.train() above flips the whole codec to train
+            # mode; flip ONLY the encoder back to eval (the decoder must stay
+            # in train — we ARE training it). The FSQ quantizer is deterministic
+            # (STE rounding, no train/eval-dependent noise) so its mode is moot.
+            codec.encoder.eval()
         if recalibrate_cdf and ep == _recal_ep and not _cdf_recal_done[0]:
             if channel_agnostic:
                 print("  [CDF] recalibration skipped (channel-agnostic unsupported)")
@@ -2112,6 +2158,12 @@ def main():
     parser.add_argument('--encoder-init', type=str, default=None,
                         help='Path to pretrained encoder weights (MAE, prior run). '
                              'Loaded before joint training starts.')
+    parser.add_argument('--freeze-encoder', action='store_true',
+                        help='Freeze the encoder (requires_grad=False, eval mode) '
+                             'and train ONLY the decoder against its fixed latent — '
+                             'the decoder-solo stage of the encoder→decoder→joint '
+                             'cascade. Requires --encoder-init and --epochs-quant 0 '
+                             '(QAT belongs to the later unfrozen joint fine-tune).')
     parser.add_argument('--asymmetric-weight', type=float, default=0.0,
                         help='Coefficient on the asymmetric (envelope-weighted) '
                              'MSE term. 0 disables. Try 0.2 for the A/B test.')
@@ -2121,6 +2173,14 @@ def main():
                              'original proposal). band: per-band envelope '
                              'with positive bias on δ/θ/α and negative bias '
                              'on β/γ — addresses the EMG/spike confound.')
+    parser.add_argument('--band-loss-weight', type=float, default=0.5,
+                        help='Coefficient on the per-band RELATIVE loss (the '
+                             'allocation fix, default ON for the full-residual '
+                             'fullband default). Each EEG band contributes its '
+                             'RELATIVE error equally, so the low-amplitude '
+                             '>15 Hz detail drives gradient instead of being '
+                             'swamped by the 1/f low-freq bulk. 0 disables '
+                             '(falls back to the global time-domain loss).')
     parser.add_argument('--clinical-sampling', dest='clinical_sampling',
                         action='store_true', default=True,
                         help='Clinical-balanced sampling: oversample seizure/spike/rare events. '
@@ -2155,21 +2215,27 @@ def main():
                         help='JSON split manifest (subjects + stems_by_subject). '
                              'Required when --lma-root is set.')
     parser.add_argument('--detail-bands', choices=['none', 'l3_detail', 'all'],
-                        default='none',
-                        help='Encoder input bands: none=L3 (21ch, MCU-deployable), '
-                             'l3_detail=+15.6-31.25Hz LVFA, all=+all detail bands '
-                             '(the >15Hz reconstruction basis). Channel count depends '
-                             'on --detail-stack-mode. Decoder always reconstructs the '
-                             '21-ch fullband target.')
+                        default='all',
+                        help='Encoder input bands. DEFAULT all=full residual (L3 + all '
+                             'detail subbands = the complete >15Hz reconstruction basis); '
+                             'L3-approx-only input cannot reach the LQS-M/C targets '
+                             '(R>0.9 @ 63-525:1 CR / PRD 5-20) because the encoder is '
+                             'blind to the high-freq detail the decoder must reconstruct. '
+                             'none=L3 only (21ch, smallest MCU encoder — opt-in for the '
+                             'L3-only ablation / tightest-SRAM SKU); l3_detail=+15.6-31.25Hz '
+                             'LVFA only. Channel count depends on --detail-stack-mode. '
+                             'Decoder always reconstructs the 21-ch fullband target. '
+                             '(detail-bands all is incompatible with --channel-agnostic; '
+                             'CA detail-conditioning is a follow-on.)')
     parser.add_argument('--detail-stack-mode', choices=['interp', 'fold'],
-                        default='interp',
+                        default='fold',
                         help='How detail bands stack onto L3 (ADR 0031). '
-                             'interp (default, legacy): each band linearly resampled '
+                             'fold (DEFAULT): zero-pad+reshape, information-preserving, '
+                             'no coefficient dropped (all=168ch) — the honest full '
+                             'residual, so a quality null cannot be blamed on the '
+                             'stacking. interp (legacy): each band linearly resampled '
                              'to the 313 grid as 1 block (LOSSY — l1/l2 downsampled; '
-                             'all=84ch). fold: zero-pad+reshape, information-preserving, '
-                             'no coefficient dropped (all=168ch). Use fold for the '
-                             'ADR-0031 input-limitation test so a null cannot be blamed '
-                             'on the stacking.')
+                             'all=84ch).')
     parser.add_argument('--encoder-width', type=int, default=None,
                         help='Override preset encoder width (e.g. 256 research).')
     parser.add_argument('--encoder-blocks', type=int, default=None,
@@ -2263,6 +2329,7 @@ def main():
                  amp=args.amp, compile_decoder=args.compile_decoder,
                  asymmetric_weight=args.asymmetric_weight,
                  asymmetric_kind=args.asymmetric_kind,
+                 band_loss_weight=args.band_loss_weight,
                  augment=args.augment,
                  ema=args.ema, ema_decay=args.ema_decay,
                  gan=args.gan, gan_weight=args.gan_weight,
@@ -2270,6 +2337,7 @@ def main():
                  seizure_head=args.seizure_head,
                  seizure_weight=args.seizure_weight,
                  encoder_init=args.encoder_init,
+                 freeze_encoder=args.freeze_encoder,
                  clinical_sampling=args.clinical_sampling,
                  lr_schedule=args.lr_schedule,
                  decay_frac=args.decay_frac,
