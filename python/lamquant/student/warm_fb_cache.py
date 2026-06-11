@@ -65,18 +65,18 @@ def _free_gb(path: str) -> float:
         return 0.0
 
 
-def warm_split(
-    lma_root: str,
-    split: str,
-    split_manifest_path: str,
-    seed: int,
-    max_windows: int | None,
-) -> tuple[int, int, int]:
-    """Warm every (or the first ``max_windows``) base window of one split.
+# Per-split warm dataset, built ONCE in the parent and INHERITED by the
+# fork-pool workers (copy-on-write). So the (potentially large) per-recording
+# index is constructed a single time, not once per worker, while each worker's
+# in-process signal LRU stays PRIVATE — decode-once-per-stem still holds within
+# a worker's contiguous slice. Module-global because a fork worker reads the
+# parent's globals; an explicit arg can't cross the fork boundary cheaply.
+_WARM_DS = None
 
-    Returns (windows_processed, windows_in_split, windows_failed). Drives the
-    trainer's adapter so the disk-cache keys match exactly.
-    """
+
+def _build_warm_ds(lma_root: str, split: str, split_manifest_path: str, seed: int):
+    """Construct + calibrate the trainer's adapter for one split (the warm
+    dataset). Reusing the adapter is what guarantees byte-identical cache keys."""
     # Bare import (matches train_joint.py): this script lives in student/ next
     # to lma_typed_adapter.py, so student/ is sys.path[0] when it runs.
     from lma_typed_adapter import LmaTypedL3Dataset
@@ -98,27 +98,33 @@ def warm_split(
     # self._fb_disk_dir and the warm silently writes NOTHING. "cpu" because the
     # decode is CPU-bound; the device is only recorded, not used for the decode.
     ds.calibrate_shard_budget("cpu")
-    n_base = int(ds._n_base)
-    total = n_base if max_windows is None else min(n_base, int(max_windows))
-    _eprint(
-        f"[warm_fb_cache] split={split} base_windows={n_base} "
-        f"warming={total} seed={seed}"
-    )
-    if total == 0:
-        return 0, n_base, 0
+    return ds
 
-    # The base index is built stem-by-stem (contiguous per stem), so iterating
-    # 0..n_base hits the adapter's in-proc per-stem LRU — one whole-recording
-    # decode per stem, not one per window (the dominant cost on long TUEG
-    # recordings). _fetch_window persists each [21,2500] window via _fb_win_save.
+
+def _warm_range(rng: tuple[int, int]) -> tuple[int, int]:
+    """Warm a contiguous ``[start, end)`` base-index slice using the
+    fork-inherited ``_WARM_DS``. Returns (processed, failed). Runs in a worker
+    process (parallel path) — kept top-level + dependency-free so the fork pool
+    can dispatch it by name."""
+    start, end = rng
+    failed = 0
+    for i in range(start, end):
+        # `except Exception` does NOT catch KeyboardInterrupt (BaseException).
+        try:
+            _WARM_DS._fetch_window(i)
+        except Exception:  # noqa: BLE001 — one bad window must not abort the slice
+            failed += 1
+    return (end - start), failed
+
+
+def _warm_serial(split: str, total: int, n_base: int) -> tuple[int, int, int]:
+    """Single-process warm of ``range(total)`` (the debug / tiny-split path)."""
     log_every = max(1, total // 100)  # ~1% granularity
     failed = 0
     t0 = time.time()
     for i in range(total):
-        # NOTE: `except Exception` does NOT catch KeyboardInterrupt (a
-        # BaseException) — Ctrl-C during a multi-hour warm still propagates.
         try:
-            ds._fetch_window(i)
+            _WARM_DS._fetch_window(i)
         except Exception as e:  # noqa: BLE001 — one bad window must not abort the warm
             failed += 1
             # Log the FIRST few in full (a systemic setup error — e.g. a missing
@@ -130,6 +136,69 @@ def warm_split(
             # parser (parse_tqdm_progress) forwards it as a StageStep.
             rate = (i + 1) / max(1e-6, time.time() - t0)
             _eprint(f"{i + 1}/{total} [warm_fb_cache split={split} {rate:.0f} win/s]")
+    if failed:
+        _eprint(f"[warm_fb_cache] split={split}: {failed}/{total} windows FAILED")
+    return total, n_base, failed
+
+
+def warm_split(
+    lma_root: str,
+    split: str,
+    split_manifest_path: str,
+    seed: int,
+    max_windows: int | None,
+    workers: int,
+) -> tuple[int, int, int]:
+    """Warm every (or the first ``max_windows``) base window of one split.
+
+    Returns (windows_processed, windows_in_split, windows_failed). Drives the
+    trainer's adapter so the disk-cache keys match exactly. ``workers`` > 1
+    decodes contiguous slices in parallel fork workers (the warm is CPU-bound
+    serial decode — single-process was ~20 h for the full corpus).
+    """
+    global _WARM_DS
+    _WARM_DS = _build_warm_ds(lma_root, split, split_manifest_path, seed)
+    n_base = int(_WARM_DS._n_base)
+    total = n_base if max_windows is None else min(n_base, int(max_windows))
+    _eprint(
+        f"[warm_fb_cache] split={split} base_windows={n_base} "
+        f"warming={total} seed={seed} workers={workers}"
+    )
+    if total == 0:
+        return 0, n_base, 0
+
+    nproc = max(1, int(workers))
+    # Serial for a small split (fork + per-worker index-share overhead isn't
+    # worth it under ~512 windows) or an explicit single worker.
+    if nproc <= 1 or total < 512:
+        return _warm_serial(split, total, n_base)
+
+    # Parallel: contiguous chunks. The base index is stem-contiguous, so a
+    # contiguous slice ≈ whole stems → the per-stem in-proc LRU still amortises
+    # the whole-recording decode within a worker; only the few stems straddling
+    # a chunk boundary decode in two workers (minor). FORK IS SAFE here: the
+    # decode is CPU/rust and no CUDA context is initialised (calibrate uses
+    # device="cpu"), so the inherited interpreter state is benign. Workers
+    # inherit `_WARM_DS` (built above) via copy-on-write — one index build total.
+    import multiprocessing as mp
+
+    bounds = [round(total * k / nproc) for k in range(nproc + 1)]
+    chunks = [(bounds[k], bounds[k + 1]) for k in range(nproc) if bounds[k + 1] > bounds[k]]
+    _eprint(
+        f"[warm_fb_cache] split={split}: {total} windows across {len(chunks)} fork workers"
+    )
+    done = 0
+    failed = 0
+    t0 = time.time()
+    ctx = mp.get_context("fork")
+    with ctx.Pool(len(chunks)) as pool:
+        for cdone, cfailed in pool.imap_unordered(_warm_range, chunks):
+            done += cdone
+            failed += cfailed
+            rate = done / max(1e-6, time.time() - t0)
+            _eprint(
+                f"{done}/{total} [warm_fb_cache split={split} x{len(chunks)} {rate:.0f} win/s]"
+            )
     if failed:
         _eprint(f"[warm_fb_cache] split={split}: {failed}/{total} windows FAILED")
     return total, n_base, failed
@@ -167,7 +236,28 @@ def main(argv: list[str] | None = None) -> int:
         "(default: FB_CACHE_MIN_FREE_GB env or 40). Prevents a silent partial "
         "warm that would leave the trainer re-decoding (and re-OOM-prone).",
     )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Parallel decode workers (the warm is CPU-bound serial decode; "
+        "single-process was ~20 h for the full corpus). Default: WARM_FB_WORKERS "
+        "env, else min(6, cpu//2). 1 = serial. Each worker holds ~one recording "
+        "in RAM, so size against the stage's memory budget.",
+    )
     args = ap.parse_args(argv)
+
+    # Resolve worker count: explicit flag > WARM_FB_WORKERS env > min(6, cpu//2).
+    # Capped so a fork-pool of decode workers (~1 GiB resident each) stays within
+    # the warm stage's memory reservation.
+    if args.workers is not None:
+        workers = max(1, args.workers)
+    else:
+        env_w = os.environ.get("WARM_FB_WORKERS", "").strip()
+        if env_w:
+            workers = max(1, int(env_w))
+        else:
+            workers = max(1, min(6, (os.cpu_count() or 4) // 2))
 
     if not os.path.isdir(args.lma_root):
         _eprint(f"[warm_fb_cache] FATAL: lma_root not a dir: {args.lma_root}")
@@ -219,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
         seed = args.seed if s == "train" else args.seed + 1
         try:
             done, n_base, failed = warm_split(
-                args.lma_root, s, args.split_manifest, seed, args.max_windows
+                args.lma_root, s, args.split_manifest, seed, args.max_windows, workers
             )
         except Exception as e:  # noqa: BLE001 — a split that can't even construct is fatal
             _eprint(f"[warm_fb_cache] FATAL: split {s} failed to warm: {e!r}")
