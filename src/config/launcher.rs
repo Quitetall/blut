@@ -10,14 +10,55 @@ use std::process::Command;
 use crate::error::{Result, TrainError};
 use crate::paths;
 
-/// Build (and optionally spawn) the command that runs a unit of work.
-pub trait Launcher {
-    /// Construct the [`Command`] that runs `inner` (the program + args) under
-    /// the named `unit`. Does not spawn — callers can inspect or further
-    /// configure the returned command first.
-    fn build_command(&self, unit: &str, inner: &[String]) -> Result<Command>;
+/// Which launcher produced a [`WrappedCommand`]. Lets a backend pick the right
+/// liveness / OOM-peak handling for the placement mechanism: systemd's
+/// `Memory peak:` stderr line + cgroup for `Local`, exit-code / `sacct` for
+/// `Slurm`, the Ray job status for `Ray`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LauncherKind {
+    Local,
+    Slurm,
+    Ray,
+}
 
-    /// Build and spawn the command, returning the child process handle.
+/// Backend-AGNOSTIC launch spec: the program + argv + env a launcher prepends
+/// around the inner command. A backend builds its OWN process from this — a
+/// `std::process::Command` for simple spawns, or a `tokio::process::Command`
+/// with `pre_exec`/piped-stdout for the async status-streaming + OOM-classify
+/// path. So the launcher owns command CONSTRUCTION; the backend owns process
+/// MANAGEMENT. This split is what lets the same launcher feed both the blocking
+/// CLI path and the streaming trainer path without the trait knowing about
+/// tokio or the broker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WrappedCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub kind: LauncherKind,
+}
+
+/// Build the launch spec that runs a unit of work, optionally on a remote
+/// scheduler. Implementors produce a [`WrappedCommand`]; the trait derives the
+/// `std::process::Command` + spawn conveniences from it.
+pub trait Launcher {
+    /// The launcher prefix + env wrapping `inner` (program + args), under the
+    /// named `unit`. The backend-agnostic core.
+    fn wrap(&self, unit: &str, inner: &[String]) -> Result<WrappedCommand>;
+
+    /// A `std::process::Command` from [`wrap`](Self::wrap), for callers that
+    /// inspect/spawn directly. The async backends build a `tokio` command from
+    /// `wrap` instead (so they can stream status + classify OOM per `kind`).
+    fn build_command(&self, unit: &str, inner: &[String]) -> Result<Command> {
+        let w = self.wrap(unit, inner)?;
+        let mut c = Command::new(&w.program);
+        c.args(&w.args);
+        for (k, v) in &w.env {
+            c.env(k, v);
+        }
+        Ok(c)
+    }
+
+    /// Build and spawn, returning the child process handle.
     fn launch(&self, unit: &str, inner: &[String]) -> Result<std::process::Child> {
         let mut c = self.build_command(unit, inner)?;
         c.spawn()
@@ -51,7 +92,7 @@ impl Default for LocalSystemd {
 }
 
 impl Launcher for LocalSystemd {
-    fn build_command(&self, unit: &str, inner: &[String]) -> Result<Command> {
+    fn wrap(&self, unit: &str, inner: &[String]) -> Result<WrappedCommand> {
         // run_contained.sh runs under systemd-run's MINIMAL cwd, so the
         // script path MUST be absolute.
         let root = paths::meta_repo_root()?;
@@ -62,14 +103,19 @@ impl Launcher for LocalSystemd {
                 script.display()
             )));
         }
-        let mut c = Command::new("bash");
-        c.arg(&script);
-        c.args(inner);
-        c.env("UNIT", unit);
-        c.env("MEMMAX", &self.mem_max);
-        c.env("MEMHIGH", &self.mem_high);
-        c.env("SWAPMAX", &self.swap_max);
-        Ok(c)
+        let mut args = vec![script.display().to_string()];
+        args.extend(inner.iter().cloned());
+        Ok(WrappedCommand {
+            program: "bash".to_string(),
+            args,
+            env: vec![
+                ("UNIT".into(), unit.to_string()),
+                ("MEMMAX".into(), self.mem_max.clone()),
+                ("MEMHIGH".into(), self.mem_high.clone()),
+                ("SWAPMAX".into(), self.swap_max.clone()),
+            ],
+            kind: LauncherKind::Local,
+        })
     }
 }
 
@@ -100,38 +146,37 @@ pub struct SlurmLauncher {
 }
 
 impl Launcher for SlurmLauncher {
-    fn build_command(&self, unit: &str, inner: &[String]) -> Result<Command> {
+    fn wrap(&self, unit: &str, inner: &[String]) -> Result<WrappedCommand> {
         if inner.is_empty() {
             return Err(TrainError::other("slurm launcher: empty inner command"));
         }
-        let mut c = Command::new("srun");
-        c.arg(format!("--job-name={unit}"));
+        let mut args = vec![format!("--job-name={unit}")];
         if let Some(p) = &self.partition {
-            c.arg(format!("--partition={p}"));
+            args.push(format!("--partition={p}"));
         }
         if let Some(m) = &self.mem {
-            c.arg(format!("--mem={m}"));
+            args.push(format!("--mem={m}"));
         }
         if let Some(n) = self.cpus {
-            c.arg(format!("--cpus-per-task={n}"));
+            args.push(format!("--cpus-per-task={n}"));
         }
         if let Some(g) = self.gpus {
-            c.arg(format!("--gpus={g}"));
+            args.push(format!("--gpus={g}"));
         }
         if let Some(t) = &self.time {
-            c.arg(format!("--time={t}"));
+            args.push(format!("--time={t}"));
         }
-        for x in &self.extra {
-            // A bare "--" would prematurely close option parsing; the real inner
-            // separator is appended below.
-            if x == "--" {
-                continue;
-            }
-            c.arg(x);
-        }
-        c.arg("--");
-        c.args(inner);
-        Ok(c)
+        // A bare "--" in extra would prematurely close option parsing; the real
+        // inner separator is appended below.
+        args.extend(self.extra.iter().filter(|x| *x != "--").cloned());
+        args.push("--".to_string());
+        args.extend(inner.iter().cloned());
+        Ok(WrappedCommand {
+            program: "srun".to_string(),
+            args,
+            env: Vec::new(),
+            kind: LauncherKind::Slurm,
+        })
     }
 }
 
@@ -149,30 +194,31 @@ pub struct RayLauncher {
 }
 
 impl Launcher for RayLauncher {
-    fn build_command(&self, unit: &str, inner: &[String]) -> Result<Command> {
+    fn wrap(&self, unit: &str, inner: &[String]) -> Result<WrappedCommand> {
         if inner.is_empty() {
             return Err(TrainError::other("ray launcher: empty inner command"));
         }
-        let mut c = Command::new("ray");
-        c.arg("job").arg("submit");
-        c.arg(format!("--submission-id={unit}"));
+        let mut args = vec![
+            "job".to_string(),
+            "submit".to_string(),
+            format!("--submission-id={unit}"),
+        ];
         if let Some(a) = &self.address {
-            c.arg(format!("--address={a}"));
+            args.push(format!("--address={a}"));
         }
         if let Some(re) = &self.runtime_env {
-            c.arg("--runtime-env-json").arg(re);
+            args.push("--runtime-env-json".to_string());
+            args.push(re.clone());
         }
-        for x in &self.extra {
-            // A bare "--" would prematurely close option parsing; the real inner
-            // separator is appended below.
-            if x == "--" {
-                continue;
-            }
-            c.arg(x);
-        }
-        c.arg("--");
-        c.args(inner);
-        Ok(c)
+        args.extend(self.extra.iter().filter(|x| *x != "--").cloned());
+        args.push("--".to_string());
+        args.extend(inner.iter().cloned());
+        Ok(WrappedCommand {
+            program: "ray".to_string(),
+            args,
+            env: Vec::new(),
+            kind: LauncherKind::Ray,
+        })
     }
 }
 
@@ -216,6 +262,22 @@ mod tests {
         assert!(!a.iter().any(|x| x.starts_with("--mem")), "unset → no flag");
         assert!(!a.iter().any(|x| x.starts_with("--partition")));
         assert!(SlurmLauncher::default().build_command("u", &[]).is_err());
+    }
+
+    #[test]
+    fn wrap_carries_kind_and_splits_env_from_argv() {
+        // Slurm: all knobs are argv, env empty, kind Slurm.
+        let s = SlurmLauncher { mem: Some("8G".into()), ..Default::default() }
+            .wrap("u", &["echo".into()])
+            .unwrap();
+        assert_eq!(s.kind, LauncherKind::Slurm);
+        assert_eq!(s.program, "srun");
+        assert!(s.env.is_empty());
+        assert!(s.args.contains(&"--mem=8G".to_string()));
+        // Ray: kind Ray.
+        let r = RayLauncher::default().wrap("u", &["echo".into()]).unwrap();
+        assert_eq!(r.kind, LauncherKind::Ray);
+        assert_eq!(r.program, "ray");
     }
 
     #[test]
