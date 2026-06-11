@@ -180,11 +180,18 @@ def warm_split(
     nproc = max(1, int(workers))
     import multiprocessing as mp
 
-    # Serial for a small split (fork + per-worker index-share overhead isn't
-    # worth it under ~512 windows), an explicit single worker, or a platform
-    # without fork (the CoW-inherited `_WARM_DS` only works under fork; spawn
-    # would re-import the module with `_WARM_DS=None`).
-    if nproc <= 1 or total < 512 or "fork" not in mp.get_all_start_methods():
+    # The CoW-inherited `_WARM_DS` only works under FORK (a `spawn` child
+    # re-imports the module with `_WARM_DS=None`), so the parallel path requires
+    # fork to be available. fork is available on Linux + macOS (deprecated but
+    # works for this pure-rust/numpy decode — we request it explicitly via
+    # get_context below regardless of the platform default); only a genuinely
+    # fork-less platform (e.g. Windows) lacks it.
+    fork_ok = "fork" in mp.get_all_start_methods()
+    # Serial for: a small split (fork + per-worker index-share overhead isn't
+    # worth it under ~512 windows), an explicit single worker, or no fork.
+    if nproc <= 1 or total < 512 or not fork_ok:
+        if not fork_ok and nproc > 1 and total >= 512:
+            _eprint("[warm_fb_cache] fork start method unavailable — warming serially")
         return _warm_serial(split, total, n_base)
 
     # Parallel: contiguous chunks. The base index is stem-contiguous, so a
