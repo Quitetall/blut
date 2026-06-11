@@ -73,9 +73,159 @@ impl Launcher for LocalSystemd {
     }
 }
 
+/// Run work as a Slurm job via `srun` — synchronous (the orchestrator blocks on
+/// the cluster-scheduled allocation, mirroring `LocalSystemd`'s `--pipe --wait`
+/// contract), so the executor's per-stage scheduling + the broker admission stay
+/// the source of truth and only the *placement* moves to the cluster. The DAG's
+/// per-stage resource needs map to `srun` flags.
+///
+/// SHARED-FILESYSTEM CONTRACT: the content-addressed cache + job dirs must live
+/// on a filesystem the compute node can see (NFS/Lustre). Cross-node SYNC of a
+/// node-local cache is a separate slice (see the `#3` roadmap); this backend
+/// assumes a shared mount, which every real HPC cluster provides.
+#[derive(Clone, Debug, Default)]
+pub struct SlurmLauncher {
+    /// `--partition`.
+    pub partition: Option<String>,
+    /// `--mem` (e.g. `"44G"`) — the per-job RAM allocation.
+    pub mem: Option<String>,
+    /// `--cpus-per-task`.
+    pub cpus: Option<u32>,
+    /// `--gpus`.
+    pub gpus: Option<u32>,
+    /// `--time` (e.g. `"08:00:00"`).
+    pub time: Option<String>,
+    /// Verbatim passthrough flags appended before the `--` separator.
+    pub extra: Vec<String>,
+}
+
+impl Launcher for SlurmLauncher {
+    fn build_command(&self, unit: &str, inner: &[String]) -> Result<Command> {
+        if inner.is_empty() {
+            return Err(TrainError::other("slurm launcher: empty inner command"));
+        }
+        let mut c = Command::new("srun");
+        c.arg(format!("--job-name={unit}"));
+        if let Some(p) = &self.partition {
+            c.arg(format!("--partition={p}"));
+        }
+        if let Some(m) = &self.mem {
+            c.arg(format!("--mem={m}"));
+        }
+        if let Some(n) = self.cpus {
+            c.arg(format!("--cpus-per-task={n}"));
+        }
+        if let Some(g) = self.gpus {
+            c.arg(format!("--gpus={g}"));
+        }
+        if let Some(t) = &self.time {
+            c.arg(format!("--time={t}"));
+        }
+        for x in &self.extra {
+            c.arg(x);
+        }
+        c.arg("--");
+        c.args(inner);
+        Ok(c)
+    }
+}
+
+/// Run work as a Ray job via `ray job submit` — the cluster head node places it.
+/// `address` targets the head (else `RAY_ADDRESS` from the env). Same
+/// shared-filesystem / cache-locality contract as [`SlurmLauncher`].
+#[derive(Clone, Debug, Default)]
+pub struct RayLauncher {
+    /// `--address` of the Ray head (e.g. `"http://127.0.0.1:8265"`).
+    pub address: Option<String>,
+    /// `--runtime-env-json` (deps / env for the job).
+    pub runtime_env: Option<String>,
+    /// Verbatim passthrough flags appended before the `--` separator.
+    pub extra: Vec<String>,
+}
+
+impl Launcher for RayLauncher {
+    fn build_command(&self, unit: &str, inner: &[String]) -> Result<Command> {
+        if inner.is_empty() {
+            return Err(TrainError::other("ray launcher: empty inner command"));
+        }
+        let mut c = Command::new("ray");
+        c.arg("job").arg("submit");
+        c.arg(format!("--submission-id={unit}"));
+        if let Some(a) = &self.address {
+            c.arg(format!("--address={a}"));
+        }
+        if let Some(re) = &self.runtime_env {
+            c.arg("--runtime-env-json").arg(re);
+        }
+        for x in &self.extra {
+            c.arg(x);
+        }
+        c.arg("--");
+        c.args(inner);
+        Ok(c)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn argv(c: &Command) -> Vec<String> {
+        c.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn slurm_build_command_maps_resources_to_flags() {
+        let l = SlurmLauncher {
+            partition: Some("gpu".into()),
+            mem: Some("44G".into()),
+            cpus: Some(8),
+            gpus: Some(1),
+            time: Some("08:00:00".into()),
+            extra: vec!["--exclusive".into()],
+        };
+        let c = l.build_command("job-x", &["python".into(), "train.py".into()]).unwrap();
+        assert_eq!(c.get_program(), "srun");
+        let a = argv(&c);
+        assert!(a.contains(&"--job-name=job-x".to_string()));
+        assert!(a.contains(&"--partition=gpu".to_string()));
+        assert!(a.contains(&"--mem=44G".to_string()));
+        assert!(a.contains(&"--cpus-per-task=8".to_string()));
+        assert!(a.contains(&"--gpus=1".to_string()));
+        assert!(a.contains(&"--time=08:00:00".to_string()));
+        assert!(a.contains(&"--exclusive".to_string()));
+        // The inner command follows the `--` separator, verbatim + last.
+        let sep = a.iter().position(|x| x == "--").unwrap();
+        assert_eq!(&a[sep + 1..], &["python", "train.py"]);
+    }
+
+    #[test]
+    fn slurm_omits_unset_flags_and_rejects_empty() {
+        let c = SlurmLauncher::default().build_command("u", &["echo".into()]).unwrap();
+        let a = argv(&c);
+        assert!(!a.iter().any(|x| x.starts_with("--mem")), "unset → no flag");
+        assert!(!a.iter().any(|x| x.starts_with("--partition")));
+        assert!(SlurmLauncher::default().build_command("u", &[]).is_err());
+    }
+
+    #[test]
+    fn ray_build_command_submits_with_id() {
+        let l = RayLauncher {
+            address: Some("http://h:8265".into()),
+            runtime_env: Some(r#"{"pip":["torch"]}"#.into()),
+            extra: vec![],
+        };
+        let c = l.build_command("job-y", &["python".into(), "-m".into(), "t".into()]).unwrap();
+        assert_eq!(c.get_program(), "ray");
+        let a = argv(&c);
+        assert_eq!(&a[..2], &["job", "submit"]);
+        assert!(a.contains(&"--submission-id=job-y".to_string()));
+        assert!(a.contains(&"--address=http://h:8265".to_string()));
+        assert!(a.contains(&"--runtime-env-json".to_string()));
+        let sep = a.iter().position(|x| x == "--").unwrap();
+        assert_eq!(&a[sep + 1..], &["python", "-m", "t"]);
+        assert!(RayLauncher::default().build_command("u", &[]).is_err());
+    }
 
     #[test]
     fn build_command_argv_is_inspectable() {
