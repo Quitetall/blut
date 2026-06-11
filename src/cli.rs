@@ -771,13 +771,14 @@ fn run_lineage_trace(hash: &str, json: bool) -> Result<()> {
         let a = &step.artifact;
         println!("  [{i}] {} :: {} = {}", a.stage_name, a.kind, short(&a.content_hash));
         if let Some(run) = &step.run {
+            // `?` for unrecorded hardware — NOT `0` (which reads as "zero RAM").
+            let ram = run.ram_gib.map(|g| format!("{g}G")).unwrap_or_else(|| "?".into());
+            let vram = run.vram_mib.map(|m| format!("{m}M")).unwrap_or_else(|| "?".into());
             println!(
-                "      job={} recipe={} git={} ram={}G vram={}M outcome={}",
+                "      job={} recipe={} git={} ram={ram} vram={vram} outcome={}",
                 run.job_id,
                 run.recipe,
                 run.git_sha.as_deref().unwrap_or("?"),
-                run.ram_gib.unwrap_or(0),
-                run.vram_mib.unwrap_or(0),
                 run.outcome.as_deref().unwrap_or("?"),
             );
         }
@@ -791,7 +792,9 @@ fn run_lineage_trace(hash: &str, json: bool) -> Result<()> {
 fn run_lineage_reindex() -> Result<()> {
     let jobs_root = crate::paths::jobs_dir()?;
     let (mut indexed, mut skipped) = (0u32, 0u32);
-    if let Ok(rd) = std::fs::read_dir(&jobs_root) {
+    let rd = std::fs::read_dir(&jobs_root)
+        .with_context(|| format!("read jobs dir {}", jobs_root.display()))?;
+    {
         for e in rd.flatten() {
             let Some(job_id) = e.file_name().to_str().map(String::from) else {
                 continue;
