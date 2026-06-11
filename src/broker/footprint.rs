@@ -69,6 +69,76 @@ pub struct Drivers {
     /// holds no whole-recording decode) AND is part of the calibration key, so a
     /// warm `Measured` peak can never resolve a cold run (and vice versa).
     pub warm: bool,
+    /// Encoder INPUT channels (`detail_bands`): 21 = L3-only, 168 = full
+    /// detail-band stack (the joint default `--detail-bands all`). The 8×
+    /// wider fullband front-end (wider encoder layers + SOAP preconditioners +
+    /// the stacked dataloader input) costs materially more RAM than L3 — without
+    /// this term a fullband launch billed identically to L3 and was admitted
+    /// then cgroup-killed. Folded into the ESTIMATE, not the key: the store's
+    /// MAX-merge keeps the largest (fullband) peak per key, so a low L3 peak can
+    /// never under-size a fullband run.
+    pub in_ch: u32,
+}
+
+/// Default encoder input channels when no `--detail-bands`/`--n` override is
+/// present: the kernel's own default is `detail_bands='all'` (the full stack →
+/// 168 ch), so a bare joint run IS fullband. Defaulting here to 168 (not 21) is
+/// the load-bearing fix — the implicit-fullband default must not be under-billed.
+pub const DEFAULT_IN_CH: u32 = 168;
+/// L3-only encoder input (`--detail-bands none` / `--n none`).
+pub const L3_ONLY_IN_CH: u32 = 21;
+
+/// Map a `--detail-bands` / `--n` mode token to the conservative encoder in_ch.
+/// `none` → L3-only (21). ANY other mode (`all` / `l3_detail` / …) → the full
+/// stack (168), billed conservatively so a partial-band run is never UNDER-sized
+/// (over-billing a partial stack only over-provisions; the store self-heals).
+pub fn in_ch_from_detail_bands(mode: &str) -> u32 {
+    if mode.trim().eq_ignore_ascii_case("none") {
+        L3_ONLY_IN_CH
+    } else {
+        DEFAULT_IN_CH
+    }
+}
+
+/// Resolve the encoder in_ch from a train invocation's passthrough args.
+///
+/// Precedence: `--detail-bands <m>` (or its `--n <m>` alias) in `extra_args`
+/// wins; else `SNN_DETAIL_BANDS=<bands>` in `extra_env` (empty ⇒ none ⇒ 21);
+/// else the kernel default `detail_bands='all'` ⇒ [`DEFAULT_IN_CH`] (168).
+///
+/// THE single shared derivation: the cli RESOLVE side (`from_args_json`) and the
+/// cookbook RECORD side (the train stage) both call this so the billed in_ch —
+/// hence the estimate — matches.
+pub fn in_ch_from_args(extra_args: &[&str], extra_env: &[&str]) -> u32 {
+    for flag in ["--detail-bands", "--n"] {
+        if let Some(i) = extra_args.iter().position(|&x| x == flag) {
+            if let Some(&m) = extra_args.get(i + 1) {
+                return in_ch_from_detail_bands(m);
+            }
+        }
+    }
+    for kv in extra_env {
+        if let Some(val) = kv.strip_prefix("SNN_DETAIL_BANDS=") {
+            return if val.trim().is_empty() {
+                L3_ONLY_IN_CH
+            } else {
+                DEFAULT_IN_CH
+            };
+        }
+    }
+    DEFAULT_IN_CH
+}
+
+/// `in_ch` from a recipe args JSON (the RESOLVE side) — extracts the
+/// `extra_args`/`extra_env` string arrays and defers to [`in_ch_from_args`].
+fn in_ch_from_args_json(raw: &serde_json::Value) -> u32 {
+    let strs = |key: &str| -> Vec<&str> {
+        raw.get(key)
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|x| x.as_str()).collect())
+            .unwrap_or_default()
+    };
+    in_ch_from_args(&strs("extra_args"), &strs("extra_env"))
 }
 
 impl Drivers {
@@ -109,31 +179,36 @@ impl Drivers {
             .get("warm_fb_cache")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Encoder in_ch from the detail-band mode (default 168 = the kernel's
+        // implicit `detail_bands='all'`); the under-bill fix for fullband.
+        let in_ch = in_ch_from_args_json(raw);
         Self {
             workers,
             batch,
             tier,
             latent,
             warm,
+            in_ch,
         }
     }
 
     /// Build directly from the resolved drivers a train stage launches
     /// with (RECORD side). Clamps `workers` to the cap so a stage that
     /// passes a raw count still keys identically to the cli.
-    pub fn new(workers: u32, batch: u32, tier: u32, latent: u32, warm: bool) -> Self {
+    pub fn new(workers: u32, batch: u32, tier: u32, latent: u32, warm: bool, in_ch: u32) -> Self {
         Self {
             workers: workers.clamp(1, UNCALIBRATED_WORKER_CAP),
             batch,
             tier,
             latent,
             warm,
+            in_ch,
         }
     }
 
     /// The conservative-high RAM/VRAM estimate for these drivers.
     pub fn estimate(&self) -> Footprint {
-        estimate(self.workers, self.batch, self.tier, self.latent, self.warm)
+        estimate(self.workers, self.batch, self.tier, self.latent, self.warm, self.in_ch)
     }
 
     /// The calibration key for these drivers under `recipe`. Latent is
@@ -200,6 +275,16 @@ const PER_LATENT256_BYTES: u64 = GIB;
 /// double-counted the dataloader's own batch staging (already in the
 /// worker term) and inflated batch-32 to a spurious 8 GiB.
 const PER_BATCH_BYTES: u64 = GIB / 16; // 64 MiB / batch unit
+
+/// RAM per extra 21-channel group of encoder input beyond the L3 baseline
+/// (`in_ch` > 21). The fullband stack (`detail_bands='all'` → 168 ch = 8 groups)
+/// drives an 8× wider encoder front-end (wider conv/linear layers + their SOAP
+/// preconditioners) plus the stacked `[in_ch, 313]` dataloader input — none of
+/// which the L3 (21-ch) baseline carries. So fullband bills `(8-1) × 1 GiB =
+/// +7 GiB` over L3. Conservative-high (a fullband tier-3 truly needs ~30 GiB vs
+/// the L3-shaped ~23 GiB estimate that was admitted then cgroup-killed); the
+/// store self-heals DOWN from the first fullband `Measured` peak.
+const PER_INCH_GROUP_BYTES: u64 = GIB;
 
 // ── OOM-correction growth (R2 / ADR 0046 slice-3) ────────────────────────
 // An `OomCorrected` entry stores the cgroup cap that was HIT on an OOM — a
@@ -355,7 +440,17 @@ impl Footprint {
 /// - `warm`: the fullband disk cache was warmed upstream (Phase 2) ⇒ the
 ///   per-worker term drops to [`PREFETCH_PER_WORKER_BYTES_WARM`] (no
 ///   whole-recording decode held).
-pub fn estimate_ram_bytes(workers: u32, batch: u32, tier: u32, latent_dim: u32, warm: bool) -> u64 {
+/// - `in_ch`: encoder input channels (21 = L3-only, 168 = full detail-band
+///   stack) ⇒ a `(in_ch/21 − 1) × `[`PER_INCH_GROUP_BYTES`] fullband term, so a
+///   168-ch run is no longer billed like a 21-ch run.
+pub fn estimate_ram_bytes(
+    workers: u32,
+    batch: u32,
+    tier: u32,
+    latent_dim: u32,
+    warm: bool,
+    in_ch: u32,
+) -> u64 {
     let workers = workers as u64;
     let batch = batch as u64;
     let tier = tier.max(1) as u64; // tier 0 is nonsensical; floor at 1
@@ -374,19 +469,32 @@ pub fn estimate_ram_bytes(workers: u32, batch: u32, tier: u32, latent_dim: u32, 
     let latent_units = latent.div_ceil(256);
     let latent_term = latent_units.saturating_mul(PER_LATENT256_BYTES);
     let batch_term = batch.saturating_mul(PER_BATCH_BYTES);
+    // Fullband front-end: extra 21-ch groups beyond the L3 baseline. 168 ch ⇒
+    // (168/21 − 1) = 7 groups ⇒ +7 GiB; 21 ch ⇒ 0. Floored at 21 so a smaller
+    // in_ch never produces a negative (wrapping) term.
+    let inch_groups = (in_ch.max(L3_ONLY_IN_CH) / L3_ONLY_IN_CH).saturating_sub(1) as u64;
+    let inch_term = inch_groups.saturating_mul(PER_INCH_GROUP_BYTES);
 
     BASE_RSS_BYTES
         .saturating_add(workers_term)
         .saturating_add(tier_term)
         .saturating_add(latent_term)
         .saturating_add(batch_term)
+        .saturating_add(inch_term)
 }
 
 /// Convenience: build a [`Footprint`] from the cost drivers (RAM
 /// scaled, VRAM left unknown for slice-1).
-pub fn estimate(workers: u32, batch: u32, tier: u32, latent_dim: u32, warm: bool) -> Footprint {
+pub fn estimate(
+    workers: u32,
+    batch: u32,
+    tier: u32,
+    latent_dim: u32,
+    warm: bool,
+    in_ch: u32,
+) -> Footprint {
     Footprint {
-        ram_bytes: estimate_ram_bytes(workers, batch, tier, latent_dim, warm),
+        ram_bytes: estimate_ram_bytes(workers, batch, tier, latent_dim, warm, in_ch),
         vram_mib: 0,
     }
 }
@@ -597,7 +705,7 @@ mod tests {
     fn base_floor_with_zero_drivers() {
         // Even all-zero drivers bill the base RSS + a tier-1 + default
         // latent floor — never zero, so admission can't be fooled.
-        let r = estimate_ram_bytes(0, 0, 0, 0, false);
+        let r = estimate_ram_bytes(0, 0, 0, 0, false, 21);
         assert!(r >= BASE_RSS_BYTES, "got {r}");
         // floors: base + tier1 + latent256 = 6 + 2 + 1 = 9 GiB
         assert_eq!(r, 9 * GIB);
@@ -605,8 +713,8 @@ mod tests {
 
     #[test]
     fn monotone_in_workers() {
-        let lo = estimate_ram_bytes(2, 16, 3, 256, false);
-        let hi = estimate_ram_bytes(8, 16, 3, 256, false);
+        let lo = estimate_ram_bytes(2, 16, 3, 256, false, 21);
+        let hi = estimate_ram_bytes(8, 16, 3, 256, false, 21);
         assert!(hi > lo, "workers must increase RAM: {lo} !< {hi}");
         // workers dominate: +6 workers × 4 GiB = +24 GiB
         assert_eq!(hi - lo, 6 * PREFETCH_PER_WORKER_BYTES);
@@ -614,22 +722,22 @@ mod tests {
 
     #[test]
     fn monotone_in_batch() {
-        let lo = estimate_ram_bytes(4, 8, 3, 256, false);
-        let hi = estimate_ram_bytes(4, 32, 3, 256, false);
+        let lo = estimate_ram_bytes(4, 8, 3, 256, false, 21);
+        let hi = estimate_ram_bytes(4, 32, 3, 256, false, 21);
         assert!(hi > lo, "batch must increase RAM: {lo} !< {hi}");
     }
 
     #[test]
     fn monotone_in_tier() {
-        let lo = estimate_ram_bytes(4, 16, 1, 256, false);
-        let hi = estimate_ram_bytes(4, 16, 4, 256, false);
+        let lo = estimate_ram_bytes(4, 16, 1, 256, false, 21);
+        let hi = estimate_ram_bytes(4, 16, 4, 256, false, 21);
         assert!(hi > lo, "tier must increase RAM: {lo} !< {hi}");
     }
 
     #[test]
     fn monotone_in_latent() {
-        let lo = estimate_ram_bytes(4, 16, 3, 256, false);
-        let hi = estimate_ram_bytes(4, 16, 3, 512, false);
+        let lo = estimate_ram_bytes(4, 16, 3, 256, false, 21);
+        let hi = estimate_ram_bytes(4, 16, 3, 512, false, 21);
         assert!(hi > lo, "latent_dim must increase RAM: {lo} !< {hi}");
     }
 
@@ -638,9 +746,9 @@ mod tests {
         // The whole point (hole #4): RAM is workers-driven, not
         // batch-driven. Doubling workers must move RAM more than
         // doubling batch from the same baseline.
-        let base = estimate_ram_bytes(4, 16, 3, 256, false);
-        let more_workers = estimate_ram_bytes(8, 16, 3, 256, false);
-        let more_batch = estimate_ram_bytes(4, 32, 3, 256, false);
+        let base = estimate_ram_bytes(4, 16, 3, 256, false, 21);
+        let more_workers = estimate_ram_bytes(8, 16, 3, 256, false, 21);
+        let more_batch = estimate_ram_bytes(4, 32, 3, 256, false, 21);
         assert!(
             more_workers - base > more_batch - base,
             "workers must dominate batch: dW={} dB={}",
@@ -651,7 +759,7 @@ mod tests {
 
     #[test]
     fn memmax_adds_headroom() {
-        let fp = estimate(4, 16, 3, 256, false);
+        let fp = estimate(4, 16, 3, 256, false, 21);
         assert_eq!(fp.memmax_bytes(), fp.ram_bytes + 2 * GIB);
     }
 
@@ -660,7 +768,7 @@ mod tests {
         // The load-bearing slice-1 property: the uncalibrated default
         // (capped workers ≤ 4) is conservative-high but still fits ONE
         // train on the 62 GiB box with the 6 GiB floor.
-        let fp = estimate(4, 16, 3, 256, false);
+        let fp = estimate(4, 16, 3, 256, false, 21);
         // 6 + 4×4 + 3×2 + 1 + 16×64MiB = 6+16+6+1+1 = 30 GiB
         assert_eq!(fp.ram_bytes, 30 * GIB);
         assert!(fp.ram_bytes < (62 - 6) * GIB, "must fit one train on 62G box");
@@ -673,7 +781,7 @@ mod tests {
         // workers=2 true working set (~16-20 GiB, DEV_LOG 2026-06-10 db39698),
         // so a cold run never OOMs at the cap. A future constant tweak that
         // re-under-sizes the hint (the 51bcc43 bug) trips this test.
-        let cold_cap = estimate(2, 32, 3, 256, false).memmax_bytes();
+        let cold_cap = estimate(2, 32, 3, 256, false, 21).memmax_bytes();
         // 6 + 2×4 + 3×2 + 1 + 32×64MiB = 23 GiB estimate, +2 GiB headroom = 25 GiB.
         // Pin the ACTUAL cap (24G threshold = the 25G cap with 1G slack), not
         // a loose ">demand" floor — a constant tweak that drops the cold cap
@@ -691,8 +799,8 @@ mod tests {
     fn warm_lowers_per_worker_term_only() {
         // The warm flag drops ONLY the per-worker term (no whole-recording
         // decode held); base/tier/latent/batch are unchanged.
-        let cold = estimate_ram_bytes(2, 32, 3, 256, false);
-        let warm = estimate_ram_bytes(2, 32, 3, 256, true);
+        let cold = estimate_ram_bytes(2, 32, 3, 256, false, 21);
+        let warm = estimate_ram_bytes(2, 32, 3, 256, true, 21);
         assert!(warm < cold, "warm must be tighter than cold: {warm} !< {cold}");
         // Δ = workers × (cold_per_worker − warm_per_worker) = 2 × (4−3) GiB.
         assert_eq!(
@@ -718,8 +826,8 @@ mod tests {
         // true working set. 6 + 2×3 + 3×2 + 1 + 32×64MiB = 21 GiB est, +2 = 23.
         // Pin it ABOVE the conservative warm demand (~20 GiB) yet BELOW the cold
         // 25 GiB cap — the tightening Phase 3 delivers, without re-OOMing.
-        let warm_cap = estimate(2, 32, 3, 256, true).memmax_bytes();
-        let cold_cap = estimate(2, 32, 3, 256, false).memmax_bytes();
+        let warm_cap = estimate(2, 32, 3, 256, true, 21).memmax_bytes();
+        let cold_cap = estimate(2, 32, 3, 256, false, 21).memmax_bytes();
         assert!(warm_cap < cold_cap, "warm cap must be tighter: {warm_cap} !< {cold_cap}");
         // Pin the EXACT cap so a future constant drift is caught concretely:
         // 6 + 2×3 + 3×2 + 1 + 32×64MiB = 21 GiB estimate, +2 GiB headroom = 23.
@@ -740,6 +848,63 @@ mod tests {
         assert!(warm.warm, "warm_fb_cache=true ⇒ warm");
         // And the warm estimate is tighter than the cold one for the same args.
         assert!(warm.estimate().ram_bytes < cold.estimate().ram_bytes);
+    }
+
+    // ── in_ch fullband term (the under-bill fix) ──────────────────────
+
+    #[test]
+    fn fullband_in_ch_adds_term_over_l3() {
+        // 168-ch fullband bills (168/21 − 1) = 7 GiB OVER the 21-ch L3 baseline —
+        // previously they were identical (the admit-then-cgroup-kill bug).
+        let l3 = estimate_ram_bytes(2, 32, 3, 256, false, 21);
+        let fb = estimate_ram_bytes(2, 32, 3, 256, false, 168);
+        assert!(fb > l3, "fullband must bill more than L3: {fb} !> {l3}");
+        assert_eq!(fb - l3, 7 * PER_INCH_GROUP_BYTES, "168ch ⇒ +7 groups");
+        // L3 baseline (21) adds nothing; a sub-baseline in_ch never wraps negative.
+        assert_eq!(
+            estimate_ram_bytes(2, 32, 3, 256, false, 0),
+            estimate_ram_bytes(2, 32, 3, 256, false, 21),
+            "in_ch < baseline floors at 21 (no wrap)"
+        );
+    }
+
+    #[test]
+    fn in_ch_from_detail_bands_mapping() {
+        assert_eq!(in_ch_from_detail_bands("none"), L3_ONLY_IN_CH);
+        assert_eq!(in_ch_from_detail_bands("NONE"), L3_ONLY_IN_CH);
+        assert_eq!(in_ch_from_detail_bands("all"), DEFAULT_IN_CH);
+        assert_eq!(in_ch_from_detail_bands("l3_detail"), DEFAULT_IN_CH);
+    }
+
+    #[test]
+    fn in_ch_from_args_precedence() {
+        // --detail-bands wins.
+        assert_eq!(in_ch_from_args(&["--detail-bands", "none"], &[]), 21);
+        assert_eq!(in_ch_from_args(&["--detail-bands", "all"], &[]), 168);
+        // --n alias.
+        assert_eq!(in_ch_from_args(&["--n", "none"], &[]), 21);
+        // SNN_DETAIL_BANDS env: empty ⇒ none, non-empty ⇒ fullband.
+        assert_eq!(in_ch_from_args(&[], &["SNN_DETAIL_BANDS="]), 21);
+        assert_eq!(in_ch_from_args(&[], &["SNN_DETAIL_BANDS=l3_detail"]), 168);
+        // Nothing ⇒ the kernel default detail_bands='all' ⇒ fullband (the fix).
+        assert_eq!(in_ch_from_args(&[], &[]), 168);
+    }
+
+    #[test]
+    fn drivers_default_is_fullband_then_overridable() {
+        // RESOLVE side: a bare joint run defaults to fullband (168) — the implicit
+        // 'all' default that was being under-billed.
+        let bare = Drivers::from_args_json(&serde_json::json!({"tier": 3}));
+        assert_eq!(bare.in_ch, 168, "bare joint run is fullband by default");
+        // Explicit L3-only drops the fullband term.
+        let l3 = Drivers::from_args_json(
+            &serde_json::json!({"tier": 3, "extra_args": ["--detail-bands", "none"]}),
+        );
+        assert_eq!(l3.in_ch, 21);
+        assert!(
+            l3.estimate().ram_bytes < bare.estimate().ram_bytes,
+            "L3 bills less than fullband"
+        );
     }
 
     // ── calibration store (ADR 0046 slice-2) ──────────────────────────
@@ -811,7 +976,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("footprints.json");
         let mut s = FootprintStore::load_from(path);
-        let hint = estimate(4, 16, 3, 256, false); // 31 GiB conservative
+        let hint = estimate(4, 16, 3, 256, false, 21); // 31 GiB conservative
         // Absent → hint verbatim.
         assert_eq!(s.resolve(&key(), hint), hint);
         // Present (measured ~20G) → measured RAM, hint VRAM (deferred).
@@ -829,7 +994,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("footprints.json");
         let mut s = FootprintStore::load_from(path);
-        let hint = estimate(2, 16, 3, 256, false); // conservative cold hint
+        let hint = estimate(2, 16, 3, 256, false, 21); // conservative cold hint
         s.record(&key(), 24 * GIB, 0, FootprintSource::OomCorrected)
             .unwrap();
         let r = s.resolve(&key(), hint);
@@ -844,7 +1009,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("footprints.json");
         let mut s = FootprintStore::load_from(path);
-        let hint = estimate(2, 16, 3, 256, false);
+        let hint = estimate(2, 16, 3, 256, false, 21);
         s.record(&key(), 8 * GIB, 0, FootprintSource::OomCorrected)
             .unwrap();
         let r = s.resolve(&key(), hint);
@@ -858,7 +1023,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("footprints.json");
         let mut s = FootprintStore::load_from(path);
-        let hint = estimate(2, 16, 3, 256, false);
+        let hint = estimate(2, 16, 3, 256, false, 21);
         s.record(&key(), 60 * GIB, 0, FootprintSource::OomCorrected)
             .unwrap();
         let r = s.resolve(&key(), hint);
@@ -872,7 +1037,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("footprints.json");
         let mut s = FootprintStore::load_from(path);
-        let hint = estimate(2, 16, 3, 256, false);
+        let hint = estimate(2, 16, 3, 256, false, 21);
         s.record(&key(), 24 * GIB, 0, FootprintSource::OomCorrected)
             .unwrap();
         let r1 = s.resolve(&key(), hint).ram_bytes; // max(30, 32)=32G

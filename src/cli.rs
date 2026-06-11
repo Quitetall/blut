@@ -1941,6 +1941,9 @@ async fn run_train(reg: &crate::framework::Registry, args: TrainArgs) -> Result<
             // The LLM bare-spawn path has no fullband warm — bill the
             // conservative COLD per-worker term.
             false,
+            // LLM trainer is not the EEG fullband path → L3-baseline in_ch (no
+            // detail-band stack term).
+            crate::broker::footprint::L3_ONLY_IN_CH,
         );
         if let Err(reason) = crate::broker::gate(&format!("train:{job_id}"), &drivers.estimate()) {
             if let Err(se) = jobs::write_state(&job_id, JobState::Failed) {
