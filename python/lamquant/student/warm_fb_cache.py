@@ -106,14 +106,24 @@ def _warm_range(rng: tuple[int, int]) -> tuple[int, int]:
     fork-inherited ``_WARM_DS``. Returns (processed, failed). Runs in a worker
     process (parallel path) — kept top-level + dependency-free so the fork pool
     can dispatch it by name."""
+    if _WARM_DS is None:
+        # The fork-inherited global is unset — would only happen if the pool
+        # somehow used `spawn` (the child re-imports the module fresh). Fail
+        # LOUDLY rather than silently warming nothing.
+        raise RuntimeError("_warm_range: _WARM_DS not inherited (non-fork start method?)")
     start, end = rng
     failed = 0
     for i in range(start, end):
-        # `except Exception` does NOT catch KeyboardInterrupt (BaseException).
+        # `except Exception` does NOT catch KeyboardInterrupt (BaseException) —
+        # Ctrl-C kills the worker + the pool raises in the parent.
         try:
             _WARM_DS._fetch_window(i)
-        except Exception:  # noqa: BLE001 — one bad window must not abort the slice
+        except Exception as e:  # noqa: BLE001 — one bad window must not abort the slice
             failed += 1
+            # Surface the first few per worker (a systemic setup error repeats);
+            # mirrors the serial path so parallel mode is debuggable too.
+            if failed <= 3:
+                _eprint(f"[warm_fb_cache] worker window {i} failed: {e!r}")
     return (end - start), failed
 
 
@@ -168,9 +178,13 @@ def warm_split(
         return 0, n_base, 0
 
     nproc = max(1, int(workers))
+    import multiprocessing as mp
+
     # Serial for a small split (fork + per-worker index-share overhead isn't
-    # worth it under ~512 windows) or an explicit single worker.
-    if nproc <= 1 or total < 512:
+    # worth it under ~512 windows), an explicit single worker, or a platform
+    # without fork (the CoW-inherited `_WARM_DS` only works under fork; spawn
+    # would re-import the module with `_WARM_DS=None`).
+    if nproc <= 1 or total < 512 or "fork" not in mp.get_all_start_methods():
         return _warm_serial(split, total, n_base)
 
     # Parallel: contiguous chunks. The base index is stem-contiguous, so a
@@ -180,9 +194,8 @@ def warm_split(
     # decode is CPU/rust and no CUDA context is initialised (calibrate uses
     # device="cpu"), so the inherited interpreter state is benign. Workers
     # inherit `_WARM_DS` (built above) via copy-on-write — one index build total.
-    import multiprocessing as mp
-
-    bounds = [round(total * k / nproc) for k in range(nproc + 1)]
+    # Integer-division bounds → gap-free, deterministic partition (no rounding).
+    bounds = [total * k // nproc for k in range(nproc + 1)]
     chunks = [(bounds[k], bounds[k + 1]) for k in range(nproc) if bounds[k + 1] > bounds[k]]
     _eprint(
         f"[warm_fb_cache] split={split}: {total} windows across {len(chunks)} fork workers"
@@ -248,16 +261,22 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     # Resolve worker count: explicit flag > WARM_FB_WORKERS env > min(6, cpu//2).
-    # Capped so a fork-pool of decode workers (~1 GiB resident each) stays within
-    # the warm stage's memory reservation.
+    # Each fork worker holds ~one recording in RAM, so the result is hard-capped
+    # at the cpu count (a stale/typo'd env must not fork-bomb the box).
+    cpu = os.cpu_count() or 4
     if args.workers is not None:
         workers = max(1, args.workers)
     else:
         env_w = os.environ.get("WARM_FB_WORKERS", "").strip()
         if env_w:
-            workers = max(1, int(env_w))
+            try:
+                workers = max(1, int(env_w))
+            except ValueError:
+                _eprint(f"[warm_fb_cache] WARM_FB_WORKERS={env_w!r} not an int — using default")
+                workers = max(1, min(6, cpu // 2))
         else:
-            workers = max(1, min(6, (os.cpu_count() or 4) // 2))
+            workers = max(1, min(6, cpu // 2))
+    workers = min(workers, cpu)  # fork-bomb guard (never more workers than cores)
 
     if not os.path.isdir(args.lma_root):
         _eprint(f"[warm_fb_cache] FATAL: lma_root not a dir: {args.lma_root}")
