@@ -339,6 +339,14 @@ enum RecipeCommand {
         /// running anything.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        /// #3 distributed placement: `local` (default) runs broker-gated +
+        /// cgroup-contained on THIS box (the never-OOM path); `slurm`/`ray`
+        /// submit each train stage to a cluster via the configured launcher
+        /// (`BLUT_SLURM_*` / `RAY_ADDRESS` env). SHARED-FS CONTRACT: the
+        /// content-addressed cache + job dirs must be reachable from the
+        /// compute node (NFS/Lustre); local admission still gates (conservative).
+        #[arg(long, default_value = "local")]
+        launcher: String,
     },
 }
 
@@ -1210,7 +1218,13 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
             set,
             sweep,
             dry_run,
+            launcher,
         } => {
+            // #3 distributed: parse placement up front so a typo fails the run
+            // BEFORE any job dir / state is written (vs deep in the executor).
+            let launch_target: crate::config::launcher::LaunchTarget = launcher
+                .parse()
+                .map_err(|e| anyhow!("invalid --launcher {launcher:?}: {e}"))?;
             // Any of these put us in config mode — so a stray --set / --config-key
             // can't be silently dropped (run_recipe_sweep then errors cleanly if
             // --config-dir/--config-name are missing).
@@ -1227,13 +1241,13 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                 }
                 run_recipe_sweep(
                     reg, &name, config_dir, config_name, config_key, &set, &sweep, dry_run,
-                    shared_cache,
+                    shared_cache, launch_target,
                 )
                 .await?;
             } else {
                 let raw: serde_json::Value = serde_json::from_str(&args)
                     .with_context(|| format!("parse --args as JSON: {args}"))?;
-                run_one_recipe(reg, &name, raw, None, shared_cache).await?;
+                run_one_recipe(reg, &name, raw, None, shared_cache, launch_target).await?;
             }
         }
     }
@@ -1251,6 +1265,7 @@ async fn run_one_recipe(
     args: serde_json::Value,
     sweep_fp: Option<crate::framework::ContentHash>,
     shared_cache: bool,
+    launch_target: crate::config::launcher::LaunchTarget,
 ) -> Result<()> {
     use crate::framework::ExecCtx;
 
@@ -1277,6 +1292,10 @@ async fn run_one_recipe(
             ctx = ctx.with_memory_budget(box_fit);
         }
     }
+    // #3 distributed: thread placement into the ExecCtx → every StageContext
+    // built by the executor carries it → a lamquant train stage routes to the
+    // cluster. `Local` (default) is a no-op vs the pre-launcher behaviour.
+    ctx = ctx.with_launch_target(launch_target);
     if shared_cache {
         if let Some(global) = crate::framework::CacheHandle::default_global_path() {
             std::fs::create_dir_all(&global)
@@ -1434,6 +1453,7 @@ async fn run_recipe_sweep(
     sweep: &[String],
     dry_run: bool,
     shared_cache: bool,
+    launch_target: crate::config::launcher::LaunchTarget,
 ) -> Result<()> {
     // Fail on a bad recipe name before composing anything.
     if reg.find(name).is_none() {
@@ -1484,7 +1504,7 @@ async fn run_recipe_sweep(
         }
         eprintln!("[{}/{total}] run (fp={})", i + 1, fp.to_hex());
         let args = project_args(entry.config.json, &key);
-        match run_one_recipe(reg, name, args, Some(fp), shared_cache).await {
+        match run_one_recipe(reg, name, args, Some(fp), shared_cache, launch_target).await {
             Ok(()) => ran += 1,
             Err(e) => {
                 eprintln!("[{}/{total}] FAILED: {e}", i + 1);
