@@ -76,7 +76,9 @@ pub struct Drivers {
     /// this term a fullband launch billed identically to L3 and was admitted
     /// then cgroup-killed. Folded into the ESTIMATE, not the key: the store's
     /// MAX-merge keeps the largest (fullband) peak per key, so a low L3 peak can
-    /// never under-size a fullband run.
+    /// never under-size a fullband run. SET VIA [`in_ch_from_args`] (or
+    /// [`L3_ONLY_IN_CH`]/[`DEFAULT_IN_CH`]); the estimate rounds a non-multiple
+    /// of 21 UP, so an arbitrary value is billed conservatively, never under.
     pub in_ch: u32,
 }
 
@@ -110,16 +112,28 @@ pub fn in_ch_from_detail_bands(mode: &str) -> u32 {
 /// cookbook RECORD side (the train stage) both call this so the billed in_ch —
 /// hence the estimate — matches.
 pub fn in_ch_from_args(extra_args: &[&str], extra_env: &[&str]) -> u32 {
-    for flag in ["--detail-bands", "--n"] {
-        if let Some(i) = extra_args.iter().position(|&x| x == flag) {
-            if let Some(&m) = extra_args.get(i + 1) {
+    for (i, &tok) in extra_args.iter().enumerate() {
+        for flag in ["--detail-bands", "--n"] {
+            // Equals form `--detail-bands=<m>` / `--n=<m>`. (`--n` can't false-
+            // match `--no-gan`: stripping `--n` leaves `o-gan`, no leading `=`.)
+            if let Some(m) = tok.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) {
                 return in_ch_from_detail_bands(m);
+            }
+            // Space form `--detail-bands <m>` / `--n <m>`.
+            if tok == flag {
+                if let Some(&m) = extra_args.get(i + 1) {
+                    return in_ch_from_detail_bands(m);
+                }
             }
         }
     }
     for kv in extra_env {
         if let Some(val) = kv.strip_prefix("SNN_DETAIL_BANDS=") {
-            return if val.trim().is_empty() {
+            // train_joint.py sets this to `''` for `detail_bands='none'`, so
+            // empty ⇒ L3-only; tolerate a literal `none` too. Any band list ⇒
+            // fullband (conservative).
+            let v = val.trim();
+            return if v.is_empty() || v.eq_ignore_ascii_case("none") {
                 L3_ONLY_IN_CH
             } else {
                 DEFAULT_IN_CH
@@ -470,10 +484,11 @@ pub fn estimate_ram_bytes(
     let latent_term = latent_units.saturating_mul(PER_LATENT256_BYTES);
     let batch_term = batch.saturating_mul(PER_BATCH_BYTES);
     // Fullband front-end: extra 21-ch groups beyond the L3 baseline. 168 ch ⇒
-    // (168/21 − 1) = 7 groups ⇒ +7 GiB; 21 ch ⇒ 0. Floored at 21 so a smaller
-    // in_ch never produces a negative (wrapping) term.
-    let inch_groups = (in_ch.max(L3_ONLY_IN_CH) / L3_ONLY_IN_CH).saturating_sub(1) as u64;
-    let inch_term = inch_groups.saturating_mul(PER_INCH_GROUP_BYTES);
+    // (168/21 − 1) = 7 groups ⇒ +7 GiB; 21 ch ⇒ 0. `div_ceil` rounds a
+    // non-multiple UP (a 30-ch encoder bills 1 group, never 0 — conservative,
+    // never under-bills); `max(21)` floors so a sub-baseline value can't wrap.
+    let in_ch_groups = (in_ch.max(L3_ONLY_IN_CH).div_ceil(L3_ONLY_IN_CH)).saturating_sub(1) as u64;
+    let inch_term = in_ch_groups.saturating_mul(PER_INCH_GROUP_BYTES);
 
     BASE_RSS_BYTES
         .saturating_add(workers_term)
@@ -866,6 +881,12 @@ mod tests {
             estimate_ram_bytes(2, 32, 3, 256, false, 21),
             "in_ch < baseline floors at 21 (no wrap)"
         );
+        // A non-multiple rounds UP (conservative): 30 ch ⇒ 1 group, not 0.
+        assert_eq!(
+            estimate_ram_bytes(2, 32, 3, 256, false, 30) - l3,
+            PER_INCH_GROUP_BYTES,
+            "30ch rounds up to 1 group (never under-bills)"
+        );
     }
 
     #[test]
@@ -883,8 +904,15 @@ mod tests {
         assert_eq!(in_ch_from_args(&["--detail-bands", "all"], &[]), 168);
         // --n alias.
         assert_eq!(in_ch_from_args(&["--n", "none"], &[]), 21);
-        // SNN_DETAIL_BANDS env: empty ⇒ none, non-empty ⇒ fullband.
+        // Equals form (shell convention) — must parse too.
+        assert_eq!(in_ch_from_args(&["--detail-bands=none"], &[]), 21);
+        assert_eq!(in_ch_from_args(&["--n=all"], &[]), 168);
+        // `--n` must NOT false-match `--no-gan` etc.
+        assert_eq!(in_ch_from_args(&["--no-gan"], &[]), 168);
+        // SNN_DETAIL_BANDS env: empty (the kernel's `none`) or literal `none`
+        // ⇒ L3; a band list ⇒ fullband.
         assert_eq!(in_ch_from_args(&[], &["SNN_DETAIL_BANDS="]), 21);
+        assert_eq!(in_ch_from_args(&[], &["SNN_DETAIL_BANDS=none"]), 21);
         assert_eq!(in_ch_from_args(&[], &["SNN_DETAIL_BANDS=l3_detail"]), 168);
         // Nothing ⇒ the kernel default detail_bands='all' ⇒ fullband (the fix).
         assert_eq!(in_ch_from_args(&[], &[]), 168);
