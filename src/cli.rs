@@ -1273,10 +1273,15 @@ async fn run_one_recipe(
         .find(name)
         .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
     let plan = (r.compile_fn)(args.clone()).map_err(|e| anyhow!("recipe compile failed: {e}"))?;
-    // ADR 0046 slice-1: resolve the RAM footprint from the args BEFORE `args`
-    // is consumed by the RecipeMarker below; the admission gate (after the job
-    // state is written) reuses it.
-    let footprint = recipe_footprint(name, &args);
+    // ADR 0046 slice-1: resolve the RAM footprint BEFORE `args` is consumed by
+    // the RecipeMarker below; the admission gate (after the job state is
+    // written) reuses it. Bill from the recipe's DEFAULTED args (the plan
+    // re-serialized them with serde defaults applied) — NOT the raw user args
+    // — so a defaulted driver like `warm_fb_cache` (Phase 3) and tier/batch are
+    // read IDENTICALLY to what the train stage records under (RECORD side),
+    // keeping the RESOLVE/RECORD calibration key in parity even when the user
+    // omitted the field.
+    let footprint = recipe_footprint(name, plan.exec_view().recipe_args);
 
     let job_id = crate::jobs::new_job_id();
     let job_dir = crate::paths::job_dir(&job_id)?;
@@ -1923,6 +1928,9 @@ async fn run_train(reg: &crate::framework::Registry, args: TrainArgs) -> Result<
             spec.batch_size,
             1,
             0,
+            // The LLM bare-spawn path has no fullband warm — bill the
+            // conservative COLD per-worker term.
+            false,
         );
         if let Err(reason) = crate::broker::gate(&format!("train:{job_id}"), &drivers.estimate()) {
             if let Err(se) = jobs::write_state(&job_id, JobState::Failed) {
@@ -2440,8 +2448,11 @@ mod footprint_resolve_tests {
         assert_eq!(d.batch, crate::broker::footprint::DEFAULT_BATCH);
         assert_eq!(d.tier, 3, "joint recipe default tier");
         assert_eq!(d.latent, 0, "no --encoder-width ⇒ default latent");
-        // The exact key the cli RESOLVES under for the joint default run.
-        assert_eq!(d.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|3|32|2");
+        assert!(!d.warm, "raw {{}} has no warm_fb_cache ⇒ cold (defaults applied via the plan, not here)");
+        // The exact key the cli RESOLVES under for a RAW (undefaulted) joint
+        // run. Production bills the plan's DEFAULTED args (warm_fb_cache=true ⇒
+        // `|w`); from_args_json on raw args is the conservative cold `|c`.
+        assert_eq!(d.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|3|32|2|c");
     }
 
     /// Explicit tier/batch flow through to the key (so a tier-6 fullband
@@ -2451,7 +2462,7 @@ mod footprint_resolve_tests {
         let raw = serde_json::json!({ "tier": 6, "batch_size": 16 });
         let d = crate::broker::Drivers::from_args_json(&raw);
         assert_eq!((d.workers, d.batch, d.tier), (2, 16, 6));
-        assert_eq!(d.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|6|16|2");
+        assert_eq!(d.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|6|16|2|c");
     }
 
     /// THE parity-bug regression: an explicit `workers:4` must clamp to the
@@ -2463,7 +2474,24 @@ mod footprint_resolve_tests {
         let raw = serde_json::json!({ "workers": 4, "tier": 3, "batch_size": 32 });
         let d = crate::broker::Drivers::from_args_json(&raw);
         assert_eq!(d.workers, crate::broker::UNCALIBRATED_WORKER_CAP);
-        assert_eq!(d.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|3|32|2");
+        assert_eq!(d.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|3|32|2|c");
+    }
+
+    /// Phase 3: the warm flag (off the recipe's DEFAULTED args) flows into the
+    /// estimate AND the key — a warm run bills the tighter per-worker term and
+    /// keys `|w` so it can't share calibration with a cold `|c` run.
+    #[test]
+    fn warm_flag_flows_to_estimate_and_key() {
+        let warm = crate::broker::Drivers::from_args_json(
+            &serde_json::json!({ "warm_fb_cache": true, "tier": 3, "batch_size": 32 }),
+        );
+        let cold = crate::broker::Drivers::from_args_json(
+            &serde_json::json!({ "warm_fb_cache": false, "tier": 3, "batch_size": 32 }),
+        );
+        assert!(warm.warm && !cold.warm);
+        assert!(warm.estimate().ram_bytes < cold.estimate().ram_bytes);
+        assert_eq!(warm.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|3|32|2|w");
+        assert_eq!(cold.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|3|32|2|c");
     }
 }
 

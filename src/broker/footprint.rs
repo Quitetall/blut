@@ -64,6 +64,11 @@ pub struct Drivers {
     /// Encoder latent width (0 ⇒ billed as the 256-wide default).
     /// Folded into the estimate, NOT the calibration key.
     pub latent: u32,
+    /// Never-OOM Phase 3: the per-window fullband disk cache is warmed upstream
+    /// (`warm_fb_cache` recipe arg). Lowers the per-worker term (the warm worker
+    /// holds no whole-recording decode) AND is part of the calibration key, so a
+    /// warm `Measured` peak can never resolve a cold run (and vice versa).
+    pub warm: bool,
 }
 
 impl Drivers {
@@ -95,36 +100,48 @@ impl Drivers {
                     .and_then(|s| s.parse::<u32>().ok())
             })
             .unwrap_or(0);
+        // `warm_fb_cache` (Phase 2/3): present + true on the warm-by-default
+        // joint recipe; ABSENT ⇒ false (the conservative cold term) so a recipe
+        // that doesn't warm is never under-billed. The cli RESOLVE side reads
+        // it here; the cookbook RECORD side reads the same flag off the train
+        // stage's args — they must agree or the calibration key never hits.
+        let warm = raw
+            .get("warm_fb_cache")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         Self {
             workers,
             batch,
             tier,
             latent,
+            warm,
         }
     }
 
     /// Build directly from the resolved drivers a train stage launches
     /// with (RECORD side). Clamps `workers` to the cap so a stage that
     /// passes a raw count still keys identically to the cli.
-    pub fn new(workers: u32, batch: u32, tier: u32, latent: u32) -> Self {
+    pub fn new(workers: u32, batch: u32, tier: u32, latent: u32, warm: bool) -> Self {
         Self {
             workers: workers.clamp(1, UNCALIBRATED_WORKER_CAP),
             batch,
             tier,
             latent,
+            warm,
         }
     }
 
     /// The conservative-high RAM/VRAM estimate for these drivers.
     pub fn estimate(&self) -> Footprint {
-        estimate(self.workers, self.batch, self.tier, self.latent)
+        estimate(self.workers, self.batch, self.tier, self.latent, self.warm)
     }
 
     /// The calibration key for these drivers under `recipe`. Latent is
     /// folded into the estimate, not the key (it rarely varies and would
-    /// fragment the calibration).
+    /// fragment the calibration). `warm` IS part of the key (a warm peak
+    /// must never resolve a cold run).
     pub fn key(&self, recipe: &str) -> FootprintKey {
-        footprint_key(recipe, self.workers, self.batch, self.tier)
+        footprint_key(recipe, self.workers, self.batch, self.tier, self.warm)
     }
 }
 
@@ -142,6 +159,26 @@ impl Drivers {
 /// calibration store refines per key; a cgroup cap (estimate + headroom)
 /// hard-bounds any under-shoot to a unit kill, never a box OOM.
 const PREFETCH_PER_WORKER_BYTES: u64 = 4 * GIB;
+
+/// Per-DataLoader-worker RAM when the per-window fullband disk cache is WARM
+/// (never-OOM Phase 2: `lamquant_warm_fb_cache` ran upstream). With every used
+/// window already on disk, the adapter's disk tier hits FIRST and the in-proc
+/// whole-recording signal LRU stays EMPTY (lma_typed_adapter `_fetch_window`),
+/// so the per-worker resident set collapses to CoW-fork + a reclaimable mmap
+/// page + the small L3 LRU — NOT a whole multi-hour recording. The cold
+/// [`PREFETCH_PER_WORKER_BYTES`] (4 GiB) was sized for the PRE-Phase-1/2 worker
+/// that held + re-decoded a whole recording every epoch (the OOM driver); the
+/// warm worker's true set is ~1.5-2.5 GiB.
+///
+/// Set conservative-HIGH at 3 GiB (a 25% cut, not the full ~40%) because no
+/// post-warm clean run has been MEASURED yet — the store auto-tightens DOWN
+/// from the first warm `Measured` peak (resolve returns it verbatim), and the
+/// 90%-rode-cap → `OomCorrected` → escalate self-heal bounds any under-shoot to
+/// a unit kill (never a box OOM). So this is the cold-START hint only; the
+/// calibration store does the rest. A run that DIDN'T warm bills the higher
+/// cold term (the `warm` flag is part of the calibration key, so warm + cold
+/// runs of the same recipe never share — nor poison — an entry).
+const PREFETCH_PER_WORKER_BYTES_WARM: u64 = 3 * GIB;
 
 /// Base RSS floor: python + torch + CUDA context + framework overhead,
 /// independent of workers/batch. Conservative-high.
@@ -248,6 +285,11 @@ pub struct FootprintKey {
     pub tier: u32,
     pub batch: u32,
     pub workers: u32,
+    /// Never-OOM Phase 3: whether the run warmed the fullband disk cache. A
+    /// warm run's per-worker footprint is much lower, so warm + cold runs MUST
+    /// key separately — else a warm `Measured` peak resolves a cold run and
+    /// under-sizes it (and an OomCorrected cold bound over-refuses a warm run).
+    pub warm: bool,
 }
 
 impl FootprintKey {
@@ -259,7 +301,18 @@ impl FootprintKey {
         // internal identifiers (never user free-text), so a debug_assert catches
         // a violation at test time without a release-path cost.
         debug_assert!(!self.recipe.contains('|'), "recipe name must not contain '|'");
-        format!("{}|{}|{}|{}", self.recipe, self.tier, self.batch, self.workers)
+        // `warm` is the trailing segment (`w`/`c`) so the key partitions warm vs
+        // cold calibration. NOTE: this changes the flat format — pre-Phase-3
+        // entries (4 segments) become unreachable, a deliberate one-time reset
+        // (their cold-regime peaks are invalid for the re-modeled warm worker).
+        format!(
+            "{}|{}|{}|{}|{}",
+            self.recipe,
+            self.tier,
+            self.batch,
+            self.workers,
+            if self.warm { "w" } else { "c" }
+        )
     }
 }
 
@@ -267,14 +320,15 @@ impl FootprintKey {
 /// THE single shared constructor: both the cli admission gate (RESOLVE)
 /// and the train stage (RECORD) call this so the keys are byte-identical
 /// — if they diverged the calibration would never be hit and the broker
-/// would over-refuse forever. `workers`/`batch`/`tier` MUST be the same
-/// values fed to [`estimate`].
-pub fn footprint_key(recipe: &str, workers: u32, batch: u32, tier: u32) -> FootprintKey {
+/// would over-refuse forever. `workers`/`batch`/`tier`/`warm` MUST be the
+/// same values fed to [`estimate`].
+pub fn footprint_key(recipe: &str, workers: u32, batch: u32, tier: u32, warm: bool) -> FootprintKey {
     FootprintKey {
         recipe: recipe.to_string(),
         tier,
         batch,
         workers,
+        warm,
     }
 }
 
@@ -297,7 +351,10 @@ impl Footprint {
 /// - `batch`: live mini-batch size.
 /// - `tier`: decoder tier (1..=4); larger tier ⇒ more model/opt RAM.
 /// - `latent_dim`: encoder latent width (0 ⇒ default, billed as 256).
-pub fn estimate_ram_bytes(workers: u32, batch: u32, tier: u32, latent_dim: u32) -> u64 {
+/// - `warm`: the fullband disk cache was warmed upstream (Phase 2) ⇒ the
+///   per-worker term drops to [`PREFETCH_PER_WORKER_BYTES_WARM`] (no
+///   whole-recording decode held).
+pub fn estimate_ram_bytes(workers: u32, batch: u32, tier: u32, latent_dim: u32, warm: bool) -> u64 {
     let workers = workers as u64;
     let batch = batch as u64;
     let tier = tier.max(1) as u64; // tier 0 is nonsensical; floor at 1
@@ -305,7 +362,12 @@ pub fn estimate_ram_bytes(workers: u32, batch: u32, tier: u32, latent_dim: u32) 
     // so the model term is never under-counted.
     let latent = if latent_dim == 0 { 256 } else { latent_dim } as u64;
 
-    let workers_term = workers.saturating_mul(PREFETCH_PER_WORKER_BYTES);
+    let per_worker = if warm {
+        PREFETCH_PER_WORKER_BYTES_WARM
+    } else {
+        PREFETCH_PER_WORKER_BYTES
+    };
+    let workers_term = workers.saturating_mul(per_worker);
     let tier_term = tier.saturating_mul(PER_TIER_BYTES);
     // ceil-div by 256 so any latent > 0 bills at least one unit.
     let latent_units = latent.div_ceil(256);
@@ -321,9 +383,9 @@ pub fn estimate_ram_bytes(workers: u32, batch: u32, tier: u32, latent_dim: u32) 
 
 /// Convenience: build a [`Footprint`] from the cost drivers (RAM
 /// scaled, VRAM left unknown for slice-1).
-pub fn estimate(workers: u32, batch: u32, tier: u32, latent_dim: u32) -> Footprint {
+pub fn estimate(workers: u32, batch: u32, tier: u32, latent_dim: u32, warm: bool) -> Footprint {
     Footprint {
-        ram_bytes: estimate_ram_bytes(workers, batch, tier, latent_dim),
+        ram_bytes: estimate_ram_bytes(workers, batch, tier, latent_dim, warm),
         vram_mib: 0,
     }
 }
@@ -520,7 +582,7 @@ mod tests {
     fn base_floor_with_zero_drivers() {
         // Even all-zero drivers bill the base RSS + a tier-1 + default
         // latent floor — never zero, so admission can't be fooled.
-        let r = estimate_ram_bytes(0, 0, 0, 0);
+        let r = estimate_ram_bytes(0, 0, 0, 0, false);
         assert!(r >= BASE_RSS_BYTES, "got {r}");
         // floors: base + tier1 + latent256 = 6 + 2 + 1 = 9 GiB
         assert_eq!(r, 9 * GIB);
@@ -528,8 +590,8 @@ mod tests {
 
     #[test]
     fn monotone_in_workers() {
-        let lo = estimate_ram_bytes(2, 16, 3, 256);
-        let hi = estimate_ram_bytes(8, 16, 3, 256);
+        let lo = estimate_ram_bytes(2, 16, 3, 256, false);
+        let hi = estimate_ram_bytes(8, 16, 3, 256, false);
         assert!(hi > lo, "workers must increase RAM: {lo} !< {hi}");
         // workers dominate: +6 workers × 4 GiB = +24 GiB
         assert_eq!(hi - lo, 6 * PREFETCH_PER_WORKER_BYTES);
@@ -537,22 +599,22 @@ mod tests {
 
     #[test]
     fn monotone_in_batch() {
-        let lo = estimate_ram_bytes(4, 8, 3, 256);
-        let hi = estimate_ram_bytes(4, 32, 3, 256);
+        let lo = estimate_ram_bytes(4, 8, 3, 256, false);
+        let hi = estimate_ram_bytes(4, 32, 3, 256, false);
         assert!(hi > lo, "batch must increase RAM: {lo} !< {hi}");
     }
 
     #[test]
     fn monotone_in_tier() {
-        let lo = estimate_ram_bytes(4, 16, 1, 256);
-        let hi = estimate_ram_bytes(4, 16, 4, 256);
+        let lo = estimate_ram_bytes(4, 16, 1, 256, false);
+        let hi = estimate_ram_bytes(4, 16, 4, 256, false);
         assert!(hi > lo, "tier must increase RAM: {lo} !< {hi}");
     }
 
     #[test]
     fn monotone_in_latent() {
-        let lo = estimate_ram_bytes(4, 16, 3, 256);
-        let hi = estimate_ram_bytes(4, 16, 3, 512);
+        let lo = estimate_ram_bytes(4, 16, 3, 256, false);
+        let hi = estimate_ram_bytes(4, 16, 3, 512, false);
         assert!(hi > lo, "latent_dim must increase RAM: {lo} !< {hi}");
     }
 
@@ -561,9 +623,9 @@ mod tests {
         // The whole point (hole #4): RAM is workers-driven, not
         // batch-driven. Doubling workers must move RAM more than
         // doubling batch from the same baseline.
-        let base = estimate_ram_bytes(4, 16, 3, 256);
-        let more_workers = estimate_ram_bytes(8, 16, 3, 256);
-        let more_batch = estimate_ram_bytes(4, 32, 3, 256);
+        let base = estimate_ram_bytes(4, 16, 3, 256, false);
+        let more_workers = estimate_ram_bytes(8, 16, 3, 256, false);
+        let more_batch = estimate_ram_bytes(4, 32, 3, 256, false);
         assert!(
             more_workers - base > more_batch - base,
             "workers must dominate batch: dW={} dB={}",
@@ -574,7 +636,7 @@ mod tests {
 
     #[test]
     fn memmax_adds_headroom() {
-        let fp = estimate(4, 16, 3, 256);
+        let fp = estimate(4, 16, 3, 256, false);
         assert_eq!(fp.memmax_bytes(), fp.ram_bytes + 2 * GIB);
     }
 
@@ -583,7 +645,7 @@ mod tests {
         // The load-bearing slice-1 property: the uncalibrated default
         // (capped workers ≤ 4) is conservative-high but still fits ONE
         // train on the 62 GiB box with the 6 GiB floor.
-        let fp = estimate(4, 16, 3, 256);
+        let fp = estimate(4, 16, 3, 256, false);
         // 6 + 4×4 + 3×2 + 1 + 16×64MiB = 6+16+6+1+1 = 30 GiB
         assert_eq!(fp.ram_bytes, 30 * GIB);
         assert!(fp.ram_bytes < (62 - 6) * GIB, "must fit one train on 62G box");
@@ -596,7 +658,7 @@ mod tests {
         // workers=2 true working set (~16-20 GiB, DEV_LOG 2026-06-10 db39698),
         // so a cold run never OOMs at the cap. A future constant tweak that
         // re-under-sizes the hint (the 51bcc43 bug) trips this test.
-        let cold_cap = estimate(2, 32, 3, 256).memmax_bytes();
+        let cold_cap = estimate(2, 32, 3, 256, false).memmax_bytes();
         // 6 + 2×4 + 3×2 + 1 + 32×64MiB = 23 GiB estimate, +2 GiB headroom = 25 GiB.
         // Pin the ACTUAL cap (24G threshold = the 25G cap with 1G slack), not
         // a loose ">demand" floor — a constant tweak that drops the cold cap
@@ -608,15 +670,69 @@ mod tests {
         );
     }
 
+    // ── Phase 3: warm-aware footprint ─────────────────────────────────
+
+    #[test]
+    fn warm_lowers_per_worker_term_only() {
+        // The warm flag drops ONLY the per-worker term (no whole-recording
+        // decode held); base/tier/latent/batch are unchanged.
+        let cold = estimate_ram_bytes(2, 32, 3, 256, false);
+        let warm = estimate_ram_bytes(2, 32, 3, 256, true);
+        assert!(warm < cold, "warm must be tighter than cold: {warm} !< {cold}");
+        // Δ = workers × (cold_per_worker − warm_per_worker) = 2 × (4−3) GiB.
+        assert_eq!(
+            cold - warm,
+            2 * (PREFETCH_PER_WORKER_BYTES - PREFETCH_PER_WORKER_BYTES_WARM)
+        );
+    }
+
+    #[test]
+    fn warm_key_differs_from_cold() {
+        // A warm run and a cold run of the same drivers MUST key separately so
+        // a warm Measured peak can never resolve a cold run (and vice versa).
+        let w = footprint_key("lamquant_joint_codec", 2, 32, 3, true);
+        let c = footprint_key("lamquant_joint_codec", 2, 32, 3, false);
+        assert_ne!(w.flat(), c.flat());
+        assert!(w.flat().ends_with("|w"));
+        assert!(c.flat().ends_with("|c"));
+    }
+
+    #[test]
+    fn warm_tier3_cap_still_holds_its_demand() {
+        // The re-modeled warm cap (workers-2 tier-3) must still exceed the warm
+        // true working set. 6 + 2×3 + 3×2 + 1 + 32×64MiB = 21 GiB est, +2 = 23.
+        // Pin it ABOVE the conservative warm demand (~20 GiB) yet BELOW the cold
+        // 25 GiB cap — the tightening Phase 3 delivers, without re-OOMing.
+        let warm_cap = estimate(2, 32, 3, 256, true).memmax_bytes();
+        let cold_cap = estimate(2, 32, 3, 256, false).memmax_bytes();
+        assert!(warm_cap < cold_cap, "warm cap must be tighter: {warm_cap} !< {cold_cap}");
+        assert!(
+            warm_cap >= 22 * GIB,
+            "warm cap {warm_cap} must still hold the ~20G warm demand with headroom"
+        );
+    }
+
+    #[test]
+    fn drivers_from_args_reads_warm_flag() {
+        // RESOLVE side: the warm flag comes off the recipe args JSON. Absent ⇒
+        // cold (conservative). Present+true ⇒ warm.
+        let cold = Drivers::from_args_json(&serde_json::json!({"tier": 3}));
+        assert!(!cold.warm, "absent warm_fb_cache ⇒ cold");
+        let warm = Drivers::from_args_json(&serde_json::json!({"warm_fb_cache": true, "tier": 3}));
+        assert!(warm.warm, "warm_fb_cache=true ⇒ warm");
+        // And the warm estimate is tighter than the cold one for the same args.
+        assert!(warm.estimate().ram_bytes < cold.estimate().ram_bytes);
+    }
+
     // ── calibration store (ADR 0046 slice-2) ──────────────────────────
 
     fn key() -> FootprintKey {
-        footprint_key("lamquant_joint_codec", 4, 16, 3)
+        footprint_key("lamquant_joint_codec", 4, 16, 3, false)
     }
 
     #[test]
     fn footprint_key_flat_is_stable_and_pipe_delimited() {
-        assert_eq!(key().flat(), "lamquant_joint_codec|3|16|4");
+        assert_eq!(key().flat(), "lamquant_joint_codec|3|16|4|c");
     }
 
     #[test]
@@ -677,7 +793,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("footprints.json");
         let mut s = FootprintStore::load_from(path);
-        let hint = estimate(4, 16, 3, 256); // 31 GiB conservative
+        let hint = estimate(4, 16, 3, 256, false); // 31 GiB conservative
         // Absent → hint verbatim.
         assert_eq!(s.resolve(&key(), hint), hint);
         // Present (measured ~20G) → measured RAM, hint VRAM (deferred).
@@ -695,7 +811,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("footprints.json");
         let mut s = FootprintStore::load_from(path);
-        let hint = estimate(2, 16, 3, 256); // conservative cold hint
+        let hint = estimate(2, 16, 3, 256, false); // conservative cold hint
         s.record(&key(), 24 * GIB, 0, FootprintSource::OomCorrected)
             .unwrap();
         let r = s.resolve(&key(), hint);
@@ -710,7 +826,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("footprints.json");
         let mut s = FootprintStore::load_from(path);
-        let hint = estimate(2, 16, 3, 256);
+        let hint = estimate(2, 16, 3, 256, false);
         s.record(&key(), 8 * GIB, 0, FootprintSource::OomCorrected)
             .unwrap();
         let r = s.resolve(&key(), hint);
@@ -724,7 +840,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("footprints.json");
         let mut s = FootprintStore::load_from(path);
-        let hint = estimate(2, 16, 3, 256);
+        let hint = estimate(2, 16, 3, 256, false);
         s.record(&key(), 60 * GIB, 0, FootprintSource::OomCorrected)
             .unwrap();
         let r = s.resolve(&key(), hint);
@@ -738,7 +854,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("footprints.json");
         let mut s = FootprintStore::load_from(path);
-        let hint = estimate(2, 16, 3, 256);
+        let hint = estimate(2, 16, 3, 256, false);
         s.record(&key(), 24 * GIB, 0, FootprintSource::OomCorrected)
             .unwrap();
         let r1 = s.resolve(&key(), hint).ram_bytes; // max(30, 32)=32G
