@@ -93,6 +93,10 @@ pub struct ExecCtx {
     /// sizes it to box-fit via `with_memory_budget`.
     pub memory: Arc<tokio::sync::Semaphore>,
     pub memory_budget_gib: u32,
+    /// Where stages place their work (#3). `Local` (default) = this box; a
+    /// launcher-aware backend reads this from `StageContext` to submit to
+    /// Slurm/Ray instead. Set by the CLI `--launcher` flag.
+    pub launch_target: crate::config::launcher::LaunchTarget,
 }
 
 impl ExecCtx {
@@ -124,7 +128,14 @@ impl ExecCtx {
             // requesting MEMORY_GIB ≪ this never blocks, so default = no gating.
             memory: Arc::new(tokio::sync::Semaphore::new(UNLIMITED_MEM_GIB as usize)),
             memory_budget_gib: UNLIMITED_MEM_GIB,
+            launch_target: crate::config::launcher::LaunchTarget::Local,
         }
+    }
+
+    /// Place stages on `target` (#3). Default `Local`.
+    pub fn with_launch_target(mut self, target: crate::config::launcher::LaunchTarget) -> Self {
+        self.launch_target = target;
+        self
     }
 
     pub fn with_resource_limit(mut self, resource: Resource, permits: usize) -> Self {
@@ -189,6 +200,7 @@ struct NodeEnv {
     resources: HashMap<Resource, Arc<tokio::sync::Semaphore>>,
     memory: Arc<tokio::sync::Semaphore>,
     memory_budget_gib: u32,
+    launch_target: crate::config::launcher::LaunchTarget,
     recipe_name: String,
     on_retry: Option<crate::framework::retry::RetryHook>,
 }
@@ -344,6 +356,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
             cancel: stage_cancel.clone(),
             cache: env.cache.clone(),
             recipe_name: env.recipe_name.clone(),
+            launch_target: env.launch_target,
         };
 
         // ── Resource permits ────────────────────────────────────────
@@ -797,6 +810,7 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
         resources: ctx.resources,
         memory: ctx.memory,
         memory_budget_gib: ctx.memory_budget_gib,
+        launch_target: ctx.launch_target,
         recipe_name: plan.name().to_string(),
         on_retry: ctx.on_retry,
     });

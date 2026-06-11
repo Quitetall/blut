@@ -146,6 +146,10 @@ pub struct StageContext {
     /// for `for_test` contexts (a calibration miss → conservative hint,
     /// which is benign).
     pub recipe_name: String,
+    /// Where to place this stage's work (#3). `Local` (default) = this box;
+    /// a launcher-aware backend submits to Slurm/Ray when set. Threaded from
+    /// the CLI `--launcher` flag via `ExecCtx`.
+    pub launch_target: crate::config::launcher::LaunchTarget,
 }
 
 impl StageContext {
@@ -160,6 +164,7 @@ impl StageContext {
             cancel: CancellationToken::new(),
             cache: Arc::new(CacheHandle::job_local(PathBuf::from("/tmp/_cache_test"))),
             recipe_name: String::new(),
+            launch_target: crate::config::launcher::LaunchTarget::Local,
         }
     }
 }

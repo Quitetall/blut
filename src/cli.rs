@@ -1010,6 +1010,7 @@ async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
                 cancel: tokio_util::sync::CancellationToken::new(),
                 cache: Arc::new(CacheHandle::job_local(td.path().join("_cache"))),
                 recipe_name: String::new(),
+                launch_target: crate::config::launcher::LaunchTarget::Local,
             };
 
             let result = stage
