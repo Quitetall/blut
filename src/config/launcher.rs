@@ -222,6 +222,57 @@ impl Launcher for RayLauncher {
     }
 }
 
+/// Where to place a unit of work, selected by `--launcher`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LaunchTarget {
+    /// This box, broker-gated + cgroup-contained (the never-OOM path).
+    #[default]
+    Local,
+    /// A Slurm allocation (`srun`).
+    Slurm,
+    /// A Ray job (`ray job submit`).
+    Ray,
+}
+
+impl std::str::FromStr for LaunchTarget {
+    type Err = TrainError;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "local" | "" => Ok(Self::Local),
+            "slurm" => Ok(Self::Slurm),
+            "ray" => Ok(Self::Ray),
+            other => Err(TrainError::other(format!(
+                "unknown launcher '{other}' (expected local|slurm|ray)"
+            ))),
+        }
+    }
+}
+
+/// The configured [`Launcher`] for a target. Slurm/Ray read their cluster
+/// config from env (`BLUT_SLURM_*` / `RAY_ADDRESS` / `BLUT_RAY_RUNTIME_ENV`) so
+/// the DAG itself stays portable — the same recipe runs locally or on a cluster
+/// by flipping `--launcher`, no recipe edit.
+pub fn launcher_for(target: LaunchTarget) -> Box<dyn Launcher> {
+    let env = |k: &str| std::env::var(k).ok();
+    let env_u32 = |k: &str| env(k).and_then(|s| s.parse::<u32>().ok());
+    match target {
+        LaunchTarget::Local => Box::new(LocalSystemd::default()),
+        LaunchTarget::Slurm => Box::new(SlurmLauncher {
+            partition: env("BLUT_SLURM_PARTITION"),
+            mem: env("BLUT_SLURM_MEM"),
+            cpus: env_u32("BLUT_SLURM_CPUS"),
+            gpus: env_u32("BLUT_SLURM_GPUS"),
+            time: env("BLUT_SLURM_TIME"),
+            extra: Vec::new(),
+        }),
+        LaunchTarget::Ray => Box::new(RayLauncher {
+            address: env("RAY_ADDRESS"),
+            runtime_env: env("BLUT_RAY_RUNTIME_ENV"),
+            extra: Vec::new(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +313,24 @@ mod tests {
         assert!(!a.iter().any(|x| x.starts_with("--mem")), "unset → no flag");
         assert!(!a.iter().any(|x| x.starts_with("--partition")));
         assert!(SlurmLauncher::default().build_command("u", &[]).is_err());
+    }
+
+    #[test]
+    fn launch_target_parses_and_resolves() {
+        use std::str::FromStr;
+        assert_eq!(LaunchTarget::from_str("slurm").unwrap(), LaunchTarget::Slurm);
+        assert_eq!(LaunchTarget::from_str("RAY").unwrap(), LaunchTarget::Ray);
+        assert_eq!(LaunchTarget::from_str("").unwrap(), LaunchTarget::Local);
+        assert!(LaunchTarget::from_str("k8s").is_err());
+        // The factory maps target → the matching launcher kind.
+        assert_eq!(
+            launcher_for(LaunchTarget::Slurm).wrap("u", &["x".into()]).unwrap().kind,
+            LauncherKind::Slurm
+        );
+        assert_eq!(
+            launcher_for(LaunchTarget::Ray).wrap("u", &["x".into()]).unwrap().kind,
+            LauncherKind::Ray
+        );
     }
 
     #[test]
