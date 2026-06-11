@@ -122,6 +122,11 @@ impl Launcher for SlurmLauncher {
             c.arg(format!("--time={t}"));
         }
         for x in &self.extra {
+            // A bare "--" would prematurely close option parsing; the real inner
+            // separator is appended below.
+            if x == "--" {
+                continue;
+            }
             c.arg(x);
         }
         c.arg("--");
@@ -158,6 +163,11 @@ impl Launcher for RayLauncher {
             c.arg("--runtime-env-json").arg(re);
         }
         for x in &self.extra {
+            // A bare "--" would prematurely close option parsing; the real inner
+            // separator is appended below.
+            if x == "--" {
+                continue;
+            }
             c.arg(x);
         }
         c.arg("--");
