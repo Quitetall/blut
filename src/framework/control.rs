@@ -68,18 +68,23 @@ impl StepMetrics<'_> {
     }
 }
 
-/// Recognize a string token that denotes a non-finite float.
+/// Recognize a string token that denotes a non-finite float. `eq_ignore_
+/// ascii_case` avoids allocating a lowercased copy per metric.
 fn is_non_finite_token(s: &str) -> bool {
     let t = s.trim();
-    // Direct tokens (case-insensitive).
-    let lower = t.to_ascii_lowercase();
-    if matches!(
-        lower.as_str(),
-        "nan" | "inf" | "-inf" | "+inf" | "infinity" | "-infinity" | "+infinity"
-    ) {
+    const TOKENS: [&str; 7] = [
+        "nan",
+        "inf",
+        "-inf",
+        "+inf",
+        "infinity",
+        "-infinity",
+        "+infinity",
+    ];
+    if TOKENS.iter().any(|tok| t.eq_ignore_ascii_case(tok)) {
         return true;
     }
-    // A numeric string that parses to a non-finite f64 (e.g. "NaN", "1e999").
+    // A numeric string that parses to a non-finite f64 (e.g. "1e999").
     if let Ok(x) = t.parse::<f64>() {
         return !x.is_finite();
     }
@@ -88,23 +93,44 @@ fn is_non_finite_token(s: &str) -> bool {
 
 /// Keys whose `true` value flags divergence even without a numeric payload.
 fn is_divergence_flag_key(key: &str) -> bool {
-    matches!(
-        key.to_ascii_lowercase().as_str(),
-        "nan" | "is_nan" | "isnan" | "has_nan" | "diverged" | "divergence" | "non_finite"
-    )
+    const KEYS: [&str; 7] = [
+        "nan",
+        "is_nan",
+        "isnan",
+        "has_nan",
+        "diverged",
+        "divergence",
+        "non_finite",
+    ];
+    KEYS.iter().any(|k| key.eq_ignore_ascii_case(k))
 }
 
+/// Bound the recursion: the step payload crosses a process boundary (the
+/// trainer subprocess), so a pathologically-nested object must not be able to
+/// overflow the stack. Real trainer metrics are flat; 16 levels is generous.
+const MAX_SCAN_DEPTH: usize = 16;
+
 fn scan_non_finite(v: &Value) -> bool {
+    scan_non_finite_at(v, 0)
+}
+
+fn scan_non_finite_at(v: &Value, depth: usize) -> bool {
+    if depth >= MAX_SCAN_DEPTH {
+        // Past the cap a payload is treated as finite (no false kill); a
+        // metric that deep is malformed, not a real divergence signal.
+        return false;
+    }
     match v {
         Value::String(s) => is_non_finite_token(s),
         // A bare number is always finite (serde guarantees it); but a float
         // that somehow round-tripped as f64 is checked defensively.
         Value::Number(n) => n.as_f64().map(|x| !x.is_finite()).unwrap_or(false),
-        Value::Array(items) => items.iter().any(scan_non_finite),
+        Value::Array(items) => items.iter().any(|x| scan_non_finite_at(x, depth + 1)),
         Value::Object(map) => map.iter().any(|(k, val)| {
             // A divergence-named boolean flag set true, or any nested value
             // that is itself non-finite.
-            (is_divergence_flag_key(k) && val.as_bool() == Some(true)) || scan_non_finite(val)
+            (is_divergence_flag_key(k) && val.as_bool() == Some(true))
+                || scan_non_finite_at(val, depth + 1)
         }),
         _ => false,
     }
@@ -123,6 +149,12 @@ pub trait ControlPolicy: Send + Sync {
 /// Kill a node's branch the moment its step metrics report a non-finite
 /// value. The simplest, highest-value runtime policy: a diverged trainer
 /// stops burning the GPU immediately instead of running to its epoch budget.
+///
+/// Relies on the fact that divergence PERSISTS — once a loss goes NaN every
+/// subsequent step is NaN too. So even if the live broadcast lags and drops
+/// the first NaN step under a flood, the next step re-signals it; the kill is
+/// not a single-shot edge. (A one-shot control signal would need a dedicated
+/// lossless channel — that is the `Spawn`/PBT slice, not this one.)
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KillOnNaN;
 

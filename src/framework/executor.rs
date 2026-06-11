@@ -1094,8 +1094,10 @@ impl ParallelExecutor {
         let mut control_rx: Option<broadcast::Receiver<StageEvent>> =
             control.as_ref().map(|_| env.status.subscribe());
         let mut node_tokens: HashMap<NodeId, CancellationToken> = HashMap::new();
+        // The killed nodes + their pruned descendants. `pruned.len()` (not a
+        // parallel counter) is the accounting source of truth — it can't drift
+        // out of sync with the set the spawn loop consults.
         let mut pruned: HashSet<NodeId> = HashSet::new();
-        let mut pruned_or_killed = 0usize;
 
         // Ready set = in-degree-0 nodes, ascending NodeId for
         // deterministic spawn order.
@@ -1257,8 +1259,10 @@ impl ParallelExecutor {
                                     // Lifecycle echoes + step-gap markers: ignored
                                     // by the watcher (the writer owns those).
                                     Ok(_) => {}
-                                    // Dropped step spam under load is fine — a kill
-                                    // signal that matters repeats on the next step.
+                                    // Dropped step spam under load is fine: divergence
+                                    // PERSISTS (a NaN loss stays NaN), so a kill signal
+                                    // dropped on lag re-arrives on the very next step —
+                                    // it is not a single-shot edge (see KillOnNaN docs).
                                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                                     // The hub Sender lives in `env` for the whole
                                     // run, so Closed cannot occur before the drain
@@ -1348,13 +1352,14 @@ impl ParallelExecutor {
                         }
                     }
                     // Prune the killed node + every node reachable from it
-                    // (their input can never materialize). A pruned node already
-                    // in `ready` is removed here; one re-added later by a
-                    // completing OTHER parent is skipped at spawn (pruned check).
+                    // (their input can never materialize). DFS via a Vec stack;
+                    // visitation order is irrelevant for a reachability prune.
+                    // A pruned node already in `ready` is removed here; one
+                    // re-added later by a completing OTHER parent is skipped at
+                    // spawn (the `pruned` check).
                     let mut stack = vec![node_id];
                     while let Some(d) = stack.pop() {
                         if pruned.insert(d) {
-                            pruned_or_killed += 1;
                             ready.remove(&d);
                             if let Some(ss) = succs.get(&d) {
                                 stack.extend(ss.iter().copied());
@@ -1390,12 +1395,26 @@ impl ParallelExecutor {
 
         // On the success path every node is either completed OR pruned by a
         // KILL-on-NaN (#4); a real failure returns above via `first_error`, so
-        // a Cancelled node can't reach here uncounted.
+        // a Cancelled node can't reach here uncounted. (`completed` counts Ok
+        // outcomes; `pruned` holds killed nodes + descendants — disjoint sets.)
         debug_assert_eq!(
-            completed + pruned_or_killed,
+            completed + pruned.len(),
             order.len(),
             "parallel executor must account for every node (completed + pruned) on success"
         );
+        // Release builds don't run the debug_assert — surface an accounting
+        // mismatch (a real bug) in the log rather than silently returning an
+        // incomplete result. Not fatal: a `None` final output from a pruned
+        // terminal node is a LEGITIMATE outcome, so we never panic here.
+        if completed + pruned.len() != order.len() {
+            tracing::error!(
+                "executor node accounting mismatch: completed={} pruned={} total={} \
+                 (final output may be incomplete)",
+                completed,
+                pruned.len(),
+                order.len()
+            );
+        }
         // If the terminal node was pruned, there is no final output — a killed
         // branch legitimately changed the graph (the caller sees the missing
         // output + the StageFailed events in status.jsonl).
