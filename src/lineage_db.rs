@@ -138,6 +138,19 @@ impl LineageDb {
             .map_err(|e| TrainError::other(format!("set WAL: {e}")))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| TrainError::other(format!("busy_timeout: {e}")))?;
+        // Migration guard: read the stored version BEFORE stamping. A new file
+        // reports 0; a NEWER db (written by a future binary) must error loudly,
+        // not get silently re-stamped to this (older) version. Older-than-current
+        // is where future migrations would run before the version bump.
+        let existing: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .map_err(|e| TrainError::other(format!("read user_version: {e}")))?;
+        if existing > SCHEMA_VERSION {
+            return Err(TrainError::other(format!(
+                "lineage.db schema v{existing} is newer than this binary (v{SCHEMA_VERSION}); \
+                 upgrade blut or `blut lineage reindex` a fresh db"
+            )));
+        }
         conn.execute_batch(CREATE_SCHEMA)
             .map_err(|e| TrainError::other(format!("create lineage schema: {e}")))?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -153,7 +166,7 @@ impl LineageDb {
                     started_unix, ended_unix, outcome, host, gpu_name, ram_gib, vram_mib)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
                  ON CONFLICT(job_id) DO UPDATE SET
-                    recipe=excluded.recipe,
+                    recipe=COALESCE(excluded.recipe, runs.recipe),
                     config_fingerprint=COALESCE(excluded.config_fingerprint, runs.config_fingerprint),
                     git_sha=COALESCE(excluded.git_sha, runs.git_sha),
                     started_unix=COALESCE(excluded.started_unix, runs.started_unix),
@@ -173,7 +186,11 @@ impl LineageDb {
     }
 
     /// Idempotent upsert of an artifact row (keyed by job_id+stage_idx).
+    /// Always a FULL row (built from the sidecar), so `INSERT OR REPLACE` is a
+    /// safe overwrite. `content_hash` is lowercased so `=`/`trace` lookups stay
+    /// consistent with the case-insensitive `find_artifacts` LIKE.
     pub fn record_artifact(&self, a: &ArtifactRow) -> Result<()> {
+        let content_hash = a.content_hash.to_lowercase();
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO artifacts
@@ -181,7 +198,7 @@ impl LineageDb {
                      sidecar_path, produced_unix)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
-                    a.job_id, a.stage_idx, a.stage_name, a.content_hash, a.kind,
+                    a.job_id, a.stage_idx, a.stage_name, content_hash, a.kind,
                     a.schema_ver, a.sidecar_path, a.produced_unix
                 ],
             )
@@ -189,13 +206,16 @@ impl LineageDb {
         Ok(())
     }
 
-    /// Idempotent upsert of a lineage edge.
+    /// Idempotent upsert of a lineage edge. Hashes lowercased so the upstream
+    /// `trace` walk (which lowercases) matches `artifact_by_hash`'s `=` lookup.
     pub fn record_edge(&self, edge: &EdgeRow) -> Result<()> {
+        let (input_hash, output_hash) =
+            (edge.input_hash.to_lowercase(), edge.output_hash.to_lowercase());
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO lineage_edges (job_id, to_idx, input_hash, output_hash)
                  VALUES (?1,?2,?3,?4)",
-                params![edge.job_id, edge.to_idx, edge.input_hash, edge.output_hash],
+                params![edge.job_id, edge.to_idx, input_hash, output_hash],
             )
             .map_err(|err| TrainError::other(format!("record edge {}: {err}", edge.job_id)))?;
         Ok(())
@@ -237,6 +257,10 @@ impl LineageDb {
     /// Walk the lineage UPSTREAM from a full content hash: this artifact, then
     /// the input that produced it, recursively, each annotated with its run's
     /// provenance. Cycle-guarded. The first step is the queried artifact.
+    ///
+    /// SINGLE-INPUT walk: at a fan-in (merge) stage with multiple input edges
+    /// this follows ONE (the primary). BLUT plans are predominantly linear
+    /// (corpus→train→gate); a full multi-branch `trace_all` is a future add.
     pub fn trace(&self, content_hash: &str) -> Result<Vec<TraceStep>> {
         let mut chain = Vec::new();
         let mut seen = HashSet::new();
