@@ -102,6 +102,7 @@ from joint_codec import (
 from checkpoint_manager import (
     CheckpointManager, GuardConfig, TrainingHaltException, make_param_groups,
 )
+from durable_resume import DurableResume  # Phase D: trainer half of durable resume
 from training_config import CONFIGS
 from training_types import (
     EpochReport, RunSummary, TrainingLogger,
@@ -465,6 +466,9 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         infinite_lr: bool = False,
         int8_bridge: bool = False,
         resume: str = None,
+        resume_dir: Optional[str] = None,
+        run_id: str = "",
+        resume_key: str = "",
         lma_root: Optional[str] = None,
         split_manifest: Optional[str] = None,
         detail_bands: str = 'all',
@@ -525,6 +529,18 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     enc_path = ckpt_dir / f'student_encoder_joint_{cfg.name}.ckpt'
     dec_path = ckpt_dir / f'decoder_tier{vocos_tier}_joint_{cfg.name}.ckpt'
+
+    # ---- Durable resume (Phase D): the trainer half ----
+    # When the BLUT stage passes --resume-dir (the stable per-config dir), the
+    # recovery checkpoints + the state.json marker live THERE (cross-invocation
+    # resumable) instead of the job-local ckpt_dir/recovery. `_dur` (or None)
+    # gates every durable side-effect below; `_rec_dir` is the single recovery
+    # location used by both the save sites and the resume block.
+    _dur = DurableResume(resume_dir, run_id, resume_key) if resume_dir else None
+    if _dur is not None:
+        _dur.start()  # write state.json={status:running} + spawn the heartbeat
+        print(f"[*] Durable resume ON — recovery dir {_dur.dir} (run_id={run_id or '?'})")
+    _rec_dir = _dur.dir if _dur is not None else (ckpt_dir / 'recovery')
 
     # ---- Build model ----
     # Enable gradient checkpointing for large decoders (Tier 5+) to fit in 24 GB
@@ -1150,35 +1166,64 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     # ---- Resume from checkpoint ----
     _resume_epoch = 0
     _resume_phase = None
+    _resume_ckpt = None  # the loaded recovery dict, stashed → the QAT-optimizer restore reuses it
+    ckpt = None
     if resume:
-        _rec_dir = ckpt_dir / 'recovery'
-        if resume == 'auto':
-            # Auto-detect: prefer qat_latest > warm_latest
-            for candidate in ('qat_latest.ckpt', 'warm_latest.ckpt'):
-                p = _rec_dir / candidate
-                if p.exists():
-                    resume = str(p)
-                    break
-        if resume and resume != 'auto' and os.path.exists(resume):
-            print(f"[*] Resuming from {resume}")
-            ckpt = _safe_load(resume, map_location=device)
-            # Strip _orig_mod. prefix if checkpoint was saved after torch.compile
-            def _strip_compile_prefix(sd):
-                return {k.replace('_orig_mod.', ''): v for k, v in sd.items()}
-            enc_sd = ckpt['encoder']
-            dec_sd = ckpt['decoder']
-            if any(k.startswith('_orig_mod.') for k in enc_sd):
-                enc_sd = _strip_compile_prefix(enc_sd)
-            if any(k.startswith('_orig_mod.') for k in dec_sd):
-                dec_sd = _strip_compile_prefix(dec_sd)
-            codec.encoder.load_state_dict(enc_sd)
-            _dec_target = getattr(codec.decoder, '_orig_mod', codec.decoder)
-            _dec_target.load_state_dict(dec_sd)
-            _resume_epoch = ckpt['epoch']
-            _resume_phase = ckpt['phase']
-            print(f"[*] Restored {_resume_phase} phase, epoch {_resume_epoch}")
+        if _dur is not None:
+            # Durable resume (Phase D): auto-pick the freshest recovery
+            # checkpoint in the stable dir (qat > warm), with the prev-rotation
+            # fallback + the resume_key (foreign-config) guard, all inside
+            # load_recovery. The stage passed --resume <resume_dir> only after
+            # the crash-gated policy decided to resume.
+            _name = _dur.detect()
+            if _name is not None:
+                ckpt = _dur.load_recovery(_name, map_location=device, loader=_safe_load)
+            if ckpt is None:
+                print(f"[!] Durable resume: no usable recovery checkpoint in {_dur.dir} — starting fresh")
         else:
-            print(f"[!] Resume checkpoint not found, starting fresh")
+            # Legacy resume (no --resume-dir): a recovery dir under ckpt_dir, or
+            # an explicit checkpoint file (operator override).
+            if resume == 'auto':
+                for candidate in ('qat_latest.ckpt', 'warm_latest.ckpt'):
+                    p = _rec_dir / candidate
+                    if p.exists():
+                        resume = str(p)
+                        break
+            if resume and resume != 'auto' and os.path.exists(resume):
+                print(f"[*] Resuming from {resume}")
+                ckpt = _safe_load(resume, map_location=device)
+            else:
+                print(f"[!] Resume checkpoint not found — starting fresh")
+    if ckpt is not None:
+        # Strip _orig_mod. prefix if the checkpoint was saved after torch.compile
+        def _strip_compile_prefix(sd):
+            return {k.replace('_orig_mod.', ''): v for k, v in sd.items()}
+        enc_sd = ckpt['encoder']
+        dec_sd = ckpt['decoder']
+        if any(k.startswith('_orig_mod.') for k in enc_sd):
+            enc_sd = _strip_compile_prefix(enc_sd)
+        if any(k.startswith('_orig_mod.') for k in dec_sd):
+            dec_sd = _strip_compile_prefix(dec_sd)
+        codec.encoder.load_state_dict(enc_sd)
+        _dec_target = getattr(codec.decoder, '_orig_mod', codec.decoder)
+        _dec_target.load_state_dict(dec_sd)
+        _resume_epoch = ckpt['epoch']
+        _resume_phase = ckpt['phase']
+        # Phase D — the "clean optimizer resume": restore the optimizer (stashed
+        # for the matching phase, since the QAT optimizer is built later) + the
+        # RNG, so the post-resume loss curve is continuous (no cold SOAP/Adam
+        # restart, no re-shuffled data stream).
+        _resume_ckpt = ckpt
+        DurableResume.restore_rng(ckpt.get('rng'))
+        # The WARM optimizer already exists (built above). Restore it now if we
+        # resumed mid-warm; the QAT optimizer is restored after it is built.
+        if _resume_phase == 'warm' and ckpt.get('optimizer') is not None:
+            try:
+                optimizer.load_state_dict(ckpt['optimizer'])
+                print("[*] Restored warm optimizer state (continuous resume)")
+            except Exception as e:  # noqa: BLE001 — a shape/param drift falls back to a cold optimizer
+                print(f"[!] Warm optimizer restore skipped ({e}) — continuing with a fresh optimizer")
+        print(f"[*] Restored {_resume_phase} phase, epoch {_resume_epoch}")
 
     # ---- Phase 1: Warm (encoder+decoder FP32, no STE on encoder) ----
     # Lazy import of Split here so the script doesn't grow a top-level
@@ -1454,16 +1499,23 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         # Rolling recovery: two files per phase — latest (every epoch) and
         # best (only when val_r improves). Crash loses ≤1 epoch; best is
         # always recoverable even if latest is corrupt on a bad shutdown.
-        _rec_dir = ckpt_dir / 'recovery'
+        # `_rec_dir` is the durable resume dir when Phase D is on (set above),
+        # else the job-local ckpt_dir/recovery.
         _rec_dir.mkdir(parents=True, exist_ok=True)
         _warm_state = {'encoder': codec.encoder.state_dict(),
                        'decoder': getattr(codec.decoder, '_orig_mod', codec.decoder).state_dict(),
                        'optimizer': optimizer.state_dict(),
                        'epoch': ep, 'phase': 'warm',
                        'provenance': provenance}
-        torch.save(_warm_state, _rec_dir / 'warm_latest.ckpt')
-        if _saved:
-            torch.save(_warm_state, _rec_dir / 'warm_best.ckpt')
+        if _dur is not None:
+            # Atomic + prev-rotation + embedded resume_key + RNG (Phase D).
+            _dur.save_recovery('warm_latest', _warm_state)
+            if _saved:
+                _dur.save_recovery('warm_best', _warm_state)
+        else:
+            torch.save(_warm_state, _rec_dir / 'warm_latest.ckpt')
+            if _saved:
+                torch.save(_warm_state, _rec_dir / 'warm_best.ckpt')
 
     print(f"  [WARM] best ValR = {best_warm_r:.4f} (FP32, diagnostic only)")
 
@@ -1677,28 +1729,35 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     _alpha_modules = [m for _, m in codec.encoder.named_modules()
                       if hasattr(m, 'lsq_alpha')]
 
-    if _resume_phase == 'qat' and resume and os.path.exists(resume):
-        ckpt = _safe_load(resume, map_location=device)
-        try:
-            optimizer.load_state_dict(ckpt['optimizer'])
-            if scheduler and ckpt.get('scheduler'):
-                scheduler.load_state_dict(ckpt['scheduler'])
-            print(f"[*] Restored QAT optimizer + scheduler state")
-        except Exception as e:
-            print(f"[!] Could not restore optimizer state: {e}")
-        # Restore seizure head state (lost on resume without this)
-        if sz_head is not None and ckpt.get('seizure_head'):
+    if _resume_phase == 'qat':
+        # The QAT optimizer + scheduler now exist, so restore their state (+ the
+        # seizure head + best tracking). For durable resume the recovery dict was
+        # already loaded above (_resume_ckpt); the legacy path re-loads the
+        # explicit checkpoint file. Either source carries the same payload.
+        _qat_ckpt = _resume_ckpt if _dur is not None else (
+            _safe_load(resume, map_location=device)
+            if (resume and os.path.exists(resume)) else None)
+        if _qat_ckpt is not None:
             try:
-                sz_head.load_state_dict(ckpt['seizure_head'])
-                print(f"[*] Restored seizure head state")
-            except Exception:
-                pass
-        # Restore best tracking so PRD stays in sync
-        if ckpt.get('best_val_r') is not None:
-            cm.best_val_r = ckpt['best_val_r']
-            cm.best_epoch = ckpt.get('epoch', 0)
-        if ckpt.get('best_val_prd') is not None:
-            best_val_prd_at_best_r = ckpt['best_val_prd']
+                optimizer.load_state_dict(_qat_ckpt['optimizer'])
+                if scheduler and _qat_ckpt.get('scheduler'):
+                    scheduler.load_state_dict(_qat_ckpt['scheduler'])
+                print(f"[*] Restored QAT optimizer + scheduler state (continuous resume)")
+            except Exception as e:
+                print(f"[!] Could not restore optimizer state: {e}")
+            # Restore seizure head state (lost on resume without this)
+            if sz_head is not None and _qat_ckpt.get('seizure_head'):
+                try:
+                    sz_head.load_state_dict(_qat_ckpt['seizure_head'])
+                    print(f"[*] Restored seizure head state")
+                except Exception:
+                    pass
+            # Restore best tracking so PRD stays in sync
+            if _qat_ckpt.get('best_val_r') is not None:
+                cm.best_val_r = _qat_ckpt['best_val_r']
+                cm.best_epoch = _qat_ckpt.get('epoch', 0)
+            if _qat_ckpt.get('best_val_prd') is not None:
+                best_val_prd_at_best_r = _qat_ckpt['best_val_prd']
 
     _qat_start = (_resume_epoch - cfg.epochs_warmup + 1) if _resume_phase == 'qat' else 1
     _qat_start = max(1, _qat_start)
@@ -1904,9 +1963,15 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
                       'best_val_prd': best_val_prd_at_best_r,
                       'epoch': ep_total, 'phase': 'qat',
                       'provenance': provenance}
-        torch.save(_qat_state, _rec_dir / 'qat_latest.ckpt')
-        if _saved_qat:
-            torch.save(_qat_state, _rec_dir / 'qat_best.ckpt')
+        if _dur is not None:
+            # Atomic + prev-rotation + embedded resume_key + RNG (Phase D).
+            _dur.save_recovery('qat_latest', _qat_state)
+            if _saved_qat:
+                _dur.save_recovery('qat_best', _qat_state)
+        else:
+            torch.save(_qat_state, _rec_dir / 'qat_latest.ckpt')
+            if _saved_qat:
+                torch.save(_qat_state, _rec_dir / 'qat_best.ckpt')
 
         if ep % cfg.val_interval == 0:
             try:
@@ -2090,6 +2155,13 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         except Exception:
             pass
 
+    # Phase D: a CLEAN completion marks the resume dir "finished" so a later
+    # re-run of this config starts fresh (never resumes a done run). Reached
+    # only on the success path — an exception leaves the marker "running", which
+    # goes stale and is correctly treated as a resumable crash.
+    if _dur is not None:
+        _dur.finish()
+
     return {
         'best_val_r': cm.best_val_r,
         'best_val_prd': best_val_prd_at_best_r,
@@ -2223,7 +2295,18 @@ def main():
                              'Reduces quantization shock vs direct FP32→ternary.')
     parser.add_argument('--resume', nargs='?', const='auto', default=None,
                         help='Resume from checkpoint. No arg = auto-detect from recovery dir. '
-                             'Or provide explicit path.')
+                             'Or provide explicit path (a file, or a --resume-dir to auto-pick).')
+    # ---- Durable resume (Phase D) — the orchestrator passes these ----
+    parser.add_argument('--resume-dir', type=str, default=None,
+                        help='Stable per-config resume directory (outside the job dir). The '
+                             'trainer writes recovery checkpoints + a state.json marker here; '
+                             'a crash-gated re-run resumes from it. Set by the BLUT stage.')
+    parser.add_argument('--run-id', type=str, default='',
+                        help='This run\'s id (job_dir basename), stamped into state.json so the '
+                             'orchestrator can tell an in-process retry from a cross-run resume.')
+    parser.add_argument('--resume-key', type=str, default='',
+                        help='The config fingerprint (stage cache key) embedded in each recovery '
+                             'checkpoint; a load rejects a checkpoint whose key differs.')
     # ---- LMA-direct training (BLUT canonical, ADR 0017) ----
     parser.add_argument('--lma-root', type=str, default=None,
                         help='Directory of per-recording .lma archives. When set '
@@ -2362,6 +2445,9 @@ def main():
                  infinite_lr=args.infinite_lr,
                  int8_bridge=args.int8_bridge,
                  resume=args.resume,
+                 resume_dir=args.resume_dir,
+                 run_id=args.run_id,
+                 resume_key=args.resume_key,
                  lma_root=args.lma_root,
                  split_manifest=args.split_manifest,
                  detail_bands=args.detail_bands,
