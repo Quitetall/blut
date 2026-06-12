@@ -175,8 +175,8 @@ def compute_band_std(lma_root: List[str], split_manifest: str,
 
     Builds the train-split ``LmaDataset`` (so val/test never leak), streams
     each recording through the decode+preprocess path, and reduces to one std
-    per band via pooled sum-of-squares. l3_approx is intentionally absent — L3
-    is the reference scale and is never rescaled.
+    per band, plus l3_approx — the reference scale each detail band is rescaled
+    TO (consumer: `inv_scale = l3_ref / band_std`). L3 itself is never rescaled.
     """
     # Build train-split dataset purely for its honest, manifest-filtered stem
     # index. We never call __getitem__ (no L3 cache, no label decode) — we
@@ -292,8 +292,9 @@ def main() -> int:
 
     payload = {
         "schema": BAND_STD_SCHEMA,
-        # Frozen scalars consumed by _stack_detail_bands. l3_approx is NOT
-        # here on purpose: L3 is the reference scale, never rescaled.
+        # Frozen scalars consumed by _stack_detail_bands: the three detail stds
+        # plus l3_approx, the reference scale detail is rescaled TO (L3 itself is
+        # never rescaled — the consumer only divides detail by std/l3_ref).
         "band_std": band_std,
         "provenance": {
             "lma_root": args.lma_root,
