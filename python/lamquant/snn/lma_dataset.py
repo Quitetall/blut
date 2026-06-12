@@ -191,6 +191,69 @@ def _fadvise_hint(path: Path) -> None:
 _BAND_NATIVE_LEN = {"l3_detail": 312, "l2_detail": 625, "l1_detail": 1250}
 
 
+# ----------------------------------------------------------------------
+# Frozen per-band INPUT std (0b allocation fix — the input half of ADR 0049,
+# complementing the landed per_band_relative_loss). The detail bands enter at
+# raw 1/f amplitudes ~10x below L3, so an unnormalized stem treats them as
+# near-noise. We divide each detail band by a GLOBAL (corpus-frozen) std — a
+# single scalar per band, precomputed once over the train split by
+# `lamquant.snn.precompute_band_std`. GLOBAL not per-window: per-window
+# normalization would destroy the clinically-relevant absolute amplitude; a
+# frozen scalar only equalizes the cross-band dynamic range the encoder sees.
+#
+# Deployment: these three scalars ARE the model's frozen input config. They
+# travel with the checkpoint as a buffer/config (NOT the LMQC wire — the latent
+# stays [32,79]; the detail rides the input, not the wire, per ADR 0045/0049).
+# LMQC wire-carry of the scale factors is deferred (see the note below).
+# ----------------------------------------------------------------------
+_BAND_STD_DETAIL = ("l3_detail", "l2_detail", "l1_detail")
+
+
+def _band_std_path() -> Optional[Path]:
+    """Resolve the frozen band-std JSON.
+
+    `SNN_BAND_STD` env var wins (lets a run pin a specific frozen file); else
+    the in-tree default `band_std.json` beside this module (written by
+    `precompute_band_std`). Returns None when neither exists -> normalization is
+    a no-op (legacy raw-coefficient behaviour, so an un-precomputed run still
+    runs, just without the input rescale).
+    """
+    env = os.environ.get("SNN_BAND_STD", "").strip()
+    if env:
+        p = Path(env)
+        return p if p.exists() else None
+    default = Path(__file__).resolve().parent / "band_std.json"
+    return default if default.exists() else None
+
+
+@functools.lru_cache(maxsize=4)
+def _band_std(path_str: Optional[str]) -> Dict[str, float]:
+    """Load + cache {band: global_std} from the frozen JSON.
+
+    Keyed on the resolved path string so the lru_cache is stable per-worker
+    (each DataLoader worker loads it at most once). Missing file / unreadable /
+    non-positive std -> empty dict == normalization disabled (fail-soft: a bad
+    std file must never silently mis-scale; it disables and logs instead).
+    Bands absent from the file (or with std<=0) are left unnormalized.
+    """
+    if not path_str:
+        return {}
+    try:
+        payload = json.loads(Path(path_str).read_text())
+        raw = payload.get("band_std", {})
+        out = {b: float(s) for b, s in raw.items()
+               if b in (_BAND_STD_DETAIL + ("l3_approx",)) and float(s) > 0.0
+               and math.isfinite(float(s))}
+        if not out:
+            LOG.warning("band_std file %s has no usable scalars — "
+                        "input normalization DISABLED", path_str)
+        return out
+    except Exception as e:
+        LOG.warning("band_std load failed (%s): %s — input normalization "
+                    "DISABLED", path_str, e)
+        return {}
+
+
 def _detail_bands_cfg() -> Tuple[str, ...]:
     """Detail subband channels to append to L3, from the SNN_DETAIL_BANDS env.
 
@@ -234,7 +297,20 @@ def _detail_cache_sig() -> str:
     bands = _detail_bands_cfg()
     if not bands:
         return ""
-    return "__" + "_".join(bands) + "_" + _detail_stack_mode_cfg()
+    sig = "__" + "_".join(bands) + "_" + _detail_stack_mode_cfg()
+    # Normalization changes the cached coefficient VALUES (not the shape), so a
+    # normalized stack must not be served from an unnormalized `<stem>__...npy`
+    # (or vice-versa). Append a short fingerprint of the active frozen std so
+    # the on-disk + in-mem caches partition by normalization state. "_raw" when
+    # no usable std is loaded (legacy un-normalized behaviour).
+    std = _band_std(str(_band_std_path()) if _band_std_path() else None)
+    if std:
+        h = hashlib.sha1(
+            repr(sorted(std.items())).encode("utf-8")).hexdigest()[:8]
+        sig += "_n" + h
+    else:
+        sig += "_raw"
+    return sig
 
 
 def detail_stack_in_channels(bands, mode: str = "interp",
@@ -275,6 +351,13 @@ def _stack_detail_bands(l3: np.ndarray, subs: list) -> np.ndarray:
         returns the bare ``[21, 313]`` L3 — identical to the prior behaviour, so
         existing callers are unaffected. ``groups`` per `detail_stack_in_channels`
         for the active SNN_DETAIL_STACK_MODE (interp: 1/band; fold: ceil(len/T)).
+
+    Input normalization (0b allocation fix): each DETAIL band's coefficients are
+    divided by its frozen GLOBAL std (`_band_std`, precomputed by
+    `precompute_band_std`) BEFORE stacking, so the ~10x-below-L3 detail bands
+    enter the encoder at a comparable dynamic range. L3 (``l3``) is the
+    reference scale and is NEVER rescaled. When no std file is present the
+    divisor is 1.0 -> bit-identical to the prior raw-coefficient behaviour.
     """
     l3 = np.asarray(l3, dtype=np.float32)
     bands = _detail_bands_cfg()
@@ -282,8 +365,21 @@ def _stack_detail_bands(l3: np.ndarray, subs: list) -> np.ndarray:
         return l3
     mode = _detail_stack_mode_cfg()
     T = l3.shape[1]
+    # Frozen per-band scale. Computed once per call (lru-cached load). Each
+    # detail band is rescaled so its std MATCHES L3's reference std (`l3_approx`),
+    # NOT unit variance: measured raw detail RMS (~19-25) is ~3-4x ABOVE L3
+    # (~6.7), so `coef / std` alone would leave detail ~6-7x BELOW L3 and
+    # under-weighted. `inv_scale = l3_ref / std[band]` lands detail AT L3 scale.
+    # Fallbacks: no l3_approx in the file (legacy band_std) -> unit-variance
+    # (`1/std`); band absent -> 1.0 (raw, no rescale). L3 itself is never rescaled.
+    std = _band_std(str(_band_std_path()) if _band_std_path() else None)
+    l3_ref = std.get("l3_approx")
     out = [l3]
     for band in bands:
+        if band in std:
+            inv_scale = np.float32((l3_ref / std[band]) if l3_ref else (1.0 / std[band]))
+        else:
+            inv_scale = np.float32(1.0)
         if mode == "fold":
             # Information-preserving: zero-pad each channel's coefficients to a
             # multiple of T, then split into ceil(len/T) blocks of [base_ch, T]
@@ -292,14 +388,19 @@ def _stack_detail_bands(l3: np.ndarray, subs: list) -> np.ndarray:
             m = math.ceil((native_len if native_len else T) / T)
             padded = np.zeros((len(subs), m * T), dtype=np.float32)
             for c, d in enumerate(subs):
-                v = np.asarray(d[band], dtype=np.float32)
+                # Divide by the frozen global std BEFORE zero-pad/fold so the
+                # fold blocks (and the zero pad) are in normalized units.
+                v = np.asarray(d[band], dtype=np.float32) * inv_scale
                 padded[c, : v.shape[0]] = v
             for g in range(m):
                 out.append(padded[:, g * T:(g + 1) * T])
         else:
             mat = np.empty((len(subs), T), dtype=np.float32)
             for c, d in enumerate(subs):
-                v = np.asarray(d[band], dtype=np.float32)
+                # Normalize first, then resample onto the 313 grid (linear is
+                # scale-equivariant, so order is numerically irrelevant; we
+                # normalize the native coefficients to match the fold path).
+                v = np.asarray(d[band], dtype=np.float32) * inv_scale
                 if v.shape[0] == T:
                     mat[c] = v
                 else:
@@ -461,8 +562,13 @@ def _cached_l3_stack(lma_path: str, stem: str,
             if _free >= _min_free:
                 # np.save auto-appends `.npy`; sandwich `.tmp` before the suffix
                 # so the rename target exists. Storage dtype via L3_CACHE_DTYPE
-                # (default float16, halves footprint).
-                tmp = disk_path.with_name(disk_path.stem + ".tmp.npy")
+                # (default float16, halves footprint). The tmp name MUST be
+                # pid-unique: fork-workers (LMA_NUM_WORKERS>1) computing the same
+                # stem would otherwise race on one `.tmp.npy` — the loser's
+                # `.replace()` hits ENOENT (the winner renamed it away) and the
+                # window falls back to in-memory, inflating per-worker RAM (the
+                # full-residual epoch-2 OOM). Mirrors lma_typed_adapter's pid tmp.
+                tmp = disk_path.with_name(f"{disk_path.stem}.{_os.getpid()}.tmp.npy")
                 np.save(tmp, result.astype(_l3_cache_dtype()))
                 tmp.replace(disk_path)
         except Exception as e:
