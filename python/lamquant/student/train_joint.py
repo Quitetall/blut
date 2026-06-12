@@ -1244,6 +1244,13 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
             print(f"[!] pre-flight diagnostics skipped (non-fatal): {_e}")
 
     best_warm_r = 0.0
+    # val_prd + per-band PRD captured AT the warm best-R epoch. Warm-only runs
+    # (epochs_quant=0 — the fullband codec-quality path) never enter the QAT
+    # loop that used to be the SOLE updater of best_val_prd_at_best_r /
+    # best_per_band_at_best_r, so without this the summary (and the LQS grade +
+    # the β/γ allocation readout) reported sentinels (PRD=100, per-band={}).
+    best_warm_prd = 100.0
+    best_warm_per_band = {}
     _n_batches_warm = max(cfg.windows_per_epoch // max(cfg.batch_size_warmup, 1), 1)
     _warm_start = _resume_epoch + 1 if _resume_phase == 'warm' else 1
     if _resume_phase == 'qat':
@@ -1402,15 +1409,18 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         # Run validation only at val_interval; fill R/PRD=0 on other epochs
         # (dashboard shows '-' for 0 values — clearly not a real measurement).
         val_r = val_prd = 0.0
+        _per_band_w = {}   # populated below when validation runs this epoch
         _saved = False
         if ep % cfg.val_interval == 0:
-            val_r, val_prd, _ = validate_joint(codec, val_ds, device,
+            val_r, val_prd, _per_band_w = validate_joint(codec, val_ds, device,
                                                  quantize=False, amp=amp,
                                                  channel_agnostic=channel_agnostic,
                                                  variable_n=variable_n, n_range=n_range)
             dash.update_val(val_r=val_r, best_r=max(best_warm_r, val_r))
             if val_r > best_warm_r:
                 best_warm_r = val_r
+                best_warm_prd = val_prd
+                best_warm_per_band = dict(_per_band_w)
                 _saved = True
                 codec.save_encoder(
                     ckpt_dir / f'student_encoder_warm_{cfg.name}.ckpt',
@@ -1432,6 +1442,11 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
             alpha_per_layer=_alpha_pl,
             alpha_min=_amin, alpha_mean=_amean, alpha_max=_amax,
             quantize_active=False,
+            val_prd_delta=_per_band_w.get('delta', 0.0),
+            val_prd_theta=_per_band_w.get('theta', 0.0),
+            val_prd_alpha=_per_band_w.get('alpha', 0.0),
+            val_prd_beta=_per_band_w.get('beta', 0.0),
+            val_prd_gamma=_per_band_w.get('gamma', 0.0),
             secs_per_epoch=_secs_per_ep,
             eta_hours=_eta_h,
         ))
@@ -1624,9 +1639,12 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     stable_ckpt_saved = False  # WSD stable-phase checkpoint (for continual training)
 
     # Track best PRD (and corresponding per-band) alongside best R so the
-    # end-of-run summary can report both at the best checkpoint.
-    best_val_prd_at_best_r = 100.0
-    best_per_band_at_best_r = {}
+    # end-of-run summary can report both at the best checkpoint. Seed from the
+    # WARM best (mirrors `cm.best_val_r = best_warm_r` above) so a warm-only run
+    # (epochs_quant=0) carries real numbers into the summary / LQS grade; the
+    # QAT loop below only overrides these when it improves R (saved_best).
+    best_val_prd_at_best_r = best_warm_prd
+    best_per_band_at_best_r = dict(best_warm_per_band)
     last_val_r = 0.0
     last_val_prd = 100.0
     last_per_band = {}
