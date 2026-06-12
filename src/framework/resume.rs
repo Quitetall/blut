@@ -269,6 +269,25 @@ mod tests {
     // ── ResumeState::read ─────────────────────────────────────────────
 
     #[test]
+    fn parses_python_written_marker_shape() {
+        // CROSS-LANGUAGE CONTRACT: the exact JSON `durable_resume.py` writes
+        // (json.dumps of {status, run_id, pid, heartbeat_unix}) must deserialize
+        // into ResumeState. If the trainer ever renames a field, this breaks
+        // here rather than silently always-Fresh in production.
+        let py = r#"{"status": "running", "run_id": "run-7", "pid": 4242, "heartbeat_unix": 1700000000}"#;
+        let s: ResumeState = serde_json::from_str(py).expect("python marker must parse");
+        assert_eq!(s.status, "running");
+        assert_eq!(s.run_id, "run-7");
+        assert_eq!(s.pid, 4242);
+        assert_eq!(s.heartbeat_unix, 1_700_000_000);
+        // And it drives the decision as expected (foreign + fresh ⇒ refuse).
+        assert_eq!(
+            decide_resume(Some(&s), "run-NEW", 1_700_000_010, DEFAULT_STALE_AFTER_SECS),
+            ResumeDecision::RefuseConcurrent
+        );
+    }
+
+    #[test]
     fn read_roundtrips_and_degrades_to_none() {
         let td = tempfile::tempdir().unwrap();
         // Absent ⇒ None.
