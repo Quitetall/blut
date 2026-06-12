@@ -88,11 +88,11 @@ class DurableResume:
         self._write_state("running")
 
         def _loop() -> None:
-            # wait() returns True the instant _stop is set → exit without a
-            # further write (so finish()'s "finished" is never clobbered).
+            # wait() returns True the instant _stop is set → the loop exits
+            # without another write. finish() sets _stop, join()s this thread,
+            # THEN writes "finished" — so the heartbeat can never clobber the
+            # final "finished" marker (no inner re-check needed).
             while not self._stop.wait(HEARTBEAT_INTERVAL):
-                if self._stop.is_set():
-                    break
                 try:
                     self._write_state("running")
                 except Exception:  # noqa: BLE001 — a heartbeat hiccup must never crash training
@@ -115,12 +115,18 @@ class DurableResume:
     def __enter__(self) -> "DurableResume":
         return self.start()
 
-    def __exit__(self, *_exc: Any) -> bool:
-        # NOTE: __exit__ marks finished on ANY exit including an exception. The
-        # trainer therefore calls finish() explicitly only on a CLEAN completion
-        # (an exception must leave the marker "running" → stale → resumable), so
-        # train_joint.py does NOT use this context manager around the loop.
-        self.finish()
+    def __exit__(self, exc_type: Any, *_exc: Any) -> bool:
+        # finish() (status "finished") ONLY on a clean exit. On an exception the
+        # run did NOT complete — stop the heartbeat but leave the marker
+        # "running", so it goes stale and the orchestrator treats the dir as a
+        # resumable crash. (train_joint.py calls start()/finish() explicitly
+        # rather than using this CM, but keep the protocol crash-correct.)
+        if exc_type is None:
+            self.finish()
+        else:
+            self._stop.set()
+            if self._thr is not None:
+                self._thr.join(timeout=2)
         return False
 
     # ---- RNG capture / restore -------------------------------------------

@@ -57,10 +57,23 @@ pub struct ResumeState {
 impl ResumeState {
     /// Read + parse `<resume_dir>/state.json`. `None` on absent / unreadable /
     /// unparseable — the caller maps `None` ⇒ [`ResumeDecision::Fresh`], so a
-    /// missing marker can never block a fresh run.
+    /// missing marker can never block a fresh run. A file that EXISTS but does
+    /// not parse (a truncated / corrupt marker) is logged at `warn` so an
+    /// operator can tell "never ran" from "marker corrupt" — but it still
+    /// degrades to `None`/Fresh (a corrupt marker must never block a run).
     pub fn read(resume_dir: &Path) -> Option<ResumeState> {
-        let body = std::fs::read_to_string(resume_dir.join("state.json")).ok()?;
-        serde_json::from_str(&body).ok()
+        let path = resume_dir.join("state.json");
+        let body = std::fs::read_to_string(&path).ok()?; // absent / unreadable ⇒ silent None (the common first-run case)
+        match serde_json::from_str(&body) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(
+                    "resume: state.json at {} is unparseable ({e}); treating as no marker (fresh)",
+                    path.display()
+                );
+                None
+            }
+        }
     }
 }
 
@@ -92,6 +105,12 @@ pub enum ResumeDecision {
 /// The run_id check comes BEFORE the heartbeat check, so an in-process OOM retry
 /// (same run_id, whose just-killed attempt left a possibly-fresh heartbeat)
 /// always `Resume`s — never falsely `RefuseConcurrent`.
+///
+/// Clock assumption: wall clocks are roughly monotonic within the stale window.
+/// A heartbeat stamped in the FUTURE (NTP jump) makes `age` saturate to 0 ⇒
+/// `RefuseConcurrent` — the SAFE direction (refuse rather than resume onto a
+/// possibly-live run); the operator can force progress with the `no_resume`
+/// override if a clock correction wedges a genuinely-crashed run.
 pub fn decide_resume(
     state: Option<&ResumeState>,
     this_run_id: &str,
@@ -118,14 +137,12 @@ pub fn decide_resume(
     }
 }
 
-/// The stable resume directory for a `(recipe, resume_key)`: OUTSIDE the per-run
-/// job_dir, under the data root, so a cross-invocation re-run with the SAME
-/// resume_key resolves the SAME dir and finds the checkpoint. `resume_key_hex`
-/// is the stage's cache-key hex (the engine's canonical same-training
-/// fingerprint). `recipe` is sanitized to a filesystem-safe slug.
-pub fn resume_dir(data_root: &Path, recipe: &str, resume_key_hex: &str) -> PathBuf {
-    let slug: String = recipe
-        .chars()
+/// Filesystem-safe slug: anything outside `[A-Za-z0-9_-]` collapses to `_`. Used
+/// on BOTH path components below so neither the recipe name nor the key can
+/// introduce a separator / `..` traversal — `resume_dir` is `pub`, so it must
+/// not trust its inputs to already be path-clean.
+fn slug(s: &str) -> String {
+    s.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
                 c
@@ -133,11 +150,21 @@ pub fn resume_dir(data_root: &Path, recipe: &str, resume_key_hex: &str) -> PathB
                 '_'
             }
         })
-        .collect();
-    data_root
-        .join("Training")
-        .join("resume")
-        .join(format!("{slug}-{resume_key_hex}"))
+        .collect()
+}
+
+/// The stable resume directory for a `(recipe, resume_key)`: OUTSIDE the per-run
+/// job_dir, under the data root, so a cross-invocation re-run with the SAME
+/// resume_key resolves the SAME dir and finds the checkpoint. `resume_key_hex`
+/// is the stage's cache-key hex (the engine's canonical same-training
+/// fingerprint — always `[0-9a-f]{64}` from `ContentHash`, but slugged anyway
+/// since this fn is `pub`). Both components are filesystem-slugged.
+pub fn resume_dir(data_root: &Path, recipe: &str, resume_key_hex: &str) -> PathBuf {
+    data_root.join("Training").join("resume").join(format!(
+        "{}-{}",
+        slug(recipe),
+        slug(resume_key_hex)
+    ))
 }
 
 #[cfg(test)]

@@ -1177,6 +1177,9 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
             # the crash-gated policy decided to resume.
             _name = _dur.detect()
             if _name is not None:
+                # loader=_safe_load: recovery checkpoints carry optimizer +
+                # RNG (non-tensor) state, so the load must tolerate
+                # weights_only=False — safe_torch_load already falls back to it.
                 ckpt = _dur.load_recovery(_name, map_location=device, loader=_safe_load)
             if ckpt is None:
                 print(f"[!] Durable resume: no usable recovery checkpoint in {_dur.dir} — starting fresh")
@@ -1499,9 +1502,10 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         # Rolling recovery: two files per phase — latest (every epoch) and
         # best (only when val_r improves). Crash loses ≤1 epoch; best is
         # always recoverable even if latest is corrupt on a bad shutdown.
-        # `_rec_dir` is the durable resume dir when Phase D is on (set above),
-        # else the job-local ckpt_dir/recovery.
-        _rec_dir.mkdir(parents=True, exist_ok=True)
+        # `_rec_dir` is the durable resume dir when Phase D is on (set above,
+        # already created by DurableResume), else the job-local ckpt_dir/recovery.
+        if _dur is None:
+            _rec_dir.mkdir(parents=True, exist_ok=True)
         _warm_state = {'encoder': codec.encoder.state_dict(),
                        'decoder': getattr(codec.decoder, '_orig_mod', codec.decoder).state_dict(),
                        'optimizer': optimizer.state_dict(),
