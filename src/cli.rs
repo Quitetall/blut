@@ -1305,6 +1305,24 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
             } else {
                 let raw: serde_json::Value = serde_json::from_str(&args)
                     .with_context(|| format!("parse --args as JSON: {args}"))?;
+                if dry_run {
+                    // `--dry-run` is documented as "without running anything". The
+                    // config-mode sweep path honors that (run_recipe_sweep), but the
+                    // single-invocation `--args` path previously fell straight into
+                    // run_one_recipe — which compiled the plan AND executed every
+                    // stage (spawning the warm systemd-run unit + acquiring the
+                    // exclusive GPU lock) before any value was produced. Short-circuit
+                    // here: report the resolved RAM footprint for this config and
+                    // return WITHOUT compiling/executing or touching any resource.
+                    let fp = recipe_footprint(&name, &raw);
+                    let gib = fp.ram_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                    println!(
+                        "[dry-run] recipe={name} resolved RAM footprint ≈ {gib:.1}G \
+                         (admission would gate this against free RAM + the 6G floor). \
+                         No stages executed; no GPU/cgroup acquired."
+                    );
+                    return Ok(());
+                }
                 run_one_recipe(reg, &name, raw, None, shared_cache, launch_target).await?;
             }
         }
