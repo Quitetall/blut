@@ -9,6 +9,23 @@ CLI/TUI + resource broker). The user-facing binaries live in separate cookbook
 crates (`blut-lamquant` → binary `blut`, `blut-lamu` → binary `blut-lamu`) that
 depend on this crate.
 
+## [Unreleased]
+
+### Added
+
+- **Durable resume (BLUT-API Phase D).** A killed training run no longer
+  restarts from scratch. The orchestrator owns a crash-gated *policy*
+  (`framework::resume`): a stable per-config resume directory keyed on the stage
+  cache key, a `state.json` run-state marker with a heartbeat, and a 5-row
+  decision (resume an in-process retry or a crashed prior run; refuse a live
+  concurrent run; start fresh otherwise). The trainer owns the *mechanics*
+  (`durable_resume.py`): atomic, prev-rotated recovery checkpoints at each
+  validation embedding the optimizer + RNG state, and a `--resume` that restores
+  model + **optimizer** + RNG (a continuous loss curve, no cold-optimizer dip).
+  Covers in-process OOM retry, cross-invocation re-run after a crash, and clean
+  optimizer resume. A `no_resume` recipe arg forces a fresh start. (Epoch-boundary
+  granularity; mid-epoch dataloader-position resume remains out of scope.)
+
 ## [0.10.0] — 2026-06-12
 
 First tagged release. The engine has graduated from the early `0.1` prototype
