@@ -514,6 +514,72 @@ pub fn estimate(
     }
 }
 
+// ── Warm-stage (parallel fullband precompute) RAM model ───────────────────
+//
+// DISTINCT from the train scaling formula above. `warm_fb_cache.py` forks N
+// copy-on-write workers, each driving the SAME `LmaTypedL3Dataset` adapter over
+// a contiguous slice of the window list. CPython refcount writes defeat CoW on
+// the fork-inherited window index, and each worker holds ~one decoded recording
+// + its fp16 cast buffer — so each worker's RSS climbs toward a near-full
+// private copy. This is the hole that OOM'd the BOX (the prior flat
+// `MEMORY_GIB = 8` reservation under ~6 workers × ~6 GiB ≈ 36 GiB real, with NO
+// cgroup cap to catch the overshoot). The warm stage now bills + caps from this
+// model, exactly as the train stage does from `estimate`.
+
+/// Never-OOM cap on warm fork workers (the warm-side analogue of
+/// [`UNCALIBRATED_WORKER_CAP`]). The warm is a one-time precompute, so
+/// box-survival dominates throughput: 4 workers is near the validated ~5.5×
+/// speedup knee, and [`warm_workers_for_budget`] drops it further on a box that
+/// can't hold the cap's footprint.
+pub const WARM_WORKER_CAP: u32 = 4;
+
+/// Parent-process RSS floor of the warm driver: python + the window index +
+/// the lossless-codec decode of the first recording + framework overhead,
+/// independent of worker count. Conservative-high (mirrors [`BASE_RSS_BYTES`]).
+const WARM_BASE_RSS_BYTES: u64 = 6 * GIB;
+
+/// Per-fork-worker RSS: a CoW-defeated near-full copy of the inherited window
+/// index plus the worker's own one-recording decode + fp16 cast buffer. Sized
+/// to the ~6 GiB/worker blow-up observed when the uncontained warm took the box.
+const PER_WARM_WORKER_BYTES: u64 = 6 * GIB;
+
+/// Conservative-high peak RSS (bytes) of the warm stage at `workers` fork
+/// workers: `base + workers × per_worker`. Monotone in `workers`; floors at 1
+/// worker (a serial warm still pays the base + one worker's set).
+pub fn warm_ram_bytes(workers: u32) -> u64 {
+    let w = workers.max(1) as u64;
+    WARM_BASE_RSS_BYTES.saturating_add(w.saturating_mul(PER_WARM_WORKER_BYTES))
+}
+
+/// A [`Footprint`] for the warm stage at `workers` (RAM scaled, VRAM 0 — the
+/// warm is CPU + disk only). `memmax_bytes()` adds the standard 2 GiB headroom.
+pub fn warm_estimate(workers: u32) -> Footprint {
+    Footprint {
+        ram_bytes: warm_ram_bytes(workers),
+        vram_mib: 0,
+    }
+}
+
+/// Pick the warm worker count that stays box-safe: the largest
+/// `w ∈ 1..=min(requested, WARM_WORKER_CAP)` whose cgroup cap
+/// (`warm_estimate(w).memmax_bytes()`) fits `budget_bytes` (the box-fit RAM
+/// ceiling, `MemTotal − floor`). `budget_bytes == 0` (probe unavailable) skips
+/// the box-fit reduction and returns `min(requested, WARM_WORKER_CAP)`. Always
+/// ≥ 1 — a single worker is the floor even on a box too small for its cap (the
+/// cgroup then kills the unit rather than the box; the warm fails closed and
+/// the contained trainer re-decodes + self-heals).
+pub fn warm_workers_for_budget(requested: u32, budget_bytes: u64) -> u32 {
+    let ceil = requested.clamp(1, WARM_WORKER_CAP);
+    if budget_bytes == 0 {
+        return ceil;
+    }
+    let mut w = ceil;
+    while w > 1 && warm_estimate(w).memmax_bytes() > budget_bytes {
+        w -= 1;
+    }
+    w
+}
+
 /// One persisted calibration entry. RAM is MAX-merged (monotone-up: a
 /// measured cgroup peak is the true need and, being cgroup-isolated,
 /// can't be poisoned by external contention — see ADR 0046 anti-poison
@@ -933,6 +999,51 @@ mod tests {
             l3.estimate().ram_bytes < bare.estimate().ram_bytes,
             "L3 bills less than fullband"
         );
+    }
+
+    // ── warm-stage footprint model (never-OOM hole: uncontained warm) ──
+
+    #[test]
+    fn warm_ram_is_base_plus_per_worker_monotone() {
+        // The warm bills base + workers × per-worker, monotone-up in workers —
+        // the replacement for the flat 8 GiB that under-billed the fork pool.
+        let w1 = warm_ram_bytes(1);
+        let w4 = warm_ram_bytes(4);
+        assert_eq!(w1, WARM_BASE_RSS_BYTES + PER_WARM_WORKER_BYTES);
+        assert_eq!(w4, WARM_BASE_RSS_BYTES + 4 * PER_WARM_WORKER_BYTES);
+        assert!(w4 > w1, "more workers ⇒ more RAM");
+        // Floors at 1 worker: 0 bills the same as 1 (a serial warm still pays).
+        assert_eq!(warm_ram_bytes(0), warm_ram_bytes(1));
+        // The 4-worker cap blows the prior flat 8 GiB reservation out of the
+        // water — that mismatch (30 GiB real vs 8 GiB billed) is the box-OOM.
+        assert!(w4 > 8 * GIB, "warm cap must dwarf the old flat 8 GiB lie");
+    }
+
+    #[test]
+    fn warm_estimate_adds_headroom() {
+        let fp = warm_estimate(2);
+        assert_eq!(fp.vram_mib, 0, "warm is CPU + disk only");
+        assert_eq!(fp.memmax_bytes(), warm_ram_bytes(2) + 2 * GIB);
+    }
+
+    #[test]
+    fn warm_workers_for_budget_reduces_to_fit_box() {
+        // The cap (4) costs base+4×per = 6+24 = 30 GiB est, +2 = 32 GiB cap.
+        let cap4 = warm_estimate(4).memmax_bytes();
+        assert_eq!(cap4, 32 * GIB);
+        // A box that can hold the cap keeps all 4.
+        assert_eq!(warm_workers_for_budget(4, 56 * GIB), 4);
+        // A tighter box steps workers DOWN until the cap fits: a 20 GiB budget
+        // holds workers=1 (6+6+2=14) but not 2 (6+12+2=20 — equals, fits) …
+        assert_eq!(warm_estimate(2).memmax_bytes(), 20 * GIB);
+        assert_eq!(warm_workers_for_budget(4, 20 * GIB), 2, "2-worker cap (20G) fits a 20G box");
+        assert_eq!(warm_workers_for_budget(4, 19 * GIB), 1, "only 1 worker fits 19G");
+        // Never below 1 even on an impossibly small box (the unit-kill floor).
+        assert_eq!(warm_workers_for_budget(4, GIB), 1);
+        // requested clamps to the cap; budget 0 (no probe) skips the reduction.
+        assert_eq!(warm_workers_for_budget(99, 0), WARM_WORKER_CAP);
+        assert_eq!(warm_workers_for_budget(2, 0), 2);
+        assert_eq!(warm_workers_for_budget(0, 0), 1, "requested 0 floors at 1");
     }
 
     // ── calibration store (ADR 0046 slice-2) ──────────────────────────
