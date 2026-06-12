@@ -32,7 +32,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[derive(Parser, Debug)]
 #[command(
     name = "blut",
-    version,
+    // Stamp the build-time commit into `--version` (e.g. `0.1.0+a1b2c3d4e5f6`,
+    // or `…-dirty` for an uncommitted build) so the running binary's provenance
+    // is visible at a glance; build.rs composes BLUT_VERSION. Complements the
+    // runtime `warn_if_stale_binary` check.
+    version = env!("BLUT_VERSION"),
     about = "BLUT — interactive training cockpit (bare `blut` opens the TUI). Subcommands: train, jobs, log, cancel, recipe, plan, cache, stage, data, auto, policy, tui."
 )]
 struct Cli {
@@ -498,6 +502,7 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 /// would pass an empty registry; the cookbook binaries pass theirs.
 pub async fn run(reg: crate::framework::Registry) -> Result<()> {
     init_tracing();
+    warn_if_stale_binary();
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Train(args)) => run_train(&reg, args).await,
@@ -519,6 +524,56 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         // Bare `blut` opens the interactive cockpit (T-track). Use
         // `blut train …` for explicit CLI training.
         None => crate::tui::run(reg).await,
+    }
+}
+
+/// Warn (once, at startup) if the running binary was built from a DIFFERENT
+/// commit than its source tree's CURRENT HEAD — the "git pull, forgot to
+/// rebuild/reinstall, silently ran the stale binary" trap. The in_ch /
+/// warm-containment never-OOM fixes only go live after a rebuild; a human who
+/// `git pull`s and runs the old `~/.cargo/bin/blut` would otherwise get the
+/// stale admission/footprint/containment logic with no signal.
+///
+/// build.rs stamps the build-time hash (`BLUT_GIT_HASH`) + the source dir
+/// (`BLUT_SRC_DIR`); this re-resolves that dir's live HEAD at RUNTIME and warns
+/// on mismatch. SILENT when up to date, when the source tree is gone (binary
+/// copied off the build box), when git is unavailable, or when the build was
+/// not stamped (`unknown`) — a missing signal must never become noise or a
+/// false alarm.
+fn warn_if_stale_binary() {
+    // `--version` / `--help` should be fast and clean: skip the git probe AND
+    // the warning when the user only wants version/help (clap exits during
+    // parse, so the stale notice would just be stderr noise atop the output).
+    if std::env::args().any(|a| matches!(a.as_str(), "--version" | "-V" | "--help" | "-h")) {
+        return;
+    }
+    let built = env!("BLUT_GIT_HASH");
+    let src = env!("BLUT_SRC_DIR");
+    if built == "unknown" || src.is_empty() {
+        return;
+    }
+    let live = std::process::Command::new("git")
+        .args(["-C", src, "rev-parse", "--short=12", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    // Source tree gone / not a repo / no git → no trustworthy comparison; stay
+    // silent rather than cry wolf.
+    let Some(live) = live else { return };
+    if live != built {
+        // Deliberately NOT a `--path` hint: the `blut` binary is built from the
+        // cookbook crate (blut-lamquant), not this engine crate (BLUT_SRC_DIR),
+        // so a specific `--path` would point at the wrong directory. Keep it
+        // generic — the operator knows how they installed.
+        tracing::warn!(
+            "blut binary is STALE: built from {built} but its source tree ({src}) is now \
+             at {live} — this run uses OLD code (admission / footprint / containment logic \
+             may predate the source). Rebuild + reinstall (`cargo install --force`, or \
+             `cargo build` for a local checkout)."
+        );
     }
 }
 
