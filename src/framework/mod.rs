@@ -34,6 +34,7 @@ pub mod executor;
 pub mod lineage;
 pub mod plan;
 pub mod resource;
+pub mod resume;
 pub mod retry;
 pub mod stage;
 pub mod status;

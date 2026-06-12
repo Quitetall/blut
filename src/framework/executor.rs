@@ -426,6 +426,10 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
             recipe_name: env.recipe_name.clone(),
             launch_target: env.launch_target,
             fb_warm: env.fb_warm,
+            // Durable resume (Phase D): the stage's cache key is its stable
+            // per-config fingerprint — a resume train stage keys its recovery
+            // dir on it so a re-run with identical args finds the checkpoint.
+            cache_key: task.key,
         };
 
         // ── Resource permits ────────────────────────────────────────

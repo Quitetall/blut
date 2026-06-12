@@ -1077,6 +1077,10 @@ async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
                 // `blut stage` runs one stage standalone (no recipe warm
                 // context) — bill the conservative cold footprint.
                 fb_warm: false,
+                // Standalone stage run: no executor cache key. A zero key gives
+                // a deterministic (if unshared) resume dir; durable resume is a
+                // recipe-path feature, so this path effectively never resumes.
+                cache_key: crate::framework::artifact::ContentHash([0u8; 32]),
             };
 
             let result = stage

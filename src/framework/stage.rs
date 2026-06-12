@@ -158,6 +158,14 @@ pub struct StageContext {
     /// cache). Set by the CLI from the recipe's `warm_fb_cache` arg via
     /// `ExecCtx`, so the RECORD side and the cli RESOLVE side read ONE source.
     pub fb_warm: bool,
+    /// This stage invocation's CACHE KEY (the engine's canonical "same input +
+    /// same args + same schema" fingerprint). Threaded so a durable-resume train
+    /// stage can derive a STABLE per-config resume directory (via
+    /// [`crate::framework::resume::resume_dir`]) that a cross-invocation re-run
+    /// with identical args resolves to the same path — finding the prior run's
+    /// recovery checkpoint. A different training arg ⇒ a different key ⇒ a fresh
+    /// dir ⇒ a fresh run (conservative: never resume onto a foreign checkpoint).
+    pub cache_key: crate::framework::artifact::ContentHash,
 }
 
 impl StageContext {
@@ -174,6 +182,7 @@ impl StageContext {
             recipe_name: String::new(),
             launch_target: crate::config::launcher::LaunchTarget::Local,
             fb_warm: false,
+            cache_key: crate::framework::artifact::ContentHash([0u8; 32]),
         }
     }
 }
