@@ -539,9 +539,14 @@ pub const WARM_WORKER_CAP: u32 = 4;
 const WARM_BASE_RSS_BYTES: u64 = 6 * GIB;
 
 /// Per-fork-worker RSS: a CoW-defeated near-full copy of the inherited window
-/// index plus the worker's own one-recording decode + fp16 cast buffer. Sized
-/// to the ~6 GiB/worker blow-up observed when the uncontained warm took the box.
-const PER_WARM_WORKER_BYTES: u64 = 6 * GIB;
+/// index plus the worker's own one-recording decode + fp16 cast buffer. Raised
+/// 6→8 GiB to match the MEASURED warm peak: a 4-worker warm rode ~23 GiB RSS +
+/// ~9 GiB swap = ~32 GiB true working set (≈8 GiB/worker), so the prior 6 GiB
+/// under-sized it → the 32 GiB cgroup cap was ridden → OOM-kill → partial cache.
+/// 8 GiB makes `warm_estimate` bill the real peak so `warm_workers_for_budget`
+/// reduces workers BEFORE the OOM (raise-to-measured is always the safe
+/// direction; cf. the never-lower-an-unproven-cap rule).
+const PER_WARM_WORKER_BYTES: u64 = 8 * GIB;
 
 /// Conservative-high peak RSS (bytes) of the warm stage at `workers` fork
 /// workers: `base + workers × per_worker`. Monotone in `workers`; floors at 1
@@ -1028,16 +1033,18 @@ mod tests {
 
     #[test]
     fn warm_workers_for_budget_reduces_to_fit_box() {
-        // The cap (4) costs base+4×per = 6+24 = 30 GiB est, +2 = 32 GiB cap.
+        // The cap (4) costs base+4×per = 6+32 = 38 GiB est, +2 = 40 GiB cap
+        // (PER_WARM_WORKER_BYTES raised 6→8 GiB to match the measured ~8 GiB/
+        // worker warm peak — see the const's doc).
         let cap4 = warm_estimate(4).memmax_bytes();
-        assert_eq!(cap4, 32 * GIB);
+        assert_eq!(cap4, 40 * GIB);
         // A box that can hold the cap keeps all 4.
         assert_eq!(warm_workers_for_budget(4, 56 * GIB), 4);
-        // A tighter box steps workers DOWN until the cap fits: a 20 GiB budget
-        // holds workers=1 (6+6+2=14) but not 2 (6+12+2=20 — equals, fits) …
-        assert_eq!(warm_estimate(2).memmax_bytes(), 20 * GIB);
-        assert_eq!(warm_workers_for_budget(4, 20 * GIB), 2, "2-worker cap (20G) fits a 20G box");
-        assert_eq!(warm_workers_for_budget(4, 19 * GIB), 1, "only 1 worker fits 19G");
+        // A tighter box steps workers DOWN until the cap fits. memmax(w)=8+8w:
+        // w2=24G, w3=32G, w4=40G.
+        assert_eq!(warm_estimate(2).memmax_bytes(), 24 * GIB);
+        assert_eq!(warm_workers_for_budget(4, 24 * GIB), 2, "2-worker cap (24G) fits a 24G box");
+        assert_eq!(warm_workers_for_budget(4, 23 * GIB), 1, "only 1 worker (16G) fits 23G");
         // Never below 1 even on an impossibly small box (the unit-kill floor).
         assert_eq!(warm_workers_for_budget(4, GIB), 1);
         // requested clamps to the cap; budget 0 (no probe) skips the reduction.
