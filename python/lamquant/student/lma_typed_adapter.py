@@ -116,6 +116,31 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _rss_worker_init(worker_id: int) -> None:
+    """DataLoader ``worker_init_fn``: when ``LAMQUANT_RSS_DEBUG`` is set, register
+    an atexit hook that prints this worker's PEAK RSS (``ru_maxrss``) at teardown.
+    ru_maxrss is the high-water resident set since fork, so it captures the
+    whole-recording-decode spike — the per-worker figure the never-OOM memory
+    work targets (cgroup memory.peak is the SUM across workers and can't isolate
+    it). Off by default; never raises (a probe must not break training)."""
+    if not os.environ.get("LAMQUANT_RSS_DEBUG"):
+        return
+    try:
+        import atexit
+        import resource
+
+        def _emit_peak():
+            try:
+                peak_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                print(f"[RSS] dataloader_worker[{worker_id}] pid={os.getpid()} "
+                      f"peak_rss={peak_kib / 1048576:.2f}G", file=sys.stderr, flush=True)
+            except Exception:  # noqa: BLE001
+                pass
+        atexit.register(_emit_peak)
+    except Exception:  # noqa: BLE001 — measurement probe must never break the run
+        pass
+
+
 def _identity_collate(rows):
     """Keep the per-window rows as a plain list. Workers already produced the
     (l3, fb, has_seizure, pid, dataset) tuples; the main process does the single
@@ -592,6 +617,7 @@ class LmaTypedL3Dataset:
                 # Default 2 (one batch of GPU/decode overlap) — env-tunable.
                 prefetch_factor=max(1, _env_int("LMA_PREFETCH_FACTOR", 2)),
                 persistent_workers=False,
+                worker_init_fn=_rss_worker_init,
             )
             for rows in loader:
                 yield _emit(rows)

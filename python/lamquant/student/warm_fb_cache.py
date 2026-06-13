@@ -54,6 +54,23 @@ def _eprint(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
+def _log_rss(tag: str) -> None:
+    """Log this process's PEAK RSS (``ru_maxrss``) when ``LAMQUANT_RSS_DEBUG`` is
+    set. ``ru_maxrss`` is the high-water resident set since the process started
+    (KiB on Linux), so logging it at worker teardown captures the
+    whole-recording-decode spike — the figure the never-OOM memory work targets.
+    Off by default (verification instrument, not steady-state logging); never
+    raises."""
+    if not os.environ.get("LAMQUANT_RSS_DEBUG"):
+        return
+    try:
+        import resource
+        peak_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        _eprint(f"[RSS] {tag} pid={os.getpid()} peak_rss={peak_kib / 1048576:.2f}G")
+    except Exception:  # noqa: BLE001 — a measurement probe must never break the run
+        pass
+
+
 def _free_gb(path: str) -> float:
     try:
         st = os.statvfs(path)
@@ -124,6 +141,7 @@ def _warm_range(rng: tuple[int, int]) -> tuple[int, int]:
             # mirrors the serial path so parallel mode is debuggable too.
             if failed <= 3:
                 _eprint(f"[warm_fb_cache] worker window {i} failed: {e!r}")
+    _log_rss(f"warm_worker[{start}:{end}]")
     return (end - start), failed
 
 
@@ -148,6 +166,7 @@ def _warm_serial(split: str, total: int, n_base: int) -> tuple[int, int, int]:
             _eprint(f"{i + 1}/{total} [warm_fb_cache split={split} {rate:.0f} win/s]")
     if failed:
         _eprint(f"[warm_fb_cache] split={split}: {failed}/{total} windows FAILED")
+    _log_rss(f"warm_serial[{split}]")
     return total, n_base, failed
 
 
