@@ -747,6 +747,53 @@ impl FootprintStore {
         self.save()
     }
 
+    /// Sorted snapshot of `(flat_key, entry)` pairs for `blut footprint list`.
+    pub fn entries_snapshot(&self) -> Vec<(String, FootprintEntry)> {
+        let mut v: Vec<(String, FootprintEntry)> =
+            self.entries.iter().map(|(k, e)| (k.clone(), *e)).collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    /// Forget ONE calibration entry by its flat key, then persist. Returns
+    /// whether an entry existed.
+    ///
+    /// The SANCTIONED, audited way to clear a stale `OomCorrected` bound that no
+    /// longer reflects reality (e.g. after a data-pipeline memory fix dropped the
+    /// true peak below the recorded OOM cap, which `record`'s monotone rank can
+    /// never demote). Never-OOM is preserved: after a forget, `resolve` falls
+    /// back to the conservative `Default` hint and the cgroup cap still
+    /// hard-bounds the run, so the next clean exit records a fresh `Measured`.
+    pub fn forget(&mut self, key_flat: &str) -> std::io::Result<bool> {
+        let removed = self.entries.remove(key_flat).is_some();
+        if removed {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+
+    /// Forget EVERY entry for a recipe (all `"<recipe>|*"` keys), then persist.
+    /// Returns the count removed. For `blut footprint forget --recipe <name>`
+    /// after a change that invalidates the whole recipe's calibration.
+    pub fn forget_recipe(&mut self, recipe: &str) -> std::io::Result<usize> {
+        if recipe.is_empty() {
+            // Guard the full-store-wipe footgun: an empty prefix matches EVERY
+            // key. A blanket reset must be an explicit, separate action.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "forget_recipe: empty recipe name would match every key",
+            ));
+        }
+        let prefix = format!("{recipe}|");
+        let before = self.entries.len();
+        self.entries.retain(|k, _| !k.starts_with(&prefix));
+        let removed = before - self.entries.len();
+        if removed > 0 {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+
     /// Atomic tmp+rename write (mirrors `registry.rs::write_registry`):
     /// a crash mid-write leaves the old store intact, never a partial.
     fn save(&self) -> std::io::Result<()> {

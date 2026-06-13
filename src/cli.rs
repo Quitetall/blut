@@ -125,6 +125,11 @@ enum Command {
         #[command(subcommand)]
         cmd: CacheCommand,
     },
+    /// Inspect / heal the resource-footprint calibration store (ADR 0046).
+    Footprint {
+        #[command(subcommand)]
+        cmd: FootprintCommand,
+    },
     /// Run a single stage standalone — Unix-style. Reads erased
     /// input bytes from stdin (or skipped for graph-input stages),
     /// writes the produced erased artifact bytes to stdout.
@@ -207,6 +212,31 @@ enum CacheCommand {
         /// Emit as JSON.
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum FootprintCommand {
+    /// List the calibration store: per-key RAM, source (Default/Measured/
+    /// OomCorrected), and sample count.
+    List {
+        /// Emit as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Forget a stale calibration entry so admission stops resolving it (the
+    /// SANCTIONED, audited reset for an `OomCorrected` bound that no longer
+    /// reflects reality — e.g. after a memory fix dropped the true peak below
+    /// the recorded OOM cap, which the monotone rank can never demote). Pass an
+    /// exact `<key>` (e.g. `lamquant_joint_codec|3|16|2|w`) OR `--recipe <name>`
+    /// to clear every key for a recipe. Never-OOM holds: admission then uses the
+    /// conservative Default + the cgroup cap still bounds the next run.
+    Forget {
+        /// Exact flat key to remove (omit when using --recipe).
+        key: Option<String>,
+        /// Remove ALL keys for this recipe prefix instead of one exact key.
+        #[arg(long)]
+        recipe: Option<String>,
     },
 }
 
@@ -519,6 +549,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Recipe { cmd }) => run_recipe(&reg, cmd).await,
         Some(Command::Plan { cmd }) => run_plan_cmd(&reg, cmd).await,
         Some(Command::Cache { cmd }) => run_cache_cmd(cmd),
+        Some(Command::Footprint { cmd }) => run_footprint_cmd(cmd),
         Some(Command::Stage { cmd }) => run_stage_cmd(cmd).await,
         Some(Command::Tui) => crate::tui::run(reg).await,
         // Bare `blut` opens the interactive cockpit (T-track). Use
@@ -691,6 +722,75 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                 .map_err(|e| anyhow!("render plan: {e}"))?;
             print!("{rendered}");
             Ok(())
+        }
+    }
+}
+
+fn run_footprint_cmd(cmd: FootprintCommand) -> Result<()> {
+    let store = crate::broker::FootprintStore::load();
+    let path = crate::config::footprint_store_path();
+    match cmd {
+        FootprintCommand::List { json } => {
+            let entries = store.entries_snapshot();
+            if json {
+                // {key: {ram_gb, source, n_samples}} — greppable for tooling.
+                let obj: serde_json::Map<String, serde_json::Value> = entries
+                    .into_iter()
+                    .map(|(k, e)| {
+                        (
+                            k,
+                            serde_json::json!({
+                                "ram_gb": e.ram_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+                                "source": format!("{:?}", e.source),
+                                "n_samples": e.n_samples,
+                            }),
+                        )
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&obj)?);
+                return Ok(());
+            }
+            println!("footprint store: {}", path.display());
+            if entries.is_empty() {
+                println!("(empty)");
+                return Ok(());
+            }
+            println!("{:<40} {:>8}  {:<13} {}", "key", "ram", "source", "n");
+            for (k, e) in entries {
+                println!(
+                    "{:<40} {:>6.1}G  {:<13} {}",
+                    k,
+                    e.ram_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+                    format!("{:?}", e.source),
+                    e.n_samples
+                );
+            }
+            Ok(())
+        }
+        FootprintCommand::Forget { key, recipe } => {
+            let mut store = store;
+            match (key, recipe) {
+                (Some(_), Some(_)) => {
+                    Err(anyhow!("pass EITHER a <key> OR --recipe, not both"))
+                }
+                (Some(k), None) => {
+                    if store.forget(&k)? {
+                        println!("forgot calibration entry: {k}");
+                    } else {
+                        println!("no entry for key: {k} (nothing to forget)");
+                    }
+                    Ok(())
+                }
+                (None, Some(r)) => {
+                    let n = store.forget_recipe(&r)?;
+                    println!("forgot {n} calibration entr{} for recipe '{r}'",
+                             if n == 1 { "y" } else { "ies" });
+                    Ok(())
+                }
+                (None, None) => {
+                    Err(anyhow!("specify a <key> or --recipe <name> to forget"))
+                }
+            }
         }
     }
 }
