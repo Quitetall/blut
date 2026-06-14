@@ -1177,10 +1177,14 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
             # the crash-gated policy decided to resume.
             _name = _dur.detect()
             if _name is not None:
-                # loader=_safe_load: recovery checkpoints carry optimizer +
-                # RNG (non-tensor) state, so the load must tolerate
-                # weights_only=False — safe_torch_load already falls back to it.
-                ckpt = _dur.load_recovery(_name, map_location=device, loader=_safe_load)
+                # Use load_recovery's DEFAULT loader (weights_only=False): a
+                # recovery checkpoint always carries optimizer + RNG (non-tensor)
+                # state, which weights_only=True rejects. NOT _safe_load — its
+                # weights_only=True-first attempt raises UnpicklingError on these,
+                # which its (TypeError, RuntimeError) fallback does NOT catch, so
+                # it re-raises and durable resume silently degrades to fresh.
+                # These are the trainer's OWN checkpoints under the data root.
+                ckpt = _dur.load_recovery(_name, map_location=device)
             if ckpt is None:
                 print(f"[!] Durable resume: no usable recovery checkpoint in {_dur.dir} — starting fresh")
         else:
