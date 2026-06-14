@@ -66,13 +66,32 @@ fn main() {
             println!("cargo:rerun-if-changed={}", abs.display());
         }
     };
-    // Re-stamp on a new commit / checkout (HEAD moves). Deliberately NOT
-    // watching `index`: staging (`git add`) would otherwise re-run this script —
-    // and recompile the crate — on every staged change. The dirty marker is
-    // best-effort (the hash is the load-bearing provenance); a commit moves HEAD
-    // and re-stamps cleanly. Also watch build.rs itself, since emitting any
-    // rerun-if-changed overrides cargo's default "re-run when the script
-    // changes" (and guarantees at least one trigger on a fresh build).
+    // Re-stamp on any HEAD movement. SUBTLE (the stamp-lag bug): a `git commit`
+    // on the current branch does NOT change HEAD's content — it stays
+    // `ref: refs/heads/<branch>`; the commit rewrites the BRANCH ref + appends
+    // the reflog. So watching HEAD alone catches only branch SWITCHES, not
+    // commits, and the embedded hash silently lags the source. Watch every file
+    // a HEAD movement can touch, resolved via `git rev-parse --git-path`
+    // (submodule/worktree-correct, where `.git` is a file pointer):
+    //   * HEAD                — a branch switch / detached-HEAD move
+    //   * refs/heads/<branch> — a commit on the current branch (LOOSE ref)
+    //   * packed-refs         — a commit when that branch ref is PACKED
+    //   * logs/HEAD           — the reflog appends on EVERY HEAD move (the
+    //                           belt-and-suspenders catch-all when enabled)
+    // Over-triggering (e.g. a `git gc` repack) only re-stamps harmlessly; the
+    // goal is to never MISS a move. Deliberately NOT watching `index`: staging
+    // (`git add`) would recompile the crate on every staged change, and the
+    // reflog already does not move on a bare `git add` (only on ref updates).
+    // Also watch build.rs itself — emitting any rerun-if-changed overrides
+    // cargo's default "re-run when the script changes".
     println!("cargo:rerun-if-changed=build.rs");
     watch(git(&["rev-parse", "--git-path", "HEAD"]));
+    watch(git(&["rev-parse", "--git-path", "logs/HEAD"]));
+    watch(git(&["rev-parse", "--git-path", "packed-refs"]));
+    // The loose branch ref HEAD points at (None on a detached HEAD — the HEAD
+    // watch above covers that case). `symbolic-ref --quiet` prints the full ref
+    // name (`refs/heads/<branch>`) or exits non-zero ⇒ git() returns None.
+    if let Some(branch_ref) = git(&["symbolic-ref", "--quiet", "HEAD"]) {
+        watch(git(&["rev-parse", "--git-path", branch_ref.as_str()]));
+    }
 }
