@@ -420,7 +420,7 @@ enum HpoCommand {
         #[arg(long = "param", value_name = "NAME=FN(...)")]
         param: Vec<String>,
         /// Search algorithm: asha (default) | random | median | percentile |
-        /// pbt (population-based, resume-on-promote) — (later: tpe).
+        /// pbt (population-based, resume-on-promote) | tpe (Parzen ask-tell).
         #[arg(long, default_value = "asha")]
         algo: String,
         /// Objective metric — a dotted key read from each trial's StageStep
@@ -1459,11 +1459,15 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
     // for median/asha, exploit/explore clones for pbt). TPE lands in a later
     // slice (model-based sampler).
     let mut sampler: Box<dyn Sampler> = match algo.as_str() {
-        "random" | "median" | "percentile" | "asha" | "pbt" => Box::new(RandomSampler::new(seed)),
+        // TPE's initial population is also random (the model-based ask conditions
+        // on completed trials, which arrive only at runtime via the policy).
+        "random" | "median" | "percentile" | "asha" | "pbt" | "tpe" => {
+            Box::new(RandomSampler::new(seed))
+        }
         other => {
             return Err(anyhow!(
-                "--algo '{other}' is not yet implemented — v0.20 ships \
-                 random/median/percentile/asha/pbt; tpe lands in a later slice"
+                "--algo '{other}' is not recognized — v0.20 ships \
+                 random/median/percentile/asha/pbt/tpe"
             ));
         }
     };
@@ -1664,6 +1668,41 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
         ctx = ctx.with_control(std::sync::Arc::new(sched));
         eprintln!(
             "hpo: pbt rungs={rungs:?} (metric={metric} {mode}, cull<p{percentile}, resume-on-promote)"
+        );
+    } else if algo == "tpe" {
+        // TPE: the fan-out is the random initial population; as each trial
+        // completes (reaches --max-budget) the policy tells the Parzen model and
+        // Spawns a fresh suggested trial (no resume — TPE explores fresh).
+        use crate::hpo::{TpeConfig, TpePolicy, TpePolicyConfig, TpeSampler};
+        if max_budget == 0 {
+            return Err(anyhow!("tpe needs --max-budget >= 1 (the per-trial completion budget)"));
+        }
+        let trial_overlays: Vec<crate::hpo::Overlay> =
+            trials.iter().map(|t| t.overlay.clone()).collect();
+        let def = reg
+            .find(&name)
+            .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+        let cfn = def.compile_fn;
+        let base_for_factory = base_args.clone();
+        let factory: crate::hpo::FreshFactory = std::sync::Arc::new(move |overlay| {
+            let mut a = base_for_factory.clone();
+            crate::hpo::apply_overlay(&mut a, overlay);
+            cfn(a).map_err(|e| format!("{e}"))
+        });
+        let sampler = TpeSampler::new(
+            TpeConfig { maximize: mode == "max", ..TpeConfig::default() },
+            seed,
+        );
+        let cfg = TpePolicyConfig {
+            metric_key: metric.clone(),
+            budget_key: metric_budget_key.clone(),
+            max_budget: max_budget as u64,
+            max_spawns: (max_trials as usize).max(1),
+        };
+        let sched = TpePolicy::new(trial_of_topo, trial_overlays, sp.clone(), cfg, sampler, factory);
+        ctx = ctx.with_control(std::sync::Arc::new(sched));
+        eprintln!(
+            "hpo: tpe (metric={metric} {mode}, complete@{max_budget}, ≤{max_trials} suggested)"
         );
     }
 
