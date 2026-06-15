@@ -1380,12 +1380,12 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
         mode,
         max_trials,
         seed,
-        metric_budget_key: _,
+        metric_budget_key,
         eta: _,
         min_budget: _,
         max_budget: _,
-        grace: _,
-        percentile: _,
+        grace,
+        percentile,
         shared_cache,
         launcher,
     } = cmd;
@@ -1410,13 +1410,15 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
     sp.validate()
         .map_err(|e| anyhow!("invalid search space: {e}"))?;
 
-    // Sampler (Phase 2: random only).
+    // Sampler — random/median/percentile all sample randomly (they differ only
+    // in EARLY-STOP, applied via the control policy below). ASHA/PBT/TPE land in
+    // later slices.
     let mut sampler: Box<dyn Sampler> = match algo.as_str() {
-        "random" => Box::new(RandomSampler::new(seed)),
+        "random" | "median" | "percentile" => Box::new(RandomSampler::new(seed)),
         other => {
             return Err(anyhow!(
-                "--algo '{other}' is not yet implemented — Phase 2 ships 'random'; \
-                 median/percentile/asha/pbt/tpe land in later v0.20 slices"
+                "--algo '{other}' is not yet implemented — Phase 3 ships \
+                 random/median/percentile; asha/pbt/tpe land in later v0.20 slices"
             ));
         }
     };
@@ -1472,6 +1474,31 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
             let cache_handle = (*ctx.cache).clone().with_global(global);
             ctx.cache = std::sync::Arc::new(cache_handle);
         }
+    }
+
+    // Early-stop scheduler (median/percentile). The scheduler maps each
+    // StageStep's topo node_idx -> trial, reads the objective + budget, and
+    // KillBranch-es a trial below the p-th percentile of its peers at the same
+    // budget (past the grace budget). Random has control=None (no early stop).
+    if algo == "median" || algo == "percentile" {
+        use crate::hpo::{HpoScheduler, MedianStop, build_trial_of_topo};
+        let offsets: Vec<crate::framework::NodeId> =
+            trials.iter().map(|t| t.node_offset).collect();
+        let topo = plan
+            .topo_order()
+            .map_err(|e| anyhow!("hpo plan topo order: {e}"))?;
+        let trial_of_topo = build_trial_of_topo(&topo, &offsets, plan.n_nodes() as u32);
+        let pct = if algo == "median" { 50.0 } else { percentile as f64 };
+        let sched = HpoScheduler::new(
+            trial_of_topo,
+            metric.clone(),
+            metric_budget_key.clone(),
+            mode == "max",
+            grace as u64,
+            Box::new(MedianStop { percentile: pct, min_peers: 2 }),
+        );
+        ctx = ctx.with_control(std::sync::Arc::new(sched));
+        eprintln!("hpo: {algo} early-stop (metric={metric} {mode}, grace={grace})");
     }
 
     RecipeMarker {
