@@ -31,8 +31,9 @@ impl EarlyStop for MedianStop {
 
 /// Nearest-rank p-th percentile of `xs` (ascending), `p` in `[0, 100]`. NaN
 /// values are dropped first — a NaN would make `partial_cmp` non-total and the
-/// sort (hence the threshold + the kill decision) non-deterministic.
-fn percentile(xs: &[f64], p: f64) -> f64 {
+/// sort (hence the threshold + the kill decision) non-deterministic. Shared with
+/// ASHA (its per-rung cut is a percentile at `(1 - 1/eta)`).
+pub(crate) fn percentile(xs: &[f64], p: f64) -> f64 {
     let mut v: Vec<f64> = xs.iter().copied().filter(|x| !x.is_nan()).collect();
     if v.is_empty() {
         return f64::NEG_INFINITY;

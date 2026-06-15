@@ -407,9 +407,9 @@ enum HpoCommand {
         /// merged over --space, later wins). At least one dim total is required.
         #[arg(long = "param", value_name = "NAME=FN(...)")]
         param: Vec<String>,
-        /// Search algorithm: random | median | percentile | asha (later: pbt | tpe).
-        /// Default flips to `asha` once the scheduler lands (v0.20 Phase 4).
-        #[arg(long, default_value = "random")]
+        /// Search algorithm: asha (default) | random | median | percentile
+        /// (later: pbt | tpe).
+        #[arg(long, default_value = "asha")]
         algo: String,
         /// Objective metric — a dotted key read from each trial's StageStep
         /// payload (e.g. `val_r`).
@@ -1381,9 +1381,9 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
         max_trials,
         seed,
         metric_budget_key,
-        eta: _,
-        min_budget: _,
-        max_budget: _,
+        eta,
+        min_budget,
+        max_budget,
         grace,
         percentile,
         shared_cache,
@@ -1414,11 +1414,11 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
     // in EARLY-STOP, applied via the control policy below). ASHA/PBT/TPE land in
     // later slices.
     let mut sampler: Box<dyn Sampler> = match algo.as_str() {
-        "random" | "median" | "percentile" => Box::new(RandomSampler::new(seed)),
+        "random" | "median" | "percentile" | "asha" => Box::new(RandomSampler::new(seed)),
         other => {
             return Err(anyhow!(
-                "--algo '{other}' is not yet implemented — Phase 3 ships \
-                 random/median/percentile; asha/pbt/tpe land in later v0.20 slices"
+                "--algo '{other}' is not yet implemented — Phase 4 ships \
+                 random/median/percentile/asha; pbt/tpe land in later v0.20 slices"
             ));
         }
     };
@@ -1476,29 +1476,48 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
         }
     }
 
-    // Early-stop scheduler (median/percentile). The scheduler maps each
-    // StageStep's topo node_idx -> trial, reads the objective + budget, and
-    // KillBranch-es a trial below the p-th percentile of its peers at the same
-    // budget (past the grace budget). Random has control=None (no early stop).
-    if algo == "median" || algo == "percentile" {
-        use crate::hpo::{HpoScheduler, MedianStop, build_trial_of_topo};
+    // Early-stop scheduler. The scheduler maps each StageStep's topo node_idx ->
+    // trial, reads the objective + budget, and KillBranch-es underperformers:
+    // median/percentile cut at the p-th percentile of peers at the same budget;
+    // ASHA culls to the top 1/eta only at rung milestones. Random has
+    // control=None (no early stop).
+    if matches!(algo.as_str(), "median" | "percentile" | "asha") {
+        use crate::hpo::{AshaStop, EarlyStop, HpoScheduler, MedianStop, build_trial_of_topo};
         let offsets: Vec<crate::framework::NodeId> =
             trials.iter().map(|t| t.node_offset).collect();
         let topo = plan
             .topo_order()
             .map_err(|e| anyhow!("hpo plan topo order: {e}"))?;
         let trial_of_topo = build_trial_of_topo(&topo, &offsets, plan.n_nodes() as u32);
-        let pct = if algo == "median" { 50.0 } else { percentile as f64 };
+        let strategy: Box<dyn EarlyStop> = match algo.as_str() {
+            "asha" => {
+                if min_budget == 0 {
+                    return Err(anyhow!("asha needs --min-budget >= 1 (the first rung)"));
+                }
+                if max_budget <= min_budget {
+                    return Err(anyhow!(
+                        "asha needs --max-budget ({max_budget}) > --min-budget ({min_budget})"
+                    ));
+                }
+                let asha = AshaStop::from_budgets(min_budget as u64, max_budget as u64, eta);
+                eprintln!("hpo: asha rungs={:?} eta={eta}", asha.rungs);
+                Box::new(asha)
+            }
+            "median" => Box::new(MedianStop { percentile: 50.0, min_peers: 2 }),
+            _ => Box::new(MedianStop { percentile: percentile as f64, min_peers: 2 }),
+        };
         let sched = HpoScheduler::new(
             trial_of_topo,
             metric.clone(),
             metric_budget_key.clone(),
             mode == "max",
             grace as u64,
-            Box::new(MedianStop { percentile: pct, min_peers: 2 }),
+            strategy,
         );
         ctx = ctx.with_control(std::sync::Arc::new(sched));
-        eprintln!("hpo: {algo} early-stop (metric={metric} {mode}, grace={grace})");
+        eprintln!(
+            "hpo: {algo} early-stop (metric={metric} {mode}, budget-key={metric_budget_key}, grace={grace})"
+        );
     }
 
     RecipeMarker {
