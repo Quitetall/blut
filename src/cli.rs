@@ -1441,7 +1441,17 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
     );
 
     // Job + ExecCtx — mirror run_one_recipe (control=None for random search).
-    let footprint = recipe_footprint(&name, &base_args);
+    // Gate on the WORST-CASE trial footprint (max over the sampled overlays):
+    // if the search space tunes a memory driver (batch/tier), a trial's overlaid
+    // footprint can exceed the base, and admission must reflect that. (The
+    // executor's per-stage memory admission is the authoritative never-OOM gate
+    // across concurrent trials; this pre-run gate is the courtesy early-refuse.)
+    let footprint = trials.iter().fold(recipe_footprint(&name, &base_args), |acc, t| {
+        let mut a = base_args.clone();
+        crate::hpo::apply_overlay(&mut a, &t.overlay);
+        let f = recipe_footprint(&name, &a);
+        if f.ram_bytes > acc.ram_bytes { f } else { acc }
+    });
     let job_id = crate::jobs::new_job_id();
     let job_dir = crate::paths::job_dir(&job_id)?;
     let mut ctx = ExecCtx::new(job_dir.clone());

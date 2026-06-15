@@ -109,7 +109,7 @@ from training_types import (
     alpha_stats_from_model, reduce_alpha_stats,
 )
 from training_dashboard import TrainingDashboard
-from train_student_subband import (
+from training_utils import (
     pearson_r_batch, channel_dropout, validate_epoch as _vendored_validate,
 )
 from augmentations import EEGAugmentor
