@@ -609,8 +609,17 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         .stage
         .rebase_output_paths(output, &tmp_stage_dir, &final_stage_dir);
 
-    // Sidecar metadata next to the promoted payload.
-    let output_hash = content_hash_from_erased(&output);
+    // Sidecar metadata next to the promoted payload. Record the CONTENT hash
+    // (the FW-1 fix path, same as the downstream logical hash uses) so the
+    // StageEnd event + the output.metadata.json sidecar + lineage are
+    // cross-machine-stable — `content_hash_from_erased` hashes the bincode
+    // handle, which embeds the producer's absolute paths. Falls back to the
+    // handle hash for non-deterministic / tuple outputs (the same well-tested
+    // fallback `compute_logical_output_hash` uses).
+    let output_hash = task
+        .stage
+        .output_content_hash(&output)
+        .unwrap_or_else(|| content_hash_from_erased(&output));
     let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, output_hash)
         .with_stage(stage_name.clone());
     let _ = metadata.write_to(&final_stage_dir.join("output.metadata.json"));
@@ -1873,6 +1882,62 @@ mod tests {
         let erased = ErasedArtifact::from_typed(&art).unwrap();
         let handle_hash = content_hash_from_erased(&erased);
         assert_ne!(observed, handle_hash, "content hash must differ from handle hash here");
+    }
+
+    /// Capture the EMITTED `StageEnd.output_hash` for node 0 of a single-stage
+    /// plan (the recorded provenance hash my B.1(a) fix changed).
+    async fn recorded_output_hash(abs_path: &str, content: u8) -> CH {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = ExecCtx::new(td.path().to_path_buf());
+        let mut rx = ctx.status.subscribe();
+        let plan = Plan::<(), LamuTrainerBackend>::new("fw1b", serde_json::json!({}))
+            .start(
+                MakePathArt,
+                PathArtArgs {
+                    abs_path: abs_path.to_string(),
+                    content,
+                },
+            )
+            .finish()
+            .into_compiled();
+        SequentialExecutor::execute(plan, ctx).await.unwrap();
+        let mut found = None;
+        while let Ok(evt) = rx.try_recv() {
+            if let StageEvent::StageEnd {
+                node_idx: 0,
+                output_hash,
+                ..
+            } = evt
+            {
+                found = Some(output_hash);
+            }
+        }
+        found.expect("StageEnd must carry an output_hash")
+    }
+
+    #[tokio::test]
+    async fn recorded_output_hash_is_content_based_and_path_stable() {
+        // B.1(a): the EMITTED StageEnd.output_hash (→ output.metadata.json sidecar
+        // + lineage_db) must be the artifact CONTENT hash, not the bincode-handle
+        // hash (which embeds absolute paths) — so recorded provenance is
+        // cross-machine stable + consistent with the downstream cache key.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let h1 = recorded_output_hash("/machine-a/jobs/r1/stages/0-make/out", 7).await;
+        let h2 = recorded_output_hash("/machine-b/elsewhere/out", 7).await;
+        assert_eq!(h1, h2, "B.1(a): recorded output_hash stable across abs paths");
+        let art = PathArt {
+            content: 7,
+            path: PathBuf::from("/machine-a/jobs/r1/stages/0-make/out"),
+        };
+        assert_eq!(h1, art.content_hash(), "recorded hash = content_hash()");
+        let erased = ErasedArtifact::from_typed(&art).unwrap();
+        assert_ne!(
+            h1,
+            content_hash_from_erased(&erased),
+            "must be the content hash, not the path-embedding handle hash"
+        );
+        let h3 = recorded_output_hash("/machine-a/jobs/r1/stages/0-make/out", 8).await;
+        assert_ne!(h1, h3, "different content must change the recorded hash");
     }
 
     // ── FW-2 atomic stage outputs ────────────────────────────────────

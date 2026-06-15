@@ -136,10 +136,15 @@ impl Stage for SftTrain {
         // status updates so the unified status.jsonl carries them.
         let stage_name_owned = SftTrain::NAME.to_string();
         let status_tx = ctx.status_tx.clone();
+        // This stage's topo position — stamped into every StageStep so a consumer
+        // attributes steps to the right node. The HPO scheduler maps
+        // StageStep.node_idx → trial; a hardcoded 0 would collapse all concurrent
+        // trial nodes onto node 0 and mis-target early-stop decisions.
+        let node_idx = ctx.node_idx;
         let on_status: crate::backend::StatusFn = Box::new(move |update| {
             if let Ok(value) = serde_json::to_value(&update) {
                 let _ = status_tx.send(crate::framework::status::StageEvent::StageStep {
-                    node_idx: 0, // recipe layer doesn't surface idx here; logger reconstructs
+                    node_idx,
                     stage_name: stage_name_owned.clone(),
                     update: value,
                 });
