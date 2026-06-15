@@ -15,6 +15,7 @@
 
 pub mod asha;
 pub mod median;
+pub mod pbt;
 pub mod plan_build;
 pub mod results;
 pub mod sampler;
@@ -23,6 +24,7 @@ pub mod space;
 
 pub use asha::AshaStop;
 pub use median::MedianStop;
+pub use pbt::{PbtConfig, PbtPolicy, PbtResume, PbtTrial, TrialFactory};
 pub use results::{HpoManifest, TrialOutcome, TrialRec, leaderboard};
 pub use plan_build::{TrialPlan, build_hpo_plan};
 pub use sampler::{RandomSampler, Sampler};

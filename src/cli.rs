@@ -419,8 +419,8 @@ enum HpoCommand {
         /// merged over --space, later wins). At least one dim total is required.
         #[arg(long = "param", value_name = "NAME=FN(...)")]
         param: Vec<String>,
-        /// Search algorithm: asha (default) | random | median | percentile
-        /// (later: pbt | tpe).
+        /// Search algorithm: asha (default) | random | median | percentile |
+        /// pbt (population-based, resume-on-promote) — (later: tpe).
         #[arg(long, default_value = "asha")]
         algo: String,
         /// Objective metric — a dotted key read from each trial's StageStep
@@ -1454,15 +1454,16 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
     sp.validate()
         .map_err(|e| anyhow!("invalid search space: {e}"))?;
 
-    // Sampler — random/median/percentile all sample randomly (they differ only
-    // in EARLY-STOP, applied via the control policy below). ASHA/PBT/TPE land in
-    // later slices.
+    // Sampler — random/median/percentile/asha/pbt all sample the INITIAL
+    // population randomly (they differ in the control policy below: early-stop
+    // for median/asha, exploit/explore clones for pbt). TPE lands in a later
+    // slice (model-based sampler).
     let mut sampler: Box<dyn Sampler> = match algo.as_str() {
-        "random" | "median" | "percentile" | "asha" => Box::new(RandomSampler::new(seed)),
+        "random" | "median" | "percentile" | "asha" | "pbt" => Box::new(RandomSampler::new(seed)),
         other => {
             return Err(anyhow!(
-                "--algo '{other}' is not yet implemented — Phase 4 ships \
-                 random/median/percentile/asha; pbt/tpe land in later v0.20 slices"
+                "--algo '{other}' is not yet implemented — v0.20 ships \
+                 random/median/percentile/asha/pbt; tpe lands in a later slice"
             ));
         }
     };
@@ -1592,6 +1593,77 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
         ctx = ctx.with_control(std::sync::Arc::new(sched));
         eprintln!(
             "hpo: {algo} early-stop (metric={metric} {mode}, budget-key={metric_budget_key}, grace={grace})"
+        );
+    } else if algo == "pbt" {
+        // Population-Based Training: at each rung a below-quantile trial is
+        // KillBranch'd and a perturbed clone of the best survivor is Spawn'd,
+        // warm-started from the winner's checkpoint dir (`--resume-from`, baked
+        // into the clone's args by the factory below).
+        use crate::hpo::{PbtConfig, PbtPolicy, PbtTrial};
+        if min_budget == 0 || max_budget <= min_budget {
+            return Err(anyhow!(
+                "pbt needs --min-budget >= 1 and --max-budget > --min-budget (the rungs)"
+            ));
+        }
+        let rungs = crate::hpo::AshaStop::rung_ladder(min_budget as u64, max_budget as u64, eta);
+        // Each trial's checkpoint dir = its TERMINAL node's stage dir
+        // (`<job_dir>/stages/<topo_idx>-<stage>`); a clone resumes from the
+        // winner's. The terminal node is the last topo position the trial owns.
+        let pg = plan
+            .graph_structure()
+            .map_err(|e| anyhow!("pbt: plan graph: {e}"))?;
+        let mut terminal_topo: Vec<Option<usize>> = vec![None; trials.len()];
+        for (p, t) in trial_of_topo.iter().enumerate() {
+            if let Some(t) = t {
+                terminal_topo[*t as usize] = Some(p); // topo ascending → last wins
+            }
+        }
+        let pbt_trials: Vec<PbtTrial> = trials
+            .iter()
+            .enumerate()
+            .map(|(i, tp)| {
+                let resume_dir = terminal_topo[i]
+                    .and_then(|p| pg.nodes.get(p))
+                    .map(|n| {
+                        job_dir
+                            .join("stages")
+                            .join(format!("{}-{}", n.idx, n.stage_name))
+                    })
+                    .unwrap_or_else(|| job_dir.clone());
+                PbtTrial { overlay: tp.overlay.clone(), resume_dir }
+            })
+            .collect();
+        // The clone factory: perturbed overlay + `resume_from` arg → recompile.
+        // `compile_fn` is a plain fn pointer (`'static`), so it captures cleanly.
+        let def = reg
+            .find(&name)
+            .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+        let cfn = def.compile_fn;
+        let base_for_factory = base_args.clone();
+        let factory: crate::hpo::TrialFactory = std::sync::Arc::new(move |overlay, resume| {
+            let mut a = base_for_factory.clone();
+            crate::hpo::apply_overlay(&mut a, overlay);
+            if let Some(obj) = a.as_object_mut() {
+                obj.insert(
+                    "resume_from".into(),
+                    serde_json::json!(resume.resume_dir.to_string_lossy()),
+                );
+            }
+            cfn(a).map_err(|e| format!("{e}"))
+        });
+        let cfg = PbtConfig {
+            metric_key: metric.clone(),
+            budget_key: metric_budget_key.clone(),
+            maximize: mode == "max",
+            rungs: rungs.clone(),
+            bottom_quantile: percentile as f64,
+            min_peers: 2,
+            max_spawns: (max_trials as usize).saturating_mul(8).max(1),
+        };
+        let sched = PbtPolicy::new(trial_of_topo, pbt_trials, sp.clone(), cfg, factory, seed);
+        ctx = ctx.with_control(std::sync::Arc::new(sched));
+        eprintln!(
+            "hpo: pbt rungs={rungs:?} (metric={metric} {mode}, cull<p{percentile}, resume-on-promote)"
         );
     }
 

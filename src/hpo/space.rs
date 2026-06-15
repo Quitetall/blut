@@ -116,6 +116,48 @@ impl Dist {
     }
 }
 
+impl Dist {
+    /// PBT "explore": perturb a CURRENT value within this dim's support. Classic
+    /// PBT scales a continuous value by 0.8 or 1.2 (then clamps to `[low, high]`);
+    /// an integer moves at least one step in the scaled direction; a categorical
+    /// resamples. Assumes [`validate`](Dist::validate) passed.
+    pub fn perturb(&self, current: &Value, rng: &mut impl Rng) -> Value {
+        let factor = if rng.gen_bool(0.5) { 0.8 } else { 1.2 };
+        match self {
+            Dist::Uniform { low, high } => {
+                let c = current.as_f64().unwrap_or((low + high) / 2.0);
+                json_f64((c * factor).clamp(*low, *high))
+            }
+            Dist::LogUniform { low, high } => {
+                let c = current.as_f64().unwrap_or((low * high).sqrt());
+                json_f64((c * factor).clamp(*low, *high))
+            }
+            Dist::IntUniform { low, high } => {
+                let c = current.as_i64().unwrap_or((low + high) / 2);
+                let mut v = ((c as f64) * factor).round() as i64;
+                // Ensure the value actually MOVES even when rounding pins it back
+                // to `c` (e.g. small magnitudes), so explore makes progress.
+                if v == c {
+                    v = if factor > 1.0 { c + 1 } else { c - 1 };
+                }
+                Value::from(v.clamp(*low, *high))
+            }
+            Dist::QUniform { low, high, q } => {
+                let c = current.as_f64().unwrap_or((low + high) / 2.0);
+                let qq = if *q == 0.0 { 1.0 } else { *q };
+                json_f64((((c * factor) / qq).round() * qq).clamp(*low, *high))
+            }
+            Dist::Choice { choices } => {
+                if choices.is_empty() {
+                    current.clone()
+                } else {
+                    choices[rng.gen_range(0..choices.len())].clone()
+                }
+            }
+        }
+    }
+}
+
 /// `f64` → a JSON number (falls back to `Null` for NaN/Inf, which `serde_json`
 /// cannot represent — never produced by the samplers above on finite inputs).
 fn json_f64(x: f64) -> Value {
