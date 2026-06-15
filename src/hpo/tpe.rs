@@ -14,6 +14,13 @@
 //! asks N times against an EMPTY history). [`TpePolicy`] runs it at runtime: a
 //! small random population starts the search, and as each trial COMPLETES the
 //! policy tells TPE the result and `Spawn`s a fresh TPE-suggested trial.
+//!
+//! v0.20 boundary: `trial_of_topo` covers the INITIAL fan-out only, so a
+//! `Spawn`'d trial's steps (topo positions beyond it) are unattributed and don't
+//! feed back into the model — TPE/PBT learn from the initial population and the
+//! suggestions explore from it, but spawned trials are not themselves re-told.
+//! A runtime trial-registration channel (attributing new node ranges to trials)
+//! is the follow-up that closes the loop.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -71,16 +78,23 @@ fn gaussian(x: f64, mu: f64, sigma: f64) -> f64 {
     (-0.5 * z * z).exp() / (s * (2.0 * std::f64::consts::PI).sqrt())
 }
 
-/// Forward transform for a continuous dim: log-space for `log_uniform`, else
-/// identity. Returns `(value_t, lo_t, hi_t)` or `None` for non-continuous dims.
-fn continuous_t(dist: &Dist, v: f64) -> Option<(f64, f64, f64)> {
+/// A continuous dim's support in t-space (log for `log_uniform`), straight from
+/// the `Dist` — independent of any data point. `None` for categoricals.
+fn support_t(dist: &Dist) -> Option<(f64, f64)> {
     match dist {
-        Dist::Uniform { low, high } | Dist::QUniform { low, high, .. } => Some((v, *low, *high)),
-        Dist::LogUniform { low, high } => {
-            Some((v.max(f64::MIN_POSITIVE).ln(), low.ln(), high.ln()))
-        }
-        Dist::IntUniform { low, high } => Some((v, *low as f64, *high as f64)),
+        Dist::Uniform { low, high } | Dist::QUniform { low, high, .. } => Some((*low, *high)),
+        Dist::LogUniform { low, high } => Some((low.ln(), high.ln())),
+        Dist::IntUniform { low, high } => Some((*low as f64, *high as f64)),
         Dist::Choice { .. } => None,
+    }
+}
+
+/// Forward transform of a value into t-space (log for `log_uniform`, else
+/// identity).
+fn to_t(dist: &Dist, v: f64) -> f64 {
+    match dist {
+        Dist::LogUniform { .. } => v.max(f64::MIN_POSITIVE).ln(),
+        _ => v,
     }
 }
 
@@ -134,13 +148,13 @@ impl TpeSampler {
     }
 
     fn suggest_continuous(&mut self, dist: &Dist, good: &[f64], bad: &[f64]) -> Value {
-        // Transform observations + support to t-space.
-        let Some((_, lo, hi)) = continuous_t(dist, good.first().copied().unwrap_or(0.0)) else {
+        // Support comes from the Dist (never a data point); values transform to
+        // the same t-space.
+        let Some((lo, hi)) = support_t(dist) else {
             return dist.sample(&mut self.rng);
         };
-        let tx = |v: f64| continuous_t(dist, v).map(|(t, _, _)| t).unwrap_or(v);
-        let good_t: Vec<f64> = good.iter().map(|&v| tx(v)).collect();
-        let bad_t: Vec<f64> = bad.iter().map(|&v| tx(v)).collect();
+        let good_t: Vec<f64> = good.iter().map(|&v| to_t(dist, v)).collect();
+        let bad_t: Vec<f64> = bad.iter().map(|&v| to_t(dist, v)).collect();
         let bw = ((hi - lo) * self.cfg.bw_factor).max(1e-9);
 
         // Draw candidates from the good model (a random good point + Gaussian
@@ -316,33 +330,36 @@ impl TpePolicy {
     /// TPE + enqueues the next suggestion.
     pub(crate) fn decide(&self, trial: u32, obj: f64, budget: u64) -> TpeDecision {
         let mut st = self.state.lock();
-        // 1. Emit a queued suggestion (one per step), under the cap.
+        // 1. Record + tell on completion FIRST — a trial's observation must never
+        //    be lost to an early Spawn return (DeepSeek review): if a trial
+        //    completes on the SAME step the drain fires, recording after the
+        //    drain would drop it (especially for the last trial).
+        if obj.is_finite() {
+            let best = {
+                let entry = st.best.entry(trial).or_insert(obj);
+                *entry = entry.max(obj);
+                *entry
+            };
+            if budget >= self.cfg.max_budget && !st.told.contains(&trial) {
+                st.told.insert(trial);
+                if let Some(overlay) = self.trial_overlays.get(trial as usize).cloned() {
+                    st.observations.push(TrialResult { overlay, objective: best });
+                }
+                // Suggest the next config if there's still spawn budget.
+                if st.spawns_done + st.queue.len() < self.cfg.max_spawns {
+                    let obs = st.observations.clone();
+                    drop(st);
+                    let suggestion = self.sampler.lock().ask(&self.space, &obs);
+                    st = self.state.lock();
+                    st.queue.push_back(suggestion);
+                }
+            }
+        }
+        // 2. Emit ONE queued suggestion (one per step), under the cap.
         if st.spawns_done < self.cfg.max_spawns {
             if let Some(overlay) = st.queue.pop_front() {
                 st.spawns_done += 1;
                 return TpeDecision::Spawn(overlay);
-            }
-        }
-        if !obj.is_finite() {
-            return TpeDecision::Continue; // ignore diverged points
-        }
-        // Track running best (for the eventual tell).
-        let entry = st.best.entry(trial).or_insert(obj);
-        *entry = entry.max(obj);
-
-        // 2. On completion, tell TPE once + enqueue the next suggestion.
-        if budget >= self.cfg.max_budget && !st.told.contains(&trial) {
-            st.told.insert(trial);
-            let best = st.best.get(&trial).copied().unwrap_or(obj);
-            if let Some(overlay) = self.trial_overlays.get(trial as usize).cloned() {
-                st.observations.push(TrialResult { overlay, objective: best });
-            }
-            // Only suggest if we still have spawn budget (incl. queued).
-            if st.spawns_done + st.queue.len() < self.cfg.max_spawns {
-                let obs = st.observations.clone();
-                drop(st);
-                let suggestion = self.sampler.lock().ask(&self.space, &obs);
-                self.state.lock().queue.push_back(suggestion);
             }
         }
         TpeDecision::Continue
@@ -484,17 +501,20 @@ mod tests {
     #[test]
     fn completion_tells_and_enqueues_suggestion() {
         let p = policy(8);
-        // t0 reaches max_budget → tell TPE + enqueue a suggestion; this step
-        // returns Continue (the drain runs BEFORE the completion, queue empty).
-        assert_eq!(p.decide(0, 0.3, 4), TpeDecision::Continue, "t0 completes → enqueue");
-        // The NEXT step drains the queued suggestion as a Spawn (one per step).
-        match p.decide(1, 0.7, 4) {
+        // A completion now RECORDS first then drains in the same step, so it
+        // emits a suggestion immediately (no deferral that could lose the last
+        // trial's observation). t0 completes → its observation is recorded and a
+        // suggestion (random, only 1 obs < n_startup) is emitted.
+        match p.decide(0, 0.3, 4) {
             TpeDecision::Spawn(o) => {
                 let lr = o.iter().find(|(k, _)| k == "lr").unwrap().1.as_f64().unwrap();
                 assert!((0.0..=1.0).contains(&lr), "suggested lr in support");
             }
-            d => panic!("a TPE suggestion must be queued + emitted, got {d:?}"),
+            d => panic!("a completion must record + emit a suggestion, got {d:?}"),
         }
+        // t1 completes → now 2 observations ≥ n_startup → a TPE-modeled
+        // suggestion is emitted.
+        assert!(matches!(p.decide(1, 0.7, 4), TpeDecision::Spawn(_)));
     }
 
     #[test]
