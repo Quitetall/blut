@@ -132,13 +132,15 @@ pub fn reconstruct(manifest: &HpoManifest, status_lines: &[String]) -> Vec<Trial
             "stage_end" | "stage_skipped" => finished[t] += 1,
             "stage_failed" => {
                 // A retry emits `stage_retrying`, NOT `stage_failed` (verified in
-                // executor.rs), so a `stage_failed` is always terminal. The
-                // executor stamps a control-kill / plan-cancel with a
-                // "cancelled…" error string (`StageError::Cancelled` ⇒
-                // "cancelled"); any other error string is a genuine crash.
+                // executor.rs), so a `stage_failed` is always terminal. EVERY
+                // control-kill / plan-cancel path stamps a "cancelled…" string
+                // (verified: the literal cancel messages + `StageError::Cancelled`
+                // ⇒ "cancelled"); a genuine crash carries the real error. Match
+                // ONLY "cancel" — NOT "kill", which would misclassify the Linux
+                // OOM killer's "Killed process …" / "Out of memory: Killed" (a
+                // real failure) as a scheduler kill.
                 let err = ev.get("error").and_then(|e| e.as_str()).unwrap_or("");
-                let low = err.to_ascii_lowercase();
-                if low.contains("cancel") || low.contains("kill") {
+                if err.to_ascii_lowercase().contains("cancel") {
                     killed[t] = true;
                 } else {
                     failed[t] = true;
@@ -251,16 +253,18 @@ mod tests {
             // trial0: scheduler/control kill (cancel-flavored error) → killed.
             json!({"kind":"stage_begin","node_idx":0,"stage_name":"t","input_hash":"x"}),
             json!({"kind":"stage_failed","node_idx":0,"stage_name":"t","error":"cancelled during stage"}),
-            // trial1: a genuine crash (OOM) → failed, NOT killed.
+            // trial1: a genuine crash whose message contains "kill" (the Linux
+            // OOM killer) → failed, NOT killed (the "kill" word must not be
+            // treated as a scheduler kill).
             json!({"kind":"stage_begin","node_idx":1,"stage_name":"t","input_hash":"x"}),
-            json!({"kind":"stage_failed","node_idx":1,"stage_name":"t","error":"out of memory: reserve 40G"}),
+            json!({"kind":"stage_failed","node_idx":1,"stage_name":"t","error":"Out of memory: Killed process 12345 (python)"}),
         ]
         .iter()
         .map(|v| v.to_string())
         .collect();
         let out = reconstruct(&m, &lines);
         assert_eq!(out[0].status, "killed");
-        assert_eq!(out[1].status, "failed");
+        assert_eq!(out[1].status, "failed", "OOM-killer 'Killed process' is a crash, not a scheduler kill");
     }
 
     #[test]
