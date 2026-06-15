@@ -64,6 +64,39 @@ pub trait Launcher {
         c.spawn()
             .map_err(|e| TrainError::other(format!("launch {unit}: {e}")))
     }
+
+    /// How many units this launcher can place CONCURRENTLY — the device
+    /// parallelism a multi-cell sweep / partition scheduler packs against
+    /// (Phase G). Default `1` (serialize); `Local` probes the visible GPU
+    /// count, `Slurm` reports its per-job `--gpus`. ALWAYS ≥ 1 so a scheduler
+    /// can always make progress (a no-GPU box still runs one cell at a time).
+    fn capacity(&self) -> usize {
+        1
+    }
+}
+
+/// The number of GPUs VISIBLE to this process: `CUDA_VISIBLE_DEVICES` when set
+/// (the authoritative visible set — empty string ⇒ no GPUs), else an
+/// `nvidia-smi -L` probe, else 1 (assume the common single-device dev box when
+/// we can't tell). Clamped to ≥ 1 for the scheduler-capacity use.
+pub fn local_gpu_count() -> usize {
+    if let Ok(v) = std::env::var("CUDA_VISIBLE_DEVICES") {
+        // A device is each non-empty, comma-separated entry. "" ⇒ 0 GPUs.
+        let n = v.split(',').filter(|s| !s.trim().is_empty()).count();
+        return n.max(1); // ≥1: even with no GPU, a scheduler runs one cell.
+    }
+    if let Ok(out) = std::process::Command::new("nvidia-smi").arg("-L").output() {
+        if out.status.success() {
+            let n = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| l.trim_start().starts_with("GPU "))
+                .count();
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    1
 }
 
 /// Run work in a memory-capped, session-detached transient systemd `--user`
@@ -92,6 +125,10 @@ impl Default for LocalSystemd {
 }
 
 impl Launcher for LocalSystemd {
+    fn capacity(&self) -> usize {
+        local_gpu_count()
+    }
+
     fn wrap(&self, unit: &str, inner: &[String]) -> Result<WrappedCommand> {
         // run_contained.sh runs under systemd-run's MINIMAL cwd, so the
         // script path MUST be absolute.
@@ -146,6 +183,11 @@ pub struct SlurmLauncher {
 }
 
 impl Launcher for SlurmLauncher {
+    fn capacity(&self) -> usize {
+        // The per-job GPU allocation is this launcher's device parallelism.
+        self.gpus.map(|g| g as usize).unwrap_or(1).max(1)
+    }
+
     fn wrap(&self, unit: &str, inner: &[String]) -> Result<WrappedCommand> {
         if inner.is_empty() {
             return Err(TrainError::other("slurm launcher: empty inner command"));
@@ -279,6 +321,25 @@ mod tests {
 
     fn argv(c: &Command) -> Vec<String> {
         c.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn capacity_reflects_cuda_visible_devices() {
+        // `CUDA_VISIBLE_DEVICES` is process-global → serialize the env mutation.
+        let _g = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prior = std::env::var("CUDA_VISIBLE_DEVICES").ok();
+        // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+        unsafe { std::env::set_var("CUDA_VISIBLE_DEVICES", "0,1,2") };
+        assert_eq!(LocalSystemd::default().capacity(), 3, "3 visible devices");
+        unsafe { std::env::set_var("CUDA_VISIBLE_DEVICES", "") };
+        assert_eq!(LocalSystemd::default().capacity(), 1, "no GPUs ⇒ still ≥1 (run one cell)");
+        match prior {
+            Some(v) => unsafe { std::env::set_var("CUDA_VISIBLE_DEVICES", v) },
+            None => unsafe { std::env::remove_var("CUDA_VISIBLE_DEVICES") },
+        }
+        // Slurm's capacity = its per-job --gpus allocation.
+        assert_eq!(SlurmLauncher { gpus: Some(4), ..Default::default() }.capacity(), 4);
+        assert_eq!(SlurmLauncher::default().capacity(), 1, "unset --gpus ⇒ 1");
     }
 
     #[test]
