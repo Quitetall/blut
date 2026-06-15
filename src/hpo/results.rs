@@ -47,12 +47,25 @@ impl HpoManifest {
     }
 
     pub fn read_from(job_dir: &std::path::Path) -> Option<HpoManifest> {
-        let body = std::fs::read_to_string(job_dir.join("hpo.json")).ok()?;
-        serde_json::from_str(&body).ok()
+        let path = job_dir.join("hpo.json");
+        let body = std::fs::read_to_string(&path).ok()?;
+        // The file EXISTS (read succeeded) — a parse error means it is corrupt,
+        // not "absent". Warn so a corrupt manifest isn't silently mistaken for a
+        // non-HPO job (e.g. the `resolve_hpo_job` most-recent fallback).
+        match serde_json::from_str(&body) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("warning: corrupt hpo manifest {}: {e}", path.display());
+                None
+            }
+        }
     }
 
+    /// Maximize unless the direction is "min" (case-insensitive — the CLI only
+    /// ever writes lowercase, but a hand-edited manifest must not silently
+    /// invert the leaderboard).
     pub fn maximize(&self) -> bool {
-        self.mode != "min"
+        !self.mode.eq_ignore_ascii_case("min")
     }
 }
 
@@ -64,7 +77,8 @@ pub struct TrialOutcome {
     /// Best objective seen (per the manifest's direction); None if the trial
     /// never reported the metric.
     pub objective: Option<f64>,
-    /// pending | running | done | killed.
+    /// pending | running | done | killed | failed. "killed" = stopped by the
+    /// HPO scheduler (or a plan cancel); "failed" = a genuine crash.
     pub status: &'static str,
 }
 
@@ -76,7 +90,8 @@ pub fn reconstruct(manifest: &HpoManifest, status_lines: &[String]) -> Vec<Trial
     let mut best: Vec<Option<f64>> = vec![None; n];
     let mut finished: Vec<u32> = vec![0; n]; // StageEnd + StageSkipped count
     let mut began: Vec<bool> = vec![false; n];
-    let mut killed: Vec<bool> = vec![false; n];
+    let mut killed: Vec<bool> = vec![false; n]; // scheduler/control kill or plan cancel
+    let mut failed: Vec<bool> = vec![false; n]; // genuine crash (OOM/code/timeout)
 
     let trial_of = |topo: u32| -> Option<usize> {
         manifest
@@ -116,14 +131,17 @@ pub fn reconstruct(manifest: &HpoManifest, status_lines: &[String]) -> Vec<Trial
             "stage_begin" => began[t] = true,
             "stage_end" | "stage_skipped" => finished[t] += 1,
             "stage_failed" => {
+                // A retry emits `stage_retrying`, NOT `stage_failed` (verified in
+                // executor.rs), so a `stage_failed` is always terminal. The
+                // executor stamps a control-kill / plan-cancel with a
+                // "cancelled…" error string (`StageError::Cancelled` ⇒
+                // "cancelled"); any other error string is a genuine crash.
                 let err = ev.get("error").and_then(|e| e.as_str()).unwrap_or("");
-                // The control kill surfaces as a cancellation-flavored failure.
-                if err.contains("cancel") || err.contains("kill") || err.contains("Killed") {
+                let low = err.to_ascii_lowercase();
+                if low.contains("cancel") || low.contains("kill") {
                     killed[t] = true;
                 } else {
-                    // A genuine failure also stops the trial; treat as killed for
-                    // leaderboard purposes (it did not complete).
-                    killed[t] = true;
+                    failed[t] = true;
                 }
             }
             _ => {}
@@ -135,8 +153,14 @@ pub fn reconstruct(manifest: &HpoManifest, status_lines: &[String]) -> Vec<Trial
         .iter()
         .enumerate()
         .map(|(t, rec)| {
+            // Cascade ORDER is load-bearing: a killed trial's pruned descendants
+            // emit `stage_skipped` (counted in `finished`), so a killed trial can
+            // satisfy `finished >= n_nodes` — checking `killed`/`failed` FIRST
+            // keeps it labelled correctly rather than "done".
             let status = if killed[t] {
                 "killed"
+            } else if failed[t] {
+                "failed"
             } else if finished[t] >= rec.n_nodes {
                 "done"
             } else if began[t] {
@@ -218,6 +242,25 @@ mod tests {
         assert_eq!(board[1].trial_id, 1);
         assert_eq!(board[1].objective, Some(0.2));
         assert_eq!(board[1].status, "killed");
+    }
+
+    #[test]
+    fn cancel_is_killed_genuine_error_is_failed() {
+        let m = manifest();
+        let lines: Vec<String> = [
+            // trial0: scheduler/control kill (cancel-flavored error) → killed.
+            json!({"kind":"stage_begin","node_idx":0,"stage_name":"t","input_hash":"x"}),
+            json!({"kind":"stage_failed","node_idx":0,"stage_name":"t","error":"cancelled during stage"}),
+            // trial1: a genuine crash (OOM) → failed, NOT killed.
+            json!({"kind":"stage_begin","node_idx":1,"stage_name":"t","input_hash":"x"}),
+            json!({"kind":"stage_failed","node_idx":1,"stage_name":"t","error":"out of memory: reserve 40G"}),
+        ]
+        .iter()
+        .map(|v| v.to_string())
+        .collect();
+        let out = reconstruct(&m, &lines);
+        assert_eq!(out[0].status, "killed");
+        assert_eq!(out[1].status, "failed");
     }
 
     #[test]

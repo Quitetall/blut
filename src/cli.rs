@@ -1738,11 +1738,10 @@ fn run_hpo_best(job: Option<String>, json: bool) -> Result<()> {
         );
         return Ok(());
     }
+    let best_obj = best.objective.expect("find() above guarantees objective.is_some()");
     println!(
-        "best trial {} — {}={} (job {id})",
-        best.trial_id,
-        manifest.metric,
-        best.objective.map(|x| format!("{x:.4}")).unwrap_or_default(),
+        "best trial {} — {}={best_obj:.4} (job {id})",
+        best.trial_id, manifest.metric,
     );
     for (k, v) in &best.overlay {
         println!("  {k} = {v}");
