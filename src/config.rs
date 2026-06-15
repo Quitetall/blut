@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use crate::error::{Result, TrainError};
 
 pub mod launcher;
+pub mod partition;
 pub mod sweep;
 pub mod sweep_index;
 
