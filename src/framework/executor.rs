@@ -1429,9 +1429,9 @@ impl ParallelExecutor {
                                                 }
                                                 // Queue the delta; it is injected at
                                                 // the top of the loop (never mid-select!).
-                                                // Cap the QUEUE too so a runaway policy
+                                                // The QUEUE is capped so a runaway policy
                                                 // can't grow it unbounded between joins.
-                                                Control::Spawn(delta) => {
+                                                Control::Spawn(delta) if first_error.is_none() => {
                                                     if spawns_total + pending_spawns.len()
                                                         < MAX_RUNTIME_SPAWNS
                                                     {
@@ -1442,6 +1442,9 @@ impl ParallelExecutor {
                                                         );
                                                     }
                                                 }
+                                                // Already failing → drain to exit; don't
+                                                // queue a delta the drain would just drop.
+                                                Control::Spawn(_) => {}
                                             }
                                         }
                                     }
