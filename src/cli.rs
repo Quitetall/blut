@@ -1283,6 +1283,9 @@ async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
                 // a deterministic (if unshared) resume dir; durable resume is a
                 // recipe-path feature, so this path effectively never resumes.
                 cache_key: crate::framework::artifact::ContentHash([0u8; 32]),
+                // `blut stage` is a single standalone attempt — no retry/resume.
+                attempt: 1,
+                resume_from: None,
             };
 
             let result = stage

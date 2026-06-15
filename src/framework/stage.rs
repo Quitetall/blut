@@ -166,6 +166,18 @@ pub struct StageContext {
     /// recovery checkpoint. A different training arg ⇒ a different key ⇒ a fresh
     /// dir ⇒ a fresh run (conservative: never resume onto a foreign checkpoint).
     pub cache_key: crate::framework::artifact::ContentHash,
+    /// 1-based retry attempt number (S3 / P7). `1` on the first try; the executor
+    /// increments it per attempt. A resumable stage reads this together with
+    /// [`resume_from`](Self::resume_from): attempt ≥ 2 with `resume_from = Some`
+    /// means "warm-start from the prior attempt's checkpoint" (the Executor owns
+    /// the retry/resume axis — one writer per env axis, P7).
+    pub attempt: u32,
+    /// Set by the Executor on a RETRY when the stage's
+    /// [`Stage::resume_handle`] reported a checkpoint AND the crash-gated
+    /// [`crate::framework::resume::decide_resume`] said `Resume`. The stage
+    /// appends `--resume <dir>` to its trainer argv. `None` = start fresh (first
+    /// attempt, a non-resumable stage, or a fresh decision).
+    pub resume_from: Option<PathBuf>,
 }
 
 impl StageContext {
@@ -183,6 +195,8 @@ impl StageContext {
             launch_target: crate::config::launcher::LaunchTarget::Local,
             fb_warm: false,
             cache_key: crate::framework::artifact::ContentHash([0u8; 32]),
+            attempt: 1,
+            resume_from: None,
         }
     }
 }

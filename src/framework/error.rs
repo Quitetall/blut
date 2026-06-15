@@ -70,6 +70,15 @@ pub enum StageError {
     #[error("training diverged: {detail}")]
     Diverged { detail: String },
 
+    /// A DIFFERENT live run currently owns this stage's resume checkpoint dir
+    /// (the crash-gated [`crate::framework::resume::decide_resume`] returned
+    /// `RefuseConcurrent`). TRANSIENT: never resume CONCURRENTLY, but the blocker
+    /// will finish — back off and retry (each attempt re-checks the marker, so
+    /// the next try `Resume`s once the dir is free, or fails after `max_attempts`
+    /// if it stays busy). ADR 0044 P7.
+    #[error("resume checkpoint busy: {detail}")]
+    CheckpointBusy { detail: String },
+
     /// Erased dispatch: input artifact arrived with the wrong
     /// `KIND` tag for what this stage expects. Should be unreachable
     /// when stages are wired through the typed `Plan` builder; can

@@ -416,7 +416,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         // it via that parent exactly as a plan cancel would — the stage's own
         // cancel handling is unchanged.
         let stage_cancel = task.node_cancel.child_token();
-        let stage_ctx = StageContext {
+        let mut stage_ctx = StageContext {
             job_dir: env.job_dir.clone(),
             stage_dir: tmp_stage_dir.clone(),
             node_idx: idx,
@@ -430,7 +430,73 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
             // per-config fingerprint — a resume train stage keys its recovery
             // dir on it so a re-run with identical args finds the checkpoint.
             cache_key: task.key,
+            attempt,
+            resume_from: None,
         };
+
+        // ── Auto-resume on retry (S3 / P7) ──────────────────────────
+        // On a re-attempt, ask the stage WHERE its checkpoint lives
+        // (`resume_handle`, default None = not resumable → no-op), then run the
+        // EXISTING crash-gated `decide_resume` against the marker there. A
+        // same-run_id retry deterministically `Resume`s; a live foreign run
+        // `RefuseConcurrent`s (we must not race two trainers on one dir). The
+        // Executor owns the resume axis: it sets `resume_from`, the stage reads
+        // it and appends `--resume`. Non-resumable stages re-run unchanged.
+        if attempt > 1 {
+            // A job dir with no basename (e.g. a filesystem root) can't yield a
+            // run identity — never auto-resume in that case (re-run fresh rather
+            // than risk matching a foreign empty run_id). job_dir is always
+            // `<jobs>/<job_id>` in practice, so this guard is belt-and-suspenders.
+            let run_id = env
+                .job_dir
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .filter(|s| !s.is_empty());
+            if let (Some(run_id), Some(token)) =
+                (run_id, task.stage.resume_handle_erased(&stage_ctx, &task.args))
+            {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let state = crate::framework::resume::ResumeState::read(&token.resume_dir);
+                match crate::framework::resume::decide_resume(
+                    state.as_ref(),
+                    &run_id,
+                    now,
+                    crate::framework::resume::DEFAULT_STALE_AFTER_SECS,
+                ) {
+                    crate::framework::resume::ResumeDecision::Resume => {
+                        tracing::info!(
+                            "auto-resume node {idx} ({stage_name}) attempt {attempt} from {}",
+                            token.resume_dir.display()
+                        );
+                        stage_ctx.resume_from = Some(token.resume_dir);
+                    }
+                    crate::framework::resume::ResumeDecision::Fresh => {}
+                    crate::framework::resume::ResumeDecision::RefuseConcurrent => {
+                        let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+                        let msg = format!(
+                            "resume checkpoint for '{stage_name}' owned by a live run: {}",
+                            token.resume_dir.display()
+                        );
+                        env.status.emit(StageEvent::StageFailed {
+                            node_idx: idx,
+                            stage_name: stage_name.clone(),
+                            error: msg.clone(),
+                        });
+                        // TRANSIENT: back off + retry (each attempt re-checks the
+                        // marker) — never resume concurrently, but the blocker
+                        // finishes. After max_attempts, this is the terminal error.
+                        return Err(NodeFailure::Stage {
+                            idx,
+                            stage: stage_name,
+                            source: StageError::CheckpointBusy { detail: msg },
+                        });
+                    }
+                }
+            }
+        }
 
         // ── Resource permits ────────────────────────────────────────
         // Acquire in canonical (sorted) order so two concurrent stages
@@ -2588,6 +2654,103 @@ mod tests {
             }
         }
         assert_eq!(retrying, 2, "two retry events for two transient failures");
+    }
+
+    // ── S3 auto-resume: a retry injects --resume from the checkpoint ──
+    static RESUMABLE_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+    static RESUMABLE_SAW_RESUME: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Fails transiently on attempt 1 (after writing a `running` resume marker),
+    /// succeeds on attempt 2 — and asserts the Executor injected `resume_from`
+    /// (the auto-resume wiring) by then.
+    struct ResumableFlaky;
+    impl ResumableFlaky {
+        fn resume_dir(ctx: &StageContext) -> std::path::PathBuf {
+            ctx.job_dir.join("resume_dir")
+        }
+    }
+    #[async_trait]
+    impl Stage for ResumableFlaky {
+        const NAME: &'static str = "resumable_flaky";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        const RETRY: RetryPolicy = RetryPolicy {
+            max_attempts: 2,
+            backoff: Backoff::None,
+            retry_on: RetryOn::Transient,
+        };
+        type Input = ();
+        type Output = Counter;
+        type Args = EmptyArgs;
+        fn resume_handle(
+            &self,
+            ctx: &StageContext,
+            _args: &EmptyArgs,
+        ) -> Option<crate::framework::resume::ResumeToken> {
+            Some(crate::framework::resume::ResumeToken {
+                resume_dir: Self::resume_dir(ctx),
+                required_keys: &[],
+            })
+        }
+        async fn run(
+            &self,
+            ctx: &StageContext,
+            _input: (),
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            let n = RESUMABLE_ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+            if ctx.attempt == 1 {
+                // Write a `running` marker keyed on THIS run's id so the retry
+                // (same run_id) resolves to Resume.
+                let dir = Self::resume_dir(ctx);
+                std::fs::create_dir_all(&dir).unwrap();
+                let run_id = ctx
+                    .job_dir
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let state = crate::framework::resume::ResumeState {
+                    status: "running".into(),
+                    run_id,
+                    pid: 0,
+                    heartbeat_unix: now,
+                };
+                std::fs::write(dir.join("state.json"), serde_json::to_string(&state).unwrap())
+                    .unwrap();
+                return Err(StageError::OutOfMemory { detail: "transient #1".into() });
+            }
+            // Attempt 2: the executor must have injected the resume dir.
+            if ctx.resume_from.as_deref() == Some(Self::resume_dir(ctx).as_path()) {
+                RESUMABLE_SAW_RESUME.store(true, Ordering::SeqCst);
+            }
+            Ok(Counter { n })
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for ResumableFlaky {}
+
+    #[tokio::test]
+    async fn retry_auto_injects_resume_from_checkpoint() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        RESUMABLE_ATTEMPTS.store(0, Ordering::SeqCst);
+        RESUMABLE_SAW_RESUME.store(false, Ordering::SeqCst);
+        let td = tempfile::tempdir().unwrap();
+        let ctx = ExecCtx::new(td.path().to_path_buf());
+        let plan = Plan::<(), LamuTrainerBackend>::new("resume", serde_json::json!({}))
+            .start(ResumableFlaky, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let r = SequentialExecutor::execute(plan, ctx).await.unwrap();
+        assert_eq!(RESUMABLE_ATTEMPTS.load(Ordering::SeqCst), 2, "ran twice (fail then resume)");
+        assert!(
+            RESUMABLE_SAW_RESUME.load(Ordering::SeqCst),
+            "attempt 2 must see resume_from = the checkpoint dir (auto-resume wired)"
+        );
+        let _ = r;
     }
 
     static DET_ATTEMPTS: AtomicU32 = AtomicU32::new(0);

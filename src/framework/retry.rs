@@ -150,6 +150,7 @@ pub fn is_retryable(err: &StageError, policy: RetryOn) -> bool {
             | StageError::Timeout { .. }
             | StageError::OutOfMemory { .. }
             | StageError::Diverged { .. }
+            | StageError::CheckpointBusy { .. }
     );
     match policy {
         // Self-heal only the OOM (the next attempt's cap is escalated);
@@ -269,6 +270,11 @@ mod tests {
         // …but a divergence is NOT an OOM, so OutOfMemoryOnly does not retry it
         // (a stage wanting divergence-retry must use Transient).
         assert!(!is_retryable(&div, RetryOn::OutOfMemoryOnly));
+        // CheckpointBusy is also transient (back off + retry until the blocker
+        // run frees the resume dir), but likewise not an OOM.
+        let busy = StageError::CheckpointBusy { detail: "owned".into() };
+        assert!(is_retryable(&busy, RetryOn::Transient));
+        assert!(!is_retryable(&busy, RetryOn::OutOfMemoryOnly));
     }
 
     #[test]
