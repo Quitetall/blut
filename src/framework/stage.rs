@@ -267,6 +267,40 @@ pub trait Stage: Send + Sync + 'static {
         input: Self::Input,
         args: &Self::Args,
     ) -> Result<Self::Output, StageError>;
+
+    /// Submit-time validation (BLUT-API Phase D / P6). The executor calls this
+    /// BEFORE any work runs (and before the resource/admission gate), so a
+    /// missing script / unsatisfiable arg fails fast with a precise message
+    /// instead of deep in a subprocess. Default `Ok(())` = no preflight; pure
+    /// stages keep it. A cookbook stage overrides to check script-exists, the
+    /// recipe↔script arg contract, free disk, etc.
+    async fn preflight(&self, _args: &Self::Args) -> Result<(), StageError> {
+        Ok(())
+    }
+
+    /// The stage's durable-resume contract (P7): WHERE this `(stage, args)`'s
+    /// recovery checkpoint lives + WHAT it must contain. Default `None` = not
+    /// resumable (pure stages, and any stage that hasn't opted in). A training
+    /// stage returns `Some(ResumeToken{resume_dir, required_keys})` keyed on
+    /// `ctx.cache_key` (via [`crate::framework::resume::resume_dir`]); the
+    /// executor consults it on a retry to auto-inject `--resume`.
+    fn resume_handle(
+        &self,
+        _ctx: &StageContext,
+        _args: &Self::Args,
+    ) -> Option<crate::framework::resume::ResumeToken> {
+        None
+    }
+
+    /// Per-step divergence sentinel (P7). Given one `StageStep` update payload,
+    /// return `true` if the run has diverged (loss > k·EMA, grad-norm spike, …)
+    /// so the executor can stop it early with a typed `Diverged` error instead
+    /// of burning the whole budget. Default `false` — the framework's built-in
+    /// `KillOnNaN` policy still catches non-finite metrics regardless; override
+    /// for a domain-aware threshold.
+    fn divergence_check(&self, _step: &serde_json::Value) -> bool {
+        false
+    }
 }
 
 /// Object-safe shadow. Implemented automatically for every
@@ -324,6 +358,22 @@ pub trait StageDyn: Send + Sync + 'static {
         input: ErasedArtifact,
         args: serde_json::Value,
     ) -> Result<ErasedArtifact, StageError>;
+
+    /// Erased [`Stage::preflight`]: deserialize `args` → typed, run the stage's
+    /// submit-time validation. An args-deserialize failure IS a preflight
+    /// failure (the recipe handed the stage args it can't parse).
+    async fn preflight_erased(&self, args: &serde_json::Value) -> Result<(), StageError>;
+
+    /// Erased [`Stage::resume_handle`]. A bad-args deserialize ⇒ `None` (can't
+    /// determine a resume point) — never blocks; the run starts fresh.
+    fn resume_handle_erased(
+        &self,
+        ctx: &StageContext,
+        args: &serde_json::Value,
+    ) -> Option<crate::framework::resume::ResumeToken>;
+
+    /// Erased [`Stage::divergence_check`] (the step payload is already erased).
+    fn divergence_check(&self, step: &serde_json::Value) -> bool;
 }
 
 #[async_trait]
@@ -466,6 +516,28 @@ impl<S: Stage> StageDyn for S {
                 source,
             },
         })
+    }
+
+    async fn preflight_erased(&self, args: &serde_json::Value) -> Result<(), StageError> {
+        let typed: S::Args =
+            serde_json::from_value(args.clone()).map_err(|source| StageError::ArgsDeserialize {
+                stage: S::NAME,
+                source,
+            })?;
+        self.preflight(&typed).await
+    }
+
+    fn resume_handle_erased(
+        &self,
+        ctx: &StageContext,
+        args: &serde_json::Value,
+    ) -> Option<crate::framework::resume::ResumeToken> {
+        let typed: S::Args = serde_json::from_value(args.clone()).ok()?;
+        self.resume_handle(ctx, &typed)
+    }
+
+    fn divergence_check(&self, step: &serde_json::Value) -> bool {
+        <S as Stage>::divergence_check(self, step)
     }
 }
 
@@ -735,6 +807,50 @@ mod tests {
             }
             other => panic!("wrong variant: {:?}", other.err()),
         }
+    }
+
+    // ── P7/P6 defaulted hooks: a non-overriding stage gets the defaults ──
+
+    #[tokio::test]
+    async fn default_stage_hooks_are_inert() {
+        let ctx = ctx();
+        let s: Box<dyn StageDyn> = Box::new(WordCount);
+        // preflight defaults to Ok(()).
+        assert!(
+            s.preflight_erased(&serde_json::json!({"delimiter": " "}))
+                .await
+                .is_ok(),
+            "default preflight is Ok"
+        );
+        // resume_handle defaults to None (not resumable).
+        assert!(
+            s.resume_handle_erased(&ctx, &serde_json::json!({"delimiter": " "}))
+                .is_none(),
+            "default resume_handle is None"
+        );
+        // divergence_check defaults to false (KillOnNaN still independently scans).
+        assert!(
+            !s.divergence_check(&serde_json::json!({"loss": 0.4})),
+            "default divergence_check is false"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_erased_surfaces_bad_args() {
+        let s: Box<dyn StageDyn> = Box::new(WordCount);
+        // delimiter must be a String; an int fails the args-deserialize → a
+        // preflight failure (the recipe gave the stage args it can't parse).
+        let r = s.preflight_erased(&serde_json::json!({"delimiter": 42})).await;
+        assert!(matches!(r, Err(StageError::ArgsDeserialize { stage, .. }) if stage == "word_count"));
+    }
+
+    #[tokio::test]
+    async fn resume_handle_erased_bad_args_is_none_not_error() {
+        let ctx = ctx();
+        let s: Box<dyn StageDyn> = Box::new(WordCount);
+        // Unparseable args ⇒ None (can't determine a resume point) — never
+        // blocks; the run just starts fresh.
+        assert!(s.resume_handle_erased(&ctx, &serde_json::json!({"delimiter": 42})).is_none());
     }
 
     // ── Constants accessible through StageDyn ────────────────────

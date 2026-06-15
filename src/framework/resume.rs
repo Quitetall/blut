@@ -77,6 +77,22 @@ impl ResumeState {
     }
 }
 
+/// A stage's resume contract (P7): WHERE its durable checkpoint lives + WHAT the
+/// recovery payload must contain. A train stage returns `Some` from
+/// [`crate::framework::stage::Stage::resume_handle`]; the executor uses
+/// `resume_dir` (via [`decide_resume`] against the marker there) to auto-inject
+/// `--resume` on a retry, and `required_keys` is the payload-completeness
+/// contract the trainer's `load_recovery` validates (weights/optimizer/LR-sched/
+/// AMP-scaler/RNG/EMA/QAT-alpha/step) so a half-written checkpoint fails fast
+/// rather than silently resuming a cold optimizer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeToken {
+    /// The stable per-config resume directory ([`resume_dir`]).
+    pub resume_dir: PathBuf,
+    /// Keys the recovery checkpoint MUST carry to be a valid resume point.
+    pub required_keys: &'static [&'static str],
+}
+
 /// The crash-gated decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResumeDecision {
