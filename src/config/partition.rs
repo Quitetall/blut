@@ -17,8 +17,8 @@
 //! in a status index, and (3) **backfill** runs only the un-materialized cells.
 //!
 //! ## Persistence (`~/.config/blut/partitions/`)
-//! - definition: `<recipe>__<set>.json`
-//! - materialization log: `<recipe>__<set>.status.jsonl` (append-only, last-wins)
+//! - definition: `<recipe>~<set>.json`
+//! - materialization log: `<recipe>~<set>.status.jsonl` (append-only, last-wins)
 //!
 //! ## Scope (slice 1)
 //! Cells map to **scalar** `axis=value` overrides (top-level recipe-arg fields),
@@ -79,14 +79,40 @@ impl PartitionStatus {
     }
 }
 
+/// Hard ceiling on a partition's cell count — `validate()` rejects above it so
+/// an accidental product (many dims × many values) can't explode a backfill.
+const MAX_CELLS: usize = 100_000;
+
+/// A recipe / set / axis name is safe iff non-empty and `[A-Za-z0-9_-]` — no
+/// `.` or `/`, so it can never traverse out of the partitions dir. The on-disk
+/// file separator is `~` ([`SEP`]), which is NOT in this alphabet, so a
+/// `<recipe>~<name>` filename is unambiguous even when a name contains `_`
+/// (a `__`-based separator would alias `a_`/`b` with `a`/`_b`).
 fn name_ok(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// The `<recipe>SEP<name>` file separator — outside [`name_ok`]'s alphabet so it
+/// can't appear in either token, making the filename collision-free.
+const SEP: char = '~';
+
+/// A partition VALUE is safe iff non-empty and free of path separators (`/`,
+/// `\`), the `axis=value` separator (`=`), and the lerna sweep-grammar
+/// metacharacters (`,` choice · `:` range · `[]()` interval/list · `*` glob).
+/// Values are never re-parsed by `cells()` (it builds the product directly), but
+/// the cell's overrides ARE applied downstream as `--set axis=value`, so a
+/// metachar there could still be re-interpreted — reject it at the source.
+fn value_ok(v: &str) -> bool {
+    !v.is_empty()
+        && !v
+            .chars()
+            .any(|c| matches!(c, '/' | '\\' | '=' | ',' | ':' | '[' | ']' | '(' | ')' | '*'))
+}
+
 impl PartitionSet {
     /// Validate the set: name/recipe well-formed, ≥1 dim, axes unique +
-    /// well-formed, every dim has ≥1 value. Returns the count of cells on Ok so
-    /// a caller can guard against an accidental combinatorial blowup.
+    /// well-formed, every dim has ≥1 metachar-free value, and the cell count is
+    /// within [`MAX_CELLS`]. Returns the (bounded) cell count on Ok.
     pub fn validate(&self) -> Result<usize> {
         if !name_ok(&self.name) {
             return Err(TrainError::other(format!(
@@ -94,8 +120,11 @@ impl PartitionSet {
                 self.name
             )));
         }
-        if self.recipe.is_empty() {
-            return Err(TrainError::other("partition set recipe is empty"));
+        if !name_ok(&self.recipe) {
+            return Err(TrainError::other(format!(
+                "partition set recipe '{}' must be non-empty [A-Za-z0-9_-]",
+                self.recipe
+            )));
         }
         if self.dims.is_empty() {
             return Err(TrainError::other("partition set needs ≥1 dimension"));
@@ -115,35 +144,46 @@ impl PartitionSet {
             if d.values.is_empty() {
                 return Err(TrainError::other(format!("partition axis '{}' has no values", d.axis)));
             }
-            if d.values.iter().any(|v| v.contains('/') || v.contains('=') || v.is_empty()) {
+            if !d.values.iter().all(|v| value_ok(v)) {
                 return Err(TrainError::other(format!(
-                    "partition axis '{}' values must be non-empty and contain no '/' or '='",
+                    "partition axis '{}' values must be non-empty and free of path / sweep-grammar \
+                     metacharacters (/ \\ = , : [ ] ( ) *)",
                     d.axis
                 )));
             }
-            cells = cells.saturating_mul(d.values.len());
+            cells = cells
+                .checked_mul(d.values.len())
+                .filter(|&c| c <= MAX_CELLS)
+                .ok_or_else(|| {
+                    TrainError::other(format!(
+                        "partition '{}' would expand to more than {MAX_CELLS} cells \
+                         (combinatorial blowup)",
+                        self.name
+                    ))
+                })?;
         }
         Ok(cells)
     }
 
-    /// Render each dimension as a sweep axis string (`axis=v1,v2,...`) for
-    /// [`super::sweep::cartesian`].
-    fn sweep_axes(&self) -> Vec<String> {
-        self.dims
-            .iter()
-            .map(|d| format!("{}={}", d.axis, d.values.join(",")))
-            .collect()
-    }
-
-    /// Expand to one [`PartitionCell`] per cell of the cartesian product.
-    /// Reuses the sweep engine so the expansion semantics match `--sweep`.
+    /// Expand to one [`PartitionCell`] per cell of the cartesian product. Built
+    /// DIRECTLY (each value → an `axis=value` override, dims in declared order)
+    /// — values are never round-tripped through the sweep grammar, so a value
+    /// can't be re-parsed (e.g. a comma split into two) or escape its cell.
     pub fn cells(&self) -> Vec<PartitionCell> {
-        super::sweep::cartesian(&self.sweep_axes())
-            .into_iter()
-            .map(|overrides| PartitionCell {
-                key: overrides.join("/"),
-                overrides,
-            })
+        let mut acc: Vec<Vec<String>> = vec![Vec::new()];
+        for d in &self.dims {
+            let mut next = Vec::with_capacity(acc.len() * d.values.len());
+            for prefix in &acc {
+                for v in &d.values {
+                    let mut overrides = prefix.clone();
+                    overrides.push(format!("{}={}", d.axis, v));
+                    next.push(overrides);
+                }
+            }
+            acc = next;
+        }
+        acc.into_iter()
+            .map(|overrides| PartitionCell { key: overrides.join("/"), overrides })
             .collect()
     }
 
@@ -160,16 +200,32 @@ impl PartitionSet {
         Ok(base.join("blut").join("partitions"))
     }
 
+    /// The chokepoint EVERY path builder passes through, so even `load()` with
+    /// an attacker-/typo-supplied `recipe`/`name` can't traverse out of the
+    /// partitions dir (`..` and `/` are not in `name_ok`'s alphabet) or alias
+    /// another set's file (the `~` separator can't appear in either token).
+    fn guard_identity(recipe: &str, name: &str) -> Result<()> {
+        if !name_ok(recipe) || !name_ok(name) {
+            return Err(TrainError::other(format!(
+                "unsafe partition identity '{recipe}/{name}' — recipe + name must be [A-Za-z0-9_-]"
+            )));
+        }
+        Ok(())
+    }
+
     fn def_path(recipe: &str, name: &str) -> Result<PathBuf> {
-        Ok(Self::dir()?.join(format!("{recipe}__{name}.json")))
+        Self::guard_identity(recipe, name)?;
+        Ok(Self::dir()?.join(format!("{recipe}{SEP}{name}.json")))
     }
 
     fn status_path(recipe: &str, name: &str) -> Result<PathBuf> {
-        Ok(Self::dir()?.join(format!("{recipe}__{name}.status.jsonl")))
+        Self::guard_identity(recipe, name)?;
+        Ok(Self::dir()?.join(format!("{recipe}{SEP}{name}.status.jsonl")))
     }
 
-    /// Persist this set's definition. Validates first; refuses to overwrite a
-    /// DIFFERENT set silently is the caller's concern (this is a plain write).
+    /// Persist this set's definition. Validates first. A plain write: it
+    /// overwrites any existing file at the same `<recipe>~<name>` path —
+    /// guarding against clobbering a DIFFERENT set is the caller's concern.
     pub fn save(&self) -> Result<PathBuf> {
         self.validate()?;
         let dir = Self::dir()?;
@@ -205,7 +261,8 @@ impl PartitionSet {
             let fname = ent.file_name();
             let s = fname.to_string_lossy();
             if let Some(stem) = s.strip_suffix(".json") {
-                if let Some((recipe, name)) = stem.split_once("__") {
+                // `SEP` can't appear in either token, so `split_once` is exact.
+                if let Some((recipe, name)) = stem.split_once(SEP) {
                     out.push((recipe.to_string(), name.to_string()));
                 }
             }
@@ -311,6 +368,81 @@ mod tests {
         let mut s3 = set();
         s3.dims[0].values = vec!["a=b".into()];
         assert!(s3.validate().is_err(), "'=' in value rejected");
+    }
+
+    #[test]
+    fn cells_do_not_reparse_grammar_metachars() {
+        // A value containing a comma must yield exactly ONE cell, verbatim — the
+        // direct product never feeds values back through the sweep grammar
+        // (which would split `a,b` into two cells). validate() also rejects such
+        // a value, but cells() must be safe regardless of how a set is built.
+        let s = PartitionSet {
+            name: "g".into(),
+            recipe: "r".into(),
+            dims: vec![PartitionDim { axis: "x".into(), values: vec!["a,b".into()] }],
+        };
+        let cells = s.cells();
+        assert_eq!(cells.len(), 1, "comma value is one cell, not two");
+        assert_eq!(cells[0].key, "x=a,b");
+        assert_eq!(cells[0].overrides, vec!["x=a,b".to_string()]);
+    }
+
+    #[test]
+    fn validate_rejects_metachars_and_unsafe_recipe() {
+        for bad in ["a,b", "1:3", "x[0]", "g*"] {
+            let mut s = set();
+            s.dims[0].values = vec![bad.into()];
+            assert!(s.validate().is_err(), "grammar/path metachar value {bad:?} rejected");
+        }
+        let mut traversal = set();
+        traversal.recipe = "../evil".into();
+        assert!(traversal.validate().is_err(), "path-traversal recipe rejected");
+        let mut tilde = set();
+        tilde.name = "a~b".into();
+        assert!(tilde.validate().is_err(), "the file separator '~' rejected in a name");
+    }
+
+    #[test]
+    fn boundary_underscore_identities_do_not_alias() {
+        // `a_`/`b` and `a`/`_b` would BOTH map to `a___b.json` under a `__`
+        // separator — the `~` separator keeps them distinct files.
+        let _g = tmp_env();
+        let a = PartitionSet {
+            name: "b".into(),
+            recipe: "a_".into(),
+            dims: vec![PartitionDim { axis: "x".into(), values: vec!["0".into()] }],
+        };
+        let b = PartitionSet { name: "_b".into(), recipe: "a".into(), ..a.clone() };
+        a.save().unwrap();
+        b.save().unwrap();
+        assert_eq!(PartitionSet::load("a_", "b").unwrap(), a, "a_/b intact");
+        assert_eq!(PartitionSet::load("a", "_b").unwrap(), b, "a/_b not clobbered by a_/b");
+        assert_eq!(PartitionSet::list().unwrap().len(), 2, "two distinct files");
+    }
+
+    #[test]
+    fn validate_rejects_combinatorial_blowup() {
+        // 20^6 = 64M cells ≫ MAX_CELLS — must be refused, not saturated.
+        let big = PartitionSet {
+            name: "big".into(),
+            recipe: "r".into(),
+            dims: (0..6)
+                .map(|i| PartitionDim {
+                    axis: format!("a{i}"),
+                    values: (0..20).map(|j| j.to_string()).collect(),
+                })
+                .collect(),
+        };
+        assert!(big.validate().is_err(), "combinatorial blowup rejected");
+    }
+
+    #[test]
+    fn unsafe_identity_path_is_refused_at_load() {
+        let _g = tmp_env();
+        // load() builds the path from its args BEFORE reading; an unsafe recipe
+        // or name must be refused at the path chokepoint, never read from disk.
+        assert!(PartitionSet::load("../../etc/passwd", "x").is_err());
+        assert!(PartitionSet::load("a~b", "x").is_err(), "'~' (separator) in recipe refused");
     }
 
     #[test]
