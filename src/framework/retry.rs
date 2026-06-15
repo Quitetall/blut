@@ -138,7 +138,10 @@ pub fn is_retryable(err: &StageError, policy: RetryOn) -> bool {
         return false;
     }
     // Transient classes always retry; anything else only under AllErrors
-    // (keeps the policy meaningful for future StageError variants).
+    // (keeps the policy meaningful for future StageError variants). `Diverged`
+    // is transient: the retry resumes from the last good checkpoint (S3) and may
+    // recover — but NOT under `OutOfMemoryOnly` (a divergence is not an OOM, so a
+    // stage wanting divergence-retry uses `Transient`).
     let transient = matches!(
         err,
         StageError::Backend(_)
@@ -146,6 +149,7 @@ pub fn is_retryable(err: &StageError, policy: RetryOn) -> bool {
             | StageError::ResourceTimeout(_)
             | StageError::Timeout { .. }
             | StageError::OutOfMemory { .. }
+            | StageError::Diverged { .. }
     );
     match policy {
         // Self-heal only the OOM (the next attempt's cap is escalated);
@@ -254,6 +258,17 @@ mod tests {
             },
             RetryOn::Transient
         ));
+    }
+
+    #[test]
+    fn diverged_is_transient_but_not_oom_only() {
+        let div = StageError::Diverged { detail: "loss nan".into() };
+        // Transient (resume on the next attempt) under Transient + AllErrors…
+        assert!(is_retryable(&div, RetryOn::Transient));
+        assert!(is_retryable(&div, RetryOn::AllErrors));
+        // …but a divergence is NOT an OOM, so OutOfMemoryOnly does not retry it
+        // (a stage wanting divergence-retry must use Transient).
+        assert!(!is_retryable(&div, RetryOn::OutOfMemoryOnly));
     }
 
     #[test]

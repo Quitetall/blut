@@ -60,6 +60,16 @@ pub enum StageError {
     #[error("out of memory: {detail}")]
     OutOfMemory { detail: String },
 
+    /// Training diverged: the per-step sentinel fired (loss NaN/Inf, grad-norm
+    /// spike, loss > k·EMA) — either the built-in non-finite scan or a stage's
+    /// [`crate::framework::stage::Stage::divergence_check`] override. A TRANSIENT
+    /// class: the next attempt resumes from the last good checkpoint (S3
+    /// auto-resume) and may recover with a fresh RNG / lower effective LR. The
+    /// sentinel stops a doomed run EARLY so it doesn't burn the whole GPU budget
+    /// (the PCCP/eval gate only fires post-run). ADR 0044 P7.
+    #[error("training diverged: {detail}")]
+    Diverged { detail: String },
+
     /// Erased dispatch: input artifact arrived with the wrong
     /// `KIND` tag for what this stage expects. Should be unreachable
     /// when stages are wired through the typed `Plan` builder; can
