@@ -91,6 +91,14 @@ enum Command {
         #[command(subcommand)]
         cmd: HpoCommand,
     },
+    /// Render a job's DAG: per-node status + edges (the graph backend, v0.20).
+    Dag {
+        /// Job id (defaults to the most recent job).
+        job: Option<String>,
+        /// Emit JSON (the full GraphSnapshot) instead of the text table.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Inspect materialized artifacts via their sidecars.
     Artifact {
         #[command(subcommand)]
@@ -633,6 +641,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Runs { cmd }) => run_runs_cmd(cmd),
         Some(Command::Lineage { cmd }) => run_lineage_cmd(cmd),
         Some(Command::Hpo { cmd }) => run_hpo(&reg, cmd).await,
+        Some(Command::Dag { job, json }) => run_dag(job, json),
         Some(Command::Artifact { cmd }) => run_artifact_cmd(cmd),
         Some(Command::Schedule { cmd }) => run_schedule_cmd(&reg, cmd),
         Some(Command::Data { cmd }) => run_data(cmd),
@@ -782,6 +791,7 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             eprintln!("resuming {} ({})", marker.name, job_id);
             eprintln!("dir      {}", job_dir.display());
             eprintln!("lock     {}", lock.path().display());
+            persist_plan_graph(&plan, &job_dir);
             let result = crate::framework::execute_plan(plan, ctx).await;
             drop(lock);
             match result {
@@ -1618,6 +1628,7 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
     eprintln!("dir    {}", job_dir.display());
     eprintln!("lock   {}", lock.path().display());
 
+    persist_plan_graph(&plan, &job_dir);
     let result = crate::framework::execute_plan(plan, ctx).await;
     drop(lock);
     crate::python_kill::unbind_current_job();
@@ -1752,6 +1763,105 @@ fn run_hpo_best(job: Option<String>, json: bool) -> Result<()> {
         serde_json::to_string(&serde_json::Value::Object(overlay_obj.clone()))
             .unwrap_or_else(|_| "{}".into())
     );
+    Ok(())
+}
+
+/// Persist the plan STRUCTURE for the DAG backend (`blut dag`). Best-effort: a
+/// snapshot write must NEVER fail or delay the actual run, so errors only warn.
+/// Call with `&plan` BEFORE `execute_plan` moves it.
+fn persist_plan_graph(plan: &crate::framework::CompiledPlan, job_dir: &std::path::Path) {
+    match plan.graph_structure() {
+        Ok(g) => {
+            if let Err(e) = g.write_to(job_dir) {
+                eprintln!("warning: could not write plan.json (blut dag unavailable): {e}");
+            }
+        }
+        Err(e) => eprintln!("warning: plan graph unavailable, not persisted: {e}"),
+    }
+}
+
+/// `blut dag <job> [--json]` — render a job's DAG: per-node status + edges,
+/// built from the persisted `plan.json` + the live `status.jsonl` (+ HPO trial
+/// attribution when present). No daemon; re-run to refresh.
+fn run_dag(job: Option<String>, json: bool) -> Result<()> {
+    let job_id = match job {
+        Some(q) => crate::jobs::resolve_job_id(&q).map_err(|e| anyhow!("{e}"))?,
+        None => crate::jobs::list_jobs()
+            .map_err(|e| anyhow!("list jobs: {e}"))?
+            .into_iter()
+            .next_back()
+            .map(|s| s.id)
+            .ok_or_else(|| anyhow!("no jobs found"))?,
+    };
+    let snap = crate::framework::graph_snapshot(&job_id).map_err(|e| anyhow!("{e}"))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&snap).map_err(|e| anyhow!("serialize snapshot: {e}"))?
+        );
+        return Ok(());
+    }
+    // Tally per-status for a one-line header.
+    let mut counts: std::collections::BTreeMap<&'static str, u32> = std::collections::BTreeMap::new();
+    for n in &snap.nodes {
+        *counts.entry(n.status.as_str()).or_default() += 1;
+    }
+    let tally = counts
+        .iter()
+        .map(|(s, c)| format!("{c} {s}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!(
+        "dag {} (job {}) — {} nodes, {} edges [{tally}]",
+        snap.name,
+        snap.job,
+        snap.nodes.len(),
+        snap.edges.len()
+    );
+    println!(
+        "{:<4} {:<22} {:<8} {:<8} {:<6} preds  detail",
+        "idx", "stage", "status", "elapsed", "trial"
+    );
+    for n in &snap.nodes {
+        let preds = snap
+            .edges
+            .iter()
+            .filter(|e| e.to == n.idx)
+            .map(|e| e.from.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let preds = if preds.is_empty() { "─".to_string() } else { preds };
+        let elapsed = n
+            .elapsed_secs
+            .map(|s| format!("{s:.1}s"))
+            .unwrap_or_else(|| "─".into());
+        let trial = n
+            .hpo
+            .as_ref()
+            .map(|h| format!("t{}", h.trial_id))
+            .unwrap_or_else(|| "─".into());
+        // For an HPO node the overlay (the diff that defines the trial) is the
+        // useful detail; otherwise fall back to the args summary.
+        let detail = match &n.hpo {
+            Some(h) => h
+                .overlay
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            None => n.args_summary.clone(),
+        };
+        println!(
+            "{:<4} {:<22} {:<8} {:<8} {:<6} {:<6} {}",
+            n.idx,
+            n.stage_name,
+            n.status.as_str(),
+            elapsed,
+            trial,
+            preds,
+            detail
+        );
+    }
     Ok(())
 }
 
@@ -2014,6 +2124,7 @@ async fn run_one_recipe(
     eprintln!("dir    {}", job_dir.display());
     eprintln!("lock   {}", lock.path().display());
 
+    persist_plan_graph(&plan, &job_dir);
     let result = crate::framework::execute_plan(plan, ctx).await;
     drop(lock);
     crate::python_kill::unbind_current_job();
@@ -2949,6 +3060,7 @@ async fn run_train_via_recipe(
     // group, then return so `lock` Drops (RAII unlocks the scheduler).
     install_cancel_handler(ctx.cancel.clone());
 
+    persist_plan_graph(&plan, &job_dir);
     let result = crate::framework::execute_plan(plan, ctx).await;
     drop(lock);
     crate::python_kill::unbind_current_job();

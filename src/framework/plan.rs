@@ -600,6 +600,42 @@ impl CompiledPlan {
         }
     }
 
+    /// Serializable plan STRUCTURE for the DAG backend (v0.20): nodes laid out
+    /// in topological order so each node's `idx` equals the `node_idx` the
+    /// executor stamps on its `StageEvent`s, and edges remapped to those topo
+    /// indices. Persisted at launch as `<job_dir>/plan.json`; the live status is
+    /// joined in by [`crate::framework::graph::graph_snapshot`]. Errors only on a
+    /// cyclic/empty plan (which would also fail execution).
+    pub fn graph_structure(
+        &self,
+    ) -> Result<crate::framework::graph::PlanGraph, crate::framework::error::PlanError> {
+        use crate::framework::graph::{PlanGraph, PlanGraphEdge, PlanGraphNode};
+        let order = self.topo_order()?;
+        // NodeId → topo position (the inverse of `order`).
+        let mut pos = vec![0usize; self.nodes.len()];
+        for (p, &nid) in order.iter().enumerate() {
+            pos[nid as usize] = p;
+        }
+        let nodes = order
+            .iter()
+            .enumerate()
+            .map(|(p, &nid)| {
+                let node = &self.nodes[nid as usize];
+                PlanGraphNode {
+                    idx: p,
+                    stage_name: node.stage.name().to_string(),
+                    args_summary: crate::framework::graph::summarize_args(&node.args),
+                }
+            })
+            .collect();
+        let edges = self
+            .edges
+            .iter()
+            .map(|e| PlanGraphEdge { from: pos[e.from as usize], to: pos[e.to as usize] })
+            .collect();
+        Ok(PlanGraph { name: self.name.clone(), nodes, edges })
+    }
+
     /// Merge N independent compiled plans into one (HPO fan-out, v0.20). Each
     /// component becomes a disjoint connected sub-graph with its node ids offset
     /// by the running total, so the executor runs all N in parallel (up to the
