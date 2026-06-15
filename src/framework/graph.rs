@@ -229,7 +229,10 @@ fn fold_status(lines: &[String], n_nodes: usize) -> Vec<Obs> {
                     o.status = Some(NodeStatus::Blocked);
                 }
             }
-            "stage_end" => {
+            // The terminal arms are ALSO `!terminal`-guarded → FIRST terminal
+            // wins; a duplicate/late terminal event (log replay, rotation) can't
+            // downgrade a node (e.g. a stray stage_skipped flipping Done→Skipped).
+            "stage_end" if !terminal => {
                 o.status = Some(NodeStatus::Done);
                 if let Some(h) = ev.get("output_hash").and_then(|v| v.as_str()) {
                     o.output_hash = Some(h.to_string());
@@ -238,11 +241,11 @@ fn fold_status(lines: &[String], n_nodes: usize) -> Vec<Obs> {
                     o.elapsed_secs = Some(d);
                 }
             }
-            "stage_skipped" => {
+            "stage_skipped" if !terminal => {
                 o.status = Some(NodeStatus::Skipped);
                 o.cache_hit = true;
             }
-            "stage_failed" => {
+            "stage_failed" if !terminal => {
                 // Same split as the HPO leaderboard: a control-kill / plan-cancel
                 // carries a "cancelled…" string; anything else is a real crash.
                 let err = ev.get("error").and_then(|e| e.as_str()).unwrap_or("");
@@ -268,12 +271,18 @@ pub fn graph_snapshot(job_id: &str) -> Result<GraphSnapshot, String> {
     let lines = crate::jobs::read_status_lines(job_id).unwrap_or_default();
     let obs = fold_status(&lines, n);
 
-    // Optional HPO attribution: trial-of-topo → overlay per node.
+    // Optional HPO attribution: trial-of-topo → overlay per node. Index the
+    // trials by id ONCE (O(trials)) so the per-node lookup is O(1) — a linear
+    // scan per node would be O(nodes × trials), a cliff for large sweeps.
     let hpo = crate::hpo::HpoManifest::read_from(&job_dir);
+    let trial_index: std::collections::HashMap<u32, &crate::hpo::TrialRec> = hpo
+        .as_ref()
+        .map(|m| m.trials.iter().map(|r| (r.trial_id, r)).collect())
+        .unwrap_or_default();
     let hpo_for = |idx: usize| -> Option<HpoNodeInfo> {
         let m = hpo.as_ref()?;
         let t = (*m.trial_of_topo.get(idx)?)?;
-        let rec = m.trials.iter().find(|r| r.trial_id == t)?;
+        let rec = trial_index.get(&t)?;
         Some(HpoNodeInfo { trial_id: t, overlay: rec.overlay.clone() })
     };
 
@@ -371,6 +380,22 @@ mod tests {
         ]);
         let o = fold_status(&l, 1);
         assert_eq!(o[0].status, Some(NodeStatus::Done));
+    }
+
+    #[test]
+    fn first_terminal_wins_over_later_terminal() {
+        // A duplicate/late terminal event (log replay/rotation) must not
+        // downgrade the node: FIRST terminal wins, metadata preserved.
+        let l = lines(&[
+            json!({"kind":"stage_end","node_idx":0,"stage_name":"a","output_hash":"good","elapsed":{"secs":2,"nanos":0}}),
+            json!({"kind":"stage_skipped","node_idx":0,"stage_name":"a","cache_key":"zz"}),
+            json!({"kind":"stage_failed","node_idx":0,"stage_name":"a","error":"boom"}),
+        ]);
+        let o = fold_status(&l, 1);
+        assert_eq!(o[0].status, Some(NodeStatus::Done), "first terminal (Done) wins");
+        assert_eq!(o[0].output_hash.as_deref(), Some("good"));
+        assert_eq!(o[0].elapsed_secs, Some(2.0));
+        assert!(!o[0].cache_hit, "late stage_skipped must not flip cache_hit");
     }
 
     #[test]

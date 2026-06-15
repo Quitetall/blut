@@ -1786,6 +1786,8 @@ fn persist_plan_graph(plan: &crate::framework::CompiledPlan, job_dir: &std::path
 fn run_dag(job: Option<String>, json: bool) -> Result<()> {
     let job_id = match job {
         Some(q) => crate::jobs::resolve_job_id(&q).map_err(|e| anyhow!("{e}"))?,
+        // `list_jobs` sorts by id ascending and job ids are timestamp-monotonic,
+        // so the last entry is the most recent run.
         None => crate::jobs::list_jobs()
             .map_err(|e| anyhow!("list jobs: {e}"))?
             .into_iter()
