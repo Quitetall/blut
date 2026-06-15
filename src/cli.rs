@@ -390,6 +390,10 @@ enum RecipeCommand {
 }
 
 #[derive(Subcommand, Debug)]
+// `Run` carries the full launch config (many flags) while `Show`/`Best` are
+// tiny — a one-shot parse, so the size spread is harmless (boxing would only
+// fight clap's derive).
+#[allow(clippy::large_enum_variant)]
 enum HpoCommand {
     /// Run hyperparameter optimization over a recipe: sample trials from a
     /// search space, run them as parallel nodes in one plan, adaptively
@@ -448,6 +452,26 @@ enum HpoCommand {
         /// Placement: local (default) | slurm | ray (per-trial; see `recipe run`).
         #[arg(long, default_value = "local")]
         launcher: String,
+    },
+    /// Leaderboard for an HPO job: per-trial best objective + status, sorted
+    /// best-first. Reconstructed from `<job_dir>/hpo.json` + the durable
+    /// status.jsonl stream, so it works during AND after a run.
+    Show {
+        /// Job id (the `blut hpo run` output, or `blut jobs`). Defaults to the
+        /// most recent HPO job.
+        job: Option<String>,
+        /// Emit JSON instead of the text table.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Print the winning trial's overlay (the best hyperparameters) for an HPO
+    /// job — ready to paste into `recipe run --args`.
+    Best {
+        /// Job id. Defaults to the most recent HPO job.
+        job: Option<String>,
+        /// Emit JSON (the overlay as an object) instead of the text summary.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -1370,6 +1394,13 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
     use crate::framework::ExecCtx;
     use crate::hpo::{RandomSampler, Sampler, SearchSpace};
 
+    // The read-only subcommands need no executor — dispatch (borrowing `cmd`) and
+    // return before the launch machinery; only `Run` falls through.
+    match &cmd {
+        HpoCommand::Show { job, json } => return run_hpo_show(job.clone(), *json),
+        HpoCommand::Best { job, json } => return run_hpo_best(job.clone(), *json),
+        HpoCommand::Run { .. } => {}
+    }
     let HpoCommand::Run {
         name,
         args,
@@ -1388,7 +1419,10 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
         percentile,
         shared_cache,
         launcher,
-    } = cmd;
+    } = cmd
+    else {
+        unreachable!("non-Run HpoCommand variants dispatched above")
+    };
 
     // Base args (the fixed part; search dims overlay each trial).
     let base_args: serde_json::Value =
@@ -1457,6 +1491,43 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
     let job_id = crate::jobs::new_job_id();
     let job_dir = crate::paths::job_dir(&job_id)?;
     let mut ctx = ExecCtx::new(job_dir.clone());
+
+    // Trial→topo map, computed ONCE: the executor emits a StageStep's topo
+    // `node_idx`, and both the early-stop scheduler (below) and `blut hpo
+    // show/best` (post-hoc, from status.jsonl) attribute it to a trial via this
+    // map. Written into `<job_dir>/hpo.json` for EVERY algo (random included),
+    // so the leaderboard reconstructs without a DB.
+    let n_nodes = plan.n_nodes() as u32;
+    let offsets: Vec<crate::framework::plan::NodeId> =
+        trials.iter().map(|t| t.node_offset).collect();
+    let topo = plan
+        .topo_order()
+        .map_err(|e| anyhow!("hpo plan topo order: {e}"))?;
+    let trial_of_topo = crate::hpo::build_trial_of_topo(&topo, &offsets, n_nodes);
+    {
+        use crate::hpo::{HpoManifest, TrialRec};
+        let recs: Vec<TrialRec> = trials
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let lo = offsets[i];
+                let hi = offsets.get(i + 1).copied().unwrap_or(n_nodes);
+                TrialRec { trial_id: t.trial_id, overlay: t.overlay.clone(), n_nodes: hi - lo }
+            })
+            .collect();
+        let manifest = HpoManifest {
+            recipe: name.to_string(),
+            algo: algo.clone(),
+            metric: metric.clone(),
+            mode: mode.clone(),
+            budget_key: metric_budget_key.clone(),
+            trials: recs,
+            trial_of_topo: trial_of_topo.clone(),
+        };
+        manifest
+            .write_to(&job_dir)
+            .with_context(|| format!("write hpo manifest for {job_id}"))?;
+    }
     {
         let snap = crate::broker::ResourceSnapshot::probe();
         if snap.mem_total_gb > 0.0 {
@@ -1482,13 +1553,7 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
     // ASHA culls to the top 1/eta only at rung milestones. Random has
     // control=None (no early stop).
     if matches!(algo.as_str(), "median" | "percentile" | "asha") {
-        use crate::hpo::{AshaStop, EarlyStop, HpoScheduler, MedianStop, build_trial_of_topo};
-        let offsets: Vec<crate::framework::NodeId> =
-            trials.iter().map(|t| t.node_offset).collect();
-        let topo = plan
-            .topo_order()
-            .map_err(|e| anyhow!("hpo plan topo order: {e}"))?;
-        let trial_of_topo = build_trial_of_topo(&topo, &offsets, plan.n_nodes() as u32);
+        use crate::hpo::{AshaStop, EarlyStop, HpoScheduler, MedianStop};
         let strategy: Box<dyn EarlyStop> = match algo.as_str() {
             "asha" => {
                 if min_budget == 0 {
@@ -1561,8 +1626,8 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
             crate::jobs::write_state(&job_id, JobState::Done)
                 .with_context(|| format!("write Done state for {job_id}"))?;
             eprintln!(
-                "hpo done: {} trials ran (job {job_id}). Per-trial results land with the \
-                 trial-tracking slice (`blut hpo show`).",
+                "hpo done: {} trials ran (job {job_id}). Leaderboard: `blut hpo show {job_id}`; \
+                 winning config: `blut hpo best {job_id}`.",
                 trials.len()
             );
             Ok(())
@@ -1572,6 +1637,123 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
             Err(anyhow!("hpo plan execution failed: {e}"))
         }
     }
+}
+
+/// Resolve the HPO job to inspect: an explicit id (via `jobs::resolve_job_id`,
+/// so a prefix works) or — when omitted — the most recent job carrying an
+/// `hpo.json` manifest (job ids are timestamp-monotonic, sorted ascending).
+fn resolve_hpo_job(job: Option<String>) -> Result<(String, crate::hpo::HpoManifest)> {
+    let load = |id: &str| -> Option<crate::hpo::HpoManifest> {
+        let dir = crate::paths::job_dir(id).ok()?;
+        crate::hpo::HpoManifest::read_from(&dir)
+    };
+    let id = match job {
+        Some(q) => crate::jobs::resolve_job_id(&q).map_err(|e| anyhow!("{e}"))?,
+        None => crate::jobs::list_jobs()
+            .map_err(|e| anyhow!("list jobs: {e}"))?
+            .into_iter()
+            .rev()
+            .map(|s| s.id)
+            .find(|id| load(id).is_some())
+            .ok_or_else(|| anyhow!("no HPO jobs found (run `blut hpo run ...` first)"))?,
+    };
+    let manifest =
+        load(&id).ok_or_else(|| anyhow!("job '{id}' has no hpo.json (not an HPO run?)"))?;
+    Ok((id, manifest))
+}
+
+/// `blut hpo show [job] [--json]` — the trial leaderboard.
+fn run_hpo_show(job: Option<String>, json: bool) -> Result<()> {
+    let (id, manifest) = resolve_hpo_job(job)?;
+    let lines = crate::jobs::read_status_lines(&id).map_err(|e| anyhow!("read status: {e}"))?;
+    let board = crate::hpo::leaderboard(&manifest, &lines);
+    if json {
+        let arr: Vec<_> = board
+            .iter()
+            .map(|o| {
+                serde_json::json!({
+                    "trial_id": o.trial_id,
+                    "objective": o.objective,
+                    "status": o.status,
+                    "overlay": serde_json::Map::from_iter(
+                        o.overlay.iter().map(|(k, v)| (k.clone(), v.clone())),
+                    ),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "job": id,
+                "recipe": manifest.recipe,
+                "algo": manifest.algo,
+                "metric": manifest.metric,
+                "mode": manifest.mode,
+                "trials": arr,
+            }))
+            .map_err(|e| anyhow!("serialize leaderboard: {e}"))?
+        );
+        return Ok(());
+    }
+    println!(
+        "hpo {} (job {id}) — {} {} ({} trials)",
+        manifest.recipe,
+        manifest.metric,
+        manifest.mode,
+        board.len()
+    );
+    println!("{:<6} {:<10} {:<8} overlay", "trial", manifest.metric, "status");
+    for o in &board {
+        let obj = match o.objective {
+            Some(x) => format!("{x:.4}"),
+            None => "—".to_string(),
+        };
+        let overlay = o
+            .overlay
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("{:<6} {:<10} {:<8} {}", o.trial_id, obj, o.status, overlay);
+    }
+    Ok(())
+}
+
+/// `blut hpo best [job] [--json]` — the winning trial's overlay.
+fn run_hpo_best(job: Option<String>, json: bool) -> Result<()> {
+    let (id, manifest) = resolve_hpo_job(job)?;
+    let lines = crate::jobs::read_status_lines(&id).map_err(|e| anyhow!("read status: {e}"))?;
+    let board = crate::hpo::leaderboard(&manifest, &lines);
+    let best = board
+        .iter()
+        .find(|o| o.objective.is_some())
+        .ok_or_else(|| anyhow!("no trial reported metric '{}' yet", manifest.metric))?;
+    let overlay_obj =
+        serde_json::Map::from_iter(best.overlay.iter().map(|(k, v)| (k.clone(), v.clone())));
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::Value::Object(overlay_obj))
+                .map_err(|e| anyhow!("serialize overlay: {e}"))?
+        );
+        return Ok(());
+    }
+    println!(
+        "best trial {} — {}={} (job {id})",
+        best.trial_id,
+        manifest.metric,
+        best.objective.map(|x| format!("{x:.4}")).unwrap_or_default(),
+    );
+    for (k, v) in &best.overlay {
+        println!("  {k} = {v}");
+    }
+    println!(
+        "\nreproduce: blut recipe run {} --args '{}'",
+        manifest.recipe,
+        serde_json::to_string(&serde_json::Value::Object(overlay_obj.clone()))
+            .unwrap_or_else(|_| "{}".into())
+    );
+    Ok(())
 }
 
 async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Result<()> {

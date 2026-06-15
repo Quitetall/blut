@@ -16,12 +16,14 @@
 pub mod asha;
 pub mod median;
 pub mod plan_build;
+pub mod results;
 pub mod sampler;
 pub mod scheduler;
 pub mod space;
 
 pub use asha::AshaStop;
 pub use median::MedianStop;
+pub use results::{HpoManifest, TrialOutcome, TrialRec, leaderboard};
 pub use plan_build::{TrialPlan, build_hpo_plan};
 pub use sampler::{RandomSampler, Sampler};
 pub use scheduler::{EarlyStop, HpoScheduler, build_trial_of_topo};
