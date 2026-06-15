@@ -207,10 +207,17 @@ impl PbtPolicy {
         // Drop the lock before perturbing (perturb takes the rng lock; no nested
         // state lock needed and keeps the two locks from ever ordering).
         st.killed.insert(trial);
+        // Don't enqueue a clone we could never emit (already at the cap incl.
+        // queued-but-unemitted) — it would just leak. The loser is still killed.
+        let at_cap = st.spawns_done + st.queue.len() >= self.cfg.max_spawns;
         drop(st);
+        if at_cap {
+            return PbtDecision::Kill;
+        }
         let overlay = self.perturb_overlay(&woverlay);
-        // Re-acquire only to enqueue.
-        self.state.lock().queue.push_back((overlay.clone(), resume.clone()));
+        // Re-acquire only to enqueue (on_step is single-threaded, so nothing
+        // changed `spawns_done`/`queue` between the drop and here).
+        self.state.lock().queue.push_back((overlay, resume));
         PbtDecision::Kill
     }
 }
