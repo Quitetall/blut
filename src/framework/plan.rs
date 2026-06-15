@@ -600,6 +600,20 @@ impl CompiledPlan {
         }
     }
 
+    /// Move the structural pieces out for a runtime `Spawn` injection — the
+    /// executor relabels these into the running graph. (`recipe_args`/`name` are
+    /// dropped; a spawned sub-plan's args live in its own nodes.)
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<PlanNode>,
+        Vec<PlanEdge>,
+        HashMap<NodeId, ErasedArtifact>,
+    ) {
+        (self.nodes, self.edges, self.initial)
+    }
+
     /// Serializable plan STRUCTURE for the DAG backend (v0.20): nodes laid out
     /// in topological order so each node's `idx` equals the `node_idx` the
     /// executor stamps on its `StageEvent`s, and edges remapped to those topo

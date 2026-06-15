@@ -26,10 +26,11 @@ use serde_json::Value;
 /// What the executor should do with the running graph after a step.
 ///
 /// `KillBranch` targets the node that EMITTED the step (the executor maps
-/// the step's `node_idx` → the in-flight node's cancel token). Kept minimal
-/// on purpose — `Spawn(delta)` lands in the next slice without reshaping the
-/// callers that match `Continue` / `KillBranch`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// the step's `node_idx` → the in-flight node's cancel token). `Spawn`
+/// appends a fresh sub-plan to the RUNNING graph at runtime — PBT / TPE
+/// ask-tell — drained on the coordinator's single-threaded seam between
+/// joins, never inside the `select!`.
+#[derive(Debug)]
 pub enum Control {
     /// Leave the graph as-is.
     Continue,
@@ -37,6 +38,46 @@ pub enum Control {
     /// never materialize). FW-2 tmp cleanup discards the partial; no cache
     /// entry is written, so a later re-run is unaffected.
     KillBranch,
+    /// Inject a new sub-plan into the running graph (its nodes become new
+    /// graph nodes; its graph-inputs seed the roots). For PBT a perturbed
+    /// clone's `--resume-from` is baked into the sub-plan's args by the
+    /// policy's factory, so the executor stays oblivious to resume.
+    Spawn(SpawnDelta),
+}
+
+/// PartialEq for `Control` compares the control INTENT: the unit variants by
+/// discriminant, and `Spawn` by its label only (the heavy `CompiledPlan` is
+/// never value-compared — equality is used only in tests, which never assert on
+/// a `Spawn`'s sub-plan). Reflexive/symmetric/transitive on that projection.
+impl PartialEq for Control {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Control::Continue, Control::Continue)
+            | (Control::KillBranch, Control::KillBranch) => true,
+            (Control::Spawn(a), Control::Spawn(b)) => a.label == b.label,
+            _ => false,
+        }
+    }
+}
+
+/// A runtime graph mutation: a self-contained sub-plan to inject. The policy
+/// builds the `subplan` via a factory it captured at construction (it owns the
+/// `Registry` + recipe + any resume-from wiring); the executor only performs the
+/// structural injection — id-offset relabel, seed roots, extend the schedule.
+pub struct SpawnDelta {
+    pub subplan: crate::framework::plan::CompiledPlan,
+    /// Optional provenance label (e.g. a PBT child trial id) for logging.
+    pub label: Option<String>,
+}
+
+impl std::fmt::Debug for SpawnDelta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnDelta")
+            .field("subplan", &self.subplan.name())
+            .field("n_nodes", &self.subplan.n_nodes())
+            .field("label", &self.label)
+            .finish()
+    }
 }
 
 /// One step's metrics, borrowed from the live `StageEvent::StageStep`. The

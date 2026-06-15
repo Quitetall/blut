@@ -841,6 +841,101 @@ fn build_task(
     })
 }
 
+/// Resolve a node id to its `PlanNode` across the ORIGINAL plan (borrowed
+/// immutably for the run) and the runtime-`Spawn`-`appended` side-vec. Spawned
+/// ids are `orig_n + appended_index`, so the split is a single bound check. Kept
+/// a free fn (not a closure) so it never holds a borrow across an `appended`
+/// push — the two happen at different points in the coordinator loop.
+fn node_at<'a>(
+    view: &'a crate::framework::plan::ExecView<'a>,
+    appended: &'a [crate::framework::plan::PlanNode],
+    orig_n: usize,
+    id: NodeId,
+) -> &'a crate::framework::plan::PlanNode {
+    let i = id as usize;
+    if i < orig_n {
+        &view.nodes[i]
+    } else {
+        &appended[i - orig_n]
+    }
+}
+
+/// Hard backstop on runtime spawns — a runaway policy must not append forever.
+/// Real PBT/TPE runs spawn O(trials), far below this; it only guards a bug.
+const MAX_RUNTIME_SPAWNS: usize = 4096;
+
+/// Inject a `Spawn` delta into the running parallel schedule (v0.20). The
+/// sub-plan's local node ids `0..k` are relabelled to globals `base + l`
+/// (`base = orig_n + appended.len()`), its nodes moved into `appended`, its
+/// edges/in-degrees/successors/topo-order extended, its graph-inputs seeded as
+/// root outputs, and its roots inserted into `ready`. Returns the count
+/// injected. Errors only if the sub-plan is cyclic/empty (caller logs + skips).
+#[allow(clippy::too_many_arguments)]
+fn inject_spawn(
+    delta: crate::framework::control::SpawnDelta,
+    orig_n: usize,
+    appended: &mut Vec<crate::framework::plan::PlanNode>,
+    all_edges: &mut Vec<crate::framework::plan::PlanEdge>,
+    order: &mut Vec<NodeId>,
+    node_idx_of: &mut HashMap<NodeId, u32>,
+    indeg: &mut HashMap<NodeId, usize>,
+    succs: &mut HashMap<NodeId, Vec<NodeId>>,
+    ready: &mut BTreeSet<NodeId>,
+    outputs: &mut HashMap<NodeId, ErasedArtifact>,
+    logical_outputs: &mut HashMap<NodeId, ContentHash>,
+) -> Result<usize, PlanError> {
+    use crate::framework::plan::PlanEdge;
+    let subplan = delta.subplan;
+    // Local topo order (also the cycle/empty check) BEFORE we mutate anything.
+    let local_order = subplan.topo_order()?;
+    let base = (orig_n + appended.len()) as NodeId;
+    let (nodes, edges, initial) = subplan.into_parts();
+    let k = nodes.len();
+
+    // Move nodes in LOCAL-ID ORDER so `appended[base - orig_n + l].id == base + l`
+    // — the invariant `node_at` relies on. (Compiled sub-plans have node.id == its
+    // index; assert it so a future builder change can't silently break the map.)
+    for (local_id, mut node) in nodes.into_iter().enumerate() {
+        debug_assert_eq!(
+            node.id as usize, local_id,
+            "spawned sub-plan node ids must be dense 0..k in index order"
+        );
+        let gid = base + local_id as NodeId;
+        node.id = gid;
+        appended.push(node);
+        indeg.entry(gid).or_insert(0);
+        succs.entry(gid).or_default();
+    }
+    // Relabel + wire edges.
+    for e in &edges {
+        let g = PlanEdge { from: base + e.from, to: base + e.to };
+        all_edges.push(g);
+        *indeg.entry(g.to).or_insert(0) += 1;
+        succs.entry(g.from).or_default().push(g.to);
+    }
+    // Seed the sub-plan's graph-inputs as root outputs (mirrors `prelude`).
+    for (local_id, art) in initial {
+        let gid = base + local_id;
+        let lh = content_hash_from_erased(&art);
+        outputs.insert(gid, art);
+        logical_outputs.insert(gid, lh);
+    }
+    // Extend topo order (node_idx == position) in the sub-plan's topo order.
+    for &lid in &local_order {
+        let gid = base + lid;
+        node_idx_of.insert(gid, order.len() as u32);
+        order.push(gid);
+    }
+    // Roots (global in-degree 0) become runnable now.
+    for l in 0..k as NodeId {
+        let gid = base + l;
+        if indeg.get(&gid).copied().unwrap_or(0) == 0 {
+            ready.insert(gid);
+        }
+    }
+    Ok(k)
+}
+
 /// Map a `NodeFailure` to a `PlanError`.
 fn plan_error_of(f: NodeFailure) -> PlanError {
     match f {
@@ -1079,7 +1174,8 @@ impl ParallelExecutor {
     /// executors observably equivalent.
     pub async fn execute(plan: CompiledPlan, ctx: ExecCtx) -> Result<PlanResult, PlanError> {
         let started = Instant::now();
-        let order = plan.topo_order()?; // also the cycle check
+        // `mut`: runtime `Spawn` (PBT/TPE) extends the topo order at runtime.
+        let mut order = plan.topo_order()?; // also the cycle check
         let view = plan.exec_view();
         debug_assert_eq!(
             order.len(),
@@ -1126,6 +1222,19 @@ impl ParallelExecutor {
         let mut control_rx: Option<broadcast::Receiver<StageEvent>> =
             control.as_ref().map(|_| env.status.subscribe());
         let mut node_tokens: HashMap<NodeId, CancellationToken> = HashMap::new();
+
+        // #4 runtime SPAWN (PBT/TPE) state. The original plan's nodes stay
+        // borrowed through `view` (immutable for the whole run); nodes appended
+        // at runtime live in `appended` (ids `orig_n + idx`), reached via
+        // `node_at`. `all_edges` starts as the plan's edges and grows with each
+        // injected sub-plan. `pending_spawns` is filled by the watcher inside
+        // `select!` and DRAINED at the top of the loop (never mid-`select!`), so
+        // schedule mutation only happens on the single-threaded coordinator seam.
+        let orig_n = view.nodes.len();
+        let mut appended: Vec<crate::framework::plan::PlanNode> = Vec::new();
+        let mut all_edges: Vec<crate::framework::plan::PlanEdge> = view.edges.to_vec();
+        let mut pending_spawns: Vec<crate::framework::control::SpawnDelta> = Vec::new();
+        let mut spawns_total = 0usize;
         // The killed nodes + their pruned descendants. `pruned.len()` (not a
         // parallel counter) is the accounting source of truth — it can't drift
         // out of sync with the set the spawn loop consults.
@@ -1183,6 +1292,36 @@ impl ParallelExecutor {
                     }
                 }
             }
+            // #4 SPAWN: drain runtime-injected sub-plans on the coordinator seam
+            // BEFORE the spawn-ready loop, so newly-ready roots are scheduled
+            // this iteration and the `in_flight == 0` termination check below
+            // sees them. Stop injecting once failing (drop pending deltas).
+            if first_error.is_none() && !pending_spawns.is_empty() {
+                for delta in pending_spawns.drain(..) {
+                    if spawns_total >= MAX_RUNTIME_SPAWNS {
+                        tracing::warn!(
+                            "runtime spawn cap {MAX_RUNTIME_SPAWNS} reached; dropping further spawns"
+                        );
+                        break;
+                    }
+                    match inject_spawn(
+                        delta,
+                        orig_n,
+                        &mut appended,
+                        &mut all_edges,
+                        &mut order,
+                        &mut node_idx_of,
+                        &mut indeg,
+                        &mut succs,
+                        &mut ready,
+                        &mut outputs,
+                        &mut logical_outputs,
+                    ) {
+                        Ok(k) => spawns_total += k,
+                        Err(e) => tracing::warn!("ignored malformed spawn delta: {e}"),
+                    }
+                }
+            }
             // Spawn ready nodes up to the in-flight cap (unless we're
             // already failing — then stop spawning and just drain).
             if first_error.is_none() {
@@ -1198,7 +1337,7 @@ impl ParallelExecutor {
                     if pruned.contains(&node_id) {
                         continue;
                     }
-                    let node = &view.nodes[node_id as usize];
+                    let node = node_at(&view, &appended, orig_n, node_id);
                     let node_idx = node_idx_of[&node_id];
                     // Per-node kill token: a child of the plan token, retained
                     // in `node_tokens` so the control watcher can fire it alone.
@@ -1206,7 +1345,7 @@ impl ParallelExecutor {
                     let task = match build_task(
                         node,
                         node_idx,
-                        view.edges,
+                        &all_edges,
                         &outputs,
                         &logical_outputs,
                         node_cancel.clone(),
@@ -1271,18 +1410,36 @@ impl ParallelExecutor {
                                                 stage_name: &stage_name,
                                                 update: &update,
                                             };
-                                            if matches!(policy.on_step(&m), Control::KillBranch) {
-                                                // Target the EMITTING node:
-                                                // topo idx → node id → its token.
-                                                if let Some(&nid) = order.get(node_idx as usize) {
-                                                    if let Some(tok) = node_tokens.get(&nid) {
-                                                        if !tok.is_cancelled() {
-                                                            tracing::warn!(
-                                                                "control policy KILL on node {node_idx} \
-                                                                 ({stage_name}): non-finite step metric"
-                                                            );
-                                                            tok.cancel();
+                                            match policy.on_step(&m) {
+                                                Control::Continue => {}
+                                                Control::KillBranch => {
+                                                    // Target the EMITTING node:
+                                                    // topo idx → node id → its token.
+                                                    if let Some(&nid) = order.get(node_idx as usize) {
+                                                        if let Some(tok) = node_tokens.get(&nid) {
+                                                            if !tok.is_cancelled() {
+                                                                tracing::warn!(
+                                                                    "control policy KILL on node {node_idx} \
+                                                                     ({stage_name}): non-finite step metric"
+                                                                );
+                                                                tok.cancel();
+                                                            }
                                                         }
+                                                    }
+                                                }
+                                                // Queue the delta; it is injected at
+                                                // the top of the loop (never mid-select!).
+                                                // Cap the QUEUE too so a runaway policy
+                                                // can't grow it unbounded between joins.
+                                                Control::Spawn(delta) => {
+                                                    if spawns_total + pending_spawns.len()
+                                                        < MAX_RUNTIME_SPAWNS
+                                                    {
+                                                        pending_spawns.push(delta);
+                                                    } else {
+                                                        tracing::warn!(
+                                                            "runtime spawn cap reached; dropping a Spawn from node {node_idx}"
+                                                        );
                                                     }
                                                 }
                                             }
@@ -2703,5 +2860,224 @@ mod tests {
         let counter: Counter = result.final_output.unwrap().into_typed().unwrap();
         assert_eq!(counter.n, 1, "plan completes normally; NaN metric ignored");
         assert_eq!(result.n_cache_misses, 2);
+    }
+
+    // ── #4 runtime Spawn (PBT/TPE) ──────────────────────────────────────
+    static SPAWN_MARKER_RAN: AtomicU32 = AtomicU32::new(0);
+    static SPAWN_CHILD_RAN: AtomicU32 = AtomicU32::new(0);
+
+    /// A spawned sub-plan ROOT (Input = ()): increments a counter so a test can
+    /// prove an injected node actually executed.
+    struct SpawnMarker;
+    #[async_trait]
+    impl Stage for SpawnMarker {
+        const NAME: &'static str = "spawn_marker";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = ();
+        type Output = Counter;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            _input: (),
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            SPAWN_MARKER_RAN.fetch_add(1, Ordering::SeqCst);
+            Ok(Counter { n: 7 })
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for SpawnMarker {}
+
+    /// A spawned sub-plan CHILD (depends on the root) — proves intra-delta edges
+    /// + the successor-decrement path work for injected nodes.
+    struct SpawnChild;
+    #[async_trait]
+    impl Stage for SpawnChild {
+        const NAME: &'static str = "spawn_child";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = Counter;
+        type Output = Counter;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            input: Counter,
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            SPAWN_CHILD_RAN.fetch_add(1, Ordering::SeqCst);
+            Ok(Counter { n: input.n })
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for SpawnChild {}
+
+    /// Emits ONE benign step then sleeps briefly before completing — stays
+    /// in-flight long enough for the coordinator's watcher to read the step
+    /// (and the policy to queue its Spawn) before this node joins.
+    struct StepThenSleep;
+    #[async_trait]
+    impl Stage for StepThenSleep {
+        const NAME: &'static str = "step_then_sleep";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = Counter;
+        type Output = Counter;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            ctx: &StageContext,
+            input: Counter,
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            let _ = ctx.status_tx.send(StageEvent::StageStep {
+                node_idx: ctx.node_idx,
+                stage_name: Self::NAME.to_string(),
+                update: serde_json::json!({ "loss": 0.5, "step": 1 }),
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            Ok(Counter { n: input.n })
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for StepThenSleep {}
+
+    /// Emits N benign steps (each followed by a short sleep) then completes —
+    /// drives a spawn-every-step policy for the bounded-termination test.
+    struct MultiStepEmitter {
+        steps: u32,
+    }
+    #[async_trait]
+    impl Stage for MultiStepEmitter {
+        const NAME: &'static str = "multi_step_emitter";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = Counter;
+        type Output = Counter;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            ctx: &StageContext,
+            input: Counter,
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            for s in 0..self.steps {
+                let _ = ctx.status_tx.send(StageEvent::StageStep {
+                    node_idx: ctx.node_idx,
+                    stage_name: Self::NAME.to_string(),
+                    update: serde_json::json!({ "loss": 0.5, "step": s }),
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            }
+            Ok(Counter { n: input.n })
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for MultiStepEmitter {}
+
+    /// Builds a fresh single- or two-node sub-plan to inject. Kept here so both
+    /// policies share one compile path.
+    fn spawn_subplan(two_node: bool) -> CompiledPlan {
+        let p = Plan::<(), LamuTrainerBackend>::new("spawned", serde_json::json!({}))
+            .start(SpawnMarker, EmptyArgs);
+        if two_node {
+            p.then(SpawnChild, EmptyArgs).finish().into_compiled()
+        } else {
+            p.finish().into_compiled()
+        }
+    }
+
+    /// Spawns a two-node sub-plan on the FIRST step, then never again.
+    struct SpawnOnce {
+        fired: std::sync::atomic::AtomicBool,
+    }
+    impl crate::framework::control::ControlPolicy for SpawnOnce {
+        fn on_step(&self, _m: &StepMetrics) -> Control {
+            if self.fired.swap(true, Ordering::SeqCst) {
+                return Control::Continue;
+            }
+            Control::Spawn(crate::framework::control::SpawnDelta {
+                subplan: spawn_subplan(true),
+                label: Some("child".into()),
+            })
+        }
+    }
+
+    /// Spawns a single-node sub-plan on EVERY step — drives the bounded
+    /// termination test (spawned nodes emit no steps, so it converges).
+    struct SpawnEveryStep;
+    impl crate::framework::control::ControlPolicy for SpawnEveryStep {
+        fn on_step(&self, _m: &StepMetrics) -> Control {
+            Control::Spawn(crate::framework::control::SpawnDelta {
+                subplan: spawn_subplan(false),
+                label: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_injects_subplan_and_runs_to_completion() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        MAKE_RUN_COUNT.store(0, Ordering::SeqCst);
+        SPAWN_MARKER_RAN.store(0, Ordering::SeqCst);
+        SPAWN_CHILD_RAN.store(0, Ordering::SeqCst);
+        let (_td, base) = fresh_ctx();
+        let ctx = base.with_control(std::sync::Arc::new(SpawnOnce {
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }));
+
+        // MakeOne → StepThenSleep (emits a step → policy spawns SpawnMarker →
+        // SpawnChild). The injected 2-node sub-plan must run to completion.
+        let plan = Plan::<(), LamuTrainerBackend>::new("spawn_main", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .then(StepThenSleep, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let fut = ParallelExecutor::execute(plan, ctx);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+            .await
+            .expect("spawn run must terminate")
+            .expect("a spawn is not a failure → Ok");
+
+        assert_eq!(SPAWN_MARKER_RAN.load(Ordering::SeqCst), 1, "injected root ran");
+        assert_eq!(SPAWN_CHILD_RAN.load(Ordering::SeqCst), 1, "injected child ran");
+        // 2 base nodes + 2 spawned = 4 accounted (the in-test debug_assert in
+        // execute() would have panicked on an accounting imbalance).
+        assert_eq!(result.n_stages, 4, "order grew to include the spawned nodes");
+    }
+
+    #[tokio::test]
+    async fn repeated_spawns_stay_bounded_and_terminate() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        SPAWN_MARKER_RAN.store(0, Ordering::SeqCst);
+        let (_td, base) = fresh_ctx();
+        let ctx = base.with_control(std::sync::Arc::new(SpawnEveryStep));
+
+        // The emitter fires 4 steps; the policy spawns on each. Spawned nodes
+        // emit NO steps, so the graph converges — the run MUST terminate, and
+        // the spawn count is bounded by the steps actually observed.
+        let plan = Plan::<(), LamuTrainerBackend>::new("spawn_many", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .then(MultiStepEmitter { steps: 4 }, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let fut = ParallelExecutor::execute(plan, ctx);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+            .await
+            .expect("repeated spawns must still terminate (no infinite loop)")
+            .expect("spawns are not failures → Ok");
+
+        // At least one spawn ran. (The injected single-node sub-plans share a
+        // cache key, so duplicates cache-HIT rather than re-run — exactly once
+        // executes its body; the rest are skipped. The point of THIS test is
+        // termination + boundedness, not distinct execution — that is covered by
+        // `spawn_injects_subplan_and_runs_to_completion`.)
+        assert!(SPAWN_MARKER_RAN.load(Ordering::SeqCst) >= 1, "at least one spawn ran");
+        // Bounded: 2 base nodes + at most one injected per observed step (≤ 4).
+        // The in-test debug_assert in execute() already proved completed+pruned
+        // balanced the (grown) order, so no node leaked.
+        assert!(
+            (3..=6).contains(&result.n_stages),
+            "spawn count bounded, no runaway: n_stages={}",
+            result.n_stages
+        );
     }
 }
