@@ -109,9 +109,11 @@ from training_types import (
     alpha_stats_from_model, reduce_alpha_stats,
 )
 from training_dashboard import TrainingDashboard
-from training_utils import (
-    pearson_r_batch, channel_dropout, validate_epoch as _vendored_validate,
-)
+# Shared training primitives now live in the common library (extracted out of
+# the archived per-arch trainers). Only `pearson_r_batch` is used here (metric
+# reporting); the old `channel_dropout` + `validate_epoch` imports were
+# vestigial (train_joint has its own validate_joint).
+from lamquant.common.metrics import pearson_r_batch
 from augmentations import EEGAugmentor
 from lamquant.common.utils import safe_torch_load as _safe_load
 import math

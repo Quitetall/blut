@@ -88,6 +88,19 @@ def pearson_r_torch(pred, target, eps: float = 1e-8):
     return r.mean()  # scalar tensor, differentiable
 
 
+def pearson_r_batch(pred, target, eps: float = 1e-8) -> float:
+    """Batch Pearson R as a plain Python float — for monitoring/logging.
+
+    The non-differentiable companion of [`pearson_r_torch`]: identical math,
+    `.item()`-ed. Use this for metric reporting; use `pearson_r_torch` (or
+    `1.0 - pearson_r_torch`) anywhere that needs a gradient — calling THIS in
+    a loss path silently zeroes the gradient (the 2026-04-17 bug). Single
+    source of truth: delegates to `pearson_r_torch` so there is exactly one
+    correlation implementation.
+    """
+    return float(pearson_r_torch(pred, target, eps=eps))
+
+
 def prd_torch(original, reconstructed, eps: float = 1e-12,
               max_prd: float = 200.0):
     """Differentiable PRD. Returns a torch scalar tensor.

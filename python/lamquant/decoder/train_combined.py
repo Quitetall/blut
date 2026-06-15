@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.join(ROOT_DIR, 'lamquant', 'oracle'))
 from lamquant_neural.models.vocos_decoder import VocosDecoder
 from lamquant_neural.models.encoder import TernaryMobileNetV5_Subband
 from train_teacher import L3Teacher
-from lamquant.student.training_utils import pearson_r_loss
+from lamquant.common.losses import pearson_r_loss
 from streaming_dataset import PrecomputedL3Dataset
 from raw_window_dataset import RawWindowDataset
 from auraloss.freq import MultiResolutionSTFTLoss

@@ -41,24 +41,13 @@ from lamquant_neural.models.encoder import (
     TernaryMobileNetV5,
     TernaryMobileNetV5_Subband,
 )
-from ternary_encoder import (
-    apply_montage_permutation,
-    clinical_augmentation,
-)
+# Shared training primitives from the common library (extracted out of the
+# archived per-arch trainers). Replaces the local `from ternary_encoder import`
+# + the duplicated inline `pearson_r_batch`.
+from lamquant.common.augment import apply_montage_permutation, clinical_augmentation
+from lamquant.common.metrics import pearson_r_batch
 from subband_preprocess import preprocess_subband_torch
 from lamquant.common.utils import safe_torch_load as _safe_load
-
-
-def pearson_r_batch(pred, target):
-    p = pred.flatten(1)
-    t = target.flatten(1)
-    pc = p - p.mean(dim=-1, keepdim=True)
-    tc = t - t.mean(dim=-1, keepdim=True)
-    r = torch.sum(pc * tc, dim=-1) / (
-        torch.sqrt(torch.sum(pc ** 2, dim=-1)) *
-        torch.sqrt(torch.sum(tc ** 2, dim=-1)) + 1e-8
-    )
-    return r.mean().item()
 
 
 def combined_loss(student, teacher_model, x, latent_weight=0.2,

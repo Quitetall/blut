@@ -13,7 +13,7 @@ from lamquant.common.metrics import (
     pearson_r_torch, prd_torch,
     masked_pearson_r_torch, masked_pearson_r_batch, masked_prd_torch,
 )
-from lamquant.student.training_utils import pearson_r_batch
+from lamquant.common.metrics import pearson_r_batch
 from lamquant_neural.data import VariableNAdapter, variable_n_collate
 
 TIER = 3                      # smallest iSTFT (fullband) tier — cheap on CPU
