@@ -599,6 +599,58 @@ impl CompiledPlan {
             recipe_args: &self.recipe_args,
         }
     }
+
+    /// Merge N independent compiled plans into one (HPO fan-out, v0.20). Each
+    /// component becomes a disjoint connected sub-graph with its node ids offset
+    /// by the running total, so the executor runs all N in parallel (up to the
+    /// concurrency cap), gated by the GPU semaphore + never-OOM admission
+    /// exactly as today. Per-component `recipe_args` are dropped (each trial's
+    /// args live in its own nodes' `args`/`canon_args`); the merged
+    /// `recipe_args` is the supplied `base_args` (for footprint billing /
+    /// provenance). Returns `(merged, node_offsets)` where `node_offsets[i]` is
+    /// the first global node id of component `i` — the caller maps trial → node
+    /// range with it. Empty `components` yields an empty plan (the caller guards
+    /// against launching it).
+    pub fn from_components(
+        name: String,
+        base_args: serde_json::Value,
+        components: Vec<CompiledPlan>,
+    ) -> (CompiledPlan, Vec<NodeId>) {
+        let mut nodes: Vec<PlanNode> = Vec::new();
+        let mut edges: Vec<PlanEdge> = Vec::new();
+        let mut initial: HashMap<NodeId, ErasedArtifact> = HashMap::new();
+        let mut node_offsets: Vec<NodeId> = Vec::with_capacity(components.len());
+        let mut offset: NodeId = 0;
+        for comp in components {
+            node_offsets.push(offset);
+            let comp_nodes = comp.nodes;
+            let n = comp_nodes.len() as NodeId;
+            for mut node in comp_nodes {
+                node.id += offset;
+                nodes.push(node);
+            }
+            for e in comp.edges {
+                edges.push(PlanEdge {
+                    from: e.from + offset,
+                    to: e.to + offset,
+                });
+            }
+            for (id, art) in comp.initial {
+                initial.insert(id + offset, art);
+            }
+            offset += n;
+        }
+        (
+            CompiledPlan {
+                name,
+                nodes,
+                edges,
+                initial,
+                recipe_args: base_args,
+            },
+            node_offsets,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -739,6 +791,39 @@ mod tests {
         assert_eq!(plan.n_edges(), 2);
         let order = plan.topo_order().unwrap();
         assert_eq!(order, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn from_components_merges_disjoint_subplans() {
+        // Two 2-node components (MakeA -> AToB) → one 4-node plan with ids,
+        // edges, and graph-input initials offset, so the executor runs both
+        // trials in parallel (the HPO fan-out).
+        let mk = || {
+            Plan::<(), LamuTrainerBackend>::new("c", serde_json::json!({}))
+                .start(MakeA, EmptyArgs)
+                .then(AToB, EmptyArgs)
+                .finish()
+                .into_compiled()
+        };
+        let (merged, offsets) = CompiledPlan::from_components(
+            "hpo".into(),
+            serde_json::json!({ "x": 1 }),
+            vec![mk(), mk()],
+        );
+        assert_eq!(merged.n_nodes(), 4);
+        assert_eq!(merged.n_edges(), 2);
+        assert_eq!(offsets, vec![0, 2], "first node id per component");
+        let ids: Vec<NodeId> = merged.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3], "node ids relabeled contiguously");
+        assert!(merged.edges.iter().any(|e| e.from == 0 && e.to == 1));
+        assert!(merged.edges.iter().any(|e| e.from == 2 && e.to == 3), "2nd edge offset");
+        assert!(
+            merged.initial.contains_key(&0) && merged.initial.contains_key(&2),
+            "both graph-input initials offset"
+        );
+        assert_eq!(merged.topo_order().unwrap().len(), 4, "valid DAG, all nodes ordered");
+        assert_eq!(merged.recipe_args, serde_json::json!({ "x": 1 }));
+        assert_eq!(merged.name(), "hpo");
     }
 
     #[test]

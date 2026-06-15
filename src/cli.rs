@@ -86,6 +86,11 @@ enum Command {
         #[command(subcommand)]
         cmd: LineageCommand,
     },
+    /// Hyperparameter optimization: adaptive search over a recipe (v0.20).
+    Hpo {
+        #[command(subcommand)]
+        cmd: HpoCommand,
+    },
     /// Inspect materialized artifacts via their sidecars.
     Artifact {
         #[command(subcommand)]
@@ -385,6 +390,68 @@ enum RecipeCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum HpoCommand {
+    /// Run hyperparameter optimization over a recipe: sample trials from a
+    /// search space, run them as parallel nodes in one plan, adaptively
+    /// early-stop the underperformers (v0.20).
+    Run {
+        /// Recipe name (the trial's base; the search space overlays its args).
+        name: String,
+        /// Base args as inline JSON (the fixed part; search dims overlay it).
+        #[arg(long, default_value = "{}")]
+        args: String,
+        /// Search-space YAML file (`dims:` map of dotted-arg-path → distribution).
+        #[arg(long)]
+        space: Option<String>,
+        /// Inline search dim(s): `--param 'lr=loguniform(1e-5,1e-2)'` (repeatable;
+        /// merged over --space, later wins). At least one dim total is required.
+        #[arg(long = "param", value_name = "NAME=FN(...)")]
+        param: Vec<String>,
+        /// Search algorithm: random | median | percentile | asha (later: pbt | tpe).
+        /// Default flips to `asha` once the scheduler lands (v0.20 Phase 4).
+        #[arg(long, default_value = "random")]
+        algo: String,
+        /// Objective metric — a dotted key read from each trial's StageStep
+        /// payload (e.g. `val_r`).
+        #[arg(long, default_value = "val_r")]
+        metric: String,
+        /// Optimization direction.
+        #[arg(long, default_value = "max", value_parser = ["max", "min"])]
+        mode: String,
+        /// Number of trials to sample.
+        #[arg(long, default_value_t = 8)]
+        max_trials: u32,
+        /// RNG seed (reproducible sampling).
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// The StageStep key carrying the trial's BUDGET coordinate (epoch/step)
+        /// — rung milestones + median comparisons key on equal budget.
+        #[arg(long, default_value = "epoch")]
+        metric_budget_key: String,
+        /// ASHA reduction factor (keep top 1/eta at each rung).
+        #[arg(long, default_value_t = 3)]
+        eta: u32,
+        /// ASHA min / max budget (in `metric_budget_key` units) + grace before
+        /// any trial may be stopped.
+        #[arg(long, default_value_t = 1)]
+        min_budget: u32,
+        #[arg(long, default_value_t = 0)]
+        max_budget: u32,
+        #[arg(long, default_value_t = 1)]
+        grace: u32,
+        /// median/percentile: stop a trial below this percentile of peers.
+        #[arg(long, default_value_t = 50)]
+        percentile: u32,
+        /// Promote outputs to the global cache (shared trial-cache reuse).
+        #[arg(long, default_value_t = false)]
+        shared_cache: bool,
+        /// Placement: local (default) | slurm | ray (per-trial; see `recipe run`).
+        #[arg(long, default_value = "local")]
+        launcher: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum DataCommand {
     /// List registered datasets, newest first.
     List,
@@ -541,6 +608,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Log { id, tail, json }) => run_log(&id, tail, json),
         Some(Command::Runs { cmd }) => run_runs_cmd(cmd),
         Some(Command::Lineage { cmd }) => run_lineage_cmd(cmd),
+        Some(Command::Hpo { cmd }) => run_hpo(&reg, cmd).await,
         Some(Command::Artifact { cmd }) => run_artifact_cmd(cmd),
         Some(Command::Schedule { cmd }) => run_schedule_cmd(&reg, cmd),
         Some(Command::Data { cmd }) => run_data(cmd),
@@ -1290,6 +1358,164 @@ fn recipe_footprint(name: &str, raw: &serde_json::Value) -> crate::broker::Footp
     // is benign: `resolve` returns the hint, so admission stays safe.
     let key = drivers.key(name);
     crate::broker::FootprintStore::load().resolve(&key, hint)
+}
+
+/// HPO entry point (v0.20). Samples trials from a search space, runs them as
+/// parallel nodes in ONE plan (the fan-out), and — once schedulers land —
+/// adaptively early-stops via the control policy. Phase 2 ships `--algo random`
+/// (a parallel random search, control=None); other algos error until their
+/// slice lands. Mirrors `run_one_recipe`'s job/admission/lock setup so HPO runs
+/// are never-OOM-gated + scheduler-arbitrated exactly like a normal recipe run.
+async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()> {
+    use crate::framework::ExecCtx;
+    use crate::hpo::{RandomSampler, Sampler, SearchSpace};
+
+    let HpoCommand::Run {
+        name,
+        args,
+        space,
+        param,
+        algo,
+        metric,
+        mode,
+        max_trials,
+        seed,
+        metric_budget_key: _,
+        eta: _,
+        min_budget: _,
+        max_budget: _,
+        grace: _,
+        percentile: _,
+        shared_cache,
+        launcher,
+    } = cmd;
+
+    // Base args (the fixed part; search dims overlay each trial).
+    let base_args: serde_json::Value =
+        serde_json::from_str(&args).map_err(|e| anyhow!("--args is not valid JSON: {e}"))?;
+
+    // Search space: YAML file (if any) then inline --param (later wins), validate.
+    let mut sp = match &space {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("read search-space file {path}"))?;
+            SearchSpace::from_yaml(&text).map_err(|e| anyhow!("{e}"))?
+        }
+        None => SearchSpace::default(),
+    };
+    for p in &param {
+        let (dim, dist) = SearchSpace::parse_param(p).map_err(|e| anyhow!("{e}"))?;
+        sp.dims.insert(dim, dist);
+    }
+    sp.validate()
+        .map_err(|e| anyhow!("invalid search space: {e}"))?;
+
+    // Sampler (Phase 2: random only).
+    let mut sampler: Box<dyn Sampler> = match algo.as_str() {
+        "random" => Box::new(RandomSampler::new(seed)),
+        other => {
+            return Err(anyhow!(
+                "--algo '{other}' is not yet implemented — Phase 2 ships 'random'; \
+                 median/percentile/asha/pbt/tpe land in later v0.20 slices"
+            ));
+        }
+    };
+
+    let launch_target: crate::config::launcher::LaunchTarget =
+        launcher.parse().map_err(|e| anyhow!("{e}"))?;
+
+    // Fan-out: N sampled trials → one merged plan.
+    let (plan, trials) = crate::hpo::plan_build::build_hpo_plan(
+        reg,
+        &name,
+        &base_args,
+        &sp,
+        sampler.as_mut(),
+        max_trials,
+    )
+    .map_err(|e| anyhow!("{e}"))?;
+    eprintln!(
+        "hpo {name}: {} trials, {} nodes (algo={algo}, metric={metric}, mode={mode})",
+        trials.len(),
+        plan.n_nodes()
+    );
+
+    // Job + ExecCtx — mirror run_one_recipe (control=None for random search).
+    let footprint = recipe_footprint(&name, &base_args);
+    let job_id = crate::jobs::new_job_id();
+    let job_dir = crate::paths::job_dir(&job_id)?;
+    let mut ctx = ExecCtx::new(job_dir.clone());
+    {
+        let snap = crate::broker::ResourceSnapshot::probe();
+        if snap.mem_total_gb > 0.0 {
+            let box_fit =
+                (snap.mem_total_gb - crate::broker::admission::DEFAULT_FLOOR_GIB).max(1.0) as u32;
+            ctx = ctx.with_memory_budget(box_fit);
+        }
+    }
+    ctx = ctx.with_launch_target(launch_target);
+    ctx = ctx.with_fb_warm(crate::broker::Drivers::from_args_json(&base_args).warm);
+    if shared_cache {
+        if let Some(global) = crate::framework::CacheHandle::default_global_path() {
+            std::fs::create_dir_all(&global)
+                .with_context(|| format!("create global cache dir {}", global.display()))?;
+            let cache_handle = (*ctx.cache).clone().with_global(global);
+            ctx.cache = std::sync::Arc::new(cache_handle);
+        }
+    }
+
+    RecipeMarker {
+        name: name.to_string(),
+        args: base_args.clone(),
+    }
+    .write_to(&job_dir)?;
+    crate::jobs::write_state(&job_id, JobState::Running)
+        .with_context(|| format!("write Running state for {job_id}"))?;
+    crate::python_kill::bind_current_job(job_id.clone());
+    install_cancel_handler(ctx.cancel.clone());
+
+    // Admission gate on a SINGLE trial's footprint — the executor's per-stage
+    // memory admission gates concurrency ACROSS trials, so the box can't OOM
+    // even with the full fan-out in flight (never-OOM-the-box, unchanged).
+    if let Err(reason) = crate::broker::gate(&format!("hpo '{name}'"), &footprint) {
+        crate::python_kill::unbind_current_job();
+        let _ = crate::jobs::write_state(&job_id, JobState::Failed);
+        return Err(anyhow!("{reason}"));
+    }
+    let lock = match scheduler_lock::acquire_exclusive(
+        format!("blut-hpo:{job_id}"),
+        LockKind::Training,
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            crate::python_kill::unbind_current_job();
+            let _ = crate::jobs::write_state(&job_id, JobState::Failed);
+            return Err(anyhow!("acquire_exclusive: {e}"));
+        }
+    };
+    eprintln!("job    {job_id}");
+    eprintln!("dir    {}", job_dir.display());
+    eprintln!("lock   {}", lock.path().display());
+
+    let result = crate::framework::execute_plan(plan, ctx).await;
+    drop(lock);
+    crate::python_kill::unbind_current_job();
+    match result {
+        Ok(_) => {
+            crate::jobs::write_state(&job_id, JobState::Done)
+                .with_context(|| format!("write Done state for {job_id}"))?;
+            eprintln!(
+                "hpo done: {} trials ran (job {job_id}). Per-trial results land with the \
+                 trial-tracking slice (`blut hpo show`).",
+                trials.len()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let _ = crate::jobs::write_state(&job_id, JobState::Failed);
+            Err(anyhow!("hpo plan execution failed: {e}"))
+        }
+    }
 }
 
 async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Result<()> {

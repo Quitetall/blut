@@ -13,8 +13,10 @@
 //!   (median/ASHA via the existing `KillBranch`), `Control::Spawn` (PBT/TPE),
 //!   and trial tracking.
 
+pub mod plan_build;
 pub mod sampler;
 pub mod space;
 
+pub use plan_build::{TrialPlan, build_hpo_plan};
 pub use sampler::{RandomSampler, Sampler};
 pub use space::{Dist, Overlay, SearchSpace, TrialResult, apply_overlay};
