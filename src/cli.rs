@@ -107,6 +107,12 @@ enum Command {
         /// Second job id.
         b: String,
     },
+    /// Declared, persistent partition key-space over a recipe + per-cell
+    /// backfill (Dagster-class partitions, v0.20 Phase G).
+    Partition {
+        #[command(subcommand)]
+        cmd: PartitionCommand,
+    },
     /// Inspect materialized artifacts via their sidecars.
     Artifact {
         #[command(subcommand)]
@@ -656,6 +662,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Hpo { cmd }) => run_hpo(&reg, cmd).await,
         Some(Command::Dag { job, json }) => run_dag(job, json),
         Some(Command::Compare { a, b }) => run_compare(&a, &b),
+        Some(Command::Partition { cmd }) => run_partition(&reg, cmd).await,
         Some(Command::Artifact { cmd }) => run_artifact_cmd(cmd),
         Some(Command::Schedule { cmd }) => run_schedule_cmd(&reg, cmd),
         Some(Command::Data { cmd }) => run_data(cmd),
@@ -1914,8 +1921,159 @@ fn persist_plan_graph(plan: &crate::framework::CompiledPlan, job_dir: &std::path
     }
 }
 
-/// `blut dag <job> [--json]` — render a job's DAG: per-node status + edges,
-/// built from the persisted `plan.json` + the live `status.jsonl` (+ HPO trial
+#[derive(Subcommand, Debug)]
+enum PartitionCommand {
+    /// Declare + persist a partition set: `define <recipe> <name> --dim
+    /// corpus=tusz,chbmit --dim fold=0,1,2`.
+    Define {
+        recipe: String,
+        name: String,
+        /// One axis per flag: `--dim axis=v1,v2,v3` (repeatable).
+        #[arg(long = "dim", value_name = "AXIS=v1,v2")]
+        dim: Vec<String>,
+    },
+    /// List all defined partition sets.
+    List,
+    /// Per-cell materialization status (done / pending) for a set.
+    Status { recipe: String, name: String },
+    /// Run the recipe for every NOT-yet-materialized cell (`--force` = all),
+    /// recording per-cell status. Cells run sequentially.
+    Backfill {
+        recipe: String,
+        name: String,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Base recipe args (the fixed part; each cell overlays its axis values).
+        #[arg(long, default_value = "{}")]
+        args: String,
+        #[arg(long, default_value = "local")]
+        launcher: String,
+    },
+}
+
+/// Apply a partition cell's `axis=value` overrides onto base recipe args:
+/// `args[axis] = <scalar>` (int / float / bool, else the verbatim string).
+fn apply_cell_overrides(base: &serde_json::Value, overrides: &[String]) -> serde_json::Value {
+    let mut obj = base.as_object().cloned().unwrap_or_default();
+    for ov in overrides {
+        if let Some((k, v)) = ov.split_once('=') {
+            let val = if let Ok(i) = v.parse::<i64>() {
+                serde_json::json!(i)
+            } else if let Ok(f) = v.parse::<f64>() {
+                serde_json::json!(f)
+            } else if let Ok(b) = v.parse::<bool>() {
+                serde_json::json!(b)
+            } else {
+                serde_json::json!(v)
+            };
+            obj.insert(k.to_string(), val);
+        }
+    }
+    serde_json::Value::Object(obj)
+}
+
+async fn run_partition(reg: &crate::framework::Registry, cmd: PartitionCommand) -> Result<()> {
+    use crate::config::partition::{PartitionDim, PartitionSet, PartitionStatus};
+    match cmd {
+        PartitionCommand::Define { recipe, name, dim } => {
+            if reg.find(&recipe).is_none() {
+                return Err(anyhow!("recipe '{recipe}' not in catalog"));
+            }
+            let dims: Vec<PartitionDim> = dim
+                .iter()
+                .map(|d| {
+                    let (axis, vals) = d
+                        .split_once('=')
+                        .ok_or_else(|| anyhow!("--dim '{d}' must be axis=v1,v2"))?;
+                    let values: Vec<String> =
+                        vals.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+                    Ok::<_, anyhow::Error>(PartitionDim { axis: axis.to_string(), values })
+                })
+                .collect::<Result<_>>()?;
+            let set = PartitionSet { name, recipe, dims };
+            let cells = set.validate().map_err(|e| anyhow!("{e}"))?;
+            let path = set.save().map_err(|e| anyhow!("{e}"))?;
+            println!("defined partition '{}/{}' — {cells} cells → {}", set.recipe, set.name, path.display());
+        }
+        PartitionCommand::List => {
+            let sets = PartitionSet::list().map_err(|e| anyhow!("{e}"))?;
+            if sets.is_empty() {
+                println!("(no partition sets defined)");
+            }
+            for (recipe, name) in sets {
+                println!("{recipe}/{name}");
+            }
+        }
+        PartitionCommand::Status { recipe, name } => {
+            let set = PartitionSet::load(&recipe, &name).map_err(|e| anyhow!("{e}"))?;
+            let done = set.statuses().map_err(|e| anyhow!("{e}"))?;
+            let cells = set.cells();
+            let n_done = cells
+                .iter()
+                .filter(|c| done.get(&c.key).is_some_and(PartitionStatus::is_materialized))
+                .count();
+            println!("{recipe}/{name} — {n_done}/{} materialized", cells.len());
+            for c in &cells {
+                let st = match done.get(&c.key) {
+                    Some(s) if s.is_materialized() => format!("done (job {})", s.job_id),
+                    Some(s) => format!("{} (job {})", s.outcome, s.job_id),
+                    None => "pending".to_string(),
+                };
+                println!("  {:<32} {st}", c.key);
+            }
+        }
+        PartitionCommand::Backfill { recipe, name, force, args, launcher } => {
+            let set = PartitionSet::load(&recipe, &name).map_err(|e| anyhow!("{e}"))?;
+            let base: serde_json::Value =
+                serde_json::from_str(&args).map_err(|e| anyhow!("--args is not valid JSON: {e}"))?;
+            let launch_target: crate::config::launcher::LaunchTarget =
+                launcher.parse().map_err(|e| anyhow!("{e}"))?;
+            let targets = set.backfill_targets(force).map_err(|e| anyhow!("{e}"))?;
+            if targets.is_empty() {
+                println!("{recipe}/{name}: nothing to backfill (all cells materialized)");
+                return Ok(());
+            }
+            eprintln!("backfill {recipe}/{name}: {} cell(s)", targets.len());
+            let (mut ok, mut failed) = (0u32, 0u32);
+            for (i, cell) in targets.iter().enumerate() {
+                eprintln!("[{}/{}] cell {}", i + 1, targets.len(), cell.key);
+                let cell_args = apply_cell_overrides(&base, &cell.overrides);
+                let (outcome, job_id) =
+                    match run_one_recipe(reg, &recipe, cell_args, None, false, launch_target).await {
+                        Ok(jid) => {
+                            ok += 1;
+                            ("done", jid)
+                        }
+                        Err(e) => {
+                            eprintln!("[{}/{}] cell {} FAILED: {e}", i + 1, targets.len(), cell.key);
+                            failed += 1;
+                            ("failed", String::new())
+                        }
+                    };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                if let Err(e) = set.record_status(&PartitionStatus {
+                    key: cell.key.clone(),
+                    job_id,
+                    outcome: outcome.to_string(),
+                    recorded_at: now,
+                }) {
+                    // A lost status write would silently re-run a completed cell
+                    // on the next backfill — warn loudly rather than swallow it.
+                    eprintln!("warning: could not record status for cell {}: {e}", cell.key);
+                }
+            }
+            eprintln!("backfill done — {ok} materialized, {failed} failed");
+            if failed > 0 {
+                return Err(anyhow!("{failed} cell(s) failed (re-run `partition backfill` to retry only those)"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `blut compare <A> <B>` (E4): provenance + a side-by-side FINAL-metric panel
 /// (with Δ) + the GPU-saturation summary, all from the queryable metric store.
 fn run_compare(a: &str, b: &str) -> Result<()> {
@@ -1971,6 +2129,8 @@ fn run_compare(a: &str, b: &str) -> Result<()> {
     Ok(())
 }
 
+/// `blut dag <job> [--json]` — render a job's DAG: per-node status + edges,
+/// built from the persisted `plan.json` + the live `status.jsonl` (+ HPO trial
 /// attribution when present). No daemon; re-run to refresh.
 fn run_dag(job: Option<String>, json: bool) -> Result<()> {
     let job_id = match job {
@@ -2210,7 +2370,7 @@ async fn run_one_recipe(
     sweep_fp: Option<crate::framework::ContentHash>,
     shared_cache: bool,
     launch_target: crate::config::launcher::LaunchTarget,
-) -> Result<()> {
+) -> Result<String> {
     use crate::framework::ExecCtx;
 
     let r = reg
@@ -2336,7 +2496,7 @@ async fn run_one_recipe(
             if let Err(e) = crate::lineage_db::ingest_job(&job_id, name, "done") {
                 tracing::warn!("lineage index {job_id}: {e}");
             }
-            Ok(())
+            Ok(job_id)
         }
         Err(e) => {
             if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
@@ -2462,7 +2622,7 @@ async fn run_recipe_sweep(
         eprintln!("[{}/{total}] run (fp={})", i + 1, fp.to_hex());
         let args = project_args(entry.config.json, &key);
         match run_one_recipe(reg, name, args, Some(fp), shared_cache, launch_target).await {
-            Ok(()) => ran += 1,
+            Ok(_job_id) => ran += 1,
             Err(e) => {
                 eprintln!("[{}/{total}] FAILED: {e}", i + 1);
                 failed += 1;
