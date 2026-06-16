@@ -73,6 +73,53 @@ pub trait Launcher {
     fn capacity(&self) -> usize {
         1
     }
+
+    /// The ORDERED set of device indices a multi-cell scheduler spreads cells
+    /// across (Phase G). Default `0..capacity`; `LocalSystemd` honors
+    /// `$BLUT_SCHED_DEVICES` to target a SUBSET (e.g. reserve some GPUs for
+    /// other work). Backfill concurrency is `device_set().len()`, and cell `i`
+    /// is pinned to `device_set()[i % len]`. Always ≥ 1 entry.
+    fn device_set(&self) -> Vec<usize> {
+        (0..self.capacity().max(1)).collect()
+    }
+}
+
+/// Parse `$BLUT_SCHED_DEVICES` (comma-separated device indices → deduped,
+/// first-seen order preserved) into a device set. `Err` on a non-numeric
+/// token; an all-blank value is an error (unset means "all"). Indices are
+/// NOT range-checked against the GPU count — targeting a subset (or a
+/// specific physical GPU) is the whole point.
+pub fn parse_sched_devices(s: &str) -> Result<Vec<usize>> {
+    let mut out: Vec<usize> = Vec::new();
+    for tok in s.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        let idx: usize = tok.parse().map_err(|_| {
+            TrainError::other(format!(
+                "BLUT_SCHED_DEVICES: '{tok}' is not a non-negative device index"
+            ))
+        })?;
+        if !out.contains(&idx) {
+            out.push(idx); // dedup, preserve first-seen order
+        }
+    }
+    if out.is_empty() {
+        return Err(TrainError::other(
+            "BLUT_SCHED_DEVICES is set but holds no valid device indices",
+        ));
+    }
+    Ok(out)
+}
+
+/// The scheduler device set: `$BLUT_SCHED_DEVICES` if set + valid, else
+/// `0..capacity`. A malformed override falls back to `0..capacity` with a
+/// warning (never panics a scheduler launch).
+pub fn sched_device_set(capacity: usize) -> Vec<usize> {
+    match std::env::var("BLUT_SCHED_DEVICES") {
+        Ok(s) => parse_sched_devices(&s).unwrap_or_else(|e| {
+            tracing::warn!("{e}; falling back to 0..{capacity}");
+            (0..capacity.max(1)).collect()
+        }),
+        Err(_) => (0..capacity.max(1)).collect(),
+    }
 }
 
 /// The number of GPUs VISIBLE to this process: `CUDA_VISIBLE_DEVICES` when set
@@ -127,6 +174,10 @@ impl Default for LocalSystemd {
 impl Launcher for LocalSystemd {
     fn capacity(&self) -> usize {
         local_gpu_count()
+    }
+
+    fn device_set(&self) -> Vec<usize> {
+        sched_device_set(self.capacity())
     }
 
     fn wrap(&self, unit: &str, inner: &[String]) -> Result<WrappedCommand> {
@@ -340,6 +391,39 @@ mod tests {
         // Slurm's capacity = its per-job --gpus allocation.
         assert_eq!(SlurmLauncher { gpus: Some(4), ..Default::default() }.capacity(), 4);
         assert_eq!(SlurmLauncher::default().capacity(), 1, "unset --gpus ⇒ 1");
+    }
+
+    #[test]
+    fn parse_sched_devices_dedups_and_validates() {
+        assert_eq!(parse_sched_devices("0,1,2").unwrap(), vec![0, 1, 2]);
+        // Order preserved, dupes removed (round-robin stays stable).
+        assert_eq!(parse_sched_devices("2, 0, 2, 1, 0").unwrap(), vec![2, 0, 1]);
+        // Reserve a subset (fewer than capacity) is legal.
+        assert_eq!(parse_sched_devices("3").unwrap(), vec![3]);
+        // Non-numeric / all-blank → error.
+        assert!(parse_sched_devices("0,x,1").is_err());
+        assert!(parse_sched_devices("  ,  ").is_err());
+        assert!(parse_sched_devices("").is_err());
+    }
+
+    #[test]
+    fn device_set_default_and_env_override() {
+        let _g = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prior = std::env::var("BLUT_SCHED_DEVICES").ok();
+        unsafe { std::env::remove_var("BLUT_SCHED_DEVICES") };
+        // Default = 0..capacity.
+        assert_eq!(sched_device_set(3), vec![0, 1, 2]);
+        assert_eq!(sched_device_set(0), vec![0], "≥1 entry so a scheduler progresses");
+        // Override targets a subset (e.g. reserve GPU 1 on a 3-GPU box).
+        unsafe { std::env::set_var("BLUT_SCHED_DEVICES", "0,2") };
+        assert_eq!(sched_device_set(3), vec![0, 2]);
+        // Malformed override → warn + fall back to 0..capacity (never panics).
+        unsafe { std::env::set_var("BLUT_SCHED_DEVICES", "0,bad") };
+        assert_eq!(sched_device_set(2), vec![0, 1]);
+        match prior {
+            Some(v) => unsafe { std::env::set_var("BLUT_SCHED_DEVICES", v) },
+            None => unsafe { std::env::remove_var("BLUT_SCHED_DEVICES") },
+        }
     }
 
     #[test]

@@ -143,6 +143,29 @@ pub fn acquire_exclusive(holder: impl Into<String>, kind: LockKind) -> Result<Ex
     acquire_exclusive_at(&lock_path()?, holder, kind)
 }
 
+/// The PER-DEVICE lock path (Phase G scheduler) — `scheduler-gpu-<idx>.lock`
+/// alongside the box-wide `scheduler.lock`, so device `i` and device `j`
+/// arbitrate INDEPENDENTLY (a multi-GPU box runs one job PER device).
+pub fn per_device_lock_path(device_idx: usize) -> Result<PathBuf> {
+    let dir = lock_path()?
+        .parent()
+        .ok_or_else(|| Error::Other("scheduler lock dir has no parent".into()))?
+        .to_path_buf();
+    Ok(dir.join(format!("scheduler-gpu-{device_idx}.lock")))
+}
+
+/// Claim the lock for ONE device (Phase G scheduler). Independent of the
+/// box-wide lock and of other devices' locks — so `capacity` cells can run
+/// concurrently, one per device. Same stale-cleanup + RAII-release as
+/// [`acquire_exclusive`].
+pub fn acquire_exclusive_device(
+    device_idx: usize,
+    holder: impl Into<String>,
+    kind: LockKind,
+) -> Result<ExclusiveLock> {
+    acquire_exclusive_at(&per_device_lock_path(device_idx)?, holder, kind)
+}
+
 /// Path-injectable variant. The default `acquire_exclusive` calls
 /// this with the canonical path; tests use it directly with a
 /// tempdir-scoped path so parallel test execution doesn't collide
@@ -408,5 +431,27 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&imposter).unwrap()).unwrap();
         drop(lock);
         assert!(path.exists(), "Drop must not remove an imposter lock body");
+    }
+
+    #[test]
+    fn per_device_locks_are_independent() {
+        // Phase G scheduler: device 0 and device 1 arbitrate independently
+        // (distinct paths), so `capacity` cells run one-per-device; a second
+        // acquire on the SAME device still blocks. (Path-injected — no touch
+        // of the real lock dir.)
+        let td = tempfile::tempdir().unwrap();
+        let p0 = td.path().join("scheduler-gpu-0.lock");
+        let p1 = td.path().join("scheduler-gpu-1.lock");
+        let l0 = acquire_exclusive_at(&p0, "dev0", LockKind::Training).unwrap();
+        // Device 1 is free even while device 0 is held.
+        let l1 = acquire_exclusive_at(&p1, "dev1", LockKind::Training).unwrap();
+        // A second acquire on device 0 (same path) fails.
+        assert!(acquire_exclusive_at(&p0, "dev0b", LockKind::Training).is_err());
+        drop(l0);
+        // Device 0 frees independently of device 1.
+        let l0b = acquire_exclusive_at(&p0, "dev0c", LockKind::Training)
+            .expect("device 0 free after its holder drops");
+        assert_eq!(l0b.info().holder, "dev0c");
+        assert_eq!(l1.info().holder, "dev1", "device 1 unaffected throughout");
     }
 }
