@@ -285,45 +285,83 @@ macro_rules! register_recipe {
 ///
 /// Each recipe declares its category statically; the TUI lists
 /// recipes under the matching section ("DATA PREPARATION",
-/// "TRAINING", "EVALUATION", "EXPORT", "PIPELINE", "USER").
-/// Categories are also used by `blut recipe list --category <…>`
+/// "PRETRAINING", "TRAINING", "EVALUATION", "GATE", "EXPORT",
+/// "PIPELINE", "USER").
+/// Courses are also used by `blut recipe list --category <…>`
 /// for filtered CLI browsing.
+///
+/// "Course" is the culinary cookbook-taxonomy grouping layer
+/// (ADR 0051: BLUT → Cookbook → Course → Recipe → Ingredient) — a
+/// static tag, not a registered object. `RecipeCategory` remains as a
+/// back-compat alias below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RecipeCategory {
+pub enum Course {
     /// Recipes that prepare / convert / index raw input → typed
     /// artifacts (e.g. a data-prep recipe packs a corpus into a typed
     /// artifact).
     DataPrep,
+    /// Self-supervised / unlabelled pretraining that produces an
+    /// encoder or backbone consumed by a later `Train` course
+    /// (MAE on the encoder, SSL-TUEG on the SNN backbone).
+    Pretrain,
     /// Recipes that consume artifacts + produce checkpoints
     /// (`SnnCkpt`, `JointCkpt`, `HfCheckpoint`, etc.).
     Train,
     /// Recipes that consume checkpoints + produce `EvalReport`.
     Eval,
+    /// PCCP / acceptance-gate course — the fail-closed accept/reject
+    /// asset-check run after evaluation (ADR 0037 asset-check ≡ gate).
+    Gate,
     /// Recipes that take a checkpoint + materialize a deployable
     /// artifact (`HardenedCkpt`, `FirmwareBundle`, `GgufModel`).
     Export,
-    /// Recipes that chain multiple categories end-to-end (e.g. a
+    /// Recipes that chain multiple courses end-to-end (e.g. a
     /// pipeline recipe = data prep → train → gate).
     Pipeline,
     /// User-authored recipes from `blut/src/recipes/user/`.
     User,
 }
 
-impl RecipeCategory {
+impl Course {
+    /// Menu position in pipeline (lifecycle-phase) order, used to group +
+    /// sort recipes in `blut tui` and `blut recipe list`. The match is
+    /// exhaustive, so a newly-added course cannot compile without being
+    /// given a position here — there is no silent "sorts last" fallback.
+    pub fn order(self) -> u8 {
+        match self {
+            Self::DataPrep => 0,
+            Self::Pretrain => 1,
+            Self::Train => 2,
+            Self::Eval => 3,
+            Self::Gate => 4,
+            Self::Export => 5,
+            Self::Pipeline => 6,
+            Self::User => 7,
+        }
+    }
+
     /// Human-readable section header used by `blut tui` + `blut
     /// recipe list`.
     pub fn label(self) -> &'static str {
         match self {
             Self::DataPrep => "DATA PREPARATION",
+            Self::Pretrain => "PRETRAINING",
             Self::Train => "TRAINING",
             Self::Eval => "EVALUATION",
+            Self::Gate => "GATE",
             Self::Export => "EXPORT",
             Self::Pipeline => "PIPELINE",
             Self::User => "USER",
         }
     }
 }
+
+/// Back-compat alias. The canonical name is [`Course`] (ADR 0051 — the
+/// culinary cookbook taxonomy BLUT → Cookbook → Course → Recipe →
+/// Ingredient). Existing `RecipeCategory` references keep compiling; new
+/// code should prefer `Course`.
+pub type RecipeCategory = Course;
 
 /// Erased registry entry. Stored in the static `RECIPES` slice.
 pub struct RecipeDef {
@@ -511,7 +549,38 @@ mod tests {
 
     #[test]
     fn category_label_is_stable() {
-        assert_eq!(RecipeCategory::Train.label(), "TRAINING");
-        assert_eq!(RecipeCategory::DataPrep.label(), "DATA PREPARATION");
+        assert_eq!(Course::Train.label(), "TRAINING");
+        assert_eq!(Course::DataPrep.label(), "DATA PREPARATION");
+        assert_eq!(Course::Pretrain.label(), "PRETRAINING");
+        assert_eq!(Course::Gate.label(), "GATE");
+    }
+
+    /// `order()` and `label()` are both exhaustive matches, so the compiler
+    /// forces every course to have a menu position + header — a new variant
+    /// cannot drop silently. This only checks the values are sane: orders
+    /// are distinct + contiguous (0..8) and labels are unique.
+    #[test]
+    fn course_order_and_label_are_well_formed() {
+        let courses = [
+            Course::DataPrep,
+            Course::Pretrain,
+            Course::Train,
+            Course::Eval,
+            Course::Gate,
+            Course::Export,
+            Course::Pipeline,
+            Course::User,
+        ];
+        let mut orders: Vec<u8> = courses.iter().map(|c| c.order()).collect();
+        orders.sort_unstable();
+        assert_eq!(
+            orders,
+            (0..8).collect::<Vec<u8>>(),
+            "course orders must be distinct + contiguous 0..8"
+        );
+        let mut labels: Vec<&str> = courses.iter().map(|c| c.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), 8, "every course must have a unique label");
     }
 }

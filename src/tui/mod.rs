@@ -497,26 +497,15 @@ impl App {
     fn recipe_menu(
         catalog: &[&'static crate::recipes::RecipeDef],
     ) -> Vec<(Option<char>, &'static crate::recipes::RecipeDef)> {
-        use crate::recipes::RecipeCategory;
-        let category_order = [
-            RecipeCategory::DataPrep,
-            RecipeCategory::Train,
-            RecipeCategory::Eval,
-            RecipeCategory::Export,
-            RecipeCategory::Pipeline,
-            RecipeCategory::User,
-        ];
+        // Menu order = each course's pipeline position (ADR 0051).
+        // `Course::order()` is a compiler-forced exhaustive match, so a
+        // newly-added course can't silently drop to the bottom here.
         let mut sorted: Vec<&'static crate::recipes::RecipeDef> = catalog.to_vec();
         sorted.sort_by(|a, b| {
-            let ai = category_order
-                .iter()
-                .position(|c| *c == a.category)
-                .unwrap_or(99);
-            let bi = category_order
-                .iter()
-                .position(|c| *c == b.category)
-                .unwrap_or(99);
-            ai.cmp(&bi).then_with(|| a.name.cmp(b.name))
+            a.category
+                .order()
+                .cmp(&b.category.order())
+                .then_with(|| a.name.cmp(b.name))
         });
         // Reserved keys: q, Q, r, R, c, C, j, k, l (lowercase / uppercase
         // map to the same action so we exclude both cases).

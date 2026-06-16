@@ -1,7 +1,8 @@
 //! Recipe machinery — the engine seam domain cookbooks build against.
 //!
 //! blut-core ships ZERO recipe DEFs. The `Recipe` trait, `RecipeDef`
-//! (erased catalog entry), and `RecipeCategory` live here; concrete
+//! (erased catalog entry), and `Course` (the grouping tag, ADR 0051;
+//! `RecipeCategory` is its back-compat alias) live here; concrete
 //! recipes live in cookbook crates (`cookbook-lamu`, `cookbook-lamquant`)
 //! that depend on this crate and register their recipes at runtime via
 //! [`crate::framework::Registry`]. The lamu recipes moved to
@@ -11,4 +12,4 @@
 pub mod declarative;
 pub mod recipe;
 
-pub use recipe::{Recipe, RecipeCategory, RecipeDef};
+pub use recipe::{Course, Recipe, RecipeCategory, RecipeDef};
