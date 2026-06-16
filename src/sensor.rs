@@ -14,7 +14,12 @@
 //! file is still mutated only by `policy enable|disable`; a sensor never
 //! writes.
 
-use std::time::SystemTime;
+/// Sentinel new-turn count for [`AutoTrainPolicySensor`]: the conversation
+/// turn count lives in the lamu store (out of BLUT's reach), so we pass a
+/// value that always clears `policy::decide`'s `threshold_new_turns` gate —
+/// the sensor then observes only the TIME + lock gates it CAN evaluate. If
+/// `decide` ever grows a turns-CEILING check, revisit this coupling.
+const ASSUME_ENOUGH_TURNS: i64 = i64::MAX;
 
 /// What a sensor observed.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -112,10 +117,10 @@ impl Sensor for AutoTrainPolicySensor {
         };
         let (now_secs, now_mins) = crate::policy::current_clock();
         let lock_held = crate::scheduler_lock::check_unlocked().is_err();
-        // turns = i64::MAX: assume plenty of new data, so the threshold
-        // gate passes and we observe the TIME + lock gates (the ones BLUT
-        // can evaluate without the conversation store).
-        match crate::policy::decide(&policy, now_secs, now_mins, i64::MAX, lock_held) {
+        // Assume plenty of new data so the threshold gate passes and we
+        // observe the TIME + lock gates (the ones BLUT can evaluate without
+        // the conversation store).
+        match crate::policy::decide(&policy, now_secs, now_mins, ASSUME_ENOUGH_TURNS, lock_held) {
             crate::policy::Decision::Run { .. } => SensorOutcome::Ready,
             crate::policy::Decision::Skip(reason) => SensorOutcome::Skip { reason },
         }
@@ -132,15 +137,6 @@ pub fn registry() -> Vec<Box<dyn Sensor>> {
 /// Look up a sensor by name.
 pub fn find(name: &str) -> Option<Box<dyn Sensor>> {
     registry().into_iter().find(|s| s.name() == name)
-}
-
-/// `SystemTime::now()` UNIX seconds — handy for callers stamping a
-/// sensor evaluation. Kept here so the CLI doesn't reach for chrono.
-pub fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
