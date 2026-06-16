@@ -8,6 +8,7 @@
 //! `cookbook-lamu` at C2b, the lamquant recipes to `cookbook-lamquant`
 //! at C2a. See `[[project_blut_cookbook_split]]`.
 
+pub mod declarative;
 pub mod recipe;
 
 pub use recipe::{Recipe, RecipeCategory, RecipeDef};

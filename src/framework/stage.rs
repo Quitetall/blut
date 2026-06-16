@@ -328,6 +328,16 @@ pub trait Stage: Send + Sync + 'static {
     }
 }
 
+/// A backend-agnostic constructor for a type-erased stage (Phase G /
+/// C3). A cookbook exposes a static `&[(name, ErasedStageCtor)]` via
+/// [`Cookbook::stages_erased`](crate::framework::cookbook::Cookbook::stages_erased);
+/// a declarative `.toml` recipe resolves a stage NAME to one of these and
+/// builds an erased plan ([`CompiledPlan::from_erased_chain`](crate::framework::plan::CompiledPlan::from_erased_chain)),
+/// RUNTIME-kind-checking the chain. The cookbook that owns the ctor also
+/// owns the stage type + its `Compatible<Backend>` witness, so the
+/// erasure is sound even though the fn pointer carries no backend.
+pub type ErasedStageCtor = fn() -> std::sync::Arc<dyn StageDyn>;
+
 /// Object-safe shadow. Implemented automatically for every
 /// `Stage` via the blanket impl below. Users never write this.
 #[async_trait]

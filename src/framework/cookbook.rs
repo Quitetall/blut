@@ -52,6 +52,18 @@ pub trait Cookbook: Send + Sync + 'static {
     fn artifacts(&self) -> &'static [ArtifactDescriptor] {
         &[]
     }
+    /// EXECUTABLE erased stage constructors keyed by name (Phase G / C3) —
+    /// the dispatch side of [`stages`](Self::stages). A declarative `.toml`
+    /// recipe resolves a stage NAME here, calls the ctor to get a fresh
+    /// `Arc<dyn StageDyn>`, and wires a runtime-kind-checked chain. Default
+    /// empty so a cookbook opts in; each entry's ctor MUST yield a stage
+    /// that is `Compatible` with the cookbook's backend (the cookbook owns
+    /// both, so this holds by construction).
+    fn stages_erased(
+        &self,
+    ) -> &'static [(&'static str, crate::framework::stage::ErasedStageCtor)] {
+        &[]
+    }
     /// Pre-baked args JSON for one of this cookbook's recipes (domain
     /// data — e.g. default corpus paths), used to prefill the TUI args
     /// editor. Default `None` so non-domain cookbooks need no impl; the
@@ -104,6 +116,20 @@ impl Registry {
     /// supplies defaults — the caller falls back to the schema template.
     pub fn default_args(&self, recipe: &str) -> Option<String> {
         self.cookbooks.iter().find_map(|c| c.default_args(recipe))
+    }
+
+    /// Resolve an erased stage CONSTRUCTOR by name across all registered
+    /// cookbooks (C3 / declarative recipes; first match wins). `None` if no
+    /// cookbook exposes a stage with that name in [`Cookbook::stages_erased`].
+    pub fn find_erased_stage(
+        &self,
+        name: &str,
+    ) -> Option<crate::framework::stage::ErasedStageCtor> {
+        self.cookbooks
+            .iter()
+            .flat_map(|c| c.stages_erased().iter().copied())
+            .find(|(n, _)| *n == name)
+            .map(|(_, ctor)| ctor)
     }
 
     /// The best starting-point args JSON for a recipe (E2): the schema-derived

@@ -726,12 +726,13 @@ impl CompiledPlan {
         if chain.is_empty() {
             return Err(PlanError::Empty);
         }
-        // The first stage must take the unit graph input.
+        // The first stage must take the unit graph input. (Errors name the
+        // STAGES/kinds only — the caller adds recipe context.)
         let first_in = chain[0].0.input_kind();
         if first_in != <() as Artifact>::KIND {
             return Err(PlanError::Other(format!(
-                "declarative recipe '{name}': first stage '{}' must be graph-input \
-                 (input_kind \"()\"), but it expects '{first_in}'",
+                "first stage '{}' must be graph-input (input_kind \"()\"), but it \
+                 expects '{first_in}'",
                 chain[0].0.name()
             )));
         }
@@ -741,8 +742,8 @@ impl CompiledPlan {
             let inp = pair[1].0.input_kind();
             if out != inp {
                 return Err(PlanError::Other(format!(
-                    "declarative recipe '{name}': kind-chain break — stage '{}' outputs \
-                     '{out}' but the next stage '{}' expects '{inp}'",
+                    "kind-chain break — stage '{}' outputs '{out}' but the next stage \
+                     '{}' expects '{inp}'",
                     pair[0].0.name(),
                     pair[1].0.name()
                 )));

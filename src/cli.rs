@@ -411,6 +411,15 @@ enum RecipeCommand {
         /// Recipe name (as listed by `recipe list`).
         name: String,
     },
+    /// DECLARATIVE recipes (G/C3): compile a `.toml` recipe (a named chain
+    /// of stages-by-name + args) into a runtime-kind-checked plan and render
+    /// its DAG. With NO file, lists the declarative recipes discovered under
+    /// `~/.config/blut/recipes/*.toml` ($BLUT_USER_RECIPES_DIR). Resolves
+    /// stages from the registered cookbooks' `stages_erased()` registries.
+    Declare {
+        /// Path to a `.toml` recipe (omit to list discovered recipes).
+        file: Option<std::path::PathBuf>,
+    },
     /// Execute a recipe, or a config-driven sweep over it.
     Run {
         /// Recipe name.
@@ -2477,6 +2486,40 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                 serde_json::to_string_pretty(&schema)
                     .unwrap_or_else(|e| format!("(serialize error: {e})"))
             );
+        }
+        RecipeCommand::Declare { file } => {
+            use crate::recipes::declarative::{
+                DeclarativeRecipe, scan_user_recipes, user_recipes_dir,
+            };
+            match file {
+                None => {
+                    // F4 discovery: list ~/.config/blut/recipes/*.toml.
+                    let found = scan_user_recipes();
+                    let dir = user_recipes_dir()
+                        .map(|d| d.display().to_string())
+                        .unwrap_or_else(|| "(no config dir)".into());
+                    if found.is_empty() {
+                        println!("no declarative recipes under {dir}");
+                    } else {
+                        println!("declarative recipes under {dir} ({}):", found.len());
+                        for (rname, path) in found {
+                            println!("  {rname:<24} {}", path.display());
+                        }
+                    }
+                }
+                Some(path) => {
+                    // Compile + kind-check the .toml against the cookbook's
+                    // stages_erased registry, then render the runnable DAG.
+                    let recipe = DeclarativeRecipe::load(&path).map_err(|e| anyhow!("{e}"))?;
+                    let n = recipe.stages.len();
+                    let plan = recipe.compile(reg).map_err(|e| anyhow!("{e}"))?;
+                    print!("{}", plan.render_ascii().map_err(|e| anyhow!("{e}"))?);
+                    println!(
+                        "✓ '{}' compiles + kind-checks ({n} stage(s)).",
+                        recipe.name
+                    );
+                }
+            }
         }
         RecipeCommand::Run {
             name,
