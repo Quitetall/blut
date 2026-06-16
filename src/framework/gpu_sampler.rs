@@ -109,15 +109,22 @@ fn now_unix() -> i64 {
 }
 
 /// Handle to a running sampler. Call [`stop`](GpuSamplerHandle::stop) at
-/// the end of the run window; dropping it also aborts the task.
+/// the end of the run window. NOTE: a bare `drop` only *detaches* the
+/// task (tokio semantics) — it keeps sampling until process exit — so
+/// always `stop()` it. `run_node` does this on every exit path.
 pub struct GpuSamplerHandle {
     task: tokio::task::JoinHandle<()>,
 }
 
 impl GpuSamplerHandle {
-    /// Stop the sampler and await its teardown (idempotent). Aborting
-    /// mid-loop cannot corrupt `status.jsonl`: every emitted event is a
-    /// fully-serialized line, and an abort only prevents *future* ticks.
+    /// Stop the sampler and await its teardown (idempotent). `abort()`
+    /// cancels the task at its next await point; because the blocking
+    /// `nvidia-smi` probe runs on a `spawn_blocking` thread (awaited),
+    /// an abort during an in-flight probe DETACHES that probe (it
+    /// finishes on the blocking pool, unobserved) and returns promptly —
+    /// a hung nvidia-smi can never wedge `stop()` and, through it, the
+    /// GPU permit. Aborting mid-loop cannot corrupt `status.jsonl`: every
+    /// emitted event is a fully-serialized line.
     pub async fn stop(self) {
         self.task.abort();
         let _ = self.task.await;
@@ -141,7 +148,15 @@ pub fn spawn_gpu_sampler(
         let mut starved_fired = false;
         loop {
             tokio::time::sleep(SAMPLE_INTERVAL).await;
-            let Some(s) = sample_gpu() else {
+            // Run the blocking nvidia-smi off the async worker pool. A
+            // hung probe then strands a blocking thread, NOT a runtime
+            // worker — and an `abort()` during the probe detaches it so
+            // `stop()` returns promptly (no GPU-permit deadlock).
+            let sampled = match tokio::task::spawn_blocking(sample_gpu).await {
+                Ok(s) => s,
+                Err(_) => continue, // probe task cancelled/panicked → skip tick
+            };
+            let Some(s) = sampled else {
                 continue;
             };
             let wall = now_unix();
