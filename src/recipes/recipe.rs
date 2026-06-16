@@ -79,12 +79,93 @@ pub fn schema_of<A: schemars::JsonSchema>() -> serde_json::Value {
 pub fn compile_erased<R: Recipe + Default>(
     raw: serde_json::Value,
 ) -> Result<CompiledPlan, RecipeError> {
+    // Schema PREFLIGHT (B / P5): validate `raw` against the recipe's own
+    // schema BEFORE serde deserializes it — so a missing required arg or a
+    // wrong-typed field fails with a FIELD-NAMED message (`arg 'lr' expected
+    // number, got string`) instead of serde's positional `expected f64 at
+    // line 1 column 17`. serde's `from_value` still backstops deeper structure.
+    let schema = schema_of::<R::Args>();
+    validate_args_against_schema(R::NAME, &schema, &raw)?;
     // Prefix the recipe name so a bad-args error names the culprit. This was
     // hand-done in only 2 of the migrated recipes; centralizing here gives the
     // prefix to every recipe uniformly.
     let args: R::Args = serde_json::from_value(raw)
         .map_err(|e| RecipeError::InvalidArgs(format!("{}: {e}", R::NAME)))?;
     R::default().compile(args).map(|p| p.into_compiled())
+}
+
+/// Whether a JSON value satisfies a schema `type` keyword. `integer` accepts
+/// only whole numbers; `number` accepts any. A `null` is tolerated (an
+/// `Option<T>` field schemars-types as `["string","null"]`, which arrives here
+/// as a non-string `type` and is skipped — see the caller).
+fn json_type_matches(v: &serde_json::Value, expected: &str) -> bool {
+    use serde_json::Value;
+    match expected {
+        "string" => v.is_string(),
+        "boolean" => v.is_boolean(),
+        // Accept a whole-valued float (`8.0`) too — serde happily takes it for a
+        // u32, so the preflight must not be STRICTER than serde (a false reject).
+        "integer" => matches!(v, Value::Number(n)
+            if n.is_i64() || n.is_u64() || n.as_f64().is_some_and(|f| f.fract() == 0.0)),
+        "number" => v.is_number(),
+        "array" => v.is_array(),
+        "object" => v.is_object(),
+        "null" => v.is_null(),
+        _ => true, // unknown keyword → don't reject (serde backstops)
+    }
+}
+
+/// Field-named preflight: every `required` field is present, and every supplied
+/// field whose schema declares a scalar `type` matches it. Deliberately shallow
+/// (recipe `Args` are flat structs) — it catches the common operator mistakes
+/// (typo'd / missing / wrong-typed arg) with a precise message; serde validates
+/// the rest. A `null` value or a field schemars typed as a `["T","null"]` union
+/// (Option) is not type-checked here (it's nullable by construction).
+fn validate_args_against_schema(
+    recipe: &str,
+    schema: &serde_json::Value,
+    raw: &serde_json::Value,
+) -> Result<(), RecipeError> {
+    let Some(root) = schema_root(schema) else {
+        return Ok(()); // no resolvable schema → let serde handle it
+    };
+    let bad = |m: String| Err(RecipeError::InvalidArgs(format!("{recipe}: {m}")));
+    let Some(obj) = raw.as_object() else {
+        // A unit/`()` Args serializes as null; only object-args reach here.
+        return if raw.is_null() { Ok(()) } else { bad("args must be a JSON object".into()) };
+    };
+    if let Some(req) = root.get("required").and_then(|r| r.as_array()) {
+        for field in req.iter().filter_map(|v| v.as_str()) {
+            if !obj.contains_key(field) {
+                return bad(format!("missing required arg '{field}'"));
+            }
+        }
+    }
+    if let Some(props) = root.get("properties").and_then(|p| p.as_object()) {
+        for (k, v) in obj {
+            // Only check a declared field with a SCALAR `type` string; a union
+            // type (Option) has `type: [..]` (not a str) → skipped.
+            if let Some(expected) = props.get(k).and_then(|d| d.get("type")).and_then(|t| t.as_str())
+            {
+                if !v.is_null() && !json_type_matches(v, expected) {
+                    return bad(format!("arg '{k}' expected {expected}, got {}", json_kind(v)));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn json_kind(v: &serde_json::Value) -> &'static str {
+    use serde_json::Value;
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 /// Resolve the root args object of a `schema_of`-shaped schema
@@ -308,6 +389,39 @@ mod tests {
         assert!(schema != serde_json::Value::Null);
         assert!(schema.is_object());
         let _ = FIXTURE.category;
+    }
+
+    #[test]
+    fn validate_args_catches_missing_required_and_bad_types() {
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Args {
+            lr: f64,
+            epochs: u32,
+        }
+        let schema = schema_of::<Args>();
+        // Valid → Ok.
+        assert!(
+            validate_args_against_schema("r", &schema, &serde_json::json!({"lr": 0.1, "epochs": 8}))
+                .is_ok()
+        );
+        // Missing a required field → field-named error.
+        let e = validate_args_against_schema("r", &schema, &serde_json::json!({"lr": 0.1}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("epochs"), "names the missing field: {e}");
+        // Wrong type → field-named error mentioning the field + expectation.
+        let e = validate_args_against_schema(
+            "r",
+            &schema,
+            &serde_json::json!({"lr": "fast", "epochs": 8}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("lr") && e.contains("number"), "names the field + type: {e}");
+        // A unit/`()`-args recipe serializes its args as null → tolerated.
+        let empty = serde_json::json!({"type": "object", "properties": {}});
+        assert!(validate_args_against_schema("r", &empty, &serde_json::Value::Null).is_ok());
     }
 
     #[test]
