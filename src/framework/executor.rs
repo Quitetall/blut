@@ -114,6 +114,12 @@ pub struct ExecCtx {
     /// Arg — warm doesn't change the trained output, so it stays out of the
     /// checkpoint cache key.
     pub fb_warm: bool,
+    /// Phase-G scheduler: the GPU DEVICE index this whole job is pinned to,
+    /// or `None` for the box default. Threaded into every `StageContext` so a
+    /// launcher-aware backend exports `CUDA_VISIBLE_DEVICES=<idx>` for the
+    /// trainer subprocess — so `capacity` partition cells run one-per-device
+    /// concurrently. Set by the parallel-backfill scheduler.
+    pub device_index: Option<usize>,
 }
 
 impl ExecCtx {
@@ -148,12 +154,20 @@ impl ExecCtx {
             launch_target: crate::config::launcher::LaunchTarget::Local,
             control: None,
             fb_warm: false,
+            device_index: None,
         }
     }
 
     /// Place stages on `target` (#3). Default `Local`.
     pub fn with_launch_target(mut self, target: crate::config::launcher::LaunchTarget) -> Self {
         self.launch_target = target;
+        self
+    }
+
+    /// Pin the job to GPU `device_index` (Phase-G scheduler). Default `None`
+    /// (box default device).
+    pub fn with_device_index(mut self, device_index: Option<usize>) -> Self {
+        self.device_index = device_index;
         self
     }
 
@@ -235,6 +249,7 @@ struct NodeEnv {
     memory: Arc<tokio::sync::Semaphore>,
     memory_budget_gib: u32,
     launch_target: crate::config::launcher::LaunchTarget,
+    device_index: Option<usize>,
     fb_warm: bool,
     recipe_name: String,
     on_retry: Option<crate::framework::retry::RetryHook>,
@@ -425,6 +440,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
             cache: env.cache.clone(),
             recipe_name: env.recipe_name.clone(),
             launch_target: env.launch_target,
+            device_index: env.device_index,
             fb_warm: env.fb_warm,
             // Durable resume (Phase D): the stage's cache key is its stable
             // per-config fingerprint — a resume train stage keys its recovery
@@ -1115,6 +1131,7 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
         memory: ctx.memory,
         memory_budget_gib: ctx.memory_budget_gib,
         launch_target: ctx.launch_target,
+        device_index: ctx.device_index,
         fb_warm: ctx.fb_warm,
         recipe_name: plan.name().to_string(),
         on_retry: ctx.on_retry,

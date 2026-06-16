@@ -1489,6 +1489,8 @@ async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
                 cache: Arc::new(CacheHandle::job_local(td.path().join("_cache"))),
                 recipe_name: String::new(),
                 launch_target: crate::config::launcher::LaunchTarget::Local,
+                // `blut stage` runs one stage standalone — box default device.
+                device_index: None,
                 // `blut stage` runs one stage standalone (no recipe warm
                 // context) — bill the conservative cold footprint.
                 fb_warm: false,
@@ -2219,38 +2221,64 @@ async fn run_partition(reg: &crate::framework::Registry, cmd: PartitionCommand) 
                 println!("{recipe}/{name}: nothing to backfill (all cells materialized)");
                 return Ok(());
             }
-            eprintln!("backfill {recipe}/{name}: {} cell(s)", targets.len());
-            let (mut ok, mut failed) = (0u32, 0u32);
-            for (i, cell) in targets.iter().enumerate() {
-                eprintln!("[{}/{}] cell {}", i + 1, targets.len(), cell.key);
-                let cell_args = apply_cell_overrides(&base, &cell.overrides);
-                let (outcome, job_id) =
-                    match run_one_recipe(reg, &recipe, cell_args, None, false, launch_target).await {
-                        Ok(jid) => {
-                            ok += 1;
-                            ("done", jid)
-                        }
+            // Phase-G PARALLEL scheduler: spread cells across the launcher's
+            // device set, ONE cell per GPU concurrently (cell i → device
+            // device_set[i % n]; each takes its PER-DEVICE lock, so distinct-GPU
+            // cells don't serialize on the box-wide lock). `buffer_unordered`
+            // bounds concurrency to the device count — capacity=1 → sequential
+            // (byte-identical to the old loop). record_status appends atomically,
+            // so concurrent writes are safe.
+            //
+            // NB the broker RAM-admission gate runs PER cell; on a multi-GPU box
+            // ensure the concurrent cells fit box RAM (cross-cell RAM
+            // coordination is a future slice). On 1 GPU there's no concurrency,
+            // so no over-subscription.
+            use futures::stream::StreamExt;
+            let devices = crate::config::launcher::launcher_for(launch_target).device_set();
+            let n_dev = devices.len().max(1);
+            eprintln!(
+                "backfill {recipe}/{name}: {} cell(s) across {} device(s) {devices:?}",
+                targets.len(),
+                n_dev
+            );
+            let (set, recipe, base, devices) = (&set, &recipe, &base, &devices);
+            let results: Vec<bool> = futures::stream::iter(targets.into_iter().enumerate())
+                .map(|(i, cell)| async move {
+                    let dev = devices[i % n_dev];
+                    let cell_args = apply_cell_overrides(base, &cell.overrides);
+                    eprintln!("[cell {}] → gpu {dev}", cell.key);
+                    let (outcome, job_id) = match run_one_recipe(
+                        reg, recipe, cell_args, None, false, launch_target, Some(dev),
+                    )
+                    .await
+                    {
+                        Ok(jid) => ("done", jid),
                         Err(e) => {
-                            eprintln!("[{}/{}] cell {} FAILED: {e}", i + 1, targets.len(), cell.key);
-                            failed += 1;
+                            eprintln!("[cell {}] FAILED: {e}", cell.key);
                             ("failed", String::new())
                         }
                     };
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                if let Err(e) = set.record_status(&PartitionStatus {
-                    key: cell.key.clone(),
-                    job_id,
-                    outcome: outcome.to_string(),
-                    recorded_at: now,
-                }) {
-                    // A lost status write would silently re-run a completed cell
-                    // on the next backfill — warn loudly rather than swallow it.
-                    eprintln!("warning: could not record status for cell {}: {e}", cell.key);
-                }
-            }
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    if let Err(e) = set.record_status(&PartitionStatus {
+                        key: cell.key.clone(),
+                        job_id,
+                        outcome: outcome.to_string(),
+                        recorded_at: now,
+                    }) {
+                        // A lost status write would silently re-run a completed
+                        // cell on the next backfill — warn rather than swallow.
+                        eprintln!("warning: could not record status for cell {}: {e}", cell.key);
+                    }
+                    outcome == "done"
+                })
+                .buffer_unordered(n_dev)
+                .collect()
+                .await;
+            let ok = results.iter().filter(|d| **d).count();
+            let failed = results.len() - ok;
             eprintln!("backfill done — {ok} materialized, {failed} failed");
             if failed > 0 {
                 return Err(anyhow!("{failed} cell(s) failed (re-run `partition backfill` to retry only those)"));
@@ -2585,7 +2613,7 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                     );
                     return Ok(());
                 }
-                run_one_recipe(reg, &name, raw, None, shared_cache, launch_target).await?;
+                run_one_recipe(reg, &name, raw, None, shared_cache, launch_target, None).await?;
             }
         }
     }
@@ -2604,6 +2632,10 @@ async fn run_one_recipe(
     sweep_fp: Option<crate::framework::ContentHash>,
     shared_cache: bool,
     launch_target: crate::config::launcher::LaunchTarget,
+    // Phase-G scheduler: pin this run to a GPU device. `Some(i)` takes the
+    // PER-DEVICE scheduler lock (so cells on distinct GPUs run concurrently)
+    // and exports CUDA_VISIBLE_DEVICES; `None` = box default + box-wide lock.
+    device_index: Option<usize>,
 ) -> Result<String> {
     use crate::framework::ExecCtx;
 
@@ -2639,6 +2671,9 @@ async fn run_one_recipe(
     // built by the executor carries it → a lamquant train stage routes to the
     // cluster. `Local` (default) is a no-op vs the pre-launcher behaviour.
     ctx = ctx.with_launch_target(launch_target);
+    // Phase-G scheduler: pin this run to a GPU device so the cookbook backend
+    // exports CUDA_VISIBLE_DEVICES for its trainer.
+    ctx = ctx.with_device_index(device_index);
     // Phase 3: thread the warm flag from the recipe's DEFAULTED args (the SAME
     // source `recipe_footprint` reads above) into every StageContext, so a
     // train stage's footprint RECORD keys identically to the admission RESOLVE.
@@ -2689,11 +2724,15 @@ async fn run_one_recipe(
     }
 
     // Cross-process GPU arbitration — recipes that don't hit GPU still pay the
-    // (cheap) lock cost.
-    let lock = match scheduler_lock::acquire_exclusive(
-        format!("blut-recipe:{job_id}"),
-        LockKind::Training,
-    ) {
+    // (cheap) lock cost. Phase-G: a device-pinned run takes its PER-DEVICE
+    // lock, so cells on distinct GPUs run concurrently; an unpinned run keeps
+    // the box-wide lock (one GPU job at a time).
+    let holder = format!("blut-recipe:{job_id}");
+    let lock = match device_index {
+        Some(dev) => scheduler_lock::acquire_exclusive_device(dev, holder, LockKind::Training),
+        None => scheduler_lock::acquire_exclusive(holder, LockKind::Training),
+    };
+    let lock = match lock {
         Ok(l) => l,
         Err(e) => {
             crate::python_kill::unbind_current_job();
@@ -2855,7 +2894,7 @@ async fn run_recipe_sweep(
         }
         eprintln!("[{}/{total}] run (fp={})", i + 1, fp.to_hex());
         let args = project_args(entry.config.json, &key);
-        match run_one_recipe(reg, name, args, Some(fp), shared_cache, launch_target).await {
+        match run_one_recipe(reg, name, args, Some(fp), shared_cache, launch_target, None).await {
             Ok(_job_id) => ran += 1,
             Err(e) => {
                 eprintln!("[{}/{total}] FAILED: {e}", i + 1);

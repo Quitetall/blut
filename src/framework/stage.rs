@@ -150,6 +150,11 @@ pub struct StageContext {
     /// a launcher-aware backend submits to Slurm/Ray when set. Threaded from
     /// the CLI `--launcher` flag via `ExecCtx`.
     pub launch_target: crate::config::launcher::LaunchTarget,
+    /// Phase-G scheduler: the GPU DEVICE index this job is pinned to (or
+    /// `None` for the box default). A launcher-aware backend exports
+    /// `CUDA_VISIBLE_DEVICES=<idx>` for its trainer subprocess so concurrent
+    /// partition cells each run on their OWN GPU. Threaded from `ExecCtx`.
+    pub device_index: Option<usize>,
     /// Never-OOM Phase 3: was the fullband disk cache warmed upstream? A train
     /// stage threads this into its broker footprint (lower per-worker term +
     /// the `|w` calibration key). Carried on the CONTEXT (not the stage Args)
@@ -193,6 +198,7 @@ impl StageContext {
             cache: Arc::new(CacheHandle::job_local(PathBuf::from("/tmp/_cache_test"))),
             recipe_name: String::new(),
             launch_target: crate::config::launcher::LaunchTarget::Local,
+            device_index: None,
             fb_warm: false,
             cache_key: crate::framework::artifact::ContentHash([0u8; 32]),
             attempt: 1,
