@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import sys
 import time
@@ -1139,13 +1140,13 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
             # object as a StageEvent::StageStep, which folds into the queryable
             # metric store (val_r is the headline; `epoch` is the coordinate).
             # Scalars only + the phase tag; flushed so a live tail/TUI sees it.
-            import json as _json
+            # (numeric fields from d, then the metadata keys kind/phase.)
             payload = {k: v for k, v in d.items()
                        if isinstance(v, (int, float)) and not isinstance(v, bool)}
             payload['kind'] = 'epoch'
             if getattr(report, 'phase', None) is not None:
                 payload['phase'] = report.phase
-            print('BLUT_METRIC ' + _json.dumps(payload), flush=True)
+            print('BLUT_METRIC ' + json.dumps(payload), flush=True)
         except Exception as e:
             print(f"[!] blut metric line emit failed (non-fatal): {e}")
 
