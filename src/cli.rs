@@ -2221,64 +2221,80 @@ async fn run_partition(reg: &crate::framework::Registry, cmd: PartitionCommand) 
                 println!("{recipe}/{name}: nothing to backfill (all cells materialized)");
                 return Ok(());
             }
-            // Phase-G PARALLEL scheduler: spread cells across the launcher's
-            // device set, ONE cell per GPU concurrently (cell i → device
-            // device_set[i % n]; each takes its PER-DEVICE lock, so distinct-GPU
-            // cells don't serialize on the box-wide lock). `buffer_unordered`
-            // bounds concurrency to the device count — capacity=1 → sequential
+            // Phase-G PARALLEL scheduler: round-robin cells across the
+            // launcher's device set, then run each device's cells SEQUENTIALLY
+            // (its per-device lock would REJECT a second concurrent cell — so
+            // never start two cells on one GPU), with the devices running
+            // CONCURRENTLY. Result: at most one cell per GPU at a time, up to
+            // `n_dev` cells in flight. capacity=1 → one chain → sequential
             // (byte-identical to the old loop). record_status appends atomically,
-            // so concurrent writes are safe.
+            // so concurrent writes from different device-chains are safe.
             //
             // NB the broker RAM-admission gate runs PER cell; on a multi-GPU box
-            // ensure the concurrent cells fit box RAM (cross-cell RAM
-            // coordination is a future slice). On 1 GPU there's no concurrency,
-            // so no over-subscription.
-            use futures::stream::StreamExt;
+            // ensure the (up to n_dev) concurrent cells fit box RAM (cross-cell
+            // RAM coordination is a future slice). On 1 GPU there's no
+            // concurrency, so no over-subscription.
             let devices = crate::config::launcher::launcher_for(launch_target).device_set();
-            let n_dev = devices.len().max(1);
+            if devices.is_empty() {
+                return Err(anyhow!(
+                    "launcher for {launch_target:?} reports no devices — cannot backfill"
+                ));
+            }
+            let n_dev = devices.len();
             eprintln!(
                 "backfill {recipe}/{name}: {} cell(s) across {} device(s) {devices:?}",
                 targets.len(),
                 n_dev
             );
-            let (set, recipe, base, devices) = (&set, &recipe, &base, &devices);
-            let results: Vec<bool> = futures::stream::iter(targets.into_iter().enumerate())
-                .map(|(i, cell)| async move {
-                    let dev = devices[i % n_dev];
-                    let cell_args = apply_cell_overrides(base, &cell.overrides);
-                    eprintln!("[cell {}] → gpu {dev}", cell.key);
-                    let (outcome, job_id) = match run_one_recipe(
-                        reg, recipe, cell_args, None, false, launch_target, Some(dev),
-                    )
-                    .await
-                    {
-                        Ok(jid) => ("done", jid),
-                        Err(e) => {
-                            eprintln!("[cell {}] FAILED: {e}", cell.key);
-                            ("failed", String::new())
+            // Bucket cells per device (round-robin), preserving cell order.
+            let mut per_device: Vec<Vec<_>> = (0..n_dev).map(|_| Vec::new()).collect();
+            for (i, cell) in targets.into_iter().enumerate() {
+                per_device[i % n_dev].push(cell);
+            }
+            let (set, recipe, base) = (&set, &recipe, &base);
+            let chains = per_device.into_iter().enumerate().map(|(d, cells)| {
+                let dev = devices[d];
+                async move {
+                    let (mut ok, mut failed) = (0usize, 0usize);
+                    for cell in cells {
+                        let cell_args = apply_cell_overrides(base, &cell.overrides);
+                        eprintln!("[gpu {dev}] cell {}", cell.key);
+                        let (outcome, job_id) = match run_one_recipe(
+                            reg, recipe, cell_args, None, false, launch_target, Some(dev),
+                        )
+                        .await
+                        {
+                            Ok(jid) => {
+                                ok += 1;
+                                ("done", jid)
+                            }
+                            Err(e) => {
+                                eprintln!("[gpu {dev}] cell {} FAILED: {e}", cell.key);
+                                failed += 1;
+                                ("failed", String::new())
+                            }
+                        };
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        if let Err(e) = set.record_status(&PartitionStatus {
+                            key: cell.key.clone(),
+                            job_id,
+                            outcome: outcome.to_string(),
+                            recorded_at: now,
+                        }) {
+                            // A lost status write would silently re-run a
+                            // completed cell next backfill — warn, don't swallow.
+                            eprintln!("warning: could not record status for cell {}: {e}", cell.key);
                         }
-                    };
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    if let Err(e) = set.record_status(&PartitionStatus {
-                        key: cell.key.clone(),
-                        job_id,
-                        outcome: outcome.to_string(),
-                        recorded_at: now,
-                    }) {
-                        // A lost status write would silently re-run a completed
-                        // cell on the next backfill — warn rather than swallow.
-                        eprintln!("warning: could not record status for cell {}: {e}", cell.key);
                     }
-                    outcome == "done"
-                })
-                .buffer_unordered(n_dev)
-                .collect()
-                .await;
-            let ok = results.iter().filter(|d| **d).count();
-            let failed = results.len() - ok;
+                    (ok, failed)
+                }
+            });
+            let totals = futures::future::join_all(chains).await;
+            let ok: usize = totals.iter().map(|(o, _)| o).sum();
+            let failed: usize = totals.iter().map(|(_, f)| f).sum();
             eprintln!("backfill done — {ok} materialized, {failed} failed");
             if failed > 0 {
                 return Err(anyhow!("{failed} cell(s) failed (re-run `partition backfill` to retry only those)"));
