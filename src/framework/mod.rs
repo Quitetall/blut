@@ -31,6 +31,7 @@ pub mod control;
 pub mod cookbook;
 pub mod error;
 pub mod executor;
+pub mod gpu_sampler;
 pub mod graph;
 pub mod lineage;
 pub mod plan;

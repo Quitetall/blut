@@ -574,6 +574,10 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
     // E1: fold this run's StageStep metrics into the queryable store so
     // `final_metric` / `top_runs_by_metric` / `blut compare` see it.
     db.record_metrics(&crate::framework::lineage::fold_metrics(job_id)?)?;
+    // E2: fold the GPU sampler's `gpu_gauge` samples into the gauges
+    // table so `gpu_saturation` / `gpu_wasted` are queryable — the
+    // first-class "GPU not wasted" number (owner directive).
+    db.record_gauges(&crate::framework::lineage::fold_gauges(job_id)?)?;
     Ok(())
 }
 

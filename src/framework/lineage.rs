@@ -95,6 +95,15 @@ pub fn fold_metrics(job_id: &str) -> Result<Vec<crate::lineage_db::MetricRow>> {
         let Some(obj) = update.as_object() else {
             continue;
         };
+        // E2: gauge / sentinel events ride the SAME StageStep channel but
+        // are NOT training metrics — route them out so their numeric
+        // fields (gpu_util, …) don't pollute the metrics table. They are
+        // folded separately by `fold_gauges`.
+        if let Some(kind) = obj.get("kind").and_then(|k| k.as_str()) {
+            if kind == "gpu_gauge" || kind == "gpu_starved" {
+                continue;
+            }
+        }
         let step = obj
             .get("step")
             .and_then(|v| v.as_i64())
@@ -131,6 +140,54 @@ pub fn fold_metrics(job_id: &str) -> Result<Vec<crate::lineage_db::MetricRow>> {
             metric,
             value,
             wall_unix: None,
+        });
+    }
+    Ok(rows)
+}
+
+/// Fold a job's `gpu_gauge` StageStep samples (E2) out of `status.jsonl`
+/// into [`GaugeRow`](crate::lineage_db::GaugeRow)s for the `gauges`
+/// table. Sibling of [`fold_metrics`]: the live GPU sampler
+/// (`gpu_sampler`) emits one `StageStep{kind:"gpu_gauge", wall_unix,
+/// gpu_util, gpu_mem_mib, gpu_temp_c, gpu_power_w}` per sample; this
+/// reconstructs them so `gpu_saturation` / `gpu_wasted` can be derived
+/// from the queryable store (the lineage DB stays rebuildable from
+/// status.jsonl, never a second source of truth).
+///
+/// `gpu_starved` sentinels are skipped here — they carry no time-series
+/// gauge value (they are a Log-pane signal, surfaced from status.jsonl
+/// directly). A sample missing `wall_unix` is dropped (the table keys on
+/// it).
+pub fn fold_gauges(job_id: &str) -> Result<Vec<crate::lineage_db::GaugeRow>> {
+    use crate::lineage_db::GaugeRow;
+    let id = jobs::resolve_job_id(job_id)?;
+    let mut rows: Vec<GaugeRow> = Vec::new();
+    for line in jobs::read_status_lines(&id)? {
+        let Ok(StageEvent::StageStep { node_idx, update, .. }) =
+            serde_json::from_str::<StageEvent>(&line)
+        else {
+            continue;
+        };
+        let Some(obj) = update.as_object() else {
+            continue;
+        };
+        if obj.get("kind").and_then(|k| k.as_str()) != Some("gpu_gauge") {
+            continue;
+        }
+        let Some(wall_unix) = obj.get("wall_unix").and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        let f = |k: &str| obj.get(k).and_then(|v| v.as_f64());
+        rows.push(GaugeRow {
+            job_id: id.clone(),
+            node_idx: node_idx as i64,
+            wall_unix,
+            gpu_util: f("gpu_util"),
+            gpu_mem_mib: f("gpu_mem_mib"),
+            gpu_temp_c: f("gpu_temp_c"),
+            gpu_power_w: f("gpu_power_w"),
+            host_ram_mib: f("host_ram_mib"),
+            host_disk_free_mib: f("host_disk_free_mib"),
         });
     }
     Ok(rows)
@@ -250,5 +307,59 @@ mod tests {
         s.per_stage.insert("a".into(), (2, 1));
         s.per_stage.insert("b".into(), (0, 3));
         assert_eq!(s.totals(), (2, 4));
+    }
+
+    /// E2 round-trip: a `status.jsonl` mixing a real training metric, two
+    /// `gpu_gauge` samples, and a `gpu_starved` sentinel must fold so the
+    /// gauges land in `fold_gauges` (sentinel skipped) and NONE of the
+    /// gauge/sentinel fields leak into `fold_metrics` (the guard), while
+    /// the genuine training metric still does.
+    #[test]
+    fn fold_gauges_routes_gpu_samples_and_metrics_guard_excludes_them() {
+        let _g = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let prev = std::env::var("LAMU_TRAIN_JOBS_DIR").ok();
+        unsafe {
+            std::env::set_var("LAMU_TRAIN_JOBS_DIR", td.path());
+        }
+
+        let job = "20260616-000000-e2gauge";
+        let jdir = td.path().join(job);
+        std::fs::create_dir_all(&jdir).unwrap();
+        // Outer `"kind":"stage_step"` is the StageEvent tag; the INNER
+        // `update.kind` ("gpu_gauge"/"gpu_starved") is the E2 routing key.
+        let lines = [
+            r#"{"kind":"stage_step","node_idx":1,"stage_name":"train","update":{"step":10,"val_r":0.42}}"#,
+            r#"{"kind":"stage_step","node_idx":1,"stage_name":"train","update":{"kind":"gpu_gauge","wall_unix":1000,"gpu_util":95.0,"gpu_mem_mib":18000.0,"gpu_temp_c":70.0,"gpu_power_w":300.0}}"#,
+            r#"{"kind":"stage_step","node_idx":1,"stage_name":"train","update":{"kind":"gpu_gauge","wall_unix":1002,"gpu_util":12.0,"gpu_mem_mib":17000.0,"gpu_temp_c":65.0,"gpu_power_w":120.0}}"#,
+            r#"{"kind":"stage_step","node_idx":1,"stage_name":"train","update":{"kind":"gpu_starved","wall_unix":1010,"gpu_util":5.0,"samples_below":5,"floor_pct":25.0}}"#,
+        ];
+        std::fs::write(jdir.join("status.jsonl"), lines.join("\n") + "\n").unwrap();
+
+        let gauges = fold_gauges(job).unwrap();
+        assert_eq!(gauges.len(), 2, "two gpu_gauge samples (starved sentinel skipped)");
+        assert_eq!(gauges[0].wall_unix, 1000);
+        assert_eq!(gauges[0].gpu_util, Some(95.0));
+        assert_eq!(gauges[0].gpu_mem_mib, Some(18000.0));
+        assert_eq!(gauges[1].gpu_util, Some(12.0));
+
+        let metrics = fold_metrics(job).unwrap();
+        assert!(
+            metrics
+                .iter()
+                .all(|m| m.metric != "gpu_util" && m.metric != "floor_pct" && m.metric != "samples_below"),
+            "gauge/sentinel fields must NOT pollute the metrics table"
+        );
+        assert!(
+            metrics.iter().any(|m| m.metric == "val_r"),
+            "the real training metric still folds"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("LAMU_TRAIN_JOBS_DIR", v),
+                None => std::env::remove_var("LAMU_TRAIN_JOBS_DIR"),
+            }
+        }
     }
 }

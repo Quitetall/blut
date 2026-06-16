@@ -550,6 +550,28 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         };
 
         let stage_started = Instant::now();
+
+        // ── GPU-saturation sampler (E2) ─────────────────────────────
+        // While a GPU stage holds the device, sample nvidia-smi so the
+        // run's utilization is MEASURED, not assumed (owner directive:
+        // "GPU must run close to maximum, never wasted"). Gated on the
+        // Gpu resource — a CPU-only stage (manifest build, …) has no GPU
+        // window to sample. The samples land in status.jsonl and fold
+        // into the gauges table at run-end; a sustained sub-floor streak
+        // raises a `gpu_starved` sentinel. Best-effort: no nvidia-smi ⇒
+        // no samples, run unaffected.
+        let gpu_sampler = task
+            .stage
+            .resources()
+            .contains(&Resource::Gpu)
+            .then(|| {
+                crate::framework::gpu_sampler::spawn_gpu_sampler(
+                    env.status.clone(),
+                    idx,
+                    stage_name.clone(),
+                )
+            });
+
         let run_fut =
             task.stage
                 .run_erased(&stage_ctx, task.input.clone(), task.args.clone());
@@ -561,6 +583,14 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
             stage_started,
         )
         .await;
+
+        // The run window is over — stop sampling before releasing the GPU
+        // permit (any later device activity isn't this stage's). Runs on
+        // every exit path from this attempt (the match below only happens
+        // after).
+        if let Some(h) = gpu_sampler {
+            h.stop().await;
+        }
         // Permits drop here, releasing the resource for queued stages
         // (including during a backoff before the next attempt).
         drop(permits);
