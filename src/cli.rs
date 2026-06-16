@@ -319,6 +319,22 @@ enum LineageCommand {
     /// Rebuild the lineage index from the job dirs (the DB is a derived index —
     /// safe to delete + reindex).
     Reindex,
+    /// FRESHNESS (G): is a job's output stale? Reports code-drift (the run's
+    /// git SHA vs current HEAD — a STALE result means a re-run would
+    /// re-execute, since the cache key includes code_sha). With
+    /// `--data-version <v>`, also flags any produced artifact whose recorded
+    /// `data_version` (in its metadata `extra`) differs from `<v>`.
+    Freshness {
+        /// Job id (or unique prefix).
+        id: String,
+        /// Current data/manifest version to check artifact `extra.data_version`
+        /// against (optional — code-drift is always reported).
+        #[arg(long)]
+        data_version: Option<String>,
+        /// Emit as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1118,7 +1134,83 @@ fn run_lineage_cmd(cmd: LineageCommand) -> Result<()> {
         LineageCommand::Show { id, json } => run_lineage(&id, json),
         LineageCommand::Trace { hash, json } => run_lineage_trace(&hash, json),
         LineageCommand::Reindex => run_lineage_reindex(),
+        LineageCommand::Freshness {
+            id,
+            data_version,
+            json,
+        } => run_lineage_freshness(&id, data_version, json),
     }
+}
+
+/// FRESHNESS (G): report whether a job's output is stale. Code-drift is
+/// always reported (the run's git SHA vs HEAD — STALE ⇒ a re-run
+/// re-executes because the cache key includes code_sha). With
+/// `--data-version`, also flag artifacts whose recorded `extra.data_version`
+/// differs from the supplied current value.
+fn run_lineage_freshness(id_query: &str, data_version: Option<String>, json: bool) -> Result<()> {
+    let job_id = crate::jobs::resolve_job_id(id_query).map_err(|e| anyhow!("{e}"))?;
+    let db = crate::lineage_db::LineageDb::open().map_err(|e| anyhow!("{e}"))?;
+    let code = db.code_freshness(&job_id).map_err(|e| anyhow!("{e}"))?;
+    let short = |h: &str| h.get(..12).unwrap_or(h).to_string();
+
+    // Optional data-version freshness: compare each produced artifact's
+    // recorded `extra.data_version` against the supplied current value.
+    let mut data_stale: Vec<(String, String)> = Vec::new(); // (stage, recorded)
+    let mut data_checked = 0usize;
+    if data_version.is_some() {
+        let current = data_version.as_deref().unwrap();
+        for rec in crate::framework::lineage::scan_artifacts(&job_id).map_err(|e| anyhow!("{e}"))? {
+            if let Some(v) = rec.meta.extra.get("data_version").and_then(|v| v.as_str()) {
+                data_checked += 1;
+                if v != current {
+                    data_stale.push((
+                        rec.meta.produced_by_stage.clone().unwrap_or_default(),
+                        v.to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    if json {
+        let v = serde_json::json!({
+            "job_id": job_id,
+            "code": code,
+            "data_version_current": data_version,
+            "data_artifacts_checked": data_checked,
+            "data_stale": data_stale.iter()
+                .map(|(s, r)| serde_json::json!({ "stage": s, "recorded": r }))
+                .collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+
+    match &code {
+        crate::lineage_db::CodeFreshness::Fresh { git_sha } => {
+            println!("job {job_id}: code FRESH (built at HEAD {})", short(git_sha))
+        }
+        crate::lineage_db::CodeFreshness::Stale { built_at, head } => println!(
+            "job {job_id}: code STALE (built at {}, HEAD is {} — a re-run re-executes)",
+            short(built_at),
+            short(head)
+        ),
+        crate::lineage_db::CodeFreshness::Unknown => {
+            println!("job {job_id}: code UNKNOWN (no recorded git SHA to compare)")
+        }
+    }
+    if let Some(current) = &data_version {
+        if data_stale.is_empty() {
+            println!("data: FRESH ({data_checked} artifact(s) at data_version {current})");
+        } else {
+            for (stage, recorded) in &data_stale {
+                println!(
+                    "data: STALE — {stage} built from data_version {recorded}, current is {current}"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reproducibility query: the full upstream provenance chain that produced a

@@ -112,6 +112,46 @@ pub struct RunRow {
     pub vram_mib: Option<i64>,
 }
 
+/// FRESHNESS verdict for a run's code (Phase G): did the code that built
+/// this output drift from the current `HEAD`? `Stale` means a re-run would
+/// re-execute (the cache key includes `code_sha`); `Unknown` means there
+/// was no recorded git SHA or no git HEAD to compare against (not stale —
+/// just unverifiable).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "freshness", rename_all = "snake_case")]
+pub enum CodeFreshness {
+    Fresh { git_sha: String },
+    Stale { built_at: String, head: String },
+    Unknown,
+}
+
+/// Pure freshness verdict (testable without a real git HEAD): compare a
+/// run's recorded git SHA against the current HEAD.
+fn freshness_verdict(recorded: Option<String>, head: Option<String>) -> CodeFreshness {
+    match (recorded, head) {
+        (Some(r), Some(h)) if r == h => CodeFreshness::Fresh { git_sha: r },
+        (Some(r), Some(h)) => CodeFreshness::Stale {
+            built_at: r,
+            head: h,
+        },
+        // No recorded SHA, or no git HEAD to compare against.
+        _ => CodeFreshness::Unknown,
+    }
+}
+
+impl CodeFreshness {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            CodeFreshness::Fresh { .. } => "FRESH",
+            CodeFreshness::Stale { .. } => "STALE",
+            CodeFreshness::Unknown => "UNKNOWN",
+        }
+    }
+    pub fn is_stale(&self) -> bool {
+        matches!(self, CodeFreshness::Stale { .. })
+    }
+}
+
 /// One materialized artifact (a stage output), located by content hash.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactRow {
@@ -453,6 +493,16 @@ impl LineageDb {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| TrainError::other(format!("collect find_artifacts: {e}")))?;
         Ok(rows)
+    }
+
+    /// FRESHNESS (Phase G): is a job's output still current, or was it
+    /// built with code that has since drifted? The cache key already busts
+    /// on `code_sha` + `input_hash` (so a re-run RE-EXECUTES a stale node);
+    /// this just SURFACES that verdict without re-running — by comparing the
+    /// git SHA recorded for the run against the current `HEAD`.
+    pub fn code_freshness(&self, job_id: &str) -> Result<CodeFreshness> {
+        let recorded = self.get_run(job_id)?.and_then(|r| r.git_sha);
+        Ok(freshness_verdict(recorded, git_head_sha()))
     }
 
     /// A run's provenance row by job id.
@@ -807,5 +857,26 @@ mod tests {
         db.record_edge(&EdgeRow { job_id: "j".into(), to_idx: 0, input_hash: "a".into(), output_hash: "b".into() }).unwrap();
         let chain = db.trace("a").unwrap();
         assert!(chain.len() <= 2, "cycle guard bounds the walk");
+    }
+
+    #[test]
+    fn freshness_verdict_classifies_code_drift() {
+        // Same SHA → FRESH.
+        assert_eq!(
+            freshness_verdict(Some("abc123".into()), Some("abc123".into())),
+            CodeFreshness::Fresh { git_sha: "abc123".into() }
+        );
+        // Different SHA → STALE (built_at vs head).
+        assert_eq!(
+            freshness_verdict(Some("old".into()), Some("new".into())),
+            CodeFreshness::Stale { built_at: "old".into(), head: "new".into() }
+        );
+        // Missing either side → UNKNOWN (not stale — just unverifiable).
+        assert_eq!(freshness_verdict(None, Some("h".into())), CodeFreshness::Unknown);
+        assert_eq!(freshness_verdict(Some("r".into()), None), CodeFreshness::Unknown);
+        assert_eq!(freshness_verdict(None, None), CodeFreshness::Unknown);
+        // is_stale only true for Stale.
+        assert!(freshness_verdict(Some("a".into()), Some("b".into())).is_stale());
+        assert!(!freshness_verdict(Some("a".into()), Some("a".into())).is_stale());
     }
 }
