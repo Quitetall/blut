@@ -30,8 +30,9 @@
 | `validate_subband.py`, `validate_cross_dataset.py` | per-tool eval SOTs (`../student/eval_fullband.py`, `../snn/eval_event_fpr.py`) |
 | `manifest_utils.py` legacy loaders | `DatasetManifest.load()` (typed) |
 
-Kept in place for back-compat / reproduction of pre-v3 results; candidates for
-relocation to the repo `legacy/` tree in a later quiescent pass.
+Kept in place for back-compat / reproduction of pre-v3 results. (The
+meta-repo `legacy/` tree once floated as a relocation target has since been
+retired; these stay in-tree as documented back-compat shims.)
 
 ## Tests
 `test_build_split.py` (split builder).
