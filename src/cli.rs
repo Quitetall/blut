@@ -157,6 +157,12 @@ enum Command {
         #[command(subcommand)]
         cmd: FootprintCommand,
     },
+    /// Named sensors (G2): observe external state (GPU lock, auto-train
+    /// policy gates) and report a typed READY/SKIP/WAIT outcome.
+    Sensor {
+        #[command(subcommand)]
+        cmd: SensorCommand,
+    },
     /// Run a single stage standalone — Unix-style. Reads erased
     /// input bytes from stdin (or skipped for graph-input stages),
     /// writes the produced erased artifact bytes to stdout.
@@ -241,6 +247,25 @@ enum CacheCommand {
     Stats {
         /// Job id (or unique prefix).
         id: String,
+        /// Emit as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SensorCommand {
+    /// List the named sensors + their current outcome.
+    List {
+        /// Emit as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Evaluate ONE named sensor and print its outcome (exit 0 = READY,
+    /// 1 = SKIP/WAIT) — usable as a cron/daemon gate.
+    Eval {
+        /// Sensor name (see `blut sensor list`).
+        name: String,
         /// Emit as JSON.
         #[arg(long)]
         json: bool,
@@ -672,6 +697,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Plan { cmd }) => run_plan_cmd(&reg, cmd).await,
         Some(Command::Cache { cmd }) => run_cache_cmd(cmd),
         Some(Command::Footprint { cmd }) => run_footprint_cmd(cmd),
+        Some(Command::Sensor { cmd }) => run_sensor_cmd(cmd),
         Some(Command::Stage { cmd }) => run_stage_cmd(cmd).await,
         Some(Command::Tui { check }) => {
             if check {
@@ -851,6 +877,66 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                 .map_err(|e| anyhow!("render plan: {e}"))?;
             print!("{rendered}");
             Ok(())
+        }
+    }
+}
+
+fn run_sensor_cmd(cmd: SensorCommand) -> Result<()> {
+    use crate::sensor;
+    match cmd {
+        SensorCommand::List { json } => {
+            let sensors = sensor::registry();
+            if json {
+                let arr: Vec<serde_json::Value> = sensors
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "name": s.name(),
+                            "description": s.description(),
+                            "outcome": s.evaluate(),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+                return Ok(());
+            }
+            let (hname, hstatus, hdetail) = ("sensor", "status", "detail");
+            println!("{hname:<20} {hstatus:<6} {hdetail}");
+            for s in &sensors {
+                let o = s.evaluate();
+                let detail = if o.reason().is_empty() {
+                    s.description()
+                } else {
+                    o.reason()
+                };
+                let (name, tag) = (s.name(), o.tag());
+                println!("{name:<20} {tag:<6} {detail}");
+            }
+            Ok(())
+        }
+        SensorCommand::Eval { name, json } => {
+            let s = sensor::find(&name)
+                .ok_or_else(|| anyhow!("unknown sensor '{name}' — see `blut sensor list`"))?;
+            let o = s.evaluate();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({ "name": s.name(), "outcome": o })
+                    )?
+                );
+            } else {
+                println!("{}: {} {}", s.name(), o.tag(), o.reason());
+            }
+            // Exit code is the contract: 0 = READY, 1 = SKIP/WAIT — so a
+            // cron/daemon can gate a launch on `blut sensor eval <name>`.
+            // We already printed the outcome, so a bare non-zero exit (not
+            // an Err — which would print an ugly "Error:" line) is right.
+            if matches!(o, crate::sensor::SensorOutcome::Ready) {
+                Ok(())
+            } else {
+                std::process::exit(1);
+            }
         }
     }
 }
