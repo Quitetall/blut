@@ -121,7 +121,7 @@ pub struct RunRow {
 #[serde(tag = "freshness", rename_all = "snake_case")]
 pub enum CodeFreshness {
     Fresh { git_sha: String },
-    Stale { built_at: String, head: String },
+    Stale { built_sha: String, head: String },
     Unknown,
 }
 
@@ -131,7 +131,7 @@ fn freshness_verdict(recorded: Option<String>, head: Option<String>) -> CodeFres
     match (recorded, head) {
         (Some(r), Some(h)) if r == h => CodeFreshness::Fresh { git_sha: r },
         (Some(r), Some(h)) => CodeFreshness::Stale {
-            built_at: r,
+            built_sha: r,
             head: h,
         },
         // No recorded SHA, or no git HEAD to compare against.
@@ -866,10 +866,10 @@ mod tests {
             freshness_verdict(Some("abc123".into()), Some("abc123".into())),
             CodeFreshness::Fresh { git_sha: "abc123".into() }
         );
-        // Different SHA → STALE (built_at vs head).
+        // Different SHA → STALE (built_sha vs head).
         assert_eq!(
             freshness_verdict(Some("old".into()), Some("new".into())),
-            CodeFreshness::Stale { built_at: "old".into(), head: "new".into() }
+            CodeFreshness::Stale { built_sha: "old".into(), head: "new".into() }
         );
         // Missing either side → UNKNOWN (not stale — just unverifiable).
         assert_eq!(freshness_verdict(None, Some("h".into())), CodeFreshness::Unknown);

@@ -1157,8 +1157,7 @@ fn run_lineage_freshness(id_query: &str, data_version: Option<String>, json: boo
     // recorded `extra.data_version` against the supplied current value.
     let mut data_stale: Vec<(String, String)> = Vec::new(); // (stage, recorded)
     let mut data_checked = 0usize;
-    if data_version.is_some() {
-        let current = data_version.as_deref().unwrap();
+    if let Some(current) = data_version.as_deref() {
         for rec in crate::framework::lineage::scan_artifacts(&job_id).map_err(|e| anyhow!("{e}"))? {
             if let Some(v) = rec.meta.extra.get("data_version").and_then(|v| v.as_str()) {
                 data_checked += 1;
@@ -1190,9 +1189,9 @@ fn run_lineage_freshness(id_query: &str, data_version: Option<String>, json: boo
         crate::lineage_db::CodeFreshness::Fresh { git_sha } => {
             println!("job {job_id}: code FRESH (built at HEAD {})", short(git_sha))
         }
-        crate::lineage_db::CodeFreshness::Stale { built_at, head } => println!(
+        crate::lineage_db::CodeFreshness::Stale { built_sha, head } => println!(
             "job {job_id}: code STALE (built at {}, HEAD is {} — a re-run re-executes)",
-            short(built_at),
+            short(built_sha),
             short(head)
         ),
         crate::lineage_db::CodeFreshness::Unknown => {
