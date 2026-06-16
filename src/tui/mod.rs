@@ -266,6 +266,12 @@ struct App {
     /// Flat recipe catalog (union of the registry's cookbooks), collected
     /// once at startup. `filter_recipes` / `recipe_menu` index into this.
     catalog: Vec<&'static crate::recipes::RecipeDef>,
+    /// F1: after a TUI-launched spawn, auto-focus the new job's Log on the
+    /// first refresh that surfaces it. `focus_baseline_top` is the newest
+    /// job id at spawn time; jobs are newest-first, so when index 0 differs
+    /// from it the new job has appeared and we jump to its live tail.
+    pending_focus: bool,
+    focus_baseline_top: Option<String>,
 }
 
 /// Two-press confirm window for the destructive Reset actions, matching
@@ -308,6 +314,8 @@ impl App {
             reset_armed: None,
             registry,
             catalog,
+            pending_focus: false,
+            focus_baseline_top: None,
         }
     }
 
@@ -398,8 +406,33 @@ impl App {
         };
         let recipe = *recipe;
         let buffer = buffer.clone();
+        // U3 (F2): run the SAME schema preflight the CLI does (B/P5) BEFORE
+        // launching, so a malformed / wrong-typed / missing arg surfaces a
+        // precise message in-TUI and the Editor STAYS OPEN to fix — instead
+        // of a detached job that only shows `Failed` minutes later. The
+        // catalog holds the recipe's `args_schema_fn`; on any reject we set
+        // the status and return without spawning.
+        if let Err(msg) = self.validate_editor_args(recipe, &buffer) {
+            self.set_status(msg);
+            return;
+        }
         self.spawn_recipe(recipe, &buffer);
         self.overlay = Overlay::None;
+    }
+
+    /// Validate an Editor buffer for `recipe` against its arg schema. `Ok` =
+    /// safe to launch; `Err(msg)` is a human-facing reason (bad JSON, or a
+    /// schema violation) for the status bar. An unknown recipe / missing
+    /// schema is permissive (serde + the CLI compile backstop it).
+    fn validate_editor_args(&self, recipe: &str, buffer: &str) -> Result<(), String> {
+        let raw: serde_json::Value = serde_json::from_str(buffer)
+            .map_err(|e| format!("args are not valid JSON: {e}"))?;
+        if let Some(def) = self.catalog.iter().find(|r| r.name == recipe) {
+            let schema = (def.args_schema_fn)();
+            crate::recipes::recipe::validate_args_against_schema(recipe, &schema, &raw)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     /// Open the args Editor overlay for a recipe, prefilled with the
@@ -430,10 +463,17 @@ impl App {
             .stderr(std::process::Stdio::null())
             .spawn()
         {
-            Ok(child) => self.set_status(format!(
-                "spawned '{name}' (pid {}). Check jobs list next tick.",
-                child.id()
-            )),
+            Ok(child) => {
+                self.set_status(format!(
+                    "spawned '{name}' (pid {}) — focusing its log when it appears…",
+                    child.id()
+                ));
+                // F1: remember the current newest job so refresh_jobs can
+                // detect the new one (which lands at index 0, newest-first)
+                // and jump straight to its live status.jsonl tail.
+                self.focus_baseline_top = self.jobs.first().map(|j| j.id.clone());
+                self.pending_focus = true;
+            }
             Err(e) => self.set_status(format!("spawn '{name}' failed: {e}")),
         }
     }
@@ -503,6 +543,19 @@ impl App {
                 } else {
                     let cur = self.selected.selected().unwrap_or(0);
                     self.selected.select(Some(cur.min(self.jobs.len() - 1)));
+                }
+                // F1: a TUI-launched spawn is pending focus — when its job
+                // surfaces (a new newest id at index 0, distinct from the
+                // pre-spawn baseline), select it + jump to the Log tail.
+                if self.pending_focus {
+                    if let Some(top) = self.jobs.first() {
+                        if Some(&top.id) != self.focus_baseline_top.as_ref() {
+                            self.pending_focus = false;
+                            self.selected.select(Some(0));
+                            self.set_view(View::Log);
+                            self.refresh_log();
+                        }
+                    }
                 }
             }
             Err(e) => self.set_status(format!("list_jobs failed: {e}")),
@@ -2398,6 +2451,27 @@ mod state_tests {
                 r.name
             );
         }
+    }
+
+    #[test]
+    fn editor_args_validation_gates_launch() {
+        // F2/U3: the Editor preflights args against the recipe schema before
+        // spawning, so a non-AI human gets a precise message in-TUI.
+        let a = app();
+        let recipe = a.catalog.first().expect("fixture has a recipe").name;
+        // The prefill is valid by construction → accepted.
+        let good = a.registry.prefill_args(recipe);
+        assert!(
+            a.validate_editor_args(recipe, &good).is_ok(),
+            "the prefilled buffer must validate for `{recipe}`"
+        );
+        // Malformed JSON → rejected (parse fails before the schema check).
+        let bad = a.validate_editor_args(recipe, "{not json");
+        assert!(bad.is_err(), "malformed JSON must be rejected");
+        assert!(bad.unwrap_err().contains("JSON"), "message names the JSON fault");
+        // Unknown recipe + valid JSON → permissive (serde / CLI compile
+        // backstop it); the TUI must not block on a name it can't resolve.
+        assert!(a.validate_editor_args("no_such_recipe_xyz", "{}").is_ok());
     }
 
     // ── recipe_menu hotkey assignment ───────────────────────────────
