@@ -11,7 +11,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from soap_optimizer import SOAP
+from lamquant.ingredients.optimizers.soap_optimizer import SOAP
 
 pytestmark = pytest.mark.l2
 

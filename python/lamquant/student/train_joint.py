@@ -1659,7 +1659,7 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
                   f"stable={scheduler.decay_start - scheduler.warmup_epochs}ep, "
                   f"decay={scheduler.decay_epochs}ep)")
     elif lr_schedule == 'muon':
-        from muon_optimizer import Muon, split_params_for_muon
+        from lamquant.ingredients.optimizers.muon_optimizer import Muon, split_params_for_muon
         muon_p, adamw_p = split_params_for_muon(codec)
         optimizer = Muon([
             dict(params=muon_p, lr=0.02, momentum=0.95, weight_decay=0, use_muon=True),
@@ -1668,7 +1668,7 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         ])
         print(f"[*] Optimizer: Muon (lr=0.02, 2D={len(muon_p)}, 1D={len(adamw_p)})")
     elif lr_schedule == 'soap':
-        from soap_optimizer import SOAP
+        from lamquant.ingredients.optimizers.soap_optimizer import SOAP
         all_params = []
         for g in enc_groups + [dec_group]:
             all_params.extend(g['params'])

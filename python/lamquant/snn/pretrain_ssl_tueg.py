@@ -456,7 +456,7 @@ def main() -> None:
             [q for _n, q in named if q.requires_grad],
             lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
     else:
-        from esoap import ESOAP
+        from lamquant.ingredients.optimizers.esoap import ESOAP
         _linear_suffixes = ("in_proj.weight", "x_proj.weight",
                             "out_proj.weight", "spatial_mix.weight")
         esoap_linear, adamw_rest = [], []

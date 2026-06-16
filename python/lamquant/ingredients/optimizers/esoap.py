@@ -36,7 +36,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from cautious_wd import cautious_decoupled_wd_
+from lamquant.ingredients.optimizers.cautious_wd import cautious_decoupled_wd_
 
 __all__ = ["ESOAP"]
 

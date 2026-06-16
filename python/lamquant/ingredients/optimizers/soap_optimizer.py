@@ -11,7 +11,7 @@ import torch
 import torch.optim as optim
 from itertools import chain
 
-from cautious_wd import cautious_decoupled_wd_
+from lamquant.ingredients.optimizers.cautious_wd import cautious_decoupled_wd_
 
 
 class SOAP(optim.Optimizer):

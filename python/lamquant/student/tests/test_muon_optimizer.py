@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from muon_optimizer import (
+from lamquant.ingredients.optimizers.muon_optimizer import (
     Muon,
     adam_update,
     muon_update,
