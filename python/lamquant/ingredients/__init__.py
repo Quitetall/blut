@@ -7,3 +7,23 @@ below the Rust ``Stage``. ``optimizers/`` is the first ingredient kind
 (ADR 0050); the ``IngredientSpec`` registry + the remaining kinds land in
 later phases of the cookbook rebuild.
 """
+
+from lamquant.ingredients.registry import (
+    build_ingredient,
+    get_spec,
+    list_ingredients,
+    register_ingredient,
+)
+from lamquant.ingredients.spec import KINDS, IngredientSpec
+
+# Register the built-in optimizer specs (ADR 0050) on package import.
+from lamquant.ingredients.optimizers import _specs as _optimizer_specs  # noqa: F401
+
+__all__ = [
+    "build_ingredient",
+    "get_spec",
+    "list_ingredients",
+    "register_ingredient",
+    "IngredientSpec",
+    "KINDS",
+]
