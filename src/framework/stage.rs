@@ -315,6 +315,17 @@ pub trait Stage: Send + Sync + 'static {
     fn divergence_check(&self, _step: &serde_json::Value) -> bool {
         false
     }
+
+    /// A fingerprint of this stage's EXTERNAL code (e.g. the SHA-256 of the
+    /// Python training script it shells), folded into the cache key (S4 / P9).
+    /// Default `None`: the stage's behavior lives entirely in the compiled
+    /// binary, covered by the build git hash the Executor already mixes in. A
+    /// SCRIPT-backed stage MUST override — else editing a kernel with identical
+    /// args silently reuses the stale checkpoint (the data-loss gap G9). The
+    /// hash catches even an UNCOMMITTED edit (which the git hash misses).
+    fn code_fingerprint(&self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// Object-safe shadow. Implemented automatically for every
@@ -388,6 +399,10 @@ pub trait StageDyn: Send + Sync + 'static {
 
     /// Erased [`Stage::divergence_check`] (the step payload is already erased).
     fn divergence_check(&self, step: &serde_json::Value) -> bool;
+
+    /// Erased [`Stage::code_fingerprint`] — the script/code hash folded into the
+    /// cache key (S4).
+    fn code_fingerprint(&self) -> Option<Vec<u8>>;
 }
 
 #[async_trait]
@@ -552,6 +567,10 @@ impl<S: Stage> StageDyn for S {
 
     fn divergence_check(&self, step: &serde_json::Value) -> bool {
         <S as Stage>::divergence_check(self, step)
+    }
+
+    fn code_fingerprint(&self) -> Option<Vec<u8>> {
+        <S as Stage>::code_fingerprint(self)
     }
 }
 

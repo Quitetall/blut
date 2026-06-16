@@ -872,6 +872,22 @@ fn gather_input_hash(
 
 /// Build the `NodeTask` for `node_id`, reading its input + input_hash
 /// from the coordinator's maps and computing the cache key.
+/// The code identity that keys the cache for a node (S4 / P9): the build-time
+/// git hash of THIS binary (catches a committed engine/cookbook change) folded
+/// with the stage's own `code_fingerprint` (the script content hash — catches an
+/// UNCOMMITTED kernel edit the git hash misses). A pure stage with no external
+/// code returns `None` and is keyed on the git hash alone.
+fn node_code_sha(stage: &dyn StageDyn) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(env!("BLUT_GIT_HASH").as_bytes());
+    if let Some(fp) = stage.code_fingerprint() {
+        h.update([0u8]);
+        h.update(&fp);
+    }
+    h.finalize().to_vec()
+}
+
 fn build_task(
     node: &crate::framework::plan::PlanNode,
     node_idx: u32,
@@ -883,11 +899,13 @@ fn build_task(
     let preds = predecessors(edges, node.id);
     let input = gather_input(node.id, &preds, outputs)?;
     let input_hash = gather_input_hash(node.id, &preds, logical_outputs)?;
+    let code_sha = node_code_sha(node.stage.as_ref());
     let key = CacheHandle::key_for_canon_bytes(
         node.stage.name(),
         node.stage.schema(),
         input_hash,
         &node.canon_args,
+        &code_sha,
     );
     // Resolve retry/timeout: a per-node override wins over the stage const.
     let retry = node.retry.unwrap_or_else(|| node.stage.retry());
@@ -1710,14 +1728,21 @@ fn compute_logical_output_hash(
             .output_content_hash(output)
             .unwrap_or_else(|| content_hash_from_erased(output));
     }
+    // S4: fold `code_sha` into the NONDET synthesized fingerprint too — else a
+    // kernel edit reuses the stale checkpoint through the DOWNSTREAM path (a
+    // nondet stage's output hash is synthesized from this, not its bytes), even
+    // after the direct cache key changes. Bumped v1→v2 to match the cache bust.
     use sha2::{Digest, Sha256};
+    let code_sha = node_code_sha(stage);
     let mut h = Sha256::new();
-    h.update(b"blut.nondet.v1");
+    h.update(b"blut.nondet.v2");
     h.update([0u8]);
     h.update(stage_name.as_bytes());
     h.update([0u8]);
     h.update(schema.to_le_bytes());
     h.update(input_hash.0);
+    h.update((code_sha.len() as u64).to_le_bytes());
+    h.update(&code_sha);
     h.update(canon_args);
     ContentHash(h.finalize().into())
 }

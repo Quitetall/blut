@@ -95,6 +95,7 @@ fn bench_cache_key(c: &mut Criterion) {
                 black_box(1),
                 black_box(input_hash),
                 black_box(&args),
+                black_box(b"code-sha"),
             );
             black_box(k);
         });
@@ -110,6 +111,7 @@ fn bench_cache_key(c: &mut Criterion) {
                 black_box(1),
                 black_box(input_hash),
                 black_box(&canon),
+                black_box(b"code-sha"),
             );
             black_box(k);
         });

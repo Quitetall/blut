@@ -87,9 +87,10 @@ impl CacheHandle {
         stage_schema: u32,
         input_hash: ContentHash,
         args: &serde_json::Value,
+        code_sha: &[u8],
     ) -> ContentHash {
         let canon = canonical_json(args);
-        Self::key_for_canon_bytes(stage_name, stage_schema, input_hash, canon.as_bytes())
+        Self::key_for_canon_bytes(stage_name, stage_schema, input_hash, canon.as_bytes(), code_sha)
     }
 
     /// Variant that accepts precomputed canonical-JSON bytes. The
@@ -101,8 +102,16 @@ impl CacheHandle {
         stage_schema: u32,
         input_hash: ContentHash,
         canon_args: &[u8],
+        code_sha: &[u8],
     ) -> ContentHash {
-        const VERSION_TAG: &[u8] = b"blut.cache.v1";
+        // v1→v2 (S4): `code_sha` (build git hash + the stage's script content
+        // hash) now keys the cache, so editing a kernel with identical args
+        // re-runs instead of reusing the stale checkpoint (closes G9). This is a
+        // ONE-TIME global cache-bust — every pre-v2 entry re-keys; BLUT is
+        // pre-1.0 so we carry no migration (the .json→.bin bust set the
+        // precedent). Length-prefix code_sha so it can't ambiguate with the
+        // trailing canon_args.
+        const VERSION_TAG: &[u8] = b"blut.cache.v2";
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(VERSION_TAG);
@@ -111,6 +120,8 @@ impl CacheHandle {
         hasher.update([0u8]);
         hasher.update(stage_schema.to_le_bytes());
         hasher.update(input_hash.0);
+        hasher.update((code_sha.len() as u64).to_le_bytes());
+        hasher.update(code_sha);
         hasher.update(canon_args);
         let arr: [u8; 32] = hasher.finalize().into();
         ContentHash(arr)
@@ -411,12 +422,14 @@ mod tests {
         serde_json::from_str(&s).unwrap()
     }
 
+    const CS: &[u8] = b"code-sha-fixture";
+
     #[test]
     fn key_changes_on_stage_name_change() {
         let h = ContentHash::of_bytes(b"x");
         let a = serde_json::json!({});
-        let k1 = CacheHandle::key_for("alpha", 1, h, &a);
-        let k2 = CacheHandle::key_for("beta", 1, h, &a);
+        let k1 = CacheHandle::key_for("alpha", 1, h, &a, CS);
+        let k2 = CacheHandle::key_for("beta", 1, h, &a, CS);
         assert_ne!(k1, k2);
     }
 
@@ -424,17 +437,29 @@ mod tests {
     fn key_changes_on_schema_bump() {
         let h = ContentHash::of_bytes(b"x");
         let a = serde_json::json!({});
-        let k1 = CacheHandle::key_for("s", 1, h, &a);
-        let k2 = CacheHandle::key_for("s", 2, h, &a);
+        let k1 = CacheHandle::key_for("s", 1, h, &a, CS);
+        let k2 = CacheHandle::key_for("s", 2, h, &a, CS);
         assert_ne!(k1, k2);
     }
 
     #[test]
     fn key_changes_on_input_hash_change() {
         let a = serde_json::json!({});
-        let k1 = CacheHandle::key_for("s", 1, ContentHash::of_bytes(b"a"), &a);
-        let k2 = CacheHandle::key_for("s", 1, ContentHash::of_bytes(b"b"), &a);
+        let k1 = CacheHandle::key_for("s", 1, ContentHash::of_bytes(b"a"), &a, CS);
+        let k2 = CacheHandle::key_for("s", 1, ContentHash::of_bytes(b"b"), &a, CS);
         assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn key_changes_on_code_sha_change() {
+        // S4: same name/schema/input/args, DIFFERENT code → different key. This
+        // is the data-loss gap (G9): editing a kernel must re-run, not reuse the
+        // stale checkpoint.
+        let h = ContentHash::of_bytes(b"x");
+        let a = serde_json::json!({"lr": 0.1});
+        let k1 = CacheHandle::key_for("train", 1, h, &a, b"code-v1");
+        let k2 = CacheHandle::key_for("train", 1, h, &a, b"code-v2");
+        assert_ne!(k1, k2, "a code edit must change the cache key");
     }
 
     #[test]
@@ -445,8 +470,8 @@ mod tests {
         let h = ContentHash::of_bytes(b"x");
         let a1 = serde_json::json!({"alpha": 1, "beta": 2});
         let a2 = serde_json::json!({"beta": 2, "alpha": 1});
-        let k1 = CacheHandle::key_for("s", 1, h, &a1);
-        let k2 = CacheHandle::key_for("s", 1, h, &a2);
+        let k1 = CacheHandle::key_for("s", 1, h, &a1, CS);
+        let k2 = CacheHandle::key_for("s", 1, h, &a2, CS);
         assert_eq!(k1, k2);
     }
 
@@ -455,8 +480,8 @@ mod tests {
         let h = ContentHash::of_bytes(b"x");
         let a1 = serde_json::json!({"alpha": 1});
         let a2 = serde_json::json!({"alpha": 2});
-        let k1 = CacheHandle::key_for("s", 1, h, &a1);
-        let k2 = CacheHandle::key_for("s", 1, h, &a2);
+        let k1 = CacheHandle::key_for("s", 1, h, &a1, CS);
+        let k2 = CacheHandle::key_for("s", 1, h, &a2, CS);
         assert_ne!(k1, k2);
     }
 
@@ -465,8 +490,8 @@ mod tests {
         let h = ContentHash::of_bytes(b"x");
         let a1 = serde_json::json!({"outer": {"a": 1, "b": 2}});
         let a2 = serde_json::json!({"outer": {"b": 2, "a": 1}});
-        let k1 = CacheHandle::key_for("s", 1, h, &a1);
-        let k2 = CacheHandle::key_for("s", 1, h, &a2);
+        let k1 = CacheHandle::key_for("s", 1, h, &a1, CS);
+        let k2 = CacheHandle::key_for("s", 1, h, &a2, CS);
         assert_eq!(k1, k2);
     }
 
