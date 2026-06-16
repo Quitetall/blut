@@ -336,6 +336,12 @@ pub trait Stage: Send + Sync + 'static {
 /// RUNTIME-kind-checking the chain. The cookbook that owns the ctor also
 /// owns the stage type + its `Compatible<Backend>` witness, so the
 /// erasure is sound even though the fn pointer carries no backend.
+///
+/// CONTRACT: a ctor MUST be safe to call concurrently and MUST return an
+/// INDEPENDENT instance each call (no captured/shared mutable state) — BLUT
+/// stages are zero-sized markers (`Arc::new(MyStage)`), which trivially
+/// satisfies this; a stage that ever needs shared state should carry it via
+/// `StageContext`, not the constructor.
 pub type ErasedStageCtor = fn() -> std::sync::Arc<dyn StageDyn>;
 
 /// Object-safe shadow. Implemented automatically for every

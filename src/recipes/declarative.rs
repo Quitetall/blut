@@ -149,10 +149,17 @@ pub fn user_recipes_dir() -> Option<PathBuf> {
 /// warning, never fatal). A missing dir yields an empty list. Sorted by
 /// name for stable display.
 pub fn scan_user_recipes() -> Vec<(String, PathBuf)> {
-    let Some(dir) = user_recipes_dir() else {
-        return Vec::new();
-    };
-    let Ok(rd) = std::fs::read_dir(&dir) else {
+    match user_recipes_dir() {
+        Some(dir) => scan_user_recipes_at(&dir),
+        None => Vec::new(),
+    }
+}
+
+/// Path-injectable [`scan_user_recipes`] (the default scans
+/// [`user_recipes_dir`]). Lets tests drive a tempdir without mutating the
+/// process environment.
+pub fn scan_user_recipes_at(dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -223,17 +230,25 @@ mod tests {
 
     #[test]
     fn scan_missing_dir_is_empty() {
-        // Point at a guaranteed-missing dir → empty, never an error.
-        // SAFETY: serialized only by being a leaf assertion; this test sets
-        // a unique path so it doesn't race the real dir.
+        // A missing dir → empty, never an error. Path-injected so the test
+        // mutates no process environment (no unsafe set_var).
         let td = tempfile::tempdir().unwrap();
-        let missing = td.path().join("does-not-exist");
-        unsafe {
-            std::env::set_var("BLUT_USER_RECIPES_DIR", &missing);
-        }
-        assert!(scan_user_recipes().is_empty());
-        unsafe {
-            std::env::remove_var("BLUT_USER_RECIPES_DIR");
-        }
+        assert!(scan_user_recipes_at(&td.path().join("does-not-exist")).is_empty());
+    }
+
+    #[test]
+    fn scan_finds_parseable_toml_and_skips_garbage() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::write(
+            td.path().join("good.toml"),
+            "name = \"good\"\n[[stages]]\nstage = \"x\"\n",
+        )
+        .unwrap();
+        std::fs::write(td.path().join("garbage.toml"), "not = [valid toml").unwrap();
+        std::fs::write(td.path().join("ignored.txt"), "name = \"nope\"").unwrap();
+        let found = scan_user_recipes_at(td.path());
+        // Only the parseable .toml surfaces; garbage is skipped, .txt ignored.
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "good");
     }
 }
