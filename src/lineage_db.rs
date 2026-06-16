@@ -67,6 +67,33 @@ CREATE TABLE IF NOT EXISTS lineage_edges (
     PRIMARY KEY (job_id, to_idx, input_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_edges_output ON lineage_edges(output_hash);
+-- v2: the queryable metric store (E1). Folded from status.jsonl StageStep
+-- events — a rebuildable INDEX, never the source of truth. `step = -1` is the
+-- per-(job,node) FINAL value (the run's headline).
+CREATE TABLE IF NOT EXISTS metrics (
+    job_id    TEXT NOT NULL,
+    node_idx  INTEGER NOT NULL,
+    step      INTEGER NOT NULL,
+    metric    TEXT NOT NULL,
+    value     REAL NOT NULL,
+    wall_unix INTEGER,
+    PRIMARY KEY (job_id, node_idx, step, metric)
+);
+CREATE INDEX IF NOT EXISTS idx_metrics_metric_val ON metrics(metric, value);
+-- v2: system + GPU gauges sampled during a run (E2). `gpu_util` drives the
+-- first-class GPU-saturation metric (gpu_saturation / gpu_wasted).
+CREATE TABLE IF NOT EXISTS gauges (
+    job_id            TEXT NOT NULL,
+    node_idx          INTEGER NOT NULL,
+    wall_unix         INTEGER NOT NULL,
+    gpu_util          REAL,
+    gpu_mem_mib       REAL,
+    gpu_temp_c        REAL,
+    gpu_power_w       REAL,
+    host_ram_mib      REAL,
+    host_disk_free_mib REAL,
+    PRIMARY KEY (job_id, node_idx, wall_unix)
+);
 ";
 
 /// One run's provenance row.
@@ -105,6 +132,44 @@ pub struct EdgeRow {
     pub to_idx: i64,
     pub input_hash: String,
     pub output_hash: String,
+}
+
+/// One metric sample (E1). `step = -1` marks the per-(job,node) FINAL value.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MetricRow {
+    pub job_id: String,
+    pub node_idx: i64,
+    pub step: i64,
+    pub metric: String,
+    pub value: f64,
+    pub wall_unix: Option<i64>,
+}
+
+/// One system/GPU gauge sample (E2). `gpu_util` is the first-class saturation
+/// signal.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GaugeRow {
+    pub job_id: String,
+    pub node_idx: i64,
+    pub wall_unix: i64,
+    pub gpu_util: Option<f64>,
+    pub gpu_mem_mib: Option<f64>,
+    pub gpu_temp_c: Option<f64>,
+    pub gpu_power_w: Option<f64>,
+    pub host_ram_mib: Option<f64>,
+    pub host_disk_free_mib: Option<f64>,
+}
+
+/// The first-class GPU-saturation summary for a run (owner directive): the mean
+/// utilization over its samples + the fraction of samples below the
+/// "wasted" floor. `gpu_wasted ≈ 0` is the optimization target.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct GpuSaturation {
+    pub samples: usize,
+    /// Mean `gpu_util` (%) over the run's gauge samples.
+    pub saturation: f64,
+    /// Fraction of samples with `gpu_util` below the floor — wasted GPU.
+    pub wasted: f64,
 }
 
 /// One hop of an upstream trace: the artifact + the run that produced it.
@@ -219,6 +284,136 @@ impl LineageDb {
             )
             .map_err(|err| TrainError::other(format!("record edge {}: {err}", edge.job_id)))?;
         Ok(())
+    }
+
+    /// Idempotent bulk upsert of metric samples (E1) in one transaction.
+    pub fn record_metrics(&self, rows: &[MetricRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| TrainError::other(format!("metrics tx: {e}")))?;
+        for m in rows {
+            tx.execute(
+                "INSERT OR REPLACE INTO metrics (job_id, node_idx, step, metric, value, wall_unix)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![m.job_id, m.node_idx, m.step, m.metric, m.value, m.wall_unix],
+            )
+            .map_err(|e| TrainError::other(format!("record metric {}: {e}", m.metric)))?;
+        }
+        tx.commit().map_err(|e| TrainError::other(format!("metrics commit: {e}")))?;
+        Ok(())
+    }
+
+    /// Idempotent bulk upsert of gauge samples (E2) in one transaction.
+    pub fn record_gauges(&self, rows: &[GaugeRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| TrainError::other(format!("gauges tx: {e}")))?;
+        for g in rows {
+            tx.execute(
+                "INSERT OR REPLACE INTO gauges
+                    (job_id, node_idx, wall_unix, gpu_util, gpu_mem_mib, gpu_temp_c,
+                     gpu_power_w, host_ram_mib, host_disk_free_mib)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    g.job_id, g.node_idx, g.wall_unix, g.gpu_util, g.gpu_mem_mib,
+                    g.gpu_temp_c, g.gpu_power_w, g.host_ram_mib, g.host_disk_free_mib
+                ],
+            )
+            .map_err(|e| TrainError::other(format!("record gauge {}: {e}", g.job_id)))?;
+        }
+        tx.commit().map_err(|e| TrainError::other(format!("gauges commit: {e}")))?;
+        Ok(())
+    }
+
+    /// The FINAL value of `metric` for a job (max `step`), across all its nodes —
+    /// the headline number `blut compare` shows. `None` if the metric was never
+    /// recorded for the job.
+    pub fn final_metric(&self, job_id: &str, metric: &str) -> Result<Option<f64>> {
+        self.conn
+            .query_row(
+                // `step = -1` is the explicit FINAL marker (NOT the max step — a
+                // metric can collapse after its peak, so the largest step value
+                // is not the final one).
+                "SELECT value FROM metrics WHERE job_id=?1 AND metric=?2 AND step=-1 LIMIT 1",
+                params![job_id, metric],
+                |r| r.get::<_, f64>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(TrainError::other(format!("final_metric: {other}"))),
+            })
+    }
+
+    /// Top runs by their FINAL `metric` value (HPO ranking / leaderboard) — the
+    /// `step = -1` row per (job, node), so an overfit run that peaked then
+    /// collapsed ranks by where it ENDED, not its best-ever intermediate.
+    /// Ordered `DESC` when `maximize`, else `ASC`. Returns `(job_id, node_idx,
+    /// final_value)` best-first, capped at `limit`.
+    pub fn top_runs_by_metric(
+        &self,
+        metric: &str,
+        maximize: bool,
+        limit: usize,
+    ) -> Result<Vec<(String, i64, f64)>> {
+        // Static SQL per direction (no `format!` into a query) — clearer + leaves
+        // no injection-shaped pattern to copy.
+        let sql = if maximize {
+            "SELECT job_id, node_idx, value FROM metrics
+             WHERE metric=?1 AND step=-1 ORDER BY value DESC LIMIT ?2"
+        } else {
+            "SELECT job_id, node_idx, value FROM metrics
+             WHERE metric=?1 AND step=-1 ORDER BY value ASC LIMIT ?2"
+        };
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .map_err(|e| TrainError::other(format!("top_runs_by_metric prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![metric, limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?))
+            })
+            .map_err(|e| TrainError::other(format!("top_runs_by_metric query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| TrainError::other(format!("top_runs_by_metric collect: {e}")))
+    }
+
+    /// The first-class GPU-saturation summary for a job (owner directive): mean
+    /// `gpu_util` + the fraction of samples below `util_floor` (wasted GPU).
+    /// `None` if the run recorded no gauge samples with a `gpu_util`.
+    pub fn gpu_saturation(&self, job_id: &str, util_floor: f64) -> Result<Option<GpuSaturation>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*), AVG(gpu_util),
+                        AVG(CASE WHEN gpu_util < ?2 THEN 1.0 ELSE 0.0 END)
+                 FROM gauges WHERE job_id=?1 AND gpu_util IS NOT NULL",
+                params![job_id, util_floor],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<f64>>(1)?,
+                        r.get::<_, Option<f64>>(2)?,
+                    ))
+                },
+            )
+            .map_err(|e| TrainError::other(format!("gpu_saturation: {e}")))?;
+        match row {
+            (n, Some(mean), Some(wasted)) if n > 0 => Ok(Some(GpuSaturation {
+                samples: n as usize,
+                saturation: mean,
+                wasted,
+            })),
+            _ => Ok(None),
+        }
     }
 
     /// Artifacts whose content hash starts with `prefix` (the `trace` key).
@@ -443,6 +638,49 @@ mod tests {
             sidecar_path: Some(format!("/j/{job}/stages/{idx}/output.metadata.json")),
             produced_unix: Some(1000 + idx),
         }
+    }
+
+    #[test]
+    fn metric_store_records_ranks_and_finals() {
+        let db = db();
+        db.record_metrics(&[
+            // j1 PEAKS at step 2 (0.8) then COLLAPSES to a final 0.4 (step=-1).
+            // final/ranking must use 0.4, NOT the max-step 0.8 — the bug guard.
+            MetricRow { job_id: "j1".into(), node_idx: 0, step: 1, metric: "val_r".into(), value: 0.3, wall_unix: None },
+            MetricRow { job_id: "j1".into(), node_idx: 0, step: 2, metric: "val_r".into(), value: 0.8, wall_unix: None },
+            MetricRow { job_id: "j1".into(), node_idx: 0, step: -1, metric: "val_r".into(), value: 0.4, wall_unix: None },
+            MetricRow { job_id: "j2".into(), node_idx: 0, step: -1, metric: "val_r".into(), value: 0.6, wall_unix: None },
+        ])
+        .unwrap();
+        // final = the step=-1 headline (0.4), not the peak (0.8).
+        assert_eq!(db.final_metric("j1", "val_r").unwrap(), Some(0.4));
+        assert_eq!(db.final_metric("j1", "absent").unwrap(), None);
+        // ranking by FINAL: j2 (0.6) beats j1 (0.4) — j1's peak 0.8 is ignored.
+        let top = db.top_runs_by_metric("val_r", true, 10).unwrap();
+        assert_eq!(top[0].0, "j2");
+        assert_eq!(top[0].2, 0.6);
+        assert_eq!(top[1].0, "j1");
+        assert_eq!(top[1].2, 0.4, "ranks by final, not best-ever");
+    }
+
+    #[test]
+    fn gpu_saturation_summarizes_gauges() {
+        let db = db();
+        // 4 samples: util 90,95,20,80 → mean 71.25; below floor(50) = 1/4 = 0.25.
+        let g = |t: i64, u: f64| GaugeRow {
+            job_id: "j".into(),
+            node_idx: 0,
+            wall_unix: t,
+            gpu_util: Some(u),
+            ..Default::default()
+        };
+        db.record_gauges(&[g(1, 90.0), g(2, 95.0), g(3, 20.0), g(4, 80.0)]).unwrap();
+        let s = db.gpu_saturation("j", 50.0).unwrap().unwrap();
+        assert_eq!(s.samples, 4);
+        assert!((s.saturation - 71.25).abs() < 1e-9, "mean util {}", s.saturation);
+        assert!((s.wasted - 0.25).abs() < 1e-9, "wasted {}", s.wasted);
+        // a job with no gauges → None.
+        assert!(db.gpu_saturation("other", 50.0).unwrap().is_none());
     }
 
     #[test]

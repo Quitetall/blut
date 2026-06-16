@@ -73,6 +73,69 @@ pub fn job_lineage(job_id: &str) -> Result<Vec<LineageNode>> {
     Ok(by_idx.into_values().collect())
 }
 
+/// Fold a job's `status.jsonl` `StageStep` events into metric rows for the
+/// queryable metric store (E1) — the sibling of [`job_lineage`], NO new writer.
+/// Each finite numeric leaf of a step's `update` payload (`val_r`, `train_loss`,
+/// `lr`, `grad_norm`, …) becomes a [`MetricRow`] at the step's coordinate
+/// (`step`/`epoch`, else a per-node counter); the coordinate keys themselves are
+/// not recorded as metrics. The LATEST value per (node, metric) is also emitted
+/// at `step = -1` (the run's headline, what `final_metric` reads).
+pub fn fold_metrics(job_id: &str) -> Result<Vec<crate::lineage_db::MetricRow>> {
+    use crate::lineage_db::MetricRow;
+    let id = jobs::resolve_job_id(job_id)?;
+    let mut rows: Vec<MetricRow> = Vec::new();
+    let mut last: BTreeMap<(u32, String), f64> = BTreeMap::new();
+    let mut counter: BTreeMap<u32, i64> = BTreeMap::new();
+    for line in jobs::read_status_lines(&id)? {
+        let Ok(StageEvent::StageStep { node_idx, update, .. }) =
+            serde_json::from_str::<StageEvent>(&line)
+        else {
+            continue;
+        };
+        let Some(obj) = update.as_object() else {
+            continue;
+        };
+        let step = obj
+            .get("step")
+            .and_then(|v| v.as_i64())
+            .or_else(|| obj.get("epoch").and_then(|v| v.as_i64()))
+            .unwrap_or_else(|| {
+                let c = counter.entry(node_idx).or_insert(0);
+                *c += 1;
+                *c
+            });
+        for (k, v) in obj {
+            if k == "step" || k == "epoch" {
+                continue; // a coordinate, not a metric
+            }
+            if let Some(x) = v.as_f64() {
+                if x.is_finite() {
+                    rows.push(MetricRow {
+                        job_id: id.clone(),
+                        node_idx: node_idx as i64,
+                        step,
+                        metric: k.clone(),
+                        value: x,
+                        wall_unix: None,
+                    });
+                    last.insert((node_idx, k.clone()), x);
+                }
+            }
+        }
+    }
+    for ((node_idx, metric), value) in last {
+        rows.push(MetricRow {
+            job_id: id.clone(),
+            node_idx: node_idx as i64,
+            step: -1,
+            metric,
+            value,
+            wall_unix: None,
+        });
+    }
+    Ok(rows)
+}
+
 fn ensure_node<'a>(
     m: &'a mut BTreeMap<u32, LineageNode>,
     idx: u32,
