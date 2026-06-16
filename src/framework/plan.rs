@@ -701,6 +701,85 @@ impl CompiledPlan {
             node_offsets,
         )
     }
+
+    /// Build a LINEAR erased plan from a chain of `(stage, args)` — the
+    /// DECLARATIVE (`.toml`) path (Phase G / C3). The typed [`Plan`] builder
+    /// proves stage wiring at COMPILE time; a `.toml` recipe is loaded at
+    /// RUNTIME with a dynamic stage list, so this checks the same contract at
+    /// runtime via `StageDyn::input_kind()`/`output_kind()`:
+    ///
+    ///   * the FIRST stage must be graph-input (`input_kind() == "()"`), and
+    ///   * each stage's `output_kind()` must equal the next's `input_kind()`.
+    ///
+    /// A break is a clear [`PlanError::Other`]. Edges form the linear chain
+    /// `0→1→…→n-1`; node 0 receives the unit graph-input artifact, exactly as
+    /// [`Plan::start`] does. The produced [`CompiledPlan`] runs through the
+    /// SAME executor as a compiled recipe (the executor only ever sees erased
+    /// `Arc<dyn StageDyn>` nodes).
+    pub fn from_erased_chain(
+        name: impl Into<String>,
+        recipe_args: serde_json::Value,
+        chain: Vec<(Arc<dyn StageDyn>, serde_json::Value)>,
+    ) -> Result<CompiledPlan, crate::framework::error::PlanError> {
+        use crate::framework::error::PlanError;
+        let name = name.into();
+        if chain.is_empty() {
+            return Err(PlanError::Empty);
+        }
+        // The first stage must take the unit graph input.
+        let first_in = chain[0].0.input_kind();
+        if first_in != <() as Artifact>::KIND {
+            return Err(PlanError::Other(format!(
+                "declarative recipe '{name}': first stage '{}' must be graph-input \
+                 (input_kind \"()\"), but it expects '{first_in}'",
+                chain[0].0.name()
+            )));
+        }
+        // Consecutive kind contract: out(i) == in(i+1).
+        for pair in chain.windows(2) {
+            let out = pair[0].0.output_kind();
+            let inp = pair[1].0.input_kind();
+            if out != inp {
+                return Err(PlanError::Other(format!(
+                    "declarative recipe '{name}': kind-chain break — stage '{}' outputs \
+                     '{out}' but the next stage '{}' expects '{inp}'",
+                    pair[0].0.name(),
+                    pair[1].0.name()
+                )));
+            }
+        }
+        let mut nodes: Vec<PlanNode> = Vec::with_capacity(chain.len());
+        let mut edges: Vec<PlanEdge> = Vec::new();
+        for (i, (stage, args)) in chain.into_iter().enumerate() {
+            let id = i as NodeId;
+            let canon_args = CacheHandle::canonical_json_bytes(&args);
+            nodes.push(PlanNode {
+                id,
+                stage,
+                args,
+                canon_args,
+                retry: None,
+                timeout: None,
+            });
+            if i > 0 {
+                edges.push(PlanEdge {
+                    from: (i - 1) as NodeId,
+                    to: id,
+                });
+            }
+        }
+        let mut initial: HashMap<NodeId, ErasedArtifact> = HashMap::new();
+        let unit = ErasedArtifact::from_typed(&())
+            .map_err(|e| PlanError::Other(format!("encode unit graph input: {e}")))?;
+        initial.insert(0, unit);
+        Ok(CompiledPlan {
+            name,
+            nodes,
+            edges,
+            initial,
+            recipe_args,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -885,6 +964,56 @@ mod tests {
         assert_eq!(plan.initial.len(), 1);
         let unit = plan.initial.get(&0).unwrap();
         assert_eq!(unit.kind, "()");
+    }
+
+    #[test]
+    fn from_erased_chain_builds_and_kind_checks() {
+        let a = serde_json::json!({});
+        let stage = |s: Arc<dyn StageDyn>| (s, a.clone());
+
+        // Valid: () → A → B → C builds a 3-node / 2-edge linear plan with the
+        // unit initial input on node 0.
+        let plan = CompiledPlan::from_erased_chain(
+            "decl",
+            serde_json::json!({}),
+            vec![
+                stage(Arc::new(MakeA)),
+                stage(Arc::new(AToB)),
+                stage(Arc::new(BToC)),
+            ],
+        )
+        .expect("valid kind chain");
+        assert_eq!(plan.n_nodes(), 3);
+        assert_eq!(plan.n_edges(), 2);
+        assert_eq!(plan.topo_order().unwrap(), vec![0, 1, 2]);
+        assert_eq!(plan.initial.get(&0).unwrap().kind, "()");
+
+        // First stage not graph-input → rejected (AToB expects test.data_a).
+        // (CompiledPlan has no Debug, so match rather than expect_err.)
+        match CompiledPlan::from_erased_chain(
+            "bad_start",
+            serde_json::json!({}),
+            vec![stage(Arc::new(AToB)), stage(Arc::new(BToC))],
+        ) {
+            Err(e) => assert!(format!("{e}").contains("graph-input")),
+            Ok(_) => panic!("non-graph-input first stage must be rejected"),
+        }
+
+        // Kind-chain break: MakeA outputs test.data_a, BToC expects test.data_b.
+        match CompiledPlan::from_erased_chain(
+            "broken",
+            serde_json::json!({}),
+            vec![stage(Arc::new(MakeA)), stage(Arc::new(BToC))],
+        ) {
+            Err(e) => assert!(format!("{e}").contains("kind-chain")),
+            Ok(_) => panic!("kind-chain break must be rejected"),
+        }
+
+        // Empty chain → Empty.
+        assert!(matches!(
+            CompiledPlan::from_erased_chain("empty", serde_json::json!({}), vec![]),
+            Err(crate::framework::error::PlanError::Empty)
+        ));
     }
 
     #[test]
