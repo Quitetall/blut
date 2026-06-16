@@ -2135,14 +2135,21 @@ fn run_compare(a: &str, b: &str) -> Result<()> {
 fn run_dag(job: Option<String>, json: bool) -> Result<()> {
     let job_id = match job {
         Some(q) => crate::jobs::resolve_job_id(&q).map_err(|e| anyhow!("{e}"))?,
-        // `list_jobs` sorts by id ascending and job ids are timestamp-monotonic,
-        // so the last entry is the most recent run.
+        // `list_jobs` sorts ascending by timestamp-monotonic id; prefer the most
+        // recent job that ACTUALLY has a `plan.json` (a pre-v0.20 run has none,
+        // so blindly taking the last job would error on a stale job).
         None => crate::jobs::list_jobs()
             .map_err(|e| anyhow!("list jobs: {e}"))?
             .into_iter()
-            .next_back()
+            .rev()
             .map(|s| s.id)
-            .ok_or_else(|| anyhow!("no jobs found"))?,
+            .find(|id| {
+                crate::paths::job_dir(id)
+                    .ok()
+                    .and_then(|d| crate::framework::graph::PlanGraph::read_from(&d))
+                    .is_some()
+            })
+            .ok_or_else(|| anyhow!("no jobs with a plan.json (run a recipe first)"))?,
     };
     let snap = crate::framework::graph_snapshot(&job_id).map_err(|e| anyhow!("{e}"))?;
     if json {
@@ -2340,8 +2347,15 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                     // run_one_recipe — which compiled the plan AND executed every
                     // stage (spawning the warm systemd-run unit + acquiring the
                     // exclusive GPU lock) before any value was produced. Short-circuit
-                    // here: report the resolved RAM footprint for this config and
-                    // return WITHOUT compiling/executing or touching any resource.
+                    // here: VALIDATE the args + confirm the plan COMPILES (so a
+                    // dry-run can't report "OK" on invalid args — B/P5), then report
+                    // the resolved RAM footprint and return WITHOUT executing or
+                    // touching any resource (compile builds the plan; it never runs).
+                    let def =
+                        reg.find(&name).ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+                    if let Err(e) = (def.compile_fn)(raw.clone()) {
+                        return Err(anyhow!("{e}")); // RecipeError already names the cause
+                    }
                     let fp = recipe_footprint(&name, &raw);
                     let gib = fp.ram_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
                     println!(
