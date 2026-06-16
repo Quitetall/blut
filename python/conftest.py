@@ -45,6 +45,20 @@ if str(_PY_ROOT) not in sys.path:
     sys.path.insert(0, str(_PY_ROOT))
 
 
+# Sequestered code (ADR 0051 cookbook rebuild): lamquant/deprecated/ holds
+# retired scripts + their tests (git-mv'd here, reversible). Keep them out of
+# collection — they exercise now-dead modules by design. Scoped to THIS tree's
+# deprecated/ subtree (not any directory merely named "deprecated") and
+# independent of which rootdir pytest picks (meta vs blut), unlike a
+# rootdir-relative collect_ignore path.
+_DEPRECATED = (_LAMQUANT / "deprecated").resolve()
+
+
+def pytest_ignore_collect(collection_path):
+    p = collection_path.resolve()
+    return p == _DEPRECATED or _DEPRECATED in p.parents
+
+
 # ---------------------------------------------------------------------------
 # Real-EDF + lml-CLI fixtures (no synthetic data — user direction 2026-05-21).
 #
