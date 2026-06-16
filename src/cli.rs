@@ -99,6 +99,14 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Compare two runs: provenance + a final-metric panel + GPU saturation
+    /// (reads the queryable metric store). `blut compare <jobA> <jobB>`.
+    Compare {
+        /// First job id (prefix ok).
+        a: String,
+        /// Second job id.
+        b: String,
+    },
     /// Inspect materialized artifacts via their sidecars.
     Artifact {
         #[command(subcommand)]
@@ -647,6 +655,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Lineage { cmd }) => run_lineage_cmd(cmd),
         Some(Command::Hpo { cmd }) => run_hpo(&reg, cmd).await,
         Some(Command::Dag { job, json }) => run_dag(job, json),
+        Some(Command::Compare { a, b }) => run_compare(&a, &b),
         Some(Command::Artifact { cmd }) => run_artifact_cmd(cmd),
         Some(Command::Schedule { cmd }) => run_schedule_cmd(&reg, cmd),
         Some(Command::Data { cmd }) => run_data(cmd),
@@ -1907,6 +1916,61 @@ fn persist_plan_graph(plan: &crate::framework::CompiledPlan, job_dir: &std::path
 
 /// `blut dag <job> [--json]` — render a job's DAG: per-node status + edges,
 /// built from the persisted `plan.json` + the live `status.jsonl` (+ HPO trial
+/// `blut compare <A> <B>` (E4): provenance + a side-by-side FINAL-metric panel
+/// (with Δ) + the GPU-saturation summary, all from the queryable metric store.
+fn run_compare(a: &str, b: &str) -> Result<()> {
+    use std::collections::BTreeMap;
+    let ja = crate::jobs::resolve_job_id(a).map_err(|e| anyhow!("{e}"))?;
+    let jb = crate::jobs::resolve_job_id(b).map_err(|e| anyhow!("{e}"))?;
+    let db = crate::lineage_db::LineageDb::open().map_err(|e| anyhow!("open lineage.db: {e}"))?;
+
+    let show_run = |id: &str| -> String {
+        match db.get_run(id) {
+            Ok(Some(r)) => format!(
+                "{id}  recipe={} outcome={} git={}",
+                r.recipe,
+                r.outcome.as_deref().unwrap_or("?"),
+                r.git_sha.as_deref().map(|s| &s[..s.len().min(8)]).unwrap_or("?"),
+            ),
+            _ => format!("{id}  (no provenance row)"),
+        }
+    };
+    println!("A  {}", show_run(&ja));
+    println!("B  {}", show_run(&jb));
+
+    let ma: BTreeMap<String, f64> =
+        db.final_metrics(&ja).map_err(|e| anyhow!("{e}"))?.into_iter().collect();
+    let mb: BTreeMap<String, f64> =
+        db.final_metrics(&jb).map_err(|e| anyhow!("{e}"))?.into_iter().collect();
+    let keys: std::collections::BTreeSet<&String> = ma.keys().chain(mb.keys()).collect();
+    if keys.is_empty() {
+        println!("\n(no metrics recorded for either run)");
+    } else {
+        println!("\n{:<18} {:>12} {:>12} {:>12}", "metric", "A", "B", "Δ(B−A)");
+        for k in keys {
+            let fmt = |v: Option<&f64>| v.map(|x| format!("{x:.4}")).unwrap_or_else(|| "—".into());
+            let delta = match (ma.get(k), mb.get(k)) {
+                (Some(x), Some(y)) => format!("{:+.4}", y - x),
+                _ => "—".into(),
+            };
+            println!("{:<18} {:>12} {:>12} {:>12}", k, fmt(ma.get(k)), fmt(mb.get(k)), delta);
+        }
+    }
+
+    // GPU saturation (the owner's first-class metric).
+    let sat = |id: &str| db.gpu_saturation(id, 50.0).ok().flatten();
+    if let (Some(sa), Some(sb)) = (sat(&ja), sat(&jb)) {
+        println!(
+            "\nGPU saturation   A {:.1}% (wasted {:.0}%)   B {:.1}% (wasted {:.0}%)",
+            sa.saturation,
+            sa.wasted * 100.0,
+            sb.saturation,
+            sb.wasted * 100.0
+        );
+    }
+    Ok(())
+}
+
 /// attribution when present). No daemon; re-run to refresh.
 fn run_dag(job: Option<String>, json: bool) -> Result<()> {
     let job_id = match job {

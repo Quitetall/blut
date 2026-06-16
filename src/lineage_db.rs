@@ -353,6 +353,26 @@ impl LineageDb {
             })
     }
 
+    /// Every metric's FINAL value for a job (`step = -1`), across its nodes —
+    /// the `(metric, value)` panel `blut compare` shows. Aggregated MAX per
+    /// metric so a multi-node job reports one headline per metric.
+    pub fn final_metrics(&self, job_id: &str) -> Result<Vec<(String, f64)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT metric, MAX(value) FROM metrics WHERE job_id=?1 AND step=-1
+                 GROUP BY metric ORDER BY metric",
+            )
+            .map_err(|e| TrainError::other(format!("final_metrics prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![job_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+            })
+            .map_err(|e| TrainError::other(format!("final_metrics query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| TrainError::other(format!("final_metrics collect: {e}")))
+    }
+
     /// Top runs by their FINAL `metric` value (HPO ranking / leaderboard) — the
     /// `step = -1` row per (job, node), so an overfit run that peaked then
     /// collapsed ranks by where it ENDED, not its best-ever intermediate.
@@ -551,6 +571,9 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
             })?;
         }
     }
+    // E1: fold this run's StageStep metrics into the queryable store so
+    // `final_metric` / `top_runs_by_metric` / `blut compare` see it.
+    db.record_metrics(&crate::framework::lineage::fold_metrics(job_id)?)?;
     Ok(())
 }
 
