@@ -227,6 +227,10 @@ enum BuiltinAction {
 /// Auto-refresh cadence for jobs list + system probes.
 const REFRESH_TICK: Duration = Duration::from_millis(1500);
 
+/// Refresh ticks (≈ `FOCUS_GIVE_UP_TICKS × REFRESH_TICK` ≈ 30 s) a
+/// post-spawn auto-focus waits for its job to surface before giving up.
+const FOCUS_GIVE_UP_TICKS: u8 = 20;
+
 /// Maximum log lines kept in memory per selected job. Older lines are
 /// dropped (caller hits `r` or re-selects to re-tail from disk).
 const MAX_LOG_LINES: usize = 2000;
@@ -272,6 +276,10 @@ struct App {
     /// from it the new job has appeared and we jump to its live tail.
     pending_focus: bool,
     focus_baseline_top: Option<String>,
+    /// Refresh ticks left before a pending auto-focus gives up — so a spawn
+    /// whose job never surfaces (child died before writing its job dir)
+    /// can't hijack focus onto an unrelated job that appears much later.
+    focus_ticks_left: u8,
 }
 
 /// Two-press confirm window for the destructive Reset actions, matching
@@ -316,6 +324,7 @@ impl App {
             catalog,
             pending_focus: false,
             focus_baseline_top: None,
+            focus_ticks_left: 0,
         }
     }
 
@@ -473,6 +482,7 @@ impl App {
                 // and jump straight to its live status.jsonl tail.
                 self.focus_baseline_top = self.jobs.first().map(|j| j.id.clone());
                 self.pending_focus = true;
+                self.focus_ticks_left = FOCUS_GIVE_UP_TICKS;
             }
             Err(e) => self.set_status(format!("spawn '{name}' failed: {e}")),
         }
@@ -548,12 +558,22 @@ impl App {
                 // surfaces (a new newest id at index 0, distinct from the
                 // pre-spawn baseline), select it + jump to the Log tail.
                 if self.pending_focus {
-                    if let Some(top) = self.jobs.first() {
-                        if Some(&top.id) != self.focus_baseline_top.as_ref() {
+                    let appeared = self
+                        .jobs
+                        .first()
+                        .is_some_and(|top| Some(&top.id) != self.focus_baseline_top.as_ref());
+                    if appeared {
+                        self.pending_focus = false;
+                        self.selected.select(Some(0));
+                        self.set_view(View::Log);
+                        self.refresh_log();
+                    } else {
+                        // Bound the wait: give up after FOCUS_GIVE_UP_TICKS so a
+                        // spawn whose job never surfaces can't hijack focus onto
+                        // an unrelated job that appears much later.
+                        self.focus_ticks_left = self.focus_ticks_left.saturating_sub(1);
+                        if self.focus_ticks_left == 0 {
                             self.pending_focus = false;
-                            self.selected.select(Some(0));
-                            self.set_view(View::Log);
-                            self.refresh_log();
                         }
                     }
                 }
