@@ -157,7 +157,12 @@ enum Command {
     /// presets / live-metrics / reset views (superset of the retired
     /// hub + Python cockpits). Keys: ↑↓ select, Enter log, c cancel,
     /// R recipe picker, J/L/Y/H/B/K/P/M/X switch views, q quit.
-    Tui,
+    Tui {
+        /// Headless self-check: build the cockpit + render every view to a test
+        /// backend, exit 0 if all draw non-blank (no raw mode). For CI / smoke.
+        #[arg(long, default_value_t = false)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -652,7 +657,13 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Cache { cmd }) => run_cache_cmd(cmd),
         Some(Command::Footprint { cmd }) => run_footprint_cmd(cmd),
         Some(Command::Stage { cmd }) => run_stage_cmd(cmd).await,
-        Some(Command::Tui) => crate::tui::run(reg).await,
+        Some(Command::Tui { check }) => {
+            if check {
+                crate::tui::check(reg)
+            } else {
+                crate::tui::run(reg).await
+            }
+        }
         // Bare `blut` opens the interactive cockpit (T-track). Use
         // `blut train …` for explicit CLI training.
         None => crate::tui::run(reg).await,

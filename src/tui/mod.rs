@@ -677,6 +677,47 @@ pub async fn run(registry: crate::framework::Registry) -> Result<()> {
     result
 }
 
+/// `blut tui --check` (P12 / F6): a REAL self-check in the shipped binary, not a
+/// unit-test-only affordance. Builds the App from the live registry and renders
+/// every view headless to a `TestBackend`, asserting each produces a non-blank
+/// buffer; exits 0 on success. Lets CI / an operator verify the cockpit builds
+/// + every view draws without entering raw mode.
+pub fn check(registry: crate::framework::Registry) -> Result<()> {
+    use ratatui::backend::TestBackend;
+    let views = [
+        View::Cockpit,
+        View::Jobs,
+        View::Log,
+        View::System,
+        View::History,
+        View::Leaderboard,
+        View::Compare,
+        View::Checkpoints,
+        View::Presets,
+        View::Metrics,
+        View::Reset,
+    ];
+    let mut app = App::new(registry);
+    app.refresh_jobs();
+    let mut term = Terminal::new(TestBackend::new(120, 40)).context("test terminal")?;
+    for view in views {
+        app.view = view;
+        term.draw(|f| draw(f, &mut app))
+            .with_context(|| format!("draw view {view:?}"))?;
+        let blank = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .all(|c| c.symbol().trim().is_empty());
+        if blank {
+            anyhow::bail!("tui --check: view {view:?} rendered a completely blank buffer");
+        }
+    }
+    println!("blut tui --check: OK ({} views render)", views.len());
+    Ok(())
+}
+
 async fn run_app<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     registry: crate::framework::Registry,
