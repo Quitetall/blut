@@ -1133,6 +1133,21 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
                 wandb_run.log(scalars, step=report.global_epoch)
         except Exception as e:
             print(f"[!] metric stream/wandb emit failed (non-fatal): {e}")
+        try:
+            # S6 (P4 contract): a runner-parseable per-epoch metric line. The
+            # BLUT runner greps `BLUT_METRIC ` off stdout and forwards the JSON
+            # object as a StageEvent::StageStep, which folds into the queryable
+            # metric store (val_r is the headline; `epoch` is the coordinate).
+            # Scalars only + the phase tag; flushed so a live tail/TUI sees it.
+            import json as _json
+            payload = {k: v for k, v in d.items()
+                       if isinstance(v, (int, float)) and not isinstance(v, bool)}
+            payload['kind'] = 'epoch'
+            if getattr(report, 'phase', None) is not None:
+                payload['phase'] = report.phase
+            print('BLUT_METRIC ' + _json.dumps(payload), flush=True)
+        except Exception as e:
+            print(f"[!] blut metric line emit failed (non-fatal): {e}")
 
     dash = TrainingDashboard(
         model_name='LamQuant Joint',
