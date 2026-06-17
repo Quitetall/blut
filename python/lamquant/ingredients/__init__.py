@@ -25,6 +25,7 @@ from lamquant.ingredients.steps import _snn_specs as _snn_step_specs  # noqa: F4
 from lamquant.ingredients.loss import _specs as _loss_specs  # noqa: F401
 from lamquant.ingredients.checkpoint import _specs as _checkpoint_specs  # noqa: F401
 from lamquant.ingredients.evals import _specs as _eval_specs  # noqa: F401
+from lamquant.ingredients.data import _specs as _data_specs  # noqa: F401
 
 __all__ = [
     "build_ingredient",
