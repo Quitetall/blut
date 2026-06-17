@@ -128,6 +128,38 @@ def test_soap_single_group_all_params():
     assert got == {id(q) for _n, q in named if q.requires_grad}
 
 
+def test_soap_param_groups_lr_wd_round_trip():
+    """train_joint passes SOAP one pre-built flat group (no per-group lr/wd); the
+    cfg lr/weight_decay must land on it (matching SOAP(all_params, lr, wd))."""
+    m = _Routed()
+    all_params = [q for _n, q in m.named_parameters() if q.requires_grad]
+    opt = build_ingredient(
+        "optimizer", "soap",
+        {"lr": 7e-4, "weight_decay": 0.02, "precondition_frequency": 10,
+         "max_precond_dim": 2048},
+        param_groups=[{"params": all_params}])
+    assert len(opt.param_groups) == 1
+    g = opt.param_groups[0]
+    assert g["lr"] == 7e-4
+    assert g["weight_decay"] == 0.02
+
+
+def test_muon_param_group_hyperparams():
+    """train_joint's muon cfg maps onto two groups: muon lr/momentum (use_muon)
+    + the adamw_* fields on the use_muon=False group."""
+    m = _Routed()
+    opt = build_ingredient(
+        "optimizer", "muon",
+        {"lr": 0.02, "momentum": 0.95, "weight_decay": 0.0,
+         "adamw_lr": 3e-4, "adamw_betas": (0.95, 0.95), "adamw_eps": 1e-8,
+         "adamw_weight_decay": 0.01},
+        named_params=list(m.named_parameters()))
+    muon_g = next(g for g in opt.param_groups if g.get("use_muon"))
+    adamw_g = next(g for g in opt.param_groups if not g.get("use_muon"))
+    assert muon_g["lr"] == 0.02 and muon_g["momentum"] == 0.95
+    assert adamw_g["lr"] == 3e-4 and adamw_g["betas"] == (0.95, 0.95)
+
+
 def test_extra_groups_appended_after_routing():
     """The distiller's student_proj (4state ADR-0027 #3) rides in as extra_groups."""
     m = _Routed()
@@ -138,6 +170,34 @@ def test_extra_groups_appended_after_routing():
         extra_groups=[{"params": list(extra.parameters())}])
     all_ids = {id(p) for g in opt.param_groups for p in g["params"]}
     assert id(extra.weight) in all_ids and id(extra.bias) in all_ids
+
+
+def test_param_groups_passthrough_bypasses_routing():
+    """A trainer with bespoke groups (train_joint's enc/dec + alpha-wd groups)
+    passes them via param_groups; the spec's routing is skipped and the groups
+    are used verbatim, each keeping its own lr/weight_decay."""
+    a = nn.Linear(4, 4)
+    b = nn.Linear(4, 4)
+    groups = [
+        {"params": list(a.parameters()), "lr": 1e-3, "weight_decay": 0.1},
+        {"params": list(b.parameters()), "lr": 5e-4, "weight_decay": 0.2},
+    ]
+    opt = build_ingredient("optimizer", "adamw", {"betas": (0.9, 0.999)},
+                           param_groups=groups)
+    assert isinstance(opt, torch.optim.AdamW)
+    assert len(opt.param_groups) == 2
+    assert opt.param_groups[0]["lr"] == 1e-3
+    assert opt.param_groups[0]["weight_decay"] == 0.1
+    assert opt.param_groups[1]["lr"] == 5e-4
+    assert opt.param_groups[1]["weight_decay"] == 0.2
+
+
+def test_param_groups_and_named_params_mutually_exclusive():
+    a = nn.Linear(4, 4)
+    with pytest.raises(TypeError, match="either param_groups or named_params"):
+        build_ingredient("optimizer", "adamw", {},
+                         named_params=list(a.named_parameters()),
+                         param_groups=[{"params": list(a.parameters())}])
 
 
 def test_unknown_optimizer_fails_closed():

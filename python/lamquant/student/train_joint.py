@@ -1617,6 +1617,11 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     )
     dec_group = {'params': list(codec.decoder.parameters()),
                  'lr': cfg.lr_quant, 'weight_decay': cfg.wd_quant}
+    # ADR 0050/0051 ingredient registry for the optimizer construction. The
+    # enc/dec groups (with their own lr + weight_decay) are passed as
+    # param_groups; the spec's lr/wd defaults are unused fallbacks. The LR
+    # SCHEDULE (WSD/cosine) + schedule-free + seizure-head re-add stay inline.
+    from lamquant.ingredients import build_ingredient
     # LR schedule selection:
     #   wsd (default): Warmup-Stable-Decay for continual training
     #   schedule-free: Schedule-Free AdamW (Defazio 2024)
@@ -1644,8 +1649,10 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
             lr_schedule = 'wsd'
     actual_decay_frac = 0.0 if infinite_lr else decay_frac
     if lr_schedule == 'wsd':
-        optimizer = torch.optim.AdamW(enc_groups + [dec_group],
-                                       fused=(device.type == 'cuda'))
+        optimizer = build_ingredient(
+            "optimizer", "adamw",
+            {"betas": (0.9, 0.999), "fused": (device.type == 'cuda')},
+            param_groups=enc_groups + [dec_group])
         scheduler = WSDScheduler(
             optimizer, total_epochs=cfg.epochs_quant,
             peak_lr=cfg.lr_quant, warmup_frac=0.05,
@@ -1659,16 +1666,18 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
                   f"stable={scheduler.decay_start - scheduler.warmup_epochs}ep, "
                   f"decay={scheduler.decay_epochs}ep)")
     elif lr_schedule == 'muon':
-        from lamquant.ingredients.optimizers.muon_optimizer import Muon, split_params_for_muon
-        muon_p, adamw_p = split_params_for_muon(codec)
-        optimizer = Muon([
-            dict(params=muon_p, lr=0.02, momentum=0.95, weight_decay=0, use_muon=True),
-            dict(params=adamw_p, lr=cfg.lr_quant, betas=(0.95, 0.95), eps=1e-8,
-                 weight_decay=cfg.wd_quant, use_muon=False),
-        ])
-        print(f"[*] Optimizer: Muon (lr=0.02, 2D={len(muon_p)}, 1D={len(adamw_p)})")
+        optimizer = build_ingredient(
+            "optimizer", "muon",
+            {"lr": 0.02, "momentum": 0.95, "weight_decay": 0.0,
+             "adamw_lr": cfg.lr_quant, "adamw_betas": (0.95, 0.95),
+             "adamw_eps": 1e-8, "adamw_weight_decay": cfg.wd_quant},
+            named_params=list(codec.named_parameters()))
+        _n2d = sum(len(g['params']) for g in optimizer.param_groups
+                   if g.get('use_muon'))
+        _n1d = sum(len(g['params']) for g in optimizer.param_groups
+                   if not g.get('use_muon'))
+        print(f"[*] Optimizer: Muon (lr=0.02, 2D={_n2d}, 1D={_n1d})")
     elif lr_schedule == 'soap':
-        from lamquant.ingredients.optimizers.soap_optimizer import SOAP
         all_params = []
         for g in enc_groups + [dec_group]:
             all_params.extend(g['params'])
@@ -1679,9 +1688,12 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         # card for Tier 5+ decoders at the first precondition step. Bounding to
         # a few thousand keeps full preconditioning where it helps (encoder +
         # small layers) and is strictly faster + lighter on the wide layers.
-        optimizer = SOAP(all_params, lr=cfg.lr_quant, weight_decay=cfg.wd_quant,
-                         precondition_frequency=10,
-                         max_precond_dim=soap_max_precond_dim)
+        optimizer = build_ingredient(
+            "optimizer", "soap",
+            {"lr": cfg.lr_quant, "weight_decay": cfg.wd_quant,
+             "precondition_frequency": 10,
+             "max_precond_dim": soap_max_precond_dim},
+            param_groups=[{"params": all_params}])
         # Wrap SOAP in WSD for warmup + optional decay
         scheduler = WSDScheduler(
             optimizer, total_epochs=cfg.epochs_quant,
@@ -1696,8 +1708,10 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
                   f"warmup={scheduler.warmup_epochs}ep, "
                   f"decay={scheduler.decay_epochs}ep)")
     elif lr_schedule == 'cosine' and not use_schedule_free:
-        optimizer = torch.optim.AdamW(enc_groups + [dec_group],
-                                       fused=(device.type == 'cuda'))
+        optimizer = build_ingredient(
+            "optimizer", "adamw",
+            {"betas": (0.9, 0.999), "fused": (device.type == 'cuda')},
+            param_groups=enc_groups + [dec_group])
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=cfg.epochs_quant, eta_min=cfg.lr_quant_min)
         print(f"[*] Optimizer: AdamW + cosine LR")

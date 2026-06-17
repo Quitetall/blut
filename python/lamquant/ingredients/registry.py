@@ -83,16 +83,27 @@ def build_ingredient(kind: str, name: str, cfg: Any = None, **extra):
     config = coerce_config(cfg, spec.config_cls)
 
     if kind == "optimizer":
-        if "named_params" not in extra:
-            raise TypeError(
-                f"build_ingredient('optimizer', {name!r}, ...) requires "
-                "named_params=<iterable of (name, Parameter)>")
-        named_params = list(extra.pop("named_params"))
+        pre_built = extra.pop("param_groups", None)
         extra_groups = extra.pop("extra_groups", None)
+        if pre_built is not None:
+            # A trainer with bespoke param grouping (e.g. train_joint's
+            # encoder/decoder + alpha-weight-decay groups) passes the groups
+            # directly, bypassing the spec's routing.
+            if "named_params" in extra:
+                raise TypeError(
+                    "pass either param_groups or named_params, not both")
+            groups = list(pre_built)
+        else:
+            if "named_params" not in extra:
+                raise TypeError(
+                    f"build_ingredient('optimizer', {name!r}, ...) requires "
+                    "named_params=<iterable of (name, Parameter)> or "
+                    "param_groups=<pre-built list of group dicts>")
+            named_params = list(extra.pop("named_params"))
+            groups = list(spec.build_param_groups(named_params, config))
         if extra:
             raise TypeError(
                 f"unexpected kwargs for optimizer build: {sorted(extra)}")
-        groups = list(spec.build_param_groups(named_params, config))
         if extra_groups:
             groups = groups + list(extra_groups)
         return spec.construct(groups, config)
