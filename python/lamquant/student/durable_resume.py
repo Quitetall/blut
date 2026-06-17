@@ -31,10 +31,12 @@ Key design points:
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import threading
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -44,6 +46,77 @@ import torch
 # Must equal blut `resume::HEARTBEAT_INTERVAL_SECS` (the Rust stale window is
 # 3× this). Time-based, NOT tied to the epoch/validation cadence.
 HEARTBEAT_INTERVAL = 60
+
+# The recovery-checkpoint keys the trainer (`train_joint.py`) reads
+# UNCONDITIONALLY on resume — absence of any one ⇒ a `KeyError` that aborts the
+# resume, OR (worse) a silent cold-start. This tuple is the SINGLE SOURCE OF
+# TRUTH for "a recovery checkpoint is structurally complete", referenced by both
+# `save_recovery` (sanity-check before write) and `load_recovery` (fail-fast
+# validate after read). Derived from the read sites in `train_joint.py`:
+#   * ``ckpt['encoder']`` / ``ckpt['decoder']``     (state-dict loads)
+#   * ``ckpt['epoch']`` / ``ckpt['phase']``         (resume position)
+#   * ``_qat_ckpt['optimizer']``                    (continuous-optimizer resume)
+# plus the two keys `save_recovery` itself always embeds:
+#   * ``rng``         (DurableResume.restore_rng — continuous data/RNG stream)
+#   * ``resume_key``  (foreign-config guard)
+# Keys read via ``.get(...)`` in the trainer (``scheduler``, ``seizure_head``,
+# ``best_val_r``, ``best_val_prd``, ``scaler``) are OPTIONAL and deliberately
+# NOT listed here — a checkpoint without them resumes correctly.
+REQUIRED_RECOVERY_KEYS = (
+    "encoder",
+    "decoder",
+    "epoch",
+    "phase",
+    "optimizer",
+    "rng",
+    "resume_key",
+)
+
+# Free-space margin for a recovery-checkpoint write, mirroring the statvfs
+# disk-fill guard used by the fullband / L3 caches
+# (`lma_typed_adapter.py::_fb_win_save`, `warm_fb_cache.py`,
+# `snn/lma_dataset.py`): free bytes = ``st.f_bavail * st.f_frsize``, threshold
+# from an env override × 1e9. The cache guards default to 40 GB because they
+# write hundreds of GB of windows; a recovery checkpoint is a single
+# encoder+decoder+optimizer blob (sub-GB to a few GB), so the default margin is
+# smaller — just enough headroom that the ``.tmp`` can't truncate mid-write.
+RECOVERY_MIN_FREE_GB_DEFAULT = 2.0
+
+
+def _recovery_min_free_bytes() -> int:
+    """Free-space floor (bytes) required before writing a recovery `.tmp`.
+
+    Reads ``RECOVERY_MIN_FREE_GB`` (GB, default ``RECOVERY_MIN_FREE_GB_DEFAULT``)
+    and scales by 1e9 — same idiom as the cache disk-fill guards. A malformed
+    env value (non-numeric, NaN) falls back to the default rather than raising
+    ``ValueError`` mid-save: a typo'd knob must not crash a long training run,
+    and the default margin is the safe floor."""
+    try:
+        gb = float(os.environ.get("RECOVERY_MIN_FREE_GB", RECOVERY_MIN_FREE_GB_DEFAULT))
+        # math.isfinite rejects NaN AND ±inf in one shot — guards the int(gb*1e9)
+        # below from OverflowError on inf (or an inf-overflowing finite value).
+        if not math.isfinite(gb) or gb < 0:
+            gb = RECOVERY_MIN_FREE_GB_DEFAULT
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError: some libc builds raise on float("1e400") instead of inf.
+        gb = RECOVERY_MIN_FREE_GB_DEFAULT
+    try:
+        return int(gb * 1e9)
+    except (OverflowError, ValueError):  # belt-and-suspenders for any residual overflow
+        return int(RECOVERY_MIN_FREE_GB_DEFAULT * 1e9)
+
+
+def _free_bytes(path: Any) -> int:
+    """Free bytes available at ``path`` via ``os.statvfs`` (``f_bavail *
+    f_frsize``). FAIL-CLOSED: an unknowable free-space state returns 0 so the
+    caller's ``< min_free`` guard trips (skip the write) rather than risking a
+    truncated checkpoint on a genuinely full/inaccessible disk — mirrors
+    ``warm_fb_cache._free_gb``."""
+    try:
+        st = os.statvfs(os.fspath(path))
+        return st.f_bavail * st.f_frsize
+    except OSError:
+        return 0
 
 
 def _default_loader(path: Any, map_location: Any = "cpu") -> dict:
@@ -174,6 +247,46 @@ class DurableResume:
             full["optimizer"] = optimizer.state_dict()
         if scaler is not None and "scaler" not in full:
             full["scaler"] = scaler.state_dict()
+
+        # Completeness sanity-check against the single-source-of-truth key set.
+        # The trainer reads these UNCONDITIONALLY on resume; a checkpoint missing
+        # one would resume-abort (or cold-start). This is a non-fatal warning,
+        # not a hard raise: a missing recovery is recoverable (the orchestrator
+        # falls back to a fresh start / the prev rotation), and we never want a
+        # heartbeat/save hiccup to crash a long training run. The matching
+        # fail-fast lives on the LOAD side (`load_recovery` rejects an incomplete
+        # checkpoint), where a cold-optimizer silent resume is the real hazard.
+        _missing = [k for k in REQUIRED_RECOVERY_KEYS if k not in full]
+        if _missing:
+            warnings.warn(
+                f"[durable] save_recovery({name!r}) payload missing required "
+                f"key(s) {_missing}; this checkpoint will be REJECTED on resume "
+                f"(REQUIRED_RECOVERY_KEYS={REQUIRED_RECOVERY_KEYS})",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # Free-space preflight (statvfs) — mirrors the cache disk-fill guards.
+        # A near-full disk produces a truncated `.tmp`; `os.replace` would then
+        # publish a CORRUPT latest, and on the next save rotate it over the last
+        # GOOD `.prev` — destroying the rotation. Skip the save loudly instead:
+        # recovery is best-effort, a MISSING recovery is recoverable, a TRUNCATED
+        # one corrupts the chain. The good `.prev` is left untouched (we never
+        # delete it to make room).
+        min_free = _recovery_min_free_bytes()
+        free = _free_bytes(self.dir)
+        if free < min_free:
+            warnings.warn(
+                f"[durable] save_recovery({name!r}) skipped: only "
+                f"{free / 1e9:.2f} GB free at {self.dir}, need >= "
+                f"{min_free / 1e9:.2f} GB to write without risking a truncated "
+                f"checkpoint (set RECOVERY_MIN_FREE_GB to override). Existing "
+                f"recovery checkpoint + prev rotation left intact.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+
         dst = self.dir / f"{name}.ckpt"
         if dst.exists():
             try:
@@ -192,6 +305,14 @@ class DurableResume:
                 return name
         return None
 
+    @staticmethod
+    def _missing_required(ck: Any) -> list:
+        """Return the ``REQUIRED_RECOVERY_KEYS`` absent from ``ck`` (the whole
+        set if ``ck`` is not a dict). Empty ⇒ structurally complete."""
+        if not isinstance(ck, dict):
+            return list(REQUIRED_RECOVERY_KEYS)
+        return [k for k in REQUIRED_RECOVERY_KEYS if k not in ck]
+
     def load_recovery(
         self,
         name: str,
@@ -199,19 +320,70 @@ class DurableResume:
         loader: Callable[..., dict] = _default_loader,
     ) -> Optional[dict]:
         """Load ``<name>.ckpt``, falling back to ``<name>.prev.ckpt`` on a
-        corrupt or foreign-key latest. Returns the checkpoint dict, or ``None``
-        if neither file is usable (the caller then starts fresh)."""
+        corrupt, foreign-key, or STRUCTURALLY INCOMPLETE latest. Returns the
+        checkpoint dict, or ``None`` if neither file exists OR every present
+        candidate is a FOREIGN-config checkpoint (the caller then starts fresh).
+
+        Validate-on-load (Phase D): a half-written checkpoint that loads but is
+        missing a ``REQUIRED_RECOVERY_KEYS`` member (e.g. no ``optimizer``) is
+        treated EXACTLY like a corrupt file — it falls through to the prev
+        rotation. If a candidate is OURS (matching/empty resume_key) yet
+        unreadable or incomplete, and no usable candidate is found, this RAISES
+        ``RuntimeError`` rather than returning ``None``: a present-but-broken
+        recovery dir means the crash-gated orchestrator chose to resume, and
+        silently cold-starting the optimizer/scheduler would corrupt the loss
+        curve. A loud refusal beats a silent cold resume.
+
+        A READABLE checkpoint with a FOREIGN ``resume_key`` is NOT a
+        broken-checkpoint case — it is a leftover from a different config (the
+        resume dir is per-config). It returns ``None`` (start fresh), the
+        existing belt-and-suspenders guard, never a raise. (An UNREADABLE file,
+        by contrast, has no inspectable ``resume_key`` — in a per-config dir it
+        is almost certainly our own torn write, so it is treated as ours-broken
+        and contributes to the loud refusal; a corrupt latest still falls
+        through to the prev rotation first.)"""
+        saw_broken = False  # an unreadable, or OURS-but-incomplete, candidate
+        broken_detail = ""  # last observed failure reason → threaded into the raise
         for cand in (self.dir / f"{name}.ckpt", self.dir / f"{name}.prev.ckpt"):
             if not cand.exists():
                 continue
             try:
                 ck = loader(cand, map_location=map_location)
             except Exception as e:  # noqa: BLE001 — a corrupt latest falls through to prev
+                # Unreadable ⇒ key uninspectable. In a per-config resume dir this
+                # is almost certainly our own torn write, so flag it broken (the
+                # loop still tries the prev before any raise fires).
                 print(f"[durable] {cand.name} unreadable ({e}); trying prev")
+                saw_broken = True
+                broken_detail = f"{cand.name} unreadable ({e})"
                 continue
             ck_key = ck.get("resume_key", "") if isinstance(ck, dict) else ""
             if self.key and ck_key and ck_key != self.key:
                 print(f"[durable] {cand.name} resume_key mismatch (foreign checkpoint); skipping")
                 continue
+            # Validate-on-load: a structurally incomplete checkpoint (half-written
+            # — missing optimizer/encoder/etc.) must NOT be returned, or the
+            # trainer resumes with a cold optimizer / KeyErrors mid-restore.
+            missing = self._missing_required(ck)
+            if missing:
+                print(
+                    f"[durable] {cand.name} incomplete — missing required "
+                    f"key(s) {missing}; trying prev"
+                )
+                saw_broken = True
+                broken_detail = f"{cand.name} missing required key(s) {missing}"
+                continue
             return ck
+        if saw_broken:
+            # A checkpoint was on disk but unusable (unreadable, or ours-but-
+            # incomplete) and no good fallback was found. Refuse loudly rather
+            # than silently cold-start (see docstring). A READABLE foreign-key
+            # checkpoint does NOT set saw_broken — it falls through to the None
+            # below (start fresh).
+            raise RuntimeError(
+                f"[durable] recovery checkpoint(s) for {name!r} present in "
+                f"{self.dir} but none is usable (last failure: {broken_detail}; "
+                f"required keys {list(REQUIRED_RECOVERY_KEYS)}). Refusing to "
+                f"cold-start a resume — inspect or remove the recovery dir."
+            )
         return None
