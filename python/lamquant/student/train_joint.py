@@ -1697,6 +1697,12 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
 
     _qat_start = (_resume_epoch - cfg.epochs_warmup + 1) if _resume_phase == 'qat' else 1
     _qat_start = max(1, _qat_start)
+    # QAT generator step (ADR 0050/0051 step ingredient) — built once, called
+    # per batch. Encapsulates the load-bearing backward / value-clip / norm-clip
+    # / optimizer.step / alpha-clamp ordering.
+    qat_step = build_ingredient(
+        "step", "qat_codec",
+        {"grad_clip_value": 1.0, "grad_clip_norm": cfg.grad_clip_quant})
     for ep in range(_qat_start, cfg.epochs_quant + 1):
         codec.train()
         if disc is not None:
@@ -1778,35 +1784,12 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
                         feat_weight=feat_match_weight)
                 g_loss = g_loss + gan_weight * (adv_loss + feat_loss)
 
-            optimizer.zero_grad()
-            g_loss.backward()
-            # Per-COORDINATE grad clamp BEFORE the norm clip. SOAP (and any
-            # Adam-family optimizer) is invariant to a global gradient rescale,
-            # so clip_grad_norm_ is a no-op on the SOAP step (it cancels in
-            # exp_avg/sqrt(exp_avg_sq)) — which let QAT diverge (grads -> 1e15
-            # over ~50 steps even after alpha calibration fixed the onset). A
-            # value clamp changes the gradient DIRECTION per coordinate, so SOAP
-            # cannot cancel it; this is what actually bounds the QAT step.
-            torch.nn.utils.clip_grad_value_(codec.parameters(), 1.0)
-            _gnorm_qat = torch.nn.utils.clip_grad_norm_(codec.parameters(), cfg.grad_clip_quant)
-            optimizer.step()
-            # Hard alpha safety net AFTER optimizer step. Clamping after
-            # step lets the optimizer converge smoothly — it sees the true
-            # gradient and moves freely, then we project back to bounds.
-            # The old placement (before step) caused oscillation: the
-            # optimizer computed gradients on unclamped values but applied
-            # them to clamped values, fighting the clamp every step.
-            with torch.no_grad():
-                for m in _alpha_modules:
-                    # DATA-DRIVEN alpha clamp [0.5*std(W), 2*std(W)] per channel,
-                    # not a fixed [1e-4, 20]. The fixed-20 ceiling let the learned
-                    # LSQ alpha drift to ~20 while weights stayed ~0.06, so
-                    # round(w/alpha)=round(0.003)=0 zeroed the entire focal_mid
-                    # encoder body -> R capped at 0.34 (dissection 2026-06-03).
-                    if hasattr(m, 'clamp_alpha'):
-                        m.clamp_alpha()
-                    else:
-                        m.lsq_alpha.data.clamp_(min=1e-4, max=20.0)
+            # QAT generator step (ADR 0050/0051 step ingredient): single
+            # backward, per-coordinate value-clip BEFORE the norm-clip,
+            # optimizer.step, then the hard alpha-clamp AFTER the step. The
+            # rationale for each ordering constraint lives in the ingredient
+            # (ingredients/steps/_specs.py) — the sequence is load-bearing.
+            _gnorm_qat = qat_step(g_loss, codec, optimizer, _alpha_modules)
             if ema_model is not None:
                 ema_model.update_parameters(codec)
             loss_acc += g_loss.detach(); n += 1  # accumulate on GPU, no sync
