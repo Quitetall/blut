@@ -431,6 +431,12 @@ enum RecipeCommand {
         /// future re-use. Default: per-job cache only.
         #[arg(long, default_value_t = false)]
         shared_cache: bool,
+        /// Force-recompute (S4): BYPASS the stage cache READ so every stage runs
+        /// even when a warm cached entry exists. The fresh result is STILL
+        /// written to the cache, so later runs hit again — this is the "force
+        /// recompute" A/B semantic, NOT a cache wipe. Alias: `--force`.
+        #[arg(long = "no-cache", alias = "force", default_value_t = false)]
+        no_cache: bool,
         /// Hydra-style config dir (enables config mode). The composed config's
         /// top-level keys must match the recipe's flat Args fields.
         #[arg(long)]
@@ -2260,7 +2266,7 @@ async fn run_partition(reg: &crate::framework::Registry, cmd: PartitionCommand) 
                         let cell_args = apply_cell_overrides(base, &cell.overrides);
                         eprintln!("[gpu {dev}] cell {}", cell.key);
                         let (outcome, job_id) = match run_one_recipe(
-                            reg, recipe, cell_args, None, false, launch_target, Some(dev),
+                            reg, recipe, cell_args, None, false, launch_target, Some(dev), false,
                         )
                         .await
                         {
@@ -2569,6 +2575,7 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
             name,
             args,
             shared_cache,
+            no_cache,
             config_dir,
             config_name,
             config_key,
@@ -2598,7 +2605,7 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                 }
                 run_recipe_sweep(
                     reg, &name, config_dir, config_name, config_key, &set, &sweep, dry_run,
-                    shared_cache, launch_target,
+                    shared_cache, launch_target, no_cache,
                 )
                 .await?;
             } else {
@@ -2629,7 +2636,8 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                     );
                     return Ok(());
                 }
-                run_one_recipe(reg, &name, raw, None, shared_cache, launch_target, None).await?;
+                run_one_recipe(reg, &name, raw, None, shared_cache, launch_target, None, no_cache)
+                    .await?;
             }
         }
     }
@@ -2641,6 +2649,7 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
 /// handler so the sweep runner can call it per combo. `sweep_fp` ties a combo
 /// to the sweep-completion index: on success it records the final output so a
 /// re-run can skip this combo (best-effort — recording never fails the run).
+#[allow(clippy::too_many_arguments)]
 async fn run_one_recipe(
     reg: &crate::framework::Registry,
     name: &str,
@@ -2652,6 +2661,9 @@ async fn run_one_recipe(
     // PER-DEVICE scheduler lock (so cells on distinct GPUs run concurrently)
     // and exports CUDA_VISIBLE_DEVICES; `None` = box default + box-wide lock.
     device_index: Option<usize>,
+    // INC D (S4): force-recompute. `true` bypasses the stage cache READ so every
+    // stage runs even with a warm entry (the fresh result is still cached).
+    no_cache: bool,
 ) -> Result<String> {
     use crate::framework::ExecCtx;
 
@@ -2697,6 +2709,9 @@ async fn run_one_recipe(
     // checkpoint cache key — a warm and a cold run share the trained output.
     let fb_warm = crate::broker::Drivers::from_args_json(plan.exec_view().recipe_args).warm;
     ctx = ctx.with_fb_warm(fb_warm);
+    // INC D (S4): `--no-cache`/`--force` bypasses the stage cache READ so every
+    // stage recomputes; the fresh result is still written to the cache.
+    ctx = ctx.with_bypass_cache(no_cache);
     if shared_cache {
         if let Some(global) = crate::framework::CacheHandle::default_global_path() {
             std::fs::create_dir_all(&global)
@@ -2860,6 +2875,8 @@ async fn run_recipe_sweep(
     dry_run: bool,
     shared_cache: bool,
     launch_target: crate::config::launcher::LaunchTarget,
+    // INC D (S4): force-recompute — threaded into every combo's run_one_recipe.
+    no_cache: bool,
 ) -> Result<()> {
     // Fail on a bad recipe name before composing anything.
     if reg.find(name).is_none() {
@@ -2910,7 +2927,9 @@ async fn run_recipe_sweep(
         }
         eprintln!("[{}/{total}] run (fp={})", i + 1, fp.to_hex());
         let args = project_args(entry.config.json, &key);
-        match run_one_recipe(reg, name, args, Some(fp), shared_cache, launch_target, None).await {
+        match run_one_recipe(reg, name, args, Some(fp), shared_cache, launch_target, None, no_cache)
+            .await
+        {
             Ok(_job_id) => ran += 1,
             Err(e) => {
                 eprintln!("[{}/{total}] FAILED: {e}", i + 1);
@@ -3927,5 +3946,38 @@ mod sweep_projection_tests {
         let cfg = json!({"lamquant_snn": 5, "epochs": 1});
         let args = project_args(cfg.clone(), "lamquant_snn");
         assert_eq!(args, cfg);
+    }
+}
+
+#[cfg(test)]
+mod recipe_run_flag_tests {
+    //! INC D (S4): the `--no-cache` / `--force` flag on `recipe run` parses,
+    //! defaults to false (so the no-flag path is byte-identical to before), and
+    //! `--force` is an accepted alias.
+    use super::{Cli, Command, RecipeCommand};
+    use clap::Parser;
+
+    fn no_cache_of(argv: &[&str]) -> bool {
+        match Cli::try_parse_from(argv).expect("parse").command {
+            Some(Command::Recipe {
+                cmd: RecipeCommand::Run { no_cache, .. },
+            }) => no_cache,
+            other => panic!("expected recipe run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_cache_defaults_false() {
+        assert!(!no_cache_of(&["blut", "recipe", "run", "demo"]));
+    }
+
+    #[test]
+    fn no_cache_flag_sets_true() {
+        assert!(no_cache_of(&["blut", "recipe", "run", "demo", "--no-cache"]));
+    }
+
+    #[test]
+    fn force_alias_sets_true() {
+        assert!(no_cache_of(&["blut", "recipe", "run", "demo", "--force"]));
     }
 }

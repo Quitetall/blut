@@ -120,6 +120,13 @@ pub struct ExecCtx {
     /// trainer subprocess — so `capacity` partition cells run one-per-device
     /// concurrently. Set by the parallel-backfill scheduler.
     pub device_index: Option<usize>,
+    /// Force-recompute (INC D / S4). `false` (default) = the executor honours
+    /// the stage cache: a warm entry skips the run. `true` = the cache READ is
+    /// bypassed, so every stage EXECUTES even when a cached entry exists; the
+    /// fresh result is STILL written to the cache (later runs hit again). This
+    /// is the A/B "force recompute" semantic — set by the CLI `--no-cache` /
+    /// `--force` flag. Default false ⇒ byte-identical to the pre-INC-D path.
+    pub bypass_cache: bool,
 }
 
 impl ExecCtx {
@@ -155,6 +162,7 @@ impl ExecCtx {
             control: None,
             fb_warm: false,
             device_index: None,
+            bypass_cache: false,
         }
     }
 
@@ -175,6 +183,15 @@ impl ExecCtx {
     /// `StageContext.fb_warm` so a train stage bills the warm footprint.
     pub fn with_fb_warm(mut self, warm: bool) -> Self {
         self.fb_warm = warm;
+        self
+    }
+
+    /// Force-recompute (INC D / S4): bypass the stage cache READ so every stage
+    /// runs even with a warm entry, while STILL writing the fresh result to the
+    /// cache. `false` (default) = honour the cache (skip on hit). Wired from the
+    /// CLI `--no-cache` / `--force` flag.
+    pub fn with_bypass_cache(mut self, bypass: bool) -> Self {
+        self.bypass_cache = bypass;
         self
     }
 
@@ -251,6 +268,9 @@ struct NodeEnv {
     launch_target: crate::config::launcher::LaunchTarget,
     device_index: Option<usize>,
     fb_warm: bool,
+    /// Force-recompute (INC D / S4). When true, `run_node` skips the cache READ
+    /// so the stage always runs; the fresh result is still cached.
+    bypass_cache: bool,
     recipe_name: String,
     on_retry: Option<crate::framework::retry::RetryHook>,
     /// Divergence registry (S1 / ADR 0044 P7). Node id → the offending step's
@@ -469,7 +489,10 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
     let stage_name = task.stage.name().to_string();
 
     // ── Cache lookup ────────────────────────────────────────────────
-    if let Some(hit) = env.cache.lookup(task.key) {
+    // INC D (S4): `bypass_cache` forces a recompute — skip the READ so the
+    // stage always runs even with a warm entry. The fresh result is still
+    // inserted into the cache below the run path, so later runs hit again.
+    if !env.bypass_cache && let Some(hit) = env.cache.lookup(task.key) {
         env.status.emit(StageEvent::StageSkipped {
             node_idx: idx,
             stage_name: stage_name.clone(),
@@ -1362,6 +1385,7 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
         launch_target: ctx.launch_target,
         device_index: ctx.device_index,
         fb_warm: ctx.fb_warm,
+        bypass_cache: ctx.bypass_cache,
         recipe_name: plan.name().to_string(),
         on_retry: ctx.on_retry,
         diverged: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2312,6 +2336,61 @@ mod tests {
         assert_eq!(r2.n_cache_misses, 0);
         assert_eq!(MAKE_RUN_COUNT.load(Ordering::SeqCst), 1);
         assert_eq!(INC_RUN_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    /// INC D (S4): `with_bypass_cache(true)` forces a recompute — a stage with a
+    /// WARM cache entry still EXECUTES (run counts climb, all misses), and the
+    /// fresh result is STILL cached, so a subsequent NON-bypass run hits again.
+    #[tokio::test]
+    async fn bypass_cache_forces_rerun_but_still_caches() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        MAKE_RUN_COUNT.store(0, Ordering::SeqCst);
+        INC_RUN_COUNT.store(0, Ordering::SeqCst);
+
+        // Run 1 (cold): both stages execute + populate the cache.
+        let (_td, ctx) = fresh_ctx();
+        let cache = ctx.cache.clone();
+        let plan = Plan::<(), LamuTrainerBackend>::new("test", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .then(Increment, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let r1 = SequentialExecutor::execute(plan, ctx).await.unwrap();
+        assert_eq!(r1.n_cache_misses, 2);
+        assert_eq!(MAKE_RUN_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(INC_RUN_COUNT.load(Ordering::SeqCst), 1);
+
+        // Run 2 (BYPASS, shared cache): warm entries exist, but bypass forces
+        // every stage to run again — all misses, run counts climb to 2.
+        let td2 = tempfile::tempdir().unwrap();
+        let ctx2 = ExecCtx::new(td2.path().to_path_buf());
+        let ctx2 = ExecCtx { cache: cache.clone(), ..ctx2 }.with_bypass_cache(true);
+        let plan2 = Plan::<(), LamuTrainerBackend>::new("test", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .then(Increment, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let r2 = SequentialExecutor::execute(plan2, ctx2).await.unwrap();
+        assert_eq!(r2.n_cache_hits, 0, "bypass: warm entries are NOT read");
+        assert_eq!(r2.n_cache_misses, 2, "bypass: every stage executes");
+        assert_eq!(MAKE_RUN_COUNT.load(Ordering::SeqCst), 2, "MakeOne re-ran");
+        assert_eq!(INC_RUN_COUNT.load(Ordering::SeqCst), 2, "Increment re-ran");
+
+        // Run 3 (NO bypass, shared cache): the fresh result Run 2 wrote is still
+        // cached → both stages hit, run counts stay at 2.
+        let td3 = tempfile::tempdir().unwrap();
+        let ctx3 = ExecCtx::new(td3.path().to_path_buf());
+        let ctx3 = ExecCtx { cache, ..ctx3 };
+        let plan3 = Plan::<(), LamuTrainerBackend>::new("test", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .then(Increment, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let r3 = SequentialExecutor::execute(plan3, ctx3).await.unwrap();
+        assert_eq!(r3.n_cache_hits, 2, "bypass still wrote fresh entries → later run hits");
+        assert_eq!(r3.n_cache_misses, 0);
+        assert_eq!(MAKE_RUN_COUNT.load(Ordering::SeqCst), 2, "Run 3 did not execute");
+        assert_eq!(INC_RUN_COUNT.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
