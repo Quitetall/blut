@@ -117,6 +117,11 @@ from training_dashboard import TrainingDashboard
 from lamquant.common.metrics import pearson_r_batch
 from augmentations import EEGAugmentor
 from lamquant.common.utils import safe_torch_load as _safe_load
+# Ingredient registry (ADR 0050/0051): the single build_ingredient entry point
+# used for the loss/step/eval/checkpoint/data wiring below. Imported at module
+# scope so it is in scope at the EARLY construction sites (durable_resume + the
+# typed-L3 dataset) that precede the in-function local imports.
+from lamquant.ingredients import build_ingredient
 import math
 
 sys.path.insert(0, os.path.join(ROOT_DIR, 'lamquant', 'decoder'))
@@ -434,7 +439,13 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     # resumable) instead of the job-local ckpt_dir/recovery. `_dur` (or None)
     # gates every durable side-effect below; `_rec_dir` is the single recovery
     # location used by both the save sites and the resume block.
-    _dur = DurableResume(resume_dir, run_id, resume_key) if resume_dir else None
+    # durable_resume checkpoint ingredient (ADR 0050/0051): returns the
+    # DurableResume instance, or None when resume_dir is falsy (verbatim the
+    # inline `DurableResume(...) if resume_dir else None` ternary). The
+    # DurableResume import stays (the static restore_rng call below uses it).
+    _dur = build_ingredient(
+        "checkpoint", "durable_resume", {},
+        resume_dir=resume_dir, run_id=run_id, resume_key=resume_key)
     if _dur is not None:
         _dur.start()  # write state.json={status:running} + spawn the heartbeat
         print(f"[*] Durable resume ON — recovery dir {_dur.dir} (run_id={run_id or '?'})")
@@ -631,56 +642,27 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     # deprecated PrecomputedL3Dataset path otherwise so existing
     # experiments stay reproducible.
     if lma_root is not None and split_manifest is not None:
-        # MANDATORY + STANDARDIZED decode caches (no skip, no misconfig). The
-        # LMA-direct path re-decodes the lossless recording every epoch — which
-        # starves the GPU (dataload-bound, ~0% util) AND grows RAM unboundedly
-        # as the in-RAM L3 cache fills (OOM at epoch 2). The canonical resolver
-        # FORCES L3_CACHE_DIR / FB_CACHE_DIR / MEMMAP_DIR from a SINGLE data root
-        # (LAMQUANT_DATA_ROOT or the canonical default) into fixed, auto-created,
-        # mutually-consistent subpaths — there is no scenario where they
-        # disagree, point off-root, or are unset (owner directive 2026-06-10).
-        # Set before the DataLoader forks so workers inherit the dirs.
-        #   L3_CACHE_DIR  — per-stem L3 stack [n,21,313] (wrapped LmaDataset).
-        #   FB_CACHE_DIR  — per-WINDOW fullband [21,2500] fp16 (the adapter);
-        #                   ~46 GB full-manifest, a few GB per A/B (window-level,
-        #                   NOT whole-recording — see lma_typed_adapter).
-        from lamquant.common.cache_paths import apply_env as _apply_cache_env
-        _cache = _apply_cache_env()
-        # Default the decode-worker count only when UNSET — preserve an explicit
-        # LMA_NUM_WORKERS=0 (serial decode, for debugging) instead of forcing 2.
-        os.environ.setdefault('LMA_NUM_WORKERS', '2')
-        print(f"[*] MANDATORY caches @ data_root={_cache.data_root}: "
-              f"L3={_cache.l3_cache_dir} FB={_cache.fb_cache_dir} "
-              f"MEMMAP={_cache.memmap_dir} LMA_NUM_WORKERS={os.environ['LMA_NUM_WORKERS']}")
-        # Neural-side typed-batch adapter (NOT the canonical codec
-        # LmaL3Dataset, which is a bare map-style Dataset lacking the
-        # streaming surface — calibrate_shard_budget / prefetch_typed_batches
-        # / real seizure labels — that this loop requires). The adapter
-        # wraps the seizure-aware lamquant.snn.lma_dataset.LmaDataset and
-        # exposes that surface. See ai_models/student/lma_typed_adapter.py.
-        from lma_typed_adapter import LmaTypedL3Dataset
+        # LMA-direct path (BLUT canonical, ADR 0017) via the lma_typed_l3 data
+        # ingredient (ADR 0050/0051). The ingredient's build() owns the
+        # MANDATORY + STANDARDIZED decode-cache priming (cache_paths.apply_env
+        # + the LMA_NUM_WORKERS default) that MUST run BEFORE the datasets are
+        # constructed so the DataLoader fork-workers inherit L3_CACHE_DIR /
+        # FB_CACHE_DIR / MEMMAP_DIR (the documented epoch-2-OOM footgun) — the
+        # priming therefore moved INTO build(), not here. Construction is
+        # byte-identical to the inline LmaTypedL3Dataset(train) + (val, seed+1)
+        # pair with the same kwargs.
         want_fullband = (use_fullband_mode != 'off')
         print(f"[*] LMA-direct (typed adapter): root={lma_root}, "
               f"manifest={split_manifest}, return_fullband={want_fullband}")
-        _mwpf = {} if max_windows_per_file is None else {"max_windows_per_file": max_windows_per_file}
-        train_ds = LmaTypedL3Dataset(
-            lma_root=lma_root,
-            split="train",
-            split_manifest_path=split_manifest,
-            windows_per_epoch=cfg.windows_per_epoch,
-            return_fullband=want_fullband,
-            seed=seed,
-            **_mwpf,
-        )
-        val_ds = LmaTypedL3Dataset(
-            lma_root=lma_root,
-            split="val",
-            split_manifest_path=split_manifest,
-            windows_per_epoch=cfg.val_windows,
-            return_fullband=want_fullband,
-            seed=seed + 1,
-            **_mwpf,
-        )
+        train_ds, val_ds = build_ingredient(
+            "data", "lma_typed_l3",
+            {"lma_root": lma_root,
+             "split_manifest": str(split_manifest),
+             "windows_per_epoch": cfg.windows_per_epoch,
+             "val_windows": cfg.val_windows,
+             "return_fullband": want_fullband,
+             "seed": seed,
+             "max_windows_per_file": max_windows_per_file})
     else:
         train_ds = PrecomputedL3Dataset(
             file_entries=train_entries,
@@ -814,95 +796,27 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     # Falls back to L3 target when:
     #   - fullband_target is None (dataset built without with_fullband)
     #   - decoder output is L3-scale (Tier 1-2, 'direct' output mode)
-    sys.path.insert(0, os.path.join(ROOT_DIR, 'lamquant'))
-    from metrics import (prd_torch, pearson_r_torch,
-                          masked_pearson_r_torch, masked_prd_torch,
-                          asymmetric_eeg_loss as _asym_env,
-                          band_aware_asymmetric_loss as _asym_band,
-                          per_band_relative_loss as _per_band_rel)
-    spectral_loss = make_spectral_loss(device)
-    R_W = cfg.pearson_r_weight
-    SP_W = cfg.spectral_weight
-    PRD_W = cfg.prd_weight
+    # ASYM_W is consumed downstream by the provenance/experiment record
+    # (cfg_for_provenance + ExperimentRecord); keep it resolved here even
+    # though the loss math now lives in the ingredient closure.
     ASYM_W = float(asymmetric_weight)
-    # Per-band relative loss (the allocation fix, default ON for the
-    # full-residual fullband default): forces each EEG band's RELATIVE
-    # fidelity to drive gradient, so the low-amplitude >15 Hz detail the
-    # encoder now ingests is actually reconstructed (de-confounds the
-    # capacity-vs-allocation question — see ADR 0049 + the band-loss note).
-    BAND_W = float(band_loss_weight)
     if ASYM_W > 0:
-        asym_fn = _asym_band if asymmetric_kind == 'band' else _asym_env
         print(f"[*] Asymmetric loss: {asymmetric_kind}, weight={ASYM_W}")
-
-    def joint_loss(recon, l3_target, fullband_target=None,
-                    ch_mask=None, return_parts: bool = True):
-        # ch_mask [B,N] (channel-agnostic padded batches): excludes padded
-        # channels from the R/PRD terms. None (the default + the variable-N
-        # uniform-k path, which never pads) == the legacy unmasked behavior.
-        # Decide which target the decoder output matches in length.
-        # Tier 3+ → recon.shape[-1] ≈ 2500; Tier 1-2 → ≈ 313.
-        if fullband_target is not None and abs(
-                recon.shape[-1] - fullband_target.shape[-1]) <= 8:
-            target = fullband_target
-            domain = 'fullband'
-        else:
-            target = l3_target
-            domain = 'l3'
-        T = min(recon.shape[-1], target.shape[-1])
-        recon_c = recon[..., :T]
-        target_c = target[..., :T]
-        l_mse = F.mse_loss(recon_c, target_c)
-        l_r = 1.0 - masked_pearson_r_torch(recon_c, target_c, ch_mask)  # 1 − R loss (differentiable)
-        # PRD/100 lands in [0, 1]ish so the weight is comparable to
-        # the other terms. Don't divide inside prd_torch — keep it as
-        # a percentage at the metric level.
-        l_prd = masked_prd_torch(target_c, recon_c, ch_mask) / 100.0 if PRD_W > 0 else 0.0
-        # Asymmetric / clinically-weighted MSE — only active when
-        # asymmetric_weight > 0. Operates on the SAME (target, recon)
-        # pair as MSE, just with a per-sample weight derived from the
-        # original signal's amplitude envelope.
-        l_asym = asym_fn(target_c, recon_c) if ASYM_W > 0 else 0.0
-        # Spectral loss STFTs are nightly fragile in BF16; force FP32
-        # for the spectral term specifically. Cheap (one cast).
-        if SP_W > 0:
-            with torch.amp.autocast(device_type=device.type, enabled=False):
-                l_sp = spectral_loss(recon_c.float(), target_c.float())
-        else:
-            l_sp = 0.0
-        # Per-band RELATIVE loss — only meaningful on the fullband target
-        # (the EEG bands need fs=250 Hz; the L3 domain at ~31 Hz has no
-        # beta/gamma). FP32 (FFT bandpass) outside the bf16 autocast.
-        if BAND_W > 0 and domain == 'fullband':
-            with torch.amp.autocast(device_type=device.type, enabled=False):
-                l_band = _per_band_rel(recon_c.float(), target_c.float(), fs=250.0)
-        else:
-            l_band = 0.0
-        total = (l_mse + R_W * l_r + PRD_W * l_prd + SP_W * l_sp
-                 + ASYM_W * l_asym + BAND_W * l_band)
-        # Detach before scalar conversion — these dict entries are diagnostic
-        # only, not part of the autograd graph. Without .detach() torch warns
-        # about converting requires_grad tensors directly to floats and (more
-        # importantly) keeps the parts dict pinning the autograd graph alive
-        # until the next loss.backward(), wasting memory.
-        # `return_parts=False` skips the dict construction entirely — the
-        # train loop only needs scalars at val_interval boundaries, so the
-        # other ~99 % of batches save a few µs per call (real on tight loops).
-        if not return_parts:
-            return total, None
-        return total, {
-            'mse': l_mse.detach().item(),
-            'r_loss': l_r.detach().item(),
-            'prd_loss': (l_prd.detach().item()
-                         if isinstance(l_prd, torch.Tensor) else l_prd),
-            'spectral': (l_sp.detach().item()
-                         if isinstance(l_sp, torch.Tensor) else l_sp),
-            'asym': (l_asym.detach().item()
-                     if isinstance(l_asym, torch.Tensor) else l_asym),
-            'band': (l_band.detach().item()
-                     if isinstance(l_band, torch.Tensor) else l_band),
-            'loss_domain': domain,
-        }
+    # Loss ingredient (ADR 0050/0051): the joint_codec loss closure, built once
+    # before the loops. The body (spectral-loss singleton, the R/PRD/MSE/
+    # spectral/asym/per-band terms + the fullband-vs-L3 target selection) is
+    # transcribed byte-identically from the inline joint_loss; the SAME weights
+    # and asymmetric_kind are passed through cfg. `device=` is required (the
+    # spectral-loss module + the per-term FP32 autocast key off it).
+    loss_fn = build_ingredient(
+        "loss", "joint_codec",
+        {"pearson_r_weight": cfg.pearson_r_weight,
+         "spectral_weight": cfg.spectral_weight,
+         "prd_weight": cfg.prd_weight,
+         "asymmetric_weight": asymmetric_weight,
+         "band_loss_weight": band_loss_weight,
+         "asymmetric_kind": asymmetric_kind},
+        device=device)
 
     # ---- Gradient health check (runs once on first batch) ----
     _grad_checked = [False]
@@ -1060,20 +974,26 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         ROOT_DIR, 'training_logs',
         f'alpha_trajectory_{run_id}.csv',
     )
-    cm = CheckpointManager(
+    # CheckpointManager via the manager checkpoint ingredient (ADR 0050/0051).
+    # The 6 GuardConfig fields are flattened into the cfg dict; only the 4 the
+    # joint trainer overrides are passed (improvement_eps / prd_tiebreak_eps
+    # keep GuardConfig's defaults, which the ingredient's ManagerConfig mirrors
+    # byte-identically). The non-guard wiring (model / paths / device / smoke /
+    # csv / provenance) is forwarded as build kwargs. make_param_groups +
+    # TrainingHaltException imports stay (used elsewhere in this trainer).
+    cm = build_ingredient(
+        "checkpoint", "manager",
+        {"r_plateau_patience": 10**6,   # Joint is exploratory; main loop manages
+         "alpha_max_safe": 10**6,        # stop. CM is here for the CSV + saves.
+         "alpha_min_safe": 0,
+         "smoke_check_tolerance": 0.5},
         model=codec.encoder,        # alpha tracking is encoder-only
         ckpt_path=enc_path,         # CM saves encoder; we save decoder manually
         ckpt_dir=ckpt_dir / 'recovery',
         device=device,
-        provenance=provenance,
         smoke_input=lambda: torch.randn(1, n_in, 313, device=device),
         alpha_log_csv=alpha_csv,
-        guard=GuardConfig(
-            r_plateau_patience=10**6,    # Joint is exploratory; main loop manages
-            alpha_max_safe=10**6,         # stop. CM is here for the CSV + saves.
-            alpha_min_safe=0,
-            smoke_check_tolerance=0.5,
-        ),
+        provenance=provenance,
     )
     print(f"[*] Alpha trajectory CSV: {alpha_csv}")
 
@@ -1185,7 +1105,7 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
                 _pf.l3_approx, _pf.fullband_target, channel_agnostic, variable_n, n_range)
             _diag = TrainingDiagnostics(
                 codec,
-                loss_fn=lambda r, l, fullband=None, ch_mask=None: joint_loss(
+                loss_fn=lambda r, l, fullband=None, ch_mask=None: loss_fn(
                     r, l, fullband_target=fullband, ch_mask=ch_mask, return_parts=False),
                 channel_agnostic=channel_agnostic, device=str(device))
             _rep = DiagReport()
@@ -1298,6 +1218,25 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
               f"(want raw-latent scale, NOT ~±0.05)")
         return True
 
+    # Warm-phase generator step (ADR 0050/0051 step ingredient) — built once,
+    # called per batch. Transcribed byte-identically from the inline zero_grad/
+    # backward/[grad-health]/clip_grad_norm_/step sequence; NO value-clip and NO
+    # alpha-clamp (the warm phase trains FP32 clean reps, so neither applies —
+    # that omission is the load-bearing distinction from the QAT step). EMA
+    # update + dash.step stay in the loop below.
+    warm_step = build_ingredient(
+        "step", "warm_codec", {"grad_clip_norm": cfg.grad_clip_warmup})
+
+    # Eval ingredient (ADR 0050/0051): the shared end-to-end codec eval (the
+    # same wrapper the PCCP gate uses). amp/channel_agnostic/variable_n/n_range
+    # are baked at build time (identical to the inline kwargs); quantize +
+    # per_category are passed per call. Built once, used at every validate site
+    # (warm + QAT + EMA + final per-category).
+    eval_fn = build_ingredient(
+        "eval", "joint_codec",
+        {"channel_agnostic": channel_agnostic, "variable_n": variable_n,
+         "n_range": n_range, "amp": amp})
+
     for ep in range(_warm_start, cfg.epochs_warmup + 1):
         codec.train()
         if freeze_encoder:
@@ -1340,19 +1279,18 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
                 x_l3, batch.fullband_target, channel_agnostic, variable_n, n_range)
             with amp_ctx:
                 recon = codec(_xin, quantize=False, coords=_coords, ch_mask=_cmask)
-                loss, parts = joint_loss(recon, _xin,
+                loss, parts = loss_fn(recon, _xin,
                                           fullband_target=_fb,
                                           ch_mask=_cmask,
                                           return_parts=need_check)
-            optimizer.zero_grad()
-            loss.backward()
-            if need_check:
-                # AFTER backward, BEFORE clip/step: reads grad norms from the
-                # caller's single backward (no retain_graph double-backward —
-                # see #255 / _gradient_health_check). Grads stay live for clip+step.
-                _gradient_health_check(loss, parts, codec)
-            _gnorm_warm = torch.nn.utils.clip_grad_norm_(codec.parameters(), cfg.grad_clip_warmup)
-            optimizer.step()
+            # warm_codec step ingredient: zero_grad + single backward + the
+            # optional post_backward grad-health check (AFTER backward, BEFORE
+            # clip/step — reads grad norms from the caller's single backward, no
+            # retain_graph double-backward, see #255) + clip_grad_norm_ + step.
+            _gnorm_warm = warm_step(
+                loss, codec, optimizer,
+                post_backward=(lambda: _gradient_health_check(loss, parts, codec))
+                if need_check else None)
             if ema_model is not None:
                 ema_model.update_parameters(codec)
             loss_acc += loss.detach(); n += 1  # accumulate on GPU, no sync
@@ -1378,10 +1316,8 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         _per_band_w = {}   # populated below when validation runs this epoch
         _saved = False
         if ep % cfg.val_interval == 0:
-            val_r, val_prd, _per_band_w = validate_joint(codec, val_ds, device,
-                                                 quantize=False, amp=amp,
-                                                 channel_agnostic=channel_agnostic,
-                                                 variable_n=variable_n, n_range=n_range)
+            val_r, val_prd, _per_band_w = eval_fn(codec, val_ds, device,
+                                                 quantize=False)
             dash.update_val(val_r=val_r, best_r=max(best_warm_r, val_r))
             if val_r > best_warm_r:
                 best_warm_r = val_r
@@ -1736,7 +1672,7 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
                 # The encoder saw x_aug, so the loss should measure how
                 # well it reconstructed what it saw — not how well it
                 # inverted the augmentation (which caps R at ~0.93).
-                g_loss, _ = joint_loss(recon, x_aug,
+                g_loss, _ = loss_fn(recon, x_aug,
                                         fullband_target=_fb,
                                         ch_mask=_cmask,
                                         return_parts=False)
@@ -1822,16 +1758,14 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         if ep % cfg.val_interval == 0:
             if use_schedule_free:
                 optimizer.eval()
-            val_r, val_prd, per_band = validate_joint(
-                codec, val_ds, device, quantize=True, amp=amp,
-                channel_agnostic=channel_agnostic, variable_n=variable_n, n_range=n_range)
+            val_r, val_prd, per_band = eval_fn(
+                codec, val_ds, device, quantize=True)
             # EMA validation: if EMA beats live model, use EMA R for
             # checkpoint selection. Free +0.003-0.01 R at no training cost.
             _ema_is_best = False
             if ema_model is not None:
-                ema_r, ema_prd, _ = validate_joint(
-                    ema_model, val_ds, device, quantize=True, amp=amp,
-                    channel_agnostic=channel_agnostic, variable_n=variable_n, n_range=n_range)
+                ema_r, ema_prd, _ = eval_fn(
+                    ema_model, val_ds, device, quantize=True)
                 if ema_r > val_r:
                     print(f"           EMA R={ema_r:.4f} > live R={val_r:.4f}, using EMA")
                     val_r, val_prd = ema_r, ema_prd
@@ -1953,17 +1887,15 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     if use_schedule_free:
         optimizer.eval()
     print(f"\n[*] Final validation (per-category metrics)...")
-    _final_r, _final_prd, _final_band, final_cat_metrics = validate_joint(
-        codec, val_ds, device, quantize=True, amp=amp, per_category=True,
-        channel_agnostic=channel_agnostic, variable_n=variable_n, n_range=n_range)
+    _final_r, _final_prd, _final_band, final_cat_metrics = eval_fn(
+        codec, val_ds, device, quantize=True, per_category=True)
 
     # ---- EMA evaluation ----
     ema_val_r, ema_val_prd = 0.0, 100.0
     if ema_model is not None:
         print(f"[*] Evaluating EMA model (decay={ema_decay})...")
-        ema_val_r, ema_val_prd, _ = validate_joint(
-            ema_model, val_ds, device, quantize=True, amp=amp,
-            channel_agnostic=channel_agnostic, variable_n=variable_n, n_range=n_range)
+        ema_val_r, ema_val_prd, _ = eval_fn(
+            ema_model, val_ds, device, quantize=True)
         print(f"    EMA R={ema_val_r:.4f}  PRD={ema_val_prd:.1f}%  "
               f"(vs best R={cm.best_val_r:.4f}  delta={ema_val_r - cm.best_val_r:+.4f})")
 
