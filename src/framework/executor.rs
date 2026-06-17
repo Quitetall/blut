@@ -253,6 +253,57 @@ struct NodeEnv {
     fb_warm: bool,
     recipe_name: String,
     on_retry: Option<crate::framework::retry::RetryHook>,
+    /// Divergence registry (S1 / ADR 0044 P7). Node id → the offending step's
+    /// divergence detail, populated by the coordinator at the KILL site (a
+    /// `Control::KillBranch` or a `Stage::divergence_check` true) BEFORE it
+    /// cancels the node's token. `run_node` reads it under `task.node_id` to
+    /// tell a DIVERGENCE kill (→ retryable `StageError::Diverged`, auto-resume)
+    /// apart from a plain targeted kill / plan cancel (→ unchanged Killed /
+    /// Cancelled). The `Mutex` is held only for a tiny insert/get/remove — NEVER
+    /// across an `.await` — so it can't deadlock the coordinator seam. Empty when
+    /// no control policy is set, so the non-control path never touches it.
+    diverged: Arc<std::sync::Mutex<HashMap<NodeId, String>>>,
+}
+
+/// A REPLACEABLE per-node kill token (#4 / S1). Shared between the coordinator
+/// (which fires it on a divergence/targeted kill) and `run_node` (which derives
+/// each attempt's `stage_cancel` from it). A plain `CancellationToken` can never
+/// be un-cancelled, so a DIVERGENCE kill — which must let the node RETRY — would
+/// otherwise poison every later attempt. The slot lets `run_node` swap in a
+/// fresh token (a child of the plan token) for the next attempt after a
+/// divergence kill, while the coordinator still targets the CURRENT token for a
+/// second divergence or a plan cancel. The `Mutex` is held only for a token
+/// clone/swap — never across an `.await`. Without a divergence retry the slot
+/// holds one token for the node's whole life → identical to the prior single
+/// `CancellationToken`.
+#[derive(Clone)]
+struct KillSlot(Arc<std::sync::Mutex<CancellationToken>>);
+
+impl KillSlot {
+    fn new(tok: CancellationToken) -> Self {
+        KillSlot(Arc::new(std::sync::Mutex::new(tok)))
+    }
+    /// The CURRENT live token (clone). Cheap; lock held only for the clone.
+    fn current(&self) -> CancellationToken {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+    /// Did the current token fire?
+    fn is_cancelled(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_cancelled()
+    }
+    /// Cancel the current token (coordinator's kill).
+    fn cancel(&self) {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).cancel();
+    }
+    /// Swap in a fresh token (run_node re-arm before a divergence retry), so the
+    /// next attempt is not poisoned by the prior kill but is STILL killable by
+    /// the coordinator. Rooted at the plan token so a plan cancel still reaches it.
+    fn rearm(&self, plan: &CancellationToken) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = plan.child_token();
+    }
 }
 
 /// Everything one node needs to run, snapshotted by the coordinator
@@ -272,12 +323,13 @@ struct NodeTask {
     /// Resolved retry policy + timeout (node override, else stage const).
     retry: crate::framework::retry::RetryPolicy,
     timeout: crate::framework::retry::StageTimeout,
-    /// Per-node cancellation token (#4). A CHILD of the plan token, so a
-    /// plan-wide cancel still propagates here, but the coordinator can ALSO
-    /// fire it alone to kill THIS node's branch (KILL-on-NaN) without
-    /// touching siblings. With no control policy it only ever fires via the
-    /// parent → behaviour is identical to the pre-#4 single-token path.
-    node_cancel: CancellationToken,
+    /// Per-node kill SLOT (#4 / S1). Holds a CHILD of the plan token, so a
+    /// plan-wide cancel still propagates here, but the coordinator can ALSO fire
+    /// it alone to kill THIS node's branch (KILL-on-NaN) without touching
+    /// siblings. A divergence kill re-arms it with a fresh token so the node can
+    /// retry. With no control policy it holds one token for the node's whole life
+    /// → behaviour is identical to the pre-#4 single-token path.
+    node_cancel: KillSlot,
 }
 
 /// A node's result, fed back to the coordinator to advance scheduling.
@@ -317,7 +369,7 @@ enum NodeFailure {
 /// instead of failing the whole plan.
 fn cancel_failure(
     node_id: NodeId,
-    node_cancel: &CancellationToken,
+    node_cancel: &KillSlot,
     plan_cancel: &CancellationToken,
 ) -> NodeFailure {
     if node_cancel.is_cancelled() && !plan_cancel.is_cancelled() {
@@ -325,6 +377,55 @@ fn cancel_failure(
     } else {
         NodeFailure::Cancelled
     }
+}
+
+/// Coordinator-side DIVERGENCE kill (S1 / ADR 0044 P7). Records the offending
+/// step's detail in the divergence registry under the emitting node's id
+/// (`env.diverged`) BEFORE cancelling its token, so `run_node` — unwinding on
+/// the cancel — reads the entry and routes the kill to a retryable
+/// `StageError::Diverged` (auto-resume) instead of a permanent branch prune.
+/// Idempotent: a no-op if the token already fired (divergence PERSISTS, so the
+/// same kill re-arrives on the next step; only the FIRST records + cancels).
+/// Holds the registry `Mutex` only for a tiny insert — never across an `.await`.
+fn record_divergence_and_kill(
+    nid: Option<NodeId>,
+    node_idx: u32,
+    stage_name: &str,
+    update: &serde_json::Value,
+    node_tokens: &HashMap<NodeId, KillSlot>,
+    env: &NodeEnv,
+) {
+    let Some(nid) = nid else { return };
+    let Some(tok) = node_tokens.get(&nid) else {
+        return;
+    };
+    if tok.is_cancelled() {
+        return;
+    }
+    // Short, human-readable detail: stage name + the offending step payload (so
+    // the surfaced `Diverged` error / status line names WHAT diverged). A step
+    // payload can be large, and this string flows into the `Diverged` error +
+    // status events + logs, so cap it (a truncated tail is still diagnostic).
+    const MAX_DETAIL: usize = 240;
+    let mut step = update.to_string();
+    if step.len() > MAX_DETAIL {
+        // Truncate on a char boundary so the `String` stays valid UTF-8.
+        let mut cut = MAX_DETAIL;
+        while !step.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        step.truncate(cut);
+        step.push('…');
+    }
+    let detail = format!("{stage_name}: divergence on step {step}");
+    {
+        let mut reg = env.diverged.lock().unwrap_or_else(|p| p.into_inner());
+        reg.insert(nid, detail);
+    }
+    tracing::warn!(
+        "divergence KILL on node {node_idx} ({stage_name}): retryable (auto-resume on retry)"
+    );
+    tok.cancel();
 }
 
 /// Run ONE node: cache lookup → tmp dir → resource permits → run →
@@ -387,11 +488,13 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         if attempt > 1 {
             let backoff = task.retry.backoff_before(attempt);
             if !backoff.is_zero() {
-                // Wake on EITHER a plan cancel or a targeted kill (the node
-                // token is a child of the plan token, so it fires on both).
+                // Wake on EITHER a plan cancel or a targeted kill (the slot's
+                // current token is a child of the plan token, so it fires on
+                // both). Bind the token so it outlives the `.cancelled()` future.
+                let cur = task.node_cancel.current();
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
-                    _ = task.node_cancel.cancelled() => {
+                    _ = cur.cancelled() => {
                         env.status.emit(StageEvent::StageFailed {
                             node_idx: idx,
                             stage_name: stage_name.clone(),
@@ -427,10 +530,12 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         // A child cancel token so a SOFT timeout (D2) can wind THIS stage
         // down cooperatively without touching the plan token / siblings;
         // a plan cancel still propagates (child tokens fire on parent).
-        // Rooted at the PER-NODE token (#4), so a targeted KILL-on-NaN fires
-        // it via that parent exactly as a plan cancel would — the stage's own
-        // cancel handling is unchanged.
-        let stage_cancel = task.node_cancel.child_token();
+        // Rooted at the kill slot's CURRENT token (#4 / S1), so a targeted /
+        // divergence KILL fires it via that parent exactly as a plan cancel
+        // would — the stage's own cancel handling is unchanged. After a
+        // divergence retry the slot holds a FRESH (un-poisoned) token, so this
+        // attempt starts clean yet stays killable by the coordinator.
+        let stage_cancel = task.node_cancel.current().child_token();
         let mut stage_ctx = StageContext {
             job_dir: env.job_dir.clone(),
             stage_dir: tmp_stage_dir.clone(),
@@ -612,7 +717,28 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         drop(permits);
         drop(stage_ctx);
 
-        match run_result {
+        // ── Divergence (S1 / P7) ────────────────────────────────────
+        // Was THIS node's token fired by a DIVERGENCE kill (a control
+        // `KillBranch` or a `Stage::divergence_check` true), as opposed to a
+        // plain targeted kill / plan cancel? The coordinator recorded the
+        // offending step's detail in the registry under our node id BEFORE it
+        // cancelled the token, so the entry is visible by the time the cancel
+        // unwinds the run here. CONSUME it (take) so a later attempt's own
+        // token state starts clean — a repeated divergence re-populates the
+        // registry on the next kill. Lock held only for a tiny remove.
+        let diverged_detail: Option<String> = {
+            let mut reg = env.diverged.lock().unwrap_or_else(|p| p.into_inner());
+            reg.remove(&task.node_id)
+        };
+
+        // Resolve this attempt to either `break` (success) or a single `err` to
+        // classify. A DIVERGENCE cancel can surface two ways: the stage returns
+        // Ok but its cancel token fired mid-run (it observed the kill and bailed
+        // cleanly), OR the stage returns an error. In BOTH cases a registry hit
+        // promotes it to the typed `StageError::Diverged` so it routes through
+        // the retryable + auto-resume path below; otherwise the prior behaviour
+        // is byte-identical (Ok-cancel → cancel_failure, Err → classify `e`).
+        let err: StageError = match run_result {
             Ok(o) => {
                 debug_assert_eq!(
                     o.kind,
@@ -622,75 +748,132 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
                     task.stage.output_kind()
                 );
                 // A cancel observed during the run must NOT be promoted /
-                // cached — discard, report Cancelled. Check the STAGE
-                // token: it fires both on a plan cancel (child inherits
-                // the parent) AND on a stage's own cooperative cancel.
+                // cached — discard. Check the STAGE token: it fires both on a
+                // plan cancel (child inherits the parent) AND on a stage's own
+                // cooperative cancel.
                 if stage_cancel.is_cancelled() {
                     let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-                    env.status.emit(StageEvent::StageFailed {
-                        node_idx: idx,
-                        stage_name,
-                        error: "cancelled during stage".into(),
-                    });
-                    return Err(cancel_failure(task.node_id, &task.node_cancel, &env.cancel));
+                    match diverged_detail {
+                        // A DIVERGENCE cancel: synthesize a retryable `Diverged`
+                        // and fall into the retry/terminal block (auto-resume on
+                        // retry) instead of a silent Killed prune.
+                        Some(detail) => StageError::Diverged { detail },
+                        // A plain plan cancel / targeted kill: unchanged.
+                        None => {
+                            env.status.emit(StageEvent::StageFailed {
+                                node_idx: idx,
+                                stage_name,
+                                error: "cancelled during stage".into(),
+                            });
+                            return Err(cancel_failure(
+                                task.node_id,
+                                &task.node_cancel,
+                                &env.cancel,
+                            ));
+                        }
+                    }
+                } else {
+                    // StageEnd reports the SUCCESSFUL attempt's wall time;
+                    // failed attempts + backoff are visible as StageRetrying
+                    // events, not folded into this duration.
+                    break (o, stage_started.elapsed());
                 }
-                // StageEnd reports the SUCCESSFUL attempt's wall time;
-                // failed attempts + backoff are visible as StageRetrying
-                // events, not folded into this duration.
-                break (o, stage_started.elapsed());
             }
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-                // The node token fired on EITHER a plan cancel or a targeted
-                // kill — a killed node must never retry (it would re-run the
-                // doomed work), so gate retry on the node token, not just the
-                // plan token (the node token is a superset).
-                let token_fired = task.node_cancel.is_cancelled();
-                let retry = attempt < task.retry.max_attempts
-                    && !token_fired
-                    && crate::framework::retry::is_retryable(&e, task.retry.retry_on);
-                if retry {
-                    // OOM-escalation / observability hook (broker wiring).
-                    if let Some(hook) = &env.on_retry {
-                        hook(&crate::framework::retry::RetryEvent {
-                            stage_name: stage_name.clone(),
-                            recipe_name: env.recipe_name.clone(),
-                            attempt,
-                            max_attempts: task.retry.max_attempts,
-                            was_oom: matches!(e, StageError::OutOfMemory { .. }),
-                            error: format!("{e}"),
-                        });
-                    }
-                    let next_backoff = task.retry.backoff_before(attempt + 1);
-                    env.status.emit(StageEvent::StageRetrying {
-                        node_idx: idx,
-                        stage_name: stage_name.clone(),
-                        attempt,
-                        max_attempts: task.retry.max_attempts,
-                        error: format!("{e}"),
-                        backoff_ms: next_backoff.as_millis() as u64,
-                    });
-                    continue;
+                // A registry hit promotes the error to `Diverged` regardless of
+                // whether the node token has fired yet: in the narrow window
+                // where the coordinator inserted the registry entry + cancelled
+                // but the stage errored *just* before observing the cancel,
+                // `diverged_detail` is `Some` while `token_fired` is still false.
+                // Promoting anyway is CORRECT — a divergence should retry — and
+                // the gate below admits it via the `diverged` disjunct.
+                match diverged_detail {
+                    Some(detail) => StageError::Diverged { detail },
+                    None => e,
                 }
-                // Terminal failure.
-                let cancelled = token_fired || matches!(e, StageError::Cancelled);
-                env.status.emit(StageEvent::StageFailed {
-                    node_idx: idx,
+            }
+        };
+
+        // `diverged` = this attempt's kill was a DIVERGENCE kill (the
+        // synthesized `Diverged`). The node token fired on EITHER a plan cancel
+        // or a targeted kill — a plain killed node must never retry (it would
+        // re-run the doomed work), so retry gates on the node token; BUT a
+        // divergence kill IS retryable (S1): the next attempt auto-resumes from
+        // the last good checkpoint (the `attempt > 1` block above) and may
+        // recover with a fresh RNG / lower effective LR.
+        let diverged = matches!(err, StageError::Diverged { .. });
+        let token_fired = task.node_cancel.is_cancelled();
+        let retry = attempt < task.retry.max_attempts
+            && (!token_fired || diverged)
+            && crate::framework::retry::is_retryable(&err, task.retry.retry_on);
+        if retry {
+            // OOM-escalation / observability hook (broker wiring).
+            if let Some(hook) = &env.on_retry {
+                hook(&crate::framework::retry::RetryEvent {
                     stage_name: stage_name.clone(),
-                    error: format!("{e}"),
-                });
-                if cancelled {
-                    // Targeted kill → Killed (prune branch); plan cancel or a
-                    // bare Cancelled error → Cancelled (fail-fast).
-                    return Err(cancel_failure(task.node_id, &task.node_cancel, &env.cancel));
-                }
-                return Err(NodeFailure::Stage {
-                    idx,
-                    stage: stage_name,
-                    source: e,
+                    recipe_name: env.recipe_name.clone(),
+                    attempt,
+                    max_attempts: task.retry.max_attempts,
+                    was_oom: matches!(err, StageError::OutOfMemory { .. }),
+                    error: format!("{err}"),
                 });
             }
+            let next_backoff = task.retry.backoff_before(attempt + 1);
+            env.status.emit(StageEvent::StageRetrying {
+                node_idx: idx,
+                stage_name: stage_name.clone(),
+                attempt,
+                max_attempts: task.retry.max_attempts,
+                error: format!("{err}"),
+                backoff_ms: next_backoff.as_millis() as u64,
+            });
+            // S1: a divergence retry's kill already FIRED the slot's token; swap
+            // in a fresh (un-poisoned) token rooted at the plan so the next
+            // attempt starts clean yet the coordinator can still kill it on a
+            // repeated divergence (or a plan cancel). A non-divergence retry left
+            // the token un-fired → no re-arm needed.
+            // ORDERING: `rearm` MUST precede `continue` — the next iteration
+            // derives `stage_cancel` from `task.node_cancel.current()`, so it has
+            // to see the fresh token. Do not reorder these two statements.
+            if diverged {
+                task.node_cancel.rearm(&env.cancel);
+            }
+            continue;
         }
+        // Terminal failure.
+        env.status.emit(StageEvent::StageFailed {
+            node_idx: idx,
+            stage_name: stage_name.clone(),
+            error: format!("{err}"),
+        });
+        // A diverged node that exhausted its retries is a REAL surfaced failure
+        // (the run diverged and could not recover) — NOT a silent Killed prune.
+        // This is the deliberate S1 behavior change: a divergence is now
+        // diverged → bounded retry → then `StageError::Diverged` fail.
+        // ORDERING: this `diverged` check MUST come BEFORE the `cancelled` check
+        // below — a diverged node's token IS fired (`token_fired` is true), so
+        // reordering would misclassify an exhausted divergence as a `Killed`
+        // prune instead of the intended surfaced `Diverged` failure.
+        if diverged {
+            return Err(NodeFailure::Stage {
+                idx,
+                stage: stage_name,
+                source: err,
+            });
+        }
+        // A token-fired, NON-diverged node keeps the EXACT prior behaviour:
+        // targeted kill → Killed (prune); plan cancel or a bare Cancelled error
+        // → Cancelled (fail-fast).
+        let cancelled = token_fired || matches!(err, StageError::Cancelled);
+        if cancelled {
+            return Err(cancel_failure(task.node_id, &task.node_cancel, &env.cancel));
+        }
+        return Err(NodeFailure::Stage {
+            idx,
+            stage: stage_name,
+            source: err,
+        });
     };
 
     // FW-2 promote: atomic rename of the completed tmp dir to the final
@@ -940,7 +1123,7 @@ fn build_task(
     edges: &[crate::framework::plan::PlanEdge],
     outputs: &HashMap<NodeId, ErasedArtifact>,
     logical_outputs: &HashMap<NodeId, ContentHash>,
-    node_cancel: CancellationToken,
+    node_cancel: KillSlot,
 ) -> Result<NodeTask, PlanError> {
     let preds = predecessors(edges, node.id);
     let input = gather_input(node.id, &preds, outputs)?;
@@ -1135,6 +1318,7 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
         fb_warm: ctx.fb_warm,
         recipe_name: plan.name().to_string(),
         on_retry: ctx.on_retry,
+        diverged: Arc::new(std::sync::Mutex::new(HashMap::new())),
     });
 
     Ok(Prelude {
@@ -1232,10 +1416,10 @@ impl SequentialExecutor {
             }
 
             let node = &view.nodes[*node_id as usize];
-            // Per-node child token (#4). Sequential wires no control policy, so
-            // it only ever fires via the plan token → identical to the prior
-            // single-token behaviour.
-            let node_cancel = env.cancel.child_token();
+            // Per-node kill slot (#4). Sequential wires no control policy, so it
+            // only ever fires via the plan token → identical to the prior
+            // single-token behaviour (never re-armed).
+            let node_cancel = KillSlot::new(env.cancel.child_token());
             let task = match build_task(
                 node,
                 idx as u32,
@@ -1352,7 +1536,14 @@ impl ParallelExecutor {
         // `completed` must cover every node at the end.
         let mut control_rx: Option<broadcast::Receiver<StageEvent>> =
             control.as_ref().map(|_| env.status.subscribe());
-        let mut node_tokens: HashMap<NodeId, CancellationToken> = HashMap::new();
+        let mut node_tokens: HashMap<NodeId, KillSlot> = HashMap::new();
+        // S1 / P7: the coordinator does not keep the stage after spawn, but it
+        // must consult the EMITTING node's `Stage::divergence_check` on each live
+        // step. Hold an `Arc<dyn StageDyn>` clone per in-flight node here (the
+        // stage is a zero-sized marker, so the clone is just a refcount bump),
+        // keyed the same as `node_tokens`, and drop it alongside the token on
+        // completion/kill so it never leaks across nodes. Empty without a policy.
+        let mut node_stages: HashMap<NodeId, Arc<dyn StageDyn>> = HashMap::new();
 
         // #4 runtime SPAWN (PBT/TPE) state. The original plan's nodes stay
         // borrowed through `view` (immutable for the whole run); nodes appended
@@ -1470,9 +1661,10 @@ impl ParallelExecutor {
                     }
                     let node = node_at(&view, &appended, orig_n, node_id);
                     let node_idx = node_idx_of[&node_id];
-                    // Per-node kill token: a child of the plan token, retained
-                    // in `node_tokens` so the control watcher can fire it alone.
-                    let node_cancel = env.cancel.child_token();
+                    // Per-node kill slot: holds a child of the plan token,
+                    // retained in `node_tokens` so the control watcher can fire
+                    // it alone (and a divergence retry can re-arm it).
+                    let node_cancel = KillSlot::new(env.cancel.child_token());
                     let task = match build_task(
                         node,
                         node_idx,
@@ -1508,6 +1700,17 @@ impl ParallelExecutor {
                     // (a deferred node `continue`s above; its token is dropped
                     // and a fresh one is built when it re-enters `ready`).
                     node_tokens.insert(node_id, node_cancel);
+                    // S1: retain a stage handle for the live `divergence_check`
+                    // (only when a control policy watches — otherwise the watcher
+                    // never runs, so the clone would be dead weight). COUPLING:
+                    // the sole `divergence_check` invocation lives inside the
+                    // `control_rx` select arm, which only exists when
+                    // `control.is_some()` — so this guard and that arm must stay
+                    // in lockstep (a future non-control divergence path would
+                    // need to populate `node_stages` unconditionally).
+                    if control.is_some() {
+                        node_stages.insert(node_id, task.stage.clone());
+                    }
                     let env_c = env.clone();
                     join.spawn(async move { run_node(task, env_c).await });
                     in_flight += 1;
@@ -1541,22 +1744,40 @@ impl ParallelExecutor {
                                                 stage_name: &stage_name,
                                                 update: &update,
                                             };
+                                            // Resolve the emitting node id once: topo idx → node id.
+                                            let nid = order.get(node_idx as usize).copied();
+                                            // S1 / P7: consult the EMITTING node's
+                                            // `Stage::divergence_check` IN ADDITION to the policy.
+                                            // A domain-aware threshold (loss > k·EMA, grad spike)
+                                            // is a divergence too — same kill + retry path as a
+                                            // `KillBranch`. This is the ONLY invocation site of
+                                            // `divergence_check` (it was previously dead code).
+                                            let stage_diverged = nid
+                                                .and_then(|n| node_stages.get(&n))
+                                                .map(|s| s.divergence_check(&update))
+                                                .unwrap_or(false);
                                             match policy.on_step(&m) {
+                                                // A stage-side divergence still kills even if the
+                                                // policy said Continue (e.g. the default null policy
+                                                // is never wired, but KillOnNaN's Continue + a
+                                                // threshold override must still fire).
+                                                Control::Continue if stage_diverged => {
+                                                    record_divergence_and_kill(
+                                                        nid, node_idx, &stage_name, &update,
+                                                        &node_tokens, &env,
+                                                    );
+                                                }
                                                 Control::Continue => {}
+                                                // A `KillBranch` IS a divergence kill — KillOnNaN
+                                                // is its only emitter (non-finite step metric); the
+                                                // separate `Spawn` arm below is NOT a kill. Record
+                                                // the divergence + cancel the token so `run_node`
+                                                // retries it (auto-resume) instead of pruning.
                                                 Control::KillBranch => {
-                                                    // Target the EMITTING node:
-                                                    // topo idx → node id → its token.
-                                                    if let Some(&nid) = order.get(node_idx as usize) {
-                                                        if let Some(tok) = node_tokens.get(&nid) {
-                                                            if !tok.is_cancelled() {
-                                                                tracing::warn!(
-                                                                    "control policy KILL on node {node_idx} \
-                                                                     ({stage_name}): non-finite step metric"
-                                                                );
-                                                                tok.cancel();
-                                                            }
-                                                        }
-                                                    }
+                                                    record_divergence_and_kill(
+                                                        nid, node_idx, &stage_name, &update,
+                                                        &node_tokens, &env,
+                                                    );
                                                 }
                                                 // Queue the delta; it is injected at
                                                 // the top of the loop (never mid-select!).
@@ -1624,6 +1845,8 @@ impl ParallelExecutor {
                     }
                     // Token no longer needed once the node is done (#4).
                     node_tokens.remove(&outcome.node_id);
+                    // S1: drop the stage handle alongside (no leak across nodes).
+                    node_stages.remove(&outcome.node_id);
                     // O(1) reverse lookup of the key this node ran under.
                     let key = node_key_of.remove(&outcome.node_id);
                     outputs.insert(outcome.node_id, outcome.output);
@@ -1659,6 +1882,7 @@ impl ParallelExecutor {
                     // failure — other branches keep running. The killed node's
                     // GPU/memory permits already dropped when run_node returned.
                     node_tokens.remove(&node_id);
+                    node_stages.remove(&node_id);
                     // Free its single-flight key. Same-key deferred waiters are
                     // duplicate-COMPUTATION siblings (not descendants — a
                     // descendant folds this output into a DIFFERENT key); the
@@ -2991,7 +3215,12 @@ mod tests {
     impl Compatible<LamuTrainerBackend> for NanThenOk {}
 
     #[tokio::test]
-    async fn kill_on_nan_prunes_branch_and_frees_gpu() {
+    async fn divergence_kill_single_attempt_fails_and_frees_gpu() {
+        // S1: `Diverger` has the DEFAULT retry (max_attempts=1), so its single
+        // attempt diverges and EXHAUSTS retries immediately → a REAL surfaced
+        // `Diverged` failure (the deliberate S1 change from the old silent
+        // prune). Increment downstream never runs; the GPU permit is freed; the
+        // diverged node leaves no promoted stage dir.
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         DIVERGER_RAN.store(0, Ordering::SeqCst);
         INC_RUN_COUNT.store(0, Ordering::SeqCst);
@@ -3000,11 +3229,10 @@ mod tests {
         let ctx = ExecCtx::new(job_dir.clone())
             .with_control(std::sync::Arc::new(crate::framework::control::KillOnNaN));
         // Clone the GPU semaphore Arc so we can assert the permit is returned
-        // after the killed node drops it.
+        // after the diverged node drops it.
         let gpu = ctx.resources[&Resource::Gpu].clone();
 
         // MakeOne(Cpu) → Diverger(Gpu, diverges) → Increment(Cpu, downstream).
-        // The kill must prune Increment (its input never materializes).
         let plan = Plan::<(), LamuTrainerBackend>::new("kill", serde_json::json!({}))
             .start(MakeOne, EmptyArgs)
             .then(Diverger, EmptyArgs)
@@ -3014,25 +3242,28 @@ mod tests {
         let fut = ParallelExecutor::execute(plan, ctx);
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
             .await
-            .expect("KILL-on-NaN must fire — a parked Diverger would otherwise hang")
-            .expect("a killed branch is NOT a plan failure → execute returns Ok");
+            .expect("divergence kill must fire — a parked Diverger would otherwise hang");
 
-        assert_eq!(DIVERGER_RAN.load(Ordering::SeqCst), 1, "diverger ran once");
+        assert_eq!(DIVERGER_RAN.load(Ordering::SeqCst), 1, "diverger ran once (max_attempts=1)");
+        assert!(
+            matches!(
+                result,
+                Err(PlanError::StageFailed { ref stage, source: StageError::Diverged { .. }, .. })
+                    if stage == "diverger"
+            ),
+            "an exhausted divergence is a REAL failure (Diverged), not a silent prune: {result:?}"
+        );
         assert_eq!(
             INC_RUN_COUNT.load(Ordering::SeqCst),
             0,
-            "downstream Increment must be PRUNED (never scheduled)"
-        );
-        assert!(
-            result.final_output.is_none(),
-            "terminal node was pruned → no final output"
+            "downstream Increment must never run (the diverged parent never produced its output)"
         );
         assert_eq!(
             gpu.available_permits(),
             1,
-            "the killed node's GPU permit must be freed"
+            "the diverged node's GPU permit must be freed"
         );
-        // FW-2: a killed node is NOT promoted → no `<idx>-diverger` stage dir
+        // FW-2: a diverged node is NOT promoted → no `<idx>-diverger` stage dir
         // and no leftover tmp.
         let stages = job_dir.join("stages");
         if stages.is_dir() {
@@ -3040,14 +3271,18 @@ mod tests {
                 let name = entry.unwrap().file_name().to_string_lossy().into_owned();
                 assert!(
                     !name.contains("diverger"),
-                    "killed node left a stage dir: {name}"
+                    "diverged node left a stage dir: {name}"
                 );
             }
         }
     }
 
     #[tokio::test]
-    async fn kill_on_nan_lets_sibling_branch_finish() {
+    async fn divergence_kill_lets_concurrent_sibling_finish_before_failfast() {
+        // S1: `Diverger` (default retry, max_attempts=1) diverges → exhausts →
+        // fails the plan. The CONCURRENT Increment sibling must still run to
+        // completion before the plan fails-fast (the kill targets only the
+        // diverging node, never the sibling).
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         DIVERGER_RAN.store(0, Ordering::SeqCst);
         INC_RUN_COUNT.store(0, Ordering::SeqCst);
@@ -3055,8 +3290,6 @@ mod tests {
         let ctx = base.with_control(std::sync::Arc::new(crate::framework::control::KillOnNaN));
 
         // MakeOne → fork(Diverger[Gpu], Increment[Cpu]) → merge(SumTwo).
-        // Diverger is killed; the Increment SIBLING must still complete; the
-        // merge (a descendant of Diverger) is pruned.
         let plan = Plan::<(), LamuTrainerBackend>::new("kill_fork", serde_json::json!({}))
             .start(MakeOne, EmptyArgs)
             .fork(Diverger, EmptyArgs, Increment, EmptyArgs)
@@ -3066,17 +3299,19 @@ mod tests {
         let fut = ParallelExecutor::execute(plan, ctx);
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
             .await
-            .expect("sibling must finish + kill must fire")
-            .expect("a killed branch is NOT a plan failure → Ok");
+            .expect("sibling must finish + divergence kill must fire");
 
+        assert!(
+            matches!(
+                result,
+                Err(PlanError::StageFailed { ref stage, .. }) if stage == "diverger"
+            ),
+            "the exhausted divergence surfaces a StageFailed: {result:?}"
+        );
         assert_eq!(
             INC_RUN_COUNT.load(Ordering::SeqCst),
             1,
-            "the sibling Increment branch must run to completion despite the kill"
-        );
-        assert!(
-            result.final_output.is_none(),
-            "the merge (descendant of the killed node) is pruned → no final output"
+            "the sibling Increment branch must run to completion despite the divergence kill"
         );
     }
 
@@ -3098,6 +3333,453 @@ mod tests {
         let counter: Counter = result.final_output.unwrap().into_typed().unwrap();
         assert_eq!(counter.n, 1, "plan completes normally; NaN metric ignored");
         assert_eq!(result.n_cache_misses, 2);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // S1 / ADR 0044 P7 — divergence kill → RETRYABLE Diverged + auto-resume,
+    // and the new `Stage::divergence_check` invocation.
+    // ════════════════════════════════════════════════════════════════
+
+    static DIV_RESUME_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+    static DIV_RESUME_SAW_RESUME: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// A trainer that DIVERGES once (emits a non-finite step, parks on its
+    /// cancel token, bails) then SUCCEEDS on the auto-resumed retry. Writes a
+    /// `running` resume marker on attempt 1 so the executor's S3 `decide_resume`
+    /// returns Resume on attempt 2 and injects `resume_from`. Mirrors
+    /// `ResumableFlaky` but the failure mechanism is a DIVERGENCE KILL (the
+    /// coordinator cancels its token after the NaN step), not a returned error.
+    struct DivergeThenResume;
+    impl DivergeThenResume {
+        fn resume_dir(ctx: &StageContext) -> std::path::PathBuf {
+            ctx.job_dir.join("diverge_resume_dir")
+        }
+    }
+    #[async_trait]
+    impl Stage for DivergeThenResume {
+        const NAME: &'static str = "diverge_then_resume";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Gpu];
+        const RETRY: RetryPolicy = RetryPolicy {
+            max_attempts: 2,
+            backoff: Backoff::None,
+            retry_on: RetryOn::Transient,
+        };
+        type Input = Counter;
+        type Output = Counter;
+        type Args = EmptyArgs;
+        fn resume_handle(
+            &self,
+            ctx: &StageContext,
+            _args: &EmptyArgs,
+        ) -> Option<crate::framework::resume::ResumeToken> {
+            Some(crate::framework::resume::ResumeToken {
+                resume_dir: Self::resume_dir(ctx),
+                required_keys: &[],
+            })
+        }
+        async fn run(
+            &self,
+            ctx: &StageContext,
+            input: Counter,
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            DIV_RESUME_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+            if ctx.attempt == 1 {
+                // Write a `running` marker keyed on THIS run's id so the retry
+                // (same run_id) resolves to Resume.
+                let dir = Self::resume_dir(ctx);
+                std::fs::create_dir_all(&dir).unwrap();
+                let run_id = ctx
+                    .job_dir
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let state = crate::framework::resume::ResumeState {
+                    status: "running".into(),
+                    run_id,
+                    pid: 0,
+                    heartbeat_unix: now,
+                };
+                std::fs::write(dir.join("state.json"), serde_json::to_string(&state).unwrap())
+                    .unwrap();
+                // Diverge: emit a non-finite step. The coordinator's KillOnNaN
+                // watcher records the divergence + cancels THIS node's token.
+                let _ = ctx.status_tx.send(StageEvent::StageStep {
+                    node_idx: ctx.node_idx,
+                    stage_name: Self::NAME.to_string(),
+                    update: serde_json::json!({ "loss": "nan", "step": 1 }),
+                });
+                // Park until the kill fires, then bail like a SIGTERM'd trainer.
+                ctx.cancel.cancelled().await;
+                return Err(StageError::Cancelled);
+            }
+            // Attempt 2: the executor must have injected the resume dir (auto-resume).
+            if ctx.resume_from.as_deref() == Some(Self::resume_dir(ctx).as_path()) {
+                DIV_RESUME_SAW_RESUME.store(true, Ordering::SeqCst);
+            }
+            Ok(Counter { n: input.n + 1 })
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for DivergeThenResume {}
+
+    #[tokio::test]
+    async fn divergence_kill_retries_resumes_and_completes() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        DIV_RESUME_ATTEMPTS.store(0, Ordering::SeqCst);
+        DIV_RESUME_SAW_RESUME.store(false, Ordering::SeqCst);
+        let td = tempfile::tempdir().unwrap();
+        let ctx = ExecCtx::new(td.path().to_path_buf())
+            .with_control(std::sync::Arc::new(crate::framework::control::KillOnNaN));
+
+        // MakeOne → DivergeThenResume (diverges on attempt 1, resumes on 2).
+        let plan = Plan::<(), LamuTrainerBackend>::new("div_resume", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .then(DivergeThenResume, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let fut = ParallelExecutor::execute(plan, ctx);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+            .await
+            .expect("divergence kill must fire + retry — a parked stage would hang")
+            .expect("a diverged-then-resumed run RECOVERS → execute returns Ok");
+
+        assert_eq!(
+            DIV_RESUME_ATTEMPTS.load(Ordering::SeqCst),
+            2,
+            "ran twice: diverge (killed) then resumed"
+        );
+        assert!(
+            DIV_RESUME_SAW_RESUME.load(Ordering::SeqCst),
+            "attempt 2 must see resume_from = the checkpoint dir (S3 auto-resume reached)"
+        );
+        let counter: Counter = result.final_output.unwrap().into_typed().unwrap();
+        assert_eq!(counter.n, 2, "the recovered run produces its real output (1 → 2)");
+    }
+
+    static ALWAYS_DIV_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+
+    /// ALWAYS diverges: every attempt emits a non-finite step + parks + bails.
+    /// Must exhaust its retries then surface a REAL `Diverged` failure — NOT a
+    /// silent prune.
+    struct AlwaysDiverge;
+    #[async_trait]
+    impl Stage for AlwaysDiverge {
+        const NAME: &'static str = "always_diverge";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Gpu];
+        const RETRY: RetryPolicy = RetryPolicy {
+            max_attempts: 3,
+            backoff: Backoff::None,
+            retry_on: RetryOn::Transient,
+        };
+        type Input = Counter;
+        type Output = Counter;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            ctx: &StageContext,
+            _input: Counter,
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            ALWAYS_DIV_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+            let _ = ctx.status_tx.send(StageEvent::StageStep {
+                node_idx: ctx.node_idx,
+                stage_name: Self::NAME.to_string(),
+                update: serde_json::json!({ "loss": "nan" }),
+            });
+            ctx.cancel.cancelled().await;
+            Err(StageError::Cancelled)
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for AlwaysDiverge {}
+
+    #[tokio::test]
+    async fn always_diverges_exhausts_retries_then_fails_not_pruned() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        ALWAYS_DIV_ATTEMPTS.store(0, Ordering::SeqCst);
+        let (_td, base) = fresh_ctx();
+        let ctx = base.with_control(std::sync::Arc::new(crate::framework::control::KillOnNaN));
+
+        let plan = Plan::<(), LamuTrainerBackend>::new("always_div", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .then(AlwaysDiverge, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let fut = ParallelExecutor::execute(plan, ctx);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+            .await
+            .expect("repeated divergence must keep firing the kill + bounded retry");
+
+        // Terminal: a REAL surfaced failure (NOT a silent Ok-with-pruned-branch).
+        match result {
+            Err(PlanError::StageFailed { stage, source, .. }) => {
+                assert_eq!(stage, "always_diverge");
+                assert!(
+                    matches!(source, StageError::Diverged { .. }),
+                    "exhausted divergence must surface StageError::Diverged, got {source:?}"
+                );
+            }
+            other => panic!("expected StageFailed(Diverged), got {other:?}"),
+        }
+        assert_eq!(
+            ALWAYS_DIV_ATTEMPTS.load(Ordering::SeqCst),
+            3,
+            "diverged node retries up to max_attempts (3) before the terminal failure"
+        );
+    }
+
+    static TARGETED_KILL_RAN: AtomicU32 = AtomicU32::new(0);
+
+    /// Under S1 every `KillBranch` is a DIVERGENCE kill (it populates the
+    /// registry), so the only PLAIN (non-divergence) cancel reachable through the
+    /// public API is a plan cancel. This node parks WITHOUT emitting a divergence
+    /// step, so a plan cancel leaves the registry empty → the prior fail-fast
+    /// `Cancelled` (no retry) path, byte-identical to before S1.
+    struct SlowOnce;
+    #[async_trait]
+    impl Stage for SlowOnce {
+        const NAME: &'static str = "slow_once";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        const RETRY: RetryPolicy = RetryPolicy {
+            max_attempts: 3,
+            backoff: Backoff::None,
+            retry_on: RetryOn::AllErrors,
+        };
+        type Input = Counter;
+        type Output = Counter;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            ctx: &StageContext,
+            _input: Counter,
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            TARGETED_KILL_RAN.fetch_add(1, Ordering::SeqCst);
+            // Park on the (plan-rooted) cancel token; bail when it fires. No
+            // divergence step emitted → no registry entry → a PLAIN cancel.
+            ctx.cancel.cancelled().await;
+            Err(StageError::Cancelled)
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for SlowOnce {}
+
+    #[tokio::test]
+    async fn plan_cancel_of_non_diverging_node_does_not_retry() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        TARGETED_KILL_RAN.store(0, Ordering::SeqCst);
+        let (_td, base) = fresh_ctx();
+        // Control policy ON (so the registry exists), but the node never diverges.
+        let ctx = base.with_control(std::sync::Arc::new(crate::framework::control::KillOnNaN));
+        let cancel = ctx.cancel.clone();
+
+        let plan = Plan::<(), LamuTrainerBackend>::new("plain_cancel", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .then(SlowOnce, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let fut = ParallelExecutor::execute(plan, ctx);
+        // Fire a plan cancel shortly after launch — SlowOnce is parked, not diverged.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            cancel.cancel();
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+            .await
+            .expect("plan cancel must unwind promptly");
+        assert!(
+            matches!(result, Err(PlanError::Cancelled)),
+            "a plan cancel of a non-diverged node is Cancelled (fail-fast), not retried/Diverged"
+        );
+        assert_eq!(
+            TARGETED_KILL_RAN.load(Ordering::SeqCst),
+            1,
+            "a plain (non-divergence) cancel must NOT retry — runs exactly once"
+        );
+    }
+
+    static DCHECK_RAN: AtomicU32 = AtomicU32::new(0);
+
+    /// Emits a BENIGN-looking step (finite loss) but overrides
+    /// `divergence_check` to return true on it — proving the coordinator now
+    /// INVOKES `divergence_check` (previously dead code). Diverges once then
+    /// succeeds on the (plain, non-resumable) retry.
+    struct DivergenceCheckStage;
+    #[async_trait]
+    impl Stage for DivergenceCheckStage {
+        const NAME: &'static str = "divergence_check_stage";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Gpu];
+        const RETRY: RetryPolicy = RetryPolicy {
+            max_attempts: 2,
+            backoff: Backoff::None,
+            retry_on: RetryOn::Transient,
+        };
+        type Input = Counter;
+        type Output = Counter;
+        type Args = EmptyArgs;
+        fn divergence_check(&self, step: &serde_json::Value) -> bool {
+            // Fire on a FINITE metric KillOnNaN would let pass → only the
+            // divergence_check invocation can produce this kill.
+            step.get("loss").and_then(|v| v.as_f64()).is_some_and(|l| l > 100.0)
+        }
+        async fn run(
+            &self,
+            ctx: &StageContext,
+            input: Counter,
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            let attempt = DCHECK_RAN.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt == 1 {
+                // A BENIGN-looking (finite) but huge loss — KillOnNaN ignores it;
+                // only divergence_check fires.
+                let _ = ctx.status_tx.send(StageEvent::StageStep {
+                    node_idx: ctx.node_idx,
+                    stage_name: Self::NAME.to_string(),
+                    update: serde_json::json!({ "loss": 9999.0, "step": 1 }),
+                });
+                ctx.cancel.cancelled().await;
+                return Err(StageError::Cancelled);
+            }
+            Ok(Counter { n: input.n + 5 })
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for DivergenceCheckStage {}
+
+    #[tokio::test]
+    async fn divergence_check_override_fires_kill_and_retry() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        DCHECK_RAN.store(0, Ordering::SeqCst);
+        let (_td, base) = fresh_ctx();
+        let ctx = base.with_control(std::sync::Arc::new(crate::framework::control::KillOnNaN));
+
+        let plan = Plan::<(), LamuTrainerBackend>::new("dcheck", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .then(DivergenceCheckStage, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let fut = ParallelExecutor::execute(plan, ctx);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+            .await
+            .expect("divergence_check kill must fire + retry")
+            .expect("diverged-then-recovered → Ok");
+
+        assert_eq!(
+            DCHECK_RAN.load(Ordering::SeqCst),
+            2,
+            "divergence_check fired the kill on attempt 1 (finite metric KillOnNaN ignores), retried"
+        );
+        let counter: Counter = result.final_output.unwrap().into_typed().unwrap();
+        assert_eq!(counter.n, 6, "recovered run produces its output (1 → 6)");
+    }
+
+    static SIB_DIV_RAN: AtomicU32 = AtomicU32::new(0);
+    static SIB_OK_RAN: AtomicU32 = AtomicU32::new(0);
+
+    /// A sibling that runs normally (no divergence) — must complete even when a
+    /// concurrent sibling is divergence-killed.
+    struct QuietSibling;
+    #[async_trait]
+    impl Stage for QuietSibling {
+        const NAME: &'static str = "quiet_sibling";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = Counter;
+        type Output = Counter;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            input: Counter,
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            SIB_OK_RAN.fetch_add(1, Ordering::SeqCst);
+            Ok(Counter { n: input.n + 10 })
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for QuietSibling {}
+
+    /// ALWAYS diverges on a `Gpu` so it is concurrent with the `Cpu` sibling and
+    /// (after exhausting retries) fails the plan — proving the kill targets ONLY
+    /// the diverging node, never its sibling.
+    struct AlwaysDivergeGpu;
+    #[async_trait]
+    impl Stage for AlwaysDivergeGpu {
+        const NAME: &'static str = "always_diverge_gpu";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Gpu];
+        const RETRY: RetryPolicy = RetryPolicy {
+            max_attempts: 2,
+            backoff: Backoff::None,
+            retry_on: RetryOn::Transient,
+        };
+        type Input = Counter;
+        type Output = Counter;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            ctx: &StageContext,
+            _input: Counter,
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            SIB_DIV_RAN.fetch_add(1, Ordering::SeqCst);
+            let _ = ctx.status_tx.send(StageEvent::StageStep {
+                node_idx: ctx.node_idx,
+                stage_name: Self::NAME.to_string(),
+                update: serde_json::json!({ "loss": "nan" }),
+            });
+            ctx.cancel.cancelled().await;
+            Err(StageError::Cancelled)
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for AlwaysDivergeGpu {}
+
+    #[tokio::test]
+    async fn divergence_kill_does_not_affect_concurrent_sibling() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        SIB_DIV_RAN.store(0, Ordering::SeqCst);
+        SIB_OK_RAN.store(0, Ordering::SeqCst);
+        let (_td, base) = fresh_ctx();
+        let ctx = base.with_control(std::sync::Arc::new(crate::framework::control::KillOnNaN));
+
+        // MakeOne → fork(AlwaysDivergeGpu[Gpu], QuietSibling[Cpu]) → merge(SumTwo).
+        // The Gpu branch diverges (killed, retried, then fails the plan); the Cpu
+        // sibling runs CONCURRENTLY and must complete before the plan fails-fast.
+        let plan = Plan::<(), LamuTrainerBackend>::new("sib_div", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .fork(AlwaysDivergeGpu, EmptyArgs, QuietSibling, EmptyArgs)
+            .merge(SumTwo, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let fut = ParallelExecutor::execute(plan, ctx);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+            .await
+            .expect("sibling must finish; diverging branch must exhaust + fail");
+
+        // The plan fails on the exhausted divergence (a REAL failure now).
+        assert!(
+            matches!(
+                result,
+                Err(PlanError::StageFailed { ref stage, .. }) if stage == "always_diverge_gpu"
+            ),
+            "the exhausted-divergence branch surfaces a StageFailed, got {result:?}"
+        );
+        assert_eq!(
+            SIB_OK_RAN.load(Ordering::SeqCst),
+            1,
+            "the concurrent QUIET sibling must run to completion despite the divergence kill"
+        );
+        assert_eq!(
+            SIB_DIV_RAN.load(Ordering::SeqCst),
+            2,
+            "the diverging node ran its max_attempts (2), never touching the sibling"
+        );
     }
 
     // ── #4 runtime Spawn (PBT/TPE) ──────────────────────────────────────
