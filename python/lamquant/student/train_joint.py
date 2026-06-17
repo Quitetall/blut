@@ -746,11 +746,12 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     else:
         print(f"[*] Augmentation: off")
 
-    # ---- EMA (exponential moving average) ----
-    from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
-    ema_model = None
-    if ema:
-        ema_model = AveragedModel(codec, multi_avg_fn=get_ema_multi_avg_fn(ema_decay))
+    # ---- EMA (exponential moving average) — ADR 0050/0051 ema ingredient. ----
+    from lamquant.ingredients import build_ingredient
+    ema_model = build_ingredient("ema", "avg_model",
+                                 {"decay": ema_decay, "enabled": ema},
+                                 model=codec)
+    if ema_model is not None:
         print(f"[*] EMA: decay={ema_decay}")
 
     # ---- Multi-task seizure detection head ----

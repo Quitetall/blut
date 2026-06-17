@@ -19,6 +19,7 @@ from lamquant.ingredients.spec import KINDS, IngredientSpec
 # Register the built-in ingredient specs on package import.
 from lamquant.ingredients.optimizers import _specs as _optimizer_specs  # noqa: F401
 from lamquant.ingredients.schedules import _specs as _schedule_specs  # noqa: F401
+from lamquant.ingredients.ema import _specs as _ema_specs  # noqa: F401
 
 __all__ = [
     "build_ingredient",
