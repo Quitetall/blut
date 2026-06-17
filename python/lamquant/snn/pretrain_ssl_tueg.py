@@ -449,32 +449,16 @@ def main() -> None:
                         num_workers=num_workers, pin_memory=pin,
                         drop_last=False, **_dl_kwargs)
 
-    # ---- Optimizer (mirror the trainer's ESOAP routing). ----
+    # ---- Optimizer (ADR 0050/0051 ingredient registry). The ESOAP suffix
+    #      routing now lives in one place (ingredients/optimizers/_specs.py)
+    #      instead of being copy-pasted here and in train_4state_controller. ----
     named = list(ssl.named_parameters())
-    if args.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(
-            [q for _n, q in named if q.requires_grad],
-            lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
-    else:
-        from lamquant.ingredients.optimizers.esoap import ESOAP
-        _linear_suffixes = ("in_proj.weight", "x_proj.weight",
-                            "out_proj.weight", "spatial_mix.weight")
-        esoap_linear, adamw_rest = [], []
-        for nm, q in named:
-            if not q.requires_grad:
-                continue
-            if q.ndim == 2 and nm.endswith(_linear_suffixes):
-                esoap_linear.append(q)
-            else:
-                adamw_rest.append(q)
-        print(f"[ssl] ESOAP: {len(esoap_linear)} linear matrices -> "
-              f"SOAP+Muon; {len(adamw_rest)} -> AdamW")
-        optimizer = ESOAP(
-            [{"params": esoap_linear, "method": "esoap",
-              "weight_decay": args.weight_decay},
-             {"params": adamw_rest, "method": "adamw",
-              "weight_decay": args.weight_decay}],
-            lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+    from lamquant.ingredients import build_ingredient
+    optimizer = build_ingredient(
+        "optimizer", args.optimizer,
+        {"lr": args.lr, "weight_decay": args.weight_decay, "betas": (0.9, 0.95)},
+        named_params=named)
+    print(f"[ssl] optimizer: {args.optimizer} (ingredient registry)")
 
     # ---- Schedule: WSD warmup -> stable -> short cosine decay tail. ----
     from train_joint import WSDScheduler

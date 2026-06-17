@@ -864,41 +864,24 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                             num_workers=num_workers, pin_memory=pin, **_dl_kwargs)
 
-    # ---- Optimizer. ----
+    # ---- Optimizer (ADR 0050/0051 ingredient registry). The ESOAP suffix
+    #      routing now lives in one place (ingredients/optimizers/_specs.py)
+    #      instead of being copy-pasted here and in pretrain_ssl_tueg. ----
     params = list(model.named_parameters()) + \
         [(f"head.{n}", q) for n, q in head.named_parameters()]
-    if args.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(
-            [q for _n, q in params if q.requires_grad],
-            lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
-    else:  # esoap
-        from lamquant.ingredients.optimizers.esoap import ESOAP
-        _linear_suffixes = ("in_proj.weight", "x_proj.weight",
-                            "out_proj.weight", "spatial_mix.weight")
-        esoap_linear, adamw_rest = [], []
-        for nm, q in params:
-            if not q.requires_grad:
-                continue
-            if q.ndim == 2 and nm.endswith(_linear_suffixes):
-                esoap_linear.append(q)
-            else:
-                adamw_rest.append(q)
-        print(f"[4state] ESOAP: {len(esoap_linear)} linear matrices -> "
-              f"SOAP-lead+Muon-tail; {len(adamw_rest)} -> AdamW")
-        optimizer = ESOAP(
-            [{"params": esoap_linear, "method": "esoap",
-              "weight_decay": args.weight_decay},
-             {"params": adamw_rest, "method": "adamw",
-              "weight_decay": args.weight_decay}],
-            lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
-
-    # ---- ADR-0027 #3: register the distiller's student_proj as a trainable
-    #      param group (the teacher stays frozen + out of the optimizer). For
-    #      ESOAP this lands as a plain AdamW group (a 2-D Linear without an
-    #      ESOAP-routed suffix → AdamW semantics, matching the rest). ----
-    if distiller is not None:
-        optimizer.add_param_group(
-            {"params": list(distiller.student_proj.parameters())})
+    # ADR-0027 #3: the distiller's student_proj is a trainable param group (the
+    # teacher stays frozen + out of the optimizer). Passed as extra_groups so it
+    # is appended after the routed groups — for ESOAP it lands as a plain
+    # AdamW-method group, matching the prior add_param_group behaviour.
+    extra_groups = (
+        [{"params": list(distiller.student_proj.parameters())}]
+        if distiller is not None else None)
+    from lamquant.ingredients import build_ingredient
+    optimizer = build_ingredient(
+        "optimizer", args.optimizer,
+        {"lr": args.lr, "weight_decay": args.weight_decay, "betas": (0.9, 0.95)},
+        named_params=params, extra_groups=extra_groups)
+    print(f"[4state] optimizer: {args.optimizer} (ingredient registry)")
 
     # ---- Schedule: WSD∞ (warmup→constant peak) or WSD with decay tail. ----
     from train_joint import WSDScheduler
