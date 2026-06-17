@@ -21,7 +21,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -424,11 +423,11 @@ def _prime_cache_env_inline():
     os.environ.setdefault("LMA_NUM_WORKERS", "2")
 
 
-def test_lma_typed_l3_sets_cache_env(lma_corpus, monkeypatch):
+def test_lma_typed_l3_sets_cache_env(lma_corpus, monkeypatch, tmp_path):
     # apply_env() forces L3_CACHE_DIR / FB_CACHE_DIR / MEMMAP_DIR from one data
     # root; build() must have set them (and LMA_NUM_WORKERS) identically to the
     # inline priming, BEFORE constructing the datasets.
-    data_root = tempfile.mkdtemp(prefix="cacheroot_")
+    data_root = str(tmp_path)
     monkeypatch.setenv("LAMQUANT_DATA_ROOT", data_root)
     monkeypatch.delenv("LMA_NUM_WORKERS", raising=False)
     monkeypatch.delenv("L3_CACHE_DIR", raising=False)
@@ -457,11 +456,10 @@ def test_lma_typed_l3_sets_cache_env(lma_corpus, monkeypatch):
 
 
 def test_lma_typed_l3_setdefault_preserves_explicit_workers(
-        lma_corpus, monkeypatch):
+        lma_corpus, monkeypatch, tmp_path):
     # An explicit LMA_NUM_WORKERS=0 (serial decode, debugging) must survive the
     # setdefault — build() must not clobber it to 2.
-    data_root = tempfile.mkdtemp(prefix="cacheroot_")
-    monkeypatch.setenv("LAMQUANT_DATA_ROOT", data_root)
+    monkeypatch.setenv("LAMQUANT_DATA_ROOT", str(tmp_path))
     monkeypatch.setenv("LMA_NUM_WORKERS", "0")
     root, manifest = lma_corpus["root"], lma_corpus["manifest"]
     build_ingredient(
@@ -471,10 +469,9 @@ def test_lma_typed_l3_setdefault_preserves_explicit_workers(
     assert os.environ["LMA_NUM_WORKERS"] == "0"
 
 
-def test_lma_typed_l3_equals_inline(lma_corpus, monkeypatch):
+def test_lma_typed_l3_equals_inline(lma_corpus, monkeypatch, tmp_path):
     import torch
-    data_root = tempfile.mkdtemp(prefix="cacheroot_")
-    monkeypatch.setenv("LAMQUANT_DATA_ROOT", data_root)
+    monkeypatch.setenv("LAMQUANT_DATA_ROOT", str(tmp_path))
     monkeypatch.delenv("LMA_NUM_WORKERS", raising=False)
     root, manifest = lma_corpus["root"], lma_corpus["manifest"]
 
@@ -486,7 +483,7 @@ def test_lma_typed_l3_equals_inline(lma_corpus, monkeypatch):
 
     # Inline the EXACT train_joint construction (with the same priming already
     # applied by build()).
-    from lma_typed_adapter import LmaTypedL3Dataset
+    from lamquant.student.lma_typed_adapter import LmaTypedL3Dataset
     inline_train = LmaTypedL3Dataset(
         lma_root=root, split="train", split_manifest_path=manifest,
         windows_per_epoch=8, return_fullband=False, seed=0)
@@ -506,10 +503,10 @@ def test_lma_typed_l3_equals_inline(lma_corpus, monkeypatch):
     assert torch.equal(glab, ilab)
 
 
-def test_lma_typed_l3_max_windows_per_file_forwarded(lma_corpus, monkeypatch):
+def test_lma_typed_l3_max_windows_per_file_forwarded(
+        lma_corpus, monkeypatch, tmp_path):
     # None -> the kwarg is omitted (adapter default); an int -> forwarded.
-    data_root = tempfile.mkdtemp(prefix="cacheroot_")
-    monkeypatch.setenv("LAMQUANT_DATA_ROOT", data_root)
+    monkeypatch.setenv("LAMQUANT_DATA_ROOT", str(tmp_path))
     root, manifest = lma_corpus["root"], lma_corpus["manifest"]
     train_ds, _ = build_ingredient(
         "data", "lma_typed_l3",
@@ -521,16 +518,21 @@ def test_lma_typed_l3_max_windows_per_file_forwarded(lma_corpus, monkeypatch):
 
 
 def test_lma_typed_l3_builds_without_bare_area_dirs_on_path(
-        lma_corpus, monkeypatch):
+        lma_corpus, monkeypatch, tmp_path):
     # A recipe/framework caller of this ingredient need not have inserted
     # ``lamquant/student`` on sys.path the way train_joint does before its bare
     # ``from lma_typed_adapter import`` — the data spec must resolve the adapter
     # via its package path regardless. Strip the bare area dirs and confirm the
     # build still succeeds (regression for the package-form import fix).
-    data_root = tempfile.mkdtemp(prefix="cacheroot_")
-    monkeypatch.setenv("LAMQUANT_DATA_ROOT", data_root)
-    cleaned = [p for p in sys.path
-               if "lamquant/student" not in p and "lamquant/snn" not in p]
+    monkeypatch.setenv("LAMQUANT_DATA_ROOT", str(tmp_path))
+    # Match the bare-name area dirs precisely (a path whose final two parts are
+    # ``lamquant/student`` or ``lamquant/snn``), not any path that merely
+    # contains the substring.
+    def _is_area_dir(p):
+        parts = Path(p).parts
+        return len(parts) >= 2 and parts[-2] == "lamquant" and \
+            parts[-1] in {"student", "snn"}
+    cleaned = [p for p in sys.path if not _is_area_dir(p)]
     monkeypatch.setattr(sys, "path", cleaned)
     root, manifest = lma_corpus["root"], lma_corpus["manifest"]
     train_ds, val_ds = build_ingredient(
