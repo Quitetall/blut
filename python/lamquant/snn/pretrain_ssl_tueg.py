@@ -72,7 +72,7 @@ _NEURAL_ROOT = "/mnt/4tb/LamQuant/LamQuant-Neural"
 if os.path.isdir(_NEURAL_ROOT) and _NEURAL_ROOT not in sys.path:
     sys.path.insert(0, _NEURAL_ROOT)
 
-from lamquant_neural.models.mamba_ssm_minimal import MambaSNN, clamp_ssm_params  # noqa: E402
+from lamquant_neural.models.mamba_ssm_minimal import MambaSNN  # noqa: E402
 from lamquant.snn.lma_dataset import LmaDataset  # noqa: E402
 
 # Geometry — L3 latent dims (preprocess_subband_single output). Must match the
@@ -236,6 +236,10 @@ def train_epoch(ssl: SSLReconstructor, loader: DataLoader,
     gen = torch.Generator(device="cpu")
     gen.manual_seed(seed + epoch)
 
+    # ADR 0050/0051 snn_ssm step ingredient (shared with train_4state_controller).
+    from lamquant.ingredients import build_ingredient
+    snn_step = build_ingredient("step", "snn_ssm", {"grad_clip_norm": grad_clip})
+
     for l3, _labels in loader:
         # Labels are IGNORED — this is unsupervised reconstruction.
         l3 = l3.to(device, non_blocking=True)
@@ -254,16 +258,9 @@ def train_epoch(ssl: SSLReconstructor, loader: DataLoader,
         recon = ssl(x_masked)
         loss = masked_recon_loss(recon, l3, mask)
 
-        if not torch.isfinite(loss):
+        if not snn_step(loss, optimizer, ssl.parameters(), ssl.backbone):
             nan_skips += 1
-            optimizer.zero_grad(set_to_none=True)
             continue
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(ssl.parameters(), grad_clip)
-        optimizer.step()
-        with torch.no_grad():
-            clamp_ssm_params(ssl.backbone)   # SSM float32-safe band (B1)
         n_steps += 1
         total += float(loss.item())
 

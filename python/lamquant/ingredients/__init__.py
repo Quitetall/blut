@@ -21,6 +21,7 @@ from lamquant.ingredients.optimizers import _specs as _optimizer_specs  # noqa: 
 from lamquant.ingredients.schedules import _specs as _schedule_specs  # noqa: F401
 from lamquant.ingredients.ema import _specs as _ema_specs  # noqa: F401
 from lamquant.ingredients.steps import _specs as _step_specs  # noqa: F401
+from lamquant.ingredients.steps import _snn_specs as _snn_step_specs  # noqa: F401
 
 __all__ = [
     "build_ingredient",

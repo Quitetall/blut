@@ -58,7 +58,7 @@ for _sub in ("snn", "student", "dataset", "common"):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from lamquant_neural.models.mamba_ssm_minimal import MambaSNN, clamp_ssm_params  # noqa: E402
+from lamquant_neural.models.mamba_ssm_minimal import MambaSNN  # noqa: E402
 from lamquant_neural.models.heads import build_head  # noqa: E402
 from lamquant.snn.lma_dataset import LmaDataset  # noqa: E402
 from lamquant.snn.four_state import (  # noqa: E402
@@ -451,6 +451,10 @@ def train_epoch(model, head, loader, optimizer, device, quiet_thr,
     cm = np.zeros((NUM_STATES, NUM_STATES), dtype=np.int64)
     cw = class_weights.to(device)
 
+    # ADR 0050/0051 snn_ssm step ingredient (shared with pretrain_ssl_tueg).
+    from lamquant.ingredients import build_ingredient
+    snn_step = build_ingredient("step", "snn_ssm", {"grad_clip_norm": grad_clip})
+
     for l3, labels in loader:
         l3, labels = l3.to(device), labels.to(device)
         optimizer.zero_grad(set_to_none=True)
@@ -488,17 +492,11 @@ def train_epoch(model, head, loader, optimizer, device, quiet_thr,
             loss = loss + lambda_distill * distiller.distill_loss(
                 activity_logits, teacher_feat)
 
-        if not torch.isfinite(loss):
+        if not snn_step(loss, optimizer,
+                        list(model.parameters()) + list(head.parameters()),
+                        model):
             nan_skips += 1
-            optimizer.zero_grad(set_to_none=True)
             continue
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(model.parameters()) + list(head.parameters()), grad_clip)
-        optimizer.step()
-        with torch.no_grad():
-            clamp_ssm_params(model)
         n_steps += 1
         total_loss += float(loss.item())
 
