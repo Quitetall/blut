@@ -514,14 +514,20 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
                 "--no-seizure-head (codec runs use --no-seizure-head anyway).")
         print(f"[*] latent_dim override: {_ld} (ADR 0045 CLINICAL preset; "
               "MONITOR default is 32)")
-    codec = build_default_joint(latent_dim=_ld, encoder_width=cfg.encoder_width,
-                                 vocos_tier=vocos_tier, in_channels=n_in,
-                                 decoder_channels=21,
-                                 gradient_checkpointing=use_grad_ckpt,
-                                 encoder_blocks=cfg.encoder_blocks,
-                                 encoder_kernels=encoder_kernels,
-                                 channel_agnostic=channel_agnostic,
-                                 ca_decoder=(channel_agnostic and not ca_decoder_legacy)).to(device)
+    # ADR 0050/0051 model ingredient — byte-identical to the inline
+    # build_default_joint(...).to(device) call (the spec applies .to(device)
+    # when device= is passed). build_ingredient imported at module top.
+    codec = build_ingredient(
+        "model", "joint_codec",
+        {"latent_dim": _ld, "encoder_width": cfg.encoder_width,
+         "vocos_tier": vocos_tier, "in_channels": n_in,
+         "decoder_channels": 21,
+         "gradient_checkpointing": use_grad_ckpt,
+         "encoder_blocks": cfg.encoder_blocks,
+         "encoder_kernels": encoder_kernels,
+         "channel_agnostic": channel_agnostic,
+         "ca_decoder": (channel_agnostic and not ca_decoder_legacy)},
+        device=device)
     if channel_agnostic:
         _dec_kind = 'legacy-21ch' if ca_decoder_legacy else 'position-conditioned'
         print(f"[*] channel-agnostic: encoder=CA front-end, decoder={_dec_kind}, "
@@ -926,6 +932,10 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
             print(f"[!] --logger wandb requested but wandb unavailable ({e}); continuing without it")
             wandb_run = None
 
+    # ADR 0050/0051 logging ingredient — the runner-parseable BLUT_METRIC stdout
+    # line (S6/P4 contract). Built once; emits a byte-identical JSON line.
+    _blut_metric = build_ingredient("logging", "blut_metric", {})
+
     def _emit(report):
         """Log one epoch to the TrainingLogger + the reviewer metric stream +
         (optional) wandb. Each sink is independently guarded — logging must
@@ -945,18 +955,14 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         except Exception as e:
             print(f"[!] metric stream/wandb emit failed (non-fatal): {e}")
         try:
-            # S6 (P4 contract): a runner-parseable per-epoch metric line. The
-            # BLUT runner greps `BLUT_METRIC ` off stdout and forwards the JSON
-            # object as a StageEvent::StageStep, which folds into the queryable
-            # metric store (val_r is the headline; `epoch` is the coordinate).
-            # Scalars only + the phase tag; flushed so a live tail/TUI sees it.
-            # (numeric fields from d, then the metadata keys kind/phase.)
-            payload = {k: v for k, v in d.items()
-                       if isinstance(v, (int, float)) and not isinstance(v, bool)}
-            payload['kind'] = 'epoch'
-            if getattr(report, 'phase', None) is not None:
-                payload['phase'] = report.phase
-            print('BLUT_METRIC ' + json.dumps(payload), flush=True)
+            # S6 (P4 contract): a runner-parseable per-epoch metric line, via the
+            # ADR 0050/0051 logging ingredient (built above). The BLUT runner
+            # greps `BLUT_METRIC ` off stdout and forwards the JSON object as a
+            # StageEvent::StageStep, which folds into the queryable metric store
+            # (val_r is the headline; `epoch` is the coordinate). Scalars only +
+            # the phase tag; flushed so a live tail/TUI sees it. Byte-identical
+            # to the inline scalar-filter + json.dumps emit.
+            _blut_metric(d, kind='epoch', phase=getattr(report, 'phase', None))
         except Exception as e:
             print(f"[!] blut metric line emit failed (non-fatal): {e}")
 
@@ -1485,11 +1491,14 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
             "optimizer", "adamw",
             {"betas": (0.9, 0.999), "fused": (device.type == 'cuda')},
             param_groups=enc_groups + [dec_group])
-        scheduler = WSDScheduler(
-            optimizer, total_epochs=cfg.epochs_quant,
-            peak_lr=cfg.lr_quant, warmup_frac=0.05,
-            decay_frac=actual_decay_frac,
-            min_lr=cfg.lr_quant_min)
+        # ADR 0050/0051 scheduler ingredient (byte-identical to the inline
+        # WSDScheduler(...) call — warmup_kind defaults to "cosine" in both).
+        scheduler = build_ingredient(
+            "scheduler", "wsd",
+            {"total_epochs": cfg.epochs_quant, "peak_lr": cfg.lr_quant,
+             "warmup_frac": 0.05, "decay_frac": actual_decay_frac,
+             "min_lr": cfg.lr_quant_min},
+            optimizer=optimizer)
         if scheduler._infinite:
             print(f"[*] Optimizer: AdamW + WSD∞ (warmup={scheduler.warmup_epochs}ep, "
                   f"stable=∞, decay=manual trigger)")
@@ -1526,12 +1535,14 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
              "precondition_frequency": 10,
              "max_precond_dim": soap_max_precond_dim},
             param_groups=[{"params": all_params}])
-        # Wrap SOAP in WSD for warmup + optional decay
-        scheduler = WSDScheduler(
-            optimizer, total_epochs=cfg.epochs_quant,
-            peak_lr=cfg.lr_quant, warmup_frac=0.05,
-            decay_frac=actual_decay_frac,
-            min_lr=cfg.lr_quant_min)
+        # Wrap SOAP in WSD for warmup + optional decay (ADR 0050/0051 scheduler
+        # ingredient; byte-identical to the inline WSDScheduler(...) call).
+        scheduler = build_ingredient(
+            "scheduler", "wsd",
+            {"total_epochs": cfg.epochs_quant, "peak_lr": cfg.lr_quant,
+             "warmup_frac": 0.05, "decay_frac": actual_decay_frac,
+             "min_lr": cfg.lr_quant_min},
+            optimizer=optimizer)
         if scheduler._infinite:
             print(f"[*] Optimizer: SOAP + WSD∞ (lr={cfg.lr_quant}, "
                   f"warmup={scheduler.warmup_epochs}ep, stable=∞)")

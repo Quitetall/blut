@@ -102,8 +102,10 @@ def main():
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                         num_workers=0, pin_memory=(device.type == 'cuda'))
 
-    # Model
-    model = L3Teacher(width=args.width).to(device)
+    # Model — ADR 0050/0051 model ingredient (byte-identical to the inline
+    # L3Teacher(width=...).to(device) construction). build_ingredient imported above.
+    model = build_ingredient("model", "l3_teacher", {"width": args.width},
+                             device=device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[*] L3 Teacher (width={args.width}) on {device}")
     print(f"    Params: {n_params:,} ({n_params * 4 / 1e6:.1f} MB FP32)")

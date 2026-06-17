@@ -242,6 +242,11 @@ def train_epoch(ssl: SSLReconstructor, loader: DataLoader,
     # ADR 0050/0051 masked-recon loss ingredient (byte-identical to the
     # module-level masked_recon_loss def, kept here for the trainer's tests).
     loss_fn = build_ingredient("loss", "masked_recon_mse_time", {})
+    # ADR 0050/0051 sampler ingredient (the span mask; mask_frac/mean_span ride
+    # its cfg). Byte-identical to the module-level make_span_mask def.
+    make_mask = build_ingredient(
+        "sampler", "span_mask",
+        {"mask_frac": mask_frac, "mean_span": mean_span})
 
     for l3, _labels in loader:
         # Labels are IGNORED — this is unsupervised reconstruction.
@@ -250,7 +255,7 @@ def train_epoch(ssl: SSLReconstructor, loader: DataLoader,
             f"expected l3 [B,21,T], got {tuple(l3.shape)}"
         B, _C, T = l3.shape
 
-        mask = make_span_mask(B, T, mask_frac, mean_span, gen, torch.device("cpu"))
+        mask = make_mask(B, T, gen, torch.device("cpu"))  # sampler ingredient
         mask = mask.to(device)
         # Zero the masked timesteps across all 21 channels (BERT [MASK] == 0
         # for a normalized L3; the backbone never sees the masked values).
@@ -464,11 +469,14 @@ def main() -> None:
     print(f"[ssl] optimizer: {args.optimizer} (ingredient registry)")
 
     # ---- Schedule: WSD warmup -> stable -> short cosine decay tail. ----
-    from lamquant.ingredients.schedules.wsd import WSDScheduler
-    scheduler = WSDScheduler(optimizer, total_epochs=args.epochs,
-                             peak_lr=args.lr, warmup_frac=args.warmup_frac,
-                             decay_frac=0.10, min_lr=args.lr_min,
-                             warmup_kind="cosine")
+    # ADR 0050/0051 scheduler ingredient (byte-identical to the inline
+    # WSDScheduler(...) construction); build_ingredient imported above.
+    scheduler = build_ingredient(
+        "scheduler", "wsd",
+        {"total_epochs": args.epochs, "peak_lr": args.lr,
+         "warmup_frac": args.warmup_frac, "decay_frac": 0.10,
+         "min_lr": args.lr_min, "warmup_kind": "cosine"},
+        optimizer=optimizer)
     print(f"[ssl] schedule: cosine-warmup -> WSD -> cosine decay "
           f"(warmup={scheduler.warmup_epochs}ep)")
 

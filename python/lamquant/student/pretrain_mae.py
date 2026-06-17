@@ -152,16 +152,20 @@ def run_pretraining(
         )
 
     # ---- Build encoder + prediction head ----
-    from lamquant_neural.models.encoder import TernaryMobileNetV5_Subband
-    encoder = TernaryMobileNetV5_Subband(in_ch=21, latent_dim=32).to(device)
-    pred_head = MAEPredictionHead(latent_dim=32).to(device)
+    # ADR 0050/0051 model ingredient (byte-identical to the inline
+    #   encoder   = TernaryMobileNetV5_Subband(in_ch=21, latent_dim=32).to(device)
+    #   pred_head = MAEPredictionHead(latent_dim=32).to(device)
+    # construction; the pred_head is discarded after pretraining).
+    from lamquant.ingredients import build_ingredient
+    _mae = build_ingredient("model", "mae_encoder",
+                            {"in_ch": 21, "latent_dim": 32}, device=device)
+    encoder, pred_head = _mae["encoder"], _mae["pred_head"]
     n_enc = sum(p.numel() for p in encoder.parameters())
     n_head = sum(p.numel() for p in pred_head.parameters())
     print(f'[*] Encoder: {n_enc:,} params')
     print(f'[*] Prediction head: {n_head:,} params (discarded after pretraining)')
 
     # ADR 0050/0051 ingredient registry (uniform optimizer construction).
-    from lamquant.ingredients import build_ingredient
     optimizer = build_ingredient(
         "optimizer", "adamw",
         {"lr": lr, "weight_decay": 1e-4, "betas": (0.9, 0.999),
@@ -174,6 +178,14 @@ def run_pretraining(
     # ADR 0050/0051 loss ingredient (masked-recon MSE, all-mean denominator).
     # Built once before the loop; byte-identical to F.mse_loss(pred*mask, l3*mask).
     loss_fn = build_ingredient("loss", "masked_recon_mse_patch", {})
+
+    # ADR 0050/0051 sampler ingredient (the patch mask) + forward ingredient
+    # (the mask-zero -> encode -> predict pass). Both built once before the loop;
+    # byte-identical to the inline create_mask(...) / encode-predict sequence.
+    make_mask = build_ingredient(
+        "sampler", "patch_mask",
+        {"mask_ratio": mask_ratio, "patch_size": patch_size})
+    forward = build_ingredient("forward", "mae_masked", {})
 
     # ---- Training loop ----
     best_loss = float('inf')
@@ -189,17 +201,12 @@ def run_pretraining(
             l3 = batch[0]  # [B, 21, 313]
             B, C, T = l3.shape
 
-            # Create mask: 1 = masked (to predict)
-            mask = create_mask(B, C, T, mask_ratio, patch_size, device)
+            # Create mask: 1 = masked (to predict) — sampler ingredient, built
+            # above (mask_ratio/patch_size ride its cfg).
+            mask = make_mask(B, C, T, device)
 
-            # Zero out masked regions in the input
-            l3_masked = l3 * (1.0 - mask)
-
-            # Encode the visible patches
-            latent = encoder.encode(l3_masked, quantize=False)
-
-            # Predict full L3 from latent
-            l3_pred = pred_head(latent)
+            # Forward ingredient: mask-zero -> encode (quantize=False) -> predict.
+            l3_pred = forward(encoder, pred_head, l3, mask)
 
             # Loss only on masked regions (loss ingredient, built above).
             loss = loss_fn(l3_pred, l3, mask)

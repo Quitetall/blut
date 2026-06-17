@@ -873,19 +873,20 @@ def main():
     print(f"[4state] optimizer: {args.optimizer} (ingredient registry)")
 
     # ---- Schedule: WSD∞ (warmup→constant peak) or WSD with decay tail. ----
-    from lamquant.ingredients.schedules.wsd import WSDScheduler
+    # ADR 0050/0051 scheduler ingredient (byte-identical to the inline
+    # WSDScheduler(...) construction); build_ingredient imported above. Only the
+    # decay_frac differs between the two branches (0.0 == infinite stable).
+    _decay_frac = 0.0 if args.infinite_lr else 0.10
+    scheduler = build_ingredient(
+        "scheduler", "wsd",
+        {"total_epochs": args.epochs, "peak_lr": args.lr,
+         "warmup_frac": args.warmup_frac, "decay_frac": _decay_frac,
+         "min_lr": args.lr_min, "warmup_kind": "cosine"},
+        optimizer=optimizer)
     if args.infinite_lr:
-        scheduler = WSDScheduler(optimizer, total_epochs=args.epochs,
-                                 peak_lr=args.lr, warmup_frac=args.warmup_frac,
-                                 decay_frac=0.0, min_lr=args.lr_min,
-                                 warmup_kind="cosine")
         print(f"[4state] schedule: cosine-warmup -> WSD∞ stable "
               f"(warmup={scheduler.warmup_epochs}ep)")
     else:
-        scheduler = WSDScheduler(optimizer, total_epochs=args.epochs,
-                                 peak_lr=args.lr, warmup_frac=args.warmup_frac,
-                                 decay_frac=0.10, min_lr=args.lr_min,
-                                 warmup_kind="cosine")
         print(f"[4state] schedule: cosine-warmup -> WSD -> cosine decay "
               f"(warmup={scheduler.warmup_epochs}ep)")
 

@@ -16,8 +16,24 @@ from typing import Any, Callable
 # selection MUST ride a hashed Args/extra_args field (never an env var or a
 # Python-side default), so two materially different trainings never collide on
 # one stage cache key.
+#
+# INVARIANT: every kind here has >=1 registered, non-stub spec that
+# build_ingredient can construct (verified by the registry tests). KINDS must
+# equal the actually-buildable set — never advertise a kind the registry can't
+# build.
+#
+# RESERVED-FOR-FUTURE (deliberately NOT in KINDS): `preprocess`. The ADR 0049
+# band-std input normalization is NOT an inline trainer-loop primitive — it
+# lives inside the LMA decode/preprocess pipeline (the Rust codec +
+# student/lma_typed_adapter), upstream of the dataset the trainer consumes. The
+# trainers receive already-preprocessed L3 and never run a standalone
+# normalization step in their loop, so there is no low-risk inline primitive to
+# extract into a spec. Carving one out would mean surgery on a working dataset
+# adapter / the codec for zero behavioral gain. Re-add `preprocess` to KINDS the
+# day a real, registry-buildable preprocess spec lands (the registry stays
+# fail-closed against a kind with no spec, so this can never silently regress).
 KINDS: frozenset[str] = frozenset({
-    "data", "sampler", "preprocess", "model", "forward", "loss",
+    "data", "sampler", "model", "forward", "loss",
     "optimizer", "scheduler", "step", "ema", "eval", "checkpoint", "logging",
 })
 

@@ -26,6 +26,10 @@ from lamquant.ingredients.loss import _specs as _loss_specs  # noqa: F401
 from lamquant.ingredients.checkpoint import _specs as _checkpoint_specs  # noqa: F401
 from lamquant.ingredients.evals import _specs as _eval_specs  # noqa: F401
 from lamquant.ingredients.data import _specs as _data_specs  # noqa: F401
+from lamquant.ingredients.sampler import _specs as _sampler_specs  # noqa: F401
+from lamquant.ingredients.model import _specs as _model_specs  # noqa: F401
+from lamquant.ingredients.forward import _specs as _forward_specs  # noqa: F401
+from lamquant.ingredients.logging import _specs as _logging_specs  # noqa: F401
 
 __all__ = [
     "build_ingredient",
