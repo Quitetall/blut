@@ -302,6 +302,44 @@ pub fn list(conn: &Connection) -> Result<Vec<DatasetRecord>> {
     Ok(out)
 }
 
+/// Datasets whose `kind` is one of `kinds`, newest-first.
+///
+/// This is the by-kind query the `blut tui` dataset picker (F3 / U5)
+/// uses to filter the catalog to a recipe's compatible `input_kinds`
+/// (a recipe consuming `dataset.jsonl` should only see `dataset.jsonl`
+/// datasets). An empty `kinds` slice returns nothing — a recipe with no
+/// declared input kinds skips the picker entirely, so it never reaches
+/// here with an empty filter; returning `[]` is the safe, explicit
+/// answer if it does (rather than silently falling back to "everything").
+///
+/// Built as a parameterized `IN (?, ?, …)` so the kind strings are bound,
+/// never interpolated (no SQL-injection surface even though kinds are
+/// `&'static` today). Ordering mirrors [`list`] (created_at DESC, name ASC).
+pub fn list_by_kinds(conn: &Connection, kinds: &[&str]) -> Result<Vec<DatasetRecord>> {
+    if kinds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat_n("?", kinds.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT id, name, kind, source_path, sha256, n_examples, n_tokens, created_at, metadata \
+         FROM datasets WHERE kind IN ({placeholders}) ORDER BY created_at DESC, name ASC"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| TrainError::other(format!("prepare list_by_kinds: {e}")))?;
+    let params = rusqlite::params_from_iter(kinds.iter());
+    let rows = stmt
+        .query_map(params, row_to_record)
+        .map_err(|e| TrainError::other(format!("query list_by_kinds: {e}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| TrainError::other(format!("row decode: {e}")))?);
+    }
+    Ok(out)
+}
+
 pub fn remove(conn: &Connection, name: &str) -> Result<bool> {
     let n = conn
         .execute("DELETE FROM datasets WHERE name = ?", params![name])
@@ -491,6 +529,36 @@ mod tests {
         let h2 = compute_file_sha256(&f).unwrap();
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64);
+    }
+
+    #[test]
+    fn list_by_kinds_filters_and_orders() {
+        let td = tempfile::tempdir().unwrap();
+        let conn = open_at(&td.path().join("test.db")).unwrap();
+        let f = td.path().join("data.jsonl");
+        make_jsonl(&f, 1);
+        // Three datasets across two kinds; created_at controls order.
+        for (name, kind, ts) in [
+            ("a-jsonl", "dataset.jsonl", 100i64),
+            ("b-split", "dataset.split", 200),
+            ("c-jsonl", "dataset.jsonl", 300),
+        ] {
+            let mut r = record_from_jsonl(name, &f, kind, None).unwrap();
+            r.created_at = ts;
+            add(&conn, &r).unwrap();
+        }
+        // Single kind → only that kind, newest-first.
+        let jsonl = list_by_kinds(&conn, &["dataset.jsonl"]).unwrap();
+        let names: Vec<&str> = jsonl.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["c-jsonl", "a-jsonl"]);
+        // Multiple kinds → union, still newest-first across kinds.
+        let both = list_by_kinds(&conn, &["dataset.jsonl", "dataset.split"]).unwrap();
+        let names: Vec<&str> = both.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["c-jsonl", "b-split", "a-jsonl"]);
+        // A kind with no rows → empty.
+        assert!(list_by_kinds(&conn, &["checkpoint.hf"]).unwrap().is_empty());
+        // Empty filter → empty (recipes with no input_kinds skip the picker).
+        assert!(list_by_kinds(&conn, &[]).unwrap().is_empty());
     }
 
     #[test]

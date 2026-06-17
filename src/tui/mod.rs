@@ -89,6 +89,24 @@ mod test_fixtures {
         serde_json::json!({"type": "object", "properties": {}})
     }
 
+    /// A `schema_of`-shaped schema with real typed fields, so the per-field
+    /// form (F2) tests have editable rows + scalar types to round-trip. Two
+    /// typed fields (`lr: number` default 0.001, `tag: string` no default).
+    fn typed_args_schema() -> serde_json::Value {
+        serde_json::json!({
+            "$ref": "#/definitions/Args",
+            "definitions": {
+                "Args": {
+                    "type": "object",
+                    "properties": {
+                        "lr": { "type": "number", "default": 0.001 },
+                        "tag": { "type": "string" }
+                    }
+                }
+            }
+        })
+    }
+
     pub(super) static TRAIN_ALPHA: RecipeDef = RecipeDef {
         name: "train_alpha",
         description: "fixture training recipe alpha",
@@ -135,10 +153,64 @@ mod test_fixtures {
         },
     };
 
+    /// A `dataset.jsonl`-consuming recipe whose schema declares the
+    /// `registered_name` input convention — so the F3 picker→inject tests can
+    /// assert the picked dataset lands in the right form field.
+    fn dataset_input_schema() -> serde_json::Value {
+        serde_json::json!({
+            "$ref": "#/definitions/Args",
+            "definitions": {
+                "Args": {
+                    "type": "object",
+                    "properties": {
+                        "registered_name": { "type": "string" },
+                        "epochs": { "type": "integer", "default": 1 }
+                    }
+                }
+            }
+        })
+    }
+
+    pub(super) static TRAIN_EPSILON: RecipeDef = RecipeDef {
+        name: "train_epsilon",
+        description: "fixture recipe consuming a registered dataset",
+        backend_id: "fixture",
+        category: RecipeCategory::Train,
+        input_kinds: &["dataset.jsonl"],
+        output_kind: "checkpoint.hf",
+        schedule: None,
+        args_schema_fn: dataset_input_schema,
+        compile_fn: |_| {
+            Err(crate::framework::error::RecipeError::CompileFailed(
+                "fixture".into(),
+            ))
+        },
+    };
+
+    /// A graph-input recipe (empty `input_kinds` → skips the F3 dataset
+    /// picker, opens the form directly) WITH a real typed args schema, so the
+    /// F2 per-field form tests have editable rows.
+    pub(super) static TRAIN_DELTA: RecipeDef = RecipeDef {
+        name: "train_delta",
+        description: "fixture training recipe delta (graph-input, typed args)",
+        backend_id: "fixture",
+        category: RecipeCategory::Train,
+        input_kinds: &[],
+        output_kind: "checkpoint.hf",
+        schedule: None,
+        args_schema_fn: typed_args_schema,
+        compile_fn: |_| {
+            Err(crate::framework::error::RecipeError::CompileFailed(
+                "fixture".into(),
+            ))
+        },
+    };
+
     /// The fixture catalog the TUI tests index (stands in for the recipes
     /// a real cookbook crate registers at runtime). Train + Eval
     /// categories exercise the category-grouped cockpit/menu paths.
-    pub(super) static FIXTURE: &[&RecipeDef] = &[&TRAIN_ALPHA, &TRAIN_BETA, &EVAL_GAMMA];
+    pub(super) static FIXTURE: &[&RecipeDef] =
+        &[&TRAIN_ALPHA, &TRAIN_BETA, &EVAL_GAMMA, &TRAIN_DELTA];
 
     struct FixtureCookbook;
     impl Cookbook for FixtureCookbook {
@@ -157,6 +229,31 @@ mod test_fixtures {
         let mut r = Registry::new();
         r.register(Box::new(FixtureCookbook));
         r
+    }
+}
+
+/// Point `datasets_db` at an empty per-process temp file so the F3 dataset
+/// picker never touches the operator's real `conversations.db`. The fixture
+/// recipes declare `input_kinds`, so opening one routes through
+/// `open_dataset_picker`; with an empty DB it finds no datasets and falls
+/// straight through to the args editor (the path the existing Picker→Editor
+/// tests assert). Idempotent + safe to call from every test helper.
+#[cfg(test)]
+fn isolate_datasets_db_for_tests() {
+    use std::sync::OnceLock;
+    static DB: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let path = DB.get_or_init(|| {
+        std::env::temp_dir().join(format!("blut-tui-datasets-{}.db", std::process::id()))
+    });
+    // SAFETY: `set_var` is `unsafe` because a concurrent `getenv` in another
+    // thread is a data race. Here every caller writes the SAME OnceLock-derived
+    // path, so the only value ever stored is identical — a benign race (the
+    // observed value is the same regardless of ordering). This is `#[cfg(test)]`
+    // and the env var is read only by `datasets_db::registry_path()`, which the
+    // dataset picker calls synchronously from the (single-threaded) test driving
+    // the key handler, never concurrently with this write.
+    unsafe {
+        std::env::set_var("LAMU_MEMORY_DB", path);
     }
 }
 
@@ -201,19 +298,71 @@ impl View {
     }
 }
 
+/// One editable row in the per-field args form (F2). Built from a
+/// recipe schema's top-level `properties`: a `name`, a `ty` hint
+/// (the schema's scalar `type` string, e.g. `"number"` / `"string"`,
+/// or `"any"` when the schema declares none / a union), and the live
+/// `value` the user edits as text. On submit the rows are reassembled
+/// into the args JSON object and run through the SAME
+/// `validate_args_against_schema` the freeform buffer used.
+struct EditorField {
+    name: String,
+    ty: String,
+    value: String,
+}
+
 /// Modal overlay state. `None` = main jobs+log view; `Picker` floats
-/// a recipe list over the main view; `Editor` shows a single-line
-/// text buffer prefilled with the recipe's args JSON template.
+/// a recipe list over the main view; `DatasetPicker` floats a
+/// kind-filtered dataset list (F3/U5) before the editor; `Editor`
+/// shows a per-field args form (F2) built from the recipe's schema
+/// properties, with an optional raw-JSON fallback toggle.
 enum Overlay {
     None,
     Picker {
         query: String,
         cursor: usize,
     },
+    /// F3/U5: pick a dataset (filtered to the recipe's `input_kinds`)
+    /// to feed the recipe's input before opening the args editor.
+    /// `datasets` is the pre-filtered, owned list (name + kind +
+    /// source_path captured at open). Esc skips → editor with no
+    /// dataset injected.
+    DatasetPicker {
+        recipe: &'static crate::recipes::RecipeDef,
+        datasets: Vec<DatasetChoice>,
+        cursor: usize,
+    },
     Editor {
         recipe: &'static str,
-        buffer: String,
+        /// Per-field form rows (the DEFAULT surface). Empty only for a
+        /// truly schema-less recipe (`{}`), in which case the form shows
+        /// a hint and the raw fallback is the way to add fields.
+        fields: Vec<EditorField>,
+        /// Which field row is focused (typing edits this row's value).
+        focus: usize,
+        /// Raw-JSON fallback toggle (Ctrl+R). `false` = the per-field
+        /// form (default); `true` = the freeform JSON buffer in
+        /// `raw_buffer`. Submitting from raw mode uses `raw_buffer`
+        /// verbatim; from form mode the fields are assembled to JSON.
+        raw_mode: bool,
+        /// The freeform JSON buffer used while `raw_mode` is on. Seeded
+        /// from the fields when the toggle flips on; re-parsed back into
+        /// the fields when it flips off (so an edit in either view
+        /// survives the toggle).
+        raw_buffer: String,
     },
+}
+
+/// A dataset row offered by the kind-filtered picker (F3). Owns just the
+/// fields the picker needs — name (the `registered_name` we inject),
+/// kind (shown), and source_path (injected when a recipe takes a path
+/// arg rather than a registered name).
+#[derive(Clone)]
+struct DatasetChoice {
+    name: String,
+    kind: String,
+    source_path: String,
+    n_examples: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -410,11 +559,24 @@ impl App {
     }
 
     fn submit_editor(&mut self) {
-        let Overlay::Editor { recipe, buffer } = &self.overlay else {
+        let Overlay::Editor {
+            recipe,
+            fields,
+            raw_mode,
+            raw_buffer,
+            ..
+        } = &self.overlay
+        else {
             return;
         };
         let recipe = *recipe;
-        let buffer = buffer.clone();
+        // The buffer to launch = the raw JSON when the fallback is on, else
+        // the per-field form assembled back into a JSON object.
+        let buffer = if *raw_mode {
+            raw_buffer.clone()
+        } else {
+            assemble_fields(fields)
+        };
         // U3 (F2): run the SAME schema preflight the CLI does (B/P5) BEFORE
         // launching, so a malformed / wrong-typed / missing arg surfaces a
         // precise message in-TUI and the Editor STAYS OPEN to fix — instead
@@ -444,21 +606,205 @@ impl App {
         Ok(())
     }
 
-    /// Open the args Editor overlay for a recipe, prefilled with the
-    /// best available starting point: the pre-baked LamQuant corpus-path
-    /// defaults for the `lamquant_*` recipes, else the schemars template.
-    /// (Previously the hotkey path always used `template_for`, leaving
-    /// `lamquant_default_args` dead — this revives it.)
+    /// Toggle the Editor's raw-JSON fallback (Ctrl+R). Form→raw seeds the raw
+    /// buffer from the current fields. Raw→form re-parses the raw buffer back
+    /// into the fields — but ONLY if it's valid JSON. On a parse error we STAY
+    /// in raw mode and set a status, so a malformed raw edit can never silently
+    /// flip to a stale form (and then launch stale data) — the user is kept on
+    /// the JSON they must fix. No-op unless the Editor overlay is open.
+    fn toggle_editor_raw_mode(&mut self) {
+        let mut parse_err: Option<String> = None;
+        if let Overlay::Editor {
+            fields,
+            raw_mode,
+            raw_buffer,
+            ..
+        } = &mut self.overlay
+        {
+            if *raw_mode {
+                // raw → form: re-derive field VALUES from the edited JSON,
+                // keeping the existing field set + types (a typo'd key doesn't
+                // spawn phantom rows); unknown keys are appended as `any`.
+                match serde_json::from_str::<serde_json::Value>(raw_buffer) {
+                    Ok(serde_json::Value::Object(m)) => {
+                        let mut seen = std::collections::HashSet::new();
+                        for f in fields.iter_mut() {
+                            if let Some(v) = m.get(&f.name) {
+                                f.value = value_to_field_text(v);
+                            } else {
+                                f.value.clear();
+                            }
+                            seen.insert(f.name.clone());
+                        }
+                        for (k, v) in &m {
+                            if !seen.contains(k) {
+                                fields.push(EditorField {
+                                    name: k.clone(),
+                                    ty: "any".into(),
+                                    value: value_to_field_text(v),
+                                });
+                            }
+                        }
+                        *raw_mode = false;
+                    }
+                    Ok(_) => {
+                        // Valid JSON but not an object (e.g. a bare array) — the
+                        // form can't represent it; keep raw mode + warn.
+                        parse_err =
+                            Some("raw args must be a JSON object to switch to the form".into());
+                    }
+                    Err(e) => {
+                        // Stay in raw mode so the user fixes the JSON; the form
+                        // is never shown with stale values.
+                        parse_err = Some(format!("raw JSON invalid ({e}) — staying in raw mode"));
+                    }
+                }
+            } else {
+                *raw_buffer = assemble_fields(fields);
+                *raw_mode = true;
+            }
+        }
+        if let Some(msg) = parse_err {
+            self.set_status(msg);
+        }
+    }
+
+    /// Open the args Editor overlay for a recipe as a PER-FIELD FORM (F2),
+    /// built from the recipe's schema `properties` and seeded with the same
+    /// prefill the freeform buffer used: the schema-default template ⊕ the
+    /// owning cookbook's domain overlay (E2). The serde defaults are the
+    /// single source; the overlay only adds domain paths + curated
+    /// non-default starts on top. Keeps blut-core domain-agnostic — no
+    /// hardcoded paths.
     fn open_editor(&mut self, recipe: &'static crate::recipes::RecipeDef) {
-        // Prefill = schema-default template ⊕ the owning cookbook's domain
-        // overlay (E2). The serde defaults are the single source; the overlay
-        // only adds domain paths + curated non-default starts on top. Keeps
-        // blut-core domain-agnostic — no hardcoded paths.
-        let buffer = self.registry.prefill_args(recipe.name);
+        // The prefill JSON is the source of the seed VALUES; the schema's
+        // `properties` is the source of the field SET + per-field type hints.
+        let prefill = self.registry.prefill_args(recipe.name);
+        let schema = (recipe.args_schema_fn)();
+        let fields = build_fields(&schema, &prefill);
+        // raw_buffer mirrors the form so flipping to the raw fallback starts
+        // from the same content the form shows.
+        let raw_buffer = assemble_fields(&fields);
         self.overlay = Overlay::Editor {
             recipe: recipe.name,
-            buffer,
+            fields,
+            focus: 0,
+            raw_mode: false,
+            raw_buffer,
         };
+    }
+
+    /// Open the kind-filtered dataset picker for a recipe (F3/U5). Queries
+    /// `datasets_db` for datasets whose `kind` matches the recipe's
+    /// `input_kinds`, then floats the selectable list. A recipe with EMPTY
+    /// `input_kinds` (graph-input, no dataset to pick) skips straight to the
+    /// args editor — unchanged from before this feature. If the db can't be
+    /// opened (e.g. no datasets registered yet) we degrade to the editor with
+    /// a status note rather than blocking the launch.
+    fn open_dataset_picker(&mut self, recipe: &'static crate::recipes::RecipeDef) {
+        if recipe.input_kinds.is_empty() {
+            self.open_editor(recipe);
+            return;
+        }
+        let datasets = match crate::datasets_db::open()
+            .and_then(|conn| crate::datasets_db::list_by_kinds(&conn, recipe.input_kinds))
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|r| DatasetChoice {
+                    name: r.name,
+                    kind: r.kind,
+                    source_path: r.source_path.to_string_lossy().into_owned(),
+                    n_examples: r.n_examples,
+                })
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                // No registry / no matching datasets is not an error worth
+                // blocking on — fall through to the editor so the operator can
+                // still type a path by hand.
+                self.set_status(format!(
+                    "dataset picker: {e}; opening args editor (set the input by hand)"
+                ));
+                self.open_editor(recipe);
+                return;
+            }
+        };
+        if datasets.is_empty() {
+            self.set_status(format!(
+                "no datasets of kind [{}] registered — opening args editor",
+                recipe.input_kinds.join(", ")
+            ));
+            self.open_editor(recipe);
+            return;
+        }
+        self.overlay = Overlay::DatasetPicker {
+            recipe,
+            datasets,
+            cursor: 0,
+        };
+    }
+
+    /// A dataset was picked in the DatasetPicker (F3): inject it into the
+    /// recipe's input arg, then open the per-field editor. The injection
+    /// target is schema-driven — the recipe's args schema decides which field
+    /// receives the dataset. A `registered_name` field (the
+    /// `materialize_dataset_path` convention) gets the dataset's registered
+    /// NAME, so the stage re-resolves + re-hashes it from `datasets_db` at run
+    /// time; otherwise a `path` / `input` / `dataset` / `lma_root` field gets
+    /// the dataset's `source_path`. If the schema declares none of those we
+    /// still open the editor (the operator wires the input by hand) and note it
+    /// in the status bar. The chosen value is layered onto the prefill so the
+    /// editor opens with the dataset already filled in.
+    fn pick_dataset(
+        &mut self,
+        recipe: &'static crate::recipes::RecipeDef,
+        choice: &DatasetChoice,
+    ) {
+        let schema = (recipe.args_schema_fn)();
+        let prop_names = schema_prop_names(&schema);
+        // Prefer the registered-name convention; fall back to a path arg.
+        let (field, value) = if prop_names.iter().any(|n| n == "registered_name") {
+            ("registered_name", choice.name.clone())
+        } else if let Some(p) = ["path", "input", "dataset", "lma_root"]
+            .into_iter()
+            .find(|c| prop_names.iter().any(|n| n == c))
+        {
+            (p, choice.source_path.clone())
+        } else {
+            // No obvious input arg in the schema — open the editor anyway so
+            // the launch isn't blocked, and tell the operator.
+            self.set_status(format!(
+                "picked '{}' but recipe '{}' has no registered_name/path arg — set the input by hand",
+                choice.name, recipe.name
+            ));
+            self.open_editor(recipe);
+            return;
+        };
+        // Build the editor from prefill, then overwrite the input field's row
+        // value with the picked dataset.
+        self.open_editor(recipe);
+        if let Overlay::Editor {
+            fields, raw_buffer, ..
+        } = &mut self.overlay
+        {
+            if let Some(row) = fields.iter_mut().find(|f| f.name == field) {
+                row.value = value.clone();
+            } else {
+                // The schema-default template may have omitted an optional
+                // field with no default; add it so the picked dataset is
+                // actually carried into the args.
+                fields.push(EditorField {
+                    name: field.to_string(),
+                    ty: schema_field_type(&schema, field),
+                    value: value.clone(),
+                });
+            }
+            *raw_buffer = assemble_fields(fields);
+            self.set_status(format!(
+                "input: {field} = '{value}' (from dataset '{}')",
+                choice.name
+            ));
+        }
     }
 
     /// Spawn `blut recipe run <name> --args '<json>'` detached. Status
@@ -712,6 +1058,166 @@ impl App {
     }
 }
 
+// ── F2 per-field form helpers (free fns, schema/JSON only) ──────────────
+//
+// These bridge the recipe's args JSON schema + the prefill JSON to the
+// editable form rows and back. They are pure (no &self) so the render code
+// and the key handler can call them with disjoint borrows.
+
+/// Resolve a `schema_of`-shaped schema (`{"$ref":"#/definitions/<Name>",
+/// "definitions":{…}}`) to its root args object (the `<Name>` definition,
+/// falling back to `"Args"`). Mirrors `recipe::schema_root` (which is
+/// private to that module).
+fn schema_args_root(schema: &serde_json::Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    let defs = schema.get("definitions").and_then(|d| d.as_object());
+    if let Some(defs) = defs {
+        let name = schema
+            .get("$ref")
+            .and_then(|r| r.as_str())
+            .and_then(|r| r.rsplit('/').next())
+            .unwrap_or("Args");
+        if let Some(obj) = defs.get(name).or_else(|| defs.get("Args")).and_then(|d| d.as_object()) {
+            return Some(obj);
+        }
+    }
+    // An inline (non-$ref) object schema — used by fixtures + simple recipes.
+    schema.as_object().filter(|o| o.contains_key("properties"))
+}
+
+/// Ordered list of the recipe schema's top-level property names. Used by the
+/// dataset-picker injection to find the recipe's input arg.
+fn schema_prop_names(schema: &serde_json::Value) -> Vec<String> {
+    schema_args_root(schema)
+        .and_then(|root| root.get("properties"))
+        .and_then(|p| p.as_object())
+        .map(|props| props.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// The scalar `type` string a schema declares for `field` (e.g. `"number"`),
+/// or `"any"` when it declares none / a union (`Option<T>` → `["T","null"]`).
+fn schema_field_type(schema: &serde_json::Value, field: &str) -> String {
+    schema_args_root(schema)
+        .and_then(|root| root.get("properties"))
+        .and_then(|p| p.as_object())
+        .and_then(|props| props.get(field))
+        .and_then(|d| d.get("type"))
+        .and_then(|t| t.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| "any".into())
+}
+
+/// Build the per-field form rows for a recipe from its schema `properties`,
+/// seeding each row's value from the prefill JSON (the schema-default
+/// template ⊕ cookbook overlay). Field ORDER follows the schema's
+/// `properties` order so the form reads like the recipe's `Args` struct.
+/// A field present in the prefill but absent from `properties` (e.g. an
+/// overlay-only key) is appended after the declared fields so nothing the
+/// prefill set is silently dropped.
+fn build_fields(schema: &serde_json::Value, prefill: &str) -> Vec<EditorField> {
+    let prefill_obj: serde_json::Map<String, serde_json::Value> =
+        match serde_json::from_str::<serde_json::Value>(prefill) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+    let mut rows = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(props) = schema_args_root(schema)
+        .and_then(|root| root.get("properties"))
+        .and_then(|p| p.as_object())
+    {
+        for (name, def) in props {
+            let ty = def
+                .get("type")
+                .and_then(|t| t.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| "any".into());
+            // Seed from the prefill value (already the merged default), else
+            // leave blank — a blank optional field is omitted on assembly.
+            let value = prefill_obj
+                .get(name)
+                .map(value_to_field_text)
+                .unwrap_or_default();
+            rows.push(EditorField {
+                name: name.clone(),
+                ty,
+                value,
+            });
+            seen.insert(name.clone());
+        }
+    }
+    // Overlay-only / extra prefill keys not declared in the schema.
+    for (name, v) in &prefill_obj {
+        if !seen.contains(name) {
+            rows.push(EditorField {
+                name: name.clone(),
+                ty: "any".into(),
+                value: value_to_field_text(v),
+            });
+        }
+    }
+    rows
+}
+
+/// Render a JSON value as the text a form row shows. Strings drop their
+/// surrounding quotes (the operator edits the raw text); everything else is
+/// its compact JSON form (so `true` / `8` / `["a","b"]` round-trip).
+fn value_to_field_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// Parse a form row's text back into a typed JSON value, guided by the
+/// field's schema `type`. The point is to NOT make every value a string:
+///   * `number`/`integer` → a JSON number (falls back to a string if the
+///     text isn't numeric, so the schema preflight reports the precise
+///     "expected number, got string" rather than a parse panic);
+///   * `boolean` → `true`/`false` (case-insensitive), else string;
+///   * `array`/`object` → parsed JSON (else string, so malformed JSON is
+///     caught by the preflight, not here);
+///   * `string` → the text verbatim;
+///   * `any`/union → best-effort `serde_json::from_str`, else a string (so
+///     an Option<number> typed `8` becomes `8`, while free text stays text).
+fn field_value_json(ty: &str, text: &str) -> serde_json::Value {
+    use serde_json::Value;
+    let t = text.trim();
+    match ty {
+        "string" => Value::String(text.to_string()),
+        "number" | "integer" => serde_json::from_str::<serde_json::Number>(t)
+            .map(Value::Number)
+            .unwrap_or_else(|_| Value::String(text.to_string())),
+        "boolean" => match t.to_ascii_lowercase().as_str() {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => Value::String(text.to_string()),
+        },
+        "array" | "object" => {
+            serde_json::from_str::<Value>(t).unwrap_or_else(|_| Value::String(text.to_string()))
+        }
+        // "any" / unknown / union (Option) — try JSON, fall back to string.
+        _ => serde_json::from_str::<Value>(t).unwrap_or_else(|_| Value::String(text.to_string())),
+    }
+}
+
+/// Assemble the form rows back into a pretty-printed args JSON object. A row
+/// left BLANK is omitted (so an untouched optional field doesn't force a
+/// `null` / empty value into the args — the recipe's serde default applies).
+/// Blank strings are omitted too; a recipe that genuinely needs an empty
+/// string is vanishingly rare and the raw-JSON fallback covers it.
+fn assemble_fields(fields: &[EditorField]) -> String {
+    let mut map = serde_json::Map::new();
+    for f in fields {
+        if f.value.trim().is_empty() {
+            continue;
+        }
+        map.insert(f.name.clone(), field_value_json(&f.ty, &f.value));
+    }
+    serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".into())
+}
+
 /// Entrypoint registered as `blut tui`. The caller (the cookbook binary)
 /// supplies the composed cookbook [`Registry`]; the cockpit's recipe
 /// catalog comes from it, not a static slice.
@@ -776,8 +1282,76 @@ pub fn check(registry: crate::framework::Registry) -> Result<()> {
             anyhow::bail!("tui --check: view {view:?} rendered a completely blank buffer");
         }
     }
-    println!("blut tui --check: OK ({} views render)", views.len());
+
+    // Also render every modal OVERLAY headless so a future break in the recipe
+    // Picker, the F2 per-field args form (+ its raw-JSON fallback), or the F3
+    // dataset picker is caught by `tui --check`, not just by unit tests.
+    app.view = View::Cockpit;
+    let mut overlays_checked = 0usize;
+    // Recipe picker.
+    app.open_picker();
+    overlays_checked += render_overlay_check(&mut term, &mut app, "Picker")?;
+    // The per-field form + raw fallback + dataset picker need a recipe; only
+    // exercise them when the live catalog has one (blut-core's bare registry
+    // may be empty — then the overlay paths are covered by the unit fixtures).
+    if let Some(recipe) = app.catalog.first().copied() {
+        app.open_editor(recipe);
+        overlays_checked += render_overlay_check(&mut term, &mut app, "Editor(form)")?;
+        // Flip to the raw-JSON fallback and render that surface too.
+        if let Overlay::Editor {
+            raw_mode,
+            raw_buffer,
+            fields,
+            ..
+        } = &mut app.overlay
+        {
+            *raw_buffer = assemble_fields(fields);
+            *raw_mode = true;
+        }
+        overlays_checked += render_overlay_check(&mut term, &mut app, "Editor(raw)")?;
+        // Dataset picker with a synthetic row (no DB touch) so the draw path
+        // is exercised even on a box with no registered datasets.
+        app.overlay = Overlay::DatasetPicker {
+            recipe,
+            datasets: vec![DatasetChoice {
+                name: "example".into(),
+                kind: recipe.input_kinds.first().copied().unwrap_or("dataset").into(),
+                source_path: "/path/to/example.jsonl".into(),
+                n_examples: 1,
+            }],
+            cursor: 0,
+        };
+        overlays_checked += render_overlay_check(&mut term, &mut app, "DatasetPicker")?;
+    }
+    app.overlay = Overlay::None;
+
+    println!(
+        "blut tui --check: OK ({} views + {overlays_checked} overlays render)",
+        views.len()
+    );
     Ok(())
+}
+
+/// Render the current frame (whatever overlay is set on `app`) to the test
+/// backend and assert it isn't completely blank. Returns 1 so callers can sum
+/// a count. Helper for [`check`] so the overlay smoke-checks stay DRY.
+fn render_overlay_check(
+    term: &mut Terminal<ratatui::backend::TestBackend>,
+    app: &mut App,
+    label: &str,
+) -> Result<usize> {
+    term.draw(|f| draw(f, app))
+        .with_context(|| format!("draw overlay {label}"))?;
+    let blank = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .all(|c| c.symbol().trim().is_empty());
+    if blank {
+        anyhow::bail!("tui --check: overlay {label} rendered a completely blank buffer");
+    }
+    Ok(1)
 }
 
 async fn run_app<B: ratatui::backend::Backend>(
@@ -830,26 +1404,99 @@ fn handle_key(app: &mut App, k: event::KeyEvent) {
         return;
     }
     match &mut app.overlay {
-        Overlay::Editor { buffer, .. } => match k.code {
-            KeyCode::Esc => app.overlay = Overlay::None,
-            KeyCode::Enter
-                if k.modifiers.contains(KeyModifiers::CONTROL)
-                    || k.modifiers.contains(KeyModifiers::SHIFT) =>
-            {
-                app.submit_editor();
+        Overlay::Editor {
+            fields,
+            focus,
+            raw_mode,
+            raw_buffer,
+            ..
+        } => {
+            // Ctrl+R toggles the raw-JSON fallback (F2 keeps a raw escape
+            // hatch, but the per-field form is the default). Handled in a
+            // method so a parse failure on raw→form can set a status message
+            // (needs &mut self, not just the overlay borrow).
+            if matches!(k.code, KeyCode::Char('r')) && k.modifiers.contains(KeyModifiers::CONTROL) {
+                app.toggle_editor_raw_mode();
+                return;
             }
-            KeyCode::Char('\n') => {
-                buffer.push('\n');
+            if *raw_mode {
+                // Freeform JSON buffer (the fallback). Same keys as the old
+                // single-buffer editor: type / Backspace edit, Enter inserts a
+                // newline, Ctrl/Shift+Enter submits, Esc cancels.
+                match k.code {
+                    KeyCode::Esc => app.overlay = Overlay::None,
+                    KeyCode::Enter
+                        if k.modifiers.contains(KeyModifiers::CONTROL)
+                            || k.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        app.submit_editor();
+                    }
+                    KeyCode::Enter | KeyCode::Char('\n') => raw_buffer.push('\n'),
+                    KeyCode::Backspace => {
+                        raw_buffer.pop();
+                    }
+                    KeyCode::Char(c) => raw_buffer.push(c),
+                    _ => {}
+                }
+            } else {
+                // Per-field form (DEFAULT). ↑↓/Tab move between rows; typing
+                // edits the focused row's value; Backspace deletes a char;
+                // Ctrl/Shift+Enter (or plain Enter) submits.
+                let n = fields.len();
+                match k.code {
+                    KeyCode::Esc => app.overlay = Overlay::None,
+                    KeyCode::Up => {
+                        if n > 0 {
+                            *focus = (*focus + n - 1) % n;
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Tab => {
+                        if n > 0 {
+                            *focus = (*focus + 1) % n;
+                        }
+                    }
+                    KeyCode::BackTab => {
+                        if n > 0 {
+                            *focus = (*focus + n - 1) % n;
+                        }
+                    }
+                    KeyCode::Enter => app.submit_editor(),
+                    KeyCode::Backspace => {
+                        if let Some(f) = fields.get_mut(*focus) {
+                            f.value.pop();
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        if let Some(f) = fields.get_mut(*focus) {
+                            f.value.push(c);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Overlay::DatasetPicker {
+            recipe,
+            datasets,
+            cursor,
+        } => match k.code {
+            // Esc SKIPS the picker → open the editor with no dataset injected
+            // (recipe input typed by hand). Matches the "Esc to skip" contract.
+            KeyCode::Esc => {
+                let recipe = *recipe;
+                app.open_editor(recipe);
+            }
+            KeyCode::Up | KeyCode::Char('k') => *cursor = cursor.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                let last = datasets.len().saturating_sub(1);
+                *cursor = (*cursor + 1).min(last);
             }
             KeyCode::Enter => {
-                // Plain Enter inserts a newline so the user can edit
-                // multi-line JSON; Ctrl/Shift-Enter submits.
-                buffer.push('\n');
+                let recipe = *recipe;
+                if let Some(choice) = datasets.get(*cursor).cloned() {
+                    app.pick_dataset(recipe, &choice);
+                }
             }
-            KeyCode::Backspace => {
-                buffer.pop();
-            }
-            KeyCode::Char(c) => buffer.push(c),
             _ => {}
         },
         Overlay::Picker { query, cursor } => match k.code {
@@ -885,7 +1532,10 @@ fn handle_key(app: &mut App, k: event::KeyEvent) {
                 let filtered = App::filter_recipes(&app.catalog, query);
                 if let Some(idx) = filtered.get(*cursor) {
                     let recipe = app.catalog[*idx];
-                    app.open_editor(recipe);
+                    // F3/U5: route through the kind-filtered dataset picker
+                    // (which itself skips straight to the editor when the
+                    // recipe has no input_kinds).
+                    app.open_dataset_picker(recipe);
                 }
             }
             _ => {}
@@ -955,12 +1605,13 @@ fn handle_key_cockpit(app: &mut App, k: event::KeyEvent) {
                 }
                 return;
             }
-            // Recipe hotkeys (auto-assigned per category order). Opens
-            // the args editor prefilled with pre-baked LamQuant defaults
-            // (or the schema template for non-lamquant recipes).
+            // Recipe hotkeys (auto-assigned per category order). Routes
+            // through the kind-filtered dataset picker (F3/U5) when the recipe
+            // declares input_kinds, else straight to the per-field args editor
+            // (F2) prefilled with pre-baked defaults / the schema template.
             let menu = App::recipe_menu(&app.catalog);
             if let Some((_, recipe)) = menu.iter().find(|(k, _)| *k == Some(c)) {
-                app.open_editor(recipe);
+                app.open_dataset_picker(recipe);
             }
         }
         _ => {}
@@ -1353,20 +2004,110 @@ fn draw_overlay(f: &mut Frame<'_>, app: &App) {
             let list = List::new(items);
             f.render_widget(list, list_area);
         }
-        Overlay::Editor { recipe, buffer } => {
-            let area = centered_rect(f.area(), 70, 70);
-            let block = Block::default()
+        Overlay::DatasetPicker {
+            recipe,
+            datasets,
+            cursor,
+        } => {
+            let area = centered_rect(f.area(), 64, 60);
+            let bg = Block::default()
                 .borders(Borders::ALL)
                 .border_style(theme::dim())
                 .title(Span::styled(
                     format!(
-                        " edit args: {recipe} — type to edit, Backspace, Ctrl+Enter submit, Esc cancel "
+                        " pick dataset for {} [{}] — ↑↓ select, Enter pick, Esc skip ",
+                        recipe.name,
+                        recipe.input_kinds.join(",")
                     ),
                     theme::title(),
                 ));
-            let text: Vec<Line> = buffer.lines().map(|l| Line::from(l.to_string())).collect();
-            let para = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
-            f.render_widget(para, area);
+            let inner = bg.inner(area);
+            f.render_widget(bg, area);
+            let items: Vec<ListItem> = datasets
+                .iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    let name_style = if i == *cursor {
+                        theme::selected()
+                    } else {
+                        theme::heading()
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("{:<28} ", truncate(&d.name, 28)), name_style),
+                        Span::styled(format!("[{}] ", d.kind), theme::key_hint()),
+                        Span::styled(format!("{} ex  ", d.n_examples), theme::normal()),
+                        Span::styled(truncate(&d.source_path, 40), theme::dim()),
+                    ]))
+                })
+                .collect();
+            f.render_widget(List::new(items), inner);
+        }
+        Overlay::Editor {
+            recipe,
+            fields,
+            focus,
+            raw_mode,
+            raw_buffer,
+        } => {
+            let area = centered_rect(f.area(), 72, 72);
+            if *raw_mode {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme::dim())
+                    .title(Span::styled(
+                        format!(
+                            " edit args (RAW JSON): {recipe} — type to edit, Ctrl+Enter submit, Ctrl+R form, Esc cancel "
+                        ),
+                        theme::title(),
+                    ));
+                let text: Vec<Line> =
+                    raw_buffer.lines().map(|l| Line::from(l.to_string())).collect();
+                let para = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
+                f.render_widget(para, area);
+            } else {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme::dim())
+                    .title(Span::styled(
+                        format!(
+                            " edit args: {recipe} — ↑↓/Tab move, type to edit, Enter submit, Ctrl+R raw, Esc cancel "
+                        ),
+                        theme::title(),
+                    ));
+                let inner = block.inner(area);
+                f.render_widget(block, area);
+                let mut lines: Vec<Line> = Vec::new();
+                if fields.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "(this recipe declares no args — press Enter to launch, or Ctrl+R to add raw JSON)",
+                        theme::dim(),
+                    )));
+                } else {
+                    for (i, fld) in fields.iter().enumerate() {
+                        let focused = i == *focus;
+                        let marker = if focused { "▶ " } else { "  " };
+                        let name_style = if focused {
+                            theme::selected()
+                        } else {
+                            theme::heading()
+                        };
+                        // The focused row shows a cursor caret after the value.
+                        let val_display = if focused {
+                            format!("{}_", fld.value)
+                        } else {
+                            fld.value.clone()
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(marker.to_string(), theme::success()),
+                            Span::styled(format!("{:<24}", fld.name), name_style),
+                            Span::styled(format!("({:<7}) ", fld.ty), theme::key_hint()),
+                            Span::styled(val_display, theme::normal()),
+                        ]));
+                    }
+                }
+                let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+                f.render_widget(para, inner);
+            }
         }
     }
 }
@@ -1968,6 +2709,7 @@ mod render_tests {
         // Force unicode + color on so the alignment test sees `┌`/`│`/`└`
         // and the section-heading assertions are charset-stable.
         theme::detect("always", "unicode");
+        super::isolate_datasets_db_for_tests();
         let mut app = App::new(test_registry());
         // Point the repo root at an empty temp dir so views::* don't pick
         // up stray training_logs / checkpoints from the dev tree.
@@ -2206,6 +2948,18 @@ mod render_tests {
             );
         }
     }
+
+    #[test]
+    fn check_renders_every_view_and_overlay_and_returns_ok() {
+        // `blut tui --check` (the shipped self-check) must build the App from
+        // the live registry and render every view AND every modal overlay (the
+        // F2 form + raw fallback, the F3 dataset picker, the recipe picker)
+        // headless without panicking, returning Ok. The fixture registry has a
+        // recipe, so the overlay branches that need one are exercised here.
+        theme::detect("always", "unicode");
+        super::isolate_datasets_db_for_tests();
+        super::check(test_registry()).expect("tui --check must render all views + overlays and exit Ok");
+    }
 }
 
 /// Pure state-transition tests for the cockpit (§5.9). These drive the
@@ -2222,6 +2976,7 @@ mod state_tests {
     /// A fresh `App` with no overlay, cockpit view, pointed at a temp
     /// repo root so nothing in these tests touches the dev tree.
     fn app() -> App {
+        super::isolate_datasets_db_for_tests();
         let mut a = App::new(test_registry());
         let tmp = std::env::temp_dir().join(format!(
             "blut-tui-state-{}-{:?}",
@@ -2333,25 +3088,253 @@ mod state_tests {
     }
 
     #[test]
-    fn editor_typing_appends_and_backspaces_buffer() {
+    fn editor_typing_appends_and_backspaces_focused_field() {
+        // F2: typing in the per-field form edits the FOCUSED row's value (not a
+        // single freeform buffer). `train_delta` is graph-input + typed, so
+        // opening it goes straight to the form with editable rows.
         let mut a = app();
-        handle_key(&mut a, key('R'));
-        handle_key(&mut a, code(KeyCode::Enter)); // → Editor with template
-        // Capture the prefill, type, then backspace once.
-        let Overlay::Editor { buffer, .. } = &a.overlay else {
+        a.open_editor(&test_fixtures::TRAIN_DELTA);
+        let Overlay::Editor { fields, focus, .. } = &a.overlay else {
             panic!("expected Editor");
         };
-        let before = buffer.clone();
+        assert!(!fields.is_empty(), "typed recipe must yield form rows");
+        let f0 = *focus;
+        let before = fields[f0].value.clone();
         handle_key(&mut a, key('x'));
-        let Overlay::Editor { buffer, .. } = &a.overlay else {
+        let Overlay::Editor { fields, .. } = &a.overlay else {
             panic!("expected Editor");
         };
-        assert_eq!(*buffer, format!("{before}x"));
+        assert_eq!(fields[f0].value, format!("{before}x"));
         handle_key(&mut a, code(KeyCode::Backspace));
-        let Overlay::Editor { buffer, .. } = &a.overlay else {
+        let Overlay::Editor { fields, .. } = &a.overlay else {
             panic!("expected Editor");
         };
-        assert_eq!(*buffer, before, "Backspace should undo the typed char");
+        assert_eq!(
+            fields[f0].value, before,
+            "Backspace should undo the typed char in the focused field"
+        );
+    }
+
+    #[test]
+    fn editor_field_navigation_wraps() {
+        // ↑↓/Tab move focus between rows and wrap at the ends.
+        let mut a = app();
+        a.open_editor(&test_fixtures::TRAIN_DELTA);
+        let n = match &a.overlay {
+            Overlay::Editor { fields, .. } => fields.len(),
+            _ => panic!("expected Editor"),
+        };
+        assert!(n >= 2, "need ≥2 fields to test navigation");
+        // Down advances.
+        handle_key(&mut a, code(KeyCode::Down));
+        assert!(matches!(&a.overlay, Overlay::Editor { focus, .. } if *focus == 1));
+        // Tab also advances; from the last row it wraps to 0.
+        for _ in 1..n {
+            handle_key(&mut a, code(KeyCode::Tab));
+        }
+        assert!(matches!(&a.overlay, Overlay::Editor { focus, .. } if *focus == 0));
+        // Up from row 0 wraps to the last row.
+        handle_key(&mut a, code(KeyCode::Up));
+        assert!(matches!(&a.overlay, Overlay::Editor { focus, .. } if *focus == n - 1));
+    }
+
+    #[test]
+    fn editor_assembles_typed_fields_to_json() {
+        // F2: the form round-trips to a typed args JSON object — a number field
+        // stays a JSON number, a string stays a string, and a blank optional
+        // field is omitted (so serde's default applies).
+        let mut a = app();
+        a.open_editor(&test_fixtures::TRAIN_DELTA);
+        // Set lr (number) + tag (string); the seed already has lr=0.001.
+        if let Overlay::Editor { fields, .. } = &mut a.overlay {
+            for f in fields.iter_mut() {
+                match f.name.as_str() {
+                    "lr" => f.value = "0.01".into(),
+                    "tag" => f.value = "exp1".into(),
+                    _ => {}
+                }
+            }
+        }
+        let json = match &a.overlay {
+            Overlay::Editor { fields, .. } => super::assemble_fields(fields),
+            _ => panic!("expected Editor"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["lr"], serde_json::json!(0.01), "number stays a JSON number");
+        assert_eq!(v["tag"], serde_json::json!("exp1"), "string stays a string");
+
+        // Blank the string field → omitted on assembly.
+        if let Overlay::Editor { fields, .. } = &mut a.overlay {
+            for f in fields.iter_mut() {
+                if f.name == "tag" {
+                    f.value.clear();
+                }
+            }
+        }
+        let json = match &a.overlay {
+            Overlay::Editor { fields, .. } => super::assemble_fields(fields),
+            _ => panic!("expected Editor"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("tag").is_none(), "blank field must be omitted");
+    }
+
+    // ── F3/U5: kind-filtered dataset picker → input injection ───────
+
+    #[test]
+    fn graph_input_recipe_skips_dataset_picker() {
+        // A recipe with empty input_kinds has nothing to pick → straight to
+        // the args form (picker is skipped entirely, unchanged behavior).
+        let mut a = app();
+        a.open_dataset_picker(&test_fixtures::TRAIN_DELTA);
+        assert!(
+            matches!(a.overlay, Overlay::Editor { .. }),
+            "graph-input recipe must skip the dataset picker"
+        );
+    }
+
+    #[test]
+    fn dataset_picker_filters_by_kind_and_injects_registered_name() {
+        // Register two datasets of different kinds into the isolated db; the
+        // picker for a `dataset.jsonl` recipe must show only the jsonl one, and
+        // picking it must inject its NAME into the `registered_name` form field.
+        let mut a = app();
+        let conn = crate::datasets_db::open().expect("isolated db opens");
+        let td = std::env::temp_dir().join(format!("blut-tui-f3-{:?}", std::thread::current().id()));
+        let _ = std::fs::create_dir_all(&td);
+        let f = td.join("ds.jsonl");
+        std::fs::write(&f, "{\"a\":1}\n{\"b\":2}\n").unwrap();
+        // Unique names so parallel tests sharing the process db don't collide.
+        let jsonl_name = format!("f3jsonl{:?}", std::thread::current().id())
+            .replace(['(', ')', ' '], "");
+        let split_name = format!("f3split{:?}", std::thread::current().id())
+            .replace(['(', ')', ' '], "");
+        let r1 = crate::datasets_db::record_from_jsonl(&jsonl_name, &f, "dataset.jsonl", None).unwrap();
+        let r2 = crate::datasets_db::record_from_jsonl(&split_name, &f, "dataset.split", None).unwrap();
+        crate::datasets_db::add(&conn, &r1).unwrap();
+        crate::datasets_db::add(&conn, &r2).unwrap();
+
+        a.open_dataset_picker(&test_fixtures::TRAIN_EPSILON);
+        let names: Vec<String> = match &a.overlay {
+            Overlay::DatasetPicker { datasets, .. } => {
+                datasets.iter().map(|d| d.name.clone()).collect()
+            }
+            other => panic!("expected DatasetPicker, got {:?}", std::mem::discriminant(other)),
+        };
+        assert!(
+            names.contains(&jsonl_name),
+            "picker must list the dataset.jsonl dataset"
+        );
+        assert!(
+            !names.contains(&split_name),
+            "picker must FILTER OUT the dataset.split dataset (wrong kind)"
+        );
+
+        // Move the cursor onto our jsonl dataset, then Enter to pick it.
+        let idx = match &a.overlay {
+            Overlay::DatasetPicker { datasets, .. } => {
+                datasets.iter().position(|d| d.name == jsonl_name).unwrap()
+            }
+            _ => unreachable!(),
+        };
+        for _ in 0..idx {
+            handle_key(&mut a, code(KeyCode::Down));
+        }
+        handle_key(&mut a, code(KeyCode::Enter));
+        // → editor with registered_name pre-filled from the picked dataset.
+        match &a.overlay {
+            Overlay::Editor { fields, .. } => {
+                let rn = fields
+                    .iter()
+                    .find(|f| f.name == "registered_name")
+                    .expect("editor must carry the registered_name field");
+                assert_eq!(rn.value, jsonl_name, "picked dataset name injected");
+            }
+            _ => panic!("Enter on a dataset must open the args editor"),
+        }
+    }
+
+    #[test]
+    fn dataset_picker_esc_skips_to_editor_without_injection() {
+        // Esc in the dataset picker skips → editor opens, no dataset injected.
+        let mut a = app();
+        let conn = crate::datasets_db::open().expect("isolated db opens");
+        let td = std::env::temp_dir().join(format!("blut-tui-f3esc-{:?}", std::thread::current().id()));
+        let _ = std::fs::create_dir_all(&td);
+        let f = td.join("ds.jsonl");
+        std::fs::write(&f, "{\"a\":1}\n").unwrap();
+        let name = format!("f3esc{:?}", std::thread::current().id()).replace(['(', ')', ' '], "");
+        let r = crate::datasets_db::record_from_jsonl(&name, &f, "dataset.jsonl", None).unwrap();
+        crate::datasets_db::add(&conn, &r).unwrap();
+        a.open_dataset_picker(&test_fixtures::TRAIN_EPSILON);
+        assert!(matches!(a.overlay, Overlay::DatasetPicker { .. }));
+        handle_key(&mut a, code(KeyCode::Esc));
+        match &a.overlay {
+            Overlay::Editor { fields, .. } => {
+                let rn = fields.iter().find(|f| f.name == "registered_name").unwrap();
+                assert!(rn.value.is_empty(), "Esc-skip must not inject a dataset");
+            }
+            _ => panic!("Esc in dataset picker should open the editor"),
+        }
+    }
+
+    #[test]
+    fn editor_raw_toggle_round_trips() {
+        // F2 keeps a raw-JSON fallback (Ctrl+R). Flip to raw, confirm it holds
+        // the assembled JSON; flip back, confirm the form survives.
+        let mut a = app();
+        a.open_editor(&test_fixtures::TRAIN_DELTA);
+        assert!(matches!(&a.overlay, Overlay::Editor { raw_mode, .. } if !*raw_mode));
+        handle_key(&mut a, ctrl('r')); // form → raw
+        let raw = match &a.overlay {
+            Overlay::Editor { raw_mode, raw_buffer, .. } => {
+                assert!(*raw_mode, "Ctrl+R must enable raw mode");
+                raw_buffer.clone()
+            }
+            _ => panic!("expected Editor"),
+        };
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&raw).is_ok(),
+            "raw buffer must hold valid JSON"
+        );
+        handle_key(&mut a, ctrl('r')); // raw → form
+        assert!(matches!(&a.overlay, Overlay::Editor { raw_mode, .. } if !*raw_mode));
+    }
+
+    #[test]
+    fn editor_raw_toggle_malformed_json_stays_in_raw_mode() {
+        // Review finding 1: flipping raw→form with MALFORMED JSON must NOT
+        // silently drop to a stale form (and risk launching stale data). It
+        // stays in raw mode + warns, so the user fixes the JSON first.
+        let mut a = app();
+        a.open_editor(&test_fixtures::TRAIN_DELTA);
+        handle_key(&mut a, ctrl('r')); // form → raw
+        // Corrupt the raw buffer.
+        if let Overlay::Editor { raw_buffer, .. } = &mut a.overlay {
+            *raw_buffer = "{ not valid json".into();
+        }
+        handle_key(&mut a, ctrl('r')); // raw → form attempt — must be refused
+        match &a.overlay {
+            Overlay::Editor { raw_mode, .. } => {
+                assert!(*raw_mode, "malformed JSON must keep the editor in raw mode");
+            }
+            _ => panic!("expected Editor still open"),
+        }
+        assert!(
+            a.status_msg
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("raw JSON")),
+            "a parse-failure status must be shown"
+        );
+        // A bare (valid) array is also refused — the form needs an object.
+        if let Overlay::Editor { raw_buffer, .. } = &mut a.overlay {
+            *raw_buffer = "[1,2,3]".into();
+        }
+        handle_key(&mut a, ctrl('r'));
+        assert!(
+            matches!(&a.overlay, Overlay::Editor { raw_mode, .. } if *raw_mode),
+            "a non-object JSON must keep raw mode"
+        );
     }
 
     // ── filter_recipes fuzzy ordering ───────────────────────────────
@@ -2441,24 +3424,23 @@ mod state_tests {
     }
 
     #[test]
-    fn open_editor_prefill_parses_for_every_recipe() {
-        // The hotkey path prefills via lamquant_default_args() else the
-        // schema template. Either way the prefill must be valid JSON so
-        // the user starts from a parseable buffer.
+    fn open_editor_form_assembles_to_valid_json_for_every_recipe() {
+        // F2: open_editor builds a per-field FORM. For every fixture recipe the
+        // form must assemble back into a valid JSON object (the buffer the
+        // submit path validates + launches).
         for r in FIXTURE {
             let mut a = app();
             a.open_editor(r);
-            let Overlay::Editor { buffer, .. } = &a.overlay else {
+            let Overlay::Editor { fields, .. } = &a.overlay else {
                 panic!(
                     "open_editor must produce an Editor overlay for `{}`",
                     r.name
                 );
             };
-            assert!(
-                serde_json::from_str::<serde_json::Value>(buffer).is_ok(),
-                "open_editor(`{}`) prefilled unparseable JSON:\n{buffer}",
-                r.name
-            );
+            let json = super::assemble_fields(fields);
+            let v = serde_json::from_str::<serde_json::Value>(&json)
+                .unwrap_or_else(|e| panic!("open_editor(`{}`) form → bad JSON: {e}\n{json}", r.name));
+            assert!(v.is_object(), "assembled args must be a JSON object for `{}`", r.name);
         }
     }
 
@@ -2628,12 +3610,14 @@ mod state_tests {
             "cursor {cursor} must index a real filtered row (len {})",
             live.len()
         );
-        // And Enter on the clamped cursor must actually open the Editor
-        // (not silently no-op as it did before the clamp).
+        // And Enter on the clamped cursor must actually SELECT a real recipe
+        // (not silently no-op as it did before the clamp). For a recipe with
+        // input_kinds that resolves a dataset it advances to the DatasetPicker;
+        // otherwise straight to the Editor — either proves the clamp worked.
         handle_key(&mut a, code(KeyCode::Enter));
         assert!(
-            matches!(a.overlay, Overlay::Editor { .. }),
-            "Enter at the clamped cursor must open the Editor, not no-op"
+            matches!(a.overlay, Overlay::Editor { .. } | Overlay::DatasetPicker { .. }),
+            "Enter at the clamped cursor must select a recipe (Editor or DatasetPicker), not no-op"
         );
     }
 
