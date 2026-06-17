@@ -11,20 +11,112 @@ depend on this crate.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-06-17
+
+**Feature-complete milestone (pre-1.0, ADR 0044).** This release lands the last
+permitted breaking core edits before the optimization gate and 1.0.0 — all of
+the BLUT-API phases A–G plus the cookbook taxonomy rebuild.
+
+*Version note.* A forward minor bump for breaking pre-1.0 changes (semver 0.x).
+The "feature-complete, pre-optimization" milestone semantics live in the 1.0
+charter (ADR 0044), not in the version integer — `v0.10.0` was already
+published, so the milestone moves forward rather than down to a `0.9.0` marker.
+
 ### Added
 
-- **Durable resume (BLUT-API Phase D).** A killed training run no longer
-  restarts from scratch. The orchestrator owns a crash-gated *policy*
-  (`framework::resume`): a stable per-config resume directory keyed on the stage
-  cache key, a `state.json` run-state marker with a heartbeat, and a 5-row
-  decision (resume an in-process retry or a crashed prior run; refuse a live
-  concurrent run; start fresh otherwise). The trainer owns the *mechanics*
-  (`durable_resume.py`): atomic, prev-rotated recovery checkpoints at each
-  validation embedding the optimizer + RNG state, and a `--resume` that restores
-  model + **optimizer** + RNG (a continuous loss curve, no cold-optimizer dip).
-  Covers in-process OOM retry, cross-invocation re-run after a crash, and clean
-  optimizer resume. A `no_resume` recipe arg forces a fresh start. (Epoch-boundary
-  granularity; mid-epoch dataloader-position resume remains out of scope.)
+#### Cookbook taxonomy + ingredient registry (ADR 0050 / 0051)
+
+- **Course** — `RecipeCategory` renamed to `Course`, the culinary layer in
+  BLUT ▸ Cookbook ▸ Course ▸ Recipe ▸ Ingredient, with new `Pretraining` and
+  `Gate` variants and a compiler-forced exhaustive `order()` driving the TUI menu
+  sort. `pub type RecipeCategory = Course` is kept as a transitional alias.
+- **Ingredient registry** — `IngredientSpec` + a fail-closed
+  `build_ingredient(kind, name, cfg, **extra)` over 13 kinds (data / sampler /
+  preprocess / model / forward / loss / optimizer / scheduler / step / ema /
+  eval / checkpoint / logging), generalizing ADR 0050's optimizer registry. Each
+  spec coerces a frozen dataclass config and declares whether its selection
+  changes the cached artifact (`cache_relevant`).
+- **Trainer decomposition** — the canonical trainers' sub-stages are extracted
+  into byte-identical ingredients (optimizer construction, the WSD scheduler,
+  EMA, the QAT generator step, the shared SNN SSM step, the joint / 4-state / MAE
+  / teacher losses, the joint + 4-state evals, atomic-save / manager /
+  durable-resume checkpointing, and the LMA data adapters), and all five canon
+  trainers (`train_l3_teacher`, `pretrain_mae`, `pretrain_ssl_tueg`,
+  `train_4state_controller`, `train_joint`) call `build_ingredient` instead of
+  inlining the primitive.
+
+#### Durable + auto resume (Phase D)
+
+- **Durable resume.** A killed training run no longer restarts from scratch. The
+  orchestrator owns a crash-gated *policy* (`framework::resume`): a stable
+  per-config resume directory keyed on the stage cache key, a `state.json`
+  run-state marker with a heartbeat, and a 5-row decision (resume an in-process
+  retry or a crashed prior run; refuse a live concurrent run; start fresh
+  otherwise). The trainer owns the *mechanics* (`durable_resume.py`): atomic,
+  prev-rotated recovery checkpoints at each validation embedding the optimizer +
+  RNG state, and a `--resume` that restores model + **optimizer** + RNG (a
+  continuous loss curve, no cold-optimizer dip). Covers in-process OOM retry,
+  cross-invocation re-run after a crash, and clean optimizer resume. A
+  `no_resume` recipe arg forces a fresh start. (Epoch-boundary granularity;
+  mid-epoch dataloader-position resume remains out of scope.)
+- **Auto-resume on retry** — a retried stage reuses `decide_resume`; on
+  attempt ≥ 2 with the same run id the decision is deterministically `Resume` and
+  the trainer is relaunched with `--resume`.
+- **`StageError::Diverged`** — a new transient, retryable error; a `KillOnNaN`
+  divergence is reclassified as `Diverged`, so a NaN kill becomes a bounded
+  retry → auto-resume instead of a hard failure.
+- **Stage hooks** — defaulted `preflight` / `resume_handle` / `divergence_check`
+  methods on the `Stage` trait, mirrored on the dyn shim (zero ripple to existing
+  `impl Stage`).
+
+#### Hyperparameter optimization
+
+- Search space + samplers, `blut hpo run` fan-out, a median/percentile early-stop
+  scheduler, **ASHA** async successive halving, **PBT**, a **TPE** Parzen-window
+  sampler, trial tracking with `blut hpo show` / `best`, `Control::Spawn` runtime
+  sub-plan injection, and a queryable graph backend behind `blut dag`.
+
+#### Metric store + GPU saturation (Phase E)
+
+- A queryable metric store — additive `metrics` / `gauges` tables folded from
+  `status.jsonl` at run-end — with `blut compare A B`; a live GPU-saturation
+  sampler recording `gpu_util / mem / temp / power` per run, deriving the
+  `gpu_saturation` / `gpu_wasted` headline numbers with a starvation sentinel; and
+  a per-epoch `BLUT_METRIC` val_r line surfaced as a `StageStep`.
+
+#### Partitions, declarative recipes, sensors, scheduler (Phase G)
+
+- A Dagster-class partition primitive with `blut partition {define,list,status,
+  backfill}`; a `.toml` declarative-recipe engine over an erased stage registry;
+  lineage **freshness** (flag outputs stale vs code/data drift); **named sensors**
+  (the resume policy reconciled as a `Sensor`); and a per-device parallel backfill
+  scheduler with multi-GPU locks (one cell per GPU).
+
+#### Schema, TUI, launcher
+
+- Schema-preflight args validation (`recipe show` lists typed fields; bad-type
+  args rejected pre-dispatch); a real `blut tui --check` flag; in-TUI arg
+  validation + auto-focus on the launched job's log; a `Launcher::capacity()`
+  device probe.
+
+### Changed
+
+- **`code_sha` in the cache key (one-time global cache bust).** Stage cache keys
+  and the nondeterministic-output fingerprint now fold a `code_sha` (cookbook git
+  SHA ‖ resolved script content hash), so editing a trainer re-runs the stage
+  instead of serving a stale checkpoint. Key tag bumped `v1 → v2` — a one-time
+  global invalidation; pre-1.0, no migration is owed.
+- Build hash re-stamped on commits, not only branch switches.
+- Sequestered 15 dead scripts + 5 tests to `deprecated/`, relocated the optimizer
+  modules under `lamquant/ingredients/optimizers/`, and retired the archived
+  mamba-SNN + per-arch student trainers.
+
+### Fixed
+
+- `blut footprint list|forget` (audited calibration heal); the warm fork pool
+  sized to the measured ~8 G/worker peak; per-worker peak-RSS logging
+  (`LAMQUANT_RSS_DEBUG`); recovery checkpoints load with `weights_only=False`; and
+  assorted HPO / executor / partition / scheduler review hardening.
 
 ## [0.10.0] — 2026-06-12
 
@@ -111,4 +203,5 @@ seam, run lineage, and declarative scheduling.
 - The LamQuant python payload still lives under this crate's `python/`
   transitionally; it moves to `blut-lamquant` in a later migration.
 
+[0.11.0]: https://github.com/Quitetall/blut/releases/tag/v0.11.0
 [0.10.0]: https://github.com/Quitetall/blut/releases/tag/v0.10.0
