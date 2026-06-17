@@ -2393,6 +2393,72 @@ mod tests {
         assert_eq!(INC_RUN_COUNT.load(Ordering::SeqCst), 2);
     }
 
+    /// INC G (C3): a declarative `.toml` recipe COMPILES (via
+    /// `DeclarativeRecipe::compile`) AND EXECUTES to completion through the
+    /// same executor `launch_compiled_plan` drives. This is the load-bearing
+    /// half of the CLI `recipe declare --run` launch path — the CLI half only
+    /// adds job-dir/admission/lock plumbing on top of this compile→execute
+    /// chain. A small `make_one → increment` chain runs end-to-end and produces
+    /// its `Counter` output, proving the `.toml` → CompiledPlan → execute bridge.
+    #[tokio::test]
+    async fn declarative_toml_compiles_and_executes_to_completion() {
+        use crate::framework::cookbook::{Cookbook, Registry};
+        use crate::framework::stage::ErasedStageCtor;
+        use crate::recipes::declarative::DeclarativeRecipe;
+        use crate::recipes::recipe::RecipeDef;
+
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        MAKE_RUN_COUNT.store(0, Ordering::SeqCst);
+        INC_RUN_COUNT.store(0, Ordering::SeqCst);
+
+        // A cookbook exposing the two toy stages as erased ctors — exactly what
+        // `Registry::find_erased_stage` resolves a `.toml` stage NAME against.
+        static ERASED: &[(&str, ErasedStageCtor)] = &[
+            ("make_one", || std::sync::Arc::new(MakeOne)),
+            ("increment", || std::sync::Arc::new(Increment)),
+        ];
+        static NO_RECIPES: &[&RecipeDef] = &[];
+        struct ToyCookbook;
+        impl Cookbook for ToyCookbook {
+            fn name(&self) -> &'static str {
+                "toy"
+            }
+            fn recipes(&self) -> &'static [&'static RecipeDef] {
+                NO_RECIPES
+            }
+            fn stages_erased(&self) -> &'static [(&'static str, ErasedStageCtor)] {
+                ERASED
+            }
+        }
+        let mut reg = Registry::new();
+        reg.register(Box::new(ToyCookbook));
+
+        // The declarative recipe: () → make_one → increment.
+        let toml = r#"
+            name = "toy_chain"
+            backend = "lamu"
+            [[stages]]
+            stage = "make_one"
+            [[stages]]
+            stage = "increment"
+        "#;
+        let recipe = DeclarativeRecipe::parse(toml, "toy_chain.toml").unwrap();
+        // Compile through the SAME path the CLI launch uses.
+        let plan = recipe.compile(&reg).expect("declarative recipe compiles + kind-checks");
+        assert_eq!(plan.n_nodes(), 2);
+        assert_eq!(plan.name(), "toy_chain");
+
+        // Execute to completion (the half `launch_compiled_plan` runs internally).
+        let (_td, ctx) = fresh_ctx();
+        let result = SequentialExecutor::execute(plan, ctx).await.unwrap();
+        assert_eq!(result.n_stages, 2);
+        assert_eq!(result.n_cache_misses, 2, "both stages executed");
+        assert_eq!(MAKE_RUN_COUNT.load(Ordering::SeqCst), 1, "make_one ran");
+        assert_eq!(INC_RUN_COUNT.load(Ordering::SeqCst), 1, "increment ran");
+        let out: Counter = result.final_output.unwrap().into_typed().unwrap();
+        assert_eq!(out.n, 2, "make_one(1) → increment(+1) = 2");
+    }
+
     #[tokio::test]
     async fn stage_failure_propagates_as_plan_error() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());

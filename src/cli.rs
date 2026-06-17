@@ -419,6 +419,20 @@ enum RecipeCommand {
     Declare {
         /// Path to a `.toml` recipe (omit to list discovered recipes).
         file: Option<std::path::PathBuf>,
+        /// LAUNCH the `.toml` recipe (C3): after it compiles + kind-checks,
+        /// execute it end-to-end through the SAME admission-gated, cgroup-
+        /// contained, cache-honouring path as `recipe run`. Without `--run`
+        /// (default) the DAG is only rendered — nothing executes. Requires a
+        /// `<file>`.
+        #[arg(long, default_value_t = false)]
+        run: bool,
+        /// Promote this run's outputs to the global cache (only with `--run`).
+        #[arg(long, default_value_t = false)]
+        shared_cache: bool,
+        /// Force-recompute on launch: bypass the stage cache READ so every stage
+        /// runs even with a warm entry (only with `--run`). Alias: `--force`.
+        #[arg(long = "no-cache", alias = "force", default_value_t = false)]
+        no_cache: bool,
     },
     /// Execute a recipe, or a config-driven sweep over it.
     Run {
@@ -2537,12 +2551,20 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                     .unwrap_or_else(|e| format!("(serialize error: {e})"))
             );
         }
-        RecipeCommand::Declare { file } => {
+        RecipeCommand::Declare {
+            file,
+            run,
+            shared_cache,
+            no_cache,
+        } => {
             use crate::recipes::declarative::{
                 DeclarativeRecipe, scan_user_recipes, user_recipes_dir,
             };
             match file {
                 None => {
+                    if run {
+                        return Err(anyhow!("--run requires a <file> (a .toml recipe to launch)"));
+                    }
                     // F4 discovery: list ~/.config/blut/recipes/*.toml.
                     let found = scan_user_recipes();
                     let dir = user_recipes_dir()
@@ -2559,15 +2581,36 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                 }
                 Some(path) => {
                     // Compile + kind-check the .toml against the cookbook's
-                    // stages_erased registry, then render the runnable DAG.
+                    // stages_erased registry.
                     let recipe = DeclarativeRecipe::load(&path).map_err(|e| anyhow!("{e}"))?;
                     let n = recipe.stages.len();
                     let plan = recipe.compile(reg).map_err(|e| anyhow!("{e}"))?;
-                    print!("{}", plan.render_ascii().map_err(|e| anyhow!("{e}"))?);
-                    println!(
-                        "✓ '{}' compiles + kind-checks ({n} stage(s)).",
-                        recipe.name
-                    );
+                    if run {
+                        // C3 LAUNCH: execute the compiled plan through the same
+                        // admission-gated / cgroup-contained / cache-honouring
+                        // core as `recipe run`. No RecipeMarker (declarative
+                        // recipes don't resume by registry name); `Local`
+                        // placement (clusters target registry recipes only).
+                        println!("✓ '{}' compiles + kind-checks ({n} stage(s)); launching…", recipe.name);
+                        launch_compiled_plan(
+                            &recipe.name,
+                            plan,
+                            None,
+                            None,
+                            shared_cache,
+                            crate::config::launcher::LaunchTarget::Local,
+                            None,
+                            no_cache,
+                        )
+                        .await?;
+                    } else {
+                        // Render-only (default): print the runnable DAG, no exec.
+                        print!("{}", plan.render_ascii().map_err(|e| anyhow!("{e}"))?);
+                        println!(
+                            "✓ '{}' compiles + kind-checks ({n} stage(s)).",
+                            recipe.name
+                        );
+                    }
                 }
             }
         }
@@ -2665,20 +2708,54 @@ async fn run_one_recipe(
     // stage runs even with a warm entry (the fresh result is still cached).
     no_cache: bool,
 ) -> Result<String> {
-    use crate::framework::ExecCtx;
-
     let r = reg
         .find(name)
         .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
     let plan = (r.compile_fn)(args.clone()).map_err(|e| anyhow!("recipe compile failed: {e}"))?;
-    // ADR 0046 slice-1: resolve the RAM footprint BEFORE `args` is consumed by
-    // the RecipeMarker below; the admission gate (after the job state is
-    // written) reuses it. Bill from the recipe's DEFAULTED args (the plan
-    // re-serialized them with serde defaults applied) — NOT the raw user args
-    // — so a defaulted driver like `warm_fb_cache` (Phase 3) and tier/batch are
-    // read IDENTICALLY to what the train stage records under (RECORD side),
-    // keeping the RESOLVE/RECORD calibration key in parity even when the user
-    // omitted the field.
+    // A registry recipe CAN resume by name+args (the RecipeMarker is the resume
+    // oracle for `blut plan resume`). Declarative `.toml` launches pass `None`
+    // (no registry recipe to re-compile from) — see `launch_compiled_plan`.
+    launch_compiled_plan(
+        name,
+        plan,
+        Some(RecipeMarker { name: name.to_string(), args }),
+        sweep_fp,
+        shared_cache,
+        launch_target,
+        device_index,
+        no_cache,
+    )
+    .await
+}
+
+/// Launch an ALREADY-COMPILED plan end-to-end: footprint → job dir → ExecCtx →
+/// admission gate → scheduler lock → execute → Done/Failed → lineage index.
+/// The shared launch core behind both `run_one_recipe` (a registry recipe,
+/// compiled via its `compile_fn`) and the declarative `.toml` launch path
+/// (`recipe declare --run`, compiled via `DeclarativeRecipe::compile`). Both
+/// paths get IDENTICAL admission/containment/cache treatment — the only
+/// difference is `marker`: `Some` for a registry recipe (resumable by
+/// name+args), `None` for a declarative launch (no registry recipe to resume
+/// from, so no marker is written).
+#[allow(clippy::too_many_arguments)]
+async fn launch_compiled_plan(
+    name: &str,
+    plan: crate::framework::plan::CompiledPlan,
+    marker: Option<RecipeMarker>,
+    sweep_fp: Option<crate::framework::ContentHash>,
+    shared_cache: bool,
+    launch_target: crate::config::launcher::LaunchTarget,
+    device_index: Option<usize>,
+    no_cache: bool,
+) -> Result<String> {
+    use crate::framework::ExecCtx;
+
+    // ADR 0046 slice-1: resolve the RAM footprint from the recipe's DEFAULTED
+    // args (the plan re-serialized them with serde defaults applied) — NOT raw
+    // user args — so a defaulted driver like `warm_fb_cache` (Phase 3) and
+    // tier/batch are read IDENTICALLY to what the train stage records under
+    // (RECORD side), keeping the RESOLVE/RECORD calibration key in parity even
+    // when the user omitted the field.
     let footprint = recipe_footprint(name, plan.exec_view().recipe_args);
 
     let job_id = crate::jobs::new_job_id();
@@ -2720,12 +2797,12 @@ async fn run_one_recipe(
             ctx.cache = std::sync::Arc::new(cache_handle);
         }
     }
-    // Mark recipe for plan resume (consumes `args`).
-    RecipeMarker {
-        name: name.to_string(),
-        args,
+    // Mark recipe for plan resume — only for a registry recipe (a declarative
+    // `.toml` launch passes `None`: there is no registry recipe to re-compile
+    // from on resume, so writing a marker would be a dangling resume oracle).
+    if let Some(m) = marker {
+        m.write_to(&job_dir)?;
     }
-    .write_to(&job_dir)?;
 
     crate::jobs::write_state(&job_id, JobState::Running)
         .with_context(|| format!("write Running state for {job_id}"))?;
@@ -3979,5 +4056,52 @@ mod recipe_run_flag_tests {
     #[test]
     fn force_alias_sets_true() {
         assert!(no_cache_of(&["blut", "recipe", "run", "demo", "--force"]));
+    }
+}
+
+#[cfg(test)]
+mod recipe_declare_flag_tests {
+    //! INC G (C3): `recipe declare --run` parses (the launch flag), defaults to
+    //! render-only (`run=false`), and carries `--shared-cache` / `--no-cache`.
+    use super::{Cli, Command, RecipeCommand};
+    use clap::Parser;
+
+    fn declare_of(argv: &[&str]) -> (Option<std::path::PathBuf>, bool, bool, bool) {
+        match Cli::try_parse_from(argv).expect("parse").command {
+            Some(Command::Recipe {
+                cmd:
+                    RecipeCommand::Declare {
+                        file,
+                        run,
+                        shared_cache,
+                        no_cache,
+                    },
+            }) => (file, run, shared_cache, no_cache),
+            other => panic!("expected recipe declare, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declare_defaults_to_render_only() {
+        let (file, run, sc, nc) = declare_of(&["blut", "recipe", "declare", "r.toml"]);
+        assert!(file.is_some());
+        assert!(!run, "no --run ⇒ render only (no execution)");
+        assert!(!sc);
+        assert!(!nc);
+    }
+
+    #[test]
+    fn declare_run_flag_launches() {
+        let (_f, run, _sc, _nc) =
+            declare_of(&["blut", "recipe", "declare", "r.toml", "--run"]);
+        assert!(run);
+    }
+
+    #[test]
+    fn declare_run_carries_cache_flags() {
+        let (_f, run, sc, nc) = declare_of(&[
+            "blut", "recipe", "declare", "r.toml", "--run", "--shared-cache", "--force",
+        ]);
+        assert!(run && sc && nc, "--force aliases --no-cache");
     }
 }
