@@ -1880,7 +1880,25 @@ impl ParallelExecutor {
                                     // PERSISTS (a NaN loss stays NaN), so a kill signal
                                     // dropped on lag re-arrives on the very next step —
                                     // it is not a single-shot edge (see KillOnNaN docs).
-                                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                                    //
+                                    // But the divergence latch's CLEAR signal
+                                    // (`StageRetrying`) also rides this lossy broadcast.
+                                    // Under sustained backpressure that overran the ring, a
+                                    // node's `StageRetrying` boundary could be evicted
+                                    // before we reach it — wedging `kill_flagged` SET, which
+                                    // would silently disable the divergence kill for that
+                                    // node's NEXT attempt. A `Lagged` reliably co-occurs
+                                    // with exactly that overrun, so clear the latch
+                                    // defensively. This cannot resurrect the stale-refire
+                                    // race: the dropped events were the OLDEST (the prior
+                                    // attempt's stale NaN steps), so no straggler survives
+                                    // the lag to spuriously re-kill a healthy attempt —
+                                    // re-killing now requires a SUBSEQUENTLY-OBSERVED
+                                    // non-finite step, which is by definition the current
+                                    // attempt genuinely diverging.
+                                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                                        kill_flagged.clear();
+                                    }
                                     // The hub Sender lives in `env` for the whole
                                     // run, so Closed cannot occur before the drain
                                     // below; treat defensively as "stop watching".
