@@ -1632,6 +1632,67 @@ fn recipe_footprint(name: &str, raw: &serde_json::Value) -> crate::broker::Footp
     crate::broker::FootprintStore::load().resolve(&key, hint)
 }
 
+/// The box-fit RAM budget (GiB) for a scheduler / executor that runs cells
+/// concurrently. MIRRORS the executor's Phase-5 sizing (cli.rs `run_hpo` /
+/// `launch_compiled_plan`): `MemTotal − floor`, clamped `>= 1`. Box-fit TOTAL
+/// (minus the standard reserve), NOT live-free — the per-cell broker admission
+/// already nets out transient other-consumers via `MemAvailable`; this budget
+/// bounds the SUM of concurrently SCHEDULED cells to the box. A `0` total
+/// (non-Linux / sandbox where `/proc/meminfo` is unreadable) ⇒ `None`: caller
+/// degrades to the per-cell gate alone (the old behaviour), never a bogus cap.
+fn scheduler_box_fit_budget_gib() -> Option<u32> {
+    let snap = crate::broker::ResourceSnapshot::probe();
+    if snap.mem_total_gb > 0.0 {
+        Some((snap.mem_total_gb - crate::broker::admission::DEFAULT_FLOOR_GIB).max(1.0) as u32)
+    } else {
+        None
+    }
+}
+
+/// Run one scheduled cell under a shared cross-cell RAM semaphore so the SUM of
+/// concurrently-running cells can't overcommit the box (never-OOM-the-BOX for
+/// the parallel partition backfill). MIRRORS the `ParallelExecutor`'s per-node
+/// memory admission (`executor::run_node`): acquire `footprint_gib` permits
+/// (GiB units, matching `NodeEnv::memory`), CLAMPED to the budget so a single
+/// cell larger than the whole box runs ALONE instead of deadlocking, hold the
+/// permit for the cell's ENTIRE run, and release it on drop AFTER `run`
+/// completes so the next queued cell can proceed.
+///
+/// Defense-in-depth: this bounds the scheduled-cell SUM; the per-cell broker
+/// admission inside `launch_compiled_plan` still gates on LIVE free RAM
+/// (incl. non-scheduler consumers) — both stay in force.
+///
+/// `budget_gib == 0` is treated as "no budget known" (the probe failed): run
+/// ungated, exactly as before this slice. A non-zero budget always admits at
+/// least 1 permit (`.max(1)`), so a `footprint_gib == 0` cell can't slip a
+/// 0-permit no-op past the gate.
+async fn gated_cell_run<F, T>(
+    mem_sem: std::sync::Arc<tokio::sync::Semaphore>,
+    footprint_gib: u32,
+    budget_gib: u32,
+    run: F,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    if budget_gib == 0 {
+        // No box-fit budget known ⇒ the semaphore is a no-op; the per-cell
+        // broker admission inside `launch_compiled_plan` is the sole guard.
+        return run.await;
+    }
+    // Clamp to the budget (the executor's `.min(budget)` trick): a cell whose
+    // footprint exceeds the whole box still acquires ALL permits and runs
+    // alone, never `> budget` permits (which `acquire_many_owned` could never
+    // grant ⇒ permanent hang).
+    let want = footprint_gib.min(budget_gib).max(1);
+    // Held for the whole `run`, dropped after it returns. `acquire_many_owned`
+    // on a never-closed semaphore only errors on closure; the scheduler never
+    // closes it, so map the (unreachable) error to running ungated rather than
+    // dropping the cell.
+    let _permit = mem_sem.acquire_many_owned(want).await.ok();
+    run.await
+}
+
 /// HPO entry point (v0.20). Samples trials from a search space, runs them as
 /// parallel nodes in ONE plan (the fan-out), and — once schedulers land —
 /// adaptively early-stops via the control policy. Phase 2 ships `--algo random`
@@ -2250,10 +2311,16 @@ async fn run_partition(reg: &crate::framework::Registry, cmd: PartitionCommand) 
             // (byte-identical to the old loop). record_status appends atomically,
             // so concurrent writes from different device-chains are safe.
             //
-            // NB the broker RAM-admission gate runs PER cell; on a multi-GPU box
-            // ensure the (up to n_dev) concurrent cells fit box RAM (cross-cell
-            // RAM coordination is a future slice). On 1 GPU there's no
-            // concurrency, so no over-subscription.
+            // NB the broker RAM-admission gate runs PER cell against LIVE free
+            // RAM; two cells launching ~simultaneously could both pass it on the
+            // SAME snapshot before either's usage registers. Cross-cell RAM
+            // coordination is now DONE (not a future slice): a SHARED box-fit
+            // RAM semaphore (`mem_sem` below) bounds the SUM of concurrently
+            // SCHEDULED cells to the box, mirroring the `ParallelExecutor`'s
+            // per-node memory budget. The per-cell gate stays in force
+            // (defense-in-depth: it handles live free RAM incl. non-scheduler
+            // consumers). On 1 GPU there's no concurrency, so the semaphore is
+            // acquired/released serially — byte-identical to the old loop.
             // Concurrency is bounded by the launcher's CAPACITY: `device_set()`
             // is `0..Launcher::capacity()` by default (see
             // `config::launcher::Launcher::{capacity,device_set}`), with
@@ -2282,16 +2349,38 @@ async fn run_partition(reg: &crate::framework::Registry, cmd: PartitionCommand) 
             for (i, cell) in targets.into_iter().enumerate() {
                 per_device[i % n_dev].push(cell);
             }
+            // Cross-cell RAM admission (never-OOM): size the box-fit budget ONCE
+            // (MemTotal − floor, same source the executor uses) and share one
+            // semaphore across all device-chains. Each cell acquires its
+            // (clamped) footprint in GiB permits for its whole run, so the SUM
+            // of concurrent cells can't exceed the box. `0` ⇒ probe failed ⇒
+            // ungated (per-cell broker gate alone), the pre-slice behaviour.
+            let budget_gib = scheduler_box_fit_budget_gib().unwrap_or(0);
+            let mem_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(budget_gib.max(1) as usize));
             let (set, recipe, base) = (&set, &recipe, &base);
             let chains = per_device.into_iter().enumerate().map(|(d, cells)| {
                 let dev = devices[d];
+                let mem_sem = mem_sem.clone();
                 async move {
                     let (mut ok, mut failed) = (0usize, 0usize);
                     for cell in cells {
                         let cell_args = apply_cell_overrides(base, &cell.overrides);
                         eprintln!("[gpu {dev}] cell {}", cell.key);
-                        let (outcome, job_id) = match run_one_recipe(
+                        // Per-cell footprint (RAM GiB) for the cross-cell gate:
+                        // the SAME `recipe_footprint` the per-cell broker
+                        // admission resolves on, rounded UP to whole GiB (never
+                        // under-bill). Clamp+acquire happens in `gated_cell_run`.
+                        let footprint = recipe_footprint(recipe, &cell_args);
+                        let footprint_gib =
+                            footprint.ram_bytes.div_ceil(crate::broker::footprint::GIB) as u32;
+                        let cell_run = run_one_recipe(
                             reg, recipe, cell_args, None, false, launch_target, Some(dev), false,
+                        );
+                        let (outcome, job_id) = match gated_cell_run(
+                            mem_sem.clone(),
+                            footprint_gib,
+                            budget_gib,
+                            cell_run,
                         )
                         .await
                         {
@@ -4004,6 +4093,121 @@ mod footprint_resolve_tests {
         assert!(warm.estimate().ram_bytes < cold.estimate().ram_bytes);
         assert_eq!(warm.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|3|32|2|w");
         assert_eq!(cold.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|3|32|2|c");
+    }
+}
+
+#[cfg(test)]
+mod gated_cell_run_tests {
+    //! Cross-cell RAM admission: the shared box-fit semaphore must SERIALIZE
+    //! concurrent cells whose footprints SUM over the budget, run cells whose
+    //! footprints SUM within the budget CONCURRENTLY, and CLAMP a single
+    //! over-budget cell to the budget (run alone, never deadlock). Mirrors the
+    //! executor's `memory_budget_serializes_when_sum_exceeds_box_fit` style.
+    use super::gated_cell_run;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio::sync::Semaphore;
+
+    /// A cell body that bumps a shared `live` counter (tracking `peak`
+    /// concurrency), holds for a beat, then drops — so the test can assert
+    /// whether two gated cells overlapped or serialized.
+    async fn busy_cell(peak: Arc<AtomicU32>, live: Arc<AtomicU32>) {
+        let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        live.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// SUM over budget ⇒ the two cells must NOT both hold permits at once.
+    /// Budget 4, each cell wants 3 (sum 6 > 4) ⇒ peak concurrency 1.
+    #[tokio::test]
+    async fn over_budget_pair_serializes() {
+        let sem = Arc::new(Semaphore::new(4));
+        let peak = Arc::new(AtomicU32::new(0));
+        let live = Arc::new(AtomicU32::new(0));
+        let c1 = gated_cell_run(sem.clone(), 3, 4, busy_cell(peak.clone(), live.clone()));
+        let c2 = gated_cell_run(sem.clone(), 3, 4, busy_cell(peak.clone(), live.clone()));
+        tokio::join!(c1, c2);
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "two cells wanting 3 GiB each (sum 6 > budget 4) must serialize"
+        );
+    }
+
+    /// SUM within budget ⇒ the two cells run CONCURRENTLY. Budget 8, each
+    /// wants 3 (sum 6 <= 8) ⇒ peak concurrency 2.
+    #[tokio::test]
+    async fn within_budget_pair_runs_concurrently() {
+        let sem = Arc::new(Semaphore::new(8));
+        let peak = Arc::new(AtomicU32::new(0));
+        let live = Arc::new(AtomicU32::new(0));
+        let c1 = gated_cell_run(sem.clone(), 3, 8, busy_cell(peak.clone(), live.clone()));
+        let c2 = gated_cell_run(sem.clone(), 3, 8, busy_cell(peak.clone(), live.clone()));
+        tokio::join!(c1, c2);
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "two cells wanting 3 GiB each (sum 6 <= budget 8) must run concurrently"
+        );
+    }
+
+    /// THE clamp: a cell whose footprint EXCEEDS the whole budget acquires
+    /// `budget` permits (runs alone), NOT `> budget` (which `acquire_many_owned`
+    /// could never grant ⇒ permanent hang). The cell must still complete, and a
+    /// second cell must wait for it (peak concurrency 1).
+    #[tokio::test]
+    async fn over_box_cell_clamps_and_runs_alone() {
+        let sem = Arc::new(Semaphore::new(4));
+        let peak = Arc::new(AtomicU32::new(0));
+        let live = Arc::new(AtomicU32::new(0));
+        // footprint 100 GiB >> budget 4 ⇒ clamps to 4 ⇒ acquires all permits.
+        let big = gated_cell_run(sem.clone(), 100, 4, busy_cell(peak.clone(), live.clone()));
+        let other = gated_cell_run(sem.clone(), 1, 4, busy_cell(peak.clone(), live.clone()));
+        // tokio::join completing at all proves the clamped cell did NOT hang.
+        tokio::join!(big, other);
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "an over-budget cell clamps to the whole budget and runs alone"
+        );
+    }
+
+    /// A zero footprint still acquires at least 1 permit (`.max(1)`), so a
+    /// 0-GiB cell can't slip a no-op past the gate. With budget 1, two 0-GiB
+    /// cells therefore serialize (each takes the single permit).
+    #[tokio::test]
+    async fn zero_footprint_takes_one_permit() {
+        let sem = Arc::new(Semaphore::new(1));
+        let peak = Arc::new(AtomicU32::new(0));
+        let live = Arc::new(AtomicU32::new(0));
+        let c1 = gated_cell_run(sem.clone(), 0, 1, busy_cell(peak.clone(), live.clone()));
+        let c2 = gated_cell_run(sem.clone(), 0, 1, busy_cell(peak.clone(), live.clone()));
+        tokio::join!(c1, c2);
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "a 0-GiB footprint still takes 1 permit (budget 1 ⇒ serialize)"
+        );
+    }
+
+    /// `budget == 0` (probe failed) ⇒ ungated: cells run with no admission, so
+    /// two overlap freely (the per-cell broker gate is the sole guard). A 0-cap
+    /// semaphore would block forever if the budget path acquired from it — this
+    /// pins the early-return that skips acquisition entirely.
+    #[tokio::test]
+    async fn zero_budget_runs_ungated() {
+        let sem = Arc::new(Semaphore::new(1)); // tiny; must NOT be acquired
+        let peak = Arc::new(AtomicU32::new(0));
+        let live = Arc::new(AtomicU32::new(0));
+        let c1 = gated_cell_run(sem.clone(), 9, 0, busy_cell(peak.clone(), live.clone()));
+        let c2 = gated_cell_run(sem.clone(), 9, 0, busy_cell(peak.clone(), live.clone()));
+        tokio::join!(c1, c2);
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "budget 0 ⇒ semaphore is a no-op, cells run concurrently (per-cell gate aside)"
+        );
     }
 }
 
