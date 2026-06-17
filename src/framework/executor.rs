@@ -384,18 +384,44 @@ fn cancel_failure(
 /// (`env.diverged`) BEFORE cancelling its token, so `run_node` — unwinding on
 /// the cancel — reads the entry and routes the kill to a retryable
 /// `StageError::Diverged` (auto-resume) instead of a permanent branch prune.
-/// Idempotent: a no-op if the token already fired (divergence PERSISTS, so the
-/// same kill re-arrives on the next step; only the FIRST records + cancels).
-/// Holds the registry `Mutex` only for a tiny insert — never across an `.await`.
+///
+/// PER-ATTEMPT KILL LATCH (S1 race fix). A REAL diverging trainer emits MANY
+/// `{"loss":"nan"}` `StageStep` lines before its `killpg` teardown reaps the
+/// subprocess — those stale steps buffer in the coordinator's lossy `broadcast`
+/// receiver and arrive AFTER `run_node` has already promoted the kill to
+/// `Diverged`, re-armed the slot with a FRESH un-cancelled token, and started
+/// attempt 2. A stale step would then find `tok.is_cancelled() == false` (the
+/// fresh token), slip past the idempotency guard below, and CANCEL the fresh
+/// token — spuriously killing attempt 2 before it even diverged on its own. The
+/// `kill_flagged` latch closes that window: once this coordinator has issued a
+/// divergence kill for `nid`, it refuses to re-issue one until the node's
+/// `StageEvent::StageRetrying` (the new-attempt boundary) clears the latch.
+/// Because the single broadcast preserves emission order and `run_node` joins
+/// the stage's stdout reader BEFORE emitting `StageRetrying`, ALL of attempt-1's
+/// stale NaN steps precede that `StageRetrying` in the stream — so they are all
+/// consumed-and-skipped here before the latch clears.
+///
+/// Idempotent: a no-op if `nid` is already kill-flagged this attempt, or if the
+/// token already fired (the `is_cancelled` guard is kept as defense-in-depth for
+/// the single-step-per-attempt path). Holds the registry `Mutex` only for a tiny
+/// insert — never across an `.await`.
 fn record_divergence_and_kill(
     nid: Option<NodeId>,
     node_idx: u32,
     stage_name: &str,
     update: &serde_json::Value,
     node_tokens: &HashMap<NodeId, KillSlot>,
+    kill_flagged: &mut HashSet<NodeId>,
     env: &NodeEnv,
 ) {
     let Some(nid) = nid else { return };
+    // Already kill-flagged this attempt: a stale buffered step from the SAME
+    // (still-in-flight) attempt must not re-fire the kill — and crucially must
+    // not cancel a fresh token a divergence retry just re-armed. Cleared at the
+    // node's `StageRetrying` (attempt boundary) or on node removal.
+    if kill_flagged.contains(&nid) {
+        return;
+    }
     let Some(tok) = node_tokens.get(&nid) else {
         return;
     };
@@ -425,6 +451,11 @@ fn record_divergence_and_kill(
     tracing::warn!(
         "divergence KILL on node {node_idx} ({stage_name}): retryable (auto-resume on retry)"
     );
+    // Latch BEFORE cancel: any stale buffered NaN step for this node that the
+    // coordinator processes before the node's `StageRetrying` boundary now
+    // short-circuits at the `kill_flagged` guard above (so it can't re-fire on
+    // the fresh, re-armed token of the next attempt).
+    kill_flagged.insert(nid);
     tok.cancel();
 }
 
@@ -820,6 +851,21 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
                 });
             }
             let next_backoff = task.retry.backoff_before(attempt + 1);
+            // S1 ORDERING INVARIANT (load-bearing for the coordinator's
+            // `kill_flagged` latch). This `StageRetrying` is the divergence latch's
+            // CLEAR signal: the coordinator re-enables divergence kills for this
+            // node only when it consumes this event. That is sound ONLY because
+            // every `StageStep` this attempt emitted has ALREADY been flushed into
+            // the broadcast (in order) by the time we reach here — so all of this
+            // attempt's stale NaN steps precede this `StageRetrying` in the single
+            // broadcast stream and are consumed-and-skipped (latch set) before the
+            // latch clears. That holds because a backend emits its steps INLINE in
+            // its `run_erased` future (the lamu backend JOINS its spawned stdout
+            // reader via `stdout_reader.await` before `run` returns), so no step
+            // can arrive after this point. A future backend that emits steps from a
+            // DETACHED task outliving its run future would break this invariant —
+            // it must instead join that task before returning (or the coordinator
+            // latch must move to attempt-stamping).
             env.status.emit(StageEvent::StageRetrying {
                 node_idx: idx,
                 stage_name: stage_name.clone(),
@@ -1544,6 +1590,16 @@ impl ParallelExecutor {
         // keyed the same as `node_tokens`, and drop it alongside the token on
         // completion/kill so it never leaks across nodes. Empty without a policy.
         let mut node_stages: HashMap<NodeId, Arc<dyn StageDyn>> = HashMap::new();
+        // S1 race fix: per-node kill latch. A node is inserted here when the
+        // coordinator issues a divergence kill for it (in `record_divergence_and_kill`)
+        // and removed at its `StageEvent::StageRetrying` boundary (the new attempt
+        // started) or on node removal. While flagged, the coordinator refuses to
+        // re-issue a divergence kill — so the burst of stale buffered NaN steps a
+        // diverging trainer emits before its subprocess is reaped cannot re-fire the
+        // kill on a fresh, re-armed token of the next attempt. Plain coordinator-local
+        // state (no lock): the coordinator seam is single-threaded. Empty without a
+        // control policy, so the non-control path never touches it.
+        let mut kill_flagged: HashSet<NodeId> = HashSet::new();
 
         // #4 runtime SPAWN (PBT/TPE) state. The original plan's nodes stay
         // borrowed through `view` (immutable for the whole run); nodes appended
@@ -1764,7 +1820,7 @@ impl ParallelExecutor {
                                                 Control::Continue if stage_diverged => {
                                                     record_divergence_and_kill(
                                                         nid, node_idx, &stage_name, &update,
-                                                        &node_tokens, &env,
+                                                        &node_tokens, &mut kill_flagged, &env,
                                                     );
                                                 }
                                                 Control::Continue => {}
@@ -1776,7 +1832,7 @@ impl ParallelExecutor {
                                                 Control::KillBranch => {
                                                     record_divergence_and_kill(
                                                         nid, node_idx, &stage_name, &update,
-                                                        &node_tokens, &env,
+                                                        &node_tokens, &mut kill_flagged, &env,
                                                     );
                                                 }
                                                 // Queue the delta; it is injected at
@@ -1798,6 +1854,23 @@ impl ParallelExecutor {
                                                 // queue a delta the drain would just drop.
                                                 Control::Spawn(_) => {}
                                             }
+                                        }
+                                    }
+                                    // S1 race fix: a node's `StageRetrying` is the
+                                    // ATTEMPT BOUNDARY — `run_node` emits it right
+                                    // before it re-arms the kill slot and `continue`s
+                                    // into the next attempt. Clear the kill latch so
+                                    // the node is killable again ONLY once its NEW
+                                    // attempt has actually begun. The single broadcast
+                                    // preserves emission order and `run_node` joins the
+                                    // stage's stdout reader before emitting this event,
+                                    // so ALL of the prior attempt's stale NaN StageSteps
+                                    // precede this in the stream and are already
+                                    // consumed-and-skipped (the latch was set) — no
+                                    // straggler step can clear-then-refire the kill.
+                                    Ok(StageEvent::StageRetrying { node_idx, .. }) => {
+                                        if let Some(&nid) = order.get(node_idx as usize) {
+                                            kill_flagged.remove(&nid);
                                         }
                                     }
                                     // Lifecycle echoes + step-gap markers: ignored
@@ -1847,6 +1920,13 @@ impl ParallelExecutor {
                     node_tokens.remove(&outcome.node_id);
                     // S1: drop the stage handle alongside (no leak across nodes).
                     node_stages.remove(&outcome.node_id);
+                    // S1 race fix: clear any leftover kill latch. A
+                    // divergence-then-recovered node was flagged on each diverging
+                    // attempt and cleared at the following `StageRetrying`; the
+                    // successful attempt set no flag, so this is usually a no-op —
+                    // but the explicit remove keeps the set from leaking across
+                    // nodes regardless of the per-attempt history.
+                    kill_flagged.remove(&outcome.node_id);
                     // O(1) reverse lookup of the key this node ran under.
                     let key = node_key_of.remove(&outcome.node_id);
                     outputs.insert(outcome.node_id, outcome.output);
@@ -1883,6 +1963,8 @@ impl ParallelExecutor {
                     // GPU/memory permits already dropped when run_node returned.
                     node_tokens.remove(&node_id);
                     node_stages.remove(&node_id);
+                    // S1 race fix: clear the kill latch for the pruned node.
+                    kill_flagged.remove(&node_id);
                     // Free its single-flight key. Same-key deferred waiters are
                     // duplicate-COMPUTATION siblings (not descendants — a
                     // descendant folds this output into a DIFFERENT key); the
@@ -1917,13 +1999,31 @@ impl ParallelExecutor {
                 Err(NodeFailure::Cancelled) => {
                     // A sibling cancelled (or this node observed the token
                     // after a peer failed). Never the PRIMARY error — only
-                    // record Cancelled if nothing else failed.
+                    // record Cancelled if nothing else failed. (No node id to
+                    // remove — the `Cancelled` variant carries none; the maps are
+                    // coordinator-local and dropped when `execute` returns on the
+                    // ensuing fail-fast drain, so no cross-node leak.)
                     if first_error.is_none() {
                         first_error = Some(PlanError::Cancelled);
                         env.cancel.cancel();
                     }
                 }
                 Err(f) => {
+                    // S1 race fix: a `Stage` failure carries the topo idx, so map
+                    // it back to the node id and clear its in-flight maps + kill
+                    // latch — this is the diverged-EXHAUSTED node
+                    // (`StageError::Diverged` after `max_attempts`), which was last
+                    // kill-flagged on its final attempt and never reached a
+                    // `StageRetrying`. Per-node-keyed, so a stale latch entry could
+                    // never affect a sibling, but clear it for hygiene before the
+                    // fail-fast drain. (`Other` carries no id; nothing to remove.)
+                    if let NodeFailure::Stage { idx, .. } = &f {
+                        if let Some(&nid) = order.get(*idx as usize) {
+                            node_tokens.remove(&nid);
+                            node_stages.remove(&nid);
+                            kill_flagged.remove(&nid);
+                        }
+                    }
                     if first_error.is_none() {
                         first_error = Some(plan_error_of(f));
                         env.cancel.cancel(); // fail-fast: cancel siblings
@@ -3531,6 +3631,258 @@ mod tests {
             ALWAYS_DIV_ATTEMPTS.load(Ordering::SeqCst),
             3,
             "diverged node retries up to max_attempts (3) before the terminal failure"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // S1 RACE — stale buffered divergence steps must NOT re-kill the retry.
+    //
+    // A REAL diverging trainer emits MANY `{"loss":"nan"}` StageSteps before its
+    // killpg teardown reaps the subprocess. Those steps buffer in the lossy
+    // broadcast and arrive at the coordinator AFTER `run_node` promoted the kill
+    // to `Diverged`, re-armed the slot with a FRESH token, and started attempt 2.
+    // WITHOUT the `kill_flagged` latch a stale step finds the fresh (un-cancelled)
+    // token, slips past the idempotency guard, and cancels it — spuriously killing
+    // attempt 2. These two tests emit ≥3 NaN steps per attempt to exercise that
+    // window (the prior single-NaN-step tests never could).
+    // ════════════════════════════════════════════════════════════════
+
+    static MULTI_DIV_RESUME_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+    static MULTI_DIV_RESUME_SAW_RESUME: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Like `DivergeThenResume`, but models a REAL diverging trainer faithfully:
+    /// it emits a BURST of non-finite steps (all flushed to the broadcast BEFORE
+    /// the stage future returns — exactly as the lamu backend's `run` joins its
+    /// stdout reader via `stdout_reader.await` before returning, so every
+    /// `StageStep` precedes the worker's `StageRetrying`), then parks + bails. The
+    /// burst is long (≥3 is the spec; the extra steps just make the coordinator's
+    /// drain lag the worker's re-arm reliably, so the race is hit on every run).
+    ///
+    /// The race (needs the multi-thread runtime, hence the test's `multi_thread`
+    /// flavor): NaN#1 fires the kill (latch set); while the coordinator still has
+    /// NaN#2/#3 BUFFERED and undrained, the worker — on the other thread — bails,
+    /// re-arms the slot with a FRESH token, and emits `StageRetrying`. WITHOUT the
+    /// `kill_flagged` latch the coordinator then drains NaN#2 against that fresh
+    /// (un-cancelled) token, slips past the `is_cancelled()` guard, and re-fires
+    /// the kill → attempt 2 is spuriously killed → exhausted → the plan FAILS.
+    /// WITH the latch, NaN#2/#3 short-circuit at the `kill_flagged` guard until
+    /// the node's `StageRetrying` clears it (and the single broadcast guarantees
+    /// all of attempt-1's NaN steps precede that `StageRetrying`).
+    ///
+    /// Attempt 2 sleeps a beat (watching its own cancel token) so a pre-fix
+    /// re-kill lands mid-run: the re-kill cancels it → it bails → a 3rd attempt
+    /// runs → the attempt-count assertion (== 2) trips.
+    struct MultiStepDivergeThenResume;
+    impl MultiStepDivergeThenResume {
+        fn resume_dir(ctx: &StageContext) -> std::path::PathBuf {
+            ctx.job_dir.join("multi_diverge_resume_dir")
+        }
+    }
+    #[async_trait]
+    impl Stage for MultiStepDivergeThenResume {
+        const NAME: &'static str = "multi_step_diverge_then_resume";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Gpu];
+        const RETRY: RetryPolicy = RetryPolicy {
+            max_attempts: 2,
+            backoff: Backoff::None,
+            retry_on: RetryOn::Transient,
+        };
+        type Input = Counter;
+        type Output = Counter;
+        type Args = EmptyArgs;
+        fn resume_handle(
+            &self,
+            ctx: &StageContext,
+            _args: &EmptyArgs,
+        ) -> Option<crate::framework::resume::ResumeToken> {
+            Some(crate::framework::resume::ResumeToken {
+                resume_dir: Self::resume_dir(ctx),
+                required_keys: &[],
+            })
+        }
+        async fn run(
+            &self,
+            ctx: &StageContext,
+            input: Counter,
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            MULTI_DIV_RESUME_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+            if ctx.attempt == 1 {
+                // Write a `running` marker so the retry auto-resumes (S3).
+                let dir = Self::resume_dir(ctx);
+                std::fs::create_dir_all(&dir).unwrap();
+                let run_id = ctx
+                    .job_dir
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let state = crate::framework::resume::ResumeState {
+                    status: "running".into(),
+                    run_id,
+                    pid: 0,
+                    heartbeat_unix: now,
+                };
+                std::fs::write(dir.join("state.json"), serde_json::to_string(&state).unwrap())
+                    .unwrap();
+                // Burst of NaN steps, all emitted BEFORE this future returns
+                // (faithful to the joined stdout reader). They land in the
+                // broadcast in order; the steps after the first are the stale
+                // buffered steps the coordinator may not drain until after the
+                // re-arm. A long burst widens the window: while the coordinator
+                // works through the queue, the worker (other thread) bails +
+                // re-arms, so a later step is drained against the FRESH token. ≥3
+                // satisfies the spec; the extra steps just make the race reliable.
+                for step in 1..=24u32 {
+                    let _ = ctx.status_tx.send(StageEvent::StageStep {
+                        node_idx: ctx.node_idx,
+                        stage_name: Self::NAME.to_string(),
+                        update: serde_json::json!({ "loss": "nan", "step": step }),
+                    });
+                }
+                // Park until the kill fires (NaN#1), then bail like a SIGTERM'd
+                // trainer. The return → re-arm → StageRetrying happens while the
+                // coordinator may still have NaN#2/#3 buffered.
+                ctx.cancel.cancelled().await;
+                return Err(StageError::Cancelled);
+            }
+            // Attempt 2: must have been auto-resumed AND not spuriously re-killed.
+            if ctx.resume_from.as_deref() == Some(Self::resume_dir(ctx).as_path()) {
+                MULTI_DIV_RESUME_SAW_RESUME.store(true, Ordering::SeqCst);
+            }
+            // Stay alive a beat, watching our own cancel token, so a pre-fix
+            // re-kill (from a stale buffered NaN step) lands mid-run → bail → a
+            // 3rd attempt → the attempt-count assertion (== 2) trips. With the
+            // fix nothing cancels us and we return Ok.
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                _ = ctx.cancel.cancelled() => {
+                    return Err(StageError::Cancelled);
+                }
+            }
+            Ok(Counter { n: input.n + 1 })
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for MultiStepDivergeThenResume {}
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_step_divergence_burst_does_not_re_kill_the_retry() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        MULTI_DIV_RESUME_ATTEMPTS.store(0, Ordering::SeqCst);
+        MULTI_DIV_RESUME_SAW_RESUME.store(false, Ordering::SeqCst);
+        let td = tempfile::tempdir().unwrap();
+        let ctx = ExecCtx::new(td.path().to_path_buf())
+            .with_control(std::sync::Arc::new(crate::framework::control::KillOnNaN));
+
+        // MakeOne → MultiStepDivergeThenResume (3 NaN steps on attempt 1, resumes).
+        let plan = Plan::<(), LamuTrainerBackend>::new("multi_div_resume", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .then(MultiStepDivergeThenResume, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let fut = ParallelExecutor::execute(plan, ctx);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(8), fut)
+            .await
+            .expect("divergence kill must fire + retry — a parked stage would hang")
+            // THE BUG: without the latch, stale step #2/#3 cancel attempt 2's
+            // fresh token → attempt 2 is killed → exhausted → `Err(Diverged)`.
+            // With the latch, attempt 2 runs clean and the plan RECOVERS.
+            .expect("a multi-NaN-step diverge must still recover (attempt 2 not re-killed)");
+
+        assert_eq!(
+            MULTI_DIV_RESUME_ATTEMPTS.load(Ordering::SeqCst),
+            2,
+            "ran exactly twice: attempt 1 diverged (burst of NaN), attempt 2 succeeded — \
+             the stale buffered steps must NOT inflate the attempt count by re-killing"
+        );
+        assert!(
+            MULTI_DIV_RESUME_SAW_RESUME.load(Ordering::SeqCst),
+            "attempt 2 must see resume_from (auto-resume reached) and run to completion"
+        );
+        let counter: Counter = result.final_output.unwrap().into_typed().unwrap();
+        assert_eq!(counter.n, 2, "the recovered run produces its real output (1 → 2)");
+    }
+
+    static MULTI_ALWAYS_DIV_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+
+    /// ALWAYS diverges, emitting a long BURST of NaN steps every attempt (≥3 is
+    /// the spec; 24 makes the coordinator's drain lag the worker's re-arm reliably
+    /// — same rationale as `MultiStepDivergeThenResume`). The extra stale steps
+    /// must neither INFLATE the count (re-kill a fresh attempt with a straggler so
+    /// the run burns attempts faster than it should) nor DEFLATE it — it must
+    /// terminate as `Diverged` after EXACTLY `max_attempts`.
+    struct MultiStepAlwaysDiverge;
+    #[async_trait]
+    impl Stage for MultiStepAlwaysDiverge {
+        const NAME: &'static str = "multi_step_always_diverge";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Gpu];
+        const RETRY: RetryPolicy = RetryPolicy {
+            max_attempts: 3,
+            backoff: Backoff::None,
+            retry_on: RetryOn::Transient,
+        };
+        type Input = Counter;
+        type Output = Counter;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            ctx: &StageContext,
+            _input: Counter,
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            MULTI_ALWAYS_DIV_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+            for step in 1..=24u32 {
+                let _ = ctx.status_tx.send(StageEvent::StageStep {
+                    node_idx: ctx.node_idx,
+                    stage_name: Self::NAME.to_string(),
+                    update: serde_json::json!({ "loss": "nan", "step": step }),
+                });
+            }
+            ctx.cancel.cancelled().await;
+            Err(StageError::Cancelled)
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for MultiStepAlwaysDiverge {}
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multi_step_always_diverge_exhausts_exactly_max_attempts() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        MULTI_ALWAYS_DIV_ATTEMPTS.store(0, Ordering::SeqCst);
+        let (_td, base) = fresh_ctx();
+        let ctx = base.with_control(std::sync::Arc::new(crate::framework::control::KillOnNaN));
+
+        let plan =
+            Plan::<(), LamuTrainerBackend>::new("multi_always_div", serde_json::json!({}))
+                .start(MakeOne, EmptyArgs)
+                .then(MultiStepAlwaysDiverge, EmptyArgs)
+                .finish()
+                .into_compiled();
+        let fut = ParallelExecutor::execute(plan, ctx);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+            .await
+            .expect("repeated multi-step divergence must keep firing the kill + bounded retry");
+
+        match result {
+            Err(PlanError::StageFailed { stage, source, .. }) => {
+                assert_eq!(stage, "multi_step_always_diverge");
+                assert!(
+                    matches!(source, StageError::Diverged { .. }),
+                    "exhausted divergence must surface StageError::Diverged, got {source:?}"
+                );
+            }
+            other => panic!("expected StageFailed(Diverged), got {other:?}"),
+        }
+        assert_eq!(
+            MULTI_ALWAYS_DIV_ATTEMPTS.load(Ordering::SeqCst),
+            3,
+            "the burst of stale NaN steps must NOT inflate or deflate the count — \
+             exactly max_attempts (3) attempts, then terminal Diverged"
         );
     }
 
