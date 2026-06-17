@@ -276,7 +276,13 @@ def _build_lma_typed_l3(cfg):
     apply_env()
     os.environ.setdefault("LMA_NUM_WORKERS", "2")
 
-    from lma_typed_adapter import LmaTypedL3Dataset
+    # Package-form import (NOT the trainer's bare ``from lma_typed_adapter``):
+    # train_joint puts ``lamquant/student`` on sys.path before its bare import,
+    # but a recipe/framework caller of this ingredient need not have — and the
+    # bare form then ModuleNotFoundErrors. The fully-qualified form always
+    # resolves and the adapter MODULE self-inserts the sibling area dirs it needs
+    # (``snn`` etc.) on import. Same class, same behaviour.
+    from lamquant.student.lma_typed_adapter import LmaTypedL3Dataset
 
     _mwpf = ({} if cfg.max_windows_per_file is None
              else {"max_windows_per_file": cfg.max_windows_per_file})

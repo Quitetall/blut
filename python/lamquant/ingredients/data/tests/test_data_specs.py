@@ -56,13 +56,19 @@ except Exception:
 
 
 def _resolve_lml() -> Path | None:
-    """The lml CLI binary, or None. Mirrors the Lossless resolver's locations."""
-    for cand in (
-        Path("/mnt/4tb/LamQuant/target/release/lml"),
-        Path(__file__).resolve().parents[6] / "target" / "release" / "lml",
-    ):
-        if cand.is_file() and os.access(cand, os.X_OK):
-            return cand
+    """The lml CLI binary, or None.
+
+    Resolution order (portable first, no machine-specific hardcode):
+      1. ``$LML_BIN`` env override (CI / dev points it wherever).
+      2. ``<meta-repo>/target/release/lml`` relative to this file.
+      3. ``lml`` on ``$PATH``.
+    """
+    env = os.environ.get("LML_BIN")
+    if env and Path(env).is_file() and os.access(env, os.X_OK):
+        return Path(env)
+    cand = Path(__file__).resolve().parents[6] / "target" / "release" / "lml"
+    if cand.is_file() and os.access(cand, os.X_OK):
+        return cand
     from shutil import which
     w = which("lml")
     return Path(w) if w else None
@@ -512,3 +518,23 @@ def test_lma_typed_l3_max_windows_per_file_forwarded(lma_corpus, monkeypatch):
          "max_windows_per_file": 2})
     # Cap of 2 per file -> the wrapped base dataset holds <= 2 windows.
     assert len(train_ds._base) <= 2
+
+
+def test_lma_typed_l3_builds_without_bare_area_dirs_on_path(
+        lma_corpus, monkeypatch):
+    # A recipe/framework caller of this ingredient need not have inserted
+    # ``lamquant/student`` on sys.path the way train_joint does before its bare
+    # ``from lma_typed_adapter import`` — the data spec must resolve the adapter
+    # via its package path regardless. Strip the bare area dirs and confirm the
+    # build still succeeds (regression for the package-form import fix).
+    data_root = tempfile.mkdtemp(prefix="cacheroot_")
+    monkeypatch.setenv("LAMQUANT_DATA_ROOT", data_root)
+    cleaned = [p for p in sys.path
+               if "lamquant/student" not in p and "lamquant/snn" not in p]
+    monkeypatch.setattr(sys, "path", cleaned)
+    root, manifest = lma_corpus["root"], lma_corpus["manifest"]
+    train_ds, val_ds = build_ingredient(
+        "data", "lma_typed_l3",
+        {"lma_root": root, "split_manifest": manifest,
+         "windows_per_epoch": 8, "val_windows": 6})
+    assert len(train_ds) == 8 and len(val_ds) == 6
