@@ -221,16 +221,42 @@ def test_durable_resume_round_trip(tmp_path):
         resume_dir=str(tmp_path / "rdir"), run_id="r1", resume_key="k1")
     assert isinstance(dur, DurableResume)
     try:
-        dur.save_recovery("qat_latest", {"epoch": 4,
-                                         "model": {"w": torch.ones(2)}})
+        # A COMPLETE recovery checkpoint: carries the full REQUIRED_RECOVERY_KEYS
+        # set (encoder/decoder/epoch/phase/optimizer; rng + resume_key are added
+        # by save_recovery). An incomplete checkpoint is deliberately rejected on
+        # load — see test_durable_resume_rejects_incomplete below.
+        dur.save_recovery("qat_latest", {
+            "epoch": 4,
+            "phase": "qat",
+            "encoder": {"w": torch.ones(2)},
+            "decoder": {"w": torch.zeros(2)},
+            "optimizer": {"state": {}},
+        })
         assert dur.detect() == "qat_latest"
         ck = dur.load_recovery("qat_latest")
         assert ck is not None
         assert ck["epoch"] == 4
         assert ck["resume_key"] == "k1"
-        assert torch.equal(ck["model"]["w"], torch.ones(2))
+        assert torch.equal(ck["encoder"]["w"], torch.ones(2))
     finally:
         # finish() joins the daemon heartbeat thread so the test doesn't hang.
+        dur.finish()
+
+
+def test_durable_resume_rejects_incomplete(tmp_path):
+    """An incomplete recovery checkpoint (missing required keys) must be REFUSED
+    on load — never silently cold-started (Phase D required-keys validation)."""
+    from lamquant.student.durable_resume import DurableResume
+    dur = build_ingredient(
+        "checkpoint", "durable_resume", {},
+        resume_dir=str(tmp_path / "rdir"), run_id="r1", resume_key="k1")
+    assert isinstance(dur, DurableResume)
+    try:
+        # Missing encoder/decoder/phase/optimizer.
+        dur.save_recovery("qat_latest", {"epoch": 4})
+        with pytest.raises(RuntimeError):
+            dur.load_recovery("qat_latest")
+    finally:
         dur.finish()
 
 
