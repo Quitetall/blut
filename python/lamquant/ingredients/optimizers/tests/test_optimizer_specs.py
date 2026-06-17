@@ -83,6 +83,31 @@ def test_adamw_one_group_all_trainable():
     assert got == {id(q) for _n, q in named if q.requires_grad}
 
 
+def test_adamw_fused_and_betas_propagate():
+    """teacher + mae pass nonstandard betas (torch default 0.9/0.999) and mae a
+    device-dependent fused flag — assert both flow through the spec."""
+    m = _Routed()
+    opt = build_ingredient(
+        "optimizer", "adamw",
+        {"lr": 2e-3, "weight_decay": 1e-4, "betas": (0.9, 0.999), "fused": False},
+        named_params=list(m.named_parameters()))
+    g = opt.param_groups[0]
+    assert g["lr"] == 2e-3
+    assert g["weight_decay"] == 1e-4
+    assert g["betas"] == (0.9, 0.999)
+    assert opt.defaults.get("fused") is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="fused AdamW requires CUDA")
+def test_adamw_fused_true_reaches_torch_on_cuda():
+    m = _Routed().cuda()
+    opt = build_ingredient(
+        "optimizer", "adamw", {"lr": 1e-3, "fused": True},
+        named_params=list(m.named_parameters()))
+    assert opt.defaults.get("fused") is True
+
+
 def test_muon_splits_by_ndim():
     m = _Routed()
     named = list(m.named_parameters())

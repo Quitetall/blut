@@ -182,7 +182,8 @@ def _muon():
 class AdamwConfig:
     lr: float = 1e-3
     weight_decay: float = 0.0
-    betas: tuple = (0.9, 0.95)
+    betas: tuple = (0.9, 0.999)  # torch AdamW's own default (least surprise)
+    fused: bool = False
 
 
 @register_ingredient
@@ -192,5 +193,6 @@ def _adamw():
         build_param_groups=lambda named, cfg: [
             {"params": [q for _n, q in named if q.requires_grad]}],
         construct=lambda groups, cfg: torch.optim.AdamW(
-            groups, lr=cfg.lr, weight_decay=cfg.weight_decay, betas=cfg.betas),
+            groups, lr=cfg.lr, weight_decay=cfg.weight_decay, betas=cfg.betas,
+            fused=cfg.fused),
     )

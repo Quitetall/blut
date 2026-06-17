@@ -118,7 +118,12 @@ def main():
     print(f"    Shapes: input {list(sample.shape)} → latent {list(lat.shape)} → output {list(out.shape)}")
     assert lat.shape == torch.Size([1, 32, 79]), f"Latent shape mismatch: {lat.shape}"
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    # ADR 0050/0051 ingredient registry (uniform optimizer construction).
+    from lamquant.ingredients import build_ingredient
+    optimizer = build_ingredient(
+        "optimizer", "adamw",
+        {"lr": args.lr, "weight_decay": 1e-4, "betas": (0.9, 0.999)},
+        named_params=list(model.named_parameters()))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=args.lr_min)
 

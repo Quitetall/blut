@@ -159,9 +159,14 @@ def run_pretraining(
     print(f'[*] Encoder: {n_enc:,} params')
     print(f'[*] Prediction head: {n_head:,} params (discarded after pretraining)')
 
-    optimizer = torch.optim.AdamW(
-        list(encoder.parameters()) + list(pred_head.parameters()),
-        lr=lr, weight_decay=1e-4, fused=(device.type == 'cuda'))
+    # ADR 0050/0051 ingredient registry (uniform optimizer construction).
+    from lamquant.ingredients import build_ingredient
+    optimizer = build_ingredient(
+        "optimizer", "adamw",
+        {"lr": lr, "weight_decay": 1e-4, "betas": (0.9, 0.999),
+         "fused": (device.type == 'cuda')},
+        named_params=list(encoder.named_parameters())
+        + list(pred_head.named_parameters()))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs, eta_min=lr * 0.01)
 
