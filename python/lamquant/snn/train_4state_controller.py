@@ -441,7 +441,7 @@ def selection_key(m: dict, alpha: float) -> tuple:
 
 def train_epoch(model, head, loader, optimizer, device, quiet_thr,
                 target_T, class_weights, head_kind, lambda_spike, grad_clip,
-                use_spectral=False, use_ordinal=False, crit_floor=0.88,
+                loss_fn, use_spectral=False, use_ordinal=False, crit_floor=0.88,
                 distiller=None, lambda_distill=0.0):
     model.train()
     head.train()
@@ -471,26 +471,17 @@ def train_epoch(model, head, loader, optimizer, device, quiet_thr,
         states, class_logits = head(activity_logits, target_T)  # [B,Tout],[B,4,Tout]
         target = derive_batch_targets(labels, l3, quiet_thr, target_T)  # [B,Tout]
 
-        if head_kind == "crf":
-            # CRF path is unaffected by --ordinal (the ordinal/constrained
-            # objective replaces the FLAT softmax CE, not the CRF NLL).
-            loss_main = head.neg_log_likelihood(class_logits, target)
-        elif use_ordinal:
-            # ADR-0027 #4: ordinal + constrained objective (drop-in for the
-            # weighted CE). escalation/ramp args stay at their module defaults.
-            loss_main = constrained_loss(class_logits, target, weight=cw,
-                                         crit_floor=crit_floor)
-        else:
-            loss_main = F.cross_entropy(class_logits, target, weight=cw)
-        loss = loss_main + lambda_spike * spike_rate
-
-        # ADR-0027 #3: foundation-teacher feature distillation. The teacher is
-        # frozen + runs under no_grad inside teacher_features; only student_proj
-        # (an optimizer param group added in main) + the backbone receive grad.
-        if distiller is not None:
-            teacher_feat = distiller.teacher_features(l3)        # [B,200] detached
-            loss = loss + lambda_distill * distiller.distill_loss(
-                activity_logits, teacher_feat)
+        # ADR 0051 four_state_objective loss ingredient. The CE/ordinal/CRF +
+        # spike + distill block is built ONCE in main() and threaded in. The
+        # distill teacher_feat is precomputed here (the ingredient has no `l3`
+        # arg — it takes the [B,200] detached feature directly), so the
+        # distill_loss call stays byte-identical.
+        teacher_feat = (distiller.teacher_features(l3)           # [B,200] detached
+                        if distiller is not None else None)
+        loss = loss_fn(class_logits, target, head=head, head_kind=head_kind,
+                       class_weights=cw, spike_rate=spike_rate,
+                       activity_logits=activity_logits, distiller=distiller,
+                       teacher_feat=teacher_feat)
 
         if not snn_step(loss, optimizer,
                         list(model.parameters()) + list(head.parameters()),
@@ -910,6 +901,21 @@ def main():
     target_T = int(args.target_T) * args.seq_windows
     snap_every = int(os.environ.get("SNN_SNAPSHOT_EVERY", "0"))
 
+    # ADR 0051 ingredients built ONCE before the loop and threaded in:
+    #   * loss      four_state_objective — the CE/ordinal/CRF + spike + distill
+    #               block (byte-identical to the prior inline body).
+    #   * eval      four_state — .metrics(cm) + .select_key(m, alpha) wrapping
+    #               four_state_metrics / selection_key (alpha stays per-call).
+    #   * checkpoint atomic_save (async) — the tmp+os.replace writer; callers
+    #               keep doing the explicit _state_dict_to_cpu, so the saver's
+    #               own state_dict_to_cpu default (False) is correct.
+    loss_fn = build_ingredient(
+        "loss", "four_state_objective",
+        {"use_ordinal": args.ordinal, "crit_floor": args.crit_floor,
+         "lambda_spike": args.lambda_spike, "lambda_distill": args.lambda_distill})
+    ev = build_ingredient("eval", "four_state", {})
+    _saver = build_ingredient("checkpoint", "atomic_save", {"async_": True})
+
     best_key = (-1, -1e9)        # ADR-0029 lexicographic feasibility-first
     best_metrics = None
     best_epoch = 0
@@ -962,18 +968,18 @@ def main():
         avg_loss, tr_cm, nan_skips, n_steps = train_epoch(
             model, head, train_loader, optimizer, device, quiet_thr,
             target_T, epoch_weights, args.head, args.lambda_spike, args.grad_clip,
-            use_spectral=args.spectral, use_ordinal=args.ordinal,
+            loss_fn, use_spectral=args.spectral, use_ordinal=args.ordinal,
             crit_floor=args.crit_floor, distiller=distiller,
             lambda_distill=args.lambda_distill)
         scheduler.step()
 
         val_cm = validate(model, head, val_loader, device, quiet_thr, target_T,
                           use_spectral=args.spectral)
-        m = four_state_metrics(val_cm)
+        m = ev.metrics(val_cm)
         # ADR-0029: lexicographic feasibility-first selection. combined_score
         # is still logged for continuity but NO LONGER selects (it rewarded the
-        # safety->compression slide).
-        key = selection_key(m, args.crit_alpha)
+        # safety->compression slide). alpha stays a per-call arg.
+        key = ev.select_key(m, args.crit_alpha)
         score = combined_score(m)
         feasible = m["critical_recall"] >= args.crit_alpha
 
@@ -984,7 +990,7 @@ def main():
             best_epoch = epoch + 1
             epochs_since_best = 0
             improved = " *BEST*"
-            _async_save({
+            _saver({
                 "model": _state_dict_to_cpu(model.state_dict()),
                 "head": _state_dict_to_cpu(head.state_dict()),
                 "head_kind": args.head,
@@ -1032,7 +1038,7 @@ def main():
         if snap_every > 0 and ((epoch + 1) % snap_every == 0
                                or epoch + 1 == args.epochs):
             snap = f"{os.path.splitext(save_path)[0]}_ep{epoch+1}.pt"
-            _async_save({
+            _saver({
                 "model": _state_dict_to_cpu(model.state_dict()),
                 "head": _state_dict_to_cpu(head.state_dict()),
                 "head_kind": args.head, "num_states": NUM_STATES,
