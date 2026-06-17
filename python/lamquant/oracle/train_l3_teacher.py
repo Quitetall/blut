@@ -27,7 +27,6 @@ import argparse
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from scipy.stats import pearsonr
 
@@ -80,17 +79,18 @@ def main():
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
 
+    # ADR 0050/0051 ingredient registry (uniform dataset/optimizer/loss build).
+    from lamquant.ingredients import build_ingredient
+
     # Load L3 data — LMA-direct (BLUT canonical) when --lma-root set,
     # else fall through to the deprecated NPZ + L3 precompute path.
     if args.lma_root is not None and args.split_manifest is not None:
-        from lamquant_codec.training import LmaL3Dataset, load_split_stems
-        train_stems, _ = load_split_stems(args.split_manifest, "train")
-        print(f"[*] LMA-direct: root={args.lma_root}, train_stems={len(train_stems)}")
-        dataset = LmaL3Dataset(
-            lma_root=args.lma_root, file_stems=train_stems,
-            windows_per_epoch=args.windows_per_epoch,
-            max_windows=args.max_windows,
-        )
+        print(f"[*] LMA-direct: root={args.lma_root}, manifest={args.split_manifest}")
+        dataset = build_ingredient(
+            "data", "lma_l3",
+            {"lma_root": args.lma_root, "split_manifest": args.split_manifest,
+             "windows_per_epoch": args.windows_per_epoch,
+             "max_windows": args.max_windows})
     else:
         q31_dir = os.path.join(ROOT_DIR, 'ai_models/dataset_sim/q31_events')
         train_files = sorted(glob.glob(os.path.join(q31_dir, '*.npz')))
@@ -119,7 +119,7 @@ def main():
     assert lat.shape == torch.Size([1, 32, 79]), f"Latent shape mismatch: {lat.shape}"
 
     # ADR 0050/0051 ingredient registry (uniform optimizer construction).
-    from lamquant.ingredients import build_ingredient
+    # build_ingredient was imported above (dataset build).
     optimizer = build_ingredient(
         "optimizer", "adamw",
         {"lr": args.lr, "weight_decay": 1e-4, "betas": (0.9, 0.999)},
@@ -144,6 +144,9 @@ def main():
             best_r = ckpt.get('best_r', 0.0)
             print(f"    Resumed from epoch {start_epoch}, best R={best_r:.4f}")
 
+    # ADR 0050/0051 loss ingredient — byte-identical F.mse_loss(recon, x_l3).
+    loss_fn = build_ingredient("loss", "teacher_mse", {})
+
     # Training loop
     n_batches = len(loader)
     train_start = time.time()
@@ -160,7 +163,7 @@ def main():
             with torch.amp.autocast(device.type, dtype=torch.bfloat16,
                                      enabled=(device.type == 'cuda')):
                 recon = model(x_l3)
-                loss = F.mse_loss(recon, x_l3)
+                loss = loss_fn(recon, x_l3)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
