@@ -239,6 +239,9 @@ def train_epoch(ssl: SSLReconstructor, loader: DataLoader,
     # ADR 0050/0051 snn_ssm step ingredient (shared with train_4state_controller).
     from lamquant.ingredients import build_ingredient
     snn_step = build_ingredient("step", "snn_ssm", {"grad_clip_norm": grad_clip})
+    # ADR 0050/0051 masked-recon loss ingredient (byte-identical to the
+    # module-level masked_recon_loss def, kept here for the trainer's tests).
+    loss_fn = build_ingredient("loss", "masked_recon_mse_time", {})
 
     for l3, _labels in loader:
         # Labels are IGNORED — this is unsupervised reconstruction.
@@ -256,7 +259,7 @@ def train_epoch(ssl: SSLReconstructor, loader: DataLoader,
 
         optimizer.zero_grad(set_to_none=True)
         recon = ssl(x_masked)
-        loss = masked_recon_loss(recon, l3, mask)
+        loss = loss_fn(recon, l3, mask)
 
         if not snn_step(loss, optimizer, ssl.parameters(), ssl.backbone):
             nan_skips += 1
@@ -319,9 +322,12 @@ def save_backbone(backbone: MambaSNN, out_path: str, meta: dict) -> dict:
         "ssl_meta": meta,
         "format": "lamquant-snn-ssl-backbone-v1",
     }
-    tmp = f"{out_path}.tmp.{os.getpid()}"
-    torch.save(payload, tmp)
-    os.replace(tmp, out_path)
+    # ADR 0050/0051 atomic_save checkpoint ingredient (byte-identical to the
+    # prior tmp + torch.save + os.replace: tmp file in the same dir, atomic
+    # rename, so a mid-write kill leaves the prior checkpoint intact).
+    from lamquant.ingredients import build_ingredient
+    _saver = build_ingredient("checkpoint", "atomic_save", {"async_": False})
+    _saver(payload, out_path)
     return payload["ssl_meta"]
 
 
