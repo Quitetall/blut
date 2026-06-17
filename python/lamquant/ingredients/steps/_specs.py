@@ -64,3 +64,50 @@ def _qat_codec_step_spec():
         name="qat_codec", kind="step", config_cls=QatCodecStepConfig,
         build=_qat_codec_step,
     )
+
+
+@dataclass(frozen=True)
+class WarmCodecStepConfig:
+    grad_clip_norm: float = 10.0
+
+
+def _warm_codec_step(cfg):
+    """train_joint's WARM-phase generator step. Transcribed verbatim from the
+    inline loop (student/train_joint.py:1347-1355):
+
+      1. optimizer.zero_grad();
+      2. a SINGLE backward (the #255 donated-buffer / grad-health invariant —
+         the optional post_backward callback reads grad norms from this one
+         backward, with no retain_graph double-backward);
+      3. the OPTIONAL post_backward callback, fired AFTER backward and BEFORE
+         the clip/step (in train_joint this is the one-shot gradient-health
+         check). Grads stay live for the clip + step that follow;
+      4. clip_grad_norm_(model.parameters(), cfg.grad_clip_norm);
+      5. optimizer.step().
+
+    The LOAD-BEARING distinction from the qat_codec step is what is ABSENT here:
+    there is NO per-coordinate value-clip and NO post-step alpha-clamp. The warm
+    phase trains FP32 clean representations (no QAT), so neither the value-clip
+    that bounds the SOAP-invariant QAT step nor the LSQ alpha projection applies;
+    adding either would change warm-phase behavior. That omission is the
+    invariant. EMA + dashboard updates live in the trainer, not the step.
+    """
+    def step(loss, model, optimizer, post_backward=None):
+        optimizer.zero_grad()
+        loss.backward()
+        if post_backward is not None:
+            post_backward()
+        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(),
+                                               cfg.grad_clip_norm)
+        optimizer.step()
+        return gnorm
+
+    return step
+
+
+@register_ingredient
+def _warm_codec_step_spec():
+    return IngredientSpec(
+        name="warm_codec", kind="step", config_cls=WarmCodecStepConfig,
+        build=_warm_codec_step,
+    )
