@@ -21,7 +21,7 @@
 # Reuses (imports, never reimplements):
 #   * MambaSNN backbone   (lamquant_neural.models.mamba_ssm_minimal)
 #   * LmaDataset          (lamquant.snn.lma_dataset) — train split, labels ignored
-#   * WSDScheduler        (lamquant.student.train_joint)
+#   * WSDScheduler        (lamquant.ingredients.schedules.wsd)
 #   * ESOAP               (lamquant.student.esoap) — optional, --optimizer esoap
 #
 # The reconstruction is built on the SHARED backbone path only: spatial_mix →
@@ -461,7 +461,7 @@ def main() -> None:
     print(f"[ssl] optimizer: {args.optimizer} (ingredient registry)")
 
     # ---- Schedule: WSD warmup -> stable -> short cosine decay tail. ----
-    from train_joint import WSDScheduler
+    from lamquant.ingredients.schedules.wsd import WSDScheduler
     scheduler = WSDScheduler(optimizer, total_epochs=args.epochs,
                              peak_lr=args.lr, warmup_frac=args.warmup_frac,
                              decay_frac=0.10, min_lr=args.lr_min,

@@ -19,7 +19,7 @@
 #   * MambaSNN backbone        (lamquant_neural.models.mamba_ssm_minimal)
 #   * build_head K=4           (lamquant_neural.models.heads)
 #   * LmaDataset / iter_labels (lamquant.snn.lma_dataset)
-#   * WSDScheduler             (lamquant.student.train_joint)
+#   * WSDScheduler             (lamquant.ingredients.schedules.wsd)
 #   * ESOAP                    (lamquant.student.esoap)
 #   * derive_4state_target / calibrate_quiet_threshold (lamquant.snn.four_state)
 #
@@ -884,7 +884,7 @@ def main():
     print(f"[4state] optimizer: {args.optimizer} (ingredient registry)")
 
     # ---- Schedule: WSD∞ (warmup→constant peak) or WSD with decay tail. ----
-    from train_joint import WSDScheduler
+    from lamquant.ingredients.schedules.wsd import WSDScheduler
     if args.infinite_lr:
         scheduler = WSDScheduler(optimizer, total_epochs=args.epochs,
                                  peak_lr=args.lr, warmup_frac=args.warmup_frac,
