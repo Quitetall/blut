@@ -41,7 +41,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 _REPO = Path(__file__).resolve().parent.parent.parent
 ROOT_DIR = str(_REPO)
@@ -126,15 +125,17 @@ def run_pretraining(
     # ---- Load data — LMA-direct (BLUT canonical) when --lma-root set,
     # else fall through to the deprecated NPZ + L3 precompute path. ----
     if lma_root is not None and split_manifest is not None:
-        from lamquant_codec.training import LmaL3Dataset, load_split_stems
+        from lamquant_codec.training import load_split_stems
+        from lamquant.ingredients import build_ingredient
         train_stems, _ = load_split_stems(split_manifest, "train")
         print(f'[*] LMA-direct: root={lma_root}, train_stems={len(train_stems)}')
-        train_ds = LmaL3Dataset(
-            lma_root=lma_root, file_stems=train_stems,
-            windows_per_epoch=windows_per_epoch,
-            max_windows=max_windows,
-            seed=seed,
-        )
+        # ADR 0050/0051 data ingredient (resolves train stems + builds the
+        # LmaL3Dataset). Byte-identical to the inline LmaL3Dataset(...) call.
+        train_ds = build_ingredient(
+            "data", "lma_l3",
+            {"lma_root": lma_root, "split_manifest": split_manifest,
+             "windows_per_epoch": windows_per_epoch,
+             "max_windows": max_windows, "seed": seed})
     else:
         from data_types import DatasetManifest, Split
         from streaming_dataset import PrecomputedL3Dataset
@@ -170,6 +171,10 @@ def run_pretraining(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs, eta_min=lr * 0.01)
 
+    # ADR 0050/0051 loss ingredient (masked-recon MSE, all-mean denominator).
+    # Built once before the loop; byte-identical to F.mse_loss(pred*mask, l3*mask).
+    loss_fn = build_ingredient("loss", "masked_recon_mse_patch", {})
+
     # ---- Training loop ----
     best_loss = float('inf')
     t0 = time.time()
@@ -196,8 +201,8 @@ def run_pretraining(
             # Predict full L3 from latent
             l3_pred = pred_head(latent)
 
-            # Loss only on masked regions
-            loss = F.mse_loss(l3_pred * mask, l3 * mask)
+            # Loss only on masked regions (loss ingredient, built above).
+            loss = loss_fn(l3_pred, l3, mask)
 
             optimizer.zero_grad()
             loss.backward()
