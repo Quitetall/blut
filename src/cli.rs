@@ -2254,12 +2254,23 @@ async fn run_partition(reg: &crate::framework::Registry, cmd: PartitionCommand) 
             // ensure the (up to n_dev) concurrent cells fit box RAM (cross-cell
             // RAM coordination is a future slice). On 1 GPU there's no
             // concurrency, so no over-subscription.
-            let devices = crate::config::launcher::launcher_for(launch_target).device_set();
+            // Concurrency is bounded by the launcher's CAPACITY: `device_set()`
+            // is `0..Launcher::capacity()` by default (see
+            // `config::launcher::Launcher::{capacity,device_set}`), with
+            // `$BLUT_SCHED_DEVICES` layered on top ONLY as a SUBSET override.
+            // So `n_dev == launcher.capacity()` in the common (no-override)
+            // case, and a subset otherwise — never more than capacity.
+            let launcher = crate::config::launcher::launcher_for(launch_target);
+            let devices = launcher.device_set();
             if devices.is_empty() {
                 return Err(anyhow!(
                     "launcher for {launch_target:?} reports no devices — cannot backfill"
                 ));
             }
+            // At most `launcher.capacity()` cells run concurrently; with a
+            // `$BLUT_SCHED_DEVICES` subset, fewer. `device_set().len()` IS that
+            // bound (it can only narrow `0..capacity()`, never widen it).
+            debug_assert!(devices.len() <= launcher.capacity().max(1));
             let n_dev = devices.len();
             eprintln!(
                 "backfill {recipe}/{name}: {} cell(s) across {} device(s) {devices:?}",

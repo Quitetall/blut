@@ -31,7 +31,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, TrainError};
 
 /// Bump when the schema changes in a non-additive way (forces a `reindex`).
-const SCHEMA_VERSION: i64 = 1;
+/// v2 adds the additive `metrics` (E1) + `gauges` (E2) tables — they
+/// materialize on existing v1 DBs via `CREATE TABLE IF NOT EXISTS`, so the
+/// 1→2 bump needs NO data migration: the open path just re-stamps an old
+/// db's `user_version` to 2 (see the migration guard in `open_at`).
+const SCHEMA_VERSION: i64 = 2;
 
 const CREATE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS runs (
@@ -59,6 +63,14 @@ CREATE TABLE IF NOT EXISTS artifacts (
     PRIMARY KEY (job_id, stage_idx)
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_hash ON artifacts(content_hash);
+-- PROVENANCE EDGE (data + code + parent, all captured — despite the bare
+-- two-hash schema). A node's `input_hash` is the cache key's content digest:
+-- it FOLDS its parents' `output_hash`es AND its data-source content hashes,
+-- so a single `input_hash`→`output_hash` edge encodes BOTH the parent edge
+-- (lineage) AND the data dependency. CODE provenance is carried separately,
+-- per-run, on `runs.git_sha` (the cache key also busts on `code_sha`, surfaced
+-- as `code_freshness`). So (data, code, parent) are each represented; only the
+-- FIELD NAMING is terse — no extra columns are needed to recover any of them.
 CREATE TABLE IF NOT EXISTS lineage_edges (
     job_id      TEXT NOT NULL,
     to_idx      INTEGER NOT NULL,
@@ -313,6 +325,10 @@ impl LineageDb {
 
     /// Idempotent upsert of a lineage edge. Hashes lowercased so the upstream
     /// `trace` walk (which lowercases) matches `artifact_by_hash`'s `=` lookup.
+    /// The `input_hash` is a fold of (parent `output_hash`es + data-source
+    /// content hashes), so this two-hash edge encodes BOTH the parent edge and
+    /// the data dependency; code provenance lives on `runs.git_sha`. See the
+    /// `lineage_edges` CREATE comment for the full (data, code, parent) mapping.
     pub fn record_edge(&self, edge: &EdgeRow) -> Result<()> {
         let (input_hash, output_hash) =
             (edge.input_hash.to_lowercase(), edge.output_hash.to_lowercase());
