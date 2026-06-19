@@ -454,7 +454,7 @@ pub fn resolve_job_id(query: &str) -> Result<String> {
 pub async fn cancel_job(job_id: &str, grace: std::time::Duration) -> Result<()> {
     let pid = read_pid(job_id)?;
     if let Some(pid) = pid {
-        crate::python_backend::graceful_kill_pid(pid, grace).await;
+        crate::python_kill::graceful_kill_pid(pid, grace).await;
     }
     let _ = write_state(job_id, JobState::Cancelled);
     let _ = clear_pid(job_id);

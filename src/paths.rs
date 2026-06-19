@@ -370,17 +370,22 @@ mod tests {
     }
 
     #[test]
-    fn resolve_trainer_finds_crate_dev_path() {
+    fn resolve_trainer_errors_without_python_in_engine() {
+        // Engine carve (v1.0): the engine ships ZERO python — the
+        // generic `trainer.py` moved to `blut-backends`. With no env
+        // override and no checked-in `python/trainer.py`, resolution
+        // must fail-closed with a clear error (not silently succeed).
         let _g = lock();
         let prev = std::env::var("LAMU_TRAINER_PY").ok();
         unsafe {
             std::env::remove_var("LAMU_TRAINER_PY");
         }
-        // Inside the crate during cargo test, the dev path always
-        // resolves because trainer.py is checked in at python/.
-        let p = resolve_trainer_script().expect("dev trainer.py must resolve");
-        assert!(p.ends_with("python/trainer.py"), "got: {}", p.display());
-        assert!(p.exists(), "resolved path must exist on disk");
+        let err = resolve_trainer_script()
+            .expect_err("pure engine ships no trainer.py — resolution must error");
+        assert!(
+            err.to_string().contains("trainer.py not found"),
+            "got: {err}"
+        );
         unsafe {
             if let Some(v) = prev {
                 std::env::set_var("LAMU_TRAINER_PY", v);

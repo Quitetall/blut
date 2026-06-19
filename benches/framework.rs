@@ -43,8 +43,20 @@ use std::sync::Arc;
 
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 
-use blut::backends::LamuTrainerBackend;
+use blut::backends::TrainingBackend;
 use blut::broker::{Drivers, FootprintSource, FootprintStore, ResourceSnapshot, decide};
+
+/// Local backend fixture for the framework benches. The engine ships
+/// no concrete backend after the v1.0 carve, and the in-crate test
+/// fixture is `#[cfg(test)]`-only (invisible to benches, which compile
+/// against the public non-test API). The benches need a
+/// `TrainingBackend` to parameterize `Plan<Out, B>` + the toy stages'
+/// `Compatible<B>` impls, so define one here.
+struct LamuTrainerBackend;
+impl TrainingBackend for LamuTrainerBackend {
+    const ID: &'static str = "lamu";
+    const DESCRIPTION: &'static str = "Bench fixture backend (engine framework benches only).";
+}
 use blut::framework::{
     Artifact, CacheHandle, Compatible, CompiledPlan, ContentHash, ErasedArtifact, Plan, Registry,
     Resource, Stage, StageContext, StageDyn, StageError, StageEvent, StatusHub,

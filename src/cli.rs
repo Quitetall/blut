@@ -13,21 +13,16 @@
 //! that window. Pass `--allow-evict` to wait if the lock is already
 //! held by an inference exclusive instead of erroring.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::scheduler_lock::{self, LockKind};
 use crate::{
-    backend::{StatusFn, TrainBackend},
-    convert,
     jobs::{self, JobState},
     paths,
-    protocol::StatusUpdate,
-    python_backend::PythonTrainBackend,
-    spec::{DatasetSource, Method, Optim, TrainSpec},
 };
 use anyhow::{Context, Result, anyhow};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -37,20 +32,15 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     // is visible at a glance; build.rs composes BLUT_VERSION. Complements the
     // runtime `warn_if_stale_binary` check.
     version = env!("BLUT_VERSION"),
-    about = "BLUT — interactive training cockpit (bare `blut` opens the TUI). Subcommands: train, jobs, log, cancel, recipe, plan, cache, stage, data, auto, policy, tui."
+    about = "BLUT — interactive training cockpit (bare `blut` opens the TUI). Subcommands: jobs, log, cancel, recipe, plan, cache, data, policy, tui."
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
-
-    #[command(flatten)]
-    train_args: TrainArgs,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run a fine-tune (also the default when invoked without a subcommand).
-    Train(TrainArgs),
     /// List training jobs (running + completed).
     Jobs {
         /// Emit the job list as a JSON array (for scripts/agents).
@@ -128,10 +118,6 @@ enum Command {
         #[command(subcommand)]
         cmd: DataCommand,
     },
-    /// Cron entry point: read train-policy.toml, decide whether
-    /// to spawn a training run, exit. Prints the decision reason
-    /// on stdout regardless of outcome (for cron log readers).
-    Auto,
     /// Inspect or modify the auto-trigger policy.
     Policy {
         #[command(subcommand)]
@@ -163,14 +149,6 @@ enum Command {
         #[command(subcommand)]
         cmd: SensorCommand,
     },
-    /// Run a single stage standalone — Unix-style. Reads erased
-    /// input bytes from stdin (or skipped for graph-input stages),
-    /// writes the produced erased artifact bytes to stdout.
-    /// Pipeable; recipes are just compositions of these.
-    Stage {
-        #[command(subcommand)]
-        cmd: StageCommand,
-    },
     /// Open the canonical interactive training cockpit (ratatui). The
     /// single, complete cockpit: recipe launcher + live jobs/log/system
     /// panels + run history / leaderboard / compare / checkpoints /
@@ -182,29 +160,6 @@ enum Command {
         /// backend, exit 0 if all draw non-blank (no raw mode). For CI / smoke.
         #[arg(long, default_value_t = false)]
         check: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum StageCommand {
-    /// List the stage catalog.
-    List,
-    /// Execute one stage.
-    Run {
-        /// Stage name (e.g. filter_dataset).
-        name: String,
-        /// Stage args as inline JSON.
-        #[arg(long)]
-        args: String,
-        /// Input source: `-` for stdin (bincode-encoded
-        /// ErasedArtifact), or `:unit` for graph-input stages whose
-        /// input is `()`. Defaults to `:unit`.
-        #[arg(long, default_value = ":unit")]
-        input: String,
-        /// Output sink: `-` for stdout (bincode-encoded
-        /// ErasedArtifact). Defaults to `-`.
-        #[arg(long, default_value = "-")]
-        output: String,
     },
 }
 
@@ -605,110 +560,6 @@ enum PolicyCommand {
     Disable,
 }
 
-#[derive(Args, Debug)]
-struct TrainArgs {
-    /// Registry name for the trained model. Required for actual runs;
-    /// missing → help text.
-    output_name: Option<String>,
-
-    /// HuggingFace base model (org/name).
-    #[arg(long, default_value = "Qwen/Qwen3-7B")]
-    base: String,
-
-    /// JSONL chat dataset path.
-    #[arg(long)]
-    dataset: Option<PathBuf>,
-
-    /// Pull conversations from lamu-mcp memory (overrides --dataset).
-    /// Materialization happens in step 7; flag accepted now for parity.
-    #[arg(long, default_value_t = false)]
-    from_conversations: bool,
-
-    /// Where to place the trainer: local (default, this box) | slurm | ray.
-    /// Cluster config is read from env (BLUT_SLURM_* / RAY_ADDRESS).
-    #[arg(long, default_value = "local")]
-    launcher: String,
-
-    /// Window for --from-conversations.
-    #[arg(long, default_value = "30d", value_parser = parse_duration)]
-    since: Duration,
-
-    /// Fine-tuning method.
-    #[arg(long, value_enum, default_value_t = MethodArg::Qlora)]
-    method: MethodArg,
-
-    /// LoRA rank.
-    #[arg(long, default_value_t = 16)]
-    rank: u32,
-
-    /// LoRA alpha.
-    #[arg(long, default_value_t = 32)]
-    alpha: u32,
-
-    /// Optimizer.
-    #[arg(long, value_enum)]
-    optim: Option<OptimArg>,
-
-    #[arg(long, default_value_t = 2e-4)]
-    lr: f32,
-
-    #[arg(long, default_value_t = 3)]
-    epochs: u32,
-
-    #[arg(long, default_value_t = 1)]
-    batch_size: u32,
-
-    #[arg(long, default_value_t = 8)]
-    grad_accum: u32,
-
-    #[arg(long, default_value_t = 4096)]
-    seq_len: u32,
-
-    #[arg(long, default_value_t = 42)]
-    seed: u64,
-
-    /// Final GGUF quant.
-    #[arg(long, default_value = "Q4_K_M")]
-    quant: String,
-
-    /// Skip GGUF convert + registry register (HF checkpoint only).
-    #[arg(long, default_value_t = false)]
-    no_convert: bool,
-
-    /// Detach: write to ~/.local/share/lamu/train-jobs/<id>/, return
-    /// the job id immediately. Use `lamu-train jobs` + `log <id>`.
-    /// (Implementation: spawns a child of itself with --foreground.
-    ///  v1 placeholder — wires to real detach in step 10 hardening.)
-    #[arg(long, default_value_t = false)]
-    background: bool,
-
-    /// Wait for the GPU lock to release instead of erroring on hold.
-    /// Polling interval is 500 ms; default timeout 1 h.
-    #[arg(long, default_value_t = false)]
-    allow_evict: bool,
-
-    /// Promote this run's stage outputs to the global cache so
-    /// future jobs can hit them. Only honoured by the v2 recipe
-    /// path (--from-conversations without LAMU_TRAIN_USE_LEGACY=1).
-    #[arg(long, default_value_t = false)]
-    shared_cache: bool,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum MethodArg {
-    Qlora,
-    Lora,
-    Full,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum OptimArg {
-    Adamw,
-    Adamw8bit,
-    Apollo,
-    ApolloMini,
-}
-
 fn parse_duration(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| format!("{e}"))
 }
@@ -723,7 +574,6 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
     warn_if_stale_binary();
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Train(args)) => run_train(&reg, args).await,
         Some(Command::Jobs { json }) => run_jobs(json),
         Some(Command::Cancel { id, grace }) => run_cancel(&id, grace).await,
         Some(Command::Log { id, tail, json }) => run_log(&id, tail, json),
@@ -736,14 +586,12 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Artifact { cmd }) => run_artifact_cmd(cmd),
         Some(Command::Schedule { cmd }) => run_schedule_cmd(&reg, cmd),
         Some(Command::Data { cmd }) => run_data(cmd),
-        Some(Command::Auto) => run_auto().await,
         Some(Command::Policy { cmd }) => run_policy(cmd),
         Some(Command::Recipe { cmd }) => run_recipe(&reg, cmd).await,
         Some(Command::Plan { cmd }) => run_plan_cmd(&reg, cmd).await,
         Some(Command::Cache { cmd }) => run_cache_cmd(cmd),
         Some(Command::Footprint { cmd }) => run_footprint_cmd(cmd),
         Some(Command::Sensor { cmd }) => run_sensor_cmd(cmd),
-        Some(Command::Stage { cmd }) => run_stage_cmd(cmd).await,
         Some(Command::Tui { check }) => {
             if check {
                 crate::tui::check(reg)
@@ -751,8 +599,9 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
                 crate::tui::run(reg).await
             }
         }
-        // Bare `blut` opens the interactive cockpit (T-track). Use
-        // `blut train …` for explicit CLI training.
+        // Bare `blut` opens the interactive cockpit (T-track). Explicit
+        // CLI training lives in the cookbook binaries' own train path
+        // (the engine ships no concrete trainer after the v1.0 carve).
         None => crate::tui::run(reg).await,
     }
 }
@@ -1427,126 +1276,6 @@ fn run_schedule_cmd(reg: &crate::framework::Registry, cmd: ScheduleCommand) -> R
         ScheduleCommand::Uninstall { recipe } => {
             schedule::uninstall(&recipe).map_err(|e| anyhow!("{e}"))?;
             eprintln!("removed timer for {recipe}");
-            Ok(())
-        }
-    }
-}
-
-async fn run_stage_cmd(cmd: StageCommand) -> Result<()> {
-    use crate::framework::artifact::Artifact;
-    use crate::framework::cache::CacheHandle;
-    use crate::framework::stage::{ErasedArtifact, StageContext};
-    use crate::stages::catalog;
-    use std::io::{Read, Write};
-    use std::sync::Arc;
-
-    match cmd {
-        StageCommand::List => {
-            println!(
-                "{:<32} {:<20} {:<20} resources",
-                "name", "input_kind", "output_kind"
-            );
-            for n in catalog::names() {
-                let s = catalog::make_stage(n).expect("listed → constructs");
-                println!(
-                    "{:<32} {:<20} {:<20} {:?}",
-                    s.name(),
-                    s.input_kind(),
-                    s.output_kind(),
-                    s.resources(),
-                );
-            }
-            Ok(())
-        }
-        StageCommand::Run {
-            name,
-            args,
-            input,
-            output,
-        } => {
-            let stage = catalog::make_stage(&name)
-                .ok_or_else(|| anyhow!("stage '{name}' not in catalog"))?;
-            let args_val: serde_json::Value = serde_json::from_str(&args)
-                .with_context(|| format!("parse --args as JSON: {args}"))?;
-
-            // Read input. `:unit` produces a synthetic () artifact;
-            // `-` reads bincode-encoded ErasedArtifact from stdin;
-            // a path reads from disk.
-            let erased_input: ErasedArtifact = match input.as_str() {
-                ":unit" => ErasedArtifact {
-                    kind: <() as Artifact>::KIND.into(),
-                    schema: <() as Artifact>::SCHEMA,
-                    payload: bincode::serialize(&()).map_err(|e| anyhow!("encode unit: {e}"))?,
-                },
-                "-" => {
-                    let mut buf = Vec::new();
-                    std::io::stdin()
-                        .read_to_end(&mut buf)
-                        .context("read stdin for --input -")?;
-                    bincode::deserialize(&buf)
-                        .map_err(|e| anyhow!("decode stdin ErasedArtifact: {e}"))?
-                }
-                path => {
-                    let buf =
-                        std::fs::read(path).with_context(|| format!("read input from {path}"))?;
-                    bincode::deserialize(&buf).map_err(|e| anyhow!("decode {path}: {e}"))?
-                }
-            };
-
-            // Each `blut stage` invocation gets its own scratch
-            // tempdir, including a private cache dir. The cache
-            // lives only for this invocation — recipes are the
-            // entry point for cross-stage cache hits.
-            let td = tempfile::tempdir().context("create stage tempdir")?;
-            let stage_dir = td.path().join("stage");
-            std::fs::create_dir_all(&stage_dir)?;
-            let ctx = StageContext {
-                job_dir: td.path().to_path_buf(),
-                stage_dir,
-                node_idx: 0,
-                status_tx: crate::framework::status::make_broadcast(),
-                cancel: tokio_util::sync::CancellationToken::new(),
-                cache: Arc::new(CacheHandle::job_local(td.path().join("_cache"))),
-                recipe_name: String::new(),
-                launch_target: crate::config::launcher::LaunchTarget::Local,
-                // `blut stage` runs one stage standalone — box default device.
-                device_index: None,
-                // `blut stage` runs one stage standalone (no recipe warm
-                // context) — bill the conservative cold footprint.
-                fb_warm: false,
-                // Standalone stage run: no executor cache key. A zero key gives
-                // a deterministic (if unshared) resume dir; durable resume is a
-                // recipe-path feature, so this path effectively never resumes.
-                cache_key: crate::framework::artifact::ContentHash([0u8; 32]),
-                // `blut stage` is a single standalone attempt — no retry/resume.
-                attempt: 1,
-                resume_from: None,
-            };
-
-            let result = stage
-                .run_erased(&ctx, erased_input, args_val)
-                .await
-                .map_err(|e| anyhow!("stage '{name}' failed: {e}"))?;
-
-            // Write output, then flush so a downstream pipe sees
-            // the bytes immediately rather than waiting for process
-            // exit + OS buffer drain.
-            let body = bincode::serialize(&result).map_err(|e| anyhow!("encode output: {e}"))?;
-            match output.as_str() {
-                "-" => {
-                    let mut out = std::io::stdout().lock();
-                    out.write_all(&body).context("write stdout")?;
-                    out.flush().context("flush stdout")?;
-                }
-                path => {
-                    std::fs::write(path, &body)
-                        .with_context(|| format!("write output to {path}"))?;
-                }
-            }
-            // Tempdir is dropped at function exit; we don't call
-            // td.close() because subprocesses (e.g. trainer) that
-            // outlive run_erased can leave open handles in the dir,
-            // and a noisy "cleanup failed" warning isn't actionable.
             Ok(())
         }
     }
@@ -3155,96 +2884,6 @@ fn warn_dotless_overrides(items: &[String], flag: &str, subtree_key: &str) {
     }
 }
 
-async fn run_auto() -> Result<()> {
-    use crate::{conversations, policy};
-
-    let pol = policy::load().context("load policy")?;
-    let (now_unix, now_local_min) = policy::current_clock();
-    let lock_held = crate::scheduler_lock::check_unlocked().is_err();
-    let new_turns = match conversations::count_turns_since(pol.last_train_ts) {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::warn!(
-                "count_turns_since failed ({e}); treating as 0. Auto will skip \
-                 on the threshold check rather than spawning blindly."
-            );
-            0
-        }
-    };
-
-    let decision = policy::decide(&pol, now_unix, now_local_min, new_turns, lock_held);
-    match decision {
-        policy::Decision::Skip(reason) => {
-            println!("auto: {reason}");
-            return Ok(());
-        }
-        policy::Decision::Run {
-            base,
-            method,
-            since,
-        } => {
-            println!(
-                "auto: triggering training (new_turns={new_turns}, threshold={})",
-                pol.threshold_new_turns
-            );
-            let bin = std::env::current_exe().context("locate own binary for auto-spawn")?;
-            let auto_name = format!("auto-{}", crate::jobs::new_job_id());
-            let mut cmd = tokio::process::Command::new(&bin);
-            cmd.arg(&auto_name)
-                .arg("--from-conversations")
-                .arg("--since")
-                .arg(&since)
-                .arg("--base")
-                .arg(&base)
-                .arg("--method")
-                .arg(&method)
-                .arg("--background")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(false);
-            match cmd.spawn() {
-                Ok(mut child) => {
-                    let pid = child.id().unwrap_or(0);
-                    println!("auto: spawned lamu-train pid={pid} as '{auto_name}'");
-                    // Stamp the ATTEMPT (not last_train_ts) at spawn — keeps
-                    // the cron from double-spawning a live run, while leaving
-                    // `last_train_ts` (the cooldown anchor) to advance ONLY on
-                    // a real completion. The child run (output_name `auto-*`)
-                    // records the outcome via `record_auto_outcome`: success
-                    // advances last_train_ts + clears the failure counter,
-                    // failure increments it (driving the backoff).
-                    let mut updated = pol.clone();
-                    updated.last_attempt_ts = now_unix;
-                    updated.last_train_n_turns = new_turns;
-                    if let Err(e) = policy::save(&updated) {
-                        tracing::warn!("failed to update last_attempt_ts: {e}");
-                    }
-                    // Reap the zombie when training finishes; the
-                    // cron-driven `auto` exits while the child runs.
-                    // Log non-zero exit so train-auto.log shows the
-                    // outcome instead of just the spawn line.
-                    tokio::spawn(async move {
-                        match child.wait().await {
-                            Ok(status) if !status.success() => {
-                                tracing::warn!("auto-train (pid={pid}) exited with {status}");
-                            }
-                            Ok(status) => {
-                                tracing::info!("auto-train (pid={pid}) exited cleanly: {status}");
-                            }
-                            Err(e) => {
-                                tracing::warn!("auto-train (pid={pid}) wait failed: {e}");
-                            }
-                        }
-                    });
-                }
-                Err(e) => return Err(anyhow!("spawn lamu-train: {e}")),
-            }
-        }
-    }
-    Ok(())
-}
-
 fn run_policy(cmd: PolicyCommand) -> Result<()> {
     use crate::policy;
     match cmd {
@@ -3343,15 +2982,6 @@ fn run_data(cmd: DataCommand) -> Result<()> {
     Ok(())
 }
 
-/// Register a JSONL dataset in the datasets registry. Best-effort:
-/// callers handle failure by logging + continuing. Used by
-/// auto-registration after `--from-conversations` materialization.
-fn register_dataset(name: &str, path: &Path, kind: &str, metadata: Option<String>) -> Result<()> {
-    let conn = crate::datasets_db::open()?;
-    let rec = crate::datasets_db::record_from_jsonl(name, path, kind, metadata)?;
-    crate::datasets_db::add(&conn, &rec)?;
-    Ok(())
-}
 
 fn truncate_for_col(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -3376,274 +3006,6 @@ fn init_tracing() {
         .with_target(false)
         .with_writer(std::io::stderr)
         .try_init();
-}
-
-async fn run_train(reg: &crate::framework::Registry, args: TrainArgs) -> Result<()> {
-    let output_name = args
-        .output_name
-        .clone()
-        .ok_or_else(|| anyhow!("output-name is required (positional). See `lamu-train --help`."))?;
-
-    // v2 commit 8: `--from-conversations` now unconditionally
-    // delegates to the typed-Plan recipe pipeline. The
-    // `LAMU_TRAIN_USE_LEGACY=1` kill-switch shipped in commit 4b
-    // is gone — the recipe path has been the default through a
-    // release window and the legacy linear flow only remains for
-    // `--dataset <path>` runs (no recipe equivalent yet).
-    if args.from_conversations {
-        return run_train_via_recipe(reg, &output_name, &args).await;
-    }
-
-    let dataset_src = build_dataset(&args)?;
-    let optimizer = pick_optimizer(args.optim, args.method);
-    let method = build_method(args.method, args.rank, args.alpha);
-
-    let job_id = jobs::new_job_id();
-    let job_dir =
-        paths::job_dir(&job_id).with_context(|| format!("create job dir for {job_id}"))?;
-    let output_dir = job_dir.join("checkpoint");
-    std::fs::create_dir_all(&output_dir)
-        .with_context(|| format!("create checkpoint dir {}", output_dir.display()))?;
-
-    // trainer.py only accepts JsonlPath at runtime. Materialize
-    // Conversations sources to a JSONL file under paths::data_dir
-    // before spec construction so the file path lands in the
-    // committed spec.json on disk for audit.
-    let dataset = match dataset_src {
-        DatasetSource::Conversations { .. } => {
-            let data_dir = paths::data_dir().context("resolve train-data dir")?;
-            std::fs::create_dir_all(&data_dir)
-                .with_context(|| format!("create {}", data_dir.display()))?;
-            let out_path = data_dir.join(format!("{job_id}.jsonl"));
-            let stats = crate::conversations::dump_to_jsonl(args.since, &out_path)
-                .context("dump conversations to JSONL")?;
-            eprintln!(
-                "dataset materialized: {} conversations, {} turns → {}",
-                stats.n_conversations,
-                stats.n_turns,
-                stats.path.display()
-            );
-            if stats.n_conversations == 0 {
-                return Err(anyhow!(
-                    "no usable conversations in window (--since {:?}). \
-                     {} short raw, {} gutted by filters, \
-                     {} error messages, {} oversize messages.",
-                    args.since,
-                    stats.n_dropped_short,
-                    stats.n_dropped_filtered_below_min,
-                    stats.n_dropped_errors,
-                    stats.n_dropped_oversize
-                ));
-            }
-            // Lineage: register the materialized dataset under
-            // 'conversations-<since>-<jobid>' so the trained model
-            // can be traced back to its source. Failure to register
-            // is a warning, not a hard error — the training itself
-            // doesn't depend on the registry, only its audit trail.
-            let dataset_name = format!(
-                "conversations-{}-{job_id}",
-                humantime::format_duration(args.since)
-            );
-            let metadata = serde_json::json!({
-                "source": "conversations",
-                "since": humantime::format_duration(args.since).to_string(),
-                "n_dropped_short": stats.n_dropped_short,
-                "n_dropped_filtered_below_min": stats.n_dropped_filtered_below_min,
-                "n_dropped_errors": stats.n_dropped_errors,
-                "n_dropped_oversize": stats.n_dropped_oversize,
-                "job_id": job_id,
-            })
-            .to_string();
-            match register_dataset(&dataset_name, &out_path, "conversations", Some(metadata)) {
-                Ok(()) => eprintln!("dataset registered as '{dataset_name}'"),
-                Err(e) => tracing::warn!(
-                    "failed to register dataset '{dataset_name}': {e}; \
-                     training will continue without lineage record"
-                ),
-            }
-            DatasetSource::JsonlPath { path: out_path }
-        }
-        other => other,
-    };
-
-    let spec = TrainSpec {
-        base_model: args.base.clone(),
-        output_name: output_name.clone(),
-        output_dir: output_dir.clone(),
-        method,
-        dataset,
-        optimizer,
-        lr: args.lr,
-        epochs: args.epochs,
-        batch_size: args.batch_size,
-        grad_accum: args.grad_accum,
-        seq_len: args.seq_len,
-        seed: args.seed,
-        quant: args.quant.clone(),
-        skip_convert: args.no_convert,
-        dpo_beta: None,
-    };
-    spec.validate().context("TrainSpec validation")?;
-    jobs::write_spec(&job_id, &spec)?;
-    jobs::write_state(&job_id, JobState::Running)?;
-
-    eprintln!("job  {job_id}");
-    eprintln!("dir  {}", job_dir.display());
-
-    if args.background {
-        // Background scaffold — spawn ourselves with the same args
-        // minus --background. v1 implementation: print the job id +
-        // a hint; the actual detach is wired in a follow-up commit
-        // since clean nohup-style detach + log redirection deserves
-        // its own review pass.
-        eprintln!(
-            "background mode is recognised but real detach lands in a follow-up.\n\
-             For now, run without --background and use `lamu-train cancel {job_id}`\n\
-             from another terminal if you need to stop early."
-        );
-        return Ok(());
-    }
-
-    // Resolve subprocess paths BEFORE acquiring the GPU lock so a
-    // path-resolution failure doesn't hold the lock. Cheap (a few
-    // env reads + stat calls); failure here means the user's setup
-    // is wrong and they need a clear error, not a held lock.
-    let python = paths::resolve_python().context("resolve python")?;
-    let trainer_script = paths::resolve_trainer_script().context("resolve trainer.py")?;
-    eprintln!("python {}", python.display());
-    eprintln!("trainer {}", trainer_script.display());
-
-    // Admission gate BEFORE the lock (ADR 0046) — the legacy bare-spawn
-    // path was previously un-gated and could OOM the box. Bill a
-    // conservative legacy footprint (cap workers, the spec's batch, the
-    // smallest model tier) so admission's `need` never under-counts. A
-    // probe miss admits; a refusal fails the job cleanly with no lock.
-    // (Stopgap: this path is slated for replacement by `systemd-run`.)
-    {
-        let drivers = crate::broker::Drivers::new(
-            crate::broker::UNCALIBRATED_WORKER_CAP,
-            spec.batch_size,
-            1,
-            0,
-            // The LLM bare-spawn path has no fullband warm — bill the
-            // conservative COLD per-worker term.
-            false,
-            // LLM trainer is not the EEG fullband path → L3-baseline in_ch (no
-            // detail-band stack term).
-            crate::broker::footprint::L3_ONLY_IN_CH,
-        );
-        if let Err(reason) = crate::broker::gate(&format!("train:{job_id}"), &drivers.estimate()) {
-            if let Err(se) = jobs::write_state(&job_id, JobState::Failed) {
-                tracing::warn!("write Failed state for {job_id}: {se}");
-            }
-            return Err(anyhow!("{reason}"));
-        }
-    }
-
-    // Acquire the GPU lock. --allow-evict waits for an existing
-    // inference exclusive to release; otherwise hard error.
-    let lock = if args.allow_evict {
-        eprintln!("lock waiting for GPU release (--allow-evict, up to 1h)...");
-        scheduler_lock::await_unlock(Duration::from_secs(3600))
-            .await
-            .context("await_unlock")?;
-        scheduler_lock::acquire_exclusive(format!("lamu-train:{job_id}"), LockKind::Training)
-            .context("acquire_exclusive after wait")?
-    } else {
-        scheduler_lock::acquire_exclusive(format!("lamu-train:{job_id}"), LockKind::Training)
-            .context("acquire_exclusive (use --allow-evict to wait)")?
-    };
-    eprintln!("lock acquired ({})", lock.path().display());
-
-    let launch_target: crate::config::launcher::LaunchTarget =
-        args.launcher.parse().map_err(|e| anyhow!("{e}"))?;
-    if !matches!(launch_target, crate::config::launcher::LaunchTarget::Local) {
-        eprintln!("launcher {} — placing the trainer on the cluster", args.launcher);
-    }
-    let mut backend = PythonTrainBackend::new(python, trainer_script).with_launch_target(launch_target);
-
-    let job_id_for_cb = job_id.clone();
-    let on_status: StatusFn = Box::new(move |u: StatusUpdate| {
-        // Persist to status.jsonl + render to stderr so the user
-        // sees progress live in foreground mode. A persist failure
-        // (full disk, permissions, etc.) is logged but doesn't stop
-        // the run — losing status history is bad but losing the
-        // training job mid-flight is worse.
-        if let Err(e) = jobs::append_status(&job_id_for_cb, &u) {
-            tracing::warn!("failed to persist status to {}: {}", job_id_for_cb, e);
-        }
-        match &u {
-            StatusUpdate::Step {
-                step,
-                total,
-                loss,
-                lr,
-                vram_mb,
-            } => eprintln!("step {step}/{total}  loss={loss:.4}  lr={lr:.2e}  vram={vram_mb}MB"),
-            StatusUpdate::Eval { step, eval_loss } => {
-                eprintln!("eval @{step}  loss={eval_loss:.4}")
-            }
-            StatusUpdate::Saved { path } => eprintln!("saved {}", path.display()),
-            StatusUpdate::Done {
-                final_loss,
-                checkpoint_dir,
-            } => eprintln!(
-                "done  final_loss={final_loss:.4}  ckpt={}",
-                checkpoint_dir.display()
-            ),
-            StatusUpdate::Failed { error } => eprintln!("FAILED: {error}"),
-            StatusUpdate::Heartbeat { phase, .. } => {
-                if let Some(p) = phase {
-                    eprintln!("… {p}");
-                }
-            }
-        }
-    });
-
-    let result = backend.run(spec.clone(), on_status).await;
-
-    drop(lock); // release GPU before convert + register; convert is
-    // CPU-bound and llama.cpp tools don't need the card.
-
-    match result {
-        Ok(artifact) => {
-            jobs::write_state(&job_id, JobState::Done)?;
-            // Advance the auto cooldown + clear the failure backoff only on
-            // a real completion (no-op for non-`auto-*` runs).
-            crate::policy::record_auto_outcome(&output_name, true);
-            eprintln!(
-                "trained in {:?}, final_loss={:.4}, ckpt={}",
-                artifact.elapsed,
-                artifact.final_loss,
-                artifact.checkpoint_dir.display()
-            );
-
-            if !args.no_convert {
-                eprintln!("converting to GGUF ({})...", args.quant);
-                let gguf =
-                    convert::convert_to_gguf(&artifact.checkpoint_dir, &output_name, &args.quant)
-                        .await
-                        .context("convert_to_gguf")?;
-                eprintln!("gguf  {}", gguf.display());
-                register_in_registry(&output_name, &gguf, &spec)?;
-                eprintln!(
-                    "registry updated; `mcp__local-llm__query model={output_name}` should work."
-                );
-            } else {
-                eprintln!(
-                    "--no-convert: HF checkpoint left at {}",
-                    artifact.checkpoint_dir.display()
-                );
-            }
-        }
-        Err(e) => {
-            jobs::write_state(&job_id, JobState::Failed)?;
-            // Grow the auto failure backoff (no-op for non-`auto-*` runs).
-            crate::policy::record_auto_outcome(&output_name, false);
-            return Err(anyhow!(e));
-        }
-    }
-    Ok(())
 }
 
 fn run_jobs(json: bool) -> Result<()> {
@@ -3735,193 +3097,6 @@ fn run_log(id_query: &str, tail: usize, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Dispatch `--from-conversations` through the v2 typed Plan
-/// pipeline. Builds the recipe Args from the legacy CLI flags so
-/// users don't have to learn a new invocation, then runs the
-/// compiled 9-stage Plan through `SequentialExecutor`.
-async fn run_train_via_recipe(
-    reg: &crate::framework::Registry,
-    output_name: &str,
-    args: &TrainArgs,
-) -> Result<()> {
-    use crate::framework::{CacheHandle, ExecCtx};
-
-    // The recipe now lives in the lamu cookbook crate (C2b); blut-core
-    // can't name its typed `Args`, so we build the args JSON directly and
-    // resolve the erased `RecipeDef` by name through the caller-supplied
-    // cookbook registry. Field names MUST match the recipe's serde
-    // contract (validated at runtime inside `compile_fn`). Fields whose
-    // value equals the recipe's serde default are omitted (notes,
-    // eval_ratio, min_turns, max_msg_bytes, drop_errors,
-    // dataset_registry_name).
-    let method: &str = match args.method {
-        MethodArg::Qlora => "qlora",
-        MethodArg::Lora => "lora",
-        MethodArg::Full => "full",
-    };
-    let optimizer: &str = match pick_optimizer(args.optim, args.method) {
-        crate::spec::Optim::AdamW => "adamw",
-        crate::spec::Optim::AdamW8bit => "adamw8bit",
-        crate::spec::Optim::ApolloRank4 => "apollo",
-        crate::spec::Optim::ApolloMini => "apollo_mini",
-    };
-    let recipe_args = serde_json::json!({
-        "output_name": output_name,
-        "since": humantime::format_duration(args.since).to_string(),
-        "base_model": args.base,
-        "method": method,
-        "quant": args.quant,
-        "lr": args.lr,
-        "epochs": args.epochs,
-        "batch_size": args.batch_size,
-        "grad_accum": args.grad_accum,
-        "seq_len": args.seq_len,
-        "seed": args.seed,
-        "rank": args.rank,
-        "alpha": args.alpha,
-        "optimizer": optimizer,
-    });
-
-    let def = reg.find("finetune_from_conversations").ok_or_else(|| {
-        anyhow!(
-            "recipe `finetune_from_conversations` is not registered in this binary \
-             (it belongs to the lamu cookbook — run via the `blut-lamu` binary)"
-        )
-    })?;
-    let plan =
-        (def.compile_fn)(recipe_args.clone()).map_err(|e| anyhow!("recipe compile failed: {e}"))?;
-
-    let job_id = jobs::new_job_id();
-    let job_dir =
-        paths::job_dir(&job_id).with_context(|| format!("create job dir for {job_id}"))?;
-
-    // Match the legacy path's lifecycle so `lamu-train jobs` shows
-    // this run and `lamu-train cancel` can find its pid.
-    jobs::write_state(&job_id, JobState::Running)
-        .with_context(|| format!("write initial job state for {job_id}"))?;
-    // KILL-3: DO NOT write blut's own pid here. The pid file must
-    // hold the python child's PROCESS GROUP id so `blut cancel <id>`
-    // SIGTERMs the trainer tree, not blut (which has no handler and
-    // would just die, orphaning the GPU child). The child pgid is
-    // mirrored into the pid file by the backend spawn once we bind
-    // the job below; until then the job has no pid (cancel no-ops
-    // safely rather than killing the wrong process).
-    crate::python_kill::bind_current_job(job_id.clone());
-
-    let mut ctx = ExecCtx::new(job_dir.clone());
-    if args.shared_cache {
-        match CacheHandle::default_global_path() {
-            Some(global) => {
-                std::fs::create_dir_all(&global)
-                    .with_context(|| format!("create global cache dir {}", global.display()))?;
-                let cache_handle = (*ctx.cache).clone().with_global(global);
-                ctx.cache = std::sync::Arc::new(cache_handle);
-            }
-            None => {
-                eprintln!(
-                    "warning: --shared-cache requested but global cache \
-                     path could not be determined (set $LAMU_TRAIN_CACHE_DIR \
-                     or fix $XDG_DATA_HOME); falling back to job-local cache."
-                );
-            }
-        }
-    }
-
-    // Mark recipe for plan resume. recipe_args is already the args JSON
-    // value built above (reused verbatim so the marker matches what was
-    // compiled).
-    RecipeMarker {
-        name: "finetune_from_conversations".into(),
-        args: recipe_args,
-    }
-    .write_to(&job_dir)?;
-
-    eprintln!("recipe finetune_from_conversations (v2)");
-    eprintln!("job    {job_id}");
-    eprintln!("dir    {}", job_dir.display());
-
-    if args.background {
-        eprintln!(
-            "background mode is recognised but real detach lands in a \
-             follow-up. For now, run without --background and use \
-             `lamu-train cancel {job_id}` from another terminal."
-        );
-        return Ok(());
-    }
-
-    // Acquire the GPU lock — required for cross-process arbitration
-    // before any training subprocess runs. Released on Drop after
-    // execute() returns. `--allow-evict` waits up to 1h for an
-    // existing exclusive to release, matching the legacy path.
-    //
-    // Lock acquisition errors must transition the job out of
-    // `Running` so `lamu-train jobs` doesn't show a permanently-
-    // stuck row after a lock timeout / permission failure.
-    let lock = {
-        let acq = async {
-            if args.allow_evict {
-                eprintln!("lock waiting for GPU release (--allow-evict, up to 1h)...");
-                scheduler_lock::await_unlock(Duration::from_secs(3600))
-                    .await
-                    .context("await_unlock")?;
-                scheduler_lock::acquire_exclusive(
-                    format!("lamu-train:{job_id}"),
-                    LockKind::Training,
-                )
-                .context("acquire_exclusive after wait")
-            } else {
-                scheduler_lock::acquire_exclusive(
-                    format!("lamu-train:{job_id}"),
-                    LockKind::Training,
-                )
-                .context("acquire_exclusive (use --allow-evict to wait)")
-            }
-        };
-        match acq.await {
-            Ok(l) => l,
-            Err(e) => {
-                crate::python_kill::unbind_current_job();
-                if let Err(state_err) = jobs::write_state(&job_id, JobState::Failed) {
-                    tracing::warn!(
-                        "failed to record Failed state for {job_id} after lock error: {state_err}"
-                    );
-                }
-                return Err(e);
-            }
-        }
-    };
-    eprintln!("lock acquired ({})", lock.path().display());
-
-    // KILL-3: trap SIGTERM/ctrl-c → cancel token + killpg the child
-    // group, then return so `lock` Drops (RAII unlocks the scheduler).
-    install_cancel_handler(ctx.cancel.clone());
-
-    persist_plan_graph(&plan, &job_dir);
-    let result = crate::framework::execute_plan(plan, ctx).await;
-    drop(lock);
-    crate::python_kill::unbind_current_job();
-
-    match result {
-        Ok(r) => {
-            jobs::write_state(&job_id, JobState::Done)
-                .with_context(|| format!("write Done state for {job_id}"))?;
-            eprintln!(
-                "done — {} stages, {} cache hits, {} misses, elapsed {:?}",
-                r.n_stages, r.n_cache_hits, r.n_cache_misses, r.elapsed
-            );
-            Ok(())
-        }
-        Err(e) => {
-            if let Err(state_err) = jobs::write_state(&job_id, JobState::Failed) {
-                tracing::warn!(
-                    "failed to record Failed state for {job_id} after plan error: {state_err}"
-                );
-            }
-            Err(anyhow!("plan execution failed: {e}"))
-        }
-    }
-}
-
 /// Install a one-shot SIGTERM + ctrl-c handler for an in-process
 /// training run (KILL-3). On either signal it:
 ///   1. cancels the executor's `CancellationToken` so the running
@@ -3962,75 +3137,6 @@ fn install_cancel_handler(cancel: tokio_util::sync::CancellationToken) {
                 .await;
         }
     });
-}
-
-fn build_dataset(args: &TrainArgs) -> Result<DatasetSource> {
-    if args.from_conversations {
-        // Step 7 materializes this to a JsonlPath; for v1 the CLI
-        // accepts the flag and constructs the variant so the spec
-        // round-trips cleanly. Use checked_sub so a since-window
-        // larger than time-since-epoch (~55 years) saturates at 0
-        // instead of panicking on SystemTime underflow.
-        let cutoff = std::time::SystemTime::now()
-            .checked_sub(args.since)
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        Ok(DatasetSource::Conversations { since_ts: cutoff })
-    } else {
-        let path = args
-            .dataset
-            .clone()
-            .ok_or_else(|| anyhow!("--dataset is required unless --from-conversations is set"))?;
-        Ok(DatasetSource::JsonlPath { path })
-    }
-}
-
-fn build_method(method: MethodArg, rank: u32, alpha: u32) -> Method {
-    match method {
-        MethodArg::Qlora => Method::QLora { rank, alpha },
-        MethodArg::Lora => Method::Lora { rank, alpha },
-        MethodArg::Full => Method::Full,
-    }
-}
-
-fn pick_optimizer(opt: Option<OptimArg>, method: MethodArg) -> Optim {
-    if let Some(o) = opt {
-        return match o {
-            OptimArg::Adamw => Optim::AdamW,
-            OptimArg::Adamw8bit => Optim::AdamW8bit,
-            OptimArg::Apollo => Optim::ApolloRank4,
-            OptimArg::ApolloMini => Optim::ApolloMini,
-        };
-    }
-    // Defaults pegged to memory profile of each method.
-    match method {
-        MethodArg::Qlora => Optim::ApolloMini,
-        MethodArg::Lora => Optim::AdamW8bit,
-        MethodArg::Full => Optim::AdamW,
-    }
-}
-
-fn register_in_registry(name: &str, gguf_path: &Path, spec: &TrainSpec) -> Result<()> {
-    use crate::registry;
-    use crate::registry::{BackendType, Capability, ModelEntry, ModelFormat, ModelStatus};
-    let registry_path = crate::config::registry_path();
-    let entry = ModelEntry {
-        name: name.into(),
-        path: gguf_path.to_path_buf(),
-        format: ModelFormat::Gguf,
-        backend: BackendType::LlamaCpp,
-        arch: "trained".into(), // refined post-conversion in a future step
-        params_b: 0.0,          // unknown until we parse GGUF
-        quant: spec.quant.clone(),
-        vram_mb: 0,
-        context_max: spec.seq_len,
-        capabilities: vec![Capability::Chat],
-        notes: format!("trained from {} via blut", spec.base_model),
-        status: ModelStatus::default(),
-    };
-    registry::add_entry(entry, &registry_path, true)
-        .map_err(|e| anyhow!("registry update failed: {e}"))
 }
 
 #[cfg(test)]
