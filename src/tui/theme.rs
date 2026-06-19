@@ -2,11 +2,9 @@
 // Copyright (C) 2026 Brian Lam
 //! Theme — BLUT cockpit colors and reusable styles.
 //!
-//! Replicates the lamquant-lossless TUI theme convention
-//! (`lamquant-lossless/src/tui/theme.rs`) so the BLUT cockpit matches
-//! the rest of the project visually. BLUT is a standalone crate and
-//! cannot depend on `lamquant-lossless`, so the convention is mirrored
-//! here verbatim rather than imported.
+//! A small, self-contained palette of named style getters (titles,
+//! headings, success/error/warning, key hints, status bar) so the views
+//! render consistently without each drawer hand-rolling colors.
 //!
 //! Honours `NO_COLOR`, `TERM=dumb`, and an explicit color/charset
 //! preference. When color is disabled every style getter returns

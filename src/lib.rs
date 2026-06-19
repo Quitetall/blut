@@ -48,9 +48,9 @@ pub mod schedule;
 pub mod scheduler_lock;
 pub mod sensor;
 pub mod spec;
-/// The interactive ratatui cockpit. Behind the off-by-default `tui` feature:
-/// 1.0 ships CLI-only; the TUI returns in 1.1. The CLI (`cli::run`) degrades
-/// to printing help for the bare `blut` command when this is disabled.
+/// The interactive ratatui cockpit. Part of the default-on `tui` feature, so
+/// it ships in 1.0; a `--no-default-features` build drops it and the CLI
+/// (`cli::run`) degrades to printing help for the bare `blut` command.
 #[cfg(feature = "tui")]
 pub mod tui;
 

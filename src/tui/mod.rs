@@ -1,52 +1,43 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Brian Lam
-//! `blut tui` — the single, complete interactive training cockpit.
+//! `blut tui` — the interactive training cockpit.
 //!
-//! This is the canonical training cockpit for the whole project. It
-//! is a superset of the three cockpits it replaced:
-//!   * the lamquant-lossless hub `CockpitPanel` (the in-process Rust
-//!     probe screen the hub used to render at SCREEN_TRAIN), and
-//!   * the retired Python `legacy/python_cockpit/cockpit.py`
-//!     (1381 LOC — run history, leaderboard, compare, checkpoints,
-//!     presets, hparams, reset, export, live metrics), and
-//!   * the original T1/T2 BLUT scaffold (jobs + log + system + recipe
-//!     launcher).
-//!
-//! The hub's "Train a model" tile now execs `blut tui` directly (no
-//! more in-process duplicate cockpit).
+//! A single ratatui surface multiplexed by a `View` enum. The default
+//! `Cockpit` view is a single-column overview (header / running jobs /
+//! resources / recipe menu); the other views are launchers + analytic /
+//! provenance panels, all reading the engine's OWN state — the jobs store,
+//! the lineage DB, the content-addressed cache, and the plan graph (the same
+//! sources as the `jobs` / `log` / `dag` / `lineage` CLI subcommands). There
+//! is no domain knowledge and no separate data model: a panel shows what the
+//! engine recorded for a run, so it works for any cookbook.
 //!
 //! ## Views
-//!
-//! A `View` enum multiplexes the single ratatui surface across the
-//! migrated screens. The default `Cockpit` view is the single-column
-//! overview (header / pipeline status / resources / recipe menu). The
-//! other views revive the formerly-dead detail panels + port the
-//! Python cockpit's diagnostic screens:
-//!   * `Jobs`        — full jobs LIST (all states, color-coded)
-//!   * `Log`         — per-job status.jsonl tail of the selected job
-//!   * `System`      — full GPU/MEM/DISK/CPU probe panel
-//!   * `History`     — `training_logs/*.csv` run history
-//!   * `Leaderboard` — runs ranked by best validation R
-//!   * `Compare`     — side-by-side metric table for marked runs
-//!   * `Checkpoints` — `.ckpt` browser grouped by dir
-//!   * `Presets`     — preset catalog + hyperparameter reference
-//!   * `Metrics`     — live tail of the newest training-log CSV
-//!   * `Reset`       — destructive maintenance (tmux/numba/logs)
+//!   * `Jobs`        — full jobs list (all states, color-coded)
+//!   * `Log`         — the selected job's `status.jsonl` tail
+//!   * `System`      — GPU / MEM / DISK / CPU probe
+//!   * `History`     — every job ⋈ its lineage record (recipe / outcome / metric)
+//!   * `Leaderboard` — runs ranked by the active metric
+//!   * `Compare`     — marked runs side by side (final metrics + GPU sat)
+//!   * `Dag`         — the selected run's plan graph + per-node status
+//!   * `Lineage`     — stage hashes · cache hits/misses · code freshness
+//!   * `Artifacts`   — the run's content-addressed stage outputs
+//!   * `Metrics`     — the selected run's final metric values
+//!   * `Catalog`     — registered recipes by course + their args schema
+//!   * `Reset`       — generic maintenance (prune cache / clear job / forget footprints)
 //!
 //! ## Keybindings (cockpit view)
 //!   ↑ / ↓ / j / k   move selection (jobs/list rows)
-//!   Enter           refresh log / open selected
+//!   Enter           open the selected job's log
 //!   r               refresh jobs + system
 //!   c               cancel selected job (SIGTERM via `blut cancel`)
 //!   R               custom-recipe fuzzy picker
 //!   `<recipe hotkey>` launch a recipe (pre-baked defaults for the
 //!                   registered cookbook recipes, schema template else)
-//!   J/L/Y/H/B/K/P/M/X  switch to Jobs/Log/sYstem/History/leaderBoard/
-//!                      checKpoints/Presets/Metrics/reset views
+//!   J/L/Y/H/B/C/G/I/A/M/P/X  switch to Jobs / Log / sYstem / History /
+//!                      leaderBoard / Compare / daG / lIneage / Artifacts /
+//!                      Metrics / catalog(P) / maintenance(X) views
 //!   Esc / b         back to cockpit view (or quit from cockpit)
 //!   q / Ctrl-C      quit
-//!
-//! Lift origin: design borrowed from `lamquant-core/src/tui/panels/`
 //! (cockpit + output + file_browser). T1/T2 of the BLUT cockpit track;
 //! U3-U7 + the three-cockpit merge per the training-cockpit directive.
 
@@ -276,9 +267,11 @@ enum View {
     History,
     Leaderboard,
     Compare,
-    Checkpoints,
-    Presets,
+    Dag,
+    Lineage,
+    Artifacts,
     Metrics,
+    Catalog,
     Reset,
 }
 
@@ -292,10 +285,12 @@ impl View {
             View::History => "Run History",
             View::Leaderboard => "Leaderboard",
             View::Compare => "Compare Runs",
-            View::Checkpoints => "Checkpoints",
-            View::Presets => "Presets & Hyperparameters",
-            View::Metrics => "Live Metrics",
-            View::Reset => "Reset Training State",
+            View::Dag => "Run DAG",
+            View::Lineage => "Lineage & Provenance",
+            View::Artifacts => "Artifacts",
+            View::Metrics => "Run Metrics",
+            View::Catalog => "Recipe Catalog",
+            View::Reset => "Maintenance",
         }
     }
 }
@@ -399,15 +394,19 @@ struct App {
     quit: bool,
     /// Active surface (cockpit / detail panel / migrated screen).
     view: View,
-    /// Repo root the diagnostic views scan (training_logs/, runs/,
-    /// checkpoints/, weights/). Resolved once at startup.
-    repo_root: std::path::PathBuf,
-    /// Cached run-history / leaderboard rows + checkpoint rows. Re-read
-    /// on view-entry + refresh so the panels aren't I/O-bound per draw.
+    /// Cached run rows (History / Leaderboard), sourced from the jobs store
+    /// ⋈ the lineage DB. Re-read on view-entry + refresh so the panels
+    /// aren't I/O-bound per draw.
     runs: Vec<views::RunRow>,
-    ckpts: Vec<views::CkptRow>,
-    /// Cursor + multi-select for list-style views (history/leaderboard/
-    /// checkpoints). `marked` holds run names selected for Compare.
+    /// Per-job view caches, loaded for `current_job_id()` on view-entry +
+    /// refresh: the selected run's artifacts, plan DAG, lineage/provenance,
+    /// and final metrics.
+    artifacts: Vec<views::ArtifactRow>,
+    dag: Option<crate::framework::GraphSnapshot>,
+    lineage: views::LineageView,
+    metrics: Vec<(String, f64)>,
+    /// Cursor for list-style views (history / leaderboard / artifacts /
+    /// catalog). `marked` holds the job ids selected for Compare.
     list_cursor: usize,
     marked: Vec<String>,
     /// Reset view: which destructive action is armed (two-press confirm).
@@ -433,16 +432,15 @@ struct App {
     focus_ticks_left: u8,
 }
 
-/// Two-press confirm window for the destructive Reset actions, matching
-/// the lamquant-lossless cockpit's `RESET_WINDOW_SECS`.
+/// Two-press confirm window for the destructive Maintenance actions.
 const RESET_WINDOW: Duration = Duration::from_secs(3);
 
-/// Reset-view rows: the three destructive maintenance actions plus the
-/// non-destructive export action.
+/// Maintenance-view rows: generic, domain-agnostic destructive actions on
+/// the engine's own state (cache / job dir / footprint store).
 const RESET_ROWS: &[views::ResetAction] = &[
-    views::ResetAction::KillTmux,
-    views::ResetAction::ClearNumba,
-    views::ResetAction::ClearLogs,
+    views::ResetAction::PruneCache,
+    views::ResetAction::ClearJob,
+    views::ResetAction::ForgetFootprints,
 ];
 
 impl App {
@@ -464,9 +462,11 @@ impl App {
             overlay: Overlay::None,
             quit: false,
             view: View::Cockpit,
-            repo_root: views::repo_root(),
             runs: Vec::new(),
-            ckpts: Vec::new(),
+            artifacts: Vec::new(),
+            dag: None,
+            lineage: views::LineageView::default(),
+            metrics: Vec::new(),
             list_cursor: 0,
             marked: Vec::new(),
             reset_cursor: 0,
@@ -483,33 +483,56 @@ impl App {
     /// Resets the list cursor so a freshly-entered view starts at the
     /// top.
     fn set_view(&mut self, view: View) {
+        // Capture the selected run BEFORE the cursor resets — the per-job
+        // views (DAG / Lineage / Artifacts / Metrics) key off it.
+        let job = self.current_job_id();
         self.view = view;
         self.list_cursor = 0;
-        match view {
-            View::History | View::Leaderboard | View::Compare => {
-                self.runs = if view == View::Leaderboard {
-                    views::leaderboard(&self.repo_root)
-                } else {
-                    views::run_history(&self.repo_root)
-                };
-            }
-            View::Checkpoints => {
-                self.ckpts = views::checkpoints(&self.repo_root);
-            }
-            View::Reset => {
-                self.reset_cursor = 0;
-                self.reset_armed = None;
-            }
-            _ => {}
+        self.load_view_data(view, job.as_deref());
+        if view == View::Reset {
+            self.reset_cursor = 0;
+            self.reset_armed = None;
         }
         self.set_status(format!("view: {}", view.title()));
+    }
+
+    /// (Re)load the data the given view renders. Split from `set_view` so the
+    /// periodic refresh can re-pull the active view (live DAG / metrics on a
+    /// running job). `job` is the run the per-job views target.
+    fn load_view_data(&mut self, view: View, job: Option<&str>) {
+        match view {
+            View::History => self.runs = views::run_history(views::DEFAULT_METRIC),
+            View::Leaderboard => self.runs = views::leaderboard(views::DEFAULT_METRIC, false),
+            View::Compare => {} // draw_compare gathers from `marked`
+            View::Artifacts => self.artifacts = job.map(views::artifacts_for).unwrap_or_default(),
+            View::Dag => self.dag = job.and_then(views::dag_for),
+            View::Lineage => self.lineage = job.map(views::lineage_for).unwrap_or_default(),
+            View::Metrics => self.metrics = job.map(views::metrics_for).unwrap_or_default(),
+            _ => {}
+        }
+    }
+
+    /// The job id the per-job views (DAG / Lineage / Artifacts / Metrics)
+    /// operate on: the Jobs/Log selection, else the run under the list cursor
+    /// (History / Leaderboard), else the newest job.
+    fn current_job_id(&self) -> Option<String> {
+        if matches!(self.view, View::Jobs | View::Log) {
+            if let Some(j) = self.selected.selected().and_then(|i| self.jobs.get(i)) {
+                return Some(j.id.clone());
+            }
+        }
+        if let Some(r) = self.runs.get(self.list_cursor) {
+            return Some(r.job_id.clone());
+        }
+        self.jobs.first().map(|j| j.id.clone())
     }
 
     /// Move the cursor in whichever list-style view is active.
     fn move_list(&mut self, delta: isize) {
         let len = match self.view {
-            View::History | View::Leaderboard | View::Compare => self.runs.len(),
-            View::Checkpoints => self.ckpts.len(),
+            View::History | View::Leaderboard => self.runs.len(),
+            View::Artifacts => self.artifacts.len(),
+            View::Catalog => self.catalog.len(),
             View::Reset => RESET_ROWS.len(),
             _ => 0,
         };
@@ -998,34 +1021,29 @@ impl App {
         self.refresh_jobs();
         self.refresh_system();
         self.refresh_log();
-        match self.view {
-            View::History | View::Compare => self.runs = views::run_history(&self.repo_root),
-            View::Leaderboard => self.runs = views::leaderboard(&self.repo_root),
-            View::Checkpoints => self.ckpts = views::checkpoints(&self.repo_root),
-            _ => {}
-        }
+        // Re-pull whatever the active view shows (keeps a running job's DAG /
+        // metrics live).
+        let job = self.current_job_id();
+        self.load_view_data(self.view, job.as_deref());
         self.last_refresh = Instant::now();
     }
 
-    /// Toggle the run under the list cursor in/out of the Compare
-    /// selection (History / Leaderboard views). Capped at 3 marks to
-    /// match the Python cockpit's compare-up-to-3 behavior.
+    /// Toggle the run under the list cursor in/out of the Compare selection
+    /// (History / Leaderboard views). Capped at 3 marks. `marked` holds job
+    /// ids.
     fn toggle_mark(&mut self) {
         let Some(row) = self.runs.get(self.list_cursor) else {
             return;
         };
-        let name = row.name.clone();
-        if let Some(pos) = self.marked.iter().position(|n| *n == name) {
+        let id = row.job_id.clone();
+        if let Some(pos) = self.marked.iter().position(|n| *n == id) {
             self.marked.remove(pos);
-            self.set_status(format!("unmarked {name}"));
+            self.set_status(format!("unmarked {id}"));
         } else if self.marked.len() >= 3 {
             self.set_status("compare holds at most 3 runs — unmark one first");
         } else {
-            self.marked.push(name.clone());
-            self.set_status(format!(
-                "marked {name} for compare ({}/3)",
-                self.marked.len()
-            ));
+            self.marked.push(id.clone());
+            self.set_status(format!("marked {id} for compare ({}/3)", self.marked.len()));
         }
     }
 
@@ -1043,7 +1061,8 @@ impl App {
             .unwrap_or(false);
         if armed {
             self.reset_armed = None;
-            let msg = views::reset(&self.repo_root, action);
+            let job = self.current_job_id();
+            let msg = views::reset(action, job.as_deref());
             self.set_status(msg);
         } else {
             self.reset_armed = Some((idx, Instant::now()));
@@ -1227,7 +1246,7 @@ fn assemble_fields(fields: &[EditorField]) -> String {
 /// catalog comes from it, not a static slice.
 pub async fn run(registry: crate::framework::Registry) -> Result<()> {
     // Detect NO_COLOR / TERM=dumb / locale once before the first draw so
-    // every theme getter returns the right style (matches lamquant).
+    // every theme getter returns the right style.
     theme::detect("auto", "auto");
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
@@ -1264,9 +1283,11 @@ pub fn check(registry: crate::framework::Registry) -> Result<()> {
         View::History,
         View::Leaderboard,
         View::Compare,
-        View::Checkpoints,
-        View::Presets,
+        View::Dag,
+        View::Lineage,
+        View::Artifacts,
         View::Metrics,
+        View::Catalog,
         View::Reset,
     ];
     let mut app = App::new(registry);
@@ -1567,9 +1588,12 @@ fn handle_key_main(app: &mut App, k: event::KeyEvent) {
         KeyCode::Char('Y') => return app.set_view(View::System),
         KeyCode::Char('H') => return app.set_view(View::History),
         KeyCode::Char('B') => return app.set_view(View::Leaderboard),
-        KeyCode::Char('K') => return app.set_view(View::Checkpoints),
-        KeyCode::Char('P') => return app.set_view(View::Presets),
+        KeyCode::Char('C') => return app.set_view(View::Compare),
+        KeyCode::Char('G') => return app.set_view(View::Dag),
+        KeyCode::Char('I') => return app.set_view(View::Lineage),
+        KeyCode::Char('A') => return app.set_view(View::Artifacts),
         KeyCode::Char('M') => return app.set_view(View::Metrics),
+        KeyCode::Char('P') => return app.set_view(View::Catalog),
         KeyCode::Char('X') => return app.set_view(View::Reset),
         // Ctrl-C handled by caller; q always quits.
         KeyCode::Char('q') => {
@@ -1658,6 +1682,8 @@ fn handle_key_detail(app: &mut App, k: event::KeyEvent) {
                 app.refresh_log();
                 app.set_view(View::Log);
             }
+            // Drill from a run into its plan DAG.
+            View::History | View::Leaderboard => app.set_view(View::Dag),
             View::Reset => app.fire_reset(),
             _ => {}
         },
@@ -1666,15 +1692,6 @@ fn handle_key_detail(app: &mut App, k: event::KeyEvent) {
             if matches!(app.view, View::History | View::Leaderboard) =>
         {
             app.toggle_mark();
-        }
-        // Compare-runs entry from history/leaderboard.
-        KeyCode::Char('C') if matches!(app.view, View::History | View::Leaderboard) => {
-            app.set_view(View::Compare);
-        }
-        // Export config (Python cockpit [e]) — only on the Reset view.
-        KeyCode::Char('e') if app.view == View::Reset => {
-            let msg = views::export_presets(&app.repo_root, &app.catalog);
-            app.set_status(msg);
         }
         _ => {}
     }
@@ -1700,9 +1717,11 @@ fn draw(f: &mut Frame<'_>, app: &mut App) {
         View::History => draw_history(f, body, app),
         View::Leaderboard => draw_leaderboard(f, body, app),
         View::Compare => draw_compare(f, body, app),
-        View::Checkpoints => draw_checkpoints(f, body, app),
-        View::Presets => draw_presets(f, body, app),
+        View::Dag => draw_dag(f, body, app),
+        View::Lineage => draw_lineage(f, body, app),
+        View::Artifacts => draw_artifacts(f, body, app),
         View::Metrics => draw_metrics(f, body, app),
+        View::Catalog => draw_catalog(f, body, app),
         View::Reset => draw_reset(f, body, app),
     }
     draw_status(f, outer[1], app);
@@ -1710,7 +1729,7 @@ fn draw(f: &mut Frame<'_>, app: &mut App) {
 }
 
 /// Section header for the cockpit menu — a dim-indented heading in the
-/// project's `theme::highlight` style (mirrors lamquant's `section_header`).
+/// a dim-indented heading in the `theme::highlight` style.
 fn section_header(title: &str) -> Line<'static> {
     Line::from(vec![
         Span::raw("  "),
@@ -1718,7 +1737,7 @@ fn section_header(title: &str) -> Line<'static> {
     ])
 }
 
-/// One `[key] Label   description` menu row (mirrors lamquant's `opt`):
+/// One `[key] Label   description` menu row:
 /// the key hint in `theme::key_hint`, the label in `theme::normal`, the
 /// description in `theme::dim`. `key` is `None` for items reachable only
 /// via the `R` recipe picker (shown as `[-]`).
@@ -1856,9 +1875,10 @@ fn draw_cockpit_body(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     f.render_widget(Paragraph::new(res_lines), res_inner);
 
     // ── Grouped recipe / action menu ─────────────────────────────────
-    // Mirrors the lamquant hub cockpit's section convention. Sections:
-    //   DATA PREPARATION / PIPELINE OPERATIONS (= TRAINING + PIPELINE
-    //   recipes) / EVALUATION / EXPORT / DIAGNOSTICS (migrated Views) /
+    // Sections, top to bottom:
+    //   the recipe courses (data-driven off the registered cookbooks'
+    //   `Course`s — DataPrep / Train / Eval / Export / …) / RUNS (the
+    //   analytic Views) / PROVENANCE (DAG + lineage) /
     //   SYSTEM (built-ins). Every BLUT recipe is reachable by its
     //   auto-assigned hotkey (or the [R] picker if it ran out of keys);
     //   every migrated screen is reachable by its capital-letter View key.
@@ -1891,41 +1911,43 @@ fn draw_cockpit_body(f: &mut Frame<'_>, area: Rect, app: &mut App) {
         lines.push(Line::from(""));
     }
 
-    // DIAGNOSTICS — the migrated detail/diagnostic Views (parity with the
-    // hub cockpit's DIAGNOSTICS section + the Python cockpit screens).
-    lines.push(section_header("DIAGNOSTICS"));
+    // RUNS — the jobs store + run-analytic views (all read the engine's own
+    // state: the jobs store + the lineage DB).
+    lines.push(section_header("RUNS"));
     lines.push(Line::from(""));
     for (key, label, desc) in [
         ('J', "Jobs", "all jobs, color-coded by state"),
         ('L', "Log", "status.jsonl tail of selected job"),
         ('Y', "System", "full GPU / MEM / DISK / CPU probe"),
-        ('H', "Run history", "training_logs/*.csv runs + best R"),
-        ('B', "Leaderboard", "runs ranked by best validation R"),
-        ('K', "Checkpoints", ".ckpt browser grouped by dir"),
-        ('M', "Live metrics", "tail of the newest training CSV"),
+        ('H', "Run history", "all jobs ⋈ recipe / outcome / metric"),
+        ('B', "Leaderboard", "runs ranked by the active metric"),
+        ('C', "Compare", "marked runs side by side"),
+        ('M', "Metrics", "the selected run's final metrics"),
     ] {
         lines.push(opt_row(Some(key), label, desc));
     }
     lines.push(Line::from(""));
 
-    // PLANNING — preset / hyperparameter reference (hub PLANNING parity).
-    lines.push(section_header("PLANNING"));
+    // PROVENANCE — the plan graph + lineage / artifacts for a selected run.
+    lines.push(section_header("PROVENANCE"));
     lines.push(Line::from(""));
-    lines.push(opt_row(
-        Some('P'),
-        "Presets & hyperparameters",
-        "preset catalog, decoder tiers, hparam groups",
-    ));
+    for (key, label, desc) in [
+        ('G', "DAG", "the run's plan graph + per-node status"),
+        ('I', "Lineage", "stage hashes · cache · code freshness"),
+        ('A', "Artifacts", "content-addressed outputs of a run"),
+        ('P', "Catalog", "registered recipes by course + args"),
+    ] {
+        lines.push(opt_row(Some(key), label, desc));
+    }
     lines.push(Line::from(""));
 
-    // SYSTEM — built-in actions + destructive maintenance (hub SYSTEM
-    // parity). The reset/export screen plus the cockpit built-ins.
+    // SYSTEM — built-in actions + generic destructive maintenance.
     lines.push(section_header("SYSTEM"));
     lines.push(Line::from(""));
     lines.push(opt_row(
         Some('X'),
-        "Reset / export",
-        "kill tmux · clear numba · clear logs · export",
+        "Maintenance",
+        "prune cache · clear job · forget footprints",
     ));
     for (k, _, label) in App::builtin_keys() {
         lines.push(opt_row(Some(*k), label, ""));
@@ -2253,13 +2275,13 @@ fn view_header(title: &str) -> Line<'static> {
     ])
 }
 
-/// Run History view (Python `_screen_history`): training logs + best-R
-/// + epoch + date, plus a checkpoint summary footer.
+/// Run History view: every job (newest first) with its recipe, outcome, and
+/// the active metric — sourced from the jobs store joined with the lineage DB.
 fn draw_history(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .title(Span::styled(
             format!(
-                " {} (↑↓ move · m mark · C compare · b back) ",
+                " {} (↑↓ move · m mark · Enter DAG · b back) ",
                 View::History.title()
             ),
             theme::title(),
@@ -2269,32 +2291,26 @@ fn draw_history(f: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines: Vec<Line> = vec![view_header("Run History"), Line::from("")];
     if app.runs.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No training runs found under training_logs/*.csv.",
+            "No runs yet — launch a recipe (R) to populate the run history.",
             theme::dim(),
         )));
     } else {
         lines.push(Line::from(Span::styled(
             format!(
-                "  {:<42} {:<10} {:<10} {}",
-                "Name", "Best R", "Epoch", "Date"
+                "  {:<24} {:<19} {:<10} {:<10} {}",
+                "Recipe", "Job", "Outcome", views::DEFAULT_METRIC, "When"
             ),
             theme::dim(),
         )));
         for (i, r) in app.runs.iter().enumerate() {
-            let marked = app.marked.contains(&r.name);
             let cursor = i == app.list_cursor;
-            let prefix = if cursor { "▶ " } else { "  " };
+            let marked = app.marked.contains(&r.job_id);
+            let prefix = if cursor { "▶" } else { " " };
             let mark = if marked { "✓" } else { " " };
-            let r_str = if r.best_r > 0.0 {
-                format!("{:.4}", r.best_r)
-            } else {
-                "—".into()
-            };
-            let ep_str = if r.total_ep > 0 {
-                format!("{}/{}", r.best_ep, r.total_ep)
-            } else {
-                "—".into()
-            };
+            let metric = r
+                .metric
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| "—".into());
             let style = if cursor {
                 theme::selected()
             } else {
@@ -2304,14 +2320,15 @@ fn draw_history(f: &mut Frame<'_>, area: Rect, app: &App) {
                 Span::styled(format!("{prefix}{mark} "), theme::success()),
                 Span::styled(
                     format!(
-                        "{:<42} {:<10} {:<10} ",
-                        truncate(&r.name, 42),
-                        r_str,
-                        ep_str
+                        "{:<24} {:<19} {:<10} {:<10} ",
+                        truncate(&r.recipe, 24),
+                        truncate(&r.job_id, 19),
+                        truncate(&r.outcome, 10),
+                        metric
                     ),
                     style,
                 ),
-                Span::styled(r.date.clone(), theme::dim()),
+                Span::styled(r.when.clone(), theme::dim()),
             ]));
         }
     }
@@ -2321,47 +2338,48 @@ fn draw_history(f: &mut Frame<'_>, area: Rect, app: &App) {
     f.render_widget(para, area);
 }
 
-/// Leaderboard view (Python `_screen_leaderboard`): runs ranked by best
-/// R descending, gold marker on #1.
+/// Leaderboard view: runs ranked by the active metric (lineage DB
+/// `top_runs_by_metric`); rank 1 is highlighted.
 fn draw_leaderboard(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .title(Span::styled(
             format!(
-                " {} (↑↓ move · m mark · C compare · b back) ",
+                " {} (↑↓ move · m mark · Enter DAG · b back) ",
                 View::Leaderboard.title()
             ),
             theme::title(),
         ))
         .border_style(theme::dim())
         .borders(Borders::ALL);
-    let mut lines: Vec<Line> = vec![view_header("Model Leaderboard"), Line::from("")];
+    let mut lines: Vec<Line> = vec![
+        view_header("Leaderboard"),
+        Line::from(Span::styled(
+            format!("ranked by {} (lower is better)", views::DEFAULT_METRIC),
+            theme::dim(),
+        )),
+        Line::from(""),
+    ];
     if app.runs.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No training logs found. Run some experiments first.",
+            format!("No runs have recorded a `{}` metric yet.", views::DEFAULT_METRIC),
             theme::dim(),
         )));
     } else {
         lines.push(Line::from(Span::styled(
             format!(
-                "  {:<5} {:<40} {:<10} {:<10} {}",
-                "Rank", "Name", "Best R", "Epoch", "Date"
+                "  {:<5} {:<24} {:<19} {:<10} {}",
+                "Rank", "Recipe", "Job", views::DEFAULT_METRIC, "When"
             ),
             theme::dim(),
         )));
         for (i, r) in app.runs.iter().enumerate().take(20) {
             let cursor = i == app.list_cursor;
-            let marked = app.marked.contains(&r.name);
+            let marked = app.marked.contains(&r.job_id);
             let medal = if i == 0 { " ▸" } else { "" };
-            let r_str = if r.best_r > 0.0 {
-                format!("{:.4}", r.best_r)
-            } else {
-                "—".into()
-            };
-            let ep_str = if r.total_ep > 0 {
-                format!("{}/{}", r.best_ep, r.total_ep)
-            } else {
-                "—".into()
-            };
+            let metric = r
+                .metric
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| "—".into());
             let style = if cursor {
                 theme::selected()
             } else if i == 0 {
@@ -2373,15 +2391,15 @@ fn draw_leaderboard(f: &mut Frame<'_>, area: Rect, app: &App) {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(
-                        "{mark} {:<5} {:<40} {:<10} {:<10} ",
+                        "{mark} {:<5} {:<24} {:<19} {:<10} ",
                         i + 1,
-                        truncate(&r.name, 40),
-                        r_str,
-                        ep_str
+                        truncate(&r.recipe, 24),
+                        truncate(&r.job_id, 19),
+                        metric
                     ),
                     style,
                 ),
-                Span::styled(format!("{}{medal}", r.date), theme::dim()),
+                Span::styled(format!("{}{medal}", r.when), theme::dim()),
             ]));
         }
         if app.runs.len() > 20 {
@@ -2397,13 +2415,13 @@ fn draw_leaderboard(f: &mut Frame<'_>, area: Rect, app: &App) {
     f.render_widget(para, area);
 }
 
-/// Compare view (Python `_screen_compare`): side-by-side metric table
-/// of the marked runs; the per-row winner is highlighted green.
+/// Compare view: the marked runs side by side — recipe, each shared final
+/// metric, and GPU saturation. Mark runs with `m` in History / Leaderboard.
 fn draw_compare(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .title(Span::styled(
             format!(
-                " {} (mark runs in History/Leaderboard with m · b back) ",
+                " {} (mark runs with m in History/Leaderboard · b back) ",
                 View::Compare.title()
             ),
             theme::title(),
@@ -2411,35 +2429,61 @@ fn draw_compare(f: &mut Frame<'_>, area: Rect, app: &App) {
         .border_style(theme::dim())
         .borders(Borders::ALL);
     let mut lines: Vec<Line> = vec![view_header("Compare Runs"), Line::from("")];
-    let selected: Vec<&views::RunRow> = app
-        .marked
-        .iter()
-        .filter_map(|n| app.runs.iter().find(|r| r.name == *n))
-        .collect();
-    if selected.len() < 2 {
+    let cols = views::compare(&app.marked);
+    if cols.len() < 2 {
         lines.push(Line::from(Span::styled(
             "Mark at least 2 runs (press m on a row in History/Leaderboard) to compare.",
             theme::dim(),
         )));
     } else {
-        // Header row of run names.
-        let mut hdr = vec![Span::styled(format!("  {:<16}", "Metric"), theme::dim())];
-        for r in &selected {
+        // Header: a metric-name column + one column per marked run.
+        let mut hdr = vec![Span::styled(format!("  {:<20}", "Metric"), theme::dim())];
+        let mut ids = vec![Span::styled(format!("  {:<20}", ""), theme::dim())];
+        for c in &cols {
             hdr.push(Span::styled(
-                format!("{:<22}", truncate(&r.name, 21)),
+                format!("{:<20}", truncate(&c.recipe, 19)),
                 theme::heading(),
+            ));
+            ids.push(Span::styled(
+                format!("{:<20}", truncate(&c.job_id, 19)),
+                theme::dim(),
             ));
         }
         lines.push(Line::from(hdr));
+        lines.push(Line::from(ids));
         lines.push(Line::from(""));
-        // epochs (higher not necessarily better — no highlight), best_r,
-        // final_r (highlight max).
-        let epochs: Vec<f64> = selected.iter().map(|r| r.total_ep as f64).collect();
-        let best_r: Vec<f64> = selected.iter().map(|r| r.best_r).collect();
-        let final_r: Vec<f64> = selected.iter().map(|r| r.final_r).collect();
-        lines.push(metric_row("epochs", &epochs, false, 0));
-        lines.push(metric_row("best_r", &best_r, true, 4));
-        lines.push(metric_row("final_r", &final_r, true, 4));
+        // The union of metric names across the marked runs, sorted.
+        let mut names: Vec<String> = Vec::new();
+        for c in &cols {
+            for (n, _) in &c.metrics {
+                if !names.contains(n) {
+                    names.push(n.clone());
+                }
+            }
+        }
+        names.sort();
+        for n in &names {
+            let mut row = vec![Span::styled(
+                format!("  {:<20}", truncate(n, 19)),
+                theme::heading(),
+            )];
+            for c in &cols {
+                let v = c.metrics.iter().find(|(m, _)| m == n).map(|(_, v)| *v);
+                let txt = v.map(|v| format!("{v:.4}")).unwrap_or_else(|| "—".into());
+                row.push(Span::styled(format!("{txt:<20}"), theme::normal()));
+            }
+            lines.push(Line::from(row));
+        }
+        // GPU saturation row.
+        let mut g = vec![Span::styled(
+            format!("  {:<20}", "gpu_saturation%"),
+            theme::heading(),
+        )];
+        for c in &cols {
+            let txt = c.gpu.map(|v| format!("{v:.1}")).unwrap_or_else(|| "—".into());
+            g.push(Span::styled(format!("{txt:<20}"), theme::normal()));
+        }
+        lines.push(Line::from(g));
     }
     let para = Paragraph::new(lines)
         .block(block)
@@ -2447,58 +2491,167 @@ fn draw_compare(f: &mut Frame<'_>, area: Rect, app: &App) {
     f.render_widget(para, area);
 }
 
-/// One Compare-table row. `highlight_max` greens the winning column;
-/// `decimals` controls float formatting.
-fn metric_row(metric: &str, vals: &[f64], highlight_max: bool, decimals: usize) -> Line<'static> {
-    let best = vals.iter().cloned().fold(f64::MIN, f64::max);
-    let mut spans = vec![Span::styled(format!("  {:<16}", metric), theme::heading())];
-    for v in vals {
-        let txt = if decimals == 0 {
-            format!("{:<22}", *v as i64)
-        } else {
-            format!("{:<22.*}", decimals, v)
-        };
-        let style = if highlight_max && *v == best && best > 0.0 {
-            theme::success().add_modifier(Modifier::BOLD)
-        } else {
-            theme::normal()
-        };
-        spans.push(Span::styled(txt, style));
+/// Style a node-status tag by outcome category.
+fn node_status_style(s: crate::framework::NodeStatus) -> ratatui::style::Style {
+    use crate::framework::NodeStatus as N;
+    match s {
+        N::Done | N::Skipped => theme::success(),
+        N::Running => theme::key_hint(),
+        N::Failed | N::Killed | N::Pruned => theme::error(),
+        N::Blocked => theme::warning(),
+        N::Pending | N::Ready => theme::dim(),
     }
-    Line::from(spans)
 }
 
-/// Checkpoints view (Python `_screen_checkpoints`): all `.ckpt` grouped
-/// by directory, with per-dir count + GiB and the newest files.
-fn draw_checkpoints(f: &mut Frame<'_>, area: Rect, app: &App) {
+/// DAG view: the selected run's plan graph — each node's derived status,
+/// elapsed time, and cache state, plus the edge list. Built from the engine's
+/// `graph_snapshot` (the same source as `blut dag`).
+fn draw_dag(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .title(Span::styled(
-            format!(
-                " {} (↑↓ move · r refresh · b back) ",
-                View::Checkpoints.title()
-            ),
+            format!(" {} (r refresh · b back) ", View::Dag.title()),
             theme::title(),
         ))
         .border_style(theme::dim())
         .borders(Borders::ALL);
-    let mut lines: Vec<Line> = vec![view_header("Checkpoints"), Line::from("")];
-    if app.ckpts.is_empty() {
+    let mut lines: Vec<Line> = vec![view_header("Run DAG"), Line::from("")];
+    match &app.dag {
+        None => lines.push(Line::from(Span::styled(
+            "No plan graph for the selected run — pick a run in History (Enter), or none has run yet.",
+            theme::dim(),
+        ))),
+        Some(g) => {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{}  ", g.name), theme::heading()),
+                Span::styled(g.job.clone(), theme::dim()),
+            ]));
+            lines.push(Line::from(Span::styled(
+                format!("{} stage(s) · {} edge(s)", g.nodes.len(), g.edges.len()),
+                theme::dim(),
+            )));
+            lines.push(Line::from(""));
+            for n in &g.nodes {
+                let elapsed = n
+                    .elapsed_secs
+                    .map(|s| format!("{s:.1}s"))
+                    .unwrap_or_else(|| "—".into());
+                let cache = if n.cache_hit { "  (cache hit)" } else { "" };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  [{:>7}] ", n.status.as_str()), node_status_style(n.status)),
+                    Span::styled(format!("{:>2} ", n.idx), theme::dim()),
+                    Span::styled(
+                        format!("{:<28} ", truncate(&n.stage_name, 28)),
+                        theme::normal(),
+                    ),
+                    Span::styled(format!("{elapsed}{cache}"), theme::dim()),
+                ]));
+            }
+            if !g.edges.is_empty() {
+                lines.push(Line::from(""));
+                let edge_str = g
+                    .edges
+                    .iter()
+                    .map(|e| format!("{}→{}", e.from, e.to))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                lines.push(Line::from(vec![
+                    Span::styled("  edges: ", theme::dim()),
+                    Span::styled(edge_str, theme::dim()),
+                ]));
+            }
+        }
+    }
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, area);
+}
+
+/// Lineage view: the selected run's per-stage provenance (input → output
+/// content hashes, cache state, timing), its cache hit/miss totals, and the
+/// code-freshness verdict (did the building code drift from HEAD?).
+fn draw_lineage(f: &mut Frame<'_>, area: Rect, app: &App) {
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" {} (r refresh · b back) ", View::Lineage.title()),
+            theme::title(),
+        ))
+        .border_style(theme::dim())
+        .borders(Borders::ALL);
+    let lv = &app.lineage;
+    let mut lines: Vec<Line> = vec![view_header("Lineage & Provenance"), Line::from("")];
+    if lv.rows.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No checkpoints found under checkpoints/ or weights/.",
+            "No lineage for the selected run — pick a run in History (Enter), or none has run yet.",
             theme::dim(),
         )));
     } else {
-        let total_gb: f64 = app.ckpts.iter().map(|c| c.size_mb).sum::<f64>() / 1024.0;
+        let fresh_style = match lv.freshness.as_str() {
+            "STALE" => theme::error(),
+            "FRESH" => theme::success(),
+            _ => theme::dim(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled("code: ", theme::dim()),
+            Span::styled(lv.freshness.clone(), fresh_style),
+            Span::styled(
+                format!("     cache: {} hit / {} miss", lv.cache_hits, lv.cache_misses),
+                theme::dim(),
+            ),
+        ]));
+        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             format!(
-                "{} checkpoints  ·  {:.1} GiB total",
-                app.ckpts.len(),
-                total_gb
+                "  {:<3} {:<24} {:<12} {:<12} {:<7} {}",
+                "#", "Stage", "Input", "Output", "Cached", "Elapsed"
             ),
             theme::dim(),
         )));
-        lines.push(Line::from(""));
-        for (i, c) in app.ckpts.iter().enumerate() {
+        for r in &lv.rows {
+            let cached = if r.cached { "yes" } else { "no" };
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {:<3} {:<24} {:<12} {:<12} {:<7} {}",
+                    r.node_idx,
+                    truncate(&r.stage, 24),
+                    r.input,
+                    r.output,
+                    cached,
+                    r.elapsed
+                ),
+                theme::normal(),
+            )));
+        }
+    }
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, area);
+}
+
+/// Artifacts view: the content-addressed outputs the selected run
+/// materialized (kind, producing stage, hash, time), read from its stage
+/// sidecars.
+fn draw_artifacts(f: &mut Frame<'_>, area: Rect, app: &App) {
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" {} (↑↓ move · r refresh · b back) ", View::Artifacts.title()),
+            theme::title(),
+        ))
+        .border_style(theme::dim())
+        .borders(Borders::ALL);
+    let mut lines: Vec<Line> = vec![view_header("Artifacts"), Line::from("")];
+    if app.artifacts.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No artifacts for the selected run — pick a run in History (Enter), or none produced output.",
+            theme::dim(),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("  {:<24} {:<24} {:<14} {}", "Kind", "Stage", "Hash", "When"),
+            theme::dim(),
+        )));
+        for (i, a) in app.artifacts.iter().enumerate() {
             let cursor = i == app.list_cursor;
             let prefix = if cursor { "▶ " } else { "  " };
             let style = if cursor {
@@ -2508,10 +2661,12 @@ fn draw_checkpoints(f: &mut Frame<'_>, area: Rect, app: &App) {
             };
             lines.push(Line::from(vec![
                 Span::styled(prefix.to_string(), theme::success()),
-                Span::styled(format!("{:<40} ", truncate(&c.name, 40)), style),
-                Span::styled(format!("{:>8.1} MB  ", c.size_mb), theme::key_hint()),
-                Span::styled(format!("{}  ", c.date), theme::dim()),
-                Span::styled(c.rel_dir.clone(), theme::dim()),
+                Span::styled(
+                    format!("{:<24} {:<24} ", truncate(&a.kind, 24), truncate(&a.stage, 24)),
+                    style,
+                ),
+                Span::styled(format!("{:<14} ", a.hash), theme::key_hint()),
+                Span::styled(a.when.clone(), theme::dim()),
             ]));
         }
     }
@@ -2521,60 +2676,85 @@ fn draw_checkpoints(f: &mut Frame<'_>, area: Rect, app: &App) {
     f.render_widget(para, area);
 }
 
-/// Presets & Hyperparameters view (Python `_screen_presets` +
-/// `_screen_hparams` + decoder tiers + validated features). Read-only
-/// catalog — the live values live in recipe Args JSON (ADR 0017).
-fn draw_presets(f: &mut Frame<'_>, area: Rect, _app: &App) {
+/// Recipe Catalog view: every recipe the loaded cookbooks registered (name,
+/// course, description) with the selected recipe's backend, I/O kinds,
+/// schedule, and args schema expanded below. Driven entirely by the live
+/// registry — no domain knowledge, no stale reference tables.
+fn draw_catalog(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .title(Span::styled(
-            format!(" {} (b back) ", View::Presets.title()),
+            format!(" {} (↑↓ move · b back) ", View::Catalog.title()),
             theme::title(),
         ))
         .border_style(theme::dim())
         .borders(Borders::ALL);
-    let mut lines: Vec<Line> = vec![view_header("Presets & Hyperparameters"), Line::from("")];
-    lines.push(Line::from(Span::styled("PRESETS", theme::highlight())));
-    for (name, ep, wpe, est, use_case) in views::PRESETS {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {:<12}", name), theme::heading()),
-            Span::styled(format!("{ep:<12} {wpe:<10} "), theme::normal()),
-            Span::styled(format!("{est:<8}  "), theme::warning()),
-            Span::styled(use_case.to_string(), theme::dim()),
-        ]));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "DECODER TIERS",
-        theme::highlight(),
-    )));
-    for (tier, params, note) in views::DECODER_TIERS {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {tier:<10}"), theme::heading()),
-            Span::styled(format!("{params:<8} "), theme::normal()),
-            Span::styled(note.to_string(), theme::dim()),
-        ]));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "PRODUCTION-VALIDATED FEATURES",
-        theme::highlight(),
-    )));
-    for feat in views::VALIDATED_FEATURES {
+    let mut lines: Vec<Line> = vec![view_header("Recipe Catalog"), Line::from("")];
+    if app.catalog.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!("  • {feat}"),
-            theme::normal(),
+            "No recipes registered — load a cookbook into the binary's Registry.",
+            theme::dim(),
         )));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "HYPERPARAMETERS (set via recipe Args JSON — ADR 0017)",
-        theme::highlight(),
-    )));
-    for (group, fields) in views::HPARAM_GROUPS {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {:<16}", group), theme::heading()),
-            Span::styled(fields.join(", "), theme::dim()),
-        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("  {:<22} {:<11} {}", "Recipe", "Course", "Description"),
+            theme::dim(),
+        )));
+        for (i, r) in app.catalog.iter().enumerate() {
+            let cursor = i == app.list_cursor;
+            let prefix = if cursor { "▶ " } else { "  " };
+            let style = if cursor {
+                theme::selected()
+            } else {
+                theme::normal()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix.to_string(), theme::success()),
+                Span::styled(format!("{:<22} ", truncate(r.name, 22)), style),
+                Span::styled(format!("{:<11} ", r.category.label()), theme::key_hint()),
+                Span::styled(truncate(r.description, 40), theme::dim()),
+            ]));
+        }
+        // Selected-recipe detail card.
+        if let Some(r) = app.catalog.get(app.list_cursor) {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(format!("▸ {}", r.name), theme::title())));
+            let kinds_in = if r.input_kinds.is_empty() {
+                "(none — graph input)".to_string()
+            } else {
+                r.input_kinds.join(", ")
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  backend ", theme::dim()),
+                Span::styled(r.backend_id.to_string(), theme::normal()),
+                Span::styled("    in ", theme::dim()),
+                Span::styled(kinds_in, theme::normal()),
+                Span::styled("  →  out ", theme::dim()),
+                Span::styled(r.output_kind.to_string(), theme::normal()),
+            ]));
+            if let Some(cal) = r.schedule {
+                lines.push(Line::from(vec![
+                    Span::styled("  schedule ", theme::dim()),
+                    Span::styled(cal.to_string(), theme::normal()),
+                ]));
+            }
+            let schema = (r.args_schema_fn)();
+            let props = schema_prop_names(&schema);
+            lines.push(Line::from(Span::styled(
+                if props.is_empty() {
+                    "  args: (none)".to_string()
+                } else {
+                    "  args:".to_string()
+                },
+                theme::dim(),
+            )));
+            for p in &props {
+                let ty = schema_field_type(&schema, p);
+                lines.push(Line::from(vec![
+                    Span::styled(format!("    {:<24} ", truncate(p, 24)), theme::heading()),
+                    Span::styled(ty, theme::dim()),
+                ]));
+            }
+        }
     }
     let para = Paragraph::new(lines)
         .block(block)
@@ -2582,8 +2762,8 @@ fn draw_presets(f: &mut Frame<'_>, area: Rect, _app: &App) {
     f.render_widget(para, area);
 }
 
-/// Live Metrics view (Python `_screen_live_metrics` terminal tail):
-/// the tail of the newest training-log CSV, re-read each tick.
+/// Run Metrics view: the selected run's final metric values (name → value),
+/// read from the lineage DB.
 fn draw_metrics(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .title(Span::styled(
@@ -2592,38 +2772,42 @@ fn draw_metrics(f: &mut Frame<'_>, area: Rect, app: &App) {
         ))
         .border_style(theme::dim())
         .borders(Borders::ALL);
-    let n = area.height.saturating_sub(4) as usize;
-    let tail = views::metrics_tail(&app.repo_root, n.max(10));
-    let lines: Vec<Line> = std::iter::once(view_header("Live Metrics"))
-        .chain(std::iter::once(Line::from("")))
-        .chain(tail.into_iter().map(|s| {
-            if s.starts_with('#') {
-                Line::from(Span::styled(s, theme::key_hint()))
-            } else {
-                Line::from(Span::styled(s, theme::normal()))
-            }
-        }))
-        .collect();
+    let mut lines: Vec<Line> = vec![view_header("Run Metrics"), Line::from("")];
+    if app.metrics.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No metrics for the selected run — pick a run in History (Enter), or none has logged metrics yet.",
+            theme::dim(),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("  {:<32} {}", "Metric", "Value"),
+            theme::dim(),
+        )));
+        for (name, value) in &app.metrics {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<32} ", truncate(name, 32)), theme::heading()),
+                Span::styled(format!("{value:.6}"), theme::normal()),
+            ]));
+        }
+    }
     let para = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
 
-/// Reset view (Python `_screen_reset` + `_screen_export`): the three
-/// destructive maintenance actions (two-press Enter confirm) + export.
+/// Maintenance view: generic, domain-agnostic destructive actions on the
+/// engine's own state — prune the cache, delete the selected job's dir,
+/// forget footprint calibrations. Each needs a second Enter to confirm.
 fn draw_reset(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .title(Span::styled(
-            format!(
-                " {} (↑↓ move · Enter confirm · e export · b back) ",
-                View::Reset.title()
-            ),
+            format!(" {} (↑↓ move · Enter confirm (2×) · b back) ", View::Reset.title()),
             theme::title(),
         ))
         .border_style(theme::dim())
         .borders(Borders::ALL);
-    let mut lines: Vec<Line> = vec![view_header("Reset Training State"), Line::from("")];
+    let mut lines: Vec<Line> = vec![view_header("Maintenance"), Line::from("")];
     lines.push(Line::from(Span::styled(
         "Destructive — each action requires a second Enter to confirm.",
         theme::warning(),
@@ -2653,14 +2837,14 @@ fn draw_reset(f: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled(format!("{}{suffix}", action.label()), style),
         ]));
     }
+    // "Delete the selected job's directory" acts on the current run — show it.
     lines.push(Line::from(""));
+    let target = app
+        .current_job_id()
+        .unwrap_or_else(|| "(none selected)".into());
     lines.push(Line::from(vec![
-        Span::styled("  [e] ", theme::key_hint()),
-        Span::styled("Export configuration ", theme::normal()),
-        Span::styled(
-            "(write recipe Args JSON schemas to repo root)",
-            theme::dim(),
-        ),
+        Span::styled("  selected job (for clear): ", theme::dim()),
+        Span::styled(target, theme::normal()),
     ]));
     let para = Paragraph::new(lines)
         .block(block)
@@ -2681,24 +2865,23 @@ fn truncate(s: &str, max: usize) -> String {
 fn draw_status(f: &mut Frame<'_>, area: Rect, app: &App) {
     let base = match app.view {
         View::Cockpit => {
-            "q quit • ↑↓ select • Enter log • r refresh • c cancel • R recipe • J/L/Y/H/B/K/P/M/X views"
+            "q quit • ↑↓ select • Enter log • r refresh • c cancel • R recipe • J/L/Y/H/B/C/G/I/A/M/P/X views"
         }
         View::Jobs => "↑↓ select • Enter log • c cancel • r refresh • b back • q quit",
         View::Log => "↑↓ select job • c cancel • r refresh • b back • q quit",
         View::System => "r refresh • b back • q quit",
         View::History | View::Leaderboard => {
-            "↑↓ move • m mark • C compare • r refresh • b back • q quit"
+            "↑↓ move • m mark • Enter DAG • r refresh • b back • q quit"
         }
         View::Compare => "mark runs with m in History/Leaderboard • b back • q quit",
-        View::Checkpoints => "↑↓ move • r refresh • b back • q quit",
-        View::Presets => "b back • q quit",
-        View::Metrics => "r refresh • b back • q quit",
-        View::Reset => "↑↓ move • Enter confirm (2x) • e export • b back • q quit",
+        View::Dag | View::Lineage | View::Metrics => "r refresh • b back • q quit",
+        View::Artifacts => "↑↓ move • r refresh • b back • q quit",
+        View::Catalog => "↑↓ move • b back • q quit",
+        View::Reset => "↑↓ move • Enter confirm (2×) • b back • q quit",
     };
     let para = if let Some((msg, _)) = &app.status_msg {
         // Status message segment in the success-tinted bar style, the
-        // key-hint base in the standard status-bar style (matches the
-        // lamquant status-bar convention).
+        // key-hint base in the standard status-bar style.
         Paragraph::new(Line::from(vec![
             Span::styled(format!(" {msg} "), theme::status_msg()),
             Span::styled(format!(" {base} "), theme::status_bar()),
@@ -2724,13 +2907,11 @@ mod render_tests {
         // and the section-heading assertions are charset-stable.
         theme::detect("always", "unicode");
         super::isolate_datasets_db_for_tests();
-        let mut app = App::new(test_registry());
-        // Point the repo root at an empty temp dir so views::* don't pick
-        // up stray training_logs / checkpoints from the dev tree.
-        let tmp = std::env::temp_dir().join(format!("blut-tui-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&tmp);
-        app.repo_root = tmp;
-        app
+        // The analytic views read the global lineage DB / jobs store lazily
+        // (only when `set_view`/refresh runs); the render tests set `app.view`
+        // directly, so the per-job caches stay at their empty `new()` defaults
+        // and the drawers render their deterministic empty states.
+        App::new(test_registry())
     }
 
     /// Render the app's current view to a fresh `TestBackend` of the
@@ -2848,8 +3029,8 @@ mod render_tests {
     fn menu_desc_collapses_and_clips_to_one_line() {
         // Multi-line / over-long descriptions squash to a single
         // ≤76-char row so lower menu sections stay on-screen.
-        let long = "Full LamQuant SNN pipeline end-to-end: EDF→.lma encode (lml) → \
-             patient-level seizure-stratified split manifest → train → gate.";
+        let long = "A deliberately long recipe description that runs well past the \
+             single-row clip width so the squash-and-ellipsis path is exercised.";
         let d = menu_desc(long);
         assert!(!d.contains('\n'));
         assert!(d.chars().count() <= 76, "got {} chars", d.chars().count());
@@ -2871,12 +3052,10 @@ mod render_tests {
         let text = buffer_text(&buf);
         // The always-present (non-recipe-driven) section headings must
         // render regardless of which cookbooks are registered. The
-        // recipe-category headings (DATA PREPARATION / PIPELINE / …) are
-        // data-driven off the injected catalog — blut-core's default
-        // registry is lamu-only (no DataPrep/Pipeline recipes; those live
-        // in cookbook-lamquant since C2a), so they are asserted in the
-        // cookbook crate's TUI tests, not here.
-        for heading in ["DIAGNOSTICS", "PLANNING", "SYSTEM"] {
+        // recipe-course headings are data-driven off the injected catalog,
+        // so they depend on the test registry and are asserted in the
+        // cookbook crates' TUI tests, not here.
+        for heading in ["RUNS", "PROVENANCE", "SYSTEM"] {
             assert!(
                 text.contains(heading),
                 "cockpit menu missing section heading `{heading}`"
@@ -2908,9 +3087,11 @@ mod render_tests {
             View::History,
             View::Leaderboard,
             View::Compare,
-            View::Checkpoints,
-            View::Presets,
+            View::Dag,
+            View::Lineage,
+            View::Artifacts,
             View::Metrics,
+            View::Catalog,
             View::Reset,
         ];
         for view in views {
@@ -2934,10 +3115,12 @@ mod render_tests {
                 View::History => "Run History",
                 View::Leaderboard => "Leaderboard",
                 View::Compare => "Compare Runs",
-                View::Checkpoints => "Checkpoints",
-                View::Presets => "Presets",
-                View::Metrics => "Live Metrics",
-                View::Reset => "Reset",
+                View::Dag => "Run DAG",
+                View::Lineage => "Lineage",
+                View::Artifacts => "Artifacts",
+                View::Metrics => "Run Metrics",
+                View::Catalog => "Recipe Catalog",
+                View::Reset => "Maintenance",
             };
             assert!(
                 text.contains(needle),
@@ -2992,15 +3175,7 @@ mod state_tests {
     /// repo root so nothing in these tests touches the dev tree.
     fn app() -> App {
         super::isolate_datasets_db_for_tests();
-        let mut a = App::new(test_registry());
-        let tmp = std::env::temp_dir().join(format!(
-            "blut-tui-state-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::create_dir_all(&tmp);
-        a.repo_root = tmp;
-        a
+        App::new(test_registry())
     }
 
     fn key(c: char) -> KeyEvent {
@@ -3563,9 +3738,12 @@ mod state_tests {
             ('Y', View::System),
             ('H', View::History),
             ('B', View::Leaderboard),
-            ('K', View::Checkpoints),
-            ('P', View::Presets),
+            ('C', View::Compare),
+            ('G', View::Dag),
+            ('I', View::Lineage),
+            ('A', View::Artifacts),
             ('M', View::Metrics),
+            ('P', View::Catalog),
             ('X', View::Reset),
         ];
         for (c, want) in cases {

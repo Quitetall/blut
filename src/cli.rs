@@ -26,8 +26,9 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 
-/// Top-level `about` line. CLI-only by default; with the `tui` feature the bare
-/// command opens the cockpit (so the banner reflects which build this is).
+/// Top-level `about` line. The default build is TUI-on, so bare `blut` opens the
+/// cockpit; a `--no-default-features` build is CLI-only (so the banner reflects
+/// which build this is).
 #[cfg(feature = "tui")]
 const CLI_ABOUT: &str = "BLUT — typed-DAG orchestrator for local ML training. Bare `blut` opens the \
      interactive cockpit; subcommands: recipe, jobs, log, cancel, plan, cache, \
@@ -616,9 +617,9 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
                 crate::tui::run(reg).await
             }
         }
-        // Bare `blut`: with the `tui` feature ON, open the interactive cockpit
-        // (the 1.1 behaviour). With it OFF (the CLI-only 1.0 default), there is
-        // no interactive mode — print help so the user sees the subcommands.
+        // Bare `blut`: the default (TUI-on) build opens the interactive cockpit.
+        // A `--no-default-features` (CLI-only) build has no interactive mode —
+        // print help so the user sees the subcommands.
         #[cfg(feature = "tui")]
         None => crate::tui::run(reg).await,
         #[cfg(not(feature = "tui"))]
@@ -626,8 +627,9 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
             use clap::CommandFactory;
             Cli::command().print_help().ok();
             println!(
-                "\n(blut 1.0 is CLI-only — run a subcommand above. The interactive \
-                 cockpit returns in 1.1; build with `--features tui` to preview it.)"
+                "\n(this is a CLI-only build — run a subcommand above. The interactive \
+                 cockpit ships in the default build; rebuild without \
+                 `--no-default-features` to get it.)"
             );
             Ok(())
         }

@@ -1,12 +1,19 @@
 # blut — the domain-agnostic BLUT engine, a lib-only crate. Ships ZERO
 # recipes, concrete stages, backends, or Python: only the framework
 # (Stage / Plan / Recipe / Registry / Cookbook trait), the content-
-# addressed cache, the never-OOM resource broker, HPO, lineage, and the
-# CLI orchestration. Cookbooks that supply recipes + the user-facing
-# binaries are SEPARATE crates depending on this one; the generic-LLM
-# stages + backends live in `blut-backends`. The interactive TUI cockpit
-# is behind the off-by-default `tui` feature (CLI-only in 1.0; returns in
-# 1.1). See README.md / API.md.
+# addressed cache, the never-OOM resource broker, HPO, lineage, the
+# interactive TUI cockpit, and the CLI orchestration. Cookbooks that
+# supply recipes + the user-facing binaries are SEPARATE crates depending
+# on this one; the generic-LLM stages + backends live in `blut-backends`.
+# The TUI cockpit ships in 1.0 (default-on `tui` feature); build with
+# `--no-default-features` for a lean CLI-only binary. See README.md / API.md.
+
+# Standalone crate: declare our own (empty) workspace so the engine builds
+# independently of whatever parent tree it's vendored or nested under (it lives
+# as a submodule inside a larger meta-repo). Ignored when consumed as a
+# crates.io dependency. Keeps `cargo build`/`publish` self-contained.
+[workspace]
+
 [package]
 name = "blut"
 version = "1.0.0"
@@ -67,17 +74,17 @@ which = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 bincode = "1.3"
 rand = "0.8"
-# TUI deps — optional, behind the off-by-default `tui` feature. The 1.0
-# release is CLI-only; the interactive cockpit returns (feature on / stabilized)
-# in 1.1. With `tui` off these three are absent from the dependency tree.
+# TUI deps — optional, behind the default-on `tui` feature. Building with
+# `--no-default-features` drops these three from the dependency tree and
+# yields a lean CLI-only binary.
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.28", optional = true }
 fuzzy-matcher = { version = "0.3", optional = true }
 
 [features]
-default = []
-# The interactive ratatui cockpit (`blut tui`, and bare `blut`). Off in 1.0
-# (CLI-only); a cookbook binary opts in with `blut = { ..., features = ["tui"] }`.
+default = ["tui"]
+# The interactive ratatui cockpit (`blut tui`, and bare `blut`). On by default
+# in 1.0; drop it with `blut = { ..., default-features = false }` for CLI-only.
 tui = ["dep:ratatui", "dep:crossterm", "dep:fuzzy-matcher"]
 
 [dev-dependencies]

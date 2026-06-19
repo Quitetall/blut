@@ -267,7 +267,8 @@ mod tests {
     fn stale_threshold_consistency() {
         // The heartbeat cadence must be tight enough that the stale window is a
         // clean multiple — a crash is detected within ~3 missed heartbeats.
-        assert!(HEARTBEAT_INTERVAL_SECS * 3 <= DEFAULT_STALE_AFTER_SECS);
+        // A compile-time invariant (both operands are consts).
+        const { assert!(HEARTBEAT_INTERVAL_SECS * 3 <= DEFAULT_STALE_AFTER_SECS) };
     }
 
     // ── resume_dir derivation ─────────────────────────────────────────
