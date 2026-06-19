@@ -15,11 +15,22 @@ edition = "2024"
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/Quitetall/blut"
+homepage = "https://github.com/Quitetall/blut"
+documentation = "https://docs.rs/blut"
 rust-version = "1.85"
 description = "BLUT — Brian Lam's Universal Trainer. Stage→Plan→Recipe orchestrator framework for local ML training (SFT, DPO, distillation, eval)."
 readme = "README.md"
 keywords = ["ml", "training", "fine-tune", "lora", "orchestrator"]
 categories = ["command-line-utilities", "development-tools"]
+# Trim the published package to the crate itself. NOTE: `scripts/` is KEPT —
+# `src/config/launcher.rs` `include_str!`s `scripts/run_contained.sh` at compile
+# time, so excluding it would break the build from a packaged tarball.
+exclude = [
+    "bench-baselines/",   # 92 Criterion baseline JSONs (~632 KB dev artifacts)
+    ".github/",           # CI config — not useful to crate consumers
+    "docs/",              # internal design specs
+    "signatures/",        # CLA signature bookkeeping — not crate content
+]
 
 [lib]
 path = "src/lib.rs"
