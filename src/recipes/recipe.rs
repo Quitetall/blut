@@ -97,7 +97,19 @@ pub fn compile_erased<R: Recipe + Default>(
     // Prefix the recipe name so a bad-args error names the culprit. This was
     // hand-done in only 2 of the migrated recipes; centralizing here gives the
     // prefix to every recipe uniformly.
-    let args: R::Args = serde_json::from_value(raw)
+    //
+    // ZERO-ARG RECIPES: a recipe that takes no args declares a unit-struct
+    // `Args` (`struct Foo;`), which serde deserializes from `null` — but the CLI
+    // / TUI default missing args to an empty object `{}`. Coerce `{}` → `null` on
+    // failure so `recipe run <name>` works with no `--args` for such recipes.
+    let args: R::Args = serde_json::from_value(raw.clone())
+        .or_else(|e| {
+            if raw.as_object().is_some_and(|o| o.is_empty()) {
+                serde_json::from_value(serde_json::Value::Null)
+            } else {
+                Err(e)
+            }
+        })
         .map_err(|e| RecipeError::InvalidArgs(format!("{}: {e}", R::NAME)))?;
     R::default().compile(args).map(|p| p.into_compiled())
 }

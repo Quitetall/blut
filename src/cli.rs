@@ -26,6 +26,17 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 
+/// Top-level `about` line. CLI-only by default; with the `tui` feature the bare
+/// command opens the cockpit (so the banner reflects which build this is).
+#[cfg(feature = "tui")]
+const CLI_ABOUT: &str = "BLUT — typed-DAG orchestrator for local ML training. Bare `blut` opens the \
+     interactive cockpit; subcommands: recipe, jobs, log, cancel, plan, cache, \
+     footprint, partition, schedule, sensor, policy, tui.";
+#[cfg(not(feature = "tui"))]
+const CLI_ABOUT: &str = "BLUT — typed-DAG orchestrator for local ML training. Run a subcommand: \
+     recipe, jobs, log, cancel, plan, cache, footprint, partition, schedule, \
+     sensor, policy.";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "blut",
@@ -34,7 +45,7 @@ use clap::{Parser, Subcommand};
     // is visible at a glance; build.rs composes BLUT_VERSION. Complements the
     // runtime `warn_if_stale_binary` check.
     version = env!("BLUT_VERSION"),
-    about = "BLUT — interactive training cockpit (bare `blut` opens the TUI). Subcommands: jobs, log, cancel, recipe, plan, cache, data, policy, tui."
+    about = CLI_ABOUT
 )]
 struct Cli {
     #[command(subcommand)]
@@ -1393,6 +1404,19 @@ fn dir_size_bytes(path: &std::path::Path) -> Result<u64> {
 ///   * `latent` — `--encoder-width N` in `extra_args` (folded into the
 ///     estimate, NOT the key).
 fn recipe_footprint(name: &str, raw: &serde_json::Value) -> crate::broker::Footprint {
+    // A recipe invoked with NO args (null or an empty object) is billed a LIGHT
+    // base footprint, not the conservative trainer estimate. A heavy data-trainer
+    // always declares required args (data roots, a manifest), so an arg-less
+    // recipe is a lightweight in-process workflow; without this a trivial zero-arg
+    // recipe is billed the full trainer ~30G and refused on a loaded box. Safe for
+    // the trainer recipes (they always carry args → the estimate path below). A
+    // general per-recipe DECLARED footprint is a tracked post-1.0 addition (API.md).
+    if raw.is_null() || raw.as_object().is_some_and(|o| o.is_empty()) {
+        return crate::broker::Footprint {
+            ram_bytes: 2 * 1024 * 1024 * 1024,
+            vram_mib: 0,
+        };
+    }
     // THE single shared extraction (RESOLVE side). `Drivers::from_args_json`
     // clamps workers to `UNCALIBRATED_WORKER_CAP` and resolves batch/tier the
     // same way the train stage's `train_containment` does (RECORD side), so
