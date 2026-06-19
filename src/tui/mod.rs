@@ -405,6 +405,7 @@ struct App {
     dag: Option<crate::framework::GraphSnapshot>,
     lineage: views::LineageView,
     metrics: Vec<(String, f64)>,
+    compare: Vec<views::CompareCol>,
     /// Cursor for list-style views (history / leaderboard / artifacts /
     /// catalog). `marked` holds the job ids selected for Compare.
     list_cursor: usize,
@@ -467,6 +468,7 @@ impl App {
             dag: None,
             lineage: views::LineageView::default(),
             metrics: Vec::new(),
+            compare: Vec::new(),
             list_cursor: 0,
             marked: Vec::new(),
             reset_cursor: 0,
@@ -503,7 +505,7 @@ impl App {
         match view {
             View::History => self.runs = views::run_history(views::DEFAULT_METRIC),
             View::Leaderboard => self.runs = views::leaderboard(views::DEFAULT_METRIC, false),
-            View::Compare => {} // draw_compare gathers from `marked`
+            View::Compare => self.compare = views::compare(&self.marked),
             View::Artifacts => self.artifacts = job.map(views::artifacts_for).unwrap_or_default(),
             View::Dag => self.dag = job.and_then(views::dag_for),
             View::Lineage => self.lineage = job.map(views::lineage_for).unwrap_or_default(),
@@ -2429,7 +2431,9 @@ fn draw_compare(f: &mut Frame<'_>, area: Rect, app: &App) {
         .border_style(theme::dim())
         .borders(Borders::ALL);
     let mut lines: Vec<Line> = vec![view_header("Compare Runs"), Line::from("")];
-    let cols = views::compare(&app.marked);
+    // Cached in `App` (loaded by `load_view_data` on entry / refresh) so the
+    // drawer doesn't reopen the lineage DB every frame.
+    let cols = &app.compare;
     if cols.len() < 2 {
         lines.push(Line::from(Span::styled(
             "Mark at least 2 runs (press m on a row in History/Leaderboard) to compare.",
@@ -2439,7 +2443,7 @@ fn draw_compare(f: &mut Frame<'_>, area: Rect, app: &App) {
         // Header: a metric-name column + one column per marked run.
         let mut hdr = vec![Span::styled(format!("  {:<20}", "Metric"), theme::dim())];
         let mut ids = vec![Span::styled(format!("  {:<20}", ""), theme::dim())];
-        for c in &cols {
+        for c in cols {
             hdr.push(Span::styled(
                 format!("{:<20}", truncate(&c.recipe, 19)),
                 theme::heading(),
@@ -2454,7 +2458,7 @@ fn draw_compare(f: &mut Frame<'_>, area: Rect, app: &App) {
         lines.push(Line::from(""));
         // The union of metric names across the marked runs, sorted.
         let mut names: Vec<String> = Vec::new();
-        for c in &cols {
+        for c in cols {
             for (n, _) in &c.metrics {
                 if !names.contains(n) {
                     names.push(n.clone());
@@ -2467,7 +2471,7 @@ fn draw_compare(f: &mut Frame<'_>, area: Rect, app: &App) {
                 format!("  {:<20}", truncate(n, 19)),
                 theme::heading(),
             )];
-            for c in &cols {
+            for c in cols {
                 let v = c.metrics.iter().find(|(m, _)| m == n).map(|(_, v)| *v);
                 let txt = v.map(|v| format!("{v:.4}")).unwrap_or_else(|| "—".into());
                 row.push(Span::styled(format!("{txt:<20}"), theme::normal()));
@@ -2479,7 +2483,7 @@ fn draw_compare(f: &mut Frame<'_>, area: Rect, app: &App) {
             format!("  {:<20}", "gpu_saturation%"),
             theme::heading(),
         )];
-        for c in &cols {
+        for c in cols {
             let txt = c.gpu.map(|v| format!("{v:.1}")).unwrap_or_else(|| "—".into());
             g.push(Span::styled(format!("{txt:<20}"), theme::normal()));
         }

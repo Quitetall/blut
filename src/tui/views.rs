@@ -137,7 +137,9 @@ pub fn leaderboard(metric: &str, maximize: bool) -> Vec<RunRow> {
     let Ok(db) = LineageDb::open() else {
         return Vec::new();
     };
-    db.top_runs_by_metric(metric, maximize, 50)
+    // Cap at 20 — the leaderboard is a top-N ranking, and 20 matches the
+    // view's render limit so the list cursor can't run past the visible rows.
+    db.top_runs_by_metric(metric, maximize, 20)
         .unwrap_or_default()
         .into_iter()
         .map(|(job_id, _node_idx, value)| {
