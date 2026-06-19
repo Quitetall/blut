@@ -20,8 +20,8 @@
 //!
 //! Why a marker trait instead of a uniform `run(...)` method?
 //! Because backends don't share a single execution shape:
-//! HF Trainer takes a `TrainingArguments` dict + dataset; LAMU's
-//! trainer.py takes a `TrainSpec` JSON; LamQuant kernels are
+//! HF Trainer takes a `TrainingArguments` dict + dataset; a custom
+//! trainer.py takes a `TrainSpec` JSON; other kernels are plain
 //! argparse scripts. Forcing a uniform method would either lose
 //! all type information at the wire (back to a generic JSON-blob
 //! protocol) or constrain every backend to one shape. Instead,

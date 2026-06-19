@@ -313,7 +313,7 @@ pub trait Artifact: Send + Sync + serde::Serialize + serde::de::DeserializeOwned
     /// Override `false` for large bulk artifacts where content
     /// equality across reruns is rare and content hashing costs
     /// minutes (large model checkpoints, multi-GB GGUF files,
-    /// fullband memmaps). Concrete artifacts that pick `false`
+    /// large memmaps). Concrete artifacts that pick `false`
     /// must implement `content_hash()` using a stat-based
     /// fingerprint instead of bytes.
     const HASH_CONTENTS: bool = true;

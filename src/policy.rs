@@ -184,8 +184,8 @@ pub fn load_at(path: &Path) -> Result<TrainPolicy> {
     toml::from_str(&body).map_err(|e| TrainError::other(format!("parse {}: {e}", path.display())))
 }
 
-/// Atomically write the policy. Tmp + rename — same pattern as
-/// `lamu-core::registry::write_atomic`.
+/// Atomically write the policy. Tmp + rename — the standard
+/// write-to-temp-then-rename atomic-replace pattern.
 pub fn save(policy: &TrainPolicy) -> Result<()> {
     save_at(&policy_path()?, policy)
 }

@@ -39,8 +39,8 @@
 //!   r               refresh jobs + system
 //!   c               cancel selected job (SIGTERM via `blut cancel`)
 //!   R               custom-recipe fuzzy picker
-//!   `<recipe hotkey>` launch a recipe (pre-baked LamQuant defaults
-//!                   for the lamquant_* recipes, schema template else)
+//!   `<recipe hotkey>` launch a recipe (pre-baked defaults for the
+//!                   registered cookbook recipes, schema template else)
 //!   J/L/Y/H/B/K/P/M/X  switch to Jobs/Log/sYstem/History/leaderBoard/
 //!                      checKpoints/Presets/Metrics/reset views
 //!   Esc / b         back to cockpit view (or quit from cockpit)

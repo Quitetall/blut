@@ -5,8 +5,8 @@
 //! The blueprint's "constant 40-50G hint" is rejected by the review:
 //! it is not an upper bound across tier / batch / latent-dim, so a
 //! larger config can admit then OOM. The real driver of the RAM OOMs
-//! on this box is the dataloader: `LMA_NUM_WORKERS × per-worker LMA
-//! prefetch ≈ 23 GiB`. So the estimate is dominated by
+//! on this box is the dataloader: `num_workers × per-worker prefetch
+//! ≈ 23 GiB`. So the estimate is dominated by
 //! `workers × prefetch_per_worker`, with smaller additive terms for
 //! the model (scales with tier + latent_dim) and the live batch.
 //!
@@ -36,7 +36,7 @@ pub const DEFAULT_BATCH: u32 = 32;
 
 /// Conservative DataLoader worker cap for a train-shaped stage (ADR 0046
 /// slice-1 item 5). Each fork-worker is a CoW copy of the ~6 GiB parent
-/// plus decode buffers + per-worker L3/FB LRU, so RAM scales ~linearly
+/// plus decode buffers + a per-worker sample LRU, so RAM scales ~linearly
 /// with workers. MEASURED (2026-06-10): workers=4 peaked ~23 GiB RSS +
 /// ~9 GiB swap under a 25 GiB cap and OOM-killed under added pressure.
 /// Cap at **2**: ~20 GiB real demand, under the cap with headroom.
@@ -61,41 +61,44 @@ pub struct Drivers {
     pub workers: u32,
     /// Live mini-batch size (resolved default applied).
     pub batch: u32,
-    /// Decoder tier (1..=8); larger ⇒ more model/optimizer RAM.
+    /// Model tier (1..=8); larger ⇒ more model/optimizer RAM.
     pub tier: u32,
-    /// Encoder latent width (0 ⇒ billed as the 256-wide default).
+    /// Model latent width (0 ⇒ billed as the 256-wide default).
     /// Folded into the estimate, NOT the calibration key.
     pub latent: u32,
-    /// Never-OOM Phase 3: the per-window fullband disk cache is warmed upstream
+    /// Never-OOM Phase 3: the per-sample disk cache is warmed upstream
     /// (`warm_fb_cache` recipe arg). Lowers the per-worker term (the warm worker
-    /// holds no whole-recording decode) AND is part of the calibration key, so a
+    /// holds no whole-input decode) AND is part of the calibration key, so a
     /// warm `Measured` peak can never resolve a cold run (and vice versa).
     pub warm: bool,
-    /// Encoder INPUT channels (`detail_bands`): 21 = L3-only, 168 = full
-    /// detail-band stack (the joint default `--detail-bands all`). The 8×
-    /// wider fullband front-end (wider encoder layers + SOAP preconditioners +
-    /// the stacked dataloader input) costs materially more RAM than L3 — without
-    /// this term a fullband launch billed identically to L3 and was admitted
-    /// then cgroup-killed. Folded into the ESTIMATE, not the key: the store's
-    /// MAX-merge keeps the largest (fullband) peak per key, so a low L3 peak can
-    /// never under-size a fullband run. SET VIA [`in_ch_from_args`] (or
-    /// [`L3_ONLY_IN_CH`]/[`DEFAULT_IN_CH`]); the estimate rounds a non-multiple
-    /// of 21 UP, so an arbitrary value is billed conservatively, never under.
+    /// Model INPUT channels (`detail_bands`): 21 = the narrow baseline, 168 =
+    /// the full input width (the wide default `--detail-bands all`). The 8×
+    /// wider full-width front-end (wider model layers + SOAP preconditioners +
+    /// the stacked dataloader input) costs materially more RAM than the narrow
+    /// baseline — without this term a full-width launch billed identically to the
+    /// baseline and was admitted then cgroup-killed. Folded into the ESTIMATE,
+    /// not the key: the store's MAX-merge keeps the largest (full-width) peak per
+    /// key, so a low baseline peak can never under-size a full-width run. SET VIA
+    /// [`in_ch_from_args`] (or [`L3_ONLY_IN_CH`]/[`DEFAULT_IN_CH`]); the estimate
+    /// rounds a non-multiple of 21 UP, so an arbitrary value is billed
+    /// conservatively, never under.
     pub in_ch: u32,
 }
 
-/// Default encoder input channels when no `--detail-bands`/`--n` override is
-/// present: the kernel's own default is `detail_bands='all'` (the full stack →
-/// 168 ch), so a bare joint run IS fullband. Defaulting here to 168 (not 21) is
-/// the load-bearing fix — the implicit-fullband default must not be under-billed.
+/// Default model input channels when no `--detail-bands`/`--n` override is
+/// present: the kernel's own default is `detail_bands='all'` (the full input
+/// width → 168 ch), so a bare run IS full-width. Defaulting here to 168 (not 21)
+/// is the load-bearing fix — the implicit full-width default must not be
+/// under-billed.
 pub const DEFAULT_IN_CH: u32 = 168;
-/// L3-only encoder input (`--detail-bands none` / `--n none`).
+/// Narrow-baseline model input (`--detail-bands none` / `--n none`).
 pub const L3_ONLY_IN_CH: u32 = 21;
 
-/// Map a `--detail-bands` / `--n` mode token to the conservative encoder in_ch.
-/// `none` → L3-only (21). ANY other mode (`all` / `l3_detail` / …) → the full
-/// stack (168), billed conservatively so a partial-band run is never UNDER-sized
-/// (over-billing a partial stack only over-provisions; the store self-heals).
+/// Map a `--detail-bands` / `--n` mode token to the conservative model in_ch.
+/// `none` → narrow baseline (21). ANY other mode (`all` / `l3_detail` / …) → the
+/// full input width (168), billed conservatively so a partial run is never
+/// UNDER-sized (over-billing a partial width only over-provisions; the store
+/// self-heals).
 pub fn in_ch_from_detail_bands(mode: &str) -> u32 {
     if mode.trim().eq_ignore_ascii_case("none") {
         L3_ONLY_IN_CH
@@ -104,7 +107,7 @@ pub fn in_ch_from_detail_bands(mode: &str) -> u32 {
     }
 }
 
-/// Resolve the encoder in_ch from a train invocation's passthrough args.
+/// Resolve the model in_ch from a train invocation's passthrough args.
 ///
 /// Precedence: `--detail-bands <m>` (or its `--n <m>` alias) in `extra_args`
 /// wins; else `SNN_DETAIL_BANDS=<bands>` in `extra_env` (empty ⇒ none ⇒ 21);
@@ -131,9 +134,9 @@ pub fn in_ch_from_args(extra_args: &[&str], extra_env: &[&str]) -> u32 {
     }
     for kv in extra_env {
         if let Some(val) = kv.strip_prefix("SNN_DETAIL_BANDS=") {
-            // train_joint.py sets this to `''` for `detail_bands='none'`, so
-            // empty ⇒ L3-only; tolerate a literal `none` too. Any band list ⇒
-            // fullband (conservative).
+            // The trainer sets this to `''` for `detail_bands='none'`, so
+            // empty ⇒ narrow baseline; tolerate a literal `none` too. Any band
+            // list ⇒ full width (conservative).
             let v = val.trim();
             return if v.is_empty() || v.eq_ignore_ascii_case("none") {
                 L3_ONLY_IN_CH
@@ -161,7 +164,7 @@ impl Drivers {
     /// Extract the cost drivers from a recipe's args JSON. Workers
     /// defaults to and is clamped by [`UNCALIBRATED_WORKER_CAP`] (the
     /// value the train stage actually launches), `batch` to
-    /// [`DEFAULT_BATCH`], `tier` to 3 (the joint-recipe default), and
+    /// [`DEFAULT_BATCH`], `tier` to 3 (the train-recipe default), and
     /// `latent` is parsed from a `--encoder-width N` token in
     /// `extra_args` (0 = unspecified).
     pub fn from_args_json(raw: &serde_json::Value) -> Self {
@@ -187,7 +190,7 @@ impl Drivers {
             })
             .unwrap_or(0);
         // `warm_fb_cache` (Phase 2/3): present + true on the warm-by-default
-        // joint recipe; ABSENT ⇒ false (the conservative cold term) so a recipe
+        // train recipe; ABSENT ⇒ false (the conservative cold term) so a recipe
         // that doesn't warm is never under-billed. The cli RESOLVE side reads
         // it here; the cookbook RECORD side reads the same flag off the train
         // stage's args — they must agree or the calibration key never hits.
@@ -195,8 +198,8 @@ impl Drivers {
             .get("warm_fb_cache")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        // Encoder in_ch from the detail-band mode (default 168 = the kernel's
-        // implicit `detail_bands='all'`); the under-bill fix for fullband.
+        // Model in_ch from the detail-band mode (default 168 = the kernel's
+        // implicit `detail_bands='all'`); the under-bill fix for full width.
         let in_ch = in_ch_from_args_json(raw);
         Self {
             workers,
@@ -243,8 +246,8 @@ impl Drivers {
     }
 }
 
-/// Per-DataLoader-worker LMA prefetch RAM (CoW fork + decode buffers +
-/// per-worker L3/FB LRU).
+/// Per-DataLoader-worker prefetch RAM (CoW fork + decode buffers +
+/// per-worker sample LRU).
 ///
 /// MEASURED (2026-06-10): a tier-3 warm run at workers=4 peaks ~23 GiB
 /// RESIDENT *plus ~9 GiB swap* under a 25 GiB cgroup cap — i.e. its true
@@ -258,15 +261,14 @@ impl Drivers {
 /// hard-bounds any under-shoot to a unit kill, never a box OOM.
 const PREFETCH_PER_WORKER_BYTES: u64 = 4 * GIB;
 
-/// Per-DataLoader-worker RAM when the per-window fullband disk cache is WARM
-/// (never-OOM Phase 2: `lamquant_warm_fb_cache` ran upstream). With every used
-/// window already on disk, the adapter's disk tier hits FIRST and the in-proc
-/// whole-recording signal LRU stays EMPTY (lma_typed_adapter `_fetch_window`),
-/// so the per-worker resident set collapses to CoW-fork + a reclaimable mmap
-/// page + the small L3 LRU — NOT a whole multi-hour recording. The cold
-/// [`PREFETCH_PER_WORKER_BYTES`] (4 GiB) was sized for the PRE-Phase-1/2 worker
-/// that held + re-decoded a whole recording every epoch (the OOM driver); the
-/// warm worker's true set is ~1.5-2.5 GiB.
+/// Per-DataLoader-worker RAM when the per-sample disk cache is WARM
+/// (never-OOM Phase 2: the warm-cache stage ran upstream). With every used
+/// sample already on disk, the adapter's disk tier hits FIRST and the in-proc
+/// whole-input LRU stays EMPTY, so the per-worker resident set collapses to
+/// CoW-fork + a reclaimable mmap page + the small per-sample LRU — NOT a whole
+/// large input. The cold [`PREFETCH_PER_WORKER_BYTES`] (4 GiB) was sized for the
+/// PRE-Phase-1/2 worker that held + re-decoded a whole input every epoch (the
+/// OOM driver); the warm worker's true set is ~1.5-2.5 GiB.
 ///
 /// Set conservative-HIGH at 3 GiB (a 25% cut, not the full ~40%) because no
 /// post-warm clean run has been MEASURED yet — the store auto-tightens DOWN
@@ -282,31 +284,32 @@ const PREFETCH_PER_WORKER_BYTES_WARM: u64 = 3 * GIB;
 /// independent of workers/batch. Conservative-high.
 const BASE_RSS_BYTES: u64 = 6 * GIB;
 
-/// Model + optimizer-state RAM per decoder tier (SOAP keeps
+/// Model + optimizer-state RAM per model tier (SOAP keeps
 /// preconditioners; bill generously). Multiplied by `tier`.
 const PER_TIER_BYTES: u64 = 2 * GIB;
 
-/// RAM per 256 units of encoder latent width (the latent-dim knob,
+/// RAM per 256 units of model latent width (the latent-dim knob,
 /// tasks #270/#271). Conservative; mostly host-side staging buffers.
 const PER_LATENT256_BYTES: u64 = GIB;
 
 /// Host-side RAM that scales with the live mini-batch (pinned buffers,
 /// collation staging), per unit of batch. Small vs the worker term —
 /// the actual batch tensors live on the GPU; only the CPU collation /
-/// pinned-staging buffers for a handful of EEG windows are host RAM, so
+/// pinned-staging buffers for a handful of samples are host RAM, so
 /// 64 MiB/unit (batch 32 ⇒ 2 GiB) is realistic. The prior 256 MiB/unit
 /// double-counted the dataloader's own batch staging (already in the
 /// worker term) and inflated batch-32 to a spurious 8 GiB.
 const PER_BATCH_BYTES: u64 = GIB / 16; // 64 MiB / batch unit
 
-/// RAM per extra 21-channel group of encoder input beyond the L3 baseline
-/// (`in_ch` > 21). The fullband stack (`detail_bands='all'` → 168 ch = 8 groups)
-/// drives an 8× wider encoder front-end (wider conv/linear layers + their SOAP
-/// preconditioners) plus the stacked `[in_ch, 313]` dataloader input — none of
-/// which the L3 (21-ch) baseline carries. So fullband bills `(8-1) × 1 GiB =
-/// +7 GiB` over L3. Conservative-high (a fullband tier-3 truly needs ~30 GiB vs
-/// the L3-shaped ~23 GiB estimate that was admitted then cgroup-killed); the
-/// store self-heals DOWN from the first fullband `Measured` peak.
+/// RAM per extra 21-channel group of model input beyond the narrow baseline
+/// (`in_ch` > 21). The full input width (`detail_bands='all'` → 168 ch = 8
+/// groups) drives an 8× wider model front-end (wider conv/linear layers + their
+/// SOAP preconditioners) plus the stacked `[in_ch, 313]` dataloader input — none
+/// of which the 21-ch baseline carries. So the full width bills `(8-1) × 1 GiB =
+/// +7 GiB` over the baseline. Conservative-high (a full-width tier-3 truly needs
+/// ~30 GiB vs the baseline-shaped ~23 GiB estimate that was admitted then
+/// cgroup-killed); the store self-heals DOWN from the first full-width
+/// `Measured` peak.
 const PER_INCH_GROUP_BYTES: u64 = GIB;
 
 // ── OOM-correction growth (R2 / ADR 0046 slice-3) ────────────────────────
@@ -380,7 +383,7 @@ impl FootprintSource {
 }
 
 /// Stable composite key for the calibration store. `recipe` is the
-/// RECIPE name (e.g. `lamquant_joint_codec`), NOT the stage name — the
+/// RECIPE name (e.g. `train_model`), NOT the stage name — the
 /// cli admission gate resolves from the recipe it was asked to run, and
 /// the stage records under the SAME recipe name (threaded via
 /// `StageContext.recipe_name`) so the RESOLVE and RECORD keys match.
@@ -393,7 +396,7 @@ pub struct FootprintKey {
     pub tier: u32,
     pub batch: u32,
     pub workers: u32,
-    /// Never-OOM Phase 3: whether the run warmed the fullband disk cache. A
+    /// Never-OOM Phase 3: whether the run warmed the per-sample disk cache. A
     /// warm run's per-worker footprint is much lower, so warm + cold runs MUST
     /// key separately — else a warm `Measured` peak resolves a cold run and
     /// under-sizes it (and an OomCorrected cold bound over-refuses a warm run).
@@ -467,13 +470,13 @@ impl Footprint {
 ///
 /// - `workers`: DataLoader workers (the dominant term via prefetch).
 /// - `batch`: live mini-batch size.
-/// - `tier`: decoder tier (1..=4); larger tier ⇒ more model/opt RAM.
-/// - `latent_dim`: encoder latent width (0 ⇒ default, billed as 256).
-/// - `warm`: the fullband disk cache was warmed upstream (Phase 2) ⇒ the
+/// - `tier`: model tier (1..=4); larger tier ⇒ more model/opt RAM.
+/// - `latent_dim`: model latent width (0 ⇒ default, billed as 256).
+/// - `warm`: the per-sample disk cache was warmed upstream (Phase 2) ⇒ the
 ///   per-worker term drops to [`PREFETCH_PER_WORKER_BYTES_WARM`] (no
-///   whole-recording decode held).
-/// - `in_ch`: encoder input channels (21 = L3-only, 168 = full detail-band
-///   stack) ⇒ a `(in_ch/21 − 1) × `[`PER_INCH_GROUP_BYTES`] fullband term, so a
+///   whole-input decode held).
+/// - `in_ch`: model input channels (21 = narrow baseline, 168 = full input
+///   width) ⇒ a `(in_ch/21 − 1) × `[`PER_INCH_GROUP_BYTES`] full-width term, so a
 ///   168-ch run is no longer billed like a 21-ch run.
 pub fn estimate_ram_bytes(
     workers: u32,
@@ -486,7 +489,7 @@ pub fn estimate_ram_bytes(
     let workers = workers as u64;
     let batch = batch as u64;
     let tier = tier.max(1) as u64; // tier 0 is nonsensical; floor at 1
-    // Treat an unspecified latent (0) as the default 256-wide encoder
+    // Treat an unspecified latent (0) as the default 256-wide model
     // so the model term is never under-counted.
     let latent = if latent_dim == 0 { 256 } else { latent_dim } as u64;
 
@@ -501,9 +504,9 @@ pub fn estimate_ram_bytes(
     let latent_units = latent.div_ceil(256);
     let latent_term = latent_units.saturating_mul(PER_LATENT256_BYTES);
     let batch_term = batch.saturating_mul(PER_BATCH_BYTES);
-    // Fullband front-end: extra 21-ch groups beyond the L3 baseline. 168 ch ⇒
-    // (168/21 − 1) = 7 groups ⇒ +7 GiB; 21 ch ⇒ 0. `div_ceil` rounds a
-    // non-multiple UP (a 30-ch encoder bills 1 group, never 0 — conservative,
+    // Full-width front-end: extra 21-ch groups beyond the narrow baseline. 168
+    // ch ⇒ (168/21 − 1) = 7 groups ⇒ +7 GiB; 21 ch ⇒ 0. `div_ceil` rounds a
+    // non-multiple UP (a 30-ch model bills 1 group, never 0 — conservative,
     // never under-bills); `max(21)` floors so a sub-baseline value can't wrap.
     let in_ch_groups = (in_ch.max(L3_ONLY_IN_CH).div_ceil(L3_ONLY_IN_CH)).saturating_sub(1) as u64;
     let inch_term = in_ch_groups.saturating_mul(PER_INCH_GROUP_BYTES);
@@ -532,12 +535,12 @@ pub fn estimate(
     }
 }
 
-// ── Warm-stage (parallel fullband precompute) RAM model ───────────────────
+// ── Warm-stage (parallel cache precompute) RAM model ──────────────────────
 //
-// DISTINCT from the train scaling formula above. `warm_fb_cache.py` forks N
-// copy-on-write workers, each driving the SAME `LmaTypedL3Dataset` adapter over
-// a contiguous slice of the window list. CPython refcount writes defeat CoW on
-// the fork-inherited window index, and each worker holds ~one decoded recording
+// DISTINCT from the train scaling formula above. The warm-cache stage forks N
+// copy-on-write workers, each driving the SAME dataset adapter over a
+// contiguous slice of the sample list. CPython refcount writes defeat CoW on
+// the fork-inherited sample index, and each worker holds ~one decoded input
 // + its fp16 cast buffer — so each worker's RSS climbs toward a near-full
 // private copy. This is the hole that OOM'd the BOX (the prior flat
 // `MEMORY_GIB = 8` reservation under ~6 workers × ~6 GiB ≈ 36 GiB real, with NO
@@ -551,13 +554,13 @@ pub fn estimate(
 /// can't hold the cap's footprint.
 pub const WARM_WORKER_CAP: u32 = 4;
 
-/// Parent-process RSS floor of the warm driver: python + the window index +
-/// the lossless-codec decode of the first recording + framework overhead,
+/// Parent-process RSS floor of the warm driver: python + the sample index +
+/// the decode of the first input + framework overhead,
 /// independent of worker count. Conservative-high (mirrors [`BASE_RSS_BYTES`]).
 const WARM_BASE_RSS_BYTES: u64 = 6 * GIB;
 
-/// Per-fork-worker RSS: a CoW-defeated near-full copy of the inherited window
-/// index plus the worker's own one-recording decode + fp16 cast buffer. Raised
+/// Per-fork-worker RSS: a CoW-defeated near-full copy of the inherited sample
+/// index plus the worker's own one-input decode + fp16 cast buffer. Raised
 /// 6→8 GiB to match the MEASURED warm peak: a 4-worker warm rode ~23 GiB RSS +
 /// ~9 GiB swap = ~32 GiB true working set (≈8 GiB/worker), so the prior 6 GiB
 /// under-sized it → the 32 GiB cgroup cap was ridden → OOM-kill → partial cache.

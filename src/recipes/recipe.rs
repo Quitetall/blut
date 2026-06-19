@@ -319,16 +319,16 @@ pub enum Course {
     /// artifacts (e.g. a data-prep recipe packs a corpus into a typed
     /// artifact).
     DataPrep,
-    /// Self-supervised / unlabelled pretraining that produces an
-    /// encoder or backbone consumed by a later `Train` course
-    /// (MAE on the encoder, SSL-TUEG on the SNN backbone).
+    /// Self-supervised / unlabelled pretraining that produces a
+    /// backbone consumed by a later `Train` course (e.g. a masked-
+    /// autoencoder or SSL pretrain stage).
     Pretrain,
     /// Recipes that consume artifacts + produce checkpoints
-    /// (`SnnCkpt`, `JointCkpt`, `HfCheckpoint`, etc.).
+    /// (`Checkpoint`, `HfCheckpoint`, etc.).
     Train,
     /// Recipes that consume checkpoints + produce `EvalReport`.
     Eval,
-    /// PCCP / acceptance-gate course — the fail-closed accept/reject
+    /// Acceptance-gate course — the fail-closed accept/reject
     /// asset-check run after evaluation (ADR 0037 asset-check ≡ gate).
     Gate,
     /// Recipes that take a checkpoint + materialize a deployable
@@ -385,7 +385,7 @@ pub type RecipeCategory = Course;
 pub struct RecipeDef {
     pub name: &'static str,
     pub description: &'static str,
-    /// Backend identity (e.g. "lamu", "hf_trainer", "lamquant").
+    /// Backend identity (e.g. "hf_trainer", "my_backend").
     /// Set from `<Recipe>::Backend::ID` in each recipe's DEF.
     pub backend_id: &'static str,
     /// Where this recipe lives in the cockpit menu hierarchy.

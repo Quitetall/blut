@@ -17,8 +17,9 @@
 //! writes.
 
 /// Sentinel new-turn count for [`AutoTrainPolicySensor`]: the conversation
-/// turn count lives in the lamu store (out of BLUT's reach), so we pass a
-/// value that always clears `policy::decide`'s `threshold_new_turns` gate —
+/// turn count lives in the external metric store (out of BLUT's reach), so we
+/// pass a value that always clears `policy::decide`'s `threshold_new_turns`
+/// gate —
 /// the sensor then observes only the TIME + lock gates it CAN evaluate. If
 /// `decide` ever grows a turns-CEILING check, revisit this coupling.
 const ASSUME_ENOUGH_TURNS: i64 = i64::MAX;
@@ -97,7 +98,7 @@ impl Sensor for SchedulerLockSensor {
 /// whether the policy currently permits an auto-run — evaluating every
 /// gate BLUT can observe locally (enabled, quiet-hours, cooldown,
 /// failure-backoff, and the GPU lock). The new-turn-count gate is the
-/// one input BLUT can't see (it lives in the lamu conversation store),
+/// one input BLUT can't see (it lives in the external conversation store),
 /// so this sensor assumes "enough turns" and reports the status of the
 /// REMAINING gates — i.e. "would the policy fire right now, given new
 /// data?". `Ready` = all observable gates pass.

@@ -108,7 +108,7 @@ pub struct ExecCtx {
     /// `BLUT_KILL_ON_NAN=1` (or call `with_control`) to wire the built-in
     /// `KillOnNaN`.
     pub control: Option<Arc<dyn ControlPolicy>>,
-    /// Never-OOM Phase 3: was the fullband disk cache warmed upstream? Threaded
+    /// Never-OOM Phase 3: was the per-sample disk cache warmed upstream? Threaded
     /// into every `StageContext` so a train stage bills the warm (lower)
     /// per-worker footprint + the `|w` calibration key. Set by the CLI from the
     /// recipe's `warm_fb_cache` arg (the SAME source the admission gate reads),
@@ -181,7 +181,7 @@ impl ExecCtx {
         self
     }
 
-    /// Mark the fullband cache as warmed upstream (Phase 3). Threaded into every
+    /// Mark the per-sample cache as warmed upstream (Phase 3). Threaded into every
     /// `StageContext.fb_warm` so a train stage bills the warm footprint.
     pub fn with_fb_warm(mut self, warm: bool) -> Self {
         self.fb_warm = warm;

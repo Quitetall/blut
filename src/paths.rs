@@ -3,10 +3,11 @@
 //! Resolve runtime paths for the trainer subprocess + per-job state.
 //!
 //! Resolution policy is keep-it-discoverable: every input has an env
-//! var the user can override. Defaults match the user's existing
-//! local-llm layout (`~/local-llm/.venv` for python, `<crate>/python/`
-//! for the bundled trainer.py during dev, XDG `data_local_dir/lamu/`
-//! for everything else).
+//! var the user can override. Defaults match a conventional local
+//! layout (`~/local-llm/.venv` for python, `<crate>/python/` for the
+//! bundled trainer.py during dev, XDG `data_local_dir/lamu/` for
+//! everything else); the `LAMU_*` env vars below are the real
+//! back-compat override hooks.
 
 use std::path::{Path, PathBuf};
 

@@ -13,14 +13,14 @@
 //! Format:
 //! ```toml
 //! name = "my_pipeline"
-//! backend = "lamquant"          # informational tag (the stages carry the real backend)
+//! backend = "my_backend"        # informational tag (the stages carry the real backend)
 //!
 //! [[stages]]
-//! stage = "lamquant_encode_lma"
-//! args  = { edf_dir = "/data/edf", out_dir = "/data/lma", corpus = "tusz" }
+//! stage = "prepare_data"
+//! args  = { in_dir = "/data/raw", out_dir = "/data/packed", corpus = "dataset_a" }
 //!
 //! [[stages]]
-//! stage = "lamquant_train_joint"
+//! stage = "train_model"
 //! args  = { preset = "fast", tier = 8 }
 //! ```
 //!

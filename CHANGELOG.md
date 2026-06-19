@@ -4,12 +4,47 @@ All notable changes to the **blut** engine crate are documented here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-`blut` is the domain-agnostic engine (Stage → Plan → Recipe → Registry +
-CLI/TUI + resource broker). The user-facing binaries live in separate cookbook
-crates (`blut-lamquant` → binary `blut`, `blut-lamu` → binary `blut-lamu`) that
+`blut` is the domain-agnostic engine (Stage → Plan → Recipe → Registry + CLI +
+resource broker). The user-facing binaries live in separate cookbook crates that
 depend on this crate.
 
 ## [Unreleased]
+
+## [1.0.0] — 2026-06-19
+
+**First public release (crates.io).** The engine is now a pure, decoupled,
+publishable framework — a clean line between the domain-agnostic orchestrator
+and any cookbook built on it.
+
+### Changed
+- **License: AGPL-3.0-or-later** (with a commercial license offered separately).
+  Per-file SPDX headers on every source file; the canonical AGPL text in `LICENSE`.
+- **CLI-only.** The interactive ratatui cockpit is now behind an off-by-default
+  `tui` feature; `ratatui`/`crossterm`/`fuzzy-matcher` are optional deps, absent
+  from the default dependency tree. The TUI returns as a first-class feature in
+  1.1. Bare `blut` prints help on the CLI-only build.
+- **Stable surface contract.** From 1.0, minor releases are additive-only — see
+  the "Stable surface" section in `API.md`.
+
+### Removed
+- The bundled generic-LLM cookbook (concrete stages + lamu/hf backends + the
+  Python payload) — extracted to a separate `blut-backends` crate. The engine
+  ships zero concrete stages/recipes/backends and zero Python.
+- The `lerna` git-dependency (the sole `cargo publish` blocker) — replaced by a
+  native, Hydra-compatible `config::hydra` compose module (serde_yaml only).
+- The `meta_repo_root()` meta-repo assumption — the engine no longer assumes it
+  lives inside a parent repo; meta-repo detection moved to the cookbook.
+
+### Added
+- `examples/first_cookbook.rs` — a runnable end-to-end demo (typed stages → plan
+  → executor → content-addressed cache hit), doubling as an integration test.
+- Off-systemd graceful degrade: containment falls back to a bare spawn (with a
+  warning) when `systemd-run` is absent or `BLUT_NO_CONTAIN` is set.
+- `run_contained.sh` embedded via `include_str!` so containment works from a
+  clean install with no repo-layout dependency.
+- A `macos-latest` CI compile-check; a `tui`-feature CI lint/test pass.
+- crates.io publish hygiene: a trimmed package (`exclude` of dev artifacts) plus
+  `homepage`/`documentation` metadata.
 
 ## [0.11.0] — 2026-06-17
 

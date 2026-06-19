@@ -2,26 +2,21 @@
 // Copyright (C) 2026 Brian Lam
 //! BLUT — Brian Lam's Universal Trainer.
 //!
-//! A Rust framework for orchestrating local ML training workloads
-//! (SFT, DPO, distillation, evaluation) via typed stages, plans,
-//! and recipes. Compile-time DAG enforcement via PhantomData on
-//! `Plan<Out>` — wrong stage wiring = `cargo build` error, not
-//! runtime panic.
+//! A standalone, domain-agnostic Rust framework for orchestrating
+//! local ML training workloads (SFT, DPO, distillation, evaluation)
+//! via typed stages, plans, and recipes. Compile-time DAG enforcement
+//! via PhantomData on `Plan<Out>` — wrong stage wiring = `cargo build`
+//! error, not runtime panic.
 //!
 //! Public surface:
 //!
 //!   - `framework::*` — Artifact / Stage / Plan / Executor + cache.
-//!   - `stages::*` — concrete stage impls (materialize, train,
-//!     convert, register, eval).
-//!   - `recipes::*` — saved plans for common workflows.
-//!   - `blut` binary — CLI driver (`blut recipe run <name>`,
-//!     `blut jobs`, `blut log <id>`, etc.).
+//!   - concrete stage impls (materialize, train, convert, register,
+//!     eval) and saved plans for common workflows.
 //!
-//! Originally extracted from the LAMU monorepo; runs as a
-//! standalone binary + library now with no upward Rust dep on
-//! LAMU. Integration with LAMU is via the `blut` binary's stdio
-//! contract (lamu-mcp's `train_from_conversations` tool shells
-//! out to it).
+//! The library has no upward dependency on any host application;
+//! integration with an outer tool is via the CLI driver's stdio
+//! contract.
 
 // Production code is unsafe-free EXCEPT one narrow place: mmap
 // in framework::artifact::hash_file_mmap. Tests also use unsafe

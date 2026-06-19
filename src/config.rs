@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Brian Lam
 //! BLUT runtime configuration: locate llama.cpp tools + model
-//! registry. Vendored from lamu-core's config.rs during the BLUT
-//! repo split. Kept self-contained so BLUT has no upward Rust
-//! dependency on the LAMU monorepo.
+//! registry. Kept self-contained so BLUT has no upward Rust
+//! dependency on any host application.
 
 use std::path::PathBuf;
 
@@ -70,8 +69,9 @@ pub fn compose(
 /// — it does NOT resolve `${...}` interpolations — so an `Interpolation` lands
 /// here as a literal string and is emitted as a JSON string. This means the
 /// frozen JSON (and therefore the fingerprint) reflects UNRESOLVED
-/// interpolations. TODO: add a `hydra` interpolation resolve pass pre-freeze;
-/// note this affects fingerprint reproducibility for interpolation-heavy configs.
+/// interpolations. Deferred post-1.0: add a `hydra` interpolation resolve pass
+/// pre-freeze; note this affects fingerprint reproducibility for
+/// interpolation-heavy configs.
 fn config_to_json(v: &ConfigValue) -> serde_json::Value {
     use serde_json::Value;
     match v {

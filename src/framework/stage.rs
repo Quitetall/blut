@@ -157,7 +157,7 @@ pub struct StageContext {
     /// `CUDA_VISIBLE_DEVICES=<idx>` for its trainer subprocess so concurrent
     /// partition cells each run on their OWN GPU. Threaded from `ExecCtx`.
     pub device_index: Option<usize>,
-    /// Never-OOM Phase 3: was the fullband disk cache warmed upstream? A train
+    /// Never-OOM Phase 3: was the per-sample disk cache warmed upstream? A train
     /// stage threads this into its broker footprint (lower per-worker term +
     /// the `|w` calibration key). Carried on the CONTEXT (not the stage Args)
     /// on purpose — warm does NOT change the trained output, so it must not

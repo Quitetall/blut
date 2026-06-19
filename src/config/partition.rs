@@ -9,7 +9,7 @@
 //! A [`PartitionSet`] declares a recipe + one or more [`PartitionDim`]s (axes).
 //! Its **cells** are the cartesian product of the dimensions — each cell is a
 //! set of `axis=value` recipe-arg overrides (the SAME shape `--set` uses), with
-//! a stable [`PartitionCell::key`] like `corpus=tusz/fold=0`.
+//! a stable [`PartitionCell::key`] like `corpus=dataset_a/fold=0`.
 //!
 //! ## Why not just `--sweep`
 //! The sweep engine ([`super::sweep`]) already expands a cartesian product and
@@ -37,6 +37,8 @@ use crate::error::{Result, TrainError};
 /// One partition axis: a recipe-arg field and the discrete values it ranges
 /// over. `axis` is the dotted arg path the cell renders as a `--set` override
 /// (e.g. `corpus`, `tier`, `fold`).
+//
+// (The example axes above are illustrative names — any recipe-arg field works.)
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PartitionDim {
     pub axis: String,
@@ -58,9 +60,9 @@ pub struct PartitionSet {
 /// parameterize the recipe for this cell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartitionCell {
-    /// Stable identity, axes in declared order: `corpus=tusz/fold=0`.
+    /// Stable identity, axes in declared order: `corpus=dataset_a/fold=0`.
     pub key: String,
-    /// `--set`-shaped overrides: `["corpus=tusz", "fold=0"]`.
+    /// `--set`-shaped overrides: `["corpus=dataset_a", "fold=0"]`.
     pub overrides: Vec<String>,
 }
 

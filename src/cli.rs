@@ -245,7 +245,7 @@ enum FootprintCommand {
     /// SANCTIONED, audited reset for an `OomCorrected` bound that no longer
     /// reflects reality — e.g. after a memory fix dropped the true peak below
     /// the recorded OOM cap, which the monotone rank can never demote). Pass an
-    /// exact `<key>` (e.g. `lamquant_joint_codec|3|16|2|w`) OR `--recipe <name>`
+    /// exact `<key>` (e.g. `train_model|3|16|2|w`) OR `--recipe <name>`
     /// to clear every key for a recipe. Never-OOM holds: admission then uses the
     /// conservative Default + the cgroup cap still bounds the next run.
     Forget {
@@ -2002,7 +2002,7 @@ fn persist_plan_graph(plan: &crate::framework::CompiledPlan, job_dir: &std::path
 #[derive(Subcommand, Debug)]
 enum PartitionCommand {
     /// Declare + persist a partition set: `define <recipe> <name> --dim
-    /// corpus=tusz,chbmit --dim fold=0,1,2`.
+    /// corpus=dataset_a,corpus_x --dim fold=0,1,2`.
     Define {
         recipe: String,
         name: String,
