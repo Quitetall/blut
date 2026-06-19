@@ -735,7 +735,9 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
         print(f"[*] Augmentation: off")
 
     # ---- EMA (exponential moving average) — ADR 0050/0051 ema ingredient. ----
-    from lamquant.ingredients import build_ingredient
+    # NB: build_ingredient is already imported at module top (line ~124); a
+    # redundant local re-import here shadowed it function-wide, making the
+    # earlier uses (data/codec build) raise UnboundLocalError. Use the module one.
     ema_model = build_ingredient("ema", "avg_model",
                                  {"decay": ema_decay, "enabled": ema},
                                  model=codec)
@@ -1459,7 +1461,8 @@ def run(cfg, vocos_tier: int = 3, ckpt_dir: Optional[str] = None,
     # enc/dec groups (with their own lr + weight_decay) are passed as
     # param_groups; the spec's lr/wd defaults are unused fallbacks. The LR
     # SCHEDULE (WSD/cosine) + schedule-free + seizure-head re-add stay inline.
-    from lamquant.ingredients import build_ingredient
+    # NB: build_ingredient is bound at module top; a local re-import here
+    # shadowed it function-wide (UnboundLocalError at the earlier call sites).
     # LR schedule selection:
     #   wsd (default): Warmup-Stable-Decay for continual training
     #   schedule-free: Schedule-Free AdamW (Defazio 2024)
