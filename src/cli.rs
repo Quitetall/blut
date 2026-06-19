@@ -864,7 +864,7 @@ fn run_footprint_cmd(cmd: FootprintCommand) -> Result<()> {
                 println!("(empty)");
                 return Ok(());
             }
-            println!("{:<40} {:>8}  {:<13} {}", "key", "ram", "source", "n");
+            println!("{:<40} {:>8}  {:<13} n", "key", "ram", "source");
             for (k, e) in entries {
                 println!(
                     "{:<40} {:>6.1}G  {:<13} {}",
@@ -2792,8 +2792,8 @@ async fn run_recipe_sweep(
     let cfg_name =
         config_name.ok_or_else(|| anyhow!("--config-name is required in config/sweep mode"))?;
     // Args subtree key (default = recipe name). Overrides/sweeps must be dotted
-    // paths INTO this subtree; dot-less keys are consumed by lerna as
-    // defaults-list group selections and silently never reach a config value.
+    // paths INTO this subtree; dot-less keys are consumed by the compose layer
+    // as defaults-list group selections and silently never reach a config value.
     let key = config_key.unwrap_or_else(|| name.to_string());
     warn_dotless_overrides(set, "--set", &key);
     warn_dotless_overrides(sweep, "--sweep", &key);
@@ -2855,7 +2855,7 @@ async fn run_recipe_sweep(
 /// that subtree — so `--set`/`--sweep` dotted paths `<key>.field=v` reach the
 /// Args. Otherwise (a flat config with no such subtree) return the whole config
 /// as-is (it feeds the Args directly, but top-level overrides can't apply — a
-/// lerna limitation; `warn_dotless_overrides` surfaces it).
+/// compose-grammar limitation; `warn_dotless_overrides` surfaces it).
 fn project_args(mut config: serde_json::Value, key: &str) -> serde_json::Value {
     if let serde_json::Value::Object(map) = &mut config {
         if let Some(sub) = map.get_mut(key) {
@@ -2867,16 +2867,16 @@ fn project_args(mut config: serde_json::Value, key: &str) -> serde_json::Value {
     config
 }
 
-/// Warn about `key=val` overrides whose key has no `.` — lerna treats those as
-/// defaults-list group selections, NOT config-value overrides, so they silently
-/// don't change a value (and the sweep would collapse to identical fingerprints).
-/// `subtree_key` is the Args subtree the override should target.
+/// Warn about `key=val` overrides whose key has no `.` — the compose layer
+/// treats those as defaults-list group selections, NOT config-value overrides,
+/// so they silently don't change a value (and the sweep would collapse to
+/// identical fingerprints). `subtree_key` is the Args subtree to target.
 fn warn_dotless_overrides(items: &[String], flag: &str, subtree_key: &str) {
     for it in items {
         let key = it.split_once('=').map_or(it.as_str(), |(k, _)| k);
         if !key.contains('.') {
             eprintln!(
-                "warning: {flag} '{it}' key is dot-less — lerna treats it as a \
+                "warning: {flag} '{it}' key is dot-less — it is treated as a \
                  defaults-list group selection, not a value override; nest Args under \
                  '{subtree_key}:' and use a dotted path (e.g. '{subtree_key}.{key}=…')."
             );

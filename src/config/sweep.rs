@@ -2,10 +2,10 @@
 //! concrete configs, fingerprint each, and (stub) decide whether a combo
 //! can be skipped because its output is already cached.
 //!
-//! The cartesian expansion is delegated to lerna's `expand_simple_sweeps`,
+//! The cartesian expansion is delegated to the native `hydra::expand_simple_sweeps`,
 //! which handles `a=1,2,3` choice sweeps and `a=range(1,10)` range sweeps.
 
-use lerna::expand_simple_sweeps;
+use crate::config::hydra::expand_simple_sweeps;
 
 use crate::config::{ResolvedConfig, compose};
 use crate::error::Result;
@@ -27,13 +27,9 @@ pub struct SweepEntry {
 
 /// Cartesian product of sweep override strings.
 ///
-/// Thin wrapper over `lerna::expand_simple_sweeps`, which takes `&[&str]`.
+/// Thin wrapper over `hydra::expand_simple_sweeps`, which takes `&[&str]`.
 /// `expand_simple_sweeps(&["lr=1e-3,1e-4", "bs=8,16"])` returns the 4-element
 /// cartesian product directly.
-///
-/// Upgrade path for a validating sweep: `OverrideParser::parse_many` +
-/// `lerna::expand_sweeps(&[Override])` gives typed parse + float/step-aware
-/// `RangeSweep`. The simple form is sufficient for this skeleton.
 pub fn cartesian(sweep_overrides: &[String]) -> Vec<Vec<String>> {
     let refs: Vec<&str> = sweep_overrides.iter().map(String::as_str).collect();
     expand_simple_sweeps(&refs)
@@ -103,7 +99,7 @@ mod tests {
     }
 
     #[test]
-    fn cartesian_matches_lerna() {
+    fn cartesian_matches_hydra() {
         let combos = cartesian(&["lr=1e-3,1e-4".to_string(), "bs=8,16".to_string()]);
         assert_eq!(combos.len(), 4);
         assert!(combos.contains(&vec!["lr=1e-3".to_string(), "bs=8".to_string()]));
@@ -114,7 +110,7 @@ mod tests {
     fn expand_produces_entry_per_combo() {
         let dir = tempfile::tempdir().unwrap();
         write_config(dir.path(), "config.yaml", "opt:\n  lr: 0.1\n  bs: 4\n");
-        // Dotted keys -> lerna treats these as VALUE overrides (group=config
+        // Dotted keys -> hydra treats these as VALUE overrides (group=config
         // selection only applies to dot-less keys against the defaults list).
         let entries = expand(
             dir.path().to_str().unwrap(),

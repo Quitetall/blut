@@ -60,7 +60,6 @@ rand = "0.8"
 ratatui = "0.30"
 crossterm = "0.28"
 fuzzy-matcher = "0.3"
-lerna = { git = "https://github.com/nbprint/lerna", rev = "a193def3064c9c8dca6f3153e2a4ae15ae59dcde", package = "lerna" }
 
 [dev-dependencies]
 tempfile = "3"

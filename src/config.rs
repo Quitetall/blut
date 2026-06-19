@@ -7,25 +7,25 @@ use std::path::PathBuf;
 
 use crate::error::{Result, TrainError};
 
+pub mod hydra;
 pub mod launcher;
 pub mod partition;
 pub mod sweep;
 pub mod sweep_index;
 
-// Explicit imports ONLY — never `use lerna::*`: lerna re-exports its own
-// `Launcher`/`BasicLauncher` at crate root, which would collide with the
-// blut-owned `Launcher` trait in `launcher.rs`.
-use lerna::{ConfigLoader, ConfigValue};
+// Native, blut-owned Hydra-style compose (replaces the former `lerna`
+// git-dependency so the engine can publish to crates.io). See `hydra.rs`.
+use crate::config::hydra::{ConfigLoader, ConfigValue};
 
 use crate::framework::artifact::ContentHash;
 use crate::framework::cache::CacheHandle;
 
-/// A composed + frozen configuration: the live `lerna` value, its
+/// A composed + frozen configuration: the live composed value, its
 /// canonical JSON projection, and a content-hash fingerprint suitable
 /// for cache keying / run identity.
 #[derive(Clone, Debug)]
 pub struct ResolvedConfig {
-    /// The raw lerna config tree (defaults-list merged + overrides applied).
+    /// The raw composed config tree (defaults-list merged + overrides applied).
     pub value: ConfigValue,
     /// JSON freeze of `value` (see `config_to_json`).
     pub json: serde_json::Value,
@@ -38,8 +38,7 @@ pub struct ResolvedConfig {
 /// `+add`/`~delete`), then freeze to JSON and fingerprint.
 ///
 /// The defaults-list merge, group=config selection, dotted overrides and
-/// `+`/`~` semantics are all handled by lerna's `load_config`; we do not
-/// reimplement them.
+/// `+`/`~` semantics are all handled by `hydra::ConfigLoader::load_config`.
 pub fn compose(
     config_dir: &str,
     config_name: &str,
@@ -60,17 +59,17 @@ pub fn compose(
     })
 }
 
-/// Freeze a `lerna::ConfigValue` tree to a `serde_json::Value`.
+/// Freeze a `hydra::ConfigValue` tree to a `serde_json::Value`.
 ///
 /// `ConfigValue` derives only `Clone`/`Debug`/`PartialEq` (no `Serialize`),
 /// so this hand-written walker is the freeze core.
 ///
-/// INTERPOLATION PASS-THROUGH: `lerna::load_config` only merges — it does
-/// NOT resolve `${...}` interpolations — so an `Interpolation` lands here as
-/// a literal string and is emitted as a JSON string. This means the frozen
-/// JSON (and therefore the fingerprint) reflects UNRESOLVED interpolations.
-/// TODO: wire `lerna::config::resolve` / a `ResolverContext` pre-freeze; note
-/// this affects fingerprint reproducibility for interpolation-heavy configs.
+/// INTERPOLATION PASS-THROUGH: `hydra::ConfigLoader::load_config` only merges
+/// — it does NOT resolve `${...}` interpolations — so an `Interpolation` lands
+/// here as a literal string and is emitted as a JSON string. This means the
+/// frozen JSON (and therefore the fingerprint) reflects UNRESOLVED
+/// interpolations. TODO: add a `hydra` interpolation resolve pass pre-freeze;
+/// note this affects fingerprint reproducibility for interpolation-heavy configs.
 fn config_to_json(v: &ConfigValue) -> serde_json::Value {
     use serde_json::Value;
     match v {
@@ -92,7 +91,7 @@ fn config_to_json(v: &ConfigValue) -> serde_json::Value {
                 .map(|(k, vv)| (k.to_string(), config_to_json(vv)))
                 .collect(),
         ),
-        // Mirror lerna's `Display` rendering of a missing value.
+        // Mirror hydra's `Display` rendering of a missing value.
         ConfigValue::Missing => Value::String("???".to_string()),
     }
 }
@@ -281,7 +280,7 @@ mod tests {
 
     // --- LANE 2: config compose / freeze / fingerprint ---
 
-    use lerna::ConfigDict;
+    use crate::config::hydra::ConfigDict;
     use std::io::Write;
 
     fn write_config(dir: &std::path::Path, name: &str, body: &str) {

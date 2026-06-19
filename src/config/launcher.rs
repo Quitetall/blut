@@ -1,9 +1,5 @@
 //! blut-owned `Launcher` abstraction: build the OS command that runs a
 //! sweep job, optionally inside a resource-capped container.
-//!
-//! This trait is intentionally NOT lerna's `Launcher` (which is sweep /
-//! `JobReturn`-oriented and the wrong shape here). We only import lerna by
-//! explicit path elsewhere so the names do not collide.
 
 use std::process::Command;
 

@@ -97,7 +97,7 @@ fn name_ok(s: &str) -> bool {
 const SEP: char = '~';
 
 /// A partition VALUE is safe iff non-empty and free of path separators (`/`,
-/// `\`), the `axis=value` separator (`=`), and the lerna sweep-grammar
+/// `\`), the `axis=value` separator (`=`), and the sweep-grammar
 /// metacharacters (`,` choice · `:` range · `[]()` interval/list · `*` glob).
 /// Values are never re-parsed by `cells()` (it builds the product directly), but
 /// the cell's overrides ARE applied downstream as `--set axis=value`, so a
