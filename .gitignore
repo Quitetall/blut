@@ -1,23 +1,14 @@
+# Build artifacts
 /target/
-/Cargo.lock.bak
-**/__pycache__/
-*.pyc
-.DS_Store
-*.swp
+
+# Local data symlink (machine-specific; points outside the repo)
 /data
 
-# Training checkpoints — too large for GitHub (100MB/file limit).
-# Regenerable from training; persist via local backup or external storage.
-*.ckpt
-*.pt
-*.pth
-python/lamquant/student/recovery/
+# Backup / packaging leftovers
+*.bak
+*.orig
 
-# Training run logs (high-volume CSV)
-python/training_logs/
-training_logs/
-
-# generated run artifacts (ADR 0044 P10 — runs write here, not code)
-python/lamquant/outputs/
-python/wandb/
-wandb/
+# Editor / OS cruft
+.DS_Store
+*.swp
+*~
