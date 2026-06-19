@@ -142,15 +142,17 @@ pub fn leaderboard(metric: &str, maximize: bool) -> Vec<RunRow> {
     let Ok(db) = LineageDb::open() else {
         return Vec::new();
     };
-    // Cap at the render limit so the list cursor can't run past visible rows.
     // `top_runs_by_metric` yields one row per (job, node) that logged the
-    // metric, so a multi-stage job can appear more than once — dedup by job_id,
-    // keeping the first (best-ranked) occurrence.
+    // metric, so a multi-stage job can appear more than once. Over-fetch, dedup
+    // by job_id (keeping the first = best-ranked occurrence), then cap at the
+    // render limit — so the list stays full AND the cursor can't run past the
+    // visible rows.
     let mut seen = std::collections::HashSet::new();
-    db.top_runs_by_metric(metric, maximize, LEADERBOARD_LIMIT)
+    db.top_runs_by_metric(metric, maximize, LEADERBOARD_LIMIT * 3)
         .unwrap_or_default()
         .into_iter()
         .filter(|(job_id, _, _)| seen.insert(job_id.clone()))
+        .take(LEADERBOARD_LIMIT)
         .map(|(job_id, _node_idx, value)| {
             let rec = db.get_run(&job_id).ok().flatten();
             let recipe = rec

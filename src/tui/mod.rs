@@ -522,7 +522,8 @@ impl App {
     }
 
     /// Number of rows in the cursor-driven list for the active view (0 for views
-    /// with no list cursor).
+    /// with no `list_cursor` — including Reset, which uses its own
+    /// `reset_cursor`, so its `list_cursor` is harmlessly clamped to 0).
     fn active_list_len(&self) -> usize {
         match self.view {
             View::History | View::Leaderboard => self.runs.len(),
