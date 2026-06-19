@@ -43,3 +43,31 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  macos-build:
+    name: macOS compile-check (containment degrades)
+    runs-on: macos-latest
+    # blut is a Linux-first engine: the never-OOM cgroup containment needs
+    # Linux + systemd, and off-systemd it degrades to a bare spawn. This job
+    # only proves the crate COMPILES on a non-Linux Unix host (the realistic
+    # `cargo add blut` target) — it does not run the systemd-dependent tests.
+    # Build-only (no `-D warnings`) so a macOS-specific lint can't mask the
+    # compile signal.
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry + git + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Build (lib + all targets)
+        run: cargo build --workspace --all-targets

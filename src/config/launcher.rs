@@ -148,6 +148,17 @@ pub fn local_gpu_count() -> usize {
 /// meta-repo). It is materialized to a cache dir at first contained launch.
 const RUN_CONTAINED_SH: &str = include_str!("../../scripts/run_contained.sh");
 
+/// Whether the never-OOM cgroup containment can be applied: it needs Linux +
+/// systemd `--user`, and the user must not have opted out. Off-systemd hosts
+/// (macOS / a container without systemd) and `BLUT_NO_CONTAIN` degrade to a
+/// bare spawn — see [`LocalSystemd::wrap`].
+fn containment_available() -> bool {
+    if std::env::var_os("BLUT_NO_CONTAIN").is_some() {
+        return false;
+    }
+    which::which("systemd-run").is_ok()
+}
+
 /// Materialize the embedded `run_contained.sh` to a stable, absolute path and
 /// return it (systemd-run's `--user` cwd is minimal, so the path must be
 /// absolute). Resolution order:
@@ -241,6 +252,28 @@ impl Launcher for LocalSystemd {
     }
 
     fn wrap(&self, unit: &str, inner: &[String]) -> Result<WrappedCommand> {
+        // Containment needs Linux + systemd `--user`. Off-systemd (macOS / a
+        // container without systemd) or with `BLUT_NO_CONTAIN` set, degrade to a
+        // BARE spawn with a warning — the never-OOM cgroup cap is then NOT
+        // enforced (admission's box-fit refusal still gates, and the kernel OOM
+        // killer is the only hard backstop).
+        if !containment_available() {
+            let Some((program, rest)) = inner.split_first() else {
+                return Err(TrainError::other("wrap: empty inner command"));
+            };
+            if std::env::var_os("BLUT_NO_CONTAIN").is_none() {
+                tracing::warn!(
+                    "systemd-run unavailable — running unit '{unit}' UNCONTAINED (no memory cap). \
+                     Containment requires Linux + systemd --user. Set BLUT_NO_CONTAIN=1 to silence."
+                );
+            }
+            return Ok(WrappedCommand {
+                program: program.clone(),
+                args: rest.to_vec(),
+                env: Vec::new(),
+                kind: LauncherKind::Local,
+            });
+        }
         // run_contained.sh runs under systemd-run's MINIMAL cwd, so the script
         // path MUST be absolute. It is embedded + materialized to a cache dir,
         // so containment works from a clean install (no repo-layout assumption).
@@ -425,25 +458,40 @@ mod tests {
     use super::*;
 
     fn argv(c: &Command) -> Vec<String> {
-        c.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+        c.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
     fn capacity_reflects_cuda_visible_devices() {
         // `CUDA_VISIBLE_DEVICES` is process-global → serialize the env mutation.
-        let _g = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let prior = std::env::var("CUDA_VISIBLE_DEVICES").ok();
         // SAFETY: serialized by TEST_ENV_LOCK; restored below.
         unsafe { std::env::set_var("CUDA_VISIBLE_DEVICES", "0,1,2") };
         assert_eq!(LocalSystemd::default().capacity(), 3, "3 visible devices");
         unsafe { std::env::set_var("CUDA_VISIBLE_DEVICES", "") };
-        assert_eq!(LocalSystemd::default().capacity(), 1, "no GPUs ⇒ still ≥1 (run one cell)");
+        assert_eq!(
+            LocalSystemd::default().capacity(),
+            1,
+            "no GPUs ⇒ still ≥1 (run one cell)"
+        );
         match prior {
             Some(v) => unsafe { std::env::set_var("CUDA_VISIBLE_DEVICES", v) },
             None => unsafe { std::env::remove_var("CUDA_VISIBLE_DEVICES") },
         }
         // Slurm's capacity = its per-job --gpus allocation.
-        assert_eq!(SlurmLauncher { gpus: Some(4), ..Default::default() }.capacity(), 4);
+        assert_eq!(
+            SlurmLauncher {
+                gpus: Some(4),
+                ..Default::default()
+            }
+            .capacity(),
+            4
+        );
         assert_eq!(SlurmLauncher::default().capacity(), 1, "unset --gpus ⇒ 1");
     }
 
@@ -462,12 +510,18 @@ mod tests {
 
     #[test]
     fn device_set_default_and_env_override() {
-        let _g = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let prior = std::env::var("BLUT_SCHED_DEVICES").ok();
         unsafe { std::env::remove_var("BLUT_SCHED_DEVICES") };
         // Default = 0..capacity.
         assert_eq!(sched_device_set(3), vec![0, 1, 2]);
-        assert_eq!(sched_device_set(0), vec![0], "≥1 entry so a scheduler progresses");
+        assert_eq!(
+            sched_device_set(0),
+            vec![0],
+            "≥1 entry so a scheduler progresses"
+        );
         // Override targets a subset (e.g. reserve GPU 1 on a 3-GPU box).
         unsafe { std::env::set_var("BLUT_SCHED_DEVICES", "0,2") };
         assert_eq!(sched_device_set(3), vec![0, 2]);
@@ -490,7 +544,9 @@ mod tests {
             time: Some("08:00:00".into()),
             extra: vec!["--exclusive".into()],
         };
-        let c = l.build_command("job-x", &["python".into(), "train.py".into()]).unwrap();
+        let c = l
+            .build_command("job-x", &["python".into(), "train.py".into()])
+            .unwrap();
         assert_eq!(c.get_program(), "srun");
         let a = argv(&c);
         assert!(a.contains(&"--job-name=job-x".to_string()));
@@ -507,7 +563,9 @@ mod tests {
 
     #[test]
     fn slurm_omits_unset_flags_and_rejects_empty() {
-        let c = SlurmLauncher::default().build_command("u", &["echo".into()]).unwrap();
+        let c = SlurmLauncher::default()
+            .build_command("u", &["echo".into()])
+            .unwrap();
         let a = argv(&c);
         assert!(!a.iter().any(|x| x.starts_with("--mem")), "unset → no flag");
         assert!(!a.iter().any(|x| x.starts_with("--partition")));
@@ -517,17 +575,26 @@ mod tests {
     #[test]
     fn launch_target_parses_and_resolves() {
         use std::str::FromStr;
-        assert_eq!(LaunchTarget::from_str("slurm").unwrap(), LaunchTarget::Slurm);
+        assert_eq!(
+            LaunchTarget::from_str("slurm").unwrap(),
+            LaunchTarget::Slurm
+        );
         assert_eq!(LaunchTarget::from_str("RAY").unwrap(), LaunchTarget::Ray);
         assert_eq!(LaunchTarget::from_str("").unwrap(), LaunchTarget::Local);
         assert!(LaunchTarget::from_str("k8s").is_err());
         // The factory maps target → the matching launcher kind.
         assert_eq!(
-            launcher_for(LaunchTarget::Slurm).wrap("u", &["x".into()]).unwrap().kind,
+            launcher_for(LaunchTarget::Slurm)
+                .wrap("u", &["x".into()])
+                .unwrap()
+                .kind,
             LauncherKind::Slurm
         );
         assert_eq!(
-            launcher_for(LaunchTarget::Ray).wrap("u", &["x".into()]).unwrap().kind,
+            launcher_for(LaunchTarget::Ray)
+                .wrap("u", &["x".into()])
+                .unwrap()
+                .kind,
             LauncherKind::Ray
         );
     }
@@ -535,9 +602,12 @@ mod tests {
     #[test]
     fn wrap_carries_kind_and_splits_env_from_argv() {
         // Slurm: all knobs are argv, env empty, kind Slurm.
-        let s = SlurmLauncher { mem: Some("8G".into()), ..Default::default() }
-            .wrap("u", &["echo".into()])
-            .unwrap();
+        let s = SlurmLauncher {
+            mem: Some("8G".into()),
+            ..Default::default()
+        }
+        .wrap("u", &["echo".into()])
+        .unwrap();
         assert_eq!(s.kind, LauncherKind::Slurm);
         assert_eq!(s.program, "srun");
         assert!(s.env.is_empty());
@@ -555,7 +625,9 @@ mod tests {
             runtime_env: Some(r#"{"pip":["torch"]}"#.into()),
             extra: vec![],
         };
-        let c = l.build_command("job-y", &["python".into(), "-m".into(), "t".into()]).unwrap();
+        let c = l
+            .build_command("job-y", &["python".into(), "-m".into(), "t".into()])
+            .unwrap();
         assert_eq!(c.get_program(), "ray");
         let a = argv(&c);
         assert_eq!(&a[..2], &["job", "submit"]);
@@ -570,43 +642,83 @@ mod tests {
     #[test]
     fn build_command_argv_is_inspectable() {
         // Materializes the EMBEDDED run_contained.sh to a cache dir (no repo
-        // layout / meta_repo_root needed); does not spawn systemd.
+        // layout / meta_repo_root needed); does not spawn systemd. On a host
+        // without systemd-run (or with BLUT_NO_CONTAIN) the launcher degrades to
+        // a bare spawn — assert whichever path THIS host takes. Hold the env lock
+        // so a concurrent BLUT_NO_CONTAIN-mutating test can't flip the branch
+        // between the probe and the assertions.
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let inner = [
+            "python".to_string(),
+            "-u".to_string(),
+            "train.py".to_string(),
+        ];
         let cmd = LocalSystemd::default()
-            .build_command(
-                "unit-x",
-                &[
-                    "python".to_string(),
-                    "-u".to_string(),
-                    "train.py".to_string(),
-                ],
-            )
-            .expect("build_command should resolve the script");
-        assert_eq!(cmd.get_program(), "bash");
-
+            .build_command("unit-x", &inner)
+            .expect("build_command should resolve");
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert!(
-            args[0].ends_with("run_contained.sh") && args[0].starts_with('/'),
-            "first arg must be the absolute materialized script path, got {:?}",
-            args[0]
-        );
-        assert_eq!(&args[1..], &["python", "-u", "train.py"]);
 
-        // UNIT/MEMMAX/MEMHIGH/SWAPMAX are passed via env (not argv).
-        let envs: std::collections::HashMap<String, Option<String>> = cmd
-            .get_envs()
-            .map(|(k, v)| {
-                (
-                    k.to_string_lossy().into_owned(),
-                    v.map(|s| s.to_string_lossy().into_owned()),
-                )
-            })
+        if containment_available() {
+            assert_eq!(cmd.get_program(), "bash");
+            assert!(
+                args[0].ends_with("run_contained.sh") && args[0].starts_with('/'),
+                "first arg must be the absolute materialized script path, got {:?}",
+                args[0]
+            );
+            assert_eq!(&args[1..], &["python", "-u", "train.py"]);
+
+            // UNIT/MEMMAX/MEMHIGH/SWAPMAX are passed via env (not argv).
+            let envs: std::collections::HashMap<String, Option<String>> = cmd
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|s| s.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect();
+            assert_eq!(envs.get("UNIT"), Some(&Some("unit-x".to_string())));
+            assert_eq!(envs.get("MEMMAX"), Some(&Some("44G".to_string())));
+            assert_eq!(envs.get("MEMHIGH"), Some(&Some("40G".to_string())));
+            assert_eq!(envs.get("SWAPMAX"), Some(&Some("12G".to_string())));
+        } else {
+            // Degraded (off-systemd) path: bare spawn of the inner command.
+            assert_eq!(cmd.get_program(), "python");
+            assert_eq!(&args[..], &["-u", "train.py"]);
+        }
+    }
+
+    #[test]
+    fn no_contain_env_degrades_to_bare_spawn() {
+        // BLUT_NO_CONTAIN forces the uncontained bare-spawn path regardless of
+        // systemd availability. Serialized on the shared env lock.
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("BLUT_NO_CONTAIN").ok();
+        // SAFETY: TEST_ENV_LOCK serializes env mutation; restored below.
+        unsafe {
+            std::env::set_var("BLUT_NO_CONTAIN", "1");
+        }
+        let cmd = LocalSystemd::default()
+            .build_command("u", &["python".to_string(), "x.py".to_string()])
+            .expect("bare spawn builds");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(envs.get("UNIT"), Some(&Some("unit-x".to_string())));
-        assert_eq!(envs.get("MEMMAX"), Some(&Some("44G".to_string())));
-        assert_eq!(envs.get("MEMHIGH"), Some(&Some("40G".to_string())));
-        assert_eq!(envs.get("SWAPMAX"), Some(&Some("12G".to_string())));
+        assert_eq!(cmd.get_program(), "python");
+        assert_eq!(&args[..], &["x.py"]);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("BLUT_NO_CONTAIN", v),
+                None => std::env::remove_var("BLUT_NO_CONTAIN"),
+            }
+        }
     }
 }
