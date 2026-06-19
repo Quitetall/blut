@@ -4,6 +4,12 @@ name: CLA Assistant
 # the OH! Tech LLC Enterprise License. See central CLA at:
 # https://github.com/Quitetall/LamQuant/blob/main/CLA.md
 # Self-hosted (CLA Assistant Lite) — signatures stored in-repo.
+#
+# Security notes:
+#   - Action pinned to full SHA (not mutable tag) to prevent supply-chain attacks.
+#   - `actions: write` omitted — not required by contributor-assistant.
+#   - `issue_comment` trigger scoped to PR comments only (github.event.issue.pull_request).
+#   - Bot allowlist enumerates specific known bots; no wildcard bypass.
 
 on:
   issue_comment:
@@ -12,7 +18,6 @@ on:
     types: [opened, synchronize]
 
 permissions:
-  actions: write
   contents: write       # store signature records in-repo
   pull-requests: write
   statuses: write
@@ -22,18 +27,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: CLA Assistant
+        # Scoped to PR comments only; also fires on pull_request_target events.
         if: >-
-          (github.event.comment.body == 'recheck' ||
-           github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') ||
+          (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+           (github.event.comment.body == 'recheck' ||
+            github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA')) ||
           github.event_name == 'pull_request_target'
-        uses: contributor-assistant/github-action@v2.6.1
+        # Pinned to commit SHA for supply-chain safety; tag: v2.6.1
+        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           path-to-signatures: 'signatures/cla.json'
           path-to-document: 'https://github.com/Quitetall/LamQuant/blob/main/CLA.md'
           branch: 'main'
-          allowlist: 'dependabot[bot],*[bot]'
+          # Enumerate specific bots — no wildcard bypass.
+          allowlist: 'dependabot[bot],renovate[bot]'
           custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
           custom-allsigned-prcomment: '✅ All contributors have signed the CLA — thank you!'
           custom-notsigned-prcomment: |
