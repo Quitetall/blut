@@ -57,9 +57,18 @@ which = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 bincode = "1.3"
 rand = "0.8"
-ratatui = "0.30"
-crossterm = "0.28"
-fuzzy-matcher = "0.3"
+# TUI deps — optional, behind the off-by-default `tui` feature. The 1.0
+# release is CLI-only; the interactive cockpit returns (feature on / stabilized)
+# in 1.1. With `tui` off these three are absent from the dependency tree.
+ratatui = { version = "0.30", optional = true }
+crossterm = { version = "0.28", optional = true }
+fuzzy-matcher = { version = "0.3", optional = true }
+
+[features]
+default = []
+# The interactive ratatui cockpit (`blut tui`, and bare `blut`). Off in 1.0
+# (CLI-only); a cookbook binary opts in with `blut = { ..., features = ["tui"] }`.
+tui = ["dep:ratatui", "dep:crossterm", "dep:fuzzy-matcher"]
 
 [dev-dependencies]
 tempfile = "3"

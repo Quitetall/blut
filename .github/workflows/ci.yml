@@ -44,6 +44,14 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # The interactive cockpit is behind the off-by-default `tui` feature
+      # (1.0 is CLI-only). Lint + test it explicitly so the gated code can't
+      # bitrot before it's re-enabled in 1.1.
+      - name: Clippy + test the tui feature
+        run: |
+          cargo clippy -p blut --features tui --all-targets -- -D warnings
+          cargo test -p blut --features tui
+
   macos-build:
     name: macOS compile-check (containment degrades)
     runs-on: macos-latest

@@ -152,9 +152,12 @@ enum Command {
     /// Open the canonical interactive training cockpit (ratatui). The
     /// single, complete cockpit: recipe launcher + live jobs/log/system
     /// panels + run history / leaderboard / compare / checkpoints /
-    /// presets / live-metrics / reset views (superset of the retired
-    /// hub + Python cockpits). Keys: ↑↓ select, Enter log, c cancel,
-    /// R recipe picker, J/L/Y/H/B/K/P/M/X switch views, q quit.
+    /// presets / live-metrics / reset views. Keys: ↑↓ select, Enter log,
+    /// c cancel, R recipe picker, J/L/Y/H/B/K/P/M/X switch views, q quit.
+    ///
+    /// Behind the off-by-default `tui` feature (1.0 is CLI-only; the cockpit
+    /// returns in 1.1). Build with `--features tui` to enable.
+    #[cfg(feature = "tui")]
     Tui {
         /// Headless self-check: build the cockpit + render every view to a test
         /// backend, exit 0 if all draw non-blank (no raw mode). For CI / smoke.
@@ -592,6 +595,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Cache { cmd }) => run_cache_cmd(cmd),
         Some(Command::Footprint { cmd }) => run_footprint_cmd(cmd),
         Some(Command::Sensor { cmd }) => run_sensor_cmd(cmd),
+        #[cfg(feature = "tui")]
         Some(Command::Tui { check }) => {
             if check {
                 crate::tui::check(reg)
@@ -599,10 +603,21 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
                 crate::tui::run(reg).await
             }
         }
-        // Bare `blut` opens the interactive cockpit (T-track). Explicit
-        // CLI training lives in the cookbook binaries' own train path
-        // (the engine ships no concrete trainer after the v1.0 carve).
+        // Bare `blut`: with the `tui` feature ON, open the interactive cockpit
+        // (the 1.1 behaviour). With it OFF (the CLI-only 1.0 default), there is
+        // no interactive mode — print help so the user sees the subcommands.
+        #[cfg(feature = "tui")]
         None => crate::tui::run(reg).await,
+        #[cfg(not(feature = "tui"))]
+        None => {
+            use clap::CommandFactory;
+            Cli::command().print_help().ok();
+            println!(
+                "\n(blut 1.0 is CLI-only — run a subcommand above. The interactive \
+                 cockpit returns in 1.1; build with `--features tui` to preview it.)"
+            );
+            Ok(())
+        }
     }
 }
 

@@ -51,6 +51,10 @@ pub mod schedule;
 pub mod scheduler_lock;
 pub mod sensor;
 pub mod spec;
+/// The interactive ratatui cockpit. Behind the off-by-default `tui` feature:
+/// 1.0 ships CLI-only; the TUI returns in 1.1. The CLI (`cli::run`) degrades
+/// to printing help for the bare `blut` command when this is disabled.
+#[cfg(feature = "tui")]
 pub mod tui;
 
 // ENGINE CARVE (v1.0): the generic-LLM cookbook — concrete `stages`,
