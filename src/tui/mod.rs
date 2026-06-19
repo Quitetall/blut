@@ -2374,7 +2374,7 @@ fn draw_leaderboard(f: &mut Frame<'_>, area: Rect, app: &App) {
             ),
             theme::dim(),
         )));
-        for (i, r) in app.runs.iter().enumerate().take(20) {
+        for (i, r) in app.runs.iter().enumerate().take(views::LEADERBOARD_LIMIT) {
             let cursor = i == app.list_cursor;
             let marked = app.marked.contains(&r.job_id);
             let medal = if i == 0 { " ▸" } else { "" };
@@ -2404,9 +2404,9 @@ fn draw_leaderboard(f: &mut Frame<'_>, area: Rect, app: &App) {
                 Span::styled(format!("{}{medal}", r.when), theme::dim()),
             ]));
         }
-        if app.runs.len() > 20 {
+        if app.runs.len() > views::LEADERBOARD_LIMIT {
             lines.push(Line::from(Span::styled(
-                format!("  ... {} more runs", app.runs.len() - 20),
+                format!("  ... {} more runs", app.runs.len() - views::LEADERBOARD_LIMIT),
                 theme::dim(),
             )));
         }

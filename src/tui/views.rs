@@ -32,6 +32,11 @@ use crate::lineage_db::LineageDb;
 /// are surfaced per-run in Compare / Metrics and via the `hpo show` CLI.
 pub const DEFAULT_METRIC: &str = "loss";
 
+/// Leaderboard top-N: the lineage query limit AND the render cap. Shared so
+/// the cursor bound (= number of fetched rows) can never exceed the visible
+/// rows.
+pub const LEADERBOARD_LIMIT: usize = 20;
+
 /// Render a UNIX-seconds timestamp as `YYYY-MM-DD HH:MM` without pulling in
 /// chrono (reuses the civil-from-days helper `jobs` uses for ids).
 fn fmt_unix(secs: u64) -> String {
@@ -139,7 +144,7 @@ pub fn leaderboard(metric: &str, maximize: bool) -> Vec<RunRow> {
     };
     // Cap at 20 — the leaderboard is a top-N ranking, and 20 matches the
     // view's render limit so the list cursor can't run past the visible rows.
-    db.top_runs_by_metric(metric, maximize, 20)
+    db.top_runs_by_metric(metric, maximize, LEADERBOARD_LIMIT)
         .unwrap_or_default()
         .into_iter()
         .map(|(job_id, _node_idx, value)| {
