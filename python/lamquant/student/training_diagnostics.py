@@ -173,7 +173,22 @@ class TrainingDiagnostics:
         self.codec.train(True)
         self.codec.zero_grad(set_to_none=True)
         recon = self._forward(x_l3, coords, ch_mask, quantize=False)
-        loss, _ = self.loss_fn(recon, x_l3, fullband, ch_mask)
+        # A RuntimeError here is BROKEN WIRING, not a diagnostic bug — report it
+        # as a clean grad FAIL (the gate then halts with a readable message)
+        # instead of letting an opaque mse size-mismatch crash propagate. Known
+        # trigger: the full-residual path (--detail-bands all) at tier 1/2, where
+        # the decoder emits 21 ch but `l3_target` is the 168-ch encoder INPUT, so
+        # the L3-domain mse(recon, l3_target) is 21-vs-168 (see check_shape_contract,
+        # which independently FAILs the same mismatch). The real fix lives in the
+        # trainer's l3-target wiring, not here; this just surfaces it cleanly.
+        try:
+            loss, _ = self.loss_fn(recon, x_l3, fullband, ch_mask)
+        except RuntimeError as _e:
+            return [DiagResult(
+                "grad.loss.compute", FAIL,
+                f"loss raised on the preflight batch (recon {tuple(recon.shape)} "
+                f"vs target — likely a full-residual l3-target shape mismatch): "
+                f"{type(_e).__name__}: {_e}")]
         out = [DiagResult("grad.loss.grad_fn", PASS if loss.requires_grad and
                           loss.grad_fn is not None else FAIL,
                           "loss is on the autograd graph")]
