@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! BLUT v0.20 — native hyperparameter optimization (HPO).
 //!
 //! Trials are parallel nodes in ONE plan, reusing the existing machinery: the

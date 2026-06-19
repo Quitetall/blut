@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Footprint estimation — the SCALING RAM model (ADR 0046, hole #3/#4).
 //!
 //! The blueprint's "constant 40-50G hint" is rejected by the review:

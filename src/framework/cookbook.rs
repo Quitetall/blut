@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Cookbook seam (the engine's recipe-registry mechanism).
 //!
 //! A "cookbook" is the unit a domain hands BLUT (ADR 0034 / ADR 0037):

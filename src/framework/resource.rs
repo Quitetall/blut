@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Resources a stage holds while running.
 //!
 //! Each `Stage` declares a `&'static [Resource]` constant. The

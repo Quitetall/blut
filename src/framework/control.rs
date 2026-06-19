@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Runtime DAG control — the policy hook the parallel executor consults
 //! against the live `StageStep` metric stream to mutate the running graph
 //! (#4 dynamic runtime DAG mutation).

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Stage / Plan / Recipe error types.
 //!
 //! `StageError` is what a stage's `run` returns. `PlanError` is

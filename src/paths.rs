@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Resolve runtime paths for the trainer subprocess + per-job state.
 //!
 //! Resolution policy is keep-it-discoverable: every input has an env

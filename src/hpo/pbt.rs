@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Population-Based Training (v0.20 Phase 7) — the one resume-on-promote
 //! consumer.
 //!

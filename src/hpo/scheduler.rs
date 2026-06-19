@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! HPO scheduler (v0.20) — a [`ControlPolicy`] that early-stops underperforming
 //! trials via the existing `KillBranch`.
 //!

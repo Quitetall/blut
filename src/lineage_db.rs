@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! LineageDB — an embedded, queryable index over BLUT's content-addressed runs.
 //!
 //! ARCHITECTURE (the load-bearing principle): this database is a **rebuildable

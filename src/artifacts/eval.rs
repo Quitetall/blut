@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Eval reports.
 //!
 //! Paradigm-agnostic metric bag emitted by `eval_loss`, `eval_lm_harness`,

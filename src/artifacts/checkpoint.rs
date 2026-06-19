@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Model checkpoint artifacts.
 //!
 //! `HfCheckpoint` is a HuggingFace-format directory (post-trainer.py

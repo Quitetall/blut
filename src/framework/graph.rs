@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! DAG-graph backend (v0.20).
 //!
 //! A queryable snapshot of a job's plan graph — the structure (persisted at

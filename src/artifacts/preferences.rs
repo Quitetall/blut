@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Preference dataset for DPO training.
 //!
 //! JSONL where each line carries a `prompt`, a `chosen` response,

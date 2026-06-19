@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! `cargo run --example first_cookbook`
 //!
 //! The smallest end-to-end blut pipeline: define a backend, a typed

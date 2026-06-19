@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Recipe machinery — the engine seam domain cookbooks build against.
 //!
 //! blut-core ships ZERO recipe DEFs. The `Recipe` trait, `RecipeDef`

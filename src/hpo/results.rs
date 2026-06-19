@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! HPO trial tracking (v0.20 Phase 5).
 //!
 //! Source of truth = the filesystem (the BLUT philosophy): at launch the HPO run

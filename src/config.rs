@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! BLUT runtime configuration: locate llama.cpp tools + model
 //! registry. Vendored from lamu-core's config.rs during the BLUT
 //! repo split. Kept self-contained so BLUT has no upward Rust

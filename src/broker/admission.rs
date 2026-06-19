@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Admission decision — the pure RAM-refuse gate (ADR 0046, slice-1
 //! item 4). Ports `tools/blut_admit.sh` L26-35.
 //!

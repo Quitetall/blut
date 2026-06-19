@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Sweep-completion index (E4).
 //!
 //! A sweep combo is identified by its composed-config `fingerprint`

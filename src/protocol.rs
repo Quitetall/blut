@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Wire protocol between the Rust trainer backend and the Python
 //! trainer subprocess. One `StatusUpdate` per line on the trainer's
 //! stdout, JSON, no envelope, no trailing fields.

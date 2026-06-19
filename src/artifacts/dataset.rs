@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Dataset artifacts.
 //!
 //! A `DatasetJsonl` is one JSONL file on disk plus its content

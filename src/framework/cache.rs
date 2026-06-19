@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Stage output cache.
 //!
 //! Skips re-execution of a stage when the inputs + args + stage

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! TrainSpec — the validated, immutable description of one training run.
 //!
 //! This type is the single source of truth for a job. The CLI deserializes

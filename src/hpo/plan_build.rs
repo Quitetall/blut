@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! HPO fan-out plan builder (v0.20 Phase 2).
 //!
 //! Samples `n_trials` configs from the search space, compiles each as an

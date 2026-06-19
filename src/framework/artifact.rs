@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Typed artifacts — the boundary between stages.
 //!
 //! An artifact is a Rust struct that *references* on-disk bytes,

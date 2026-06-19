@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Cross-process advisory lock for the GPU.
 //!
 //! Why this exists: lamu-cli, lamu-mcp, lamu-api, and lamu-train are

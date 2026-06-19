@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Resource probe for the admission gate (ADR 0046, slice-1).
 //!
 //! Cheap, best-effort reads of free RAM (`/proc/meminfo` MemAvailable)

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Lineage + cache observability (E3).
 //!
 //! The executor already records everything needed to answer "what ran,

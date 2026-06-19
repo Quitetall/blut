@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Backend abstraction — the public 1.0 backend-identity seam.
 //!
 //! BLUT is an orchestrator. Concrete training engines (HuggingFace

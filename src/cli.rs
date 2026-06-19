@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! `lamu-train` — local fine-tuning subcommand binary.
 //!
 //! Top-level subcommands:

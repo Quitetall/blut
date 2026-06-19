@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! HPO search space (BLUT v0.20).
 //!
 //! A typed space of named hyperparameter dimensions, each with a distribution.

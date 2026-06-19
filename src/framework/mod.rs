@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! BLUT framework core — typed Stages, Plans, Recipes.
 //!
 //! BLUT (Brian Lam's Universal Trainer) is built around three layers:

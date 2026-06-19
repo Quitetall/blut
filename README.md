@@ -164,4 +164,13 @@ C-track) and cluster launchers (Slurm / Ray) are in progress / deferred.
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+[GNU AGPL-3.0-or-later](LICENSE). BLUT is free software: you may use, study,
+modify, and redistribute it under the GNU Affero General Public License,
+version 3 or (at your option) any later version.
+
+Note the AGPL's **network clause** (§13): if you run a modified version of
+BLUT as a network-accessible service, you must offer that service's users the
+corresponding source of your modified version.
+
+A **commercial license** — for use without the AGPL's copyleft / source-
+availability obligations — is available from the maintainer on request.

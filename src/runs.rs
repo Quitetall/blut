@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! `blut runs diff` — compare two jobs' recipe/args PROVENANCE plus a
 //! one-line outcome each. Provenance (what was launched) is BLUT's noun;
 //! metric-curve comparison stays in wandb (ADR 0034). All data is already

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Minimal model registry for BLUT.
 //!
 //! After a successful training run, `register_model` writes here

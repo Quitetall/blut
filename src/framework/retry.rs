@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Per-stage retry policy (D1) + stage/plan timeouts (D2).
 //!
 //! A `Stage` declares `const RETRY` and `const TIMEOUT`; a plan can

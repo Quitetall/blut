@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! ASHA — Asynchronous Successive Halving (v0.20 Phase 4), the headline
 //! adaptive search.
 //!

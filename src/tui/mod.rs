@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! `blut tui` — the single, complete interactive training cockpit.
 //!
 //! This is the canonical training cockpit for the whole project. It

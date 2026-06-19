@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Median / percentile early-stop (v0.20 Phase 3).
 //!
 //! Kill a trial whose score (higher = better; the scheduler already negated for

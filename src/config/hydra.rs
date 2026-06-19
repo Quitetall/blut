@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Native Hydra-style config compose — the blut-owned replacement for the
 //! former `lerna` git-dependency (removed so the engine can publish to
 //! crates.io, which forbids git deps).

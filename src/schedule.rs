@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Declarative schedules via systemd `--user` timers (E5).
 //!
 //! BLUT owns the noun (recipe → schedule mapping); systemd owns the

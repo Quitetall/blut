@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! BLUT resource broker — SLICE-1 ("box never RAM-OOMs").
 //!
 //! Per ADR 0046 (the adversarial review's *corrected* smallest-first

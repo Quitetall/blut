@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Concrete typed artifacts used by stages + recipes.
 //!
 //! Each artifact is a Rust struct that references on-disk bytes

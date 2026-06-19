@@ -82,3 +82,10 @@ the runtime check, or keep them as opt-in integration tests.
 
 Use the issue templates under `.github/ISSUE_TEMPLATE/`. For bugs, the
 Linux+systemd answer matters — it changes which code path ran.
+
+## License of contributions
+
+`blut` is licensed under **AGPL-3.0-or-later**. By submitting a contribution
+you agree it is licensed under those same terms. Because the project also
+offers a commercial license, contributions may additionally require signing
+the project's Contributor License Agreement before they can be merged.

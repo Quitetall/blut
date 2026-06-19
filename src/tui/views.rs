@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Diagnostic / planning views migrated into the BLUT cockpit from the
 //! retired Python training cockpit (`legacy/python_cockpit/cockpit.py`)
 //! and the lamquant-lossless hub `CockpitPanel`.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Sweep engine: expand sweep overrides into a cartesian product of
 //! concrete configs, fingerprint each, and (stub) decide whether a combo
 //! can be skipped because its output is already cached.

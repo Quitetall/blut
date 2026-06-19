@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Durable resume policy (BLUT-API Phase D) — the orchestrator HALF.
 //!
 //! The crash-gated DECISION: given a stable resume directory's run-state marker

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Partitions — a NAMED, persistent partition key-space over a recipe, with
 //! per-cell materialization tracking + backfill (BLUT-API Phase G, the
 //! Dagster-class "run one plan over a key-set, fill only the missing cells"

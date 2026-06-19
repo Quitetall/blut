@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Live GPU-saturation sampler (E2 — owner directive: "GPU must run
 //! close to maximum, never wasted — and this must be MEASURED, not
 //! assumed").

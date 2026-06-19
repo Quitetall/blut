@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! Auto-trigger heuristic for `lamu-train auto`.
 //!
 //! Goal: keep a personal model fresh against accumulated

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
 //! TPE — Tree-structured Parzen Estimator (v0.20 Phase 8), a model-based
 //! ask-tell sampler + the policy that drives it at runtime.
 //!
