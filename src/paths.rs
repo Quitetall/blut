@@ -49,84 +49,15 @@ pub fn data_dir() -> Result<PathBuf> {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// Meta-repo detection + reusable root primitives.
+// Reusable root primitives (domain-agnostic).
 //
-// Domain-agnostic: blut-core only needs to LOCATE the meta-repo (the
-// dir that owns the workspace submodules) and offer the
-// root-existence / path-join error-format primitives. The DOMAIN root
-// map (which submodule holds ai_models/, scripts/, pccp/, etc.) lives
-// in the cookbook crates (e.g. `cookbook-lamquant::paths`), which call
-// these primitives. `LocalSystemd` (the contained launcher) uses
-// `meta_repo_root` to find `tools/run_contained.sh`.
+// The engine offers only the root-existence / path-join error-format
+// primitives below. Locating any PARTICULAR repo (a meta-repo, a
+// submodule that holds `ai_models/`/`scripts/`, etc.) is a COOKBOOK
+// concern — a cookbook composes these primitives with its own roots /
+// env-var names. The engine assumes nothing about the directory it
+// lives in (the contained launcher embeds its own helper script).
 // ─────────────────────────────────────────────────────────────────
-
-/// Detect the meta-repo root: the directory that owns the workspace
-/// submodules (it has a `.gitmodules` AND a `blut/` submodule child).
-///
-/// Detection order:
-///   1. `$BLUT_META_ROOT` (explicit override).
-///   2. Walk up from `$CARGO_MANIFEST_DIR` (dev/cargo-test) then from
-///      `current_exe()` (installed), looking for a dir that both has a
-///      `.gitmodules` AND a `blut/` child — the meta-repo signature.
-///   3. Fallback: the parent of `$CARGO_MANIFEST_DIR` (blut compiles as
-///      `<meta>/blut`, so its parent is the meta-repo root).
-///
-/// Returns a clean `Err` only if every candidate is unusable AND the
-/// fallback does not exist, so callers never panic.
-pub fn meta_repo_root() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("BLUT_META_ROOT") {
-        let p = PathBuf::from(p);
-        if p.is_dir() {
-            return Ok(p);
-        }
-        return Err(TrainError::other(format!(
-            "$BLUT_META_ROOT={} is not a directory",
-            p.display()
-        )));
-    }
-
-    let mut starts: Vec<PathBuf> = Vec::new();
-    // CARGO_MANIFEST_DIR points at `<meta>/blut` during dev/test.
-    starts.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            starts.push(dir.to_path_buf());
-        }
-    }
-    for start in &starts {
-        if let Some(meta) = walk_up_for_meta(start) {
-            return Ok(meta);
-        }
-    }
-
-    // Fallback: blut's manifest dir is `<meta>/blut`, so its parent is
-    // the meta-repo root (`.gitmodules` lists `blut` as a submodule).
-    if let Some(parent) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
-        if parent.is_dir() {
-            return Ok(parent.to_path_buf());
-        }
-    }
-    Err(TrainError::other(format!(
-        "could not detect the meta-repo: no ancestor of {starts:?} has \
-         both .gitmodules and a blut/ submodule. Set $BLUT_META_ROOT to \
-         override."
-    )))
-}
-
-/// Walk up from `start` looking for the meta-repo signature
-/// (`.gitmodules` + a `blut/` submodule child). Returns the first match.
-fn walk_up_for_meta(start: &Path) -> Option<PathBuf> {
-    let mut cur: Option<&Path> = Some(start);
-    while let Some(dir) = cur {
-        let has_gitmodules = dir.join(".gitmodules").is_file();
-        let has_blut = dir.join("blut").is_dir();
-        if has_gitmodules && has_blut {
-            return Some(dir.to_path_buf());
-        }
-        cur = dir.parent();
-    }
-    None
-}
 
 /// Validate that `root` holds the `expects` subtree; clean `Err`
 /// naming the env var to set if not. Generic primitive — domain

@@ -1,10 +1,10 @@
 //! blut-owned `Launcher` abstraction: build the OS command that runs a
 //! sweep job, optionally inside a resource-capped container.
 
+use std::path::PathBuf;
 use std::process::Command;
 
 use crate::error::{Result, TrainError};
-use crate::paths;
 
 /// Which launcher produced a [`WrappedCommand`]. Lets a backend pick the right
 /// liveness / OOM-peak handling for the placement mechanism: systemd's
@@ -142,8 +142,72 @@ pub fn local_gpu_count() -> usize {
     1
 }
 
+/// The contained-launch helper, embedded into the engine so a published /
+/// `cargo install`ed binary carries it with NO dependency on a surrounding
+/// repo layout (the old `meta_repo_root()` walk assumed blut lived inside its
+/// meta-repo). It is materialized to a cache dir at first contained launch.
+const RUN_CONTAINED_SH: &str = include_str!("../../scripts/run_contained.sh");
+
+/// Materialize the embedded `run_contained.sh` to a stable, absolute path and
+/// return it (systemd-run's `--user` cwd is minimal, so the path must be
+/// absolute). Resolution order:
+///   1. `$BLUT_RUN_CONTAINED` — explicit path override (a patched script).
+///   2. `<base>/blut/run_contained.sh`, written from the embedded copy and
+///      refreshed when content-stale, where `<base>` is `$BLUT_HOME` or the
+///      XDG cache dir.
+fn resolve_run_contained_script() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("BLUT_RUN_CONTAINED") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Ok(p);
+        }
+        return Err(TrainError::other(format!(
+            "$BLUT_RUN_CONTAINED={} is not a file",
+            p.display()
+        )));
+    }
+    let base = match std::env::var("BLUT_HOME") {
+        Ok(h) => PathBuf::from(h),
+        Err(_) => dirs::cache_dir().ok_or_else(|| {
+            TrainError::other("cache_dir() unavailable; set $BLUT_HOME or $BLUT_RUN_CONTAINED")
+        })?,
+    };
+    let dir = base.join("blut");
+    std::fs::create_dir_all(&dir).map_err(|e| TrainError::Io {
+        path: dir.clone(),
+        source: e,
+    })?;
+    let script = dir.join("run_contained.sh");
+    // Rewrite when missing or content-stale (e.g. after an engine upgrade).
+    let stale = std::fs::read_to_string(&script)
+        .map(|cur| cur != RUN_CONTAINED_SH)
+        .unwrap_or(true);
+    if stale {
+        std::fs::write(&script, RUN_CONTAINED_SH).map_err(|e| TrainError::Io {
+            path: script.clone(),
+            source: e,
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script)
+                .map_err(|e| TrainError::Io {
+                    path: script.clone(),
+                    source: e,
+                })?
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).map_err(|e| TrainError::Io {
+                path: script.clone(),
+                source: e,
+            })?;
+        }
+    }
+    Ok(script)
+}
+
 /// Run work in a memory-capped, session-detached transient systemd `--user`
-/// service by shelling `tools/run_contained.sh`. The script reads
+/// service by shelling the embedded `run_contained.sh`. The script reads
 /// `UNIT`/`MEMMAX`/`MEMHIGH`/`SWAPMAX` from the environment and execs
 /// `systemd-run --user --unit=$UNIT ... -- "$@"`.
 #[derive(Clone, Debug)]
@@ -177,16 +241,10 @@ impl Launcher for LocalSystemd {
     }
 
     fn wrap(&self, unit: &str, inner: &[String]) -> Result<WrappedCommand> {
-        // run_contained.sh runs under systemd-run's MINIMAL cwd, so the
-        // script path MUST be absolute.
-        let root = paths::meta_repo_root()?;
-        let script = root.join("tools").join("run_contained.sh");
-        if !script.is_file() {
-            return Err(TrainError::other(format!(
-                "run_contained.sh not found at {}",
-                script.display()
-            )));
-        }
+        // run_contained.sh runs under systemd-run's MINIMAL cwd, so the script
+        // path MUST be absolute. It is embedded + materialized to a cache dir,
+        // so containment works from a clean install (no repo-layout assumption).
+        let script = resolve_run_contained_script()?;
         let mut args = vec![script.display().to_string()];
         args.extend(inner.iter().cloned());
         Ok(WrappedCommand {
@@ -511,9 +569,8 @@ mod tests {
 
     #[test]
     fn build_command_argv_is_inspectable() {
-        // Relies on meta_repo_root() default resolution (walks up from
-        // CARGO_MANIFEST_DIR to the real meta-repo where tools/run_contained.sh
-        // exists); does not spawn systemd.
+        // Materializes the EMBEDDED run_contained.sh to a cache dir (no repo
+        // layout / meta_repo_root needed); does not spawn systemd.
         let cmd = LocalSystemd::default()
             .build_command(
                 "unit-x",
@@ -531,8 +588,8 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert!(
-            args[0].ends_with("tools/run_contained.sh"),
-            "first arg must be the script path, got {:?}",
+            args[0].ends_with("run_contained.sh") && args[0].starts_with('/'),
+            "first arg must be the absolute materialized script path, got {:?}",
             args[0]
         );
         assert_eq!(&args[1..], &["python", "-u", "train.py"]);

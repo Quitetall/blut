@@ -1,9 +1,9 @@
 //! System-probe panel data for `blut tui`.
 //!
 //! Cheap once-per-tick reads: `/proc/meminfo`, `/proc/loadavg`,
-//! `nvidia-smi --query-gpu`, and `statvfs(/mnt/4tb)`. All best-effort
-//! — a missing tool / unreadable file degrades to a single "n/a"
-//! line rather than failing the TUI loop.
+//! `nvidia-smi --query-gpu`, and `df` of the blut state filesystem. All
+//! best-effort — a missing tool / unreadable file degrades to a single
+//! "n/a" line rather than failing the TUI loop.
 
 use std::process::Command;
 
@@ -16,6 +16,8 @@ pub(super) struct SystemSnapshot {
     pub mem_total_gb: f64,
     pub mem_used_gb: f64,
     pub mem_avail_gb: f64,
+    /// The path whose filesystem the disk panel reports (for the panel label).
+    pub disk_path: String,
     pub disk_free_human: String,
     pub disk_used_pct: u32,
     pub load1: f64,
@@ -23,6 +25,7 @@ pub(super) struct SystemSnapshot {
 
 impl SystemSnapshot {
     pub(super) fn probe() -> Self {
+        let disk_path = disk_probe_path();
         Self {
             gpu_mem_used_mib: probe_gpu_field("memory.used").and_then(|s| s.parse().ok()),
             gpu_mem_total_mib: probe_gpu_field("memory.total").and_then(|s| s.parse().ok()),
@@ -35,8 +38,9 @@ impl SystemSnapshot {
                 ((total - avail).max(0.0)) / 1024.0 / 1024.0
             },
             mem_avail_gb: probe_meminfo_kib("MemAvailable:") / 1024.0 / 1024.0,
-            disk_free_human: probe_disk_free_human("/mnt/4tb"),
-            disk_used_pct: probe_disk_used_pct("/mnt/4tb"),
+            disk_free_human: probe_disk_free_human(&disk_path),
+            disk_used_pct: probe_disk_used_pct(&disk_path),
+            disk_path,
             load1: probe_loadavg(),
         }
     }
@@ -57,6 +61,25 @@ impl SystemSnapshot {
             _ => "n/a (nvidia-smi missing?)".into(),
         }
     }
+}
+
+/// The path whose filesystem the disk panel reports. Never a hardcoded machine
+/// path, so a stranger sees their own layout. Resolution order:
+///   1. `$BLUT_DISK_PATH` — explicit override.
+///   2. `$BLUT_HOME` — the engine's home, if set.
+///   3. the job-state dir (`paths::jobs_dir`) — the filesystem blut writes to.
+///   4. `.` (current dir) — last resort.
+fn disk_probe_path() -> String {
+    if let Ok(p) = std::env::var("BLUT_DISK_PATH") {
+        return p;
+    }
+    if let Ok(p) = std::env::var("BLUT_HOME") {
+        return p;
+    }
+    if let Ok(p) = crate::paths::jobs_dir() {
+        return p.to_string_lossy().into_owned();
+    }
+    ".".to_string()
 }
 
 fn probe_gpu_field(field: &str) -> Option<String> {

@@ -2209,7 +2209,10 @@ fn draw_system(f: &mut Frame<'_>, area: Rect, app: &App) {
             theme::normal(),
         )),
         Line::from(""),
-        Line::from(Span::styled("DISK /mnt/4tb", theme::highlight())),
+        Line::from(Span::styled(
+            format!("DISK {}", snap.disk_path),
+            theme::highlight(),
+        )),
         Line::from(Span::styled(
             format!(
                 "free {} ({}% used)",
