@@ -417,10 +417,13 @@ def test_lma_l3_teacher_default_seed_is_byte_identical(lma_corpus):
 # ===========================================================================
 
 def _prime_cache_env_inline():
-    """The exact priming train_joint does inline (lines 647-654)."""
-    from lamquant.common.cache_paths import apply_env
+    """The exact priming _build_lma_typed_l3 does — cache-CONDITIONED worker
+    default (OPT-2 #2): 4 when the on-disk decode cache is warm, else 2.
+    setdefault preserves an explicit override either way."""
+    from lamquant.common.cache_paths import apply_env, decode_cache_is_warm
     apply_env()
-    os.environ.setdefault("LMA_NUM_WORKERS", "2")
+    os.environ.setdefault(
+        "LMA_NUM_WORKERS", "4" if decode_cache_is_warm() else "2")
 
 
 def test_lma_typed_l3_sets_cache_env(lma_corpus, monkeypatch, tmp_path):
@@ -451,8 +454,33 @@ def test_lma_typed_l3_sets_cache_env(lma_corpus, monkeypatch, tmp_path):
     exp_env = {k: os.environ.get(k) for k in
                ("L3_CACHE_DIR", "FB_CACHE_DIR", "MEMMAP_DIR", "LMA_NUM_WORKERS")}
     assert got_env == exp_env
+    # Fresh tmp data root → the cache dirs build() creates are EMPTY → cold →
+    # the conservative worker default (2). The warm-cache bump is covered by
+    # test_lma_typed_l3_warm_cache_bumps_workers below.
     assert got_env["LMA_NUM_WORKERS"] == "2"
     assert got_env["L3_CACHE_DIR"].startswith(data_root)
+
+
+def test_lma_typed_l3_warm_cache_bumps_workers(
+        lma_corpus, monkeypatch, tmp_path):
+    # OPT-2 #2: when the on-disk L3/FB decode cache already holds content (warm),
+    # the typed path's worker default rises from 2 -> 4 to feed the decode-bound
+    # GPU. Simulate warmth by dropping a file into the L3 cache subdir BEFORE
+    # build() runs (apply_env creates the dirs; content makes them warm).
+    data_root = tmp_path
+    monkeypatch.setenv("LAMQUANT_DATA_ROOT", str(data_root))
+    monkeypatch.delenv("LMA_NUM_WORKERS", raising=False)
+    l3_dir = data_root / "Training" / "l3_cache"
+    l3_dir.mkdir(parents=True, exist_ok=True)
+    (l3_dir / "warm_marker.npz").write_bytes(b"\x00")
+
+    root, manifest = lma_corpus["root"], lma_corpus["manifest"]
+    build_ingredient(
+        "data", "lma_typed_l3",
+        {"lma_root": root, "split_manifest": manifest,
+         "windows_per_epoch": 8, "val_windows": 8, "return_fullband": False,
+         "seed": 0})
+    assert os.environ["LMA_NUM_WORKERS"] == "4"
 
 
 def test_lma_typed_l3_setdefault_preserves_explicit_workers(

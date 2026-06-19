@@ -272,9 +272,23 @@ def _build_lma_typed_l3(cfg):
     """
     # MANDATORY + STANDARDIZED decode caches — set BEFORE the datasets (and the
     # DataLoader fork that follows in the trainer) so workers inherit the dirs.
-    from lamquant.common.cache_paths import apply_env
+    from lamquant.common.cache_paths import apply_env, decode_cache_is_warm
     apply_env()
-    os.environ.setdefault("LMA_NUM_WORKERS", "2")
+    # Cache-conditioned worker default (OPT-2 #2). The typed path was blanket
+    # LMA_NUM_WORKERS=2 — but the GPU is decode-bound (one LMA decode ~301ms vs
+    # an 8.3ms model step; gpu_saturation ~30%), so when the on-disk L3/FB decode
+    # cache is already WARM, more decode fork-workers overlap reads with GPU
+    # compute and feed the GPU. This mirrors the SNN path's long-standing
+    # L3-cache-conditioned default (build_lma_dataloader_kwargs above): a warm
+    # cache makes 4 workers a throughput win, a cold one makes them a RAM
+    # liability (every worker re-runs the full decode, peak RSS sums across
+    # workers). apply_env() always *creates* the cache dirs, so "configured" is
+    # not the signal — decode_cache_is_warm() checks the dirs hold content.
+    # setdefault (not assignment) preserves an explicit LMA_NUM_WORKERS override
+    # (incl. =0 serial decode), which the A/B harness sets. RAM note: the typed
+    # adapter pairs this with prefetch_factor (default 4 when warm) — peak host
+    # footprint scales with workers x prefetch x per-window decode RSS.
+    os.environ.setdefault("LMA_NUM_WORKERS", "4" if decode_cache_is_warm() else "2")
 
     # Package-form import (NOT the trainer's bare ``from lma_typed_adapter``):
     # train_joint puts ``lamquant/student`` on sys.path before its bare import,

@@ -99,3 +99,40 @@ def apply_env(create: bool = True) -> CacheLayout:
     os.environ[FB_ENV] = lay.fb_cache_dir
     os.environ[MEMMAP_ENV] = lay.memmap_dir
     return lay
+
+
+def _dir_has_content(path: str) -> bool:
+    """True iff ``path`` is a directory that holds at least one entry.
+
+    Used to tell a WARM on-disk decode cache (worth more decode workers) from a
+    merely-CONFIGURED-but-empty one. ``apply_env`` always *creates* the cache
+    dirs, so a configured cache dir always exists on the typed path — the dir
+    existing is therefore NOT a warm signal; the dir having content is. Never
+    raises (a probe must not break a launch): an unreadable / missing dir reads
+    as cold.
+    """
+    if not path:
+        return False
+    try:
+        with os.scandir(path) as it:
+            return any(True for _ in it)
+    except OSError:
+        return False
+
+
+def decode_cache_is_warm() -> bool:
+    """True iff a decode cache (L3 or fullband-window) is configured AND already
+    holds entries on disk.
+
+    This is the cache-conditioning signal both the typed and SNN dataloader
+    paths use to pick their worker/prefetch depth: a warm on-disk cache makes
+    more decode fork-workers a throughput win (the heavy per-window decode is
+    served from cache, so workers mostly do cheap reads); a cold cache makes the
+    same workers a RAM liability (every worker re-runs the full decode and the
+    per-worker RSS spike sums across workers). Reads ``L3_CACHE_DIR`` /
+    ``FB_CACHE_DIR`` from the env (set by ``apply_env``); content of EITHER cache
+    counts as warm. Never raises."""
+    return (
+        _dir_has_content(os.environ.get(L3_ENV, ""))
+        or _dir_has_content(os.environ.get(FB_ENV, ""))
+    )

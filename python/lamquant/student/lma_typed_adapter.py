@@ -116,6 +116,19 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _decode_cache_is_warm() -> bool:
+    """Cache-conditioning signal for the prefetch-depth default (OPT-2 #2):
+    delegates to the canonical ``cache_paths.decode_cache_is_warm`` (True iff an
+    L3/FB decode cache dir holds content). Imported lazily + guarded so a missing
+    module never breaks the loader build — it just degrades to "cold" (the
+    conservative shallow-prefetch default)."""
+    try:
+        from lamquant.common.cache_paths import decode_cache_is_warm
+        return decode_cache_is_warm()
+    except Exception:
+        return False
+
+
 def _rss_worker_init(worker_id: int) -> None:
     """DataLoader ``worker_init_fn``: when ``LAMQUANT_RSS_DEBUG`` is set, register
     an atexit hook that prints this worker's PEAK RSS (``ru_maxrss``) at teardown.
@@ -614,8 +627,17 @@ class LmaTypedL3Dataset:
                 pin_memory=(dev.type == "cuda"),
                 # Each in-flight prefetched batch pins host buffers + forces the
                 # worker to decode ahead; 4 was the per-worker RSS multiplier.
-                # Default 2 (one batch of GPU/decode overlap) — env-tunable.
-                prefetch_factor=max(1, _env_int("LMA_PREFETCH_FACTOR", 2)),
+                # Cache-conditioned default (OPT-2 #2): 4 (deeper GPU/decode
+                # overlap) when the on-disk decode cache is WARM — the decode the
+                # workers run ahead is then a cheap cache read, so the deeper
+                # queue feeds the decode-bound GPU without the cold per-worker RSS
+                # blow-up; 2 (one batch of overlap) when cold. Mirrors the worker
+                # default set in the lma_typed_l3 ingredient. env LMA_PREFETCH_FACTOR
+                # overrides either default. RAM: peak host footprint ~
+                # num_workers x prefetch_factor x per-window decode RSS.
+                prefetch_factor=max(1, _env_int(
+                    "LMA_PREFETCH_FACTOR",
+                    4 if _decode_cache_is_warm() else 2)),
                 persistent_workers=False,
                 worker_init_fn=_rss_worker_init,
             )
