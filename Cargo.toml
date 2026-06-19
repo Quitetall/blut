@@ -1,13 +1,12 @@
 # blut — the domain-agnostic BLUT engine, a lib-only crate. Ships ZERO
-# recipes and ZERO concrete cookbooks: only the framework (Stage / Plan /
-# Recipe / Registry / Cookbook trait), the CLI / TUI orchestration, and
-# the generic LLM stage / backend primitives. The cookbooks that supply
-# recipes + the user-facing binaries are now SEPARATE repos depending on
-# this crate (C2c): `blut-lamquant` (binary `blut`, neural EEG codec) and
-# `blut-lamu` (binary `blut-lamu`, generic LLM). This crate still hosts
-# the LamQuant python payload at `python/lamquant/` transitionally — it
-# moves to blut-lamquant in migration #2, once the oracle frees it. See
-# [[project_blut_cookbook_split]].
+# recipes, concrete stages, backends, or Python: only the framework
+# (Stage / Plan / Recipe / Registry / Cookbook trait), the content-
+# addressed cache, the never-OOM resource broker, HPO, lineage, and the
+# CLI orchestration. Cookbooks that supply recipes + the user-facing
+# binaries are SEPARATE crates depending on this one; the generic-LLM
+# stages + backends live in `blut-backends`. The interactive TUI cockpit
+# is behind the off-by-default `tui` feature (CLI-only in 1.0; returns in
+# 1.1). See README.md / API.md.
 [package]
 name = "blut"
 version = "0.11.0"
