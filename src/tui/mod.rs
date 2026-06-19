@@ -512,13 +512,34 @@ impl App {
             View::Metrics => self.metrics = job.map(views::metrics_for).unwrap_or_default(),
             _ => {}
         }
+        // A refresh may have SHRUNK the active list (a job disappeared, the DB
+        // returned fewer rows). Re-clamp the cursor so it can't point past the
+        // end — otherwise `current_job_id()` (which drives Compare-mark,
+        // Enter→DAG, and the Reset→ClearJob target) would act on a different run
+        // than the highlighted row.
+        let len = self.active_list_len();
+        self.list_cursor = self.list_cursor.min(len.saturating_sub(1));
+    }
+
+    /// Number of rows in the cursor-driven list for the active view (0 for views
+    /// with no list cursor).
+    fn active_list_len(&self) -> usize {
+        match self.view {
+            View::History | View::Leaderboard => self.runs.len(),
+            View::Artifacts => self.artifacts.len(),
+            View::Catalog => self.catalog.len(),
+            _ => 0,
+        }
     }
 
     /// The job id the per-job views (DAG / Lineage / Artifacts / Metrics)
-    /// operate on: the Jobs/Log selection, else the run under the list cursor
-    /// (History / Leaderboard), else the newest job.
+    /// operate on: the Cockpit/Jobs/Log selection, else the run under the list
+    /// cursor (History / Leaderboard), else the newest job.
     fn current_job_id(&self) -> Option<String> {
-        if matches!(self.view, View::Jobs | View::Log) {
+        // On the cockpit + the Jobs/Log views the live cursor is `self.selected`
+        // over `self.jobs`; honour it so jumping straight to a detail view uses
+        // the highlighted job, not just the newest.
+        if matches!(self.view, View::Cockpit | View::Jobs | View::Log) {
             if let Some(j) = self.selected.selected().and_then(|i| self.jobs.get(i)) {
                 return Some(j.id.clone());
             }
@@ -531,23 +552,17 @@ impl App {
 
     /// Move the cursor in whichever list-style view is active.
     fn move_list(&mut self, delta: isize) {
-        let len = match self.view {
-            View::History | View::Leaderboard => self.runs.len(),
-            View::Artifacts => self.artifacts.len(),
-            View::Catalog => self.catalog.len(),
-            View::Reset => RESET_ROWS.len(),
-            _ => 0,
-        };
+        if self.view == View::Reset {
+            // RESET_ROWS is a fixed, non-empty const slice.
+            let len = RESET_ROWS.len() as isize;
+            self.reset_cursor = (self.reset_cursor as isize + delta).rem_euclid(len) as usize;
+            return;
+        }
+        let len = self.active_list_len();
         if len == 0 {
             return;
         }
-        if self.view == View::Reset {
-            let cur = self.reset_cursor as isize;
-            self.reset_cursor = (cur + delta).rem_euclid(len as isize) as usize;
-            return;
-        }
-        let cur = self.list_cursor as isize;
-        self.list_cursor = (cur + delta).rem_euclid(len as isize) as usize;
+        self.list_cursor = (self.list_cursor as isize + delta).rem_euclid(len as isize) as usize;
     }
 
     /// Filtered list of recipes against the picker's fuzzy query.
@@ -876,9 +891,10 @@ impl App {
                 .cmp(&b.category.order())
                 .then_with(|| a.name.cmp(b.name))
         });
-        // Reserved keys: q, Q, r, R, c, C, j, k, l (lowercase / uppercase
-        // map to the same action so we exclude both cases).
-        let reserved: &[char] = &['q', 'Q', 'r', 'R', 'c', 'C', 'j', 'k', 'l'];
+        // Reserved keys: the cockpit built-ins (q/r/c/R), vi nav (j/k/l), and
+        // back-nav (b) — excluded from the recipe-hotkey pool so a recipe can
+        // never shadow a navigation key (lowercase + uppercase both reserved).
+        let reserved: &[char] = &['q', 'Q', 'r', 'R', 'c', 'C', 'j', 'k', 'l', 'b', 'B'];
         let mut pool: Vec<char> = ('1'..='9').collect();
         pool.extend('a'..='z');
         pool.retain(|c| !reserved.contains(c));
@@ -1406,11 +1422,10 @@ async fn run_app<B: ratatui::backend::Backend>(
         // on Enter / selection change to avoid blocking the loop on
         // every tick.
         if app.last_refresh.elapsed() >= REFRESH_TICK {
-            app.refresh_jobs();
-            app.refresh_system();
-            // Refresh log too — running jobs grow fast.
-            app.refresh_log();
-            app.last_refresh = Instant::now();
+            // Full refresh: jobs + system + log + the ACTIVE view's data, so a
+            // running job's DAG / Metrics / Lineage / Artifacts panels stay live
+            // without a manual `r`. (`refresh_all` stamps `last_refresh`.)
+            app.refresh_all();
         }
 
         term.draw(|f| draw(f, &mut app))
@@ -3865,5 +3880,337 @@ mod state_tests {
             panic!("expected Picker");
         };
         assert_eq!(*cursor, 0, "Up must saturate at 0");
+    }
+}
+
+/// V2 validation harness: drive the cockpit headless with POPULATED + adversarial
+/// data through every view, every terminal size, and long key sequences, asserting
+/// it never panics and never renders a blank frame. The other test modules cover
+/// the EMPTY-state drawers; this one fills the per-view caches (runs / artifacts /
+/// dag / lineage / metrics / compare) with synthetic engine data — including the
+/// nasty cases (NaN/inf metrics, 300-char names, unicode, missing hashes, a 1×1
+/// terminal) — so a layout/format/overflow bug surfaces here, not in production.
+#[cfg(test)]
+mod harness_tests {
+    use super::test_fixtures::test_registry;
+    use super::*;
+
+    const ALL_VIEWS: &[View] = &[
+        View::Cockpit,
+        View::Jobs,
+        View::Log,
+        View::System,
+        View::History,
+        View::Leaderboard,
+        View::Compare,
+        View::Dag,
+        View::Lineage,
+        View::Artifacts,
+        View::Metrics,
+        View::Catalog,
+        View::Reset,
+    ];
+
+    fn job(id: &str, state: JobState) -> JobSummary {
+        JobSummary {
+            id: id.into(),
+            state,
+            pid: Some(1234),
+            output_name: Some("artifact".into()),
+            last_loss: Some(0.5),
+            last_step: Some(10),
+            final_loss: Some(0.4),
+        }
+    }
+
+    fn run_row(id: &str, recipe: &str, metric: Option<f64>) -> views::RunRow {
+        views::RunRow {
+            job_id: id.into(),
+            recipe: recipe.into(),
+            outcome: "done".into(),
+            metric,
+            when: "2026-06-18 07:30".into(),
+        }
+    }
+
+    fn graph(n: usize) -> crate::framework::GraphSnapshot {
+        use crate::framework::NodeStatus as N;
+        use crate::framework::graph::{GraphNode, PlanGraphEdge};
+        let st = [
+            N::Done,
+            N::Running,
+            N::Failed,
+            N::Skipped,
+            N::Pending,
+            N::Blocked,
+            N::Killed,
+            N::Pruned,
+            N::Ready,
+        ];
+        let nodes = (0..n)
+            .map(|i| GraphNode {
+                idx: i,
+                stage_name: format!("stage_number_{i}_with_a_longish_name"),
+                status: st[i % st.len()],
+                args_summary: String::new(),
+                input_hash: if i == 0 {
+                    None
+                } else {
+                    Some("abcdef0123456789".into())
+                },
+                output_hash: Some("0123456789abcdef".into()),
+                elapsed_secs: Some(1.5 * i as f64),
+                cache_hit: i % 2 == 0,
+                hpo: None,
+            })
+            .collect();
+        let edges = (1..n).map(|i| PlanGraphEdge { from: i - 1, to: i }).collect();
+        crate::framework::GraphSnapshot {
+            job: "20260618-073012-000000001".into(),
+            name: "demo_plan".into(),
+            nodes,
+            edges,
+        }
+    }
+
+    fn lineage_view() -> views::LineageView {
+        views::LineageView {
+            rows: vec![
+                views::LineageRow {
+                    node_idx: 0,
+                    stage: "make_data".into(),
+                    input: "—".into(),
+                    output: "abcdef0123".into(),
+                    cached: false,
+                    elapsed: "2.3s".into(),
+                },
+                views::LineageRow {
+                    node_idx: 1,
+                    stage: "train".into(),
+                    input: "abcdef0123".into(),
+                    output: "9876543210".into(),
+                    cached: true,
+                    elapsed: "—".into(),
+                },
+            ],
+            cache_hits: 1,
+            cache_misses: 1,
+            freshness: "STALE".into(),
+        }
+    }
+
+    fn compare_col(id: &str) -> views::CompareCol {
+        views::CompareCol {
+            job_id: id.into(),
+            recipe: "train_codec".into(),
+            metrics: vec![("loss".into(), 0.42), ("val_r".into(), 0.81)],
+            gpu: Some(72.5),
+        }
+    }
+
+    /// An App with every per-view cache populated with reasonable data.
+    fn populated_app() -> App {
+        super::isolate_datasets_db_for_tests();
+        theme::detect("always", "unicode");
+        let mut app = App::new(test_registry());
+        app.jobs = vec![
+            job("20260618-073012-000000001", JobState::Running),
+            job("20260618-070000-000000002", JobState::Done),
+            job("20260617-235959-000000003", JobState::Failed),
+            job("20260617-120000-000000004", JobState::Cancelled),
+        ];
+        app.selected.select(Some(0));
+        app.runs = vec![
+            run_row("20260618-073012-000000001", "train_codec", Some(0.42)),
+            run_row("20260618-070000-000000002", "eval_codec", Some(0.55)),
+            run_row("20260617-235959-000000003", "distill", None),
+        ];
+        app.artifacts = vec![views::ArtifactRow {
+            kind: "checkpoint".into(),
+            stage: "train".into(),
+            hash: "abcdef012345".into(),
+            when: "2026-06-18 07:30".into(),
+        }];
+        app.dag = Some(graph(6));
+        app.lineage = lineage_view();
+        app.metrics = vec![("loss".into(), 0.42), ("val_r".into(), 0.81)];
+        app.compare = vec![compare_col("job_a"), compare_col("job_b")];
+        app.marked = vec!["20260618-073012-000000001".into()];
+        app.log_lines = (0..50).map(|i| format!("step {i}: loss=0.{i}")).collect();
+        app
+    }
+
+    fn render(app: &mut App, w: u16, h: u16) {
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h))
+            .expect("test terminal");
+        term.draw(|f| draw(f, app)).expect("draw must not panic");
+    }
+
+    #[test]
+    fn populated_views_render_across_sizes() {
+        // Every view, with full caches, at sane → cramped → degenerate sizes.
+        for size in [(200u16, 60u16), (120, 40), (80, 24), (40, 12), (20, 6), (8, 3), (1, 1)] {
+            for &view in ALL_VIEWS {
+                let mut app = populated_app();
+                app.view = view;
+                render(&mut app, size.0, size.1); // panic ⇒ test fails
+            }
+        }
+    }
+
+    #[test]
+    fn adversarial_data_does_not_panic() {
+        // NaN / inf / negative metrics, a 300-char recipe name, unicode, a huge
+        // DAG, missing hashes — none may panic the drawers.
+        let mut app = populated_app();
+        let long = "ε".repeat(300);
+        app.runs = vec![
+            run_row("x", &long, Some(f64::NAN)),
+            run_row("y", "r", Some(f64::INFINITY)),
+            run_row("z", "r", Some(f64::NEG_INFINITY)),
+            run_row("w", "r", Some(-0.0)),
+        ];
+        app.metrics = vec![
+            ("nan".into(), f64::NAN),
+            ("inf".into(), f64::INFINITY),
+            (long.clone(), 1.0),
+        ];
+        app.compare = vec![
+            views::CompareCol {
+                job_id: long.clone(),
+                recipe: long.clone(),
+                metrics: vec![("loss".into(), f64::NAN)],
+                gpu: None,
+            },
+            compare_col("b"),
+        ];
+        app.dag = Some(graph(64));
+        app.lineage = views::LineageView {
+            rows: (0..40)
+                .map(|i| views::LineageRow {
+                    node_idx: i,
+                    stage: long.clone(),
+                    input: "—".into(),
+                    output: "—".into(),
+                    cached: i % 2 == 0,
+                    elapsed: "—".into(),
+                })
+                .collect(),
+            cache_hits: u64::MAX,
+            cache_misses: u64::MAX,
+            freshness: "UNKNOWN".into(),
+        };
+        for &view in ALL_VIEWS {
+            app.view = view;
+            render(&mut app, 80, 24);
+            render(&mut app, 20, 6);
+        }
+    }
+
+    #[test]
+    fn cursor_past_shrunk_data_does_not_panic() {
+        // Park the cursor at the end of a list, then shrink the data (as a
+        // refresh returning fewer rows would) and render — `.get()`/`enumerate`
+        // must keep it safe even though the cursor now points past the end.
+        let mut app = populated_app();
+        app.view = View::History;
+        app.list_cursor = 999;
+        render(&mut app, 80, 24);
+        app.runs.clear();
+        render(&mut app, 80, 24);
+        app.view = View::Artifacts;
+        app.list_cursor = 999;
+        app.artifacts.clear();
+        render(&mut app, 80, 24);
+        app.view = View::Catalog;
+        app.list_cursor = usize::MAX;
+        render(&mut app, 80, 24);
+    }
+
+    fn k(c: char) -> event::KeyEvent {
+        event::KeyEvent::new(event::KeyCode::Char(c), event::KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn key_sequences_across_views_do_not_panic() {
+        // Walk every view-switch key, list nav, mark, and back — repeatedly —
+        // and confirm no key path panics or wedges. NOTE: we never send a second
+        // Enter on the Reset view, so no destructive maintenance action fires.
+        let mut app = populated_app();
+        let seq = "JLYHBCGIAMPX";
+        for c in seq.chars() {
+            handle_key(&mut app, k(c));
+            // exercise list nav + mark + refresh in whatever view we landed in
+            for nav in ['j', 'k', 'm', ' ', 'r'] {
+                handle_key(&mut app, k(nav));
+            }
+            handle_key(&mut app, k('b')); // back to cockpit
+            assert!(!app.quit, "navigation must not quit");
+            render(&mut app, 80, 24);
+        }
+    }
+
+    #[test]
+    fn reset_arms_but_a_single_enter_never_fires() {
+        // On the Maintenance view a single Enter only ARMS the action (sets the
+        // confirm window); it must not run the destructive op. We assert the
+        // armed state is set and never send the confirming second Enter.
+        let mut app = populated_app();
+        app.set_view(View::Reset);
+        handle_key(&mut app, event::KeyEvent::new(event::KeyCode::Enter, event::KeyModifiers::NONE));
+        assert!(app.reset_armed.is_some(), "first Enter must arm, not fire");
+        render(&mut app, 80, 24);
+    }
+
+    #[test]
+    fn enter_on_a_run_drills_into_its_dag() {
+        // Enter on a History row loads that run's DAG view for the selected run.
+        let mut app = populated_app();
+        app.set_view(View::History);
+        app.list_cursor = 1; // second run
+        handle_key(&mut app, event::KeyEvent::new(event::KeyCode::Enter, event::KeyModifiers::NONE));
+        assert_eq!(app.view, View::Dag, "Enter on a run opens its DAG");
+        render(&mut app, 80, 24);
+    }
+
+    #[test]
+    fn leaderboard_cursor_cannot_exceed_render_cap() {
+        // Regression guard for the MiMo finding: the move_list bound (runs.len)
+        // must not exceed the rendered cap, so a fetched list can never be longer
+        // than LEADERBOARD_LIMIT.
+        const {
+            assert!(
+                views::LEADERBOARD_LIMIT <= 20,
+                "render path draws .take(LEADERBOARD_LIMIT); keep the query cap aligned"
+            )
+        };
+    }
+
+    #[test]
+    fn load_view_data_clamps_cursor_into_range() {
+        // Regression: a refresh that shrinks the active list must re-clamp the
+        // cursor so current_job_id() can't target an off-list run. Use Catalog
+        // (registry-driven, no DB dependency) for a deterministic length.
+        let mut app = populated_app();
+        app.set_view(View::Catalog);
+        let n = app.catalog.len();
+        assert!(n > 0, "fixture registry must register recipes");
+        app.list_cursor = 9_999;
+        app.load_view_data(View::Catalog, None);
+        assert!(app.list_cursor < n, "cursor must be clamped within the list");
+    }
+
+    #[test]
+    fn current_job_id_honors_cockpit_selection() {
+        // Regression: jumping from the cockpit straight to a per-job view must
+        // target the highlighted job, not just the newest.
+        let mut app = populated_app();
+        app.view = View::Cockpit;
+        app.selected.select(Some(2));
+        assert_eq!(
+            app.current_job_id().as_deref(),
+            Some(app.jobs[2].id.as_str()),
+            "cockpit selection should drive the per-job target"
+        );
     }
 }

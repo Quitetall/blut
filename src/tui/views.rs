@@ -142,11 +142,15 @@ pub fn leaderboard(metric: &str, maximize: bool) -> Vec<RunRow> {
     let Ok(db) = LineageDb::open() else {
         return Vec::new();
     };
-    // Cap at 20 — the leaderboard is a top-N ranking, and 20 matches the
-    // view's render limit so the list cursor can't run past the visible rows.
+    // Cap at the render limit so the list cursor can't run past visible rows.
+    // `top_runs_by_metric` yields one row per (job, node) that logged the
+    // metric, so a multi-stage job can appear more than once — dedup by job_id,
+    // keeping the first (best-ranked) occurrence.
+    let mut seen = std::collections::HashSet::new();
     db.top_runs_by_metric(metric, maximize, LEADERBOARD_LIMIT)
         .unwrap_or_default()
         .into_iter()
+        .filter(|(job_id, _, _)| seen.insert(job_id.clone()))
         .map(|(job_id, _node_idx, value)| {
             let rec = db.get_run(&job_id).ok().flatten();
             let recipe = rec
@@ -390,12 +394,19 @@ pub fn reset(action: ResetAction, current_job: Option<&str>) -> String {
                 .map(|(k, _)| k)
                 .collect();
             let mut forgotten = 0usize;
+            let mut errors = 0usize;
             for k in &keys {
-                if store.forget(k).unwrap_or(false) {
-                    forgotten += 1;
+                match store.forget(k) {
+                    Ok(true) => forgotten += 1,
+                    Ok(false) => {}
+                    Err(_) => errors += 1,
                 }
             }
-            format!("forgot {forgotten} footprint calibration(s)")
+            if errors > 0 {
+                format!("forgot {forgotten} footprint calibration(s); {errors} write(s) failed")
+            } else {
+                format!("forgot {forgotten} footprint calibration(s)")
+            }
         }
     }
 }
