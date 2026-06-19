@@ -1,0 +1,1 @@
+- [BLUT cockpit TUI module](project_blut_cockpit_tui.md) — src/tui/{mod,views,theme,system}.rs map: state machine, hot paths (none), keymap, cursor-clamp invariant, the 6 reviewed fixes

@@ -134,9 +134,12 @@ observability, HPO, lineage, and the recipe/cookbook system are stable and
 end-to-end runnable. From 1.0, minor releases are **additive-only** (see the
 "Stable surface" contract in [`API.md`](API.md)); cookbooks should pin `blut = "1"`.
 
-**1.0 is CLI-only.** The interactive TUI cockpit is behind an off-by-default
-`tui` feature (`--features tui`) and is **unstable until 1.1**, when it returns
-as a first-class feature.
+**The interactive TUI cockpit ships in 1.0** (default-on `tui` feature): bare
+`blut` opens a ratatui cockpit — a recipe launcher plus live, engine-native
+panels for jobs, logs, the run DAG, lineage/provenance, artifacts, run history,
+a metric leaderboard, compare, and a recipe catalog, all reading the engine's
+own jobs store + lineage DB. Build with `--no-default-features` for a lean
+CLI-only binary (no ratatui in the tree; bare `blut` prints help).
 
 ## License
 

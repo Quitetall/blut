@@ -107,8 +107,8 @@ refuses to wire a stage tagged for a different backend.
 cookbook binary supplies its `Registry` and delegates the whole CLI to it
 (`recipe`, `jobs`, `log`, `cancel`, `plan`, `cache`, `footprint`, `partition`,
 `schedule`, `sensor`, `policy`, …). The interactive `tui` subcommand + the
-bare-command cockpit are behind the off-by-default `tui` feature (1.0 is
-CLI-only; bare `blut` prints help).
+bare-command cockpit ship in the default build (the default-on `tui` feature);
+`--no-default-features` yields a lean CLI-only binary (bare `blut` prints help).
 
 ## Platform
 
@@ -138,8 +138,10 @@ these requires a major bump. Cookbooks should pin `blut = "1"`.
   (`args_schema_fn` / `compile_fn` function pointers included).
 - **CLI entry:** `cli::run(Registry)`.
 
-**Not yet stable** (may change before they're promoted): the `tui` feature
-(unstable until 1.1); the `Slurm` / `Ray` launchers (deferred); the
+**Not yet stable** (may change before they're promoted): the cockpit's internal
+`tui` module surface (the cockpit ships in 1.0, but it is driven entirely
+through the stable `cli::run` entry — the `View`/drawer internals are not a
+public contract); the `Slurm` / `Ray` launchers (deferred); the
 `broker::Drivers` footprint-driver shape (a planned post-1.0 refactor moves its
 domain-specific arg parsing into cookbooks — additive, but the `Drivers` fields
 may change). Treat anything not listed under "Stable surface" as subject to

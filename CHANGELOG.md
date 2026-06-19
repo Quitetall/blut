@@ -19,10 +19,14 @@ and any cookbook built on it.
 ### Changed
 - **License: AGPL-3.0-or-later** (with a commercial license offered separately).
   Per-file SPDX headers on every source file; the canonical AGPL text in `LICENSE`.
-- **CLI-only.** The interactive ratatui cockpit is now behind an off-by-default
-  `tui` feature; `ratatui`/`crossterm`/`fuzzy-matcher` are optional deps, absent
-  from the default dependency tree. The TUI returns as a first-class feature in
-  1.1. Bare `blut` prints help on the CLI-only build.
+- **Interactive TUI cockpit ships (default-on `tui` feature).** Bare `blut`
+  opens a ratatui cockpit whose panels read the engine's OWN state — jobs, log,
+  run DAG (`graph_snapshot`), lineage/provenance, artifacts, run history,
+  metric leaderboard, compare, run metrics, and a registry-driven recipe
+  catalog — instead of any domain file convention. `--no-default-features`
+  drops `ratatui`/`crossterm`/`fuzzy-matcher` for a lean CLI-only binary (bare
+  `blut` then prints help). The cockpit is fully domain-clean and covered by a
+  headless render/interaction test harness (`tui --check` + 57 unit tests).
 - **Stable surface contract.** From 1.0, minor releases are additive-only — see
   the "Stable surface" section in `API.md`.
 
