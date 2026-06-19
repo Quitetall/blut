@@ -202,7 +202,10 @@ impl PbtPolicy {
         let Some(w) = self.trials.get(wt as usize) else {
             return PbtDecision::Continue;
         };
-        let resume = PbtResume { winner_trial: wt, resume_dir: w.resume_dir.clone() };
+        let resume = PbtResume {
+            winner_trial: wt,
+            resume_dir: w.resume_dir.clone(),
+        };
         let woverlay = w.overlay.clone();
         // Drop the lock before perturbing (perturb takes the rng lock; no nested
         // state lock needed and keeps the two locks from ever ordering).
@@ -224,7 +227,12 @@ impl PbtPolicy {
 
 impl ControlPolicy for PbtPolicy {
     fn on_step(&self, m: &StepMetrics) -> Control {
-        let Some(trial) = self.trial_of_topo.get(m.node_idx as usize).copied().flatten() else {
+        let Some(trial) = self
+            .trial_of_topo
+            .get(m.node_idx as usize)
+            .copied()
+            .flatten()
+        else {
             return Control::Continue;
         };
         let Some(obj) = dotted_f64(m.update, &self.cfg.metric_key) else {
@@ -255,15 +263,27 @@ mod tests {
 
     fn space() -> SearchSpace {
         let mut s = SearchSpace::default();
-        s.dims.insert("lr".into(), crate::hpo::space::Dist::LogUniform { low: 1e-4, high: 1e-1 });
+        s.dims.insert(
+            "lr".into(),
+            crate::hpo::space::Dist::LogUniform {
+                low: 1e-4,
+                high: 1e-1,
+            },
+        );
         s
     }
 
     fn policy(rungs: Vec<u64>) -> PbtPolicy {
         // Two trials with distinct overlays + resume dirs.
         let trials = vec![
-            PbtTrial { overlay: vec![("lr".into(), json!(0.01))], resume_dir: "/jobs/t0".into() },
-            PbtTrial { overlay: vec![("lr".into(), json!(0.02))], resume_dir: "/jobs/t1".into() },
+            PbtTrial {
+                overlay: vec![("lr".into(), json!(0.01))],
+                resume_dir: "/jobs/t0".into(),
+            },
+            PbtTrial {
+                overlay: vec![("lr".into(), json!(0.02))],
+                resume_dir: "/jobs/t1".into(),
+            },
         ];
         let cfg = PbtConfig {
             metric_key: "val_r".into(),
@@ -283,7 +303,11 @@ mod tests {
     fn loser_at_rung_is_killed_and_clone_enqueued() {
         let p = policy(vec![1]);
         // Both trials report at rung 1. t1 is the winner (0.9), t0 the loser (0.1).
-        assert_eq!(p.decide(1, 0.9, 1), PbtDecision::Continue, "winner survives");
+        assert_eq!(
+            p.decide(1, 0.9, 1),
+            PbtDecision::Continue,
+            "winner survives"
+        );
         match p.decide(0, 0.1, 1) {
             PbtDecision::Kill => {}
             d => panic!("loser must be killed, got {d:?}"),
@@ -313,7 +337,11 @@ mod tests {
         // A non-finite objective kills the trial but must NOT enqueue a clone
         // (the next step has nothing queued → Continue, not Spawn).
         assert_eq!(p.decide(0, f64::NAN, 1), PbtDecision::Kill);
-        assert_eq!(p.decide(1, 0.5, 2), PbtDecision::Continue, "no clone from a NaN");
+        assert_eq!(
+            p.decide(1, 0.5, 2),
+            PbtDecision::Continue,
+            "no clone from a NaN"
+        );
     }
 
     #[test]
@@ -331,7 +359,11 @@ mod tests {
         // A second report from the (now killed) loser at the same rung does
         // nothing but drain the queued clone.
         assert!(matches!(p.decide(1, 0.9, 1), PbtDecision::Spawn { .. }));
-        assert_eq!(p.decide(0, 0.1, 1), PbtDecision::Continue, "killed trial is inert");
+        assert_eq!(
+            p.decide(0, 0.1, 1),
+            PbtDecision::Continue,
+            "killed trial is inert"
+        );
     }
 
     #[test]
@@ -341,6 +373,10 @@ mod tests {
         assert_eq!(pol.decide(1, 0.9, 1), PbtDecision::Continue);
         assert!(matches!(pol.decide(0, 0.1, 1), PbtDecision::Kill));
         // Cap is 0 → the queued clone never emits.
-        assert_eq!(pol.decide(1, 0.95, 2), PbtDecision::Continue, "cap blocks the clone");
+        assert_eq!(
+            pol.decide(1, 0.95, 2),
+            PbtDecision::Continue,
+            "cap blocks the clone"
+        );
     }
 }

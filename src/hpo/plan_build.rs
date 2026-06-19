@@ -47,8 +47,7 @@ pub fn build_hpo_plan(
         let overlay = sampler.ask(space, &[]);
         let mut args = base_args.clone();
         apply_overlay(&mut args, &overlay);
-        let comp = (def.compile_fn)(args)
-            .map_err(|e| format!("trial {t} compile failed: {e}"))?;
+        let comp = (def.compile_fn)(args).map_err(|e| format!("trial {t} compile failed: {e}"))?;
         components.push(comp);
         overlays.push(overlay);
     }

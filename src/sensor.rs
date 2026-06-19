@@ -32,7 +32,10 @@ pub enum SensorOutcome {
     Skip { reason: String },
     /// Ready in principle but backing off — retry after the hint. Unlike
     /// `Skip` (a standing condition), `Wait` is transient.
-    Wait { reason: String, retry_after_secs: u64 },
+    Wait {
+        reason: String,
+        retry_after_secs: u64,
+    },
 }
 
 impl SensorOutcome {
@@ -131,7 +134,10 @@ impl Sensor for AutoTrainPolicySensor {
 /// cookbook registry) — extend by adding a constructor here; cookbooks
 /// with domain sensors compose their own list in a later phase.
 pub fn registry() -> Vec<Box<dyn Sensor>> {
-    vec![Box::new(SchedulerLockSensor), Box::new(AutoTrainPolicySensor)]
+    vec![
+        Box::new(SchedulerLockSensor),
+        Box::new(AutoTrainPolicySensor),
+    ]
 }
 
 /// Look up a sensor by name.

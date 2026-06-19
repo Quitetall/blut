@@ -222,7 +222,14 @@ impl Drivers {
 
     /// The conservative-high RAM/VRAM estimate for these drivers.
     pub fn estimate(&self) -> Footprint {
-        estimate(self.workers, self.batch, self.tier, self.latent, self.warm, self.in_ch)
+        estimate(
+            self.workers,
+            self.batch,
+            self.tier,
+            self.latent,
+            self.warm,
+            self.in_ch,
+        )
     }
 
     /// The calibration key for these drivers under `recipe`. Latent is
@@ -399,7 +406,10 @@ impl FootprintKey {
         // distinct keys (e.g. `a|b`+tier1 vs `a`+tier`b|1`). Recipe names are
         // internal identifiers (never user free-text), so a debug_assert catches
         // a violation at test time without a release-path cost.
-        debug_assert!(!self.recipe.contains('|'), "recipe name must not contain '|'");
+        debug_assert!(
+            !self.recipe.contains('|'),
+            "recipe name must not contain '|'"
+        );
         // `warm` is the trailing segment (`w`/`c`) so the key partitions warm vs
         // cold calibration. NOTE: this changes the flat format — pre-Phase-3
         // entries (4-segment, no warm/cold suffix) become unreachable, a
@@ -422,7 +432,13 @@ impl FootprintKey {
 /// — if they diverged the calibration would never be hit and the broker
 /// would over-refuse forever. `workers`/`batch`/`tier`/`warm` MUST be the
 /// same values fed to [`estimate`].
-pub fn footprint_key(recipe: &str, workers: u32, batch: u32, tier: u32, warm: bool) -> FootprintKey {
+pub fn footprint_key(
+    recipe: &str,
+    workers: u32,
+    batch: u32,
+    tier: u32,
+    warm: bool,
+) -> FootprintKey {
     FootprintKey {
         recipe: recipe.to_string(),
         tier,
@@ -647,7 +663,10 @@ impl FootprintStore {
         // conservative estimate, which the cgroup cap + OOM self-heal backstop)
         // — debug-log it so an operator wondering why calibration "reset" can
         // see it, without spamming the warn channel on every load.
-        let stale = entries.keys().filter(|k| k.matches('|').count() == 3).count();
+        let stale = entries
+            .keys()
+            .filter(|k| k.matches('|').count() == 3)
+            .count();
         if stale > 0 {
             tracing::debug!(
                 "footprint store: {stale} pre-Phase-3 entries (no warm/cold key suffix) \
@@ -684,10 +703,7 @@ impl FootprintStore {
                 // the conservative hint; clamped by OOM_RESOLVE_CEILING_BYTES
                 // (a runaway guard) — admission.rs is the authoritative
                 // box-fit refusal.
-                let grown = (e
-                    .ram_bytes
-                    .saturating_mul(OOM_GROWTH_NUM)
-                    / OOM_GROWTH_DEN)
+                let grown = (e.ram_bytes.saturating_mul(OOM_GROWTH_NUM) / OOM_GROWTH_DEN)
                     .max(e.ram_bytes.saturating_add(OOM_GROWTH_STEP_BYTES));
                 Footprint {
                     ram_bytes: grown.max(hint.ram_bytes).min(OOM_RESOLVE_CEILING_BYTES),
@@ -904,7 +920,10 @@ mod tests {
         let fp = estimate(4, 16, 3, 256, false, 21);
         // 6 + 4×4 + 3×2 + 1 + 16×64MiB = 6+16+6+1+1 = 30 GiB
         assert_eq!(fp.ram_bytes, 30 * GIB);
-        assert!(fp.ram_bytes < (62 - 6) * GIB, "must fit one train on 62G box");
+        assert!(
+            fp.ram_bytes < (62 - 6) * GIB,
+            "must fit one train on 62G box"
+        );
     }
 
     #[test]
@@ -934,7 +953,10 @@ mod tests {
         // decode held); base/tier/latent/batch are unchanged.
         let cold = estimate_ram_bytes(2, 32, 3, 256, false, 21);
         let warm = estimate_ram_bytes(2, 32, 3, 256, true, 21);
-        assert!(warm < cold, "warm must be tighter than cold: {warm} !< {cold}");
+        assert!(
+            warm < cold,
+            "warm must be tighter than cold: {warm} !< {cold}"
+        );
         // Δ = workers × (cold_per_worker − warm_per_worker) = 2 × (4−3) GiB.
         assert_eq!(
             cold - warm,
@@ -961,10 +983,17 @@ mod tests {
         // 25 GiB cap — the tightening Phase 3 delivers, without re-OOMing.
         let warm_cap = estimate(2, 32, 3, 256, true, 21).memmax_bytes();
         let cold_cap = estimate(2, 32, 3, 256, false, 21).memmax_bytes();
-        assert!(warm_cap < cold_cap, "warm cap must be tighter: {warm_cap} !< {cold_cap}");
+        assert!(
+            warm_cap < cold_cap,
+            "warm cap must be tighter: {warm_cap} !< {cold_cap}"
+        );
         // Pin the EXACT cap so a future constant drift is caught concretely:
         // 6 + 2×3 + 3×2 + 1 + 32×64MiB = 21 GiB estimate, +2 GiB headroom = 23.
-        assert_eq!(warm_cap, 23 * GIB, "warm tier-3 workers-2 cap must be exactly 23G");
+        assert_eq!(
+            warm_cap,
+            23 * GIB,
+            "warm tier-3 workers-2 cap must be exactly 23G"
+        );
         assert!(
             warm_cap >= 22 * GIB,
             "warm cap {warm_cap} must still hold the ~20G warm demand with headroom"
@@ -1090,8 +1119,16 @@ mod tests {
         // A tighter box steps workers DOWN until the cap fits. memmax(w)=8+8w:
         // w2=24G, w3=32G, w4=40G.
         assert_eq!(warm_estimate(2).memmax_bytes(), 24 * GIB);
-        assert_eq!(warm_workers_for_budget(4, 24 * GIB), 2, "2-worker cap (24G) fits a 24G box");
-        assert_eq!(warm_workers_for_budget(4, 23 * GIB), 1, "only 1 worker (16G) fits 23G");
+        assert_eq!(
+            warm_workers_for_budget(4, 24 * GIB),
+            2,
+            "2-worker cap (24G) fits a 24G box"
+        );
+        assert_eq!(
+            warm_workers_for_budget(4, 23 * GIB),
+            1,
+            "only 1 worker (16G) fits 23G"
+        );
         // Never below 1 even on an impossibly small box (the unit-kill floor).
         assert_eq!(warm_workers_for_budget(4, GIB), 1);
         // requested clamps to the cap; budget 0 (no probe) skips the reduction.
@@ -1154,13 +1191,21 @@ mod tests {
         s.record(&key(), 22 * GIB, 0, FootprintSource::OomCorrected)
             .unwrap();
         let e = s.entries.get(&key().flat()).unwrap();
-        assert_eq!(e.source, FootprintSource::OomCorrected, "OomCorrected > Measured");
+        assert_eq!(
+            e.source,
+            FootprintSource::OomCorrected,
+            "OomCorrected > Measured"
+        );
         assert_eq!(e.ram_bytes, 30 * GIB, "still max-merged");
         // And a later Measured run must NOT demote the source back.
         s.record(&key(), 31 * GIB, 0, FootprintSource::Measured)
             .unwrap();
         let e = s.entries.get(&key().flat()).unwrap();
-        assert_eq!(e.source, FootprintSource::OomCorrected, "Measured must not demote");
+        assert_eq!(
+            e.source,
+            FootprintSource::OomCorrected,
+            "Measured must not demote"
+        );
         assert_eq!(e.ram_bytes, 31 * GIB);
     }
 
@@ -1176,8 +1221,15 @@ mod tests {
         s.record(&key(), 20 * GIB, 18_000, FootprintSource::Measured)
             .unwrap();
         let r = s.resolve(&key(), hint);
-        assert_eq!(r.ram_bytes, 20 * GIB, "calibrated RAM admits at the measured ~20G");
-        assert_eq!(r.vram_mib, hint.vram_mib, "VRAM stays the conservative estimate");
+        assert_eq!(
+            r.ram_bytes,
+            20 * GIB,
+            "calibrated RAM admits at the measured ~20G"
+        );
+        assert_eq!(
+            r.vram_mib, hint.vram_mib,
+            "VRAM stays the conservative estimate"
+        );
     }
 
     #[test]
@@ -1193,7 +1245,10 @@ mod tests {
         let r = s.resolve(&key(), hint);
         // max(24×5/4=30, 24+8=32) = 32 GiB, above the 24G bound.
         assert_eq!(r.ram_bytes, 32 * GIB, "OOM bound must grow, not re-sit");
-        assert!(r.ram_bytes > 24 * GIB, "escalated cap must exceed the OOMing cap");
+        assert!(
+            r.ram_bytes > 24 * GIB,
+            "escalated cap must exceed the OOMing cap"
+        );
     }
 
     #[test]
@@ -1220,7 +1275,10 @@ mod tests {
         s.record(&key(), 60 * GIB, 0, FootprintSource::OomCorrected)
             .unwrap();
         let r = s.resolve(&key(), hint);
-        assert_eq!(r.ram_bytes, OOM_RESOLVE_CEILING_BYTES, "clamped at the guard");
+        assert_eq!(
+            r.ram_bytes, OOM_RESOLVE_CEILING_BYTES,
+            "clamped at the guard"
+        );
     }
 
     #[test]
@@ -1235,7 +1293,8 @@ mod tests {
             .unwrap();
         let r1 = s.resolve(&key(), hint).ram_bytes; // max(30, 32)=32G
         // A retry OOMs at the escalated 32G cap → record it.
-        s.record(&key(), r1, 0, FootprintSource::OomCorrected).unwrap();
+        s.record(&key(), r1, 0, FootprintSource::OomCorrected)
+            .unwrap();
         let r2 = s.resolve(&key(), hint).ram_bytes; // max(32×5/4=40, 32+8=40)=40G
         assert!(r2 > r1, "repeated OOM must keep escalating: {r1} !< {r2}");
     }
@@ -1259,6 +1318,9 @@ mod tests {
         let path = td.path().join("footprints.json");
         std::fs::write(&path, b"{ this is not json").unwrap();
         let s = FootprintStore::load_from(path);
-        assert!(s.is_empty(), "corrupt store must degrade to empty, not panic");
+        assert!(
+            s.is_empty(),
+            "corrupt store must degrade to empty, not panic"
+        );
     }
 }

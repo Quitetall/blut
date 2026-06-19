@@ -25,7 +25,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, TrainError};
@@ -315,8 +315,14 @@ impl LineageDb {
                      sidecar_path, produced_unix)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
-                    a.job_id, a.stage_idx, a.stage_name, content_hash, a.kind,
-                    a.schema_ver, a.sidecar_path, a.produced_unix
+                    a.job_id,
+                    a.stage_idx,
+                    a.stage_name,
+                    content_hash,
+                    a.kind,
+                    a.schema_ver,
+                    a.sidecar_path,
+                    a.produced_unix
                 ],
             )
             .map_err(|e| TrainError::other(format!("record artifact {}: {e}", a.content_hash)))?;
@@ -330,8 +336,10 @@ impl LineageDb {
     /// the data dependency; code provenance lives on `runs.git_sha`. See the
     /// `lineage_edges` CREATE comment for the full (data, code, parent) mapping.
     pub fn record_edge(&self, edge: &EdgeRow) -> Result<()> {
-        let (input_hash, output_hash) =
-            (edge.input_hash.to_lowercase(), edge.output_hash.to_lowercase());
+        let (input_hash, output_hash) = (
+            edge.input_hash.to_lowercase(),
+            edge.output_hash.to_lowercase(),
+        );
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO lineage_edges (job_id, to_idx, input_hash, output_hash)
@@ -359,7 +367,8 @@ impl LineageDb {
             )
             .map_err(|e| TrainError::other(format!("record metric {}: {e}", m.metric)))?;
         }
-        tx.commit().map_err(|e| TrainError::other(format!("metrics commit: {e}")))?;
+        tx.commit()
+            .map_err(|e| TrainError::other(format!("metrics commit: {e}")))?;
         Ok(())
     }
 
@@ -379,13 +388,21 @@ impl LineageDb {
                      gpu_power_w, host_ram_mib, host_disk_free_mib)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                 params![
-                    g.job_id, g.node_idx, g.wall_unix, g.gpu_util, g.gpu_mem_mib,
-                    g.gpu_temp_c, g.gpu_power_w, g.host_ram_mib, g.host_disk_free_mib
+                    g.job_id,
+                    g.node_idx,
+                    g.wall_unix,
+                    g.gpu_util,
+                    g.gpu_mem_mib,
+                    g.gpu_temp_c,
+                    g.gpu_power_w,
+                    g.host_ram_mib,
+                    g.host_disk_free_mib
                 ],
             )
             .map_err(|e| TrainError::other(format!("record gauge {}: {e}", g.job_id)))?;
         }
-        tx.commit().map_err(|e| TrainError::other(format!("gauges commit: {e}")))?;
+        tx.commit()
+            .map_err(|e| TrainError::other(format!("gauges commit: {e}")))?;
         Ok(())
     }
 
@@ -455,7 +472,11 @@ impl LineageDb {
             .map_err(|e| TrainError::other(format!("top_runs_by_metric prepare: {e}")))?;
         let rows = stmt
             .query_map(params![metric, limit as i64], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, f64>(2)?,
+                ))
             })
             .map_err(|e| TrainError::other(format!("top_runs_by_metric query: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -739,10 +760,38 @@ mod tests {
         db.record_metrics(&[
             // j1 PEAKS at step 2 (0.8) then COLLAPSES to a final 0.4 (step=-1).
             // final/ranking must use 0.4, NOT the max-step 0.8 — the bug guard.
-            MetricRow { job_id: "j1".into(), node_idx: 0, step: 1, metric: "val_r".into(), value: 0.3, wall_unix: None },
-            MetricRow { job_id: "j1".into(), node_idx: 0, step: 2, metric: "val_r".into(), value: 0.8, wall_unix: None },
-            MetricRow { job_id: "j1".into(), node_idx: 0, step: -1, metric: "val_r".into(), value: 0.4, wall_unix: None },
-            MetricRow { job_id: "j2".into(), node_idx: 0, step: -1, metric: "val_r".into(), value: 0.6, wall_unix: None },
+            MetricRow {
+                job_id: "j1".into(),
+                node_idx: 0,
+                step: 1,
+                metric: "val_r".into(),
+                value: 0.3,
+                wall_unix: None,
+            },
+            MetricRow {
+                job_id: "j1".into(),
+                node_idx: 0,
+                step: 2,
+                metric: "val_r".into(),
+                value: 0.8,
+                wall_unix: None,
+            },
+            MetricRow {
+                job_id: "j1".into(),
+                node_idx: 0,
+                step: -1,
+                metric: "val_r".into(),
+                value: 0.4,
+                wall_unix: None,
+            },
+            MetricRow {
+                job_id: "j2".into(),
+                node_idx: 0,
+                step: -1,
+                metric: "val_r".into(),
+                value: 0.6,
+                wall_unix: None,
+            },
         ])
         .unwrap();
         // final = the step=-1 headline (0.4), not the peak (0.8).
@@ -767,10 +816,15 @@ mod tests {
             gpu_util: Some(u),
             ..Default::default()
         };
-        db.record_gauges(&[g(1, 90.0), g(2, 95.0), g(3, 20.0), g(4, 80.0)]).unwrap();
+        db.record_gauges(&[g(1, 90.0), g(2, 95.0), g(3, 20.0), g(4, 80.0)])
+            .unwrap();
         let s = db.gpu_saturation("j", 50.0).unwrap().unwrap();
         assert_eq!(s.samples, 4);
-        assert!((s.saturation - 71.25).abs() < 1e-9, "mean util {}", s.saturation);
+        assert!(
+            (s.saturation - 71.25).abs() < 1e-9,
+            "mean util {}",
+            s.saturation
+        );
         assert!((s.wasted - 0.25).abs() < 1e-9, "wasted {}", s.wasted);
         // a job with no gauges → None.
         assert!(db.gpu_saturation("other", 50.0).unwrap().is_none());
@@ -797,7 +851,10 @@ mod tests {
             ..Default::default()
         };
         db.record_run(&r).unwrap();
-        assert_eq!(db.get_run("job-1").unwrap().unwrap().git_sha.as_deref(), Some("abc123"));
+        assert_eq!(
+            db.get_run("job-1").unwrap().unwrap().git_sha.as_deref(),
+            Some("abc123")
+        );
         assert!(db.get_run("nope").unwrap().is_none());
     }
 
@@ -821,7 +878,11 @@ mod tests {
         })
         .unwrap();
         let got = db.get_run("j").unwrap().unwrap();
-        assert_eq!(got.git_sha.as_deref(), Some("sha"), "COALESCE preserves prior provenance");
+        assert_eq!(
+            got.git_sha.as_deref(),
+            Some("sha"),
+            "COALESCE preserves prior provenance"
+        );
         assert_eq!(got.ended_unix, Some(42));
         assert_eq!(db.run_count().unwrap(), 1, "upsert, not duplicate");
     }
@@ -842,25 +903,60 @@ mod tests {
     fn trace_walks_upstream_chain() {
         let db = db();
         // corpus(C) → train(T) → gate(G): three stages, two edges.
-        db.record_run(&RunRow { job_id: "j".into(), recipe: "r".into(), ..Default::default() })
-            .unwrap();
+        db.record_run(&RunRow {
+            job_id: "j".into(),
+            recipe: "r".into(),
+            ..Default::default()
+        })
+        .unwrap();
         db.record_artifact(&art("j", 0, "corpushash")).unwrap();
         db.record_artifact(&art("j", 1, "trainhash")).unwrap();
         db.record_artifact(&art("j", 2, "gatehash")).unwrap();
-        db.record_edge(&EdgeRow { job_id: "j".into(), to_idx: 1, input_hash: "corpushash".into(), output_hash: "trainhash".into() }).unwrap();
-        db.record_edge(&EdgeRow { job_id: "j".into(), to_idx: 2, input_hash: "trainhash".into(), output_hash: "gatehash".into() }).unwrap();
+        db.record_edge(&EdgeRow {
+            job_id: "j".into(),
+            to_idx: 1,
+            input_hash: "corpushash".into(),
+            output_hash: "trainhash".into(),
+        })
+        .unwrap();
+        db.record_edge(&EdgeRow {
+            job_id: "j".into(),
+            to_idx: 2,
+            input_hash: "trainhash".into(),
+            output_hash: "gatehash".into(),
+        })
+        .unwrap();
 
         let chain = db.trace("gatehash").unwrap();
-        let hashes: Vec<&str> = chain.iter().map(|s| s.artifact.content_hash.as_str()).collect();
-        assert_eq!(hashes, vec!["gatehash", "trainhash", "corpushash"], "upstream order");
-        assert!(chain[0].run.is_some(), "trace annotates each hop with its run");
+        let hashes: Vec<&str> = chain
+            .iter()
+            .map(|s| s.artifact.content_hash.as_str())
+            .collect();
+        assert_eq!(
+            hashes,
+            vec!["gatehash", "trainhash", "corpushash"],
+            "upstream order"
+        );
+        assert!(
+            chain[0].run.is_some(),
+            "trace annotates each hop with its run"
+        );
     }
 
     #[test]
     fn stage_idx_parsed_from_sidecar_path() {
-        assert_eq!(stage_idx_of(Path::new("/j/stages/0-make/output.metadata.json")), 0);
-        assert_eq!(stage_idx_of(Path::new("/j/stages/12-train_joint/output.metadata.json")), 12);
-        assert_eq!(stage_idx_of(Path::new("/j/stages/garbage/output.metadata.json")), 0);
+        assert_eq!(
+            stage_idx_of(Path::new("/j/stages/0-make/output.metadata.json")),
+            0
+        );
+        assert_eq!(
+            stage_idx_of(Path::new("/j/stages/12-train_joint/output.metadata.json")),
+            12
+        );
+        assert_eq!(
+            stage_idx_of(Path::new("/j/stages/garbage/output.metadata.json")),
+            0
+        );
     }
 
     #[test]
@@ -869,8 +965,20 @@ mod tests {
         db.record_artifact(&art("j", 0, "a")).unwrap();
         db.record_artifact(&art("j", 1, "b")).unwrap();
         // A pathological cycle a→b→a must terminate, not hang.
-        db.record_edge(&EdgeRow { job_id: "j".into(), to_idx: 1, input_hash: "b".into(), output_hash: "a".into() }).unwrap();
-        db.record_edge(&EdgeRow { job_id: "j".into(), to_idx: 0, input_hash: "a".into(), output_hash: "b".into() }).unwrap();
+        db.record_edge(&EdgeRow {
+            job_id: "j".into(),
+            to_idx: 1,
+            input_hash: "b".into(),
+            output_hash: "a".into(),
+        })
+        .unwrap();
+        db.record_edge(&EdgeRow {
+            job_id: "j".into(),
+            to_idx: 0,
+            input_hash: "a".into(),
+            output_hash: "b".into(),
+        })
+        .unwrap();
         let chain = db.trace("a").unwrap();
         assert!(chain.len() <= 2, "cycle guard bounds the walk");
     }
@@ -880,16 +988,27 @@ mod tests {
         // Same SHA → FRESH.
         assert_eq!(
             freshness_verdict(Some("abc123".into()), Some("abc123".into())),
-            CodeFreshness::Fresh { git_sha: "abc123".into() }
+            CodeFreshness::Fresh {
+                git_sha: "abc123".into()
+            }
         );
         // Different SHA → STALE (built_sha vs head).
         assert_eq!(
             freshness_verdict(Some("old".into()), Some("new".into())),
-            CodeFreshness::Stale { built_sha: "old".into(), head: "new".into() }
+            CodeFreshness::Stale {
+                built_sha: "old".into(),
+                head: "new".into()
+            }
         );
         // Missing either side → UNKNOWN (not stale — just unverifiable).
-        assert_eq!(freshness_verdict(None, Some("h".into())), CodeFreshness::Unknown);
-        assert_eq!(freshness_verdict(Some("r".into()), None), CodeFreshness::Unknown);
+        assert_eq!(
+            freshness_verdict(None, Some("h".into())),
+            CodeFreshness::Unknown
+        );
+        assert_eq!(
+            freshness_verdict(Some("r".into()), None),
+            CodeFreshness::Unknown
+        );
         assert_eq!(freshness_verdict(None, None), CodeFreshness::Unknown);
         // is_stale only true for Stale.
         assert!(freshness_verdict(Some("a".into()), Some("b".into())).is_stale());

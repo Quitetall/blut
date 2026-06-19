@@ -16,8 +16,7 @@ use crate::error::{Result, TrainError};
 const UNIT_PREFIX: &str = "blut-";
 
 fn user_units_dir() -> Result<PathBuf> {
-    let base = dirs::config_dir()
-        .ok_or_else(|| TrainError::other("cannot resolve ~/.config"))?;
+    let base = dirs::config_dir().ok_or_else(|| TrainError::other("cannot resolve ~/.config"))?;
     Ok(base.join("systemd").join("user"))
 }
 
@@ -26,7 +25,13 @@ fn user_units_dir() -> Result<PathBuf> {
 fn unit_stem(recipe: &str) -> String {
     let slug: String = recipe
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     format!("{UNIT_PREFIX}{slug}")
 }
@@ -77,7 +82,8 @@ pub fn install(recipe: &str, calendar: &str, args_json: &str) -> Result<()> {
     let exe = std::env::current_exe()
         .map_err(|e| TrainError::other(format!("locate own binary: {e}")))?;
     let dir = user_units_dir()?;
-    std::fs::create_dir_all(&dir).map_err(|e| TrainError::other(format!("mkdir {}: {e}", dir.display())))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| TrainError::other(format!("mkdir {}: {e}", dir.display())))?;
     let stem = unit_stem(recipe);
 
     let service = format!(
@@ -160,7 +166,10 @@ mod tests {
 
     #[test]
     fn unit_stem_sanitizes() {
-        assert_eq!(unit_stem("lamquant_joint_codec"), "blut-lamquant_joint_codec");
+        assert_eq!(
+            unit_stem("lamquant_joint_codec"),
+            "blut-lamquant_joint_codec"
+        );
         assert_eq!(unit_stem("a/b c"), "blut-a_b_c");
     }
 

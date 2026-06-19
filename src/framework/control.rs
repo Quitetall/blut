@@ -52,8 +52,9 @@ pub enum Control {
 impl PartialEq for Control {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Control::Continue, Control::Continue)
-            | (Control::KillBranch, Control::KillBranch) => true,
+            (Control::Continue, Control::Continue) | (Control::KillBranch, Control::KillBranch) => {
+                true
+            }
             (Control::Spawn(a), Control::Spawn(b)) => a.label == b.label,
             _ => false,
         }

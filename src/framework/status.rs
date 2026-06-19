@@ -107,7 +107,10 @@ impl StageEvent {
     /// channel; `StageStep` (and the writer-generated `StepGap`) are
     /// the lossy, high-volume class.
     pub fn is_lifecycle(&self) -> bool {
-        !matches!(self, StageEvent::StageStep { .. } | StageEvent::StepGap { .. })
+        !matches!(
+            self,
+            StageEvent::StageStep { .. } | StageEvent::StepGap { .. }
+        )
     }
 }
 
@@ -348,18 +351,22 @@ mod tests {
 
     #[test]
     fn lifecycle_classification() {
-        assert!(StageEvent::StageBegin {
-            node_idx: 0,
-            stage_name: "s".into(),
-            input_hash: ContentHash::of_bytes(b""),
-        }
-        .is_lifecycle());
-        assert!(!StageEvent::StageStep {
-            node_idx: 0,
-            stage_name: "s".into(),
-            update: serde_json::json!({}),
-        }
-        .is_lifecycle());
+        assert!(
+            StageEvent::StageBegin {
+                node_idx: 0,
+                stage_name: "s".into(),
+                input_hash: ContentHash::of_bytes(b""),
+            }
+            .is_lifecycle()
+        );
+        assert!(
+            !StageEvent::StageStep {
+                node_idx: 0,
+                stage_name: "s".into(),
+                update: serde_json::json!({}),
+            }
+            .is_lifecycle()
+        );
         assert!(!StageEvent::StepGap { dropped: 3 }.is_lifecycle());
     }
 

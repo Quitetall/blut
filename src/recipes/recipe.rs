@@ -53,7 +53,10 @@ pub fn schema_of<A: schemars::JsonSchema>() -> serde_json::Value {
     let mut g = schemars::r#gen::SchemaGenerator::default();
     let root = g.subschema_for::<A>();
     let mut v = serde_json::to_value(root).unwrap_or_else(|e| {
-        panic!("schema for {} must serialize: {e}", std::any::type_name::<A>())
+        panic!(
+            "schema for {} must serialize: {e}",
+            std::any::type_name::<A>()
+        )
     });
     // A `#[derive(JsonSchema)]` struct/enum is *referenceable*, so
     // `subschema_for::<A>()` always parks A's own schema in the generator under
@@ -63,7 +66,10 @@ pub fn schema_of<A: schemars::JsonSchema>() -> serde_json::Value {
     let defs = g.take_definitions();
     if !defs.is_empty() {
         let defs_val = serde_json::to_value(&defs).unwrap_or_else(|e| {
-            panic!("definitions for {} must serialize: {e}", std::any::type_name::<A>())
+            panic!(
+                "definitions for {} must serialize: {e}",
+                std::any::type_name::<A>()
+            )
         });
         if let serde_json::Value::Object(map) = &mut v {
             map.insert("definitions".to_string(), defs_val);
@@ -136,7 +142,11 @@ pub(crate) fn validate_args_against_schema(
     let bad = |m: String| Err(RecipeError::InvalidArgs(format!("{recipe}: {m}")));
     let Some(obj) = raw.as_object() else {
         // A unit/`()` Args serializes as null; only object-args reach here.
-        return if raw.is_null() { Ok(()) } else { bad("args must be a JSON object".into()) };
+        return if raw.is_null() {
+            Ok(())
+        } else {
+            bad("args must be a JSON object".into())
+        };
     };
     if let Some(req) = root.get("required").and_then(|r| r.as_array()) {
         for field in req.iter().filter_map(|v| v.as_str()) {
@@ -149,10 +159,16 @@ pub(crate) fn validate_args_against_schema(
         for (k, v) in obj {
             // Only check a declared field with a SCALAR `type` string; a union
             // type (Option) has `type: [..]` (not a str) → skipped.
-            if let Some(expected) = props.get(k).and_then(|d| d.get("type")).and_then(|t| t.as_str())
+            if let Some(expected) = props
+                .get(k)
+                .and_then(|d| d.get("type"))
+                .and_then(|t| t.as_str())
             {
                 if !v.is_null() && !json_type_matches(v, expected) {
-                    return bad(format!("arg '{k}' expected {expected}, got {}", json_kind(v)));
+                    return bad(format!(
+                        "arg '{k}' expected {expected}, got {}",
+                        json_kind(v)
+                    ));
                 }
             }
         }
@@ -262,22 +278,22 @@ pub fn args_template(def: &RecipeDef) -> serde_json::Value {
 macro_rules! register_recipe {
     ($ty:ty) => {
         pub static DEF: $crate::recipes::recipe::RecipeDef =
-            $crate::recipes::recipe::RecipeDef {
-                name: <$ty as $crate::recipes::recipe::Recipe>::NAME,
-                description: <$ty as $crate::recipes::recipe::Recipe>::DESCRIPTION,
-                backend_id: <<$ty as $crate::recipes::recipe::Recipe>::Backend
-                    as $crate::backends::TrainingBackend>::ID,
-                category: <$ty as $crate::recipes::recipe::Recipe>::CATEGORY,
-                input_kinds: <$ty as $crate::recipes::recipe::Recipe>::INPUT_KINDS,
-                output_kind: <$ty as $crate::recipes::recipe::Recipe>::OUTPUT_KIND,
-                schedule: <$ty as $crate::recipes::recipe::Recipe>::SCHEDULE,
-                args_schema_fn: || {
-                    $crate::recipes::recipe::schema_of::<
-                        <$ty as $crate::recipes::recipe::Recipe>::Args,
-                    >()
-                },
-                compile_fn: |raw| $crate::recipes::recipe::compile_erased::<$ty>(raw),
-            };
+                    $crate::recipes::recipe::RecipeDef {
+                        name: <$ty as $crate::recipes::recipe::Recipe>::NAME,
+                        description: <$ty as $crate::recipes::recipe::Recipe>::DESCRIPTION,
+                        backend_id: <<$ty as $crate::recipes::recipe::Recipe>::Backend
+                            as $crate::backends::TrainingBackend>::ID,
+                        category: <$ty as $crate::recipes::recipe::Recipe>::CATEGORY,
+                        input_kinds: <$ty as $crate::recipes::recipe::Recipe>::INPUT_KINDS,
+                        output_kind: <$ty as $crate::recipes::recipe::Recipe>::OUTPUT_KIND,
+                        schedule: <$ty as $crate::recipes::recipe::Recipe>::SCHEDULE,
+                        args_schema_fn: || {
+                            $crate::recipes::recipe::schema_of::<
+                                <$ty as $crate::recipes::recipe::Recipe>::Args,
+                            >()
+                        },
+                        compile_fn: |raw| $crate::recipes::recipe::compile_erased::<$ty>(raw),
+                    };
     };
 }
 
@@ -444,8 +460,12 @@ mod tests {
         let schema = schema_of::<Args>();
         // Valid → Ok.
         assert!(
-            validate_args_against_schema("r", &schema, &serde_json::json!({"lr": 0.1, "epochs": 8}))
-                .is_ok()
+            validate_args_against_schema(
+                "r",
+                &schema,
+                &serde_json::json!({"lr": 0.1, "epochs": 8})
+            )
+            .is_ok()
         );
         // Missing a required field → field-named error.
         let e = validate_args_against_schema("r", &schema, &serde_json::json!({"lr": 0.1}))
@@ -460,7 +480,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(e.contains("lr") && e.contains("number"), "names the field + type: {e}");
+        assert!(
+            e.contains("lr") && e.contains("number"),
+            "names the field + type: {e}"
+        );
         // A unit/`()`-args recipe serializes its args as null → tolerated.
         let empty = serde_json::json!({"type": "object", "properties": {}});
         assert!(validate_args_against_schema("r", &empty, &serde_json::Value::Null).is_ok());
@@ -528,7 +551,7 @@ mod tests {
             preset: String,
             #[serde(default)]
             epochs: Option<u32>, // null default → omitted (noise)
-            lma_root: String,    // required, no default → placeholder
+            lma_root: String, // required, no default → placeholder
         }
         static D: RecipeDef = RecipeDef {
             name: "t",
@@ -544,7 +567,10 @@ mod tests {
         let t = args_template(&D);
         assert_eq!(t["preset"], serde_json::json!("production"));
         assert_eq!(t["lma_root"], serde_json::json!("<TODO>"));
-        assert!(t.get("epochs").is_none(), "null defaults are omitted as noise");
+        assert!(
+            t.get("epochs").is_none(),
+            "null defaults are omitted as noise"
+        );
     }
 
     #[test]

@@ -497,10 +497,12 @@ impl ConfigLoader {
 
     /// Read + parse a single config file to its mapping body + header.
     fn load_single_config(&self, config_path: &str) -> Result<LoadedConfig, HydraError> {
-        let path = self.resolve_path(config_path).ok_or_else(|| HydraError::NotFound {
-            dir: self.config_dir.display().to_string(),
-            path: config_path.to_string(),
-        })?;
+        let path = self
+            .resolve_path(config_path)
+            .ok_or_else(|| HydraError::NotFound {
+                dir: self.config_dir.display().to_string(),
+                path: config_path.to_string(),
+            })?;
         let content = std::fs::read_to_string(&path).map_err(|e| HydraError::Io {
             path: path.display().to_string(),
             source: e,
@@ -702,7 +704,10 @@ fn parse_override_value(value_str: &str) -> ConfigValue {
         if inner.trim().is_empty() {
             return ConfigValue::List(Vec::new());
         }
-        let items = inner.split(',').map(|s| parse_override_value(s.trim())).collect();
+        let items = inner
+            .split(',')
+            .map(|s| parse_override_value(s.trim()))
+            .collect();
         return ConfigValue::List(items);
     }
     let unquoted = strip_matching_quotes(trimmed);
@@ -876,7 +881,10 @@ fn expand_one_axis(ovr: &str) -> Vec<String> {
     let value = &ovr[eq + 1..];
 
     // Range FIRST — `range(...)` contains commas that are not choice separators.
-    if let Some(inner) = value.strip_prefix("range(").and_then(|v| v.strip_suffix(')')) {
+    if let Some(inner) = value
+        .strip_prefix("range(")
+        .and_then(|v| v.strip_suffix(')'))
+    {
         let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
         let start: i64 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
         let stop: i64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
@@ -973,7 +981,11 @@ mod tests {
         d.insert("b".into(), ConfigValue::Int(2));
         d.insert("a".into(), ConfigValue::Int(10)); // overwrite in place
         let keys: Vec<&str> = d.keys().collect();
-        assert_eq!(keys, vec!["a", "b"], "insertion order preserved on overwrite");
+        assert_eq!(
+            keys,
+            vec!["a", "b"],
+            "insertion order preserved on overwrite"
+        );
         assert_eq!(d.get("a").unwrap().as_int(), Some(10));
         assert_eq!(d.len(), 2);
         assert_eq!(d.remove("a").unwrap().as_int(), Some(10));
@@ -1021,9 +1033,10 @@ mod tests {
 
     #[test]
     fn yaml_scalar_types() {
-        let y: serde_yaml::Value =
-            serde_yaml::from_str("i: 7\nf: 1.5\nb: true\nn: null\ns: hi\ninterp: ${a.b}\nmiss: '???'\n")
-                .unwrap();
+        let y: serde_yaml::Value = serde_yaml::from_str(
+            "i: 7\nf: 1.5\nb: true\nn: null\ns: hi\ninterp: ${a.b}\nmiss: '???'\n",
+        )
+        .unwrap();
         let cv = yaml_to_config_value(&y);
         let d = cv.as_dict().unwrap();
         assert_eq!(d.get("i").unwrap(), &ConfigValue::Int(7));
@@ -1055,7 +1068,11 @@ mod tests {
     #[test]
     fn load_simple_config() {
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "config.yaml", "db:\n  host: localhost\n  port: 3306\n");
+        write_config(
+            dir.path(),
+            "config.yaml",
+            "db:\n  host: localhost\n  port: 3306\n",
+        );
         let loader = ConfigLoader::from_config_dir(dir.path().to_str().unwrap());
         let cfg = loader.load_config(Some("config"), &[]).unwrap();
         let db = cfg.as_dict().unwrap().get("db").unwrap().as_dict().unwrap();
@@ -1066,7 +1083,11 @@ mod tests {
     #[test]
     fn load_with_dotted_override() {
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "config.yaml", "db:\n  host: localhost\n  port: 3306\n");
+        write_config(
+            dir.path(),
+            "config.yaml",
+            "db:\n  host: localhost\n  port: 3306\n",
+        );
         let loader = ConfigLoader::from_config_dir(dir.path().to_str().unwrap());
         let cfg = loader
             .load_config(
@@ -1094,14 +1115,26 @@ mod tests {
         assert_eq!(d.get("keep").unwrap().as_int(), Some(1));
         assert!(!d.contains_key("drop"), "~drop removed it");
         let added = d.get("added").unwrap().as_dict().unwrap();
-        assert_eq!(added.get("deep").unwrap().as_int(), Some(9), "+ creates nesting");
+        assert_eq!(
+            added.get("deep").unwrap().as_int(),
+            Some(9),
+            "+ creates nesting"
+        );
     }
 
     #[test]
     fn defaults_list_with_package_header() {
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "db/mysql.yaml", "# @package db\ndriver: mysql\nport: 3306\n");
-        write_config(dir.path(), "config.yaml", "defaults:\n  - db: mysql\n\napp_name: myapp\n");
+        write_config(
+            dir.path(),
+            "db/mysql.yaml",
+            "# @package db\ndriver: mysql\nport: 3306\n",
+        );
+        write_config(
+            dir.path(),
+            "config.yaml",
+            "defaults:\n  - db: mysql\n\napp_name: myapp\n",
+        );
         let loader = ConfigLoader::from_config_dir(dir.path().to_str().unwrap());
         let cfg = loader.load_config(Some("config"), &[]).unwrap();
         let d = cfg.as_dict().unwrap();
@@ -1114,12 +1147,22 @@ mod tests {
     #[test]
     fn default_group_selection_override() {
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "db/mysql.yaml", "# @package db\ndriver: mysql\n");
-        write_config(dir.path(), "db/postgres.yaml", "# @package db\ndriver: postgres\n");
+        write_config(
+            dir.path(),
+            "db/mysql.yaml",
+            "# @package db\ndriver: mysql\n",
+        );
+        write_config(
+            dir.path(),
+            "db/postgres.yaml",
+            "# @package db\ndriver: postgres\n",
+        );
         write_config(dir.path(), "config.yaml", "defaults:\n  - db: mysql\n");
         let loader = ConfigLoader::from_config_dir(dir.path().to_str().unwrap());
         // dot-less `db=postgres` re-selects the group option.
-        let cfg = loader.load_config(Some("config"), &["db=postgres".to_string()]).unwrap();
+        let cfg = loader
+            .load_config(Some("config"), &["db=postgres".to_string()])
+            .unwrap();
         let db = cfg.as_dict().unwrap().get("db").unwrap().as_dict().unwrap();
         assert_eq!(db.get("driver").unwrap().as_str(), Some("postgres"));
     }
@@ -1128,8 +1171,16 @@ mod tests {
     fn primary_overrides_defaults() {
         // The primary body is merged LAST, so it wins over a defaults entry.
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "base/a.yaml", "shared: from_default\nonly_default: 1\n");
-        write_config(dir.path(), "config.yaml", "defaults:\n  - base: a\nshared: from_primary\n");
+        write_config(
+            dir.path(),
+            "base/a.yaml",
+            "shared: from_default\nonly_default: 1\n",
+        );
+        write_config(
+            dir.path(),
+            "config.yaml",
+            "defaults:\n  - base: a\nshared: from_primary\n",
+        );
         let loader = ConfigLoader::from_config_dir(dir.path().to_str().unwrap());
         let cfg = loader.load_config(Some("config"), &[]).unwrap();
         let d = cfg.as_dict().unwrap();
@@ -1144,7 +1195,11 @@ mod tests {
         // Hydra's `optional` marker sits in the SAME defaults entry as the
         // group (`- db: nope` + `optional: true` → one mapping).
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "config.yaml", "defaults:\n  - db: nope\n    optional: true\nx: 1\n");
+        write_config(
+            dir.path(),
+            "config.yaml",
+            "defaults:\n  - db: nope\n    optional: true\nx: 1\n",
+        );
         let loader = ConfigLoader::from_config_dir(dir.path().to_str().unwrap());
         let cfg = loader.load_config(Some("config"), &[]).unwrap();
         assert_eq!(cfg.as_dict().unwrap().get("x").unwrap().as_int(), Some(1));
@@ -1167,11 +1222,21 @@ mod tests {
         assert_eq!(parse_override_value("~"), ConfigValue::Null);
         assert_eq!(parse_override_value("42"), ConfigValue::Int(42));
         assert_eq!(parse_override_value("1e-3"), ConfigValue::Float(0.001));
-        assert_eq!(parse_override_value("'quoted'"), ConfigValue::String("quoted".into()));
-        assert_eq!(parse_override_value("bare"), ConfigValue::String("bare".into()));
+        assert_eq!(
+            parse_override_value("'quoted'"),
+            ConfigValue::String("quoted".into())
+        );
+        assert_eq!(
+            parse_override_value("bare"),
+            ConfigValue::String("bare".into())
+        );
         assert_eq!(
             parse_override_value("[1, 2, 3]"),
-            ConfigValue::List(vec![ConfigValue::Int(1), ConfigValue::Int(2), ConfigValue::Int(3)])
+            ConfigValue::List(vec![
+                ConfigValue::Int(1),
+                ConfigValue::Int(2),
+                ConfigValue::Int(3)
+            ])
         );
         assert_eq!(parse_override_value("[]"), ConfigValue::List(vec![]));
     }
@@ -1185,7 +1250,10 @@ mod tests {
         let loader = ConfigLoader::from_config_dir(dir.path().to_str().unwrap());
         assert!(loader.config_exists("config"));
         assert!(!loader.config_exists("nope"));
-        assert_eq!(loader.list_group("db"), vec!["mysql".to_string(), "postgres".to_string()]);
+        assert_eq!(
+            loader.list_group("db"),
+            vec!["mysql".to_string(), "postgres".to_string()]
+        );
     }
 
     // --- sweep expansion ---
@@ -1201,7 +1269,14 @@ mod tests {
     #[test]
     fn sweep_range() {
         let r = expand_simple_sweeps(&["x=range(1,4)"]);
-        assert_eq!(r, vec![vec!["x=1".to_string()], vec!["x=2".to_string()], vec!["x=3".to_string()]]);
+        assert_eq!(
+            r,
+            vec![
+                vec!["x=1".to_string()],
+                vec!["x=2".to_string()],
+                vec!["x=3".to_string()]
+            ]
+        );
         let stepped = expand_simple_sweeps(&["x=range(0,10,3)"]);
         assert_eq!(
             stepped,
@@ -1285,9 +1360,18 @@ mod tests {
     fn non_finite_values_stay_strings() {
         // Hydra keeps bare inf/nan as strings; a Float(nan) would also break
         // ConfigValue PartialEq.
-        assert_eq!(parse_override_value("inf"), ConfigValue::String("inf".into()));
-        assert_eq!(parse_override_value("nan"), ConfigValue::String("nan".into()));
-        assert_eq!(parse_override_value("Infinity"), ConfigValue::String("Infinity".into()));
+        assert_eq!(
+            parse_override_value("inf"),
+            ConfigValue::String("inf".into())
+        );
+        assert_eq!(
+            parse_override_value("nan"),
+            ConfigValue::String("nan".into())
+        );
+        assert_eq!(
+            parse_override_value("Infinity"),
+            ConfigValue::String("Infinity".into())
+        );
         // real numbers still parse
         assert_eq!(parse_override_value(".5"), ConfigValue::Float(0.5));
         assert_eq!(parse_override_value("1."), ConfigValue::Float(1.0));
@@ -1309,7 +1393,11 @@ mod tests {
         // positive step still expands
         assert_eq!(
             expand_simple_sweeps(&["x=range(0,6,2)"]),
-            vec![vec!["x=0".to_string()], vec!["x=2".to_string()], vec!["x=4".to_string()]]
+            vec![
+                vec!["x=0".to_string()],
+                vec!["x=2".to_string()],
+                vec!["x=4".to_string()]
+            ]
         );
     }
 

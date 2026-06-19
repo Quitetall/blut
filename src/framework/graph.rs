@@ -81,7 +81,10 @@ pub fn summarize_args(args: &Value) -> String {
     }
     let s = parts.join(" ");
     if s.len() > 120 {
-        format!("{}…", &s[..s.char_indices().nth(120).map(|(i, _)| i).unwrap_or(s.len())])
+        format!(
+            "{}…",
+            &s[..s.char_indices().nth(120).map(|(i, _)| i).unwrap_or(s.len())]
+        )
     } else {
         s
     }
@@ -129,7 +132,10 @@ impl NodeStatus {
         matches!(self, NodeStatus::Done | NodeStatus::Skipped)
     }
     fn is_terminal_bad(self) -> bool {
-        matches!(self, NodeStatus::Killed | NodeStatus::Failed | NodeStatus::Pruned)
+        matches!(
+            self,
+            NodeStatus::Killed | NodeStatus::Failed | NodeStatus::Pruned
+        )
     }
 }
 
@@ -283,7 +289,10 @@ pub fn graph_snapshot(job_id: &str) -> Result<GraphSnapshot, String> {
         let m = hpo.as_ref()?;
         let t = (*m.trial_of_topo.get(idx)?)?;
         let rec = trial_index.get(&t)?;
-        Some(HpoNodeInfo { trial_id: t, overlay: rec.overlay.clone() })
+        Some(HpoNodeInfo {
+            trial_id: t,
+            overlay: rec.overlay.clone(),
+        })
     };
 
     // Predecessor adjacency in topo indices (idx == topo position).
@@ -340,7 +349,12 @@ pub fn graph_snapshot(job_id: &str) -> Result<GraphSnapshot, String> {
         })
         .collect();
 
-    Ok(GraphSnapshot { job: job_id.to_string(), name: plan.name, nodes, edges: plan.edges })
+    Ok(GraphSnapshot {
+        job: job_id.to_string(),
+        name: plan.name,
+        nodes,
+        edges: plan.edges,
+    })
 }
 
 #[cfg(test)]
@@ -392,10 +406,17 @@ mod tests {
             json!({"kind":"stage_failed","node_idx":0,"stage_name":"a","error":"boom"}),
         ]);
         let o = fold_status(&l, 1);
-        assert_eq!(o[0].status, Some(NodeStatus::Done), "first terminal (Done) wins");
+        assert_eq!(
+            o[0].status,
+            Some(NodeStatus::Done),
+            "first terminal (Done) wins"
+        );
         assert_eq!(o[0].output_hash.as_deref(), Some("good"));
         assert_eq!(o[0].elapsed_secs, Some(2.0));
-        assert!(!o[0].cache_hit, "late stage_skipped must not flip cache_hit");
+        assert!(
+            !o[0].cache_hit,
+            "late stage_skipped must not flip cache_hit"
+        );
     }
 
     #[test]

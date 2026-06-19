@@ -190,7 +190,11 @@ pub fn read_status_lines(job_id: &str) -> Result<Vec<String>> {
             path: p.clone(),
             source: e,
         })?;
-        out.extend(body.lines().filter(|l| !l.trim().is_empty()).map(String::from));
+        out.extend(
+            body.lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(String::from),
+        );
     }
     Ok(out)
 }
@@ -510,10 +514,17 @@ mod tests {
         assert!(rotate_status_with_cap(&path, 4));
         assert!(path.with_extension("jsonl.1").exists());
         assert!(!path.exists());
-        assert_eq!(std::fs::read_to_string(path.with_extension("jsonl.1")).unwrap(), "a\nb\n");
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("jsonl.1")).unwrap(),
+            "a\nb\n"
+        );
 
         // Fresh writes land in a new current file; both generations readable.
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(f, "c").unwrap();
         // read_status order = .1 (older) then current (newer).
         let combined = {

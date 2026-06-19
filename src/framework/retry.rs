@@ -263,7 +263,9 @@ mod tests {
 
     #[test]
     fn diverged_is_transient_but_not_oom_only() {
-        let div = StageError::Diverged { detail: "loss nan".into() };
+        let div = StageError::Diverged {
+            detail: "loss nan".into(),
+        };
         // Transient (resume on the next attempt) under Transient + AllErrors…
         assert!(is_retryable(&div, RetryOn::Transient));
         assert!(is_retryable(&div, RetryOn::AllErrors));
@@ -272,14 +274,18 @@ mod tests {
         assert!(!is_retryable(&div, RetryOn::OutOfMemoryOnly));
         // CheckpointBusy is also transient (back off + retry until the blocker
         // run frees the resume dir), but likewise not an OOM.
-        let busy = StageError::CheckpointBusy { detail: "owned".into() };
+        let busy = StageError::CheckpointBusy {
+            detail: "owned".into(),
+        };
         assert!(is_retryable(&busy, RetryOn::Transient));
         assert!(!is_retryable(&busy, RetryOn::OutOfMemoryOnly));
     }
 
     #[test]
     fn oom_only_retries_oom_not_other_transients() {
-        let oom = StageError::OutOfMemory { detail: "cgroup".into() };
+        let oom = StageError::OutOfMemory {
+            detail: "cgroup".into(),
+        };
         let backend = StageError::Backend(anyhow::anyhow!("crashed"));
         // OutOfMemoryOnly: the OOM self-heals (escalated cap next attempt);
         // a non-OOM backend crash reproduces, so it must NOT retry.

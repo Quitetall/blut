@@ -44,7 +44,13 @@ mod tests {
 
     fn space() -> SearchSpace {
         let mut s = SearchSpace::default();
-        s.dims.insert("lr".into(), Dist::Uniform { low: 0.0, high: 1.0 });
+        s.dims.insert(
+            "lr".into(),
+            Dist::Uniform {
+                low: 0.0,
+                high: 1.0,
+            },
+        );
         s
     }
 

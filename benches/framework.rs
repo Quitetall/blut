@@ -297,7 +297,12 @@ impl Stage for MakeA {
     type Input = ();
     type Output = ToyA;
     type Args = BenchArgs;
-    async fn run(&self, _ctx: &StageContext, _input: (), _args: &BenchArgs) -> Result<ToyA, StageError> {
+    async fn run(
+        &self,
+        _ctx: &StageContext,
+        _input: (),
+        _args: &BenchArgs,
+    ) -> Result<ToyA, StageError> {
         Ok(ToyA)
     }
 }
@@ -314,7 +319,12 @@ impl Stage for AToA {
     type Input = ToyA;
     type Output = ToyA;
     type Args = BenchArgs;
-    async fn run(&self, _ctx: &StageContext, _input: ToyA, _args: &BenchArgs) -> Result<ToyA, StageError> {
+    async fn run(
+        &self,
+        _ctx: &StageContext,
+        _input: ToyA,
+        _args: &BenchArgs,
+    ) -> Result<ToyA, StageError> {
         Ok(ToyA)
     }
 }
@@ -330,7 +340,12 @@ impl Stage for AToB {
     type Input = ToyA;
     type Output = ToyB;
     type Args = BenchArgs;
-    async fn run(&self, _ctx: &StageContext, _input: ToyA, _args: &BenchArgs) -> Result<ToyB, StageError> {
+    async fn run(
+        &self,
+        _ctx: &StageContext,
+        _input: ToyA,
+        _args: &BenchArgs,
+    ) -> Result<ToyB, StageError> {
         Ok(ToyB)
     }
 }
@@ -405,8 +420,8 @@ fn bench_plan_compile(c: &mut Criterion) {
                 v
             },
             |chain| {
-                let plan = CompiledPlan::from_erased_chain("decl", serde_json::json!({}), chain)
-                    .unwrap();
+                let plan =
+                    CompiledPlan::from_erased_chain("decl", serde_json::json!({}), chain).unwrap();
                 black_box(plan);
             },
             BatchSize::SmallInput,
@@ -608,7 +623,11 @@ fn bench_metric_store(c: &mut Criterion) {
                 // half intermediate steps, half final markers (-1) so the
                 // step=-1 queries have real rows to scan.
                 step: if k % 2 == 0 { k as i64 } else { -1 },
-                metric: if k % 3 == 0 { "val_r".into() } else { "train_loss".into() },
+                metric: if k % 3 == 0 {
+                    "val_r".into()
+                } else {
+                    "train_loss".into()
+                },
                 value: 0.40 + (j as f64) * 0.01 + (k as f64) * 0.0001,
                 wall_unix: None,
             });

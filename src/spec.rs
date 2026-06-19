@@ -593,7 +593,8 @@ mod tests {
     fn dpo_beta_some_round_trips_and_validates() {
         let mut s = good_spec();
         s.dpo_beta = Some(0.1);
-        s.validate().expect("positive finite dpo_beta must validate");
+        s.validate()
+            .expect("positive finite dpo_beta must validate");
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"dpo_beta\":0.1"), "got: {json}");
         let back: TrainSpec = serde_json::from_str(&json).unwrap();

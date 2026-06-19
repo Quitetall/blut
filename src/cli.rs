@@ -879,9 +879,7 @@ fn run_footprint_cmd(cmd: FootprintCommand) -> Result<()> {
         FootprintCommand::Forget { key, recipe } => {
             let mut store = store;
             match (key, recipe) {
-                (Some(_), Some(_)) => {
-                    Err(anyhow!("pass EITHER a <key> OR --recipe, not both"))
-                }
+                (Some(_), Some(_)) => Err(anyhow!("pass EITHER a <key> OR --recipe, not both")),
                 (Some(k), None) => {
                     if store.forget(&k)? {
                         println!("forgot calibration entry: {k}");
@@ -892,13 +890,13 @@ fn run_footprint_cmd(cmd: FootprintCommand) -> Result<()> {
                 }
                 (None, Some(r)) => {
                     let n = store.forget_recipe(&r)?;
-                    println!("forgot {n} calibration entr{} for recipe '{r}'",
-                             if n == 1 { "y" } else { "ies" });
+                    println!(
+                        "forgot {n} calibration entr{} for recipe '{r}'",
+                        if n == 1 { "y" } else { "ies" }
+                    );
                     Ok(())
                 }
-                (None, None) => {
-                    Err(anyhow!("specify a <key> or --recipe <name> to forget"))
-                }
+                (None, None) => Err(anyhow!("specify a <key> or --recipe <name> to forget")),
             }
         }
     }
@@ -988,7 +986,12 @@ fn run_lineage(id_query: &str, json: bool) -> Result<()> {
         let out = n.output_hash.as_deref().unwrap_or("-");
         let short = |h: &str| h.chars().take(12).collect::<String>();
         if n.cached {
-            println!("  {:>2} {:<28} [CACHE HIT {}]", n.node_idx, n.stage, short(out));
+            println!(
+                "  {:>2} {:<28} [CACHE HIT {}]",
+                n.node_idx,
+                n.stage,
+                short(out)
+            );
         } else {
             let took = n
                 .elapsed
@@ -1065,7 +1068,10 @@ fn run_lineage_freshness(id_query: &str, data_version: Option<String>, json: boo
 
     match &code {
         crate::lineage_db::CodeFreshness::Fresh { git_sha } => {
-            println!("job {job_id}: code FRESH (built at HEAD {})", short(git_sha))
+            println!(
+                "job {job_id}: code FRESH (built at HEAD {})",
+                short(git_sha)
+            )
         }
         crate::lineage_db::CodeFreshness::Stale { built_sha, head } => println!(
             "job {job_id}: code STALE (built at {}, HEAD is {} — a re-run re-executes)",
@@ -1104,7 +1110,10 @@ fn run_lineage_trace(hash: &str, json: bool) -> Result<()> {
         }
         Some(a) => {
             if matches.len() > 1 {
-                eprintln!("note: {} artifacts match '{hash}'; tracing the most recent", matches.len());
+                eprintln!(
+                    "note: {} artifacts match '{hash}'; tracing the most recent",
+                    matches.len()
+                );
             }
             a.content_hash.clone()
         }
@@ -1118,14 +1127,29 @@ fn run_lineage_trace(hash: &str, json: bool) -> Result<()> {
         return Ok(());
     }
     let short = |h: &str| h.get(..16).unwrap_or(h).to_string();
-    println!("provenance trace for {} — {} hop(s), upstream:", short(&target), chain.len());
+    println!(
+        "provenance trace for {} — {} hop(s), upstream:",
+        short(&target),
+        chain.len()
+    );
     for (i, step) in chain.iter().enumerate() {
         let a = &step.artifact;
-        println!("  [{i}] {} :: {} = {}", a.stage_name, a.kind, short(&a.content_hash));
+        println!(
+            "  [{i}] {} :: {} = {}",
+            a.stage_name,
+            a.kind,
+            short(&a.content_hash)
+        );
         if let Some(run) = &step.run {
             // `?` for unrecorded hardware — NOT `0` (which reads as "zero RAM").
-            let ram = run.ram_gib.map(|g| format!("{g}G")).unwrap_or_else(|| "?".into());
-            let vram = run.vram_mib.map(|m| format!("{m}M")).unwrap_or_else(|| "?".into());
+            let ram = run
+                .ram_gib
+                .map(|g| format!("{g}G"))
+                .unwrap_or_else(|| "?".into());
+            let vram = run
+                .vram_mib
+                .map(|m| format!("{m}M"))
+                .unwrap_or_else(|| "?".into());
             println!(
                 "      job={} recipe={} git={} ram={ram} vram={vram} outcome={}",
                 run.job_id,
@@ -1191,9 +1215,18 @@ fn run_artifact_cmd(cmd: ArtifactCommand) -> Result<()> {
             }
             println!("{:<24} {:<14} {:<10} stage", "kind", "hash", "schema");
             for r in &recs {
-                let hash = r.meta.content_hash.to_hex().chars().take(12).collect::<String>();
+                let hash = r
+                    .meta
+                    .content_hash
+                    .to_hex()
+                    .chars()
+                    .take(12)
+                    .collect::<String>();
                 let stage = r.meta.produced_by_stage.as_deref().unwrap_or("-");
-                println!("{:<24} {:<14} v{:<9} {stage}", r.meta.kind, hash, r.meta.schema);
+                println!(
+                    "{:<24} {:<14} v{:<9} {stage}",
+                    r.meta.kind, hash, r.meta.schema
+                );
             }
             Ok(())
         }
@@ -1525,12 +1558,14 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
     // footprint can exceed the base, and admission must reflect that. (The
     // executor's per-stage memory admission is the authoritative never-OOM gate
     // across concurrent trials; this pre-run gate is the courtesy early-refuse.)
-    let footprint = trials.iter().fold(recipe_footprint(&name, &base_args), |acc, t| {
-        let mut a = base_args.clone();
-        crate::hpo::apply_overlay(&mut a, &t.overlay);
-        let f = recipe_footprint(&name, &a);
-        if f.ram_bytes > acc.ram_bytes { f } else { acc }
-    });
+    let footprint = trials
+        .iter()
+        .fold(recipe_footprint(&name, &base_args), |acc, t| {
+            let mut a = base_args.clone();
+            crate::hpo::apply_overlay(&mut a, &t.overlay);
+            let f = recipe_footprint(&name, &a);
+            if f.ram_bytes > acc.ram_bytes { f } else { acc }
+        });
     let job_id = crate::jobs::new_job_id();
     let job_dir = crate::paths::job_dir(&job_id)?;
     let mut ctx = ExecCtx::new(job_dir.clone());
@@ -1555,7 +1590,11 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
             .map(|(i, t)| {
                 let lo = offsets[i];
                 let hi = offsets.get(i + 1).copied().unwrap_or(n_nodes);
-                TrialRec { trial_id: t.trial_id, overlay: t.overlay.clone(), n_nodes: hi - lo }
+                TrialRec {
+                    trial_id: t.trial_id,
+                    overlay: t.overlay.clone(),
+                    n_nodes: hi - lo,
+                }
             })
             .collect();
         let manifest = HpoManifest {
@@ -1611,8 +1650,14 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
                 eprintln!("hpo: asha rungs={:?} eta={eta}", asha.rungs);
                 Box::new(asha)
             }
-            "median" => Box::new(MedianStop { percentile: 50.0, min_peers: 2 }),
-            _ => Box::new(MedianStop { percentile: percentile as f64, min_peers: 2 }),
+            "median" => Box::new(MedianStop {
+                percentile: 50.0,
+                min_peers: 2,
+            }),
+            _ => Box::new(MedianStop {
+                percentile: percentile as f64,
+                min_peers: 2,
+            }),
         };
         let sched = HpoScheduler::new(
             trial_of_topo,
@@ -1662,7 +1707,10 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
                             .join(format!("{}-{}", n.idx, n.stage_name))
                     })
                     .unwrap_or_else(|| job_dir.clone());
-                PbtTrial { overlay: tp.overlay.clone(), resume_dir }
+                PbtTrial {
+                    overlay: tp.overlay.clone(),
+                    resume_dir,
+                }
             })
             .collect();
         // The clone factory: perturbed overlay + `resume_from` arg → recompile.
@@ -1703,7 +1751,9 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
         // Spawns a fresh suggested trial (no resume — TPE explores fresh).
         use crate::hpo::{TpeConfig, TpePolicy, TpePolicyConfig, TpeSampler};
         if max_budget == 0 {
-            return Err(anyhow!("tpe needs --max-budget >= 1 (the per-trial completion budget)"));
+            return Err(anyhow!(
+                "tpe needs --max-budget >= 1 (the per-trial completion budget)"
+            ));
         }
         let trial_overlays: Vec<crate::hpo::Overlay> =
             trials.iter().map(|t| t.overlay.clone()).collect();
@@ -1718,7 +1768,10 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
             cfn(a).map_err(|e| format!("{e}"))
         });
         let sampler = TpeSampler::new(
-            TpeConfig { maximize: mode == "max", ..TpeConfig::default() },
+            TpeConfig {
+                maximize: mode == "max",
+                ..TpeConfig::default()
+            },
             seed,
         );
         let cfg = TpePolicyConfig {
@@ -1727,7 +1780,14 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
             max_budget: max_budget as u64,
             max_spawns: (max_trials as usize).max(1),
         };
-        let sched = TpePolicy::new(trial_of_topo, trial_overlays, sp.clone(), cfg, sampler, factory);
+        let sched = TpePolicy::new(
+            trial_of_topo,
+            trial_overlays,
+            sp.clone(),
+            cfg,
+            sampler,
+            factory,
+        );
         ctx = ctx.with_control(std::sync::Arc::new(sched));
         eprintln!(
             "hpo: tpe (metric={metric} {mode}, complete@{max_budget}, ≤{max_trials} suggested)"
@@ -1752,17 +1812,15 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
         let _ = crate::jobs::write_state(&job_id, JobState::Failed);
         return Err(anyhow!("{reason}"));
     }
-    let lock = match scheduler_lock::acquire_exclusive(
-        format!("blut-hpo:{job_id}"),
-        LockKind::Training,
-    ) {
-        Ok(l) => l,
-        Err(e) => {
-            crate::python_kill::unbind_current_job();
-            let _ = crate::jobs::write_state(&job_id, JobState::Failed);
-            return Err(anyhow!("acquire_exclusive: {e}"));
-        }
-    };
+    let lock =
+        match scheduler_lock::acquire_exclusive(format!("blut-hpo:{job_id}"), LockKind::Training) {
+            Ok(l) => l,
+            Err(e) => {
+                crate::python_kill::unbind_current_job();
+                let _ = crate::jobs::write_state(&job_id, JobState::Failed);
+                return Err(anyhow!("acquire_exclusive: {e}"));
+            }
+        };
     eprintln!("job    {job_id}");
     eprintln!("dir    {}", job_dir.display());
     eprintln!("lock   {}", lock.path().display());
@@ -1852,7 +1910,10 @@ fn run_hpo_show(job: Option<String>, json: bool) -> Result<()> {
         manifest.mode,
         board.len()
     );
-    println!("{:<6} {:<10} {:<8} overlay", "trial", manifest.metric, "status");
+    println!(
+        "{:<6} {:<10} {:<8} overlay",
+        "trial", manifest.metric, "status"
+    );
     for o in &board {
         let obj = match o.objective {
             Some(x) => format!("{x:.4}"),
@@ -1888,7 +1949,9 @@ fn run_hpo_best(job: Option<String>, json: bool) -> Result<()> {
         );
         return Ok(());
     }
-    let best_obj = best.objective.expect("find() above guarantees objective.is_some()");
+    let best_obj = best
+        .objective
+        .expect("find() above guarantees objective.is_some()");
     println!(
         "best trial {} — {}={best_obj:.4} (job {id})",
         best.trial_id, manifest.metric,
@@ -1983,15 +2046,26 @@ async fn run_partition(reg: &crate::framework::Registry, cmd: PartitionCommand) 
                     let (axis, vals) = d
                         .split_once('=')
                         .ok_or_else(|| anyhow!("--dim '{d}' must be axis=v1,v2"))?;
-                    let values: Vec<String> =
-                        vals.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
-                    Ok::<_, anyhow::Error>(PartitionDim { axis: axis.to_string(), values })
+                    let values: Vec<String> = vals
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .collect();
+                    Ok::<_, anyhow::Error>(PartitionDim {
+                        axis: axis.to_string(),
+                        values,
+                    })
                 })
                 .collect::<Result<_>>()?;
             let set = PartitionSet { name, recipe, dims };
             let cells = set.validate().map_err(|e| anyhow!("{e}"))?;
             let path = set.save().map_err(|e| anyhow!("{e}"))?;
-            println!("defined partition '{}/{}' — {cells} cells → {}", set.recipe, set.name, path.display());
+            println!(
+                "defined partition '{}/{}' — {cells} cells → {}",
+                set.recipe,
+                set.name,
+                path.display()
+            );
         }
         PartitionCommand::List => {
             let sets = PartitionSet::list().map_err(|e| anyhow!("{e}"))?;
@@ -2008,7 +2082,10 @@ async fn run_partition(reg: &crate::framework::Registry, cmd: PartitionCommand) 
             let cells = set.cells();
             let n_done = cells
                 .iter()
-                .filter(|c| done.get(&c.key).is_some_and(PartitionStatus::is_materialized))
+                .filter(|c| {
+                    done.get(&c.key)
+                        .is_some_and(PartitionStatus::is_materialized)
+                })
                 .count();
             println!("{recipe}/{name} — {n_done}/{} materialized", cells.len());
             for c in &cells {
@@ -2020,10 +2097,16 @@ async fn run_partition(reg: &crate::framework::Registry, cmd: PartitionCommand) 
                 println!("  {:<32} {st}", c.key);
             }
         }
-        PartitionCommand::Backfill { recipe, name, force, args, launcher } => {
+        PartitionCommand::Backfill {
+            recipe,
+            name,
+            force,
+            args,
+            launcher,
+        } => {
             let set = PartitionSet::load(&recipe, &name).map_err(|e| anyhow!("{e}"))?;
-            let base: serde_json::Value =
-                serde_json::from_str(&args).map_err(|e| anyhow!("--args is not valid JSON: {e}"))?;
+            let base: serde_json::Value = serde_json::from_str(&args)
+                .map_err(|e| anyhow!("--args is not valid JSON: {e}"))?;
             let launch_target: crate::config::launcher::LaunchTarget =
                 launcher.parse().map_err(|e| anyhow!("{e}"))?;
             let targets = set.backfill_targets(force).map_err(|e| anyhow!("{e}"))?;
@@ -2085,7 +2168,8 @@ async fn run_partition(reg: &crate::framework::Registry, cmd: PartitionCommand) 
             // of concurrent cells can't exceed the box. `0` ⇒ probe failed ⇒
             // ungated (per-cell broker gate alone), the pre-slice behaviour.
             let budget_gib = scheduler_box_fit_budget_gib().unwrap_or(0);
-            let mem_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(budget_gib.max(1) as usize));
+            let mem_sem =
+                std::sync::Arc::new(tokio::sync::Semaphore::new(budget_gib.max(1) as usize));
             let (set, recipe, base) = (&set, &recipe, &base);
             let chains = per_device.into_iter().enumerate().map(|(d, cells)| {
                 let dev = devices[d];
@@ -2103,7 +2187,14 @@ async fn run_partition(reg: &crate::framework::Registry, cmd: PartitionCommand) 
                         let footprint_gib =
                             footprint.ram_bytes.div_ceil(crate::broker::footprint::GIB) as u32;
                         let cell_run = run_one_recipe(
-                            reg, recipe, cell_args, None, false, launch_target, Some(dev), false,
+                            reg,
+                            recipe,
+                            cell_args,
+                            None,
+                            false,
+                            launch_target,
+                            Some(dev),
+                            false,
                         );
                         let (outcome, job_id) = match gated_cell_run(
                             mem_sem.clone(),
@@ -2135,7 +2226,10 @@ async fn run_partition(reg: &crate::framework::Registry, cmd: PartitionCommand) 
                         }) {
                             // A lost status write would silently re-run a
                             // completed cell next backfill — warn, don't swallow.
-                            eprintln!("warning: could not record status for cell {}: {e}", cell.key);
+                            eprintln!(
+                                "warning: could not record status for cell {}: {e}",
+                                cell.key
+                            );
                         }
                     }
                     (ok, failed)
@@ -2146,7 +2240,9 @@ async fn run_partition(reg: &crate::framework::Registry, cmd: PartitionCommand) 
             let failed: usize = totals.iter().map(|(_, f)| f).sum();
             eprintln!("backfill done — {ok} materialized, {failed} failed");
             if failed > 0 {
-                return Err(anyhow!("{failed} cell(s) failed (re-run `partition backfill` to retry only those)"));
+                return Err(anyhow!(
+                    "{failed} cell(s) failed (re-run `partition backfill` to retry only those)"
+                ));
             }
         }
     }
@@ -2167,7 +2263,10 @@ fn run_compare(a: &str, b: &str) -> Result<()> {
                 "{id}  recipe={} outcome={} git={}",
                 r.recipe,
                 r.outcome.as_deref().unwrap_or("?"),
-                r.git_sha.as_deref().map(|s| &s[..s.len().min(8)]).unwrap_or("?"),
+                r.git_sha
+                    .as_deref()
+                    .map(|s| &s[..s.len().min(8)])
+                    .unwrap_or("?"),
             ),
             _ => format!("{id}  (no provenance row)"),
         }
@@ -2175,22 +2274,37 @@ fn run_compare(a: &str, b: &str) -> Result<()> {
     println!("A  {}", show_run(&ja));
     println!("B  {}", show_run(&jb));
 
-    let ma: BTreeMap<String, f64> =
-        db.final_metrics(&ja).map_err(|e| anyhow!("{e}"))?.into_iter().collect();
-    let mb: BTreeMap<String, f64> =
-        db.final_metrics(&jb).map_err(|e| anyhow!("{e}"))?.into_iter().collect();
+    let ma: BTreeMap<String, f64> = db
+        .final_metrics(&ja)
+        .map_err(|e| anyhow!("{e}"))?
+        .into_iter()
+        .collect();
+    let mb: BTreeMap<String, f64> = db
+        .final_metrics(&jb)
+        .map_err(|e| anyhow!("{e}"))?
+        .into_iter()
+        .collect();
     let keys: std::collections::BTreeSet<&String> = ma.keys().chain(mb.keys()).collect();
     if keys.is_empty() {
         println!("\n(no metrics recorded for either run)");
     } else {
-        println!("\n{:<18} {:>12} {:>12} {:>12}", "metric", "A", "B", "Δ(B−A)");
+        println!(
+            "\n{:<18} {:>12} {:>12} {:>12}",
+            "metric", "A", "B", "Δ(B−A)"
+        );
         for k in keys {
             let fmt = |v: Option<&f64>| v.map(|x| format!("{x:.4}")).unwrap_or_else(|| "—".into());
             let delta = match (ma.get(k), mb.get(k)) {
                 (Some(x), Some(y)) => format!("{:+.4}", y - x),
                 _ => "—".into(),
             };
-            println!("{:<18} {:>12} {:>12} {:>12}", k, fmt(ma.get(k)), fmt(mb.get(k)), delta);
+            println!(
+                "{:<18} {:>12} {:>12} {:>12}",
+                k,
+                fmt(ma.get(k)),
+                fmt(mb.get(k)),
+                delta
+            );
         }
     }
 
@@ -2239,7 +2353,8 @@ fn run_dag(job: Option<String>, json: bool) -> Result<()> {
         return Ok(());
     }
     // Tally per-status for a one-line header.
-    let mut counts: std::collections::BTreeMap<&'static str, u32> = std::collections::BTreeMap::new();
+    let mut counts: std::collections::BTreeMap<&'static str, u32> =
+        std::collections::BTreeMap::new();
     for n in &snap.nodes {
         *counts.entry(n.status.as_str()).or_default() += 1;
     }
@@ -2267,7 +2382,11 @@ fn run_dag(job: Option<String>, json: bool) -> Result<()> {
             .map(|e| e.from.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let preds = if preds.is_empty() { "─".to_string() } else { preds };
+        let preds = if preds.is_empty() {
+            "─".to_string()
+        } else {
+            preds
+        };
         let elapsed = n
             .elapsed_secs
             .map(|s| format!("{s:.1}s"))
@@ -2392,7 +2511,9 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
             match file {
                 None => {
                     if run {
-                        return Err(anyhow!("--run requires a <file> (a .toml recipe to launch)"));
+                        return Err(anyhow!(
+                            "--run requires a <file> (a .toml recipe to launch)"
+                        ));
                     }
                     // F4 discovery: list ~/.config/blut/recipes/*.toml.
                     let found = scan_user_recipes();
@@ -2420,7 +2541,10 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                         // core as `recipe run`. No RecipeMarker (declarative
                         // recipes don't resume by registry name); `Local`
                         // placement (clusters target registry recipes only).
-                        println!("✓ '{}' compiles + kind-checks ({n} stage(s)); launching…", recipe.name);
+                        println!(
+                            "✓ '{}' compiles + kind-checks ({n} stage(s)); launching…",
+                            recipe.name
+                        );
                         launch_compiled_plan(
                             &recipe.name,
                             plan,
@@ -2435,10 +2559,7 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                     } else {
                         // Render-only (default): print the runnable DAG, no exec.
                         print!("{}", plan.render_ascii().map_err(|e| anyhow!("{e}"))?);
-                        println!(
-                            "✓ '{}' compiles + kind-checks ({n} stage(s)).",
-                            recipe.name
-                        );
+                        println!("✓ '{}' compiles + kind-checks ({n} stage(s)).", recipe.name);
                     }
                 }
             }
@@ -2476,8 +2597,17 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                     );
                 }
                 run_recipe_sweep(
-                    reg, &name, config_dir, config_name, config_key, &set, &sweep, dry_run,
-                    shared_cache, launch_target, no_cache,
+                    reg,
+                    &name,
+                    config_dir,
+                    config_name,
+                    config_key,
+                    &set,
+                    &sweep,
+                    dry_run,
+                    shared_cache,
+                    launch_target,
+                    no_cache,
                 )
                 .await?;
             } else {
@@ -2494,8 +2624,9 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                     // dry-run can't report "OK" on invalid args — B/P5), then report
                     // the resolved RAM footprint and return WITHOUT executing or
                     // touching any resource (compile builds the plan; it never runs).
-                    let def =
-                        reg.find(&name).ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+                    let def = reg
+                        .find(&name)
+                        .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
                     if let Err(e) = (def.compile_fn)(raw.clone()) {
                         return Err(anyhow!("{e}")); // RecipeError already names the cause
                     }
@@ -2508,8 +2639,17 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                     );
                     return Ok(());
                 }
-                run_one_recipe(reg, &name, raw, None, shared_cache, launch_target, None, no_cache)
-                    .await?;
+                run_one_recipe(
+                    reg,
+                    &name,
+                    raw,
+                    None,
+                    shared_cache,
+                    launch_target,
+                    None,
+                    no_cache,
+                )
+                .await?;
             }
         }
     }
@@ -2547,7 +2687,10 @@ async fn run_one_recipe(
     launch_compiled_plan(
         name,
         plan,
-        Some(RecipeMarker { name: name.to_string(), args }),
+        Some(RecipeMarker {
+            name: name.to_string(),
+            args,
+        }),
         sweep_fp,
         shared_cache,
         launch_target,
@@ -2833,8 +2976,17 @@ async fn run_recipe_sweep(
         }
         eprintln!("[{}/{total}] run (fp={})", i + 1, fp.to_hex());
         let args = project_args(entry.config.json, &key);
-        match run_one_recipe(reg, name, args, Some(fp), shared_cache, launch_target, None, no_cache)
-            .await
+        match run_one_recipe(
+            reg,
+            name,
+            args,
+            Some(fp),
+            shared_cache,
+            launch_target,
+            None,
+            no_cache,
+        )
+        .await
         {
             Ok(_job_id) => ran += 1,
             Err(e) => {
@@ -2982,7 +3134,6 @@ fn run_data(cmd: DataCommand) -> Result<()> {
     Ok(())
 }
 
-
 fn truncate_for_col(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -3013,8 +3164,8 @@ fn run_jobs(json: bool) -> Result<()> {
     if json {
         // JobSummary derives Serialize — emit the array verbatim so a
         // script/agent gets the same data the table renders.
-        let out = serde_json::to_string_pretty(&jobs)
-            .map_err(|e| anyhow!("serialize jobs: {e}"))?;
+        let out =
+            serde_json::to_string_pretty(&jobs).map_err(|e| anyhow!("serialize jobs: {e}"))?;
         println!("{out}");
         return Ok(());
     }
@@ -3155,11 +3306,17 @@ mod footprint_resolve_tests {
         assert_eq!(d.batch, crate::broker::footprint::DEFAULT_BATCH);
         assert_eq!(d.tier, 3, "joint recipe default tier");
         assert_eq!(d.latent, 0, "no --encoder-width ⇒ default latent");
-        assert!(!d.warm, "raw {{}} has no warm_fb_cache ⇒ cold (defaults applied via the plan, not here)");
+        assert!(
+            !d.warm,
+            "raw {{}} has no warm_fb_cache ⇒ cold (defaults applied via the plan, not here)"
+        );
         // The exact key the cli RESOLVES under for a RAW (undefaulted) joint
         // run. Production bills the plan's DEFAULTED args (warm_fb_cache=true ⇒
         // `|w`); from_args_json on raw args is the conservative cold `|c`.
-        assert_eq!(d.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|3|32|2|c");
+        assert_eq!(
+            d.key("lamquant_joint_codec").flat(),
+            "lamquant_joint_codec|3|32|2|c"
+        );
     }
 
     /// Explicit tier/batch flow through to the key (so a tier-6 fullband
@@ -3169,7 +3326,10 @@ mod footprint_resolve_tests {
         let raw = serde_json::json!({ "tier": 6, "batch_size": 16 });
         let d = crate::broker::Drivers::from_args_json(&raw);
         assert_eq!((d.workers, d.batch, d.tier), (2, 16, 6));
-        assert_eq!(d.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|6|16|2|c");
+        assert_eq!(
+            d.key("lamquant_joint_codec").flat(),
+            "lamquant_joint_codec|6|16|2|c"
+        );
     }
 
     /// THE parity-bug regression: an explicit `workers:4` must clamp to the
@@ -3181,7 +3341,10 @@ mod footprint_resolve_tests {
         let raw = serde_json::json!({ "workers": 4, "tier": 3, "batch_size": 32 });
         let d = crate::broker::Drivers::from_args_json(&raw);
         assert_eq!(d.workers, crate::broker::UNCALIBRATED_WORKER_CAP);
-        assert_eq!(d.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|3|32|2|c");
+        assert_eq!(
+            d.key("lamquant_joint_codec").flat(),
+            "lamquant_joint_codec|3|32|2|c"
+        );
     }
 
     /// Phase 3: the warm flag (off the recipe's DEFAULTED args) flows into the
@@ -3197,8 +3360,14 @@ mod footprint_resolve_tests {
         );
         assert!(warm.warm && !cold.warm);
         assert!(warm.estimate().ram_bytes < cold.estimate().ram_bytes);
-        assert_eq!(warm.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|3|32|2|w");
-        assert_eq!(cold.key("lamquant_joint_codec").flat(), "lamquant_joint_codec|3|32|2|c");
+        assert_eq!(
+            warm.key("lamquant_joint_codec").flat(),
+            "lamquant_joint_codec|3|32|2|w"
+        );
+        assert_eq!(
+            cold.key("lamquant_joint_codec").flat(),
+            "lamquant_joint_codec|3|32|2|c"
+        );
     }
 }
 
@@ -3371,7 +3540,13 @@ mod recipe_run_flag_tests {
 
     #[test]
     fn no_cache_flag_sets_true() {
-        assert!(no_cache_of(&["blut", "recipe", "run", "demo", "--no-cache"]));
+        assert!(no_cache_of(&[
+            "blut",
+            "recipe",
+            "run",
+            "demo",
+            "--no-cache"
+        ]));
     }
 
     #[test]
@@ -3413,15 +3588,20 @@ mod recipe_declare_flag_tests {
 
     #[test]
     fn declare_run_flag_launches() {
-        let (_f, run, _sc, _nc) =
-            declare_of(&["blut", "recipe", "declare", "r.toml", "--run"]);
+        let (_f, run, _sc, _nc) = declare_of(&["blut", "recipe", "declare", "r.toml", "--run"]);
         assert!(run);
     }
 
     #[test]
     fn declare_run_carries_cache_flags() {
         let (_f, run, sc, nc) = declare_of(&[
-            "blut", "recipe", "declare", "r.toml", "--run", "--shared-cache", "--force",
+            "blut",
+            "recipe",
+            "declare",
+            "r.toml",
+            "--run",
+            "--shared-cache",
+            "--force",
         ]);
         assert!(run && sc && nc, "--force aliases --no-cache");
     }

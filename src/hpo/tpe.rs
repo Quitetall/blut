@@ -55,7 +55,13 @@ pub struct TpeConfig {
 
 impl Default for TpeConfig {
     fn default() -> Self {
-        Self { gamma: 0.25, n_candidates: 24, n_startup: 5, bw_factor: 0.15, maximize: true }
+        Self {
+            gamma: 0.25,
+            n_candidates: 24,
+            n_startup: 5,
+            bw_factor: 0.15,
+            maximize: true,
+        }
     }
 }
 
@@ -67,7 +73,10 @@ pub struct TpeSampler {
 
 impl TpeSampler {
     pub fn new(cfg: TpeConfig, seed: u64) -> Self {
-        Self { cfg, rng: StdRng::seed_from_u64(seed) }
+        Self {
+            cfg,
+            rng: StdRng::seed_from_u64(seed),
+        }
     }
 }
 
@@ -100,7 +109,11 @@ fn to_t(dist: &Dist, v: f64) -> f64 {
 
 /// Inverse transform: t-space value → a JSON value honoring the dim's type.
 fn from_t(dist: &Dist, t: f64) -> Value {
-    let num = |x: f64| serde_json::Number::from_f64(x).map(Value::Number).unwrap_or(Value::Null);
+    let num = |x: f64| {
+        serde_json::Number::from_f64(x)
+            .map(Value::Number)
+            .unwrap_or(Value::Null)
+    };
     match dist {
         Dist::Uniform { .. } => num(t),
         Dist::LogUniform { .. } => num(t.exp()),
@@ -343,7 +356,10 @@ impl TpePolicy {
             if budget >= self.cfg.max_budget && !st.told.contains(&trial) {
                 st.told.insert(trial);
                 if let Some(overlay) = self.trial_overlays.get(trial as usize).cloned() {
-                    st.observations.push(TrialResult { overlay, objective: best });
+                    st.observations.push(TrialResult {
+                        overlay,
+                        objective: best,
+                    });
                 }
                 // Suggest the next config if there's still spawn budget.
                 if st.spawns_done + st.queue.len() < self.cfg.max_spawns {
@@ -368,7 +384,12 @@ impl TpePolicy {
 
 impl ControlPolicy for TpePolicy {
     fn on_step(&self, m: &StepMetrics) -> Control {
-        let Some(trial) = self.trial_of_topo.get(m.node_idx as usize).copied().flatten() else {
+        let Some(trial) = self
+            .trial_of_topo
+            .get(m.node_idx as usize)
+            .copied()
+            .flatten()
+        else {
             return Control::Continue;
         };
         let Some(obj) = dotted_f64(m.update, &self.cfg.metric_key) else {
@@ -378,9 +399,10 @@ impl ControlPolicy for TpePolicy {
         match self.decide(trial, obj, budget) {
             TpeDecision::Continue => Control::Continue,
             TpeDecision::Spawn(overlay) => match (self.factory)(&overlay) {
-                Ok(subplan) => {
-                    Control::Spawn(SpawnDelta { subplan, label: Some("tpe-suggest".into()) })
-                }
+                Ok(subplan) => Control::Spawn(SpawnDelta {
+                    subplan,
+                    label: Some("tpe-suggest".into()),
+                }),
                 Err(e) => {
                     tracing::warn!("tpe suggest factory failed: {e}");
                     Control::Continue
@@ -398,19 +420,34 @@ mod tests {
 
     fn cont_space() -> SearchSpace {
         let mut s = SearchSpace::default();
-        s.dims.insert("lr".into(), Dist::Uniform { low: 0.0, high: 1.0 });
+        s.dims.insert(
+            "lr".into(),
+            Dist::Uniform {
+                low: 0.0,
+                high: 1.0,
+            },
+        );
         s
     }
 
     fn tr(lr: f64, obj: f64) -> TrialResult {
-        TrialResult { overlay: vec![("lr".into(), json!(lr))], objective: obj }
+        TrialResult {
+            overlay: vec![("lr".into(), json!(lr))],
+            objective: obj,
+        }
     }
 
     #[test]
     fn cold_start_samples_in_support() {
         let mut t = TpeSampler::new(TpeConfig::default(), 1);
         let o = t.ask(&cont_space(), &[]); // empty → random
-        let lr = o.iter().find(|(k, _)| k == "lr").unwrap().1.as_f64().unwrap();
+        let lr = o
+            .iter()
+            .find(|(k, _)| k == "lr")
+            .unwrap()
+            .1
+            .as_f64()
+            .unwrap();
         assert!((0.0..=1.0).contains(&lr));
     }
 
@@ -423,7 +460,13 @@ mod tests {
             hist.push(tr(0.08 + 0.01 * i as f64, 0.1)); // bad
         }
         let mut t = TpeSampler::new(
-            TpeConfig { gamma: 0.5, n_candidates: 64, n_startup: 4, bw_factor: 0.15, maximize: true },
+            TpeConfig {
+                gamma: 0.5,
+                n_candidates: 64,
+                n_startup: 4,
+                bw_factor: 0.15,
+                maximize: true,
+            },
             7,
         );
         // Average several suggestions — they should lean to the good region.
@@ -431,10 +474,19 @@ mod tests {
         let n = 12;
         for _ in 0..n {
             let o = t.ask(&cont_space(), &hist);
-            sum += o.iter().find(|(k, _)| k == "lr").unwrap().1.as_f64().unwrap();
+            sum += o
+                .iter()
+                .find(|(k, _)| k == "lr")
+                .unwrap()
+                .1
+                .as_f64()
+                .unwrap();
         }
         let avg = sum / n as f64;
-        assert!(avg > 0.5, "TPE should favor the good lr≈0.9 region, got avg {avg}");
+        assert!(
+            avg > 0.5,
+            "TPE should favor the good lr≈0.9 region, got avg {avg}"
+        );
     }
 
     #[test]
@@ -446,16 +498,31 @@ mod tests {
             hist.push(tr(0.08 + 0.01 * i as f64, 0.1));
         }
         let mut t = TpeSampler::new(
-            TpeConfig { gamma: 0.5, n_candidates: 64, n_startup: 4, bw_factor: 0.15, maximize: false },
+            TpeConfig {
+                gamma: 0.5,
+                n_candidates: 64,
+                n_startup: 4,
+                bw_factor: 0.15,
+                maximize: false,
+            },
             7,
         );
         let mut sum = 0.0;
         let n = 12;
         for _ in 0..n {
             let o = t.ask(&cont_space(), &hist);
-            sum += o.iter().find(|(k, _)| k == "lr").unwrap().1.as_f64().unwrap();
+            sum += o
+                .iter()
+                .find(|(k, _)| k == "lr")
+                .unwrap()
+                .1
+                .as_f64()
+                .unwrap();
         }
-        assert!(sum / (n as f64) < 0.5, "minimize should favor the low-lr region");
+        assert!(
+            sum / (n as f64) < 0.5,
+            "minimize should favor the low-lr region"
+        );
     }
 
     #[test]
@@ -463,16 +530,30 @@ mod tests {
         let mut s = SearchSpace::default();
         s.dims.insert(
             "opt".into(),
-            Dist::Choice { choices: vec![json!("soap"), json!("adamw")] },
+            Dist::Choice {
+                choices: vec![json!("soap"), json!("adamw")],
+            },
         );
         // Good trials picked "soap"; bad picked "adamw".
         let mut hist = vec![];
         for _ in 0..6 {
-            hist.push(TrialResult { overlay: vec![("opt".into(), json!("soap"))], objective: 0.9 });
-            hist.push(TrialResult { overlay: vec![("opt".into(), json!("adamw"))], objective: 0.1 });
+            hist.push(TrialResult {
+                overlay: vec![("opt".into(), json!("soap"))],
+                objective: 0.9,
+            });
+            hist.push(TrialResult {
+                overlay: vec![("opt".into(), json!("adamw"))],
+                objective: 0.1,
+            });
         }
         let mut t = TpeSampler::new(
-            TpeConfig { gamma: 0.5, n_candidates: 16, n_startup: 4, bw_factor: 0.15, maximize: true },
+            TpeConfig {
+                gamma: 0.5,
+                n_candidates: 16,
+                n_startup: 4,
+                bw_factor: 0.15,
+                maximize: true,
+            },
             3,
         );
         let o = t.ask(&s, &hist);
@@ -486,11 +567,20 @@ mod tests {
             max_budget: 4,
             max_spawns,
         };
-        let sampler = TpeSampler::new(TpeConfig { n_startup: 2, ..TpeConfig::default() }, 9);
+        let sampler = TpeSampler::new(
+            TpeConfig {
+                n_startup: 2,
+                ..TpeConfig::default()
+            },
+            9,
+        );
         let factory: FreshFactory = Arc::new(|_| Err("unused".into()));
         TpePolicy::new(
             vec![Some(0), Some(1)],
-            vec![vec![("lr".into(), json!(0.5))], vec![("lr".into(), json!(0.6))]],
+            vec![
+                vec![("lr".into(), json!(0.5))],
+                vec![("lr".into(), json!(0.6))],
+            ],
             cont_space(),
             cfg,
             sampler,
@@ -507,7 +597,13 @@ mod tests {
         // suggestion (random, only 1 obs < n_startup) is emitted.
         match p.decide(0, 0.3, 4) {
             TpeDecision::Spawn(o) => {
-                let lr = o.iter().find(|(k, _)| k == "lr").unwrap().1.as_f64().unwrap();
+                let lr = o
+                    .iter()
+                    .find(|(k, _)| k == "lr")
+                    .unwrap()
+                    .1
+                    .as_f64()
+                    .unwrap();
                 assert!((0.0..=1.0).contains(&lr), "suggested lr in support");
             }
             d => panic!("a completion must record + emit a suggestion, got {d:?}"),
@@ -531,6 +627,10 @@ mod tests {
         let p = policy(0); // no spawns allowed
         assert_eq!(p.decide(0, 0.3, 4), TpeDecision::Continue);
         assert_eq!(p.decide(1, 0.7, 4), TpeDecision::Continue);
-        assert_eq!(p.decide(0, 0.3, 5), TpeDecision::Continue, "cap 0 → never suggests");
+        assert_eq!(
+            p.decide(0, 0.3, 5),
+            TpeDecision::Continue,
+            "cap 0 → never suggests"
+        );
     }
 }

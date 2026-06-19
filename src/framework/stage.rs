@@ -895,8 +895,12 @@ mod tests {
         let s: Box<dyn StageDyn> = Box::new(WordCount);
         // delimiter must be a String; an int fails the args-deserialize → a
         // preflight failure (the recipe gave the stage args it can't parse).
-        let r = s.preflight_erased(&serde_json::json!({"delimiter": 42})).await;
-        assert!(matches!(r, Err(StageError::ArgsDeserialize { stage, .. }) if stage == "word_count"));
+        let r = s
+            .preflight_erased(&serde_json::json!({"delimiter": 42}))
+            .await;
+        assert!(
+            matches!(r, Err(StageError::ArgsDeserialize { stage, .. }) if stage == "word_count")
+        );
     }
 
     #[tokio::test]
@@ -905,7 +909,10 @@ mod tests {
         let s: Box<dyn StageDyn> = Box::new(WordCount);
         // Unparseable args ⇒ None (can't determine a resume point) — never
         // blocks; the run just starts fresh.
-        assert!(s.resume_handle_erased(&ctx, &serde_json::json!({"delimiter": 42})).is_none());
+        assert!(
+            s.resume_handle_erased(&ctx, &serde_json::json!({"delimiter": 42}))
+                .is_none()
+        );
     }
 
     // ── Constants accessible through StageDyn ────────────────────

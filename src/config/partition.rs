@@ -89,7 +89,9 @@ const MAX_CELLS: usize = 100_000;
 /// `<recipe>~<name>` filename is unambiguous even when a name contains `_`
 /// (a `__`-based separator would alias `a_`/`b` with `a`/`_b`).
 fn name_ok(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// The `<recipe>SEP<name>` file separator — outside [`name_ok`]'s alphabet so it
@@ -104,9 +106,12 @@ const SEP: char = '~';
 /// metachar there could still be re-interpreted — reject it at the source.
 fn value_ok(v: &str) -> bool {
     !v.is_empty()
-        && !v
-            .chars()
-            .any(|c| matches!(c, '/' | '\\' | '=' | ',' | ':' | '[' | ']' | '(' | ')' | '*'))
+        && !v.chars().any(|c| {
+            matches!(
+                c,
+                '/' | '\\' | '=' | ',' | ':' | '[' | ']' | '(' | ')' | '*'
+            )
+        })
 }
 
 impl PartitionSet {
@@ -139,10 +144,16 @@ impl PartitionSet {
                 )));
             }
             if !seen.insert(&d.axis) {
-                return Err(TrainError::other(format!("duplicate partition axis '{}'", d.axis)));
+                return Err(TrainError::other(format!(
+                    "duplicate partition axis '{}'",
+                    d.axis
+                )));
             }
             if d.values.is_empty() {
-                return Err(TrainError::other(format!("partition axis '{}' has no values", d.axis)));
+                return Err(TrainError::other(format!(
+                    "partition axis '{}' has no values",
+                    d.axis
+                )));
             }
             if !d.values.iter().all(|v| value_ok(v)) {
                 return Err(TrainError::other(format!(
@@ -183,7 +194,10 @@ impl PartitionSet {
             acc = next;
         }
         acc.into_iter()
-            .map(|overrides| PartitionCell { key: overrides.join("/"), overrides })
+            .map(|overrides| PartitionCell {
+                key: overrides.join("/"),
+                overrides,
+            })
             .collect()
     }
 
@@ -195,8 +209,9 @@ impl PartitionSet {
         if let Ok(p) = std::env::var("BLUT_PARTITIONS_DIR") {
             return Ok(PathBuf::from(p));
         }
-        let base = dirs::config_dir()
-            .ok_or_else(|| TrainError::other("cannot resolve ~/.config (set $BLUT_PARTITIONS_DIR)"))?;
+        let base = dirs::config_dir().ok_or_else(|| {
+            TrainError::other("cannot resolve ~/.config (set $BLUT_PARTITIONS_DIR)")
+        })?;
         Ok(base.join("blut").join("partitions"))
     }
 
@@ -229,19 +244,24 @@ impl PartitionSet {
     pub fn save(&self) -> Result<PathBuf> {
         self.validate()?;
         let dir = Self::dir()?;
-        std::fs::create_dir_all(&dir).map_err(|e| TrainError::other(format!("mkdir {dir:?}: {e}")))?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| TrainError::other(format!("mkdir {dir:?}: {e}")))?;
         let path = Self::def_path(&self.recipe, &self.name)?;
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| TrainError::other(format!("serialize partition set: {e}")))?;
-        std::fs::write(&path, json).map_err(|e| TrainError::other(format!("write {path:?}: {e}")))?;
+        std::fs::write(&path, json)
+            .map_err(|e| TrainError::other(format!("write {path:?}: {e}")))?;
         Ok(path)
     }
 
     /// Load a named set for a recipe.
     pub fn load(recipe: &str, name: &str) -> Result<Self> {
         let path = Self::def_path(recipe, name)?;
-        let body = std::fs::read_to_string(&path)
-            .map_err(|e| TrainError::other(format!("partition set {recipe}/{name} not found ({path:?}): {e}")))?;
+        let body = std::fs::read_to_string(&path).map_err(|e| {
+            TrainError::other(format!(
+                "partition set {recipe}/{name} not found ({path:?}): {e}"
+            ))
+        })?;
         let set: Self = serde_json::from_str(&body)
             .map_err(|e| TrainError::other(format!("parse partition set {path:?}: {e}")))?;
         set.validate()?;
@@ -274,7 +294,8 @@ impl PartitionSet {
     /// Append a materialization record (append-only; never rewrites history).
     pub fn record_status(&self, status: &PartitionStatus) -> Result<()> {
         let dir = Self::dir()?;
-        std::fs::create_dir_all(&dir).map_err(|e| TrainError::other(format!("mkdir {dir:?}: {e}")))?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| TrainError::other(format!("mkdir {dir:?}: {e}")))?;
         let path = Self::status_path(&self.recipe, &self.name)?;
         let line = serde_json::to_string(status)
             .map_err(|e| TrainError::other(format!("serialize status: {e}")))?;
@@ -320,7 +341,11 @@ impl PartitionSet {
         Ok(self
             .cells()
             .into_iter()
-            .filter(|c| !done.get(&c.key).is_some_and(PartitionStatus::is_materialized))
+            .filter(|c| {
+                !done
+                    .get(&c.key)
+                    .is_some_and(PartitionStatus::is_materialized)
+            })
             .collect())
     }
 }
@@ -334,8 +359,14 @@ mod tests {
             name: "by_corpus_fold".into(),
             recipe: "lamquant_snn_4state".into(),
             dims: vec![
-                PartitionDim { axis: "corpus".into(), values: vec!["tusz".into(), "chbmit".into()] },
-                PartitionDim { axis: "fold".into(), values: vec!["0".into(), "1".into(), "2".into()] },
+                PartitionDim {
+                    axis: "corpus".into(),
+                    values: vec!["tusz".into(), "chbmit".into()],
+                },
+                PartitionDim {
+                    axis: "fold".into(),
+                    values: vec!["0".into(), "1".into(), "2".into()],
+                },
             ],
         }
     }
@@ -349,18 +380,26 @@ mod tests {
         _td: tempfile::TempDir,
     }
     fn tmp_env() -> EnvGuard {
-        let lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let td = tempfile::tempdir().unwrap();
         // SAFETY: TEST_ENV_LOCK serializes this env mutation across tests.
         unsafe { std::env::set_var("BLUT_PARTITIONS_DIR", td.path()) };
-        EnvGuard { _lock: lock, _td: td }
+        EnvGuard {
+            _lock: lock,
+            _td: td,
+        }
     }
 
     #[test]
     fn validate_counts_cells_and_rejects_bad() {
         assert_eq!(set().validate().unwrap(), 6);
         let mut s = set();
-        s.dims.push(PartitionDim { axis: "corpus".into(), values: vec!["x".into()] });
+        s.dims.push(PartitionDim {
+            axis: "corpus".into(),
+            values: vec!["x".into()],
+        });
         assert!(s.validate().is_err(), "duplicate axis rejected");
         let mut s2 = set();
         s2.dims[0].values.clear();
@@ -379,7 +418,10 @@ mod tests {
         let s = PartitionSet {
             name: "g".into(),
             recipe: "r".into(),
-            dims: vec![PartitionDim { axis: "x".into(), values: vec!["a,b".into()] }],
+            dims: vec![PartitionDim {
+                axis: "x".into(),
+                values: vec!["a,b".into()],
+            }],
         };
         let cells = s.cells();
         assert_eq!(cells.len(), 1, "comma value is one cell, not two");
@@ -392,14 +434,23 @@ mod tests {
         for bad in ["a,b", "1:3", "x[0]", "g*"] {
             let mut s = set();
             s.dims[0].values = vec![bad.into()];
-            assert!(s.validate().is_err(), "grammar/path metachar value {bad:?} rejected");
+            assert!(
+                s.validate().is_err(),
+                "grammar/path metachar value {bad:?} rejected"
+            );
         }
         let mut traversal = set();
         traversal.recipe = "../evil".into();
-        assert!(traversal.validate().is_err(), "path-traversal recipe rejected");
+        assert!(
+            traversal.validate().is_err(),
+            "path-traversal recipe rejected"
+        );
         let mut tilde = set();
         tilde.name = "a~b".into();
-        assert!(tilde.validate().is_err(), "the file separator '~' rejected in a name");
+        assert!(
+            tilde.validate().is_err(),
+            "the file separator '~' rejected in a name"
+        );
     }
 
     #[test]
@@ -410,13 +461,24 @@ mod tests {
         let a = PartitionSet {
             name: "b".into(),
             recipe: "a_".into(),
-            dims: vec![PartitionDim { axis: "x".into(), values: vec!["0".into()] }],
+            dims: vec![PartitionDim {
+                axis: "x".into(),
+                values: vec!["0".into()],
+            }],
         };
-        let b = PartitionSet { name: "_b".into(), recipe: "a".into(), ..a.clone() };
+        let b = PartitionSet {
+            name: "_b".into(),
+            recipe: "a".into(),
+            ..a.clone()
+        };
         a.save().unwrap();
         b.save().unwrap();
         assert_eq!(PartitionSet::load("a_", "b").unwrap(), a, "a_/b intact");
-        assert_eq!(PartitionSet::load("a", "_b").unwrap(), b, "a/_b not clobbered by a_/b");
+        assert_eq!(
+            PartitionSet::load("a", "_b").unwrap(),
+            b,
+            "a/_b not clobbered by a_/b"
+        );
         assert_eq!(PartitionSet::list().unwrap().len(), 2, "two distinct files");
     }
 
@@ -442,7 +504,10 @@ mod tests {
         // load() builds the path from its args BEFORE reading; an unsafe recipe
         // or name must be refused at the path chokepoint, never read from disk.
         assert!(PartitionSet::load("../../etc/passwd", "x").is_err());
-        assert!(PartitionSet::load("a~b", "x").is_err(), "'~' (separator) in recipe refused");
+        assert!(
+            PartitionSet::load("a~b", "x").is_err(),
+            "'~' (separator) in recipe refused"
+        );
     }
 
     #[test]
@@ -453,8 +518,14 @@ mod tests {
         assert!(keys.contains(&"corpus=tusz/fold=0"));
         assert!(keys.contains(&"corpus=chbmit/fold=2"));
         // overrides are --set-shaped
-        let c0 = cells.iter().find(|c| c.key == "corpus=tusz/fold=0").unwrap();
-        assert_eq!(c0.overrides, vec!["corpus=tusz".to_string(), "fold=0".to_string()]);
+        let c0 = cells
+            .iter()
+            .find(|c| c.key == "corpus=tusz/fold=0")
+            .unwrap();
+        assert_eq!(
+            c0.overrides,
+            vec!["corpus=tusz".to_string(), "fold=0".to_string()]
+        );
     }
 
     #[test]
@@ -496,7 +567,11 @@ mod tests {
             recorded_at: 2,
         })
         .unwrap();
-        assert_eq!(s.backfill_targets(false).unwrap().len(), 4, "failed cell still pending");
+        assert_eq!(
+            s.backfill_targets(false).unwrap().len(),
+            4,
+            "failed cell still pending"
+        );
         // force returns all
         assert_eq!(s.backfill_targets(true).unwrap().len(), 6);
     }
@@ -506,8 +581,20 @@ mod tests {
         let _g = tmp_env();
         let s = set();
         let k = "corpus=tusz/fold=0";
-        s.record_status(&PartitionStatus { key: k.into(), job_id: "a".into(), outcome: "failed".into(), recorded_at: 1 }).unwrap();
-        s.record_status(&PartitionStatus { key: k.into(), job_id: "b".into(), outcome: "done".into(), recorded_at: 2 }).unwrap();
+        s.record_status(&PartitionStatus {
+            key: k.into(),
+            job_id: "a".into(),
+            outcome: "failed".into(),
+            recorded_at: 1,
+        })
+        .unwrap();
+        s.record_status(&PartitionStatus {
+            key: k.into(),
+            job_id: "b".into(),
+            outcome: "done".into(),
+            recorded_at: 2,
+        })
+        .unwrap();
         let st = s.statuses().unwrap();
         assert_eq!(st.get(k).unwrap().job_id, "b");
         assert!(st.get(k).unwrap().is_materialized());

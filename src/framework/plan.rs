@@ -645,9 +645,16 @@ impl CompiledPlan {
         let edges = self
             .edges
             .iter()
-            .map(|e| PlanGraphEdge { from: pos[e.from as usize], to: pos[e.to as usize] })
+            .map(|e| PlanGraphEdge {
+                from: pos[e.from as usize],
+                to: pos[e.to as usize],
+            })
             .collect();
-        Ok(PlanGraph { name: self.name.clone(), nodes, edges })
+        Ok(PlanGraph {
+            name: self.name.clone(),
+            nodes,
+            edges,
+        })
     }
 
     /// Merge N independent compiled plans into one (HPO fan-out, v0.20). Each
@@ -946,12 +953,19 @@ mod tests {
         let ids: Vec<NodeId> = merged.nodes.iter().map(|n| n.id).collect();
         assert_eq!(ids, vec![0, 1, 2, 3], "node ids relabeled contiguously");
         assert!(merged.edges.iter().any(|e| e.from == 0 && e.to == 1));
-        assert!(merged.edges.iter().any(|e| e.from == 2 && e.to == 3), "2nd edge offset");
+        assert!(
+            merged.edges.iter().any(|e| e.from == 2 && e.to == 3),
+            "2nd edge offset"
+        );
         assert!(
             merged.initial.contains_key(&0) && merged.initial.contains_key(&2),
             "both graph-input initials offset"
         );
-        assert_eq!(merged.topo_order().unwrap().len(), 4, "valid DAG, all nodes ordered");
+        assert_eq!(
+            merged.topo_order().unwrap().len(),
+            4,
+            "valid DAG, all nodes ordered"
+        );
         assert_eq!(merged.recipe_args, serde_json::json!({ "x": 1 }));
         assert_eq!(merged.name(), "hpo");
     }

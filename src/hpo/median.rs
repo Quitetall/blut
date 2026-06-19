@@ -58,7 +58,10 @@ mod tests {
 
     #[test]
     fn below_median_stops_at_or_above_survives() {
-        let m = MedianStop { percentile: 50.0, min_peers: 2 };
+        let m = MedianStop {
+            percentile: 50.0,
+            min_peers: 2,
+        };
         let peers = [0.1, 0.5, 0.9];
         assert!(m.should_stop(1, 0.1, &peers), "below median → kill");
         assert!(!m.should_stop(1, 0.5, &peers), "at median → survive");
@@ -70,7 +73,10 @@ mod tests {
     fn higher_percentile_prunes_more() {
         // p=75 keeps only the top 25%; 0.5 (the median value) is now below the
         // 75th-percentile threshold (0.9) → killed.
-        let m = MedianStop { percentile: 75.0, min_peers: 2 };
+        let m = MedianStop {
+            percentile: 75.0,
+            min_peers: 2,
+        };
         let peers = [0.1, 0.5, 0.9];
         assert!(m.should_stop(1, 0.5, &peers));
     }

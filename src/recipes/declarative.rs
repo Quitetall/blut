@@ -106,15 +106,17 @@ impl DeclarativeRecipe {
                 recipe: self.name.clone(),
             });
         }
-        let mut chain: Vec<(std::sync::Arc<dyn crate::framework::stage::StageDyn>, serde_json::Value)> =
-            Vec::with_capacity(self.stages.len());
+        let mut chain: Vec<(
+            std::sync::Arc<dyn crate::framework::stage::StageDyn>,
+            serde_json::Value,
+        )> = Vec::with_capacity(self.stages.len());
         for s in &self.stages {
-            let ctor = reg
-                .find_erased_stage(&s.stage)
-                .ok_or_else(|| DeclarativeError::UnknownStage {
-                    recipe: self.name.clone(),
-                    stage: s.stage.clone(),
-                })?;
+            let ctor =
+                reg.find_erased_stage(&s.stage)
+                    .ok_or_else(|| DeclarativeError::UnknownStage {
+                        recipe: self.name.clone(),
+                        stage: s.stage.clone(),
+                    })?;
             chain.push((ctor(), s.args.clone()));
         }
         // recipe_args = a per-stage provenance summary (audit only; the

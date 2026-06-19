@@ -859,8 +859,7 @@ mod tests {
         let env = (a.clone(), b.clone()).encode_erased().unwrap();
         assert_eq!(env.kind, "tuple<2>");
         assert_eq!(env.schema, TUPLE_ENVELOPE_SCHEMA);
-        let (ra, rb): (TestArt, OtherArt) =
-            <(TestArt, OtherArt)>::decode_erased(env).unwrap();
+        let (ra, rb): (TestArt, OtherArt) = <(TestArt, OtherArt)>::decode_erased(env).unwrap();
         assert_eq!(ra.byte, 7);
         assert_eq!(rb.word, "hi");
     }
@@ -895,11 +894,13 @@ mod tests {
     fn tuple_envelope_arity_mismatch_detected() {
         use crate::framework::stage::{ErasedArtifact, ErasedDecodeError, TUPLE_ENVELOPE_SCHEMA};
         // A 1-child envelope decoded as a 2-tuple → Arity error.
-        let one = vec![ErasedArtifact::from_typed(&TestArt {
-            byte: 1,
-            path: PathBuf::from("/a"),
-        })
-        .unwrap()];
+        let one = vec![
+            ErasedArtifact::from_typed(&TestArt {
+                byte: 1,
+                path: PathBuf::from("/a"),
+            })
+            .unwrap(),
+        ];
         let env = ErasedArtifact {
             kind: "tuple<2>".into(),
             schema: TUPLE_ENVELOPE_SCHEMA,
@@ -907,7 +908,10 @@ mod tests {
         };
         assert!(matches!(
             <(TestArt, TestArt)>::decode_erased(env),
-            Err(ErasedDecodeError::Arity { expected: 2, got: 1 })
+            Err(ErasedDecodeError::Arity {
+                expected: 2,
+                got: 1
+            })
         ));
     }
 

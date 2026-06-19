@@ -596,8 +596,8 @@ impl App {
     /// schema violation) for the status bar. An unknown recipe / missing
     /// schema is permissive (serde + the CLI compile backstop it).
     fn validate_editor_args(&self, recipe: &str, buffer: &str) -> Result<(), String> {
-        let raw: serde_json::Value = serde_json::from_str(buffer)
-            .map_err(|e| format!("args are not valid JSON: {e}"))?;
+        let raw: serde_json::Value =
+            serde_json::from_str(buffer).map_err(|e| format!("args are not valid JSON: {e}"))?;
         if let Some(def) = self.catalog.iter().find(|r| r.name == recipe) {
             let schema = (def.args_schema_fn)();
             crate::recipes::recipe::validate_args_against_schema(recipe, &schema, &raw)
@@ -755,11 +755,7 @@ impl App {
     /// still open the editor (the operator wires the input by hand) and note it
     /// in the status bar. The chosen value is layered onto the prefill so the
     /// editor opens with the dataset already filled in.
-    fn pick_dataset(
-        &mut self,
-        recipe: &'static crate::recipes::RecipeDef,
-        choice: &DatasetChoice,
-    ) {
+    fn pick_dataset(&mut self, recipe: &'static crate::recipes::RecipeDef, choice: &DatasetChoice) {
         let schema = (recipe.args_schema_fn)();
         let prop_names = schema_prop_names(&schema);
         // Prefer the registered-name convention; fall back to a path arg.
@@ -1068,7 +1064,9 @@ impl App {
 /// "definitions":{…}}`) to its root args object (the `<Name>` definition,
 /// falling back to `"Args"`). Mirrors `recipe::schema_root` (which is
 /// private to that module).
-fn schema_args_root(schema: &serde_json::Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
+fn schema_args_root(
+    schema: &serde_json::Value,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
     let defs = schema.get("definitions").and_then(|d| d.as_object());
     if let Some(defs) = defs {
         let name = schema
@@ -1076,7 +1074,11 @@ fn schema_args_root(schema: &serde_json::Value) -> Option<&serde_json::Map<Strin
             .and_then(|r| r.as_str())
             .and_then(|r| r.rsplit('/').next())
             .unwrap_or("Args");
-        if let Some(obj) = defs.get(name).or_else(|| defs.get("Args")).and_then(|d| d.as_object()) {
+        if let Some(obj) = defs
+            .get(name)
+            .or_else(|| defs.get("Args"))
+            .and_then(|d| d.as_object())
+        {
             return Some(obj);
         }
     }
@@ -1315,7 +1317,12 @@ pub fn check(registry: crate::framework::Registry) -> Result<()> {
             recipe,
             datasets: vec![DatasetChoice {
                 name: "example".into(),
-                kind: recipe.input_kinds.first().copied().unwrap_or("dataset").into(),
+                kind: recipe
+                    .input_kinds
+                    .first()
+                    .copied()
+                    .unwrap_or("dataset")
+                    .into(),
                 source_path: "/path/to/example.jsonl".into(),
                 n_examples: 1,
             }],
@@ -2060,8 +2067,10 @@ fn draw_overlay(f: &mut Frame<'_>, app: &App) {
                         ),
                         theme::title(),
                     ));
-                let text: Vec<Line> =
-                    raw_buffer.lines().map(|l| Line::from(l.to_string())).collect();
+                let text: Vec<Line> = raw_buffer
+                    .lines()
+                    .map(|l| Line::from(l.to_string()))
+                    .collect();
                 let para = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
                 f.render_widget(para, area);
             } else {
@@ -2961,7 +2970,8 @@ mod render_tests {
         // recipe, so the overlay branches that need one are exercised here.
         theme::detect("always", "unicode");
         super::isolate_datasets_db_for_tests();
-        super::check(test_registry()).expect("tui --check must render all views + overlays and exit Ok");
+        super::check(test_registry())
+            .expect("tui --check must render all views + overlays and exit Ok");
     }
 }
 
@@ -3163,7 +3173,11 @@ mod state_tests {
             _ => panic!("expected Editor"),
         };
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["lr"], serde_json::json!(0.01), "number stays a JSON number");
+        assert_eq!(
+            v["lr"],
+            serde_json::json!(0.01),
+            "number stays a JSON number"
+        );
         assert_eq!(v["tag"], serde_json::json!("exp1"), "string stays a string");
 
         // Blank the string field → omitted on assembly.
@@ -3203,17 +3217,20 @@ mod state_tests {
         // picking it must inject its NAME into the `registered_name` form field.
         let mut a = app();
         let conn = crate::datasets_db::open().expect("isolated db opens");
-        let td = std::env::temp_dir().join(format!("blut-tui-f3-{:?}", std::thread::current().id()));
+        let td =
+            std::env::temp_dir().join(format!("blut-tui-f3-{:?}", std::thread::current().id()));
         let _ = std::fs::create_dir_all(&td);
         let f = td.join("ds.jsonl");
         std::fs::write(&f, "{\"a\":1}\n{\"b\":2}\n").unwrap();
         // Unique names so parallel tests sharing the process db don't collide.
-        let jsonl_name = format!("f3jsonl{:?}", std::thread::current().id())
-            .replace(['(', ')', ' '], "");
-        let split_name = format!("f3split{:?}", std::thread::current().id())
-            .replace(['(', ')', ' '], "");
-        let r1 = crate::datasets_db::record_from_jsonl(&jsonl_name, &f, "dataset.jsonl", None).unwrap();
-        let r2 = crate::datasets_db::record_from_jsonl(&split_name, &f, "dataset.split", None).unwrap();
+        let jsonl_name =
+            format!("f3jsonl{:?}", std::thread::current().id()).replace(['(', ')', ' '], "");
+        let split_name =
+            format!("f3split{:?}", std::thread::current().id()).replace(['(', ')', ' '], "");
+        let r1 =
+            crate::datasets_db::record_from_jsonl(&jsonl_name, &f, "dataset.jsonl", None).unwrap();
+        let r2 =
+            crate::datasets_db::record_from_jsonl(&split_name, &f, "dataset.split", None).unwrap();
         crate::datasets_db::add(&conn, &r1).unwrap();
         crate::datasets_db::add(&conn, &r2).unwrap();
 
@@ -3222,7 +3239,10 @@ mod state_tests {
             Overlay::DatasetPicker { datasets, .. } => {
                 datasets.iter().map(|d| d.name.clone()).collect()
             }
-            other => panic!("expected DatasetPicker, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected DatasetPicker, got {:?}",
+                std::mem::discriminant(other)
+            ),
         };
         assert!(
             names.contains(&jsonl_name),
@@ -3262,7 +3282,8 @@ mod state_tests {
         // Esc in the dataset picker skips → editor opens, no dataset injected.
         let mut a = app();
         let conn = crate::datasets_db::open().expect("isolated db opens");
-        let td = std::env::temp_dir().join(format!("blut-tui-f3esc-{:?}", std::thread::current().id()));
+        let td =
+            std::env::temp_dir().join(format!("blut-tui-f3esc-{:?}", std::thread::current().id()));
         let _ = std::fs::create_dir_all(&td);
         let f = td.join("ds.jsonl");
         std::fs::write(&f, "{\"a\":1}\n").unwrap();
@@ -3290,7 +3311,11 @@ mod state_tests {
         assert!(matches!(&a.overlay, Overlay::Editor { raw_mode, .. } if !*raw_mode));
         handle_key(&mut a, ctrl('r')); // form → raw
         let raw = match &a.overlay {
-            Overlay::Editor { raw_mode, raw_buffer, .. } => {
+            Overlay::Editor {
+                raw_mode,
+                raw_buffer,
+                ..
+            } => {
                 assert!(*raw_mode, "Ctrl+R must enable raw mode");
                 raw_buffer.clone()
             }
@@ -3441,9 +3466,14 @@ mod state_tests {
                 );
             };
             let json = super::assemble_fields(fields);
-            let v = serde_json::from_str::<serde_json::Value>(&json)
-                .unwrap_or_else(|e| panic!("open_editor(`{}`) form → bad JSON: {e}\n{json}", r.name));
-            assert!(v.is_object(), "assembled args must be a JSON object for `{}`", r.name);
+            let v = serde_json::from_str::<serde_json::Value>(&json).unwrap_or_else(|e| {
+                panic!("open_editor(`{}`) form → bad JSON: {e}\n{json}", r.name)
+            });
+            assert!(
+                v.is_object(),
+                "assembled args must be a JSON object for `{}`",
+                r.name
+            );
         }
     }
 
@@ -3462,7 +3492,10 @@ mod state_tests {
         // Malformed JSON → rejected (parse fails before the schema check).
         let bad = a.validate_editor_args(recipe, "{not json");
         assert!(bad.is_err(), "malformed JSON must be rejected");
-        assert!(bad.unwrap_err().contains("JSON"), "message names the JSON fault");
+        assert!(
+            bad.unwrap_err().contains("JSON"),
+            "message names the JSON fault"
+        );
         // Unknown recipe + valid JSON → permissive (serde / CLI compile
         // backstop it); the TUI must not block on a name it can't resolve.
         assert!(a.validate_editor_args("no_such_recipe_xyz", "{}").is_ok());
@@ -3619,7 +3652,10 @@ mod state_tests {
         // otherwise straight to the Editor — either proves the clamp worked.
         handle_key(&mut a, code(KeyCode::Enter));
         assert!(
-            matches!(a.overlay, Overlay::Editor { .. } | Overlay::DatasetPicker { .. }),
+            matches!(
+                a.overlay,
+                Overlay::Editor { .. } | Overlay::DatasetPicker { .. }
+            ),
             "Enter at the clamped cursor must select a recipe (Editor or DatasetPicker), not no-op"
         );
     }

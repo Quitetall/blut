@@ -213,8 +213,16 @@ mod tests {
             mode: "max".into(),
             budget_key: "epoch".into(),
             trials: vec![
-                TrialRec { trial_id: 0, overlay: vec![("lr".into(), json!(0.1))], n_nodes: 1 },
-                TrialRec { trial_id: 1, overlay: vec![("lr".into(), json!(0.2))], n_nodes: 1 },
+                TrialRec {
+                    trial_id: 0,
+                    overlay: vec![("lr".into(), json!(0.1))],
+                    n_nodes: 1,
+                },
+                TrialRec {
+                    trial_id: 1,
+                    overlay: vec![("lr".into(), json!(0.2))],
+                    n_nodes: 1,
+                },
             ],
             trial_of_topo: vec![Some(0), Some(1)],
         }
@@ -264,7 +272,10 @@ mod tests {
         .collect();
         let out = reconstruct(&m, &lines);
         assert_eq!(out[0].status, "killed");
-        assert_eq!(out[1].status, "failed", "OOM-killer 'Killed process' is a crash, not a scheduler kill");
+        assert_eq!(
+            out[1].status, "failed",
+            "OOM-killer 'Killed process' is a crash, not a scheduler kill"
+        );
     }
 
     #[test]

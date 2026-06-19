@@ -177,7 +177,11 @@ mod tests {
         sweep_index::record_completion(fp0, "job-x", ContentHash([9u8; 32]), sidecar).unwrap();
 
         let after = expand(dir, "config", &[], &sweep).unwrap();
-        let skip0 = after.iter().find(|e| e.fingerprint.0 == fp0.0).unwrap().cache_skip;
+        let skip0 = after
+            .iter()
+            .find(|e| e.fingerprint.0 == fp0.0)
+            .unwrap()
+            .cache_skip;
         assert!(skip0, "recorded combo must now skip");
         assert_eq!(
             after.iter().filter(|e| !e.cache_skip).count(),

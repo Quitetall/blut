@@ -229,10 +229,7 @@ impl ExecCtx {
         self
     }
 
-    pub fn with_retry_hook(
-        mut self,
-        hook: crate::framework::retry::RetryHook,
-    ) -> Self {
+    pub fn with_retry_hook(mut self, hook: crate::framework::retry::RetryHook) -> Self {
         self.on_retry = Some(hook);
         self
     }
@@ -492,7 +489,9 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
     // INC D (S4): `bypass_cache` forces a recompute — skip the READ so the
     // stage always runs even with a warm entry. The fresh result is still
     // inserted into the cache below the run path, so later runs hit again.
-    if !env.bypass_cache && let Some(hit) = env.cache.lookup(task.key) {
+    if !env.bypass_cache
+        && let Some(hit) = env.cache.lookup(task.key)
+    {
         env.status.emit(StageEvent::StageSkipped {
             node_idx: idx,
             stage_name: stage_name.clone(),
@@ -627,9 +626,10 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .filter(|s| !s.is_empty());
-            if let (Some(run_id), Some(token)) =
-                (run_id, task.stage.resume_handle_erased(&stage_ctx, &task.args))
-            {
+            if let (Some(run_id), Some(token)) = (
+                run_id,
+                task.stage.resume_handle_erased(&stage_ctx, &task.args),
+            ) {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -735,21 +735,17 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         // into the gauges table at run-end; a sustained sub-floor streak
         // raises a `gpu_starved` sentinel. Best-effort: no nvidia-smi ⇒
         // no samples, run unaffected.
-        let gpu_sampler = task
-            .stage
-            .resources()
-            .contains(&Resource::Gpu)
-            .then(|| {
-                crate::framework::gpu_sampler::spawn_gpu_sampler(
-                    env.status.clone(),
-                    idx,
-                    stage_name.clone(),
-                )
-            });
+        let gpu_sampler = task.stage.resources().contains(&Resource::Gpu).then(|| {
+            crate::framework::gpu_sampler::spawn_gpu_sampler(
+                env.status.clone(),
+                idx,
+                stage_name.clone(),
+            )
+        });
 
-        let run_fut =
-            task.stage
-                .run_erased(&stage_ctx, task.input.clone(), task.args.clone());
+        let run_fut = task
+            .stage
+            .run_erased(&stage_ctx, task.input.clone(), task.args.clone());
         let run_result = run_with_timeout(
             run_fut,
             &stage_cancel,
@@ -1290,7 +1286,10 @@ fn inject_spawn(
     }
     // Relabel + wire edges.
     for e in &edges {
-        let g = PlanEdge { from: base + e.from, to: base + e.to };
+        let g = PlanEdge {
+            from: base + e.from,
+            to: base + e.to,
+        };
         all_edges.push(g);
         *indeg.entry(g.to).or_insert(0) += 1;
         succs.entry(g.from).or_default().push(g.to);
@@ -1753,21 +1752,21 @@ impl ParallelExecutor {
                         &logical_outputs,
                         node_cancel.clone(),
                     ) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                // Surface the failure on the status channel
-                                // (in-flight siblings keep emitting, so a
-                                // silent build error would be conspicuous).
-                                env.status.emit(StageEvent::StageFailed {
-                                    node_idx,
-                                    stage_name: node.stage.name().to_string(),
-                                    error: format!("{e}"),
-                                });
-                                first_error.get_or_insert(e);
-                                env.cancel.cancel();
-                                break;
-                            }
-                        };
+                        Ok(t) => t,
+                        Err(e) => {
+                            // Surface the failure on the status channel
+                            // (in-flight siblings keep emitting, so a
+                            // silent build error would be conspicuous).
+                            env.status.emit(StageEvent::StageFailed {
+                                node_idx,
+                                stage_name: node.stage.name().to_string(),
+                                error: format!("{e}"),
+                            });
+                            first_error.get_or_insert(e);
+                            env.cancel.cancel();
+                            break;
+                        }
+                    };
                     // Single-flight: if this exact key is already running,
                     // defer until it completes (then it cache-hits).
                     if inflight_keys.contains(&task.key) {
@@ -1941,9 +1940,8 @@ impl ParallelExecutor {
                 Some(Ok(r)) => r,
                 Some(Err(join_err)) => {
                     // Task panicked. Record as the first error, cancel.
-                    first_error.get_or_insert(PlanError::Other(format!(
-                        "node task panicked: {join_err}"
-                    )));
+                    first_error
+                        .get_or_insert(PlanError::Other(format!("node task panicked: {join_err}")));
                     env.cancel.cancel();
                     continue;
                 }
@@ -2332,7 +2330,10 @@ mod tests {
             .finish()
             .into_compiled();
         let r2 = SequentialExecutor::execute(plan2, ctx2).await.unwrap();
-        assert_eq!(r2.n_cache_hits, 2, "second run should hit cache for both stages");
+        assert_eq!(
+            r2.n_cache_hits, 2,
+            "second run should hit cache for both stages"
+        );
         assert_eq!(r2.n_cache_misses, 0);
         assert_eq!(MAKE_RUN_COUNT.load(Ordering::SeqCst), 1);
         assert_eq!(INC_RUN_COUNT.load(Ordering::SeqCst), 1);
@@ -2364,7 +2365,11 @@ mod tests {
         // every stage to run again — all misses, run counts climb to 2.
         let td2 = tempfile::tempdir().unwrap();
         let ctx2 = ExecCtx::new(td2.path().to_path_buf());
-        let ctx2 = ExecCtx { cache: cache.clone(), ..ctx2 }.with_bypass_cache(true);
+        let ctx2 = ExecCtx {
+            cache: cache.clone(),
+            ..ctx2
+        }
+        .with_bypass_cache(true);
         let plan2 = Plan::<(), LamuTrainerBackend>::new("test", serde_json::json!({}))
             .start(MakeOne, EmptyArgs)
             .then(Increment, EmptyArgs)
@@ -2387,9 +2392,16 @@ mod tests {
             .finish()
             .into_compiled();
         let r3 = SequentialExecutor::execute(plan3, ctx3).await.unwrap();
-        assert_eq!(r3.n_cache_hits, 2, "bypass still wrote fresh entries → later run hits");
+        assert_eq!(
+            r3.n_cache_hits, 2,
+            "bypass still wrote fresh entries → later run hits"
+        );
         assert_eq!(r3.n_cache_misses, 0);
-        assert_eq!(MAKE_RUN_COUNT.load(Ordering::SeqCst), 2, "Run 3 did not execute");
+        assert_eq!(
+            MAKE_RUN_COUNT.load(Ordering::SeqCst),
+            2,
+            "Run 3 did not execute"
+        );
         assert_eq!(INC_RUN_COUNT.load(Ordering::SeqCst), 2);
     }
 
@@ -2444,7 +2456,9 @@ mod tests {
         "#;
         let recipe = DeclarativeRecipe::parse(toml, "toy_chain.toml").unwrap();
         // Compile through the SAME path the CLI launch uses.
-        let plan = recipe.compile(&reg).expect("declarative recipe compiles + kind-checks");
+        let plan = recipe
+            .compile(&reg)
+            .expect("declarative recipe compiles + kind-checks");
         assert_eq!(plan.n_nodes(), 2);
         assert_eq!(plan.name(), "toy_chain");
 
@@ -2535,7 +2549,11 @@ mod tests {
             .into_compiled();
         let _ = SequentialExecutor::execute(plan, ctx).await.unwrap();
         let sidecar = td.path().join("stages/0-make_one/output.metadata.json");
-        assert!(sidecar.exists(), "expected sidecar at {}", sidecar.display());
+        assert!(
+            sidecar.exists(),
+            "expected sidecar at {}",
+            sidecar.display()
+        );
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
         assert_eq!(parsed["kind"], "test.counter");
@@ -2666,7 +2684,10 @@ mod tests {
         assert_eq!(observed, want, "FW-1: logical hash = content_hash()");
         let erased = ErasedArtifact::from_typed(&art).unwrap();
         let handle_hash = content_hash_from_erased(&erased);
-        assert_ne!(observed, handle_hash, "content hash must differ from handle hash here");
+        assert_ne!(
+            observed, handle_hash,
+            "content hash must differ from handle hash here"
+        );
     }
 
     /// Capture the EMITTED `StageEnd.output_hash` for node 0 of a single-stage
@@ -2709,7 +2730,10 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let h1 = recorded_output_hash("/machine-a/jobs/r1/stages/0-make/out", 7).await;
         let h2 = recorded_output_hash("/machine-b/elsewhere/out", 7).await;
-        assert_eq!(h1, h2, "B.1(a): recorded output_hash stable across abs paths");
+        assert_eq!(
+            h1, h2,
+            "B.1(a): recorded output_hash stable across abs paths"
+        );
         let art = PathArt {
             content: 7,
             path: PathBuf::from("/machine-a/jobs/r1/stages/0-make/out"),
@@ -2805,11 +2829,21 @@ mod tests {
             .finish()
             .into_compiled();
         let r = SequentialExecutor::execute(plan, ctx).await;
-        assert!(matches!(r, Err(PlanError::StageFailed { .. })), "stage must fail");
+        assert!(
+            matches!(r, Err(PlanError::StageFailed { .. })),
+            "stage must fail"
+        );
         let final_dir = write_then_final_dir(&job_dir);
         assert!(!final_dir.exists(), "FW-2: no final dir after error");
-        assert!(leftover_tmp_dirs(&job_dir).is_empty(), "FW-2: tmp removed on error");
-        assert_eq!(cache_entry_count(&job_dir), 0, "FW-2: failed stage not cached");
+        assert!(
+            leftover_tmp_dirs(&job_dir).is_empty(),
+            "FW-2: tmp removed on error"
+        );
+        assert_eq!(
+            cache_entry_count(&job_dir),
+            0,
+            "FW-2: failed stage not cached"
+        );
     }
 
     #[tokio::test]
@@ -2819,15 +2853,33 @@ mod tests {
         let job_dir = td.path().to_path_buf();
         let ctx = ExecCtx::new(job_dir.clone());
         let plan = Plan::<(), LamuTrainerBackend>::new("fw2-cancel", serde_json::json!({}))
-            .start(WriteThen, WriteThenArgs { mode: "cancel".into() })
+            .start(
+                WriteThen,
+                WriteThenArgs {
+                    mode: "cancel".into(),
+                },
+            )
             .finish()
             .into_compiled();
         let r = SequentialExecutor::execute(plan, ctx).await;
-        assert!(matches!(r, Err(PlanError::Cancelled)), "mid-stage cancel → Cancelled, got {r:?}");
+        assert!(
+            matches!(r, Err(PlanError::Cancelled)),
+            "mid-stage cancel → Cancelled, got {r:?}"
+        );
         let final_dir = write_then_final_dir(&job_dir);
-        assert!(!final_dir.exists(), "FW-2: cancelled stage leaves no partial");
-        assert!(leftover_tmp_dirs(&job_dir).is_empty(), "FW-2: tmp removed on cancel");
-        assert_eq!(cache_entry_count(&job_dir), 0, "FW-2: cancelled stage not cached");
+        assert!(
+            !final_dir.exists(),
+            "FW-2: cancelled stage leaves no partial"
+        );
+        assert!(
+            leftover_tmp_dirs(&job_dir).is_empty(),
+            "FW-2: tmp removed on cancel"
+        );
+        assert_eq!(
+            cache_entry_count(&job_dir),
+            0,
+            "FW-2: cancelled stage not cached"
+        );
     }
 
     #[tokio::test]
@@ -2844,10 +2896,23 @@ mod tests {
         let res = SequentialExecutor::execute(plan, ctx).await.unwrap();
         assert_eq!(res.n_cache_misses, 1);
         let final_dir = write_then_final_dir(&job_dir);
-        assert!(final_dir.join("partial.txt").exists(), "promoted output present");
-        assert!(final_dir.join("output.metadata.json").exists(), "sidecar in promoted dir");
-        assert!(leftover_tmp_dirs(&job_dir).is_empty(), "no tmp survives promote");
-        assert_eq!(cache_entry_count(&job_dir), 1, "FW-2: successful stage cached");
+        assert!(
+            final_dir.join("partial.txt").exists(),
+            "promoted output present"
+        );
+        assert!(
+            final_dir.join("output.metadata.json").exists(),
+            "sidecar in promoted dir"
+        );
+        assert!(
+            leftover_tmp_dirs(&job_dir).is_empty(),
+            "no tmp survives promote"
+        );
+        assert_eq!(
+            cache_entry_count(&job_dir),
+            1,
+            "FW-2: successful stage cached"
+        );
         let ctx2 = ExecCtx::new(td.path().join("job2"));
         let ctx2 = ExecCtx { cache, ..ctx2 };
         let plan2 = Plan::<(), LamuTrainerBackend>::new("fw2-ok", serde_json::json!({}))
@@ -2873,8 +2938,14 @@ mod tests {
             .finish()
             .into_compiled();
         SequentialExecutor::execute(plan, ctx).await.unwrap();
-        assert!(final_dir.join("partial.txt").exists(), "fresh output present");
-        assert!(!final_dir.join("orphan.txt").exists(), "FW-2: stale orphan gone");
+        assert!(
+            final_dir.join("partial.txt").exists(),
+            "fresh output present"
+        );
+        assert!(
+            !final_dir.join("orphan.txt").exists(),
+            "FW-2: stale orphan gone"
+        );
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -3011,7 +3082,11 @@ mod tests {
             .await
             .expect("parallel CPU stages must overlap (barrier would deadlock if serialized)")
             .unwrap();
-        assert_eq!(peak.load(Ordering::SeqCst), 2, "two CPU stages must run concurrently");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "two CPU stages must run concurrently"
+        );
         let _ = result;
     }
 
@@ -3058,8 +3133,14 @@ mod tests {
         let ctx = ExecCtx::new(td.path().to_path_buf())
             .with_resource_limit(Resource::Cpu, 4)
             .with_memory_budget(4);
-        let h1 = MemHog { peak: peak.clone(), live: live.clone() };
-        let h2 = MemHog { peak: peak.clone(), live: live.clone() };
+        let h1 = MemHog {
+            peak: peak.clone(),
+            live: live.clone(),
+        };
+        let h2 = MemHog {
+            peak: peak.clone(),
+            live: live.clone(),
+        };
         let plan = Plan::<(), LamuTrainerBackend>::new("memgate", serde_json::json!({}))
             .start(MakeOne, EmptyArgs)
             .fork(h1, BarrierArgs { id: 0 }, h2, BarrierArgs { id: 1 })
@@ -3140,7 +3221,10 @@ mod tests {
         let par = ParallelExecutor::execute(mk(), ctx_par).await.unwrap();
         let par_out: Counter = par.final_output.unwrap().into_typed().unwrap();
 
-        assert_eq!(seq_out.n, par_out.n, "both executors produce the same output");
+        assert_eq!(
+            seq_out.n, par_out.n,
+            "both executors produce the same output"
+        );
         assert_eq!(
             par.n_cache_hits, par.n_stages,
             "parallel run must hit the sequential run's cache for every stage (identical keys)"
@@ -3205,7 +3289,11 @@ mod tests {
         let r = SequentialExecutor::execute(plan, ctx).await.unwrap();
         assert_eq!(FLAKY_ATTEMPTS.load(Ordering::SeqCst), 3, "ran 3 attempts");
         assert_eq!(r.n_cache_misses, 1);
-        assert_eq!(cache_entry_count(&job_dir), 1, "only the successful attempt is cached");
+        assert_eq!(
+            cache_entry_count(&job_dir),
+            1,
+            "only the successful attempt is cached"
+        );
         let mut retrying = 0;
         while let Ok(evt) = rx.try_recv() {
             if matches!(evt, StageEvent::StageRetrying { .. }) {
@@ -3279,9 +3367,14 @@ mod tests {
                     pid: 0,
                     heartbeat_unix: now,
                 };
-                std::fs::write(dir.join("state.json"), serde_json::to_string(&state).unwrap())
-                    .unwrap();
-                return Err(StageError::OutOfMemory { detail: "transient #1".into() });
+                std::fs::write(
+                    dir.join("state.json"),
+                    serde_json::to_string(&state).unwrap(),
+                )
+                .unwrap();
+                return Err(StageError::OutOfMemory {
+                    detail: "transient #1".into(),
+                });
             }
             // Attempt 2: the executor must have injected the resume dir.
             if ctx.resume_from.as_deref() == Some(Self::resume_dir(ctx).as_path()) {
@@ -3304,7 +3397,11 @@ mod tests {
             .finish()
             .into_compiled();
         let r = SequentialExecutor::execute(plan, ctx).await.unwrap();
-        assert_eq!(RESUMABLE_ATTEMPTS.load(Ordering::SeqCst), 2, "ran twice (fail then resume)");
+        assert_eq!(
+            RESUMABLE_ATTEMPTS.load(Ordering::SeqCst),
+            2,
+            "ran twice (fail then resume)"
+        );
         assert!(
             RESUMABLE_SAW_RESUME.load(Ordering::SeqCst),
             "attempt 2 must see resume_from = the checkpoint dir (auto-resume wired)"
@@ -3400,7 +3497,10 @@ mod tests {
             .expect("hard timeout must fire well before the test's 5s guard");
         match r {
             Err(PlanError::StageFailed { source, .. }) => {
-                assert!(matches!(source, StageError::Timeout { .. }), "got {source:?}");
+                assert!(
+                    matches!(source, StageError::Timeout { .. }),
+                    "got {source:?}"
+                );
             }
             other => panic!("expected StageFailed(Timeout), got {other:?}"),
         }
@@ -3507,7 +3607,11 @@ mod tests {
             .await
             .expect("divergence kill must fire — a parked Diverger would otherwise hang");
 
-        assert_eq!(DIVERGER_RAN.load(Ordering::SeqCst), 1, "diverger ran once (max_attempts=1)");
+        assert_eq!(
+            DIVERGER_RAN.load(Ordering::SeqCst),
+            1,
+            "diverger ran once (max_attempts=1)"
+        );
         assert!(
             matches!(
                 result,
@@ -3669,8 +3773,11 @@ mod tests {
                     pid: 0,
                     heartbeat_unix: now,
                 };
-                std::fs::write(dir.join("state.json"), serde_json::to_string(&state).unwrap())
-                    .unwrap();
+                std::fs::write(
+                    dir.join("state.json"),
+                    serde_json::to_string(&state).unwrap(),
+                )
+                .unwrap();
                 // Diverge: emit a non-finite step. The coordinator's KillOnNaN
                 // watcher records the divergence + cancels THIS node's token.
                 let _ = ctx.status_tx.send(StageEvent::StageStep {
@@ -3722,7 +3829,10 @@ mod tests {
             "attempt 2 must see resume_from = the checkpoint dir (S3 auto-resume reached)"
         );
         let counter: Counter = result.final_output.unwrap().into_typed().unwrap();
-        assert_eq!(counter.n, 2, "the recovered run produces its real output (1 → 2)");
+        assert_eq!(
+            counter.n, 2,
+            "the recovered run produces its real output (1 → 2)"
+        );
     }
 
     static ALWAYS_DIV_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
@@ -3891,8 +4001,11 @@ mod tests {
                     pid: 0,
                     heartbeat_unix: now,
                 };
-                std::fs::write(dir.join("state.json"), serde_json::to_string(&state).unwrap())
-                    .unwrap();
+                std::fs::write(
+                    dir.join("state.json"),
+                    serde_json::to_string(&state).unwrap(),
+                )
+                .unwrap();
                 // Burst of NaN steps, all emitted BEFORE this future returns
                 // (faithful to the joined stdout reader). They land in the
                 // broadcast in order; the steps after the first are the stale
@@ -3968,7 +4081,10 @@ mod tests {
             "attempt 2 must see resume_from (auto-resume reached) and run to completion"
         );
         let counter: Counter = result.final_output.unwrap().into_typed().unwrap();
-        assert_eq!(counter.n, 2, "the recovered run produces its real output (1 → 2)");
+        assert_eq!(
+            counter.n, 2,
+            "the recovered run produces its real output (1 → 2)"
+        );
     }
 
     static MULTI_ALWAYS_DIV_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
@@ -4020,12 +4136,11 @@ mod tests {
         let (_td, base) = fresh_ctx();
         let ctx = base.with_control(std::sync::Arc::new(crate::framework::control::KillOnNaN));
 
-        let plan =
-            Plan::<(), LamuTrainerBackend>::new("multi_always_div", serde_json::json!({}))
-                .start(MakeOne, EmptyArgs)
-                .then(MultiStepAlwaysDiverge, EmptyArgs)
-                .finish()
-                .into_compiled();
+        let plan = Plan::<(), LamuTrainerBackend>::new("multi_always_div", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .then(MultiStepAlwaysDiverge, EmptyArgs)
+            .finish()
+            .into_compiled();
         let fut = ParallelExecutor::execute(plan, ctx);
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
             .await
@@ -4142,7 +4257,9 @@ mod tests {
         fn divergence_check(&self, step: &serde_json::Value) -> bool {
             // Fire on a FINITE metric KillOnNaN would let pass → only the
             // divergence_check invocation can produce this kill.
-            step.get("loss").and_then(|v| v.as_f64()).is_some_and(|l| l > 100.0)
+            step.get("loss")
+                .and_then(|v| v.as_f64())
+                .is_some_and(|l| l > 100.0)
         }
         async fn run(
             &self,
@@ -4472,11 +4589,22 @@ mod tests {
             .expect("spawn run must terminate")
             .expect("a spawn is not a failure → Ok");
 
-        assert_eq!(SPAWN_MARKER_RAN.load(Ordering::SeqCst), 1, "injected root ran");
-        assert_eq!(SPAWN_CHILD_RAN.load(Ordering::SeqCst), 1, "injected child ran");
+        assert_eq!(
+            SPAWN_MARKER_RAN.load(Ordering::SeqCst),
+            1,
+            "injected root ran"
+        );
+        assert_eq!(
+            SPAWN_CHILD_RAN.load(Ordering::SeqCst),
+            1,
+            "injected child ran"
+        );
         // 2 base nodes + 2 spawned = 4 accounted (the in-test debug_assert in
         // execute() would have panicked on an accounting imbalance).
-        assert_eq!(result.n_stages, 4, "order grew to include the spawned nodes");
+        assert_eq!(
+            result.n_stages, 4,
+            "order grew to include the spawned nodes"
+        );
     }
 
     #[tokio::test]
@@ -4505,7 +4633,10 @@ mod tests {
         // executes its body; the rest are skipped. The point of THIS test is
         // termination + boundedness, not distinct execution — that is covered by
         // `spawn_injects_subplan_and_runs_to_completion`.)
-        assert!(SPAWN_MARKER_RAN.load(Ordering::SeqCst) >= 1, "at least one spawn ran");
+        assert!(
+            SPAWN_MARKER_RAN.load(Ordering::SeqCst) >= 1,
+            "at least one spawn ran"
+        );
         // Bounded: 2 base nodes + at most one injected per observed step (≤ 4).
         // The in-test debug_assert in execute() already proved completed+pruned
         // balanced the (grown) order, so no node leaked.

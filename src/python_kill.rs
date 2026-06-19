@@ -541,7 +541,10 @@ mod tests {
         register_child(a);
         register_child(b);
         let live = active_children();
-        assert!(live.contains(&a) && live.contains(&b), "both children registered: {live:?}");
+        assert!(
+            live.contains(&a) && live.contains(&b),
+            "both children registered: {live:?}"
+        );
 
         unregister_child(a.pid);
         let live = active_children();

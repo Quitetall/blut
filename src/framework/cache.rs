@@ -90,7 +90,13 @@ impl CacheHandle {
         code_sha: &[u8],
     ) -> ContentHash {
         let canon = canonical_json(args);
-        Self::key_for_canon_bytes(stage_name, stage_schema, input_hash, canon.as_bytes(), code_sha)
+        Self::key_for_canon_bytes(
+            stage_name,
+            stage_schema,
+            input_hash,
+            canon.as_bytes(),
+            code_sha,
+        )
     }
 
     /// Variant that accepts precomputed canonical-JSON bytes. The

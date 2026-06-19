@@ -146,6 +146,12 @@ mod tests {
         assert!(!back.is_terminal());
         // Bare heartbeat (both optionals omitted) still parses.
         let bare: StatusUpdate = serde_json::from_str("{\"kind\":\"heartbeat\"}").unwrap();
-        assert_eq!(bare, StatusUpdate::Heartbeat { phase: None, vram_mb: None });
+        assert_eq!(
+            bare,
+            StatusUpdate::Heartbeat {
+                phase: None,
+                vram_mb: None
+            }
+        );
     }
 }

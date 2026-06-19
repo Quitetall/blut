@@ -87,8 +87,9 @@ pub fn fold_metrics(job_id: &str) -> Result<Vec<crate::lineage_db::MetricRow>> {
     let mut last: BTreeMap<(u32, String), f64> = BTreeMap::new();
     let mut counter: BTreeMap<u32, i64> = BTreeMap::new();
     for line in jobs::read_status_lines(&id)? {
-        let Ok(StageEvent::StageStep { node_idx, update, .. }) =
-            serde_json::from_str::<StageEvent>(&line)
+        let Ok(StageEvent::StageStep {
+            node_idx, update, ..
+        }) = serde_json::from_str::<StageEvent>(&line)
         else {
             continue;
         };
@@ -163,8 +164,9 @@ pub fn fold_gauges(job_id: &str) -> Result<Vec<crate::lineage_db::GaugeRow>> {
     let id = jobs::resolve_job_id(job_id)?;
     let mut rows: Vec<GaugeRow> = Vec::new();
     for line in jobs::read_status_lines(&id)? {
-        let Ok(StageEvent::StageStep { node_idx, update, .. }) =
-            serde_json::from_str::<StageEvent>(&line)
+        let Ok(StageEvent::StageStep {
+            node_idx, update, ..
+        }) = serde_json::from_str::<StageEvent>(&line)
         else {
             continue;
         };
@@ -316,7 +318,9 @@ mod tests {
     /// the genuine training metric still does.
     #[test]
     fn fold_gauges_routes_gpu_samples_and_metrics_guard_excludes_them() {
-        let _g = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let td = tempfile::tempdir().unwrap();
         let prev = std::env::var("LAMU_TRAIN_JOBS_DIR").ok();
         unsafe {
@@ -337,7 +341,11 @@ mod tests {
         std::fs::write(jdir.join("status.jsonl"), lines.join("\n") + "\n").unwrap();
 
         let gauges = fold_gauges(job).unwrap();
-        assert_eq!(gauges.len(), 2, "two gpu_gauge samples (starved sentinel skipped)");
+        assert_eq!(
+            gauges.len(),
+            2,
+            "two gpu_gauge samples (starved sentinel skipped)"
+        );
         assert_eq!(gauges[0].wall_unix, 1000);
         assert_eq!(gauges[0].gpu_util, Some(95.0));
         assert_eq!(gauges[0].gpu_mem_mib, Some(18000.0));
@@ -345,9 +353,9 @@ mod tests {
 
         let metrics = fold_metrics(job).unwrap();
         assert!(
-            metrics
-                .iter()
-                .all(|m| m.metric != "gpu_util" && m.metric != "floor_pct" && m.metric != "samples_below"),
+            metrics.iter().all(|m| m.metric != "gpu_util"
+                && m.metric != "floor_pct"
+                && m.metric != "samples_below"),
             "gauge/sentinel fields must NOT pollute the metrics table"
         );
         assert!(

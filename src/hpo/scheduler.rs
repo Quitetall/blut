@@ -153,7 +153,8 @@ pub fn build_trial_of_topo(
 /// numeric value or a numeric string — some trainers stringify metrics).
 pub fn dotted_f64(v: &Value, path: &str) -> Option<f64> {
     let node = dotted(v, path)?;
-    node.as_f64().or_else(|| node.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+    node.as_f64()
+        .or_else(|| node.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
 }
 
 /// Read a dotted path as a u64 (number or numeric string; a float is floored).
@@ -161,7 +162,11 @@ pub fn dotted_u64(v: &Value, path: &str) -> Option<u64> {
     let node = dotted(v, path)?;
     node.as_u64()
         .or_else(|| node.as_f64().map(|x| x.max(0.0) as u64))
-        .or_else(|| node.as_str().and_then(|s| s.trim().parse::<f64>().ok()).map(|x| x.max(0.0) as u64))
+        .or_else(|| {
+            node.as_str()
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .map(|x| x.max(0.0) as u64)
+        })
 }
 
 fn dotted<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
@@ -205,12 +210,19 @@ mod tests {
             "epoch",
             maximize,
             grace,
-            Box::new(MedianStop { percentile: 50.0, min_peers: 2 }),
+            Box::new(MedianStop {
+                percentile: 50.0,
+                min_peers: 2,
+            }),
         )
     }
 
     fn step<'a>(node_idx: u32, u: &'a Value) -> StepMetrics<'a> {
-        StepMetrics { node_idx, stage_name: "t", update: u }
+        StepMetrics {
+            node_idx,
+            stage_name: "t",
+            update: u,
+        }
     }
 
     #[test]
@@ -219,11 +231,23 @@ mod tests {
         // Maximize. trial0=0.5 reports alone (<2 peers → continue). trial1=0.9 is
         // at/above the cohort median → survives. trial2=0.1 is below the cohort
         // median {0.5,0.9,0.1}→0.5 → killed.
-        assert_eq!(s.on_step(&step(0, &json!({"val_r":0.5,"epoch":1}))), Control::Continue);
-        assert_eq!(s.on_step(&step(1, &json!({"val_r":0.9,"epoch":1}))), Control::Continue);
-        assert_eq!(s.on_step(&step(2, &json!({"val_r":0.1,"epoch":1}))), Control::KillBranch);
+        assert_eq!(
+            s.on_step(&step(0, &json!({"val_r":0.5,"epoch":1}))),
+            Control::Continue
+        );
+        assert_eq!(
+            s.on_step(&step(1, &json!({"val_r":0.9,"epoch":1}))),
+            Control::Continue
+        );
+        assert_eq!(
+            s.on_step(&step(2, &json!({"val_r":0.1,"epoch":1}))),
+            Control::KillBranch
+        );
         // a killed trial is not re-killed.
-        assert_eq!(s.on_step(&step(2, &json!({"val_r":0.05,"epoch":2}))), Control::Continue);
+        assert_eq!(
+            s.on_step(&step(2, &json!({"val_r":0.05,"epoch":2}))),
+            Control::Continue
+        );
     }
 
     #[test]
@@ -231,16 +255,28 @@ mod tests {
         let s = sched(true, 100); // huge grace
         // a "nan" objective (stringy) → non-finite → killed immediately even
         // below grace, and even with no peers.
-        assert_eq!(s.on_step(&step(0, &json!({"val_r":"nan","epoch":1}))), Control::KillBranch);
+        assert_eq!(
+            s.on_step(&step(0, &json!({"val_r":"nan","epoch":1}))),
+            Control::KillBranch
+        );
     }
 
     #[test]
     fn grace_protects_early_budgets() {
         let s = sched(true, 5);
         // budget 1 < grace 5: never killed even if worst.
-        assert_eq!(s.on_step(&step(0, &json!({"val_r":0.9,"epoch":1}))), Control::Continue);
-        assert_eq!(s.on_step(&step(1, &json!({"val_r":0.5,"epoch":1}))), Control::Continue);
-        assert_eq!(s.on_step(&step(2, &json!({"val_r":0.1,"epoch":1}))), Control::Continue);
+        assert_eq!(
+            s.on_step(&step(0, &json!({"val_r":0.9,"epoch":1}))),
+            Control::Continue
+        );
+        assert_eq!(
+            s.on_step(&step(1, &json!({"val_r":0.5,"epoch":1}))),
+            Control::Continue
+        );
+        assert_eq!(
+            s.on_step(&step(2, &json!({"val_r":0.1,"epoch":1}))),
+            Control::Continue
+        );
     }
 
     #[test]
@@ -248,8 +284,17 @@ mod tests {
         let s = sched(false, 1); // minimize: lower obj is better
         // trial0=0.5 alone (continue). trial1=0.1 is BEST when minimizing →
         // survives. trial2=0.9 is the worst (above cohort median) → killed.
-        assert_eq!(s.on_step(&step(0, &json!({"val_r":0.5,"epoch":1}))), Control::Continue);
-        assert_eq!(s.on_step(&step(1, &json!({"val_r":0.1,"epoch":1}))), Control::Continue);
-        assert_eq!(s.on_step(&step(2, &json!({"val_r":0.9,"epoch":1}))), Control::KillBranch);
+        assert_eq!(
+            s.on_step(&step(0, &json!({"val_r":0.5,"epoch":1}))),
+            Control::Continue
+        );
+        assert_eq!(
+            s.on_step(&step(1, &json!({"val_r":0.1,"epoch":1}))),
+            Control::Continue
+        );
+        assert_eq!(
+            s.on_step(&step(2, &json!({"val_r":0.9,"epoch":1}))),
+            Control::KillBranch
+        );
     }
 }

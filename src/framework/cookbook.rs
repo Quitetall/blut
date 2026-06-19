@@ -59,9 +59,7 @@ pub trait Cookbook: Send + Sync + 'static {
     /// empty so a cookbook opts in; each entry's ctor MUST yield a stage
     /// that is `Compatible` with the cookbook's backend (the cookbook owns
     /// both, so this holds by construction).
-    fn stages_erased(
-        &self,
-    ) -> &'static [(&'static str, crate::framework::stage::ErasedStageCtor)] {
+    fn stages_erased(&self) -> &'static [(&'static str, crate::framework::stage::ErasedStageCtor)] {
         &[]
     }
     /// Pre-baked args JSON for one of this cookbook's recipes (domain
@@ -285,7 +283,9 @@ mod tests {
             schedule: None,
             args_schema_fn: || crate::recipes::recipe::schema_of::<PrefillArgs>(),
             compile_fn: |_| {
-                Err(crate::framework::error::RecipeError::CompileFailed("x".into()))
+                Err(crate::framework::error::RecipeError::CompileFailed(
+                    "x".into(),
+                ))
             },
         };
         static DEFS: &[&RecipeDef] = &[&DEF];
@@ -304,10 +304,17 @@ mod tests {
         }
         let mut r = Registry::new();
         r.register(Box::new(PrefillCookbook));
-        let v: serde_json::Value =
-            serde_json::from_str(&r.prefill_args("prefill_recipe")).unwrap();
-        assert_eq!(v["preset"], serde_json::json!("production"), "template default");
-        assert_eq!(v["lma_root"], serde_json::json!("/data/lma"), "overlay path");
+        let v: serde_json::Value = serde_json::from_str(&r.prefill_args("prefill_recipe")).unwrap();
+        assert_eq!(
+            v["preset"],
+            serde_json::json!("production"),
+            "template default"
+        );
+        assert_eq!(
+            v["lma_root"],
+            serde_json::json!("/data/lma"),
+            "overlay path"
+        );
         assert_eq!(
             v["subband"],
             serde_json::json!(true),

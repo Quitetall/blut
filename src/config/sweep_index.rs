@@ -67,7 +67,9 @@ pub fn record_to(index_path: &Path, rec: &SweepRecord) -> Result<()> {
         .create(true)
         .append(true)
         .open(index_path)
-        .map_err(|e| TrainError::other(format!("open sweep-index {}: {e}", index_path.display())))?;
+        .map_err(|e| {
+            TrainError::other(format!("open sweep-index {}: {e}", index_path.display()))
+        })?;
     f.write_all(line.as_bytes())
         .map_err(|e| TrainError::other(format!("append sweep-index: {e}")))
 }
@@ -129,9 +131,7 @@ pub fn is_record_live(rec: &SweepRecord) -> bool {
 /// fingerprint is recorded AND `is_record_live`.
 pub fn is_complete_in(index_path: &Path, fingerprint: ContentHash) -> bool {
     let fp = fingerprint.to_hex();
-    load_index(index_path)
-        .get(&fp)
-        .is_some_and(is_record_live)
+    load_index(index_path).get(&fp).is_some_and(is_record_live)
 }
 
 /// `is_complete_in` against the default global index. Resolves to `false`
@@ -262,6 +262,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(is_complete_in(&idx, fp), "live last-writer record must win over torn + stale lines");
+        assert!(
+            is_complete_in(&idx, fp),
+            "live last-writer record must win over torn + stale lines"
+        );
     }
 }
