@@ -19,6 +19,20 @@ lineage index, and the CLI that drives all of it. It ships **zero** concrete
 stages, recipes, backends, or Python — those live in downstream *cookbook*
 crates that depend on `blut`.
 
+## The abstraction model
+
+`BLUT ▸ Cookbook ▸ Course ▸ Recipe ▸ Ingredient`, mapped to the code:
+
+| Layer | What it is | Code |
+|---|---|---|
+| **Cookbook** | a domain pack (recipes + backend), loaded into BLUT | `framework::Cookbook` + `framework::Registry` |
+| **Course** | the phase, selected + orchestrated in order (DataPrep → … → Export) | `recipes::Course` (`RecipeCategory` alias) |
+| **Recipe** | middle-level orchestration: composes ingredients into a typed `Plan` | `recipes::Recipe` + `register_recipe!` → `RecipeDef` |
+| **Ingredient** | atomic primitive: a typed `Stage` (`Input → Output`) | `framework::Stage` |
+| **BLUT** | the engine: loads cookbooks, runs a recipe's plan over the cache | `cli::run(Registry)` |
+
+See `examples/first_cookbook.rs` for one of each, runnable.
+
 ## Framework (`framework/`) — the engine
 
 | Item | Role |
@@ -64,7 +78,10 @@ a resource-capped systemd unit.
 footprint, gate admission against the box-fit budget (`MemTotal − floor`), and
 calibrate the estimate from measured peaks (with an OOM-aware self-heal). This is
 the engine behind the containment guarantee: a job that wouldn't fit is refused,
-not admitted-then-killed.
+not admitted-then-killed. A recipe invoked with **no args** is billed a light
+base footprint (a heavy data-trainer always declares required args); everything
+else uses the conservative `Drivers` estimate. A first-class **per-recipe
+declared footprint** is a planned post-1.0 addition (see "Not yet stable").
 
 ## Backends (`backends/`)
 

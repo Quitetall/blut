@@ -18,6 +18,43 @@ blut = "1"
 **API reference:** [`API.md`](API.md) · `cargo doc --no-deps --open` · runnable
 demo: [`examples/first_cookbook.rs`](examples/first_cookbook.rs).
 
+## The abstraction model
+
+BLUT organizes work as a five-layer hierarchy:
+
+```text
+  BLUT   ▸   Cookbook   ▸   Course   ▸   Recipe    ▸   Ingredient
+ engine     domain pack      phase      workflow       primitive
+```
+
+- **Cookbook** — a domain pack: a set of recipes plus the backend they target.
+  Cookbooks are **loaded into** BLUT (via a `Registry`). *(the `Cookbook` trait)*
+- **Course** — the phase a recipe belongs to, **selected and orchestrated in
+  order**: `DataPrep → Pretrain → Train → Eval → Gate → Export` (a `Pipeline`
+  course chains several end-to-end). Recipes are grouped by course. *(the
+  `Course` enum)*
+- **Recipe** — a **middle-level orchestration function**: it composes ingredients
+  into a typed `Plan` and exposes typed args. *(the `Recipe` trait +
+  `register_recipe!`)*
+- **Ingredient** — an **atomic primitive**: a typed `Stage` (`Input → Output`),
+  the smallest reusable unit of work. A training cookbook also has finer
+  primitives — optimizers, schedulers, losses — that a stage composes. *(the
+  `Stage` trait)*
+- **BLUT** — the engine: it loads cookbooks, lists/selects recipes by course, and
+  runs a recipe's plan against the content-addressed cache under per-stage
+  resource + memory admission. *(`blut::cli::run(registry)`)*
+
+[`examples/first_cookbook.rs`](examples/first_cookbook.rs) builds one of each
+layer and runs it end-to-end:
+
+```text
+$ cargo run --example first_cookbook
+BLUT loaded cookbook 'demo'. Recipes by course:
+  • User  count_to_three  — MakeOne → Increment → Increment (demo)
+Run 1 (cold cache):  → 3 stages, 0 hits, 3 misses
+Run 2 (warm cache):  → 3 stages, 3 hits, 0 misses
+```
+
 ## Why
 
 Local ML pipelines accrete ad-hoc shell glue: dump data, kick off a trainer,
