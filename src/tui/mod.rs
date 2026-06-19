@@ -2316,7 +2316,11 @@ fn draw_history(f: &mut Frame<'_>, area: Rect, app: &App) {
         lines.push(Line::from(Span::styled(
             format!(
                 "  {:<24} {:<19} {:<10} {:<10} {}",
-                "Recipe", "Job", "Outcome", views::DEFAULT_METRIC, "When"
+                "Recipe",
+                "Job",
+                "Outcome",
+                views::DEFAULT_METRIC,
+                "When"
             ),
             theme::dim(),
         )));
@@ -2379,14 +2383,21 @@ fn draw_leaderboard(f: &mut Frame<'_>, area: Rect, app: &App) {
     ];
     if app.runs.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!("No runs have recorded a `{}` metric yet.", views::DEFAULT_METRIC),
+            format!(
+                "No runs have recorded a `{}` metric yet.",
+                views::DEFAULT_METRIC
+            ),
             theme::dim(),
         )));
     } else {
         lines.push(Line::from(Span::styled(
             format!(
                 "  {:<5} {:<24} {:<19} {:<10} {}",
-                "Rank", "Recipe", "Job", views::DEFAULT_METRIC, "When"
+                "Rank",
+                "Recipe",
+                "Job",
+                views::DEFAULT_METRIC,
+                "When"
             ),
             theme::dim(),
         )));
@@ -2422,7 +2433,10 @@ fn draw_leaderboard(f: &mut Frame<'_>, area: Rect, app: &App) {
         }
         if app.runs.len() > views::LEADERBOARD_LIMIT {
             lines.push(Line::from(Span::styled(
-                format!("  ... {} more runs", app.runs.len() - views::LEADERBOARD_LIMIT),
+                format!(
+                    "  ... {} more runs",
+                    app.runs.len() - views::LEADERBOARD_LIMIT
+                ),
                 theme::dim(),
             )));
         }
@@ -2500,7 +2514,10 @@ fn draw_compare(f: &mut Frame<'_>, area: Rect, app: &App) {
             theme::heading(),
         )];
         for c in cols {
-            let txt = c.gpu.map(|v| format!("{v:.1}")).unwrap_or_else(|| "—".into());
+            let txt = c
+                .gpu
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| "—".into());
             g.push(Span::styled(format!("{txt:<20}"), theme::normal()));
         }
         lines.push(Line::from(g));
@@ -2615,7 +2632,10 @@ fn draw_lineage(f: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled("code: ", theme::dim()),
             Span::styled(lv.freshness.clone(), fresh_style),
             Span::styled(
-                format!("     cache: {} hit / {} miss", lv.cache_hits, lv.cache_misses),
+                format!(
+                    "     cache: {} hit / {} miss",
+                    lv.cache_hits, lv.cache_misses
+                ),
                 theme::dim(),
             ),
         ]));
@@ -2655,7 +2675,10 @@ fn draw_lineage(f: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_artifacts(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .title(Span::styled(
-            format!(" {} (↑↓ move · r refresh · b back) ", View::Artifacts.title()),
+            format!(
+                " {} (↑↓ move · r refresh · b back) ",
+                View::Artifacts.title()
+            ),
             theme::title(),
         ))
         .border_style(theme::dim())
@@ -2682,7 +2705,11 @@ fn draw_artifacts(f: &mut Frame<'_>, area: Rect, app: &App) {
             lines.push(Line::from(vec![
                 Span::styled(prefix.to_string(), theme::success()),
                 Span::styled(
-                    format!("{:<24} {:<24} ", truncate(&a.kind, 24), truncate(&a.stage, 24)),
+                    format!(
+                        "{:<24} {:<24} ",
+                        truncate(&a.kind, 24),
+                        truncate(&a.stage, 24)
+                    ),
                     style,
                 ),
                 Span::styled(format!("{:<14} ", a.hash), theme::key_hint()),
@@ -2737,7 +2764,10 @@ fn draw_catalog(f: &mut Frame<'_>, area: Rect, app: &App) {
         // Selected-recipe detail card.
         if let Some(r) = app.catalog.get(app.list_cursor) {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(format!("▸ {}", r.name), theme::title())));
+            lines.push(Line::from(Span::styled(
+                format!("▸ {}", r.name),
+                theme::title(),
+            )));
             let kinds_in = if r.input_kinds.is_empty() {
                 "(none — graph input)".to_string()
             } else {
@@ -2822,7 +2852,10 @@ fn draw_metrics(f: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_reset(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .title(Span::styled(
-            format!(" {} (↑↓ move · Enter confirm (2×) · b back) ", View::Reset.title()),
+            format!(
+                " {} (↑↓ move · Enter confirm (2×) · b back) ",
+                View::Reset.title()
+            ),
             theme::title(),
         ))
         .border_style(theme::dim())
@@ -3965,7 +3998,9 @@ mod harness_tests {
                 hpo: None,
             })
             .collect();
-        let edges = (1..n).map(|i| PlanGraphEdge { from: i - 1, to: i }).collect();
+        let edges = (1..n)
+            .map(|i| PlanGraphEdge { from: i - 1, to: i })
+            .collect();
         crate::framework::GraphSnapshot {
             job: "20260618-073012-000000001".into(),
             name: "demo_plan".into(),
@@ -4042,15 +4077,23 @@ mod harness_tests {
     }
 
     fn render(app: &mut App, w: u16, h: u16) {
-        let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h))
-            .expect("test terminal");
+        let mut term =
+            Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("test terminal");
         term.draw(|f| draw(f, app)).expect("draw must not panic");
     }
 
     #[test]
     fn populated_views_render_across_sizes() {
         // Every view, with full caches, at sane → cramped → degenerate sizes.
-        for size in [(200u16, 60u16), (120, 40), (80, 24), (40, 12), (20, 6), (8, 3), (1, 1)] {
+        for size in [
+            (200u16, 60u16),
+            (120, 40),
+            (80, 24),
+            (40, 12),
+            (20, 6),
+            (8, 3),
+            (1, 1),
+        ] {
             for &view in ALL_VIEWS {
                 let mut app = populated_app();
                 app.view = view;
@@ -4158,7 +4201,10 @@ mod harness_tests {
         // armed state is set and never send the confirming second Enter.
         let mut app = populated_app();
         app.set_view(View::Reset);
-        handle_key(&mut app, event::KeyEvent::new(event::KeyCode::Enter, event::KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            event::KeyEvent::new(event::KeyCode::Enter, event::KeyModifiers::NONE),
+        );
         assert!(app.reset_armed.is_some(), "first Enter must arm, not fire");
         render(&mut app, 80, 24);
     }
@@ -4169,7 +4215,10 @@ mod harness_tests {
         let mut app = populated_app();
         app.set_view(View::History);
         app.list_cursor = 1; // second run
-        handle_key(&mut app, event::KeyEvent::new(event::KeyCode::Enter, event::KeyModifiers::NONE));
+        handle_key(
+            &mut app,
+            event::KeyEvent::new(event::KeyCode::Enter, event::KeyModifiers::NONE),
+        );
         assert_eq!(app.view, View::Dag, "Enter on a run opens its DAG");
         render(&mut app, 80, 24);
     }
@@ -4198,7 +4247,10 @@ mod harness_tests {
         assert!(n > 0, "fixture registry must register recipes");
         app.list_cursor = 9_999;
         app.load_view_data(View::Catalog, None);
-        assert!(app.list_cursor < n, "cursor must be clamped within the list");
+        assert!(
+            app.list_cursor < n,
+            "cursor must be clamped within the list"
+        );
     }
 
     #[test]

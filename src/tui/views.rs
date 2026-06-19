@@ -419,7 +419,10 @@ mod tests {
 
     #[test]
     fn fmt_job_id_date_parses_canonical_id() {
-        assert_eq!(fmt_job_id_date("20260618-073012-000000001"), "2026-06-18 07:30");
+        assert_eq!(
+            fmt_job_id_date("20260618-073012-000000001"),
+            "2026-06-18 07:30"
+        );
     }
 
     #[test]
@@ -430,7 +433,10 @@ mod tests {
 
     #[test]
     fn short_hash_truncates_and_handles_none() {
-        assert_eq!(short_hash(&Some("abcdef0123456789".into()), 10), "abcdef0123");
+        assert_eq!(
+            short_hash(&Some("abcdef0123456789".into()), 10),
+            "abcdef0123"
+        );
         assert_eq!(short_hash(&None, 10), "—");
     }
 
