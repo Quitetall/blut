@@ -554,6 +554,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
                             node_idx: idx,
                             stage_name: stage_name.clone(),
                             error: "cancelled during retry backoff".into(),
+                            failure: None,
                         });
                         return Err(cancel_failure(task.node_id, &task.node_cancel, &env.cancel));
                     }
@@ -565,6 +566,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
                 node_idx: idx,
                 stage_name: stage_name.clone(),
                 error: "cancelled before stage attempt".into(),
+                failure: None,
             });
             return Err(cancel_failure(task.node_id, &task.node_cancel, &env.cancel));
         }
@@ -661,6 +663,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
                             node_idx: idx,
                             stage_name: stage_name.clone(),
                             error: msg.clone(),
+                            failure: None,
                         });
                         // TRANSIENT: back off + retry (each attempt re-checks the
                         // marker) — never resume concurrently, but the blocker
@@ -816,6 +819,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
                                 node_idx: idx,
                                 stage_name,
                                 error: "cancelled during stage".into(),
+                                failure: None,
                             });
                             return Err(cancel_failure(
                                 task.node_id,
@@ -913,6 +917,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
             node_idx: idx,
             stage_name: stage_name.clone(),
             error: format!("{err}"),
+            failure: crate::framework::error_domain::extract_failure_summary(&err),
         });
         // A diverged node that exhausted its retries is a REAL surfaced failure
         // (the run diverged and could not recover) — NOT a silent Killed prune.
@@ -953,6 +958,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
             node_idx: idx,
             stage_name: stage_name.clone(),
             error: format!("promote stage output: {e}"),
+            failure: None,
         });
         return Err(NodeFailure::Stage {
             idx,
@@ -1481,6 +1487,7 @@ impl SequentialExecutor {
                     node_idx: idx as u32,
                     stage_name: "<cancelled>".into(),
                     error: "plan cancelled before stage".into(),
+                    failure: None,
                 });
                 finish_writer(env, writer_handle).await;
                 return Err(PlanError::Cancelled);
@@ -1675,6 +1682,7 @@ impl ParallelExecutor {
                 node_idx: 0,
                 stage_name: "<cancelled>".into(),
                 error: "plan cancelled before stage".into(),
+                failure: None,
             });
             finish_writer(env, writer_handle).await;
             return Err(PlanError::Cancelled);
@@ -1763,6 +1771,7 @@ impl ParallelExecutor {
                                 node_idx,
                                 stage_name: node.stage.name().to_string(),
                                 error: format!("{e}"),
+                                failure: None,
                             });
                             first_error.get_or_insert(e);
                             env.cancel.cancel();

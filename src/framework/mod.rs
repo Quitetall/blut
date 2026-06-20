@@ -32,6 +32,7 @@ pub mod compat;
 pub mod control;
 pub mod cookbook;
 pub mod error;
+pub mod error_domain;
 pub mod executor;
 pub mod gpu_sampler;
 pub mod graph;
@@ -48,6 +49,9 @@ pub use cache::{CacheHandle, CacheHit, lru_prune};
 pub use compat::Compatible;
 pub use cookbook::{ArtifactDescriptor, Cookbook, Registry, StageDescriptor};
 pub use error::{PlanError, RecipeError, StageError};
+pub use error_domain::{
+    ErrorDomain, FailureSummary, Severity, StageFailure, extract_failure_summary,
+};
 pub use executor::{ExecCtx, ParallelExecutor, PlanResult, SequentialExecutor, execute_plan};
 pub use graph::{GraphSnapshot, NodeStatus, PlanGraph, graph_snapshot};
 pub use plan::{CompiledPlan, NodeId, Plan};

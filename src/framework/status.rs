@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::framework::artifact::ContentHash;
+use crate::framework::error_domain::FailureSummary;
 use crate::framework::resource::Resource;
 
 /// Default broadcast channel capacity. 4096 sized for chatty
@@ -63,12 +64,15 @@ pub enum StageEvent {
         cache_key: ContentHash,
     },
     /// Stage failed. `error` is the `Display` form of the
-    /// `StageError`; structured fields land in a follow-up if the
-    /// CLI ever needs to format errors specially.
+    /// `StageError`. When the error chain contains a [`StageFailure`],
+    /// `failure` carries the structured summary (code, severity,
+    /// context) for lineage storage and machine parsing.
     StageFailed {
         node_idx: u32,
         stage_name: String,
         error: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        failure: Option<FailureSummary>,
     },
     /// Stage is blocked on a resource semaphore. Useful for the TUI
     /// to show "waiting on GPU" instead of "running".
