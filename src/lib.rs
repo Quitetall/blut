@@ -4,14 +4,14 @@
 //!
 //! A standalone, domain-agnostic Rust framework for orchestrating
 //! local ML training workloads (SFT, DPO, distillation, evaluation)
-//! via typed stages, plans, and recipes. Compile-time DAG enforcement
-//! via PhantomData on `Plan<Out>` — wrong stage wiring = `cargo build`
+//! via typed ingredients, plans, and recipes. Compile-time DAG enforcement
+//! via PhantomData on `Plan<Out>` — wrong ingredient wiring = `cargo build`
 //! error, not runtime panic.
 //!
 //! Public surface:
 //!
 //!   - `framework::*` — Artifact / Stage / Plan / Executor + cache.
-//!   - concrete stage impls (materialize, train, convert, register,
+//!   - concrete ingredient impls (materialize, train, convert, register,
 //!     eval) and saved plans for common workflows.
 //!
 //! The library has no upward dependency on any host application;
@@ -31,6 +31,7 @@ pub mod backends;
 pub mod broker;
 pub mod cli;
 pub mod config;
+pub mod containment;
 pub mod datasets_db;
 pub mod error;
 pub mod framework;
@@ -54,7 +55,7 @@ pub mod spec;
 #[cfg(feature = "tui")]
 pub mod tui;
 
-// ENGINE CARVE (v1.0): the generic-LLM cookbook — concrete `stages`,
+// ENGINE CARVE (v1.0): the generic-LLM cookbook — concrete `ingredients`,
 // the `backend` trait + concrete backends (`backends::{lamu,hf_trainer}`),
 // `convert`, and `conversations` — moved to the `blut-backends` crate.
 // `backends` here keeps ONLY the abstract `TrainingBackend` trait (the
