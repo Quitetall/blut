@@ -59,7 +59,6 @@ impl Containment for SystemdCgroup {
     fn wrap_command(
         &self,
         program: &Path,
-        script: &Path,
         args: &[String],
         cwd: &Path,
         env: &[(String, String)],
@@ -104,8 +103,8 @@ impl Containment for SystemdCgroup {
         for (k, v) in env {
             c.arg(format!("--setenv={k}={v}"));
         }
-        // Terminator, then the actual kernel command.
-        c.arg("--").arg(program).arg(script);
+        // Terminator, then the actual kernel command (program + full argv).
+        c.arg("--").arg(program);
         for a in args {
             c.arg(a);
         }
@@ -146,8 +145,7 @@ mod tests {
         let wr = be
             .wrap_command(
                 &PathBuf::from("python3"),
-                &PathBuf::from("train.py"),
-                &["--epochs".into(), "5".into()],
+                &["train.py".into(), "--epochs".into(), "5".into()],
                 &PathBuf::from("/tmp/job"),
                 &[("PYTHONPATH".into(), "/x".into())],
                 "blut-job-stage",

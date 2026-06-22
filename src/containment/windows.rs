@@ -40,7 +40,6 @@ impl Containment for WindowsJobObject {
     fn wrap_command(
         &self,
         _program: &Path,
-        _script: &Path,
         _args: &[String],
         _cwd: &Path,
         _env: &[(String, String)],

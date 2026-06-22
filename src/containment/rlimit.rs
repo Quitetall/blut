@@ -38,7 +38,6 @@ impl Containment for RlimitAddressSpace {
     fn wrap_command(
         &self,
         program: &Path,
-        script: &Path,
         args: &[String],
         cwd: &Path,
         env: &[(String, String)],
@@ -49,7 +48,8 @@ impl Containment for RlimitAddressSpace {
             return Err(TrainError::other("rlimit wrap: empty program"));
         }
         let mut c = tokio::process::Command::new(program);
-        c.arg(script);
+        // args[0] is the script (or `-m` for a torchrun DDP launch); the runner's
+        // kernel_argv builds the full argv after the program.
         for a in args {
             c.arg(a);
         }

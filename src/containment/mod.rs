@@ -120,16 +120,16 @@ pub trait Containment: Send + Sync {
     /// mid-process).
     fn available(&self) -> Availability;
 
-    /// Build the child command + teardown metadata. `unit` is the
-    /// runner-derived identity (`blut-<job>-<stage>`), already sanitized to
-    /// `[A-Za-z0-9_-]`. `env` carries `PYTHONPATH` + `BLUT_*` identity that
-    /// must reach the child. Errors if the backend can't construct (e.g.
-    /// cgroup mkdir/delegation refused).
-    #[allow(clippy::too_many_arguments)] // the kernel command is intrinsically (program, script, args, cwd, env) + (unit, caps)
+    /// Build the child command + teardown metadata. `program` is the executable
+    /// (e.g. `python3`); `args` is the full argv after it (e.g.
+    /// `[script, ...]` or `[-m, torch.distributed.run, ..., script, ...]` for a
+    /// DDP run). `unit` is the runner-derived identity (`blut-<job>-<stage>`),
+    /// already sanitized to `[A-Za-z0-9_-]`. `env` carries `PYTHONPATH` +
+    /// `BLUT_*` identity that must reach the child. Errors if the backend can't
+    /// construct (e.g. cgroup mkdir/delegation refused).
     fn wrap_command(
         &self,
         program: &Path,
-        script: &Path,
         args: &[String],
         cwd: &Path,
         env: &[(String, String)],
