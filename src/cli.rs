@@ -215,7 +215,7 @@ enum CacheCommand {
         #[arg(long)]
         max_gb: Option<f64>,
     },
-    /// Per-stage cache hit/miss tally for a job (from its status.jsonl).
+    /// Per-ingredient cache hit/miss tally for a job (from its status.jsonl).
     Stats {
         /// Job id (or unique prefix).
         id: String,
@@ -271,7 +271,7 @@ enum FootprintCommand {
 
 #[derive(Subcommand, Debug)]
 enum LineageCommand {
-    /// Show a job's stage lineage (input→output hashes, cache hits).
+    /// Show a job's ingredient lineage (input→output hashes, cache hits).
     Show {
         /// Job id (or unique prefix).
         id: String,
@@ -776,7 +776,7 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                     crate::jobs::write_state(&job_id, JobState::Done)
                         .with_context(|| format!("write Done state for {job_id}"))?;
                     eprintln!(
-                        "done — {} stages, {} cache hits, {} misses, elapsed {:?}",
+                        "done — {} ingredients, {} cache hits, {} misses, elapsed {:?}",
                         r.n_stages, r.n_cache_hits, r.n_cache_misses, r.elapsed
                     );
                     Ok(())
@@ -978,7 +978,7 @@ fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
                 return Ok(());
             }
             let (th, tm) = stats.totals();
-            println!("{:<32} {:>6} {:>6} {:>7}", "stage", "hits", "miss", "hit%");
+            println!("{:<32} {:>6} {:>6} {:>7}", "ingredient", "hits", "miss", "hit%");
             for (stage, (h, m)) in &stats.per_stage {
                 let pct = if h + m == 0 {
                     0.0
@@ -1008,7 +1008,7 @@ fn run_lineage(id_query: &str, json: bool) -> Result<()> {
         return Ok(());
     }
     if nodes.is_empty() {
-        println!("no stage lineage (job has no framework status events).");
+        println!("no ingredient lineage (job has no framework status events).");
         return Ok(());
     }
     for n in &nodes {
@@ -1240,10 +1240,10 @@ fn run_artifact_cmd(cmd: ArtifactCommand) -> Result<()> {
                 return Ok(());
             }
             if recs.is_empty() {
-                println!("no artifacts (job has no materialized stage outputs).");
+                println!("no artifacts (job has no materialized ingredient outputs).");
                 return Ok(());
             }
-            println!("{:<24} {:<14} {:<10} stage", "kind", "hash", "schema");
+            println!("{:<24} {:<14} {:<10} ingredient", "kind", "hash", "schema");
             for r in &recs {
                 let hash = r
                     .meta
@@ -2415,7 +2415,7 @@ fn run_dag(job: Option<String>, json: bool) -> Result<()> {
     );
     println!(
         "{:<4} {:<22} {:<8} {:<8} {:<6} preds  detail",
-        "idx", "stage", "status", "elapsed", "trial"
+        "idx", "ingredient", "status", "elapsed", "trial"
     );
     for n in &snap.nodes {
         let preds = snap
@@ -2585,7 +2585,7 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                         // recipes don't resume by registry name); `Local`
                         // placement (clusters target registry recipes only).
                         println!(
-                            "✓ '{}' compiles + kind-checks ({n} stage(s)); launching…",
+                            "✓ '{}' compiles + kind-checks ({n} ingredient(s)); launching…",
                             recipe.name
                         );
                         launch_compiled_plan(
@@ -2602,7 +2602,7 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                     } else {
                         // Render-only (default): print the runnable DAG, no exec.
                         print!("{}", plan.render_ascii().map_err(|e| anyhow!("{e}"))?);
-                        println!("✓ '{}' compiles + kind-checks ({n} stage(s)).", recipe.name);
+                        println!("✓ '{}' compiles + kind-checks ({n} ingredient(s)).", recipe.name);
                     }
                 }
             }
@@ -2678,7 +2678,7 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                     println!(
                         "[dry-run] recipe={name} resolved RAM footprint ≈ {gib:.1}G \
                          (admission would gate this against free RAM + the 6G floor). \
-                         No stages executed; no GPU/cgroup acquired."
+                         No ingredients executed; no GPU/cgroup acquired."
                     );
                     return Ok(());
                 }
@@ -2794,6 +2794,13 @@ async fn launch_compiled_plan(
     // Phase-G scheduler: pin this run to a GPU device so the cookbook backend
     // exports CUDA_VISIBLE_DEVICES for its trainer.
     ctx = ctx.with_device_index(device_index);
+    // Single-job multi-GPU: size the GPU semaphore pool to the box's device
+    // count so a DDP stage can acquire `nproc` permits (and a single-GPU cell
+    // can't co-schedule onto a device the DDP job owns). On a 1-GPU box this is
+    // 1 → byte-identical to before. `capacity()` probes CUDA_VISIBLE_DEVICES /
+    // nvidia-smi for the local launcher; Slurm reports its --gpus allocation.
+    let gpu_pool = crate::config::launcher::launcher_for(launch_target).capacity();
+    ctx = ctx.with_resource_limit(crate::framework::Resource::Gpu, gpu_pool.max(1));
     // Phase 3: thread the warm flag from the recipe's DEFAULTED args (the SAME
     // source `recipe_footprint` reads above) into every StageContext, so a
     // train stage's footprint RECORD keys identically to the admission RESOLVE.
@@ -2880,7 +2887,7 @@ async fn launch_compiled_plan(
             crate::jobs::write_state(&job_id, JobState::Done)
                 .with_context(|| format!("write Done state for {job_id}"))?;
             eprintln!(
-                "done — {} stages, {} cache hits, {} misses, elapsed {:?}",
+                "done — {} ingredients, {} cache hits, {} misses, elapsed {:?}",
                 r.n_stages, r.n_cache_hits, r.n_cache_misses, r.elapsed
             );
             if let Some(fp) = sweep_fp {

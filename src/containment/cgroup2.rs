@@ -27,8 +27,10 @@ const CG_ROOT: &str = "/sys/fs/cgroup";
 pub struct CgroupV2Direct;
 
 /// The writable base cgroup under which we create per-run leaves. Resolution:
-///   1. `$BLUT_CGROUP_PARENT` — an operator-prepared delegated dir.
-///   2. the process's own cgroup dir (from `/proc/self/cgroup`), if writable.
+///
+/// 1. `$BLUT_CGROUP_PARENT` — an operator-prepared delegated dir.
+/// 2. the process's own cgroup dir (from `/proc/self/cgroup`), if writable.
+///
 /// Returns `None` when neither is writable (→ `BusOffline`).
 fn writable_base() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("BLUT_CGROUP_PARENT") {
@@ -110,7 +112,6 @@ impl Containment for CgroupV2Direct {
     fn wrap_command(
         &self,
         program: &Path,
-        script: &Path,
         args: &[String],
         cwd: &Path,
         env: &[(String, String)],
@@ -148,7 +149,6 @@ impl Containment for CgroupV2Direct {
         let _ = std::fs::write(cgdir.join("memory.oom.group"), b"1");
 
         let mut c = tokio::process::Command::new(program);
-        c.arg(script);
         for a in args {
             c.arg(a);
         }

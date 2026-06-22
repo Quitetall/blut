@@ -262,6 +262,10 @@ struct NodeEnv {
     status: Arc<StatusHub>,
     cancel: CancellationToken,
     resources: HashMap<Resource, Arc<tokio::sync::Semaphore>>,
+    /// Total `Resource::Gpu` permits (== the box's GPU pool / device count). A
+    /// DDP stage's `gpu_permits` is clamped to this so it never asks for more
+    /// GPUs than exist.
+    gpu_pool: usize,
     memory: Arc<tokio::sync::Semaphore>,
     memory_budget_gib: u32,
     launch_target: crate::config::launcher::LaunchTarget,
@@ -684,12 +688,37 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         // `try_acquire` first; only emit `StageBlocked` on contention.
         let mut sorted_resources: Vec<Resource> = task.stage.resources().to_vec();
         sorted_resources.sort();
+        // A DDP stage holds `nproc` GPU permits (sized to the box's GPU pool);
+        // every other resource holds 1. Clamp to the pool so a request for more
+        // permits than exist can't park forever (the GPU pool == device count,
+        // set by the CLI via `with_resource_limit`).
         let mut permits = Vec::new();
         for resource in sorted_resources {
             let Some(sem) = env.resources.get(&resource) else {
                 continue;
             };
-            let permit = match sem.clone().try_acquire_owned() {
+            let want = if resource == Resource::Gpu {
+                let n = task.stage.gpu_permits(&task.args).max(1) as usize;
+                // The pool size is the semaphore's total permits; clamp so a
+                // DDP job asking for more GPUs than the box has runs on all of
+                // them rather than deadlocking.
+                let clamped = n.min(env.gpu_pool.max(1));
+                if clamped < n {
+                    // A DDP stage requested more GPUs than the box has — it will
+                    // run DEGRADED (on `clamped` GPUs). Warn loudly so a user
+                    // who thinks they're at full width isn't silently demoted.
+                    tracing::warn!(
+                        "stage '{}' requested {n} GPU permits but the pool has \
+                         only {} — running on {clamped} (DDP width degraded)",
+                        stage_name,
+                        env.gpu_pool
+                    );
+                }
+                clamped
+            } else {
+                1
+            };
+            let permit = match sem.clone().try_acquire_many_owned(want as u32) {
                 Ok(p) => p,
                 Err(_) => {
                     env.status.emit(StageEvent::StageBlocked {
@@ -697,7 +726,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
                         stage_name: stage_name.clone(),
                         resource,
                     });
-                    match sem.clone().acquire_owned().await {
+                    match sem.clone().acquire_many_owned(want as u32).await {
                         Ok(p) => p,
                         Err(_) => {
                             let _ = std::fs::remove_dir_all(&tmp_stage_dir);
@@ -716,7 +745,10 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         // the SUM of concurrent stages can't exceed the box (never-OOM-the-BOX
         // under the parallel executor). Clamp to the budget so a stage needing
         // the whole box runs alone instead of deadlocking. `0` = no reservation.
-        let mem_want = task.stage.memory_gib().min(env.memory_budget_gib);
+        let mem_want = task
+            .stage
+            .memory_gib_for(&task.args)
+            .min(env.memory_budget_gib);
         let _mem_permit = if mem_want > 0 {
             match env.memory.clone().acquire_many_owned(mem_want).await {
                 Ok(p) => Some(p),
@@ -1381,12 +1413,23 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
     }
 
     // MOVE ctx's fields into env — the hub Arc lives only here now.
+    // Snapshot the GPU pool size (total permits) BEFORE any node acquires, so a
+    // DDP stage's gpu_permits clamps to the real device count. ORDERING: this
+    // MUST stay before the `resources: ctx.resources` move below AND before any
+    // node spawns — `available_permits()` reads the CURRENT free count, which
+    // equals the total only while nothing is held (true here in prelude).
+    let gpu_pool = ctx
+        .resources
+        .get(&Resource::Gpu)
+        .map(|s| s.available_permits())
+        .unwrap_or(1);
     let env = Arc::new(NodeEnv {
         job_dir: ctx.job_dir,
         cache: ctx.cache,
         status: ctx.status,
         cancel: ctx.cancel,
         resources: ctx.resources,
+        gpu_pool,
         memory: ctx.memory,
         memory_budget_gib: ctx.memory_budget_gib,
         launch_target: ctx.launch_target,
@@ -3163,6 +3206,113 @@ mod tests {
             peak.load(Ordering::SeqCst),
             1,
             "memory budget (4) must serialize two MEMORY_GIB=4 stages (sum 8 > budget)"
+        );
+        let _ = result;
+    }
+
+    /// A GPU stage that holds `gpu_permits = args.id + 1` permits (so id=1
+    /// requests 2 GPUs = a DDP job owning the whole 2-GPU pool, id=0 requests
+    /// 1). Records peak concurrency; a short sleep makes overlap observable.
+    struct GpuHog {
+        peak: Arc<std::sync::atomic::AtomicU32>,
+        live: Arc<std::sync::atomic::AtomicU32>,
+    }
+    #[async_trait]
+    impl Stage for GpuHog {
+        const NAME: &'static str = "gpu_hog";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Gpu];
+        type Input = Counter;
+        type Output = Counter;
+        type Args = BarrierArgs;
+        fn gpu_permits(&self, args: &BarrierArgs) -> u32 {
+            // id>=2 → a 2-GPU DDP job; id 0/1 → a 1-GPU cell (distinct ids keep
+            // distinct cache keys so the executor doesn't dedup the fork).
+            if args.id >= 2 {
+                2
+            } else {
+                1
+            }
+        }
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            input: Counter,
+            _args: &BarrierArgs,
+        ) -> Result<Counter, StageError> {
+            let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            Ok(Counter { n: input.n })
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for GpuHog {}
+
+    #[tokio::test]
+    async fn ddp_stage_holds_whole_gpu_pool_blocking_single_gpu_cell() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        // A 2-GPU box. One branch is a DDP job (id=1 → 2 GPU permits = the whole
+        // pool); the other is a single-GPU cell (id=0 → 1 permit). The DDP job
+        // holding both permits MUST block the single-GPU cell — they serialize.
+        let peak = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let live = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ctx = ExecCtx::new(td.path().to_path_buf())
+            .with_resource_limit(Resource::Gpu, 2)
+            .with_resource_limit(Resource::Cpu, 4);
+        let ddp = GpuHog {
+            peak: peak.clone(),
+            live: live.clone(),
+        };
+        let cell = GpuHog {
+            peak: peak.clone(),
+            live: live.clone(),
+        };
+        let plan = Plan::<(), LamuTrainerBackend>::new("gpugate", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .fork(ddp, BarrierArgs { id: 2 }, cell, BarrierArgs { id: 0 })
+            .merge(SumTwo, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let result = ParallelExecutor::execute(plan, ctx).await.unwrap();
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "a DDP job holding all GPU permits must block the single-GPU cell"
+        );
+        let _ = result;
+    }
+
+    #[tokio::test]
+    async fn two_single_gpu_cells_overlap_on_two_gpu_pool() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        // A 2-GPU box, two single-GPU cells (1 permit each) → they overlap.
+        let peak = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let live = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ctx = ExecCtx::new(td.path().to_path_buf())
+            .with_resource_limit(Resource::Gpu, 2)
+            .with_resource_limit(Resource::Cpu, 4);
+        let a = GpuHog {
+            peak: peak.clone(),
+            live: live.clone(),
+        };
+        let b = GpuHog {
+            peak: peak.clone(),
+            live: live.clone(),
+        };
+        let plan = Plan::<(), LamuTrainerBackend>::new("gpupair", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .fork(a, BarrierArgs { id: 0 }, b, BarrierArgs { id: 1 })
+            .merge(SumTwo, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let result = ParallelExecutor::execute(plan, ctx).await.unwrap();
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "two 1-GPU cells must overlap on a 2-GPU pool"
         );
         let _ = result;
     }
