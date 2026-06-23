@@ -30,6 +30,10 @@ pub struct TaskManifest {
     pub input_hash: ContentHash,
     /// Content hash of the serialized args.
     pub args_hash: ContentHash,
+    /// Expected content hash of the output artifact. The coordinator
+    /// pre-computes this from the cache key so it can verify the peer's
+    /// result without re-executing the stage.
+    pub expected_output_hash: ContentHash,
     /// JSON-encoded stage args.
     pub args: serde_json::Value,
     /// Resource requirements for this task.
@@ -86,6 +90,7 @@ impl TaskManifest {
         write_lp_string(&mut buf, &self.stage_name);
         buf.extend_from_slice(&self.input_hash.0);
         buf.extend_from_slice(&self.args_hash.0);
+        buf.extend_from_slice(&self.expected_output_hash.0);
         buf.extend_from_slice(&self.coordinator_id.0);
         buf.extend_from_slice(&self.resources.cpu_cores.to_le_bytes());
         buf.extend_from_slice(&self.resources.memory_gib.to_le_bytes());
@@ -164,6 +169,7 @@ mod tests {
             stage_schema: 1,
             input_hash,
             args_hash,
+            expected_output_hash: ContentHash::of_bytes(&[3u8; 32]),
             args: serde_json::json!({"lma_root": "/data"}),
             resources: ResourceRequest::default(),
             data_class: DataClass::Public,

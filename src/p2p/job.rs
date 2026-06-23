@@ -38,6 +38,8 @@ pub struct P2pJob {
     peer_id: PeerId,
     state: Arc<Mutex<P2pJobState>>,
     result_rx: Mutex<Option<oneshot::Receiver<Result<TaskResult, String>>>>,
+    /// Callback to signal the coordinator to send a Cancel message to the peer.
+    cancel_tx: Mutex<Option<oneshot::Sender<String>>>,
 }
 
 impl P2pJob {
@@ -50,31 +52,53 @@ impl P2pJob {
         Self {
             task_id,
             peer_id,
-            state: Arc::new(Mutex::new(P2pJobState::Running {
-                peer_id: PeerId([0u8; 32]), // will be set when peer accepts
-            })),
+            state: Arc::new(Mutex::new(P2pJobState::Pending)),
             result_rx: Mutex::new(Some(result_rx)),
+            cancel_tx: Mutex::new(None),
         }
     }
 
-    /// Get the current state (for testing).
-    pub fn state(&self) -> P2pJobState {
-        // We can't clone P2pJobState, so we just check via poll semantics.
-        // This is a testing-only method.
-        let rx = self.result_rx.lock();
-        if rx.is_none() {
-            // Result already consumed.
-            return P2pJobState::Done(TaskResult {
-                task_id: self.task_id.clone(),
-                peer_id: self.peer_id.clone(),
-                output_hash: crate::framework::artifact::ContentHash::of_bytes(&[0u8; 32]),
-                encrypted_output: None,
-                wall_time_ms: 0,
-                signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
-            });
-        }
-        P2pJobState::Pending
+    /// Set a cancel callback. The coordinator calls this to register a
+    /// channel that signals the coordinator to send a Cancel message.
+    pub fn set_cancel_callback(&self, tx: oneshot::Sender<String>) {
+        *self.cancel_tx.lock() = Some(tx);
     }
+
+    /// Get the task ID.
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    /// Get the peer ID.
+    pub fn peer_id(&self) -> &PeerId {
+        &self.peer_id
+    }
+
+    /// Get a snapshot of the current state.
+    pub fn state_snapshot(&self) -> P2pJobStateSnapshot {
+        let state = self.state.lock();
+        match &*state {
+            P2pJobState::Pending => P2pJobStateSnapshot::Pending,
+            P2pJobState::Running { peer_id } => P2pJobStateSnapshot::Running {
+                peer_id: peer_id.clone(),
+            },
+            P2pJobState::Done(r) => P2pJobStateSnapshot::Done {
+                wall_time_ms: r.wall_time_ms,
+            },
+            P2pJobState::Failed(reason) => P2pJobStateSnapshot::Failed(reason.clone()),
+            P2pJobState::Cancelled => P2pJobStateSnapshot::Cancelled,
+        }
+    }
+}
+
+/// Serializable snapshot of job state (for testing / logging).
+#[derive(Debug, Clone)]
+pub enum P2pJobStateSnapshot {
+    Pending,
+    Running { peer_id: PeerId },
+    Done { wall_time_ms: u64 },
+    Failed(String),
+    Cancelled,
 }
 
 impl RemoteJob for P2pJob {
@@ -97,7 +121,12 @@ impl RemoteJob for P2pJob {
                     Ok(JobState::Failed(reason))
                 }
                 Err(oneshot::error::TryRecvError::Empty) => {
-                    Ok(JobState::Running)
+                    // Check if cancelled.
+                    if matches!(&*self.state.lock(), P2pJobState::Cancelled) {
+                        Ok(JobState::Cancelled)
+                    } else {
+                        Ok(JobState::Running)
+                    }
                 }
                 Err(oneshot::error::TryRecvError::Closed) => {
                     *rx_guard = None;
@@ -106,7 +135,7 @@ impl RemoteJob for P2pJob {
                 }
             }
         } else {
-            // Already consumed.
+            // Result already consumed — return the recorded state.
             match &*self.state.lock() {
                 P2pJobState::Done(_) => Ok(JobState::Succeeded),
                 P2pJobState::Failed(r) => Ok(JobState::Failed(r.clone())),
@@ -117,9 +146,9 @@ impl RemoteJob for P2pJob {
     }
 
     fn stream(&self, sink: &dyn Fn(&str)) -> Result<(), TrainError> {
-        // P2P jobs don't stream intermediate output — the result comes
-        // as a single TaskResult. Progress is reported via poll().
-        // Wait for the result, then report it.
+        // Non-blocking check for result. The RemoteJob trait is sync
+        // (no async), so we can't block here. The executor calls poll()
+        // in a loop which drives the state machine.
         let mut rx_guard = self.result_rx.lock();
         if let Some(rx) = rx_guard.as_mut() {
             match rx.try_recv() {
@@ -154,6 +183,10 @@ impl RemoteJob for P2pJob {
         *self.state.lock() = P2pJobState::Cancelled;
         // Drop the receiver so the coordinator's send fails.
         *self.result_rx.lock() = None;
+        // Signal the coordinator to send a Cancel message to the peer.
+        if let Some(tx) = self.cancel_tx.lock().take() {
+            let _ = tx.send(self.task_id.clone());
+        }
         tracing::info!("P2P task {} cancelled", self.task_id);
         Ok(())
     }
@@ -209,9 +242,29 @@ mod tests {
     }
 
     #[test]
-    fn job_id() {
+    fn job_cancel_signals_coordinator() {
         let (_tx, rx) = oneshot::channel();
-        let job = P2pJob::new("test-42".into(), PeerId([0u8; 32]), rx);
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        let job = P2pJob::new("test-1".into(), PeerId([0u8; 32]), rx);
+        job.set_cancel_callback(cancel_tx);
+
+        job.cancel().unwrap();
+        // The cancel channel should have received the task_id.
+        assert_eq!(cancel_rx.try_recv().unwrap(), "test-1");
+    }
+
+    #[test]
+    fn job_state_snapshot() {
+        let (_tx, rx) = oneshot::channel();
+        let job = P2pJob::new("test-1".into(), PeerId([1u8; 32]), rx);
+        assert!(matches!(job.state_snapshot(), P2pJobStateSnapshot::Pending));
+    }
+
+    #[test]
+    fn job_id_and_peer() {
+        let (_tx, rx) = oneshot::channel();
+        let job = P2pJob::new("test-42".into(), PeerId([2u8; 32]), rx);
         assert_eq!(job.id(), "test-42");
+        assert_eq!(job.peer_id(), &PeerId([2u8; 32]));
     }
 }
