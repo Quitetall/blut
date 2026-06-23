@@ -22,6 +22,7 @@ use crate::p2p::peer::PeerId;
 use crate::p2p::registry::PeerRegistry;
 use crate::p2p::task::{TaskManifest, TaskResult};
 use crate::p2p::transport::P2pServer;
+use crate::config::launcher::JobState;
 
 /// Handle to a task submitted to the coordinator, used to track its
 /// lifecycle and deliver the result.
@@ -250,22 +251,47 @@ impl Coordinator {
     }
 }
 
-/// A handle to a dispatched P2P task, polling via the pending map.
+/// A handle to a dispatched P2P task, polling via the oneshot receiver.
 struct CoordinatorDispatchHandle {
-    _task_id: String,
-    _result_rx: tokio::sync::oneshot::Receiver<Result<TaskResult, String>>,
+    task_id: String,
+    result_rx: parking_lot::Mutex<Option<tokio::sync::oneshot::Receiver<Result<TaskResult, String>>>>,
+    pending: Arc<parking_lot::RwLock<HashMap<String, PendingTask>>>,
 }
 
 impl crate::framework::executor::DispatchHandle for CoordinatorDispatchHandle {
     fn poll(&self) -> Result<Option<crate::config::launcher::JobState>, crate::error::TrainError> {
-        // We can't poll a oneshot receiver synchronously. Return None
-        // (still running) and let the executor's async poll loop drive it.
-        // The actual polling happens in the P2pJob's poll() method.
-        Ok(None)
+        let mut rx_guard = self.result_rx.lock();
+        if let Some(rx) = rx_guard.as_mut() {
+            match rx.try_recv() {
+                Ok(Ok(_result)) => {
+                    *rx_guard = None;
+                    // Clean up pending entry.
+                    self.pending.write().remove(&self.task_id);
+                    Ok(Some(JobState::Succeeded))
+                }
+                Ok(Err(reason)) => {
+                    *rx_guard = None;
+                    self.pending.write().remove(&self.task_id);
+                    Ok(Some(JobState::Failed(reason)))
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => Ok(None),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    *rx_guard = None;
+                    self.pending.write().remove(&self.task_id);
+                    Ok(Some(JobState::Failed("channel closed".into())))
+                }
+            }
+        } else {
+            Ok(Some(JobState::Cancelled))
+        }
     }
 
     fn cancel(&self) -> Result<(), crate::error::TrainError> {
-        // TODO: send cancel to peer
+        // Drop the receiver so poll() returns Cancelled.
+        *self.result_rx.lock() = None;
+        // Remove from pending map.
+        self.pending.write().remove(&self.task_id);
+        tracing::info!("P2P dispatch task {} cancelled", self.task_id);
         Ok(())
     }
 }
@@ -337,8 +363,9 @@ impl crate::framework::executor::DispatchSubmitter for Coordinator {
         });
 
         Ok(Box::new(CoordinatorDispatchHandle {
-            _task_id: task_id,
-            _result_rx: result_rx,
+            task_id,
+            result_rx: parking_lot::Mutex::new(Some(result_rx)),
+            pending: self.pending.clone(),
         }))
     }
 }

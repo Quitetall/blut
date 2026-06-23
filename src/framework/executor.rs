@@ -51,6 +51,16 @@ use crate::framework::resource::Resource;
 use crate::framework::stage::{ErasedArtifact, StageContext, StageDyn};
 use crate::framework::status::{StageEvent, StatusHub, spawn_status_writer};
 
+/// RAII guard that decrements the in-flight counter when dropped.
+/// Used by spawned dispatch tasks to ensure in_flight is decremented
+/// even if the task panics.
+struct InFlightDecrementGuard(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for InFlightDecrementGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Default bound on concurrently-spawned node tasks in the parallel
 /// executor. The real throttle is the per-`Resource` semaphores; this
 /// only caps task/memory overhead so a very wide DAG can't spawn
@@ -1777,7 +1787,7 @@ impl ParallelExecutor {
 
         let mut join: tokio::task::JoinSet<Result<NodeOutcome, NodeFailure>> =
             tokio::task::JoinSet::new();
-        let mut in_flight = 0usize;
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut n_hits = 0usize;
         let mut n_misses = 0usize;
         let mut first_error: Option<PlanError> = None;
@@ -1843,7 +1853,7 @@ impl ParallelExecutor {
             // Spawn ready nodes up to the in-flight cap (unless we're
             // already failing — then stop spawning and just drain).
             if first_error.is_none() {
-                while in_flight < max_in_flight {
+                while in_flight.load(std::sync::atomic::Ordering::Relaxed) < max_in_flight {
                     let Some(&node_id) = ready.iter().next() else {
                         break;
                     };
@@ -1935,10 +1945,11 @@ impl ParallelExecutor {
                                     let status = env.status.clone();
                                     let stage_name = task.stage.name().to_string();
                                     let key = task.key;
-                                    let _node_id_c = node_id;
-                                    let env_c = env.clone();
+                                    // Decrement in_flight when the dispatch poll task ends.
+                                    let in_flight_c = in_flight.clone();
                                     tokio::spawn(async move {
-                                        // Poll the remote task until terminal.
+                                        let _guard = InFlightDecrementGuard(in_flight_c);
+                                        let start = std::time::Instant::now();
                                         loop {
                                             match handle.poll() {
                                                 Ok(Some(JobState::Succeeded)) => {
@@ -1946,7 +1957,7 @@ impl ParallelExecutor {
                                                         node_idx,
                                                         stage_name,
                                                         output_hash: key,
-                                                        elapsed: std::time::Duration::from_secs(0), // TODO: track actual elapsed
+                                                        elapsed: start.elapsed(),
                                                     });
                                                     break;
                                                 }
@@ -1957,7 +1968,8 @@ impl ParallelExecutor {
                                                         error: reason,
                                                         failure: None,
                                                     });
-                                                    env_c.cancel.cancel();
+                                                    // Don't cancel the whole plan —
+                                                    // just report the failure.
                                                     break;
                                                 }
                                                 Ok(Some(_)) => break, // Cancelled/Unknown
@@ -1973,13 +1985,12 @@ impl ParallelExecutor {
                                                         error: format!("{e}"),
                                                         failure: None,
                                                     });
-                                                    env_c.cancel.cancel();
                                                     break;
                                                 }
                                             }
                                         }
                                     });
-                                    in_flight += 1;
+                                    in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     continue; // skip local spawn
                                 }
                                 Err(e) => {
@@ -1996,11 +2007,11 @@ impl ParallelExecutor {
 
                     let env_c = env.clone();
                     join.spawn(async move { run_node(task, env_c).await });
-                    in_flight += 1;
+                    in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
 
-            if in_flight == 0 {
+            if in_flight.load(std::sync::atomic::Ordering::Relaxed) == 0 {
                 break; // nothing running and nothing spawnable → done
             }
 
@@ -2139,7 +2150,7 @@ impl ParallelExecutor {
                     }
                 }
             };
-            in_flight -= 1;
+            in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             let res = match joined {
                 Some(Ok(r)) => r,
                 Some(Err(join_err)) => {

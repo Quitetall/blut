@@ -971,7 +971,7 @@ impl std::str::FromStr for LaunchTarget {
             "ray" => Ok(Self::Ray),
             "p2p" => Ok(Self::P2P),
             other => Err(TrainError::other(format!(
-                "unknown launcher '{other}' (expected local|slurm|ray)"
+                "unknown launcher '{other}' (expected local|slurm|ray|p2p)"
             ))),
         }
     }
