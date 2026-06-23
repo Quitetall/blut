@@ -70,22 +70,33 @@ impl Default for ResourceRequest {
     }
 }
 
-/// The data the coordinator signs to authenticate a task.
-fn sign_payload(task_id: &str, stage_name: &str, input_hash: &ContentHash, args_hash: &ContentHash) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(task_id.as_bytes());
-    buf.push(0);
-    buf.extend_from_slice(stage_name.as_bytes());
-    buf.push(0);
-    buf.extend_from_slice(&input_hash.0);
-    buf.extend_from_slice(&args_hash.0);
-    buf
+/// Length-prefix a string into a buffer (4-byte LE length + bytes).
+fn write_lp_string(buf: &mut Vec<u8>, s: &str) {
+    let len = s.len() as u32;
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(s.as_bytes());
 }
 
 impl TaskManifest {
-    /// Build the signing payload for this manifest.
+    /// Build the signing payload for this manifest. Covers all mutable
+    /// fields to prevent MITM tampering.
     pub fn sign_payload(&self) -> Vec<u8> {
-        sign_payload(&self.task_id, &self.stage_name, &self.input_hash, &self.args_hash)
+        let mut buf = Vec::new();
+        write_lp_string(&mut buf, &self.task_id);
+        write_lp_string(&mut buf, &self.stage_name);
+        buf.extend_from_slice(&self.input_hash.0);
+        buf.extend_from_slice(&self.args_hash.0);
+        buf.extend_from_slice(&self.coordinator_id.0);
+        buf.extend_from_slice(&self.resources.cpu_cores.to_le_bytes());
+        buf.extend_from_slice(&self.resources.memory_gib.to_le_bytes());
+        buf.push(self.resources.gpu as u8);
+        buf.push(match self.data_class {
+            DataClass::Public => 0,
+            DataClass::Internal => 1,
+            DataClass::Restricted => 2,
+        });
+        buf.extend_from_slice(&self.timeout_secs.to_le_bytes());
+        buf
     }
 }
 
@@ -100,21 +111,22 @@ pub struct TaskResult {
     pub output_hash: ContentHash,
     /// Encrypted output data (None if output is on shared filesystem).
     pub encrypted_output: Option<EncryptedPayload>,
-    /// Wall-clock time for the task (seconds).
-    pub wall_time_secs: f64,
-    /// Ed25519 signature over (task_id + output_hash + wall_time_secs).
+    /// Wall-clock time for the task (milliseconds, integer for deterministic signing).
+    pub wall_time_ms: u64,
+    /// Ed25519 signature over all fields.
     #[serde(with = "sig_serde")]
     pub signature: Signature,
 }
 
 impl TaskResult {
-    /// Build the signing payload for this result.
+    /// Build the signing payload for this result. Covers all mutable
+    /// fields to prevent MITM tampering.
     pub fn sign_payload(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(self.task_id.as_bytes());
-        buf.push(0);
+        write_lp_string(&mut buf, &self.task_id);
+        buf.extend_from_slice(&self.peer_id.0);
         buf.extend_from_slice(&self.output_hash.0);
-        buf.extend_from_slice(&self.wall_time_secs.to_le_bytes());
+        buf.extend_from_slice(&self.wall_time_ms.to_le_bytes());
         buf
     }
 }
@@ -145,9 +157,7 @@ mod tests {
     fn make_manifest(kp: &KeyPair) -> TaskManifest {
         let input_hash = ContentHash::of_bytes(&[1u8; 32]);
         let args_hash = ContentHash::of_bytes(&[2u8; 32]);
-        let payload = sign_payload("test-task-1", "warm_fb_cache", &input_hash, &args_hash);
-        let sig = kp.sign(&payload);
-        TaskManifest {
+        let mut manifest = TaskManifest {
             task_id: "test-task-1".into(),
             coordinator_id: crate::p2p::peer::PeerId::from_pubkey(&kp.verifying),
             stage_name: "warm_fb_cache".into(),
@@ -159,8 +169,10 @@ mod tests {
             data_class: DataClass::Public,
             timeout_secs: 3600,
             encrypted_input: None,
-            signature: sig,
-        }
+            signature: kp.sign(b"placeholder"),
+        };
+        manifest.signature = kp.sign(&manifest.sign_payload());
+        manifest
     }
 
     #[test]
@@ -191,7 +203,7 @@ mod tests {
             peer_id: crate::p2p::peer::PeerId::from_pubkey(&kp.verifying),
             output_hash,
             encrypted_output: None,
-            wall_time_secs: 42.5,
+            wall_time_ms: 42500,
             signature: Signature::from_bytes(&[0u8; 64]), // placeholder
         };
         let payload = result.sign_payload();
@@ -207,7 +219,7 @@ mod tests {
             peer_id: crate::p2p::peer::PeerId::from_pubkey(&kp.verifying),
             output_hash: ContentHash::of_bytes(&[3u8; 32]),
             encrypted_output: None,
-            wall_time_secs: 42.5,
+            wall_time_ms: 42500,
             signature: kp.sign(b"test"),
         };
         let json = serde_json::to_string(&result).unwrap();
