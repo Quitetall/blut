@@ -11,11 +11,15 @@
 //! Gated behind `#[cfg(feature = "p2p")]`.
 
 pub mod crypto;
+pub mod dispatch;
 pub mod peer;
 pub mod registry;
+pub mod task;
 pub mod trust;
 
 pub use crypto::{EncryptedPayload, KeyPair};
+pub use dispatch::{DefaultDispatchPolicy, DispatchPolicy, DispatchVerdict};
 pub use peer::{PeerCapabilities, PeerId, PeerInfo};
 pub use registry::PeerRegistry;
+pub use task::{ResourceRequest, TaskManifest, TaskResult};
 pub use trust::{DataClass, DispatchMatrix, TrustLevel};
