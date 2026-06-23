@@ -103,10 +103,14 @@ impl Coordinator {
             });
         }
 
-        // Send the task to the peer.
-        let connections = self.connections.read().await;
-        if let Some(conn) = connections.get(&peer_id) {
-            P2pServer::send_task(conn, &manifest).await?;
+        // Send the task to the peer. Clone the connection out, drop the
+        // lock, then send — avoids holding the read lock during I/O.
+        let conn = {
+            let connections = self.connections.read().await;
+            connections.get(&peer_id).cloned()
+        };
+        if let Some(conn) = conn {
+            P2pServer::send_task(&conn, &manifest).await?;
             tracing::info!("Dispatched task {} to peer {}", task_id, peer_id);
         } else {
             // Peer not connected — remove from pending and fail.

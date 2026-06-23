@@ -107,6 +107,18 @@ impl RemoteJob for P2pJob {
     }
 
     fn poll(&self) -> Result<JobState, TrainError> {
+        // Lock ordering: state first, then result_rx (same as cancel()).
+        // Check state for terminal conditions before touching the receiver.
+        {
+            let state = self.state.lock();
+            match &*state {
+                P2pJobState::Done(_) => return Ok(JobState::Succeeded),
+                P2pJobState::Failed(r) => return Ok(JobState::Failed(r.clone())),
+                P2pJobState::Cancelled => return Ok(JobState::Cancelled),
+                _ => {} // Pending or Running — check receiver below.
+            }
+        }
+
         let mut rx_guard = self.result_rx.lock();
         if let Some(rx) = rx_guard.as_mut() {
             match rx.try_recv() {
@@ -121,12 +133,7 @@ impl RemoteJob for P2pJob {
                     Ok(JobState::Failed(reason))
                 }
                 Err(oneshot::error::TryRecvError::Empty) => {
-                    // Check if cancelled.
-                    if matches!(&*self.state.lock(), P2pJobState::Cancelled) {
-                        Ok(JobState::Cancelled)
-                    } else {
-                        Ok(JobState::Running)
-                    }
+                    Ok(JobState::Running)
                 }
                 Err(oneshot::error::TryRecvError::Closed) => {
                     *rx_guard = None;
@@ -135,13 +142,7 @@ impl RemoteJob for P2pJob {
                 }
             }
         } else {
-            // Result already consumed — return the recorded state.
-            match &*self.state.lock() {
-                P2pJobState::Done(_) => Ok(JobState::Succeeded),
-                P2pJobState::Failed(r) => Ok(JobState::Failed(r.clone())),
-                P2pJobState::Cancelled => Ok(JobState::Cancelled),
-                _ => Ok(JobState::Running),
-            }
+            Ok(JobState::Running)
         }
     }
 
@@ -180,8 +181,8 @@ impl RemoteJob for P2pJob {
     }
 
     fn cancel(&self) -> Result<(), TrainError> {
+        // Lock ordering: state first, then result_rx (same as poll()).
         *self.state.lock() = P2pJobState::Cancelled;
-        // Drop the receiver so the coordinator's send fails.
         *self.result_rx.lock() = None;
         // Signal the coordinator to send a Cancel message to the peer.
         if let Some(tx) = self.cancel_tx.lock().take() {

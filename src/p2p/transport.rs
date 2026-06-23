@@ -351,8 +351,11 @@ impl P2pClient {
     }
 }
 
-/// TLS cert verifier that pins the coordinator's Ed25519 public key.
-/// Rejects connections from servers whose cert SPKI doesn't match.
+/// TLS cert verifier stub — accepts any certificate.
+/// SAFETY: relies entirely on the Ed25519 handshake for authentication.
+/// The handshake payload is signed by the coordinator's private key, so
+/// a MITM who tampers with it causes signature verification to fail.
+/// TODO: implement real SPKI pinning when rcgen supports Ed25519 certs.
 #[derive(Debug)]
 struct PinnedVerifier {
     expected_pubkey: [u8; 32],
