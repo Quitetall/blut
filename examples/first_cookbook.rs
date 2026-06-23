@@ -10,7 +10,7 @@
 //!
 //! - **Ingredient** — an atomic primitive: a typed [`Stage`] (`Input → Output`).
 //!   The smallest reusable unit of work. (A training cookbook also has finer
-//!   primitives — optimizers, schedulers, losses — that a stage composes.)
+//!   primitives — optimizers, schedulers, losses — that an ingredient composes.)
 //! - **Recipe** — a middle-level orchestration function: it composes ingredients
 //!   into a typed [`Plan`]. A named, args-driven workflow.
 //! - **Course** — the phase a recipe belongs to (`DataPrep`, `Pretrain`, `Train`,
@@ -20,10 +20,11 @@
 //!   Cookbooks are *loaded into* BLUT.
 //! - **BLUT** — the engine: it loads cookbooks into a [`Registry`], then compiles
 //!   and runs a recipe's plan against the content-addressed cache, under
-//!   per-stage resource + memory admission.
+//!   per-ingredient resource + memory admission.
 //!
-//! Wrong wiring is a `cargo build` error, not a runtime panic: a stage's `Input`
-//! must equal the previous stage's `Output`, and a stage can only join a plan
+//! Wrong wiring is a `cargo build` error, not a runtime panic: an ingredient's
+//! `Input` must equal the previous ingredient's `Output`, and an ingredient can
+//! only join a plan
 //! whose backend it is [`Compatible`] with.
 
 use async_trait::async_trait;
@@ -47,7 +48,7 @@ impl TrainingBackend for DemoBackend {
 }
 
 // ── Artifact ─────────────────────────────────────────────────────────────────
-// A content-hashed handle to a stage's output. Identical inputs + args ⇒ identical
+// A content-hashed handle to an ingredient's output. Identical inputs + args ⇒ identical
 // hash ⇒ a cache hit instead of a re-run.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Counter {
@@ -69,8 +70,8 @@ impl Artifact for Counter {
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct NoArgs;
 
-// ── Ingredients (atomic primitives = Stages) ─────────────────────────────────
-// `MakeOne`: () → Counter{1}. `Input = ()` makes it a source stage.
+// ── Ingredients (atomic primitives) ──────────────────────────────────────────
+// `MakeOne`: () → Counter{1}. `Input = ()` makes it a source ingredient.
 struct MakeOne;
 #[async_trait]
 impl Stage for MakeOne {
@@ -87,8 +88,8 @@ impl Stage for MakeOne {
 }
 impl Compatible<DemoBackend> for MakeOne {}
 
-// `Increment`: Counter → Counter{n+1}. Its `Input` MUST match the prior stage's
-// `Output` or `.then(...)` won't compile.
+// `Increment`: Counter → Counter{n+1}. Its `Input` MUST match the prior
+// ingredient's `Output` or `.then(...)` won't compile.
 struct Increment;
 #[async_trait]
 impl Stage for Increment {
@@ -183,7 +184,7 @@ async fn main() {
         .await
         .expect("run 1");
     println!(
-        "  → {} stages, {} hits, {} misses",
+        "  → {} ingredients, {} hits, {} misses",
         r1.n_stages, r1.n_cache_hits, r1.n_cache_misses
     );
 
@@ -192,7 +193,7 @@ async fn main() {
         .await
         .expect("run 2");
     println!(
-        "  → {} stages, {} hits, {} misses",
+        "  → {} ingredients, {} hits, {} misses",
         r2.n_stages, r2.n_cache_hits, r2.n_cache_misses
     );
 

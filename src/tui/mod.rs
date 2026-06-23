@@ -1951,7 +1951,7 @@ fn draw_cockpit_body(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     lines.push(Line::from(""));
     for (key, label, desc) in [
         ('G', "DAG", "the run's plan graph + per-node status"),
-        ('I', "Lineage", "stage hashes · cache · code freshness"),
+        ('I', "Lineage", "ingredient hashes · cache · code freshness"),
         ('A', "Artifacts", "content-addressed outputs of a run"),
         ('P', "Catalog", "registered recipes by course + args"),
     ] {
@@ -2563,7 +2563,7 @@ fn draw_dag(f: &mut Frame<'_>, area: Rect, app: &App) {
                 Span::styled(g.job.clone(), theme::dim()),
             ]));
             lines.push(Line::from(Span::styled(
-                format!("{} stage(s) · {} edge(s)", g.nodes.len(), g.edges.len()),
+                format!("{} ingredient(s) · {} edge(s)", g.nodes.len(), g.edges.len()),
                 theme::dim(),
             )));
             lines.push(Line::from(""));
@@ -2643,7 +2643,7 @@ fn draw_lineage(f: &mut Frame<'_>, area: Rect, app: &App) {
         lines.push(Line::from(Span::styled(
             format!(
                 "  {:<3} {:<24} {:<12} {:<12} {:<7} {}",
-                "#", "Stage", "Input", "Output", "Cached", "Elapsed"
+                "#", "Ingredient", "Input", "Output", "Cached", "Elapsed"
             ),
             theme::dim(),
         )));
@@ -2691,7 +2691,7 @@ fn draw_artifacts(f: &mut Frame<'_>, area: Rect, app: &App) {
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            format!("  {:<24} {:<24} {:<14} {}", "Kind", "Stage", "Hash", "When"),
+            format!("  {:<24} {:<24} {:<14} {}", "Kind", "Ingredient", "Hash", "When"),
             theme::dim(),
         )));
         for (i, a) in app.artifacts.iter().enumerate() {

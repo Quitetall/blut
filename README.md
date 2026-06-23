@@ -1,12 +1,13 @@
 # BLUT — Brian Lam's Universal Trainer
 
 A **Rust-native, compile-time-typed orchestration framework for local ML
-training.** You wire stages into a typed DAG; blut runs it against a
-content-addressed cache, under per-stage memory containment, with structured
-observability — and refuses to wire two stages whose types don't line up.
+training.** You wire stages, called *ingredients* in BLUT, into a typed DAG;
+blut runs it against a content-addressed cache, under per-ingredient memory
+containment, with structured observability — and refuses to wire two ingredients
+whose types don't line up.
 
 `blut` is a **library crate** (no binary of its own). You build a *cookbook* on
-top of it — your stages, your recipes, your CLI binary — in a few hundred lines.
+top of it — your ingredients, your recipes, your CLI binary — in a few hundred lines.
 It ships **zero** domain code: no bundled recipes, no Python, no opinion about
 what you train.
 
@@ -38,10 +39,10 @@ BLUT organizes work as a five-layer hierarchy:
   `register_recipe!`)*
 - **Ingredient** — an **atomic primitive**: a typed `Stage` (`Input → Output`),
   the smallest reusable unit of work. A training cookbook also has finer
-  primitives — optimizers, schedulers, losses — that a stage composes. *(the
-  `Stage` trait)*
+  primitives — optimizers, schedulers, losses — that an ingredient composes.
+  *(the `Stage` trait)*
 - **BLUT** — the engine: it loads cookbooks, lists/selects recipes by course, and
-  runs a recipe's plan against the content-addressed cache under per-stage
+  runs a recipe's plan against the content-addressed cache under per-ingredient
   resource + memory admission. *(`blut::cli::run(registry)`)*
 
 [`examples/first_cookbook.rs`](examples/first_cookbook.rs) builds one of each
@@ -51,8 +52,8 @@ layer and runs it end-to-end:
 $ cargo run --example first_cookbook
 BLUT loaded cookbook 'demo'. Recipes by course:
   • User  count_to_three  — MakeOne → Increment → Increment (demo)
-Run 1 (cold cache):  → 3 stages, 0 hits, 3 misses
-Run 2 (warm cache):  → 3 stages, 3 hits, 0 misses
+Run 1 (cold cache):  → 3 ingredients, 0 hits, 3 misses
+Run 2 (warm cache):  → 3 ingredients, 3 hits, 0 misses
 ```
 
 ## Why
@@ -74,16 +75,16 @@ let plan = Plan::<(), MyBackend>::new("train", json!({}))
 let result = SequentialExecutor::execute(plan, ExecCtx::new(job_dir)).await?;
 ```
 
-- **Stages** declare a typed `Input → Output` and the resources they hold
+- **Ingredients** declare a typed `Input → Output` and the resources they hold
   (`Gpu`, `Cpu`, `Network`, `Disk`). Wrong wiring is a `cargo build` error, not a
   runtime panic — `Train`'s `Input` must equal `PrepareData`'s `Output`.
 - **Plans** are typed DAGs; **recipes** compile typed args into plans (a named,
   args-driven catalog); **cookbooks** group recipes + their backend.
-- **Cache** content-addresses every stage output by
-  `(stage, schema, input_hash, args_hash)` — crash mid-run, re-run, and finished
-  stages are served from cache instead of recomputed.
-- **Containment** (Linux + systemd) runs each stage under a `systemd-run --user`
-  transient unit with a `MemoryMax` cap sized from a per-stage footprint, plus a
+- **Cache** content-addresses every ingredient output by
+  `(ingredient, schema, input_hash, args_hash)` — crash mid-run, re-run, and
+  finished ingredients are served from cache instead of recomputed.
+- **Containment** (Linux + systemd) runs each ingredient under a `systemd-run --user`
+  transient unit with a `MemoryMax` cap sized from a per-ingredient footprint, plus a
   box-fit **admission gate** that refuses a job that wouldn't fit — so an OOM is
   a contained unit-kill, never a session-wide crash.
 - **Observability** streams a `status.jsonl` event log per job and exposes a
@@ -95,12 +96,12 @@ The four moving parts (see the runnable
 [`examples/first_cookbook.rs`](examples/first_cookbook.rs)):
 
 1. A **backend identity** — a unit struct implementing `TrainingBackend`. A
-   `Plan<Out, B>` is parameterized over its backend `B`; a stage only joins a
-   plan whose backend it is `Compatible` with.
+   `Plan<Out, B>` is parameterized over its backend `B`; an ingredient only joins
+   a plan whose backend it is `Compatible` with.
 2. An **artifact** — a `Serialize`/`Deserialize` struct implementing `Artifact`
-   (a content-hashed handle to a stage's output).
-3. **Stages** — typed `Input → Output` units implementing `Stage`.
-4. A **plan / recipe** — wire stages with `Plan::start().then().finish()`, or
+   (a content-hashed handle to an ingredient's output).
+3. **Ingredients** — typed `Input → Output` units implementing `Stage`.
+4. A **plan / recipe** — wire ingredients with `Plan::start().then().finish()`, or
    register a named recipe with the `register_recipe!` macro and group recipes
    into a `Cookbook`.
 
