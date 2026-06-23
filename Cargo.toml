@@ -79,6 +79,7 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"], optional = true }
 aes-gcm = { version = "0.10", optional = true }
 x25519-dalek = { version = "2.0", features = ["static_secrets"], optional = true }
 blake3 = { version = "1", optional = true }
+hkdf = { version = "0.12", optional = true }
 # TUI deps — optional, behind the default-on `tui` feature. Building with
 # `--no-default-features` drops these three from the dependency tree and
 # yields a lean CLI-only binary.
@@ -92,7 +93,7 @@ default = ["tui"]
 # in 1.0; drop it with `blut = { ..., default-features = false }` for CLI-only.
 tui = ["dep:ratatui", "dep:crossterm", "dep:fuzzy-matcher"]
 # P2P distributed compute — trust model, encryption, task dispatch.
-p2p = ["dep:ed25519-dalek", "dep:aes-gcm", "dep:x25519-dalek", "dep:blake3"]
+p2p = ["dep:ed25519-dalek", "dep:aes-gcm", "dep:x25519-dalek", "dep:blake3", "dep:hkdf"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -47,7 +47,7 @@ impl PeerRegistry {
         }
     }
 
-    /// Save the registry to disk (atomic write via rename).
+    /// Save the registry to disk (atomic write via fsync + rename).
     pub fn save(&self) -> Result<(), TrainError> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| TrainError::Io {
@@ -59,6 +59,16 @@ impl PeerRegistry {
             .map_err(|e| TrainError::other(format!("serialize registry: {e}")))?;
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, &json).map_err(|e| TrainError::Io {
+            path: tmp.clone(),
+            source: e,
+        })?;
+        // fsync before rename to prevent data loss on crash (ext4 data=writeback,
+        // XFS can reorder writes vs rename without fsync).
+        let f = std::fs::File::open(&tmp).map_err(|e| TrainError::Io {
+            path: tmp.clone(),
+            source: e,
+        })?;
+        f.sync_all().map_err(|e| TrainError::Io {
             path: tmp.clone(),
             source: e,
         })?;

@@ -105,7 +105,7 @@ impl PeerInfo {
         }
     }
 
-    /// Update reputation after a task completes. Bayesian-style:
+    /// Update reputation after a task completes. Exponential moving average:
     /// success → reputation moves toward 1.0, failure → toward 0.0.
     pub fn record_outcome(&mut self, success: bool) {
         if success {

@@ -113,7 +113,7 @@ pub fn encrypt(
     let eph_secret = x25519_dalek::EphemeralSecret::random_from_rng(rand::thread_rng());
     let eph_public = x25519_dalek::PublicKey::from(&eph_secret);
     let shared = eph_secret.diffie_hellman(recipient_x25519_pub);
-    let seal_key = sha256_bytes(shared.as_bytes());
+    let seal_key = hkdf_derive(shared.as_bytes(), b"blut-p2p-seal-v1");
     let seal_cipher = Aes256Gcm::new_from_slice(&seal_key).expect("32-byte key");
     let seal_nonce_ref = Nonce::from_slice(&seal_nonce);
     let sealed_aes = seal_cipher
@@ -152,7 +152,7 @@ pub fn decrypt(
     // ECDH → shared secret → SHA-256 → AES key for unsealing.
     let eph_pub = x25519_dalek::PublicKey::from(eph_pub_bytes);
     let shared = recipient_x25519_secret.diffie_hellman(&eph_pub);
-    let seal_key = sha256_bytes(shared.as_bytes());
+    let seal_key = hkdf_derive(shared.as_bytes(), b"blut-p2p-seal-v1");
     let seal_cipher = Aes256Gcm::new_from_slice(&seal_key)
         .map_err(|_| TrainError::other("invalid seal key"))?;
     let seal_nonce = Nonce::from_slice(&seal_nonce_bytes);
@@ -169,12 +169,12 @@ pub fn decrypt(
         .map_err(|_| TrainError::other("AES-256-GCM decryption failed — wrong key or tampered"))
 }
 
-/// SHA-256 helper (returns 32 bytes).
-fn sha256_bytes(data: &[u8]) -> [u8; 32] {
-    use sha2::Digest;
-    let mut h = sha2::Sha256::new();
-    h.update(data);
-    h.finalize().into()
+/// HKDF-SHA256 key derivation with domain separation.
+fn hkdf_derive(ikm: &[u8], info: &[u8]) -> [u8; 32] {
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, ikm);
+    let mut okm = [0u8; 32];
+    hk.expand(info, &mut okm).expect("32 bytes is valid for SHA-256");
+    okm
 }
 
 #[cfg(test)]
