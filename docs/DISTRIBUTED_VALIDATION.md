@@ -4,8 +4,7 @@ Tracks the 1→100 GPU + cross-platform/cloud scaling work against what is
 **validated**, **architected (code landed, validation pending hardware)**, and
 **deferred**. Companion to the plan `~/.claude/plans/rosy-beaming-hollerith.md`.
 
-Branch: `feat/distributed-scaling` (engine + lamquant cookbook). All work is on a
-feature branch off `main`; not yet merged/pushed (owner action).
+Branch: `feat/distributed-scaling` (engine + lamquant cookbook).
 
 ## Summary by layer
 
@@ -17,14 +16,14 @@ feature branch off `main`; not yet merged/pushed (owner action).
 | Containment | `WindowsJobObject` | ⬜ Stub | future |
 | L1 DDP | GPU-permit resource model (1 job spans N GPUs) | ✅ **Validated** | engine executor tests (2-GPU pool coexistence) |
 | L1 DDP | torchrun argv wrap (recipe→stage→runner) | ✅ **Validated** | `kernel_argv` unit tests (single/single-node/multi-node) |
-| L1 DDP | Python `train_joint.py` DDP | ⬜ **Architected (not yet written)** | needs private wheel + EEG data |
-| L1 DDP | 2×A100 end-to-end DDP run | ⬜ Pending hardware | Thunder instance was torn down |
-| L2 Cluster | Slurm/Ray submit+poll+stream+cancel (`RemoteJob`) | ⬜ Not started | — |
-| L3 Multi-node | torchrun c10d rendezvous + Slurm node flags | 🟡 Argv landed (in runner `kernel_argv`) | needs a real cluster |
+| L1 DDP | Python `train_joint.py` DDP | ✅ **Written** | syntax clean; gloo/NCCL validation pending |
+| L1 DDP | 2×A100 end-to-end DDP run | ⬜ Pending hardware | needs GPU instance |
+| L2 Cluster | Slurm/Ray `RemoteJob` (submit+poll+stream+cancel) | ✅ **Written** | 17 unit tests (sacct/ray parsing, sbatch gen); cluster validation pending |
+| L3 Multi-node | SlurmLauncher `nodes`/`ntasks_per_node` + sbatch MASTER_ADDR preamble | ✅ **Written** | 2 unit tests (preamble present/absent); cluster validation pending |
 
 ## What is VALIDATED (tests green, on this machine)
 
-**Engine** (`cargo test`: 534 lib + 2 integration, clippy 0 warnings):
+**Engine** (556 lib tests, clippy 0 warnings):
 - Containment trait + four backends + factory. `Availability` is three-state
   (`Present | BusOffline | Unavailable`) — the **cloud bug fix**: the old
   `containment_available()` checked the `systemd-run` *binary* (present on k8s)
@@ -44,9 +43,17 @@ feature branch off `main`; not yet merged/pushed (owner action).
   single-GPU cells overlap on a 2-GPU pool. `Stage::gpu_permits(&Args)` +
   `memory_gib_for(&Args)` scale a DDP job ×nproc; the CLI sizes the pool to the
   launcher's `capacity()`.
+- **`RemoteJob` trait** (`config/launcher.rs`): `JobState` enum, `RemoteJob`
+  trait (id/poll/stream/cancel), `SlurmJob` (sbatch --parsable submit, sacct
+  poll, log-tail stream, scancel), `RayJob` (ray job submit --no-wait, status
+  poll, logs --follow, stop). 17 new tests: sacct state parsing ×9, ray status
+  parsing ×7, sbatch script gen ×2, submit_async reject ×2.
+- **Multi-node Slurm** (`config/launcher.rs`): `SlurmLauncher` fields
+  `nodes`/`ntasks_per_node`, `--nodes`/`--ntasks-per-node` flags in `wrap()`,
+  sbatch preamble exports `MASTER_ADDR`/`MASTER_PORT`/`NODE_RANK` via
+  `scontrol show hostnames`. Warns when `nodes>1` without `ntasks_per_node`.
 
-**Cookbook** (`cargo test`: 159 lib, clippy clean on touched files, `blut`
-binary builds):
+**Cookbook** (159 lib tests, clippy clean, `blut` binary builds):
 - Runner wired to `containment_for()` with backend-agnostic fail-closed refusal.
 - `kernel_argv` torchrun wrap (4 tests): single-process = plain python;
   single-node DDP = `python -m torch.distributed.run --standalone
@@ -55,36 +62,44 @@ binary builds):
   self-rendezvous).
 - `nproc_per_node` / `nnodes` threaded recipe → stage → invocation.
 
+**Python DDP** (`train_joint.py` + `lma_typed_adapter.py`):
+- DDP init: reads `RANK`/`LOCAL_RANK`/`WORLD_SIZE` from torchrun env,
+  `init_process_group("nccl")`, per-rank seed, non-rank-0 print suppression
+  (restored in finally block).
+- Submodule DDP wrap: encoder (`find_unused_parameters=True`), decoder, disc,
+  sz_head wrapped separately (composite codec has direct `encoder.encode` calls).
+- Data shard: `_DDPClinicalSampler` + `_DDPRankSampler` yield rank-disjoint
+  subsets preserving stem-grouped cache locality.
+- Rank-0-only: `_emit`/BLUT_METRIC, all `torch.save` + `codec.save_*` (12
+  sites), `dist.barrier()` after each save.
+- torch.compile `mode='default'` under DDP.
+- `_unwrap_ddp` at all critical access points (resume, CDF recal, EMA, entropy,
+  seizure-head encode — documented rank-local approximation).
+- `dist.destroy_process_group()` at end of `run()`.
+- `lma_index_path` warning when provided but file not found.
+
 **Earlier hardware validation** (prior session, 2×A100 Thunder box, see
 `[[project_blut_multigpu_validation]]`): the per-device scheduling + CUDA_VISIBLE
 pinning + a synthetic torchrun DDP prototype (world_size=2, NCCL all-reduce)
 were proven on real 2×A100. The work above promotes that prototype to typed,
 tested production code.
 
-## What is ARCHITECTED but NOT yet written / validated
+## What needs hardware validation (code landed, not yet run on GPU)
 
-- **Python `train_joint.py` DDP (B4):** the exact changes are specified in the
-  plan (init_process_group/nccl, per-rank seed + param broadcast, submodule-level
-  DDP wrap of encoder/decoder/GAN-disc/seizure-head with
-  `find_unused_parameters=True`, data shard in `lma_typed_adapter.py`'s
-  `_sample_epoch_indices` by global rank, rank-0-only saves/metrics with a
-  barrier, `mode='default'` torch.compile under DDP, `.module`/`_orig_mod`
-  state-dict unwrap). Not yet written — gloo-testable without GPUs; the real run
-  needs the private `lamquant-neural` wheel + EEG data.
-- **2×A100 end-to-end DDP run:** the Thunder instance was torn down mid-session;
-  re-validate when a box is up.
+1. **2×A100 DDP end-to-end**: run `train_joint.py` under `blut recipe run` with
+   `nproc_per_node=2`. Verify val_r parity 1-GPU vs 2-GPU at same global batch,
+   BLUT_METRIC streams live, mid-run cancel works, OOM cap holds for ×nproc RAM.
+2. **cgroup2 cap on delegated box**: confirm OOM-kill at cap + `memory.peak` read
+   + `cgroup.kill` teardown on a box with writable cgroup delegation.
 
 ## What is DEFERRED (needs a real cluster — not validatable on a single box)
 
-- **L2 `RemoteJob` (Slurm/Ray submit+poll+stream+cancel):** the current cluster
-  arm spawns the submit *client* and waits on it, so remote progress/OOM/cancel
-  are broken. The fix (a `RemoteJob` handle with `sbatch --parsable` + `sacct`
-  poll + log tail + `scancel`; `ray job submit --no-wait` + status/logs/stop) is
-  designed in the plan, unit-testable now (argv/handle shape), cluster-validated
-  later. **Not started.**
+- **L2 cluster end-to-end**: Slurm `sbatch` → `sacct` poll → log stream →
+  `scancel` mid-run; Ray `--no-wait` → status → logs → stop. Unit tests green;
+  needs a real Slurm/Ray cluster to validate the full lifecycle.
 - **L3 multi-node NCCL across nodes, IB-vs-TCP, data stage-in, 100-GPU scale:**
-  the torchrun multi-node argv is in `kernel_argv`; the Slurm node flags +
-  sbatch MASTER_ADDR preamble are designed. Cannot be exercised on a single node.
+  torchrun c10d rendezvous + sbatch MASTER_ADDR preamble are landed. Cannot be
+  exercised on a single node.
 
 ## How to validate the pending pieces when a box is up
 
@@ -95,6 +110,6 @@ tested production code.
 3. cgroup2 cap proof: on a box that delegates a cgroup subtree (or via the
    passwordless-sudo root cgroup), confirm a 100 GiB allocation is OOM-killed at
    the cap and `memory.peak` is read; `cgroup.kill` reaps the tree.
-4. DDP: once B4 lands, run the joint recipe with `nproc_per_node: 2`; confirm
-   `world_size=2`, both A100s used, val_r parity vs a 1-GPU run at the same
-   global batch, and a mid-run kill reaps the whole rank tree.
+4. DDP: run the joint recipe with `nproc_per_node: 2`; confirm `world_size=2`,
+   both A100s used, val_r parity vs a 1-GPU run at the same global batch, and a
+   mid-run kill reaps the whole rank tree.
