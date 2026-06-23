@@ -25,7 +25,7 @@ use crate::p2p::transport::P2pServer;
 
 /// Handle to a task submitted to the coordinator, used to track its
 /// lifecycle and deliver the result.
-struct PendingTask {
+pub(crate) struct PendingTask {
     result_tx: oneshot::Sender<Result<TaskResult, String>>,
     expected_output_hash: ContentHash,
 }
@@ -34,9 +34,11 @@ struct PendingTask {
 pub struct Coordinator {
     server: Arc<P2pServer>,
     dispatch: Arc<dyn DispatchPolicy>,
-    pending: Arc<RwLock<HashMap<String, PendingTask>>>,
+    /// Pending tasks. Uses parking_lot so the sync DispatchSubmitter::submit
+    /// can lock without async.
+    pub(crate) pending: Arc<parking_lot::RwLock<HashMap<String, PendingTask>>>,
     /// Active peer connections, keyed by PeerId.
-    connections: Arc<RwLock<HashMap<PeerId, quinn::Connection>>>,
+    pub(crate) connections: Arc<RwLock<HashMap<PeerId, quinn::Connection>>>,
 }
 
 impl Coordinator {
@@ -48,7 +50,7 @@ impl Coordinator {
         peers: PeerRegistry,
     ) -> Result<Self, TrainError> {
         let server = Arc::new(P2pServer::bind(addr, keypair, peers).await?);
-        let pending = Arc::new(RwLock::new(HashMap::new()));
+        let pending = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let connections = Arc::new(RwLock::new(HashMap::new()));
 
         // Spawn the accept loop.
@@ -96,7 +98,7 @@ impl Coordinator {
 
         // Register as pending.
         {
-            let mut pending = self.pending.write().await;
+            let mut pending = self.pending.write();
             pending.insert(task_id.clone(), PendingTask {
                 result_tx,
                 expected_output_hash,
@@ -114,7 +116,7 @@ impl Coordinator {
             tracing::info!("Dispatched task {} to peer {}", task_id, peer_id);
         } else {
             // Peer not connected — remove from pending and fail.
-            let mut pending = self.pending.write().await;
+            let mut pending = self.pending.write();
             pending.remove(&task_id);
             return Err(TrainError::other(format!(
                 "peer {} not connected (task {})", peer_id, task_id
@@ -139,7 +141,7 @@ impl Coordinator {
     /// results to pending tasks.
     async fn accept_loop(
         server: Arc<P2pServer>,
-        pending: Arc<RwLock<HashMap<String, PendingTask>>>,
+        pending: Arc<parking_lot::RwLock<HashMap<String, PendingTask>>>,
         dispatch: Arc<dyn DispatchPolicy>,
         connections: Arc<RwLock<HashMap<PeerId, quinn::Connection>>>,
     ) {
@@ -175,7 +177,7 @@ impl Coordinator {
         peer_id: PeerId,
         conn: quinn::Connection,
         server: Arc<P2pServer>,
-        pending: Arc<RwLock<HashMap<String, PendingTask>>>,
+        pending: Arc<parking_lot::RwLock<HashMap<String, PendingTask>>>,
         dispatch: Arc<dyn DispatchPolicy>,
     ) {
         tracing::debug!("Handling peer {}", peer_id);
@@ -189,7 +191,7 @@ impl Coordinator {
                     let verdict = {
                         let peers = server.peers.read().await;
                         if let Some(peer_info) = peers.get(&result.peer_id) {
-                            let pending_map = pending.read().await;
+                            let pending_map = pending.read();
                             if let Some(pt) = pending_map.get(&task_id) {
                                 dispatch.verify_result(&result, &pt.expected_output_hash, &peer_info.pubkey)
                             } else {
@@ -208,7 +210,7 @@ impl Coordinator {
                                 peers.update_reputation(&result.peer_id, true);
                                 let _ = peers.save();
                             }
-                            let mut pending_map = pending.write().await;
+                            let mut pending_map = pending.write();
                             if let Some(pt) = pending_map.remove(&task_id) {
                                 let _ = pt.result_tx.send(Ok(result));
                             }
@@ -220,14 +222,14 @@ impl Coordinator {
                                 peers.update_reputation(&result.peer_id, false);
                                 let _ = peers.save();
                             }
-                            let mut pending_map = pending.write().await;
+                            let mut pending_map = pending.write();
                             if let Some(pt) = pending_map.remove(&task_id) {
                                 let _ = pt.result_tx.send(Err(reason));
                             }
                         }
                         DispatchVerdict::RetryOnDifferentPeer => {
                             tracing::info!("Task {} needs retry on different peer", task_id);
-                            let mut pending_map = pending.write().await;
+                            let mut pending_map = pending.write();
                             if let Some(pt) = pending_map.remove(&task_id) {
                                 let _ = pt.result_tx.send(Err("retry on different peer".into()));
                             }
@@ -245,5 +247,98 @@ impl Coordinator {
     /// Shut down the coordinator.
     pub fn shutdown(&self) {
         self.server.shutdown();
+    }
+}
+
+/// A handle to a dispatched P2P task, polling via the pending map.
+struct CoordinatorDispatchHandle {
+    _task_id: String,
+    _result_rx: tokio::sync::oneshot::Receiver<Result<TaskResult, String>>,
+}
+
+impl crate::framework::executor::DispatchHandle for CoordinatorDispatchHandle {
+    fn poll(&self) -> Result<Option<crate::config::launcher::JobState>, crate::error::TrainError> {
+        // We can't poll a oneshot receiver synchronously. Return None
+        // (still running) and let the executor's async poll loop drive it.
+        // The actual polling happens in the P2pJob's poll() method.
+        Ok(None)
+    }
+
+    fn cancel(&self) -> Result<(), crate::error::TrainError> {
+        // TODO: send cancel to peer
+        Ok(())
+    }
+}
+
+impl crate::framework::executor::DispatchSubmitter for Coordinator {
+    fn submit(
+        &self,
+        stage_name: &str,
+        stage_schema: u32,
+        input_hash: ContentHash,
+        args_hash: ContentHash,
+        args: &serde_json::Value,
+        expected_output_hash: ContentHash,
+    ) -> Result<Box<dyn crate::framework::executor::DispatchHandle>, crate::error::TrainError> {
+        // Build a TaskManifest and submit via the coordinator's async path.
+        // Since DispatchSubmitter::submit is sync, we spawn the async work.
+        let task_id = format!("p2p-{}", uuid::Uuid::new_v4());
+        let manifest = TaskManifest {
+            task_id: task_id.clone(),
+            coordinator_id: PeerId([0u8; 32]), // TODO: coordinator's peer ID
+            stage_name: stage_name.to_string(),
+            stage_schema,
+            input_hash,
+            args_hash,
+            expected_output_hash,
+            args: args.clone(),
+            resources: crate::p2p::task::ResourceRequest::default(),
+            data_class: crate::p2p::trust::DataClass::Public,
+            timeout_secs: 3600,
+            encrypted_input: None,
+            signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]), // TODO: sign properly
+        };
+
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+
+        // Register as pending.
+        {
+            let mut pending = self.pending.write();
+            pending.insert(task_id.clone(), PendingTask {
+                result_tx,
+                expected_output_hash,
+            });
+        }
+
+        // Spawn the async dispatch.
+        let connections = self.connections.clone();
+        let pending_c = self.pending.clone();
+        let task_id_c = task_id.clone();
+        tokio::spawn(async move {
+            let conn = {
+                let conns = connections.read().await;
+                // TODO: select peer via dispatch policy
+                conns.values().next().cloned()
+            };
+            if let Some(conn) = conn {
+                if let Err(e) = P2pServer::send_task(&conn, &manifest).await {
+                    tracing::warn!("P2P dispatch failed for {}: {e}", task_id_c);
+                    let mut pending = pending_c.write();
+                    if let Some(pt) = pending.remove(&task_id_c) {
+                        let _ = pt.result_tx.send(Err(format!("dispatch failed: {e}")));
+                    }
+                }
+            } else {
+                let mut pending = pending_c.write();
+                if let Some(pt) = pending.remove(&task_id_c) {
+                    let _ = pt.result_tx.send(Err("no peers connected".into()));
+                }
+            }
+        });
+
+        Ok(Box::new(CoordinatorDispatchHandle {
+            _task_id: task_id,
+            _result_rx: result_rx,
+        }))
     }
 }

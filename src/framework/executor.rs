@@ -43,6 +43,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::framework::artifact::{ArtifactMetadata, ContentHash};
 use crate::framework::cache::CacheHandle;
+use crate::config::launcher::JobState;
 use crate::framework::control::{Control, ControlPolicy, StepMetrics};
 use crate::framework::error::{PlanError, StageError};
 use crate::framework::plan::{CompiledPlan, NodeId};
@@ -61,6 +62,33 @@ pub const DEFAULT_MAX_IN_FLIGHT: usize = 8;
 /// box-fit. Picked large enough to never gate, small enough to stay a valid
 /// `tokio::Semaphore` permit count.
 pub const UNLIMITED_MEM_GIB: u32 = 1_000_000;
+
+/// Handle to a dispatched remote task. The executor polls this to
+/// determine when the task completes.
+pub trait DispatchHandle: Send + Sync {
+    /// Poll the remote task. Returns `Some(JobState)` when terminal,
+    /// `None` if still running.
+    fn poll(&self) -> Result<Option<JobState>, crate::error::TrainError>;
+    /// Cancel the remote task.
+    fn cancel(&self) -> Result<(), crate::error::TrainError>;
+}
+
+/// Trait for submitting tasks to a remote compute network. The P2P
+/// coordinator implements this; the executor calls it when a stage
+/// is dispatchable.
+pub trait DispatchSubmitter: Send + Sync {
+    /// Submit a stage for remote execution. Returns a handle for
+    /// tracking the task's lifecycle.
+    fn submit(
+        &self,
+        stage_name: &str,
+        stage_schema: u32,
+        input_hash: ContentHash,
+        args_hash: ContentHash,
+        args: &serde_json::Value,
+        expected_output_hash: ContentHash,
+    ) -> Result<Box<dyn DispatchHandle>, crate::error::TrainError>;
+}
 
 /// Caller-supplied execution context. Threaded through every
 /// `StageContext`. Lives for the duration of one `execute` call.
@@ -129,6 +157,14 @@ pub struct ExecCtx {
     /// is the A/B "force recompute" semantic — set by the CLI `--no-cache` /
     /// `--force` flag. Default false ⇒ byte-identical to the pre-INC-D path.
     pub bypass_cache: bool,
+    /// P2P dispatch: policy that decides which stages are dispatchable.
+    /// When set alongside `dispatcher`, the parallel executor offloads
+    /// dispatchable DAG nodes to remote peers.
+    #[cfg(feature = "p2p")]
+    pub dispatch_policy: Option<Arc<dyn crate::p2p::dispatch::DispatchPolicy>>,
+    /// P2P dispatch: submits tasks to the remote compute network.
+    #[cfg(feature = "p2p")]
+    pub dispatcher: Option<Arc<dyn DispatchSubmitter>>,
 }
 
 impl ExecCtx {
@@ -165,6 +201,10 @@ impl ExecCtx {
             fb_warm: false,
             device_index: None,
             bypass_cache: false,
+            #[cfg(feature = "p2p")]
+            dispatch_policy: None,
+            #[cfg(feature = "p2p")]
+            dispatcher: None,
         }
     }
 
@@ -185,6 +225,19 @@ impl ExecCtx {
     /// `StageContext.fb_warm` so a train stage bills the warm footprint.
     pub fn with_fb_warm(mut self, warm: bool) -> Self {
         self.fb_warm = warm;
+        self
+    }
+
+    /// Set the P2P dispatch policy and submitter. When both are set,
+    /// the parallel executor offloads dispatchable stages to peers.
+    #[cfg(feature = "p2p")]
+    pub fn with_dispatch(
+        mut self,
+        policy: Arc<dyn crate::p2p::dispatch::DispatchPolicy>,
+        submitter: Arc<dyn DispatchSubmitter>,
+    ) -> Self {
+        self.dispatch_policy = Some(policy);
+        self.dispatcher = Some(submitter);
         self
     }
 
@@ -280,12 +333,19 @@ struct NodeEnv {
     /// divergence detail, populated by the coordinator at the KILL site (a
     /// `Control::KillBranch` or a `Stage::divergence_check` true) BEFORE it
     /// cancels the node's token. `run_node` reads it under `task.node_id` to
+    /// skip the stage on a targeted KILL (vs plan-wide cancel).
     /// tell a DIVERGENCE kill (→ retryable `StageError::Diverged`, auto-resume)
     /// apart from a plain targeted kill / plan cancel (→ unchanged Killed /
     /// Cancelled). The `Mutex` is held only for a tiny insert/get/remove — NEVER
     /// across an `.await` — so it can't deadlock the coordinator seam. Empty when
     /// no control policy is set, so the non-control path never touches it.
     diverged: Arc<std::sync::Mutex<HashMap<NodeId, String>>>,
+    /// P2P dispatch policy + submitter. When set, dispatchable stages
+    /// are offloaded to peers instead of running locally.
+    #[cfg(feature = "p2p")]
+    dispatch_policy: Option<Arc<dyn crate::p2p::dispatch::DispatchPolicy>>,
+    #[cfg(feature = "p2p")]
+    dispatcher: Option<Arc<dyn DispatchSubmitter>>,
 }
 
 /// A REPLACEABLE per-node kill token (#4 / S1). Shared between the coordinator
@@ -1439,6 +1499,10 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
         recipe_name: plan.name().to_string(),
         on_retry: ctx.on_retry,
         diverged: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        #[cfg(feature = "p2p")]
+        dispatch_policy: ctx.dispatch_policy,
+        #[cfg(feature = "p2p")]
+        dispatcher: ctx.dispatcher,
     });
 
     Ok(Prelude {
@@ -1844,6 +1908,92 @@ impl ParallelExecutor {
                     if control.is_some() {
                         node_stages.insert(node_id, task.stage.clone());
                     }
+
+                    // P2P dispatch: if the stage is dispatchable and a
+                    // dispatcher is available, offload to a peer instead
+                    // of running locally.
+                    #[cfg(feature = "p2p")]
+                    if let (Some(policy), Some(dispatcher)) =
+                        (env.dispatch_policy.as_ref(), env.dispatcher.as_ref())
+                    {
+                        if policy.is_dispatchable(task.stage.name()) {
+                            let args_hash = ContentHash::of_bytes(&task.canon_args);
+                            match dispatcher.submit(
+                                task.stage.name(),
+                                task.stage.schema(),
+                                task.input_hash,
+                                args_hash,
+                                &task.args,
+                                task.key, // cache key = expected output hash
+                            ) {
+                                Ok(handle) => {
+                                    tracing::info!(
+                                        "Dispatched node {} ({}) to P2P peer",
+                                        node_idx,
+                                        task.stage.name()
+                                    );
+                                    let status = env.status.clone();
+                                    let stage_name = task.stage.name().to_string();
+                                    let key = task.key;
+                                    let _node_id_c = node_id;
+                                    let env_c = env.clone();
+                                    tokio::spawn(async move {
+                                        // Poll the remote task until terminal.
+                                        loop {
+                                            match handle.poll() {
+                                                Ok(Some(JobState::Succeeded)) => {
+                                                    status.emit(StageEvent::StageEnd {
+                                                        node_idx,
+                                                        stage_name,
+                                                        output_hash: key,
+                                                        elapsed: std::time::Duration::from_secs(0), // TODO: track actual elapsed
+                                                    });
+                                                    break;
+                                                }
+                                                Ok(Some(JobState::Failed(reason))) => {
+                                                    status.emit(StageEvent::StageFailed {
+                                                        node_idx,
+                                                        stage_name,
+                                                        error: reason,
+                                                        failure: None,
+                                                    });
+                                                    env_c.cancel.cancel();
+                                                    break;
+                                                }
+                                                Ok(Some(_)) => break, // Cancelled/Unknown
+                                                Ok(None) => {
+                                                    tokio::time::sleep(
+                                                        std::time::Duration::from_millis(500),
+                                                    ).await;
+                                                }
+                                                Err(e) => {
+                                                    status.emit(StageEvent::StageFailed {
+                                                        node_idx,
+                                                        stage_name,
+                                                        error: format!("{e}"),
+                                                        failure: None,
+                                                    });
+                                                    env_c.cancel.cancel();
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    });
+                                    in_flight += 1;
+                                    continue; // skip local spawn
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "P2P dispatch failed for node {} ({}), running locally: {e}",
+                                        node_idx,
+                                        task.stage.name()
+                                    );
+                                    // Fall through to local spawn.
+                                }
+                            }
+                        }
+                    }
+
                     let env_c = env.clone();
                     join.spawn(async move { run_node(task, env_c).await });
                     in_flight += 1;

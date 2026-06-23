@@ -958,6 +958,8 @@ pub enum LaunchTarget {
     Slurm,
     /// A Ray job (`ray job submit`).
     Ray,
+    /// P2P distributed compute (peer GPUs over QUIC).
+    P2P,
 }
 
 impl std::str::FromStr for LaunchTarget {
@@ -967,6 +969,7 @@ impl std::str::FromStr for LaunchTarget {
             "local" | "" => Ok(Self::Local),
             "slurm" => Ok(Self::Slurm),
             "ray" => Ok(Self::Ray),
+            "p2p" => Ok(Self::P2P),
             other => Err(TrainError::other(format!(
                 "unknown launcher '{other}' (expected local|slurm|ray)"
             ))),
@@ -998,6 +1001,9 @@ pub fn launcher_for(target: LaunchTarget) -> Box<dyn Launcher> {
             runtime_env: env("BLUT_RAY_RUNTIME_ENV"),
             extra: Vec::new(),
         }),
+        // P2P dispatch is handled by DispatchSubmitter, not Launcher.
+        // Fall through to LocalSystemd for local process management.
+        LaunchTarget::P2P => Box::new(LocalSystemd::default()),
     }
 }
 
