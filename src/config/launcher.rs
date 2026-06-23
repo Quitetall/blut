@@ -356,10 +356,14 @@ pub struct SlurmLauncher {
     pub mem: Option<String>,
     /// `--cpus-per-task`.
     pub cpus: Option<u32>,
-    /// `--gpus`.
+    /// `--gpus` (per-node GPU count).
     pub gpus: Option<u32>,
     /// `--time` (e.g. `"08:00:00"`).
     pub time: Option<String>,
+    /// `--nodes` — number of cluster nodes to allocate.
+    pub nodes: Option<u32>,
+    /// `--ntasks-per-node` — tasks (ranks) per node.
+    pub ntasks_per_node: Option<u32>,
     /// Verbatim passthrough flags appended before the `--` separator.
     pub extra: Vec<String>,
 }
@@ -389,6 +393,12 @@ impl Launcher for SlurmLauncher {
         }
         if let Some(t) = &self.time {
             args.push(format!("--time={t}"));
+        }
+        if let Some(n) = self.nodes {
+            args.push(format!("--nodes={n}"));
+        }
+        if let Some(n) = self.ntasks_per_node {
+            args.push(format!("--ntasks-per-node={n}"));
         }
         // A bare "--" in extra would prematurely close option parsing; the real
         // inner separator is appended below.
@@ -464,6 +474,12 @@ impl SlurmJob {
         if let Some(t) = time {
             lines.push(format!("#SBATCH --time={t}"));
         }
+        if let Some(n) = launcher.nodes {
+            lines.push(format!("#SBATCH --nodes={n}"));
+        }
+        if let Some(n) = launcher.ntasks_per_node {
+            lines.push(format!("#SBATCH --ntasks-per-node={n}"));
+        }
         // Only emit default --output if extra doesn't already specify one.
         let has_output = extra.iter().any(|x| x.starts_with("--output"));
         if !has_output {
@@ -474,6 +490,16 @@ impl SlurmJob {
             lines.push(format!("#SBATCH {x}"));
         }
         lines.push(String::new());
+        // Multi-node preamble: export MASTER_ADDR from Slurm's allocation so
+        // torchrun's c10d rendezvous can find the coordinator. Only needed when
+        // nodes > 1; single-node torchrun uses --standalone.
+        if launcher.nodes.unwrap_or(1) > 1 {
+            lines.push("# Multi-node rendezvous: resolve MASTER_ADDR from Slurm allocation".to_string());
+            lines.push("export MASTER_ADDR=$(scontrol show hostnames \"$SLURM_JOB_NODELIST\" | head -n1)".to_string());
+            lines.push("export MASTER_PORT=${MASTER_PORT:-29500}".to_string());
+            lines.push("export NODE_RANK=${SLURM_NODEID:-0}".to_string());
+            lines.push(String::new());
+        }
         // The inner command — shell-escape each arg to prevent injection.
         let escaped: Vec<String> = inner.iter().map(|a| Self::shell_escape(a)).collect();
         lines.push(escaped.join(" "));
@@ -956,6 +982,8 @@ pub fn launcher_for(target: LaunchTarget) -> Box<dyn Launcher> {
             cpus: env_u32("BLUT_SLURM_CPUS"),
             gpus: env_u32("BLUT_SLURM_GPUS"),
             time: env("BLUT_SLURM_TIME"),
+            nodes: env_u32("BLUT_SLURM_NODES"),
+            ntasks_per_node: env_u32("BLUT_SLURM_NTASKS_PER_NODE"),
             extra: Vec::new(),
         }),
         LaunchTarget::Ray => Box::new(RayLauncher {
@@ -1055,6 +1083,8 @@ mod tests {
             cpus: Some(8),
             gpus: Some(1),
             time: Some("08:00:00".into()),
+            nodes: None,
+            ntasks_per_node: None,
             extra: vec!["--exclusive".into()],
         };
         let c = l
@@ -1369,6 +1399,8 @@ mod tests {
             cpus: Some(16),
             gpus: Some(2),
             time: Some("12:00:00".into()),
+            nodes: None,
+            ntasks_per_node: None,
             extra: vec!["--exclusive".to_string(), "--".to_string()],
         };
         let script = SlurmJob::build_sbatch_script(
@@ -1390,6 +1422,44 @@ mod tests {
         assert_eq!(count, 0, "bare '--' should not appear as a flag");
         // Inner command appears at the end.
         assert!(script.contains("python train.py"));
+    }
+
+    #[test]
+    fn sbatch_script_multinode_has_master_addr_preamble() {
+        let launcher = SlurmLauncher {
+            nodes: Some(4),
+            ntasks_per_node: Some(2),
+            gpus: Some(2),
+            ..Default::default()
+        };
+        let script = SlurmJob::build_sbatch_script(
+            "ddp-job",
+            &launcher,
+            &["python".into(), "train.py".into()],
+        );
+        assert!(script.contains("#SBATCH --nodes=4"));
+        assert!(script.contains("#SBATCH --ntasks-per-node=2"));
+        assert!(script.contains("#SBATCH --gpus=2"));
+        // Multi-node preamble exports rendezvous env vars.
+        assert!(script.contains("MASTER_ADDR"));
+        assert!(script.contains("scontrol show hostnames"));
+        assert!(script.contains("NODE_RANK"));
+    }
+
+    #[test]
+    fn sbatch_script_single_node_omits_master_addr() {
+        let launcher = SlurmLauncher {
+            nodes: Some(1),
+            gpus: Some(2),
+            ..Default::default()
+        };
+        let script = SlurmJob::build_sbatch_script(
+            "single",
+            &launcher,
+            &["echo".into()],
+        );
+        assert!(!script.contains("MASTER_ADDR"));
+        assert!(!script.contains("scontrol"));
     }
 
     #[test]
