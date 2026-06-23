@@ -396,6 +396,13 @@ impl Launcher for SlurmLauncher {
         }
         if let Some(n) = self.nodes {
             args.push(format!("--nodes={n}"));
+            if n > 1 && self.ntasks_per_node.is_none() {
+                tracing::warn!(
+                    "SlurmLauncher: --nodes={n} without --ntasks-per-node; \
+                     Slurm defaults to 1 task/node — set BLUT_SLURM_NTASKS_PER_NODE \
+                     if you want N ranks per node (e.g. --ntasks-per-node=gpus)."
+                );
+            }
         }
         if let Some(n) = self.ntasks_per_node {
             args.push(format!("--ntasks-per-node={n}"));
