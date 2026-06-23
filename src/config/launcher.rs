@@ -24,6 +24,7 @@ pub enum LauncherKind {
 
 /// State of a remote job, as reported by the scheduler.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum JobState {
     /// Job is queued or running.
     Running,
@@ -414,9 +415,26 @@ pub struct SlurmJob {
 }
 
 impl SlurmJob {
+    /// Shell-escape a single argument for safe interpolation into a bash script.
+    /// Wraps in single quotes and escapes any embedded single quotes.
+    fn shell_escape(arg: &str) -> String {
+        if arg.is_empty() {
+            return "''".to_string();
+        }
+        // Fast path: safe characters only.
+        if arg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-+=:@/".contains(&b))
+        {
+            return arg.to_string();
+        }
+        // General path: single-quote and escape embedded single quotes.
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
+
     /// Build an `sbatch` script body from the launcher config + inner command.
     /// The script is submitted via stdin to `sbatch`, so no temp file is
-    /// needed.
+    /// needed. Inner args are shell-escaped to prevent injection.
     fn build_sbatch_script(
         unit: &str,
         launcher: &SlurmLauncher,
@@ -446,14 +464,19 @@ impl SlurmJob {
         if let Some(t) = time {
             lines.push(format!("#SBATCH --time={t}"));
         }
-        lines.push("#SBATCH --output=slurm-%j.out".to_string());
+        // Only emit default --output if extra doesn't already specify one.
+        let has_output = extra.iter().any(|x| x.starts_with("--output"));
+        if !has_output {
+            lines.push("#SBATCH --output=slurm-%j.out".to_string());
+        }
         // Append extra flags that are not bare "--".
         for x in extra.iter().filter(|x| *x != "--") {
             lines.push(format!("#SBATCH {x}"));
         }
         lines.push(String::new());
-        // The inner command.
-        lines.push(inner.join(" "));
+        // The inner command — shell-escape each arg to prevent injection.
+        let escaped: Vec<String> = inner.iter().map(|a| Self::shell_escape(a)).collect();
+        lines.push(escaped.join(" "));
         lines.join("\n")
     }
 
@@ -476,7 +499,7 @@ impl SlurmJob {
                 "OUT_OF_MEMORY" => JobState::Failed("OutOfMemory".to_string()),
                 "NODE_FAIL" => JobState::Failed("NODE_FAIL".to_string()),
                 "RUNNING" | "PENDING" | "CONFIGURING" | "SUSPENDED" => JobState::Running,
-                "CANCELLED" | "CANCELLED+" => JobState::Cancelled,
+                "CANCELLED" => JobState::Cancelled,
                 "BOOT_FAIL" | "DEADLINE" => JobState::Failed(state.to_string()),
                 _ => JobState::Unknown(state.to_string()),
             };
@@ -504,10 +527,14 @@ impl RemoteJob for SlurmJob {
             .map_err(|e| TrainError::other(format!("sacct invocation failed: {e}")))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
+            let code = match out.status.code() {
+                Some(c) => c.to_string(),
+                None => "signal".to_string(),
+            };
             return Err(TrainError::other(format!(
                 "sacct -j {} failed (exit {}): {}",
                 self.job_id,
-                out.status.code().unwrap_or(-1),
+                code,
                 stderr.trim()
             )));
         }
@@ -516,11 +543,12 @@ impl RemoteJob for SlurmJob {
     }
 
     fn stream(&self, sink: &dyn Fn(&str)) -> Result<()> {
-        // Poll the log file for new lines. Returns when the job reaches a
-        // terminal state. Uses a simple tail-follow loop: track the current
-        // byte offset and poll every 500ms.
-        let poll_interval = Duration::from_millis(500);
+        // Tail-follow the log file, polling sacct every 2s for terminal state.
+        // Returns Ok(()) on success, Err on failure/cancel/timeout.
+        let poll_interval = Duration::from_secs(2);
+        let max_idle = Duration::from_secs(3600); // 1h idle → timeout
         let mut offset: u64 = 0;
+        let mut idle_since = std::time::Instant::now();
         loop {
             // Stream whatever is new in the log file.
             if self.log_path.exists() {
@@ -531,7 +559,7 @@ impl RemoteJob for SlurmJob {
                         source: e,
                     }
                 })?;
-                let mut reader = std::io::BufReader::new(&file);
+                let mut reader = std::io::BufReader::new(file);
                 reader.seek(SeekFrom::Start(offset)).map_err(|e| {
                     TrainError::Io {
                         path: self.log_path.clone(),
@@ -551,7 +579,7 @@ impl RemoteJob for SlurmJob {
                         break;
                     }
                     offset += n as u64;
-                    // Trim the trailing newline for the sink.
+                    idle_since = std::time::Instant::now();
                     let trimmed = line.trim_end_matches('\n');
                     if !trimmed.is_empty() {
                         sink(trimmed);
@@ -561,10 +589,35 @@ impl RemoteJob for SlurmJob {
             // Check if the job has finished.
             match self.poll()? {
                 JobState::Running => {
+                    if idle_since.elapsed() > max_idle {
+                        return Err(TrainError::other(format!(
+                            "slurm job {} stream timed out after no output for {}s",
+                            self.job_id,
+                            max_idle.as_secs()
+                        )));
+                    }
                     thread::sleep(poll_interval);
                     continue;
                 }
-                _ => return Ok(()),
+                JobState::Succeeded => return Ok(()),
+                JobState::Failed(ref reason) => {
+                    return Err(TrainError::other(format!(
+                        "slurm job {} failed: {reason}",
+                        self.job_id,
+                    )));
+                }
+                JobState::Cancelled => {
+                    return Err(TrainError::other(format!(
+                        "slurm job {} was cancelled",
+                        self.job_id,
+                    )));
+                }
+                JobState::Unknown(ref s) => {
+                    return Err(TrainError::other(format!(
+                        "slurm job {} ended in unknown state: {s}",
+                        self.job_id,
+                    )));
+                }
             }
         }
     }
@@ -763,7 +816,7 @@ impl RemoteJob for RayJob {
         cmd.args(["job", "logs", &self.submission_id, "--follow"]);
         cmd.args(self.address_args());
         cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::piped());
         let mut child = cmd
             .spawn()
             .map_err(|e| TrainError::other(format!("ray job logs failed: {e}")))?;
@@ -777,8 +830,20 @@ impl RemoteJob for RayJob {
             })?;
             sink(&line);
         }
-        // After the log stream ends, check final status.
-        let _ = child.wait();
+        // After the log stream ends, check exit code.
+        let status = child
+            .wait()
+            .map_err(|e| TrainError::other(format!("ray job logs wait failed: {e}")))?;
+        if !status.success() {
+            let code = match status.code() {
+                Some(c) => c.to_string(),
+                None => "signal".to_string(),
+            };
+            return Err(TrainError::other(format!(
+                "ray job logs {} exited with {code}",
+                self.submission_id,
+            )));
+        }
         Ok(())
     }
 
