@@ -311,7 +311,9 @@ impl crate::framework::executor::DispatchSubmitter for Coordinator {
             0 => crate::p2p::trust::DataClass::Public,
             1 => crate::p2p::trust::DataClass::Internal,
             2 => crate::p2p::trust::DataClass::Restricted,
-            _ => crate::p2p::trust::DataClass::Public,
+            other => return Err(TrainError::other(format!(
+                "unknown data_class: {other} (expected 0=Public, 1=Internal, 2=Restricted)"
+            ))),
         };
         let resources = crate::p2p::task::ResourceRequest {
             cpu_cores: req.resource_request.cpu_cores,

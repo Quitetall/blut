@@ -22,9 +22,10 @@ use blut::p2p::trust::{DataClass, DispatchMatrix, TrustLevel};
 use blut::p2p::Coordinator;
 
 /// Create a temporary peer registry.
-fn temp_registry() -> PeerRegistry {
+fn temp_registry() -> (PeerRegistry, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    PeerRegistry::load(&dir.path().join("peers.json")).unwrap()
+    let reg = PeerRegistry::load(&dir.path().join("peers.json")).unwrap();
+    (reg, dir)
 }
 
 #[tokio::test]
@@ -34,7 +35,7 @@ async fn coordinator_accepts_peer_connection() {
 
     let dispatch: Arc<dyn DispatchPolicy> =
         Arc::new(DefaultDispatchPolicy::new(DispatchMatrix::default()));
-    let registry = temp_registry();
+    let (registry, _dir) = temp_registry();
 
     let coordinator = Coordinator::start(
         "127.0.0.1:0".parse().unwrap(),
