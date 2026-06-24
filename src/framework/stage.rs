@@ -5,7 +5,7 @@
 //!
 //! Architectural keystone of the v2 framework. Reading order:
 //!
-//!   1. `Stage` — typed user-facing trait. Concrete stages (in
+//!   1. `Stage` — typed user-facing trait. Concrete ingredients (in
 //!      `stages/`) implement this. Three associated types
 //!      (`Input`, `Output`, `Args`) and three constants (`NAME`,
 //!      `SCHEMA`, `RESOURCES`).
@@ -280,6 +280,21 @@ pub trait Stage: Send + Sync + 'static {
         + Sync
         + 'static;
 
+    /// How many `Resource::Gpu` permits to hold (default 1). A single-job DDP
+    /// stage overrides this to its `nproc_per_node` so it holds every GPU it
+    /// uses, blocking single-GPU cells from co-scheduling onto those devices.
+    /// Typed `Args` access; the erased `StageDyn::gpu_permits` deserializes and
+    /// delegates here.
+    fn gpu_permits(&self, _args: &Self::Args) -> u32 {
+        1
+    }
+
+    /// Args-aware RAM reservation (default = the const `MEMORY_GIB`). A DDP
+    /// stage scales it ×nproc (each rank is a full process).
+    fn memory_gib_for(&self, _args: &Self::Args) -> u32 {
+        Self::MEMORY_GIB
+    }
+
     /// Run the stage. Pure function over `(input, args)` plus
     /// whatever side effects the stage's nature requires (reading
     /// `ctx.job_dir`, writing to `ctx.stage_dir`, etc.).
@@ -361,6 +376,20 @@ pub trait StageDyn: Send + Sync + 'static {
     fn deterministic(&self) -> bool;
     fn resources(&self) -> &'static [Resource];
     fn memory_gib(&self) -> u32;
+    /// Args-aware RAM reservation. Defaults to the const `memory_gib()`; a
+    /// DDP stage overrides it to scale ×nproc (each rank is a full process).
+    /// The executor reserves THIS against the box-fit budget.
+    fn memory_gib_for(&self, _args: &serde_json::Value) -> u32 {
+        self.memory_gib()
+    }
+    /// How many `Resource::Gpu` permits this stage holds while running. Default
+    /// 1 (a single-GPU stage). A DDP stage returns `nproc_per_node` so it holds
+    /// every GPU it uses — the executor's GPU pool is sized to the device count,
+    /// so a DDP job blocks any single-GPU cell from co-scheduling onto a device
+    /// it owns. Args-aware (nproc comes from the recipe args).
+    fn gpu_permits(&self, _args: &serde_json::Value) -> u32 {
+        1
+    }
     fn input_kind(&self) -> &'static str;
     fn output_kind(&self) -> &'static str;
     fn args_schema(&self) -> serde_json::Value;
@@ -445,6 +474,30 @@ impl<S: Stage> StageDyn for S {
     }
     fn memory_gib(&self) -> u32 {
         S::MEMORY_GIB
+    }
+    fn memory_gib_for(&self, args: &serde_json::Value) -> u32 {
+        // Deserialize to typed Args and delegate; a bad-args value (shouldn't
+        // happen post-preflight) falls back to the const reservation.
+        match serde_json::from_value::<S::Args>(args.clone()) {
+            Ok(typed) => Stage::memory_gib_for(self, &typed),
+            Err(_) => S::MEMORY_GIB,
+        }
+    }
+    fn gpu_permits(&self, args: &serde_json::Value) -> u32 {
+        match serde_json::from_value::<S::Args>(args.clone()) {
+            Ok(typed) => Stage::gpu_permits(self, &typed),
+            Err(e) => {
+                // Shouldn't happen post-preflight; if it does, fall back to a
+                // single GPU (safe — never over-allocates) but WARN so a DDP
+                // stage that silently degraded to 1 GPU is visible.
+                tracing::warn!(
+                    "gpu_permits: args for stage '{}' didn't deserialize ({e}); \
+                     defaulting to 1 GPU (DDP would be silently degraded)",
+                    S::NAME
+                );
+                1
+            }
+        }
     }
     fn retry(&self) -> crate::framework::retry::RetryPolicy {
         S::RETRY

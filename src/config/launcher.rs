@@ -3,8 +3,11 @@
 //! blut-owned `Launcher` abstraction: build the OS command that runs a
 //! sweep job, optionally inside a resource-capped container.
 
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use crate::error::{Result, TrainError};
 
@@ -17,6 +20,45 @@ pub enum LauncherKind {
     Local,
     Slurm,
     Ray,
+}
+
+/// State of a remote job, as reported by the scheduler.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum JobState {
+    /// Job is queued or running.
+    Running,
+    /// Job completed successfully.
+    Succeeded,
+    /// Job failed (non-zero exit, OOM, timeout, etc). The string carries
+    /// the scheduler-reported reason (e.g. `"OutOfMemory"`, `"TIMEOUT"`).
+    Failed(String),
+    /// Job was cancelled by the user or the scheduler.
+    Cancelled,
+    /// State could not be determined from the scheduler's output.
+    Unknown(String),
+}
+
+/// A handle to a running remote job. The runner calls [`poll`](Self::poll) in
+/// a loop and [`stream`](Self::stream) to receive log lines for metric
+/// parsing. Implementations are *synchronous* — no async runtime required — so
+/// the runner can drive them from a plain thread alongside the blocking
+/// orchestrator path.
+pub trait RemoteJob: Send + Sync {
+    /// The scheduler-assigned job ID (Slurm job-id, Ray submission-id, etc).
+    fn id(&self) -> &str;
+
+    /// Query the current job state. Called in a loop by the runner.
+    fn poll(&self) -> Result<JobState>;
+
+    /// Stream log lines to the provided sink. The sink receives each stdout
+    /// line (the runner feeds it to `parse_step_update` for `BLUT_METRIC`
+    /// extraction). This is a *blocking* call that returns when the job
+    /// finishes or is cancelled.
+    fn stream(&self, sink: &dyn Fn(&str)) -> Result<()>;
+
+    /// Cancel the running job.
+    fn cancel(&self) -> Result<()>;
 }
 
 /// Backend-AGNOSTIC launch spec: the program + argv + env a launcher prepends
@@ -314,10 +356,14 @@ pub struct SlurmLauncher {
     pub mem: Option<String>,
     /// `--cpus-per-task`.
     pub cpus: Option<u32>,
-    /// `--gpus`.
+    /// `--gpus` (per-node GPU count).
     pub gpus: Option<u32>,
     /// `--time` (e.g. `"08:00:00"`).
     pub time: Option<String>,
+    /// `--nodes` — number of cluster nodes to allocate.
+    pub nodes: Option<u32>,
+    /// `--ntasks-per-node` — tasks (ranks) per node.
+    pub ntasks_per_node: Option<u32>,
     /// Verbatim passthrough flags appended before the `--` separator.
     pub extra: Vec<String>,
 }
@@ -348,6 +394,19 @@ impl Launcher for SlurmLauncher {
         if let Some(t) = &self.time {
             args.push(format!("--time={t}"));
         }
+        if let Some(n) = self.nodes {
+            args.push(format!("--nodes={n}"));
+            if n > 1 && self.ntasks_per_node.is_none() {
+                tracing::warn!(
+                    "SlurmLauncher: --nodes={n} without --ntasks-per-node; \
+                     Slurm defaults to 1 task/node — set BLUT_SLURM_NTASKS_PER_NODE \
+                     if you want N ranks per node (e.g. --ntasks-per-node=gpus)."
+                );
+            }
+        }
+        if let Some(n) = self.ntasks_per_node {
+            args.push(format!("--ntasks-per-node={n}"));
+        }
         // A bare "--" in extra would prematurely close option parsing; the real
         // inner separator is appended below.
         args.extend(self.extra.iter().filter(|x| *x != "--").cloned());
@@ -359,6 +418,317 @@ impl Launcher for SlurmLauncher {
             env: Vec::new(),
             kind: LauncherKind::Slurm,
         })
+    }
+}
+
+/// A handle to a submitted Slurm job, returned by
+/// [`SlurmLauncher::submit_async`]. Supports polling, log streaming, and
+/// cancellation via `sacct` / `scancel`.
+pub struct SlurmJob {
+    /// Slurm-assigned numeric job ID.
+    job_id: String,
+    /// Path to the Slurm output log (`slurm-<id>.out`).
+    log_path: PathBuf,
+}
+
+impl SlurmJob {
+    /// Shell-escape a single argument for safe interpolation into a bash script.
+    /// Wraps in single quotes and escapes any embedded single quotes.
+    fn shell_escape(arg: &str) -> String {
+        if arg.is_empty() {
+            return "''".to_string();
+        }
+        // Fast path: safe characters only.
+        if arg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-+=:@/".contains(&b))
+        {
+            return arg.to_string();
+        }
+        // General path: single-quote and escape embedded single quotes.
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
+
+    /// Build an `sbatch` script body from the launcher config + inner command.
+    /// The script is submitted via stdin to `sbatch`, so no temp file is
+    /// needed. Inner args are shell-escaped to prevent injection.
+    fn build_sbatch_script(
+        unit: &str,
+        launcher: &SlurmLauncher,
+        inner: &[String],
+    ) -> String {
+        let partition = launcher.partition.as_deref();
+        let mem = launcher.mem.as_deref();
+        let cpus = launcher.cpus;
+        let gpus = launcher.gpus;
+        let time = launcher.time.as_deref();
+        let extra = &launcher.extra;
+        let mut lines: Vec<String> = Vec::new();
+        lines.push("#!/bin/bash".to_string());
+        lines.push(format!("#SBATCH --job-name={unit}"));
+        if let Some(p) = partition {
+            lines.push(format!("#SBATCH --partition={p}"));
+        }
+        if let Some(m) = mem {
+            lines.push(format!("#SBATCH --mem={m}"));
+        }
+        if let Some(n) = cpus {
+            lines.push(format!("#SBATCH --cpus-per-task={n}"));
+        }
+        if let Some(g) = gpus {
+            lines.push(format!("#SBATCH --gpus={g}"));
+        }
+        if let Some(t) = time {
+            lines.push(format!("#SBATCH --time={t}"));
+        }
+        if let Some(n) = launcher.nodes {
+            lines.push(format!("#SBATCH --nodes={n}"));
+        }
+        if let Some(n) = launcher.ntasks_per_node {
+            lines.push(format!("#SBATCH --ntasks-per-node={n}"));
+        }
+        // Only emit default --output if extra doesn't already specify one.
+        let has_output = extra.iter().any(|x| x.starts_with("--output"));
+        if !has_output {
+            lines.push("#SBATCH --output=slurm-%j.out".to_string());
+        }
+        // Append extra flags that are not bare "--".
+        for x in extra.iter().filter(|x| *x != "--") {
+            lines.push(format!("#SBATCH {x}"));
+        }
+        lines.push(String::new());
+        // Multi-node preamble: export MASTER_ADDR from Slurm's allocation so
+        // torchrun's c10d rendezvous can find the coordinator. Only needed when
+        // nodes > 1; single-node torchrun uses --standalone.
+        if launcher.nodes.unwrap_or(1) > 1 {
+            lines.push("# Multi-node rendezvous: resolve MASTER_ADDR from Slurm allocation".to_string());
+            lines.push("export MASTER_ADDR=$(scontrol show hostnames \"$SLURM_JOB_NODELIST\" | head -n1)".to_string());
+            lines.push("export MASTER_PORT=${MASTER_PORT:-29500}".to_string());
+            lines.push("export NODE_RANK=${SLURM_NODEID:-0}".to_string());
+            lines.push(String::new());
+        }
+        // The inner command — shell-escape each arg to prevent injection.
+        let escaped: Vec<String> = inner.iter().map(|a| Self::shell_escape(a)).collect();
+        lines.push(escaped.join(" "));
+        lines.join("\n")
+    }
+
+    /// Parse `sacct -j <id> -n -o State` output into a [`JobState`].
+    fn parse_sacct_state(output: &str) -> JobState {
+        // sacct may produce multiple lines (per-step entries). The first
+        // non-empty token is the job-level state.
+        for line in output.lines() {
+            let state = line.trim();
+            if state.is_empty() {
+                continue;
+            }
+            // Strip extended info after a "+" (e.g. "FAILED+TIMEOUT" or just
+            // take the first word if space-separated).
+            let base = state.split('+').next().unwrap_or(state).trim();
+            return match base {
+                "COMPLETED" => JobState::Succeeded,
+                "FAILED" => JobState::Failed(state.to_string()),
+                "TIMEOUT" => JobState::Failed("TIMEOUT".to_string()),
+                "OUT_OF_MEMORY" => JobState::Failed("OutOfMemory".to_string()),
+                "NODE_FAIL" => JobState::Failed("NODE_FAIL".to_string()),
+                "RUNNING" | "PENDING" | "CONFIGURING" | "SUSPENDED" => JobState::Running,
+                "CANCELLED" => JobState::Cancelled,
+                "BOOT_FAIL" | "DEADLINE" => JobState::Failed(state.to_string()),
+                _ => JobState::Unknown(state.to_string()),
+            };
+        }
+        JobState::Unknown("empty sacct output".to_string())
+    }
+}
+
+impl RemoteJob for SlurmJob {
+    fn id(&self) -> &str {
+        &self.job_id
+    }
+
+    fn poll(&self) -> Result<JobState> {
+        let out = Command::new("sacct")
+            .args([
+                "-j",
+                &self.job_id,
+                "-n",
+                "-o",
+                "State",
+                "--noheader",
+            ])
+            .output()
+            .map_err(|e| TrainError::other(format!("sacct invocation failed: {e}")))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let code = match out.status.code() {
+                Some(c) => c.to_string(),
+                None => "signal".to_string(),
+            };
+            return Err(TrainError::other(format!(
+                "sacct -j {} failed (exit {}): {}",
+                self.job_id,
+                code,
+                stderr.trim()
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        Ok(Self::parse_sacct_state(&stdout))
+    }
+
+    fn stream(&self, sink: &dyn Fn(&str)) -> Result<()> {
+        // Tail-follow the log file, polling sacct every 2s for terminal state.
+        // Returns Ok(()) on success, Err on failure/cancel/timeout.
+        let poll_interval = Duration::from_secs(2);
+        let max_idle = Duration::from_secs(3600); // 1h idle → timeout
+        let mut offset: u64 = 0;
+        let mut idle_since = std::time::Instant::now();
+        loop {
+            // Stream whatever is new in the log file.
+            if self.log_path.exists() {
+                use std::io::{Seek, SeekFrom};
+                let file = std::fs::File::open(&self.log_path).map_err(|e| {
+                    TrainError::Io {
+                        path: self.log_path.clone(),
+                        source: e,
+                    }
+                })?;
+                let mut reader = std::io::BufReader::new(file);
+                reader.seek(SeekFrom::Start(offset)).map_err(|e| {
+                    TrainError::Io {
+                        path: self.log_path.clone(),
+                        source: e,
+                    }
+                })?;
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let n = reader.read_line(&mut line).map_err(|e| {
+                        TrainError::Io {
+                            path: self.log_path.clone(),
+                            source: e,
+                        }
+                    })?;
+                    if n == 0 {
+                        break;
+                    }
+                    offset += n as u64;
+                    idle_since = std::time::Instant::now();
+                    let trimmed = line.trim_end_matches('\n');
+                    if !trimmed.is_empty() {
+                        sink(trimmed);
+                    }
+                }
+            }
+            // Check if the job has finished.
+            match self.poll()? {
+                JobState::Running => {
+                    if idle_since.elapsed() > max_idle {
+                        return Err(TrainError::other(format!(
+                            "slurm job {} stream timed out after no output for {}s",
+                            self.job_id,
+                            max_idle.as_secs()
+                        )));
+                    }
+                    thread::sleep(poll_interval);
+                    continue;
+                }
+                JobState::Succeeded => return Ok(()),
+                JobState::Failed(ref reason) => {
+                    return Err(TrainError::other(format!(
+                        "slurm job {} failed: {reason}",
+                        self.job_id,
+                    )));
+                }
+                JobState::Cancelled => {
+                    return Err(TrainError::other(format!(
+                        "slurm job {} was cancelled",
+                        self.job_id,
+                    )));
+                }
+                JobState::Unknown(ref s) => {
+                    return Err(TrainError::other(format!(
+                        "slurm job {} ended in unknown state: {s}",
+                        self.job_id,
+                    )));
+                }
+            }
+        }
+    }
+
+    fn cancel(&self) -> Result<()> {
+        let out = Command::new("scancel")
+            .arg(&self.job_id)
+            .output()
+            .map_err(|e| TrainError::other(format!("scancel invocation failed: {e}")))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(TrainError::other(format!(
+                "scancel {} failed (exit {}): {}",
+                self.job_id,
+                out.status.code().unwrap_or(-1),
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl SlurmLauncher {
+    /// Submit a Slurm job asynchronously via `sbatch --parsable`. Returns a
+    /// [`SlurmJob`] handle for polling, log streaming, and cancellation.
+    ///
+    /// The sbatch script is generated in-memory and piped to `sbatch` via
+    /// stdin, so no temporary file is left on disk.
+    pub fn submit_async(
+        &self,
+        unit: &str,
+        inner: &[String],
+    ) -> Result<Box<dyn RemoteJob>> {
+        if inner.is_empty() {
+            return Err(TrainError::other(
+                "slurm submit_async: empty inner command",
+            ));
+        }
+        let script = SlurmJob::build_sbatch_script(unit, self, inner);
+        use std::io::Write;
+        let mut child = Command::new("sbatch")
+            .arg("--parsable")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| TrainError::other(format!("sbatch spawn failed: {e}")))?;
+        if let Some(ref mut stdin) = child.stdin {
+            stdin
+                .write_all(script.as_bytes())
+                .map_err(|e| TrainError::other(format!("sbatch stdin write failed: {e}")))?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|e| TrainError::other(format!("sbatch wait failed: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(TrainError::other(format!(
+                "sbatch failed (exit {}): {}",
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            )));
+        }
+        // --parsable output is "<job_id>" or "<job_id>;<cluster>".
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let job_id = raw
+            .trim()
+            .split(';')
+            .next()
+            .unwrap_or(raw.trim())
+            .to_string();
+        if job_id.is_empty() {
+            return Err(TrainError::other(
+                "sbatch --parsable returned empty job ID",
+            ));
+        }
+        let log_path = PathBuf::from(format!("slurm-{job_id}.out"));
+        Ok(Box::new(SlurmJob { job_id, log_path }))
     }
 }
 
@@ -404,6 +774,180 @@ impl Launcher for RayLauncher {
     }
 }
 
+/// A handle to a submitted Ray job, returned by
+/// [`RayLauncher::submit_async`]. Supports polling, log streaming, and
+/// cancellation via `ray job status` / `ray job stop` / `ray job logs`.
+pub struct RayJob {
+    /// Ray submission ID (typically the unit name).
+    submission_id: String,
+    /// Optional `--address` of the Ray head node.
+    address: Option<String>,
+}
+
+impl RayJob {
+    /// Build the optional `--address` flag slice for Ray CLI commands.
+    fn address_args(&self) -> Vec<String> {
+        match &self.address {
+            Some(a) => vec![format!("--address={a}")],
+            None => vec![],
+        }
+    }
+
+    /// Parse `ray job status <id>` output into a [`JobState`].
+    fn parse_ray_status(output: &str) -> JobState {
+        // Ray job status typically outputs a table like:
+        //   Status: SUCCEEDED
+        //   ...
+        // or a JSON blob. We scan for a "Status:" line.
+        for line in output.lines() {
+            let trimmed = line.trim();
+            if let Some(status) = trimmed.strip_prefix("Status:") {
+                let status = status.trim();
+                return match status {
+                    "SUCCEEDED" => JobState::Succeeded,
+                    "FAILED" => JobState::Failed("FAILED".to_string()),
+                    "RUNNING" | "PENDING" | "WAITING" | "CONSTRUCTOR" => {
+                        JobState::Running
+                    }
+                    "STOPPED" | "CANCELLED" => JobState::Cancelled,
+                    "UNKNOWN" => JobState::Unknown("UNKNOWN".to_string()),
+                    other => JobState::Unknown(other.to_string()),
+                };
+            }
+        }
+        JobState::Unknown("could not parse ray job status".to_string())
+    }
+}
+
+impl RemoteJob for RayJob {
+    fn id(&self) -> &str {
+        &self.submission_id
+    }
+
+    fn poll(&self) -> Result<JobState> {
+        let mut cmd = Command::new("ray");
+        cmd.args(["job", "status", &self.submission_id]);
+        cmd.args(self.address_args());
+        let output = cmd
+            .output()
+            .map_err(|e| TrainError::other(format!("ray job status failed: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(TrainError::other(format!(
+                "ray job status {} failed (exit {}): {}",
+                self.submission_id,
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(Self::parse_ray_status(&stdout))
+    }
+
+    fn stream(&self, sink: &dyn Fn(&str)) -> Result<()> {
+        let mut cmd = Command::new("ray");
+        cmd.args(["job", "logs", &self.submission_id, "--follow"]);
+        cmd.args(self.address_args());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| TrainError::other(format!("ray job logs failed: {e}")))?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            TrainError::other("ray job logs: could not capture stdout")
+        })?;
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let line = line.map_err(|e| {
+                TrainError::other(format!("ray job logs read error: {e}"))
+            })?;
+            sink(&line);
+        }
+        // After the log stream ends, check exit code.
+        let status = child
+            .wait()
+            .map_err(|e| TrainError::other(format!("ray job logs wait failed: {e}")))?;
+        if !status.success() {
+            let code = match status.code() {
+                Some(c) => c.to_string(),
+                None => "signal".to_string(),
+            };
+            return Err(TrainError::other(format!(
+                "ray job logs {} exited with {code}",
+                self.submission_id,
+            )));
+        }
+        Ok(())
+    }
+
+    fn cancel(&self) -> Result<()> {
+        let mut cmd = Command::new("ray");
+        cmd.args(["job", "stop", &self.submission_id]);
+        cmd.args(self.address_args());
+        let output = cmd
+            .output()
+            .map_err(|e| TrainError::other(format!("ray job stop failed: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(TrainError::other(format!(
+                "ray job stop {} failed (exit {}): {}",
+                self.submission_id,
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl RayLauncher {
+    /// Submit a Ray job asynchronously via `ray job submit --no-wait`. Returns
+    /// a [`RayJob`] handle for polling, log streaming, and cancellation.
+    pub fn submit_async(
+        &self,
+        unit: &str,
+        inner: &[String],
+    ) -> Result<Box<dyn RemoteJob>> {
+        if inner.is_empty() {
+            return Err(TrainError::other(
+                "ray submit_async: empty inner command",
+            ));
+        }
+        let mut args = vec![
+            "job".to_string(),
+            "submit".to_string(),
+            "--no-wait".to_string(),
+            format!("--submission-id={unit}"),
+        ];
+        if let Some(a) = &self.address {
+            args.push(format!("--address={a}"));
+        }
+        if let Some(re) = &self.runtime_env {
+            args.push("--runtime-env-json".to_string());
+            args.push(re.clone());
+        }
+        args.extend(self.extra.iter().filter(|x| *x != "--").cloned());
+        args.push("--".to_string());
+        args.extend(inner.iter().cloned());
+        let output = Command::new("ray")
+            .args(&args)
+            .output()
+            .map_err(|e| TrainError::other(format!("ray job submit failed: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(TrainError::other(format!(
+                "ray job submit failed (exit {}): {}",
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            )));
+        }
+        Ok(Box::new(RayJob {
+            submission_id: unit.to_string(),
+            address: self.address.clone(),
+        }))
+    }
+}
+
 /// Where to place a unit of work, selected by `--launcher`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum LaunchTarget {
@@ -414,6 +958,8 @@ pub enum LaunchTarget {
     Slurm,
     /// A Ray job (`ray job submit`).
     Ray,
+    /// P2P distributed compute (peer GPUs over QUIC).
+    P2P,
 }
 
 impl std::str::FromStr for LaunchTarget {
@@ -423,8 +969,9 @@ impl std::str::FromStr for LaunchTarget {
             "local" | "" => Ok(Self::Local),
             "slurm" => Ok(Self::Slurm),
             "ray" => Ok(Self::Ray),
+            "p2p" => Ok(Self::P2P),
             other => Err(TrainError::other(format!(
-                "unknown launcher '{other}' (expected local|slurm|ray)"
+                "unknown launcher '{other}' (expected local|slurm|ray|p2p)"
             ))),
         }
     }
@@ -445,6 +992,8 @@ pub fn launcher_for(target: LaunchTarget) -> Box<dyn Launcher> {
             cpus: env_u32("BLUT_SLURM_CPUS"),
             gpus: env_u32("BLUT_SLURM_GPUS"),
             time: env("BLUT_SLURM_TIME"),
+            nodes: env_u32("BLUT_SLURM_NODES"),
+            ntasks_per_node: env_u32("BLUT_SLURM_NTASKS_PER_NODE"),
             extra: Vec::new(),
         }),
         LaunchTarget::Ray => Box::new(RayLauncher {
@@ -452,6 +1001,9 @@ pub fn launcher_for(target: LaunchTarget) -> Box<dyn Launcher> {
             runtime_env: env("BLUT_RAY_RUNTIME_ENV"),
             extra: Vec::new(),
         }),
+        // P2P dispatch is handled by DispatchSubmitter, not Launcher.
+        // Fall through to LocalSystemd for local process management.
+        LaunchTarget::P2P => Box::new(LocalSystemd::default()),
     }
 }
 
@@ -544,6 +1096,8 @@ mod tests {
             cpus: Some(8),
             gpus: Some(1),
             time: Some("08:00:00".into()),
+            nodes: None,
+            ntasks_per_node: None,
             extra: vec!["--exclusive".into()],
         };
         let c = l
@@ -722,5 +1276,231 @@ mod tests {
                 None => std::env::remove_var("BLUT_NO_CONTAIN"),
             }
         }
+    }
+
+    // --- RemoteJob: sacct parsing ---
+
+    #[test]
+    fn slurm_parse_sacct_completed() {
+        assert_eq!(SlurmJob::parse_sacct_state("COMPLETED\n"), JobState::Succeeded);
+    }
+
+    #[test]
+    fn slurm_parse_sacct_failed() {
+        let s = SlurmJob::parse_sacct_state("FAILED\n");
+        match s {
+            JobState::Failed(reason) => assert!(reason.contains("FAILED")),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slurm_parse_sacct_timeout() {
+        assert_eq!(
+            SlurmJob::parse_sacct_state("TIMEOUT\n"),
+            JobState::Failed("TIMEOUT".to_string())
+        );
+    }
+
+    #[test]
+    fn slurm_parse_sacct_oom() {
+        assert_eq!(
+            SlurmJob::parse_sacct_state("OUT_OF_MEMORY\n"),
+            JobState::Failed("OutOfMemory".to_string())
+        );
+    }
+
+    #[test]
+    fn slurm_parse_sacct_running() {
+        assert_eq!(SlurmJob::parse_sacct_state("RUNNING\n"), JobState::Running);
+    }
+
+    #[test]
+    fn slurm_parse_sacct_pending() {
+        assert_eq!(SlurmJob::parse_sacct_state("PENDING\n"), JobState::Running);
+    }
+
+    #[test]
+    fn slurm_parse_sacct_cancelled() {
+        assert_eq!(
+            SlurmJob::parse_sacct_state("CANCELLED+\n"),
+            JobState::Cancelled
+        );
+    }
+
+    #[test]
+    fn slurm_parse_sacct_empty() {
+        assert!(matches!(
+            SlurmJob::parse_sacct_state(""),
+            JobState::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn slurm_parse_sacct_node_fail() {
+        assert_eq!(
+            SlurmJob::parse_sacct_state("NODE_FAIL\n"),
+            JobState::Failed("NODE_FAIL".to_string())
+        );
+    }
+
+    // --- RemoteJob: ray job status parsing ---
+
+    #[test]
+    fn ray_parse_status_succeeded() {
+        assert_eq!(
+            RayJob::parse_ray_status("Status: SUCCEEDED\n"),
+            JobState::Succeeded
+        );
+    }
+
+    #[test]
+    fn ray_parse_status_failed() {
+        assert_eq!(
+            RayJob::parse_ray_status("Status: FAILED\n"),
+            JobState::Failed("FAILED".to_string())
+        );
+    }
+
+    #[test]
+    fn ray_parse_status_running() {
+        assert_eq!(
+            RayJob::parse_ray_status("Status: RUNNING\n"),
+            JobState::Running
+        );
+    }
+
+    #[test]
+    fn ray_parse_status_pending() {
+        assert_eq!(
+            RayJob::parse_ray_status("Status: PENDING\n"),
+            JobState::Running
+        );
+    }
+
+    #[test]
+    fn ray_parse_status_stopped() {
+        assert_eq!(
+            RayJob::parse_ray_status("Status: STOPPED\n"),
+            JobState::Cancelled
+        );
+    }
+
+    #[test]
+    fn ray_parse_status_cancelled() {
+        assert_eq!(
+            RayJob::parse_ray_status("Status: CANCELLED\n"),
+            JobState::Cancelled
+        );
+    }
+
+    #[test]
+    fn ray_parse_status_unknown() {
+        assert!(matches!(
+            RayJob::parse_ray_status("something weird"),
+            JobState::Unknown(_)
+        ));
+    }
+
+    // --- sbatch script generation ---
+
+    #[test]
+    fn sbatch_script_has_all_flags() {
+        let launcher = SlurmLauncher {
+            partition: Some("gpu".into()),
+            mem: Some("48G".into()),
+            cpus: Some(16),
+            gpus: Some(2),
+            time: Some("12:00:00".into()),
+            nodes: None,
+            ntasks_per_node: None,
+            extra: vec!["--exclusive".to_string(), "--".to_string()],
+        };
+        let script = SlurmJob::build_sbatch_script(
+            "train-run1",
+            &launcher,
+            &["python".into(), "train.py".into()],
+        );
+        assert!(script.contains("#!/bin/bash"));
+        assert!(script.contains("#SBATCH --job-name=train-run1"));
+        assert!(script.contains("#SBATCH --partition=gpu"));
+        assert!(script.contains("#SBATCH --mem=48G"));
+        assert!(script.contains("#SBATCH --cpus-per-task=16"));
+        assert!(script.contains("#SBATCH --gpus=2"));
+        assert!(script.contains("#SBATCH --time=12:00:00"));
+        assert!(script.contains("#SBATCH --exclusive"));
+        assert!(script.contains("#SBATCH --output=slurm-%j.out"));
+        // Bare "--" in extra should be filtered out.
+        let count = script.matches("#SBATCH --\n").count();
+        assert_eq!(count, 0, "bare '--' should not appear as a flag");
+        // Inner command appears at the end.
+        assert!(script.contains("python train.py"));
+    }
+
+    #[test]
+    fn sbatch_script_multinode_has_master_addr_preamble() {
+        let launcher = SlurmLauncher {
+            nodes: Some(4),
+            ntasks_per_node: Some(2),
+            gpus: Some(2),
+            ..Default::default()
+        };
+        let script = SlurmJob::build_sbatch_script(
+            "ddp-job",
+            &launcher,
+            &["python".into(), "train.py".into()],
+        );
+        assert!(script.contains("#SBATCH --nodes=4"));
+        assert!(script.contains("#SBATCH --ntasks-per-node=2"));
+        assert!(script.contains("#SBATCH --gpus=2"));
+        // Multi-node preamble exports rendezvous env vars.
+        assert!(script.contains("MASTER_ADDR"));
+        assert!(script.contains("scontrol show hostnames"));
+        assert!(script.contains("NODE_RANK"));
+    }
+
+    #[test]
+    fn sbatch_script_single_node_omits_master_addr() {
+        let launcher = SlurmLauncher {
+            nodes: Some(1),
+            gpus: Some(2),
+            ..Default::default()
+        };
+        let script = SlurmJob::build_sbatch_script(
+            "single",
+            &launcher,
+            &["echo".into()],
+        );
+        assert!(!script.contains("MASTER_ADDR"));
+        assert!(!script.contains("scontrol"));
+    }
+
+    #[test]
+    fn sbatch_script_minimal() {
+        let script = SlurmJob::build_sbatch_script(
+            "unit",
+            &SlurmLauncher::default(),
+            &["echo".into(), "hello".into()],
+        );
+        assert!(script.contains("#!/bin/bash"));
+        assert!(script.contains("#SBATCH --job-name=unit"));
+        assert!(script.contains("#SBATCH --output=slurm-%j.out"));
+        assert!(!script.contains("--partition"));
+        assert!(!script.contains("--mem"));
+        assert!(script.contains("echo hello"));
+    }
+
+    // --- submit_async argument shape (non-exec tests) ---
+
+    #[test]
+    fn slurm_submit_async_rejects_empty_inner() {
+        let l = SlurmLauncher::default();
+        assert!(l.submit_async("unit", &[]).is_err());
+    }
+
+    #[test]
+    fn ray_submit_async_rejects_empty_inner() {
+        let l = RayLauncher::default();
+        assert!(l.submit_async("unit", &[]).is_err());
     }
 }

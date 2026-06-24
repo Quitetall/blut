@@ -43,12 +43,23 @@ use tokio_util::sync::CancellationToken;
 
 use crate::framework::artifact::{ArtifactMetadata, ContentHash};
 use crate::framework::cache::CacheHandle;
+use crate::config::launcher::JobState;
 use crate::framework::control::{Control, ControlPolicy, StepMetrics};
 use crate::framework::error::{PlanError, StageError};
 use crate::framework::plan::{CompiledPlan, NodeId};
 use crate::framework::resource::Resource;
 use crate::framework::stage::{ErasedArtifact, StageContext, StageDyn};
 use crate::framework::status::{StageEvent, StatusHub, spawn_status_writer};
+
+/// RAII guard that decrements the in-flight counter when dropped.
+/// Used by spawned dispatch tasks to ensure in_flight is decremented
+/// even if the task panics.
+struct InFlightDecrementGuard(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for InFlightDecrementGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// Default bound on concurrently-spawned node tasks in the parallel
 /// executor. The real throttle is the per-`Resource` semaphores; this
@@ -61,6 +72,48 @@ pub const DEFAULT_MAX_IN_FLIGHT: usize = 8;
 /// box-fit. Picked large enough to never gate, small enough to stay a valid
 /// `tokio::Semaphore` permit count.
 pub const UNLIMITED_MEM_GIB: u32 = 1_000_000;
+
+/// Handle to a dispatched remote task. The executor polls this to
+/// determine when the task completes.
+pub trait DispatchHandle: Send + Sync {
+    /// Poll the remote task. Returns `Some(JobState)` when terminal,
+    /// `None` if still running.
+    fn poll(&self) -> Result<Option<JobState>, crate::error::TrainError>;
+    /// Cancel the remote task.
+    fn cancel(&self) -> Result<(), crate::error::TrainError>;
+}
+
+/// Trait for submitting tasks to a remote compute network. The P2P
+/// coordinator implements this; the executor calls it when a stage
+/// is dispatchable.
+/// Parameters for dispatching a stage to a remote peer.
+pub struct DispatchRequest<'a> {
+    pub stage_name: &'a str,
+    pub stage_schema: u32,
+    pub input_hash: ContentHash,
+    pub args_hash: ContentHash,
+    pub args: &'a serde_json::Value,
+    pub expected_output_hash: ContentHash,
+    pub resource_request: ResourceRequest,
+    pub data_class: u8, // 0=Public, 1=Internal, 2=Restricted
+}
+
+pub trait DispatchSubmitter: Send + Sync {
+    /// Submit a stage for remote execution. Returns a handle for
+    /// tracking the task's lifecycle.
+    fn submit(&self, request: DispatchRequest<'_>)
+        -> Result<Box<dyn DispatchHandle>, crate::error::TrainError>;
+}
+
+/// Resource requirements for a dispatched task. Mirrors
+/// `p2p::task::ResourceRequest` without the p2p dependency.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResourceRequest {
+    pub cpu_cores: u32,
+    pub memory_gib: u32,
+    pub gpu: bool,
+    pub gpu_vram_gib: Option<u32>,
+}
 
 /// Caller-supplied execution context. Threaded through every
 /// `StageContext`. Lives for the duration of one `execute` call.
@@ -129,6 +182,14 @@ pub struct ExecCtx {
     /// is the A/B "force recompute" semantic — set by the CLI `--no-cache` /
     /// `--force` flag. Default false ⇒ byte-identical to the pre-INC-D path.
     pub bypass_cache: bool,
+    /// P2P dispatch: policy that decides which stages are dispatchable.
+    /// When set alongside `dispatcher`, the parallel executor offloads
+    /// dispatchable DAG nodes to remote peers.
+    #[cfg(feature = "p2p")]
+    pub dispatch_policy: Option<Arc<dyn crate::p2p::dispatch::DispatchPolicy>>,
+    /// P2P dispatch: submits tasks to the remote compute network.
+    #[cfg(feature = "p2p")]
+    pub dispatcher: Option<Arc<dyn DispatchSubmitter>>,
 }
 
 impl ExecCtx {
@@ -165,6 +226,10 @@ impl ExecCtx {
             fb_warm: false,
             device_index: None,
             bypass_cache: false,
+            #[cfg(feature = "p2p")]
+            dispatch_policy: None,
+            #[cfg(feature = "p2p")]
+            dispatcher: None,
         }
     }
 
@@ -185,6 +250,19 @@ impl ExecCtx {
     /// `StageContext.fb_warm` so a train stage bills the warm footprint.
     pub fn with_fb_warm(mut self, warm: bool) -> Self {
         self.fb_warm = warm;
+        self
+    }
+
+    /// Set the P2P dispatch policy and submitter. When both are set,
+    /// the parallel executor offloads dispatchable stages to peers.
+    #[cfg(feature = "p2p")]
+    pub fn with_dispatch(
+        mut self,
+        policy: Arc<dyn crate::p2p::dispatch::DispatchPolicy>,
+        submitter: Arc<dyn DispatchSubmitter>,
+    ) -> Self {
+        self.dispatch_policy = Some(policy);
+        self.dispatcher = Some(submitter);
         self
     }
 
@@ -262,6 +340,10 @@ struct NodeEnv {
     status: Arc<StatusHub>,
     cancel: CancellationToken,
     resources: HashMap<Resource, Arc<tokio::sync::Semaphore>>,
+    /// Total `Resource::Gpu` permits (== the box's GPU pool / device count). A
+    /// DDP stage's `gpu_permits` is clamped to this so it never asks for more
+    /// GPUs than exist.
+    gpu_pool: usize,
     memory: Arc<tokio::sync::Semaphore>,
     memory_budget_gib: u32,
     launch_target: crate::config::launcher::LaunchTarget,
@@ -276,12 +358,19 @@ struct NodeEnv {
     /// divergence detail, populated by the coordinator at the KILL site (a
     /// `Control::KillBranch` or a `Stage::divergence_check` true) BEFORE it
     /// cancels the node's token. `run_node` reads it under `task.node_id` to
+    /// skip the stage on a targeted KILL (vs plan-wide cancel).
     /// tell a DIVERGENCE kill (→ retryable `StageError::Diverged`, auto-resume)
     /// apart from a plain targeted kill / plan cancel (→ unchanged Killed /
     /// Cancelled). The `Mutex` is held only for a tiny insert/get/remove — NEVER
     /// across an `.await` — so it can't deadlock the coordinator seam. Empty when
     /// no control policy is set, so the non-control path never touches it.
     diverged: Arc<std::sync::Mutex<HashMap<NodeId, String>>>,
+    /// P2P dispatch policy + submitter. When set, dispatchable stages
+    /// are offloaded to peers instead of running locally.
+    #[cfg(feature = "p2p")]
+    dispatch_policy: Option<Arc<dyn crate::p2p::dispatch::DispatchPolicy>>,
+    #[cfg(feature = "p2p")]
+    dispatcher: Option<Arc<dyn DispatchSubmitter>>,
 }
 
 /// A REPLACEABLE per-node kill token (#4 / S1). Shared between the coordinator
@@ -684,12 +773,37 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         // `try_acquire` first; only emit `StageBlocked` on contention.
         let mut sorted_resources: Vec<Resource> = task.stage.resources().to_vec();
         sorted_resources.sort();
+        // A DDP stage holds `nproc` GPU permits (sized to the box's GPU pool);
+        // every other resource holds 1. Clamp to the pool so a request for more
+        // permits than exist can't park forever (the GPU pool == device count,
+        // set by the CLI via `with_resource_limit`).
         let mut permits = Vec::new();
         for resource in sorted_resources {
             let Some(sem) = env.resources.get(&resource) else {
                 continue;
             };
-            let permit = match sem.clone().try_acquire_owned() {
+            let want = if resource == Resource::Gpu {
+                let n = task.stage.gpu_permits(&task.args).max(1) as usize;
+                // The pool size is the semaphore's total permits; clamp so a
+                // DDP job asking for more GPUs than the box has runs on all of
+                // them rather than deadlocking.
+                let clamped = n.min(env.gpu_pool.max(1));
+                if clamped < n {
+                    // A DDP stage requested more GPUs than the box has — it will
+                    // run DEGRADED (on `clamped` GPUs). Warn loudly so a user
+                    // who thinks they're at full width isn't silently demoted.
+                    tracing::warn!(
+                        "stage '{}' requested {n} GPU permits but the pool has \
+                         only {} — running on {clamped} (DDP width degraded)",
+                        stage_name,
+                        env.gpu_pool
+                    );
+                }
+                clamped
+            } else {
+                1
+            };
+            let permit = match sem.clone().try_acquire_many_owned(want as u32) {
                 Ok(p) => p,
                 Err(_) => {
                     env.status.emit(StageEvent::StageBlocked {
@@ -697,7 +811,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
                         stage_name: stage_name.clone(),
                         resource,
                     });
-                    match sem.clone().acquire_owned().await {
+                    match sem.clone().acquire_many_owned(want as u32).await {
                         Ok(p) => p,
                         Err(_) => {
                             let _ = std::fs::remove_dir_all(&tmp_stage_dir);
@@ -716,7 +830,10 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         // the SUM of concurrent stages can't exceed the box (never-OOM-the-BOX
         // under the parallel executor). Clamp to the budget so a stage needing
         // the whole box runs alone instead of deadlocking. `0` = no reservation.
-        let mem_want = task.stage.memory_gib().min(env.memory_budget_gib);
+        let mem_want = task
+            .stage
+            .memory_gib_for(&task.args)
+            .min(env.memory_budget_gib);
         let _mem_permit = if mem_want > 0 {
             match env.memory.clone().acquire_many_owned(mem_want).await {
                 Ok(p) => Some(p),
@@ -1381,12 +1498,23 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
     }
 
     // MOVE ctx's fields into env — the hub Arc lives only here now.
+    // Snapshot the GPU pool size (total permits) BEFORE any node acquires, so a
+    // DDP stage's gpu_permits clamps to the real device count. ORDERING: this
+    // MUST stay before the `resources: ctx.resources` move below AND before any
+    // node spawns — `available_permits()` reads the CURRENT free count, which
+    // equals the total only while nothing is held (true here in prelude).
+    let gpu_pool = ctx
+        .resources
+        .get(&Resource::Gpu)
+        .map(|s| s.available_permits())
+        .unwrap_or(1);
     let env = Arc::new(NodeEnv {
         job_dir: ctx.job_dir,
         cache: ctx.cache,
         status: ctx.status,
         cancel: ctx.cancel,
         resources: ctx.resources,
+        gpu_pool,
         memory: ctx.memory,
         memory_budget_gib: ctx.memory_budget_gib,
         launch_target: ctx.launch_target,
@@ -1396,6 +1524,10 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
         recipe_name: plan.name().to_string(),
         on_retry: ctx.on_retry,
         diverged: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        #[cfg(feature = "p2p")]
+        dispatch_policy: ctx.dispatch_policy,
+        #[cfg(feature = "p2p")]
+        dispatcher: ctx.dispatcher,
     });
 
     Ok(Prelude {
@@ -1670,7 +1802,7 @@ impl ParallelExecutor {
 
         let mut join: tokio::task::JoinSet<Result<NodeOutcome, NodeFailure>> =
             tokio::task::JoinSet::new();
-        let mut in_flight = 0usize;
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut n_hits = 0usize;
         let mut n_misses = 0usize;
         let mut first_error: Option<PlanError> = None;
@@ -1736,7 +1868,7 @@ impl ParallelExecutor {
             // Spawn ready nodes up to the in-flight cap (unless we're
             // already failing — then stop spawning and just drain).
             if first_error.is_none() {
-                while in_flight < max_in_flight {
+                while in_flight.load(std::sync::atomic::Ordering::Relaxed) < max_in_flight {
                     let Some(&node_id) = ready.iter().next() else {
                         break;
                     };
@@ -1801,13 +1933,115 @@ impl ParallelExecutor {
                     if control.is_some() {
                         node_stages.insert(node_id, task.stage.clone());
                     }
+
+                    // P2P dispatch: if the stage is dispatchable and a
+                    // dispatcher is available, offload to a peer instead
+                    // of running locally.
+                    #[cfg(feature = "p2p")]
+                    if let (Some(policy), Some(dispatcher)) =
+                        (env.dispatch_policy.as_ref(), env.dispatcher.as_ref())
+                    {
+                        if policy.is_dispatchable(task.stage.name()) {
+                            let args_hash = ContentHash::of_bytes(&task.canon_args);
+                            let stage_resources = task.stage.resources();
+                            let has_gpu = stage_resources.contains(&Resource::Gpu);
+                            let resource_request = ResourceRequest {
+                                cpu_cores: 1, // TODO: derive from RESOURCES
+                                memory_gib: task.stage.memory_gib(),
+                                gpu: has_gpu,
+                                gpu_vram_gib: None,
+                            };
+                            let data_class = policy.classify_stage(
+                                task.stage.name(),
+                                &task.args,
+                            ) as u8;
+                            let request = DispatchRequest {
+                                stage_name: task.stage.name(),
+                                stage_schema: task.stage.schema(),
+                                input_hash: task.input_hash,
+                                args_hash,
+                                args: &task.args,
+                                expected_output_hash: task.key,
+                                resource_request,
+                                data_class,
+                            };
+                            match dispatcher.submit(request) {
+                                Ok(handle) => {
+                                    tracing::info!(
+                                        "Dispatched node {} ({}) to P2P peer",
+                                        node_idx,
+                                        task.stage.name()
+                                    );
+                                    let status = env.status.clone();
+                                    let stage_name = task.stage.name().to_string();
+                                    let key = task.key;
+                                    // Decrement in_flight when the dispatch poll task ends.
+                                    let in_flight_c = in_flight.clone();
+                                    tokio::spawn(async move {
+                                        let _guard = InFlightDecrementGuard(in_flight_c);
+                                        let start = std::time::Instant::now();
+                                        loop {
+                                            match handle.poll() {
+                                                Ok(Some(JobState::Succeeded)) => {
+                                                    status.emit(StageEvent::StageEnd {
+                                                        node_idx,
+                                                        stage_name,
+                                                        output_hash: key,
+                                                        elapsed: start.elapsed(),
+                                                    });
+                                                    break;
+                                                }
+                                                Ok(Some(JobState::Failed(reason))) => {
+                                                    status.emit(StageEvent::StageFailed {
+                                                        node_idx,
+                                                        stage_name,
+                                                        error: reason,
+                                                        failure: None,
+                                                    });
+                                                    // Don't cancel the whole plan —
+                                                    // just report the failure.
+                                                    break;
+                                                }
+                                                Ok(Some(_)) => break, // Cancelled/Unknown
+                                                Ok(None) => {
+                                                    tokio::time::sleep(
+                                                        std::time::Duration::from_millis(500),
+                                                    ).await;
+                                                }
+                                                Err(e) => {
+                                                    status.emit(StageEvent::StageFailed {
+                                                        node_idx,
+                                                        stage_name,
+                                                        error: format!("{e}"),
+                                                        failure: None,
+                                                    });
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    });
+                                    in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    continue; // skip local spawn
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "P2P dispatch failed for node {} ({}), running locally: {e}",
+                                        node_idx,
+                                        task.stage.name()
+                                    );
+                                    // Fall through to local spawn.
+                                }
+                            }
+                        }
+                    }
+
                     let env_c = env.clone();
                     join.spawn(async move { run_node(task, env_c).await });
-                    in_flight += 1;
+                    in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
 
-            if in_flight == 0 {
+            if in_flight.load(std::sync::atomic::Ordering::Relaxed) == 0 {
                 break; // nothing running and nothing spawnable → done
             }
 
@@ -1946,7 +2180,7 @@ impl ParallelExecutor {
                     }
                 }
             };
-            in_flight -= 1;
+            in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             let res = match joined {
                 Some(Ok(r)) => r,
                 Some(Err(join_err)) => {
@@ -3163,6 +3397,113 @@ mod tests {
             peak.load(Ordering::SeqCst),
             1,
             "memory budget (4) must serialize two MEMORY_GIB=4 stages (sum 8 > budget)"
+        );
+        let _ = result;
+    }
+
+    /// A GPU stage that holds `gpu_permits = args.id + 1` permits (so id=1
+    /// requests 2 GPUs = a DDP job owning the whole 2-GPU pool, id=0 requests
+    /// 1). Records peak concurrency; a short sleep makes overlap observable.
+    struct GpuHog {
+        peak: Arc<std::sync::atomic::AtomicU32>,
+        live: Arc<std::sync::atomic::AtomicU32>,
+    }
+    #[async_trait]
+    impl Stage for GpuHog {
+        const NAME: &'static str = "gpu_hog";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Gpu];
+        type Input = Counter;
+        type Output = Counter;
+        type Args = BarrierArgs;
+        fn gpu_permits(&self, args: &BarrierArgs) -> u32 {
+            // id>=2 → a 2-GPU DDP job; id 0/1 → a 1-GPU cell (distinct ids keep
+            // distinct cache keys so the executor doesn't dedup the fork).
+            if args.id >= 2 {
+                2
+            } else {
+                1
+            }
+        }
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            input: Counter,
+            _args: &BarrierArgs,
+        ) -> Result<Counter, StageError> {
+            let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            Ok(Counter { n: input.n })
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for GpuHog {}
+
+    #[tokio::test]
+    async fn ddp_stage_holds_whole_gpu_pool_blocking_single_gpu_cell() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        // A 2-GPU box. One branch is a DDP job (id=1 → 2 GPU permits = the whole
+        // pool); the other is a single-GPU cell (id=0 → 1 permit). The DDP job
+        // holding both permits MUST block the single-GPU cell — they serialize.
+        let peak = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let live = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ctx = ExecCtx::new(td.path().to_path_buf())
+            .with_resource_limit(Resource::Gpu, 2)
+            .with_resource_limit(Resource::Cpu, 4);
+        let ddp = GpuHog {
+            peak: peak.clone(),
+            live: live.clone(),
+        };
+        let cell = GpuHog {
+            peak: peak.clone(),
+            live: live.clone(),
+        };
+        let plan = Plan::<(), LamuTrainerBackend>::new("gpugate", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .fork(ddp, BarrierArgs { id: 2 }, cell, BarrierArgs { id: 0 })
+            .merge(SumTwo, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let result = ParallelExecutor::execute(plan, ctx).await.unwrap();
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "a DDP job holding all GPU permits must block the single-GPU cell"
+        );
+        let _ = result;
+    }
+
+    #[tokio::test]
+    async fn two_single_gpu_cells_overlap_on_two_gpu_pool() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        // A 2-GPU box, two single-GPU cells (1 permit each) → they overlap.
+        let peak = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let live = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let ctx = ExecCtx::new(td.path().to_path_buf())
+            .with_resource_limit(Resource::Gpu, 2)
+            .with_resource_limit(Resource::Cpu, 4);
+        let a = GpuHog {
+            peak: peak.clone(),
+            live: live.clone(),
+        };
+        let b = GpuHog {
+            peak: peak.clone(),
+            live: live.clone(),
+        };
+        let plan = Plan::<(), LamuTrainerBackend>::new("gpupair", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .fork(a, BarrierArgs { id: 0 }, b, BarrierArgs { id: 1 })
+            .merge(SumTwo, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let result = ParallelExecutor::execute(plan, ctx).await.unwrap();
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "two 1-GPU cells must overlap on a 2-GPU pool"
         );
         let _ = result;
     }
