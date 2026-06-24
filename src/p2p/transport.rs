@@ -339,10 +339,11 @@ impl P2pClient {
                 Arc::new(InsecureVerifier)
             };
 
-        let crypto = rustls::ClientConfig::builder()
+        let mut crypto = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth();
+        crypto.alpn_protocols = vec![b"blut-p2p".to_vec()];
 
         Ok(quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)

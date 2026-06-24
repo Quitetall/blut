@@ -86,18 +86,33 @@ pub trait DispatchHandle: Send + Sync {
 /// Trait for submitting tasks to a remote compute network. The P2P
 /// coordinator implements this; the executor calls it when a stage
 /// is dispatchable.
+/// Parameters for dispatching a stage to a remote peer.
+pub struct DispatchRequest<'a> {
+    pub stage_name: &'a str,
+    pub stage_schema: u32,
+    pub input_hash: ContentHash,
+    pub args_hash: ContentHash,
+    pub args: &'a serde_json::Value,
+    pub expected_output_hash: ContentHash,
+    pub resource_request: ResourceRequest,
+    pub data_class: u8, // 0=Public, 1=Internal, 2=Restricted
+}
+
 pub trait DispatchSubmitter: Send + Sync {
     /// Submit a stage for remote execution. Returns a handle for
     /// tracking the task's lifecycle.
-    fn submit(
-        &self,
-        stage_name: &str,
-        stage_schema: u32,
-        input_hash: ContentHash,
-        args_hash: ContentHash,
-        args: &serde_json::Value,
-        expected_output_hash: ContentHash,
-    ) -> Result<Box<dyn DispatchHandle>, crate::error::TrainError>;
+    fn submit(&self, request: DispatchRequest<'_>)
+        -> Result<Box<dyn DispatchHandle>, crate::error::TrainError>;
+}
+
+/// Resource requirements for a dispatched task. Mirrors
+/// `p2p::task::ResourceRequest` without the p2p dependency.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResourceRequest {
+    pub cpu_cores: u32,
+    pub memory_gib: u32,
+    pub gpu: bool,
+    pub gpu_vram_gib: Option<u32>,
 }
 
 /// Caller-supplied execution context. Threaded through every
@@ -1928,14 +1943,29 @@ impl ParallelExecutor {
                     {
                         if policy.is_dispatchable(task.stage.name()) {
                             let args_hash = ContentHash::of_bytes(&task.canon_args);
-                            match dispatcher.submit(
+                            let stage_resources = task.stage.resources();
+                            let has_gpu = stage_resources.contains(&Resource::Gpu);
+                            let resource_request = ResourceRequest {
+                                cpu_cores: 1, // TODO: derive from RESOURCES
+                                memory_gib: task.stage.memory_gib(),
+                                gpu: has_gpu,
+                                gpu_vram_gib: None,
+                            };
+                            let data_class = policy.classify_stage(
                                 task.stage.name(),
-                                task.stage.schema(),
-                                task.input_hash,
-                                args_hash,
                                 &task.args,
-                                task.key, // cache key = expected output hash
-                            ) {
+                            ) as u8;
+                            let request = DispatchRequest {
+                                stage_name: task.stage.name(),
+                                stage_schema: task.stage.schema(),
+                                input_hash: task.input_hash,
+                                args_hash,
+                                args: &task.args,
+                                expected_output_hash: task.key,
+                                resource_request,
+                                data_class,
+                            };
+                            match dispatcher.submit(request) {
                                 Ok(handle) => {
                                     tracing::info!(
                                         "Dispatched node {} ({}) to P2P peer",

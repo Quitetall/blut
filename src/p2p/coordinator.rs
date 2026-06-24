@@ -35,6 +35,10 @@ pub(crate) struct PendingTask {
 pub struct Coordinator {
     server: Arc<P2pServer>,
     dispatch: Arc<dyn DispatchPolicy>,
+    /// The coordinator's keypair for signing task manifests.
+    keypair: Arc<KeyPair>,
+    /// The coordinator's peer ID (derived from keypair).
+    coordinator_id: PeerId,
     /// Pending tasks. Uses parking_lot so the sync DispatchSubmitter::submit
     /// can lock without async.
     pub(crate) pending: Arc<parking_lot::RwLock<HashMap<String, PendingTask>>>,
@@ -50,7 +54,8 @@ impl Coordinator {
         dispatch: Arc<dyn DispatchPolicy>,
         peers: PeerRegistry,
     ) -> Result<Self, TrainError> {
-        let server = Arc::new(P2pServer::bind(addr, keypair, peers).await?);
+        let coordinator_id = PeerId::from_pubkey(&keypair.verifying);
+        let server = Arc::new(P2pServer::bind(addr, keypair.clone(), peers).await?);
         let pending = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let connections = Arc::new(RwLock::new(HashMap::new()));
 
@@ -63,7 +68,7 @@ impl Coordinator {
             Self::accept_loop(server_c, pending_c, dispatch_c, connections_c).await;
         });
 
-        Ok(Self { server, dispatch, pending, connections })
+        Ok(Self { server, dispatch, keypair, coordinator_id, pending, connections })
     }
 
     /// The coordinator's local address.
@@ -299,31 +304,39 @@ impl crate::framework::executor::DispatchHandle for CoordinatorDispatchHandle {
 impl crate::framework::executor::DispatchSubmitter for Coordinator {
     fn submit(
         &self,
-        stage_name: &str,
-        stage_schema: u32,
-        input_hash: ContentHash,
-        args_hash: ContentHash,
-        args: &serde_json::Value,
-        expected_output_hash: ContentHash,
+        req: crate::framework::executor::DispatchRequest<'_>,
     ) -> Result<Box<dyn crate::framework::executor::DispatchHandle>, crate::error::TrainError> {
-        // Build a TaskManifest and submit via the coordinator's async path.
-        // Since DispatchSubmitter::submit is sync, we spawn the async work.
         let task_id = format!("p2p-{}", uuid::Uuid::new_v4());
-        let manifest = TaskManifest {
+        let data_class = match req.data_class {
+            0 => crate::p2p::trust::DataClass::Public,
+            1 => crate::p2p::trust::DataClass::Internal,
+            2 => crate::p2p::trust::DataClass::Restricted,
+            _ => crate::p2p::trust::DataClass::Public,
+        };
+        let resources = crate::p2p::task::ResourceRequest {
+            cpu_cores: req.resource_request.cpu_cores,
+            memory_gib: req.resource_request.memory_gib,
+            gpu: req.resource_request.gpu,
+            gpu_vram_gib: req.resource_request.gpu_vram_gib,
+        };
+
+        let expected_output_hash = req.expected_output_hash;
+        let mut manifest = TaskManifest {
             task_id: task_id.clone(),
-            coordinator_id: PeerId([0u8; 32]), // TODO: coordinator's peer ID
-            stage_name: stage_name.to_string(),
-            stage_schema,
-            input_hash,
-            args_hash,
+            coordinator_id: self.coordinator_id.clone(),
+            stage_name: req.stage_name.to_string(),
+            stage_schema: req.stage_schema,
+            input_hash: req.input_hash,
+            args_hash: req.args_hash,
             expected_output_hash,
-            args: args.clone(),
-            resources: crate::p2p::task::ResourceRequest::default(),
-            data_class: crate::p2p::trust::DataClass::Public,
+            args: req.args.clone(),
+            resources,
+            data_class,
             timeout_secs: 3600,
             encrypted_input: None,
-            signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]), // TODO: sign properly
+            signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
         };
+        manifest.signature = self.keypair.sign(&manifest.sign_payload());
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
