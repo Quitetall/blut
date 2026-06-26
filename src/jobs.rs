@@ -589,6 +589,8 @@ mod tests {
             quant: "Q4_K_M".into(),
             skip_convert: false,
             dpo_beta: None,
+            nproc_per_node: 1,
+            nnodes: 1,
         }
     }
 

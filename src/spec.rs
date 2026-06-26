@@ -144,7 +144,21 @@ pub struct TrainSpec {
     /// DPO trainer reads this verbatim from the spec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dpo_beta: Option<f32>,
+
+    /// Number of GPUs for DDP. 1 = single-GPU (default). >1 = torchrun DDP.
+    /// When >1, the backend launches `torchrun --nproc_per_node=N` instead
+    /// of bare python, and the trainer initializes DDP automatically.
+    #[serde(default = "default_nproc")]
+    pub nproc_per_node: u32,
+
+    /// Number of DDP nodes (for multi-node training). Default 1.
+    /// When >1, requires MASTER_ADDR/MASTER_PORT to be set.
+    #[serde(default = "default_nnodes")]
+    pub nnodes: u32,
 }
+
+fn default_nproc() -> u32 { 1 }
+fn default_nnodes() -> u32 { 1 }
 
 impl TrainSpec {
     /// Sensible defaults for a 4090 + 7B base + QLoRA. Fields you almost
@@ -172,6 +186,8 @@ impl TrainSpec {
             quant: "Q4_K_M".into(),
             skip_convert: false,
             dpo_beta: None,
+            nproc_per_node: 1,
+            nnodes: 1,
         }
     }
 
