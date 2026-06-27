@@ -131,7 +131,6 @@ mod tests {
             vram_total_mib: None,
             vram_free_mib: None,
             gpus: Vec::new(),
-            gpu_count: 0,
         }
     }
 

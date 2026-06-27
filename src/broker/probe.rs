@@ -45,8 +45,6 @@ pub struct ResourceSnapshot {
     pub vram_free_mib: Option<u64>,
     /// Per-GPU information (empty if no nvidia-smi).
     pub gpus: Vec<GpuInfo>,
-    /// Number of GPUs detected.
-    pub gpu_count: u32,
 }
 
 impl ResourceSnapshot {
@@ -56,7 +54,6 @@ impl ResourceSnapshot {
         let mem_total_gb = probe_meminfo_kib("MemTotal:") / 1024.0 / 1024.0;
         let mem_avail_gb = probe_meminfo_kib("MemAvailable:") / 1024.0 / 1024.0;
         let gpus = probe_all_gpus();
-        let gpu_count = gpus.len() as u32;
         let vram_total_mib = if gpus.is_empty() {
             None
         } else {
@@ -73,18 +70,17 @@ impl ResourceSnapshot {
             vram_total_mib,
             vram_free_mib,
             gpus,
-            gpu_count,
         }
     }
 
     /// Get the number of GPUs available.
     pub fn gpu_count(&self) -> u32 {
-        self.gpu_count
+        self.gpus.len() as u32
     }
 
-    /// Get per-GPU VRAM info for device scheduling.
-    pub fn gpu_vram_mib(&self) -> Vec<(u32, u64, u64)> {
-        self.gpus.iter().map(|g| (g.index, g.vram_total_mib, g.vram_free_mib)).collect()
+    /// Get per-GPU info for device scheduling.
+    pub fn gpus(&self) -> &[GpuInfo] {
+        &self.gpus
     }
 }
 
@@ -131,10 +127,12 @@ fn probe_nvidia_gpus() -> Option<Vec<GpuInfo>> {
     for line in s.lines() {
         let parts: Vec<&str> = line.split(',').map(|p| p.trim()).collect();
         if parts.len() >= 4 {
-            let index = parts[0].parse::<u32>().ok()?;
+            // Bug fix: use `ok()` + `continue` instead of `ok()?` so a
+            // single malformed line doesn't discard all already-parsed GPUs.
+            let Some(index) = parts[0].parse::<u32>().ok() else { continue };
             let model = parts[1].to_string();
-            let total = parts[2].parse::<u64>().ok()?;
-            let used = parts[3].parse::<u64>().ok()?;
+            let Some(total) = parts[2].parse::<u64>().ok() else { continue };
+            let Some(used) = parts[3].parse::<u64>().ok() else { continue };
             gpus.push(GpuInfo {
                 index,
                 model,
@@ -158,6 +156,7 @@ fn probe_rocm_gpus() -> Option<Vec<GpuInfo>> {
     let s = String::from_utf8_lossy(&out.stdout);
     let mut gpus = Vec::new();
     // rocm-smi CSV format varies; try a simple parse
+    let mut gpu_idx: u32 = 0;
     for (i, line) in s.lines().enumerate() {
         if i == 0 && line.contains("GPU") {
             continue; // skip header
@@ -167,11 +166,12 @@ fn probe_rocm_gpus() -> Option<Vec<GpuInfo>> {
             let model = parts[0].to_string();
             let total = parts.last().and_then(|p| p.parse::<u64>().ok()).unwrap_or(0);
             gpus.push(GpuInfo {
-                index: i as u32,
+                index: gpu_idx,
                 model,
                 vram_total_mib: total,
-                vram_free_mib: total, // rocm-smi doesn't easily give free VRAM in CSV
+                vram_free_mib: 0, // conservative: no free-VRAM signal from rocm-smi
             });
+            gpu_idx += 1;
         }
     }
     if gpus.is_empty() { None } else { Some(gpus) }
