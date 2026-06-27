@@ -31,6 +31,7 @@ pub mod cache;
 pub mod compat;
 pub mod control;
 pub mod cookbook;
+pub mod dag_opt;
 pub mod error;
 pub mod error_domain;
 pub mod executor;
@@ -47,6 +48,7 @@ pub mod status;
 pub use artifact::{Artifact, ArtifactMetadata, ContentHash};
 pub use cache::{CacheHandle, CacheHit, lru_prune};
 pub use compat::Compatible;
+pub use dag_opt::{DagOptimizer, ScheduleHint};
 pub use cookbook::{ArtifactDescriptor, Cookbook, Registry, StageDescriptor};
 pub use error::{PlanError, RecipeError, StageError};
 pub use error_domain::{

@@ -190,6 +190,10 @@ pub struct ExecCtx {
     /// P2P dispatch: submits tasks to the remote compute network.
     #[cfg(feature = "p2p")]
     pub dispatcher: Option<Arc<dyn DispatchSubmitter>>,
+    /// DAG optimizer. When set, the executor runs the optimizer pass
+    /// on the plan before execution (dead code elimination, critical
+    /// path scheduling, cache-aware ordering). Default: enabled.
+    pub dag_optimizer: Option<crate::framework::dag_opt::DagOptimizer>,
 }
 
 impl ExecCtx {
@@ -230,6 +234,7 @@ impl ExecCtx {
             dispatch_policy: None,
             #[cfg(feature = "p2p")]
             dispatcher: None,
+            dag_optimizer: Some(crate::framework::dag_opt::DagOptimizer::new()),
         }
     }
 
@@ -1699,6 +1704,15 @@ impl ParallelExecutor {
     /// executors observably equivalent.
     pub async fn execute(plan: CompiledPlan, ctx: ExecCtx) -> Result<PlanResult, PlanError> {
         let started = Instant::now();
+
+        // DAG optimization pass: dead code elimination, critical path
+        // scheduling, cache-aware ordering. Runs before topo_sort.
+        let (plan, _schedule_hints) = if let Some(ref optimizer) = ctx.dag_optimizer {
+            optimizer.optimize(plan)
+        } else {
+            (plan, std::collections::HashMap::new())
+        };
+
         // `mut`: runtime `Spawn` (PBT/TPE) extends the topo order at runtime.
         let mut order = plan.topo_order()?; // also the cycle check
         let view = plan.exec_view();
