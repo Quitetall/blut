@@ -26,7 +26,10 @@
 //!         "compute_time_secs": 1847
 //!     }
 
+mod api;
+
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -57,6 +60,10 @@ struct Cli {
     /// Worker ID (auto-generated if not provided).
     #[arg(long)]
     worker_id: Option<String>,
+
+    /// Enable REST API server on this port.
+    #[arg(long)]
+    api_port: Option<u16>,
 }
 
 /// A job pulled from the queue.
@@ -126,7 +133,25 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&cli.work_dir).await?;
     fs::create_dir_all(&cli.results_dir).await?;
 
+    // Start API server if configured
+    if let Some(port) = cli.api_port {
+        let api_state = api::ApiState {
+            queue_dir: cli.queue_dir.clone(),
+            results_dir: cli.results_dir.clone(),
+            jobs: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        };
+        let app = api::router(api_state);
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        tracing::info!("API server listening on {addr}");
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+            axum::serve(listener, app).await.unwrap();
+        });
+    }
+
     let poll_interval = Duration::from_secs(cli.poll_interval);
+
+    tracing::info!("worker {worker_id} entering poll loop (interval: {}s)", cli.poll_interval);
 
     loop {
         match poll_and_run(&cli, &worker_id).await {
