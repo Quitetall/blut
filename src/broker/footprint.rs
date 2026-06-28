@@ -739,17 +739,44 @@ impl FootprintStore {
         let flat = key.flat();
         let merged = match self.entries.get(&flat).copied() {
             Some(prev) => {
-                // Higher-rank source wins outright; equal/lower rank keeps
-                // the larger RAM (monotone-up). The stored source is the
-                // MAX rank ever seen so an OomCorrected lower bound is
-                // never demoted by a later lucky Measured run.
-                let winning_source = if source.rank() >= prev.source.rank() {
-                    source
+                // B2 self-heal — converge from BOTH directions:
+                //  * A clean `Measured` peak is AUTHORITATIVE over a stored
+                //    `OomCorrected` bound: it REPLACES it (ram + source), even
+                //    if lower. An OOM cap is often a SPURIOUS contention/co-tenant
+                //    kill, not the run's intrinsic need; a same-key run that
+                //    cleanly exited with ≥10% cap headroom proves the true need.
+                //    This lets a low run pull the cap DOWN (Q1) and de-ratchets a
+                //    spurious OOM so it can't inflate every future run (Q2).
+                //  * `Measured`-vs-`Measured` MAX-merges (a higher real peak can
+                //    recur → keep it; variance-safe).
+                //  * `OomCorrected` (rank 2) still wins over `Measured`/`Default`
+                //    and MAX-merges UP — an OOM proved the prior cap insufficient,
+                //    escalate-for-retry (now PROVISIONAL: a later clean `Measured`
+                //    can override it via the first rule).
+                // The "clean run proves the true need" headroom check is enforced
+                // UPSTREAM at classification (record_train_footprint): only a
+                // CleanExit with peak <90% of ITS cap is labelled `Measured`; a
+                // run that rode its cap (≥90%) is `OomCorrected`. So reaching this
+                // branch with `source == Measured` already means a run that fit
+                // with headroom. `ram_bytes > 0` guards a pathological 0-byte
+                // measurement from zeroing a valid bound. (We deliberately heal on
+                // the FIRST clean sample — fast convergence is the goal; genuine
+                // cross-run variance re-OOMs and re-escalates, self-correcting.)
+                let measured_overrides_oom = source == FootprintSource::Measured
+                    && prev.source == FootprintSource::OomCorrected
+                    && ram_bytes > 0;
+                let (winning_source, winning_ram) = if measured_overrides_oom {
+                    (FootprintSource::Measured, ram_bytes)
+                } else if source.rank() >= prev.source.rank() {
+                    (source, ram_bytes.max(prev.ram_bytes))
                 } else {
-                    prev.source
+                    (prev.source, ram_bytes.max(prev.ram_bytes))
                 };
                 FootprintEntry {
-                    ram_bytes: ram_bytes.max(prev.ram_bytes),
+                    ram_bytes: winning_ram,
+                    // VRAM is MAX-merged regardless of the RAM override: a GPU
+                    // high-water mark is a real hard limit even on a run that
+                    // RAM-OOM'd spuriously, so it never shrinks here.
                     vram_mib: vram_mib.max(prev.vram_mib),
                     n_samples: prev.n_samples.saturating_add(1),
                     source: winning_source,
@@ -1202,16 +1229,50 @@ mod tests {
             "OomCorrected > Measured"
         );
         assert_eq!(e.ram_bytes, 30 * GIB, "still max-merged");
-        // And a later Measured run must NOT demote the source back.
+        // B2 self-heal: a later CLEAN Measured run OVERRIDES the OomCorrected
+        // bound (it proves the true need) — the source demotes to Measured and
+        // ram becomes the clean measurement verbatim (the Q1/Q2 fix; an OOM cap
+        // is provisional, not a permanent floor).
         s.record(&key(), 31 * GIB, 0, FootprintSource::Measured)
             .unwrap();
         let e = s.entries.get(&key().flat()).unwrap();
         assert_eq!(
             e.source,
-            FootprintSource::OomCorrected,
-            "Measured must not demote"
+            FootprintSource::Measured,
+            "a clean Measured overrides a stale OomCorrected (B2 self-heal)"
         );
-        assert_eq!(e.ram_bytes, 31 * GIB);
+        assert_eq!(e.ram_bytes, 31 * GIB, "ram = the clean measurement, verbatim");
+    }
+
+    #[test]
+    fn clean_measured_lowers_cap_and_de_ratchets_spurious_oom() {
+        // The user's two questions:
+        //  Q1 — can a low-memory run lower the cap?  (was: NO; now: YES)
+        //  Q2 — does a spurious OOM force future runs higher forever? (was: YES;
+        //       now: NO — the next clean run de-ratchets it.)
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("footprints.json");
+        let mut s = FootprintStore::load_from(path);
+        // A spurious/contention OOM poisons the entry at 40 GiB.
+        s.record(&key(), 40 * GIB, 0, FootprintSource::OomCorrected)
+            .unwrap();
+        // Before B2 this resolved ESCALATED (40 → ~48/64); the next clean run
+        // could never bring it down. Now a clean 18 GiB run overrides it DOWN.
+        s.record(&key(), 18 * GIB, 0, FootprintSource::Measured)
+            .unwrap();
+        let e = s.entries.get(&key().flat()).unwrap();
+        assert_eq!(e.source, FootprintSource::Measured, "Q2: spurious OOM de-ratcheted");
+        assert_eq!(e.ram_bytes, 18 * GIB, "Q1: clean run lowered the cap to actual");
+        // And resolve now returns the tight measured value (+2G headroom), NOT an
+        // escalated OOM cap.
+        let hint = Footprint { ram_bytes: 33 * GIB, vram_mib: 0 };
+        let r = s.resolve(&key(), hint);
+        assert_eq!(r.ram_bytes, 18 * GIB, "resolve returns the healed Measured verbatim");
+        assert_eq!(
+            r.memmax_bytes(),
+            18 * GIB + Footprint::MEMMAX_HEADROOM_BYTES,
+            "+2G safety margin"
+        );
     }
 
     #[test]
