@@ -321,6 +321,11 @@ impl crate::framework::executor::DispatchSubmitter for Coordinator {
             gpu: req.resource_request.gpu,
             gpu_vram_gib: req.resource_request.gpu_vram_gib,
         };
+        // Captured for peer selection inside the async dispatch (the manifest
+        // moves `resources`/`data_class`, so clone what `select_peer` needs).
+        let select_stage = req.stage_name.to_string();
+        let select_resources = resources; // ResourceRequest is Copy
+        let select_data_class = data_class;
 
         let expected_output_hash = req.expected_output_hash;
         let mut manifest = TaskManifest {
@@ -355,11 +360,30 @@ impl crate::framework::executor::DispatchSubmitter for Coordinator {
         let connections = self.connections.clone();
         let pending_c = self.pending.clone();
         let task_id_c = task_id.clone();
+        let dispatch = self.dispatch.clone();
+        let registry = self.server.peers.clone();
         tokio::spawn(async move {
             let conn = {
                 let conns = connections.read().await;
-                // TODO: select peer via dispatch policy
-                conns.values().next().cloned()
+                // Route through the dispatch policy: gather the PeerInfo for the
+                // peers we actually hold a live connection to, ask the policy to
+                // pick one (trust matrix + capability + reputation), and dispatch
+                // to THAT peer. `None` ⇒ no suitable peer (we fail the task back
+                // rather than silently sending to an arbitrary connection).
+                let selected = {
+                    let reg = registry.read().await;
+                    let candidates: Vec<crate::p2p::peer::PeerInfo> = conns
+                        .keys()
+                        .filter_map(|id| reg.get(id).cloned())
+                        .collect();
+                    dispatch.select_peer(
+                        &select_stage,
+                        &select_resources,
+                        select_data_class,
+                        &candidates,
+                    )
+                };
+                selected.and_then(|peer_id| conns.get(&peer_id).cloned())
             };
             if let Some(conn) = conn {
                 if let Err(e) = P2pServer::send_task(&conn, &manifest).await {
@@ -372,7 +396,10 @@ impl crate::framework::executor::DispatchSubmitter for Coordinator {
             } else {
                 let mut pending = pending_c.write();
                 if let Some(pt) = pending.remove(&task_id_c) {
-                    let _ = pt.result_tx.send(Err("no peers connected".into()));
+                    let _ = pt.result_tx.send(Err(
+                        "no suitable peer (none connected, or none cleared the dispatch policy)"
+                            .into(),
+                    ));
                 }
             }
         });
