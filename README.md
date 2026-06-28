@@ -3,7 +3,7 @@
 A **Rust-native, compile-time-typed orchestration framework for ML training
 that scales from 1 GPU to 100 datacenters.** You wire stages into a typed DAG;
 BLUT runs it against a content-addressed cache, under per-stage memory
-containment, with structured observability — and refuses to wire two stages
+containment, with structured observability, and BLUT refuses to wire two stages
 whose types don't line up.
 
 ```toml
@@ -13,9 +13,7 @@ blut = "1.2"
 
 ## What BLUT is
 
-BLUT is the **git of ML training**. The core is a DAG orchestrator. Everything
-else — resource brokerage, containment, P2P, HPO, lineage, cloud compute — is
-a layer on top.
+BLUT is a DAG orchestrator. Everything else, resource brokerage, containment, P2P, HPO, lineage, cloud compute, is just a layer on top.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
