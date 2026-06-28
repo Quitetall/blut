@@ -212,6 +212,46 @@ impl ControlPolicy for KillOnNaN {
     }
 }
 
+/// Compose several policies into one, consulted in order. The FIRST policy to
+/// return a non-`Continue` decision wins and short-circuits the rest; if every
+/// policy is satisfied the composite returns `Continue`.
+///
+/// The canonical use is layering the broad [`KillOnNaN`] safety net UNDER an
+/// HPO policy (TPE / PBT / ASHA): `[KillOnNaN, hpo]`. Order is load-bearing.
+///
+/// * **Safety is never dropped.** Today `ExecCtx::with_control` REPLACES the
+///   default `KillOnNaN`, so enabling an HPO policy would otherwise lose the
+///   payload-wide non-finite scan (an HPO policy typically only watches its
+///   single objective key — `TpePolicy` doesn't kill on divergence at all).
+/// * **No spawn-slot leak.** An HPO policy's `on_step` may pop its trial queue
+///   and bump its spawn counter BEFORE returning `Spawn`. Running `KillOnNaN`
+///   first and short-circuiting means the HPO policy is never consulted on a
+///   step that is already being killed, so no queued spawn is silently dropped.
+pub struct CompositePolicy {
+    policies: Vec<std::sync::Arc<dyn ControlPolicy>>,
+}
+
+impl CompositePolicy {
+    /// Build a composite from policies in consult order (first wins on a tie).
+    pub fn new(policies: Vec<std::sync::Arc<dyn ControlPolicy>>) -> Self {
+        Self { policies }
+    }
+}
+
+impl ControlPolicy for CompositePolicy {
+    fn on_step(&self, metrics: &StepMetrics) -> Control {
+        for p in &self.policies {
+            match p.on_step(metrics) {
+                // Satisfied by this policy — consult the next one.
+                Control::Continue => continue,
+                // KillBranch or Spawn — the first decisive policy wins.
+                decisive => return decisive,
+            }
+        }
+        Control::Continue
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +313,84 @@ mod tests {
         // Some trainers emit numbers as strings; a finite one must not kill.
         let u = json!({ "loss": "0.0421" });
         assert_eq!(KillOnNaN.on_step(&metrics(&u)), Control::Continue);
+    }
+
+    // --- CompositePolicy (B2) ---------------------------------------------
+
+    /// Always `Continue`, but counts how many times it was consulted — lets a
+    /// test prove the composite short-circuited (counter stays 0) instead of
+    /// falling through to a downstream policy.
+    #[derive(Default)]
+    struct CountingContinue {
+        seen: std::sync::atomic::AtomicU32,
+    }
+    impl ControlPolicy for CountingContinue {
+        fn on_step(&self, _m: &StepMetrics) -> Control {
+            self.seen
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Control::Continue
+        }
+    }
+
+    /// Always `KillBranch` — stands in for a decisive downstream policy.
+    struct AlwaysKill;
+    impl ControlPolicy for AlwaysKill {
+        fn on_step(&self, _m: &StepMetrics) -> Control {
+            Control::KillBranch
+        }
+    }
+
+    #[test]
+    fn composite_safety_kills_even_if_inner_continues() {
+        // [KillOnNaN, AlwaysContinue] on a NaN payload → KillBranch from the
+        // safety net, even though the inner policy would have continued.
+        let inner = std::sync::Arc::new(CountingContinue::default());
+        let comp = CompositePolicy::new(vec![
+            std::sync::Arc::new(KillOnNaN),
+            inner.clone(),
+        ]);
+        let u = json!({ "loss": "nan" });
+        assert_eq!(comp.on_step(&metrics(&u)), Control::KillBranch);
+        // Short-circuited: the inner policy was never consulted (no spawn-slot
+        // leak — an HPO policy would not have popped its trial queue here).
+        assert_eq!(inner.seen.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn composite_inner_decides_when_safe() {
+        // [KillOnNaN, AlwaysKill] on a FINITE payload → the inner policy is
+        // consulted (KillOnNaN continues) and its decision wins.
+        let comp = CompositePolicy::new(vec![
+            std::sync::Arc::new(KillOnNaN),
+            std::sync::Arc::new(AlwaysKill),
+        ]);
+        let u = json!({ "loss": 0.42 });
+        assert_eq!(comp.on_step(&metrics(&u)), Control::KillBranch);
+    }
+
+    #[test]
+    fn composite_empty_and_single() {
+        // Empty list → Continue. Single element behaves exactly like it alone.
+        let empty = CompositePolicy::new(vec![]);
+        let u = json!({ "loss": 0.1 });
+        assert_eq!(empty.on_step(&metrics(&u)), Control::Continue);
+
+        let single = CompositePolicy::new(vec![std::sync::Arc::new(KillOnNaN)]);
+        let nan = json!({ "loss": "inf" });
+        assert_eq!(single.on_step(&metrics(&nan)), Control::KillBranch);
+        assert_eq!(single.on_step(&metrics(&u)), Control::Continue);
+    }
+
+    #[test]
+    fn composite_first_decisive_wins() {
+        // A kill from policy 0 returns without consulting policy 1.
+        let inner = std::sync::Arc::new(CountingContinue::default());
+        let comp = CompositePolicy::new(vec![
+            std::sync::Arc::new(AlwaysKill),
+            inner.clone(),
+        ]);
+        let u = json!({ "loss": 0.3 });
+        assert_eq!(comp.on_step(&metrics(&u)), Control::KillBranch);
+        assert_eq!(inner.seen.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

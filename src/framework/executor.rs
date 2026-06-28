@@ -5101,4 +5101,84 @@ mod tests {
             result.n_stages
         );
     }
+
+    // --- CompositePolicy integration (B2): safety layered under a spawner ---
+
+    #[tokio::test]
+    async fn composite_kills_nan_under_hpo_spawner() {
+        // [KillOnNaN, SpawnEveryStep] — the diverging node emits NaN; KillOnNaN
+        // must fire FIRST and short-circuit, so the spawner is never consulted
+        // on the kill step (no SpawnMarker injected) and the branch is killed.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        ALWAYS_DIV_ATTEMPTS.store(0, Ordering::SeqCst);
+        SPAWN_MARKER_RAN.store(0, Ordering::SeqCst);
+        let (_td, base) = fresh_ctx();
+        let comp = crate::framework::control::CompositePolicy::new(vec![
+            std::sync::Arc::new(crate::framework::control::KillOnNaN),
+            std::sync::Arc::new(SpawnEveryStep),
+        ]);
+        let ctx = base.with_control(std::sync::Arc::new(comp));
+
+        let plan = Plan::<(), LamuTrainerBackend>::new("comp_nan", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .then(AlwaysDiverge, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let fut = ParallelExecutor::execute(plan, ctx);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+            .await
+            .expect("composite kill must keep firing + bounded retry");
+
+        // KillOnNaN wins: the diverging node surfaces a terminal failure.
+        match result {
+            Err(PlanError::StageFailed { stage, source, .. }) => {
+                assert_eq!(stage, "always_diverge");
+                assert!(
+                    matches!(source, StageError::Diverged { .. }),
+                    "composite must surface StageError::Diverged, got {source:?}"
+                );
+            }
+            other => panic!("expected StageFailed(Diverged), got {other:?}"),
+        }
+        // The spawner was short-circuited on every NaN step — no sub-plan ran.
+        assert_eq!(
+            SPAWN_MARKER_RAN.load(Ordering::SeqCst),
+            0,
+            "KillOnNaN short-circuited the spawner; no spawn leaked"
+        );
+    }
+
+    #[tokio::test]
+    async fn composite_spawns_when_finite() {
+        // [KillOnNaN, SpawnOnce] — finite steps, so KillOnNaN continues and the
+        // inner spawner's injection runs to completion (composition does not
+        // suppress legitimate spawns).
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        MAKE_RUN_COUNT.store(0, Ordering::SeqCst);
+        SPAWN_MARKER_RAN.store(0, Ordering::SeqCst);
+        SPAWN_CHILD_RAN.store(0, Ordering::SeqCst);
+        let (_td, base) = fresh_ctx();
+        let comp = crate::framework::control::CompositePolicy::new(vec![
+            std::sync::Arc::new(crate::framework::control::KillOnNaN),
+            std::sync::Arc::new(SpawnOnce {
+                fired: std::sync::atomic::AtomicBool::new(false),
+            }),
+        ]);
+        let ctx = base.with_control(std::sync::Arc::new(comp));
+
+        let plan = Plan::<(), LamuTrainerBackend>::new("comp_spawn", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .then(StepThenSleep, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let fut = ParallelExecutor::execute(plan, ctx);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+            .await
+            .expect("composite spawn run must terminate")
+            .expect("a spawn is not a failure → Ok");
+
+        assert_eq!(SPAWN_MARKER_RAN.load(Ordering::SeqCst), 1, "injected root ran");
+        assert_eq!(SPAWN_CHILD_RAN.load(Ordering::SeqCst), 1, "injected child ran");
+        assert_eq!(result.n_stages, 4, "order grew to include the spawned nodes");
+    }
 }

@@ -1504,6 +1504,21 @@ where
 /// (a parallel random search, control=None); other algos error until their
 /// slice lands. Mirrors `run_one_recipe`'s job/admission/lock setup so HPO runs
 /// are never-OOM-gated + scheduler-arbitrated exactly like a normal recipe run.
+/// Layer the broad `KillOnNaN` safety net UNDER an HPO policy. `with_control`
+/// REPLACES the executor's default `KillOnNaN`, so wiring an HPO policy raw
+/// would drop the payload-wide non-finite kill (HPO policies only watch their
+/// objective key; TPE doesn't kill on divergence at all). `[KillOnNaN, hpo]`
+/// keeps the safety net active — order is load-bearing (KillOnNaN first
+/// short-circuits, so a doomed step never consumes the HPO policy's spawn slot).
+fn with_nan_safety(
+    hpo: std::sync::Arc<dyn crate::framework::control::ControlPolicy>,
+) -> std::sync::Arc<dyn crate::framework::control::ControlPolicy> {
+    std::sync::Arc::new(crate::framework::control::CompositePolicy::new(vec![
+        std::sync::Arc::new(crate::framework::control::KillOnNaN),
+        hpo,
+    ]))
+}
+
 async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()> {
     use crate::framework::ExecCtx;
     use crate::hpo::{RandomSampler, Sampler, SearchSpace};
@@ -1710,7 +1725,7 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
             grace as u64,
             strategy,
         );
-        ctx = ctx.with_control(std::sync::Arc::new(sched));
+        ctx = ctx.with_control(with_nan_safety(std::sync::Arc::new(sched)));
         eprintln!(
             "hpo: {algo} early-stop (metric={metric} {mode}, budget-key={metric_budget_key}, grace={grace})"
         );
@@ -1784,7 +1799,7 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
             max_spawns: (max_trials as usize).saturating_mul(8).max(1),
         };
         let sched = PbtPolicy::new(trial_of_topo, pbt_trials, sp.clone(), cfg, factory, seed);
-        ctx = ctx.with_control(std::sync::Arc::new(sched));
+        ctx = ctx.with_control(with_nan_safety(std::sync::Arc::new(sched)));
         eprintln!(
             "hpo: pbt rungs={rungs:?} (metric={metric} {mode}, cull<p{percentile}, resume-on-promote)"
         );
@@ -1831,7 +1846,7 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
             sampler,
             factory,
         );
-        ctx = ctx.with_control(std::sync::Arc::new(sched));
+        ctx = ctx.with_control(with_nan_safety(std::sync::Arc::new(sched)));
         eprintln!(
             "hpo: tpe (metric={metric} {mode}, complete@{max_budget}, ≤{max_trials} suggested)"
         );
