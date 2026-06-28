@@ -1372,6 +1372,34 @@ fn node_at<'a>(
 /// Real PBT/TPE runs spawn O(trials), far below this; it only guards a bug.
 const MAX_RUNTIME_SPAWNS: usize = 4096;
 
+/// Pick the ready node with the LONGEST critical path to the terminal, so the
+/// critical path is never starved behind a cheap side branch. Ties are broken
+/// by ascending `NodeId` — which makes the no-optimizer / all-equal-priority
+/// case byte-identical to the historical `ready.iter().next()` (smallest id),
+/// since `ready` is a `BTreeSet`. Nodes absent from `hints` (runtime-injected
+/// sub-plans, or no optimizer configured) default to `critical_path_len = 0`,
+/// so they schedule after any positive-priority original node but are never
+/// dropped — `cap` keeps draining them.
+///
+/// Determinism: iteration is driven by the sorted `ready` set and only does
+/// point `get`s into the `HashMap` `hints`; the composite key
+/// `(critical_path_len, Reverse(id))` is unique per node, so the argmax never
+/// depends on `max_by_key`'s tie rule.
+///
+/// Cost: O(|ready|) per call (a linear argmax), vs the old `ready.iter().next()`
+/// at O(log n). The `max_in_flight` cap bounds calls per loop pass and ML
+/// training DAGs keep the ready set in the single-to-low-hundreds range, so the
+/// linear scan is negligible; revisit only if a workload makes `ready` very wide.
+fn next_ready(
+    ready: &BTreeSet<NodeId>,
+    hints: &HashMap<NodeId, crate::framework::dag_opt::ScheduleHint>,
+) -> Option<NodeId> {
+    ready.iter().copied().max_by_key(|id| {
+        let cp = hints.get(id).map(|h| h.critical_path_len).unwrap_or(0);
+        (cp, std::cmp::Reverse(*id))
+    })
+}
+
 /// Inject a `Spawn` delta into the running parallel schedule (v0.20). The
 /// sub-plan's local node ids `0..k` are relabelled to globals `base + l`
 /// (`base = orig_n + appended.len()`), its nodes moved into `appended`, its
@@ -1706,8 +1734,12 @@ impl ParallelExecutor {
         let started = Instant::now();
 
         // DAG optimization pass: dead code elimination, critical path
-        // scheduling, cache-aware ordering. Runs before topo_sort.
-        let (plan, _schedule_hints) = if let Some(ref optimizer) = ctx.dag_optimizer {
+        // scheduling, cache-aware ordering. Runs before topo_sort. The
+        // per-node `schedule_hints` drive ready-node priority in the spawn
+        // loop (longest critical path first); with no optimizer the map is
+        // empty and `next_ready` falls back to smallest-NodeId order, which
+        // is byte-identical to the historical `ready.iter().next()`.
+        let (plan, schedule_hints) = if let Some(ref optimizer) = ctx.dag_optimizer {
             optimizer.optimize(plan)
         } else {
             (plan, std::collections::HashMap::new())
@@ -1883,7 +1915,10 @@ impl ParallelExecutor {
             // already failing — then stop spawning and just drain).
             if first_error.is_none() {
                 while in_flight.load(std::sync::atomic::Ordering::Relaxed) < max_in_flight {
-                    let Some(&node_id) = ready.iter().next() else {
+                    // Critical-path-first among ready nodes (longest path to the
+                    // terminal wins); ties → smallest NodeId, byte-identical to the
+                    // historical `ready.iter().next()` when priorities are equal.
+                    let Some(node_id) = next_ready(&ready, &schedule_hints) else {
                         break;
                     };
                     ready.remove(&node_id);
@@ -2468,6 +2503,60 @@ mod tests {
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     static MAKE_RUN_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    // --- next_ready: critical-path-first ready-node selection (B1) ---------
+
+    /// Build a `ScheduleHint` carrying only a critical-path length (the only
+    /// field `next_ready` reads).
+    fn cp_hint(critical_path_len: u32) -> crate::framework::dag_opt::ScheduleHint {
+        crate::framework::dag_opt::ScheduleHint {
+            critical_path_len,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn next_ready_prefers_longer_critical_path() {
+        // The higher-priority node (2) has the LARGER id, so the old
+        // smallest-id rule would have wrongly returned 1.
+        let ready: BTreeSet<NodeId> = [1, 2].into_iter().collect();
+        let hints: HashMap<NodeId, _> = [(1, cp_hint(1)), (2, cp_hint(3))].into_iter().collect();
+        assert_eq!(next_ready(&ready, &hints), Some(2));
+    }
+
+    #[test]
+    fn next_ready_tie_breaks_ascending_id() {
+        // Equal critical paths → smallest NodeId, matching the historical
+        // `ready.iter().next()` behaviour (byte-equal output).
+        let ready: BTreeSet<NodeId> = [1, 4].into_iter().collect();
+        let hints: HashMap<NodeId, _> = [(1, cp_hint(1)), (4, cp_hint(1))].into_iter().collect();
+        assert_eq!(next_ready(&ready, &hints), Some(1));
+    }
+
+    #[test]
+    fn next_ready_empty_hints_is_smallest_id() {
+        // No optimizer configured (empty map) → smallest id, identical to today.
+        let ready: BTreeSet<NodeId> = [5, 6].into_iter().collect();
+        let hints: HashMap<NodeId, crate::framework::dag_opt::ScheduleHint> = HashMap::new();
+        assert_eq!(next_ready(&ready, &hints), Some(5));
+    }
+
+    #[test]
+    fn next_ready_injected_node_defaults_to_zero() {
+        // A runtime-injected node (id 100, absent from hints) defaults to
+        // cp=0, so the critical-path original (id 2, cp=3) is picked first.
+        let ready: BTreeSet<NodeId> = [2, 100].into_iter().collect();
+        let hints: HashMap<NodeId, _> = [(2, cp_hint(3))].into_iter().collect();
+        assert_eq!(next_ready(&ready, &hints), Some(2));
+    }
+
+    #[test]
+    fn next_ready_empty_set_is_none() {
+        // Preserves the `else break` termination in the spawn loop.
+        let ready: BTreeSet<NodeId> = BTreeSet::new();
+        let hints: HashMap<NodeId, crate::framework::dag_opt::ScheduleHint> = HashMap::new();
+        assert_eq!(next_ready(&ready, &hints), None);
+    }
 
     struct MakeOne;
     #[async_trait]
