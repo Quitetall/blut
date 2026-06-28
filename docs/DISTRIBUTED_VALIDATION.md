@@ -2,114 +2,100 @@
 
 Tracks the 1→100 GPU + cross-platform/cloud scaling work against what is
 **validated**, **architected (code landed, validation pending hardware)**, and
-**deferred**. Companion to the plan `~/.claude/plans/rosy-beaming-hollerith.md`.
+**deferred**.
 
-Branch: `feat/distributed-scaling` (engine + lamquant cookbook).
+Last updated: 2026-06-27 (v1.2.0).
 
 ## Summary by layer
 
 | Layer | Capability | Status | Validated on |
 |-------|-----------|--------|--------------|
-| Containment | Pluggable trait (systemd/cgroup2/rlimit/bare) + cloud-bug fix | ✅ **Validated** | local + (rlimit) end-to-end |
-| Containment | `RLIMIT_AS` portable cap (cloud fallback) | ✅ **Validated** | real spawn: 100 GiB → MemoryError under 512 MiB cap |
-| Containment | `CgroupV2Direct` (delegated cgroup, no systemd) | 🟡 Architected | needs a box that delegates a cgroup subtree (Thunder k8s = read-only → falls back, correct) |
-| Containment | `WindowsJobObject` | ⬜ Stub | future |
-| L1 DDP | GPU-permit resource model (1 job spans N GPUs) | ✅ **Validated** | engine executor tests (2-GPU pool coexistence) |
-| L1 DDP | torchrun argv wrap (recipe→stage→runner) | ✅ **Validated** | `kernel_argv` unit tests (single/single-node/multi-node) |
-| L1 DDP | Python `train_joint.py` DDP | ✅ **Written** | syntax clean; gloo/NCCL validation pending |
-| L1 DDP | 2×A100 end-to-end DDP run | ⬜ Pending hardware | needs GPU instance |
-| L2 Cluster | Slurm/Ray `RemoteJob` (submit+poll+stream+cancel) | ✅ **Written** | 17 unit tests (sacct/ray parsing, sbatch gen); cluster validation pending |
-| L3 Multi-node | SlurmLauncher `nodes`/`ntasks_per_node` + sbatch MASTER_ADDR preamble | ✅ **Written** | 2 unit tests (preamble present/absent); cluster validation pending |
+| **Containment** | Pluggable trait (systemd/cgroup2/rlimit/bare) | ✅ Validated | local + rlimit end-to-end |
+| **Containment** | `RLIMIT_AS` portable cap (cloud fallback) | ✅ Validated | real spawn: 100 GiB → MemoryError under 512 MiB cap |
+| **Containment** | `CgroupV2Direct` (delegated cgroup) | 🟡 Architected | needs writable cgroup subtree |
+| **Containment** | `WindowsJobObject` | ⬜ Stub | future |
+| **L1 DDP** | GPU-permit resource model (1 job spans N GPUs) | ✅ Validated | executor tests (2-GPU pool coexistence) |
+| **L1 DDP** | torchrun argv wrap (single-node) | ✅ Validated | core trainer + LAMU + HF backends |
+| **L1 DDP** | torchrun argv wrap (multi-node) | ✅ Validated | MASTER_ADDR/PORT/RANK wiring |
+| **L1 DDP** | Python DDP (train_joint.py) | ✅ Written | syntax clean; NCCL validation pending |
+| **L1 DDP** | 2×A100 end-to-end DDP run | ⬜ Pending hardware | needs GPU instance |
+| **L1 DDP** | Core cookbook DDP (blut_core/trainer.py) | ✅ Validated | auto-detect DDP, DDP-wrap, DistributedSampler, rank-0 saves |
+| **L2 Cluster** | Slurm/Ray `RemoteJob` | ✅ Validated | 17 unit tests (sacct/ray parsing, sbatch gen) |
+| **L2 Cluster** | Multi-node Slurm + MASTER_ADDR preamble | ✅ Validated | 2 unit tests |
+| **L2 DAG Opt** | Dead code elimination | ✅ Validated | 3 tests (disconnected, diamond, linear) |
+| **L2 DAG Opt** | Critical path scheduling | ✅ Validated | 2 tests (linear, diamond) |
+| **L2 DAG Opt** | Memory-aware scheduling | ✅ Validated | 1 test (concurrent memory per level) |
+| **L3 P2P** | Trust model + crypto + QUIC + dispatch | ✅ Validated | 48 unit tests |
+| **L3 P2P** | Live peer validation | ⬜ Deferred | needs two machines |
+| **L4 Cloud** | Worker agent (file queue + REST API) | ✅ Validated | 6 integration tests |
+| **L4 Cloud** | Real queue backend (Redis/SQS) | ⬜ Deferred | needs queue infrastructure |
+| **L4 Cloud** | Artifact storage (S3/R2) | ⬜ Deferred | needs storage infrastructure |
 
-## What is VALIDATED (tests green, on this machine)
+## What is VALIDATED (tests green)
 
-**Engine** (556 lib tests, clippy 0 warnings):
-- Containment trait + four backends + factory. `Availability` is three-state
-  (`Present | BusOffline | Unavailable`) — the **cloud bug fix**: the old
-  `containment_available()` checked the `systemd-run` *binary* (present on k8s)
-  instead of the *bus* (offline there), reporting available and then failing at
-  runtime. Now the factory probes the bus and falls through `BusOffline`
-  backends: systemd → cgroup2 → rlimit → bare.
-- **`RLIMIT_AS` cap proven end-to-end** (`tests/rlimit_containment.rs`): driving
-  the real `RlimitAddressSpace::wrap_command` + spawn, a 100 GiB allocation
-  under a 512 MiB cap aborts with `MemoryError`; a 64 MiB allocation under 4 GiB
-  succeeds. This is the portable cloud fallback (no root, no cgroup, no
-  systemd). **Caveat (documented in the backend):** `RLIMIT_AS` caps virtual
-  address space, which a CUDA process reserves hugely — so it is applied only on
-  explicit opt-in and sized with CUDA's VA in mind; cgroup2/systemd are the
-  RSS-precise preferred caps.
-- **GPU resource model** (`framework/executor.rs` tests): a DDP stage holding
-  all GPU permits (2 on a 2-GPU pool) serializes a single-GPU cell; two
-  single-GPU cells overlap on a 2-GPU pool. `Stage::gpu_permits(&Args)` +
-  `memory_gib_for(&Args)` scale a DDP job ×nproc; the CLI sizes the pool to the
-  launcher's `capacity()`.
-- **`RemoteJob` trait** (`config/launcher.rs`): `JobState` enum, `RemoteJob`
-  trait (id/poll/stream/cancel), `SlurmJob` (sbatch --parsable submit, sacct
-  poll, log-tail stream, scancel), `RayJob` (ray job submit --no-wait, status
-  poll, logs --follow, stop). 17 new tests: sacct state parsing ×9, ray status
-  parsing ×7, sbatch script gen ×2, submit_async reject ×2.
-- **Multi-node Slurm** (`config/launcher.rs`): `SlurmLauncher` fields
-  `nodes`/`ntasks_per_node`, `--nodes`/`--ntasks-per-node` flags in `wrap()`,
-  sbatch preamble exports `MASTER_ADDR`/`MASTER_PORT`/`NODE_RANK` via
-  `scontrol show hostnames`. Warns when `nodes>1` without `ntasks_per_node`.
+### Engine (562 lib tests)
 
-**Cookbook** (159 lib tests, clippy clean, `blut` binary builds):
-- Runner wired to `containment_for()` with backend-agnostic fail-closed refusal.
-- `kernel_argv` torchrun wrap (4 tests): single-process = plain python;
-  single-node DDP = `python -m torch.distributed.run --standalone
-  --nproc_per_node=n`; multi-node = c10d rendezvous flags from launcher env
-  (with a warn on missing `MASTER_ADDR`/`NODE_RANK` to catch silent
-  self-rendezvous).
-- `nproc_per_node` / `nnodes` threaded recipe → stage → invocation.
+- **Containment trait** + four backends + factory. `Availability` is three-state
+  (`Present | BusOffline | Unavailable`). Factory probes the bus and falls
+  through: systemd → cgroup2 → rlimit → bare.
+- **`RLIMIT_AS` cap** proven end-to-end (`tests/rlimit_containment.rs`).
+- **GPU resource model**: DDP stage holding N GPU permits serializes correctly.
+  Two single-GPU cells overlap on a 2-GPU pool.
+- **`RemoteJob` trait**: `SlurmJob` + `RayJob` implementations. 17 tests.
+- **Multi-node Slurm**: `SlurmLauncher` with `nodes`/`ntasks_per_node`,
+  sbatch preamble exports `MASTER_ADDR`/`MASTER_PORT`/`NODE_RANK`.
+- **DAG optimizer**: dead code elimination, critical path scheduling,
+  cache-aware hints, memory-aware scheduling. 6 tests.
+- **GPU discovery**: per-GPU VRAM via nvidia-smi + rocm-smi. GpuInfo struct
+  with index, model, vram_total/free. Conservative fail-safe for AMD.
 
-**Python DDP** (`train_joint.py` + `lma_typed_adapter.py`):
-- DDP init: reads `RANK`/`LOCAL_RANK`/`WORLD_SIZE` from torchrun env,
-  `init_process_group("nccl")`, per-rank seed, non-rank-0 print suppression
-  (restored in finally block).
-- Submodule DDP wrap: encoder (`find_unused_parameters=True`), decoder, disc,
-  sz_head wrapped separately (composite codec has direct `encoder.encode` calls).
-- Data shard: `_DDPClinicalSampler` + `_DDPRankSampler` yield rank-disjoint
-  subsets preserving stem-grouped cache locality.
-- Rank-0-only: `_emit`/BLUT_METRIC, all `torch.save` + `codec.save_*` (12
-  sites), `dist.barrier()` after each save.
-- torch.compile `mode='default'` under DDP.
-- `_unwrap_ddp` at all critical access points (resume, CDF recal, EMA, entropy,
-  seizure-head encode — documented rank-local approximation).
-- `dist.destroy_process_group()` at end of `run()`.
-- `lma_index_path` warning when provided but file not found.
+### Core cookbook (17 lib tests)
 
-**Earlier hardware validation** (prior session, 2×A100 Thunder box, see
-`[[project_blut_multigpu_validation]]`): the per-device scheduling + CUDA_VISIBLE
-pinning + a synthetic torchrun DDP prototype (world_size=2, NCCL all-reduce)
-were proven on real 2×A100. The work above promotes that prototype to typed,
-tested production code.
+- 34 generic ingredient specs across 12 kinds.
+- 3 stages: LoadDataset, TrainModel, EvaluateModel.
+- 3 recipes: train_from_dataset, finetune_pretrained, eval_only.
+- TrainModel: `nproc_per_node` + `nnodes` args, gpu_permits returns N,
+  launches via torchrun when N>1, multi-node rendezvous from env.
+
+### Backends (59 lib tests)
+
+- LAMU backend: DDP via torchrun when `nproc_per_node > 1`.
+- HF Trainer backend: DDP via torchrun when `nproc_per_node > 1`.
+- `TrainSpec` + `HfTrainerJob` have `nproc_per_node`/`nnodes` fields.
+
+### Cloud worker (6 integration tests)
+
+- File-based queue (JSON files in a directory).
+- REST API: `POST /jobs`, `GET /jobs`, `GET /jobs/:id`, `GET /health`.
+- Atomic job processing (rename to .processing).
+- Malformed job handling, concurrent queue access.
+
+### Platform validation
+
+| Platform | Status | Notes |
+|----------|--------|-------|
+| Linux x86_64 | ✅ Full | 562 engine tests, systemd/cgroup2, nvidia-smi |
+| Apple M1 (macOS ARM64) | ✅ Validated | 34 ingredients, MPS, rlimit containment |
+| AMD MI300X (RunPod) | ✅ Validated | 556 engine tests, rocm-smi |
 
 ## What needs hardware validation (code landed, not yet run on GPU)
 
 1. **2×A100 DDP end-to-end**: run `train_joint.py` under `blut recipe run` with
-   `nproc_per_node=2`. Verify val_r parity 1-GPU vs 2-GPU at same global batch,
-   BLUT_METRIC streams live, mid-run cancel works, OOM cap holds for ×nproc RAM.
-2. **cgroup2 cap on delegated box**: confirm OOM-kill at cap + `memory.peak` read
-   + `cgroup.kill` teardown on a box with writable cgroup delegation.
+   `nproc_per_node=2`. Verify val_r parity 1-GPU vs 2-GPU at same global batch.
+2. **Core cookbook DDP on real GPU**: run `train_from_dataset` with
+   `nproc_per_node=2` on a multi-GPU box.
+3. **cgroup2 cap on delegated box**: confirm OOM-kill at cap + `memory.peak` read.
 
-## What is DEFERRED (needs a real cluster — not validatable on a single box)
+## What is DEFERRED (needs infrastructure)
 
-- **L2 cluster end-to-end**: Slurm `sbatch` → `sacct` poll → log stream →
-  `scancel` mid-run; Ray `--no-wait` → status → logs → stop. Unit tests green;
-  needs a real Slurm/Ray cluster to validate the full lifecycle.
-- **L3 multi-node NCCL across nodes, IB-vs-TCP, data stage-in, 100-GPU scale:**
-  torchrun c10d rendezvous + sbatch MASTER_ADDR preamble are landed. Cannot be
-  exercised on a single node.
+- **Cloud queue backend**: Replace file queue with Redis/SQS for multi-worker.
+- **Artifact storage**: S3/R2 for checkpoint/metric storage.
+- **P2P live validation**: Two machines, real QUIC handshake, task dispatch.
+- **Multi-node NCCL across nodes**: torchrun c10d rendezvous + sbatch preamble
+  are landed. Cannot be exercised on a single node.
 
-## How to validate the pending pieces when a box is up
+## Full vision
 
-1. `tnr create --gpu a100 --num-gpus 2`; re-establish `ssh thunder-blut` from
-   `tnr status --json` (instances are ephemeral — uuid/ip/port/key all change).
-2. Sync the `feat/distributed-scaling` branch of engine + cookbook; `cargo build
-   --bin blut`.
-3. cgroup2 cap proof: on a box that delegates a cgroup subtree (or via the
-   passwordless-sudo root cgroup), confirm a 100 GiB allocation is OOM-killed at
-   the cap and `memory.peak` is read; `cgroup.kill` reaps the tree.
-4. DDP: run the joint recipe with `nproc_per_node: 2`; confirm `world_size=2`,
-   both A100s used, val_r parity vs a 1-GPU run at the same global batch, and a
-   mid-run kill reaps the whole rank tree.
+See `docs/proposals/blut-full-vision-2026-06.md` for the 12-phase plan from
+1 GPU to 100 datacenters. See `docs/proposals/blut-cloud-compute-queue.md`
+for the cloud compute queue vision.

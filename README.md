@@ -1,158 +1,194 @@
 # BLUT — Brian Lam's Universal Trainer
 
-A **Rust-native, compile-time-typed orchestration framework for local ML
-training.** You wire stages, called *ingredients* in BLUT, into a typed DAG;
-blut runs it against a content-addressed cache, under per-ingredient memory
-containment, with structured observability — and refuses to wire two ingredients
+A **Rust-native, compile-time-typed orchestration framework for ML training
+that scales from 1 GPU to 100 datacenters.** You wire stages into a typed DAG;
+BLUT runs it against a content-addressed cache, under per-stage memory
+containment, with structured observability — and refuses to wire two stages
 whose types don't line up.
-
-`blut` is a **library crate** (no binary of its own). You build a *cookbook* on
-top of it — your ingredients, your recipes, your CLI binary — in a few hundred lines.
-It ships **zero** domain code: no bundled recipes, no Python, no opinion about
-what you train.
 
 ```toml
 [dependencies]
-blut = "1"
+blut = "1.2"
 ```
 
-**API reference:** [`API.md`](API.md) · `cargo doc --no-deps --open` · runnable
-demo: [`examples/first_cookbook.rs`](examples/first_cookbook.rs).
+## What BLUT is
+
+BLUT is the **git of ML training**. The core is a DAG orchestrator. Everything
+else — resource brokerage, containment, P2P, HPO, lineage, cloud compute — is
+a layer on top.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    CLI / TUI (v1.3.0)                           │
+├─────────────────────────────────────────────────────────────────┤
+│  Recipes (typed Plan builders)                                  │
+├─────────────────────────────────────────────────────────────────┤
+│  DAG Orchestrator (Stage → Plan → Executor → Cache)             │
+├──────────┬──────────┬──────────┬──────────┬─────────────────────┤
+│ Resource │  Async   │  DAG     │ Process  │ Algorithmic         │
+│ Broker   │  Runtime │ Opt      │ Opt      │ Opt                 │
+├──────────┴──────────┴──────────┴──────────┴─────────────────────┤
+│  LaunchTarget (Local / Slurm / Ray / P2P / Cloud)               │
+├─────────────────────────────────────────────────────────────────┤
+│  Containment (systemd / cgroup2 / rlimit / bare / JobObject)    │
+├─────────────────────────────────────────────────────────────────┤
+│  P2P Transport (QUIC + Ed25519 + AES-256-GCM)                  │
+├─────────────────────────────────────────────────────────────────┤
+│  Platform (Linux / macOS / Windows / AMD / NVIDIA / Apple)      │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ## The abstraction model
-
-BLUT organizes work as a five-layer hierarchy:
 
 ```text
   BLUT   ▸   Cookbook   ▸   Course   ▸   Recipe    ▸   Ingredient
  engine     domain pack      phase      workflow       primitive
 ```
 
-- **Cookbook** — a domain pack: a set of recipes plus the backend they target.
-  Cookbooks are **loaded into** BLUT (via a `Registry`). *(the `Cookbook` trait)*
-- **Course** — the phase a recipe belongs to, **selected and orchestrated in
-  order**: `DataPrep → Pretrain → Train → Eval → Gate → Export` (a `Pipeline`
-  course chains several end-to-end). Recipes are grouped by course. *(the
-  `Course` enum)*
-- **Recipe** — a **middle-level orchestration function**: it composes ingredients
-  into a typed `Plan` and exposes typed args. *(the `Recipe` trait +
-  `register_recipe!`)*
-- **Ingredient** — an **atomic primitive**: a typed `Stage` (`Input → Output`),
-  the smallest reusable unit of work. A training cookbook also has finer
-  primitives — optimizers, schedulers, losses — that an ingredient composes.
-  *(the `Stage` trait)*
-- **BLUT** — the engine: it loads cookbooks, lists/selects recipes by course, and
-  runs a recipe's plan against the content-addressed cache under per-ingredient
-  resource + memory admission. *(`blut::cli::run(registry)`)*
-
-[`examples/first_cookbook.rs`](examples/first_cookbook.rs) builds one of each
-layer and runs it end-to-end:
-
-```text
-$ cargo run --example first_cookbook
-BLUT loaded cookbook 'demo'. Recipes by course:
-  • User  count_to_three  — MakeOne → Increment → Increment (demo)
-Run 1 (cold cache):  → 3 ingredients, 0 hits, 3 misses
-Run 2 (warm cache):  → 3 ingredients, 3 hits, 0 misses
-```
+- **Ingredient** — an atomic primitive: a typed `Stage` (`Input → Output`).
+- **Recipe** — composes ingredients into a typed `Plan` with typed args.
+- **Cookbook** — a domain pack: recipes + backend + ingredients.
+- **BLUT** — the engine: loads cookbooks, runs plans, manages cache/containment.
 
 ## Why
 
-Local ML pipelines accrete ad-hoc shell glue: dump data, kick off a trainer,
-wait, convert a checkpoint, copy it somewhere. Each step grows its own retry
-logic, logging, and cache; a crash mid-run replays everything; a DataLoader
-that over-allocates takes down your whole login session. blut replaces the glue
-with a typed pipeline:
+Local ML pipelines accrete ad-hoc shell glue. BLUT replaces it with a typed
+pipeline that never OOMs, never loses data, and scales from 1 GPU to 100
+datacenters:
 
 ```rust
 let plan = Plan::<(), MyBackend>::new("train", json!({}))
     .start(PrepareData, prep_args)
     .then(Train, train_args)
     .then(Evaluate, eval_args)
-    .finish()
-    .into_compiled();
+    .finish();
 
-let result = SequentialExecutor::execute(plan, ExecCtx::new(job_dir)).await?;
+let result = ParallelExecutor::execute(plan.into_compiled(), ctx).await?;
 ```
 
-- **Ingredients** declare a typed `Input → Output` and the resources they hold
-  (`Gpu`, `Cpu`, `Network`, `Disk`). Wrong wiring is a `cargo build` error, not a
-  runtime panic — `Train`'s `Input` must equal `PrepareData`'s `Output`.
-- **Plans** are typed DAGs; **recipes** compile typed args into plans (a named,
-  args-driven catalog); **cookbooks** group recipes + their backend.
-- **Cache** content-addresses every ingredient output by
-  `(ingredient, schema, input_hash, args_hash)` — crash mid-run, re-run, and
-  finished ingredients are served from cache instead of recomputed.
-- **Containment** (Linux + systemd) runs each ingredient under a `systemd-run --user`
-  transient unit with a `MemoryMax` cap sized from a per-ingredient footprint, plus a
-  box-fit **admission gate** that refuses a job that wouldn't fit — so an OOM is
-  a contained unit-kill, never a session-wide crash.
-- **Observability** streams a `status.jsonl` event log per job and exposes a
-  metric store, a lineage index, and an HPO loop.
+## Key features
 
-## Build your own cookbook
+### v1.2.0 — Current release
 
-The four moving parts (see the runnable
-[`examples/first_cookbook.rs`](examples/first_cookbook.rs)):
+| Feature | What |
+|---------|------|
+| **Core cookbook** | 34 generic ingredient specs (data/model/optimizer/scheduler/loss/step/ema/checkpoint/eval/sampler/logging/forward) |
+| **DDP single-node** | `torchrun --nproc_per_node=N`, auto-detect from `WORLD_SIZE` |
+| **DDP multi-node** | `MASTER_ADDR`/`MASTER_PORT`/`NODE_RANK` → torchrun rendezvous |
+| **Multi-GPU discovery** | Per-GPU VRAM via nvidia-smi + rocm-smi |
+| **DAG optimizer** | Dead code elimination, critical path scheduling, cache/memory-aware ordering |
+| **Cloud worker** | File-based queue + REST API (`POST /jobs`, `GET /jobs/:id`) |
+| **Platform validation** | Linux x86_64, Apple M1, AMD MI300X |
 
-1. A **backend identity** — a unit struct implementing `TrainingBackend`. A
-   `Plan<Out, B>` is parameterized over its backend `B`; an ingredient only joins
-   a plan whose backend it is `Compatible` with.
-2. An **artifact** — a `Serialize`/`Deserialize` struct implementing `Artifact`
-   (a content-hashed handle to an ingredient's output).
-3. **Ingredients** — typed `Input → Output` units implementing `Stage`.
-4. A **plan / recipe** — wire ingredients with `Plan::start().then().finish()`, or
-   register a named recipe with the `register_recipe!` macro and group recipes
-   into a `Cookbook`.
+### v1.1.0
 
-Your binary is then a thin stub — supply your `Registry` and hand off to the
-engine's CLI:
+| Feature | What |
+|---------|------|
+| **Ingredient system** | 12 kinds, registry pattern, frozen config validation |
+| **P2P module** | Trust model, Ed25519, AES-256-GCM, QUIC transport, dispatch policy |
+| **RemoteJob trait** | Slurm + Ray launchers |
+| **Containment** | systemd → cgroup2 → rlimit → bare fallback chain |
 
-```rust
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    blut::cli::run(my_cookbook::registry()).await
-}
+### v1.0.0
+
+| Feature | What |
+|---------|------|
+| **DAG orchestrator** | Stage → Plan → Recipe, typed wiring, content-addressed cache |
+| **Parallel executor** | Resource semaphores (GPU/CPU/Disk/Network), box-fit budget |
+| **Broker** | RAM admission gate, footprint estimation, OOM-aware calibration |
+| **Durable resume** | Crash-gated recovery, epoch-level resume |
+| **Observability** | status.jsonl, metric store, lineage index |
+
+## Scaling ladder
+
+| Rung | Scale | What you can do |
+|------|-------|-----------------|
+| **1 GPU** | 1 machine | Train any model, any recipe, full ingredient system |
+| **Multi-GPU** | 1 machine, N GPUs | DDP/FSDP, N× throughput, larger models |
+| **Multi-Node** | 1 cluster, N machines | Slurm/torchrun, NCCL interconnect, 100+ GPUs |
+| **Cluster** | 1 datacenter | K8s/Ray, auto-scaling, distributed cache |
+| **P2P Mesh** | N machines, async | Trust-based dispatch, heterogeneous compute |
+| **Cloud Queue** | Any | Submit jobs, get results, zero environment setup |
+
+## Cloud compute queue
+
+Instead of renting a cloud GPU and setting up an environment, submit a BLUT
+job to a cloud queue:
+
+```bash
+# Submit a job
+curl -X POST http://worker:8080/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"recipe": "train_from_dataset", "args": {"dataset": "imdb", "model": "distilbert-base-uncased", "epochs": 3}}'
+
+# Check status
+curl http://worker:8080/jobs/job-abc
 ```
 
-That one call gives your binary the whole CLI: `recipe list` / `recipe run`,
-`jobs`, `log`, `cancel`, `plan resume/inspect`, `cache prune`, `footprint`,
-`partition`, `schedule`, `sensor`, and more (`--help` for the full set).
+The worker runs the full BLUT DAG (data prep → training → eval → checkpoint)
+and returns the result. No environment setup. No idle GPU time.
 
 ## Platform support
 
-- **Linux + systemd** — full support, including never-OOM cgroup containment.
-- **macOS / other Unix** — compiles and runs; containment **degrades to a bare
-  spawn** (no memory cap — the admission gate still refuses oversized jobs, and
-  the kernel OOM killer is the only hard backstop). Set `BLUT_NO_CONTAIN=1` to
-  force the bare path. A `macos-latest` CI job keeps the build green.
-- **Windows** — not supported (Unix process/signal primitives).
+| Platform | Status | Notes |
+|----------|--------|-------|
+| **Linux x86_64** | ✅ Full | systemd/cgroup2 containment, nvidia-smi GPU discovery |
+| **Linux AMD64** | ✅ Full | rocm-smi GPU discovery, HIP via CUDA shim |
+| **macOS ARM64** | ✅ Validated | MPS, rlimit containment, 34 ingredients build |
+| **Windows** | ⚠️ Partial | Compiles, bare containment only |
 
-## Status — 1.0
+## Build your own cookbook
+
+```rust
+// 1. Define your backend
+struct MyBackend;
+impl TrainingBackend for MyBackend { const ID: &str = "my"; }
+
+// 2. Define your stages
+struct Train;
+#[async_trait]
+impl Stage for Train {
+    const NAME: &str = "train";
+    type Input = Dataset;
+    type Output = Checkpoint;
+    type Args = TrainArgs;
+    // ...
+}
+
+// 3. Wire a recipe
+fn compile(args: TrainArgs) -> Plan<(), MyBackend> {
+    Plan::new("my_recipe", json!(args))
+        .start(LoadData, load_args)
+        .then(Train, train_args)
+        .finish()
+}
+
+// 4. Run it
+blut::cli::run(registry()).await
+```
+
+## Status — 1.2
 
 The framework, typed DAG, content-addressed cache, containment + admission,
-observability, HPO, lineage, and the recipe/cookbook system are stable and
-end-to-end runnable. From 1.0, minor releases are **additive-only** (see the
-"Stable surface" contract in [`API.md`](API.md)); cookbooks should pin `blut = "1"`.
+DDP, DAG optimizer, and cloud worker are stable and end-to-end runnable.
+The TUI cockpit ships in v1.3.0.
 
-**The interactive TUI cockpit ships in 1.0** (default-on `tui` feature): bare
-`blut` opens a ratatui cockpit — a recipe launcher plus live, engine-native
-panels for jobs, logs, the run DAG, lineage/provenance, artifacts, run history,
-a metric leaderboard, compare, and a recipe catalog, all reading the engine's
-own jobs store + lineage DB. Build with `--no-default-features` for a lean
-CLI-only binary (no ratatui in the tree; bare `blut` prints help).
+**644 tests pass** (562 engine + 17 core cookbook + 59 backends + 6 worker).
 
 ## License
 
-[GNU AGPL-3.0-or-later](LICENSE). BLUT is free software: you may use, study,
-modify, and redistribute it under the GNU Affero General Public License, version
-3 or (at your option) any later version.
+[GNU AGPL-3.0-or-later](LICENSE). BLUT is free software.
 
 Note the AGPL's **network clause** (§13): if you run a modified version of BLUT
 as a network-accessible service, you must offer that service's users the
 corresponding source of your modified version.
 
-A **commercial license** — for use without the AGPL's copyleft / source-
-availability obligations — is available from the maintainer on request.
+A **commercial license** is available from the maintainer on request.
 
-Contributions are welcome under the same terms — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+## Links
+
+- [Full vision plan](../../docs/proposals/blut-full-vision-2026-06.md)
+- [Cloud compute queue](../../docs/proposals/blut-cloud-compute-queue.md)
+- [P2P distributed compute](../../docs/decisions/0061-blut-p2p-compute.md)
+- [API reference](API.md)
+- [Contributing](CONTRIBUTING.md)
