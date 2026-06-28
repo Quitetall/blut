@@ -340,6 +340,27 @@ const OOM_GROWTH_STEP_BYTES: u64 = 8 * GIB;
 /// stops growing — admission's box-fit refusal is then the only exit.
 const OOM_RESOLVE_CEILING_BYTES: u64 = 64 * GIB;
 
+/// Operational override: when `BLUT_FOOTPRINT_STANDARD` is set to a TRUTHY value
+/// (`1`/`true`/`yes`/`on`, case-insensitive), the broker IGNORES the learned
+/// high-water-mark calibration and uses the conservative STATIC formula estimate
+/// instead — on BOTH read (`FootprintStore::resolve` returns the hint) and write
+/// (the cookbook's `record_train_footprint` skips storing the peak). Use it when a
+/// recorded cgroup peak may be DIRTY (inflated by OTHER processes co-resident on
+/// the box during a contained run), so a contaminated measurement neither drives
+/// nor poisons admission. The env var is PROCESS-WIDE — set it INLINE per
+/// invocation (`BLUT_FOOTPRINT_STANDARD=1 lqt recipe run …`), not exported, so it
+/// scopes to the one dirty run. Falsey / unset / unrecognised ⇒ off (so
+/// `…=false`/`0`/`off` disable it as an operator would expect).
+pub fn use_standard_footprint_estimate() -> bool {
+    match std::env::var("BLUT_FOOTPRINT_STANDARD") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
 /// A resolved footprint estimate. Slice-1 tracks RAM only as a hard
 /// number; VRAM is carried for the (deferred) VRAM courtesy pre-check
 /// but never gates the box-survival guarantee.
@@ -702,6 +723,37 @@ impl FootprintStore {
     /// VRAM is DEFERRED — we keep the hint's VRAM regardless (RAM is the
     /// over-refuse constraint; recording VRAM peaks is a later slice).
     pub fn resolve(&self, key: &FootprintKey, hint: Footprint) -> Footprint {
+        // Read the BLUT_FOOTPRINT_STANDARD operational override at the boundary,
+        // then delegate to the pure resolver (so the override is unit-testable
+        // without mutating the process env). Log when active so an operator who
+        // left it exported notices admission is running on the static estimate.
+        let standard = use_standard_footprint_estimate();
+        if standard {
+            tracing::info!(
+                "BLUT_FOOTPRINT_STANDARD active — ignoring learned calibration for \
+                 key {}, using the static estimate ({:.1}G)",
+                key.flat(),
+                hint.ram_bytes as f64 / GIB as f64,
+            );
+        }
+        self.resolve_inner(key, hint, standard)
+    }
+
+    /// Core resolver. `standard_estimate = true` IGNORES the learned calibration
+    /// and returns the conservative STATIC `hint` verbatim — use when a recorded
+    /// cgroup peak may be DIRTY (inflated by OTHER processes co-resident on the
+    /// box during a contained run), so neither it nor any stored peak drives
+    /// admission. Pairs with `record_train_footprint`'s matching skip so the dirty
+    /// run doesn't poison the store either (ignore on BOTH read and write).
+    fn resolve_inner(
+        &self,
+        key: &FootprintKey,
+        hint: Footprint,
+        standard_estimate: bool,
+    ) -> Footprint {
+        if standard_estimate {
+            return hint;
+        }
         match self.entries.get(&key.flat()) {
             Some(e) if e.source == FootprintSource::OomCorrected => {
                 // Grow strictly above the OOMing lower bound; never below
@@ -1272,6 +1324,39 @@ mod tests {
             r.memmax_bytes(),
             18 * GIB + Footprint::MEMMAX_HEADROOM_BYTES,
             "+2G safety margin"
+        );
+    }
+
+    #[test]
+    fn standard_estimate_override_ignores_calibration() {
+        // BLUT_FOOTPRINT_STANDARD: when a recorded peak may be DIRTY (other
+        // processes loading the box), ignore the calibration and use the static
+        // hint. Tested via resolve_inner so no process-env mutation / race.
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("footprints.json");
+        let mut s = FootprintStore::load_from(path);
+        s.record(&key(), 50 * GIB, 0, FootprintSource::Measured)
+            .unwrap();
+        let hint = Footprint { ram_bytes: 33 * GIB, vram_mib: 0 };
+        // Normal: the calibrated (possibly dirty) Measured value wins.
+        assert_eq!(s.resolve_inner(&key(), hint, false).ram_bytes, 50 * GIB);
+        // Override: ignore calibration, fall back to the conservative static hint.
+        assert_eq!(s.resolve_inner(&key(), hint, true).ram_bytes, 33 * GIB);
+
+        // The override also bypasses the OomCorrected escalation branch (a dirty
+        // OOM bound must not drive admission either).
+        let td2 = tempfile::tempdir().unwrap();
+        let mut s2 = FootprintStore::load_from(td2.path().join("footprints.json"));
+        s2.record(&key(), 40 * GIB, 0, FootprintSource::OomCorrected)
+            .unwrap();
+        assert!(
+            s2.resolve_inner(&key(), hint, false).ram_bytes > 40 * GIB,
+            "normal: OomCorrected escalates above its bound"
+        );
+        assert_eq!(
+            s2.resolve_inner(&key(), hint, true).ram_bytes,
+            33 * GIB,
+            "override: ignore the OomCorrected bound, use the static hint"
         );
     }
 
