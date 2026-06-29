@@ -141,3 +141,94 @@ async fn peer_capabilities_serde_roundtrip() {
     assert_eq!(caps.cpu_cores, caps2.cpu_cores);
     assert_eq!(caps.gpu_vram_gib, caps2.gpu_vram_gib);
 }
+
+#[tokio::test]
+async fn blob_side_stream_round_trips_over_quic() {
+    use blut::p2p::bundle::BlobDir;
+    use blut::p2p::transport::{recv_blob, send_blob, P2pServer, P2pClient};
+
+    let coord_kp = Arc::new(KeyPair::generate());
+    let peer_kp = Arc::new(KeyPair::generate());
+    let (registry, _dir) = temp_registry();
+
+    let server = Arc::new(
+        P2pServer::bind("127.0.0.1:0".parse().unwrap(), coord_kp.clone(), registry)
+            .await
+            .unwrap(),
+    );
+    let addr = server.local_addr().unwrap();
+
+    // Payload > CHUNK_MAX (12 MiB) so send_blob actually emits ≥2 chunks and the
+    // receiver exercises seq ordering + reassembly. Pattern bytes so a reorder
+    // or truncation changes the sha.
+    let pack: Vec<u8> = (0..(13 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
+    let expect = pack.clone();
+
+    // Server side: accept the peer (consumes the handshake stream), then recv
+    // the blob.
+    let server_c = server.clone();
+    let recv = tokio::spawn(async move {
+        let (_peer_id, conn) = server_c.accept_peer().await.unwrap();
+        recv_blob(&conn, "task-blob-1", BlobDir::Input, blut::p2p::transport::MAX_BLOB_SIZE)
+            .await
+            .unwrap()
+    });
+
+    // Peer side: connect (sends handshake), then send the blob.
+    let client = P2pClient::new(peer_kp.clone());
+    let (conn, _peer_id) = client.connect(addr).await.unwrap();
+    send_blob(&conn, "task-blob-1", BlobDir::Input, &pack)
+        .await
+        .unwrap();
+
+    let got = tokio::time::timeout(Duration::from_secs(5), recv)
+        .await
+        .expect("blob recv must finish")
+        .unwrap();
+    assert_eq!(got, expect, "reassembled blob matches the sent pack");
+
+    drop(conn);
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn recv_blob_rejects_oversized_total_len() {
+    use blut::p2p::bundle::BlobDir;
+    use blut::p2p::transport::{recv_blob, send_blob, P2pServer, P2pClient};
+
+    let coord_kp = Arc::new(KeyPair::generate());
+    let peer_kp = Arc::new(KeyPair::generate());
+    let (registry, _dir) = temp_registry();
+    let server = Arc::new(
+        P2pServer::bind("127.0.0.1:0".parse().unwrap(), coord_kp.clone(), registry)
+            .await
+            .unwrap(),
+    );
+    let addr = server.local_addr().unwrap();
+
+    // A 2 MiB pack, but the receiver caps at 1 MiB → Begin's total_len (2 MiB)
+    // must be rejected BEFORE any chunk is buffered.
+    let pack: Vec<u8> = vec![0xab; 2 * 1024 * 1024];
+
+    let server_c = server.clone();
+    let recv = tokio::spawn(async move {
+        let (_id, conn) = server_c.accept_peer().await.unwrap();
+        recv_blob(&conn, "t", BlobDir::Input, 1024 * 1024).await // 1 MiB cap
+    });
+
+    let client = P2pClient::new(peer_kp.clone());
+    let (conn, _id) = client.connect(addr).await.unwrap();
+    // Sender doesn't know the cap; it just streams. The receiver rejects.
+    let _ = send_blob(&conn, "t", BlobDir::Input, &pack).await;
+
+    let r = tokio::time::timeout(Duration::from_secs(5), recv)
+        .await
+        .expect("recv must finish")
+        .unwrap();
+    assert!(r.is_err(), "oversized total_len must be rejected");
+    let msg = format!("{:?}", r.unwrap_err());
+    assert!(msg.contains("max_blob_size"), "rejected for the cap reason: {msg}");
+
+    drop(conn);
+    server.shutdown();
+}
