@@ -329,6 +329,27 @@ pub trait Artifact: Send + Sync + serde::Serialize + serde::de::DeserializeOwned
     /// tmpfile that might disappear.
     fn primary_path(&self) -> &Path;
 
+    /// Re-derive the content address from ON-DISK bytes — NOT the cached
+    /// `content_hash()` field. The P2P import path (`p2p::bundle::unbundle`)
+    /// calls this to verify a transferred artifact against the
+    /// coordinator-SIGNED `input_hash`: the cached accessor is a
+    /// self-attestation (`DatasetJsonl`/`HfCheckpoint` just
+    /// `return self.content_hash`) that proves nothing about the bytes that
+    /// actually crossed the wire.
+    ///
+    /// The default re-walks `primary_path()` (dir → `hash_dir`, file →
+    /// `hash_file`). A COMPOSITE artifact whose `content_hash()` is a merkle
+    /// over members MUST override — the default sees only `primary_path()` and
+    /// can never reproduce the merkle (e.g. `DatasetSplit`).
+    fn recompute_content_hash(&self) -> std::io::Result<ContentHash> {
+        let p = self.primary_path();
+        if p.is_dir() {
+            ContentHash::hash_dir(p)
+        } else {
+            ContentHash::hash_file(p)
+        }
+    }
+
     /// Encode to the erased wire form for transit across the `StageDyn`
     /// boundary (and as a merge-tuple member). Default: bincode-of-self
     /// tagged with `KIND`/`SCHEMA`. The tuple impls override this to a

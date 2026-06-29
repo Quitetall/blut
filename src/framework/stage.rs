@@ -456,6 +456,72 @@ pub trait StageDyn: Send + Sync + 'static {
     /// Erased [`Stage::code_fingerprint`] — the script/code hash folded into the
     /// cache key (S4).
     fn code_fingerprint(&self) -> Option<Vec<u8>>;
+
+    // ── P2P data-plane (artifact bundle transfer) ─────────────────────────
+    // These mirror `output_content_hash` / `rebase_output_paths` but for the
+    // INPUT side, so a peer can ship/rebase/verify the artifact it was handed.
+    // Keyed on `S::Input`/`S::Output` via monomorphization — the dispatched
+    // stage (resolved by name through the Registry) fixes the concrete type on
+    // both ends, so no per-artifact KIND registry is needed.
+
+    /// Absolute paths embedded in this stage's INPUT artifact that are `root`
+    /// or a descendant of it (decode `S::Input` → JSON → collect path-shaped
+    /// strings that exist on disk under `root`). `None` = the erased artifact
+    /// didn't decode as `S::Input`. Used by `bundle()` to find the backing
+    /// files to ship. The producer writes only under its own stage_dir, so
+    /// `root` = the producing stage_dir bounds the shipped subtree.
+    ///
+    /// Defaults to `None` so the trait stays extensible; the blanket
+    /// `impl<S: Stage>` supplies the real type-aware logic for every in-tree
+    /// stage. (These P2P methods are intentionally defaulted — unlike the
+    /// older required methods — so the trait surface can grow without
+    /// touching hypothetical hand-written implementors.)
+    fn input_backing_under(
+        &self,
+        _art: &ErasedArtifact,
+        _root: &std::path::Path,
+    ) -> Option<Vec<std::path::PathBuf>> {
+        None
+    }
+
+    /// As `input_backing_under` but for the stage's OUTPUT artifact (the peer
+    /// ships its result back the same way).
+    fn output_backing_under(
+        &self,
+        _art: &ErasedArtifact,
+        _root: &std::path::Path,
+    ) -> Option<Vec<std::path::PathBuf>> {
+        None
+    }
+
+    /// Mirror of `rebase_output_paths` but decodes as `S::Input`, and returns
+    /// `None` on ANY decode/encode failure. The P2P import path treats a
+    /// failed rebase as a HARD error (never run a stage whose input paths
+    /// weren't provably re-pointed at peer-local files) — unlike the
+    /// local-promote `rebase_output_paths`, which swallows failure because the
+    /// promote already happened.
+    fn rebase_input_paths(
+        &self,
+        _art: ErasedArtifact,
+        _from: &std::path::Path,
+        _to: &std::path::Path,
+    ) -> Option<ErasedArtifact> {
+        None
+    }
+
+    /// Re-walk the on-disk bytes of this stage's INPUT artifact and return its
+    /// content address (`Artifact::recompute_content_hash`), NOT the cached
+    /// field. `None` = didn't decode as `S::Input`. The P2P import path asserts
+    /// this equals the coordinator-signed `input_hash` after transfer.
+    fn recompute_input_hash(&self, _art: &ErasedArtifact) -> Option<std::io::Result<ContentHash>> {
+        None
+    }
+
+    /// As `recompute_input_hash` but for the OUTPUT artifact (coordinator-side
+    /// verification of a peer's returned result against `expected_output_hash`).
+    fn recompute_output_hash(&self, _art: &ErasedArtifact) -> Option<std::io::Result<ContentHash>> {
+        None
+    }
 }
 
 #[async_trait]
@@ -648,6 +714,112 @@ impl<S: Stage> StageDyn for S {
 
     fn code_fingerprint(&self) -> Option<Vec<u8>> {
         <S as Stage>::code_fingerprint(self)
+    }
+
+    fn input_backing_under(
+        &self,
+        art: &ErasedArtifact,
+        root: &std::path::Path,
+    ) -> Option<Vec<std::path::PathBuf>> {
+        backing_under_typed::<S::Input>(art, root)
+    }
+
+    fn output_backing_under(
+        &self,
+        art: &ErasedArtifact,
+        root: &std::path::Path,
+    ) -> Option<Vec<std::path::PathBuf>> {
+        backing_under_typed::<S::Output>(art, root)
+    }
+
+    fn rebase_input_paths(
+        &self,
+        art: ErasedArtifact,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> Option<ErasedArtifact> {
+        rebase_typed::<S::Input>(art, from, to)
+    }
+
+    fn recompute_input_hash(&self, art: &ErasedArtifact) -> Option<std::io::Result<ContentHash>> {
+        recompute_typed::<S::Input>(art)
+    }
+
+    fn recompute_output_hash(&self, art: &ErasedArtifact) -> Option<std::io::Result<ContentHash>> {
+        recompute_typed::<S::Output>(art)
+    }
+}
+
+/// Collect every absolute path-shaped string in `art` (decoded as `A`) that is
+/// `root` or a descendant of it AND exists on disk. The producer writes only
+/// under its own stage_dir, so `root` bounds the shippable subtree; paths
+/// outside it (shared corpora on `/mnt/...`) are left for the peer to resolve.
+/// `None` ⇒ the erased payload didn't decode as `A`.
+fn backing_under_typed<A: Artifact>(
+    art: &ErasedArtifact,
+    root: &std::path::Path,
+) -> Option<Vec<std::path::PathBuf>> {
+    let typed: A = art.clone().into_typed::<A>().ok()?;
+    let v = serde_json::to_value(&typed).ok()?;
+    let mut out = Vec::new();
+    collect_paths_under(&v, root, &mut out);
+    Some(out)
+}
+
+/// Decode `art` as `A`, re-walk its on-disk bytes, return the content address.
+fn recompute_typed<A: Artifact>(art: &ErasedArtifact) -> Option<std::io::Result<ContentHash>> {
+    let typed: A = art.clone().into_typed::<A>().ok()?;
+    Some(typed.recompute_content_hash())
+}
+
+/// Decode `art` as `A`, JSON-project, rebase every path-shaped string under
+/// `from` to live under `to`, re-encode. `None` on any decode/encode failure —
+/// the caller (P2P import) treats that as a hard error.
+fn rebase_typed<A: Artifact>(
+    art: ErasedArtifact,
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> Option<ErasedArtifact> {
+    let typed: A = art.into_typed::<A>().ok()?;
+    let mut v = serde_json::to_value(&typed).ok()?;
+    rebase_path_strings(&mut v, &from.to_string_lossy(), &to.to_string_lossy());
+    let rebased: A = serde_json::from_value(v).ok()?;
+    ErasedArtifact::from_typed(&rebased).ok()
+}
+
+/// Recurse a JSON value collecting every `String` that is an absolute path
+/// equal to `root` or a descendant (`root` + separator prefix), and that
+/// currently `exists()` on disk. Mirrors `rebase_path_strings`' prefix rule so
+/// the discovered set is exactly the set that a `from→to` rebase would move.
+fn collect_paths_under(
+    value: &serde_json::Value,
+    root: &std::path::Path,
+    out: &mut Vec<std::path::PathBuf>,
+) {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => {
+            // `starts_with` is component-wise and already true when `p == root`
+            // (and, unlike a raw string prefix, won't match `/a/bc` against
+            // `/a/b`). NOTE (TOCTOU): `exists()` here is advisory — the bundle
+            // layer (C1b) re-hashes every file at ship time, so a file that
+            // vanishes between discovery and packing fails there, not silently.
+            let p = std::path::Path::new(s);
+            if p.is_absolute() && p.starts_with(root) && p.exists() {
+                out.push(p.to_path_buf());
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_paths_under(item, root, out);
+            }
+        }
+        Value::Object(map) => {
+            for (_k, v) in map.iter() {
+                collect_paths_under(v, root, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1165,5 +1337,117 @@ mod tests {
         assert_eq!(v["nested"]["p"], json!(format!("{to}{sep}inner")));
         assert_eq!(v["list"][0], json!(format!("{to}{sep}k")));
         assert_eq!(v["list"][1], json!("keep"));
+    }
+
+    // ── P2P data-plane: backing discovery + rebase + recompute (C1a) ──────
+
+    /// A file-backed toy artifact: carries an absolute `path` whose bytes live
+    /// on disk (so recompute / backing-discovery have something real to walk).
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct FileArt {
+        path: std::path::PathBuf,
+        content_hash: ContentHash,
+    }
+    impl Artifact for FileArt {
+        const KIND: &'static str = "test.filed";
+        const SCHEMA: u32 = 1;
+        fn content_hash(&self) -> ContentHash {
+            self.content_hash // self-attested (like DatasetJsonl)
+        }
+        fn primary_path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    /// A stage whose INPUT is the file-backed artifact, so the blanket
+    /// `StageDyn` P2P methods monomorphize on `S::Input = FileArt`.
+    struct FileStage;
+    #[async_trait]
+    impl Stage for FileStage {
+        const NAME: &'static str = "file_stage";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = FileArt;
+        type Output = FileArt;
+        type Args = EmptyTestArgs;
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            input: Self::Input,
+            _args: &Self::Args,
+        ) -> Result<Self::Output, StageError> {
+            Ok(input)
+        }
+    }
+    #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+    struct EmptyTestArgs;
+
+    fn write_file(dir: &Path, name: &str, body: &[u8]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn recompute_content_hash_default_file() {
+        let td = tempfile::tempdir().unwrap();
+        let p = write_file(td.path(), "data.bin", b"hello bytes");
+        let art = FileArt {
+            path: p.clone(),
+            content_hash: ContentHash([0u8; 32]), // deliberately WRONG self-attest
+        };
+        // recompute re-walks disk and ignores the (wrong) cached field.
+        let got = art.recompute_content_hash().unwrap();
+        assert_eq!(got, ContentHash::hash_file(&p).unwrap());
+        assert_ne!(got, art.content_hash(), "recompute must not trust the field");
+    }
+
+    #[test]
+    fn stagedyn_input_backing_under_finds_the_file() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        let p = write_file(root, "in.bin", b"abc");
+        let art = ErasedArtifact::from_typed(&FileArt {
+            path: p.clone(),
+            content_hash: ContentHash::hash_file(&p).unwrap(),
+        })
+        .unwrap();
+        let stage = FileStage;
+        let backing = StageDyn::input_backing_under(&stage, &art, root).unwrap();
+        assert_eq!(backing, vec![p]);
+        // A root that contains nothing of the artifact → empty.
+        let other = tempfile::tempdir().unwrap();
+        let empty = StageDyn::input_backing_under(&stage, &art, other.path()).unwrap();
+        assert!(empty.is_empty(), "path not under `root` is not collected");
+    }
+
+    #[test]
+    fn stagedyn_rebase_input_paths_repoints_under_new_root() {
+        let from = tempfile::tempdir().unwrap();
+        let to = tempfile::tempdir().unwrap();
+        let p = from.path().join("in.bin");
+        let art = ErasedArtifact::from_typed(&FileArt {
+            path: p.clone(),
+            content_hash: ContentHash([7u8; 32]),
+        })
+        .unwrap();
+        let stage = FileStage;
+        let rebased = StageDyn::rebase_input_paths(&stage, art, from.path(), to.path()).unwrap();
+        let typed: FileArt = rebased.into_typed().unwrap();
+        assert_eq!(typed.path, to.path().join("in.bin"), "path re-rooted under `to`");
+    }
+
+    #[test]
+    fn stagedyn_recompute_input_hash_walks_disk() {
+        let td = tempfile::tempdir().unwrap();
+        let p = write_file(td.path(), "in.bin", b"payload");
+        let art = ErasedArtifact::from_typed(&FileArt {
+            path: p.clone(),
+            content_hash: ContentHash([0u8; 32]), // wrong on purpose
+        })
+        .unwrap();
+        let stage = FileStage;
+        let got = StageDyn::recompute_input_hash(&stage, &art).unwrap().unwrap();
+        assert_eq!(got, ContentHash::hash_file(&p).unwrap());
     }
 }
