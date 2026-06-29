@@ -191,6 +191,234 @@ async fn blob_side_stream_round_trips_over_quic() {
     server.shutdown();
 }
 
+// ── End-to-end: a real dispatchable stage runs on a peer (C1d) ───────────────
+
+mod e2e {
+    use super::*;
+    use async_trait::async_trait;
+    use blut::framework::artifact::Artifact;
+    use blut::framework::cookbook::{Cookbook, Registry};
+    use blut::framework::error::StageError;
+    use blut::framework::resource::Resource;
+    use blut::framework::stage::{ErasedStageCtor, Stage, StageContext, StageDyn};
+    use blut::p2p::dispatch::{DispatchPolicy, DispatchVerdict};
+    use blut::p2p::peer_exec::{dispatch_to_peer, run_peer_loop, CoordinatorKeys};
+    use blut::p2p::task::ResourceRequest;
+    use blut::p2p::transport::P2pServer;
+    use blut::p2p::PeerInfo;
+    use serde::{Deserialize, Serialize};
+    use std::path::{Path, PathBuf};
+
+    // A file-backed artifact: one text file on disk.
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct TextFile {
+        path: PathBuf,
+        content_hash: ContentHash,
+    }
+    impl Artifact for TextFile {
+        const KIND: &'static str = "test.textfile";
+        const SCHEMA: u32 = 1;
+        fn content_hash(&self) -> ContentHash {
+            self.content_hash
+        }
+        fn primary_path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    // A deterministic dispatchable stage: read the input file, uppercase it,
+    // write the output file. Real work that opens primary_path().
+    struct Upper;
+    #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+    struct UpperArgs {}
+    #[async_trait]
+    impl Stage for Upper {
+        const NAME: &'static str = "upper";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        const DETERMINISTIC: bool = true;
+        type Input = TextFile;
+        type Output = TextFile;
+        type Args = UpperArgs;
+        async fn run(
+            &self,
+            ctx: &StageContext,
+            input: Self::Input,
+            _args: &Self::Args,
+        ) -> Result<Self::Output, StageError> {
+            let body = std::fs::read_to_string(&input.path)
+                .map_err(|e| StageError::Backend(anyhow::anyhow!("read input: {e}")))?;
+            let upper = body.to_uppercase();
+            let out = ctx.stage_dir.join("out.txt");
+            std::fs::write(&out, upper.as_bytes())
+                .map_err(|e| StageError::Backend(anyhow::anyhow!("write output: {e}")))?;
+            Ok(TextFile {
+                content_hash: ContentHash::hash_file(&out).unwrap(),
+                path: out,
+            })
+        }
+    }
+
+    struct UpperCookbook;
+    impl Cookbook for UpperCookbook {
+        fn name(&self) -> &'static str {
+            "upper-cookbook"
+        }
+        fn recipes(&self) -> &'static [&'static blut::recipes::recipe::RecipeDef] {
+            &[]
+        }
+        fn stages_erased(&self) -> &'static [(&'static str, ErasedStageCtor)] {
+            static S: &[(&str, ErasedStageCtor)] =
+                &[("upper", || std::sync::Arc::new(Upper))];
+            S
+        }
+    }
+
+    fn registry() -> Registry {
+        let mut r = Registry::new();
+        r.register(Box::new(UpperCookbook));
+        r
+    }
+
+    // A permissive policy that allows the `upper` stage to all peers.
+    struct AllowUpper;
+    impl DispatchPolicy for AllowUpper {
+        fn is_dispatchable(&self, stage_name: &str) -> bool {
+            stage_name == "upper"
+        }
+        fn classify_stage(&self, _s: &str, _a: &serde_json::Value) -> DataClass {
+            DataClass::Public
+        }
+        fn select_peer(
+            &self,
+            _s: &str,
+            _r: &ResourceRequest,
+            _d: DataClass,
+            peers: &[PeerInfo],
+        ) -> Option<PeerId> {
+            peers.first().map(|p| p.id.clone())
+        }
+        fn verify_result(
+            &self,
+            _r: &TaskResult,
+            _e: &ContentHash,
+            _k: &ed25519_dalek::VerifyingKey,
+        ) -> DispatchVerdict {
+            DispatchVerdict::Accept
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_runs_real_stage_end_to_end() {
+        let coord_kp = Arc::new(KeyPair::generate());
+        let peer_kp = Arc::new(KeyPair::generate());
+        let (registry_store, _dir) = temp_registry();
+
+        let server = Arc::new(
+            P2pServer::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                coord_kp.clone(),
+                registry_store,
+            )
+            .await
+            .unwrap(),
+        );
+        let addr = server.local_addr().unwrap();
+
+        // Produce the input artifact on the COORDINATOR's disk (its src_root).
+        let src_root = tempfile::tempdir().unwrap();
+        let in_path = src_root.path().join("in.txt");
+        std::fs::write(&in_path, b"hello p2p world").unwrap();
+        let input = TextFile {
+            content_hash: ContentHash::hash_file(&in_path).unwrap(),
+            path: in_path.clone(),
+        };
+        let input_hash = input.content_hash;
+        let input_erased =
+            blut::framework::stage::ErasedArtifact::from_typed(&input).unwrap();
+
+        // Expected output hash = what a LOCAL run of `upper` would produce.
+        let expected_out_hash = ContentHash::of_bytes(b"HELLO P2P WORLD");
+
+        // ── Peer side: accept the connection, run the loop for one task. ──
+        let server_c = server.clone();
+        let peer_kp_c = peer_kp.clone();
+        let coord_verifying = coord_kp.verifying;
+        let coord_x = coord_kp.x25519_public;
+        let peer_work = tempfile::tempdir().unwrap();
+        let peer_work_path = peer_work.path().to_path_buf();
+        let peer = tokio::spawn(async move {
+            let (_peer_id, conn) = server_c.accept_peer().await.unwrap();
+            let reg = registry();
+            let policy = AllowUpper;
+            let ck = CoordinatorKeys {
+                verifying: coord_verifying,
+                x25519_pub: coord_x,
+            };
+            // Run exactly one task then return (recv_task errs when the conn
+            // closes, ending the loop).
+            let _ = tokio::time::timeout(
+                Duration::from_secs(8),
+                run_peer_loop(&conn, &peer_kp_c, &ck, &reg, &policy, &peer_work_path),
+            )
+            .await;
+        });
+
+        // ── Coordinator side (this test). ──
+        // The QUIC connection is bidirectional. The peer task above accepted the
+        // SERVER end (`conn`) and runs the peer loop on it (recv_task = accept_uni,
+        // send_result = open_uni). Here we hold the CLIENT end (`coord_conn`) and
+        // drive the coordinator half: dispatch_to_peer does send_task (open_uni)
+        // + recv_result (accept_uni), which pair with the peer's opposite ends.
+        let client = P2pClient::new(peer_kp.clone());
+        let (coord_conn, _coord_peer_id) = client.connect(addr).await.unwrap();
+
+        // Poll for the server-side accept_peer to register the peer (no fixed
+        // sleep — retry up to ~2s), then fetch its info.
+        let peer_id = PeerId::from_pubkey(&peer_kp.verifying);
+        let mut peer_info = None;
+        for _ in 0..40 {
+            if let Some(info) = server.peers.read().await.get(&peer_id).cloned() {
+                peer_info = Some(info);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let peer_info = peer_info.expect("peer must register within 2s");
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let dispatched = dispatch_to_peer(
+            &coord_conn,
+            &coord_kp,
+            &peer_info,
+            &registry(),
+            "task-e2e-1",
+            "upper",
+            input_erased,
+            src_root.path(),
+            serde_json::json!({}),
+            input_hash,
+            expected_out_hash,
+            DataClass::Public,
+            60, // timeout_secs
+            out_dir.path(),
+        )
+        .await
+        .expect("dispatch must succeed");
+
+        // The returned output is a local handle; its file holds the uppercased
+        // text and verifies against expected_output_hash (the bundle gates ran).
+        let out: TextFile = dispatched.output.into_typed().unwrap();
+        let body = std::fs::read_to_string(&out.path).unwrap();
+        assert_eq!(body, "HELLO P2P WORLD", "peer ran the real stage");
+        assert!(out.path.starts_with(out_dir.path()), "output materialized locally");
+
+        drop(coord_conn);
+        let _ = tokio::time::timeout(Duration::from_secs(2), peer).await;
+        server.shutdown();
+    }
+}
+
 #[tokio::test]
 async fn recv_blob_rejects_oversized_total_len() {
     use blut::p2p::bundle::BlobDir;

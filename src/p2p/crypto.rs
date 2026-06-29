@@ -64,6 +64,13 @@ impl KeyPair {
     pub fn sign(&self, msg: &[u8]) -> Signature {
         self.signing.sign(msg)
     }
+
+    /// Decrypt a payload sealed to THIS keypair's X25519 public key. Keeps the
+    /// X25519 secret encapsulated (no accessor) — a peer decrypts its dispatched
+    /// input, a coordinator decrypts a returned output, both via this method.
+    pub fn decrypt(&self, payload: &EncryptedPayload) -> Result<Vec<u8>, TrainError> {
+        decrypt(payload, &self.x25519_secret)
+    }
 }
 
 /// Verify a detached Ed25519 signature.

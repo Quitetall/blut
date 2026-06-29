@@ -207,6 +207,37 @@ impl StageContext {
             resume_from: None,
         }
     }
+
+    /// Build a context for a P2P PEER running ONE dispatched stage in isolation
+    /// (no surrounding executor). The peer owns `job_dir`/`stage_dir` for this
+    /// task and a job-local cache; everything else takes the inert defaults a
+    /// single isolated stage needs. `cache_key` is a REQUIRED parameter (not a
+    /// zeroed default) so concurrent peer tasks can't collide on a shared key if
+    /// a stage does a content-addressed cache lookup — pass the task's input
+    /// hash, which is unique per dispatch.
+    #[cfg(feature = "p2p")]
+    pub fn for_peer(
+        job_dir: PathBuf,
+        stage_dir: PathBuf,
+        cache: Arc<CacheHandle>,
+        cache_key: crate::framework::artifact::ContentHash,
+    ) -> Self {
+        Self {
+            job_dir,
+            stage_dir,
+            node_idx: 0,
+            status_tx: crate::framework::status::make_broadcast(),
+            cancel: CancellationToken::new(),
+            cache,
+            recipe_name: String::new(),
+            launch_target: crate::config::launcher::LaunchTarget::Local,
+            device_index: None,
+            fb_warm: false,
+            cache_key,
+            attempt: 1,
+            resume_from: None,
+        }
+    }
 }
 
 /// Typed user-facing trait. Implementors are concrete stages.

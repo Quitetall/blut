@@ -16,6 +16,7 @@ pub mod crypto;
 pub mod dispatch;
 pub mod job;
 pub mod peer;
+pub mod peer_exec;
 pub mod registry;
 pub mod task;
 pub mod transport;
