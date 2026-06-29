@@ -10,6 +10,7 @@
 //!
 //! Gated behind `#[cfg(feature = "p2p")]`.
 
+pub mod bundle;
 pub mod coordinator;
 pub mod crypto;
 pub mod dispatch;
@@ -20,6 +21,7 @@ pub mod task;
 pub mod transport;
 pub mod trust;
 
+pub use bundle::{bundle, unbundle, BlobDir, BundleError, BundleManifest};
 pub use coordinator::Coordinator;
 pub use crypto::{EncryptedPayload, KeyPair};
 pub use dispatch::{DefaultDispatchPolicy, DispatchPolicy, DispatchVerdict};
