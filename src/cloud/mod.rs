@@ -15,6 +15,7 @@
 //! from cloud in v1: cloud workers are capped at `Registered` trust, so the reused
 //! `DispatchMatrix` refuses `DataClass::Restricted` to any cloud worker.
 
+pub mod cost;
 pub mod job;
 pub mod queue;
 pub mod store;

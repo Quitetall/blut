@@ -81,6 +81,7 @@ async fn cloud_dispatch_round_trips_over_local_object_store() {
     let policy = DefaultDispatchPolicy::new(DispatchMatrix::default());
     let matrix = DispatchMatrix::default();
     let work_root = tempfile::tempdir().unwrap();
+    let ledger = blut::cloud::cost::CostLedger::new(Default::default());
     let ran = run_one(
         store.as_ref(),
         queue.as_ref(),
@@ -91,10 +92,14 @@ async fn cloud_dispatch_round_trips_over_local_object_store() {
         TrustLevel::Registered,
         30,
         work_root.path(),
+        Some(&ledger),
     )
     .await
     .expect("worker run");
     assert_eq!(ran.as_deref(), Some("job-1"), "worker claimed + ran the job");
+    // The job was billed (one ledger entry — the "billed on compute" plumbing fired;
+    // p2p-echo is sub-ms so the unit total may round to ~0, hence assert the entry).
+    assert_eq!(ledger.entries().len(), 1, "completed job recorded a cost entry");
 
     // The coordinator downloads + verifies the output (the four bundle gates run,
     // including the bind to expected_output_hash).
@@ -151,6 +156,7 @@ async fn restricted_job_is_refused_by_a_registered_cloud_worker() {
         TrustLevel::Registered,
         30,
         work_root.path(),
+        None,
     )
     .await
     .expect("worker run");

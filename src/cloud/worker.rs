@@ -45,6 +45,7 @@ pub async fn run_one(
     worker_trust: TrustLevel,
     lease_secs: u64,
     work_root: &Path,
+    ledger: Option<&super::cost::CostLedger>,
 ) -> Result<Option<String>, CloudError> {
     let Some(job) = queue.claim(worker_id, lease_secs).await? else {
         return Ok(None);
@@ -66,10 +67,21 @@ pub async fn run_one(
             wall_time_ms: compute_ms,
             error: None,
         },
-        // A failed job produced no compute; report the total occupied time.
+        // A failed job produced no compute; report total occupied time (for
+        // observability) but it is NOT billed (see below).
         Err(e) => CloudResult::failed(job_id.clone(), started.elapsed().as_millis() as u64, e.to_string()),
     };
+
+    // Bill compute-only, and ONLY a successful job — the operator absorbs failed
+    // work in v1. Capture the figures BEFORE `result` moves into `complete`, and
+    // record AFTER `complete` durably commits, so a failed-then-retried completion
+    // can't double-bill.
+    let billable = matches!(result.outcome, JobOutcome::Succeeded).then_some(result.wall_time_ms);
+    let resources = job.resources;
     queue.complete(worker_id, result).await?;
+    if let (Some(l), Some(compute_ms)) = (ledger, billable) {
+        l.record(&job_id, &resources, compute_ms);
+    }
     Ok(Some(job_id))
 }
 
