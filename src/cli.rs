@@ -861,7 +861,9 @@ fn warn_if_stale_binary() {
 /// case we can rebuild from). Lines look like:
 ///   "blut-lamquant 1.0.0 (path+file:///abs/dir)" = ["blut", ...]
 /// Returns `None` for a registry/git install (no local dir to `--path` at) or
-/// when `bin` isn't an installed binary. Pure (testable) — no IO.
+/// when `bin` isn't an installed binary. Pure (testable) — no IO. Assumes
+/// cargo's single-line `.crates.toml` format; an unexpected/evolved format
+/// falls through to `None` (warn-only), never a wrong dir.
 fn crate_dir_for_installed_bin(crates_toml: &str, bin: &str) -> Option<String> {
     let needle = format!("\"{bin}\"");
     for line in crates_toml.lines() {
@@ -893,13 +895,24 @@ fn crate_dir_for_installed_bin(crates_toml: &str, bin: &str) -> Option<String> {
 }
 
 /// Resolve how to rebuild the installed `blut` binary. Prefers an explicit
-/// `BLUT_REBUILD_CMD` (run via `sh -c` — covers a local `cargo build` checkout);
-/// otherwise detects a `cargo install --path <cookbook-dir>` from
-/// `$CARGO_HOME/.crates.toml`. `None` ⇒ can't determine the target → warn only.
+/// `BLUT_REBUILD_CMD` (run via `sh -c` — covers a local `cargo build` checkout,
+/// pipes, `&&` chains); otherwise detects a `cargo install --path <cookbook-dir>`
+/// from `$CARGO_HOME/.crates.toml`. `None` ⇒ can't determine the target → warn
+/// only.
+///
+/// TRUST MODEL: `BLUT_REBUILD_CMD` is executed verbatim by a shell, so it is an
+/// arbitrary-command surface. It is opt-in (only consulted when both it AND
+/// `BLUT_AUTO_REBUILD=1` are set) and the value comes from the invoking user's
+/// OWN environment — a user who can set it can already run any command, so this
+/// is not a privilege escalation in normal (non-setuid) use. The `sh -c` form
+/// is deliberate: the value must support shell features (a local checkout often
+/// needs `cargo build --release && cp …`). Do NOT run blut setuid / as another
+/// user with an attacker-controlled environment.
 fn resolve_rebuild_command() -> Option<Vec<String>> {
     if let Some(cmd) = std::env::var_os("BLUT_REBUILD_CMD") {
         let cmd = cmd.to_string_lossy().to_string();
         if !cmd.trim().is_empty() {
+            // Shell-exec surface — see the TRUST MODEL note above.
             return Some(vec!["sh".into(), "-c".into(), cmd]);
         }
     }
@@ -948,11 +961,13 @@ fn maybe_auto_rebuild(info: &StaleInfo) {
         return;
     };
     tracing::warn!(
-        "blut stale ({} → {}); BLUT_AUTO_REBUILD=1 → rebuilding via `{}` ...",
+        "blut stale ({} → {}); BLUT_AUTO_REBUILD=1 → rebuilding via `{}` (a from-source \
+         `cargo install` may take a few minutes — not a hang) ...",
         info.built,
         info.live,
         cmd.join(" ")
     );
+    // cmd is ["cargo","install",...] (detected) or ["sh","-c",<BLUT_REBUILD_CMD>].
     let status = std::process::Command::new(&cmd[0])
         .args(&cmd[1..])
         .status();
@@ -968,8 +983,9 @@ fn maybe_auto_rebuild(info: &StaleInfo) {
         }
     }
     // Re-exec the freshly-installed binary with the original args. current_exe()
-    // resolves the on-disk path (now the NEW content after --force), and the
-    // DONE sentinel arms the loop guard in the child.
+    // returns the PATH (not a pinned inode/vnode) on both Linux (/proc/self/exe)
+    // and macOS, so exec() re-resolves it to the NEW content cargo wrote in
+    // place under --force. The DONE sentinel arms the loop guard in the child.
     let Ok(exe) = std::env::current_exe() else {
         tracing::warn!("rebuilt OK but current_exe() unknown; re-run blut to use fresh code.");
         return;
@@ -995,6 +1011,8 @@ fn maybe_auto_rebuild(info: &StaleInfo) {
             .env("BLUT_AUTO_REBUILD_DONE", "1")
             .status()
         {
+            // exit() skips Drop/atexit — fine here: we're mid-startup (this runs
+            // before the async runtime does real work), nothing to flush.
             Ok(s) => std::process::exit(s.code().unwrap_or(0)),
             Err(e) => tracing::error!("re-spawn failed ({e}); continuing STALE."),
         }
