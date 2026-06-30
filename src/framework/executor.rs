@@ -169,6 +169,10 @@ pub struct ExecCtx {
     /// Arg — warm doesn't change the trained output, so it stays out of the
     /// checkpoint cache key.
     pub fb_warm: bool,
+    /// Auto-tuned decode worker count (ADR 0071 A2), cached at admission so the
+    /// cookbook train stage (RECORD) launches the SAME count the cli sized (RESOLVE)
+    /// — parity + never-OOM. `None` ⇒ the conservative cap (unchanged behaviour).
+    pub admitted_workers: Option<u32>,
     /// Phase-G scheduler: the GPU DEVICE index this whole job is pinned to,
     /// or `None` for the box default. Threaded into every `StageContext` so a
     /// launcher-aware backend exports `CUDA_VISIBLE_DEVICES=<idx>` for the
@@ -228,6 +232,7 @@ impl ExecCtx {
             launch_target: crate::config::launcher::LaunchTarget::Local,
             control: None,
             fb_warm: false,
+            admitted_workers: None,
             device_index: None,
             bypass_cache: false,
             #[cfg(feature = "p2p")]
@@ -255,6 +260,12 @@ impl ExecCtx {
     /// `StageContext.fb_warm` so a train stage bills the warm footprint.
     pub fn with_fb_warm(mut self, warm: bool) -> Self {
         self.fb_warm = warm;
+        self
+    }
+    /// Set the auto-tuned decode worker count (ADR 0071 A2). Threaded into every
+    /// `StageContext.admitted_workers` so the cookbook train stage launches it.
+    pub fn with_admitted_workers(mut self, workers: u32) -> Self {
+        self.admitted_workers = Some(workers);
         self
     }
 
@@ -376,6 +387,7 @@ struct NodeEnv {
     launch_target: crate::config::launcher::LaunchTarget,
     device_index: Option<usize>,
     fb_warm: bool,
+    admitted_workers: Option<u32>,
     /// Force-recompute (INC D / S4). When true, `run_node` skips the cache READ
     /// so the stage always runs; the fresh result is still cached.
     bypass_cache: bool,
@@ -720,6 +732,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
             launch_target: env.launch_target,
             device_index: env.device_index,
             fb_warm: env.fb_warm,
+            admitted_workers: env.admitted_workers,
             // Durable resume (Phase D): the stage's cache key is its stable
             // per-config fingerprint — a resume train stage keys its recovery
             // dir on it so a re-run with identical args finds the checkpoint.
@@ -1575,6 +1588,7 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
         launch_target: ctx.launch_target,
         device_index: ctx.device_index,
         fb_warm: ctx.fb_warm,
+        admitted_workers: ctx.admitted_workers,
         bypass_cache: ctx.bypass_cache,
         recipe_name: plan.name().to_string(),
         on_retry: ctx.on_retry,

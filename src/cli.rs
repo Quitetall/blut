@@ -1921,6 +1921,70 @@ fn recipe_footprint(name: &str, raw: &serde_json::Value) -> crate::broker::Footp
     crate::broker::FootprintStore::load().resolve(&key, hint)
 }
 
+/// Like [`recipe_footprint`] but with the decode worker count OVERRIDDEN to the
+/// auto-tuned `workers` (ADR 0071 A2) — so the gate's footprint + calibration key
+/// reflect the count the stage will actually launch (threaded via
+/// `ExecCtx::with_admitted_workers`). The light arg-less path is unchanged.
+fn recipe_footprint_tuned(
+    name: &str,
+    raw: &serde_json::Value,
+    workers: u32,
+) -> crate::broker::Footprint {
+    if raw.is_null() || raw.as_object().is_some_and(|o| o.is_empty()) {
+        return crate::broker::Footprint {
+            ram_bytes: 2 * 1024 * 1024 * 1024,
+            vram_mib: 0,
+        };
+    }
+    let mut drivers = crate::broker::Drivers::from_args_json(raw);
+    drivers.workers = workers; // the fit-and-saturate count (overrides the cap)
+    let hint = drivers.estimate();
+    let key = drivers.key(name);
+    crate::broker::FootprintStore::load().resolve(&key, hint)
+}
+
+/// ADR 0071 A2: auto-tune the decode worker count to FIT-AND-SATURATE from a SINGLE
+/// memory snapshot. Returns `Some(W)` for a train-shaped recipe (so RESOLVE +
+/// RECORD share the cached count), or `None` for a light/arg-less recipe or when
+/// the mem probe is unavailable (keep the conservative cap = unchanged behaviour).
+/// Prints the `workers N→W` admission note when it changes the count.
+fn admitted_workers_for(name: &str, raw: &serde_json::Value) -> Option<u32> {
+    if raw.is_null() || raw.as_object().is_some_and(|o| o.is_empty()) {
+        return None; // light recipe — no decode workers to tune
+    }
+    let snap = crate::broker::ResourceSnapshot::probe();
+    if snap.mem_total_gb <= 0.0 {
+        return None; // no probe → leave the conservative cap
+    }
+    let gib = crate::broker::footprint::GIB as f64;
+    let cpu = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(4);
+    let avail = (snap.mem_avail_gb * gib) as u64;
+    let floor = (crate::broker::admission::DEFAULT_FLOOR_GIB * gib) as u64;
+    // Critically-low RAM (less than the floor free): don't tune — fall back to the
+    // conservative cap and let the existing gate refuse on the cap footprint.
+    if avail <= floor {
+        return None;
+    }
+    // never-OOM-the-BOX is the cgroup cap's job (ADR 0047), not admission's: this
+    // single snapshot is serialized blut-vs-blut by the scheduler lock and nets out
+    // other processes via MemAvailable; a residual drift only ever cgroup-kills the
+    // contained unit, never the box. workers_to_fit_and_saturate is ≥1 (never 0) and
+    // saturating, so no underflow / zero-worker admission.
+    let base = crate::broker::Drivers::from_args_json(raw);
+    let w = crate::broker::footprint::workers_to_fit_and_saturate(cpu, avail, floor, &base);
+    if w != crate::broker::footprint::UNCALIBRATED_WORKER_CAP {
+        eprintln!(
+            "admission: recipe '{name}' decode workers {} → {w} to fit {:.0}G available + {} cores (auto-tuned, never-OOM)",
+            crate::broker::footprint::UNCALIBRATED_WORKER_CAP,
+            snap.mem_avail_gb,
+            cpu
+        );
+    }
+    Some(w)
+}
+
 /// The box-fit RAM budget (GiB) for a scheduler / executor that runs cells
 /// concurrently. MIRRORS the executor's Phase-5 sizing (cli.rs `run_hpo` /
 /// `launch_compiled_plan`): `MemTotal − floor`, clamped `>= 1`. Box-fit TOTAL
@@ -3270,7 +3334,15 @@ async fn launch_compiled_plan(
     // tier/batch are read IDENTICALLY to what the train stage records under
     // (RECORD side), keeping the RESOLVE/RECORD calibration key in parity even
     // when the user omitted the field.
-    let footprint = recipe_footprint(name, plan.exec_view().recipe_args);
+    // ADR 0071 A2: auto-tune decode workers to fit-AND-saturate (one knob fixes
+    // both the over-refuse and the GPU-starvation). Compute W from a SINGLE mem
+    // snapshot; the gate's footprint uses W, and W is cached on the ExecCtx below
+    // so the cookbook train stage (RECORD) launches exactly this count.
+    let admitted_workers = admitted_workers_for(name, plan.exec_view().recipe_args);
+    let footprint = match admitted_workers {
+        Some(w) => recipe_footprint_tuned(name, plan.exec_view().recipe_args, w),
+        None => recipe_footprint(name, plan.exec_view().recipe_args),
+    };
 
     let job_id = crate::jobs::new_job_id();
     let job_dir = crate::paths::job_dir(&job_id)?;
@@ -3307,6 +3379,11 @@ async fn launch_compiled_plan(
     // checkpoint cache key — a warm and a cold run share the trained output.
     let fb_warm = crate::broker::Drivers::from_args_json(plan.exec_view().recipe_args).warm;
     ctx = ctx.with_fb_warm(fb_warm);
+    // A2: cache the auto-tuned worker count on the ctx so the cookbook train stage
+    // launches exactly what admission sized (RESOLVE↔RECORD parity, never-OOM).
+    if let Some(w) = admitted_workers {
+        ctx = ctx.with_admitted_workers(w);
+    }
     // INC D (S4): `--no-cache`/`--force` bypasses the stage cache READ so every
     // stage recomputes; the fresh result is still written to the cache.
     ctx = ctx.with_bypass_cache(no_cache);

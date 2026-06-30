@@ -165,6 +165,10 @@ pub struct StageContext {
     /// cache). Set by the CLI from the recipe's `warm_fb_cache` arg via
     /// `ExecCtx`, so the RECORD side and the cli RESOLVE side read ONE source.
     pub fb_warm: bool,
+    /// Auto-tuned decode worker count (ADR 0071 A2). Set by the cli at admission
+    /// (RESOLVE) via `ExecCtx` so the train stage (RECORD) launches the SAME count
+    /// the broker sized — parity + never-OOM. `None` ⇒ the conservative cap.
+    pub admitted_workers: Option<u32>,
     /// This stage invocation's CACHE KEY (the engine's canonical "same input +
     /// same args + same schema" fingerprint). Threaded so a durable-resume train
     /// stage can derive a STABLE per-config resume directory (via
@@ -202,6 +206,7 @@ impl StageContext {
             launch_target: crate::config::launcher::LaunchTarget::Local,
             device_index: None,
             fb_warm: false,
+            admitted_workers: None,
             cache_key: crate::framework::artifact::ContentHash([0u8; 32]),
             attempt: 1,
             resume_from: None,
@@ -233,6 +238,7 @@ impl StageContext {
             launch_target: crate::config::launcher::LaunchTarget::Local,
             device_index: None,
             fb_warm: false,
+            admitted_workers: None,
             cache_key,
             attempt: 1,
             resume_from: None,
