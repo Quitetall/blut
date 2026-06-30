@@ -111,6 +111,19 @@ enum Command {
         /// Second job id.
         b: String,
     },
+    /// One run's results from the metric store (ADR 0071 A3): best val_r +
+    /// trajectory + per-band PRD + ckpt path. `blut results <job> [--json]` —
+    /// replaces grepping BLUT_METRIC out of raw logs + `ls -t`-hunting a CSV.
+    Results {
+        /// Job id (prefix ok).
+        job: String,
+        /// Emit machine-readable JSON instead of a human summary.
+        #[arg(long)]
+        json: bool,
+        /// The headline metric to report best/trajectory for (default `val_r`).
+        #[arg(long, default_value = "val_r")]
+        metric: String,
+    },
     /// Declared, persistent partition key-space over a recipe + per-cell
     /// backfill (Dagster-class partitions, v0.20 Phase G).
     Partition {
@@ -696,6 +709,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Hpo { cmd }) => run_hpo(&reg, cmd).await,
         Some(Command::Dag { job, json }) => run_dag(job, json),
         Some(Command::Compare { a, b }) => run_compare(&a, &b),
+        Some(Command::Results { job, json, metric }) => run_results(&job, json, &metric),
         Some(Command::Partition { cmd }) => run_partition(&reg, cmd).await,
         Some(Command::Artifact { cmd }) => run_artifact_cmd(cmd),
         Some(Command::Schedule { cmd }) => run_schedule_cmd(&reg, cmd),
@@ -2924,6 +2938,109 @@ fn run_compare(a: &str, b: &str) -> Result<()> {
             sb.saturation,
             sb.wasted * 100.0
         );
+    }
+    Ok(())
+}
+
+/// `blut results <job> [--json] [--metric M]` — one run's results from the
+/// metric store (ADR 0071 A3): best (peak) value + per-step trajectory +
+/// per-band PRD + the produced ckpt path. Replaces grepping `BLUT_METRIC` out
+/// of raw logs and `ls -t`-hunting the run CSV. The metric store is a derived,
+/// rebuildable index (ADR 0071 §3) — an un-flushed/just-started job has no rows
+/// yet, so we say "no data yet" rather than erroring.
+fn run_results(job: &str, json: bool, metric: &str) -> Result<()> {
+    let job_id = crate::jobs::resolve_job_id(job).map_err(|e| anyhow!("{e}"))?;
+    let db = crate::lineage_db::LineageDb::open().map_err(|e| anyhow!("open lineage.db: {e}"))?;
+
+    // val_r is maximize; a PRD/loss-shaped headline minimizes. Default to
+    // maximize (the canonical headline is val_r) unless the metric name reads
+    // like an error/loss.
+    let lower = metric.to_ascii_lowercase();
+    let maximize = !(lower.contains("prd")
+        || lower.contains("loss")
+        || lower.contains("err")
+        || lower.contains("mae")
+        || lower.contains("rmse")
+        || lower.contains("nrmse"));
+
+    let best = db
+        .best_metric(&job_id, metric, maximize)
+        .map_err(|e| anyhow!("{e}"))?;
+    let series = db
+        .metric_series(&job_id, metric)
+        .map_err(|e| anyhow!("{e}"))?;
+    let finals = db.final_metrics(&job_id).map_err(|e| anyhow!("{e}"))?;
+    // per-band PRD: final metrics whose name carries a band prefix + "prd"
+    // (delta_prd / theta_prd / … — emitted by --detail-bands).
+    let per_band: Vec<(String, f64)> = finals
+        .iter()
+        .filter(|(k, _)| {
+            let kl = k.to_ascii_lowercase();
+            kl.contains("prd") && kl != "prd" && kl != metric.to_ascii_lowercase()
+        })
+        .cloned()
+        .collect();
+    let ckpt = db
+        .terminal_artifact(&job_id)
+        .map_err(|e| anyhow!("{e}"))?
+        .and_then(|a| a.sidecar_path);
+
+    let has_data = best.is_some() || !series.is_empty() || !finals.is_empty() || ckpt.is_some();
+
+    if json {
+        let traj: Vec<serde_json::Value> = series
+            .iter()
+            .map(|(s, v)| serde_json::json!({ "step": s, "value": v }))
+            .collect();
+        let band_obj: serde_json::Map<String, serde_json::Value> = per_band
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::json!(v)))
+            .collect();
+        let out = serde_json::json!({
+            "job": job_id,
+            "metric": metric,
+            "maximize": maximize,
+            "has_data": has_data,
+            "best": best.map(|(step, value)| serde_json::json!({ "step": step, "value": value })),
+            "trajectory": traj,
+            "per_band_prd": band_obj,
+            "ckpt_path": ckpt,
+        });
+        println!("{}", serde_json::to_string_pretty(&out).map_err(|e| anyhow!("{e}"))?);
+        return Ok(());
+    }
+
+    println!("job  {job_id}");
+    if !has_data {
+        println!("(no data yet — the run hasn't flushed any metrics to the store)");
+        return Ok(());
+    }
+    match best {
+        Some((step, value)) => println!(
+            "best {metric}  {value:.4}  @ step {step}  ({} of {} samples)",
+            if maximize { "max" } else { "min" },
+            series.len()
+        ),
+        None => println!("best {metric}  — (no per-step samples recorded)"),
+    }
+    if let Some(p) = &ckpt {
+        println!("ckpt {p}");
+    }
+    if !per_band.is_empty() {
+        println!("\nper-band PRD (final):");
+        for (k, v) in &per_band {
+            println!("  {k:<16} {v:>8.3}");
+        }
+    }
+    if !series.is_empty() {
+        // A compact sparkline-free trajectory tail (last up to 8 points) so the
+        // shape is legible without a plotting dep.
+        let tail: Vec<&(i64, f64)> = series.iter().rev().take(8).collect();
+        print!("\n{metric} trajectory (last {}):", tail.len());
+        for (s, v) in tail.into_iter().rev() {
+            print!("  {s}:{v:.4}");
+        }
+        println!();
     }
     Ok(())
 }
