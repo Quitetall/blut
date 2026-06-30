@@ -123,6 +123,14 @@ enum Command {
         /// The headline metric to report best/trajectory for (default `val_r`).
         #[arg(long, default_value = "val_r")]
         metric: String,
+        /// Force "best = max" (override the name heuristic for a non-standard
+        /// metric). Mutually exclusive with --minimize.
+        #[arg(long, conflicts_with = "minimize")]
+        maximize: bool,
+        /// Force "best = min" (override the name heuristic — e.g. a custom loss
+        /// not matching the prd/loss/err naming convention).
+        #[arg(long)]
+        minimize: bool,
     },
     /// Declared, persistent partition key-space over a recipe + per-cell
     /// backfill (Dagster-class partitions, v0.20 Phase G).
@@ -709,7 +717,18 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Hpo { cmd }) => run_hpo(&reg, cmd).await,
         Some(Command::Dag { job, json }) => run_dag(job, json),
         Some(Command::Compare { a, b }) => run_compare(&a, &b),
-        Some(Command::Results { job, json, metric }) => run_results(&job, json, &metric),
+        Some(Command::Results { job, json, metric, maximize, minimize }) => {
+            // Explicit flags override the name heuristic; clap's conflicts_with
+            // guarantees at most one is set.
+            let force = if maximize {
+                Some(true)
+            } else if minimize {
+                Some(false)
+            } else {
+                None
+            };
+            run_results(&job, json, &metric, force)
+        }
         Some(Command::Partition { cmd }) => run_partition(&reg, cmd).await,
         Some(Command::Artifact { cmd }) => run_artifact_cmd(cmd),
         Some(Command::Schedule { cmd }) => run_schedule_cmd(&reg, cmd),
@@ -2948,20 +2967,22 @@ fn run_compare(a: &str, b: &str) -> Result<()> {
 /// of raw logs and `ls -t`-hunting the run CSV. The metric store is a derived,
 /// rebuildable index (ADR 0071 §3) — an un-flushed/just-started job has no rows
 /// yet, so we say "no data yet" rather than erroring.
-fn run_results(job: &str, json: bool, metric: &str) -> Result<()> {
+fn run_results(job: &str, json: bool, metric: &str, force_maximize: Option<bool>) -> Result<()> {
     let job_id = crate::jobs::resolve_job_id(job).map_err(|e| anyhow!("{e}"))?;
     let db = crate::lineage_db::LineageDb::open().map_err(|e| anyhow!("open lineage.db: {e}"))?;
 
-    // val_r is maximize; a PRD/loss-shaped headline minimizes. Default to
-    // maximize (the canonical headline is val_r) unless the metric name reads
-    // like an error/loss.
-    let lower = metric.to_ascii_lowercase();
-    let maximize = !(lower.contains("prd")
-        || lower.contains("loss")
-        || lower.contains("err")
-        || lower.contains("mae")
-        || lower.contains("rmse")
-        || lower.contains("nrmse"));
+    // Direction: explicit --maximize/--minimize wins; else the name heuristic —
+    // val_r-shaped headlines maximize, a PRD/loss/err-shaped name minimizes.
+    // `--maximize`/`--minimize` is the escape hatch for a non-standard name.
+    let maximize = force_maximize.unwrap_or_else(|| {
+        let lower = metric.to_ascii_lowercase();
+        !(lower.contains("prd")
+            || lower.contains("loss")
+            || lower.contains("err")
+            || lower.contains("mae")
+            || lower.contains("rmse")
+            || lower.contains("nrmse"))
+    });
 
     let best = db
         .best_metric(&job_id, metric, maximize)

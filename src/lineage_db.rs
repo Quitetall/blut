@@ -451,6 +451,11 @@ impl LineageDb {
     /// The per-step TRAJECTORY of `metric` for a job (real samples, `step >= 0`),
     /// ordered by step — for `blut results` (ADR 0071 A3). Excludes the `step = -1`
     /// final marker so the series is the live curve, not the headline.
+    ///
+    /// Job-level aggregate (no `node_idx` filter), consistent with `final_metrics`:
+    /// a single train node emits the headline (val_r), so this is the curve as
+    /// the run reports it. A future multi-node-per-metric layout would interleave
+    /// samples — add a `node_idx` clause then.
     pub fn metric_series(&self, job_id: &str, metric: &str) -> Result<Vec<(i64, f64)>> {
         let mut stmt = self
             .conn
@@ -471,7 +476,8 @@ impl LineageDb {
     /// The BEST (peak) value of `metric` over the real trajectory (`step >= 0`) —
     /// the best-EVER, distinct from `final_metric`'s ended value (which can collapse
     /// after the peak). `maximize` picks MAX else MIN; ties → earliest step. `None`
-    /// if the metric was never sampled.
+    /// if the metric was never sampled. Job-level aggregate (no `node_idx` filter),
+    /// consistent with `metric_series` / `final_metrics`.
     pub fn best_metric(
         &self,
         job_id: &str,
