@@ -15,6 +15,8 @@
 //! from cloud in v1: cloud workers are capped at `Registered` trust, so the reused
 //! `DispatchMatrix` refuses `DataClass::Restricted` to any cloud worker.
 
+pub mod job;
+pub mod queue;
 pub mod store;
 
 /// Errors from the cloud queue layer. Grows as the sibling modules (queue,
@@ -23,12 +25,22 @@ pub mod store;
 pub enum CloudError {
     /// Object-store transport failure (put/get/head).
     Store(String),
+    /// A job id that isn't traversal-safe (it becomes an object-store key).
+    BadJobId(String),
+    /// Enqueue of an id already pending/leased/done.
+    DuplicateJob(String),
+    /// `complete` from a worker that no longer holds the job's lease (it expired
+    /// and the job was reclaimed + re-leased to another worker). Stale; rejected.
+    LeaseLost(String),
 }
 
 impl std::fmt::Display for CloudError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CloudError::Store(m) => write!(f, "cloud object store: {m}"),
+            CloudError::BadJobId(id) => write!(f, "unsafe cloud job id '{id}'"),
+            CloudError::DuplicateJob(id) => write!(f, "duplicate cloud job id '{id}'"),
+            CloudError::LeaseLost(id) => write!(f, "lease lost for cloud job '{id}' (reclaimed)"),
         }
     }
 }
