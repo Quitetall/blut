@@ -206,6 +206,15 @@ enum P2pCommand {
         /// Identity key file (defaults to the standard p2p key path).
         #[arg(long)]
         key: Option<std::path::PathBuf>,
+        /// Turnkey smoke test (ADR 0067 · T2.3): instead of the long-running
+        /// coordinator, accept ONE worker and dispatch this built-in stage to it
+        /// over the full data plane (bundle → blob → remote run → verify), print
+        /// the verified output, then exit. Use `p2p-echo` for connectivity.
+        #[arg(long)]
+        smoke_stage: Option<String>,
+        /// Text payload for `--smoke-stage` (default: "hello p2p world").
+        #[arg(long)]
+        smoke_input: Option<String>,
     },
     /// Run as a worker PEER: connect to a coordinator and execute dispatched
     /// stages until the connection closes.
@@ -698,7 +707,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Footprint { cmd }) => run_footprint_cmd(cmd),
         Some(Command::Sensor { cmd }) => run_sensor_cmd(cmd),
         #[cfg(feature = "p2p")]
-        Some(Command::P2p { cmd }) => run_p2p_cmd(&reg, cmd).await,
+        Some(Command::P2p { cmd }) => run_p2p_cmd(reg, cmd).await,
         #[cfg(feature = "tui")]
         Some(Command::Tui { check }) => {
             if check {
@@ -1016,11 +1025,16 @@ mod p2p_cli {
 }
 
 #[cfg(feature = "p2p")]
-async fn run_p2p_cmd(reg: &crate::framework::Registry, cmd: P2pCommand) -> Result<()> {
+async fn run_p2p_cmd(mut reg: crate::framework::Registry, cmd: P2pCommand) -> Result<()> {
     use crate::p2p::crypto::KeyPair;
     use crate::p2p::peer::PeerId;
     use crate::p2p::registry::PeerRegistry;
     use p2p_cli::*;
+
+    // Ship the built-in connectivity probe (`p2p-echo`) so both the dispatching
+    // coordinator (`serve --smoke-stage`) and the executing worker (`connect`)
+    // can resolve it via find_erased_stage.
+    crate::p2p::smoke::register(&mut reg);
 
     match cmd {
         P2pCommand::Keys { cmd } => match cmd {
@@ -1077,15 +1091,21 @@ async fn run_p2p_cmd(reg: &crate::framework::Registry, cmd: P2pCommand) -> Resul
                 Ok(())
             }
         },
-        P2pCommand::Serve { addr, key } => {
+        P2pCommand::Serve { addr, key, smoke_stage, smoke_input } => {
             let path = key.map(Ok).unwrap_or_else(default_key_path)?;
             let kp = std::sync::Arc::new(load_keypair(&path)?);
-            run_p2p_serve(addr, kp).await
+            match smoke_stage {
+                Some(stage) => {
+                    let input = smoke_input.unwrap_or_else(|| "hello p2p world".to_string());
+                    run_p2p_smoke_serve(addr, kp, &reg, stage, input).await
+                }
+                None => run_p2p_serve(addr, kp).await,
+            }
         }
         P2pCommand::Connect { coordinator, coordinator_pubkey, key } => {
             let path = key.map(Ok).unwrap_or_else(default_key_path)?;
             let kp = load_keypair(&path)?;
-            run_p2p_connect(reg, coordinator, coordinator_pubkey, kp).await
+            run_p2p_connect(&reg, coordinator, coordinator_pubkey, kp).await
         }
         P2pCommand::Peers { cmd } => {
             let reg_path = default_registry_path()?;
@@ -1202,6 +1222,67 @@ async fn run_p2p_serve(
         }
     }
     coordinator.shutdown();
+    Ok(())
+}
+
+/// Turnkey smoke serve (ADR 0067 · T2.3): bind a one-shot QUIC server, accept ONE
+/// worker, dispatch `stage` to it over the full data plane, print the
+/// content-verified output, then exit. Drives a raw `P2pServer` (not the full
+/// `Coordinator`) so `dispatch_to_peer`'s `recv_result` doesn't race the
+/// `Coordinator`'s background `handle_peer` reader on the same connection.
+#[cfg(feature = "p2p")]
+async fn run_p2p_smoke_serve(
+    addr: String,
+    keypair: std::sync::Arc<crate::p2p::crypto::KeyPair>,
+    reg: &crate::framework::Registry,
+    stage: String,
+    input: String,
+) -> Result<()> {
+    use crate::p2p::registry::PeerRegistry;
+    use crate::p2p::transport::P2pServer;
+
+    // Fail fast on a bad stage name BEFORE binding / waiting for a worker — a typo
+    // would otherwise hang on accept_peer and then fail cryptically on the worker.
+    // (smoke_dispatch_once ships a text SmokeText input, so the built-in `p2p-echo`
+    // is the dispatchable target here; a real-workload dispatch CLI is future work.)
+    if reg.find_erased_stage(&stage).is_none() {
+        return Err(anyhow!(
+            "unknown stage '{stage}': not registered. Use `--smoke-stage p2p-echo` \
+             for the built-in connectivity probe."
+        ));
+    }
+
+    let sockaddr: std::net::SocketAddr = addr
+        .parse()
+        .with_context(|| format!("parse listen addr '{addr}'"))?;
+    let reg_path = p2p_cli::default_registry_path()?;
+    let peers = PeerRegistry::load(&reg_path).map_err(|e| anyhow!("load registry: {e}"))?;
+    let server = std::sync::Arc::new(
+        P2pServer::bind(sockaddr, keypair.clone(), peers)
+            .await
+            .map_err(|e| anyhow!("bind smoke server: {e}"))?,
+    );
+    let bound = server.local_addr().map_err(|e| anyhow!("{e}"))?;
+    eprintln!("smoke coordinator listening on {bound}");
+    eprintln!("pubkey    {}", p2p_pubkey_hex(&keypair));
+    eprintln!("(on the worker: `blut p2p connect {bound} --coordinator-pubkey <pubkey>`)");
+    eprintln!("waiting for ONE worker to connect, then dispatching stage '{stage}'…");
+
+    let (peer_id, conn) = server
+        .accept_peer()
+        .await
+        .map_err(|e| anyhow!("accept worker: {e}"))?;
+    eprintln!("worker {peer_id} connected — dispatching…");
+
+    let out = crate::p2p::smoke::smoke_dispatch_once(
+        &server, &conn, &keypair, reg, &peer_id, &stage, &input, 60,
+    )
+    .await
+    .map_err(|e| anyhow!("smoke dispatch: {e}"))?;
+
+    println!("✔ stage '{stage}' ran on peer {peer_id}; verified output:");
+    println!("{out}");
+    server.shutdown();
     Ok(())
 }
 

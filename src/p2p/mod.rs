@@ -18,6 +18,7 @@ pub mod job;
 pub mod peer;
 pub mod peer_exec;
 pub mod registry;
+pub mod smoke;
 pub mod task;
 pub mod transport;
 pub mod trust;

@@ -75,6 +75,10 @@ impl DefaultDispatchPolicy {
             "export_firmware".into(),
             "build_manifest".into(),
             "build_split_manifest".into(),
+            // Built-in connectivity probe (deterministic, Public, dependency-free).
+            // Always dispatchable so `blut p2p serve --smoke-stage` works out of the
+            // box on any worker. See crate::p2p::smoke.
+            crate::p2p::smoke::SMOKE_STAGE.into(),
         ]);
         Self {
             matrix,
@@ -179,6 +183,8 @@ mod tests {
         assert!(policy.is_dispatchable("warm_fb_cache"));
         assert!(policy.is_dispatchable("precompute_l3"));
         assert!(policy.is_dispatchable("pccp_gate_encoder"));
+        // Built-in connectivity probe is always dispatchable.
+        assert!(policy.is_dispatchable(crate::p2p::smoke::SMOKE_STAGE));
         assert!(!policy.is_dispatchable("train_joint"));
         assert!(!policy.is_dispatchable("train_snn"));
         assert!(!policy.is_dispatchable("train_l3_teacher"));

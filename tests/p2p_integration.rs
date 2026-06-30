@@ -460,3 +460,70 @@ async fn recv_blob_rejects_oversized_total_len() {
     drop(conn);
     server.shutdown();
 }
+
+/// T1.6 (ADR 0067): the CLI smoke path — coordinator BINDS (`serve --smoke-stage`),
+/// worker DIALS (`connect`) — dispatches the shipped `p2p-echo` stage over the full
+/// data plane and content-verifies the result. Mirrors `peer_runs_real_stage_end_to_end`
+/// but with the bind/dial roles matching the CLI and using the real shipped stage +
+/// `DefaultDispatchPolicy` (which now allow-lists `p2p-echo`).
+#[tokio::test]
+async fn smoke_serve_dispatches_echo_over_loopback() {
+    use blut::framework::cookbook::Registry;
+    use blut::p2p::crypto::KeyPair;
+    use blut::p2p::dispatch::DefaultDispatchPolicy;
+    use blut::p2p::peer::PeerId;
+    use blut::p2p::peer_exec::{run_peer_loop, CoordinatorKeys};
+    use blut::p2p::smoke;
+    use blut::p2p::transport::{P2pClient, P2pServer};
+    use blut::p2p::trust::DispatchMatrix;
+
+    let coord_kp = Arc::new(KeyPair::generate());
+    let peer_kp = Arc::new(KeyPair::generate());
+    let (peer_reg_store, _dir) = temp_registry();
+
+    // Coordinator binds (the `serve` role).
+    let server = Arc::new(
+        P2pServer::bind("127.0.0.1:0".parse().unwrap(), coord_kp.clone(), peer_reg_store)
+            .await
+            .unwrap(),
+    );
+    let addr = server.local_addr().unwrap();
+
+    // Worker dials in (the `connect` role) and runs the peer loop for one task.
+    let coord_verifying = coord_kp.verifying;
+    let coord_x = coord_kp.x25519_public;
+    let peer_kp_c = peer_kp.clone();
+    let peer_work = tempfile::tempdir().unwrap();
+    let peer_work_path = peer_work.path().to_path_buf();
+    let worker = tokio::spawn(async move {
+        let mut pin = [0u8; 32];
+        pin.copy_from_slice(coord_verifying.as_bytes());
+        let client = P2pClient::with_coordinator_pin(peer_kp_c.clone(), pin);
+        let (conn, _my_id) = client.connect(addr).await.unwrap();
+        let mut reg = Registry::new();
+        smoke::register(&mut reg);
+        let policy = DefaultDispatchPolicy::new(DispatchMatrix::default());
+        let ck = CoordinatorKeys { verifying: coord_verifying, x25519_pub: coord_x };
+        let _ = tokio::time::timeout(
+            Duration::from_secs(8),
+            run_peer_loop(&conn, &peer_kp_c, &ck, &reg, &policy, &peer_work_path),
+        )
+        .await;
+    });
+
+    // Coordinator accepts the worker, then drives the smoke dispatch.
+    let (peer_id, conn) = server.accept_peer().await.unwrap();
+    assert_eq!(peer_id, PeerId::from_pubkey(&peer_kp.verifying));
+    let mut reg = Registry::new();
+    smoke::register(&mut reg);
+    let out = smoke::smoke_dispatch_once(
+        &server, &conn, &coord_kp, &reg, &peer_id, smoke::SMOKE_STAGE, "hello smoke", 30,
+    )
+    .await
+    .expect("smoke dispatch must succeed");
+    assert_eq!(out, "HELLO SMOKE", "peer ran the shipped p2p-echo stage");
+
+    drop(conn);
+    let _ = tokio::time::timeout(Duration::from_secs(2), worker).await;
+    server.shutdown();
+}
