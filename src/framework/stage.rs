@@ -290,6 +290,14 @@ pub trait Stage: Send + Sync + 'static {
     /// doesn't re-execute just because its upstream was retrained.
     const DETERMINISTIC: bool = true;
 
+    /// Whether this stage is ADVISORY (ADR 0071). An advisory stage's failure is
+    /// recorded as a non-fatal warning and PRUNES its descendants, but does NOT
+    /// fail the plan / exit non-zero — the canonical case is a `--dry-run` /
+    /// verdict gate that runs after training: its verdict is information, not a
+    /// build gate, so it must never mislabel a good training run as a failure.
+    /// A real *promotion* gate stays `false` (fatal). Opt-in: default `false`.
+    const ADVISORY: bool = false;
+
     /// Retry policy for this stage (D1). Default: no retry. Override for
     /// stages whose failures are often transient (network downloads,
     /// OOM-prone trainers). A plan can override per-node via
@@ -412,6 +420,12 @@ pub trait StageDyn: Send + Sync + 'static {
     /// The executor reserves THIS against the box-fit budget.
     fn memory_gib_for(&self, _args: &serde_json::Value) -> u32 {
         self.memory_gib()
+    }
+    /// Whether this stage is advisory (ADR 0071 · `Stage::ADVISORY`). Defaulted
+    /// `false` so manual `StageDyn` impls keep the fatal semantics; the blanket
+    /// impl below forwards `S::ADVISORY`.
+    fn is_advisory(&self) -> bool {
+        false
     }
     /// How many `Resource::Gpu` permits this stage holds while running. Default
     /// 1 (a single-GPU stage). A DDP stage returns `nproc_per_node` so it holds
@@ -565,6 +579,9 @@ impl<S: Stage> StageDyn for S {
     }
     fn deterministic(&self) -> bool {
         S::DETERMINISTIC
+    }
+    fn is_advisory(&self) -> bool {
+        S::ADVISORY
     }
     fn resources(&self) -> &'static [Resource] {
         S::RESOURCES

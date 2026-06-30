@@ -330,6 +330,28 @@ pub struct PlanResult {
     pub n_cache_hits: usize,
     pub n_cache_misses: usize,
     pub elapsed: std::time::Duration,
+    /// Advisory stages that FAILED (ADR 0071): each warns + prunes its
+    /// descendants but does not fail the plan. NON-EMPTY ⇒ the run completed
+    /// "with warnings" — the machine-parseable signal that distinguishes this
+    /// from a clean success (both exit 0). Tooling that acts on `final_output`
+    /// (e.g. a promoter) MUST check this is empty first.
+    pub warnings: Vec<StageWarning>,
+}
+
+/// One advisory stage that tripped (ADR 0071).
+#[derive(Debug, Clone)]
+pub struct StageWarning {
+    /// Topo index of the advisory stage.
+    pub idx: u32,
+    pub stage: String,
+    /// The failure the advisory stage produced (downgraded from fatal).
+    pub reason: String,
+}
+
+/// Whether advisory stages are forced FATAL for this run (ADR 0071 strict mode),
+/// via `BLUT_STRICT_ADVISORY=1` — for CI that wants the old fail-hard behaviour.
+fn strict_advisory() -> bool {
+    std::env::var("BLUT_STRICT_ADVISORY").map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -1634,6 +1656,7 @@ impl SequentialExecutor {
 
         let mut n_hits = 0usize;
         let mut n_misses = 0usize;
+        let mut warnings: Vec<StageWarning> = Vec::new();
 
         for (idx, node_id) in order.iter().enumerate() {
             // Plan-level deadline (D2): coarse between-stage check; a
@@ -1689,13 +1712,35 @@ impl SequentialExecutor {
                     logical_outputs.insert(outcome.node_id, outcome.logical);
                 }
                 Err(f) => {
+                    // ADR 0071: an advisory stage's failure is a non-fatal warning,
+                    // not a plan failure — record it and STOP (the remaining topo
+                    // nodes are its descendants and can't run). `strict_advisory()`
+                    // forces the old fail-hard behaviour for CI.
+                    if let NodeFailure::Stage { idx, stage, source } = &f {
+                        if node.stage.is_advisory() && !strict_advisory() {
+                            tracing::warn!("advisory stage '{stage}' failed (non-fatal): {source}");
+                            warnings.push(StageWarning {
+                                idx: *idx,
+                                stage: stage.clone(),
+                                reason: source.to_string(),
+                            });
+                            break;
+                        }
+                    }
                     finish_writer(env, writer_handle).await;
                     return Err(plan_error_of(f));
                 }
             }
         }
 
-        let final_output = order.last().and_then(|id| outputs.remove(id));
+        // If an advisory stage pruned the terminal node, surface the last COMPLETED
+        // node in topo order (the upstream train ckpt in the canonical linear
+        // train→gate plan) rather than None (ADR 0071).
+        let final_output = if warnings.is_empty() {
+            order.last().and_then(|id| outputs.remove(id))
+        } else {
+            order.iter().rev().find_map(|id| outputs.remove(id))
+        };
         finish_writer(env, writer_handle).await;
 
         Ok(PlanResult {
@@ -1704,6 +1749,7 @@ impl SequentialExecutor {
             n_cache_hits: n_hits,
             n_cache_misses: n_misses,
             elapsed: started.elapsed(),
+            warnings,
         })
     }
 }
@@ -1853,6 +1899,7 @@ impl ParallelExecutor {
         let mut n_misses = 0usize;
         let mut first_error: Option<PlanError> = None;
         let mut completed = 0usize;
+        let mut warnings: Vec<StageWarning> = Vec::new();
 
         // Pre-cancel: honour a token already fired before the first spawn.
         if env.cancel.is_cancelled() {
@@ -2345,20 +2392,50 @@ impl ParallelExecutor {
                 Err(f) => {
                     // S1 race fix: a `Stage` failure carries the topo idx, so map
                     // it back to the node id and clear its in-flight maps + kill
-                    // latch — this is the diverged-EXHAUSTED node
-                    // (`StageError::Diverged` after `max_attempts`), which was last
-                    // kill-flagged on its final attempt and never reached a
-                    // `StageRetrying`. Per-node-keyed, so a stale latch entry could
-                    // never affect a sibling, but clear it for hygiene before the
-                    // fail-fast drain. (`Other` carries no id; nothing to remove.)
-                    if let NodeFailure::Stage { idx, .. } = &f {
+                    // latch. Capture whether the failing stage is ADVISORY (ADR
+                    // 0071) BEFORE removing it from `node_stages`.
+                    let mut advisory: Option<(u32, String, String, NodeId)> = None;
+                    if let NodeFailure::Stage { idx, stage, source } = &f {
                         if let Some(&nid) = order.get(*idx as usize) {
+                            let is_adv = node_stages
+                                .get(&nid)
+                                .map(|s| s.is_advisory())
+                                .unwrap_or(false)
+                                && !strict_advisory();
                             node_tokens.remove(&nid);
                             node_stages.remove(&nid);
                             kill_flagged.remove(&nid);
+                            if is_adv {
+                                advisory = Some((*idx, stage.clone(), source.to_string(), nid));
+                            }
                         }
                     }
-                    if first_error.is_none() {
+                    if let Some((idx, stage, reason, nid)) = advisory {
+                        // Advisory failure: WARN, prune descendants exactly like a
+                        // KILL (their input can't materialize), but do NOT fail the
+                        // plan — other branches keep running.
+                        tracing::warn!("advisory stage '{stage}' failed (non-fatal): {reason}");
+                        warnings.push(StageWarning { idx, stage, reason });
+                        if let Some(k) = node_key_of.remove(&nid) {
+                            inflight_keys.remove(&k);
+                            if let Some(waiters) = deferred.remove(&k) {
+                                for w in waiters {
+                                    if !pruned.contains(&w) {
+                                        ready.insert(w);
+                                    }
+                                }
+                            }
+                        }
+                        let mut stack = vec![nid];
+                        while let Some(d) = stack.pop() {
+                            if pruned.insert(d) {
+                                ready.remove(&d);
+                                if let Some(ss) = succs.get(&d) {
+                                    stack.extend(ss.iter().copied());
+                                }
+                            }
+                        }
+                    } else if first_error.is_none() {
                         first_error = Some(plan_error_of(f));
                         env.cancel.cancel(); // fail-fast: cancel siblings
                     }
@@ -2398,8 +2475,15 @@ impl ParallelExecutor {
         }
         // If the terminal node was pruned, there is no final output — a killed
         // branch legitimately changed the graph (the caller sees the missing
-        // output + the StageFailed events in status.jsonl).
-        let final_output = order.last().and_then(|id| outputs.remove(id));
+        // output + the StageFailed events in status.jsonl). EXCEPT when an
+        // advisory stage did the pruning (ADR 0071): surface the last completed
+        // node in topo order (the upstream train ckpt for a linear train→gate plan)
+        // so the operator gets it live.
+        let final_output = if warnings.is_empty() {
+            order.last().and_then(|id| outputs.remove(id))
+        } else {
+            order.iter().rev().find_map(|id| outputs.remove(id))
+        };
         finish_writer(env, writer_handle).await;
 
         Ok(PlanResult {
@@ -2408,6 +2492,7 @@ impl ParallelExecutor {
             n_cache_hits: n_hits,
             n_cache_misses: n_misses,
             elapsed: started.elapsed(),
+            warnings,
         })
     }
 }
@@ -2623,6 +2708,29 @@ mod tests {
     }
     impl Compatible<LamuTrainerBackend> for AlwaysFail {}
 
+    // An ADVISORY gate that always fails — models a dry-run/verdict gate after
+    // training (ADR 0071). Its failure must NOT fail the plan.
+    struct AdvisoryGate;
+    #[async_trait]
+    impl Stage for AdvisoryGate {
+        const NAME: &'static str = "advisory_gate";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        const ADVISORY: bool = true;
+        type Input = Counter;
+        type Output = Counter;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            _input: Counter,
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            Err(StageError::BadInput("advisory verdict: would-not-promote".into()))
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for AdvisoryGate {}
+
     fn fresh_ctx() -> (tempfile::TempDir, ExecCtx) {
         let td = tempfile::tempdir().unwrap();
         let ctx = ExecCtx::new(td.path().to_path_buf());
@@ -2648,6 +2756,33 @@ mod tests {
         let out = result.final_output.unwrap();
         let counter: Counter = out.into_typed().unwrap();
         assert_eq!(counter.n, 3);
+    }
+
+    #[tokio::test]
+    async fn advisory_gate_failure_is_non_fatal_and_preserves_output() {
+        // ADR 0071: train (MakeOne) → an advisory gate that FAILS. The plan must
+        // NOT fail; the warning is recorded and the train output is surfaced.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        MAKE_RUN_COUNT.store(0, Ordering::SeqCst);
+        INC_RUN_COUNT.store(0, Ordering::SeqCst);
+        let (_td, ctx) = fresh_ctx();
+        let plan = Plan::<(), LamuTrainerBackend>::new("test", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .then(AdvisoryGate, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let result = SequentialExecutor::execute(plan, ctx)
+            .await
+            .expect("an advisory gate's failure must NOT fail the plan");
+        assert_eq!(result.warnings.len(), 1, "the advisory failure is recorded");
+        assert_eq!(result.warnings[0].stage, "advisory_gate");
+        // The upstream train output is surfaced even though the terminal gate tripped.
+        let counter: Counter = result
+            .final_output
+            .expect("train output preserved past the advisory gate")
+            .into_typed()
+            .unwrap();
+        assert_eq!(counter.n, 1);
     }
 
     #[tokio::test]

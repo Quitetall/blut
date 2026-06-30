@@ -3389,6 +3389,21 @@ async fn launch_compiled_plan(
                 "done — {} ingredients, {} cache hits, {} misses, elapsed {:?}",
                 r.n_stages, r.n_cache_hits, r.n_cache_misses, r.elapsed
             );
+            // ADR 0071: advisory stages (e.g. a dry-run/verdict gate) failing do
+            // NOT fail the run — surface them as warnings so a good experiment is
+            // never mis-read as a failure, and point at the preserved output.
+            if !r.warnings.is_empty() {
+                eprintln!(
+                    "⚠ training OK — completed with {} advisory warning(s) (the run did NOT fail):",
+                    r.warnings.len()
+                );
+                for w in &r.warnings {
+                    eprintln!("    · {} (advisory, skipped): {}", w.stage, w.reason);
+                }
+                eprintln!(
+                    "  the trained output + metrics are preserved — `blut results {job_id}` / `blut lineage show {job_id}`."
+                );
+            }
             if let Some(fp) = sweep_fp {
                 record_sweep_completion(fp, &job_id);
             }
