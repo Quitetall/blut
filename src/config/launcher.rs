@@ -939,6 +939,8 @@ pub enum LaunchTarget {
     /// and shells `kubectl` — zero kube deps in the engine; the operator crate
     /// owns the reconcile loop.
     K8s,
+    /// Cloud compute queue (object-store dispatch, billed on compute — ADR 0082).
+    Cloud,
 }
 
 impl std::str::FromStr for LaunchTarget {
@@ -950,8 +952,9 @@ impl std::str::FromStr for LaunchTarget {
             "ray" => Ok(Self::Ray),
             "p2p" => Ok(Self::P2P),
             "k8s" | "kubernetes" => Ok(Self::K8s),
+            "cloud" => Ok(Self::Cloud),
             other => Err(TrainError::other(format!(
-                "unknown launcher '{other}' (expected local|slurm|ray|p2p|k8s|kubernetes)"
+                "unknown launcher '{other}' (expected local|slurm|ray|p2p|k8s|kubernetes|cloud)"
             ))),
         }
     }
@@ -988,6 +991,9 @@ pub fn launcher_for(target: LaunchTarget) -> Box<dyn Launcher> {
         // wrapped local process; fall through to LocalSystemd for any local
         // process management on the submitting side.
         LaunchTarget::K8s => Box::new(LocalSystemd::default()),
+        // Cloud dispatch is handled by the cloud submit path (CloudSubmitter +
+        // CloudQueue), not Launcher — same precedent as P2P. Fall through to local.
+        LaunchTarget::Cloud => Box::new(LocalSystemd::default()),
     }
 }
 

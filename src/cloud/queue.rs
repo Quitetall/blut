@@ -70,9 +70,11 @@ struct Inner {
     done: HashMap<String, CloudResult>,
 }
 
-/// Whether `id` is safe to use as an object-store key (the cross-process backend
-/// turns job ids into keys). Mirrors the p2p `is_safe_task_id` guard.
-fn is_safe_job_id(id: &str) -> bool {
+/// Whether `id` is safe to use as an object-store key / path component (the
+/// cross-process backend turns job ids into keys, and the worker into a stage_dir).
+/// Mirrors the p2p `is_safe_task_id` guard. `pub(crate)` so the worker can
+/// re-check defensively rather than trust the queue.
+pub(crate) fn is_safe_job_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && !id.contains("..")
