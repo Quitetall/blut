@@ -192,6 +192,14 @@ enum Command {
         #[command(subcommand)]
         cmd: P2pCommand,
     },
+    /// Cloud compute queue (ADR 0082 / 0067 T3.1) — submit a job, get the
+    /// result back, billed on compute. Behind the off-by-default `cloud`
+    /// feature (implies `p2p`).
+    #[cfg(feature = "cloud")]
+    Cloud {
+        #[command(subcommand)]
+        cmd: CloudCommand,
+    },
     /// Open the canonical interactive training cockpit (ratatui). The
     /// single, complete cockpit: recipe launcher + live jobs/log/system
     /// panels + run history / leaderboard / compare / checkpoints /
@@ -440,6 +448,8 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Sensor { cmd }) => run_sensor_cmd(cmd),
         #[cfg(feature = "p2p")]
         Some(Command::P2p { cmd }) => run_p2p_cmd(reg, cmd).await,
+        #[cfg(feature = "cloud")]
+        Some(Command::Cloud { cmd }) => run_cloud_cmd(reg, cmd).await,
         #[cfg(feature = "tui")]
         Some(Command::Tui { check }) => {
             if check {
@@ -1241,6 +1251,11 @@ use lineage::*;
 mod p2p;
 #[cfg(feature = "p2p")]
 use p2p::*;
+
+#[cfg(feature = "cloud")]
+mod cloud;
+#[cfg(feature = "cloud")]
+use cloud::*;
 
 mod partition;
 use partition::*;
