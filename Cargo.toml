@@ -99,7 +99,6 @@ rcgen = { version = "0.13", optional = true }
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.28", optional = true }
 fuzzy-matcher = { version = "0.3", optional = true }
-
 [features]
 default = ["tui"]
 # The interactive ratatui cockpit (`blut tui`, and bare `blut`). On by default
@@ -112,6 +111,12 @@ p2p = ["dep:ed25519-dalek", "dep:aes-gcm", "dep:x25519-dalek", "dep:blake3", "de
 # the ADR 0034 no-server charter (scope-guard verified). Non-default: the lean
 # CLI and the firmware/no_std paths never pull it in.
 s3 = ["dep:object_store", "dep:bytes"]
+# Cloud compute queue (T3.1 / ADR 0082) — "submit a job, get the result back,
+# billed on compute". Reuses the entire P2P data plane (bundle/verify, dispatch
+# seam, trust matrix, peer-exec choreography, bundle-at-rest encryption) with an
+# object store in place of QUIC, so it depends on `p2p`. Object-store transport
+# is dev-testable on the local filesystem (no cloud account).
+cloud = ["p2p", "dep:object_store", "dep:bytes"]
 
 # NOTE (ADR 0078): the Starlark DSL is NOT a feature of this crate. `starlark`
 # hard-depends on `serde_json/arbitrary_precision`, which Cargo feature
