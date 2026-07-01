@@ -927,6 +927,12 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
                 if let Some(h) = gpu_sampler {
                     h.stop().await;
                 }
+                // Match every other error exit from this attempt (see the
+                // sibling `let _ = std::fs::remove_dir_all(&tmp_stage_dir)`
+                // calls above/below): a caught panic must not skip cleanup
+                // of this attempt's tmp dir either, or it lingers on disk
+                // until process exit.
+                let _ = std::fs::remove_dir_all(&tmp_stage_dir);
                 drop(permits);
                 drop(stage_ctx);
                 std::panic::resume_unwind(panic_payload);
@@ -2157,10 +2163,21 @@ impl ParallelExecutor {
                                                                 input_hash,
                                                                 &canon_args,
                                                             );
+                                                            // Match the local run_node path: `output_hash`
+                                                            // must be a content hash of the ARTIFACT, not
+                                                            // `key` (a hash of the job's inputs). Lineage
+                                                            // tooling reads this field expecting content
+                                                            // addressability regardless of whether the node
+                                                            // ran locally or was P2P-dispatched.
+                                                            let output_hash = stage
+                                                                .output_content_hash(&hit.artifact)
+                                                                .unwrap_or_else(|| {
+                                                                    content_hash_from_erased(&hit.artifact)
+                                                                });
                                                             status.emit(StageEvent::StageEnd {
                                                                 node_idx,
                                                                 stage_name: stage_name.clone(),
-                                                                output_hash: key,
+                                                                output_hash,
                                                                 elapsed: start.elapsed(),
                                                             });
                                                             Ok(NodeOutcome {

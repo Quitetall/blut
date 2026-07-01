@@ -237,7 +237,19 @@ fn write_caps(cgdir: &Path, caps: &CapSpec) -> Result<()> {
 /// nothing downstream can ever remove the leaf if we don't do it here.
 fn write_caps_or_cleanup(cgdir: &Path, caps: &CapSpec) -> Result<()> {
     if let Err(e) = write_caps(cgdir, caps) {
-        let _ = std::fs::remove_dir(cgdir);
+        // `remove_dir_all` (not `remove_dir`): today's only fallible knob
+        // (memory.max) fails before anything else is written, so the leaf
+        // is empty and either call would succeed — but `remove_dir` would
+        // silently ENOTEMPTY-fail (dropped by the `let _`) if a future
+        // fallible knob is added after one that already wrote a file.
+        // `remove_dir_all` has no such trap, and nothing is joined into
+        // this leaf yet, so recursive removal is always safe here.
+        if let Err(cleanup_err) = std::fs::remove_dir_all(cgdir) {
+            tracing::warn!(
+                "containment: failed to remove orphaned cgroup leaf {cgdir:?} after \
+                 cap write failure ({e}): {cleanup_err}"
+            );
+        }
         return Err(e);
     }
     Ok(())
