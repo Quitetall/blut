@@ -82,6 +82,12 @@ blake3 = { version = "1", optional = true }
 hkdf = { version = "0.12", optional = true }
 quinn = { version = "0.11", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+# X.509/SPKI parsing for PinnedVerifier (p2p/transport.rs) to extract a
+# presented cert's SubjectPublicKeyInfo for pin comparison. Already resolved
+# transitively — rustls's own "ring" feature enables "webpki/ring" — so this
+# just exposes the existing dependency directly rather than hand-rolling a
+# DER parser over attacker-controlled certificate bytes.
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc"], optional = true }
 rcgen = { version = "0.13", optional = true }
 # TUI deps — optional, behind the default-on `tui` feature. Building with
 # `--no-default-features` drops these three from the dependency tree and
@@ -96,7 +102,7 @@ default = ["tui"]
 # in 1.0; drop it with `blut = { ..., default-features = false }` for CLI-only.
 tui = ["dep:ratatui", "dep:crossterm", "dep:fuzzy-matcher"]
 # P2P distributed compute — trust model, encryption, task dispatch.
-p2p = ["dep:ed25519-dalek", "dep:aes-gcm", "dep:x25519-dalek", "dep:blake3", "dep:hkdf", "dep:quinn", "dep:rustls", "dep:rcgen"]
+p2p = ["dep:ed25519-dalek", "dep:aes-gcm", "dep:x25519-dalek", "dep:blake3", "dep:hkdf", "dep:quinn", "dep:rustls", "dep:webpki", "dep:rcgen"]
 
 [dev-dependencies]
 tempfile = "3"

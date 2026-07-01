@@ -130,23 +130,16 @@ impl Containment for CgroupV2Direct {
         std::fs::create_dir_all(&cgdir)
             .map_err(|e| TrainError::other(format!("cgroup2 mkdir {}: {e}", cgdir.display())))?;
 
-        // Write the caps. cgroup-v2 memory files take a decimal byte count or
-        // the literal `max`. Resolve TYPED → env → default (RSS-based, so a
-        // default is safe — unlike RLIMIT_AS). Reject 0 (a 0-byte hard cap =
-        // instant kill) — leave the knob at `max` instead.
-        if let Some(b) = resolve_mem_bytes(caps.mem_max, "MEMMAX", "44G") {
-            write_knob(&cgdir, "memory.max", b)?;
-        }
-        if let Some(b) = resolve_mem_bytes(caps.mem_high, "MEMHIGH", "40G") {
-            // soft throttle — best-effort, don't fail the run if absent.
-            let _ = std::fs::write(cgdir.join("memory.high"), b.to_string());
-        }
-        if let Some(b) = resolve_mem_bytes(caps.swap_max, "SWAPMAX", "2G") {
-            let _ = std::fs::write(cgdir.join("memory.swap.max"), b.to_string());
-        }
-        // Kill the whole leaf as a unit on OOM (matches systemd MemoryMax
-        // semantics where the unit dies, not just one worker). Best-effort.
-        let _ = std::fs::write(cgdir.join("memory.oom.group"), b"1");
+        // `cgdir` is now a REAL kernel cgroup-v2 leaf (creating a subdirectory
+        // under a cgroup-v2 mount instantiates a live cgroup, not a plain
+        // directory). No `TeardownHandle` exists for it yet — that's only
+        // constructed in the `Ok(WrappedRun { .. })` below — so if writing the
+        // caps fails (e.g. the parent's `subtree_control` doesn't have
+        // `+memory` enabled yet and `memory.max` never appears under `cgdir`),
+        // a bare `?` here would return `Err` with no handle for the caller to
+        // call `cleanup()` on, orphaning the empty, capless leaf forever.
+        // `write_caps_or_cleanup` removes the leaf itself before propagating.
+        write_caps_or_cleanup(&cgdir, caps)?;
 
         let mut c = tokio::process::Command::new(program);
         for a in args {
@@ -210,6 +203,56 @@ impl Containment for CgroupV2Direct {
 fn write_knob(cgdir: &Path, file: &str, bytes: u64) -> Result<()> {
     std::fs::write(cgdir.join(file), bytes.to_string())
         .map_err(|e| TrainError::other(format!("cgroup2 write {file}: {e}")))
+}
+
+/// Write the memory-cap knobs into a freshly-created cgroup leaf. cgroup-v2
+/// memory files take a decimal byte count or the literal `max`. Resolve
+/// TYPED → env → default (RSS-based, so a default is safe — unlike
+/// RLIMIT_AS). Reject 0 (a 0-byte hard cap = instant kill) — leave the knob
+/// at `max` instead. Only `memory.max` is fallible (`?`); the rest are
+/// advisory soft knobs and intentionally swallow their own errors.
+fn write_caps(cgdir: &Path, caps: &CapSpec) -> Result<()> {
+    if let Some(b) = resolve_mem_bytes(caps.mem_max, "MEMMAX", "44G") {
+        write_knob(cgdir, "memory.max", b)?;
+    }
+    if let Some(b) = resolve_mem_bytes(caps.mem_high, "MEMHIGH", "40G") {
+        // soft throttle — best-effort, don't fail the run if absent.
+        let _ = std::fs::write(cgdir.join("memory.high"), b.to_string());
+    }
+    if let Some(b) = resolve_mem_bytes(caps.swap_max, "SWAPMAX", "2G") {
+        let _ = std::fs::write(cgdir.join("memory.swap.max"), b.to_string());
+    }
+    // Kill the whole leaf as a unit on OOM (matches systemd MemoryMax
+    // semantics where the unit dies, not just one worker). Best-effort.
+    let _ = std::fs::write(cgdir.join("memory.oom.group"), b"1");
+    Ok(())
+}
+
+/// [`write_caps`], but on failure removes the just-created `cgdir` before
+/// propagating the error — a bare `remove_dir`, same as
+/// [`Containment::cleanup`]'s teardown (best-effort; rmdir only succeeds
+/// when the leaf is empty, which it is here since nothing was ever joined
+/// into it). This is `wrap_command`'s OWN failure-path cleanup: the caller
+/// never receives a `TeardownHandle` when `wrap_command` returns `Err`, so
+/// nothing downstream can ever remove the leaf if we don't do it here.
+fn write_caps_or_cleanup(cgdir: &Path, caps: &CapSpec) -> Result<()> {
+    if let Err(e) = write_caps(cgdir, caps) {
+        // `remove_dir_all` (not `remove_dir`): today's only fallible knob
+        // (memory.max) fails before anything else is written, so the leaf
+        // is empty and either call would succeed — but `remove_dir` would
+        // silently ENOTEMPTY-fail (dropped by the `let _`) if a future
+        // fallible knob is added after one that already wrote a file.
+        // `remove_dir_all` has no such trap, and nothing is joined into
+        // this leaf yet, so recursive removal is always safe here.
+        if let Err(cleanup_err) = std::fs::remove_dir_all(cgdir) {
+            tracing::warn!(
+                "containment: failed to remove orphaned cgroup leaf {cgdir:?} after \
+                 cap write failure ({e}): {cleanup_err}"
+            );
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Async-signal-safe cgroup-join: open `cgroup.procs` and write our own pid.
@@ -283,5 +326,57 @@ mod tests {
             a,
             Availability::Present | Availability::BusOffline | Availability::Unavailable
         ));
+    }
+
+    /// Regression test for the orphaned-cgroup-leaf bug: `wrap_command`
+    /// creates `cgdir` via `create_dir_all`, then writes the cap knobs. If
+    /// the `memory.max` write fails (e.g. the parent's `subtree_control`
+    /// doesn't have `+memory` enabled yet), the old code propagated the
+    /// error via a bare `?` BEFORE any `TeardownHandle` existed, so the
+    /// just-created leaf was never cleaned up by anyone.
+    ///
+    /// This doesn't need a real cgroup-v2 mount (CI/sandboxed boxes often
+    /// have none, or a non-writable one — see `writable_base`'s doc): a
+    /// plain temp directory reproduces the exact failure shape, exercising
+    /// `write_caps_or_cleanup` directly (the same helper `wrap_command` now
+    /// calls right after its own `create_dir_all`). We force the
+    /// `memory.max` write to fail with EACCES by stripping write
+    /// permission from `cgdir` itself — deliberately NOT by pre-creating
+    /// `memory.max` as a directory (EISDIR), which would leave a leftover
+    /// directory entry inside `cgdir` and make the cleanup's `remove_dir`
+    /// fail with ENOTEMPTY on an ordinary filesystem (a real cgroup-v2 leaf
+    /// has no such issue: its `memory.max` etc. are kernel-provided virtual
+    /// files, not directory entries that block `rmdir`, which is exactly
+    /// why the cleanup helper mirrors `Containment::cleanup`'s bare
+    /// `remove_dir` rather than a `remove_dir_all`). Stripping write perm
+    /// keeps `cgdir` genuinely empty, matching the real-world case.
+    #[test]
+    fn write_caps_failure_removes_the_leaf_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cgdir = tmp.path().join("leaf");
+        std::fs::create_dir_all(&cgdir)
+            .expect("create leaf (simulates wrap_command's create_dir_all)");
+        let mut perms = std::fs::metadata(&cgdir).expect("stat leaf").permissions();
+        perms.set_mode(0o555); // r-xr-xr-x: no write → creating memory.max inside fails EACCES
+        std::fs::set_permissions(&cgdir, perms).expect("chmod leaf read-only");
+
+        let caps = CapSpec {
+            mem_max: Some(4 * 1024 * 1024 * 1024),
+            mem_high: None,
+            swap_max: None,
+        };
+
+        let result = write_caps_or_cleanup(&cgdir, &caps);
+        assert!(
+            result.is_err(),
+            "expected the forced memory.max write failure to propagate"
+        );
+        assert!(
+            !cgdir.exists(),
+            "BUG: a failed cap write must remove the just-created (capless, \
+             unjoined) cgroup leaf, not orphan it on disk"
+        );
     }
 }

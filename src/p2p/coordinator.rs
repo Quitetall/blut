@@ -211,11 +211,12 @@ impl Coordinator {
                     match verdict {
                         DispatchVerdict::Accept => {
                             tracing::info!("Task {} completed by peer {}", task_id, peer_id);
-                            {
-                                let mut peers = server.peers.write().await;
-                                peers.update_reputation(&result.peer_id, true);
-                                let _ = peers.save();
-                            }
+                            Self::persist_reputation_update(
+                                &server.peers,
+                                &result.peer_id,
+                                true,
+                                &format!("task {task_id} accepted"),
+                            ).await;
                             let mut pending_map = pending.write();
                             if let Some(pt) = pending_map.remove(&task_id) {
                                 let _ = pt.result_tx.send(Ok(result));
@@ -223,11 +224,12 @@ impl Coordinator {
                         }
                         DispatchVerdict::Reject(reason) => {
                             tracing::warn!("Task {} rejected: {reason}", task_id);
-                            {
-                                let mut peers = server.peers.write().await;
-                                peers.update_reputation(&result.peer_id, false);
-                                let _ = peers.save();
-                            }
+                            Self::persist_reputation_update(
+                                &server.peers,
+                                &result.peer_id,
+                                false,
+                                &format!("task {task_id} rejected: {reason}"),
+                            ).await;
                             let mut pending_map = pending.write();
                             if let Some(pt) = pending_map.remove(&task_id) {
                                 let _ = pt.result_tx.send(Err(reason));
@@ -253,6 +255,140 @@ impl Coordinator {
     /// Shut down the coordinator.
     pub fn shutdown(&self) {
         self.server.shutdown();
+    }
+
+    /// Apply a reputation update in memory and try to persist the peer
+    /// registry to disk, logging (rather than silently discarding) any
+    /// persistence failure.
+    ///
+    /// The in-memory update via `update_reputation` always applies
+    /// regardless of whether `save()` succeeds — a failed persist must not
+    /// be allowed to crash the peer loop, but it also must not vanish with
+    /// zero log trail: if `peers.json`'s directory hits ENOSPC or the
+    /// process is killed/restarted before a later successful save,
+    /// `PeerRegistry::load()` will read the stale on-disk file on restart.
+    ///
+    /// `success = false` (a rejection-driven demotion, e.g. a peer just
+    /// returned a tampered/failing result) logs at `error!` rather than
+    /// `warn!`: losing that persist is security-relevant — a known-bad peer
+    /// can silently regain its pre-demotion trust level after a restart,
+    /// not just an operational hiccup.
+    async fn persist_reputation_update(
+        peers: &RwLock<PeerRegistry>,
+        peer_id: &PeerId,
+        success: bool,
+        context: &str,
+    ) {
+        let mut peers = peers.write().await;
+        peers.update_reputation(peer_id, success);
+        if let Err(e) = peers.save() {
+            if success {
+                tracing::warn!(
+                    "p2p: failed to persist peer registry after reputation update for {peer_id} ({context}): {e}"
+                );
+            } else {
+                tracing::error!(
+                    "p2p: failed to persist peer registry after reputation demotion for {peer_id} ({context}): {e}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::p2p::crypto::KeyPair;
+    use crate::p2p::peer::PeerCapabilities;
+    use crate::p2p::trust::TrustLevel;
+
+    fn make_peer(trust: TrustLevel) -> crate::p2p::peer::PeerInfo {
+        let kp = KeyPair::generate();
+        crate::p2p::peer::PeerInfo::new(
+            kp.verifying,
+            kp.x25519_public,
+            trust,
+            PeerCapabilities::default(),
+        )
+    }
+
+    /// Regression test for the silent `let _ = peers.save();` bug: a
+    /// reputation demotion must still apply in memory even when the
+    /// subsequent persist to disk fails (e.g. ENOSPC, read-only
+    /// filesystem). Before the fix, callers had no way to distinguish "save
+    /// failed" from "save succeeded" — both looked identical from the
+    /// in-memory registry's perspective, which made the bug invisible to a
+    /// black-box test. What we CAN verify without a tracing-capture harness
+    /// (not a dev-dependency of this crate) is the behavioral contract that
+    /// actually matters operationally: `persist_reputation_update` must not
+    /// panic when `save()` fails, and the in-memory reputation update must
+    /// still have applied (so the running coordinator's *current* dispatch
+    /// decisions are correct even if the on-disk copy is stale).
+    #[cfg_attr(not(unix), ignore = "relies on unix directory permission bits")]
+    #[tokio::test]
+    async fn persist_reputation_update_applies_in_memory_when_save_fails() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("peers.json");
+
+            let mut reg = PeerRegistry::load(&path).unwrap();
+            let peer = make_peer(TrustLevel::Registered);
+            let id = peer.id.clone();
+            reg.add(peer).unwrap();
+            // One successful save so the file exists before we break writes.
+            reg.save().unwrap();
+
+            let peers = RwLock::new(reg);
+
+            // Make the directory read-only so PeerRegistry::save()'s
+            // `std::fs::write(&tmp, ..)` fails with a permission error —
+            // stands in for ENOSPC / a read-only filesystem without
+            // actually needing to exhaust disk space.
+            let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+            perms.set_mode(0o500);
+            std::fs::set_permissions(dir.path(), perms.clone()).unwrap();
+
+            Coordinator::persist_reputation_update(&peers, &id, false, "test-reject").await;
+
+            // Restore write perms so the tempdir can clean itself up.
+            perms.set_mode(0o700);
+            std::fs::set_permissions(dir.path(), perms).unwrap();
+
+            let guard = peers.read().await;
+            let p = guard.get(&id).unwrap();
+            assert_eq!(
+                p.tasks_failed, 1,
+                "reputation demotion must apply in-memory even when persistence fails"
+            );
+        }
+    }
+
+    /// Sanity companion: when `save()` succeeds, behavior is unchanged from
+    /// before this refactor (in-memory update + on-disk update agree).
+    #[tokio::test]
+    async fn persist_reputation_update_persists_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+
+        let mut reg = PeerRegistry::load(&path).unwrap();
+        let peer = make_peer(TrustLevel::Registered);
+        let id = peer.id.clone();
+        reg.add(peer).unwrap();
+        reg.save().unwrap();
+
+        let peers = RwLock::new(reg);
+        Coordinator::persist_reputation_update(&peers, &id, true, "test-accept").await;
+
+        let guard = peers.read().await;
+        assert_eq!(guard.get(&id).unwrap().tasks_completed, 1);
+        drop(guard);
+
+        // Reload from disk to confirm the save actually happened.
+        let reloaded = PeerRegistry::load(&path).unwrap();
+        assert_eq!(reloaded.get(&id).unwrap().tasks_completed, 1);
     }
 }
 

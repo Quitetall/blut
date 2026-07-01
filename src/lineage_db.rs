@@ -448,6 +448,89 @@ impl LineageDb {
             .map_err(|e| TrainError::other(format!("final_metrics collect: {e}")))
     }
 
+    /// The per-step TRAJECTORY of `metric` for a job (real samples, `step >= 0`),
+    /// ordered by step — for `blut results` (ADR 0071 A3). Excludes the `step = -1`
+    /// final marker so the series is the live curve, not the headline.
+    ///
+    /// Job-level aggregate (no `node_idx` filter), consistent with `final_metrics`:
+    /// a single train node emits the headline (val_r), so this is the curve as
+    /// the run reports it. A future multi-node-per-metric layout would interleave
+    /// samples — add a `node_idx` clause then.
+    pub fn metric_series(&self, job_id: &str, metric: &str) -> Result<Vec<(i64, f64)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT step, value FROM metrics
+                 WHERE job_id=?1 AND metric=?2 AND step>=0 ORDER BY step",
+            )
+            .map_err(|e| TrainError::other(format!("metric_series prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![job_id, metric], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
+            })
+            .map_err(|e| TrainError::other(format!("metric_series query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| TrainError::other(format!("metric_series collect: {e}")))
+    }
+
+    /// The BEST (peak) value of `metric` over the real trajectory (`step >= 0`) —
+    /// the best-EVER, distinct from `final_metric`'s ended value (which can collapse
+    /// after the peak). `maximize` picks MAX else MIN; ties → earliest step. `None`
+    /// if the metric was never sampled. Job-level aggregate (no `node_idx` filter),
+    /// consistent with `metric_series` / `final_metrics`.
+    pub fn best_metric(
+        &self,
+        job_id: &str,
+        metric: &str,
+        maximize: bool,
+    ) -> Result<Option<(i64, f64)>> {
+        let sql = if maximize {
+            "SELECT step, value FROM metrics
+             WHERE job_id=?1 AND metric=?2 AND step>=0 ORDER BY value DESC, step ASC LIMIT 1"
+        } else {
+            "SELECT step, value FROM metrics
+             WHERE job_id=?1 AND metric=?2 AND step>=0 ORDER BY value ASC, step ASC LIMIT 1"
+        };
+        self.conn
+            .query_row(sql, params![job_id, metric], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
+            })
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(TrainError::other(format!("best_metric: {other}"))),
+            })
+    }
+
+    /// The TERMINAL artifact (highest `stage_idx`) for a job — its `sidecar_path`
+    /// holds the produced ckpt's location. `None` if no artifacts were recorded.
+    pub fn terminal_artifact(&self, job_id: &str) -> Result<Option<ArtifactRow>> {
+        self.conn
+            .query_row(
+                "SELECT job_id, stage_idx, stage_name, content_hash, kind, schema_ver,
+                        sidecar_path, produced_unix
+                 FROM artifacts WHERE job_id=?1 ORDER BY stage_idx DESC LIMIT 1",
+                params![job_id],
+                |r| {
+                    Ok(ArtifactRow {
+                        job_id: r.get(0)?,
+                        stage_idx: r.get(1)?,
+                        stage_name: r.get(2)?,
+                        content_hash: r.get(3)?,
+                        kind: r.get(4)?,
+                        schema_ver: r.get(5)?,
+                        sidecar_path: r.get(6)?,
+                        produced_unix: r.get(7)?,
+                    })
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(TrainError::other(format!("terminal_artifact: {other}"))),
+            })
+    }
+
     /// Top runs by their FINAL `metric` value (HPO ranking / leaderboard) — the
     /// `step = -1` row per (job, node), so an overfit run that peaked then
     /// collapsed ranks by where it ENDED, not its best-ever intermediate.
@@ -805,6 +888,36 @@ mod tests {
         assert_eq!(top[0].2, 0.6);
         assert_eq!(top[1].0, "j1");
         assert_eq!(top[1].2, 0.4, "ranks by final, not best-ever");
+    }
+
+    #[test]
+    fn results_queries_best_series_and_terminal_artifact() {
+        let db = db();
+        // val_r peaks at step 2 (0.8) then collapses to a final 0.4 (step=-1).
+        db.record_metrics(&[
+            MetricRow { job_id: "j".into(), node_idx: 0, step: 0, metric: "val_r".into(), value: 0.3, wall_unix: None },
+            MetricRow { job_id: "j".into(), node_idx: 0, step: 1, metric: "val_r".into(), value: 0.5, wall_unix: None },
+            MetricRow { job_id: "j".into(), node_idx: 0, step: 2, metric: "val_r".into(), value: 0.8, wall_unix: None },
+            MetricRow { job_id: "j".into(), node_idx: 0, step: -1, metric: "val_r".into(), value: 0.4, wall_unix: None },
+        ])
+        .unwrap();
+        // best (peak) is the step=2 0.8, NOT the collapsed final 0.4.
+        assert_eq!(db.best_metric("j", "val_r", true).unwrap(), Some((2, 0.8)));
+        // trajectory excludes the step=-1 marker → exactly the 3 real samples.
+        let series = db.metric_series("j", "val_r").unwrap();
+        assert_eq!(series, vec![(0, 0.3), (1, 0.5), (2, 0.8)]);
+        // a never-sampled metric → None / empty.
+        assert_eq!(db.best_metric("j", "absent", true).unwrap(), None);
+        assert!(db.metric_series("j", "absent").unwrap().is_empty());
+
+        // terminal artifact = highest stage_idx.
+        db.record_artifact(&art("j", 0, "h0")).unwrap();
+        db.record_artifact(&art("j", 3, "h3")).unwrap();
+        let term = db.terminal_artifact("j").unwrap().unwrap();
+        assert_eq!(term.stage_idx, 3);
+        assert_eq!(term.sidecar_path.as_deref(), Some("/j/j/stages/3/output.metadata.json"));
+        // a job with no artifacts → None.
+        assert!(db.terminal_artifact("other").unwrap().is_none());
     }
 
     #[test]

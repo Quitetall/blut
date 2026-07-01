@@ -394,18 +394,28 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let tmp = dest.with_file_name(format!(".{stem}.tmp.{}.{nanos}", std::process::id()));
-    let mut f = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp)?;
-    f.write_all(bytes)?;
-    let _ = f.sync_all();
-    drop(f);
-    if let Err(e) = std::fs::rename(&tmp, dest) {
+    // Write+sync+rename in one fallible step; clean up the tmp on ANY
+    // failure (mirrors `broker/footprint.rs::save`) — a sync error must
+    // not leave an orphaned tmp file behind, same as a rename error. A
+    // dropped `sync_all` error would let `insert()` report `Ok(())` even
+    // though the bytes may not be durable: a crash before background
+    // writeback flushes the page leaves a truncated/garbage file at
+    // `dest` after the rename, which `lookup()` would only catch later
+    // via the corrupt-entry downgrade-to-miss path.
+    let result = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, dest)
+    })();
+    if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e);
     }
-    Ok(())
+    result
 }
 
 #[cfg(test)]
@@ -691,6 +701,58 @@ mod tests {
         // Nonexistent directory → 0 freed, no error.
         let freed = lru_prune(Path::new("/tmp/lamu-nonexistent-xyz-9999"), 1024).unwrap();
         assert_eq!(freed, 0);
+    }
+
+    /// Happy path for `write_atomic` itself (not just via `insert`):
+    /// bytes land at `dest`, and no sibling `.tmp.<pid>.<nanos>` file
+    /// survives. Direct regression test for the write→sync→rename
+    /// refactor that now propagates `sync_all()` errors (previously
+    /// `let _ = f.sync_all();` silently dropped a failed fsync, so
+    /// `insert()` could report `Ok(())` for bytes that were never made
+    /// durable — see `broker/footprint.rs::save()` for the identical
+    /// fix applied earlier to the footprint store).
+    #[test]
+    fn write_atomic_success_writes_bytes_and_leaves_no_tmp() {
+        let td = tempfile::tempdir().unwrap();
+        let dest = td.path().join("out.bin");
+        write_atomic(&dest, b"hello").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+        let tmp_remnants: Vec<_> = std::fs::read_dir(td.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            tmp_remnants.is_empty(),
+            "no tmp file should remain after a successful write_atomic"
+        );
+    }
+
+    /// A genuine fsync-failure injection (ENOSPC/EIO at fsync time) isn't
+    /// portably reachable from a `#[test]` without OS-level tricks or new
+    /// dependencies, and `broker/footprint.rs`'s own tests for the
+    /// identical fix don't attempt it either — so this instead forces a
+    /// *different* failure (`rename(tmp, dest)` onto an existing
+    /// directory) that routes through the SAME cleanup branch
+    /// (`if result.is_err() { remove_file(&tmp) }`) that a propagated
+    /// `sync_all()` error now also takes. Confirms the refactor didn't
+    /// regress tmp cleanup on error.
+    #[test]
+    fn write_atomic_cleans_up_tmp_on_failure() {
+        let td = tempfile::tempdir().unwrap();
+        let dest = td.path().join("out.bin");
+        std::fs::create_dir_all(&dest).unwrap(); // dest occupied by a dir → rename fails
+        let err = write_atomic(&dest, b"hello");
+        assert!(err.is_err(), "rename onto an existing dir must fail");
+        let tmp_remnants: Vec<_> = std::fs::read_dir(td.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            tmp_remnants.is_empty(),
+            "tmp file must be cleaned up when write_atomic fails, not orphaned"
+        );
     }
 
     #[test]

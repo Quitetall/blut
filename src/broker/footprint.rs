@@ -50,6 +50,11 @@ pub const DEFAULT_BATCH: u32 = 32;
 /// hard-coded a different `1..=4` clamp — a live parity bug).
 pub const UNCALIBRATED_WORKER_CAP: u32 = 2;
 
+/// Upper bound on auto-tuned DataLoader workers (ADR 0071). Decode saturates the
+/// GPU feed well before the core count on a many-core box, and each worker holds a
+/// multi-GiB prefetch buffer, so raising past this just burns RAM for no throughput.
+pub const MAX_AUTO_WORKERS: u32 = 16;
+
 /// The footprint cost drivers for a train-shaped recipe/stage, plus THE
 /// single extraction from a recipe's args JSON. Both the cli admission
 /// gate (RESOLVE) and the cookbook train stage (RECORD) build their
@@ -622,6 +627,40 @@ pub fn warm_workers_for_budget(requested: u32, budget_bytes: u64) -> u32 {
     }
     let mut w = ceil;
     while w > 1 && warm_estimate(w).memmax_bytes() > budget_bytes {
+        w -= 1;
+    }
+    w
+}
+
+/// Auto-tune DataLoader workers to FIT-AND-SATURATE (ADR 0071): the largest
+/// `w ∈ 1..=target` whose train footprint `estimate_ram_bytes(w, …)` fits the RAM
+/// budget `avail_bytes − floor_bytes`, where `target` is the CPU-bound throughput
+/// goal (`cpu_count − 2`, clamped to [`MAX_AUTO_WORKERS`]). So it RAISES workers to
+/// saturate decode up to what RAM allows, and LOWERS them to fit — never-OOM-the-box.
+///
+/// Always ≥ 1. If even one worker doesn't fit, returns 1 (the admission gate then
+/// refuses on box-capacity — there is NO silent OOM-cap fallback). `avail_bytes == 0`
+/// (probe unavailable) ⇒ the conservative [`UNCALIBRATED_WORKER_CAP`], so a box we
+/// can't size to behaves exactly as before.
+///
+/// The cross-crate parity contract (see [`UNCALIBRATED_WORKER_CAP`]) is preserved by
+/// computing the count ONCE at admission and caching it (the cli sets
+/// `BLUT_ADMITTED_WORKERS`; the cookbook train stage reads it), so RESOLVE and RECORD
+/// build the SAME `FootprintKey`.
+pub fn workers_to_fit_and_saturate(
+    cpu_count: u32,
+    avail_bytes: u64,
+    floor_bytes: u64,
+    d: &Drivers,
+) -> u32 {
+    if avail_bytes == 0 {
+        return UNCALIBRATED_WORKER_CAP; // can't size to RAM → conservative
+    }
+    let budget = avail_bytes.saturating_sub(floor_bytes);
+    let target = cpu_count.saturating_sub(2).clamp(1, MAX_AUTO_WORKERS);
+    let est = |w: u32| estimate_ram_bytes(w, d.batch, d.tier, d.latent, d.warm, d.in_ch);
+    let mut w = target;
+    while w > 1 && est(w) > budget {
         w -= 1;
     }
     w
@@ -1219,6 +1258,45 @@ mod tests {
         assert_eq!(warm_workers_for_budget(99, 0), WARM_WORKER_CAP);
         assert_eq!(warm_workers_for_budget(2, 0), 2);
         assert_eq!(warm_workers_for_budget(0, 0), 1, "requested 0 floors at 1");
+    }
+
+    #[test]
+    fn workers_auto_tune_fits_and_saturates() {
+        let d = Drivers { workers: 0, batch: 16, tier: 3, latent: 256, warm: false, in_ch: 21 };
+        let est = |w: u32| estimate_ram_bytes(w, d.batch, d.tier, d.latent, d.warm, d.in_ch);
+
+        // Huge RAM + many cores → saturate up to MAX_AUTO_WORKERS (not all cores).
+        assert_eq!(
+            workers_to_fit_and_saturate(64, 10_000 * GIB, 6 * GIB, &d),
+            MAX_AUTO_WORKERS
+        );
+
+        // Tight RAM → the LARGEST w that fits `avail − floor`, and maximal.
+        let (avail, floor) = (40 * GIB, 6 * GIB);
+        let budget = avail - floor;
+        let target = (64u32 - 2).min(MAX_AUTO_WORKERS);
+        let w = workers_to_fit_and_saturate(64, avail, floor, &d);
+        assert!(w >= 1 && w <= target);
+        assert!(est(w) <= budget, "fits the RAM budget (never-OOM)");
+        if w < target {
+            assert!(est(w + 1) > budget, "maximal: one more worker would not fit");
+        }
+
+        // Probe unavailable → the conservative cap (unchanged behaviour).
+        assert_eq!(
+            workers_to_fit_and_saturate(64, 0, 6 * GIB, &d),
+            UNCALIBRATED_WORKER_CAP
+        );
+
+        // Even one worker doesn't fit a tiny box → 1 (the gate then refuses on box-cap).
+        let budget_lt_one = est(1) - GIB; // a budget smaller than a single worker needs
+        assert_eq!(
+            workers_to_fit_and_saturate(64, budget_lt_one + 6 * GIB, 6 * GIB, &d),
+            1
+        );
+
+        // Few cores caps the throughput target at cpu_count − 2.
+        assert_eq!(workers_to_fit_and_saturate(6, 10_000 * GIB, 6 * GIB, &d), 4);
     }
 
     // ── calibration store (ADR 0046 slice-2) ──────────────────────────

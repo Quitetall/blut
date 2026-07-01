@@ -165,6 +165,10 @@ pub struct StageContext {
     /// cache). Set by the CLI from the recipe's `warm_fb_cache` arg via
     /// `ExecCtx`, so the RECORD side and the cli RESOLVE side read ONE source.
     pub fb_warm: bool,
+    /// Auto-tuned decode worker count (ADR 0071 A2). Set by the cli at admission
+    /// (RESOLVE) via `ExecCtx` so the train stage (RECORD) launches the SAME count
+    /// the broker sized — parity + never-OOM. `None` ⇒ the conservative cap.
+    pub admitted_workers: Option<u32>,
     /// This stage invocation's CACHE KEY (the engine's canonical "same input +
     /// same args + same schema" fingerprint). Threaded so a durable-resume train
     /// stage can derive a STABLE per-config resume directory (via
@@ -202,6 +206,7 @@ impl StageContext {
             launch_target: crate::config::launcher::LaunchTarget::Local,
             device_index: None,
             fb_warm: false,
+            admitted_workers: None,
             cache_key: crate::framework::artifact::ContentHash([0u8; 32]),
             attempt: 1,
             resume_from: None,
@@ -233,6 +238,7 @@ impl StageContext {
             launch_target: crate::config::launcher::LaunchTarget::Local,
             device_index: None,
             fb_warm: false,
+            admitted_workers: None,
             cache_key,
             attempt: 1,
             resume_from: None,
@@ -289,6 +295,14 @@ pub trait Stage: Send + Sync + 'static {
     /// input_hash) — stable across re-runs so a downstream stage
     /// doesn't re-execute just because its upstream was retrained.
     const DETERMINISTIC: bool = true;
+
+    /// Whether this stage is ADVISORY (ADR 0071). An advisory stage's failure is
+    /// recorded as a non-fatal warning and PRUNES its descendants, but does NOT
+    /// fail the plan / exit non-zero — the canonical case is a `--dry-run` /
+    /// verdict gate that runs after training: its verdict is information, not a
+    /// build gate, so it must never mislabel a good training run as a failure.
+    /// A real *promotion* gate stays `false` (fatal). Opt-in: default `false`.
+    const ADVISORY: bool = false;
 
     /// Retry policy for this stage (D1). Default: no retry. Override for
     /// stages whose failures are often transient (network downloads,
@@ -412,6 +426,12 @@ pub trait StageDyn: Send + Sync + 'static {
     /// The executor reserves THIS against the box-fit budget.
     fn memory_gib_for(&self, _args: &serde_json::Value) -> u32 {
         self.memory_gib()
+    }
+    /// Whether this stage is advisory (ADR 0071 · `Stage::ADVISORY`). Defaulted
+    /// `false` so manual `StageDyn` impls keep the fatal semantics; the blanket
+    /// impl below forwards `S::ADVISORY`.
+    fn is_advisory(&self) -> bool {
+        false
     }
     /// How many `Resource::Gpu` permits this stage holds while running. Default
     /// 1 (a single-GPU stage). A DDP stage returns `nproc_per_node` so it holds
@@ -565,6 +585,9 @@ impl<S: Stage> StageDyn for S {
     }
     fn deterministic(&self) -> bool {
         S::DETERMINISTIC
+    }
+    fn is_advisory(&self) -> bool {
+        S::ADVISORY
     }
     fn resources(&self) -> &'static [Resource] {
         S::RESOURCES

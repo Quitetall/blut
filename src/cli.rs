@@ -111,6 +111,27 @@ enum Command {
         /// Second job id.
         b: String,
     },
+    /// One run's results from the metric store (ADR 0071 A3): best val_r +
+    /// trajectory + per-band PRD + ckpt path. `blut results <job> [--json]` —
+    /// replaces grepping BLUT_METRIC out of raw logs + `ls -t`-hunting a CSV.
+    Results {
+        /// Job id (prefix ok).
+        job: String,
+        /// Emit machine-readable JSON instead of a human summary.
+        #[arg(long)]
+        json: bool,
+        /// The headline metric to report best/trajectory for (default `val_r`).
+        #[arg(long, default_value = "val_r")]
+        metric: String,
+        /// Force "best = max" (override the name heuristic for a non-standard
+        /// metric). Mutually exclusive with --minimize.
+        #[arg(long, conflicts_with = "minimize")]
+        maximize: bool,
+        /// Force "best = min" (override the name heuristic — e.g. a custom loss
+        /// not matching the prd/loss/err naming convention).
+        #[arg(long)]
+        minimize: bool,
+    },
     /// Declared, persistent partition key-space over a recipe + per-cell
     /// backfill (Dagster-class partitions, v0.20 Phase G).
     Partition {
@@ -696,6 +717,18 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Hpo { cmd }) => run_hpo(&reg, cmd).await,
         Some(Command::Dag { job, json }) => run_dag(job, json),
         Some(Command::Compare { a, b }) => run_compare(&a, &b),
+        Some(Command::Results { job, json, metric, maximize, minimize }) => {
+            // Explicit flags override the name heuristic; clap's conflicts_with
+            // guarantees at most one is set.
+            let force = if maximize {
+                Some(true)
+            } else if minimize {
+                Some(false)
+            } else {
+                None
+            };
+            run_results(&job, json, &metric, force)
+        }
         Some(Command::Partition { cmd }) => run_partition(&reg, cmd).await,
         Some(Command::Artifact { cmd }) => run_artifact_cmd(cmd),
         Some(Command::Schedule { cmd }) => run_schedule_cmd(&reg, cmd),
@@ -748,17 +781,29 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
 /// copied off the build box), when git is unavailable, or when the build was
 /// not stamped (`unknown`) — a missing signal must never become noise or a
 /// false alarm.
-fn warn_if_stale_binary() {
-    // `--version` / `--help` should be fast and clean: skip the git probe AND
-    // the warning when the user only wants version/help (clap exits during
-    // parse, so the stale notice would just be stderr noise atop the output).
+/// The result of the staleness probe: the binary's build-time hash, its source
+/// tree's CURRENT short HEAD, and the stamped source dir. Present only when
+/// there IS a trustworthy mismatch.
+struct StaleInfo {
+    built: String,
+    live: String,
+    src: String,
+}
+
+/// Probe whether the running binary is stale (built from a different commit
+/// than its stamped source tree's live HEAD). Returns `None` — stay silent — on
+/// version/help, an unstamped build, a vanished source tree, or no git: a
+/// missing signal must never become noise or a false alarm.
+fn detect_stale_binary() -> Option<StaleInfo> {
+    // `--version` / `--help` should be fast and clean: skip the git probe (clap
+    // exits during parse, so a stale notice would just be stderr noise).
     if std::env::args().any(|a| matches!(a.as_str(), "--version" | "-V" | "--help" | "-h")) {
-        return;
+        return None;
     }
     let built = env!("BLUT_GIT_HASH");
     let src = env!("BLUT_SRC_DIR");
     if built == "unknown" || src.is_empty() {
-        return;
+        return None;
     }
     let live = std::process::Command::new("git")
         .args(["-C", src, "rev-parse", "--short=12", "HEAD"])
@@ -767,21 +812,242 @@ fn warn_if_stale_binary() {
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    // Source tree gone / not a repo / no git → no trustworthy comparison; stay
-    // silent rather than cry wolf.
-    let Some(live) = live else { return };
-    if live != built {
-        // Deliberately NOT a `--path` hint: the `blut` binary is built from the
-        // cookbook crate (blut-lamquant), not this engine crate (BLUT_SRC_DIR),
-        // so a specific `--path` would point at the wrong directory. Keep it
-        // generic — the operator knows how they installed.
+        .filter(|s| !s.is_empty())?;
+    if live == built {
+        return None;
+    }
+    Some(StaleInfo {
+        built: built.to_string(),
+        live,
+        src: src.to_string(),
+    })
+}
+
+/// Warn (once, at startup) if the running binary was built from a DIFFERENT
+/// commit than its source tree's CURRENT HEAD — the "git pull, forgot to
+/// rebuild/reinstall, silently ran the stale binary" trap. The in_ch /
+/// warm-containment never-OOM fixes only go live after a rebuild; a human who
+/// `git pull`s and runs the old `~/.cargo/bin/blut` would otherwise get the
+/// stale admission/footprint/containment logic with no signal.
+///
+/// build.rs stamps the build-time hash (`BLUT_GIT_HASH`) + the source dir
+/// (`BLUT_SRC_DIR`); [`detect_stale_binary`] re-resolves that dir's live HEAD at
+/// RUNTIME. When `BLUT_AUTO_REBUILD=1` (opt-in, ADR 0071 A4) a stale binary is
+/// rebuilt + re-exec'd instead of merely warned; default OFF (warn-only) so
+/// there are no surprise rebuilds.
+fn warn_if_stale_binary() {
+    let Some(info) = detect_stale_binary() else {
+        return;
+    };
+    // Opt-in auto-rebuild. On a successful rebuild this re-execs the fresh
+    // binary and never returns; otherwise it falls through to the warning.
+    maybe_auto_rebuild(&info);
+    // Deliberately NOT a `--path` hint: the `blut` binary is built from the
+    // cookbook crate (blut-lamquant), not this engine crate (BLUT_SRC_DIR), so a
+    // specific `--path` would point at the wrong directory. Keep it generic —
+    // the operator knows how they installed.
+    tracing::warn!(
+        "blut binary is STALE: built from {} but its source tree ({}) is now \
+         at {} — this run uses OLD code (admission / footprint / containment logic \
+         may predate the source). Rebuild + reinstall (`cargo install --force`, or \
+         `cargo build` for a local checkout), or set BLUT_AUTO_REBUILD=1 to do it \
+         automatically.",
+        info.built, info.src, info.live
+    );
+}
+
+/// Parse a cargo `.crates.toml` for the package that installed binary `bin`,
+/// returning the local crate DIR if it was a `path+file://` install (the only
+/// case we can rebuild from). Lines look like:
+///   "blut-lamquant 1.0.0 (path+file:///abs/dir)" = ["blut", ...]
+/// Returns `None` for a registry/git install (no local dir to `--path` at) or
+/// when `bin` isn't an installed binary. Pure (testable) — no IO. Assumes
+/// cargo's single-line `.crates.toml` format; an unexpected/evolved format
+/// falls through to `None` (warn-only), never a wrong dir.
+fn crate_dir_for_installed_bin(crates_toml: &str, bin: &str) -> Option<String> {
+    let needle = format!("\"{bin}\"");
+    for line in crates_toml.lines() {
+        let line = line.trim();
+        // The value side lists the binaries this package installed.
+        let Some((key, vals)) = line.split_once('=') else {
+            continue;
+        };
+        // Match the bin as a quoted list element (avoid a substring false-hit on
+        // e.g. "blutx" when looking for "blut").
+        let lists_bin = vals.split(',').any(|tok| {
+            tok.trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim()
+                == needle
+        });
+        if !lists_bin {
+            continue;
+        }
+        // Extract the `path+file://DIR` source from the key's `(...)`.
+        let src = key.split_once("(path+file://")?.1;
+        let dir = src.split(')').next()?.trim();
+        if !dir.is_empty() {
+            return Some(dir.to_string());
+        }
+    }
+    None
+}
+
+/// Resolve how to rebuild the installed `blut` binary. Prefers an explicit
+/// `BLUT_REBUILD_CMD` (run via `sh -c` — covers a local `cargo build` checkout,
+/// pipes, `&&` chains); otherwise detects a `cargo install --path <cookbook-dir>`
+/// from `$CARGO_HOME/.crates.toml`. `None` ⇒ can't determine the target → warn
+/// only.
+///
+/// TRUST MODEL: `BLUT_REBUILD_CMD` is executed verbatim by a shell, so it is an
+/// arbitrary-command surface. It is opt-in (only consulted when both it AND
+/// `BLUT_AUTO_REBUILD=1` are set) and the value comes from the invoking user's
+/// OWN environment — a user who can set it can already run any command, so this
+/// is not a privilege escalation in normal (non-setuid) use. The `sh -c` form
+/// is deliberate: the value must support shell features (a local checkout often
+/// needs `cargo build --release && cp …`). Do NOT run blut setuid / as another
+/// user with an attacker-controlled environment.
+fn resolve_rebuild_command() -> Option<Vec<String>> {
+    if let Some(cmd) = std::env::var_os("BLUT_REBUILD_CMD") {
+        let cmd = cmd.to_string_lossy().to_string();
+        if !cmd.trim().is_empty() {
+            // Shell-exec surface — see the TRUST MODEL note above.
+            return Some(vec!["sh".into(), "-c".into(), cmd]);
+        }
+    }
+    // Detect the path-install source. The bin name is this exe's file stem.
+    let exe = std::env::current_exe().ok()?;
+    let bin = exe.file_stem()?.to_string_lossy().to_string();
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cargo")))?;
+    let crates_toml = std::fs::read_to_string(cargo_home.join(".crates.toml")).ok()?;
+    let dir = crate_dir_for_installed_bin(&crates_toml, &bin)?;
+    Some(vec![
+        "cargo".into(),
+        "install".into(),
+        "--path".into(),
+        dir,
+        "--force".into(),
+    ])
+}
+
+/// Opt-in (`BLUT_AUTO_REBUILD=1`) rebuild + re-exec of a stale binary (ADR 0071
+/// A4). On a successful rebuild this re-execs the fresh binary with the same
+/// args and DOES NOT RETURN. Returns (falling through to the warning) when:
+/// the opt-in is off, a rebuild already ran this chain (loop guard), the target
+/// can't be resolved, or the rebuild/exec failed.
+fn maybe_auto_rebuild(info: &StaleInfo) {
+    if std::env::var_os("BLUT_AUTO_REBUILD").is_none() {
+        return;
+    }
+    // Loop guard: we rebuild+re-exec at most once per invocation chain. If the
+    // child still reads stale (rebuild didn't move the hash — uncommitted work,
+    // src moved again), don't spin.
+    if std::env::var_os("BLUT_AUTO_REBUILD_DONE").is_some() {
         tracing::warn!(
-            "blut binary is STALE: built from {built} but its source tree ({src}) is now \
-             at {live} — this run uses OLD code (admission / footprint / containment logic \
-             may predate the source). Rebuild + reinstall (`cargo install --force`, or \
-             `cargo build` for a local checkout)."
+            "auto-rebuild already ran but blut is still stale ({} ≠ {}); not retrying — \
+             rebuild manually (uncommitted changes in {}?).",
+            info.built, info.live, info.src
         );
+        return;
+    }
+    let Some(cmd) = resolve_rebuild_command() else {
+        tracing::warn!(
+            "BLUT_AUTO_REBUILD=1 but the install source can't be determined; set \
+             BLUT_REBUILD_CMD='<rebuild command>' or rebuild manually."
+        );
+        return;
+    };
+    tracing::warn!(
+        "blut stale ({} → {}); BLUT_AUTO_REBUILD=1 → rebuilding via `{}` (a from-source \
+         `cargo install` may take a few minutes — not a hang) ...",
+        info.built,
+        info.live,
+        cmd.join(" ")
+    );
+    // cmd is ["cargo","install",...] (detected) or ["sh","-c",<BLUT_REBUILD_CMD>].
+    let status = std::process::Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            tracing::error!("auto-rebuild failed (exit {s}); continuing on the STALE binary.");
+            return;
+        }
+        Err(e) => {
+            tracing::error!("auto-rebuild could not start (`{}`: {e}); continuing STALE.", cmd[0]);
+            return;
+        }
+    }
+    // Re-exec the freshly-installed binary with the original args. current_exe()
+    // returns the PATH (not a pinned inode/vnode) on both Linux (/proc/self/exe)
+    // and macOS, so exec() re-resolves it to the NEW content cargo wrote in
+    // place under --force. The DONE sentinel arms the loop guard in the child.
+    let Ok(exe) = std::env::current_exe() else {
+        tracing::warn!("rebuilt OK but current_exe() unknown; re-run blut to use fresh code.");
+        return;
+    };
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    tracing::info!("auto-rebuild OK — re-exec {} with fresh code.", exe.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // exec replaces this process image; on success it never returns. If it
+        // DOES return, it failed — fall through to the warning.
+        let err = std::process::Command::new(&exe)
+            .args(&args)
+            .env("BLUT_AUTO_REBUILD_DONE", "1")
+            .exec();
+        tracing::error!("re-exec failed ({err}); continuing on the STALE (pre-rebuild) process.");
+    }
+    #[cfg(not(unix))]
+    {
+        // No exec(); spawn the fresh binary, forward its exit, and stop this one.
+        match std::process::Command::new(&exe)
+            .args(&args)
+            .env("BLUT_AUTO_REBUILD_DONE", "1")
+            .status()
+        {
+            // exit() skips Drop/atexit — fine here: we're mid-startup (this runs
+            // before the async runtime does real work), nothing to flush.
+            Ok(s) => std::process::exit(s.code().unwrap_or(0)),
+            Err(e) => tracing::error!("re-spawn failed ({e}); continuing STALE."),
+        }
+    }
+}
+
+#[cfg(test)]
+mod stale_rebuild_tests {
+    use super::crate_dir_for_installed_bin;
+
+    const SAMPLE: &str = r#"[v1]
+"blut-lamquant 1.0.0 (path+file:///mnt/4tb/LamQuant/training/cookbooks/lamquant)" = ["blut"]
+"ripgrep 14.0.0 (registry+https://github.com/rust-lang/crates.io-index)" = ["rg"]
+"some-multi 0.1.0 (path+file:///home/u/multi)" = ["foo", "blutx", "bar"]
+"#;
+
+    #[test]
+    fn finds_path_install_dir_for_bin() {
+        assert_eq!(
+            crate_dir_for_installed_bin(SAMPLE, "blut").as_deref(),
+            Some("/mnt/4tb/LamQuant/training/cookbooks/lamquant"),
+        );
+    }
+
+    #[test]
+    fn ignores_registry_install_and_substring_binaries() {
+        // `rg` is a registry install → no local dir to --path at.
+        assert_eq!(crate_dir_for_installed_bin(SAMPLE, "rg"), None);
+        // "blut" must NOT match the "blutx" element (quoted-token compare).
+        assert_eq!(
+            crate_dir_for_installed_bin(SAMPLE, "blutx").as_deref(),
+            Some("/home/u/multi"),
+        );
+        // an unknown bin → None.
+        assert_eq!(crate_dir_for_installed_bin(SAMPLE, "nope"), None);
     }
 }
 
@@ -1921,6 +2187,70 @@ fn recipe_footprint(name: &str, raw: &serde_json::Value) -> crate::broker::Footp
     crate::broker::FootprintStore::load().resolve(&key, hint)
 }
 
+/// Like [`recipe_footprint`] but with the decode worker count OVERRIDDEN to the
+/// auto-tuned `workers` (ADR 0071 A2) — so the gate's footprint + calibration key
+/// reflect the count the stage will actually launch (threaded via
+/// `ExecCtx::with_admitted_workers`). The light arg-less path is unchanged.
+fn recipe_footprint_tuned(
+    name: &str,
+    raw: &serde_json::Value,
+    workers: u32,
+) -> crate::broker::Footprint {
+    if raw.is_null() || raw.as_object().is_some_and(|o| o.is_empty()) {
+        return crate::broker::Footprint {
+            ram_bytes: 2 * 1024 * 1024 * 1024,
+            vram_mib: 0,
+        };
+    }
+    let mut drivers = crate::broker::Drivers::from_args_json(raw);
+    drivers.workers = workers; // the fit-and-saturate count (overrides the cap)
+    let hint = drivers.estimate();
+    let key = drivers.key(name);
+    crate::broker::FootprintStore::load().resolve(&key, hint)
+}
+
+/// ADR 0071 A2: auto-tune the decode worker count to FIT-AND-SATURATE from a SINGLE
+/// memory snapshot. Returns `Some(W)` for a train-shaped recipe (so RESOLVE +
+/// RECORD share the cached count), or `None` for a light/arg-less recipe or when
+/// the mem probe is unavailable (keep the conservative cap = unchanged behaviour).
+/// Prints the `workers N→W` admission note when it changes the count.
+fn admitted_workers_for(name: &str, raw: &serde_json::Value) -> Option<u32> {
+    if raw.is_null() || raw.as_object().is_some_and(|o| o.is_empty()) {
+        return None; // light recipe — no decode workers to tune
+    }
+    let snap = crate::broker::ResourceSnapshot::probe();
+    if snap.mem_total_gb <= 0.0 {
+        return None; // no probe → leave the conservative cap
+    }
+    let gib = crate::broker::footprint::GIB as f64;
+    let cpu = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(4);
+    let avail = (snap.mem_avail_gb * gib) as u64;
+    let floor = (crate::broker::admission::DEFAULT_FLOOR_GIB * gib) as u64;
+    // Critically-low RAM (less than the floor free): don't tune — fall back to the
+    // conservative cap and let the existing gate refuse on the cap footprint.
+    if avail <= floor {
+        return None;
+    }
+    // never-OOM-the-BOX is the cgroup cap's job (ADR 0047), not admission's: this
+    // single snapshot is serialized blut-vs-blut by the scheduler lock and nets out
+    // other processes via MemAvailable; a residual drift only ever cgroup-kills the
+    // contained unit, never the box. workers_to_fit_and_saturate is ≥1 (never 0) and
+    // saturating, so no underflow / zero-worker admission.
+    let base = crate::broker::Drivers::from_args_json(raw);
+    let w = crate::broker::footprint::workers_to_fit_and_saturate(cpu, avail, floor, &base);
+    if w != crate::broker::footprint::UNCALIBRATED_WORKER_CAP {
+        eprintln!(
+            "admission: recipe '{name}' decode workers {} → {w} to fit {:.0}G available + {} cores (auto-tuned, never-OOM)",
+            crate::broker::footprint::UNCALIBRATED_WORKER_CAP,
+            snap.mem_avail_gb,
+            cpu
+        );
+    }
+    Some(w)
+}
+
 /// The box-fit RAM budget (GiB) for a scheduler / executor that runs cells
 /// concurrently. MIRRORS the executor's Phase-5 sizing (cli.rs `run_hpo` /
 /// `launch_compiled_plan`): `MemTotal − floor`, clamped `>= 1`. Box-fit TOTAL
@@ -2864,6 +3194,111 @@ fn run_compare(a: &str, b: &str) -> Result<()> {
     Ok(())
 }
 
+/// `blut results <job> [--json] [--metric M]` — one run's results from the
+/// metric store (ADR 0071 A3): best (peak) value + per-step trajectory +
+/// per-band PRD + the produced ckpt path. Replaces grepping `BLUT_METRIC` out
+/// of raw logs and `ls -t`-hunting the run CSV. The metric store is a derived,
+/// rebuildable index (ADR 0071 §3) — an un-flushed/just-started job has no rows
+/// yet, so we say "no data yet" rather than erroring.
+fn run_results(job: &str, json: bool, metric: &str, force_maximize: Option<bool>) -> Result<()> {
+    let job_id = crate::jobs::resolve_job_id(job).map_err(|e| anyhow!("{e}"))?;
+    let db = crate::lineage_db::LineageDb::open().map_err(|e| anyhow!("open lineage.db: {e}"))?;
+
+    // Direction: explicit --maximize/--minimize wins; else the name heuristic —
+    // val_r-shaped headlines maximize, a PRD/loss/err-shaped name minimizes.
+    // `--maximize`/`--minimize` is the escape hatch for a non-standard name.
+    let maximize = force_maximize.unwrap_or_else(|| {
+        let lower = metric.to_ascii_lowercase();
+        !(lower.contains("prd")
+            || lower.contains("loss")
+            || lower.contains("err")
+            || lower.contains("mae")
+            || lower.contains("rmse")
+            || lower.contains("nrmse"))
+    });
+
+    let best = db
+        .best_metric(&job_id, metric, maximize)
+        .map_err(|e| anyhow!("{e}"))?;
+    let series = db
+        .metric_series(&job_id, metric)
+        .map_err(|e| anyhow!("{e}"))?;
+    let finals = db.final_metrics(&job_id).map_err(|e| anyhow!("{e}"))?;
+    // per-band PRD: final metrics whose name carries a band prefix + "prd"
+    // (delta_prd / theta_prd / … — emitted by --detail-bands).
+    let per_band: Vec<(String, f64)> = finals
+        .iter()
+        .filter(|(k, _)| {
+            let kl = k.to_ascii_lowercase();
+            kl.contains("prd") && kl != "prd" && kl != metric.to_ascii_lowercase()
+        })
+        .cloned()
+        .collect();
+    let ckpt = db
+        .terminal_artifact(&job_id)
+        .map_err(|e| anyhow!("{e}"))?
+        .and_then(|a| a.sidecar_path);
+
+    let has_data = best.is_some() || !series.is_empty() || !finals.is_empty() || ckpt.is_some();
+
+    if json {
+        let traj: Vec<serde_json::Value> = series
+            .iter()
+            .map(|(s, v)| serde_json::json!({ "step": s, "value": v }))
+            .collect();
+        let band_obj: serde_json::Map<String, serde_json::Value> = per_band
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::json!(v)))
+            .collect();
+        let out = serde_json::json!({
+            "job": job_id,
+            "metric": metric,
+            "maximize": maximize,
+            "has_data": has_data,
+            "best": best.map(|(step, value)| serde_json::json!({ "step": step, "value": value })),
+            "trajectory": traj,
+            "per_band_prd": band_obj,
+            "ckpt_path": ckpt,
+        });
+        println!("{}", serde_json::to_string_pretty(&out).map_err(|e| anyhow!("{e}"))?);
+        return Ok(());
+    }
+
+    println!("job  {job_id}");
+    if !has_data {
+        println!("(no data yet — the run hasn't flushed any metrics to the store)");
+        return Ok(());
+    }
+    match best {
+        Some((step, value)) => println!(
+            "best {metric}  {value:.4}  @ step {step}  ({} of {} samples)",
+            if maximize { "max" } else { "min" },
+            series.len()
+        ),
+        None => println!("best {metric}  — (no per-step samples recorded)"),
+    }
+    if let Some(p) = &ckpt {
+        println!("ckpt {p}");
+    }
+    if !per_band.is_empty() {
+        println!("\nper-band PRD (final):");
+        for (k, v) in &per_band {
+            println!("  {k:<16} {v:>8.3}");
+        }
+    }
+    if !series.is_empty() {
+        // A compact sparkline-free trajectory tail (last up to 8 points) so the
+        // shape is legible without a plotting dep.
+        let tail: Vec<&(i64, f64)> = series.iter().rev().take(8).collect();
+        print!("\n{metric} trajectory (last {}):", tail.len());
+        for (s, v) in tail.into_iter().rev() {
+            print!("  {s}:{v:.4}");
+        }
+        println!();
+    }
+    Ok(())
+}
+
 /// `blut dag <job> [--json]` — render a job's DAG: per-node status + edges,
 /// built from the persisted `plan.json` + the live `status.jsonl` (+ HPO trial
 /// attribution when present). No daemon; re-run to refresh.
@@ -3270,7 +3705,15 @@ async fn launch_compiled_plan(
     // tier/batch are read IDENTICALLY to what the train stage records under
     // (RECORD side), keeping the RESOLVE/RECORD calibration key in parity even
     // when the user omitted the field.
-    let footprint = recipe_footprint(name, plan.exec_view().recipe_args);
+    // ADR 0071 A2: auto-tune decode workers to fit-AND-saturate (one knob fixes
+    // both the over-refuse and the GPU-starvation). Compute W from a SINGLE mem
+    // snapshot; the gate's footprint uses W, and W is cached on the ExecCtx below
+    // so the cookbook train stage (RECORD) launches exactly this count.
+    let admitted_workers = admitted_workers_for(name, plan.exec_view().recipe_args);
+    let footprint = match admitted_workers {
+        Some(w) => recipe_footprint_tuned(name, plan.exec_view().recipe_args, w),
+        None => recipe_footprint(name, plan.exec_view().recipe_args),
+    };
 
     let job_id = crate::jobs::new_job_id();
     let job_dir = crate::paths::job_dir(&job_id)?;
@@ -3307,6 +3750,11 @@ async fn launch_compiled_plan(
     // checkpoint cache key — a warm and a cold run share the trained output.
     let fb_warm = crate::broker::Drivers::from_args_json(plan.exec_view().recipe_args).warm;
     ctx = ctx.with_fb_warm(fb_warm);
+    // A2: cache the auto-tuned worker count on the ctx so the cookbook train stage
+    // launches exactly what admission sized (RESOLVE↔RECORD parity, never-OOM).
+    if let Some(w) = admitted_workers {
+        ctx = ctx.with_admitted_workers(w);
+    }
     // INC D (S4): `--no-cache`/`--force` bypasses the stage cache READ so every
     // stage recomputes; the fresh result is still written to the cache.
     ctx = ctx.with_bypass_cache(no_cache);
@@ -3389,6 +3837,21 @@ async fn launch_compiled_plan(
                 "done — {} ingredients, {} cache hits, {} misses, elapsed {:?}",
                 r.n_stages, r.n_cache_hits, r.n_cache_misses, r.elapsed
             );
+            // ADR 0071: advisory stages (e.g. a dry-run/verdict gate) failing do
+            // NOT fail the run — surface them as warnings so a good experiment is
+            // never mis-read as a failure, and point at the preserved output.
+            if !r.warnings.is_empty() {
+                eprintln!(
+                    "⚠ training OK — completed with {} advisory warning(s) (the run did NOT fail):",
+                    r.warnings.len()
+                );
+                for w in &r.warnings {
+                    eprintln!("    · {} (advisory, skipped): {}", w.stage, w.reason);
+                }
+                eprintln!(
+                    "  the trained output + metrics are preserved — `blut results {job_id}` / `blut lineage show {job_id}`."
+                );
+            }
             if let Some(fp) = sweep_fp {
                 record_sweep_completion(fp, &job_id);
             }

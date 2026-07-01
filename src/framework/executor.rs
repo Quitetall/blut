@@ -38,6 +38,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures::FutureExt;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -50,16 +51,6 @@ use crate::framework::plan::{CompiledPlan, NodeId};
 use crate::framework::resource::Resource;
 use crate::framework::stage::{ErasedArtifact, StageContext, StageDyn};
 use crate::framework::status::{StageEvent, StatusHub, spawn_status_writer};
-
-/// RAII guard that decrements the in-flight counter when dropped.
-/// Used by spawned dispatch tasks to ensure in_flight is decremented
-/// even if the task panics.
-struct InFlightDecrementGuard(Arc<std::sync::atomic::AtomicUsize>);
-impl Drop for InFlightDecrementGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
 
 /// Default bound on concurrently-spawned node tasks in the parallel
 /// executor. The real throttle is the per-`Resource` semaphores; this
@@ -169,6 +160,10 @@ pub struct ExecCtx {
     /// Arg — warm doesn't change the trained output, so it stays out of the
     /// checkpoint cache key.
     pub fb_warm: bool,
+    /// Auto-tuned decode worker count (ADR 0071 A2), cached at admission so the
+    /// cookbook train stage (RECORD) launches the SAME count the cli sized (RESOLVE)
+    /// — parity + never-OOM. `None` ⇒ the conservative cap (unchanged behaviour).
+    pub admitted_workers: Option<u32>,
     /// Phase-G scheduler: the GPU DEVICE index this whole job is pinned to,
     /// or `None` for the box default. Threaded into every `StageContext` so a
     /// launcher-aware backend exports `CUDA_VISIBLE_DEVICES=<idx>` for the
@@ -228,6 +223,7 @@ impl ExecCtx {
             launch_target: crate::config::launcher::LaunchTarget::Local,
             control: None,
             fb_warm: false,
+            admitted_workers: None,
             device_index: None,
             bypass_cache: false,
             #[cfg(feature = "p2p")]
@@ -255,6 +251,12 @@ impl ExecCtx {
     /// `StageContext.fb_warm` so a train stage bills the warm footprint.
     pub fn with_fb_warm(mut self, warm: bool) -> Self {
         self.fb_warm = warm;
+        self
+    }
+    /// Set the auto-tuned decode worker count (ADR 0071 A2). Threaded into every
+    /// `StageContext.admitted_workers` so the cookbook train stage launches it.
+    pub fn with_admitted_workers(mut self, workers: u32) -> Self {
+        self.admitted_workers = Some(workers);
         self
     }
 
@@ -330,6 +332,28 @@ pub struct PlanResult {
     pub n_cache_hits: usize,
     pub n_cache_misses: usize,
     pub elapsed: std::time::Duration,
+    /// Advisory stages that FAILED (ADR 0071): each warns + prunes its
+    /// descendants but does not fail the plan. NON-EMPTY ⇒ the run completed
+    /// "with warnings" — the machine-parseable signal that distinguishes this
+    /// from a clean success (both exit 0). Tooling that acts on `final_output`
+    /// (e.g. a promoter) MUST check this is empty first.
+    pub warnings: Vec<StageWarning>,
+}
+
+/// One advisory stage that tripped (ADR 0071).
+#[derive(Debug, Clone)]
+pub struct StageWarning {
+    /// Topo index of the advisory stage.
+    pub idx: u32,
+    pub stage: String,
+    /// The failure the advisory stage produced (downgraded from fatal).
+    pub reason: String,
+}
+
+/// Whether advisory stages are forced FATAL for this run (ADR 0071 strict mode),
+/// via `BLUT_STRICT_ADVISORY=1` — for CI that wants the old fail-hard behaviour.
+fn strict_advisory() -> bool {
+    std::env::var("BLUT_STRICT_ADVISORY").map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -354,6 +378,7 @@ struct NodeEnv {
     launch_target: crate::config::launcher::LaunchTarget,
     device_index: Option<usize>,
     fb_warm: bool,
+    admitted_workers: Option<u32>,
     /// Force-recompute (INC D / S4). When true, `run_node` skips the cache READ
     /// so the stage always runs; the fresh result is still cached.
     bypass_cache: bool,
@@ -698,6 +723,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
             launch_target: env.launch_target,
             device_index: env.device_index,
             fb_warm: env.fb_warm,
+            admitted_workers: env.admitted_workers,
             // Durable resume (Phase D): the stage's cache key is its stable
             // per-config fingerprint — a resume train stage keys its recovery
             // dir on it so a re-run with identical args finds the checkpoint.
@@ -873,19 +899,50 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         let run_fut = task
             .stage
             .run_erased(&stage_ctx, task.input.clone(), task.args.clone());
-        let run_result = run_with_timeout(
+        let timed_fut = run_with_timeout(
             run_fut,
             &stage_cancel,
             task.timeout.soft,
             task.timeout.hard,
             stage_started,
-        )
-        .await;
+        );
+        // Panic-safe stage run. `GpuSamplerHandle` has no `Drop` impl (a bare
+        // drop only DETACHES its background nvidia-smi poller — see the NOTE
+        // on `GpuSamplerHandle` in gpu_sampler.rs — it keeps sampling until
+        // process exit), so a panic unwinding straight through this scope
+        // used to skip the `h.stop().await` below entirely and leak the
+        // sampler task forever. `catch_unwind` runs the SAME teardown on a
+        // caught panic, then `resume_unwind`s unchanged — the coordinator's
+        // panic handling (`JoinError` → `PlanError::Other("node task
+        // panicked...")`, see the `join.join_next()` match) is untouched;
+        // only the sampler cleanup is now unwind-safe. `AssertUnwindSafe` is
+        // sound here: `timed_fut` is dropped either way immediately after
+        // this point, so no unwind-unsafe state is ever observed again.
+        let run_result = match std::panic::AssertUnwindSafe(timed_fut)
+            .catch_unwind()
+            .await
+        {
+            Ok(r) => r,
+            Err(panic_payload) => {
+                if let Some(h) = gpu_sampler {
+                    h.stop().await;
+                }
+                // Match every other error exit from this attempt (see the
+                // sibling `let _ = std::fs::remove_dir_all(&tmp_stage_dir)`
+                // calls above/below): a caught panic must not skip cleanup
+                // of this attempt's tmp dir either, or it lingers on disk
+                // until process exit.
+                let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+                drop(permits);
+                drop(stage_ctx);
+                std::panic::resume_unwind(panic_payload);
+            }
+        };
 
         // The run window is over — stop sampling before releasing the GPU
         // permit (any later device activity isn't this stage's). Runs on
-        // every exit path from this attempt (the match below only happens
-        // after).
+        // every exit path from this attempt (the match above already
+        // stopped it on the panic exit; this is the normal-return path).
         if let Some(h) = gpu_sampler {
             h.stop().await;
         }
@@ -1112,7 +1169,11 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         .unwrap_or_else(|| content_hash_from_erased(&output));
     let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, output_hash)
         .with_stage(stage_name.clone());
-    let _ = metadata.write_to(&final_stage_dir.join("output.metadata.json"));
+    if let Err(e) = metadata.write_to(&final_stage_dir.join("output.metadata.json")) {
+        tracing::warn!(
+            "executor: sidecar write for stage '{stage_name}' failed: {e}; lineage tooling will not see this artifact"
+        );
+    }
 
     // Cache insert — STRICTLY after the atomic promote (the load-bearing
     // FW-2 ordering: the resume oracle appears only once the output is
@@ -1553,6 +1614,7 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
         launch_target: ctx.launch_target,
         device_index: ctx.device_index,
         fb_warm: ctx.fb_warm,
+        admitted_workers: ctx.admitted_workers,
         bypass_cache: ctx.bypass_cache,
         recipe_name: plan.name().to_string(),
         on_retry: ctx.on_retry,
@@ -1634,6 +1696,7 @@ impl SequentialExecutor {
 
         let mut n_hits = 0usize;
         let mut n_misses = 0usize;
+        let mut warnings: Vec<StageWarning> = Vec::new();
 
         for (idx, node_id) in order.iter().enumerate() {
             // Plan-level deadline (D2): coarse between-stage check; a
@@ -1689,13 +1752,35 @@ impl SequentialExecutor {
                     logical_outputs.insert(outcome.node_id, outcome.logical);
                 }
                 Err(f) => {
+                    // ADR 0071: an advisory stage's failure is a non-fatal warning,
+                    // not a plan failure — record it and STOP (the remaining topo
+                    // nodes are its descendants and can't run). `strict_advisory()`
+                    // forces the old fail-hard behaviour for CI.
+                    if let NodeFailure::Stage { idx, stage, source } = &f {
+                        if node.stage.is_advisory() && !strict_advisory() {
+                            tracing::warn!("advisory stage '{stage}' failed (non-fatal): {source}");
+                            warnings.push(StageWarning {
+                                idx: *idx,
+                                stage: stage.clone(),
+                                reason: source.to_string(),
+                            });
+                            break;
+                        }
+                    }
                     finish_writer(env, writer_handle).await;
                     return Err(plan_error_of(f));
                 }
             }
         }
 
-        let final_output = order.last().and_then(|id| outputs.remove(id));
+        // If an advisory stage pruned the terminal node, surface the last COMPLETED
+        // node in topo order (the upstream train ckpt in the canonical linear
+        // train→gate plan) rather than None (ADR 0071).
+        let final_output = if warnings.is_empty() {
+            order.last().and_then(|id| outputs.remove(id))
+        } else {
+            order.iter().rev().find_map(|id| outputs.remove(id))
+        };
         finish_writer(env, writer_handle).await;
 
         Ok(PlanResult {
@@ -1704,6 +1789,7 @@ impl SequentialExecutor {
             n_cache_hits: n_hits,
             n_cache_misses: n_misses,
             elapsed: started.elapsed(),
+            warnings,
         })
     }
 }
@@ -1853,6 +1939,7 @@ impl ParallelExecutor {
         let mut n_misses = 0usize;
         let mut first_error: Option<PlanError> = None;
         let mut completed = 0usize;
+        let mut warnings: Vec<StageWarning> = Vec::new();
 
         // Pre-cancel: honour a token already fired before the first spawn.
         if env.cancel.is_cancelled() {
@@ -2022,49 +2109,159 @@ impl ParallelExecutor {
                                         task.stage.name()
                                     );
                                     let status = env.status.clone();
+                                    let cache = env.cache.clone();
                                     let stage_name = task.stage.name().to_string();
+                                    let stage = task.stage.clone();
+                                    let deterministic = task.stage.deterministic();
+                                    let schema = task.stage.schema();
                                     let key = task.key;
-                                    // Decrement in_flight when the dispatch poll task ends.
-                                    let in_flight_c = in_flight.clone();
-                                    tokio::spawn(async move {
-                                        let _guard = InFlightDecrementGuard(in_flight_c);
+                                    let node_id = task.node_id;
+                                    let input_hash = task.input_hash;
+                                    let canon_args = task.canon_args.clone();
+                                    // Route this dispatch's completion through the SAME
+                                    // JoinSet the coordinator awaits below (`join.join_next()`)
+                                    // instead of a detached `tokio::spawn` side-channel. A
+                                    // detached task bumps `in_flight` but is invisible to
+                                    // `join_next()`, so once every ready node is P2P-dispatched
+                                    // the JoinSet goes empty and `join_next()` returns `None`
+                                    // immediately — ending the coordinator loop while the
+                                    // remote work is still running, and tripping the
+                                    // `completed + pruned == order.len()` accounting check
+                                    // below. Being a JoinSet member also means a
+                                    // `JobState::Failed` now produces a real
+                                    // `NodeFailure::Stage` that flows through the SAME
+                                    // `first_error` / `env.cancel.cancel()` handling as a local
+                                    // stage failure (the `Err(f)` arm a few hundred lines down) —
+                                    // previously it only emitted a status event on a detached
+                                    // side-channel and the plan could return `Ok` past an
+                                    // explicitly failed remote stage.
+                                    join.spawn(async move {
                                         let start = std::time::Instant::now();
                                         loop {
                                             match handle.poll() {
                                                 Ok(Some(JobState::Succeeded)) => {
-                                                    status.emit(StageEvent::StageEnd {
-                                                        node_idx,
-                                                        stage_name,
-                                                        output_hash: key,
-                                                        elapsed: start.elapsed(),
-                                                    });
-                                                    break;
+                                                    // `DispatchHandle::poll` carries no artifact
+                                                    // payload (`JobState::Succeeded` is a unit
+                                                    // variant), so the only route back to a real
+                                                    // `ErasedArtifact` without widening that trait
+                                                    // is the content-addressed cache: the P2P data
+                                                    // plane is expected to have landed the peer's
+                                                    // output bytes there under
+                                                    // `expected_output_hash` (== `key`) by the time
+                                                    // the job goes terminal. A miss here means the
+                                                    // peer claimed success but never delivered the
+                                                    // artifact — fail closed instead of returning a
+                                                    // phantom `Ok` with no real output.
+                                                    return match cache.lookup(key) {
+                                                        Some(hit) => {
+                                                            let logical = compute_logical_output_hash(
+                                                                stage.as_ref(),
+                                                                &hit.artifact,
+                                                                deterministic,
+                                                                &stage_name,
+                                                                schema,
+                                                                input_hash,
+                                                                &canon_args,
+                                                            );
+                                                            // Match the local run_node path: `output_hash`
+                                                            // must be a content hash of the ARTIFACT, not
+                                                            // `key` (a hash of the job's inputs). Lineage
+                                                            // tooling reads this field expecting content
+                                                            // addressability regardless of whether the node
+                                                            // ran locally or was P2P-dispatched.
+                                                            let output_hash = stage
+                                                                .output_content_hash(&hit.artifact)
+                                                                .unwrap_or_else(|| {
+                                                                    content_hash_from_erased(&hit.artifact)
+                                                                });
+                                                            status.emit(StageEvent::StageEnd {
+                                                                node_idx,
+                                                                stage_name: stage_name.clone(),
+                                                                output_hash,
+                                                                elapsed: start.elapsed(),
+                                                            });
+                                                            Ok(NodeOutcome {
+                                                                node_id,
+                                                                output: hit.artifact,
+                                                                logical,
+                                                                cache_hit: false,
+                                                            })
+                                                        }
+                                                        None => {
+                                                            let msg = format!(
+                                                                "P2P dispatch reported success for node {node_idx} ({stage_name}) but no artifact was found in the cache for key {}",
+                                                                key.to_hex()
+                                                            );
+                                                            status.emit(StageEvent::StageFailed {
+                                                                node_idx,
+                                                                stage_name: stage_name.clone(),
+                                                                error: msg.clone(),
+                                                                failure: None,
+                                                            });
+                                                            Err(NodeFailure::Stage {
+                                                                idx: node_idx,
+                                                                stage: stage_name,
+                                                                source: StageError::Backend(anyhow::anyhow!(msg)),
+                                                            })
+                                                        }
+                                                    };
                                                 }
                                                 Ok(Some(JobState::Failed(reason))) => {
                                                     status.emit(StageEvent::StageFailed {
                                                         node_idx,
-                                                        stage_name,
-                                                        error: reason,
+                                                        stage_name: stage_name.clone(),
+                                                        error: reason.clone(),
                                                         failure: None,
                                                     });
-                                                    // Don't cancel the whole plan —
-                                                    // just report the failure.
-                                                    break;
+                                                    // Was: "Don't cancel the whole plan — just
+                                                    // report the failure", with first_error/cancel
+                                                    // never touched. Now: return a real Err so the
+                                                    // coordinator's normal Err(f) handling (which
+                                                    // sets first_error + cancels siblings) applies —
+                                                    // an explicit remote-stage failure fails the plan.
+                                                    return Err(NodeFailure::Stage {
+                                                        idx: node_idx,
+                                                        stage: stage_name,
+                                                        source: StageError::Backend(anyhow::anyhow!(reason)),
+                                                    });
                                                 }
-                                                Ok(Some(_)) => break, // Cancelled/Unknown
-                                                Ok(None) => {
+                                                Ok(Some(JobState::Cancelled)) => {
+                                                    return Err(NodeFailure::Cancelled);
+                                                }
+                                                Ok(Some(JobState::Unknown(reason))) => {
+                                                    let msg = format!(
+                                                        "P2P dispatch for node {node_idx} ({stage_name}) ended in an unknown state: {reason}"
+                                                    );
+                                                    status.emit(StageEvent::StageFailed {
+                                                        node_idx,
+                                                        stage_name: stage_name.clone(),
+                                                        error: msg.clone(),
+                                                        failure: None,
+                                                    });
+                                                    return Err(NodeFailure::Stage {
+                                                        idx: node_idx,
+                                                        stage: stage_name,
+                                                        source: StageError::Backend(anyhow::anyhow!(msg)),
+                                                    });
+                                                }
+                                                Ok(Some(JobState::Running)) | Ok(None) => {
                                                     tokio::time::sleep(
                                                         std::time::Duration::from_millis(500),
                                                     ).await;
                                                 }
                                                 Err(e) => {
+                                                    let msg = format!("{e}");
                                                     status.emit(StageEvent::StageFailed {
                                                         node_idx,
-                                                        stage_name,
-                                                        error: format!("{e}"),
+                                                        stage_name: stage_name.clone(),
+                                                        error: msg.clone(),
                                                         failure: None,
                                                     });
-                                                    break;
+                                                    return Err(NodeFailure::Stage {
+                                                        idx: node_idx,
+                                                        stage: stage_name,
+                                                        source: StageError::Backend(anyhow::anyhow!(msg)),
+                                                    });
                                                 }
                                             }
                                         }
@@ -2345,20 +2542,50 @@ impl ParallelExecutor {
                 Err(f) => {
                     // S1 race fix: a `Stage` failure carries the topo idx, so map
                     // it back to the node id and clear its in-flight maps + kill
-                    // latch — this is the diverged-EXHAUSTED node
-                    // (`StageError::Diverged` after `max_attempts`), which was last
-                    // kill-flagged on its final attempt and never reached a
-                    // `StageRetrying`. Per-node-keyed, so a stale latch entry could
-                    // never affect a sibling, but clear it for hygiene before the
-                    // fail-fast drain. (`Other` carries no id; nothing to remove.)
-                    if let NodeFailure::Stage { idx, .. } = &f {
+                    // latch. Capture whether the failing stage is ADVISORY (ADR
+                    // 0071) BEFORE removing it from `node_stages`.
+                    let mut advisory: Option<(u32, String, String, NodeId)> = None;
+                    if let NodeFailure::Stage { idx, stage, source } = &f {
                         if let Some(&nid) = order.get(*idx as usize) {
+                            let is_adv = node_stages
+                                .get(&nid)
+                                .map(|s| s.is_advisory())
+                                .unwrap_or(false)
+                                && !strict_advisory();
                             node_tokens.remove(&nid);
                             node_stages.remove(&nid);
                             kill_flagged.remove(&nid);
+                            if is_adv {
+                                advisory = Some((*idx, stage.clone(), source.to_string(), nid));
+                            }
                         }
                     }
-                    if first_error.is_none() {
+                    if let Some((idx, stage, reason, nid)) = advisory {
+                        // Advisory failure: WARN, prune descendants exactly like a
+                        // KILL (their input can't materialize), but do NOT fail the
+                        // plan — other branches keep running.
+                        tracing::warn!("advisory stage '{stage}' failed (non-fatal): {reason}");
+                        warnings.push(StageWarning { idx, stage, reason });
+                        if let Some(k) = node_key_of.remove(&nid) {
+                            inflight_keys.remove(&k);
+                            if let Some(waiters) = deferred.remove(&k) {
+                                for w in waiters {
+                                    if !pruned.contains(&w) {
+                                        ready.insert(w);
+                                    }
+                                }
+                            }
+                        }
+                        let mut stack = vec![nid];
+                        while let Some(d) = stack.pop() {
+                            if pruned.insert(d) {
+                                ready.remove(&d);
+                                if let Some(ss) = succs.get(&d) {
+                                    stack.extend(ss.iter().copied());
+                                }
+                            }
+                        }
+                    } else if first_error.is_none() {
                         first_error = Some(plan_error_of(f));
                         env.cancel.cancel(); // fail-fast: cancel siblings
                     }
@@ -2398,8 +2625,15 @@ impl ParallelExecutor {
         }
         // If the terminal node was pruned, there is no final output — a killed
         // branch legitimately changed the graph (the caller sees the missing
-        // output + the StageFailed events in status.jsonl).
-        let final_output = order.last().and_then(|id| outputs.remove(id));
+        // output + the StageFailed events in status.jsonl). EXCEPT when an
+        // advisory stage did the pruning (ADR 0071): surface the last completed
+        // node in topo order (the upstream train ckpt for a linear train→gate plan)
+        // so the operator gets it live.
+        let final_output = if warnings.is_empty() {
+            order.last().and_then(|id| outputs.remove(id))
+        } else {
+            order.iter().rev().find_map(|id| outputs.remove(id))
+        };
         finish_writer(env, writer_handle).await;
 
         Ok(PlanResult {
@@ -2408,6 +2642,7 @@ impl ParallelExecutor {
             n_cache_hits: n_hits,
             n_cache_misses: n_misses,
             elapsed: started.elapsed(),
+            warnings,
         })
     }
 }
@@ -2623,6 +2858,29 @@ mod tests {
     }
     impl Compatible<LamuTrainerBackend> for AlwaysFail {}
 
+    // An ADVISORY gate that always fails — models a dry-run/verdict gate after
+    // training (ADR 0071). Its failure must NOT fail the plan.
+    struct AdvisoryGate;
+    #[async_trait]
+    impl Stage for AdvisoryGate {
+        const NAME: &'static str = "advisory_gate";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        const ADVISORY: bool = true;
+        type Input = Counter;
+        type Output = Counter;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            _input: Counter,
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            Err(StageError::BadInput("advisory verdict: would-not-promote".into()))
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for AdvisoryGate {}
+
     fn fresh_ctx() -> (tempfile::TempDir, ExecCtx) {
         let td = tempfile::tempdir().unwrap();
         let ctx = ExecCtx::new(td.path().to_path_buf());
@@ -2648,6 +2906,33 @@ mod tests {
         let out = result.final_output.unwrap();
         let counter: Counter = out.into_typed().unwrap();
         assert_eq!(counter.n, 3);
+    }
+
+    #[tokio::test]
+    async fn advisory_gate_failure_is_non_fatal_and_preserves_output() {
+        // ADR 0071: train (MakeOne) → an advisory gate that FAILS. The plan must
+        // NOT fail; the warning is recorded and the train output is surfaced.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        MAKE_RUN_COUNT.store(0, Ordering::SeqCst);
+        INC_RUN_COUNT.store(0, Ordering::SeqCst);
+        let (_td, ctx) = fresh_ctx();
+        let plan = Plan::<(), LamuTrainerBackend>::new("test", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .then(AdvisoryGate, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let result = SequentialExecutor::execute(plan, ctx)
+            .await
+            .expect("an advisory gate's failure must NOT fail the plan");
+        assert_eq!(result.warnings.len(), 1, "the advisory failure is recorded");
+        assert_eq!(result.warnings[0].stage, "advisory_gate");
+        // The upstream train output is surfaced even though the terminal gate tripped.
+        let counter: Counter = result
+            .final_output
+            .expect("train output preserved past the advisory gate")
+            .into_typed()
+            .unwrap();
+        assert_eq!(counter.n, 1);
     }
 
     #[tokio::test]
@@ -5180,5 +5465,349 @@ mod tests {
         assert_eq!(SPAWN_MARKER_RAN.load(Ordering::SeqCst), 1, "injected root ran");
         assert_eq!(SPAWN_CHILD_RAN.load(Ordering::SeqCst), 1, "injected child ran");
         assert_eq!(result.n_stages, 4, "order grew to include the spawned nodes");
+    }
+
+    // ── P2P dispatch (audit findings 1 & 2) ─────────────────────────────
+    //
+    // Pre-fix, a P2P-dispatched node's completion poll loop was a detached
+    // `tokio::spawn` that bumped `in_flight` but was never a member of the
+    // `JoinSet` the coordinator actually awaits via `join.join_next()`. Once
+    // every ready node was dispatched, the JoinSet went empty and
+    // `join_next()` returned `None` immediately — ending the coordinator
+    // loop while the remote work was still running (finding 1), and a
+    // remote `JobState::Failed` never touched `first_error`/`env.cancel`, so
+    // an explicit remote failure could not fail the plan (finding 2). The
+    // fix makes the poll loop itself a `join.spawn`-ed task that produces a
+    // real `Result<NodeOutcome, NodeFailure>`, so both properties are
+    // enforced by the SAME machinery a local node uses.
+    //
+    // These mocks stand in for `p2p::coordinator::Coordinator` (the real
+    // `DispatchSubmitter`/`DispatchHandle` impls, in `src/p2p/coordinator.rs`,
+    // outside this file's scope) without needing a live peer connection.
+    #[cfg(feature = "p2p")]
+    struct MockDispatchPolicy {
+        dispatchable: &'static str,
+    }
+    #[cfg(feature = "p2p")]
+    impl crate::p2p::dispatch::DispatchPolicy for MockDispatchPolicy {
+        fn is_dispatchable(&self, stage_name: &str) -> bool {
+            stage_name == self.dispatchable
+        }
+        fn classify_stage(
+            &self,
+            _stage_name: &str,
+            _args: &serde_json::Value,
+        ) -> crate::p2p::trust::DataClass {
+            crate::p2p::trust::DataClass::Public
+        }
+        fn select_peer(
+            &self,
+            _stage_name: &str,
+            _resources: &crate::p2p::task::ResourceRequest,
+            _data_class: crate::p2p::trust::DataClass,
+            _peers: &[crate::p2p::peer::PeerInfo],
+        ) -> Option<crate::p2p::peer::PeerId> {
+            // Peer selection is the coordinator's async dispatch loop (p2p/
+            // coordinator.rs), never called on the executor's `submit` path
+            // these tests exercise.
+            unimplemented!("not exercised by the executor dispatch path")
+        }
+        fn verify_result(
+            &self,
+            _result: &crate::p2p::task::TaskResult,
+            _expected: &ContentHash,
+            _peer_pubkey: &ed25519_dalek::VerifyingKey,
+        ) -> crate::p2p::dispatch::DispatchVerdict {
+            unimplemented!("not exercised by the executor dispatch path")
+        }
+    }
+
+    /// Terminal state a [`MockDispatchHandle`] settles into after
+    /// `polls_before_terminal` `Ok(None)` ("still running") answers.
+    #[cfg(feature = "p2p")]
+    #[derive(Clone)]
+    enum MockTerminal {
+        Succeeded,
+        Failed(String),
+    }
+
+    #[cfg(feature = "p2p")]
+    struct MockDispatchHandle {
+        polls_remaining: std::sync::atomic::AtomicU32,
+        terminal: MockTerminal,
+        poll_count: Arc<AtomicU32>,
+    }
+    #[cfg(feature = "p2p")]
+    impl DispatchHandle for MockDispatchHandle {
+        fn poll(&self) -> Result<Option<JobState>, crate::error::TrainError> {
+            self.poll_count.fetch_add(1, Ordering::SeqCst);
+            let still_running = self
+                .polls_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    if n == 0 { None } else { Some(n - 1) }
+                })
+                .is_ok();
+            if still_running {
+                return Ok(None);
+            }
+            Ok(Some(match &self.terminal {
+                MockTerminal::Succeeded => JobState::Succeeded,
+                MockTerminal::Failed(reason) => JobState::Failed(reason.clone()),
+            }))
+        }
+        fn cancel(&self) -> Result<(), crate::error::TrainError> {
+            Ok(())
+        }
+    }
+
+    /// Submits every dispatchable node to a [`MockDispatchHandle`]. On a
+    /// `Succeeded` terminal it ALSO pre-populates `cache` under the
+    /// request's `expected_output_hash` — standing in for the P2P data
+    /// plane having already landed the peer's output bytes by the time the
+    /// job goes terminal, which is what the fixed dispatch-success arm now
+    /// relies on (`cache.lookup(key)` in the executor's P2P dispatch block).
+    #[cfg(feature = "p2p")]
+    struct MockDispatchSubmitter {
+        cache: Arc<CacheHandle>,
+        polls_before_terminal: u32,
+        terminal: MockTerminal,
+        succeed_with: Counter,
+        poll_count: Arc<AtomicU32>,
+        submit_count: Arc<AtomicU32>,
+    }
+    #[cfg(feature = "p2p")]
+    impl DispatchSubmitter for MockDispatchSubmitter {
+        fn submit(
+            &self,
+            request: DispatchRequest<'_>,
+        ) -> Result<Box<dyn DispatchHandle>, crate::error::TrainError> {
+            self.submit_count.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.terminal, MockTerminal::Succeeded) {
+                let art = ErasedArtifact::from_typed(&self.succeed_with).unwrap();
+                self.cache
+                    .insert(request.expected_output_hash, &art)
+                    .expect("mock cache insert");
+            }
+            Ok(Box::new(MockDispatchHandle {
+                polls_remaining: std::sync::atomic::AtomicU32::new(self.polls_before_terminal),
+                terminal: self.terminal.clone(),
+                poll_count: self.poll_count.clone(),
+            }))
+        }
+    }
+
+    #[cfg(feature = "p2p")]
+    struct DispatchableStage;
+    #[cfg(feature = "p2p")]
+    #[async_trait]
+    impl Stage for DispatchableStage {
+        const NAME: &'static str = "dispatchable_thing";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = ();
+        type Output = Counter;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            _input: (),
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            // Distinct from `succeed_with` below: if the executor ever fell
+            // through to running this LOCALLY instead of honouring the
+            // dispatch, this value makes that wiring bug obvious.
+            Ok(Counter { n: 999 })
+        }
+    }
+    #[cfg(feature = "p2p")]
+    impl Compatible<LamuTrainerBackend> for DispatchableStage {}
+
+    #[cfg(feature = "p2p")]
+    #[tokio::test]
+    async fn p2p_dispatch_success_is_awaited_before_plan_completes() {
+        // Finding 1 repro shape: a dispatch policy that dispatches the
+        // SINGLE (and therefore last/only ready) node in the plan. Pre-fix,
+        // the coordinator's very next `join.join_next().await` hit an EMPTY
+        // JoinSet (the detached poll task was never added to it) and
+        // returned `None` immediately, so the loop broke — either tripping
+        // the `completed + pruned == order.len()` debug assertion or (in a
+        // release build) returning an incomplete `PlanResult` — well before
+        // the mock had gone terminal. The fix makes the poll loop a real
+        // JoinSet member, so the coordinator must actually wait through the
+        // mock's `Ok(None)` backoff cycles.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_td, base) = fresh_ctx();
+        let cache = base.cache.clone();
+        let poll_count = Arc::new(AtomicU32::new(0));
+        let submitter = Arc::new(MockDispatchSubmitter {
+            cache,
+            polls_before_terminal: 2,
+            terminal: MockTerminal::Succeeded,
+            succeed_with: Counter { n: 42 },
+            poll_count: poll_count.clone(),
+            submit_count: Arc::new(AtomicU32::new(0)),
+        });
+        let policy = Arc::new(MockDispatchPolicy {
+            dispatchable: "dispatchable_thing",
+        });
+        let ctx = base.with_dispatch(policy, submitter);
+
+        let plan = Plan::<(), LamuTrainerBackend>::new("p2p_success", serde_json::json!({}))
+            .start(DispatchableStage, EmptyArgs)
+            .finish()
+            .into_compiled();
+
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ParallelExecutor::execute(plan, ctx),
+        )
+        .await
+        .expect("dispatched plan must terminate")
+        .expect("a Succeeded remote node must not fail the plan");
+        let elapsed = start.elapsed();
+
+        // The mock forces 2 "still running" poll cycles (500ms backoff each,
+        // per the executor's poll loop) before going terminal. A coordinator
+        // that raced ahead of the real completion (the pre-fix bug) would
+        // return in a few milliseconds instead.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(900),
+            "coordinator returned in {elapsed:?}, before the dispatched node's \
+             mock backoff cycles could have completed — it did not genuinely \
+             await the dispatched node's result"
+        );
+        assert!(
+            poll_count.load(Ordering::SeqCst) >= 3,
+            "expected at least 3 polls (2×still-running + 1 terminal), got {}",
+            poll_count.load(Ordering::SeqCst)
+        );
+        let out: Counter = result
+            .final_output
+            .expect("the dispatched node's real output must be in the plan result")
+            .into_typed()
+            .unwrap();
+        assert_eq!(
+            out.n, 42,
+            "final output must be the artifact delivered by the mock P2P peer \
+             (via cache), not a local re-run (999) or a missing/stale output"
+        );
+    }
+
+    #[cfg(feature = "p2p")]
+    #[tokio::test]
+    async fn p2p_dispatch_failure_fails_the_plan() {
+        // Finding 2 repro: pre-fix, a remote `JobState::Failed` only emitted
+        // a `StageFailed` status event on the detached side-channel —
+        // `first_error`/`env.cancel` were never touched, so `execute()`
+        // could still return `Ok` past an explicitly failed dispatched node.
+        // The fix routes the Failed outcome through the SAME
+        // `Err(NodeFailure::Stage)` path a local stage failure uses.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_td, base) = fresh_ctx();
+        let cache = base.cache.clone();
+        let submitter = Arc::new(MockDispatchSubmitter {
+            cache,
+            polls_before_terminal: 1,
+            terminal: MockTerminal::Failed("remote OOM".to_string()),
+            succeed_with: Counter { n: 0 },
+            poll_count: Arc::new(AtomicU32::new(0)),
+            submit_count: Arc::new(AtomicU32::new(0)),
+        });
+        let policy = Arc::new(MockDispatchPolicy {
+            dispatchable: "dispatchable_thing",
+        });
+        let ctx = base.with_dispatch(policy, submitter);
+
+        let plan = Plan::<(), LamuTrainerBackend>::new("p2p_failure", serde_json::json!({}))
+            .start(DispatchableStage, EmptyArgs)
+            .finish()
+            .into_compiled();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ParallelExecutor::execute(plan, ctx),
+        )
+        .await
+        .expect("dispatched plan must terminate");
+
+        match result {
+            Err(PlanError::StageFailed { stage, source, .. }) => {
+                assert_eq!(stage, "dispatchable_thing");
+                let msg = source.to_string();
+                assert!(
+                    msg.contains("remote OOM"),
+                    "expected the remote failure reason surfaced in the error, got: {msg}"
+                );
+            }
+            other => panic!(
+                "an explicit remote-stage failure must fail the plan \
+                 (StageFailed), got: {other:?}"
+            ),
+        }
+    }
+
+    // ── GPU sampler leaked on panic (audit finding 4) ───────────────────
+    //
+    // `GpuSamplerHandle` (gpu_sampler.rs) has no `Drop` impl — a bare drop
+    // only DETACHES its background nvidia-smi poller (it keeps sampling
+    // until process exit) — so `run_node` must always reach `h.stop().await`
+    // to tear it down cleanly. Pre-fix, that call sat strictly after the
+    // stage's run future was awaited, so a panic inside the stage unwound
+    // straight past it, leaking the sampler task. The fix wraps the
+    // run-with-timeout future in `catch_unwind`, runs the same `.stop()`
+    // teardown on a caught panic, then `resume_unwind`s.
+    //
+    // `GpuSamplerHandle`'s inner `JoinHandle` is private to gpu_sampler.rs,
+    // so the leak itself isn't observable from here; this test instead
+    // pins the two properties that ARE observable at this layer: a
+    // panicking GPU-resource stage still reports as a plan-level panic
+    // (not swallowed, not silently downgraded to a normal `StageFailed`),
+    // and the catch_unwind wrapping doesn't hang the plan.
+    struct PanickingGpuStage;
+    #[async_trait]
+    impl Stage for PanickingGpuStage {
+        const NAME: &'static str = "panicking_gpu_stage";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Gpu];
+        type Input = ();
+        type Output = Counter;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            _input: (),
+            _args: &EmptyArgs,
+        ) -> Result<Counter, StageError> {
+            panic!("simulated stage panic — GpuSamplerHandle must still be stopped");
+        }
+    }
+    impl Compatible<LamuTrainerBackend> for PanickingGpuStage {}
+
+    #[tokio::test]
+    async fn panicking_gpu_stage_is_reported_and_does_not_hang() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_td, ctx) = fresh_ctx();
+        let plan = Plan::<(), LamuTrainerBackend>::new("gpu_panic", serde_json::json!({}))
+            .start(PanickingGpuStage, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ParallelExecutor::execute(plan, ctx),
+        )
+        .await
+        .expect("a panicking GPU-resource stage must not hang the plan");
+        match result {
+            Err(PlanError::Other(msg)) => {
+                assert!(
+                    msg.contains("panicked"),
+                    "expected a 'node task panicked' PlanError::Other, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected PlanError::Other(\"node task panicked...\"), got {other:?}"
+            ),
+        }
     }
 }

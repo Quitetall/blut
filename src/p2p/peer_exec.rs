@@ -82,6 +82,57 @@ pub async fn run_peer_loop(
     }
 }
 
+/// RAII guard: removes the peer's per-task work directory (`stage_dir`) when
+/// dropped — i.e. on every exit path of [`execute_one`], success or error.
+/// Without this, a coordinator dispatching repeated tasks accumulates one
+/// leaked directory (containing full artifact bytes: imported input, stage
+/// outputs, job-local cache) per task, unboundedly. Best-effort: logs on
+/// failure rather than propagating — cleanup must never turn an otherwise-
+/// successful task into a failure.
+struct StageDirGuard(PathBuf);
+
+impl Drop for StageDirGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    "peer stage_dir cleanup failed for {}: {e}",
+                    self.0.display()
+                );
+            }
+        }
+    }
+}
+
+/// Seal a blob's plaintext bundle pack for `recipient`, then frame the result
+/// as opaque bytes for [`transport::send_blob`] (whose own doc comment says
+/// encryption, if any, is the caller's job — that layer only frames/chunks).
+/// Uses the SAME AES-256-GCM hybrid primitive as the small `BundleManifest`
+/// (`crypto::encrypt`, already used for `encrypted_input`/`encrypted_output`);
+/// bulk artifact bytes previously rode `send_blob` in plaintext even for
+/// `DataClass::Restricted` (real clinical EEG/PHI corpora) — bundle.rs's doc
+/// comment claims the transport layer owns per-chunk encryption, which it does
+/// not (see transport.rs's own doc comment on `send_blob`/`recv_blob`).
+///
+/// One `crypto::encrypt` call per blob is safe to repeat across many blob
+/// sends: each call mints a FRESH random AES-256 key and a fresh nonce (see
+/// `crypto::encrypt`'s implementation), so there is no nonce reuse across
+/// calls even when sealing to the same recipient repeatedly.
+fn seal_blob(pack: &[u8], recipient: &x25519_dalek::PublicKey) -> Result<Vec<u8>, TrainError> {
+    let sealed = crypto::encrypt(pack, recipient);
+    bincode::serialize(&sealed)
+        .map_err(|e| TrainError::other(format!("serialize encrypted blob: {e}")))
+}
+
+/// Inverse of [`seal_blob`]: decode the framed [`crypto::EncryptedPayload`]
+/// returned by [`transport::recv_blob`] and decrypt it with `kp`'s own X25519
+/// secret.
+fn open_blob(bytes: &[u8], kp: &KeyPair) -> Result<Vec<u8>, TrainError> {
+    let sealed: crypto::EncryptedPayload = bincode::deserialize(bytes)
+        .map_err(|e| TrainError::other(format!("decode encrypted blob: {e}")))?;
+    kp.decrypt(&sealed)
+}
+
 /// Handle a single dispatched task end-to-end.
 async fn execute_one(
     conn: &QuinnConnection,
@@ -100,6 +151,10 @@ async fn execute_one(
     if task.coordinator_id != PeerId::from_pubkey(&coordinator.verifying) {
         return Err(TrainError::other("task coordinator_id != connected coordinator"));
     }
+    // Belt-and-suspenders: sign_payload() now covers `args` directly (a prior
+    // version only signed args_hash and never checked it against the received
+    // args), but reconcile args_hash explicitly too in case that ever regresses.
+    task.verify_args(&task.args)?;
 
     // task_id is network-controlled and becomes a path component below — reject
     // anything that isn't a flat, safe slug so a malicious coordinator can't
@@ -141,19 +196,43 @@ async fn execute_one(
         }
     };
 
+    // 4b. Fail-fast hash-binding check, BEFORE `recv_blob` buffers the (up to
+    //     MAX_BLOB_SIZE = 16 GiB) blob bytes. `bundle::unbundle` re-checks this
+    //     exact comparison later (defense in depth, on the rebased path); doing
+    //     it here too means a mismatched/malicious blob from a low-trust peer
+    //     is never fully received into memory in the first place.
+    if input_manifest.content_hash != task.input_hash {
+        return Err(TrainError::other(format!(
+            "hash binding: bundle.content_hash {} != signed input_hash {} — rejecting before blob receive",
+            input_manifest.content_hash.to_hex(),
+            task.input_hash.to_hex(),
+        )));
+    }
+
     // 5. Per-task work dir + a job-local cache. (task_id validated safe above.)
     let stage_dir = work_root.join(&task.task_id);
     std::fs::create_dir_all(&stage_dir)
         .map_err(|e| TrainError::other(format!("create peer stage_dir: {e}")))?;
+    // RAII cleanup: `stage_dir` holds the imported input, the job-local cache,
+    // and the stage's own outputs. Nothing past this function needs any of it
+    // on disk — `run_peer_loop` only reads `task_id` (a String it already
+    // cloned) for logging, and by the time this function returns, the output
+    // bytes it produced are already fully buffered in memory and sent over the
+    // wire (step 8 below). Removed on EVERY exit path: the many early `?`
+    // returns below and the success path alike.
+    let _stage_dir_guard = StageDirGuard(stage_dir.clone());
     let cache = Arc::new(CacheHandle::job_local(stage_dir.join(".cache")));
     // Isolated: job_dir == stage_dir for a single dispatched stage. cache_key =
     // the input hash (unique per task) so concurrent peer tasks don't collide if
     // a stage does a content-addressed cache lookup.
     let ctx = StageContext::for_peer(stage_dir.clone(), stage_dir.clone(), cache, task.input_hash);
 
-    // 6. Receive the input blob side-stream and unbundle into stage_dir. The
-    //    bundle layer runs the four fail-closed gates against task.input_hash.
-    let pack = transport::recv_blob(conn, &task.task_id, BlobDir::Input, MAX_BLOB_SIZE).await?;
+    // 6. Receive the input blob side-stream (sealed to this peer's X25519 key —
+    //    see `seal_blob`) and unbundle into stage_dir. The bundle layer runs
+    //    the four fail-closed gates against task.input_hash (content_hash was
+    //    already pre-checked in 4b, before this buffered the blob).
+    let sealed_pack = transport::recv_blob(conn, &task.task_id, BlobDir::Input, MAX_BLOB_SIZE).await?;
+    let pack = open_blob(&sealed_pack, keypair)?;
     let input: ErasedArtifact = bundle::unbundle(
         &*stage,
         &input_manifest,
@@ -203,8 +282,13 @@ async fn execute_one(
     };
     result.signature = keypair.sign(&result.sign_payload());
 
+    // Seal the bulk output blob to the coordinator too (same reasoning as the
+    // input leg in step 6 — see `seal_blob`); previously this shipped the
+    // plaintext `out_pack` straight to `send_blob`.
+    let sealed_out_pack = seal_blob(&out_pack, &coordinator.x25519_pub)?;
+
     P2pClient::send_result(conn, &result).await?;
-    transport::send_blob(conn, &task.task_id, BlobDir::Output, &out_pack).await?;
+    transport::send_blob(conn, &task.task_id, BlobDir::Output, &sealed_out_pack).await?;
     Ok(())
 }
 
@@ -269,6 +353,10 @@ pub async fn dispatch_to_peer(
     let manifest_bytes = bincode::serialize(&in_manifest)
         .map_err(|e| TrainError::other(format!("serialize input manifest: {e}")))?;
     let encrypted_input = crypto::encrypt(&manifest_bytes, &peer.x25519_pub);
+    // Seal the bulk input blob to the PEER's X25519 key too — see `seal_blob`;
+    // previously the plaintext `in_pack` (the actual file bytes, which may be
+    // DataClass::Internal/Restricted corpora) rode `send_blob` unencrypted.
+    let sealed_in_pack = seal_blob(&in_pack, &peer.x25519_pub)?;
     let args_hash = ContentHash::of_bytes(
         &serde_json::to_vec(&args).map_err(|e| TrainError::other(format!("args hash: {e}")))?,
     );
@@ -289,9 +377,9 @@ pub async fn dispatch_to_peer(
     };
     task.signature = coordinator_kp.sign(&task.sign_payload());
 
-    // 3. Send task + input blob.
+    // 3. Send task + input blob (encrypted — see 2).
     transport::P2pServer::send_task(conn, &task).await?;
-    transport::send_blob(conn, task_id, BlobDir::Input, &in_pack).await?;
+    transport::send_blob(conn, task_id, BlobDir::Input, &sealed_in_pack).await?;
 
     // 4. Receive the result, then the output blob, and verify. Bound by the
     //    peer's deadline + slack so a hung/stalled peer can't block the
@@ -313,8 +401,25 @@ pub async fn dispatch_to_peer(
     let out_bytes = coordinator_kp.decrypt(out_payload)?;
     let out_manifest = bincode::deserialize::<bundle::BundleManifest>(&out_bytes)
         .map_err(|e| TrainError::other(format!("decode output manifest: {e}")))?;
-    let out_pack =
+
+    // Fail-fast hash-binding check, BEFORE `recv_blob` buffers the (up to
+    // MAX_BLOB_SIZE = 16 GiB) output blob. A rogue/compromised peer that
+    // passed signature verification above could still return a blob that
+    // doesn't match what we dispatched; reject it before spending memory on
+    // it, not just after. `bundle::unbundle` re-checks this exact comparison
+    // later (defense in depth) — mirrors the identical pre-check on the peer
+    // side in `execute_one`, step 4b.
+    if out_manifest.content_hash != expected_output_hash {
+        return Err(TrainError::other(format!(
+            "hash binding: bundle.content_hash {} != expected_output_hash {} — rejecting before blob receive",
+            out_manifest.content_hash.to_hex(),
+            expected_output_hash.to_hex(),
+        )));
+    }
+
+    let sealed_out_pack =
         transport::recv_blob(conn, task_id, BlobDir::Output, MAX_BLOB_SIZE).await?;
+    let out_pack = open_blob(&sealed_out_pack, coordinator_kp)?;
     let output = bundle::unbundle(
         &*stage,
         &out_manifest,
@@ -359,5 +464,109 @@ mod tests {
         assert!(is_safe_task_id("blut-job7-node3"));
         assert!(is_safe_task_id("task-e2e-1"));
         assert!(is_safe_task_id("a.b_c-1"));
+    }
+
+    // ── Finding 1: stage_dir leak ────────────────────────────────────────
+    //
+    // `execute_one` itself needs a live QuinnConnection to unit-test
+    // end-to-end (see tests/p2p_integration.rs's `e2e` module for the real
+    // dispatch path), so these tests pin the RAII mechanism directly: a
+    // `StageDirGuard` removes its directory when dropped, on any path
+    // (Rust drops locals on every fn exit — early `?` return, explicit
+    // `return Err`, or falling off the end — so proving the Drop impl fires
+    // once is sufficient to cover every exit path of `execute_one`).
+
+    #[test]
+    fn stage_dir_guard_removes_dir_on_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let stage_dir = root.path().join("task-123");
+        std::fs::create_dir_all(&stage_dir).unwrap();
+        std::fs::write(stage_dir.join("secret.bin"), b"leaked artifact bytes").unwrap();
+        assert!(stage_dir.exists());
+        {
+            let _guard = StageDirGuard(stage_dir.clone());
+            // still present while the guard is alive
+            assert!(stage_dir.exists());
+        }
+        assert!(!stage_dir.exists(), "stage_dir must be removed when the guard drops");
+    }
+
+    #[test]
+    fn stage_dir_guard_early_return_still_cleans_up() {
+        // Simulates the shape of `execute_one`: a guard is created, then a
+        // later `?`-style early return happens — the guard must still fire.
+        fn run(stage_dir: &std::path::Path) -> Result<(), &'static str> {
+            let _guard = StageDirGuard(stage_dir.to_path_buf());
+            Err("simulated mid-function failure")?;
+            Ok(())
+        }
+        let root = tempfile::tempdir().unwrap();
+        let stage_dir = root.path().join("task-456");
+        std::fs::create_dir_all(&stage_dir).unwrap();
+        let _ = run(&stage_dir);
+        assert!(!stage_dir.exists(), "early-return path must still clean up stage_dir");
+    }
+
+    #[test]
+    fn stage_dir_guard_missing_dir_is_noop() {
+        // Best-effort cleanup: removing an already-absent dir must not panic.
+        let root = tempfile::tempdir().unwrap();
+        let stage_dir = root.path().join("never-created");
+        let guard = StageDirGuard(stage_dir);
+        drop(guard);
+    }
+
+    // ── Finding 3: plaintext bulk artifact transfer ──────────────────────
+
+    #[test]
+    fn seal_open_blob_roundtrip() {
+        let kp = KeyPair::generate();
+        let plaintext = b"bulk artifact bytes: real clinical EEG corpus".to_vec();
+        let sealed = seal_blob(&plaintext, &kp.x25519_public).unwrap();
+        // The wire bytes must not contain the plaintext verbatim — proves
+        // actual encryption happened, not a pass-through/no-op.
+        assert_ne!(sealed, plaintext);
+        assert!(
+            !sealed.windows(plaintext.len()).any(|w| w == plaintext.as_slice()),
+            "sealed blob must not contain the plaintext as a contiguous substring"
+        );
+        let opened = open_blob(&sealed, &kp).unwrap();
+        assert_eq!(opened, plaintext);
+    }
+
+    #[test]
+    fn seal_blob_wrong_recipient_cannot_open() {
+        let kp1 = KeyPair::generate();
+        let kp2 = KeyPair::generate();
+        let plaintext = b"restricted data class corpus".to_vec();
+        let sealed = seal_blob(&plaintext, &kp1.x25519_public).unwrap();
+        assert!(open_blob(&sealed, &kp2).is_err(), "wrong recipient must not decrypt");
+    }
+
+    #[test]
+    fn seal_blob_fresh_nonce_and_key_each_call() {
+        // crypto::encrypt mints a fresh AES-256 key + nonce per call (a full
+        // ephemeral-ECDH hybrid seal), so calling it once per blob send — as
+        // `seal_blob` does — is safe even when sealing the same plaintext to
+        // the same recipient repeatedly: no static key/nonce reuse across
+        // calls (which would be a real AES-GCM vulnerability).
+        let kp = KeyPair::generate();
+        let plaintext = b"same bytes sent twice".to_vec();
+        let a = seal_blob(&plaintext, &kp.x25519_public).unwrap();
+        let b = seal_blob(&plaintext, &kp.x25519_public).unwrap();
+        assert_ne!(a, b, "two seals of identical plaintext must produce different wire bytes");
+        assert_eq!(open_blob(&a, &kp).unwrap(), plaintext);
+        assert_eq!(open_blob(&b, &kp).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn seal_open_blob_roundtrip_large() {
+        // Exercise a multi-MiB buffer (the realistic shape of a bundle
+        // pack), not just a short string.
+        let kp = KeyPair::generate();
+        let plaintext: Vec<u8> = (0..(4 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
+        let sealed = seal_blob(&plaintext, &kp.x25519_public).unwrap();
+        let opened = open_blob(&sealed, &kp).unwrap();
+        assert_eq!(opened, plaintext);
     }
 }
