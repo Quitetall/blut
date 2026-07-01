@@ -446,7 +446,7 @@ fn identity_cert(
 > {
     let seed: [u8; 32] = keypair.to_bytes()[..32]
         .try_into()
-        .expect("KeyPair::to_bytes() returns 64 bytes");
+        .map_err(|_| TrainError::other("KeyPair::to_bytes() did not return >= 32 bytes"))?;
     let pkcs8_der = ed25519_pkcs8_der(&seed);
     let cert_key_pair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
         &rustls::pki_types::PrivatePkcs8KeyDer::from(pkcs8_der),
@@ -758,6 +758,32 @@ mod pinned_verifier_tests {
             matches!(result.unwrap_err(), rustls::Error::InvalidCertificate(_)),
             "rejection must be a hard `InvalidCertificate` handshake failure, not a \
              warning-and-continue"
+        );
+    }
+
+    /// The accept/reject test above proves generate/verify agreement only
+    /// implicitly (through a successful handshake). Assert it explicitly:
+    /// the SPKI bytes `ed25519_spki_der` builds for comparison must
+    /// byte-for-byte equal what `webpki` (the same parser
+    /// `verify_server_cert` uses) actually extracts from a cert
+    /// `identity_cert`/rcgen generated for the same key. If a future
+    /// rustls-webpki or rcgen upgrade ever changes how either side encodes
+    /// or re-serializes SPKI DER, this fails loudly here instead of as a
+    /// silent pinning bypass.
+    #[test]
+    fn spki_encoding_matches_what_webpki_extracts_from_the_generated_cert() {
+        let coordinator = KeyPair::generate();
+        let (cert_der, _key_der) = identity_cert(&coordinator).unwrap();
+
+        let cert = webpki::EndEntityCert::try_from(&cert_der).unwrap();
+        let extracted_spki = cert.subject_public_key_info().as_ref().to_vec();
+        let built_spki = ed25519_spki_der(&coordinator.verifying.to_bytes());
+
+        assert_eq!(
+            extracted_spki, built_spki,
+            "ed25519_spki_der's output must match what webpki actually extracts \
+             from a cert generated for the same key, or PinnedVerifier's exact-byte \
+             comparison silently stops matching legitimate coordinators"
         );
     }
 
