@@ -274,6 +274,7 @@ dependencies = [
  "rcgen",
  "rusqlite",
  "rustls",
+ "rustls-webpki",
  "schemars",
  "serde",
  "serde_json",

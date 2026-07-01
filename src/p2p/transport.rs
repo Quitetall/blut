@@ -331,7 +331,11 @@ impl P2pServer {
                     registry.upsert(info);
                     TrustLevel::Anonymous
                 };
-                let _ = registry.save();
+                if let Err(e) = registry.save() {
+                    tracing::warn!(
+                        "p2p: failed to persist peer registry after registering {peer_id}: {e}"
+                    );
+                }
 
                 // Send ack.
                 let ack = WireMessage::HandshakeAck {
@@ -397,14 +401,16 @@ impl P2pServer {
         self.endpoint.close(0u32.into(), b"shutdown");
     }
 
-    fn make_server_config(_keypair: &KeyPair) -> Result<ServerConfig, TrainError> {
-        // Generate a self-signed TLS cert. The coordinator's Ed25519
-        // identity is verified via the handshake on top of QUIC.
-        // TODO: embed Ed25519 pubkey in cert extension for SPKI pinning.
-        let rcgen_cert = rcgen::generate_simple_self_signed(vec!["blut-p2p".into()])
-            .map_err(|e| TrainError::other(format!("generate cert: {e}")))?;
-        let cert_der = rcgen_cert.cert.der().clone();
-        let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(rcgen_cert.key_pair.serialize_der());
+    fn make_server_config(keypair: &KeyPair) -> Result<ServerConfig, TrainError> {
+        // Derive the TLS leaf cert's key pair FROM the coordinator's Ed25519
+        // identity key (rather than an unrelated, freshly-random one) so the
+        // cert's SubjectPublicKeyInfo IS `keypair.verifying`. This is what
+        // lets `PinnedVerifier::verify_server_cert` (below) actually pin: it
+        // extracts the presented cert's SPKI and compares it byte-for-byte
+        // against `--coordinator-pubkey`, so the generate side here and the
+        // verify side must agree on the same key material and encoding —
+        // see `identity_cert`.
+        let (cert_der, key_der) = identity_cert(keypair)?;
 
         let mut server_crypto = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -420,6 +426,85 @@ impl P2pServer {
                 .map_err(|e| TrainError::other(format!("QUIC server config: {e}")))?,
         )))
     }
+}
+
+/// Derive a self-signed TLS leaf certificate whose key pair — and therefore
+/// whose `SubjectPublicKeyInfo` — IS `keypair`'s Ed25519 identity key,
+/// encoded via the fixed RFC 8410 PKCS#8 layout (`ed25519_pkcs8_der`).
+/// Shared by [`P2pServer::make_server_config`] (the real QUIC server config)
+/// and by unit tests below, so the "generate side" encoding a test exercises
+/// is provably the same one production ships — see the note on
+/// `PinnedVerifier::verify_server_cert` about generate/verify agreement.
+fn identity_cert(
+    keypair: &KeyPair,
+) -> Result<
+    (
+        rustls::pki_types::CertificateDer<'static>,
+        rustls::pki_types::PrivatePkcs8KeyDer<'static>,
+    ),
+    TrainError,
+> {
+    let seed: [u8; 32] = keypair.to_bytes()[..32]
+        .try_into()
+        .expect("KeyPair::to_bytes() returns 64 bytes");
+    let pkcs8_der = ed25519_pkcs8_der(&seed);
+    let cert_key_pair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+        &rustls::pki_types::PrivatePkcs8KeyDer::from(pkcs8_der),
+        &rcgen::PKCS_ED25519,
+    )
+    .map_err(|e| TrainError::other(format!("derive TLS keypair from identity: {e}")))?;
+    let rcgen_cert = rcgen::CertificateParams::new(vec!["blut-p2p".into()])
+        .map_err(|e| TrainError::other(format!("cert params: {e}")))?
+        .self_signed(&cert_key_pair)
+        .map_err(|e| TrainError::other(format!("generate cert: {e}")))?;
+    let cert_der = rcgen_cert.der().clone();
+    let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert_key_pair.serialize_der());
+    Ok((cert_der, key_der))
+}
+
+/// Wrap a raw 32-byte Ed25519 private key seed in the fixed RFC 8410 §7 /
+/// Appendix A PKCS#8 v1 DER encoding: a constant 16-byte prefix followed by
+/// the 32-byte seed, with no attributes and no embedded public key ("v1,
+/// unchecked" — `rcgen` decodes this via ring's
+/// `Ed25519KeyPair::from_pkcs8_maybe_unchecked`, which accepts exactly this
+/// shape). This lets [`rcgen::KeyPair::from_pkcs8_der_and_sign_algo`] build
+/// a TLS certificate key pair directly from a [`KeyPair`]'s Ed25519 identity
+/// without pulling in a `pkcs8`-encoding crate for one fixed-format wrapper.
+fn ed25519_pkcs8_der(seed: &[u8; 32]) -> Vec<u8> {
+    #[rustfmt::skip]
+    const PREFIX: [u8; 16] = [
+        0x30, 0x2e,                               // SEQUENCE, len 46
+        0x02, 0x01, 0x00,                         // INTEGER version = 0
+        0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, // AlgorithmIdentifier: OID 1.3.101.112 (id-Ed25519)
+        0x04, 0x22,                               // OCTET STRING (outer "privateKey"), len 34
+        0x04, 0x20,                               // OCTET STRING (inner CurvePrivateKey), len 32
+    ];
+    let mut der = Vec::with_capacity(PREFIX.len() + 32);
+    der.extend_from_slice(&PREFIX);
+    der.extend_from_slice(seed);
+    der
+}
+
+/// Build the fixed RFC 8410 `SubjectPublicKeyInfo` DER encoding for a raw
+/// 32-byte Ed25519 public key: a constant 12-byte prefix followed by the
+/// 32-byte key. Used by [`PinnedVerifier::verify_server_cert`] to compare,
+/// byte-for-byte, against the SPKI `rustls-webpki` parses out of the peer's
+/// presented certificate. This is the public-key half of the SAME encoding
+/// `ed25519_pkcs8_der`'s cert embeds, since both sides derive from a
+/// `p2p::crypto::KeyPair`'s Ed25519 key — a legitimate coordinator's cert
+/// (built by `identity_cert`) therefore matches byte-for-byte, while an
+/// attacker's unrelated self-signed cert does not.
+fn ed25519_spki_der(pubkey: &[u8; 32]) -> Vec<u8> {
+    #[rustfmt::skip]
+    const PREFIX: [u8; 12] = [
+        0x30, 0x2a,                               // SEQUENCE, len 42
+        0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, // AlgorithmIdentifier: OID 1.3.101.112 (id-Ed25519)
+        0x03, 0x21, 0x00,                         // BIT STRING, len 33, 0 unused bits
+    ];
+    let mut der = Vec::with_capacity(PREFIX.len() + 32);
+    der.extend_from_slice(&PREFIX);
+    der.extend_from_slice(pubkey);
+    der
 }
 
 /// P2P QUIC client — runs on a peer, connects to the coordinator.
@@ -541,11 +626,28 @@ impl P2pClient {
     }
 }
 
-/// TLS cert verifier stub — accepts any certificate.
-/// SAFETY: relies entirely on the Ed25519 handshake for authentication.
-/// The handshake payload is signed by the coordinator's private key, so
-/// a MITM who tampers with it causes signature verification to fail.
-/// TODO: implement real SPKI pinning when rcgen supports Ed25519 certs.
+/// TLS cert verifier enforcing `--coordinator-pubkey` pinning.
+///
+/// SECURITY: `end_entity` is fully attacker-controlled in the MITM threat
+/// model this verifier exists to defeat (rogue AP / ARP / DNS spoof
+/// terminating the QUIC/TLS handshake), so cert parsing is delegated to
+/// `rustls-webpki` — the same hardened DER/X.509 parser rustls's own default
+/// verifier uses — rather than hand-rolled here. `verify_server_cert`
+/// requires the presented leaf cert's `SubjectPublicKeyInfo` to be an EXACT
+/// byte match for `expected_pubkey` (encoded via `ed25519_spki_der`); the
+/// coordinator's cert is generated in `identity_cert` from the SAME Ed25519
+/// identity key using the SAME fixed RFC 8410 encoding, so a legitimate
+/// coordinator always matches and an impostor's unrelated self-signed cert
+/// never does.
+///
+/// `verify_tls12_signature` / `verify_tls13_signature` matter just as much
+/// as the SPKI check above: they verify the `CertificateVerify` handshake
+/// message actually proves possession of the private key for `cert` (via
+/// `rustls::crypto::verify_tls1{2,3}_signature`, which internally re-parses
+/// `cert` and checks the signature against its SPKI). Without this, an
+/// attacker could present a cert with byte-for-byte the correct (public,
+/// non-secret) pinned SPKI and skip proving they hold the matching private
+/// key — `verify_server_cert` alone is not sufficient authentication.
 #[derive(Debug)]
 struct PinnedVerifier {
     expected_pubkey: [u8; 32],
@@ -560,36 +662,197 @@ impl rustls::client::danger::ServerCertVerifier for PinnedVerifier {
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        // Extract the cert's SPKI and verify it contains the expected
-        // coordinator pubkey. For now, we accept any valid cert — the
-        // Ed25519 handshake on top provides the real identity binding.
-        // TODO: extract SPKI and compare against expected_pubkey.
-        let _ = (end_entity, self.expected_pubkey);
+        let cert = webpki::EndEntityCert::try_from(end_entity).map_err(|_| {
+            rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+        })?;
+        let expected_spki = ed25519_spki_der(&self.expected_pubkey);
+        if cert.subject_public_key_info().as_ref() != expected_spki.as_slice() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ));
+        }
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod pinned_verifier_tests {
+    use super::*;
+    use crate::p2p::registry::PeerRegistry;
+    use rustls::client::danger::ServerCertVerifier as _;
+
+    fn test_server_name() -> rustls::pki_types::ServerName<'static> {
+        rustls::pki_types::ServerName::try_from("blut-p2p").unwrap()
+    }
+
+    /// Direct regression test for the reported bug: `verify_server_cert`
+    /// used to do `let _ = (end_entity, self.expected_pubkey); Ok(...)` —
+    /// i.e. accept ANY cert regardless of the pin. Prove the fixed version
+    /// accepts a cert whose SPKI matches the pin and rejects one that
+    /// doesn't, using the exact cert-generation helper (`identity_cert`)
+    /// that `P2pServer::make_server_config` ships, so this test can't pass
+    /// by exercising a different (and possibly out-of-sync) encoding than
+    /// production uses.
+    #[test]
+    fn verify_server_cert_matches_pin_accepts_and_mismatch_rejects() {
+        let coordinator = KeyPair::generate();
+        let (cert_der, _key_der) = identity_cert(&coordinator).unwrap();
+        let server_name = test_server_name();
+        let now = rustls::pki_types::UnixTime::now();
+
+        let correct_pin = PinnedVerifier {
+            expected_pubkey: coordinator.verifying.to_bytes(),
+        };
+        assert!(
+            correct_pin
+                .verify_server_cert(&cert_der, &[], &server_name, &[], now)
+                .is_ok(),
+            "a cert whose SPKI matches the pinned coordinator pubkey must be accepted"
+        );
+
+        let impostor = KeyPair::generate();
+        let wrong_pin = PinnedVerifier {
+            expected_pubkey: impostor.verifying.to_bytes(),
+        };
+        let result = wrong_pin.verify_server_cert(&cert_der, &[], &server_name, &[], now);
+        assert!(
+            result.is_err(),
+            "a cert whose SPKI does NOT match the pinned coordinator pubkey must be \
+             rejected, not silently accepted like the pre-fix stub did"
+        );
+        assert!(
+            matches!(result.unwrap_err(), rustls::Error::InvalidCertificate(_)),
+            "rejection must be a hard `InvalidCertificate` handshake failure, not a \
+             warning-and-continue"
+        );
+    }
+
+    /// `InsecureVerifier` (the no-pin, trust-on-first-use fallback used when
+    /// `--coordinator-pubkey` is NOT passed) must stay deliberately
+    /// permissive — this fix must not change behavior on that path.
+    #[test]
+    fn insecure_verifier_still_accepts_any_cert() {
+        let coordinator = KeyPair::generate();
+        let (cert_der, _key_der) = identity_cert(&coordinator).unwrap();
+        let server_name = test_server_name();
+        let now = rustls::pki_types::UnixTime::now();
+
+        assert!(
+            InsecureVerifier
+                .verify_server_cert(&cert_der, &[], &server_name, &[], now)
+                .is_ok(),
+            "InsecureVerifier (no-pin mode) must remain permissive"
+        );
+    }
+
+    async fn bind_loopback_server() -> (P2pServer, std::sync::Arc<KeyPair>) {
+        let keypair = std::sync::Arc::new(KeyPair::generate());
+        let dir = tempfile::tempdir().unwrap();
+        let peers = PeerRegistry::load(&dir.path().join("peers.json")).unwrap();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = P2pServer::bind(addr, keypair.clone(), peers).await.unwrap();
+        // Keep the tempdir alive for the registry's lifetime by leaking it —
+        // this is a short-lived unit test process, not a long-running one.
+        std::mem::forget(dir);
+        (server, keypair)
+    }
+
+    /// End-to-end companion to the direct unit test above: exercises the
+    /// REAL documented flow (`P2pClient::with_coordinator_pin` connecting
+    /// to a `P2pServer::bind`-ed coordinator over actual QUIC/TLS), proving
+    /// the fix holds through the full handshake, not just in isolation.
+    #[tokio::test]
+    async fn connect_with_correct_pin_succeeds_end_to_end() {
+        let (server, server_keypair) = bind_loopback_server().await;
+        let addr = server.local_addr().unwrap();
+
+        // Drain the app-level handshake so `P2pClient::connect` (which waits
+        // for a `HandshakeAck` after the TLS handshake completes) doesn't
+        // hang waiting for the coordinator side. Hold the accepted
+        // `Connection` open (via `conn.closed()`) rather than letting it
+        // drop the instant `accept_peer` returns: dropping the last
+        // `Connection` handle tears the QUIC connection down immediately,
+        // which can race the just-sent `HandshakeAck` bytes still in
+        // flight and flake the test with "closed by peer" — unrelated to
+        // the cert-pinning behavior under test.
+        tokio::spawn(async move {
+            if let Ok((_, conn)) = server.accept_peer().await {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
+            }
+        });
+
+        let client_keypair = std::sync::Arc::new(KeyPair::generate());
+        let client =
+            P2pClient::with_coordinator_pin(client_keypair, server_keypair.verifying.to_bytes());
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), client.connect(addr))
+            .await
+            .expect("connect() must not hang");
+        assert!(
+            result.is_ok(),
+            "connecting with the CORRECT --coordinator-pubkey must succeed: {:?}",
+            result.err()
+        );
+    }
+
+    /// The other half: a wrong pin must fail the QUIC/TLS handshake itself
+    /// (before any application-level exchange), and must fail fast rather
+    /// than hang — this is what makes the bug exploitable (MITM presents an
+    /// unrelated cert and the old code accepted it unconditionally).
+    #[tokio::test]
+    async fn connect_with_wrong_pin_fails_end_to_end() {
+        let (server, _server_keypair) = bind_loopback_server().await;
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = server.accept_peer().await;
+        });
+
+        let client_keypair = std::sync::Arc::new(KeyPair::generate());
+        let wrong_pubkey = KeyPair::generate().verifying.to_bytes();
+        let client = P2pClient::with_coordinator_pin(client_keypair, wrong_pubkey);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), client.connect(addr))
+            .await
+            .expect("connect() must not hang even on rejection");
+        assert!(
+            result.is_err(),
+            "connecting with the WRONG --coordinator-pubkey must be rejected \
+             (regression test for the PinnedVerifier stub that accepted any cert)"
+        );
     }
 }
 
