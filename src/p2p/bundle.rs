@@ -16,9 +16,15 @@
 //!   `TaskManifest.encrypted_input` / `TaskResult.encrypted_output` slots
 //!   (bincode → `crypto::encrypt`).
 //! - The bulk **pack** (the actual file bytes) is produced by [`bundle`] and
-//!   consumed by [`unbundle`] as a plain `Vec<u8>`. The transport layer streams
-//!   it in <64 MiB chunks (the QUIC `recv_message` cap) on a side channel and
-//!   owns per-chunk encryption — this module is pack/unpack/VERIFY only.
+//!   consumed by [`unbundle`] as a plain `Vec<u8>`. The transport layer
+//!   (`transport::send_blob`/`recv_blob`) streams it in <64 MiB chunks (the
+//!   QUIC `recv_message` cap) on a side channel and is framing-only — it does
+//!   NOT encrypt (see its own doc comment). The caller (`peer_exec.rs`'s
+//!   `seal_blob`/`open_blob`) seals the WHOLE plaintext pack with the same
+//!   AES-256-GCM primitive used for the small manifest (`crypto::encrypt`)
+//!   before handing bytes to `send_blob`, and opens it after `recv_blob`
+//!   reassembles them. This module itself stays pack/unpack/VERIFY only —
+//!   it never sees ciphertext, only the plaintext pack.
 //!
 //! ## Pack layout (deterministic, reproducible `blob_sha256`)
 //!
