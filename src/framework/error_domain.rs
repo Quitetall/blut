@@ -122,6 +122,10 @@ pub struct ErrorDomainDef {
 /// called this yet (a later cookbook-side workflow adds the first one) —
 /// `blut errors list` prints "no error domains registered" until then,
 /// rather than assuming a catalog exists.
+///
+/// One error domain per module: like [`crate::recipes::recipe::register_recipe!`],
+/// this emits an unnamespaced `pub static ERROR_DOMAIN_DEF`, so a second
+/// invocation in the same module is a duplicate-symbol error.
 #[macro_export]
 macro_rules! register_error_domain {
     ($ty:ty) => {

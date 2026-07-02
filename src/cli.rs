@@ -3636,6 +3636,9 @@ fn run_errors_show(job: &str, json: bool) -> Result<()> {
             println!("  code       : {}", f.code);
             println!("  domain     : {}", f.domain);
             println!("  severity   : {}", f.severity);
+            // `FaultOrigin` has no `Display` impl (it's an A1 type; adding one
+            // is out of this command's scope) — `{:?}` on its PascalCase
+            // variants (Engine/Cookbook/External) already reads fine.
             println!("  origin     : {:?}", f.origin);
             println!(
                 "  course     : {}",
