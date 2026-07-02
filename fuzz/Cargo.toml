@@ -1,0 +1,82 @@
+# cargo-fuzz scaffold for the `blut` engine crate (ADR 0072 item A6).
+#
+# Usage:
+#   cargo +nightly fuzz build                      # build all targets
+#   cargo +nightly fuzz run <target> -- -max_total_time=30   # CI-shaped smoke run
+#   cargo +nightly fuzz run <target>                # unbounded local corpus campaign
+#
+# CI runs a 30s smoke budget per target (not yet wired into CI itself — that's
+# a separate follow-up). Longer local corpus-building campaigns are a manual
+# workflow; drop found regressions' `artifacts/<target>/crash-*` files into
+# `corpus/<target>/` as seeds once triaged.
+[package]
+name = "blut-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# Detach from the parent `blut` crate's empty `[workspace]` table -- without
+# this, cargo treats `fuzz/` as an implicit workspace member sharing the
+# parent's target dir/lockfile, which cargo-fuzz's own build invocation (a
+# separate `--manifest-path`) then rejects with "current package believes
+# it's in a workspace when it's not".
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+bincode = "1"
+
+# `p2p` is required for the two p2p-boundary targets (bundle manifest, wire
+# message) since `blut::p2p` is `#[cfg(feature = "p2p")]`-gated. Building it
+# on for ALL targets keeps this Cargo.toml simple (one dependency line) at
+# the cost of a slightly bigger build for the non-p2p targets -- acceptable
+# for a fuzz-only crate that's never shipped.
+[dependencies.blut]
+path = ".."
+features = ["p2p"]
+
+[[bin]]
+name = "fuzz_train_spec"
+path = "fuzz_targets/fuzz_train_spec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_declarative_recipe"
+path = "fuzz_targets/fuzz_declarative_recipe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_erased_artifact"
+path = "fuzz_targets/fuzz_erased_artifact.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_p2p_bundle_manifest"
+path = "fuzz_targets/fuzz_p2p_bundle_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_p2p_wire_message"
+path = "fuzz_targets/fuzz_p2p_wire_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_failure_summary"
+path = "fuzz_targets/fuzz_failure_summary.rs"
+test = false
+doc = false
+bench = false
