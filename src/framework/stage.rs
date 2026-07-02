@@ -169,6 +169,11 @@ pub struct StageContext {
     /// (RESOLVE) via `ExecCtx` so the train stage (RECORD) launches the SAME count
     /// the broker sized — parity + never-OOM. `None` ⇒ the conservative cap.
     pub admitted_workers: Option<u32>,
+    /// Auto-tuned batch size (E2, extends ADR 0071's fit-and-saturate to a
+    /// second knob). Set by the cli at admission via `ExecCtx`, resolved
+    /// against the SAME snapshot as `admitted_workers`. `None` ⇒ the recipe's
+    /// requested batch, unchanged.
+    pub admitted_batch_size: Option<u32>,
     /// This stage invocation's CACHE KEY (the engine's canonical "same input +
     /// same args + same schema" fingerprint). Threaded so a durable-resume train
     /// stage can derive a STABLE per-config resume directory (via
@@ -207,6 +212,7 @@ impl StageContext {
             device_index: None,
             fb_warm: false,
             admitted_workers: None,
+            admitted_batch_size: None,
             cache_key: crate::framework::artifact::ContentHash([0u8; 32]),
             attempt: 1,
             resume_from: None,
@@ -239,6 +245,7 @@ impl StageContext {
             device_index: None,
             fb_warm: false,
             admitted_workers: None,
+            admitted_batch_size: None,
             cache_key,
             attempt: 1,
             resume_from: None,

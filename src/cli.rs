@@ -2188,13 +2188,16 @@ fn recipe_footprint(name: &str, raw: &serde_json::Value) -> crate::broker::Footp
 }
 
 /// Like [`recipe_footprint`] but with the decode worker count OVERRIDDEN to the
-/// auto-tuned `workers` (ADR 0071 A2) — so the gate's footprint + calibration key
-/// reflect the count the stage will actually launch (threaded via
-/// `ExecCtx::with_admitted_workers`). The light arg-less path is unchanged.
+/// auto-tuned `workers` (ADR 0071 A2), and OPTIONALLY the batch size too (E2,
+/// extends the same auto-tune to a second knob) — so the gate's footprint +
+/// calibration key reflect what the stage will actually launch (threaded via
+/// `ExecCtx::with_admitted_workers`/`with_admitted_batch_size`). The light
+/// arg-less path is unchanged.
 fn recipe_footprint_tuned(
     name: &str,
     raw: &serde_json::Value,
     workers: u32,
+    batch: Option<u32>,
 ) -> crate::broker::Footprint {
     if raw.is_null() || raw.as_object().is_some_and(|o| o.is_empty()) {
         return crate::broker::Footprint {
@@ -2204,6 +2207,9 @@ fn recipe_footprint_tuned(
     }
     let mut drivers = crate::broker::Drivers::from_args_json(raw);
     drivers.workers = workers; // the fit-and-saturate count (overrides the cap)
+    if let Some(b) = batch {
+        drivers.batch = b; // the fit-and-saturate batch (E2, overrides the request)
+    }
     let hint = drivers.estimate();
     let key = drivers.key(name);
     crate::broker::FootprintStore::load().resolve(&key, hint)
@@ -2249,6 +2255,42 @@ fn admitted_workers_for(name: &str, raw: &serde_json::Value) -> Option<u32> {
         );
     }
     Some(w)
+}
+
+/// E2: auto-tune the batch size to FIT the RAM budget, extending ADR 0071 A2's
+/// fit-and-saturate auto-tune to a second knob. Runs ONLY when `resolved_workers`
+/// came from [`admitted_workers_for`] on this SAME admission call (batch is
+/// searched against the residual budget after workers is already fixed — see
+/// [`crate::broker::footprint::batch_size_to_fit`]'s doc comment for why this
+/// reaches the same feasibility boundary a joint search would). Returns
+/// `Some(B)` only when it actually LOWERS the recipe's requested batch (unlike
+/// workers, there is no "saturate up" direction — see that function's doc);
+/// `None` means "the requested batch already fits, launch it unchanged."
+fn admitted_batch_size_for(name: &str, raw: &serde_json::Value, resolved_workers: u32) -> Option<u32> {
+    if raw.is_null() || raw.as_object().is_some_and(|o| o.is_empty()) {
+        return None; // light recipe — no batch to tune
+    }
+    let snap = crate::broker::ResourceSnapshot::probe();
+    if snap.mem_total_gb <= 0.0 {
+        return None; // no probe → leave the requested batch
+    }
+    let gib = crate::broker::footprint::GIB as f64;
+    let avail = (snap.mem_avail_gb * gib) as u64;
+    let floor = (crate::broker::admission::DEFAULT_FLOOR_GIB * gib) as u64;
+    if avail <= floor {
+        return None;
+    }
+    let base = crate::broker::Drivers::from_args_json(raw);
+    let requested = base.batch;
+    let b = crate::broker::footprint::batch_size_to_fit(resolved_workers, avail, floor, &base);
+    if b == requested {
+        return None; // already fits — no override needed
+    }
+    eprintln!(
+        "admission: recipe '{name}' batch size {requested} → {b} to fit {:.0}G available at {resolved_workers} workers (auto-tuned, never-OOM)",
+        snap.mem_avail_gb
+    );
+    Some(b)
 }
 
 /// The box-fit RAM budget (GiB) for a scheduler / executor that runs cells
@@ -3709,9 +3751,13 @@ async fn launch_compiled_plan(
     // both the over-refuse and the GPU-starvation). Compute W from a SINGLE mem
     // snapshot; the gate's footprint uses W, and W is cached on the ExecCtx below
     // so the cookbook train stage (RECORD) launches exactly this count.
+    // E2: auto-tune batch size against the SAME snapshot, against the residual
+    // budget after W is fixed (extends the same knob to a second driver).
     let admitted_workers = admitted_workers_for(name, plan.exec_view().recipe_args);
+    let admitted_batch_size = admitted_workers
+        .and_then(|w| admitted_batch_size_for(name, plan.exec_view().recipe_args, w));
     let footprint = match admitted_workers {
-        Some(w) => recipe_footprint_tuned(name, plan.exec_view().recipe_args, w),
+        Some(w) => recipe_footprint_tuned(name, plan.exec_view().recipe_args, w, admitted_batch_size),
         None => recipe_footprint(name, plan.exec_view().recipe_args),
     };
 
@@ -3754,6 +3800,11 @@ async fn launch_compiled_plan(
     // launches exactly what admission sized (RESOLVE↔RECORD parity, never-OOM).
     if let Some(w) = admitted_workers {
         ctx = ctx.with_admitted_workers(w);
+    }
+    // E2: cache the auto-tuned batch size on the ctx so the cookbook train stage
+    // launches exactly what admission sized (RESOLVE↔RECORD parity, never-OOM).
+    if let Some(b) = admitted_batch_size {
+        ctx = ctx.with_admitted_batch_size(b);
     }
     // INC D (S4): `--no-cache`/`--force` bypasses the stage cache READ so every
     // stage recomputes; the fresh result is still written to the cache.

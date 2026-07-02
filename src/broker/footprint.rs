@@ -666,6 +666,47 @@ pub fn workers_to_fit_and_saturate(
     w
 }
 
+/// Auto-tune batch size to FIT the RAM budget, extending ADR 0071's
+/// fit-and-saturate auto-tune to a second knob (E2). Unlike workers, batch has
+/// no "saturate up" direction — raising it beyond what the recipe requested
+/// changes gradient-noise scale / convergence, a training-quality decision
+/// this auto-tuner must never make silently. So this only ever LOWERS:
+/// the largest `b ∈ 1..=d.batch` (the recipe's REQUESTED batch, not a computed
+/// target) whose footprint `estimate_ram_bytes(resolved_workers, b, …)` fits
+/// `avail_bytes − floor_bytes`.
+///
+/// `resolved_workers` must be the value `workers_to_fit_and_saturate` already
+/// picked for this SAME admission snapshot — `estimate_ram_bytes`'s
+/// `batch_term` (`PER_BATCH_BYTES` per unit) has no cross-term with the
+/// workers/tier/latent/in_ch terms (they're a flat additive sum), so
+/// resolving workers first and batch second against the residual budget
+/// reaches the identical feasibility boundary a joint 2-D search would —
+/// see `estimate_ram_bytes`'s doc comment for the term breakdown.
+///
+/// Always ≥ 1. `avail_bytes == 0` (probe unavailable) ⇒ returns the
+/// recipe's requested batch unchanged (mirrors `workers_to_fit_and_saturate`'s
+/// uncalibrated-box behavior — a box we can't size to behaves as before, no
+/// silent shrink). Same cross-crate parity contract as workers: compute ONCE
+/// at admission, thread the resolved value so RESOLVE and RECORD agree.
+pub fn batch_size_to_fit(
+    resolved_workers: u32,
+    avail_bytes: u64,
+    floor_bytes: u64,
+    d: &Drivers,
+) -> u32 {
+    if avail_bytes == 0 {
+        return d.batch.max(1);
+    }
+    let budget = avail_bytes.saturating_sub(floor_bytes);
+    let est =
+        |b: u32| estimate_ram_bytes(resolved_workers, b, d.tier, d.latent, d.warm, d.in_ch);
+    let mut b = d.batch.max(1);
+    while b > 1 && est(b) > budget {
+        b -= 1;
+    }
+    b
+}
+
 /// One persisted calibration entry. RAM is MAX-merged (monotone-up: a
 /// measured cgroup peak is the true need and, being cgroup-isolated,
 /// can't be poisoned by external contention — see ADR 0046 anti-poison
@@ -1297,6 +1338,77 @@ mod tests {
 
         // Few cores caps the throughput target at cpu_count − 2.
         assert_eq!(workers_to_fit_and_saturate(6, 10_000 * GIB, 6 * GIB, &d), 4);
+    }
+
+    #[test]
+    fn batch_auto_tune_only_ever_lowers_never_raises() {
+        let d = Drivers { workers: 0, batch: 64, tier: 3, latent: 256, warm: false, in_ch: 21 };
+        let est = |b: u32| estimate_ram_bytes(4, b, d.tier, d.latent, d.warm, d.in_ch);
+
+        // Huge RAM → the requested batch is returned UNCHANGED (never raised
+        // beyond what the recipe asked, unlike workers' saturate-up behavior).
+        assert_eq!(batch_size_to_fit(4, 10_000 * GIB, 6 * GIB, &d), 64);
+
+        // Tight RAM → the LARGEST b ≤ requested that fits `avail − floor`.
+        // (base 6G + workers 4×4G=16G + tier 3×2G=6G + latent 1G = 29G before
+        // any batch term, so the budget must clear that floor to be meaningful.)
+        let (avail, floor) = (37 * GIB, 6 * GIB);
+        let budget = avail - floor;
+        let b = batch_size_to_fit(4, avail, floor, &d);
+        assert!(b >= 1 && b <= 64);
+        assert!(est(b) <= budget, "fits the RAM budget (never-OOM)");
+        if b < 64 {
+            assert!(est(b + 1) > budget, "maximal: one more batch unit would not fit");
+        }
+
+        // Probe unavailable → the requested batch, unchanged (no silent shrink
+        // on a box we can't size to — mirrors workers' uncalibrated fallback,
+        // but returns the REQUEST not a fixed cap, since batch has no cap).
+        assert_eq!(batch_size_to_fit(4, 0, 6 * GIB, &d), 64);
+
+        // Even batch=1 doesn't fit a tiny box → 1 (never below 1; the gate
+        // then refuses on box-capacity, same floor as workers).
+        let budget_lt_one = est(1) - GIB;
+        assert_eq!(batch_size_to_fit(4, budget_lt_one + 6 * GIB, 6 * GIB, &d), 1);
+
+        // requested batch 0 floors at 1 (defensive; DEFAULT_BATCH is never 0
+        // in practice, but the fn must not divide-by/loop-on a 0 target).
+        let d0 = Drivers { batch: 0, ..d };
+        assert_eq!(batch_size_to_fit(4, 10_000 * GIB, 6 * GIB, &d0), 1);
+    }
+
+    #[test]
+    fn batch_and_workers_sequential_resolution_matches_joint_search() {
+        // The additive (no-cross-term) claim in `batch_size_to_fit`'s doc
+        // comment, checked empirically: resolving workers first via
+        // `workers_to_fit_and_saturate`, then batch against the residual
+        // budget, must reach the SAME feasibility boundary a hypothetical
+        // joint 2-D search would — i.e. the pair (w, b) it returns is the
+        // pointwise-maximal pair that still fits, not a strictly-smaller one.
+        let d = Drivers { workers: 0, batch: 48, tier: 3, latent: 256, warm: false, in_ch: 21 };
+        let (avail, floor) = (30 * GIB, 6 * GIB);
+        let budget = avail - floor;
+        let est = |w: u32, b: u32| estimate_ram_bytes(w, b, d.tier, d.latent, d.warm, d.in_ch);
+
+        let w = workers_to_fit_and_saturate(16, avail, floor, &d);
+        let b = batch_size_to_fit(w, avail, floor, &d);
+        assert!(est(w, b) <= budget, "the resolved (w,b) pair fits the budget");
+
+        // Maximality: bumping EITHER knob by one unit (holding the other
+        // fixed at its resolved value) must not fit — otherwise the
+        // sequential search left a cheaper joint solution on the table.
+        if w < MAX_AUTO_WORKERS {
+            assert!(
+                est(w + 1, b) > budget,
+                "one more worker (at the resolved batch) must not fit"
+            );
+        }
+        if b < d.batch {
+            assert!(
+                est(w, b + 1) > budget,
+                "one more batch unit (at the resolved workers) must not fit"
+            );
+        }
     }
 
     // ── calibration store (ADR 0046 slice-2) ──────────────────────────
