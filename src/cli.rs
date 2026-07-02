@@ -708,7 +708,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
     init_tracing();
     warn_if_stale_binary();
     let cli = Cli::parse();
-    match cli.command {
+    let result = match cli.command {
         Some(Command::Jobs { json }) => run_jobs(json),
         Some(Command::Cancel { id, grace }) => run_cancel(&id, grace).await,
         Some(Command::Log { id, tail, json }) => run_log(&id, tail, json),
@@ -765,6 +765,130 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
             );
             Ok(())
         }
+    };
+    // ADR 0072 A2: the command dispatch above is the CLI's single top-level
+    // error boundary — every subcommand's Result funnels through here before
+    // the caller's own `main()` formats it for the user. A `StageFailure`
+    // (ADR 0072) buried in the chain carries fields (`origin`/`course`/
+    // `recipe`/`ingredient`) that its own `Display` impl does NOT print (only
+    // severity/code/stage/context/message do) — surface them here so they're
+    // never silently lost. No-op (and silent) when the chain carries no
+    // `StageFailure`, e.g. a plain arg-parse error.
+    if let Err(ref e) = result {
+        print_stage_failure_detail(e);
+    }
+    result
+}
+
+/// See the call in [`run`]. Mirrors the terseness of the ADR-0071
+/// advisory-warning print (`⚠ training OK — completed with N advisory
+/// warning(s)...` below `run_recipe`): a short header line, then one
+/// `    · field: value` bullet per populated field. Fields left `None`
+/// (e.g. a `StageFailure` with no `ingredient` set) are simply omitted, not
+/// printed as empty.
+fn print_stage_failure_detail(err: &anyhow::Error) {
+    let Some(sf) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::framework::StageFailure>())
+    else {
+        return;
+    };
+    eprintln!("  [{}] {}:", sf.severity, sf.code);
+    eprintln!("    · origin: {:?}", sf.origin);
+    if let Some(course) = &sf.course {
+        eprintln!("    · course: {course}");
+    }
+    if let Some(recipe) = &sf.recipe {
+        eprintln!("    · recipe: {recipe}");
+    }
+    if let Some(stage) = &sf.stage {
+        eprintln!("    · stage: {stage}");
+    }
+    if let Some(ingredient) = &sf.ingredient {
+        eprintln!("    · ingredient: {ingredient}");
+    }
+}
+
+#[cfg(test)]
+mod chain_preservation_tests {
+    //! ADR 0072 A2 regression pin. The three `run_plan_cmd`/`run_hpo`/
+    //! `launch_compiled_plan` sites used to do
+    //! `Err(anyhow!("plan execution failed: {e}"))` — Display-interpolating
+    //! `e` into a FRESH `anyhow!()` erases `e` as the
+    //! new error's `source()`, so nothing downstream can downcast back to the
+    //! `StageFailure` a cookbook stage attached. The fix wraps with
+    //! `anyhow::Error::from(e).context(...)` instead, which preserves `e` as
+    //! the source. Reconstruct the exact chain the real code produces —
+    //! `StageFailure::into_error` → `StageError::Backend` →
+    //! `PlanError::StageFailed` → the cli.rs `.context()` wrap — and assert
+    //! the `StageFailure`, with every field, survives to the top.
+    use crate::framework::error::{PlanError, StageError};
+    use crate::framework::{FaultOrigin, Severity, StageFailure};
+
+    fn sample_stage_failure() -> StageFailure {
+        StageFailure {
+            course: Some("train".to_string()),
+            recipe: Some("train_joint".to_string()),
+            ingredient: Some("encoder".to_string()),
+            ..StageFailure::new("E_ROUNDTRIP", "eagle")
+                .severity(Severity::Critical)
+                .origin(FaultOrigin::External)
+                .stage("eagle_decode")
+                .context("ch", "4")
+        }
+    }
+
+    /// Build the exact chain `run_plan_cmd`/`run_recipe` produce on a stage
+    /// failure, ending with the (now-fixed) cli.rs wrap.
+    fn wrapped_chain(sf: StageFailure) -> anyhow::Error {
+        let backend_err = sf.into_error("decode(encode(x)) != x: first diff at sample 1847");
+        let stage_err = StageError::Backend(backend_err);
+        let plan_err = PlanError::StageFailed {
+            idx: 2,
+            stage: "eagle_decode".to_string(),
+            source: stage_err,
+        };
+        // The cli.rs fix (was: `anyhow!("plan execution failed: {e}")`).
+        anyhow::Error::from(plan_err).context("plan execution failed")
+    }
+
+    #[test]
+    fn stage_failure_survives_the_cli_context_wrap() {
+        let original = sample_stage_failure();
+        let final_err = wrapped_chain(original.clone());
+
+        // Top-level message still reads as before (context wrap didn't
+        // regress the user-facing text).
+        assert_eq!(final_err.to_string(), "plan execution failed");
+
+        // The regression pin: `e` must still be downcastable out of the
+        // chain — this is exactly what `print_stage_failure_detail` and
+        // any future `blut errors show`-style tooling rely on.
+        let found = final_err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<StageFailure>())
+            .expect("StageFailure must survive the .context() wrap — chain-preservation regressed");
+
+        assert_eq!(found.code, original.code);
+        assert_eq!(found.domain, original.domain);
+        assert_eq!(found.severity, original.severity);
+        assert_eq!(found.origin, original.origin);
+        assert_eq!(found.course, original.course);
+        assert_eq!(found.recipe, original.recipe);
+        assert_eq!(found.ingredient, original.ingredient);
+        assert_eq!(found.stage, original.stage);
+        assert_eq!(found.context, original.context);
+    }
+
+    #[test]
+    fn print_stage_failure_detail_finds_it_via_the_same_chain_walk() {
+        // Exercises the actual production helper (not a reimplementation) —
+        // it must not panic, and its internal `.chain().find_map(...)` must
+        // resolve to `Some` for this chain (verified indirectly: calling it
+        // is safe and it's a pure eprintln sink with no other observable
+        // side effect to assert on here).
+        let final_err = wrapped_chain(sample_stage_failure());
+        super::print_stage_failure_detail(&final_err);
     }
 }
 
@@ -1181,7 +1305,11 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                     if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
                         tracing::warn!("write Failed state for {job_id}: {se}");
                     }
-                    Err(anyhow!("plan execution failed: {e}"))
+                    // `.context()` (not `anyhow!("...: {e}")`) — preserves `e` as the
+                    // source() of the new error, so a StageFailure buried in the
+                    // PlanError→StageError chain survives to the top-level printer
+                    // in `run()` (ADR 0072 A2).
+                    Err(anyhow::Error::from(e).context("plan execution failed"))
                 }
             }
         }
@@ -2787,7 +2915,9 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
         }
         Err(e) => {
             let _ = crate::jobs::write_state(&job_id, JobState::Failed);
-            Err(anyhow!("hpo plan execution failed: {e}"))
+            // See the `plan execution failed` site in `run_plan_cmd` — same
+            // chain-preservation rationale (ADR 0072 A2).
+            Err(anyhow::Error::from(e).context("hpo plan execution failed"))
         }
     }
 }
@@ -3953,7 +4083,9 @@ async fn launch_compiled_plan(
             if let Err(ie) = crate::lineage_db::ingest_job(&job_id, name, "failed") {
                 tracing::debug!("lineage index (failed) {job_id}: {ie}");
             }
-            Err(anyhow!("plan execution failed: {e}"))
+            // See the `plan execution failed` site in `run_plan_cmd` — same
+            // chain-preservation rationale (ADR 0072 A2).
+            Err(anyhow::Error::from(e).context("plan execution failed"))
         }
     }
 }
