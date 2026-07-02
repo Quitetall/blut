@@ -1049,6 +1049,37 @@ mod stale_rebuild_tests {
         // an unknown bin → None.
         assert_eq!(crate_dir_for_installed_bin(SAMPLE, "nope"), None);
     }
+
+    // ── ADR 0072 A7: never-panics on adversarial input (property-based) ──
+    //
+    // The two tests above pin correctness on well-formed `.crates.toml`
+    // input. This is the complementary property: the doc comment on
+    // `crate_dir_for_installed_bin` promises "an unexpected/evolved format
+    // falls through to `None`... never a wrong dir" — the proptest below
+    // widens that to "never PANICS", fed input that is emphatically NOT
+    // well-formed `.crates.toml` (arbitrary Unicode, and separately, random
+    // garbage built only from the characters the real format uses — quotes,
+    // parens, brackets, `=`, `,`, newlines — to bias toward the parser's
+    // internal branches without being valid).
+    proptest::proptest! {
+        #[test]
+        fn crate_dir_for_installed_bin_never_panics(
+            crates_toml in proptest::prop_oneof![
+                proptest::prelude::any::<String>(),
+                "[a-zA-Z0-9_.:/()\\[\\],=+\"'\n -]{0,400}",
+            ],
+            bin in proptest::prop_oneof![
+                proptest::prelude::any::<String>(),
+                "[a-zA-Z0-9_-]{0,40}",
+            ],
+        ) {
+            // Only claim: this must run to completion (no panic — no OOB
+            // index/slice, no unwrap/expect, no arithmetic overflow). The
+            // return value is intentionally not asserted on here; happy-path
+            // shape is already pinned above.
+            let _ = crate_dir_for_installed_bin(&crates_toml, &bin);
+        }
+    }
 }
 
 /// Marker file written next to `args.json` so `plan resume` can

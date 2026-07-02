@@ -1686,4 +1686,45 @@ mod tests {
             "corrupt store must degrade to empty, not panic"
         );
     }
+
+    // ── ADR 0072 A7: property-based monotonicity ───────────────────────
+    //
+    // The hand-written `monotone_in_*` tests above pin specific before/after
+    // values. This proptest generalizes the doc-commented invariant
+    // ("**Monotone non-decreasing** in every argument") over random driver
+    // combinations: bumping ANY single driver (workers/batch/tier/
+    // latent_dim/in_ch) by a random positive delta, holding every other
+    // driver (including `warm`) fixed, must never lower the estimate. A
+    // hand-picked pair of values can miss a term that regresses only in
+    // some region of the input space; random generation exercises the
+    // whole domain.
+    proptest::proptest! {
+        #[test]
+        fn estimate_ram_bytes_monotone_in_each_driver(
+            workers in 0u32..100_000,
+            batch in 0u32..100_000,
+            tier in 0u32..1_000,
+            latent_dim in 0u32..1_000_000,
+            in_ch in 0u32..1_000_000,
+            warm in proptest::bool::ANY,
+            driver in 0u8..5,
+            delta in 1u32..1_000_000,
+        ) {
+            let lo = estimate_ram_bytes(workers, batch, tier, latent_dim, warm, in_ch);
+            let (w2, b2, t2, l2, i2) = match driver {
+                0 => (workers.saturating_add(delta), batch, tier, latent_dim, in_ch),
+                1 => (workers, batch.saturating_add(delta), tier, latent_dim, in_ch),
+                2 => (workers, batch, tier.saturating_add(delta), latent_dim, in_ch),
+                3 => (workers, batch, tier, latent_dim.saturating_add(delta), in_ch),
+                _ => (workers, batch, tier, latent_dim, in_ch.saturating_add(delta)),
+            };
+            let hi = estimate_ram_bytes(w2, b2, t2, l2, warm, i2);
+            proptest::prop_assert!(
+                hi >= lo,
+                "driver {driver} increase must not decrease RAM: lo={lo} hi={hi} \
+                 (w{workers} b{batch} t{tier} l{latent_dim} i{in_ch} warm={warm} -> \
+                 w{w2} b{b2} t{t2} l{l2} i{i2})"
+            );
+        }
+    }
 }

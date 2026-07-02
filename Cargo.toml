@@ -107,6 +107,9 @@ p2p = ["dep:ed25519-dalek", "dep:aes-gcm", "dep:x25519-dalek", "dep:blake3", "de
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.5", features = ["async_tokio"] }
+# Property-based testing (ADR 0072 A7) — monotonicity / soundness / never-panics
+# properties over random inputs, layered on top of the hand-written unit tests.
+proptest = "1"
 
 [[bench]]
 name = "framework"
