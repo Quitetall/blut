@@ -110,7 +110,10 @@ pub fn compile_erased<R: Recipe + Default>(
                 Err(e)
             }
         })
-        .map_err(|e| RecipeError::InvalidArgs(format!("{}: {e}", R::NAME)))?;
+        .map_err(|e| RecipeError::InvalidArgs {
+            field: None,
+            message: format!("{}: {e}", R::NAME),
+        })?;
     R::default().compile(args).map(|p| p.into_compiled())
 }
 
@@ -153,7 +156,12 @@ pub(crate) fn validate_args_against_schema(
     let Some(root) = schema_root(schema) else {
         return Ok(()); // no resolvable schema → let serde handle it
     };
-    let bad = |m: String| Err(RecipeError::InvalidArgs(format!("{recipe}: {m}")));
+    let bad = |m: String| {
+        Err(RecipeError::InvalidArgs {
+            field: None,
+            message: format!("{recipe}: {m}"),
+        })
+    };
     let Some(obj) = raw.as_object() else {
         // A unit/`()` Args serializes as null; only object-args reach here.
         return if raw.is_null() {

@@ -159,12 +159,33 @@ pub enum PlanError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RecipeError {
-    #[error("recipe args invalid: {0}")]
-    InvalidArgs(String),
+    /// Recipe args failed compile-time validation (schema preflight or
+    /// serde deserialize). `field` names the offending arg when the
+    /// caller can identify it statically; `None` when the message
+    /// already covers the failure precisely enough (e.g. a whole-args
+    /// shape error) or the field name is only known at runtime (not
+    /// `'static`, so it can't live in this variant — it stays folded
+    /// into `message` instead).
+    #[error("{}", invalid_args_display(*field, message))]
+    InvalidArgs {
+        field: Option<&'static str>,
+        message: String,
+    },
     #[error("recipe compile failed: {0}")]
     CompileFailed(String),
     #[error("recipe '{name}' not found in catalog")]
     NotFound { name: String },
+}
+
+/// `Display` helper for `RecipeError::InvalidArgs` — thiserror's `#[error]`
+/// can reference struct fields directly, but formatting the field name
+/// only when present needs a branch, so it's factored out here rather
+/// than duplicated across a manual `impl Display`.
+fn invalid_args_display(field: Option<&'static str>, message: &str) -> String {
+    match field {
+        Some(field) => format!("recipe args invalid ({field}): {message}"),
+        None => format!("recipe args invalid: {message}"),
+    }
 }
 
 #[cfg(test)]
@@ -218,5 +239,28 @@ mod tests {
             name: "frobulate".into(),
         };
         assert!(format!("{e}").contains("frobulate"));
+    }
+
+    #[test]
+    fn recipe_error_invalid_args_shows_field_when_some() {
+        let e = RecipeError::InvalidArgs {
+            field: Some("learning_rate"),
+            message: "expected number, got string".into(),
+        };
+        let msg = format!("{e}");
+        assert!(msg.contains("learning_rate"));
+        assert!(msg.contains("expected number, got string"));
+    }
+
+    #[test]
+    fn recipe_error_invalid_args_message_only_when_none() {
+        let e = RecipeError::InvalidArgs {
+            field: None,
+            message: "sft_train: args must be a JSON object".into(),
+        };
+        let msg = format!("{e}");
+        assert!(msg.contains("sft_train: args must be a JSON object"));
+        // No stray field-name parenthetical when `field` is absent.
+        assert!(!msg.contains("("));
     }
 }
