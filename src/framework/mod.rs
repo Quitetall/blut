@@ -52,7 +52,8 @@ pub use dag_opt::{DagOptimizer, ScheduleHint};
 pub use cookbook::{ArtifactDescriptor, Cookbook, Registry, StageDescriptor};
 pub use error::{PlanError, RecipeError, StageError};
 pub use error_domain::{
-    ErrorDomain, FailureSummary, FaultOrigin, Severity, StageFailure, extract_failure_summary,
+    ErrorDomain, ErrorDomainDef, FailureSummary, FaultOrigin, Severity, StageFailure,
+    extract_failure_summary,
 };
 pub use executor::{ExecCtx, ParallelExecutor, PlanResult, SequentialExecutor, execute_plan};
 pub use graph::{GraphSnapshot, NodeStatus, PlanGraph, graph_snapshot};

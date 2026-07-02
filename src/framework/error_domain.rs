@@ -86,6 +86,53 @@ pub trait ErrorDomain: Send + Sync + 'static {
     const CODES: &[(&'static str, &'static str)];
 }
 
+/// Plain-data snapshot of an [`ErrorDomain`]'s catalog.
+///
+/// Associated consts (`NAME`/`CODES`) block `ErrorDomain` from being
+/// object-safe, so a registry can't hold `Vec<Box<dyn ErrorDomain>>` the
+/// way [`crate::framework::cookbook::Cookbook`] holds trait objects.
+/// [`register_error_domain!`] copies the consts into this plain struct at
+/// the registration site instead — the exact move
+/// [`crate::recipes::recipe::register_recipe!`] makes for `Recipe` →
+/// `RecipeDef`. This is what actually travels through
+/// [`crate::framework::cookbook::Cookbook::error_domains`] and
+/// [`crate::framework::cookbook::Registry::all_error_domains`] for
+/// `blut errors list` (ADR 0072 A4) to enumerate.
+#[derive(Clone, Copy, Debug)]
+pub struct ErrorDomainDef {
+    pub name: &'static str,
+    pub codes: &'static [(&'static str, &'static str)],
+}
+
+/// Emit a cookbook's `pub static ERROR_DOMAIN_DEF: ErrorDomainDef` from its
+/// [`ErrorDomain`] impl, so `blut errors list` can discover it. Mirrors
+/// [`crate::recipes::recipe::register_recipe!`]'s shape:
+///
+/// ```ignore
+/// pub struct EagleErrorDomain;
+/// impl ErrorDomain for EagleErrorDomain {
+///     const NAME: &'static str = "eagle";
+///     const CODES: &[(&'static str, &'static str)] = &[("E_ROUNDTRIP", "decode(encode(x)) != x")];
+/// }
+/// blut::register_error_domain!(EagleErrorDomain);   // → pub static ERROR_DOMAIN_DEF
+/// ```
+///
+/// A cookbook then lists it from `Cookbook::error_domains()`, e.g.
+/// `&[&errors::ERROR_DOMAIN_DEF]`. As of this writing no cookbook has
+/// called this yet (a later cookbook-side workflow adds the first one) —
+/// `blut errors list` prints "no error domains registered" until then,
+/// rather than assuming a catalog exists.
+#[macro_export]
+macro_rules! register_error_domain {
+    ($ty:ty) => {
+        pub static ERROR_DOMAIN_DEF: $crate::framework::error_domain::ErrorDomainDef =
+            $crate::framework::error_domain::ErrorDomainDef {
+                name: <$ty as $crate::framework::error_domain::ErrorDomain>::NAME,
+                codes: <$ty as $crate::framework::error_domain::ErrorDomain>::CODES,
+            };
+    };
+}
+
 // ── StageFailure ───────────────────────────────────────────────────
 
 /// Structured failure context emitted by cookbook stages.
