@@ -364,6 +364,11 @@ pub struct StageWarning {
     pub stage: String,
     /// The failure the advisory stage produced (downgraded from fatal).
     pub reason: String,
+    /// Who's at fault for the advisory failure — engine, cookbook glue, or
+    /// external (ADR 0072). `None` when the underlying `StageError` doesn't
+    /// carry a `StageFailure` to extract it from (the common case today;
+    /// cookbooks don't yet attach structured failures to advisory stages).
+    pub origin: Option<crate::framework::error_domain::FaultOrigin>,
 }
 
 /// Whether advisory stages are forced FATAL for this run (ADR 0071 strict mode),
@@ -1782,6 +1787,11 @@ impl SequentialExecutor {
                                 idx: *idx,
                                 stage: stage.clone(),
                                 reason: source.to_string(),
+                                // No StageFailure downcast happens on this path today
+                                // (source is only stringified above) — nothing to
+                                // thread through yet (ADR 0072 B-series wires real
+                                // origins into cookbook StageFailures).
+                                origin: None,
                             });
                             break;
                         }
@@ -2584,7 +2594,16 @@ impl ParallelExecutor {
                         // KILL (their input can't materialize), but do NOT fail the
                         // plan — other branches keep running.
                         tracing::warn!("advisory stage '{stage}' failed (non-fatal): {reason}");
-                        warnings.push(StageWarning { idx, stage, reason });
+                        // No StageFailure downcast happens on this path today
+                        // (reason is only stringified above) — nothing to thread
+                        // through yet (ADR 0072 B-series wires real origins into
+                        // cookbook StageFailures).
+                        warnings.push(StageWarning {
+                            idx,
+                            stage,
+                            reason,
+                            origin: None,
+                        });
                         if let Some(k) = node_key_of.remove(&nid) {
                             inflight_keys.remove(&k);
                             if let Some(waiters) = deferred.remove(&k) {
@@ -2945,6 +2964,11 @@ mod tests {
             .expect("an advisory gate's failure must NOT fail the plan");
         assert_eq!(result.warnings.len(), 1, "the advisory failure is recorded");
         assert_eq!(result.warnings[0].stage, "advisory_gate");
+        // ADR 0072 A5: the coordinator/sequential paths don't downcast the
+        // failure to a `StageFailure` before building the warning today, so
+        // there's no origin to thread through yet — this pins that current
+        // behaviour rather than silently starting to assume a value.
+        assert_eq!(result.warnings[0].origin, None);
         // The upstream train output is surfaced even though the terminal gate tripped.
         let counter: Counter = result
             .final_output
@@ -2952,6 +2976,28 @@ mod tests {
             .into_typed()
             .unwrap();
         assert_eq!(counter.n, 1);
+    }
+
+    /// ADR 0072 A5: `StageWarning::origin` can carry fault-attribution data
+    /// when it's available. `StageWarning` isn't `Serialize` and its
+    /// `warnings` Vec is only ever inspected in-memory (printed by `cli.rs`,
+    /// asserted on directly in tests) — no serde round-trip exists to pin,
+    /// so this is a plain construction + field-access regression test.
+    #[test]
+    fn stage_warning_carries_optional_fault_origin() {
+        let w = StageWarning {
+            idx: 0,
+            stage: "advisory_gate".to_string(),
+            reason: "upstream service timed out".to_string(),
+            origin: Some(crate::framework::error_domain::FaultOrigin::Engine),
+        };
+        assert_eq!(
+            w.origin,
+            Some(crate::framework::error_domain::FaultOrigin::Engine)
+        );
+        // Clone must preserve it too (StageWarning derives Clone).
+        let cloned = w.clone();
+        assert_eq!(cloned.origin, w.origin);
     }
 
     #[tokio::test]
