@@ -1409,6 +1409,28 @@ mod tests {
                 "one more batch unit (at the resolved workers) must not fit"
             );
         }
+
+        // MiMo review follow-up: pointwise maximality at (w,b) alone doesn't
+        // rule out a DIFFERENT pair (w', b') — e.g. fewer workers freeing
+        // enough budget for strictly more batch — that also fits. Brute-force
+        // every candidate pair in range and assert none dominates (w,b) on
+        // BOTH axes simultaneously; a workers-heavy target is the correct
+        // choice for the stated lexicographic objective (saturate throughput
+        // first, batch second), so a candidate with w' > w is allowed to have
+        // b' < b (that's expected, not a violation) — the real claim is that
+        // nothing fits with aHIGHER batch at the SAME OR HIGHER worker count.
+        for cand_w in 1..=16u32 {
+            for cand_b in 1..=d.batch {
+                if est(cand_w, cand_b) <= budget && cand_w >= w {
+                    assert!(
+                        cand_b <= b,
+                        "({cand_w},{cand_b}) fits at >= the resolved worker count \
+                         but has a HIGHER batch than the resolved ({w},{b}) — the \
+                         sequential search left a better solution on the table"
+                    );
+                }
+            }
+        }
     }
 
     // ── calibration store (ADR 0046 slice-2) ──────────────────────────
