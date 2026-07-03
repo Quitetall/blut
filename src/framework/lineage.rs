@@ -75,6 +75,82 @@ pub fn job_lineage(job_id: &str) -> Result<Vec<LineageNode>> {
     Ok(by_idx.into_values().collect())
 }
 
+/// One job's TERMINAL failure — replayed from `status.jsonl`'s
+/// `StageFailed` events, the same source [`job_lineage`] replays. A stage
+/// that fails and still has retries left emits `StageRetrying`, not
+/// `StageFailed` (executor.rs); only an exhausted-retries or non-retried
+/// failure reaches this stream, and it halts the plan — so the LAST
+/// `StageFailed` line in the file is the terminal one. `blut errors show`
+/// (ADR 0072 A4) is the sole consumer.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct JobFailure {
+    pub node_idx: u32,
+    pub stage: String,
+    /// The `Display` form of the `StageError` (always present).
+    pub error: String,
+    /// Structured origin/course/recipe/ingredient breakdown, when the
+    /// failing stage's error chain carried a `StageFailure`. `None` for a
+    /// legacy status.jsonl predating ADR 0072, or a `StageError` variant
+    /// that never wraps one — the raw `error` string is still shown.
+    pub failure: Option<crate::framework::error_domain::FailureSummary>,
+}
+
+/// Result of scanning a job's `status.jsonl` for its terminal failure.
+///
+/// `failure.is_none() && parse_errors == 0` is the only case that means
+/// "genuinely no failure" (succeeded, still running, or hasn't started).
+/// `failure.is_none() && parse_errors > 0` means the scan hit one or more
+/// lines it could not parse as a `StageEvent` — e.g. a torn/truncated
+/// write from a disk-full condition or the orchestrator dying mid-flush.
+/// Any of those unparseable lines COULD have been the terminal
+/// `StageFailed` event; there is no way to tell from a line that failed
+/// to parse. Callers must not report a clean "no failure" in that case.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct JobFailureLookup {
+    pub failure: Option<JobFailure>,
+    /// Count of `status.jsonl` lines that failed to parse as a
+    /// `StageEvent` during the scan.
+    pub parse_errors: u32,
+}
+
+/// `failure: None, parse_errors: 0` when the job has no `StageFailed`
+/// event at all and every line parsed cleanly — it succeeded, is still
+/// running, or hasn't started. `parse_errors > 0` means the record may be
+/// incomplete (see [`JobFailureLookup`]); never silently treat that as
+/// "no failure".
+pub fn job_failure(job_id: &str) -> Result<JobFailureLookup> {
+    let id = jobs::resolve_job_id(job_id)?;
+    let mut last: Option<JobFailure> = None;
+    let mut parse_errors: u32 = 0;
+    for line in jobs::read_status_lines(&id)? {
+        let ev = match serde_json::from_str::<StageEvent>(&line) {
+            Ok(ev) => ev,
+            Err(_) => {
+                parse_errors += 1;
+                continue;
+            }
+        };
+        if let StageEvent::StageFailed {
+            node_idx,
+            stage_name,
+            error,
+            failure,
+        } = ev
+        {
+            last = Some(JobFailure {
+                node_idx,
+                stage: stage_name,
+                error,
+                failure,
+            });
+        }
+    }
+    Ok(JobFailureLookup {
+        failure: last,
+        parse_errors,
+    })
+}
+
 /// Fold a job's `status.jsonl` `StageStep` events into metric rows for the
 /// queryable metric store (E1) — the sibling of [`job_lineage`], NO new writer.
 /// Each finite numeric leaf of a step's `update` payload (`val_r`, `train_loss`,
@@ -363,6 +439,158 @@ mod tests {
         assert!(
             metrics.iter().any(|m| m.metric == "val_r"),
             "the real training metric still folds"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("LAMU_TRAIN_JOBS_DIR", v),
+                None => std::env::remove_var("LAMU_TRAIN_JOBS_DIR"),
+            }
+        }
+    }
+
+    /// `blut errors show` (ADR 0072 A4) reads exactly this: a terminal
+    /// `StageFailed` carrying a full `FailureSummary` must surface all 5
+    /// breakdown fields (origin/course/recipe/stage/ingredient), and a
+    /// preceding `StageRetrying` on the same node must NOT be mistaken
+    /// for the terminal failure.
+    #[test]
+    fn job_failure_surfaces_full_structured_breakdown() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let prev = std::env::var("LAMU_TRAIN_JOBS_DIR").ok();
+        unsafe {
+            std::env::set_var("LAMU_TRAIN_JOBS_DIR", td.path());
+        }
+
+        let job = "20260702-000000-errshow";
+        let jdir = td.path().join(job);
+        std::fs::create_dir_all(&jdir).unwrap();
+        let lines = [
+            r#"{"kind":"stage_retrying","node_idx":2,"stage_name":"train_joint","attempt":1,"max_attempts":3,"error":"transient OOM","backoff_ms":500}"#,
+            r#"{"kind":"stage_failed","node_idx":2,"stage_name":"train_joint","error":"stage failed: OOM killed at epoch 3","failure":{"code":"E_OOM","domain":"lamquant","stage":"train_joint","severity":"critical","origin":"external","course":"train","recipe":"train_joint","ingredient":"trainer","context":[["ram_gib","64"]],"message":"OOM killed at epoch 3"}}"#,
+        ];
+        std::fs::write(jdir.join("status.jsonl"), lines.join("\n") + "\n").unwrap();
+
+        let lookup = job_failure(job).unwrap();
+        assert_eq!(lookup.parse_errors, 0, "every line here parses cleanly");
+        let jf = lookup.failure.expect("a StageFailed event exists");
+        assert_eq!(jf.node_idx, 2);
+        assert_eq!(jf.stage, "train_joint");
+        assert!(jf.error.contains("OOM killed"));
+        let f = jf.failure.expect("a structured FailureSummary was attached");
+        assert_eq!(f.origin, crate::framework::error_domain::FaultOrigin::External);
+        assert_eq!(f.course.as_deref(), Some("train"));
+        assert_eq!(f.recipe.as_deref(), Some("train_joint"));
+        assert_eq!(f.stage.as_deref(), Some("train_joint"));
+        assert_eq!(f.ingredient.as_deref(), Some("trainer"));
+        assert_eq!(f.code, "E_OOM");
+        assert_eq!(f.domain, "lamquant");
+        assert_eq!(
+            f.severity,
+            crate::framework::error_domain::Severity::Critical
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("LAMU_TRAIN_JOBS_DIR", v),
+                None => std::env::remove_var("LAMU_TRAIN_JOBS_DIR"),
+            }
+        }
+    }
+
+    /// A job that succeeded (or hasn't run yet) has no `StageFailed`
+    /// event at all and every line parses cleanly — `job_failure` must
+    /// return `failure: None, parse_errors: 0`, never panic or synthesize
+    /// a failure. `blut errors show` reads this as "no failure recorded".
+    #[test]
+    fn job_failure_none_when_no_failed_event_recorded() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let prev = std::env::var("LAMU_TRAIN_JOBS_DIR").ok();
+        unsafe {
+            std::env::set_var("LAMU_TRAIN_JOBS_DIR", td.path());
+        }
+
+        let job = "20260702-000001-errshowok";
+        let jdir = td.path().join(job);
+        std::fs::create_dir_all(&jdir).unwrap();
+        let zeros = "0".repeat(64);
+        let ones = "1".repeat(64);
+        let lines = [
+            format!(
+                r#"{{"kind":"stage_begin","node_idx":0,"stage_name":"prep","input_hash":"{zeros}"}}"#
+            ),
+            format!(
+                r#"{{"kind":"stage_end","node_idx":0,"stage_name":"prep","output_hash":"{ones}","elapsed":{{"secs":1,"nanos":0}}}}"#
+            ),
+        ];
+        std::fs::write(jdir.join("status.jsonl"), lines.join("\n") + "\n").unwrap();
+
+        let lookup = job_failure(job).unwrap();
+        assert!(lookup.failure.is_none());
+        assert_eq!(
+            lookup.parse_errors, 0,
+            "every line parses cleanly, so the clean 'no failure' reading is trustworthy"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("LAMU_TRAIN_JOBS_DIR", v),
+                None => std::env::remove_var("LAMU_TRAIN_JOBS_DIR"),
+            }
+        }
+    }
+
+    /// The auditor's empirical repro (CONFIRMED finding, feat/error-domains
+    /// hardening pass): a torn/truncated write (disk-full, or the
+    /// orchestrator dying mid-flush) can corrupt exactly the terminal
+    /// `StageFailed` line. Before this fix, `job_failure` silently
+    /// `continue`d past the unparseable line and returned `None` —
+    /// indistinguishable from a job that actually succeeded. It must now
+    /// surface `parse_errors > 0` so `blut errors show` can tell the
+    /// operator the record may be incomplete instead of flatly asserting
+    /// "no failure recorded".
+    #[test]
+    fn job_failure_surfaces_parse_errors_instead_of_false_clean_none() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let prev = std::env::var("LAMU_TRAIN_JOBS_DIR").ok();
+        unsafe {
+            std::env::set_var("LAMU_TRAIN_JOBS_DIR", td.path());
+        }
+
+        let job = "20260702-000002-tornwrite";
+        let jdir = td.path().join(job);
+        std::fs::create_dir_all(&jdir).unwrap();
+        let zeros = "0".repeat(64);
+        // A clean StageBegin, then a StageFailed line torn mid-write (the
+        // process died / disk filled up after flushing only a prefix of
+        // the JSON object) — invalid JSON, not a legitimate non-StageEvent
+        // line.
+        let lines = [
+            format!(
+                r#"{{"kind":"stage_begin","node_idx":3,"stage_name":"train_joint","input_hash":"{zeros}"}}"#
+            ),
+            r#"{"kind":"stage_failed","node_idx":3,"stage_name":"train_joint","error":"stage fail"#
+                .to_string(),
+        ];
+        std::fs::write(jdir.join("status.jsonl"), lines.join("\n") + "\n").unwrap();
+
+        let lookup = job_failure(job).unwrap();
+        assert!(
+            lookup.failure.is_none(),
+            "the torn line can't be parsed as the terminal failure"
+        );
+        assert_eq!(
+            lookup.parse_errors, 1,
+            "the torn StageFailed line must be counted, not silently skipped"
         );
 
         unsafe {

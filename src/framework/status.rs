@@ -329,6 +329,53 @@ mod tests {
         assert!(s.contains("\"resource\":\"gpu\""));
     }
 
+    /// Forward-compat regression pin at the exact level the finding
+    /// describes: a raw `status.jsonl` line for `StageFailed` carrying a
+    /// `failure.origin`/`failure.severity` token this binary version
+    /// doesn't recognize (e.g. written by a future binary with a new
+    /// `FaultOrigin` variant) must still deserialize as a `StageEvent` --
+    /// not be silently dropped by callers like `lineage.rs`'s
+    /// `let Ok(ev) = serde_json::from_str::<StageEvent>(&line) else {
+    /// continue }` pattern, which previously dropped the WHOLE event (not
+    /// just the one unrecognized field) on any unrecognized token.
+    #[test]
+    fn stage_failed_survives_unrecognized_origin_and_severity_tokens() {
+        let line = r#"{"kind":"stage_failed","node_idx":3,"stage_name":"train_joint","error":"stage failed: e2e recon mismatch","failure":{"code":"E_FUTURE","domain":"lamquant","stage":"train_joint","severity":"apocalyptic","origin":"quantum","course":"train","recipe":"train_joint","ingredient":"trainer","context":[["ram_gib","64"]],"message":"e2e recon mismatch"}}"#;
+        let ev: StageEvent =
+            serde_json::from_str(line).expect("unrecognized origin/severity tokens must not fail the whole StageEvent");
+        match ev {
+            StageEvent::StageFailed {
+                node_idx,
+                stage_name,
+                error,
+                failure,
+            } => {
+                assert_eq!(node_idx, 3);
+                assert_eq!(stage_name, "train_joint");
+                assert!(error.contains("e2e recon mismatch"));
+                let f = failure.expect("the structured FailureSummary must still attach");
+                assert_eq!(
+                    f.origin,
+                    crate::framework::error_domain::FaultOrigin::Unknown
+                );
+                assert_eq!(
+                    f.severity,
+                    crate::framework::error_domain::Severity::Unknown
+                );
+                // The rest of the record survives too, not just the two
+                // fallback fields.
+                assert_eq!(f.code, "E_FUTURE");
+                assert_eq!(f.domain, "lamquant");
+                assert_eq!(f.stage.as_deref(), Some("train_joint"));
+                assert_eq!(f.course.as_deref(), Some("train"));
+                assert_eq!(f.recipe.as_deref(), Some("train_joint"));
+                assert_eq!(f.ingredient.as_deref(), Some("trainer"));
+                assert_eq!(f.message, "e2e recon mismatch");
+            }
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
     #[tokio::test]
     async fn make_broadcast_subscribes_round_trip() {
         let tx = make_broadcast();

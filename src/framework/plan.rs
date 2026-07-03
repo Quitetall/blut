@@ -1086,4 +1086,124 @@ mod tests {
     // proxy: building a typed chain is checked by the compiler;
     // mismatched-tuple Plan<(A, B)>::merge requires a stage with
     // Input = (A, B) which forces the compile-time witness.
+
+    // ── ADR 0072 A7: DAG cycle-detection soundness (property-based) ────
+    //
+    // `topo_order`'s Kahn's-algorithm implementation only reads
+    // `nodes.len()` + `edges` — it never inspects a node's kind-chain, so a
+    // `CompiledPlan` can be built directly (bypassing the typed `Plan`
+    // builder's kind-chain checks) with an arbitrary edge set. That is
+    // exactly what we want here: the property under test is graph-
+    // structural (topological-sort soundness), not the typed-stage DSL.
+
+    /// Minimal stand-in node — `topo_order` never inspects a node's stage
+    /// content, only `nodes.len()` and `edges`, so any `Stage` impl works.
+    fn dummy_node(id: NodeId) -> PlanNode {
+        PlanNode {
+            id,
+            stage: Arc::new(MakeA),
+            args: serde_json::json!({}),
+            canon_args: Vec::new(),
+            retry: None,
+            timeout: None,
+        }
+    }
+
+    /// Build a bare `CompiledPlan` with `n` nodes (ids `0..n`) and the
+    /// given `(from, to)` edges — no typed kind-chain checks, no `initial`
+    /// entries (`topo_order` doesn't read either).
+    fn make_compiled_plan(n: usize, edges: Vec<(NodeId, NodeId)>) -> CompiledPlan {
+        CompiledPlan {
+            name: "prop_plan".to_string(),
+            nodes: (0..n as NodeId).map(dummy_node).collect(),
+            edges: edges
+                .into_iter()
+                .map(|(from, to)| PlanEdge { from, to })
+                .collect(),
+            initial: HashMap::new(),
+            recipe_args: serde_json::json!({}),
+        }
+    }
+
+    /// Strategy: a random small DAG (5..=10 nodes) with a sparse random
+    /// subset of the forward-only pairs `(i, j)` for `i < j`. Restricting
+    /// edges to `i < j` guarantees the generated graph is acyclic by
+    /// construction (a topological order — the identity permutation —
+    /// always exists), without needing a separate acyclicity check.
+    fn arb_acyclic_dag() -> impl proptest::strategy::Strategy<Value = (usize, Vec<(NodeId, NodeId)>)>
+    {
+        use proptest::prelude::*;
+        (5usize..=10).prop_flat_map(|n| {
+            let pairs: Vec<(NodeId, NodeId)> = (0..n)
+                .flat_map(|i| ((i + 1)..n).map(move |j| (i as NodeId, j as NodeId)))
+                .collect();
+            let len = pairs.len();
+            prop::collection::vec(any::<bool>(), len).prop_map(move |mask| {
+                let edges: Vec<(NodeId, NodeId)> = pairs
+                    .iter()
+                    .zip(mask.iter())
+                    .filter(|&(_, &keep)| keep)
+                    .map(|(&e, _)| e)
+                    .collect();
+                (n, edges)
+            })
+        })
+    }
+
+    /// Same generator, plus a deliberately-inserted cycle: a ring edge
+    /// `i -> (i+1) % n` for every node. The ring alone gives every node an
+    /// incoming edge, so Kahn's algorithm can never find a 0-indegree node
+    /// to start from — the whole node set is one cycle, regardless of
+    /// whatever forward edges are unioned in on top.
+    fn arb_dag_with_cycle() -> impl proptest::strategy::Strategy<Value = (usize, Vec<(NodeId, NodeId)>)>
+    {
+        use proptest::strategy::Strategy;
+        arb_acyclic_dag().prop_map(|(n, mut edges)| {
+            for i in 0..n {
+                edges.push((i as NodeId, ((i + 1) % n) as NodeId));
+            }
+            (n, edges)
+        })
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn topo_order_succeeds_on_random_acyclic_dag((n, edges) in arb_acyclic_dag()) {
+            let plan = make_compiled_plan(n, edges.clone());
+            let order = plan.topo_order().expect("acyclic DAG must topo-sort");
+            proptest::prop_assert_eq!(order.len(), n, "must visit exactly N nodes");
+            let mut seen = std::collections::HashSet::new();
+            for &id in &order {
+                proptest::prop_assert!(seen.insert(id), "node {id} visited twice");
+            }
+            // Every edge's predecessor must precede its successor in the order.
+            let pos: std::collections::HashMap<NodeId, usize> =
+                order.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+            for (from, to) in &edges {
+                proptest::prop_assert!(
+                    pos[from] < pos[to],
+                    "edge {from}->{to} violated: pos[{from}]={} pos[{to}]={}",
+                    pos[from],
+                    pos[to]
+                );
+            }
+        }
+
+        #[test]
+        fn topo_order_always_errs_on_dag_with_cycle((n, edges) in arb_dag_with_cycle()) {
+            let plan = make_compiled_plan(n, edges);
+            match plan.topo_order() {
+                Err(crate::framework::error::PlanError::Cycle(_)) => {}
+                Err(other) => proptest::prop_assert!(
+                    false,
+                    "a graph containing a cycle must report PlanError::Cycle, got {other:?}"
+                ),
+                Ok(order) => proptest::prop_assert!(
+                    false,
+                    "a graph containing a cycle must report PlanError::Cycle, got Ok(len={})",
+                    order.len()
+                ),
+            }
+        }
+    }
 }

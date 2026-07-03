@@ -132,6 +132,11 @@ enum Command {
         #[arg(long)]
         minimize: bool,
     },
+    /// Error-domain catalog + per-job failure breakdown (ADR 0072 A4).
+    Errors {
+        #[command(subcommand)]
+        cmd: ErrorsCommand,
+    },
     /// Declared, persistent partition key-space over a recipe + per-cell
     /// backfill (Dagster-class partitions, v0.20 Phase G).
     Partition {
@@ -489,6 +494,31 @@ enum RunsCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum ErrorsCommand {
+    /// List every registered `ErrorDomain` catalog (ADR 0072 A4). A
+    /// cookbook registers one via `register_error_domain!`; none does
+    /// today (a later cookbook-side workflow adds the first), so this
+    /// prints "no error domains registered" instead of assuming a
+    /// catalog exists.
+    List {
+        /// Emit the catalog as JSON (for scripts/agents).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a job's terminal failure: the origin/course/recipe/stage/
+    /// ingredient breakdown, read from the same status.jsonl `blut
+    /// results` reads lineage from. Prints "no failure recorded" for a
+    /// job that succeeded or hasn't run/failed yet.
+    Show {
+        /// Job id (prefix ok).
+        job: String,
+        /// Emit machine-readable JSON instead of a human summary.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum RecipeCommand {
     /// List the recipe catalog.
     List {
@@ -708,7 +738,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
     init_tracing();
     warn_if_stale_binary();
     let cli = Cli::parse();
-    match cli.command {
+    let result = match cli.command {
         Some(Command::Jobs { json }) => run_jobs(json),
         Some(Command::Cancel { id, grace }) => run_cancel(&id, grace).await,
         Some(Command::Log { id, tail, json }) => run_log(&id, tail, json),
@@ -729,6 +759,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
             };
             run_results(&job, json, &metric, force)
         }
+        Some(Command::Errors { cmd }) => run_errors(&reg, cmd),
         Some(Command::Partition { cmd }) => run_partition(&reg, cmd).await,
         Some(Command::Artifact { cmd }) => run_artifact_cmd(cmd),
         Some(Command::Schedule { cmd }) => run_schedule_cmd(&reg, cmd),
@@ -765,6 +796,130 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
             );
             Ok(())
         }
+    };
+    // ADR 0072 A2: the command dispatch above is the CLI's single top-level
+    // error boundary — every subcommand's Result funnels through here before
+    // the caller's own `main()` formats it for the user. A `StageFailure`
+    // (ADR 0072) buried in the chain carries fields (`origin`/`course`/
+    // `recipe`/`ingredient`) that its own `Display` impl does NOT print (only
+    // severity/code/stage/context/message do) — surface them here so they're
+    // never silently lost. No-op (and silent) when the chain carries no
+    // `StageFailure`, e.g. a plain arg-parse error.
+    if let Err(ref e) = result {
+        print_stage_failure_detail(e);
+    }
+    result
+}
+
+/// See the call in [`run`]. Mirrors the terseness of the ADR-0071
+/// advisory-warning print (`⚠ training OK — completed with N advisory
+/// warning(s)...` below `run_recipe`): a short header line, then one
+/// `    · field: value` bullet per populated field. Fields left `None`
+/// (e.g. a `StageFailure` with no `ingredient` set) are simply omitted, not
+/// printed as empty.
+fn print_stage_failure_detail(err: &anyhow::Error) {
+    let Some(sf) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::framework::StageFailure>())
+    else {
+        return;
+    };
+    eprintln!("  [{}] {}:", sf.severity, sf.code);
+    eprintln!("    · origin: {:?}", sf.origin);
+    if let Some(course) = &sf.course {
+        eprintln!("    · course: {course}");
+    }
+    if let Some(recipe) = &sf.recipe {
+        eprintln!("    · recipe: {recipe}");
+    }
+    if let Some(stage) = &sf.stage {
+        eprintln!("    · stage: {stage}");
+    }
+    if let Some(ingredient) = &sf.ingredient {
+        eprintln!("    · ingredient: {ingredient}");
+    }
+}
+
+#[cfg(test)]
+mod chain_preservation_tests {
+    //! ADR 0072 A2 regression pin. The three `run_plan_cmd`/`run_hpo`/
+    //! `launch_compiled_plan` sites used to do
+    //! `Err(anyhow!("plan execution failed: {e}"))` — Display-interpolating
+    //! `e` into a FRESH `anyhow!()` erases `e` as the
+    //! new error's `source()`, so nothing downstream can downcast back to the
+    //! `StageFailure` a cookbook stage attached. The fix wraps with
+    //! `anyhow::Error::from(e).context(...)` instead, which preserves `e` as
+    //! the source. Reconstruct the exact chain the real code produces —
+    //! `StageFailure::into_error` → `StageError::Backend` →
+    //! `PlanError::StageFailed` → the cli.rs `.context()` wrap — and assert
+    //! the `StageFailure`, with every field, survives to the top.
+    use crate::framework::error::{PlanError, StageError};
+    use crate::framework::{FaultOrigin, Severity, StageFailure};
+
+    fn sample_stage_failure() -> StageFailure {
+        StageFailure {
+            course: Some("train".to_string()),
+            recipe: Some("train_joint".to_string()),
+            ingredient: Some("encoder".to_string()),
+            ..StageFailure::new("E_ROUNDTRIP", "eagle")
+                .severity(Severity::Critical)
+                .origin(FaultOrigin::External)
+                .stage("eagle_decode")
+                .context("ch", "4")
+        }
+    }
+
+    /// Build the exact chain `run_plan_cmd`/`run_recipe` produce on a stage
+    /// failure, ending with the (now-fixed) cli.rs wrap.
+    fn wrapped_chain(sf: StageFailure) -> anyhow::Error {
+        let backend_err = sf.into_error("decode(encode(x)) != x: first diff at sample 1847");
+        let stage_err = StageError::Backend(backend_err);
+        let plan_err = PlanError::StageFailed {
+            idx: 2,
+            stage: "eagle_decode".to_string(),
+            source: stage_err,
+        };
+        // The cli.rs fix (was: `anyhow!("plan execution failed: {e}")`).
+        anyhow::Error::from(plan_err).context("plan execution failed")
+    }
+
+    #[test]
+    fn stage_failure_survives_the_cli_context_wrap() {
+        let original = sample_stage_failure();
+        let final_err = wrapped_chain(original.clone());
+
+        // Top-level message still reads as before (context wrap didn't
+        // regress the user-facing text).
+        assert_eq!(final_err.to_string(), "plan execution failed");
+
+        // The regression pin: `e` must still be downcastable out of the
+        // chain — this is exactly what `print_stage_failure_detail` and
+        // any future `blut errors show`-style tooling rely on.
+        let found = final_err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<StageFailure>())
+            .expect("StageFailure must survive the .context() wrap — chain-preservation regressed");
+
+        assert_eq!(found.code, original.code);
+        assert_eq!(found.domain, original.domain);
+        assert_eq!(found.severity, original.severity);
+        assert_eq!(found.origin, original.origin);
+        assert_eq!(found.course, original.course);
+        assert_eq!(found.recipe, original.recipe);
+        assert_eq!(found.ingredient, original.ingredient);
+        assert_eq!(found.stage, original.stage);
+        assert_eq!(found.context, original.context);
+    }
+
+    #[test]
+    fn print_stage_failure_detail_finds_it_via_the_same_chain_walk() {
+        // Exercises the actual production helper (not a reimplementation) —
+        // it must not panic, and its internal `.chain().find_map(...)` must
+        // resolve to `Some` for this chain (verified indirectly: calling it
+        // is safe and it's a pure eprintln sink with no other observable
+        // side effect to assert on here).
+        let final_err = wrapped_chain(sample_stage_failure());
+        super::print_stage_failure_detail(&final_err);
     }
 }
 
@@ -1049,6 +1204,37 @@ mod stale_rebuild_tests {
         // an unknown bin → None.
         assert_eq!(crate_dir_for_installed_bin(SAMPLE, "nope"), None);
     }
+
+    // ── ADR 0072 A7: never-panics on adversarial input (property-based) ──
+    //
+    // The two tests above pin correctness on well-formed `.crates.toml`
+    // input. This is the complementary property: the doc comment on
+    // `crate_dir_for_installed_bin` promises "an unexpected/evolved format
+    // falls through to `None`... never a wrong dir" — the proptest below
+    // widens that to "never PANICS", fed input that is emphatically NOT
+    // well-formed `.crates.toml` (arbitrary Unicode, and separately, random
+    // garbage built only from the characters the real format uses — quotes,
+    // parens, brackets, `=`, `,`, newlines — to bias toward the parser's
+    // internal branches without being valid).
+    proptest::proptest! {
+        #[test]
+        fn crate_dir_for_installed_bin_never_panics(
+            crates_toml in proptest::prop_oneof![
+                proptest::prelude::any::<String>(),
+                "[a-zA-Z0-9_.:/()\\[\\],=+\"'\n -]{0,400}",
+            ],
+            bin in proptest::prop_oneof![
+                proptest::prelude::any::<String>(),
+                "[a-zA-Z0-9_-]{0,40}",
+            ],
+        ) {
+            // Only claim: this must run to completion (no panic — no OOB
+            // index/slice, no unwrap/expect, no arithmetic overflow). The
+            // return value is intentionally not asserted on here; happy-path
+            // shape is already pinned above.
+            let _ = crate_dir_for_installed_bin(&crates_toml, &bin);
+        }
+    }
 }
 
 /// Marker file written next to `args.json` so `plan resume` can
@@ -1150,7 +1336,11 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                     if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
                         tracing::warn!("write Failed state for {job_id}: {se}");
                     }
-                    Err(anyhow!("plan execution failed: {e}"))
+                    // `.context()` (not `anyhow!("...: {e}")`) — preserves `e` as the
+                    // source() of the new error, so a StageFailure buried in the
+                    // PlanError→StageError chain survives to the top-level printer
+                    // in `run()` (ADR 0072 A2).
+                    Err(anyhow::Error::from(e).context("plan execution failed"))
                 }
             }
         }
@@ -2188,13 +2378,16 @@ fn recipe_footprint(name: &str, raw: &serde_json::Value) -> crate::broker::Footp
 }
 
 /// Like [`recipe_footprint`] but with the decode worker count OVERRIDDEN to the
-/// auto-tuned `workers` (ADR 0071 A2) — so the gate's footprint + calibration key
-/// reflect the count the stage will actually launch (threaded via
-/// `ExecCtx::with_admitted_workers`). The light arg-less path is unchanged.
+/// auto-tuned `workers` (ADR 0071 A2), and OPTIONALLY the batch size too (E2,
+/// extends the same auto-tune to a second knob) — so the gate's footprint +
+/// calibration key reflect what the stage will actually launch (threaded via
+/// `ExecCtx::with_admitted_workers`/`with_admitted_batch_size`). The light
+/// arg-less path is unchanged.
 fn recipe_footprint_tuned(
     name: &str,
     raw: &serde_json::Value,
     workers: u32,
+    batch: Option<u32>,
 ) -> crate::broker::Footprint {
     if raw.is_null() || raw.as_object().is_some_and(|o| o.is_empty()) {
         return crate::broker::Footprint {
@@ -2204,6 +2397,9 @@ fn recipe_footprint_tuned(
     }
     let mut drivers = crate::broker::Drivers::from_args_json(raw);
     drivers.workers = workers; // the fit-and-saturate count (overrides the cap)
+    if let Some(b) = batch {
+        drivers.batch = b; // the fit-and-saturate batch (E2, overrides the request)
+    }
     let hint = drivers.estimate();
     let key = drivers.key(name);
     crate::broker::FootprintStore::load().resolve(&key, hint)
@@ -2249,6 +2445,42 @@ fn admitted_workers_for(name: &str, raw: &serde_json::Value) -> Option<u32> {
         );
     }
     Some(w)
+}
+
+/// E2: auto-tune the batch size to FIT the RAM budget, extending ADR 0071 A2's
+/// fit-and-saturate auto-tune to a second knob. Runs ONLY when `resolved_workers`
+/// came from [`admitted_workers_for`] on this SAME admission call (batch is
+/// searched against the residual budget after workers is already fixed — see
+/// [`crate::broker::footprint::batch_size_to_fit`]'s doc comment for why this
+/// reaches the same feasibility boundary a joint search would). Returns
+/// `Some(B)` only when it actually LOWERS the recipe's requested batch (unlike
+/// workers, there is no "saturate up" direction — see that function's doc);
+/// `None` means "the requested batch already fits, launch it unchanged."
+fn admitted_batch_size_for(name: &str, raw: &serde_json::Value, resolved_workers: u32) -> Option<u32> {
+    if raw.is_null() || raw.as_object().is_some_and(|o| o.is_empty()) {
+        return None; // light recipe — no batch to tune
+    }
+    let snap = crate::broker::ResourceSnapshot::probe();
+    if snap.mem_total_gb <= 0.0 {
+        return None; // no probe → leave the requested batch
+    }
+    let gib = crate::broker::footprint::GIB as f64;
+    let avail = (snap.mem_avail_gb * gib) as u64;
+    let floor = (crate::broker::admission::DEFAULT_FLOOR_GIB * gib) as u64;
+    if avail <= floor {
+        return None;
+    }
+    let base = crate::broker::Drivers::from_args_json(raw);
+    let requested = base.batch;
+    let b = crate::broker::footprint::batch_size_to_fit(resolved_workers, avail, floor, &base);
+    if b == requested {
+        return None; // already fits — no override needed
+    }
+    eprintln!(
+        "admission: recipe '{name}' batch size {requested} → {b} to fit {:.0}G available at {resolved_workers} workers (auto-tuned, never-OOM)",
+        snap.mem_avail_gb
+    );
+    Some(b)
 }
 
 /// The box-fit RAM budget (GiB) for a scheduler / executor that runs cells
@@ -2714,7 +2946,9 @@ async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()
         }
         Err(e) => {
             let _ = crate::jobs::write_state(&job_id, JobState::Failed);
-            Err(anyhow!("hpo plan execution failed: {e}"))
+            // See the `plan execution failed` site in `run_plan_cmd` — same
+            // chain-preservation rationale (ADR 0072 A2).
+            Err(anyhow::Error::from(e).context("hpo plan execution failed"))
         }
     }
 }
@@ -3299,6 +3533,166 @@ fn run_results(job: &str, json: bool, metric: &str, force_maximize: Option<bool>
     Ok(())
 }
 
+/// `blut errors list|show` (ADR 0072 A4) dispatch — mirrors `run_recipe`'s
+/// shape over `RecipeCommand`.
+fn run_errors(reg: &crate::framework::Registry, cmd: ErrorsCommand) -> Result<()> {
+    match cmd {
+        ErrorsCommand::List { json } => run_errors_list(reg, json),
+        ErrorsCommand::Show { job, json } => run_errors_show(&job, json),
+    }
+}
+
+/// `blut errors list [--json]`: every registered `ErrorDomain` catalog,
+/// unioned across the cookbooks in `reg` (mirrors `RecipeCommand::List`'s
+/// composition over `reg.all()`). Cookbooks registering one is a separate,
+/// later workflow — no implementor ships today — so an empty union prints
+/// "no error domains registered" rather than assuming one exists.
+fn run_errors_list(reg: &crate::framework::Registry, json: bool) -> Result<()> {
+    let mut domains: Vec<&'static crate::framework::error_domain::ErrorDomainDef> =
+        reg.all_error_domains().collect();
+    domains.sort_by(|a, b| a.name.cmp(b.name));
+
+    if json {
+        let arr: Vec<_> = domains
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "name": d.name,
+                    "codes": d.codes.iter().map(|(code, description)| {
+                        serde_json::json!({ "code": code, "description": description })
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&arr)
+                .map_err(|e| anyhow!("serialize error domains: {e}"))?
+        );
+        return Ok(());
+    }
+
+    if domains.is_empty() {
+        println!("no error domains registered");
+        return Ok(());
+    }
+    for d in domains {
+        println!(
+            "{}  ({} code{})",
+            d.name,
+            d.codes.len(),
+            if d.codes.len() == 1 { "" } else { "s" }
+        );
+        for (code, description) in d.codes {
+            println!("  {code:<24} {description}");
+        }
+    }
+    Ok(())
+}
+
+/// `blut errors show <job> [--json]`: a job's terminal failure — the
+/// origin/course/recipe/stage/ingredient breakdown, extracted from
+/// `status.jsonl`'s `StageFailed` event (the SAME source `blut results`
+/// reads lineage from), plus provenance (recipe, outcome) from the lineage
+/// DB `blut results` also opens. "no failure recorded" for a job that
+/// succeeded or hasn't run/failed yet — never assumes a failure exists.
+/// If any `status.jsonl` line failed to parse during the scan (a torn/
+/// truncated write — disk-full, or the orchestrator dying mid-flush —
+/// could have clobbered exactly the terminal `StageFailed` line), that is
+/// surfaced distinctly instead of a flatly confident "no failure".
+fn run_errors_show(job: &str, json: bool) -> Result<()> {
+    let job_id = crate::jobs::resolve_job_id(job).map_err(|e| anyhow!("{e}"))?;
+    let db = crate::lineage_db::LineageDb::open().map_err(|e| anyhow!("open lineage.db: {e}"))?;
+    let run = db.get_run(&job_id).map_err(|e| anyhow!("{e}"))?;
+    let lookup = crate::framework::lineage::job_failure(&job_id).map_err(|e| anyhow!("{e}"))?;
+
+    if json {
+        let out = serde_json::json!({
+            "job": job_id,
+            "recipe": run.as_ref().map(|r| r.recipe.clone()),
+            "outcome": run.as_ref().and_then(|r| r.outcome.clone()),
+            "failure": lookup.failure,
+            "parse_errors": lookup.parse_errors,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out).map_err(|e| anyhow!("{e}"))?
+        );
+        return Ok(());
+    }
+
+    println!("job     : {job_id}");
+    if let Some(r) = &run {
+        println!("recipe  : {}", r.recipe);
+        println!("outcome : {}", r.outcome.as_deref().unwrap_or("?"));
+    }
+
+    let Some(jf) = lookup.failure else {
+        if lookup.parse_errors > 0 {
+            println!(
+                "\nno StageFailed event found, but {} status.jsonl line(s) could not be parsed \
+                 — the record may be incomplete (a torn/truncated write?). This is NOT a \
+                 confirmed clean success.",
+                lookup.parse_errors
+            );
+        } else {
+            println!("\nno failure recorded (job succeeded, or hasn't run/failed yet)");
+        }
+        return Ok(());
+    };
+
+    if lookup.parse_errors > 0 {
+        println!(
+            "\nnote: {} other status.jsonl line(s) could not be parsed during this scan — \
+             earlier lineage detail may be incomplete.",
+            lookup.parse_errors
+        );
+    }
+    println!(
+        "\nterminal failure @ stage '{}' (node {})",
+        jf.stage, jf.node_idx
+    );
+    match &jf.failure {
+        Some(f) => {
+            println!("  code       : {}", f.code);
+            println!("  domain     : {}", f.domain);
+            println!("  severity   : {}", f.severity);
+            // `FaultOrigin` has no `Display` impl (it's an A1 type; adding one
+            // is out of this command's scope) — `{:?}` on its PascalCase
+            // variants (Engine/Cookbook/External) already reads fine.
+            println!("  origin     : {:?}", f.origin);
+            println!(
+                "  course     : {}",
+                f.course.as_deref().unwrap_or("(unknown)")
+            );
+            println!(
+                "  recipe     : {}",
+                f.recipe.as_deref().unwrap_or("(unknown)")
+            );
+            println!(
+                "  stage      : {}",
+                f.stage.as_deref().unwrap_or(jf.stage.as_str())
+            );
+            println!(
+                "  ingredient : {}",
+                f.ingredient.as_deref().unwrap_or("(unknown)")
+            );
+            if !f.context.is_empty() {
+                println!("  context    :");
+                for (k, v) in &f.context {
+                    println!("    {k} = {v}");
+                }
+            }
+            println!("  message    : {}", f.message);
+        }
+        None => {
+            println!("  (no structured StageFailure attached — raw error only)");
+            println!("  error      : {}", jf.error);
+        }
+    }
+    Ok(())
+}
+
 /// `blut dag <job> [--json]` — render a job's DAG: per-node status + edges,
 /// built from the persisted `plan.json` + the live `status.jsonl` (+ HPO trial
 /// attribution when present). No daemon; re-run to refresh.
@@ -3709,9 +4103,13 @@ async fn launch_compiled_plan(
     // both the over-refuse and the GPU-starvation). Compute W from a SINGLE mem
     // snapshot; the gate's footprint uses W, and W is cached on the ExecCtx below
     // so the cookbook train stage (RECORD) launches exactly this count.
+    // E2: auto-tune batch size against the SAME snapshot, against the residual
+    // budget after W is fixed (extends the same knob to a second driver).
     let admitted_workers = admitted_workers_for(name, plan.exec_view().recipe_args);
+    let admitted_batch_size = admitted_workers
+        .and_then(|w| admitted_batch_size_for(name, plan.exec_view().recipe_args, w));
     let footprint = match admitted_workers {
-        Some(w) => recipe_footprint_tuned(name, plan.exec_view().recipe_args, w),
+        Some(w) => recipe_footprint_tuned(name, plan.exec_view().recipe_args, w, admitted_batch_size),
         None => recipe_footprint(name, plan.exec_view().recipe_args),
     };
 
@@ -3754,6 +4152,11 @@ async fn launch_compiled_plan(
     // launches exactly what admission sized (RESOLVE↔RECORD parity, never-OOM).
     if let Some(w) = admitted_workers {
         ctx = ctx.with_admitted_workers(w);
+    }
+    // E2: cache the auto-tuned batch size on the ctx so the cookbook train stage
+    // launches exactly what admission sized (RESOLVE↔RECORD parity, never-OOM).
+    if let Some(b) = admitted_batch_size {
+        ctx = ctx.with_admitted_batch_size(b);
     }
     // INC D (S4): `--no-cache`/`--force` bypasses the stage cache READ so every
     // stage recomputes; the fresh result is still written to the cache.
@@ -3871,7 +4274,9 @@ async fn launch_compiled_plan(
             if let Err(ie) = crate::lineage_db::ingest_job(&job_id, name, "failed") {
                 tracing::debug!("lineage index (failed) {job_id}: {ie}");
             }
-            Err(anyhow!("plan execution failed: {e}"))
+            // See the `plan execution failed` site in `run_plan_cmd` — same
+            // chain-preservation rationale (ADR 0072 A2).
+            Err(anyhow::Error::from(e).context("plan execution failed"))
         }
     }
 }
@@ -4616,6 +5021,74 @@ mod recipe_declare_flag_tests {
             "--force",
         ]);
         assert!(run && sc && nc, "--force aliases --no-cache");
+    }
+}
+
+#[cfg(test)]
+mod errors_cli_tests {
+    //! ADR 0072 A4: `blut errors list` / `blut errors show <job>` — clap
+    //! parsing + the empty-registry "no error domains registered" case
+    //! (no cookbook has called `register_error_domain!` yet). The
+    //! structured origin/course/recipe/stage/ingredient breakdown itself
+    //! is covered at its data source in
+    //! `framework::lineage::tests::job_failure_surfaces_full_structured_breakdown`
+    //! — `run_errors_show` is a thin formatter over that.
+    use super::{Cli, Command, ErrorsCommand};
+    use clap::Parser;
+
+    fn errors_of(argv: &[&str]) -> ErrorsCommand {
+        match Cli::try_parse_from(argv).expect("parse").command {
+            Some(Command::Errors { cmd }) => cmd,
+            other => panic!("expected errors, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_parses_default_json_false() {
+        match errors_of(&["blut", "errors", "list"]) {
+            ErrorsCommand::List { json } => assert!(!json),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_json_flag_parses() {
+        match errors_of(&["blut", "errors", "list", "--json"]) {
+            ErrorsCommand::List { json } => assert!(json),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn show_requires_job_and_parses_json_flag() {
+        // No job id ⇒ parse error.
+        assert!(Cli::try_parse_from(["blut", "errors", "show"]).is_err());
+        match errors_of(&["blut", "errors", "show", "20260702-000000-abcdef", "--json"]) {
+            ErrorsCommand::Show { job, json } => {
+                assert_eq!(job, "20260702-000000-abcdef");
+                assert!(json);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// The chicken-and-egg case this command was explicitly designed for:
+    /// zero cookbooks have called `register_error_domain!` yet, so the
+    /// composed registry is empty. `run_errors_list` must print "no error
+    /// domains registered" and return `Ok(())`, never panic or error —
+    /// in both text and `--json` modes.
+    #[test]
+    fn errors_list_on_empty_registry_prints_gracefully_text() {
+        let reg = crate::framework::Registry::new();
+        assert!(super::run_errors_list(&reg, false).is_ok());
+    }
+
+    #[test]
+    fn errors_list_on_empty_registry_prints_gracefully_json() {
+        let reg = crate::framework::Registry::new();
+        // `--json` on an empty catalog must still serialize (an empty
+        // array), not error.
+        assert!(super::run_errors_list(&reg, true).is_ok());
     }
 }
 

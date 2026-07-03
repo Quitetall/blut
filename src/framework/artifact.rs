@@ -237,10 +237,25 @@ impl ContentHash {
         if s.len() != 64 {
             return Err(ContentHashError::WrongLength(s.len()));
         }
+        // Index into raw bytes, not `&str`, so a multi-byte UTF-8 character
+        // landing on one of the (even) 2-byte chunk boundaries can't panic
+        // with "byte index is not a char boundary" — `s.len() == 64` is a
+        // BYTE count, so a 64-byte string can still contain non-ASCII chars
+        // (e.g. one 3-byte char + 61 ASCII bytes). `u8 as char` is always a
+        // total, panic-free cast (every byte is a valid Latin-1 scalar), and
+        // `to_digit(16)` rejects anything that isn't an ASCII hex digit —
+        // found via cargo-fuzz (ADR 0072 A6) on `fuzz_erased_artifact`
+        // within the first smoke run, deserializing a `DatasetJsonl` whose
+        // `content_hash` field carried a hostile 64-byte string.
+        let bytes = s.as_bytes();
         let mut out = [0u8; 32];
         for (i, byte_str) in (0..64).step_by(2).enumerate() {
-            out[i] = u8::from_str_radix(&s[byte_str..byte_str + 2], 16)
-                .map_err(|_| ContentHashError::NotHex(byte_str))?;
+            let hi = (bytes[byte_str] as char).to_digit(16);
+            let lo = (bytes[byte_str + 1] as char).to_digit(16);
+            match (hi, lo) {
+                (Some(h), Some(l)) => out[i] = ((h << 4) | l) as u8,
+                _ => return Err(ContentHashError::NotHex(byte_str)),
+            }
         }
         Ok(Self(out))
     }
@@ -721,6 +736,24 @@ mod tests {
         assert!(matches!(
             ContentHash::from_hex(&bad),
             Err(ContentHashError::NotHex(0))
+        ));
+    }
+
+    /// Regression for a cargo-fuzz find (ADR 0072 A6, `fuzz_erased_artifact`,
+    /// hit within the first 15s smoke run): a 64-BYTE string containing a
+    /// multi-byte UTF-8 character can land a `step_by(2)` chunk boundary
+    /// mid-character. The old impl sliced `&str` directly and panicked with
+    /// "byte index is not a char boundary" instead of returning `NotHex`.
+    /// 39 ASCII bytes + one 3-byte char ('➝', U+279D) + 22 ASCII bytes = 64
+    /// bytes, with the char starting at odd offset 39 so the chunk starting
+    /// at byte_str=38 straddles it.
+    #[test]
+    fn content_hash_from_hex_rejects_non_char_boundary_multibyte() {
+        let bad = format!("{}➝{}", "a".repeat(39), "a".repeat(22));
+        assert_eq!(bad.len(), 64);
+        assert!(matches!(
+            ContentHash::from_hex(&bad),
+            Err(ContentHashError::NotHex(38))
         ));
     }
 

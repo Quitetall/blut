@@ -16,6 +16,7 @@
 //! [`Cookbook::artifacts`] (today DESCRIPTORS only — name / kind /
 //! schema, not executable handles).
 
+use crate::framework::error_domain::ErrorDomainDef;
 use crate::recipes::recipe::{RecipeCategory, RecipeDef};
 
 /// Lightweight descriptor for a stage a cookbook declares. Name /
@@ -72,6 +73,15 @@ pub trait Cookbook: Send + Sync + 'static {
     fn default_args(&self, _recipe: &str) -> Option<String> {
         None
     }
+    /// Error-code catalogs this cookbook registers via
+    /// [`crate::register_error_domain!`] (ADR 0072 A4). Default empty —
+    /// most cookbooks don't need one, and none does yet (a later
+    /// cookbook-side workflow adds the first one); `blut errors list`
+    /// prints "no error domains registered" when the union across every
+    /// registered cookbook is empty rather than assuming one exists.
+    fn error_domains(&self) -> &'static [&'static ErrorDomainDef] {
+        &[]
+    }
 }
 
 /// Runtime registry that ingests cookbooks: holds boxed cookbooks and
@@ -109,6 +119,17 @@ impl Registry {
         cat: RecipeCategory,
     ) -> impl Iterator<Item = &'static RecipeDef> + '_ {
         self.all().filter(move |r| r.category == cat)
+    }
+
+    /// Every registered `ErrorDomain` catalog, unioned across every
+    /// registered cookbook (ADR 0072 A4) — mirrors [`Registry::all`]'s
+    /// composition over `Cookbook::recipes`. Empty until a cookbook calls
+    /// [`crate::register_error_domain!`]; `blut errors list` handles that
+    /// gracefully rather than assuming a catalog exists.
+    pub fn all_error_domains(&self) -> impl Iterator<Item = &'static ErrorDomainDef> + '_ {
+        self.cookbooks
+            .iter()
+            .flat_map(|c| c.error_domains().iter().copied())
     }
 
     /// Pre-baked args JSON for a recipe, from whichever registered
@@ -231,6 +252,26 @@ mod tests {
         let r = Registry::new();
         assert_eq!(r.all().count(), 0, "blut-core ships no recipes");
         assert!(r.find("anything").is_none());
+    }
+
+    /// ADR 0072 A4: no cookbook has called `register_error_domain!` yet (a
+    /// later cookbook-side workflow adds the first one), so the union must
+    /// be empty and iterable without panicking — the composition `blut
+    /// errors list` runs before it can print "no error domains
+    /// registered".
+    #[test]
+    fn empty_registry_has_no_error_domains() {
+        let r = Registry::new();
+        assert_eq!(r.all_error_domains().count(), 0);
+    }
+
+    /// A registered cookbook that only declares recipes (no
+    /// `error_domains()` override, per the default-empty trait method)
+    /// contributes nothing to the union either.
+    #[test]
+    fn registered_cookbook_with_no_error_domains_contributes_none() {
+        let r = registry();
+        assert_eq!(r.all_error_domains().count(), 0);
     }
 
     #[test]

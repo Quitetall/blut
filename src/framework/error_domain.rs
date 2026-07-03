@@ -31,12 +31,20 @@ use serde::{Deserialize, Serialize};
 /// Critical = data loss, corruption, safety violation.
 /// Major = wrong output, failed invariant.
 /// Minor = perf regression, edge case, cosmetic.
+/// Unknown = forward-compat fallback (see below).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     Critical,
     Major,
     Minor,
+    /// A severity token this binary version does not recognize (e.g. a
+    /// `status.jsonl` line written by a newer binary that added a variant).
+    /// `#[serde(other)]` routes any unrecognized string here at
+    /// deserialization time instead of failing the whole containing
+    /// struct/event — never constructed directly by this binary itself.
+    #[serde(other)]
+    Unknown,
 }
 
 impl fmt::Display for Severity {
@@ -45,8 +53,38 @@ impl fmt::Display for Severity {
             Self::Critical => write!(f, "CRITICAL"),
             Self::Major => write!(f, "MAJOR"),
             Self::Minor => write!(f, "MINOR"),
+            Self::Unknown => write!(f, "UNKNOWN"),
         }
     }
+}
+
+// ── FaultOrigin ────────────────────────────────────────────────────
+
+/// Who is at fault for this failure — engine, cookbook glue, or the
+/// outside world?
+///
+/// `Engine` = a bug in BLUT's own executor/framework code.
+/// `Cookbook` = a bug (or unhandled edge case) in cookbook glue code.
+/// `External` = something outside BLUT's control (disk full, network,
+/// upstream service, malformed user input).
+///
+/// Defaults to `Cookbook` in [`StageFailure::new`] — most failures
+/// genuinely are cookbook glue; `Engine`/`External` are the minority
+/// that need an explicit `.origin(...)` override.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FaultOrigin {
+    Engine,
+    Cookbook,
+    External,
+    /// An origin value this binary version does not recognize — forward-
+    /// compat fallback for a `status.jsonl` line written by a newer binary
+    /// that added a `FaultOrigin` variant. `#[serde(other)]` routes any
+    /// unrecognized string here at deserialization time instead of failing
+    /// the whole containing struct/event; never constructed directly by
+    /// this binary itself.
+    #[serde(other)]
+    Unknown,
 }
 
 // ── ErrorDomain ────────────────────────────────────────────────────
@@ -63,6 +101,57 @@ pub trait ErrorDomain: Send + Sync + 'static {
 
     /// Error codes this domain defines: `(code, description)`.
     const CODES: &[(&'static str, &'static str)];
+}
+
+/// Plain-data snapshot of an [`ErrorDomain`]'s catalog.
+///
+/// Associated consts (`NAME`/`CODES`) block `ErrorDomain` from being
+/// object-safe, so a registry can't hold `Vec<Box<dyn ErrorDomain>>` the
+/// way [`crate::framework::cookbook::Cookbook`] holds trait objects.
+/// [`register_error_domain!`] copies the consts into this plain struct at
+/// the registration site instead — the exact move
+/// [`crate::recipes::recipe::register_recipe!`] makes for `Recipe` →
+/// `RecipeDef`. This is what actually travels through
+/// [`crate::framework::cookbook::Cookbook::error_domains`] and
+/// [`crate::framework::cookbook::Registry::all_error_domains`] for
+/// `blut errors list` (ADR 0072 A4) to enumerate.
+#[derive(Clone, Copy, Debug)]
+pub struct ErrorDomainDef {
+    pub name: &'static str,
+    pub codes: &'static [(&'static str, &'static str)],
+}
+
+/// Emit a cookbook's `pub static ERROR_DOMAIN_DEF: ErrorDomainDef` from its
+/// [`ErrorDomain`] impl, so `blut errors list` can discover it. Mirrors
+/// [`crate::recipes::recipe::register_recipe!`]'s shape:
+///
+/// ```ignore
+/// pub struct EagleErrorDomain;
+/// impl ErrorDomain for EagleErrorDomain {
+///     const NAME: &'static str = "eagle";
+///     const CODES: &[(&'static str, &'static str)] = &[("E_ROUNDTRIP", "decode(encode(x)) != x")];
+/// }
+/// blut::register_error_domain!(EagleErrorDomain);   // → pub static ERROR_DOMAIN_DEF
+/// ```
+///
+/// A cookbook then lists it from `Cookbook::error_domains()`, e.g.
+/// `&[&errors::ERROR_DOMAIN_DEF]`. As of this writing no cookbook has
+/// called this yet (a later cookbook-side workflow adds the first one) —
+/// `blut errors list` prints "no error domains registered" until then,
+/// rather than assuming a catalog exists.
+///
+/// One error domain per module: like [`crate::recipes::recipe::register_recipe!`],
+/// this emits an unnamespaced `pub static ERROR_DOMAIN_DEF`, so a second
+/// invocation in the same module is a duplicate-symbol error.
+#[macro_export]
+macro_rules! register_error_domain {
+    ($ty:ty) => {
+        pub static ERROR_DOMAIN_DEF: $crate::framework::error_domain::ErrorDomainDef =
+            $crate::framework::error_domain::ErrorDomainDef {
+                name: <$ty as $crate::framework::error_domain::ErrorDomain>::NAME,
+                codes: <$ty as $crate::framework::error_domain::ErrorDomain>::CODES,
+            };
+    };
 }
 
 // ── StageFailure ───────────────────────────────────────────────────
@@ -87,6 +176,18 @@ pub trait ErrorDomain: Send + Sync + 'static {
 ///         .context("len", "4096")
 ///         .into_error("decode(encode(x)) != x: first diff at sample 1847"),
 /// ));
+///
+/// // Most failures are cookbook glue (the default). Override when the
+/// // fault genuinely lies outside BLUT's control:
+/// use blut::framework::error_domain::FaultOrigin;
+///
+/// return Err(StageError::Backend(
+///     StageFailure::new("EAGLE_UPSTREAM_TIMEOUT", "eagle")
+///         .severity(Severity::Major)
+///         .origin(FaultOrigin::External)
+///         .stage("eagle_fetch")
+///         .into_error("upstream service timed out after 30s"),
+/// ));
 /// ```
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StageFailure {
@@ -98,6 +199,18 @@ pub struct StageFailure {
     pub stage: Option<String>,
     /// Severity classification.
     pub severity: Severity,
+    /// Who's at fault — engine, cookbook glue, or external. Defaults
+    /// to `Cookbook` in [`StageFailure::new`]; override with
+    /// [`StageFailure::origin`] for the `Engine`/`External` minority.
+    pub origin: FaultOrigin,
+    /// Recipe course, if known (e.g. "train", "eval"). Plain `String`
+    /// — `error_domain` sits below `recipes` in the module layering
+    /// and must not depend on `recipes::recipe::Course`.
+    pub course: Option<String>,
+    /// Recipe name, if known (e.g. "train_joint").
+    pub recipe: Option<String>,
+    /// Ingredient (stage/component) implicated, if known.
+    pub ingredient: Option<String>,
     /// Structured key-value context pairs.
     pub context: Vec<(String, String)>,
     /// Human-readable summary.
@@ -106,12 +219,20 @@ pub struct StageFailure {
 
 impl StageFailure {
     /// Create a new failure with code and domain.
+    ///
+    /// `origin` defaults to [`FaultOrigin::Cookbook`] — most failures
+    /// genuinely are cookbook glue. Use [`StageFailure::origin`] to
+    /// override for the `Engine`/`External` minority.
     pub fn new(code: impl Into<String>, domain: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             domain: domain.into(),
             stage: None,
             severity: Severity::Major,
+            origin: FaultOrigin::Cookbook,
+            course: None,
+            recipe: None,
+            ingredient: None,
             context: Vec::new(),
             message: String::new(),
         }
@@ -126,6 +247,12 @@ impl StageFailure {
     /// Set the stage name.
     pub fn stage(mut self, stage: impl Into<String>) -> Self {
         self.stage = Some(stage.into());
+        self
+    }
+
+    /// Override the fault origin (defaults to [`FaultOrigin::Cookbook`]).
+    pub fn origin(mut self, origin: FaultOrigin) -> Self {
+        self.origin = origin;
         self
     }
 
@@ -193,7 +320,16 @@ impl std::error::Error for StageFailure {}
 pub struct FailureSummary {
     pub code: String,
     pub domain: String,
+    /// Stage that produced this failure. Mirrors `StageFailure::stage`
+    /// (previously missing here — a pre-existing bug: the flattened
+    /// summary persisted to `status.jsonl` silently dropped which
+    /// stage failed).
+    pub stage: Option<String>,
     pub severity: Severity,
+    pub origin: FaultOrigin,
+    pub course: Option<String>,
+    pub recipe: Option<String>,
+    pub ingredient: Option<String>,
     pub context: Vec<(String, String)>,
     pub message: String,
 }
@@ -203,7 +339,12 @@ impl From<&StageFailure> for FailureSummary {
         Self {
             code: f.code.clone(),
             domain: f.domain.clone(),
+            stage: f.stage.clone(),
             severity: f.severity,
+            origin: f.origin,
+            course: f.course.clone(),
+            recipe: f.recipe.clone(),
+            ingredient: f.ingredient.clone(),
             context: f.context.clone(),
             message: f.message.clone(),
         }
@@ -245,6 +386,11 @@ mod tests {
         assert!(msg.contains("ch=4"));
         assert!(msg.contains("len=4096"));
         assert!(msg.contains("first diff at sample 1847"));
+        // origin not overridden — defaults to Cookbook.
+        assert_eq!(f.origin, FaultOrigin::Cookbook);
+        assert_eq!(f.course, None);
+        assert_eq!(f.recipe, None);
+        assert_eq!(f.ingredient, None);
     }
 
     #[test]
@@ -259,6 +405,7 @@ mod tests {
         assert_eq!(f.code, "E_REJECT");
         assert_eq!(f.domain, "eagle");
         assert_eq!(f.severity, Severity::Critical);
+        assert_eq!(f.origin, FaultOrigin::Cookbook);
         assert_eq!(f.context, vec![("cut_at".into(), "42".into())]);
         assert_eq!(f.message, "accepted truncated blob");
     }
@@ -273,13 +420,106 @@ mod tests {
     fn failure_summary_from_stage_failure() {
         let f = StageFailure::new("E_THRESHOLD", "lamquant")
             .severity(Severity::Minor)
+            .stage("cr_check")
             .context("cr", "0.79")
             .context("floor", "0.80")
             .message("CR below floor");
         let summary = FailureSummary::from(&f);
         assert_eq!(summary.code, "E_THRESHOLD");
         assert_eq!(summary.domain, "lamquant");
+        assert_eq!(summary.stage, Some("cr_check".to_string()));
         assert_eq!(summary.severity, Severity::Minor);
+        assert_eq!(summary.origin, FaultOrigin::Cookbook);
+        assert_eq!(summary.course, None);
+        assert_eq!(summary.recipe, None);
+        assert_eq!(summary.ingredient, None);
         assert_eq!(summary.context.len(), 2);
+    }
+
+    #[test]
+    fn stage_failure_new_defaults_origin_to_cookbook() {
+        let f = StageFailure::new("E_DEFAULT_ORIGIN", "eagle");
+        assert_eq!(f.origin, FaultOrigin::Cookbook);
+    }
+
+    #[test]
+    fn stage_failure_origin_builder_overrides_default() {
+        let f = StageFailure::new("E_EXTERNAL", "eagle").origin(FaultOrigin::External);
+        assert_eq!(f.origin, FaultOrigin::External);
+
+        let f = StageFailure::new("E_ENGINE", "eagle").origin(FaultOrigin::Engine);
+        assert_eq!(f.origin, FaultOrigin::Engine);
+    }
+
+    /// Regression pin for the `FailureSummary` `stage`-dropping bug:
+    /// `FailureSummary::from` must carry `stage` through. Reverting the
+    /// `stage: f.stage.clone()` line in the `From` impl (or dropping
+    /// `stage` back out of `FailureSummary`) makes this fail.
+    #[test]
+    fn failure_summary_from_carries_stage_through() {
+        let f = StageFailure::new("E_STAGE_BUG", "eagle").stage("eagle_encode");
+        let summary = FailureSummary::from(&f);
+        assert_eq!(summary.stage, Some("eagle_encode".to_string()));
+    }
+
+    /// Forward-compat regression pin: a `FailureSummary` JSON blob carrying
+    /// an `origin`/`severity` token this binary version doesn't recognize
+    /// (e.g. written by a future binary with a new `FaultOrigin` variant)
+    /// must still deserialize successfully -- `#[serde(other)]` on
+    /// `FaultOrigin::Unknown`/`Severity::Unknown` catches it -- and every
+    /// OTHER field must still be populated correctly. Before the fix, an
+    /// unrecognized token failed the whole struct's `Deserialize`, which
+    /// (via lineage.rs's tolerant `let Ok(ev) = ... else { continue }`)
+    /// silently dropped the entire containing `StageEvent`, not just the
+    /// one field.
+    #[test]
+    fn failure_summary_forward_compat_unknown_origin_and_severity() {
+        let json = r#"{
+            "code": "E_FUTURE",
+            "domain": "eagle",
+            "stage": "eagle_decode",
+            "severity": "apocalyptic",
+            "origin": "quantum",
+            "course": "train",
+            "recipe": "train_joint",
+            "ingredient": "trainer",
+            "context": [["ch", "4"]],
+            "message": "a future binary's failure mode"
+        }"#;
+        let summary: FailureSummary =
+            serde_json::from_str(json).expect("unrecognized origin/severity tokens must not fail the whole struct");
+        assert_eq!(summary.origin, FaultOrigin::Unknown);
+        assert_eq!(summary.severity, Severity::Unknown);
+        // The REST of the record survives too -- not just deserialization
+        // not-erroring.
+        assert_eq!(summary.code, "E_FUTURE");
+        assert_eq!(summary.domain, "eagle");
+        assert_eq!(summary.stage, Some("eagle_decode".to_string()));
+        assert_eq!(summary.course, Some("train".to_string()));
+        assert_eq!(summary.recipe, Some("train_joint".to_string()));
+        assert_eq!(summary.ingredient, Some("trainer".to_string()));
+        assert_eq!(summary.context, vec![("ch".to_string(), "4".to_string())]);
+        assert_eq!(summary.message, "a future binary's failure mode");
+    }
+
+    /// Known tokens still round-trip to the real variants (the `#[serde(other)]`
+    /// catch-all must not shadow legitimate values).
+    #[test]
+    fn failure_summary_known_tokens_still_deserialize_to_real_variants() {
+        let json = r#"{
+            "code": "E_KNOWN",
+            "domain": "eagle",
+            "stage": null,
+            "severity": "critical",
+            "origin": "external",
+            "course": null,
+            "recipe": null,
+            "ingredient": null,
+            "context": [],
+            "message": "known tokens"
+        }"#;
+        let summary: FailureSummary = serde_json::from_str(json).unwrap();
+        assert_eq!(summary.severity, Severity::Critical);
+        assert_eq!(summary.origin, FaultOrigin::External);
     }
 }

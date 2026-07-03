@@ -164,6 +164,13 @@ pub struct ExecCtx {
     /// cookbook train stage (RECORD) launches the SAME count the cli sized (RESOLVE)
     /// — parity + never-OOM. `None` ⇒ the conservative cap (unchanged behaviour).
     pub admitted_workers: Option<u32>,
+    /// Auto-tuned batch size, extending ADR 0071's fit-and-saturate auto-tune
+    /// to a second knob (E2). Resolved from the SAME admission snapshot as
+    /// `admitted_workers` (batch is searched against the residual budget
+    /// AFTER workers is fixed — see `batch_size_to_fit`'s doc comment for why
+    /// this reaches the same result a joint search would). `None` ⇒ the
+    /// recipe's requested batch, unchanged (no auto-tune ran).
+    pub admitted_batch_size: Option<u32>,
     /// Phase-G scheduler: the GPU DEVICE index this whole job is pinned to,
     /// or `None` for the box default. Threaded into every `StageContext` so a
     /// launcher-aware backend exports `CUDA_VISIBLE_DEVICES=<idx>` for the
@@ -224,6 +231,7 @@ impl ExecCtx {
             control: None,
             fb_warm: false,
             admitted_workers: None,
+            admitted_batch_size: None,
             device_index: None,
             bypass_cache: false,
             #[cfg(feature = "p2p")]
@@ -257,6 +265,14 @@ impl ExecCtx {
     /// `StageContext.admitted_workers` so the cookbook train stage launches it.
     pub fn with_admitted_workers(mut self, workers: u32) -> Self {
         self.admitted_workers = Some(workers);
+        self
+    }
+
+    /// Set the auto-tuned batch size (E2, extends ADR 0071's fit-and-saturate
+    /// to a second knob). Threaded into every `StageContext.admitted_batch_size`
+    /// so the cookbook train stage launches it.
+    pub fn with_admitted_batch_size(mut self, batch_size: u32) -> Self {
+        self.admitted_batch_size = Some(batch_size);
         self
     }
 
@@ -348,6 +364,11 @@ pub struct StageWarning {
     pub stage: String,
     /// The failure the advisory stage produced (downgraded from fatal).
     pub reason: String,
+    /// Who's at fault for the advisory failure — engine, cookbook glue, or
+    /// external (ADR 0072). `None` when the underlying `StageError` doesn't
+    /// carry a `StageFailure` to extract it from (the common case today;
+    /// cookbooks don't yet attach structured failures to advisory stages).
+    pub origin: Option<crate::framework::error_domain::FaultOrigin>,
 }
 
 /// Whether advisory stages are forced FATAL for this run (ADR 0071 strict mode),
@@ -379,6 +400,7 @@ struct NodeEnv {
     device_index: Option<usize>,
     fb_warm: bool,
     admitted_workers: Option<u32>,
+    admitted_batch_size: Option<u32>,
     /// Force-recompute (INC D / S4). When true, `run_node` skips the cache READ
     /// so the stage always runs; the fresh result is still cached.
     bypass_cache: bool,
@@ -724,6 +746,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
             device_index: env.device_index,
             fb_warm: env.fb_warm,
             admitted_workers: env.admitted_workers,
+            admitted_batch_size: env.admitted_batch_size,
             // Durable resume (Phase D): the stage's cache key is its stable
             // per-config fingerprint — a resume train stage keys its recovery
             // dir on it so a re-run with identical args finds the checkpoint.
@@ -1615,6 +1638,7 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
         device_index: ctx.device_index,
         fb_warm: ctx.fb_warm,
         admitted_workers: ctx.admitted_workers,
+        admitted_batch_size: ctx.admitted_batch_size,
         bypass_cache: ctx.bypass_cache,
         recipe_name: plan.name().to_string(),
         on_retry: ctx.on_retry,
@@ -1763,6 +1787,11 @@ impl SequentialExecutor {
                                 idx: *idx,
                                 stage: stage.clone(),
                                 reason: source.to_string(),
+                                // No StageFailure downcast happens on this path today
+                                // (source is only stringified above) — nothing to
+                                // thread through yet (ADR 0072 B-series wires real
+                                // origins into cookbook StageFailures).
+                                origin: None,
                             });
                             break;
                         }
@@ -2565,7 +2594,16 @@ impl ParallelExecutor {
                         // KILL (their input can't materialize), but do NOT fail the
                         // plan — other branches keep running.
                         tracing::warn!("advisory stage '{stage}' failed (non-fatal): {reason}");
-                        warnings.push(StageWarning { idx, stage, reason });
+                        // No StageFailure downcast happens on this path today
+                        // (reason is only stringified above) — nothing to thread
+                        // through yet (ADR 0072 B-series wires real origins into
+                        // cookbook StageFailures).
+                        warnings.push(StageWarning {
+                            idx,
+                            stage,
+                            reason,
+                            origin: None,
+                        });
                         if let Some(k) = node_key_of.remove(&nid) {
                             inflight_keys.remove(&k);
                             if let Some(waiters) = deferred.remove(&k) {
@@ -2926,6 +2964,11 @@ mod tests {
             .expect("an advisory gate's failure must NOT fail the plan");
         assert_eq!(result.warnings.len(), 1, "the advisory failure is recorded");
         assert_eq!(result.warnings[0].stage, "advisory_gate");
+        // ADR 0072 A5: the coordinator/sequential paths don't downcast the
+        // failure to a `StageFailure` before building the warning today, so
+        // there's no origin to thread through yet — this pins that current
+        // behaviour rather than silently starting to assume a value.
+        assert_eq!(result.warnings[0].origin, None);
         // The upstream train output is surfaced even though the terminal gate tripped.
         let counter: Counter = result
             .final_output
@@ -2933,6 +2976,28 @@ mod tests {
             .into_typed()
             .unwrap();
         assert_eq!(counter.n, 1);
+    }
+
+    /// ADR 0072 A5: `StageWarning::origin` can carry fault-attribution data
+    /// when it's available. `StageWarning` isn't `Serialize` and its
+    /// `warnings` Vec is only ever inspected in-memory (printed by `cli.rs`,
+    /// asserted on directly in tests) — no serde round-trip exists to pin,
+    /// so this is a plain construction + field-access regression test.
+    #[test]
+    fn stage_warning_carries_optional_fault_origin() {
+        let w = StageWarning {
+            idx: 0,
+            stage: "advisory_gate".to_string(),
+            reason: "upstream service timed out".to_string(),
+            origin: Some(crate::framework::error_domain::FaultOrigin::Engine),
+        };
+        assert_eq!(
+            w.origin,
+            Some(crate::framework::error_domain::FaultOrigin::Engine)
+        );
+        // Clone must preserve it too (StageWarning derives Clone).
+        let cloned = w.clone();
+        assert_eq!(cloned.origin, w.origin);
     }
 
     #[tokio::test]
