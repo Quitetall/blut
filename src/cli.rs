@@ -3596,18 +3596,23 @@ fn run_errors_list(reg: &crate::framework::Registry, json: bool) -> Result<()> {
 /// reads lineage from), plus provenance (recipe, outcome) from the lineage
 /// DB `blut results` also opens. "no failure recorded" for a job that
 /// succeeded or hasn't run/failed yet — never assumes a failure exists.
+/// If any `status.jsonl` line failed to parse during the scan (a torn/
+/// truncated write — disk-full, or the orchestrator dying mid-flush —
+/// could have clobbered exactly the terminal `StageFailed` line), that is
+/// surfaced distinctly instead of a flatly confident "no failure".
 fn run_errors_show(job: &str, json: bool) -> Result<()> {
     let job_id = crate::jobs::resolve_job_id(job).map_err(|e| anyhow!("{e}"))?;
     let db = crate::lineage_db::LineageDb::open().map_err(|e| anyhow!("open lineage.db: {e}"))?;
     let run = db.get_run(&job_id).map_err(|e| anyhow!("{e}"))?;
-    let failure = crate::framework::lineage::job_failure(&job_id).map_err(|e| anyhow!("{e}"))?;
+    let lookup = crate::framework::lineage::job_failure(&job_id).map_err(|e| anyhow!("{e}"))?;
 
     if json {
         let out = serde_json::json!({
             "job": job_id,
             "recipe": run.as_ref().map(|r| r.recipe.clone()),
             "outcome": run.as_ref().and_then(|r| r.outcome.clone()),
-            "failure": failure,
+            "failure": lookup.failure,
+            "parse_errors": lookup.parse_errors,
         });
         println!(
             "{}",
@@ -3622,11 +3627,27 @@ fn run_errors_show(job: &str, json: bool) -> Result<()> {
         println!("outcome : {}", r.outcome.as_deref().unwrap_or("?"));
     }
 
-    let Some(jf) = failure else {
-        println!("\nno failure recorded (job succeeded, or hasn't run/failed yet)");
+    let Some(jf) = lookup.failure else {
+        if lookup.parse_errors > 0 {
+            println!(
+                "\nno StageFailed event found, but {} status.jsonl line(s) could not be parsed \
+                 — the record may be incomplete (a torn/truncated write?). This is NOT a \
+                 confirmed clean success.",
+                lookup.parse_errors
+            );
+        } else {
+            println!("\nno failure recorded (job succeeded, or hasn't run/failed yet)");
+        }
         return Ok(());
     };
 
+    if lookup.parse_errors > 0 {
+        println!(
+            "\nnote: {} other status.jsonl line(s) could not be parsed during this scan — \
+             earlier lineage detail may be incomplete.",
+            lookup.parse_errors
+        );
+    }
     println!(
         "\nterminal failure @ stage '{}' (node {})",
         jf.stage, jf.node_idx
