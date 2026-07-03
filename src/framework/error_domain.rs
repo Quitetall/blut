@@ -31,12 +31,20 @@ use serde::{Deserialize, Serialize};
 /// Critical = data loss, corruption, safety violation.
 /// Major = wrong output, failed invariant.
 /// Minor = perf regression, edge case, cosmetic.
+/// Unknown = forward-compat fallback (see below).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     Critical,
     Major,
     Minor,
+    /// A severity token this binary version does not recognize (e.g. a
+    /// `status.jsonl` line written by a newer binary that added a variant).
+    /// `#[serde(other)]` routes any unrecognized string here at
+    /// deserialization time instead of failing the whole containing
+    /// struct/event — never constructed directly by this binary itself.
+    #[serde(other)]
+    Unknown,
 }
 
 impl fmt::Display for Severity {
@@ -45,6 +53,7 @@ impl fmt::Display for Severity {
             Self::Critical => write!(f, "CRITICAL"),
             Self::Major => write!(f, "MAJOR"),
             Self::Minor => write!(f, "MINOR"),
+            Self::Unknown => write!(f, "UNKNOWN"),
         }
     }
 }
@@ -68,6 +77,14 @@ pub enum FaultOrigin {
     Engine,
     Cookbook,
     External,
+    /// An origin value this binary version does not recognize — forward-
+    /// compat fallback for a `status.jsonl` line written by a newer binary
+    /// that added a `FaultOrigin` variant. `#[serde(other)]` routes any
+    /// unrecognized string here at deserialization time instead of failing
+    /// the whole containing struct/event; never constructed directly by
+    /// this binary itself.
+    #[serde(other)]
+    Unknown,
 }
 
 // ── ErrorDomain ────────────────────────────────────────────────────
@@ -443,5 +460,66 @@ mod tests {
         let f = StageFailure::new("E_STAGE_BUG", "eagle").stage("eagle_encode");
         let summary = FailureSummary::from(&f);
         assert_eq!(summary.stage, Some("eagle_encode".to_string()));
+    }
+
+    /// Forward-compat regression pin: a `FailureSummary` JSON blob carrying
+    /// an `origin`/`severity` token this binary version doesn't recognize
+    /// (e.g. written by a future binary with a new `FaultOrigin` variant)
+    /// must still deserialize successfully -- `#[serde(other)]` on
+    /// `FaultOrigin::Unknown`/`Severity::Unknown` catches it -- and every
+    /// OTHER field must still be populated correctly. Before the fix, an
+    /// unrecognized token failed the whole struct's `Deserialize`, which
+    /// (via lineage.rs's tolerant `let Ok(ev) = ... else { continue }`)
+    /// silently dropped the entire containing `StageEvent`, not just the
+    /// one field.
+    #[test]
+    fn failure_summary_forward_compat_unknown_origin_and_severity() {
+        let json = r#"{
+            "code": "E_FUTURE",
+            "domain": "eagle",
+            "stage": "eagle_decode",
+            "severity": "apocalyptic",
+            "origin": "quantum",
+            "course": "train",
+            "recipe": "train_joint",
+            "ingredient": "trainer",
+            "context": [["ch", "4"]],
+            "message": "a future binary's failure mode"
+        }"#;
+        let summary: FailureSummary =
+            serde_json::from_str(json).expect("unrecognized origin/severity tokens must not fail the whole struct");
+        assert_eq!(summary.origin, FaultOrigin::Unknown);
+        assert_eq!(summary.severity, Severity::Unknown);
+        // The REST of the record survives too -- not just deserialization
+        // not-erroring.
+        assert_eq!(summary.code, "E_FUTURE");
+        assert_eq!(summary.domain, "eagle");
+        assert_eq!(summary.stage, Some("eagle_decode".to_string()));
+        assert_eq!(summary.course, Some("train".to_string()));
+        assert_eq!(summary.recipe, Some("train_joint".to_string()));
+        assert_eq!(summary.ingredient, Some("trainer".to_string()));
+        assert_eq!(summary.context, vec![("ch".to_string(), "4".to_string())]);
+        assert_eq!(summary.message, "a future binary's failure mode");
+    }
+
+    /// Known tokens still round-trip to the real variants (the `#[serde(other)]`
+    /// catch-all must not shadow legitimate values).
+    #[test]
+    fn failure_summary_known_tokens_still_deserialize_to_real_variants() {
+        let json = r#"{
+            "code": "E_KNOWN",
+            "domain": "eagle",
+            "stage": null,
+            "severity": "critical",
+            "origin": "external",
+            "course": null,
+            "recipe": null,
+            "ingredient": null,
+            "context": [],
+            "message": "known tokens"
+        }"#;
+        let summary: FailureSummary = serde_json::from_str(json).unwrap();
+        assert_eq!(summary.severity, Severity::Critical);
+        assert_eq!(summary.origin, FaultOrigin::External);
     }
 }
