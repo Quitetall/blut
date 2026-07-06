@@ -488,6 +488,7 @@ fn bench_broker_admission(c: &mut Criterion) {
         mem_avail_gb: 50.0,
         vram_total_mib: Some(24576),
         vram_free_mib: Some(20000),
+        gpus: Vec::new(),
     };
     let fp = drivers.estimate();
     c.bench_function("broker decide (pure box-fit)", |b| {

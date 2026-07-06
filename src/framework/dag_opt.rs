@@ -105,7 +105,7 @@ impl Default for DagOptimizer {
 /// A node is "live" if it's reachable from at least one root via
 /// forward edges. This catches both fully disconnected nodes and
 /// subgraphs that nothing feeds into.
-fn eliminate_dead_code(mut plan: CompiledPlan) -> CompiledPlan {
+fn eliminate_dead_code(plan: CompiledPlan) -> CompiledPlan {
     let n = plan.nodes.len();
     if n == 0 {
         return plan;
@@ -345,21 +345,16 @@ fn topo_order_from_adj(successors: &[Vec<NodeId>], n: usize) -> Vec<NodeId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::framework::stage::{ErasedArtifact, StageDyn};
+    use crate::framework::stage::StageDyn;
     use std::sync::Arc;
 
     /// Helper: create a minimal CompiledPlan for testing.
     fn make_plan(n_nodes: usize, edges: &[(NodeId, NodeId)]) -> CompiledPlan {
         use crate::framework::stage::Stage;
         use async_trait::async_trait;
-        use serde::{Deserialize, Serialize};
 
         // A dummy stage for testing
-        struct DummyStage {
-            name_str: &'static str,
-            mem: u32,
-            det: bool,
-        }
+        struct DummyStage;
 
         #[async_trait]
         impl Stage for DummyStage {
@@ -380,7 +375,7 @@ mod tests {
         let nodes: Vec<PlanNode> = (0..n_nodes)
             .map(|i| PlanNode {
                 id: i as NodeId,
-                stage: Arc::new(DummyStage { name_str: "dummy", mem: 4, det: true }) as Arc<dyn StageDyn>,
+                stage: Arc::new(DummyStage) as Arc<dyn StageDyn>,
                 args: serde_json::Value::Null,
                 canon_args: Vec::new(),
                 retry: None,

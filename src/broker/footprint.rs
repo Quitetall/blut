@@ -1355,7 +1355,7 @@ mod tests {
         let (avail, floor) = (37 * GIB, 6 * GIB);
         let budget = avail - floor;
         let b = batch_size_to_fit(4, avail, floor, &d);
-        assert!(b >= 1 && b <= 64);
+        assert!((1..=64).contains(&b));
         assert!(est(b) <= budget, "fits the RAM budget (never-OOM)");
         if b < 64 {
             assert!(est(b + 1) > budget, "maximal: one more batch unit would not fit");
