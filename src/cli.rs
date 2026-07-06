@@ -3127,7 +3127,15 @@ fn apply_cell_overrides(base: &serde_json::Value, overrides: &[String]) -> serde
             let val = if let Ok(i) = v.parse::<i64>() {
                 serde_json::json!(i)
             } else if let Ok(f) = v.parse::<f64>() {
-                serde_json::json!(f)
+                // Require a digit and a finite value, mirroring hydra's
+                // parse_override_value: bare `nan`/`inf` (which f64::from_str
+                // accepts) must stay strings — `json!(NAN)` silently emits
+                // JSON null, corrupting the cell's args.
+                if v.bytes().any(|b| b.is_ascii_digit()) && f.is_finite() {
+                    serde_json::json!(f)
+                } else {
+                    serde_json::json!(v)
+                }
             } else if let Ok(b) = v.parse::<bool>() {
                 serde_json::json!(b)
             } else {
@@ -4552,15 +4560,13 @@ fn run_data(cmd: DataCommand) -> Result<()> {
 }
 
 fn truncate_for_col(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    // `max` is a CHAR budget — compare char count, not byte length, so a
+    // multibyte string that fits the column isn't truncated early.
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        let cut = s
-            .char_indices()
-            .nth(max.saturating_sub(1))
-            .map(|(i, _)| i)
-            .unwrap_or(s.len().min(max));
-        format!("{}…", &s[..cut])
+        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{cut}…")
     }
 }
 
@@ -4930,6 +4936,55 @@ mod sweep_projection_tests {
         let cfg = json!({"lamquant_snn": 5, "epochs": 1});
         let args = project_args(cfg.clone(), "lamquant_snn");
         assert_eq!(args, cfg);
+    }
+}
+
+#[cfg(test)]
+mod cell_override_and_truncate_tests {
+    use super::{apply_cell_overrides, truncate_for_col};
+    use serde_json::json;
+
+    #[test]
+    fn overrides_coerce_scalars() {
+        let out = apply_cell_overrides(&json!({}), &[
+            "a=3".into(),
+            "b=2.5".into(),
+            "c=true".into(),
+            "d=hello".into(),
+        ]);
+        assert_eq!(out, json!({"a": 3, "b": 2.5, "c": true, "d": "hello"}));
+    }
+
+    #[test]
+    fn bare_nan_inf_stay_strings() {
+        // f64::from_str accepts these, but json!(NAN) emits null — a silent
+        // corruption of the cell's args. They must survive as strings.
+        let out = apply_cell_overrides(&json!({}), &[
+            "a=nan".into(),
+            "b=inf".into(),
+            "c=-inf".into(),
+            "d=infinity".into(),
+        ]);
+        assert_eq!(
+            out,
+            json!({"a": "nan", "b": "inf", "c": "-inf", "d": "infinity"})
+        );
+    }
+
+    #[test]
+    fn overflowing_exponent_stays_string() {
+        // "1e999" parses to +inf: has digits but non-finite → string, not null.
+        let out = apply_cell_overrides(&json!({}), &["a=1e999".into()]);
+        assert_eq!(out, json!({"a": "1e999"}));
+    }
+
+    #[test]
+    fn truncate_is_char_correct() {
+        // 5 chars, 15 bytes — fits a 5-char column and must NOT be cut.
+        assert_eq!(truncate_for_col("ααβββ", 5), "ααβββ");
+        assert_eq!(truncate_for_col("ααβββ", 4), "ααβ…");
+        assert_eq!(truncate_for_col("ascii", 5), "ascii");
+        assert_eq!(truncate_for_col("ascii!", 5), "asci…");
     }
 }
 
