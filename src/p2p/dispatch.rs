@@ -386,7 +386,6 @@ mod tests {
     fn verify_result_bad_signature() {
         let policy = DefaultDispatchPolicy::new(DispatchMatrix::default());
         let kp = KeyPair::generate();
-        let _kp_other = KeyPair::generate();
         let hash = ContentHash::of_bytes(&[42u8; 32]);
         let result = TaskResult {
             task_id: "test".into(),
@@ -397,6 +396,31 @@ mod tests {
             signature: kp.sign(b"wrong payload"),
         };
         // Signature was over "wrong payload", not sign_payload() → rejects.
+        assert!(matches!(
+            policy.verify_result(&result, &hash, &kp.verifying),
+            DispatchVerdict::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn verify_result_wrong_key() {
+        // Signed by a key that is NOT the peer's registered key — must
+        // reject even though the signed payload bytes are exactly right
+        // (an impersonating peer can produce a valid-looking signature
+        // with its own key; only the registered pubkey may verify).
+        let policy = DefaultDispatchPolicy::new(DispatchMatrix::default());
+        let kp = KeyPair::generate();
+        let kp_other = KeyPair::generate();
+        let hash = ContentHash::of_bytes(&[42u8; 32]);
+        let mut result = TaskResult {
+            task_id: "test".into(),
+            peer_id: crate::p2p::peer::PeerId::from_pubkey(&kp.verifying),
+            output_hash: hash,
+            encrypted_output: None,
+            wall_time_ms: 1000,
+            signature: kp_other.sign(b"placeholder"),
+        };
+        result.signature = kp_other.sign(&result.sign_payload());
         assert!(matches!(
             policy.verify_result(&result, &hash, &kp.verifying),
             DispatchVerdict::Reject(_)
