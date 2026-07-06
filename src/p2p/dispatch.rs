@@ -64,6 +64,11 @@ pub struct DefaultDispatchPolicy {
     pub matrix: DispatchMatrix,
     /// Stage names eligible for remote dispatch.
     pub dispatchable_stages: HashSet<String>,
+    /// Explicit per-stage data classifications. A stage NOT in this map
+    /// classifies as `DataClass::Restricted` (fail-closed): its data can
+    /// only reach Trusted peers until an operator explicitly declares it
+    /// less sensitive via [`classify`](Self::classify).
+    pub stage_classes: std::collections::HashMap<String, DataClass>,
 }
 
 impl DefaultDispatchPolicy {
@@ -85,9 +90,20 @@ impl DefaultDispatchPolicy {
             // box on any worker. See crate::p2p::smoke.
             crate::p2p::smoke::SMOKE_STAGE.into(),
         ]);
+        // The ONLY default classification: the smoke probe's payload is
+        // synthetic by construction (no corpus data), so it is safely
+        // Public — connectivity tests work out of the box against
+        // anonymous peers. Every other stage touches corpus data whose
+        // sensitivity the engine cannot know, so it inherits the
+        // fail-closed Restricted default until the operator classifies it.
+        let stage_classes = std::collections::HashMap::from([(
+            crate::p2p::smoke::SMOKE_STAGE.to_string(),
+            DataClass::Public,
+        )]);
         Self {
             matrix,
             dispatchable_stages: dispatchable,
+            stage_classes,
         }
     }
 
@@ -96,7 +112,15 @@ impl DefaultDispatchPolicy {
         Self {
             matrix,
             dispatchable_stages: stages,
+            stage_classes: std::collections::HashMap::new(),
         }
+    }
+
+    /// Declare a stage's data classification (builder-style). Stages
+    /// without a declaration classify as `Restricted` — fail-closed.
+    pub fn classify(mut self, stage: impl Into<String>, class: DataClass) -> Self {
+        self.stage_classes.insert(stage.into(), class);
+        self
     }
 }
 
@@ -105,10 +129,16 @@ impl DispatchPolicy for DefaultDispatchPolicy {
         self.dispatchable_stages.contains(stage_name)
     }
 
-    fn classify_stage(&self, _stage_name: &str, _args: &serde_json::Value) -> DataClass {
-        // TODO: domain-specific policies should override this to classify
-        // stages by actual data sensitivity. Default is Public.
-        DataClass::Public
+    fn classify_stage(&self, stage_name: &str, _args: &serde_json::Value) -> DataClass {
+        // FAIL-CLOSED: an unclassified stage is treated as Restricted
+        // (Trusted peers only). Defaulting to Public here would silently
+        // ship potentially-clinical corpus data to anonymous peers the
+        // moment a stage is marked dispatchable. Domain policies override
+        // per stage via `classify` (or their own DispatchPolicy impl).
+        self.stage_classes
+            .get(stage_name)
+            .copied()
+            .unwrap_or(DataClass::Restricted)
     }
 
     fn select_peer(
@@ -203,6 +233,45 @@ mod tests {
         assert!(!policy.is_dispatchable("train_joint"));
         assert!(!policy.is_dispatchable("train_snn"));
         assert!(!policy.is_dispatchable("train_l3_teacher"));
+    }
+
+    #[test]
+    fn unclassified_stage_is_restricted_fail_closed() {
+        // An unclassified stage must NOT default to Public — that would
+        // ship potentially-clinical corpus data to anonymous peers.
+        let policy = DefaultDispatchPolicy::new(DispatchMatrix::default());
+        let args = serde_json::json!({});
+        assert_eq!(
+            policy.classify_stage("warm_fb_cache", &args),
+            DataClass::Restricted
+        );
+        assert_eq!(
+            policy.classify_stage("some_future_stage", &args),
+            DataClass::Restricted
+        );
+        // The smoke probe's payload is synthetic by construction — the one
+        // default Public classification, so out-of-the-box connectivity
+        // tests still reach anonymous peers.
+        assert_eq!(
+            policy.classify_stage(crate::p2p::smoke::SMOKE_STAGE, &args),
+            DataClass::Public
+        );
+    }
+
+    #[test]
+    fn classify_builder_overrides_default() {
+        let policy = DefaultDispatchPolicy::new(DispatchMatrix::default())
+            .classify("warm_fb_cache", DataClass::Internal);
+        let args = serde_json::json!({});
+        assert_eq!(
+            policy.classify_stage("warm_fb_cache", &args),
+            DataClass::Internal
+        );
+        // Everything else stays fail-closed.
+        assert_eq!(
+            policy.classify_stage("precompute_l3", &args),
+            DataClass::Restricted
+        );
     }
 
     #[test]

@@ -303,6 +303,13 @@ pub trait Stage: Send + Sync + 'static {
     /// doesn't re-execute just because its upstream was retrained.
     const DETERMINISTIC: bool = true;
 
+    /// CPU cores this stage keeps busy while running. Default 1 (a
+    /// single-threaded or GPU-bound stage). Used by the p2p dispatch
+    /// path to size the `ResourceRequest` sent to peers — a rayon/
+    /// dataloader-heavy stage should declare its real parallelism so
+    /// peer selection doesn't schedule it onto a 1-core box.
+    const CPU_CORES: u32 = 1;
+
     /// Whether this stage is ADVISORY (ADR 0071). An advisory stage's failure is
     /// recorded as a non-fatal warning and PRUNES its descendants, but does NOT
     /// fail the plan / exit non-zero — the canonical case is a `--dry-run` /
@@ -433,6 +440,12 @@ pub trait StageDyn: Send + Sync + 'static {
     /// The executor reserves THIS against the box-fit budget.
     fn memory_gib_for(&self, _args: &serde_json::Value) -> u32 {
         self.memory_gib()
+    }
+    /// CPU cores held while running (`Stage::CPU_CORES`). Defaulted 1 so
+    /// manual `StageDyn` impls keep the old semantics; the blanket impl
+    /// forwards the const.
+    fn cpu_cores(&self) -> u32 {
+        1
     }
     /// Whether this stage is advisory (ADR 0071 · `Stage::ADVISORY`). Defaulted
     /// `false` so manual `StageDyn` impls keep the fatal semantics; the blanket
@@ -601,6 +614,9 @@ impl<S: Stage> StageDyn for S {
     }
     fn memory_gib(&self) -> u32 {
         S::MEMORY_GIB
+    }
+    fn cpu_cores(&self) -> u32 {
+        S::CPU_CORES
     }
     fn memory_gib_for(&self, args: &serde_json::Value) -> u32 {
         // Deserialize to typed Args and delegate; a bad-args value (shouldn't

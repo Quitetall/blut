@@ -2112,7 +2112,7 @@ impl ParallelExecutor {
                             let stage_resources = task.stage.resources();
                             let has_gpu = stage_resources.contains(&Resource::Gpu);
                             let resource_request = ResourceRequest {
-                                cpu_cores: 1, // TODO: derive from RESOURCES
+                                cpu_cores: task.stage.cpu_cores(),
                                 memory_gib: task.stage.memory_gib(),
                                 gpu: has_gpu,
                                 gpu_vram_gib: None,
