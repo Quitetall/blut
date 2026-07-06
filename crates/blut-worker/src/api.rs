@@ -3,19 +3,25 @@
 //! REST API for the BLUT cloud worker.
 //!
 //! Endpoints:
-//!   POST /jobs          — submit a new job
-//!   GET  /jobs          — list all jobs
-//!   GET  /jobs/:id      — get job status
-//!   GET  /health        — health check
+//!   POST /jobs          — submit a new job          (bearer-token protected)
+//!   GET  /jobs          — list all jobs             (bearer-token protected)
+//!   GET  /jobs/:id      — get job status            (bearer-token protected)
+//!   GET  /health        — health check              (unauthenticated)
+//!
+//! SECURITY: `POST /jobs` executes recipes — arbitrary code. When a token
+//! is configured (`BLUT_WORKER_TOKEN`), every job route requires
+//! `Authorization: Bearer <token>`. Running token-less is only permitted
+//! on a loopback bind (enforced at startup in `main.rs`, fail-closed).
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Request, State},
     http::StatusCode,
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -28,6 +34,11 @@ pub struct ApiState {
     pub queue_dir: PathBuf,
     pub results_dir: PathBuf,
     pub jobs: Arc<RwLock<Vec<JobStatus>>>,
+    /// Worker identity reported by `/health` (the real one, not a placeholder).
+    pub worker_id: String,
+    /// Bearer token required on the job routes. `None` = token-less
+    /// loopback-only mode (main.rs refuses non-loopback binds without it).
+    pub token: Option<Arc<str>>,
 }
 
 /// Job submission request.
@@ -69,13 +80,48 @@ pub struct HealthResponse {
     pub queue_depth: usize,
 }
 
-/// Build the API router.
+/// Build the API router. Job routes sit behind the bearer-token layer;
+/// `/health` stays open (it exposes only liveness + queue depth).
 pub fn router(state: ApiState) -> Router {
-    Router::new()
+    let protected = Router::new()
         .route("/jobs", post(submit_job).get(list_jobs))
         .route("/jobs/{id}", get(get_job))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer,
+        ));
+    Router::new()
+        .merge(protected)
         .route("/health", get(health))
         .with_state(state)
+}
+
+/// Middleware: when a token is configured, demand a matching
+/// `Authorization: Bearer <token>` header on every protected route.
+async fn require_bearer(State(state): State<ApiState>, req: Request, next: Next) -> Response {
+    let Some(expected) = state.token.as_deref() else {
+        // Token-less mode — main.rs only allows this on a loopback bind.
+        return next.run(req).await;
+    };
+    let presented = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match presented {
+        Some(t) if constant_time_eq(t.as_bytes(), expected.as_bytes()) => next.run(req).await,
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "missing or invalid bearer token"})),
+        )
+            .into_response(),
+    }
+}
+
+/// Length-then-XOR-fold comparison: no early exit on the first differing
+/// byte, so the match loop leaks no timing signal about the token prefix.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// POST /jobs — submit a new job.
@@ -97,7 +143,16 @@ async fn submit_job(
     });
 
     let job_path = state.queue_dir.join(format!("{job_id}.json"));
-    let content = serde_json::to_string_pretty(&job).unwrap();
+    let content = match serde_json::to_string_pretty(&job) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("failed to serialize job: {e}")})),
+            )
+                .into_response();
+        }
+    };
 
     if let Err(e) = fs::write(&job_path, &content).await {
         return (
@@ -173,18 +228,98 @@ async fn get_job(State(state): State<ApiState>, Path(id): Path<String>) -> impl 
 
 /// GET /health — health check.
 async fn health(State(state): State<ApiState>) -> impl IntoResponse {
-    // Count queue depth
-    let queue_depth = fs::read_dir(&state.queue_dir)
-        .await
-        .map(|_entries| {
-            // TODO: count entries asynchronously
-            0
-        })
-        .unwrap_or(0);
+    // Count pending .json job files (an unreadable dir reports depth 0).
+    let queue_depth = match fs::read_dir(&state.queue_dir).await {
+        Ok(mut entries) => {
+            let mut n = 0usize;
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.path().extension().is_some_and(|e| e == "json") {
+                    n += 1;
+                }
+            }
+            n
+        }
+        Err(_) => 0,
+    };
 
     Json(HealthResponse {
         status: "ok".to_string(),
-        worker_id: "worker-001".to_string(),
+        worker_id: state.worker_id.clone(),
         queue_depth,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request as HttpRequest, StatusCode, header};
+    use tower::util::ServiceExt;
+
+    fn state(token: Option<&str>, dir: &std::path::Path) -> ApiState {
+        ApiState {
+            queue_dir: dir.to_path_buf(),
+            results_dir: dir.to_path_buf(),
+            jobs: Arc::new(RwLock::new(Vec::new())),
+            worker_id: "test-worker".into(),
+            token: token.map(Arc::from),
+        }
+    }
+
+    fn get(uri: &str, bearer: Option<&str>) -> HttpRequest<Body> {
+        let mut b = HttpRequest::builder().uri(uri);
+        if let Some(t) = bearer {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn job_routes_reject_without_token() {
+        let td = tempfile::tempdir().unwrap();
+        let app = router(state(Some("s3cret"), td.path()));
+        let res = app.oneshot(get("/jobs", None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn job_routes_reject_wrong_token() {
+        let td = tempfile::tempdir().unwrap();
+        let app = router(state(Some("s3cret"), td.path()));
+        let res = app.oneshot(get("/jobs", Some("wrong"))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn job_routes_accept_correct_token() {
+        let td = tempfile::tempdir().unwrap();
+        let app = router(state(Some("s3cret"), td.path()));
+        let res = app.oneshot(get("/jobs", Some("s3cret"))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_is_open_even_with_token() {
+        let td = tempfile::tempdir().unwrap();
+        let app = router(state(Some("s3cret"), td.path()));
+        let res = app.oneshot(get("/health", None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn tokenless_mode_allows_job_routes() {
+        // Loopback-only mode (main.rs enforces the bind restriction).
+        let td = tempfile::tempdir().unwrap();
+        let app = router(state(None, td.path()));
+        let res = app.oneshot(get("/jobs", None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn constant_time_eq_basics() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(constant_time_eq(b"", b""));
+    }
 }

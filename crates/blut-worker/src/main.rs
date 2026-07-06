@@ -64,6 +64,14 @@ struct Cli {
     /// Enable REST API server on this port.
     #[arg(long)]
     api_port: Option<u16>,
+
+    /// Bind address for the REST API. Defaults to loopback. Binding a
+    /// non-loopback address REQUIRES a bearer token in BLUT_WORKER_TOKEN
+    /// (the API executes recipes — arbitrary code); startup fails closed
+    /// otherwise. The token is env-only, never a CLI flag, so it can't
+    /// leak through /proc/<pid>/cmdline or shell history.
+    #[arg(long, default_value = "127.0.0.1")]
+    api_bind: std::net::IpAddr,
 }
 
 /// A job pulled from the queue.
@@ -135,19 +143,46 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&cli.work_dir).await?;
     fs::create_dir_all(&cli.results_dir).await?;
 
-    // Start API server if configured
+    // Start API server if configured. Fail-closed: POST /jobs executes
+    // recipes (arbitrary code), so a non-loopback bind without a bearer
+    // token is refused at startup rather than warned about.
     if let Some(port) = cli.api_port {
+        let token = std::env::var("BLUT_WORKER_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty());
+        if !cli.api_bind.is_loopback() && token.is_none() {
+            anyhow::bail!(
+                "refusing to serve the REST API on non-loopback {} without a bearer token: \
+                 POST /jobs executes recipes (arbitrary code). Set BLUT_WORKER_TOKEN, or keep \
+                 the default --api-bind 127.0.0.1.",
+                cli.api_bind
+            );
+        }
+        if token.is_none() {
+            tracing::warn!(
+                "REST API is running WITHOUT auth (BLUT_WORKER_TOKEN unset) — \
+                 loopback-only mode; any local process can submit jobs"
+            );
+        }
         let api_state = api::ApiState {
             queue_dir: cli.queue_dir.clone(),
             results_dir: cli.results_dir.clone(),
             jobs: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            worker_id: worker_id.clone(),
+            token: token.map(Arc::from),
         };
         let app = api::router(api_state);
-        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        let addr = std::net::SocketAddr::new(cli.api_bind, port);
+        // Bind BEFORE spawning: a bind failure (port taken, no permission)
+        // is a startup error the operator must see, not a background panic.
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("bind REST API on {addr}"))?;
         tracing::info!("API server listening on {addr}");
         tokio::spawn(async move {
-            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-            axum::serve(listener, app).await.unwrap();
+            if let Err(e) = axum::serve(listener, app).await {
+                tracing::error!("REST API server exited: {e:#}");
+            }
         });
     }
 
