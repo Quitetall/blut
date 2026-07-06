@@ -5,7 +5,6 @@
 //! Tests the job lifecycle: queue → read → process → result.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 /// Helper: create a temp dir for testing.
 fn temp_dir() -> tempfile::TempDir {
@@ -97,7 +96,7 @@ fn queue_listing_finds_json_files() {
     let entries: Vec<_> = std::fs::read_dir(&queue_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "json"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
         .collect();
 
     assert_eq!(entries.len(), 3);
@@ -177,7 +176,7 @@ fn concurrent_queue_access() {
     let entries: Vec<_> = std::fs::read_dir(&queue_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "json"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
         .collect();
 
     assert_eq!(entries.len(), 10);

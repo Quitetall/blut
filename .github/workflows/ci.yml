@@ -44,13 +44,25 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-      # The interactive cockpit is behind the off-by-default `tui` feature
-      # (1.0 is CLI-only). Lint + test it explicitly so the gated code can't
-      # bitrot before it's re-enabled in 1.1.
+      # The cockpit's `tui` feature is default-on since 1.0, but pin it
+      # explicitly so a future change to the default feature set can't
+      # silently drop the cockpit from CI coverage.
       - name: Clippy + test the tui feature
         run: |
           cargo clippy -p blut --features tui --all-targets -- -D warnings
           cargo test -p blut --features tui
+
+      # crates/blut-worker is a STANDALONE workspace (it path-depends on the
+      # engine but is not a member of the root [workspace]), so none of the
+      # --workspace steps above touch it. Gate it explicitly or it rots
+      # silently — the framework bench already demonstrated that failure mode.
+      - name: Build + lint + test blut-worker (standalone workspace)
+        working-directory: crates/blut-worker
+        run: |
+          cargo fmt --all -- --check
+          cargo build --all-targets
+          cargo clippy --all-targets -- -D warnings
+          cargo test
 
   macos-build:
     name: macOS compile-check (containment degrades)

@@ -180,7 +180,7 @@ async fn poll_and_run(cli: &Cli, worker_id: &str) -> Result<bool> {
     let mut job_files: Vec<PathBuf> = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        if path.extension().map_or(false, |e| e == "json") {
+        if path.extension().is_some_and(|e| e == "json") {
             job_files.push(path);
         }
     }

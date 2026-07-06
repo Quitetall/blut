@@ -138,19 +138,18 @@ async fn get_job(State(state): State<ApiState>, Path(id): Path<String>) -> impl 
 
     // Check results directory
     let result_path = state.results_dir.join(format!("{id}.json"));
-    if result_path.exists() {
-        if let Ok(content) = fs::read_to_string(&result_path).await {
-            if let Ok(result) = serde_json::from_str::<serde_json::Value>(&content) {
-                let status = result["status"].as_str().unwrap_or("unknown");
-                return Json(JobStatus {
-                    id: id.clone(),
-                    recipe: String::new(),
-                    status: status.to_string(),
-                    result: Some(result),
-                })
-                .into_response();
-            }
-        }
+    if result_path.exists()
+        && let Ok(content) = fs::read_to_string(&result_path).await
+        && let Ok(result) = serde_json::from_str::<serde_json::Value>(&content)
+    {
+        let status = result["status"].as_str().unwrap_or("unknown");
+        return Json(JobStatus {
+            id: id.clone(),
+            recipe: String::new(),
+            status: status.to_string(),
+            result: Some(result),
+        })
+        .into_response();
     }
 
     // Check queue directory
