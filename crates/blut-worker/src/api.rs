@@ -118,10 +118,12 @@ async fn require_bearer(State(state): State<ApiState>, req: Request, next: Next)
     }
 }
 
-/// Constant-time comparison with no short-circuit on EITHER content or
-/// length: iterate over the longer input (zero-padding the shorter) and
-/// OR the length difference into the accumulator, so timing reveals
-/// neither a matching prefix nor the token's length.
+/// Comparison with no short-circuit on content or length mismatch:
+/// iterate over the longer input (zero-padding the shorter) and OR the
+/// length difference into the accumulator, so timing reveals no signal
+/// about the token's content or matching prefix. (Iteration count still
+/// tracks the LONGER input, so probe timing can bound the token's
+/// length — acceptable here; don't reuse this where length is secret.)
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let mut diff = a.len() ^ b.len();
     for i in 0..a.len().max(b.len()) {
