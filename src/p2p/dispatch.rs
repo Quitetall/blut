@@ -221,9 +221,11 @@ mod tests {
 
     fn make_gpu_peer(trust: TrustLevel, reputation: f64, vram: u32) -> PeerInfo {
         let kp = KeyPair::generate();
-        let mut caps = PeerCapabilities::default();
-        caps.gpu_model = Some("RTX 4090".into());
-        caps.gpu_vram_gib = Some(vram);
+        let caps = PeerCapabilities {
+            gpu_model: Some("RTX 4090".into()),
+            gpu_vram_gib: Some(vram),
+            ..Default::default()
+        };
         let mut peer = PeerInfo::new(kp.verifying, kp.x25519_public, trust, caps);
         peer.reputation = reputation;
         peer
@@ -347,7 +349,7 @@ mod tests {
         let mut result = TaskResult {
             task_id: "test".into(),
             peer_id: crate::p2p::peer::PeerId::from_pubkey(&kp.verifying),
-            output_hash: hash.clone(),
+            output_hash: hash,
             encrypted_output: None,
             wall_time_ms: 1000,
             signature: kp.sign(b"placeholder"),
@@ -384,12 +386,12 @@ mod tests {
     fn verify_result_bad_signature() {
         let policy = DefaultDispatchPolicy::new(DispatchMatrix::default());
         let kp = KeyPair::generate();
-        let kp_other = KeyPair::generate();
+        let _kp_other = KeyPair::generate();
         let hash = ContentHash::of_bytes(&[42u8; 32]);
         let result = TaskResult {
             task_id: "test".into(),
             peer_id: crate::p2p::peer::PeerId::from_pubkey(&kp.verifying),
-            output_hash: hash.clone(),
+            output_hash: hash,
             encrypted_output: None,
             wall_time_ms: 1000,
             signature: kp.sign(b"wrong payload"),

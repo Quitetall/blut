@@ -52,6 +52,14 @@ jobs:
           cargo clippy -p blut --features tui --all-targets -- -D warnings
           cargo test -p blut --features tui
 
+      # P2P distributed compute is off-by-default; without an explicit gate
+      # the entire src/p2p tree (and the executor's #[cfg(feature = "p2p")]
+      # dispatch path) never compiles in CI and rots silently.
+      - name: Clippy + test the p2p feature
+        run: |
+          cargo clippy -p blut --features p2p --all-targets -- -D warnings
+          cargo test -p blut --features p2p
+
       # crates/blut-worker is a STANDALONE workspace (it path-depends on the
       # engine but is not a member of the root [workspace]), so none of the
       # --workspace steps above touch it. Gate it explicitly or it rots

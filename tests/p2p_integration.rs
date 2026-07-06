@@ -7,7 +7,6 @@
 
 #![cfg(feature = "p2p")]
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -213,7 +212,7 @@ mod e2e {
     use blut::framework::cookbook::{Cookbook, Registry};
     use blut::framework::error::StageError;
     use blut::framework::resource::Resource;
-    use blut::framework::stage::{ErasedStageCtor, Stage, StageContext, StageDyn};
+    use blut::framework::stage::{ErasedStageCtor, Stage, StageContext};
     use blut::p2p::PeerInfo;
     use blut::p2p::dispatch::{DispatchPolicy, DispatchVerdict};
     use blut::p2p::peer_exec::{CoordinatorKeys, dispatch_to_peer, run_peer_loop};
