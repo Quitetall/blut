@@ -118,10 +118,18 @@ async fn require_bearer(State(state): State<ApiState>, req: Request, next: Next)
     }
 }
 
-/// Length-then-XOR-fold comparison: no early exit on the first differing
-/// byte, so the match loop leaks no timing signal about the token prefix.
+/// Constant-time comparison with no short-circuit on EITHER content or
+/// length: iterate over the longer input (zero-padding the shorter) and
+/// OR the length difference into the accumulator, so timing reveals
+/// neither a matching prefix nor the token's length.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= (x ^ y) as usize;
+    }
+    diff == 0
 }
 
 /// POST /jobs — submit a new job.
@@ -315,11 +323,48 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
+    fn post_job(bearer: Option<&str>) -> HttpRequest<Body> {
+        let mut b = HttpRequest::builder()
+            .method("POST")
+            .uri("/jobs")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(t) = bearer {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        b.body(Body::from(r#"{"recipe": "noop"}"#)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn post_jobs_rejected_without_valid_token() {
+        // POST /jobs is the recipe-execution (arbitrary-code) route — the
+        // one the auth layer exists for. Both missing and wrong tokens
+        // must 401 BEFORE the handler runs (no job file written).
+        let td = tempfile::tempdir().unwrap();
+        let app = router(state(Some("s3cret"), td.path()));
+        let res = app.clone().oneshot(post_job(None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let res = app.oneshot(post_job(Some("wrong"))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let queued = std::fs::read_dir(td.path()).unwrap().count();
+        assert_eq!(queued, 0, "rejected submissions must not enqueue a job");
+    }
+
+    #[tokio::test]
+    async fn post_jobs_accepted_with_correct_token() {
+        let td = tempfile::tempdir().unwrap();
+        let app = router(state(Some("s3cret"), td.path()));
+        let res = app.oneshot(post_job(Some("s3cret"))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let queued = std::fs::read_dir(td.path()).unwrap().count();
+        assert_eq!(queued, 1, "accepted submission writes one queue file");
+    }
+
     #[test]
     fn constant_time_eq_basics() {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"abc\0", b"abc"));
         assert!(constant_time_eq(b"", b""));
     }
 }

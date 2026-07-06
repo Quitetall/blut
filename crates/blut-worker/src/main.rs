@@ -157,8 +157,7 @@ async fn main() -> Result<()> {
                  the default --api-bind 127.0.0.1.",
                 cli.api_bind
             );
-        }
-        if token.is_none() {
+        } else if token.is_none() {
             tracing::warn!(
                 "REST API is running WITHOUT auth (BLUT_WORKER_TOKEN unset) — \
                  loopback-only mode; any local process can submit jobs"
