@@ -32,11 +32,9 @@ impl PeerRegistry {
                 path: path.to_path_buf(),
                 source: e,
             })?;
-            let mut reg: Self =
-                serde_json::from_str(&data).map_err(|e| TrainError::other(format!(
-                    "corrupt peer registry {}: {e}",
-                    path.display()
-                )))?;
+            let mut reg: Self = serde_json::from_str(&data).map_err(|e| {
+                TrainError::other(format!("corrupt peer registry {}: {e}", path.display()))
+            })?;
             reg.path = path.to_path_buf();
             Ok(reg)
         } else {
@@ -187,7 +185,12 @@ mod tests {
 
     fn make_peer(trust: TrustLevel) -> PeerInfo {
         let kp = KeyPair::generate();
-        PeerInfo::new(kp.verifying, kp.x25519_public, trust, PeerCapabilities::default())
+        PeerInfo::new(
+            kp.verifying,
+            kp.x25519_public,
+            trust,
+            PeerCapabilities::default(),
+        )
     }
 
     #[test]

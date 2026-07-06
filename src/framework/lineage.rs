@@ -480,8 +480,13 @@ mod tests {
         assert_eq!(jf.node_idx, 2);
         assert_eq!(jf.stage, "train_joint");
         assert!(jf.error.contains("OOM killed"));
-        let f = jf.failure.expect("a structured FailureSummary was attached");
-        assert_eq!(f.origin, crate::framework::error_domain::FaultOrigin::External);
+        let f = jf
+            .failure
+            .expect("a structured FailureSummary was attached");
+        assert_eq!(
+            f.origin,
+            crate::framework::error_domain::FaultOrigin::External
+        );
         assert_eq!(f.course.as_deref(), Some("train"));
         assert_eq!(f.recipe.as_deref(), Some("train_joint"));
         assert_eq!(f.stage.as_deref(), Some("train_joint"));

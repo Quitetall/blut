@@ -2691,7 +2691,10 @@ fn draw_artifacts(f: &mut Frame<'_>, area: Rect, app: &App) {
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            format!("  {:<24} {:<24} {:<14} {}", "Kind", "Ingredient", "Hash", "When"),
+            format!(
+                "  {:<24} {:<24} {:<14} {}",
+                "Kind", "Ingredient", "Hash", "When"
+            ),
             theme::dim(),
         )));
         for (i, a) in app.artifacts.iter().enumerate() {

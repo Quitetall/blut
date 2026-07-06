@@ -452,11 +452,7 @@ impl SlurmJob {
     /// Build an `sbatch` script body from the launcher config + inner command.
     /// The script is submitted via stdin to `sbatch`, so no temp file is
     /// needed. Inner args are shell-escaped to prevent injection.
-    fn build_sbatch_script(
-        unit: &str,
-        launcher: &SlurmLauncher,
-        inner: &[String],
-    ) -> String {
+    fn build_sbatch_script(unit: &str, launcher: &SlurmLauncher, inner: &[String]) -> String {
         let partition = launcher.partition.as_deref();
         let mem = launcher.mem.as_deref();
         let cpus = launcher.cpus;
@@ -501,8 +497,13 @@ impl SlurmJob {
         // torchrun's c10d rendezvous can find the coordinator. Only needed when
         // nodes > 1; single-node torchrun uses --standalone.
         if launcher.nodes.unwrap_or(1) > 1 {
-            lines.push("# Multi-node rendezvous: resolve MASTER_ADDR from Slurm allocation".to_string());
-            lines.push("export MASTER_ADDR=$(scontrol show hostnames \"$SLURM_JOB_NODELIST\" | head -n1)".to_string());
+            lines.push(
+                "# Multi-node rendezvous: resolve MASTER_ADDR from Slurm allocation".to_string(),
+            );
+            lines.push(
+                "export MASTER_ADDR=$(scontrol show hostnames \"$SLURM_JOB_NODELIST\" | head -n1)"
+                    .to_string(),
+            );
             lines.push("export MASTER_PORT=${MASTER_PORT:-29500}".to_string());
             lines.push("export NODE_RANK=${SLURM_NODEID:-0}".to_string());
             lines.push(String::new());
@@ -548,14 +549,7 @@ impl RemoteJob for SlurmJob {
 
     fn poll(&self) -> Result<JobState> {
         let out = Command::new("sacct")
-            .args([
-                "-j",
-                &self.job_id,
-                "-n",
-                "-o",
-                "State",
-                "--noheader",
-            ])
+            .args(["-j", &self.job_id, "-n", "-o", "State", "--noheader"])
             .output()
             .map_err(|e| TrainError::other(format!("sacct invocation failed: {e}")))?;
         if !out.status.success() {
@@ -586,27 +580,23 @@ impl RemoteJob for SlurmJob {
             // Stream whatever is new in the log file.
             if self.log_path.exists() {
                 use std::io::{Seek, SeekFrom};
-                let file = std::fs::File::open(&self.log_path).map_err(|e| {
-                    TrainError::Io {
-                        path: self.log_path.clone(),
-                        source: e,
-                    }
+                let file = std::fs::File::open(&self.log_path).map_err(|e| TrainError::Io {
+                    path: self.log_path.clone(),
+                    source: e,
                 })?;
                 let mut reader = std::io::BufReader::new(file);
-                reader.seek(SeekFrom::Start(offset)).map_err(|e| {
-                    TrainError::Io {
+                reader
+                    .seek(SeekFrom::Start(offset))
+                    .map_err(|e| TrainError::Io {
                         path: self.log_path.clone(),
                         source: e,
-                    }
-                })?;
+                    })?;
                 let mut line = String::new();
                 loop {
                     line.clear();
-                    let n = reader.read_line(&mut line).map_err(|e| {
-                        TrainError::Io {
-                            path: self.log_path.clone(),
-                            source: e,
-                        }
+                    let n = reader.read_line(&mut line).map_err(|e| TrainError::Io {
+                        path: self.log_path.clone(),
+                        source: e,
                     })?;
                     if n == 0 {
                         break;
@@ -679,15 +669,9 @@ impl SlurmLauncher {
     ///
     /// The sbatch script is generated in-memory and piped to `sbatch` via
     /// stdin, so no temporary file is left on disk.
-    pub fn submit_async(
-        &self,
-        unit: &str,
-        inner: &[String],
-    ) -> Result<Box<dyn RemoteJob>> {
+    pub fn submit_async(&self, unit: &str, inner: &[String]) -> Result<Box<dyn RemoteJob>> {
         if inner.is_empty() {
-            return Err(TrainError::other(
-                "slurm submit_async: empty inner command",
-            ));
+            return Err(TrainError::other("slurm submit_async: empty inner command"));
         }
         let script = SlurmJob::build_sbatch_script(unit, self, inner);
         use std::io::Write;
@@ -723,9 +707,7 @@ impl SlurmLauncher {
             .unwrap_or(raw.trim())
             .to_string();
         if job_id.is_empty() {
-            return Err(TrainError::other(
-                "sbatch --parsable returned empty job ID",
-            ));
+            return Err(TrainError::other("sbatch --parsable returned empty job ID"));
         }
         let log_path = PathBuf::from(format!("slurm-{job_id}.out"));
         Ok(Box::new(SlurmJob { job_id, log_path }))
@@ -806,9 +788,7 @@ impl RayJob {
                 return match status {
                     "SUCCEEDED" => JobState::Succeeded,
                     "FAILED" => JobState::Failed("FAILED".to_string()),
-                    "RUNNING" | "PENDING" | "WAITING" | "CONSTRUCTOR" => {
-                        JobState::Running
-                    }
+                    "RUNNING" | "PENDING" | "WAITING" | "CONSTRUCTOR" => JobState::Running,
                     "STOPPED" | "CANCELLED" => JobState::Cancelled,
                     "UNKNOWN" => JobState::Unknown("UNKNOWN".to_string()),
                     other => JobState::Unknown(other.to_string()),
@@ -853,14 +833,14 @@ impl RemoteJob for RayJob {
         let mut child = cmd
             .spawn()
             .map_err(|e| TrainError::other(format!("ray job logs failed: {e}")))?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            TrainError::other("ray job logs: could not capture stdout")
-        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| TrainError::other("ray job logs: could not capture stdout"))?;
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
-            let line = line.map_err(|e| {
-                TrainError::other(format!("ray job logs read error: {e}"))
-            })?;
+            let line =
+                line.map_err(|e| TrainError::other(format!("ray job logs read error: {e}")))?;
             sink(&line);
         }
         // After the log stream ends, check exit code.
@@ -903,15 +883,9 @@ impl RemoteJob for RayJob {
 impl RayLauncher {
     /// Submit a Ray job asynchronously via `ray job submit --no-wait`. Returns
     /// a [`RayJob`] handle for polling, log streaming, and cancellation.
-    pub fn submit_async(
-        &self,
-        unit: &str,
-        inner: &[String],
-    ) -> Result<Box<dyn RemoteJob>> {
+    pub fn submit_async(&self, unit: &str, inner: &[String]) -> Result<Box<dyn RemoteJob>> {
         if inner.is_empty() {
-            return Err(TrainError::other(
-                "ray submit_async: empty inner command",
-            ));
+            return Err(TrainError::other("ray submit_async: empty inner command"));
         }
         let mut args = vec![
             "job".to_string(),
@@ -1282,7 +1256,10 @@ mod tests {
 
     #[test]
     fn slurm_parse_sacct_completed() {
-        assert_eq!(SlurmJob::parse_sacct_state("COMPLETED\n"), JobState::Succeeded);
+        assert_eq!(
+            SlurmJob::parse_sacct_state("COMPLETED\n"),
+            JobState::Succeeded
+        );
     }
 
     #[test]
@@ -1466,11 +1443,7 @@ mod tests {
             gpus: Some(2),
             ..Default::default()
         };
-        let script = SlurmJob::build_sbatch_script(
-            "single",
-            &launcher,
-            &["echo".into()],
-        );
+        let script = SlurmJob::build_sbatch_script("single", &launcher, &["echo".into()]);
         assert!(!script.contains("MASTER_ADDR"));
         assert!(!script.contains("scontrol"));
     }

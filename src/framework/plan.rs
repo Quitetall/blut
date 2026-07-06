@@ -1155,8 +1155,8 @@ mod tests {
     /// incoming edge, so Kahn's algorithm can never find a 0-indegree node
     /// to start from — the whole node set is one cycle, regardless of
     /// whatever forward edges are unioned in on top.
-    fn arb_dag_with_cycle() -> impl proptest::strategy::Strategy<Value = (usize, Vec<(NodeId, NodeId)>)>
-    {
+    fn arb_dag_with_cycle()
+    -> impl proptest::strategy::Strategy<Value = (usize, Vec<(NodeId, NodeId)>)> {
         use proptest::strategy::Strategy;
         arb_acyclic_dag().prop_map(|(n, mut edges)| {
             for i in 0..n {

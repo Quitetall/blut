@@ -1460,7 +1460,11 @@ mod tests {
         // recompute re-walks disk and ignores the (wrong) cached field.
         let got = art.recompute_content_hash().unwrap();
         assert_eq!(got, ContentHash::hash_file(&p).unwrap());
-        assert_ne!(got, art.content_hash(), "recompute must not trust the field");
+        assert_ne!(
+            got,
+            art.content_hash(),
+            "recompute must not trust the field"
+        );
     }
 
     #[test]
@@ -1495,7 +1499,11 @@ mod tests {
         let stage = FileStage;
         let rebased = StageDyn::rebase_input_paths(&stage, art, from.path(), to.path()).unwrap();
         let typed: FileArt = rebased.into_typed().unwrap();
-        assert_eq!(typed.path, to.path().join("in.bin"), "path re-rooted under `to`");
+        assert_eq!(
+            typed.path,
+            to.path().join("in.bin"),
+            "path re-rooted under `to`"
+        );
     }
 
     #[test]
@@ -1508,7 +1516,9 @@ mod tests {
         })
         .unwrap();
         let stage = FileStage;
-        let got = StageDyn::recompute_input_hash(&stage, &art).unwrap().unwrap();
+        let got = StageDyn::recompute_input_hash(&stage, &art)
+            .unwrap()
+            .unwrap();
         assert_eq!(got, ContentHash::hash_file(&p).unwrap());
     }
 }

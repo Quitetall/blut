@@ -75,7 +75,7 @@ impl Containment for RlimitAddressSpace {
             #[allow(unsafe_code)]
             unsafe {
                 c.pre_exec(move || {
-                    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+                    use nix::sys::resource::{Resource, getrlimit, setrlimit};
                     // Don't exceed the inherited HARD limit — a process can
                     // only LOWER its hard limit, so requesting `max` above it
                     // fails with EPERM (an opaque spawn error). Clamp to the

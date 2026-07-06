@@ -41,10 +41,7 @@ fn writable_base() -> Option<PathBuf> {
     }
     // /proc/self/cgroup is a single `0::<path>` line for v2.
     let self_cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let rel = self_cg
-        .lines()
-        .find_map(|l| l.strip_prefix("0::"))?
-        .trim();
+    let rel = self_cg.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
     let base = PathBuf::from(CG_ROOT).join(rel.trim_start_matches('/'));
     if dir_writable(&base) {
         Some(base)

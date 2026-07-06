@@ -132,9 +132,7 @@ impl RemoteJob for P2pJob {
                     *self.state.lock() = P2pJobState::Failed(reason.clone());
                     Ok(JobState::Failed(reason))
                 }
-                Err(oneshot::error::TryRecvError::Empty) => {
-                    Ok(JobState::Running)
-                }
+                Err(oneshot::error::TryRecvError::Empty) => Ok(JobState::Running),
                 Err(oneshot::error::TryRecvError::Closed) => {
                     *rx_guard = None;
                     *self.state.lock() = P2pJobState::Failed("channel closed".into());
@@ -154,7 +152,10 @@ impl RemoteJob for P2pJob {
         if let Some(rx) = rx_guard.as_mut() {
             match rx.try_recv() {
                 Ok(Ok(result)) => {
-                    sink(&format!("P2P task {} completed in {}ms", self.task_id, result.wall_time_ms));
+                    sink(&format!(
+                        "P2P task {} completed in {}ms",
+                        self.task_id, result.wall_time_ms
+                    ));
                     *rx_guard = None;
                     *self.state.lock() = P2pJobState::Done(result);
                     Ok(())

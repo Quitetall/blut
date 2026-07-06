@@ -326,8 +326,7 @@ mod tests {
     }
     impl ControlPolicy for CountingContinue {
         fn on_step(&self, _m: &StepMetrics) -> Control {
-            self.seen
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Control::Continue
         }
     }
@@ -345,10 +344,7 @@ mod tests {
         // [KillOnNaN, AlwaysContinue] on a NaN payload → KillBranch from the
         // safety net, even though the inner policy would have continued.
         let inner = std::sync::Arc::new(CountingContinue::default());
-        let comp = CompositePolicy::new(vec![
-            std::sync::Arc::new(KillOnNaN),
-            inner.clone(),
-        ]);
+        let comp = CompositePolicy::new(vec![std::sync::Arc::new(KillOnNaN), inner.clone()]);
         let u = json!({ "loss": "nan" });
         assert_eq!(comp.on_step(&metrics(&u)), Control::KillBranch);
         // Short-circuited: the inner policy was never consulted (no spawn-slot
@@ -385,10 +381,7 @@ mod tests {
     fn composite_first_decisive_wins() {
         // A kill from policy 0 returns without consulting policy 1.
         let inner = std::sync::Arc::new(CountingContinue::default());
-        let comp = CompositePolicy::new(vec![
-            std::sync::Arc::new(AlwaysKill),
-            inner.clone(),
-        ]);
+        let comp = CompositePolicy::new(vec![std::sync::Arc::new(AlwaysKill), inner.clone()]);
         let u = json!({ "loss": 0.3 });
         assert_eq!(comp.on_step(&metrics(&u)), Control::KillBranch);
         assert_eq!(inner.seen.load(std::sync::atomic::Ordering::SeqCst), 0);

@@ -183,7 +183,9 @@ impl Stage for AdvisoryGate {
         _input: Counter,
         _args: &EmptyArgs,
     ) -> Result<Counter, StageError> {
-        Err(StageError::BadInput("advisory verdict: would-not-promote".into()))
+        Err(StageError::BadInput(
+            "advisory verdict: would-not-promote".into(),
+        ))
     }
 }
 impl Compatible<LamuTrainerBackend> for AdvisoryGate {}
@@ -1141,11 +1143,7 @@ impl Stage for GpuHog {
     fn gpu_permits(&self, args: &BarrierArgs) -> u32 {
         // id>=2 → a 2-GPU DDP job; id 0/1 → a 1-GPU cell (distinct ids keep
         // distinct cache keys so the executor doesn't dedup the fork).
-        if args.id >= 2 {
-            2
-        } else {
-            1
-        }
+        if args.id >= 2 { 2 } else { 1 }
     }
     async fn run(
         &self,
@@ -2796,9 +2794,20 @@ async fn composite_spawns_when_finite() {
         .expect("composite spawn run must terminate")
         .expect("a spawn is not a failure → Ok");
 
-    assert_eq!(SPAWN_MARKER_RAN.load(Ordering::SeqCst), 1, "injected root ran");
-    assert_eq!(SPAWN_CHILD_RAN.load(Ordering::SeqCst), 1, "injected child ran");
-    assert_eq!(result.n_stages, 4, "order grew to include the spawned nodes");
+    assert_eq!(
+        SPAWN_MARKER_RAN.load(Ordering::SeqCst),
+        1,
+        "injected root ran"
+    );
+    assert_eq!(
+        SPAWN_CHILD_RAN.load(Ordering::SeqCst),
+        1,
+        "injected child ran"
+    );
+    assert_eq!(
+        result.n_stages, 4,
+        "order grew to include the spawned nodes"
+    );
 }
 
 // ── P2P dispatch (audit findings 1 & 2) ─────────────────────────────
@@ -3139,8 +3148,6 @@ async fn panicking_gpu_stage_is_reported_and_does_not_hang() {
                 "expected a 'node task panicked' PlanError::Other, got: {msg}"
             );
         }
-        other => panic!(
-            "expected PlanError::Other(\"node task panicked...\"), got {other:?}"
-        ),
+        other => panic!("expected PlanError::Other(\"node task panicked...\"), got {other:?}"),
     }
 }

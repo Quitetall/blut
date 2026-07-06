@@ -29,9 +29,9 @@
 //! is THIS-box memory capped". A local run is placed by `LocalSystemd` and
 //! capped by whichever `Containment` the factory selects.
 
+pub mod bare;
 #[cfg(target_os = "linux")]
 pub mod cgroup2;
-pub mod bare;
 pub mod memsize;
 #[cfg(unix)]
 pub mod rlimit;
@@ -200,9 +200,7 @@ pub fn containment_for() -> Box<dyn Containment> {
         }
         let cg = cgroup2::CgroupV2Direct;
         if cg.available() == Availability::Present {
-            tracing::info!(
-                "containment: systemd --user bus unavailable; using CgroupV2Direct"
-            );
+            tracing::info!("containment: systemd --user bus unavailable; using CgroupV2Direct");
             return Box::new(cg);
         }
     }

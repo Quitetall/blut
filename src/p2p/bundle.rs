@@ -146,11 +146,7 @@ pub enum BundleError {
 /// where `rel` is relative to `root`, '/'-normalized. Sidecars are EXCLUDED so
 /// the reconstructed dir reproduces the producer's `hash_dir` (which ran before
 /// the sidecar was written). Files are returned in sorted-`rel` order.
-fn walk_backing(
-    abs: &Path,
-    root: &Path,
-    out: &mut Vec<(PathBuf, String)>,
-) -> std::io::Result<()> {
+fn walk_backing(abs: &Path, root: &Path, out: &mut Vec<(PathBuf, String)>) -> std::io::Result<()> {
     if abs.is_dir() {
         let mut entries: Vec<_> = std::fs::read_dir(abs)?
             .collect::<Result<Vec<_>, _>>()?
@@ -189,7 +185,9 @@ fn is_sidecar(p: &Path) -> bool {
 #[cfg(unix)]
 fn file_mode(p: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).map(|m| m.permissions().mode()).unwrap_or(0o644)
+    std::fs::metadata(p)
+        .map(|m| m.permissions().mode())
+        .unwrap_or(0o644)
 }
 #[cfg(not(unix))]
 fn file_mode(_p: &Path) -> u32 {
@@ -363,7 +361,12 @@ fn unbundle_inner(
         // freshly created and we only ever write regular files, but a crafted
         // pack could ship a symlink-shaped entry earlier in the stream; refuse
         // to follow one.
-        if dest.is_symlink() || dest.parent().map(|p| has_symlink_ancestor(p, import_root)).unwrap_or(false) {
+        if dest.is_symlink()
+            || dest
+                .parent()
+                .map(|p| has_symlink_ancestor(p, import_root))
+                .unwrap_or(false)
+        {
             return Err(BundleError::UnsafePath { rel });
         }
         std::fs::write(&dest, &body)?;
@@ -432,11 +435,16 @@ fn reject_unsafe_rel(rel: &str) -> Result<(), BundleError> {
     if rel.is_empty()
         || rel.contains('\0')
         || rel.starts_with('/')
-        || Path::new(rel)
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir))
+        || Path::new(rel).components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::RootDir
+            )
+        })
     {
-        return Err(BundleError::UnsafePath { rel: rel.to_string() });
+        return Err(BundleError::UnsafePath {
+            rel: rel.to_string(),
+        });
     }
     Ok(())
 }
@@ -450,7 +458,9 @@ fn safe_join(base: &Path, rel: &str) -> Result<PathBuf, BundleError> {
     // base.join(rel) cannot lexically escape base. (Symlinks inside the freshly
     // created import_root cannot exist — we only ever write regular files.)
     if !joined.starts_with(base) {
-        return Err(BundleError::UnsafePath { rel: rel.to_string() });
+        return Err(BundleError::UnsafePath {
+            rel: rel.to_string(),
+        });
     }
     Ok(joined)
 }
@@ -567,8 +577,7 @@ mod tests {
     fn round_trip_directory_artifact() {
         let stage = DirStage;
         let (src, erased, hash) = make_dir_artifact();
-        let (manifest, pack) =
-            bundle(&stage, erased, src.path(), BlobDir::Input, &hash).unwrap();
+        let (manifest, pack) = bundle(&stage, erased, src.path(), BlobDir::Input, &hash).unwrap();
         assert_eq!(manifest.files.len(), 3, "all 3 files shipped");
         assert!(manifest.files.iter().all(|f| f.rel.starts_with("ckpt/")));
 
@@ -595,15 +604,24 @@ mod tests {
         std::fs::remove_file(art_dir.join(".lamu-meta.json")).unwrap();
         let clean_hash = ContentHash::hash_dir(&art_dir).unwrap();
         std::fs::write(art_dir.join(".lamu-meta.json"), b"meta").unwrap();
-        let art = DirArt { path: art_dir, content_hash: clean_hash };
+        let art = DirArt {
+            path: art_dir,
+            content_hash: clean_hash,
+        };
         let erased = ErasedArtifact::from_typed(&art).unwrap();
         let (manifest, _pack) =
             bundle(&stage, erased, src.path(), BlobDir::Input, &clean_hash).unwrap();
         assert!(
-            !manifest.files.iter().any(|f| f.rel.ends_with(".lamu-meta.json")),
+            !manifest
+                .files
+                .iter()
+                .any(|f| f.rel.ends_with(".lamu-meta.json")),
             "sidecar must be excluded"
         );
-        assert_ne!(hash, clean_hash, "sidecar would change hash_dir if included");
+        assert_ne!(
+            hash, clean_hash,
+            "sidecar would change hash_dir if included"
+        );
     }
 
     #[test]
@@ -649,7 +667,14 @@ mod tests {
         }
         manifest.blob_sha256 = ContentHash::of_bytes(&new_pack); // fix gate 1 too
         let dest = tempfile::tempdir().unwrap();
-        let r = unbundle(&stage, &manifest, &new_pack, dest.path(), &hash, BlobDir::Input);
+        let r = unbundle(
+            &stage,
+            &manifest,
+            &new_pack,
+            dest.path(),
+            &hash,
+            BlobDir::Input,
+        );
         assert!(
             matches!(r, Err(BundleError::ContentMismatch { .. })),
             "whole-artifact recompute must catch structural tamper, got {r:?}"
@@ -660,11 +685,17 @@ mod tests {
     fn rejects_hash_binding_mismatch() {
         let stage = DirStage;
         let (src, erased, hash) = make_dir_artifact();
-        let (manifest, pack) =
-            bundle(&stage, erased, src.path(), BlobDir::Input, &hash).unwrap();
+        let (manifest, pack) = bundle(&stage, erased, src.path(), BlobDir::Input, &hash).unwrap();
         let dest = tempfile::tempdir().unwrap();
         let wrong = ContentHash([9u8; 32]);
-        let r = unbundle(&stage, &manifest, &pack, dest.path(), &wrong, BlobDir::Input);
+        let r = unbundle(
+            &stage,
+            &manifest,
+            &pack,
+            dest.path(),
+            &wrong,
+            BlobDir::Input,
+        );
         assert!(matches!(r, Err(BundleError::HashBinding { .. })));
     }
 
@@ -742,8 +773,7 @@ mod tests {
     fn idempotent_unbundle() {
         let stage = DirStage;
         let (src, erased, hash) = make_dir_artifact();
-        let (manifest, pack) =
-            bundle(&stage, erased, src.path(), BlobDir::Input, &hash).unwrap();
+        let (manifest, pack) = bundle(&stage, erased, src.path(), BlobDir::Input, &hash).unwrap();
         let dest = tempfile::tempdir().unwrap();
         let a = unbundle(&stage, &manifest, &pack, dest.path(), &hash, BlobDir::Input).unwrap();
         let b = unbundle(&stage, &manifest, &pack, dest.path(), &hash, BlobDir::Input).unwrap();

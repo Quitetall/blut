@@ -341,8 +341,8 @@ mod tests {
     #[test]
     fn stage_failed_survives_unrecognized_origin_and_severity_tokens() {
         let line = r#"{"kind":"stage_failed","node_idx":3,"stage_name":"train_joint","error":"stage failed: e2e recon mismatch","failure":{"code":"E_FUTURE","domain":"lamquant","stage":"train_joint","severity":"apocalyptic","origin":"quantum","course":"train","recipe":"train_joint","ingredient":"trainer","context":[["ram_gib","64"]],"message":"e2e recon mismatch"}}"#;
-        let ev: StageEvent =
-            serde_json::from_str(line).expect("unrecognized origin/severity tokens must not fail the whole StageEvent");
+        let ev: StageEvent = serde_json::from_str(line)
+            .expect("unrecognized origin/severity tokens must not fail the whole StageEvent");
         match ev {
             StageEvent::StageFailed {
                 node_idx,

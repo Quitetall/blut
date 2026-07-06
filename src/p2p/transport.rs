@@ -17,7 +17,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use quinn::{Endpoint, ServerConfig, Connection as QuinnConnection};
+use quinn::{Connection as QuinnConnection, Endpoint, ServerConfig};
 use serde::{Deserialize, Serialize};
 // write_all/read_exact are inherent on quinn streams, no trait import needed.
 use tokio::sync::RwLock;
@@ -41,10 +41,7 @@ pub enum WireMessage {
         capabilities: PeerCapabilities,
     },
     /// Coordinator → Peer: authentication result.
-    HandshakeAck {
-        peer_id: PeerId,
-        trust: TrustLevel,
-    },
+    HandshakeAck { peer_id: PeerId, trust: TrustLevel },
     /// Coordinator → Peer: a task to execute.
     Task(TaskManifest),
     /// Peer → Coordinator: task result.
@@ -90,38 +87,41 @@ pub const CHUNK_MAX: usize = 12 * 1024 * 1024;
 pub const MAX_BLOB_SIZE: u64 = 16 * 1024 * 1024 * 1024;
 
 /// Write a length-prefixed JSON message to a QUIC stream.
-async fn send_message(
-    stream: &mut quinn::SendStream,
-    msg: &WireMessage,
-) -> Result<(), TrainError> {
+async fn send_message(stream: &mut quinn::SendStream, msg: &WireMessage) -> Result<(), TrainError> {
     let json = serde_json::to_vec(msg)
         .map_err(|e| TrainError::other(format!("serialize message: {e}")))?;
     let len = (json.len() as u32).to_le_bytes();
-    stream.write_all(&len).await
+    stream
+        .write_all(&len)
+        .await
         .map_err(|e| TrainError::other(format!("write length: {e}")))?;
-    stream.write_all(&json).await
+    stream
+        .write_all(&json)
+        .await
         .map_err(|e| TrainError::other(format!("write payload: {e}")))?;
-    stream.finish()
+    stream
+        .finish()
         .map_err(|e| TrainError::other(format!("finish stream: {e}")))?;
     Ok(())
 }
 
 /// Read a length-prefixed JSON message from a QUIC stream.
-async fn recv_message(
-    stream: &mut quinn::RecvStream,
-) -> Result<WireMessage, TrainError> {
+async fn recv_message(stream: &mut quinn::RecvStream) -> Result<WireMessage, TrainError> {
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await
+    stream
+        .read_exact(&mut len_buf)
+        .await
         .map_err(|e| TrainError::other(format!("read length: {e}")))?;
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > 64 * 1024 * 1024 {
         return Err(TrainError::other(format!("message too large: {len} bytes")));
     }
     let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await
+    stream
+        .read_exact(&mut buf)
+        .await
         .map_err(|e| TrainError::other(format!("read payload: {e}")))?;
-    serde_json::from_slice(&buf)
-        .map_err(|e| TrainError::other(format!("deserialize message: {e}")))
+    serde_json::from_slice(&buf).map_err(|e| TrainError::other(format!("deserialize message: {e}")))
 }
 
 /// Send a bundle blob over a sequence of fresh uni streams: one `BundleBlobBegin`,
@@ -138,34 +138,52 @@ pub async fn send_blob(
 ) -> Result<(), TrainError> {
     let blob_sha256 = ContentHash::of_bytes(pack);
     {
-        let mut s = conn.open_uni().await
+        let mut s = conn
+            .open_uni()
+            .await
             .map_err(|e| TrainError::other(format!("open blob-begin stream: {e}")))?;
-        send_message(&mut s, &WireMessage::BundleBlobBegin {
-            task_id: task_id.to_string(),
-            dir,
-            total_len: pack.len() as u64,
-            blob_sha256,
-        }).await?;
+        send_message(
+            &mut s,
+            &WireMessage::BundleBlobBegin {
+                task_id: task_id.to_string(),
+                dir,
+                total_len: pack.len() as u64,
+                blob_sha256,
+            },
+        )
+        .await?;
     }
     for (seq, chunk) in pack.chunks(CHUNK_MAX).enumerate() {
         let seq = u32::try_from(seq)
             .map_err(|_| TrainError::other("blob has too many chunks (seq overflow)"))?;
-        let mut s = conn.open_uni().await
+        let mut s = conn
+            .open_uni()
+            .await
             .map_err(|e| TrainError::other(format!("open blob-chunk stream: {e}")))?;
-        send_message(&mut s, &WireMessage::BundleBlobChunk {
-            task_id: task_id.to_string(),
-            dir,
-            seq,
-            bytes: chunk.to_vec(),
-        }).await?;
+        send_message(
+            &mut s,
+            &WireMessage::BundleBlobChunk {
+                task_id: task_id.to_string(),
+                dir,
+                seq,
+                bytes: chunk.to_vec(),
+            },
+        )
+        .await?;
     }
     {
-        let mut s = conn.open_uni().await
+        let mut s = conn
+            .open_uni()
+            .await
             .map_err(|e| TrainError::other(format!("open blob-end stream: {e}")))?;
-        send_message(&mut s, &WireMessage::BundleBlobEnd {
-            task_id: task_id.to_string(),
-            dir,
-        }).await?;
+        send_message(
+            &mut s,
+            &WireMessage::BundleBlobEnd {
+                task_id: task_id.to_string(),
+                dir,
+            },
+        )
+        .await?;
     }
     Ok(())
 }
@@ -202,10 +220,17 @@ pub async fn recv_blob(
     let mut header: Option<(u64, ContentHash)> = None;
     let mut next_seq: u32 = 0;
     loop {
-        let mut s = conn.accept_uni().await
+        let mut s = conn
+            .accept_uni()
+            .await
             .map_err(|e| TrainError::other(format!("accept blob stream: {e}")))?;
         match recv_message(&mut s).await? {
-            WireMessage::BundleBlobBegin { task_id, dir, total_len, blob_sha256 } => {
+            WireMessage::BundleBlobBegin {
+                task_id,
+                dir,
+                total_len,
+                blob_sha256,
+            } => {
                 if task_id != expect_task_id || dir != expect_dir {
                     return Err(TrainError::other("blob begin: task_id/dir mismatch"));
                 }
@@ -225,12 +250,17 @@ pub async fn recv_blob(
                 // sending it. The buffer grows chunk-by-chunk, bounded below.
                 header = Some((total_len, blob_sha256));
             }
-            WireMessage::BundleBlobChunk { task_id, dir, seq, bytes } => {
+            WireMessage::BundleBlobChunk {
+                task_id,
+                dir,
+                seq,
+                bytes,
+            } => {
                 if task_id != expect_task_id || dir != expect_dir {
                     return Err(TrainError::other("blob chunk: task_id/dir mismatch"));
                 }
-                let (total_len, _) = header
-                    .ok_or_else(|| TrainError::other("BundleBlobChunk before Begin"))?;
+                let (total_len, _) =
+                    header.ok_or_else(|| TrainError::other("BundleBlobChunk before Begin"))?;
                 if seq != next_seq {
                     return Err(TrainError::other(format!(
                         "blob chunk out of order: got seq {seq}, want {next_seq}"
@@ -241,13 +271,12 @@ pub async fn recv_blob(
                 // the declared total_len. Also cap a single chunk at CHUNK_MAX.
                 if bytes.len() > CHUNK_MAX {
                     return Err(TrainError::other(format!(
-                        "blob chunk too large: {} > {CHUNK_MAX}", bytes.len()
+                        "blob chunk too large: {} > {CHUNK_MAX}",
+                        bytes.len()
                     )));
                 }
                 if pack.len() as u64 + bytes.len() as u64 > total_len {
-                    return Err(TrainError::other(
-                        "blob chunks exceed declared total_len",
-                    ));
+                    return Err(TrainError::other("blob chunks exceed declared total_len"));
                 }
                 next_seq += 1;
                 pack.extend_from_slice(&bytes);
@@ -256,11 +285,12 @@ pub async fn recv_blob(
                 if task_id != expect_task_id || dir != expect_dir {
                     return Err(TrainError::other("blob end: task_id/dir mismatch"));
                 }
-                let (total_len, sha) = header
-                    .ok_or_else(|| TrainError::other("BundleBlobEnd before Begin"))?;
+                let (total_len, sha) =
+                    header.ok_or_else(|| TrainError::other("BundleBlobEnd before Begin"))?;
                 if pack.len() as u64 != total_len {
                     return Err(TrainError::other(format!(
-                        "blob length {} != declared {total_len}", pack.len()
+                        "blob length {} != declared {total_len}",
+                        pack.len()
                     )));
                 }
                 if ContentHash::of_bytes(&pack) != sha {
@@ -303,18 +333,27 @@ impl P2pServer {
     /// Accept the next incoming peer connection. Returns the peer's ID
     /// and the connection handle after a successful handshake.
     pub async fn accept_peer(&self) -> Result<(PeerId, QuinnConnection), TrainError> {
-        let conn = self.endpoint.accept().await
+        let conn = self
+            .endpoint
+            .accept()
+            .await
             .ok_or_else(|| TrainError::other("QUIC endpoint closed"))?
             .await
             .map_err(|e| TrainError::other(format!("accept connection: {e}")))?;
 
         // Read the handshake message.
-        let mut stream = conn.accept_uni().await
+        let mut stream = conn
+            .accept_uni()
+            .await
             .map_err(|e| TrainError::other(format!("accept stream: {e}")))?;
         let msg = recv_message(&mut stream).await?;
 
         let (peer_id, trust) = match msg {
-            WireMessage::Handshake { pubkey, x25519_pub, capabilities } => {
+            WireMessage::Handshake {
+                pubkey,
+                x25519_pub,
+                capabilities,
+            } => {
                 let verifying = ed25519_dalek::VerifyingKey::from_bytes(&pubkey)
                     .map_err(|e| TrainError::other(format!("invalid pubkey: {e}")))?;
                 let x25519_pub = x25519_dalek::PublicKey::from(x25519_pub);
@@ -326,7 +365,8 @@ impl P2pServer {
                     existing.trust
                 } else {
                     // New peer starts as Anonymous.
-                    let info = PeerInfo::new(verifying, x25519_pub, TrustLevel::Anonymous, capabilities);
+                    let info =
+                        PeerInfo::new(verifying, x25519_pub, TrustLevel::Anonymous, capabilities);
                     let _id = info.id.clone();
                     registry.upsert(info);
                     TrustLevel::Anonymous
@@ -342,7 +382,9 @@ impl P2pServer {
                     peer_id: peer_id.clone(),
                     trust,
                 };
-                let mut send = conn.open_uni().await
+                let mut send = conn
+                    .open_uni()
+                    .await
                     .map_err(|e| TrainError::other(format!("open ack stream: {e}")))?;
                 send_message(&mut send, &ack).await?;
 
@@ -356,43 +398,48 @@ impl P2pServer {
     }
 
     /// Send a task to a peer over a new unidirectional stream.
-    pub async fn send_task(
-        conn: &QuinnConnection,
-        task: &TaskManifest,
-    ) -> Result<(), TrainError> {
-        let mut stream = conn.open_uni().await
+    pub async fn send_task(conn: &QuinnConnection, task: &TaskManifest) -> Result<(), TrainError> {
+        let mut stream = conn
+            .open_uni()
+            .await
             .map_err(|e| TrainError::other(format!("open task stream: {e}")))?;
         send_message(&mut stream, &WireMessage::Task(task.clone())).await
     }
 
     /// Wait for a result from a peer on an accepted stream.
-    pub async fn recv_result(
-        conn: &QuinnConnection,
-    ) -> Result<TaskResult, TrainError> {
-        let mut stream = conn.accept_uni().await
+    pub async fn recv_result(conn: &QuinnConnection) -> Result<TaskResult, TrainError> {
+        let mut stream = conn
+            .accept_uni()
+            .await
             .map_err(|e| TrainError::other(format!("accept result stream: {e}")))?;
         match recv_message(&mut stream).await? {
             WireMessage::Result(result) => Ok(result),
-            WireMessage::Error { message } => Err(TrainError::other(format!("peer error: {message}"))),
+            WireMessage::Error { message } => {
+                Err(TrainError::other(format!("peer error: {message}")))
+            }
             other => Err(TrainError::other(format!("unexpected message: {other:?}"))),
         }
     }
 
     /// Send a cancel signal to a peer.
-    pub async fn send_cancel(
-        conn: &QuinnConnection,
-        task_id: &str,
-    ) -> Result<(), TrainError> {
-        let mut stream = conn.open_uni().await
+    pub async fn send_cancel(conn: &QuinnConnection, task_id: &str) -> Result<(), TrainError> {
+        let mut stream = conn
+            .open_uni()
+            .await
             .map_err(|e| TrainError::other(format!("open cancel stream: {e}")))?;
-        send_message(&mut stream, &WireMessage::Cancel {
-            task_id: task_id.to_string(),
-        }).await
+        send_message(
+            &mut stream,
+            &WireMessage::Cancel {
+                task_id: task_id.to_string(),
+            },
+        )
+        .await
     }
 
     /// The local address the server is bound to.
     pub fn local_addr(&self) -> Result<SocketAddr, TrainError> {
-        self.endpoint.local_addr()
+        self.endpoint
+            .local_addr()
             .map_err(|e| TrainError::other(format!("local_addr: {e}")))
     }
 
@@ -414,10 +461,7 @@ impl P2pServer {
 
         let mut server_crypto = rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(
-                vec![cert_der],
-                key_der.into(),
-            )
+            .with_single_cert(vec![cert_der], key_der.into())
             .map_err(|e| TrainError::other(format!("TLS config: {e}")))?;
         server_crypto.alpn_protocols = vec![b"blut-p2p".to_vec()];
 
@@ -517,14 +561,20 @@ pub struct P2pClient {
 impl P2pClient {
     /// Create a new P2P client.
     pub fn new(keypair: Arc<KeyPair>) -> Self {
-        Self { keypair, coordinator_pubkey: None }
+        Self {
+            keypair,
+            coordinator_pubkey: None,
+        }
     }
 
     /// Create a new P2P client with coordinator pubkey pinning.
     /// The client will reject connections from servers whose TLS cert
     /// doesn't match the expected coordinator identity.
     pub fn with_coordinator_pin(keypair: Arc<KeyPair>, coordinator_pubkey: [u8; 32]) -> Self {
-        Self { keypair, coordinator_pubkey: Some(coordinator_pubkey) }
+        Self {
+            keypair,
+            coordinator_pubkey: Some(coordinator_pubkey),
+        }
     }
 
     /// Connect to a coordinator and perform the handshake.
@@ -538,7 +588,8 @@ impl P2pClient {
             .map_err(|e| TrainError::other(format!("create client endpoint: {e}")))?;
         endpoint.set_default_client_config(client_config);
 
-        let conn = endpoint.connect(coordinator_addr, "blut-p2p")
+        let conn = endpoint
+            .connect(coordinator_addr, "blut-p2p")
             .map_err(|e| TrainError::other(format!("connect: {e}")))?
             .await
             .map_err(|e| TrainError::other(format!("QUIC handshake: {e}")))?;
@@ -549,20 +600,30 @@ impl P2pClient {
             x25519_pub: self.keypair.x25519_public.to_bytes(),
             capabilities: PeerCapabilities::default(),
         };
-        let mut stream = conn.open_uni().await
+        let mut stream = conn
+            .open_uni()
+            .await
             .map_err(|e| TrainError::other(format!("open handshake stream: {e}")))?;
         send_message(&mut stream, &handshake).await?;
 
         // Read ack.
-        let mut ack_stream = conn.accept_uni().await
+        let mut ack_stream = conn
+            .accept_uni()
+            .await
             .map_err(|e| TrainError::other(format!("accept ack stream: {e}")))?;
         let msg = recv_message(&mut ack_stream).await?;
         let peer_id = match msg {
             WireMessage::HandshakeAck { peer_id, trust } => {
-                tracing::info!("Connected to coordinator as {} (trust: {})", peer_id, trust.label());
+                tracing::info!(
+                    "Connected to coordinator as {} (trust: {})",
+                    peer_id,
+                    trust.label()
+                );
                 peer_id
             }
-            WireMessage::Error { message } => return Err(TrainError::other(format!("handshake rejected: {message}"))),
+            WireMessage::Error { message } => {
+                return Err(TrainError::other(format!("handshake rejected: {message}")));
+            }
             other => return Err(TrainError::other(format!("unexpected ack: {other:?}"))),
         };
 
@@ -571,11 +632,15 @@ impl P2pClient {
 
     /// Wait for a task from the coordinator.
     pub async fn recv_task(conn: &QuinnConnection) -> Result<TaskManifest, TrainError> {
-        let mut stream = conn.accept_uni().await
+        let mut stream = conn
+            .accept_uni()
+            .await
             .map_err(|e| TrainError::other(format!("accept task stream: {e}")))?;
         match recv_message(&mut stream).await? {
             WireMessage::Task(task) => Ok(task),
-            WireMessage::Cancel { task_id } => Err(TrainError::other(format!("cancelled: {task_id}"))),
+            WireMessage::Cancel { task_id } => {
+                Err(TrainError::other(format!("cancelled: {task_id}")))
+            }
             other => Err(TrainError::other(format!("unexpected message: {other:?}"))),
         }
     }
@@ -585,30 +650,39 @@ impl P2pClient {
         conn: &QuinnConnection,
         result: &TaskResult,
     ) -> Result<(), TrainError> {
-        let mut stream = conn.open_uni().await
+        let mut stream = conn
+            .open_uni()
+            .await
             .map_err(|e| TrainError::other(format!("open result stream: {e}")))?;
         send_message(&mut stream, &WireMessage::Result(result.clone())).await
     }
 
     /// Send an error to the coordinator.
-    pub async fn send_error(
-        conn: &QuinnConnection,
-        message: &str,
-    ) -> Result<(), TrainError> {
-        let mut stream = conn.open_uni().await
+    pub async fn send_error(conn: &QuinnConnection, message: &str) -> Result<(), TrainError> {
+        let mut stream = conn
+            .open_uni()
+            .await
             .map_err(|e| TrainError::other(format!("open error stream: {e}")))?;
-        send_message(&mut stream, &WireMessage::Error {
-            message: message.to_string(),
-        }).await
+        send_message(
+            &mut stream,
+            &WireMessage::Error {
+                message: message.to_string(),
+            },
+        )
+        .await
     }
 
-    fn make_client_config(coordinator_pubkey: Option<[u8; 32]>) -> Result<quinn::ClientConfig, TrainError> {
+    fn make_client_config(
+        coordinator_pubkey: Option<[u8; 32]>,
+    ) -> Result<quinn::ClientConfig, TrainError> {
         // If a coordinator pubkey is provided, pin it — reject connections
         // from servers whose TLS cert doesn't match. Otherwise accept any
         // cert (the Ed25519 handshake authenticates the peer).
         let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
             if let Some(pubkey) = coordinator_pubkey {
-                Arc::new(PinnedVerifier { expected_pubkey: pubkey })
+                Arc::new(PinnedVerifier {
+                    expected_pubkey: pubkey,
+                })
             } else {
                 Arc::new(InsecureVerifier)
             };
@@ -837,7 +911,8 @@ mod pinned_verifier_tests {
         // the cert-pinning behavior under test.
         tokio::spawn(async move {
             if let Ok((_, conn)) = server.accept_peer().await {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
             }
         });
 

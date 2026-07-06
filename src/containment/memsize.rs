@@ -148,6 +148,9 @@ mod tests {
     fn resolve_rejects_zero() {
         // Some(0) must NOT produce "0" (systemd = unlimited); falls to default.
         assert_eq!(resolve_mem_knob(Some(0), "NONEXISTENT_ENV_X", "44G"), "44G");
-        assert_eq!(resolve_mem_knob(Some(8 * 1024 * 1024 * 1024), "X", "44G"), "8G");
+        assert_eq!(
+            resolve_mem_knob(Some(8 * 1024 * 1024 * 1024), "X", "44G"),
+            "8G"
+        );
     }
 }

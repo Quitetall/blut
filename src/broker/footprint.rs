@@ -698,8 +698,7 @@ pub fn batch_size_to_fit(
         return d.batch.max(1);
     }
     let budget = avail_bytes.saturating_sub(floor_bytes);
-    let est =
-        |b: u32| estimate_ram_bytes(resolved_workers, b, d.tier, d.latent, d.warm, d.in_ch);
+    let est = |b: u32| estimate_ram_bytes(resolved_workers, b, d.tier, d.latent, d.warm, d.in_ch);
     let mut b = d.batch.max(1);
     while b > 1 && est(b) > budget {
         b -= 1;
@@ -1303,7 +1302,14 @@ mod tests {
 
     #[test]
     fn workers_auto_tune_fits_and_saturates() {
-        let d = Drivers { workers: 0, batch: 16, tier: 3, latent: 256, warm: false, in_ch: 21 };
+        let d = Drivers {
+            workers: 0,
+            batch: 16,
+            tier: 3,
+            latent: 256,
+            warm: false,
+            in_ch: 21,
+        };
         let est = |w: u32| estimate_ram_bytes(w, d.batch, d.tier, d.latent, d.warm, d.in_ch);
 
         // Huge RAM + many cores → saturate up to MAX_AUTO_WORKERS (not all cores).
@@ -1320,7 +1326,10 @@ mod tests {
         assert!(w >= 1 && w <= target);
         assert!(est(w) <= budget, "fits the RAM budget (never-OOM)");
         if w < target {
-            assert!(est(w + 1) > budget, "maximal: one more worker would not fit");
+            assert!(
+                est(w + 1) > budget,
+                "maximal: one more worker would not fit"
+            );
         }
 
         // Probe unavailable → the conservative cap (unchanged behaviour).
@@ -1342,7 +1351,14 @@ mod tests {
 
     #[test]
     fn batch_auto_tune_only_ever_lowers_never_raises() {
-        let d = Drivers { workers: 0, batch: 64, tier: 3, latent: 256, warm: false, in_ch: 21 };
+        let d = Drivers {
+            workers: 0,
+            batch: 64,
+            tier: 3,
+            latent: 256,
+            warm: false,
+            in_ch: 21,
+        };
         let est = |b: u32| estimate_ram_bytes(4, b, d.tier, d.latent, d.warm, d.in_ch);
 
         // Huge RAM → the requested batch is returned UNCHANGED (never raised
@@ -1358,7 +1374,10 @@ mod tests {
         assert!((1..=64).contains(&b));
         assert!(est(b) <= budget, "fits the RAM budget (never-OOM)");
         if b < 64 {
-            assert!(est(b + 1) > budget, "maximal: one more batch unit would not fit");
+            assert!(
+                est(b + 1) > budget,
+                "maximal: one more batch unit would not fit"
+            );
         }
 
         // Probe unavailable → the requested batch, unchanged (no silent shrink
@@ -1369,7 +1388,10 @@ mod tests {
         // Even batch=1 doesn't fit a tiny box → 1 (never below 1; the gate
         // then refuses on box-capacity, same floor as workers).
         let budget_lt_one = est(1) - GIB;
-        assert_eq!(batch_size_to_fit(4, budget_lt_one + 6 * GIB, 6 * GIB, &d), 1);
+        assert_eq!(
+            batch_size_to_fit(4, budget_lt_one + 6 * GIB, 6 * GIB, &d),
+            1
+        );
 
         // requested batch 0 floors at 1 (defensive; DEFAULT_BATCH is never 0
         // in practice, but the fn must not divide-by/loop-on a 0 target).
@@ -1385,14 +1407,24 @@ mod tests {
         // budget, must reach the SAME feasibility boundary a hypothetical
         // joint 2-D search would — i.e. the pair (w, b) it returns is the
         // pointwise-maximal pair that still fits, not a strictly-smaller one.
-        let d = Drivers { workers: 0, batch: 48, tier: 3, latent: 256, warm: false, in_ch: 21 };
+        let d = Drivers {
+            workers: 0,
+            batch: 48,
+            tier: 3,
+            latent: 256,
+            warm: false,
+            in_ch: 21,
+        };
         let (avail, floor) = (30 * GIB, 6 * GIB);
         let budget = avail - floor;
         let est = |w: u32, b: u32| estimate_ram_bytes(w, b, d.tier, d.latent, d.warm, d.in_ch);
 
         let w = workers_to_fit_and_saturate(16, avail, floor, &d);
         let b = batch_size_to_fit(w, avail, floor, &d);
-        assert!(est(w, b) <= budget, "the resolved (w,b) pair fits the budget");
+        assert!(
+            est(w, b) <= budget,
+            "the resolved (w,b) pair fits the budget"
+        );
 
         // Maximality: bumping EITHER knob by one unit (holding the other
         // fixed at its resolved value) must not fit — otherwise the
@@ -1505,7 +1537,11 @@ mod tests {
             FootprintSource::Measured,
             "a clean Measured overrides a stale OomCorrected (B2 self-heal)"
         );
-        assert_eq!(e.ram_bytes, 31 * GIB, "ram = the clean measurement, verbatim");
+        assert_eq!(
+            e.ram_bytes,
+            31 * GIB,
+            "ram = the clean measurement, verbatim"
+        );
     }
 
     #[test]
@@ -1525,13 +1561,28 @@ mod tests {
         s.record(&key(), 18 * GIB, 0, FootprintSource::Measured)
             .unwrap();
         let e = s.entries.get(&key().flat()).unwrap();
-        assert_eq!(e.source, FootprintSource::Measured, "Q2: spurious OOM de-ratcheted");
-        assert_eq!(e.ram_bytes, 18 * GIB, "Q1: clean run lowered the cap to actual");
+        assert_eq!(
+            e.source,
+            FootprintSource::Measured,
+            "Q2: spurious OOM de-ratcheted"
+        );
+        assert_eq!(
+            e.ram_bytes,
+            18 * GIB,
+            "Q1: clean run lowered the cap to actual"
+        );
         // And resolve now returns the tight measured value (+2G headroom), NOT an
         // escalated OOM cap.
-        let hint = Footprint { ram_bytes: 33 * GIB, vram_mib: 0 };
+        let hint = Footprint {
+            ram_bytes: 33 * GIB,
+            vram_mib: 0,
+        };
         let r = s.resolve(&key(), hint);
-        assert_eq!(r.ram_bytes, 18 * GIB, "resolve returns the healed Measured verbatim");
+        assert_eq!(
+            r.ram_bytes,
+            18 * GIB,
+            "resolve returns the healed Measured verbatim"
+        );
         assert_eq!(
             r.memmax_bytes(),
             18 * GIB + Footprint::MEMMAX_HEADROOM_BYTES,
@@ -1549,7 +1600,10 @@ mod tests {
         let mut s = FootprintStore::load_from(path);
         s.record(&key(), 50 * GIB, 0, FootprintSource::Measured)
             .unwrap();
-        let hint = Footprint { ram_bytes: 33 * GIB, vram_mib: 0 };
+        let hint = Footprint {
+            ram_bytes: 33 * GIB,
+            vram_mib: 0,
+        };
         // Normal: the calibrated (possibly dirty) Measured value wins.
         assert_eq!(s.resolve_inner(&key(), hint, false).ram_bytes, 50 * GIB);
         // Override: ignore calibration, fall back to the conservative static hint.

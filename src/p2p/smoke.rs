@@ -23,10 +23,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::TrainError;
 use crate::framework::artifact::{Artifact, ContentHash};
 use crate::framework::cookbook::{Cookbook, Registry};
 use crate::framework::error::StageError;
-use crate::TrainError;
 use crate::framework::resource::Resource;
 use crate::framework::stage::{ErasedArtifact, ErasedStageCtor, Stage, StageContext};
 use crate::recipes::recipe::RecipeDef;
@@ -82,7 +82,10 @@ impl Stage for SmokeEcho {
             .map_err(|e| StageError::Backend(anyhow::anyhow!("write smoke output: {e}")))?;
         let content_hash = ContentHash::hash_file(&out)
             .map_err(|e| StageError::Backend(anyhow::anyhow!("hash smoke output: {e}")))?;
-        Ok(SmokeText { content_hash, path: out })
+        Ok(SmokeText {
+            content_hash,
+            path: out,
+        })
     }
 }
 
@@ -97,8 +100,7 @@ impl Cookbook for SmokeCookbook {
         &[]
     }
     fn stages_erased(&self) -> &'static [(&'static str, ErasedStageCtor)] {
-        static S: &[(&str, ErasedStageCtor)] =
-            &[(SMOKE_STAGE, || std::sync::Arc::new(SmokeEcho))];
+        static S: &[(&str, ErasedStageCtor)] = &[(SMOKE_STAGE, || std::sync::Arc::new(SmokeEcho))];
         S
     }
 }
@@ -148,24 +150,27 @@ pub async fn smoke_dispatch_once(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let peer_info = peer_info
-        .ok_or_else(|| TrainError::other("peer did not register within 2s"))?;
+    let peer_info =
+        peer_info.ok_or_else(|| TrainError::other("peer did not register within 2s"))?;
 
     // Produce the input artifact on the coordinator's disk (its src_root).
-    let src_root = tempfile::tempdir()
-        .map_err(|e| TrainError::other(format!("smoke src_root: {e}")))?;
+    let src_root =
+        tempfile::tempdir().map_err(|e| TrainError::other(format!("smoke src_root: {e}")))?;
     let in_path = src_root.path().join("p2p-echo-in.txt");
     std::fs::write(&in_path, input_text.as_bytes())
         .map_err(|e| TrainError::other(format!("write smoke input: {e}")))?;
     let input_hash = ContentHash::hash_file(&in_path)
         .map_err(|e| TrainError::other(format!("hash smoke input: {e}")))?;
-    let input = SmokeText { content_hash: input_hash, path: in_path };
+    let input = SmokeText {
+        content_hash: input_hash,
+        path: in_path,
+    };
     let input_erased = ErasedArtifact::from_typed(&input)
         .map_err(|e| TrainError::other(format!("erase smoke input: {e}")))?;
     let expected = expected_echo_hash(input_text);
 
-    let out_dir = tempfile::tempdir()
-        .map_err(|e| TrainError::other(format!("smoke out_dir: {e}")))?;
+    let out_dir =
+        tempfile::tempdir().map_err(|e| TrainError::other(format!("smoke out_dir: {e}")))?;
     let dispatched = crate::p2p::peer_exec::dispatch_to_peer(
         conn,
         coord_kp,

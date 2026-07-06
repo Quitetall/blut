@@ -28,15 +28,15 @@ use quinn::Connection as QuinnConnection;
 
 use crate::error::TrainError;
 use crate::framework::artifact::ContentHash;
+use crate::framework::cache::CacheHandle;
 use crate::framework::cookbook::Registry;
 use crate::framework::stage::{ErasedArtifact, StageContext};
-use crate::framework::cache::CacheHandle;
+use crate::p2p::PeerId;
 use crate::p2p::bundle::{self, BlobDir};
 use crate::p2p::crypto::{self, KeyPair};
 use crate::p2p::dispatch::DispatchPolicy;
 use crate::p2p::task::{TaskManifest, TaskResult};
-use crate::p2p::transport::{self, P2pClient, MAX_BLOB_SIZE};
-use crate::p2p::PeerId;
+use crate::p2p::transport::{self, MAX_BLOB_SIZE, P2pClient};
 
 /// The coordinator's public identity a peer needs to trust a dispatch and reply.
 pub struct CoordinatorKeys {
@@ -71,7 +71,17 @@ pub async fn run_peer_loop(
             }
         };
         let task_id = task.task_id.clone();
-        match execute_one(conn, keypair, coordinator, registry, policy, work_root, task).await {
+        match execute_one(
+            conn,
+            keypair,
+            coordinator,
+            registry,
+            policy,
+            work_root,
+            task,
+        )
+        .await
+        {
             Ok(()) => {}
             Err(e) => {
                 tracing::warn!("peer task {task_id} failed: {e}");
@@ -144,12 +154,18 @@ async fn execute_one(
     task: TaskManifest,
 ) -> Result<(), TrainError> {
     // 1. Verify the coordinator's Ed25519 signature over the manifest.
-    if !crypto::verify(&coordinator.verifying, &task.sign_payload(), &task.signature) {
+    if !crypto::verify(
+        &coordinator.verifying,
+        &task.sign_payload(),
+        &task.signature,
+    ) {
         return Err(TrainError::other("task manifest signature invalid"));
     }
     // The signer must be the coordinator we connected to.
     if task.coordinator_id != PeerId::from_pubkey(&coordinator.verifying) {
-        return Err(TrainError::other("task coordinator_id != connected coordinator"));
+        return Err(TrainError::other(
+            "task coordinator_id != connected coordinator",
+        ));
     }
     // Belt-and-suspenders: sign_payload() now covers `args` directly (a prior
     // version only signed args_hash and never checked it against the received
@@ -175,9 +191,9 @@ async fn execute_one(
     }
 
     // 3. Resolve the stage constructor (the peer hosts the cookbook).
-    let ctor = registry.find_erased_stage(&task.stage_name).ok_or_else(|| {
-        TrainError::other(format!("unknown stage '{}'", task.stage_name))
-    })?;
+    let ctor = registry
+        .find_erased_stage(&task.stage_name)
+        .ok_or_else(|| TrainError::other(format!("unknown stage '{}'", task.stage_name)))?;
     let stage = ctor();
 
     // 4. Decode the input BundleManifest from the encrypted_input slot. Public
@@ -231,7 +247,8 @@ async fn execute_one(
     //    see `seal_blob`) and unbundle into stage_dir. The bundle layer runs
     //    the four fail-closed gates against task.input_hash (content_hash was
     //    already pre-checked in 4b, before this buffered the blob).
-    let sealed_pack = transport::recv_blob(conn, &task.task_id, BlobDir::Input, MAX_BLOB_SIZE).await?;
+    let sealed_pack =
+        transport::recv_blob(conn, &task.task_id, BlobDir::Input, MAX_BLOB_SIZE).await?;
     let pack = open_blob(&sealed_pack, keypair)?;
     let input: ErasedArtifact = bundle::unbundle(
         &*stage,
@@ -250,9 +267,12 @@ async fn execute_one(
     let timeout = std::time::Duration::from_secs(task.timeout_secs.max(1));
     let output = tokio::time::timeout(timeout, stage.run_erased(&ctx, input, task.args.clone()))
         .await
-        .map_err(|_| TrainError::other(format!(
-            "stage '{}' exceeded timeout_secs {}", task.stage_name, task.timeout_secs
-        )))?
+        .map_err(|_| {
+            TrainError::other(format!(
+                "stage '{}' exceeded timeout_secs {}",
+                task.stage_name, task.timeout_secs
+            ))
+        })?
         .map_err(|e| TrainError::other(format!("stage run failed: {e}")))?;
     let wall_time_ms = started.elapsed().as_millis() as u64;
 
@@ -300,7 +320,9 @@ fn is_safe_task_id(id: &str) -> bool {
         && id != "."
         && id != ".."
         && id.len() <= 128
-        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// The verified output of a dispatched task: the rebased local artifact handle
@@ -488,7 +510,10 @@ mod tests {
             // still present while the guard is alive
             assert!(stage_dir.exists());
         }
-        assert!(!stage_dir.exists(), "stage_dir must be removed when the guard drops");
+        assert!(
+            !stage_dir.exists(),
+            "stage_dir must be removed when the guard drops"
+        );
     }
 
     #[test]
@@ -504,7 +529,10 @@ mod tests {
         let stage_dir = root.path().join("task-456");
         std::fs::create_dir_all(&stage_dir).unwrap();
         let _ = run(&stage_dir);
-        assert!(!stage_dir.exists(), "early-return path must still clean up stage_dir");
+        assert!(
+            !stage_dir.exists(),
+            "early-return path must still clean up stage_dir"
+        );
     }
 
     #[test]
@@ -527,7 +555,9 @@ mod tests {
         // actual encryption happened, not a pass-through/no-op.
         assert_ne!(sealed, plaintext);
         assert!(
-            !sealed.windows(plaintext.len()).any(|w| w == plaintext.as_slice()),
+            !sealed
+                .windows(plaintext.len())
+                .any(|w| w == plaintext.as_slice()),
             "sealed blob must not contain the plaintext as a contiguous substring"
         );
         let opened = open_blob(&sealed, &kp).unwrap();
@@ -540,7 +570,10 @@ mod tests {
         let kp2 = KeyPair::generate();
         let plaintext = b"restricted data class corpus".to_vec();
         let sealed = seal_blob(&plaintext, &kp1.x25519_public).unwrap();
-        assert!(open_blob(&sealed, &kp2).is_err(), "wrong recipient must not decrypt");
+        assert!(
+            open_blob(&sealed, &kp2).is_err(),
+            "wrong recipient must not decrypt"
+        );
     }
 
     #[test]
@@ -554,7 +587,10 @@ mod tests {
         let plaintext = b"same bytes sent twice".to_vec();
         let a = seal_blob(&plaintext, &kp.x25519_public).unwrap();
         let b = seal_blob(&plaintext, &kp.x25519_public).unwrap();
-        assert_ne!(a, b, "two seals of identical plaintext must produce different wire bytes");
+        assert_ne!(
+            a, b,
+            "two seals of identical plaintext must produce different wire bytes"
+        );
         assert_eq!(open_blob(&a, &kp).unwrap(), plaintext);
         assert_eq!(open_blob(&b, &kp).unwrap(), plaintext);
     }

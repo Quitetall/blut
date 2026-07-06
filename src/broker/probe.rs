@@ -129,10 +129,16 @@ fn probe_nvidia_gpus() -> Option<Vec<GpuInfo>> {
         if parts.len() >= 4 {
             // Bug fix: use `ok()` + `continue` instead of `ok()?` so a
             // single malformed line doesn't discard all already-parsed GPUs.
-            let Some(index) = parts[0].parse::<u32>().ok() else { continue };
+            let Some(index) = parts[0].parse::<u32>().ok() else {
+                continue;
+            };
             let model = parts[1].to_string();
-            let Some(total) = parts[2].parse::<u64>().ok() else { continue };
-            let Some(used) = parts[3].parse::<u64>().ok() else { continue };
+            let Some(total) = parts[2].parse::<u64>().ok() else {
+                continue;
+            };
+            let Some(used) = parts[3].parse::<u64>().ok() else {
+                continue;
+            };
             gpus.push(GpuInfo {
                 index,
                 model,
@@ -164,7 +170,10 @@ fn probe_rocm_gpus() -> Option<Vec<GpuInfo>> {
         let parts: Vec<&str> = line.split(',').map(|p| p.trim()).collect();
         if parts.len() >= 2 {
             let model = parts[0].to_string();
-            let total = parts.last().and_then(|p| p.parse::<u64>().ok()).unwrap_or(0);
+            let total = parts
+                .last()
+                .and_then(|p| p.parse::<u64>().ok())
+                .unwrap_or(0);
             gpus.push(GpuInfo {
                 index: gpu_idx,
                 model,

@@ -11,8 +11,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{RwLock, oneshot};
 
+use crate::config::launcher::JobState;
 use crate::error::TrainError;
 use crate::framework::artifact::ContentHash;
 use crate::p2p::crypto::KeyPair;
@@ -22,7 +23,6 @@ use crate::p2p::peer::PeerId;
 use crate::p2p::registry::PeerRegistry;
 use crate::p2p::task::{TaskManifest, TaskResult};
 use crate::p2p::transport::P2pServer;
-use crate::config::launcher::JobState;
 
 /// Handle to a task submitted to the coordinator, used to track its
 /// lifecycle and deliver the result.
@@ -68,7 +68,14 @@ impl Coordinator {
             Self::accept_loop(server_c, pending_c, dispatch_c, connections_c).await;
         });
 
-        Ok(Self { server, dispatch, keypair, coordinator_id, pending, connections })
+        Ok(Self {
+            server,
+            dispatch,
+            keypair,
+            coordinator_id,
+            pending,
+            connections,
+        })
     }
 
     /// The coordinator's local address.
@@ -94,21 +101,29 @@ impl Coordinator {
         let peer_list: Vec<_> = peers.list().into_iter().cloned().collect();
         drop(peers);
 
-        let data_class = self.dispatch.classify_stage(&manifest.stage_name, &manifest.args);
-        let peer_id = self.dispatch.select_peer(
-            &manifest.stage_name,
-            &manifest.resources,
-            data_class,
-            &peer_list,
-        ).ok_or_else(|| TrainError::other("no suitable peer available"))?;
+        let data_class = self
+            .dispatch
+            .classify_stage(&manifest.stage_name, &manifest.args);
+        let peer_id = self
+            .dispatch
+            .select_peer(
+                &manifest.stage_name,
+                &manifest.resources,
+                data_class,
+                &peer_list,
+            )
+            .ok_or_else(|| TrainError::other("no suitable peer available"))?;
 
         // Register as pending.
         {
             let mut pending = self.pending.write();
-            pending.insert(task_id.clone(), PendingTask {
-                result_tx,
-                expected_output_hash,
-            });
+            pending.insert(
+                task_id.clone(),
+                PendingTask {
+                    result_tx,
+                    expected_output_hash,
+                },
+            );
         }
 
         // Send the task to the peer. Clone the connection out, drop the
@@ -125,7 +140,8 @@ impl Coordinator {
             let mut pending = self.pending.write();
             pending.remove(&task_id);
             return Err(TrainError::other(format!(
-                "peer {} not connected (task {})", peer_id, task_id
+                "peer {} not connected (task {})",
+                peer_id, task_id
             )));
         }
 
@@ -134,7 +150,11 @@ impl Coordinator {
     }
 
     /// Verify a task result. Returns the dispatch verdict.
-    pub async fn verify_result(&self, result: &TaskResult, expected: &ContentHash) -> DispatchVerdict {
+    pub async fn verify_result(
+        &self,
+        result: &TaskResult,
+        expected: &ContentHash,
+    ) -> DispatchVerdict {
         let peers = self.server.peers.read().await;
         if let Some(peer) = peers.get(&result.peer_id) {
             self.dispatch.verify_result(result, expected, &peer.pubkey)
@@ -165,7 +185,8 @@ impl Coordinator {
                     let dispatch_c = dispatch.clone();
                     let connections_c = connections.clone();
                     tokio::spawn(async move {
-                        Self::handle_peer(peer_id.clone(), conn, server_c, pending_c, dispatch_c).await;
+                        Self::handle_peer(peer_id.clone(), conn, server_c, pending_c, dispatch_c)
+                            .await;
                         // Remove connection when peer disconnects.
                         connections_c.write().await.remove(&peer_id);
                     });
@@ -199,7 +220,11 @@ impl Coordinator {
                         if let Some(peer_info) = peers.get(&result.peer_id) {
                             let pending_map = pending.read();
                             if let Some(pt) = pending_map.get(&task_id) {
-                                dispatch.verify_result(&result, &pt.expected_output_hash, &peer_info.pubkey)
+                                dispatch.verify_result(
+                                    &result,
+                                    &pt.expected_output_hash,
+                                    &peer_info.pubkey,
+                                )
                             } else {
                                 DispatchVerdict::Reject(format!("no pending task: {task_id}"))
                             }
@@ -216,7 +241,8 @@ impl Coordinator {
                                 &result.peer_id,
                                 true,
                                 &format!("task {task_id} accepted"),
-                            ).await;
+                            )
+                            .await;
                             let mut pending_map = pending.write();
                             if let Some(pt) = pending_map.remove(&task_id) {
                                 let _ = pt.result_tx.send(Ok(result));
@@ -229,7 +255,8 @@ impl Coordinator {
                                 &result.peer_id,
                                 false,
                                 &format!("task {task_id} rejected: {reason}"),
-                            ).await;
+                            )
+                            .await;
                             let mut pending_map = pending.write();
                             if let Some(pt) = pending_map.remove(&task_id) {
                                 let _ = pt.result_tx.send(Err(reason));
@@ -395,7 +422,8 @@ mod tests {
 /// A handle to a dispatched P2P task, polling via the oneshot receiver.
 struct CoordinatorDispatchHandle {
     task_id: String,
-    result_rx: parking_lot::Mutex<Option<tokio::sync::oneshot::Receiver<Result<TaskResult, String>>>>,
+    result_rx:
+        parking_lot::Mutex<Option<tokio::sync::oneshot::Receiver<Result<TaskResult, String>>>>,
     pending: Arc<parking_lot::RwLock<HashMap<String, PendingTask>>>,
 }
 
@@ -447,9 +475,11 @@ impl crate::framework::executor::DispatchSubmitter for Coordinator {
             0 => crate::p2p::trust::DataClass::Public,
             1 => crate::p2p::trust::DataClass::Internal,
             2 => crate::p2p::trust::DataClass::Restricted,
-            other => return Err(TrainError::other(format!(
-                "unknown data_class: {other} (expected 0=Public, 1=Internal, 2=Restricted)"
-            ))),
+            other => {
+                return Err(TrainError::other(format!(
+                    "unknown data_class: {other} (expected 0=Public, 1=Internal, 2=Restricted)"
+                )));
+            }
         };
         let resources = crate::p2p::task::ResourceRequest {
             cpu_cores: req.resource_request.cpu_cores,
@@ -486,10 +516,13 @@ impl crate::framework::executor::DispatchSubmitter for Coordinator {
         // Register as pending.
         {
             let mut pending = self.pending.write();
-            pending.insert(task_id.clone(), PendingTask {
-                result_tx,
-                expected_output_hash,
-            });
+            pending.insert(
+                task_id.clone(),
+                PendingTask {
+                    result_tx,
+                    expected_output_hash,
+                },
+            );
         }
 
         // Spawn the async dispatch.
@@ -508,10 +541,8 @@ impl crate::framework::executor::DispatchSubmitter for Coordinator {
                 // rather than silently sending to an arbitrary connection).
                 let selected = {
                     let reg = registry.read().await;
-                    let candidates: Vec<crate::p2p::peer::PeerInfo> = conns
-                        .keys()
-                        .filter_map(|id| reg.get(id).cloned())
-                        .collect();
+                    let candidates: Vec<crate::p2p::peer::PeerInfo> =
+                        conns.keys().filter_map(|id| reg.get(id).cloned()).collect();
                     dispatch.select_peer(
                         &select_stage,
                         &select_resources,

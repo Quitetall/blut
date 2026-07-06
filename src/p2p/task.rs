@@ -117,8 +117,8 @@ impl TaskManifest {
         // that could fail), and uses a `BTreeMap`-backed `Map` by default
         // (no `preserve_order` feature enabled — see Cargo.toml), so object
         // key order is canonical/deterministic across identical `Value`s.
-        let args_bytes = serde_json::to_vec(&self.args)
-            .expect("serde_json::Value serialization is infallible");
+        let args_bytes =
+            serde_json::to_vec(&self.args).expect("serde_json::Value serialization is infallible");
         write_lp_bytes(&mut buf, &args_bytes);
         buf.extend_from_slice(&self.expected_output_hash.0);
         buf.extend_from_slice(&self.coordinator_id.0);
@@ -373,6 +373,10 @@ mod tests {
         assert_ne!(manifest_a.sign_payload(), manifest_b.sign_payload());
         // The original signature (over manifest_a's payload) must NOT
         // verify against the tampered manifest's payload.
-        assert!(!verify(&kp.verifying, &manifest_b.sign_payload(), &manifest_a.signature));
+        assert!(!verify(
+            &kp.verifying,
+            &manifest_b.sign_payload(),
+            &manifest_a.signature
+        ));
     }
 }

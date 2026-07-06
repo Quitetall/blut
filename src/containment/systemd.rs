@@ -122,9 +122,7 @@ impl Containment for SystemdCgroup {
     fn cancel(&self, unit: &str, _teardown: &TeardownHandle) -> Option<tokio::process::Command> {
         // Stop the transient unit; the cgroup reaps the whole tree.
         let mut c = tokio::process::Command::new("systemctl");
-        c.arg("--user")
-            .arg("stop")
-            .arg(format!("{unit}.service"));
+        c.arg("--user").arg("stop").arg(format!("{unit}.service"));
         Some(c)
     }
 }

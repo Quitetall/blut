@@ -120,7 +120,9 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let worker_id = cli.worker_id.clone()
+    let worker_id = cli
+        .worker_id
+        .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     tracing::info!("BLUT worker {worker_id} starting");
@@ -151,7 +153,10 @@ async fn main() -> Result<()> {
 
     let poll_interval = Duration::from_secs(cli.poll_interval);
 
-    tracing::info!("worker {worker_id} entering poll loop (interval: {}s)", cli.poll_interval);
+    tracing::info!(
+        "worker {worker_id} entering poll loop (interval: {}s)",
+        cli.poll_interval
+    );
 
     loop {
         match poll_and_run(&cli, &worker_id).await {
@@ -235,7 +240,9 @@ async fn poll_and_run(cli: &Cli, worker_id: &str) -> Result<bool> {
 
     tracing::info!(
         "job {} completed: {:?} in {}s",
-        job.id, job_result.status, elapsed
+        job.id,
+        job_result.status,
+        elapsed
     );
 
     Ok(true)
@@ -243,17 +250,12 @@ async fn poll_and_run(cli: &Cli, worker_id: &str) -> Result<bool> {
 
 /// Read and parse a job file.
 async fn read_job(path: &Path) -> Result<Job> {
-    let content = fs::read_to_string(path).await
-        .context("read job file")?;
+    let content = fs::read_to_string(path).await.context("read job file")?;
     serde_json::from_str(&content).context("parse job JSON")
 }
 
 /// Execute a job by compiling its recipe and running the DAG.
-async fn run_job(
-    job: &Job,
-    cli: &Cli,
-    _worker_id: &str,
-) -> Result<Vec<String>> {
+async fn run_job(job: &Job, cli: &Cli, _worker_id: &str) -> Result<Vec<String>> {
     let job_dir = cli.work_dir.join(&job.id);
     fs::create_dir_all(&job_dir).await?;
 
@@ -262,17 +264,23 @@ async fn run_job(
 
     // Look up the recipe in the registry
     let reg = blut::framework::Registry::new();
-    let recipe = reg.find(&job.recipe)
+    let recipe = reg
+        .find(&job.recipe)
         .ok_or_else(|| anyhow::anyhow!("unknown recipe: {}", job.recipe))?;
 
     // Compile the recipe
     let compiled = (recipe.compile_fn)(job.args.clone())
         .map_err(|e| anyhow::anyhow!("recipe compile failed: {e}"))?;
 
-    tracing::info!("executing plan: {} ({} nodes)", compiled.name(), compiled.n_nodes());
+    tracing::info!(
+        "executing plan: {} ({} nodes)",
+        compiled.name(),
+        compiled.n_nodes()
+    );
 
     // Execute the DAG
-    let result = blut::framework::ParallelExecutor::execute(compiled, ctx).await
+    let result = blut::framework::ParallelExecutor::execute(compiled, ctx)
+        .await
         .map_err(|e| anyhow::anyhow!("execution failed: {e}"))?;
 
     tracing::info!("plan completed in {:.1}s", result.elapsed.as_secs_f64());

@@ -42,9 +42,9 @@ use futures::FutureExt;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::launcher::JobState;
 use crate::framework::artifact::{ArtifactMetadata, ContentHash};
 use crate::framework::cache::CacheHandle;
-use crate::config::launcher::JobState;
 use crate::framework::control::{Control, ControlPolicy, StepMetrics};
 use crate::framework::error::{PlanError, StageError};
 use crate::framework::plan::{CompiledPlan, NodeId};
@@ -92,8 +92,10 @@ pub struct DispatchRequest<'a> {
 pub trait DispatchSubmitter: Send + Sync {
     /// Submit a stage for remote execution. Returns a handle for
     /// tracking the task's lifecycle.
-    fn submit(&self, request: DispatchRequest<'_>)
-        -> Result<Box<dyn DispatchHandle>, crate::error::TrainError>;
+    fn submit(
+        &self,
+        request: DispatchRequest<'_>,
+    ) -> Result<Box<dyn DispatchHandle>, crate::error::TrainError>;
 }
 
 /// Resource requirements for a dispatched task. Mirrors
@@ -374,7 +376,9 @@ pub struct StageWarning {
 /// Whether advisory stages are forced FATAL for this run (ADR 0071 strict mode),
 /// via `BLUT_STRICT_ADVISORY=1` — for CI that wants the old fail-hard behaviour.
 fn strict_advisory() -> bool {
-    std::env::var("BLUT_STRICT_ADVISORY").map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+    std::env::var("BLUT_STRICT_ADVISORY")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -941,10 +945,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         // only the sampler cleanup is now unwind-safe. `AssertUnwindSafe` is
         // sound here: `timed_fut` is dropped either way immediately after
         // this point, so no unwind-unsafe state is ever observed again.
-        let run_result = match std::panic::AssertUnwindSafe(timed_fut)
-            .catch_unwind()
-            .await
-        {
+        let run_result = match std::panic::AssertUnwindSafe(timed_fut).catch_unwind().await {
             Ok(r) => r,
             Err(panic_payload) => {
                 if let Some(h) = gpu_sampler {
@@ -2116,10 +2117,8 @@ impl ParallelExecutor {
                                 gpu: has_gpu,
                                 gpu_vram_gib: None,
                             };
-                            let data_class = policy.classify_stage(
-                                task.stage.name(),
-                                &task.args,
-                            ) as u8;
+                            let data_class =
+                                policy.classify_stage(task.stage.name(), &task.args) as u8;
                             let request = DispatchRequest {
                                 stage_name: task.stage.name(),
                                 stage_schema: task.stage.schema(),

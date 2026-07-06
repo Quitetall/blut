@@ -11,9 +11,9 @@ use std::collections::HashSet;
 use crate::framework::artifact::ContentHash;
 use crate::p2p::peer::{PeerId, PeerInfo};
 use crate::p2p::task::{ResourceRequest, TaskResult};
-use crate::p2p::trust::{DataClass, DispatchMatrix};
 #[cfg(test)]
 use crate::p2p::trust::TrustLevel;
+use crate::p2p::trust::{DataClass, DispatchMatrix};
 
 /// Trait for dispatch policies. Implementors decide whether a DAG node
 /// should run locally or be offloaded to a peer.
@@ -38,7 +38,12 @@ pub trait DispatchPolicy: Send + Sync {
     /// Verify a task result. The coordinator calls this after receiving
     /// a result from a peer. Checks both the Ed25519 signature and the
     /// output hash.
-    fn verify_result(&self, result: &TaskResult, expected: &ContentHash, peer_pubkey: &ed25519_dalek::VerifyingKey) -> DispatchVerdict;
+    fn verify_result(
+        &self,
+        result: &TaskResult,
+        expected: &ContentHash,
+        peer_pubkey: &ed25519_dalek::VerifyingKey,
+    ) -> DispatchVerdict;
 }
 
 /// Verdict on a peer's task result.
@@ -135,7 +140,12 @@ impl DispatchPolicy for DefaultDispatchPolicy {
             .map(|p| p.id.clone())
     }
 
-    fn verify_result(&self, result: &TaskResult, expected: &ContentHash, peer_pubkey: &ed25519_dalek::VerifyingKey) -> DispatchVerdict {
+    fn verify_result(
+        &self,
+        result: &TaskResult,
+        expected: &ContentHash,
+        peer_pubkey: &ed25519_dalek::VerifyingKey,
+    ) -> DispatchVerdict {
         // Verify Ed25519 signature first.
         let payload = result.sign_payload();
         if !crate::p2p::crypto::verify(peer_pubkey, &payload, &result.signature) {
@@ -162,7 +172,12 @@ mod tests {
 
     fn make_peer(trust: TrustLevel, reputation: f64) -> PeerInfo {
         let kp = KeyPair::generate();
-        let mut peer = PeerInfo::new(kp.verifying, kp.x25519_public, trust, PeerCapabilities::default());
+        let mut peer = PeerInfo::new(
+            kp.verifying,
+            kp.x25519_public,
+            trust,
+            PeerCapabilities::default(),
+        );
         peer.reputation = reputation;
         peer
     }
@@ -222,7 +237,10 @@ mod tests {
         let small_peer = make_peer(TrustLevel::Anonymous, 0.9); // default: 1 core, 4 GiB
 
         // Need 16 cores.
-        let resources = ResourceRequest { cpu_cores: 16, ..Default::default() };
+        let resources = ResourceRequest {
+            cpu_cores: 16,
+            ..Default::default()
+        };
         let peers = vec![small_peer.clone()];
         let selected = policy.select_peer("warm_fb_cache", &resources, DataClass::Public, &peers);
         assert!(selected.is_none()); // no suitable peer
@@ -235,7 +253,11 @@ mod tests {
         let gpu_peer = make_gpu_peer(TrustLevel::Anonymous, 0.8, 24);
 
         // Need GPU with 16 GiB VRAM.
-        let resources = ResourceRequest { gpu: true, gpu_vram_gib: Some(16), ..Default::default() };
+        let resources = ResourceRequest {
+            gpu: true,
+            gpu_vram_gib: Some(16),
+            ..Default::default()
+        };
         let peers = vec![cpu_peer, gpu_peer.clone()];
         let selected = policy.select_peer("warm_fb_cache", &resources, DataClass::Public, &peers);
         assert_eq!(selected, Some(gpu_peer.id.clone()));
@@ -255,7 +277,10 @@ mod tests {
             signature: kp.sign(b"placeholder"),
         };
         result.signature = kp.sign(&result.sign_payload());
-        assert!(matches!(policy.verify_result(&result, &hash, &kp.verifying), DispatchVerdict::Accept));
+        assert!(matches!(
+            policy.verify_result(&result, &hash, &kp.verifying),
+            DispatchVerdict::Accept
+        ));
     }
 
     #[test]
@@ -273,7 +298,10 @@ mod tests {
             signature: kp.sign(b"placeholder"),
         };
         result.signature = kp.sign(&result.sign_payload());
-        assert!(matches!(policy.verify_result(&result, &expected, &kp.verifying), DispatchVerdict::Reject(_)));
+        assert!(matches!(
+            policy.verify_result(&result, &expected, &kp.verifying),
+            DispatchVerdict::Reject(_)
+        ));
     }
 
     #[test]

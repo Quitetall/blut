@@ -12,11 +12,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -56,7 +56,7 @@ pub struct ResourceRequest {
 pub struct JobStatus {
     pub id: String,
     pub recipe: String,
-    pub status: String,  // "queued", "processing", "succeeded", "failed"
+    pub status: String, // "queued", "processing", "succeeded", "failed"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
 }
@@ -103,7 +103,8 @@ async fn submit_job(
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("failed to write job: {e}")})),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Track in memory
@@ -117,22 +118,18 @@ async fn submit_job(
     (
         StatusCode::CREATED,
         Json(serde_json::json!({"id": job_id, "status": "queued"})),
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// GET /jobs — list all jobs.
-async fn list_jobs(
-    State(state): State<ApiState>,
-) -> impl IntoResponse {
+async fn list_jobs(State(state): State<ApiState>) -> impl IntoResponse {
     let jobs = state.jobs.read().await;
     Json(jobs.clone()).into_response()
 }
 
 /// GET /jobs/:id — get job status.
-async fn get_job(
-    State(state): State<ApiState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn get_job(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
     // Check in-memory list first
     let jobs = state.jobs.read().await;
     if let Some(job) = jobs.iter().find(|j| j.id == id) {
@@ -150,7 +147,8 @@ async fn get_job(
                     recipe: String::new(),
                     status: status.to_string(),
                     result: Some(result),
-                }).into_response();
+                })
+                .into_response();
             }
         }
     }
@@ -163,18 +161,22 @@ async fn get_job(
             recipe: String::new(),
             status: "queued".to_string(),
             result: None,
-        }).into_response();
+        })
+        .into_response();
     }
 
-    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "job not found"}))).into_response()
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "job not found"})),
+    )
+        .into_response()
 }
 
 /// GET /health — health check.
-async fn health(
-    State(state): State<ApiState>,
-) -> impl IntoResponse {
+async fn health(State(state): State<ApiState>) -> impl IntoResponse {
     // Count queue depth
-    let queue_depth = fs::read_dir(&state.queue_dir).await
+    let queue_depth = fs::read_dir(&state.queue_dir)
+        .await
         .map(|_entries| {
             // TODO: count entries asynchronously
             0

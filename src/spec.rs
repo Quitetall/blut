@@ -157,8 +157,12 @@ pub struct TrainSpec {
     pub nnodes: u32,
 }
 
-fn default_nproc() -> u32 { 1 }
-fn default_nnodes() -> u32 { 1 }
+fn default_nproc() -> u32 {
+    1
+}
+fn default_nnodes() -> u32 {
+    1
+}
 
 impl TrainSpec {
     /// Sensible defaults for a 4090 + 7B base + QLoRA. Fields you almost

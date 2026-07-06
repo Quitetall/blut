@@ -895,10 +895,38 @@ mod tests {
         let db = db();
         // val_r peaks at step 2 (0.8) then collapses to a final 0.4 (step=-1).
         db.record_metrics(&[
-            MetricRow { job_id: "j".into(), node_idx: 0, step: 0, metric: "val_r".into(), value: 0.3, wall_unix: None },
-            MetricRow { job_id: "j".into(), node_idx: 0, step: 1, metric: "val_r".into(), value: 0.5, wall_unix: None },
-            MetricRow { job_id: "j".into(), node_idx: 0, step: 2, metric: "val_r".into(), value: 0.8, wall_unix: None },
-            MetricRow { job_id: "j".into(), node_idx: 0, step: -1, metric: "val_r".into(), value: 0.4, wall_unix: None },
+            MetricRow {
+                job_id: "j".into(),
+                node_idx: 0,
+                step: 0,
+                metric: "val_r".into(),
+                value: 0.3,
+                wall_unix: None,
+            },
+            MetricRow {
+                job_id: "j".into(),
+                node_idx: 0,
+                step: 1,
+                metric: "val_r".into(),
+                value: 0.5,
+                wall_unix: None,
+            },
+            MetricRow {
+                job_id: "j".into(),
+                node_idx: 0,
+                step: 2,
+                metric: "val_r".into(),
+                value: 0.8,
+                wall_unix: None,
+            },
+            MetricRow {
+                job_id: "j".into(),
+                node_idx: 0,
+                step: -1,
+                metric: "val_r".into(),
+                value: 0.4,
+                wall_unix: None,
+            },
         ])
         .unwrap();
         // best (peak) is the step=2 0.8, NOT the collapsed final 0.4.
@@ -915,7 +943,10 @@ mod tests {
         db.record_artifact(&art("j", 3, "h3")).unwrap();
         let term = db.terminal_artifact("j").unwrap().unwrap();
         assert_eq!(term.stage_idx, 3);
-        assert_eq!(term.sidecar_path.as_deref(), Some("/j/j/stages/3/output.metadata.json"));
+        assert_eq!(
+            term.sidecar_path.as_deref(),
+            Some("/j/j/stages/3/output.metadata.json")
+        );
         // a job with no artifacts → None.
         assert!(db.terminal_artifact("other").unwrap().is_none());
     }

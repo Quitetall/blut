@@ -23,7 +23,7 @@ pub mod task;
 pub mod transport;
 pub mod trust;
 
-pub use bundle::{bundle, unbundle, BlobDir, BundleError, BundleManifest};
+pub use bundle::{BlobDir, BundleError, BundleManifest, bundle, unbundle};
 pub use coordinator::Coordinator;
 pub use crypto::{EncryptedPayload, KeyPair};
 pub use dispatch::{DefaultDispatchPolicy, DispatchPolicy, DispatchVerdict};

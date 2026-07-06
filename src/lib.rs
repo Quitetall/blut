@@ -38,12 +38,12 @@ pub mod framework;
 pub mod hpo;
 pub mod jobs;
 pub mod lineage_db;
-pub mod paths;
-pub mod policy;
 /// P2P distributed compute — trust model, encryption, task dispatch.
 /// Gated behind the `p2p` feature.
 #[cfg(feature = "p2p")]
 pub mod p2p;
+pub mod paths;
+pub mod policy;
 pub mod protocol;
 pub mod python_kill;
 pub mod recipes;

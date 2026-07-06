@@ -14,9 +14,9 @@
 //! public key is shared alongside the Ed25519 public key during
 //! registration.
 
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use aes_gcm::aead::Aead;
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey, Signature, Verifier};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use crate::error::TrainError;
@@ -39,7 +39,12 @@ impl KeyPair {
         let verifying = signing.verifying_key();
         let x25519_secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
         let x25519_public = x25519_dalek::PublicKey::from(&x25519_secret);
-        Self { signing, verifying, x25519_secret, x25519_public }
+        Self {
+            signing,
+            verifying,
+            x25519_secret,
+            x25519_public,
+        }
     }
 
     /// Load a keypair from stored bytes: [32 Ed25519 seed | 32 X25519 secret].
@@ -49,7 +54,12 @@ impl KeyPair {
         let x25519_bytes: [u8; 32] = bytes[32..64].try_into().unwrap();
         let x25519_secret = x25519_dalek::StaticSecret::from(x25519_bytes);
         let x25519_public = x25519_dalek::PublicKey::from(&x25519_secret);
-        Self { signing, verifying, x25519_secret, x25519_public }
+        Self {
+            signing,
+            verifying,
+            x25519_secret,
+            x25519_public,
+        }
     }
 
     /// Export the 64-byte secret material (for persistence).
@@ -160,8 +170,8 @@ pub fn decrypt(
     let eph_pub = x25519_dalek::PublicKey::from(eph_pub_bytes);
     let shared = recipient_x25519_secret.diffie_hellman(&eph_pub);
     let seal_key = hkdf_derive(shared.as_bytes(), b"blut-p2p-seal-v1");
-    let seal_cipher = Aes256Gcm::new_from_slice(&seal_key)
-        .map_err(|_| TrainError::other("invalid seal key"))?;
+    let seal_cipher =
+        Aes256Gcm::new_from_slice(&seal_key).map_err(|_| TrainError::other("invalid seal key"))?;
     let seal_nonce = Nonce::from_slice(&seal_nonce_bytes);
     let aes_key = seal_cipher
         .decrypt(seal_nonce, sealed_aes)
@@ -180,7 +190,8 @@ pub fn decrypt(
 fn hkdf_derive(ikm: &[u8], info: &[u8]) -> [u8; 32] {
     let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, ikm);
     let mut okm = [0u8; 32];
-    hk.expand(info, &mut okm).expect("32 bytes is valid for SHA-256");
+    hk.expand(info, &mut okm)
+        .expect("32 bytes is valid for SHA-256");
     okm
 }
 

@@ -128,7 +128,10 @@ mod tests {
             },
         };
         // recompute (from disk) == the cached merkle.
-        assert_eq!(split.recompute_content_hash().unwrap(), split.content_hash());
+        assert_eq!(
+            split.recompute_content_hash().unwrap(),
+            split.content_hash()
+        );
         // And it actually depends on the EVAL file (default would miss it):
         std::fs::write(&ep, b"eval rows CHANGED").unwrap();
         let drifted = DatasetSplit {

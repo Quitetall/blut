@@ -356,7 +356,9 @@ impl From<&StageFailure> for FailureSummary {
 /// Walks the error chain looking for a `StageFailure` in `Backend(anyhow)`
 /// variants. Returns `None` for non-Backend variants or if the anyhow
 /// chain doesn't contain a `StageFailure`.
-pub fn extract_failure_summary(err: &crate::framework::error::StageError) -> Option<FailureSummary> {
+pub fn extract_failure_summary(
+    err: &crate::framework::error::StageError,
+) -> Option<FailureSummary> {
     match err {
         crate::framework::error::StageError::Backend(anyhow_err) => {
             StageFailure::try_extract(anyhow_err).map(FailureSummary::from)
@@ -486,8 +488,8 @@ mod tests {
             "context": [["ch", "4"]],
             "message": "a future binary's failure mode"
         }"#;
-        let summary: FailureSummary =
-            serde_json::from_str(json).expect("unrecognized origin/severity tokens must not fail the whole struct");
+        let summary: FailureSummary = serde_json::from_str(json)
+            .expect("unrecognized origin/severity tokens must not fail the whole struct");
         assert_eq!(summary.origin, FaultOrigin::Unknown);
         assert_eq!(summary.severity, Severity::Unknown);
         // The REST of the record survives too -- not just deserialization

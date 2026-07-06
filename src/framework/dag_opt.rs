@@ -126,8 +126,9 @@ fn eliminate_dead_code(plan: CompiledPlan) -> CompiledPlan {
         vec![0]
     } else {
         (0..n as NodeId)
-            .filter(|&id| predecessors[id as usize].is_empty()
-                && !successors[id as usize].is_empty())
+            .filter(|&id| {
+                predecessors[id as usize].is_empty() && !successors[id as usize].is_empty()
+            })
             .collect()
     };
 
@@ -167,7 +168,9 @@ fn eliminate_dead_code(plan: CompiledPlan) -> CompiledPlan {
     }
 
     // Remap edges
-    let new_edges: Vec<PlanEdge> = plan.edges.into_iter()
+    let new_edges: Vec<PlanEdge> = plan
+        .edges
+        .into_iter()
         .filter(|e| live.contains(&e.from) && live.contains(&e.to))
         .map(|e| PlanEdge {
             from: old_to_new[&e.from],
@@ -176,7 +179,9 @@ fn eliminate_dead_code(plan: CompiledPlan) -> CompiledPlan {
         .collect();
 
     // Remap initial artifacts
-    let new_initial: HashMap<NodeId, _> = plan.initial.into_iter()
+    let new_initial: HashMap<NodeId, _> = plan
+        .initial
+        .into_iter()
         .filter(|(id, _)| live.contains(id))
         .map(|(id, art)| (old_to_new[&id], art))
         .collect();
@@ -185,7 +190,8 @@ fn eliminate_dead_code(plan: CompiledPlan) -> CompiledPlan {
     if eliminated > 0 {
         tracing::info!(
             "DAG optimizer: eliminated {eliminated} dead nodes ({}→{})",
-            n, new_nodes.len()
+            n,
+            new_nodes.len()
         );
     }
 
@@ -226,7 +232,8 @@ fn compute_critical_paths(plan: &CompiledPlan, hints: &mut HashMap<NodeId, Sched
         if successors[idx].is_empty() {
             cp_len[idx] = 1;
         } else {
-            let max_succ = successors[idx].iter()
+            let max_succ = successors[idx]
+                .iter()
                 .map(|&s| cp_len[s as usize])
                 .max()
                 .unwrap_or(0);
@@ -285,11 +292,16 @@ fn compute_memory_hints(plan: &CompiledPlan, hints: &mut HashMap<NodeId, Schedul
 
     for &node_id in &topo {
         let idx = node_id as usize;
-        let max_pred_level = predecessors[idx].iter()
+        let max_pred_level = predecessors[idx]
+            .iter()
             .map(|&p| levels[p as usize])
             .max()
             .unwrap_or(0);
-        levels[idx] = if predecessors[idx].is_empty() { 0 } else { max_pred_level + 1 };
+        levels[idx] = if predecessors[idx].is_empty() {
+            0
+        } else {
+            max_pred_level + 1
+        };
     }
 
     // Group nodes by level
@@ -298,7 +310,8 @@ fn compute_memory_hints(plan: &CompiledPlan, hints: &mut HashMap<NodeId, Schedul
         let nodes_at_level: Vec<NodeId> = (0..n as NodeId)
             .filter(|&id| levels[id as usize] == level)
             .collect();
-        let total_mem: u32 = nodes_at_level.iter()
+        let total_mem: u32 = nodes_at_level
+            .iter()
             .map(|&id| plan.nodes[id as usize].stage.memory_gib())
             .sum();
         for &node_id in &nodes_at_level {
@@ -367,7 +380,12 @@ mod tests {
             type Output = ();
             type Args = ();
 
-            async fn run(&self, _ctx: &crate::framework::stage::StageContext, _input: (), _args: &()) -> Result<(), crate::framework::error::StageError> {
+            async fn run(
+                &self,
+                _ctx: &crate::framework::stage::StageContext,
+                _input: (),
+                _args: &(),
+            ) -> Result<(), crate::framework::error::StageError> {
                 Ok(())
             }
         }
@@ -383,7 +401,8 @@ mod tests {
             })
             .collect();
 
-        let edges: Vec<PlanEdge> = edges.iter()
+        let edges: Vec<PlanEdge> = edges
+            .iter()
             .map(|&(from, to)| PlanEdge { from, to })
             .collect();
 
@@ -428,7 +447,10 @@ mod tests {
     fn critical_path_longest_chain() {
         // 0 → 1 → 2 → 3 (linear chain)
         let plan = make_plan(4, &[(0, 1), (1, 2), (2, 3)]);
-        let opt = DagOptimizer { eliminate_dead_code: false, ..DagOptimizer::new() };
+        let opt = DagOptimizer {
+            eliminate_dead_code: false,
+            ..DagOptimizer::new()
+        };
         let (_, hints) = opt.optimize(plan);
         assert_eq!(hints[&0].critical_path_len, 4);
         assert_eq!(hints[&1].critical_path_len, 3);
@@ -441,7 +463,10 @@ mod tests {
         // 0 → 1, 0 → 2, 1 → 3, 2 → 3
         // Both paths have length 3, so critical_path_len should be 3 for all
         let plan = make_plan(4, &[(0, 1), (0, 2), (1, 3), (2, 3)]);
-        let opt = DagOptimizer { eliminate_dead_code: false, ..DagOptimizer::new() };
+        let opt = DagOptimizer {
+            eliminate_dead_code: false,
+            ..DagOptimizer::new()
+        };
         let (_, hints) = opt.optimize(plan);
         assert_eq!(hints[&0].critical_path_len, 3);
         assert_eq!(hints[&1].critical_path_len, 2);
@@ -455,11 +480,14 @@ mod tests {
         // Level 0: {0}, Level 1: {1, 2}, Level 2: {3}
         // Each node has memory_gib=4, so level 1 should have peak=8
         let plan = make_plan(4, &[(0, 1), (0, 2), (1, 3), (2, 3)]);
-        let opt = DagOptimizer { eliminate_dead_code: false, ..DagOptimizer::new() };
+        let opt = DagOptimizer {
+            eliminate_dead_code: false,
+            ..DagOptimizer::new()
+        };
         let (_, hints) = opt.optimize(plan);
-        assert_eq!(hints[&0].peak_concurrent_gib, 4);  // level 0: 1 node
-        assert_eq!(hints[&1].peak_concurrent_gib, 8);  // level 1: 2 nodes
-        assert_eq!(hints[&2].peak_concurrent_gib, 8);  // level 1: 2 nodes
-        assert_eq!(hints[&3].peak_concurrent_gib, 4);  // level 2: 1 node
+        assert_eq!(hints[&0].peak_concurrent_gib, 4); // level 0: 1 node
+        assert_eq!(hints[&1].peak_concurrent_gib, 8); // level 1: 2 nodes
+        assert_eq!(hints[&2].peak_concurrent_gib, 8); // level 1: 2 nodes
+        assert_eq!(hints[&3].peak_concurrent_gib, 4); // level 2: 1 node
     }
 }

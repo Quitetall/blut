@@ -4,7 +4,7 @@
 // validated on the Thunder k8s box (read-only cgroupfs, no systemd bus).
 #![cfg(unix)]
 
-use blut::containment::{rlimit::RlimitAddressSpace, CapSpec, Containment, PeakSource};
+use blut::containment::{CapSpec, Containment, PeakSource, rlimit::RlimitAddressSpace};
 use std::path::PathBuf;
 
 #[tokio::test]
@@ -30,7 +30,11 @@ async fn rlimit_caps_a_runaway_allocation() {
             &caps,
         )
         .expect("wrap");
-    assert_eq!(wr.peak_source, PeakSource::None, "rlimit has no peak source");
+    assert_eq!(
+        wr.peak_source,
+        PeakSource::None,
+        "rlimit has no peak source"
+    );
 
     let mut cmd = wr.command;
     let out = cmd.output().await.expect("spawn python");
@@ -38,7 +42,10 @@ async fn rlimit_caps_a_runaway_allocation() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     println!("RLIMIT_CAP_TEST status={:?}", out.status);
     println!("RLIMIT_CAP_TEST stdout={stdout}");
-    println!("RLIMIT_CAP_TEST stderr(last)={}", stderr.lines().last().unwrap_or(""));
+    println!(
+        "RLIMIT_CAP_TEST stderr(last)={}",
+        stderr.lines().last().unwrap_or("")
+    );
     // The allocation must FAIL (non-zero exit), and must NOT print NO_CAP.
     assert!(
         !out.status.success(),

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use blut::framework::artifact::ContentHash;
+use blut::p2p::Coordinator;
 use blut::p2p::crypto::KeyPair;
 use blut::p2p::dispatch::{DefaultDispatchPolicy, DispatchPolicy};
 use blut::p2p::peer::{PeerCapabilities, PeerId};
@@ -19,7 +20,6 @@ use blut::p2p::registry::PeerRegistry;
 use blut::p2p::task::{ResourceRequest, TaskManifest, TaskResult};
 use blut::p2p::transport::P2pClient;
 use blut::p2p::trust::{DataClass, DispatchMatrix, TrustLevel};
-use blut::p2p::Coordinator;
 
 /// Create a temporary peer registry.
 fn temp_registry() -> (PeerRegistry, tempfile::TempDir) {
@@ -88,7 +88,11 @@ async fn task_manifest_sign_verify_roundtrip() {
 
     // Verify signature.
     let payload = manifest.sign_payload();
-    assert!(blut::p2p::crypto::verify(&kp.verifying, &payload, &manifest.signature));
+    assert!(blut::p2p::crypto::verify(
+        &kp.verifying,
+        &payload,
+        &manifest.signature
+    ));
 
     // Tamper with task_id → signature invalid.
     let mut tampered = manifest.clone();
@@ -117,7 +121,11 @@ async fn task_result_sign_verify_roundtrip() {
     result.signature = kp.sign(&result.sign_payload());
 
     let payload = result.sign_payload();
-    assert!(blut::p2p::crypto::verify(&kp.verifying, &payload, &result.signature));
+    assert!(blut::p2p::crypto::verify(
+        &kp.verifying,
+        &payload,
+        &result.signature
+    ));
 }
 
 #[tokio::test]
@@ -145,7 +153,7 @@ async fn peer_capabilities_serde_roundtrip() {
 #[tokio::test]
 async fn blob_side_stream_round_trips_over_quic() {
     use blut::p2p::bundle::BlobDir;
-    use blut::p2p::transport::{recv_blob, send_blob, P2pServer, P2pClient};
+    use blut::p2p::transport::{P2pClient, P2pServer, recv_blob, send_blob};
 
     let coord_kp = Arc::new(KeyPair::generate());
     let peer_kp = Arc::new(KeyPair::generate());
@@ -169,9 +177,14 @@ async fn blob_side_stream_round_trips_over_quic() {
     let server_c = server.clone();
     let recv = tokio::spawn(async move {
         let (_peer_id, conn) = server_c.accept_peer().await.unwrap();
-        recv_blob(&conn, "task-blob-1", BlobDir::Input, blut::p2p::transport::MAX_BLOB_SIZE)
-            .await
-            .unwrap()
+        recv_blob(
+            &conn,
+            "task-blob-1",
+            BlobDir::Input,
+            blut::p2p::transport::MAX_BLOB_SIZE,
+        )
+        .await
+        .unwrap()
     });
 
     // Peer side: connect (sends handshake), then send the blob.
@@ -201,11 +214,11 @@ mod e2e {
     use blut::framework::error::StageError;
     use blut::framework::resource::Resource;
     use blut::framework::stage::{ErasedStageCtor, Stage, StageContext, StageDyn};
+    use blut::p2p::PeerInfo;
     use blut::p2p::dispatch::{DispatchPolicy, DispatchVerdict};
-    use blut::p2p::peer_exec::{dispatch_to_peer, run_peer_loop, CoordinatorKeys};
+    use blut::p2p::peer_exec::{CoordinatorKeys, dispatch_to_peer, run_peer_loop};
     use blut::p2p::task::ResourceRequest;
     use blut::p2p::transport::P2pServer;
-    use blut::p2p::PeerInfo;
     use serde::{Deserialize, Serialize};
     use std::path::{Path, PathBuf};
 
@@ -268,8 +281,7 @@ mod e2e {
             &[]
         }
         fn stages_erased(&self) -> &'static [(&'static str, ErasedStageCtor)] {
-            static S: &[(&str, ErasedStageCtor)] =
-                &[("upper", || std::sync::Arc::new(Upper))];
+            static S: &[(&str, ErasedStageCtor)] = &[("upper", || std::sync::Arc::new(Upper))];
             S
         }
     }
@@ -334,8 +346,7 @@ mod e2e {
             path: in_path.clone(),
         };
         let input_hash = input.content_hash;
-        let input_erased =
-            blut::framework::stage::ErasedArtifact::from_typed(&input).unwrap();
+        let input_erased = blut::framework::stage::ErasedArtifact::from_typed(&input).unwrap();
 
         // Expected output hash = what a LOCAL run of `upper` would produce.
         let expected_out_hash = ContentHash::of_bytes(b"HELLO P2P WORLD");
@@ -411,7 +422,10 @@ mod e2e {
         let out: TextFile = dispatched.output.into_typed().unwrap();
         let body = std::fs::read_to_string(&out.path).unwrap();
         assert_eq!(body, "HELLO P2P WORLD", "peer ran the real stage");
-        assert!(out.path.starts_with(out_dir.path()), "output materialized locally");
+        assert!(
+            out.path.starts_with(out_dir.path()),
+            "output materialized locally"
+        );
 
         drop(coord_conn);
         let _ = tokio::time::timeout(Duration::from_secs(2), peer).await;
@@ -422,7 +436,7 @@ mod e2e {
 #[tokio::test]
 async fn recv_blob_rejects_oversized_total_len() {
     use blut::p2p::bundle::BlobDir;
-    use blut::p2p::transport::{recv_blob, send_blob, P2pServer, P2pClient};
+    use blut::p2p::transport::{P2pClient, P2pServer, recv_blob, send_blob};
 
     let coord_kp = Arc::new(KeyPair::generate());
     let peer_kp = Arc::new(KeyPair::generate());
@@ -455,7 +469,10 @@ async fn recv_blob_rejects_oversized_total_len() {
         .unwrap();
     assert!(r.is_err(), "oversized total_len must be rejected");
     let msg = format!("{:?}", r.unwrap_err());
-    assert!(msg.contains("max_blob_size"), "rejected for the cap reason: {msg}");
+    assert!(
+        msg.contains("max_blob_size"),
+        "rejected for the cap reason: {msg}"
+    );
 
     drop(conn);
     server.shutdown();
@@ -472,7 +489,7 @@ async fn smoke_serve_dispatches_echo_over_loopback() {
     use blut::p2p::crypto::KeyPair;
     use blut::p2p::dispatch::DefaultDispatchPolicy;
     use blut::p2p::peer::PeerId;
-    use blut::p2p::peer_exec::{run_peer_loop, CoordinatorKeys};
+    use blut::p2p::peer_exec::{CoordinatorKeys, run_peer_loop};
     use blut::p2p::smoke;
     use blut::p2p::transport::{P2pClient, P2pServer};
     use blut::p2p::trust::DispatchMatrix;
@@ -483,9 +500,13 @@ async fn smoke_serve_dispatches_echo_over_loopback() {
 
     // Coordinator binds (the `serve` role).
     let server = Arc::new(
-        P2pServer::bind("127.0.0.1:0".parse().unwrap(), coord_kp.clone(), peer_reg_store)
-            .await
-            .unwrap(),
+        P2pServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            coord_kp.clone(),
+            peer_reg_store,
+        )
+        .await
+        .unwrap(),
     );
     let addr = server.local_addr().unwrap();
 
@@ -503,7 +524,10 @@ async fn smoke_serve_dispatches_echo_over_loopback() {
         let mut reg = Registry::new();
         smoke::register(&mut reg);
         let policy = DefaultDispatchPolicy::new(DispatchMatrix::default());
-        let ck = CoordinatorKeys { verifying: coord_verifying, x25519_pub: coord_x };
+        let ck = CoordinatorKeys {
+            verifying: coord_verifying,
+            x25519_pub: coord_x,
+        };
         let _ = tokio::time::timeout(
             Duration::from_secs(8),
             run_peer_loop(&conn, &peer_kp_c, &ck, &reg, &policy, &peer_work_path),
@@ -517,7 +541,14 @@ async fn smoke_serve_dispatches_echo_over_loopback() {
     let mut reg = Registry::new();
     smoke::register(&mut reg);
     let out = smoke::smoke_dispatch_once(
-        &server, &conn, &coord_kp, &reg, &peer_id, smoke::SMOKE_STAGE, "hello smoke", 30,
+        &server,
+        &conn,
+        &coord_kp,
+        &reg,
+        &peer_id,
+        smoke::SMOKE_STAGE,
+        "hello smoke",
+        30,
     )
     .await
     .expect("smoke dispatch must succeed");

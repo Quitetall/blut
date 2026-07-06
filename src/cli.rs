@@ -747,7 +747,13 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Hpo { cmd }) => run_hpo(&reg, cmd).await,
         Some(Command::Dag { job, json }) => run_dag(job, json),
         Some(Command::Compare { a, b }) => run_compare(&a, &b),
-        Some(Command::Results { job, json, metric, maximize, minimize }) => {
+        Some(Command::Results {
+            job,
+            json,
+            metric,
+            maximize,
+            minimize,
+        }) => {
             // Explicit flags override the name heuristic; clap's conflicts_with
             // guarantees at most one is set.
             let force = if maximize {
@@ -1007,7 +1013,9 @@ fn warn_if_stale_binary() {
          may predate the source). Rebuild + reinstall (`cargo install --force`, or \
          `cargo build` for a local checkout), or set BLUT_AUTO_REBUILD=1 to do it \
          automatically.",
-        info.built, info.src, info.live
+        info.built,
+        info.src,
+        info.live
     );
 }
 
@@ -1104,7 +1112,9 @@ fn maybe_auto_rebuild(info: &StaleInfo) {
         tracing::warn!(
             "auto-rebuild already ran but blut is still stale ({} ≠ {}); not retrying — \
              rebuild manually (uncommitted changes in {}?).",
-            info.built, info.live, info.src
+            info.built,
+            info.live,
+            info.src
         );
         return;
     }
@@ -1123,9 +1133,7 @@ fn maybe_auto_rebuild(info: &StaleInfo) {
         cmd.join(" ")
     );
     // cmd is ["cargo","install",...] (detected) or ["sh","-c",<BLUT_REBUILD_CMD>].
-    let status = std::process::Command::new(&cmd[0])
-        .args(&cmd[1..])
-        .status();
+    let status = std::process::Command::new(&cmd[0]).args(&cmd[1..]).status();
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => {
@@ -1133,7 +1141,10 @@ fn maybe_auto_rebuild(info: &StaleInfo) {
             return;
         }
         Err(e) => {
-            tracing::error!("auto-rebuild could not start (`{}`: {e}); continuing STALE.", cmd[0]);
+            tracing::error!(
+                "auto-rebuild could not start (`{}`: {e}); continuing STALE.",
+                cmd[0]
+            );
             return;
         }
     }
@@ -1146,7 +1157,10 @@ fn maybe_auto_rebuild(info: &StaleInfo) {
         return;
     };
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    tracing::info!("auto-rebuild OK — re-exec {} with fresh code.", exe.display());
+    tracing::info!(
+        "auto-rebuild OK — re-exec {} with fresh code.",
+        exe.display()
+    );
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1443,7 +1457,10 @@ mod p2p_cli {
     /// Load the identity keypair from `path` (64-byte file), or error if absent.
     pub fn load_keypair(path: &std::path::Path) -> Result<KeyPair> {
         let bytes = std::fs::read(path).with_context(|| {
-            format!("read identity key {} (run `blut p2p keys generate`)", path.display())
+            format!(
+                "read identity key {} (run `blut p2p keys generate`)",
+                path.display()
+            )
         })?;
         let arr: [u8; 64] = bytes
             .as_slice()
@@ -1458,7 +1475,9 @@ mod p2p_cli {
             "anonymous" => Ok(TrustLevel::Anonymous),
             "registered" => Ok(TrustLevel::Registered),
             "trusted" => Ok(TrustLevel::Trusted),
-            other => Err(anyhow!("unknown trust level '{other}' (anonymous|registered|trusted)")),
+            other => Err(anyhow!(
+                "unknown trust level '{other}' (anonymous|registered|trusted)"
+            )),
         }
     }
 
@@ -1475,7 +1494,10 @@ mod p2p_cli {
         match matches.as_slice() {
             [one] => Ok(one.id.clone()),
             [] => Err(anyhow!("no peer matches '{prefix}'")),
-            _ => Err(anyhow!("'{prefix}' is ambiguous ({} peers match)", matches.len())),
+            _ => Err(anyhow!(
+                "'{prefix}' is ambiguous ({} peers match)",
+                matches.len()
+            )),
         }
     }
 }
@@ -1543,11 +1565,18 @@ async fn run_p2p_cmd(mut reg: crate::framework::Registry, cmd: P2pCommand) -> Re
                 let pid = PeerId::from_pubkey(&kp.verifying);
                 println!("peer id   {pid}");
                 println!("pubkey    {}", p2p_pubkey_hex(&kp));
-                println!("(share the pubkey with peers: `blut p2p connect <coord> --coordinator-pubkey <hex>`)");
+                println!(
+                    "(share the pubkey with peers: `blut p2p connect <coord> --coordinator-pubkey <hex>`)"
+                );
                 Ok(())
             }
         },
-        P2pCommand::Serve { addr, key, smoke_stage, smoke_input } => {
+        P2pCommand::Serve {
+            addr,
+            key,
+            smoke_stage,
+            smoke_input,
+        } => {
             let path = key.map(Ok).unwrap_or_else(default_key_path)?;
             let kp = std::sync::Arc::new(load_keypair(&path)?);
             match smoke_stage {
@@ -1558,15 +1587,19 @@ async fn run_p2p_cmd(mut reg: crate::framework::Registry, cmd: P2pCommand) -> Re
                 None => run_p2p_serve(addr, kp).await,
             }
         }
-        P2pCommand::Connect { coordinator, coordinator_pubkey, key } => {
+        P2pCommand::Connect {
+            coordinator,
+            coordinator_pubkey,
+            key,
+        } => {
             let path = key.map(Ok).unwrap_or_else(default_key_path)?;
             let kp = load_keypair(&path)?;
             run_p2p_connect(&reg, coordinator, coordinator_pubkey, kp).await
         }
         P2pCommand::Peers { cmd } => {
             let reg_path = default_registry_path()?;
-            let mut registry = PeerRegistry::load(&reg_path)
-                .map_err(|e| anyhow!("load peer registry: {e}"))?;
+            let mut registry =
+                PeerRegistry::load(&reg_path).map_err(|e| anyhow!("load peer registry: {e}"))?;
             match cmd {
                 P2pPeersCommand::List { json } => {
                     if json {
@@ -1643,10 +1676,10 @@ async fn run_p2p_serve(
     addr: String,
     keypair: std::sync::Arc<crate::p2p::crypto::KeyPair>,
 ) -> Result<()> {
+    use crate::p2p::Coordinator;
     use crate::p2p::dispatch::{DefaultDispatchPolicy, DispatchPolicy};
     use crate::p2p::registry::PeerRegistry;
     use crate::p2p::trust::DispatchMatrix;
-    use crate::p2p::Coordinator;
 
     let sockaddr: std::net::SocketAddr = addr
         .parse()
@@ -1750,8 +1783,8 @@ async fn run_p2p_connect(
     coordinator_pubkey_hex: String,
     keypair: crate::p2p::crypto::KeyPair,
 ) -> Result<()> {
-    use crate::p2p::dispatch::{DefaultDispatchPolicy};
-    use crate::p2p::peer_exec::{run_peer_loop, CoordinatorKeys};
+    use crate::p2p::dispatch::DefaultDispatchPolicy;
+    use crate::p2p::peer_exec::{CoordinatorKeys, run_peer_loop};
     use crate::p2p::transport::P2pClient;
     use crate::p2p::trust::DispatchMatrix;
 
@@ -1763,27 +1796,25 @@ async fn run_p2p_connect(
     let mut pub64 = [0u8; 64];
     faster_hex::hex_decode(coordinator_pubkey_hex.as_bytes(), &mut pub64)
         .map_err(|e| anyhow!("invalid --coordinator-pubkey hex: {e}"))?;
-    let verifying = ed25519_dalek::VerifyingKey::from_bytes(
-        &pub64[..32].try_into().unwrap(),
-    )
-    .map_err(|e| anyhow!("invalid coordinator Ed25519 key: {e}"))?;
+    let verifying = ed25519_dalek::VerifyingKey::from_bytes(&pub64[..32].try_into().unwrap())
+        .map_err(|e| anyhow!("invalid coordinator Ed25519 key: {e}"))?;
     let x_arr: [u8; 32] = pub64[32..].try_into().unwrap();
     let x25519_pub = x25519_dalek::PublicKey::from(x_arr);
-    let coord_keys = CoordinatorKeys { verifying, x25519_pub };
+    let coord_keys = CoordinatorKeys {
+        verifying,
+        x25519_pub,
+    };
 
     let policy = DefaultDispatchPolicy::new(DispatchMatrix::default());
     let work_root = crate::p2p::peer_exec::default_work_root();
     std::fs::create_dir_all(&work_root)
         .with_context(|| format!("create peer work root {}", work_root.display()))?;
 
-    let client = P2pClient::with_coordinator_pin(
-        std::sync::Arc::new(clone_keypair(&keypair)),
-        {
-            let mut k = [0u8; 32];
-            k.copy_from_slice(verifying.as_bytes());
-            k
-        },
-    );
+    let client = P2pClient::with_coordinator_pin(std::sync::Arc::new(clone_keypair(&keypair)), {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(verifying.as_bytes());
+        k
+    });
     let (conn, my_id) = client
         .connect(sockaddr)
         .await
@@ -1918,7 +1949,10 @@ fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
                 return Ok(());
             }
             let (th, tm) = stats.totals();
-            println!("{:<32} {:>6} {:>6} {:>7}", "ingredient", "hits", "miss", "hit%");
+            println!(
+                "{:<32} {:>6} {:>6} {:>7}",
+                "ingredient", "hits", "miss", "hit%"
+            );
             for (stage, (h, m)) in &stats.per_stage {
                 let pct = if h + m == 0 {
                     0.0
@@ -2456,7 +2490,11 @@ fn admitted_workers_for(name: &str, raw: &serde_json::Value) -> Option<u32> {
 /// `Some(B)` only when it actually LOWERS the recipe's requested batch (unlike
 /// workers, there is no "saturate up" direction — see that function's doc);
 /// `None` means "the requested batch already fits, launch it unchanged."
-fn admitted_batch_size_for(name: &str, raw: &serde_json::Value, resolved_workers: u32) -> Option<u32> {
+fn admitted_batch_size_for(
+    name: &str,
+    raw: &serde_json::Value,
+    resolved_workers: u32,
+) -> Option<u32> {
     if raw.is_null() || raw.as_object().is_some_and(|o| o.is_empty()) {
         return None; // light recipe — no batch to tune
     }
@@ -3502,7 +3540,10 @@ fn run_results(job: &str, json: bool, metric: &str, force_maximize: Option<bool>
             "per_band_prd": band_obj,
             "ckpt_path": ckpt,
         });
-        println!("{}", serde_json::to_string_pretty(&out).map_err(|e| anyhow!("{e}"))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out).map_err(|e| anyhow!("{e}"))?
+        );
         return Ok(());
     }
 
@@ -3938,7 +3979,10 @@ async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeCommand) -> Res
                     } else {
                         // Render-only (default): print the runnable DAG, no exec.
                         print!("{}", plan.render_ascii().map_err(|e| anyhow!("{e}"))?);
-                        println!("✓ '{}' compiles + kind-checks ({n} ingredient(s)).", recipe.name);
+                        println!(
+                            "✓ '{}' compiles + kind-checks ({n} ingredient(s)).",
+                            recipe.name
+                        );
                     }
                 }
             }
@@ -4117,7 +4161,9 @@ async fn launch_compiled_plan(
     let admitted_batch_size = admitted_workers
         .and_then(|w| admitted_batch_size_for(name, plan.exec_view().recipe_args, w));
     let footprint = match admitted_workers {
-        Some(w) => recipe_footprint_tuned(name, plan.exec_view().recipe_args, w, admitted_batch_size),
+        Some(w) => {
+            recipe_footprint_tuned(name, plan.exec_view().recipe_args, w, admitted_batch_size)
+        }
         None => recipe_footprint(name, plan.exec_view().recipe_args),
     };
 
@@ -4946,12 +4992,15 @@ mod cell_override_and_truncate_tests {
 
     #[test]
     fn overrides_coerce_scalars() {
-        let out = apply_cell_overrides(&json!({}), &[
-            "a=3".into(),
-            "b=2.5".into(),
-            "c=true".into(),
-            "d=hello".into(),
-        ]);
+        let out = apply_cell_overrides(
+            &json!({}),
+            &[
+                "a=3".into(),
+                "b=2.5".into(),
+                "c=true".into(),
+                "d=hello".into(),
+            ],
+        );
         assert_eq!(out, json!({"a": 3, "b": 2.5, "c": true, "d": "hello"}));
     }
 
@@ -4959,12 +5008,15 @@ mod cell_override_and_truncate_tests {
     fn bare_nan_inf_stay_strings() {
         // f64::from_str accepts these, but json!(NAN) emits null — a silent
         // corruption of the cell's args. They must survive as strings.
-        let out = apply_cell_overrides(&json!({}), &[
-            "a=nan".into(),
-            "b=inf".into(),
-            "c=-inf".into(),
-            "d=infinity".into(),
-        ]);
+        let out = apply_cell_overrides(
+            &json!({}),
+            &[
+                "a=nan".into(),
+                "b=inf".into(),
+                "c=-inf".into(),
+                "d=infinity".into(),
+            ],
+        );
         assert_eq!(
             out,
             json!({"a": "nan", "b": "inf", "c": "-inf", "d": "infinity"})
@@ -5149,9 +5201,7 @@ mod errors_cli_tests {
 
 #[cfg(all(test, feature = "p2p"))]
 mod p2p_cli_tests {
-    use super::{
-        Cli, Command, P2pCommand, P2pKeysCommand, P2pPeersCommand,
-    };
+    use super::{Cli, Command, P2pCommand, P2pKeysCommand, P2pPeersCommand};
     use clap::Parser;
 
     fn p2p_of(argv: &[&str]) -> P2pCommand {
@@ -5164,7 +5214,9 @@ mod p2p_cli_tests {
     #[test]
     fn keys_generate_parses() {
         match p2p_of(&["blut", "p2p", "keys", "generate", "--force"]) {
-            P2pCommand::Keys { cmd: P2pKeysCommand::Generate { force, .. } } => assert!(force),
+            P2pCommand::Keys {
+                cmd: P2pKeysCommand::Generate { force, .. },
+            } => assert!(force),
             other => panic!("got {other:?}"),
         }
     }
@@ -5183,9 +5235,18 @@ mod p2p_cli_tests {
         assert!(Cli::try_parse_from(["blut", "p2p", "connect", "1.2.3.4:9320"]).is_err());
         // With it, parses.
         match p2p_of(&[
-            "blut", "p2p", "connect", "1.2.3.4:9320", "--coordinator-pubkey", "deadbeef",
+            "blut",
+            "p2p",
+            "connect",
+            "1.2.3.4:9320",
+            "--coordinator-pubkey",
+            "deadbeef",
         ]) {
-            P2pCommand::Connect { coordinator, coordinator_pubkey, .. } => {
+            P2pCommand::Connect {
+                coordinator,
+                coordinator_pubkey,
+                ..
+            } => {
                 assert_eq!(coordinator, "1.2.3.4:9320");
                 assert_eq!(coordinator_pubkey, "deadbeef");
             }
@@ -5196,11 +5257,15 @@ mod p2p_cli_tests {
     #[test]
     fn peers_subcommands_parse() {
         match p2p_of(&["blut", "p2p", "peers", "list", "--json"]) {
-            P2pCommand::Peers { cmd: P2pPeersCommand::List { json } } => assert!(json),
+            P2pCommand::Peers {
+                cmd: P2pPeersCommand::List { json },
+            } => assert!(json),
             other => panic!("got {other:?}"),
         }
         match p2p_of(&["blut", "p2p", "peers", "trust", "abc123", "trusted"]) {
-            P2pCommand::Peers { cmd: P2pPeersCommand::Trust { id, level } } => {
+            P2pCommand::Peers {
+                cmd: P2pPeersCommand::Trust { id, level },
+            } => {
                 assert_eq!(id, "abc123");
                 assert_eq!(level, "trusted");
             }

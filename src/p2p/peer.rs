@@ -174,11 +174,16 @@ mod pubkey_serde {
 mod x25519_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    pub fn serialize<S: Serializer>(key: &x25519_dalek::PublicKey, s: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(
+        key: &x25519_dalek::PublicKey,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
         faster_hex::hex_string(&key.to_bytes()).serialize(s)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<x25519_dalek::PublicKey, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<x25519_dalek::PublicKey, D::Error> {
         let hex: String = Deserialize::deserialize(d)?;
         let mut bytes = [0u8; 32];
         faster_hex::hex_decode(hex.as_bytes(), &mut bytes)
@@ -194,7 +199,12 @@ mod tests {
 
     fn make_test_peer(trust: TrustLevel) -> PeerInfo {
         let kp = KeyPair::generate();
-        PeerInfo::new(kp.verifying, kp.x25519_public, trust, PeerCapabilities::default())
+        PeerInfo::new(
+            kp.verifying,
+            kp.x25519_public,
+            trust,
+            PeerCapabilities::default(),
+        )
     }
 
     #[test]
@@ -267,12 +277,17 @@ mod tests {
     #[test]
     fn peer_info_serialization_roundtrip() {
         let kp = KeyPair::generate();
-        let peer = PeerInfo::new(kp.verifying, kp.x25519_public, TrustLevel::Trusted, PeerCapabilities {
-            cpu_cores: 16,
-            memory_gib: 64,
-            gpu_model: Some("NVIDIA A100".into()),
-            gpu_vram_gib: Some(80),
-        });
+        let peer = PeerInfo::new(
+            kp.verifying,
+            kp.x25519_public,
+            TrustLevel::Trusted,
+            PeerCapabilities {
+                cpu_cores: 16,
+                memory_gib: 64,
+                gpu_model: Some("NVIDIA A100".into()),
+                gpu_vram_gib: Some(80),
+            },
+        );
         let json = serde_json::to_string(&peer).unwrap();
         let peer2: PeerInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(peer.id, peer2.id);
