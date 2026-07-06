@@ -308,6 +308,13 @@ pub trait Stage: Send + Sync + 'static {
     /// path to size the `ResourceRequest` sent to peers — a rayon/
     /// dataloader-heavy stage should declare its real parallelism so
     /// peer selection doesn't schedule it onto a 1-core box.
+    ///
+    /// Deliberately a const, not args-aware (unlike `memory_gib_for`/
+    /// `gpu_permits`): training stages — the ones whose core count
+    /// scales with args (DDP nproc) — are excluded from dispatch by
+    /// policy, so no dispatchable stage needs it today. If that ever
+    /// changes, add a `cpu_cores_for(args)` alongside the existing
+    /// args-aware pair rather than widening this const.
     const CPU_CORES: u32 = 1;
 
     /// Whether this stage is ADVISORY (ADR 0071). An advisory stage's failure is

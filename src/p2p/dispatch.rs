@@ -107,12 +107,19 @@ impl DefaultDispatchPolicy {
         }
     }
 
-    /// Create with a custom set of dispatchable stages.
+    /// Create with a custom set of dispatchable stages. Like [`new`](Self::new),
+    /// only the smoke probe is pre-classified (Public — its payload is
+    /// synthetic by construction, independent of the operator's stage set);
+    /// every custom stage classifies Restricted until [`classify`](Self::classify)d.
     pub fn with_stages(matrix: DispatchMatrix, stages: HashSet<String>) -> Self {
+        let stage_classes = std::collections::HashMap::from([(
+            crate::p2p::smoke::SMOKE_STAGE.to_string(),
+            DataClass::Public,
+        )]);
         Self {
             matrix,
             dispatchable_stages: stages,
-            stage_classes: std::collections::HashMap::new(),
+            stage_classes,
         }
     }
 
