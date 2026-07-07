@@ -389,6 +389,73 @@ impl ConsoleModel {
         self.cache = cache.split_off(keep);
         true
     }
+
+    /// Overlay the real symmetric mesh from the peer registry (`peers.json`),
+    /// if present + non-empty. Peers only (the local node isn't in the
+    /// registry). No-op when the `p2p` feature is off.
+    #[cfg(feature = "p2p")]
+    pub fn apply_mesh(&mut self) {
+        use crate::p2p::registry::PeerRegistry;
+        use crate::p2p::trust::TrustLevel;
+        let Ok(dir) = crate::paths::data_dir() else {
+            return;
+        };
+        let Ok(reg) = PeerRegistry::load(&dir.join("p2p").join("peers.json")) else {
+            return;
+        };
+        let peers = reg.list();
+        if peers.is_empty() {
+            return;
+        }
+        self.mesh = peers
+            .iter()
+            .map(|p| {
+                let trust = match p.trust {
+                    TrustLevel::Trusted => Trust::Trusted,
+                    TrustLevel::Registered => Trust::Registered,
+                    TrustLevel::Anonymous => Trust::Anonymous,
+                };
+                let c = &p.capabilities;
+                let gpu = c.gpu_model.as_deref().unwrap_or("cpu-only");
+                MeshPeer {
+                    id: p.id.short(),
+                    trust,
+                    caps: format!("{}c · {}G · {gpu}", c.cpu_cores, c.memory_gib),
+                    reputation: p.reputation,
+                    is_self: false,
+                }
+            })
+            .collect();
+    }
+
+    /// Overlay the real per-corpus ε budgets from the privacy ledger
+    /// (read-only — the chain is NOT verified here; enforcement is elsewhere).
+    /// No-op when the `p2p` feature is off or the ledger is empty.
+    #[cfg(feature = "p2p")]
+    pub fn apply_privacy(&mut self) {
+        use crate::p2p::privacy::PrivacyLedger;
+        let Ok(dir) = crate::paths::data_dir() else {
+            return;
+        };
+        let Ok(ledger) = PrivacyLedger::load_readonly(dir.join("p2p").join("privacy_ledger.json"))
+        else {
+            return;
+        };
+        let mut s = ledger.corpus_summaries();
+        if s.is_empty() {
+            return;
+        }
+        s.sort_by(|a, b| a.0.cmp(&b.0));
+        self.corpora = s
+            .into_iter()
+            .map(|(name, spent, budget)| CorpusBudget {
+                name,
+                eps_spent: spent,
+                eps_budget: budget,
+                restricted: false,
+            })
+            .collect();
+    }
 }
 
 // ── rendering helpers ─────────────────────────────────────────────────────

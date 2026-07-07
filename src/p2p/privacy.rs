@@ -164,6 +164,34 @@ impl PrivacyLedger {
         entry.epsilon_budget = epsilon_budget;
     }
 
+    /// Load a ledger for READ-ONLY display (e.g. the console) WITHOUT verifying
+    /// the signed chain — the numbers are shown, not enforced. Any code that
+    /// ENFORCES the budget must go through [`load`](Self::load) +
+    /// [`verify_chain`](Self::verify_chain) instead.
+    pub fn load_readonly(path: PathBuf) -> Result<Self, TrainError> {
+        if !path.exists() {
+            return Ok(Self::new(path));
+        }
+        let data = std::fs::read_to_string(&path).map_err(|e| TrainError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
+        let mut ledger: Self = serde_json::from_str(&data).map_err(|e| {
+            TrainError::other(format!("corrupt privacy ledger {}: {e}", path.display()))
+        })?;
+        ledger.path = path;
+        Ok(ledger)
+    }
+
+    /// `(corpus_id, ε spent, ε budget)` for every known corpus — for read-only
+    /// display. Order is unspecified (a `HashMap`); callers sort if needed.
+    pub fn corpus_summaries(&self) -> Vec<(String, f64, f64)> {
+        self.budgets
+            .iter()
+            .map(|(id, b)| (id.clone(), b.epsilon_spent, b.epsilon_budget))
+            .collect()
+    }
+
     /// ε remaining for a corpus (0 if unknown — fail-closed: no budget set means
     /// nothing may be spent).
     pub fn remaining(&self, corpus_id: &str) -> f64 {

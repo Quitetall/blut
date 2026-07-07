@@ -989,6 +989,12 @@ impl App {
                 m.plan = name.clone();
             }
         }
+        // Overlay the real mesh + ε budgets when the p2p plane is compiled in.
+        #[cfg(feature = "p2p")]
+        {
+            m.apply_mesh();
+            m.apply_privacy();
+        }
         self.console = m;
     }
 
