@@ -109,6 +109,12 @@ pub enum MeshFrame {
     ChunkRequest { needed: Vec<u32> },
     /// A signed peer-address gossip (A5). One-way — the responder just `Ack`s.
     PeerExchange(Box<crate::p2p::gossip::PeerExchange>),
+    /// A lifecycle status event forwarded from a worker to the initiator (D5),
+    /// tagged with the sender's short host id. One-way — the responder `Ack`s.
+    Status {
+        host: String,
+        event: Box<crate::framework::status::StageEvent>,
+    },
     /// Generic acknowledgement.
     Ack,
     /// A protocol-level error (either direction).
@@ -129,6 +135,7 @@ impl MeshFrame {
             MeshFrame::ChunkIndex(_) => "ChunkIndex",
             MeshFrame::ChunkRequest { .. } => "ChunkRequest",
             MeshFrame::PeerExchange(_) => "PeerExchange",
+            MeshFrame::Status { .. } => "Status",
             MeshFrame::Ack => "Ack",
             MeshFrame::Error { .. } => "Error",
         }

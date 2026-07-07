@@ -120,6 +120,30 @@ impl StageEvent {
     }
 }
 
+/// A [`StageEvent`] tagged with the host that produced it (D5, cross-host
+/// observability). This is the status.jsonl LINE format: the event's fields
+/// are flattened in, plus an optional `host` (a peer's short-hex id). `host`
+/// is omitted when `None` (local events), so old single-host readers are
+/// unaffected — the field is purely additive.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HostedEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(flatten)]
+    pub event: StageEvent,
+}
+
+impl HostedEvent {
+    /// Tag `event` with `host` (clone of the local node id, or a forwarded
+    /// peer's id). `None` host ⇒ a local, untagged line.
+    pub fn wrap(host: &Option<String>, event: StageEvent) -> Self {
+        Self {
+            host: host.clone(),
+            event,
+        }
+    }
+}
+
 /// Fan-out hub for stage status. A single [`emit`](StatusHub::emit)
 /// choke point stamps a process-wide sequence number and routes each
 /// event:
@@ -133,6 +157,16 @@ impl StageEvent {
 pub struct StatusHub {
     broadcast: broadcast::Sender<StageEvent>,
     lifecycle_tx: mpsc::UnboundedSender<StageEvent>,
+    /// This node's short-hex id, stamped onto locally-emitted lines (D5).
+    /// `None` (default) ⇒ single-host run, `host` omitted from the JSON.
+    host: Option<String>,
+    /// Already-host-tagged events forwarded FROM other nodes (D5). Drained by
+    /// the same writer so one status.jsonl on the initiator tells the whole
+    /// multi-host story. The receiver is taken once by [`spawn_status_writer`].
+    /// BOUNDED (a display audit trail) so a flooding/malicious worker can't OOM
+    /// the initiator — on a full channel the event is dropped + logged.
+    remote_tx: mpsc::Sender<HostedEvent>,
+    remote_rx: std::sync::Mutex<Option<mpsc::Receiver<HostedEvent>>>,
 }
 
 impl StatusHub {
@@ -141,11 +175,55 @@ impl StatusHub {
     pub fn new() -> (Arc<StatusHub>, mpsc::UnboundedReceiver<StageEvent>) {
         let (broadcast, _rx) = broadcast::channel(DEFAULT_BROADCAST_CAPACITY);
         let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+        let (remote_tx, remote_rx) = mpsc::channel(DEFAULT_BROADCAST_CAPACITY);
         let hub = Arc::new(StatusHub {
             broadcast,
             lifecycle_tx,
+            host: None,
+            remote_tx,
+            remote_rx: std::sync::Mutex::new(Some(remote_rx)),
         });
         (hub, lifecycle_rx)
+    }
+
+    /// Set this node's short id, stamped onto locally-emitted status lines
+    /// (D5). Call IMMEDIATELY after [`new`](Self::new), before the `Arc` is
+    /// cloned/shared or the writer is spawned — it consumes + rebuilds the
+    /// `Arc` and PANICS if any other strong reference exists.
+    pub fn with_host(self: Arc<Self>, host: impl Into<String>) -> Arc<Self> {
+        let mut inner = Arc::try_unwrap(self)
+            .unwrap_or_else(|_| panic!("with_host must be called before the hub is shared"));
+        inner.host = Some(host.into());
+        Arc::new(inner)
+    }
+
+    /// This node's configured host id, if any.
+    pub fn host(&self) -> Option<&str> {
+        self.host.as_deref()
+    }
+
+    /// Ingest a lifecycle event FORWARDED from another node, tagged with that
+    /// node's `host` (D5). Written to this node's status.jsonl by the writer.
+    /// Non-lifecycle events are ignored (only the audit trail crosses hosts).
+    pub fn ingest_remote(&self, host: impl Into<String>, event: StageEvent) {
+        if !event.is_lifecycle() {
+            // Only the lossless audit trail crosses hosts; Steps stay local.
+            tracing::trace!("status: dropping forwarded non-lifecycle event");
+            return;
+        }
+        // try_send (not await): sync caller + bounded channel. A full channel
+        // means the initiator's writer is far behind (or a flood) — drop the
+        // event rather than block/OOM; it's a display trail.
+        if self
+            .remote_tx
+            .try_send(HostedEvent {
+                host: Some(host.into()),
+                event,
+            })
+            .is_err()
+        {
+            tracing::warn!("status: remote event channel full/closed; dropped a forwarded event");
+        }
     }
 
     /// Emit one event. Lifecycle events go to the lossless writer
@@ -211,6 +289,11 @@ pub fn spawn_status_writer(
         .append(true)
         .open(&path)?;
     let mut brx = hub.subscribe();
+    // D5: the local host tag (stamped on local lines) + the remote channel of
+    // already-tagged events forwarded from other nodes (drained by this same
+    // writer so one status.jsonl carries the whole multi-host story).
+    let local_host = hub.host.clone();
+    let mut remote_rx = hub.remote_rx.lock().ok().and_then(|mut g| g.take());
     Ok(tokio::spawn(async move {
         let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
         let reopen = |p: &std::path::Path| {
@@ -245,23 +328,42 @@ pub fn spawn_status_writer(
             let timeout = tokio::time::sleep(STEP_FLUSH_INTERVAL);
             tokio::pin!(timeout);
             tokio::select! {
-                // Lossless lifecycle — immediate flush, seq-ordered.
+                // Lossless lifecycle — immediate flush, seq-ordered. Local
+                // events are tagged with this node's host (D5).
                 got = lifecycle_rx.recv() => match got {
                     Some(event) => {
-                        if !write_event!(event, true) { return; }
+                        if !write_event!(HostedEvent::wrap(&local_host, event), true) { return; }
                     }
                     None => {
-                        // Last StatusHub dropped → run is finishing. Drain
-                        // any remaining broadcast Steps, then exit.
+                        // Last StatusHub dropped → run is finishing. Drain any
+                        // remaining REMOTE lifecycle events (D5) + broadcast
+                        // Steps before exiting, so a worker event that arrived
+                        // just before shutdown isn't lost.
                         let _ = writer.flush();
+                        if let Some(rx) = remote_rx.as_mut() {
+                            while let Ok(hosted) = rx.try_recv() {
+                                let _ = write_event!(hosted, false);
+                            }
+                        }
                         while let Ok(event) = brx.try_recv() {
                             if matches!(event, StageEvent::StageStep { .. }) {
-                                let _ = write_event!(event, false);
+                                let _ = write_event!(HostedEvent::wrap(&local_host, event), false);
                             }
                         }
                         let _ = writer.flush();
                         return;
                     }
+                },
+                // Lossless REMOTE lifecycle (D5): events forwarded from other
+                // nodes, already host-tagged. A never-future when no remote
+                // channel is attached so the select arm is inert.
+                remote = async {
+                    match &mut remote_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => if let Some(hosted) = remote {
+                    if !write_event!(hosted, true) { return; }
                 },
                 // Lossy Step spam — batched.
                 got = brx.recv() => match got {
@@ -270,7 +372,7 @@ pub fn spawn_status_writer(
                         // the lossless path already wrote them — skip to avoid
                         // duplicates; only Steps are writer-owned on this path.
                         if matches!(event, StageEvent::StageStep { .. })
-                            && !write_event!(event, false)
+                            && !write_event!(HostedEvent::wrap(&local_host, event), false)
                         {
                             return;
                         }
@@ -281,7 +383,10 @@ pub fn spawn_status_writer(
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("status writer: broadcast lagged by {n} steps");
-                        let _ = write_event!(StageEvent::StepGap { dropped: n }, false);
+                        let _ = write_event!(
+                            HostedEvent::wrap(&local_host, StageEvent::StepGap { dropped: n }),
+                            false
+                        );
                     }
                 },
                 _ = &mut timeout => {
@@ -316,6 +421,76 @@ mod tests {
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains("\"kind\":\"stage_begin\""));
         let _back: StageEvent = serde_json::from_str(&s).unwrap();
+    }
+
+    #[test]
+    fn hosted_event_flattens_host_and_omits_when_none() {
+        let event = StageEvent::StageEnd {
+            node_idx: 2,
+            stage_name: "train".into(),
+            output_hash: ContentHash::of_bytes(b"out"),
+            elapsed: Duration::from_secs(1),
+        };
+        // No host → the field is omitted (old single-host readers unaffected).
+        let local = HostedEvent::wrap(&None, event.clone());
+        let s = serde_json::to_string(&local).unwrap();
+        assert!(
+            s.contains("\"kind\":\"stage_end\""),
+            "event fields flattened in"
+        );
+        assert!(!s.contains("\"host\""), "host omitted when None: {s}");
+
+        // With a host → inline `host` alongside the flattened event.
+        let hosted = HostedEvent::wrap(&Some("ab12cd".into()), event);
+        let s = serde_json::to_string(&hosted).unwrap();
+        assert!(s.contains("\"host\":\"ab12cd\""), "host tagged inline: {s}");
+        assert!(s.contains("\"node_idx\":2"), "event still flattened");
+        // Round-trips back to the tagged wrapper.
+        let back: HostedEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.host.as_deref(), Some("ab12cd"));
+        assert!(matches!(
+            back.event,
+            StageEvent::StageEnd { node_idx: 2, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn writer_aggregates_local_and_remote_host_tagged_events() {
+        let (hub, lifecycle_rx) = StatusHub::new();
+        let hub = hub.with_host("initiatorX");
+        let td = tempfile::tempdir().unwrap();
+        let handle = spawn_status_writer(&hub, lifecycle_rx, td.path()).unwrap();
+
+        // A local lifecycle event (tagged with the initiator's host).
+        hub.emit(StageEvent::StageBegin {
+            node_idx: 0,
+            stage_name: "local".into(),
+            input_hash: ContentHash::of_bytes(b"i"),
+        });
+        // A lifecycle event forwarded FROM a worker, tagged with the worker id.
+        hub.ingest_remote(
+            "workerC",
+            StageEvent::StageEnd {
+                node_idx: 5,
+                stage_name: "remote".into(),
+                output_hash: ContentHash::of_bytes(b"o"),
+                elapsed: Duration::from_millis(3),
+            },
+        );
+
+        // Drop the hub so the writer drains + exits, then read status.jsonl.
+        drop(hub);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        let body = std::fs::read_to_string(td.path().join("status.jsonl")).unwrap();
+
+        assert!(
+            body.contains("\"host\":\"initiatorX\"") && body.contains("\"stage_name\":\"local\""),
+            "local event host-tagged: {body}"
+        );
+        assert!(
+            body.contains("\"host\":\"workerC\"") && body.contains("\"stage_name\":\"remote\""),
+            "worker event forwarded + host-tagged into the initiator's status.jsonl: {body}"
+        );
     }
 
     #[test]

@@ -67,4 +67,4 @@ pub use plan_spec::{PLAN_SPEC_VERSION, PlanSpec, PlanSpecError, SpecNode};
 pub use resource::Resource;
 pub use retry::{Backoff, RetryEvent, RetryHook, RetryOn, RetryPolicy, StageTimeout};
 pub use stage::{ErasedArtifact, ErasedDecodeError, Stage, StageContext, StageDyn};
-pub use status::{StageEvent, StatusHub, make_broadcast, spawn_status_writer};
+pub use status::{HostedEvent, StageEvent, StatusHub, make_broadcast, spawn_status_writer};

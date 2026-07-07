@@ -88,6 +88,10 @@ pub struct MeshNode {
     /// Gossip teaches only WHERE a peer is; its identity + keys are confirmed
     /// at connect time by mutual TLS (A1), never asserted in the gossip itself.
     addr_book: Arc<RwLock<HashMap<PeerId, SocketAddr>>>,
+    /// Optional local status hub (D5). On an INITIATOR node, forwarded worker
+    /// `Status` frames are ingested here so one status.jsonl tells the whole
+    /// multi-host story. `None` on a plain worker.
+    status_hub: std::sync::Mutex<Option<Arc<crate::framework::status::StatusHub>>>,
 }
 
 impl MeshNode {
@@ -124,6 +128,7 @@ impl MeshNode {
             runner,
             connections: Arc::new(RwLock::new(HashMap::new())),
             addr_book: Arc::new(RwLock::new(HashMap::new())),
+            status_hub: std::sync::Mutex::new(None),
         });
         let accept = node.clone();
         tokio::spawn(async move { accept.accept_loop().await });
@@ -154,6 +159,33 @@ impl MeshNode {
     /// The address learned for a peer via gossip (A5), if any.
     pub async fn learned_addr(&self, id: &PeerId) -> Option<SocketAddr> {
         self.addr_book.read().await.get(id).copied()
+    }
+
+    /// Attach a status hub (D5): forwarded worker `Status` frames are ingested
+    /// into it, so an initiator's status.jsonl carries every host's lifecycle.
+    pub fn set_status_hub(&self, hub: Arc<crate::framework::status::StatusHub>) {
+        *self.status_hub.lock().unwrap() = Some(hub);
+    }
+
+    /// Forward one lifecycle status event to a connected initiator (D5), tagged
+    /// with this node's short id. The initiator ingests it into its status hub.
+    pub async fn forward_status(
+        &self,
+        conn: &quinn::Connection,
+        event: crate::framework::status::StageEvent,
+    ) -> Result<(), TrainError> {
+        let frame = MeshFrame::Status {
+            host: self.node_id.short(),
+            event: Box::new(event),
+        };
+        match mesh_request(conn, &frame).await? {
+            MeshFrame::Ack => Ok(()),
+            MeshFrame::Error { message } => Err(TrainError::other(message)),
+            other => Err(TrainError::other(format!(
+                "unexpected status response: {}",
+                other.kind()
+            ))),
+        }
     }
 
     /// Send a signed peer exchange (A5) to a connected peer. The responder
@@ -332,6 +364,14 @@ impl MeshNode {
             // The Ack IS the response (sent by serve_connection's write_frame);
             // None here is the reputation signal, not "no reply".
             MeshFrame::PeerExchange(ex) => (self.handle_peer_exchange(*ex).await, None),
+            // D5: ingest a forwarded worker lifecycle event into the local hub
+            // (if this node is an initiator with one attached).
+            MeshFrame::Status { host, event } => {
+                if let Some(hub) = self.status_hub.lock().unwrap().as_ref() {
+                    hub.ingest_remote(host, *event);
+                }
+                (MeshFrame::Ack, None)
+            }
             other => (
                 MeshFrame::Error {
                     message: format!("unsupported request: {}", other.kind()),
@@ -685,6 +725,73 @@ mod tests {
         assert!(
             format!("{err}").contains("unknown sender") || format!("{err}").contains("verify"),
             "forged-origin gossip rejected, got: {err}"
+        );
+    }
+
+    /// D5: a worker forwards a lifecycle event to an initiator over the mesh;
+    /// the initiator ingests it (host-tagged) into its status hub → its
+    /// status.jsonl carries the worker's event.
+    #[tokio::test]
+    async fn worker_forwards_status_to_initiator() {
+        use crate::framework::artifact::ContentHash;
+        use crate::framework::status::{StageEvent, StatusHub, spawn_status_writer};
+
+        // Initiator node with a status hub + writer.
+        let (initiator, initiator_kp) = spawn_node(NodeCapabilities::default(), {
+            let r: Arc<dyn MeshTaskRunner> = Arc::new(EchoRunner {
+                keypair: Arc::new(KeyPair::generate()),
+            });
+            Some(r)
+        })
+        .await;
+        let (hub, lifecycle_rx) = StatusHub::new();
+        let hub = hub.with_host("initiator");
+        let td = tempfile::tempdir().unwrap();
+        let writer = spawn_status_writer(&hub, lifecycle_rx, td.path()).unwrap();
+        initiator.set_status_hub(hub.clone());
+
+        // Worker dials the initiator and forwards a lifecycle event.
+        let (worker, _wkp) = spawn_node(
+            NodeCapabilities {
+                worker: true,
+                scheduler: false,
+            },
+            {
+                let r: Arc<dyn MeshTaskRunner> = Arc::new(EchoRunner {
+                    keypair: Arc::new(KeyPair::generate()),
+                });
+                Some(r)
+            },
+        )
+        .await;
+        let worker_host = worker.node_id().short();
+        let conn = worker
+            .connect_to(
+                initiator.local_addr().unwrap(),
+                initiator_kp.verifying.to_bytes(),
+            )
+            .await
+            .unwrap();
+        worker
+            .forward_status(
+                &conn,
+                StageEvent::StageEnd {
+                    node_idx: 3,
+                    stage_name: "worker-stage".into(),
+                    output_hash: ContentHash::of_bytes(b"o"),
+                    elapsed: std::time::Duration::from_millis(2),
+                },
+            )
+            .await
+            .expect("forward_status");
+
+        // Flush the writer (drop the hub) and read the initiator's status.jsonl.
+        drop(hub);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), writer).await;
+        let body = std::fs::read_to_string(td.path().join("status.jsonl")).unwrap();
+        assert!(
+            body.contains(&format!("\"host\":\"{worker_host}\"")) && body.contains("worker-stage"),
+            "initiator status.jsonl carries the worker's host-tagged event: {body}"
         );
     }
 
