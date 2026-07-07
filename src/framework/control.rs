@@ -78,14 +78,20 @@ pub struct SpawnDelta {
     /// input instead of the unit graph input. Empty for a disconnected spawn
     /// (PBT/TPE) — then the sub-plan's own `initial` seeds its roots, exactly
     /// as before. Non-empty for a map element: the element artifact.
-    pub root_seeds: Vec<(
+    ///
+    /// `pub(crate)`: set ONLY by the engine's map path (external control
+    /// policies construct spawns via [`SpawnDelta::new`], which leaves these
+    /// empty/`None`). This keeps `provenance_parent` a trustworthy "this is a
+    /// map shard" flag — the executor uses it to fail (not warn-drop) at the
+    /// spawn cap.
+    pub(crate) root_seeds: Vec<(
         crate::framework::plan::NodeId,
         crate::framework::stage::ErasedArtifact,
         crate::framework::artifact::ContentHash,
     )>,
     /// The global node id whose `list` output produced this spawn (map
-    /// provenance); `None` for PBT/TPE spawns.
-    pub provenance_parent: Option<crate::framework::plan::NodeId>,
+    /// provenance); `None` for PBT/TPE spawns. `pub(crate)` — see `root_seeds`.
+    pub(crate) provenance_parent: Option<crate::framework::plan::NodeId>,
 }
 
 impl SpawnDelta {

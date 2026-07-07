@@ -547,6 +547,9 @@ impl CompiledTemplate {
     /// `SpawnDelta::root_seeds`, so `initial` is empty. Cheap: `PlanNode`
     /// clones are `Arc`-backed.
     pub(crate) fn instantiate(&self, name: String) -> CompiledPlan {
+        // A template always has ≥1 node (its root); the caller pairs this with
+        // a `root_seeds` entry, so `initial` is intentionally empty.
+        debug_assert!(!self.nodes.is_empty(), "map template must have a root node");
         CompiledPlan {
             name,
             nodes: self.nodes.clone(),

@@ -2021,6 +2021,11 @@ impl ParallelExecutor {
             // this iteration and the `in_flight == 0` termination check below
             // sees them. Stop injecting once failing (drop pending deltas).
             if first_error.is_none() && !pending_spawns.is_empty() {
+                // Drain map_output shards (provenance_parent set) BEFORE
+                // best-effort HPO spawns, so a soft HPO spawn can't claim the
+                // last cap slot and force a wrong-answer shard to fail. Stable:
+                // relative order within each group is preserved.
+                pending_spawns.sort_by_key(|d| d.provenance_parent.is_none());
                 for delta in pending_spawns.drain(..) {
                     if spawns_total >= MAX_RUNTIME_SPAWNS {
                         // A map_output shard hitting the cap is a WRONG ANSWER
@@ -2556,13 +2561,25 @@ impl ParallelExecutor {
                             if exp.parent != outcome.node_id {
                                 continue;
                             }
-                            // Decode the parent's `list` output into its
-                            // element artifacts (erased — the executor doesn't
-                            // know the concrete element type).
-                            let list_env = match outputs.get(&outcome.node_id) {
-                                Some(a) => a.clone(),
-                                None => continue,
+                            // The parent's output + logical hash were promoted
+                            // into the maps immediately above; a miss is an
+                            // internal invariant break, not a silent skip (a
+                            // fallback would collide unrelated fan-outs' cache
+                            // keys).
+                            let (Some(list_env), Some(parent_logical)) = (
+                                outputs.get(&outcome.node_id).cloned(),
+                                logical_outputs.get(&outcome.node_id).copied(),
+                            ) else {
+                                first_error = Some(PlanError::Other(format!(
+                                    "map over node {}: parent output/logical-hash missing after \
+                                     its completion (internal invariant)",
+                                    outcome.node_id
+                                )));
+                                break;
                             };
+                            // Decode the parent's `list` output into its element
+                            // artifacts (erased — the executor doesn't know the
+                            // concrete element type).
                             let elements = match crate::framework::artifact::decode_list_children(
                                 list_env,
                             ) {
@@ -2575,10 +2592,6 @@ impl ParallelExecutor {
                                     break;
                                 }
                             };
-                            let parent_logical = logical_outputs
-                                .get(&outcome.node_id)
-                                .copied()
-                                .unwrap_or_else(|| ContentHash::of_bytes(&[]));
                             let base_label = exp.label.clone().unwrap_or_else(|| "map".into());
                             for (i, elem) in elements.into_iter().enumerate() {
                                 // Invariant: each element's kind is the element
