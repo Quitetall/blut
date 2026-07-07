@@ -6,16 +6,18 @@
 
 use serde_json::Value;
 
-use blut::framework::plan_spec::{PLAN_SPEC_VERSION, PlanSpec, SpecNode};
+use blut::framework::plan_spec::{MapSpec, PLAN_SPEC_VERSION, PlanSpec, SpecNode};
 
-/// Nodes + edges collected while a script runs. Each `add()` appends one
-/// node and wires its `after` predecessors immediately, so all edges into a
-/// node are contiguous and in `after` order — exactly the tuple element
-/// order `CompiledPlan::from_erased_graph` expects for a merge.
+/// Nodes + edges (+ map expansions) collected while a script runs. Each
+/// `add()` appends one node and wires its `after` predecessors immediately,
+/// so all edges into a node are contiguous and in `after` order — exactly the
+/// tuple element order `CompiledPlan::from_erased_graph` expects for a merge.
 #[derive(Debug, Default)]
 pub(crate) struct PlanDraft {
     pub nodes: Vec<SpecNode>,
     pub edges: Vec<(u32, u32)>,
+    /// Runtime `map_output` fan-outs collected via `map_output(...)`.
+    pub expansions: Vec<MapSpec>,
 }
 
 impl PlanDraft {
@@ -43,6 +45,7 @@ impl PlanDraft {
             name,
             nodes: self.nodes,
             edges: self.edges,
+            expansions: self.expansions,
             version: PLAN_SPEC_VERSION,
         }
     }

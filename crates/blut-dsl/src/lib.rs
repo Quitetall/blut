@@ -108,7 +108,19 @@ pub fn evaluate_script(
     });
     run?;
 
-    Ok(store.0.into_inner().into_spec(name))
+    // The main plan is the sole remaining draft (every map_output pushed a
+    // template scope and popped it). A leftover scope is an internal bug.
+    let mut drafts = store.0.into_inner();
+    if drafts.len() != 1 {
+        return Err(DslError::Eval {
+            path: path_label.to_string(),
+            msg: format!(
+                "internal: {} draft scopes remained (expected 1) — unbalanced map_output",
+                drafts.len()
+            ),
+        });
+    }
+    Ok(drafts.remove(0).into_spec(name))
 }
 
 /// Plan name from a script path: the file stem (`recipes/train.star` →
@@ -186,6 +198,51 @@ def build(args):
         assert_eq!(spec.nodes[0].stage, "make");
         assert_eq!(spec.nodes[1].args, json!({ "n": 3 }));
         assert_eq!(spec.edges, vec![(0, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn map_output_declares_an_expansion() {
+        let src = r#"
+def build(args):
+    shards = add("sharder")
+    def per_item():
+        a = add("train_item")     # root: consumes the element
+        add("eval_item", after=a)
+    map_output(shards, per_item, label="shard")
+    add("done", after=shards)
+"#;
+        let spec = evaluate_script(src, "map.star", &json!({})).unwrap();
+        // Main plan: sharder + done (2 nodes); map is NOT inlined.
+        assert_eq!(spec.nodes.len(), 2);
+        assert_eq!(spec.nodes[0].stage, "sharder");
+        assert_eq!(spec.edges, vec![(0, 1)]);
+        // One expansion over the sharder, with a 2-node template.
+        assert_eq!(spec.expansions.len(), 1);
+        let m = &spec.expansions[0];
+        assert_eq!(m.parent, 0);
+        assert_eq!(m.label.as_deref(), Some("shard"));
+        assert_eq!(m.template.nodes.len(), 2);
+        assert_eq!(m.template.nodes[0].stage, "train_item");
+        assert_eq!(m.template.edges, vec![(0, 1)]);
+        // The template is separate from the main plan — the stack balanced.
+        assert!(m.template.expansions.is_empty());
+    }
+
+    #[test]
+    fn map_output_body_error_does_not_corrupt_the_stack() {
+        // A body that raises must still leave a well-formed (failed) result,
+        // not a dangling template scope.
+        let src = r#"
+def build(args):
+    s = add("sharder")
+    def bad():
+        add(undefined_name)
+    map_output(s, bad)
+"#;
+        assert!(matches!(
+            evaluate_script(src, "bad.star", &json!({})),
+            Err(DslError::Eval { .. })
+        ));
     }
 
     #[test]
