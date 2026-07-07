@@ -83,9 +83,16 @@ pub fn evaluate_script(
 
     let run = Module::with_temp_heap(|module| -> Result<(), DslError> {
         let mut eval = Evaluator::new(&module);
-        // Fail-safe caps (ignore the Result: setting a cap can't fail here).
-        let _ = eval.set_max_tick_count(MAX_TICKS);
-        let _ = eval.set_max_heap_size(MAX_HEAP_BYTES);
+        // Fail-safe caps against a runaway script. Propagate rather than
+        // discard: if a cap can't be set, the hermeticity/termination
+        // guarantee is void, so refuse to run rather than silently proceed.
+        let set_caps = eval
+            .set_max_tick_count(MAX_TICKS)
+            .and_then(|()| eval.set_max_heap_size(MAX_HEAP_BYTES));
+        set_caps.map_err(|e| DslError::Eval {
+            path: path_label.to_string(),
+            msg: format!("failed to set evaluation limits: {e}"),
+        })?;
         eval.extra = Some(&store);
         // Run top level (defines `build`).
         eval.eval_module(ast, &starlark_globals)
@@ -97,7 +104,7 @@ pub fn evaluate_script(
         let build = module.get("build").ok_or_else(|| DslError::MissingBuild {
             path: path_label.to_string(),
         })?;
-        let args_val = json_to_value(module.heap(), args);
+        let args_val = json_to_value(module.heap(), args, path_label)?;
         eval.eval_function(build, &[args_val], &[])
             .map_err(|e| DslError::Eval {
                 path: path_label.to_string(),
@@ -122,7 +129,9 @@ pub fn script_fingerprint(source: &str, args: &serde_json::Value, spec: &PlanSpe
     let canon_args = CacheHandle::canonical_json_bytes(args);
     buf.extend_from_slice(&(canon_args.len() as u64).to_le_bytes());
     buf.extend_from_slice(&canon_args);
-    buf.extend_from_slice(&spec.canonical_bytes());
+    let spec_bytes = spec.canonical_bytes();
+    buf.extend_from_slice(&(spec_bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&spec_bytes);
     ContentHash::of_bytes(&buf)
 }
 
@@ -137,31 +146,52 @@ fn plan_name_from(path_label: &str) -> String {
 }
 
 /// Recursively allocate a `serde_json::Value` as a Starlark value on `heap`
-/// (so the script's `build(args)` sees native dicts/lists/scalars).
-fn json_to_value<'v>(heap: starlark::values::Heap<'v>, v: &serde_json::Value) -> Value<'v> {
-    match v {
+/// (so the script's `build(args)` sees native dicts/lists/scalars). Errors on
+/// a numerically unrepresentable JSON number rather than silently coercing it
+/// to NaN — a wrong value passed to a script is worse than a clear failure.
+fn json_to_value<'v>(
+    heap: starlark::values::Heap<'v>,
+    v: &serde_json::Value,
+    path_label: &str,
+) -> Result<Value<'v>, DslError> {
+    let val = match v {
         serde_json::Value::Null => Value::new_none(),
         serde_json::Value::Bool(b) => Value::new_bool(*b),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 heap.alloc(i)
+            } else if let Some(f) = n.as_f64() {
+                // Non-integer or out-of-i64 number → f64 (JSON's only other
+                // numeric); may lose precision for huge integers, as any
+                // JSON→f64 does.
+                heap.alloc(f)
             } else {
-                // Non-integer (or > i64) number → f64 (JSON's only other numeric).
-                heap.alloc(n.as_f64().unwrap_or(f64::NAN))
+                return Err(DslError::Eval {
+                    path: path_label.to_string(),
+                    msg: format!("arg value {n} is not representable as a Starlark number"),
+                });
             }
         }
         serde_json::Value::String(s) => heap.alloc(s.as_str()),
         serde_json::Value::Array(a) => {
-            heap.alloc(a.iter().map(|x| json_to_value(heap, x)).collect::<Vec<_>>())
+            let items = a
+                .iter()
+                .map(|x| json_to_value(heap, x, path_label))
+                .collect::<Result<Vec<_>, _>>()?;
+            heap.alloc(items)
         }
         serde_json::Value::Object(o) => {
-            let pairs: Vec<(Value<'v>, Value<'v>)> = o
-                .iter()
-                .map(|(k, val)| (heap.alloc(k.as_str()), json_to_value(heap, val)))
-                .collect();
+            let mut pairs: Vec<(Value<'v>, Value<'v>)> = Vec::with_capacity(o.len());
+            for (k, val) in o {
+                pairs.push((
+                    heap.alloc(k.as_str()),
+                    json_to_value(heap, val, path_label)?,
+                ));
+            }
             heap.alloc(AllocDict(pairs))
         }
-    }
+    };
+    Ok(val)
 }
 
 #[cfg(test)]

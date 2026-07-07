@@ -22,6 +22,12 @@ impl PlanDraft {
     /// Append a node with `args`, wire an edge from each id in `after`, and
     /// return the new node's id (its dense index).
     pub fn add(&mut self, stage: String, args: Value, after: &[u32]) -> u32 {
+        // Node ids are u32; the evaluator's tick cap bounds node count far
+        // below u32::MAX, so this only fires on a corrupt invariant.
+        debug_assert!(
+            self.nodes.len() < u32::MAX as usize,
+            "plan node count exceeds u32"
+        );
         let id = self.nodes.len() as u32;
         self.nodes.push(SpecNode { stage, args });
         for &p in after {
