@@ -33,6 +33,11 @@ pub mod cli;
 pub mod config;
 pub mod containment;
 pub mod datasets_db;
+/// Starlark front-end for authoring PlanSpecs from `.star` scripts (ADR
+/// 0078). Gated behind the `dsl` feature (off by default — keeps the lean
+/// CLI build free of the starlark dependency).
+#[cfg(feature = "dsl")]
+pub mod dsl;
 pub mod error;
 pub mod framework;
 pub mod hpo;
