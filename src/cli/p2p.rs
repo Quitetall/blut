@@ -71,6 +71,12 @@ pub(super) enum P2pCommand {
         /// one transition release).
         #[arg(long, default_value_t = false)]
         allow_legacy_peers: bool,
+        /// Run REAL dispatched stages (not just the smoke echo) via the shared
+        /// content-addressed cache: the Ed25519 pubkey (hex) of the scheduler
+        /// whose signed tasks this worker will execute. Without it, the worker
+        /// runs the connectivity smoke runner.
+        #[arg(long)]
+        coordinator_pubkey: Option<String>,
         /// Identity key file (defaults to the standard p2p key path).
         #[arg(long)]
         key: Option<std::path::PathBuf>,
@@ -293,16 +299,19 @@ pub(super) async fn run_p2p_cmd(
             no_worker,
             no_scheduler,
             allow_legacy_peers,
+            coordinator_pubkey,
             key,
         } => {
             let path = key.map(Ok).unwrap_or_else(default_key_path)?;
             let kp = std::sync::Arc::new(load_keypair(&path)?);
             run_p2p_node(
+                reg,
                 listen,
                 seeds,
                 !no_worker,
                 !no_scheduler,
                 allow_legacy_peers,
+                coordinator_pubkey,
                 kp,
             )
             .await
@@ -597,12 +606,15 @@ impl crate::p2p::node::MeshTaskRunner for SmokeRunner {
 
 /// Run a symmetric mesh node until Ctrl-C (ADR 0079 A3).
 #[cfg(feature = "p2p")]
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_p2p_node(
+    reg: crate::framework::Registry,
     listen: String,
     seeds: Vec<String>,
     worker: bool,
     scheduler: bool,
     allow_legacy: bool,
+    coordinator_pubkey: Option<String>,
     keypair: std::sync::Arc<crate::p2p::crypto::KeyPair>,
 ) -> Result<()> {
     use crate::p2p::node::{MeshNode, MeshTaskRunner, NodeCapabilities};
@@ -616,9 +628,39 @@ pub(super) async fn run_p2p_node(
 
     let caps = NodeCapabilities { worker, scheduler };
     let runner: Option<std::sync::Arc<dyn MeshTaskRunner>> = if worker {
-        Some(std::sync::Arc::new(SmokeRunner {
-            keypair: keypair.clone(),
-        }))
+        match &coordinator_pubkey {
+            // Real stage execution via the shared content-addressed cache.
+            Some(hex) => {
+                use crate::framework::object_store::FsBlobStore;
+                use crate::p2p::dispatch::{DefaultDispatchPolicy, DispatchPolicy};
+                use crate::p2p::mesh_runner::SharedCacheRunner;
+                use crate::p2p::trust::DispatchMatrix;
+
+                let mut kbytes = [0u8; 32];
+                faster_hex::hex_decode(hex.as_bytes(), &mut kbytes)
+                    .map_err(|e| anyhow!("--coordinator-pubkey hex: {e}"))?;
+                let coord = ed25519_dalek::VerifyingKey::from_bytes(&kbytes)
+                    .map_err(|e| anyhow!("--coordinator-pubkey: invalid Ed25519 key: {e}"))?;
+                let cache_dir = paths::data_dir()?.join("p2p").join("shared-cache");
+                let work_root = paths::data_dir()?.join("p2p").join("work");
+                let store: std::sync::Arc<dyn crate::framework::object_store::BlobStore> =
+                    std::sync::Arc::new(FsBlobStore::new(cache_dir));
+                let policy: std::sync::Arc<dyn DispatchPolicy> =
+                    std::sync::Arc::new(DefaultDispatchPolicy::new(DispatchMatrix::default()));
+                Some(std::sync::Arc::new(SharedCacheRunner::new(
+                    std::sync::Arc::new(reg),
+                    store,
+                    work_root,
+                    keypair.clone(),
+                    policy,
+                    coord,
+                )))
+            }
+            // No scheduler pinned → the connectivity smoke runner.
+            None => Some(std::sync::Arc::new(SmokeRunner {
+                keypair: keypair.clone(),
+            })),
+        }
     } else {
         None
     };
@@ -629,7 +671,15 @@ pub(super) async fn run_p2p_node(
     let bound = node.local_addr().map_err(|e| anyhow!("{e}"))?;
     eprintln!("mesh node {} listening on {bound}", node.node_id());
     eprintln!("pubkey       {}", p2p_pubkey_hex(&keypair));
+    let runner_mode = if !worker {
+        "none"
+    } else if coordinator_pubkey.is_some() {
+        "shared-cache (real stages)"
+    } else {
+        "smoke (echo only)"
+    };
     eprintln!("capabilities worker={worker} scheduler={scheduler} allow_legacy={allow_legacy}");
+    eprintln!("worker runner {runner_mode}");
 
     // Dial seeds (best-effort — a down/hung seed must not block the others, so
     // each dial is time-bounded).
