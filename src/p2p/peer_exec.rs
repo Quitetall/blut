@@ -315,7 +315,7 @@ async fn execute_one(
 /// A `task_id` is safe to use as a single path component: non-empty, only
 /// `[A-Za-z0-9._-]`, and not `.`/`..`. Network-controlled, so this gates the
 /// peer's `work_root.join(task_id)` against directory traversal.
-fn is_safe_task_id(id: &str) -> bool {
+pub(crate) fn is_safe_task_id(id: &str) -> bool {
     !id.is_empty()
         && id != "."
         && id != ".."

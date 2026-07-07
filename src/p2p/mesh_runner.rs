@@ -1,0 +1,399 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
+//! Production `MeshTaskRunner` over a shared content-addressed store (ADR 0079
+//! A3 · the mesh↔execution wiring).
+//!
+//! The A3 node core made task execution pluggable ([`MeshTaskRunner`]); the CLI
+//! ships a smoke runner. This is the REAL one: it executes a dispatched cookbook
+//! stage, sourcing its input and sinking its output through a shared
+//! [`BlobStore`] (the cache's remote tier — an RWX PVC or S3/MinIO), keyed by
+//! content hash. No per-task blob transfer is needed: the scheduler
+//! [`publish_input`]s the bundle under `input_hash`, the worker reads it, runs
+//! the stage, writes the output bundle under `output_hash`, and returns a
+//! signed [`TaskResult`] carrying only the hash — the initiator reads the bytes
+//! back from the same store.
+//!
+//! This is the SHARED-CACHE model, the natural fit for the k8s `BlutWorkerPool`
+//! (pods share a cache) and a mesh with a common object store. It reuses the
+//! bundle/unbundle/run core the legacy `peer_exec` path uses, so the same
+//! fail-closed hash-binding + signature checks apply. `Restricted` data never
+//! reaches here (the dispatch gate denies it before any dispatch, ADR 0061), so
+//! the shared store only ever holds `Public`/`Internal` bundles — un-sealed by
+//! design (the store is the cluster's trusted cache).
+//!
+//! [`publish_input`]: SharedCacheRunner::publish_input
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use ed25519_dalek::VerifyingKey;
+use serde::{Deserialize, Serialize};
+
+use crate::error::TrainError;
+use crate::framework::artifact::ContentHash;
+use crate::framework::cache::CacheHandle;
+use crate::framework::cookbook::Registry;
+use crate::framework::object_store::BlobStore;
+use crate::framework::stage::{ErasedArtifact, StageContext};
+use crate::p2p::bundle::{self, BlobDir, BundleManifest};
+use crate::p2p::crypto::{KeyPair, verify};
+use crate::p2p::dispatch::DispatchPolicy;
+use crate::p2p::node::MeshTaskRunner;
+use crate::p2p::peer::PeerId;
+use crate::p2p::task::{TaskManifest, TaskResult};
+
+/// A bundled artifact (its manifest + packed bytes) as stored on the shared
+/// object store under the artifact's content hash.
+#[derive(Serialize, Deserialize)]
+struct SharedBundle {
+    manifest: BundleManifest,
+    pack: Vec<u8>,
+}
+
+/// Executes dispatched cookbook stages, sourcing/sinking artifacts through a
+/// shared content-addressed [`BlobStore`].
+pub struct SharedCacheRunner {
+    registry: Arc<Registry>,
+    store: Arc<dyn BlobStore>,
+    work_root: PathBuf,
+    keypair: Arc<KeyPair>,
+    policy: Arc<dyn DispatchPolicy>,
+    /// The scheduler's Ed25519 key — every dispatched manifest must be signed by
+    /// it (zero-trust; the TLS connection auth is separate, defense in depth).
+    coordinator_verifying: VerifyingKey,
+}
+
+impl SharedCacheRunner {
+    pub fn new(
+        registry: Arc<Registry>,
+        store: Arc<dyn BlobStore>,
+        work_root: PathBuf,
+        keypair: Arc<KeyPair>,
+        policy: Arc<dyn DispatchPolicy>,
+        coordinator_verifying: VerifyingKey,
+    ) -> Self {
+        Self {
+            registry,
+            store,
+            work_root,
+            keypair,
+            policy,
+            coordinator_verifying,
+        }
+    }
+
+    /// Scheduler-side: bundle `input` (rooted at `src_root`) and publish it to
+    /// the shared store under `input_hash`, so a worker's [`run`](Self::run) can
+    /// source it. The stage resolves the artifact's backing paths.
+    pub fn publish_input(
+        store: &dyn BlobStore,
+        registry: &Registry,
+        stage_name: &str,
+        input: ErasedArtifact,
+        src_root: &std::path::Path,
+        input_hash: ContentHash,
+    ) -> Result<(), TrainError> {
+        let ctor = registry.find_erased_stage(stage_name).ok_or_else(|| {
+            TrainError::other(format!("publish_input: unknown stage '{stage_name}'"))
+        })?;
+        let stage = ctor();
+        let (manifest, pack) =
+            bundle::bundle(&*stage, input, src_root, BlobDir::Input, &input_hash)
+                .map_err(|e| TrainError::other(format!("bundle input: {e}")))?;
+        let bytes = bincode::serialize(&SharedBundle { manifest, pack })
+            .map_err(|e| TrainError::other(format!("serialize input bundle: {e}")))?;
+        store
+            .put(input_hash, &bytes)
+            .map_err(|e| TrainError::other(format!("publish input bundle: {e}")))
+    }
+
+    /// Initiator-side: read the output bundle a completed task wrote to the
+    /// shared store, rebase it into `into_dir`, and return the verified handle.
+    pub fn fetch_output(
+        &self,
+        stage_name: &str,
+        output_hash: ContentHash,
+        into_dir: &std::path::Path,
+    ) -> Result<ErasedArtifact, TrainError> {
+        let ctor = self.registry.find_erased_stage(stage_name).ok_or_else(|| {
+            TrainError::other(format!("fetch_output: unknown stage '{stage_name}'"))
+        })?;
+        let stage = ctor();
+        let shared = self.read_bundle(output_hash)?;
+        bundle::unbundle(
+            &*stage,
+            &shared.manifest,
+            &shared.pack,
+            into_dir,
+            &output_hash,
+            BlobDir::Output,
+        )
+        .map_err(|e| TrainError::other(format!("unbundle output: {e}")))
+    }
+
+    fn read_bundle(&self, hash: ContentHash) -> Result<SharedBundle, TrainError> {
+        let bytes = self
+            .store
+            .get(hash)
+            .map_err(|e| TrainError::other(format!("read shared bundle: {e}")))?
+            .ok_or_else(|| {
+                TrainError::other(format!("shared store has no bundle for {}", hash.to_hex()))
+            })?;
+        bincode::deserialize(&bytes)
+            .map_err(|e| TrainError::other(format!("decode shared bundle: {e}")))
+    }
+}
+
+#[async_trait]
+impl MeshTaskRunner for SharedCacheRunner {
+    async fn run(&self, task: TaskManifest) -> Result<TaskResult, TrainError> {
+        // 1. Zero-trust manifest checks (mirror peer_exec): signature by the
+        //    scheduler, args bound, safe task id.
+        if !verify(
+            &self.coordinator_verifying,
+            &task.sign_payload(),
+            &task.signature,
+        ) {
+            return Err(TrainError::other("task manifest signature invalid"));
+        }
+        task.verify_args(&task.args)?;
+        if !crate::p2p::peer_exec::is_safe_task_id(&task.task_id) {
+            return Err(TrainError::other(format!(
+                "unsafe task_id '{}'",
+                task.task_id
+            )));
+        }
+
+        // 2. Policy gate (training never leaves home, etc.).
+        if !self.policy.is_dispatchable(&task.stage_name) {
+            return Err(TrainError::other(format!(
+                "stage '{}' is not dispatchable",
+                task.stage_name
+            )));
+        }
+
+        // 3. Resolve the stage (the worker hosts the cookbook).
+        let ctor = self
+            .registry
+            .find_erased_stage(&task.stage_name)
+            .ok_or_else(|| TrainError::other(format!("unknown stage '{}'", task.stage_name)))?;
+        let stage = ctor();
+
+        // 4. Per-task work dir (task_id validated safe above).
+        let stage_dir = self.work_root.join(&task.task_id);
+        std::fs::create_dir_all(&stage_dir)
+            .map_err(|e| TrainError::other(format!("create stage dir: {e}")))?;
+
+        // 5. Source the input bundle from the shared store + unbundle (the four
+        //    fail-closed gates run against task.input_hash inside unbundle).
+        let shared_in = self.read_bundle(task.input_hash)?;
+        let input = bundle::unbundle(
+            &*stage,
+            &shared_in.manifest,
+            &shared_in.pack,
+            &stage_dir,
+            &task.input_hash,
+            BlobDir::Input,
+        )
+        .map_err(|e| TrainError::other(format!("unbundle input: {e}")))?;
+
+        // 6. Run the stage under the coordinator's deadline.
+        let cache = Arc::new(CacheHandle::job_local(stage_dir.join(".cache")));
+        let ctx =
+            StageContext::for_peer(stage_dir.clone(), stage_dir.clone(), cache, task.input_hash);
+        let started = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(task.timeout_secs.max(1));
+        let output =
+            tokio::time::timeout(timeout, stage.run_erased(&ctx, input, task.args.clone()))
+                .await
+                .map_err(|_| {
+                    TrainError::other(format!(
+                        "stage '{}' exceeded timeout_secs {}",
+                        task.stage_name, task.timeout_secs
+                    ))
+                })?
+                .map_err(|e| TrainError::other(format!("stage run failed: {e}")))?;
+        let wall_time_ms = started.elapsed().as_millis() as u64;
+
+        // 7. Bundle the output + publish it to the shared store under its hash
+        //    (verified == task.expected_output_hash inside bundle()).
+        let (out_manifest, out_pack) = bundle::bundle(
+            &*stage,
+            output,
+            &stage_dir,
+            BlobDir::Output,
+            &task.expected_output_hash,
+        )
+        .map_err(|e| TrainError::other(format!("bundle output: {e}")))?;
+        let output_hash = out_manifest.content_hash;
+        let out_bytes = bincode::serialize(&SharedBundle {
+            manifest: out_manifest,
+            pack: out_pack,
+        })
+        .map_err(|e| TrainError::other(format!("serialize output bundle: {e}")))?;
+        self.store
+            .put(output_hash, &out_bytes)
+            .map_err(|e| TrainError::other(format!("publish output bundle: {e}")))?;
+
+        // Best-effort cleanup of the work dir (the output is on the store now).
+        let _ = std::fs::remove_dir_all(&stage_dir);
+
+        // 8. Sign + return the result (output on the shared store, not sealed).
+        let mut result = TaskResult {
+            task_id: task.task_id,
+            peer_id: PeerId::from_pubkey(&self.keypair.verifying),
+            output_hash,
+            encrypted_output: None,
+            wall_time_ms,
+            signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
+        };
+        result.signature = self.keypair.sign(&result.sign_payload());
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framework::object_store::FsBlobStore;
+    use crate::p2p::dispatch::DefaultDispatchPolicy;
+    use crate::p2p::smoke::{SMOKE_STAGE, SmokeText, expected_echo_hash};
+    use crate::p2p::trust::DispatchMatrix;
+
+    /// End-to-end (single process): a scheduler publishes an echo input to a
+    /// shared store, the runner executes `p2p-echo` sourcing/sinking through
+    /// that store, and the signed result's output hash matches — and the output
+    /// bytes are on the store for the initiator to fetch.
+    #[tokio::test]
+    async fn shared_cache_runner_executes_a_real_stage() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(store_dir.path().to_path_buf()));
+
+        let mut registry = Registry::new();
+        crate::p2p::smoke::register(&mut registry);
+        let registry = Arc::new(registry);
+        let policy: Arc<dyn DispatchPolicy> =
+            Arc::new(DefaultDispatchPolicy::new(DispatchMatrix::default()));
+
+        let coordinator = Arc::new(KeyPair::generate());
+        let worker = Arc::new(KeyPair::generate());
+
+        // Scheduler side: build + publish the echo input.
+        let src_root = tempfile::tempdir().unwrap();
+        let in_path = src_root.path().join("p2p-echo-in.txt");
+        std::fs::write(&in_path, b"hello mesh runner").unwrap();
+        let input_hash = ContentHash::hash_file(&in_path).unwrap();
+        let input = SmokeText {
+            content_hash: input_hash,
+            path: in_path,
+        };
+        let input_erased = ErasedArtifact::from_typed(&input).unwrap();
+        SharedCacheRunner::publish_input(
+            &*store,
+            &registry,
+            SMOKE_STAGE,
+            input_erased,
+            src_root.path(),
+            input_hash,
+        )
+        .unwrap();
+
+        // The scheduler's signed manifest.
+        let expected = expected_echo_hash("hello mesh runner");
+        let mut task = TaskManifest {
+            task_id: "mesh-run-1".into(),
+            coordinator_id: PeerId::from_pubkey(&coordinator.verifying),
+            stage_name: SMOKE_STAGE.into(),
+            stage_schema: 1,
+            input_hash,
+            args_hash: ContentHash::of_bytes(b"{}"),
+            expected_output_hash: expected,
+            args: serde_json::json!({}),
+            resources: crate::p2p::task::ResourceRequest::default(),
+            data_class: crate::p2p::trust::DataClass::Public,
+            timeout_secs: 30,
+            encrypted_input: None,
+            signature: coordinator.sign(b"placeholder"),
+        };
+        task.signature = coordinator.sign(&task.sign_payload());
+
+        // Worker side: run it.
+        let work_root = tempfile::tempdir().unwrap();
+        let runner = SharedCacheRunner::new(
+            registry.clone(),
+            store.clone(),
+            work_root.path().to_path_buf(),
+            worker.clone(),
+            policy,
+            coordinator.verifying,
+        );
+        let result = runner.run(task).await.expect("stage executes");
+
+        assert_eq!(result.output_hash, expected, "output hash matches expected");
+        assert_eq!(result.peer_id, PeerId::from_pubkey(&worker.verifying));
+        assert!(
+            crate::p2p::crypto::verify(
+                &worker.verifying,
+                &result.sign_payload(),
+                &result.signature
+            ),
+            "worker's result signature verifies"
+        );
+
+        // The initiator fetches the output from the shared store.
+        let out_dir = tempfile::tempdir().unwrap();
+        let out = runner
+            .fetch_output(SMOKE_STAGE, result.output_hash, out_dir.path())
+            .expect("fetch output from shared store");
+        let out: SmokeText = out.into_typed().unwrap();
+        let body = std::fs::read_to_string(&out.path).unwrap();
+        assert_eq!(
+            body, "HELLO MESH RUNNER",
+            "echo stage ran + output round-trips"
+        );
+    }
+
+    #[tokio::test]
+    async fn forged_manifest_signature_is_rejected() {
+        let store: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+        ));
+        let mut registry = Registry::new();
+        crate::p2p::smoke::register(&mut registry);
+        let policy: Arc<dyn DispatchPolicy> =
+            Arc::new(DefaultDispatchPolicy::new(DispatchMatrix::default()));
+        let coordinator = KeyPair::generate();
+        let impostor = KeyPair::generate();
+        let worker = Arc::new(KeyPair::generate());
+
+        // A manifest signed by an impostor, but the runner pins the coordinator.
+        let mut task = TaskManifest {
+            task_id: "x".into(),
+            coordinator_id: PeerId::from_pubkey(&coordinator.verifying),
+            stage_name: SMOKE_STAGE.into(),
+            stage_schema: 1,
+            input_hash: ContentHash::of_bytes(b"i"),
+            args_hash: ContentHash::of_bytes(b"{}"),
+            expected_output_hash: ContentHash::of_bytes(b"o"),
+            args: serde_json::json!({}),
+            resources: crate::p2p::task::ResourceRequest::default(),
+            data_class: crate::p2p::trust::DataClass::Public,
+            timeout_secs: 30,
+            encrypted_input: None,
+            signature: impostor.sign(b"placeholder"),
+        };
+        task.signature = impostor.sign(&task.sign_payload());
+
+        let runner = SharedCacheRunner::new(
+            Arc::new(registry),
+            store,
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            worker,
+            policy,
+            coordinator.verifying, // pins the real coordinator
+        );
+        let err = runner.run(task).await.unwrap_err();
+        assert!(format!("{err}").contains("signature invalid"));
+    }
+}
