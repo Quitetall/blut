@@ -250,6 +250,7 @@ fn isolate_datasets_db_for_tests() {
     }
 }
 
+mod console;
 mod render;
 mod system;
 mod theme;
@@ -265,6 +266,8 @@ use render::*;
 /// /`draw_system`) and the screens ported from the Python cockpit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum View {
+    /// The BLUT engine console — the default landing surface (redesign).
+    Console,
     Cockpit,
     Jobs,
     Log,
@@ -283,6 +286,7 @@ enum View {
 impl View {
     fn title(self) -> &'static str {
         match self {
+            View::Console => "BLUT Console",
             View::Cockpit => "Training Cockpit",
             View::Jobs => "Jobs",
             View::Log => "Job Log",
@@ -387,6 +391,8 @@ const FOCUS_GIVE_UP_TICKS: u8 = 20;
 const MAX_LOG_LINES: usize = 2000;
 
 struct App {
+    /// The engine-console model (mesh / DAG / broker / ledger / cache / gov).
+    console: console::ConsoleModel,
     jobs: Vec<JobSummary>,
     selected: ListState,
     log_lines: Vec<String>,
@@ -458,6 +464,7 @@ impl App {
         // `registry` and `App` can hold both without a self-referential tie.
         let catalog: Vec<&'static crate::recipes::RecipeDef> = registry.all().collect();
         Self {
+            console: console::ConsoleModel::demo(),
             jobs: Vec::new(),
             selected,
             log_lines: Vec::new(),
@@ -467,7 +474,7 @@ impl App {
             status_msg: None,
             overlay: Overlay::None,
             quit: false,
-            view: View::Cockpit,
+            view: View::Console,
             runs: Vec::new(),
             artifacts: Vec::new(),
             dag: None,
@@ -1300,6 +1307,7 @@ pub async fn run(registry: crate::framework::Registry) -> Result<()> {
 pub fn check(registry: crate::framework::Registry) -> Result<()> {
     use ratatui::backend::TestBackend;
     let views = [
+        View::Console,
         View::Cockpit,
         View::Jobs,
         View::Log,
@@ -1606,6 +1614,8 @@ fn handle_key_main(app: &mut App, k: event::KeyEvent) {
     // Capital letters jump straight to a detail view. Chosen so they
     // don't collide with the lowercase recipe-hotkey pool (1-9,a-z).
     match k.code {
+        KeyCode::Char('E') => return app.set_view(View::Console),
+        KeyCode::Char('K') => return app.set_view(View::Cockpit),
         KeyCode::Char('J') => return app.set_view(View::Jobs),
         KeyCode::Char('L') => return app.set_view(View::Log),
         KeyCode::Char('Y') => return app.set_view(View::System),
@@ -1678,7 +1688,7 @@ fn handle_key_cockpit(app: &mut App, k: event::KeyEvent) {
 /// to the cockpit.
 fn handle_key_detail(app: &mut App, k: event::KeyEvent) {
     match k.code {
-        KeyCode::Esc | KeyCode::Char('b') => app.set_view(View::Cockpit),
+        KeyCode::Esc | KeyCode::Char('b') => app.set_view(View::Console),
         KeyCode::Up | KeyCode::Char('k') => {
             if matches!(app.view, View::Jobs | View::Log) {
                 app.move_selection(-1);

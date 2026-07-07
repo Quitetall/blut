@@ -7,10 +7,14 @@ use super::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// A fresh `App` with no overlay, cockpit view, pointed at a temp
-/// repo root so nothing in these tests touches the dev tree.
+/// repo root so nothing in these tests touches the dev tree. Starts on the
+/// (legacy) Cockpit view — these exercise the cockpit recipe-picker / editor
+/// overlays, which the new default Console view doesn't host.
 fn app() -> App {
     super::isolate_datasets_db_for_tests();
-    App::new(test_registry())
+    let mut a = App::new(test_registry());
+    a.view = super::View::Cockpit;
+    a
 }
 
 fn key(c: char) -> KeyEvent {
@@ -586,13 +590,17 @@ fn capital_keys_switch_views() {
 
 #[test]
 fn esc_or_b_returns_detail_view_to_cockpit() {
-    // From a detail view, both Esc and 'b' go back to the cockpit.
+    // From a detail view, both Esc and 'b' go back to the Console home.
     for back in [code(KeyCode::Esc), key('b')] {
         let mut a = app();
         handle_key(&mut a, key('J')); // → Jobs
         assert_eq!(a.view, View::Jobs);
         handle_key(&mut a, back);
-        assert_eq!(a.view, View::Cockpit, "Esc/b should return to Cockpit");
+        assert_eq!(
+            a.view,
+            super::View::Console,
+            "Esc/b should return to the Console home"
+        );
     }
 }
 

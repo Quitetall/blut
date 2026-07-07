@@ -7,6 +7,7 @@ use super::test_fixtures::test_registry;
 use super::*;
 
 const ALL_VIEWS: &[View] = &[
+    View::Console,
     View::Cockpit,
     View::Jobs,
     View::Log,

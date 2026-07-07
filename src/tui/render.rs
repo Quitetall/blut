@@ -26,6 +26,7 @@ pub(super) fn draw(f: &mut Frame<'_>, app: &mut App) {
         .split(f.area());
     let body = outer[0];
     match app.view {
+        View::Console => super::console::draw_console(f, body, &app.console),
         View::Cockpit => draw_cockpit_body(f, body, app),
         View::Jobs => draw_jobs(f, body, app),
         View::Log => draw_log(f, body, app),
@@ -1218,6 +1219,9 @@ pub(super) fn truncate(s: &str, max: usize) -> String {
 
 pub(super) fn draw_status(f: &mut Frame<'_>, area: Rect, app: &App) {
     let base = match app.view {
+        View::Console => {
+            "q quit • r refresh • K cockpit (legacy) • mesh · DAG · broker · ε · cache at a glance"
+        }
         View::Cockpit => {
             "q quit • ↑↓ select • Enter log • r refresh • c cancel • R recipe • J/L/Y/H/B/C/G/I/A/M/P/X views"
         }
@@ -1434,6 +1438,7 @@ mod render_tests {
     #[test]
     fn each_view_renders_nonempty() {
         let views = [
+            View::Console,
             View::Cockpit,
             View::Jobs,
             View::Log,
@@ -1462,6 +1467,7 @@ mod render_tests {
             // uses its header strip; the detail views use the block title
             // and/or the view_header line.
             let needle = match view {
+                View::Console => "Symmetric mesh",
                 View::Cockpit => "BLUT Training Cockpit",
                 View::Jobs => "jobs",
                 View::Log => "log",

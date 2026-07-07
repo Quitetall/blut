@@ -122,6 +122,63 @@ pub fn status_msg() -> Style {
     maybe(Style::default().bg(Color::DarkGray).fg(GREEN))
 }
 
+// ── BLUT console palette (the engine-console identity) ────────────────────
+// Truecolor named tokens; `maybe()` still zeroes them under NO_COLOR/dumb, so
+// the accessibility discipline is preserved. Teal = verification / interactive
+// (content-addressed integrity), green = cache-hit / healthy, amber = warning,
+// red = the fail-closed hard-block.
+pub const SIGNAL: Color = Color::Rgb(0x37, 0xC2, 0xB0);
+/// Emphasis teal — reserved for the phase-2 drill-down tab bar.
+#[allow(dead_code)]
+pub const SIGNAL_BRIGHT: Color = Color::Rgb(0x5F, 0xE0, 0xCE);
+pub const VERIFIED: Color = Color::Rgb(0x6B, 0xD0, 0x8A);
+pub const AMBER: Color = Color::Rgb(0xE8, 0xA2, 0x3C);
+pub const HALT: Color = Color::Rgb(0xE5, 0x54, 0x4B);
+pub const FOG: Color = Color::Rgb(0x7B, 0x87, 0x94);
+pub const LINE: Color = Color::Rgb(0x2A, 0x33, 0x3E);
+pub const BRIGHT_C: Color = Color::Rgb(0xE7, 0xEC, 0xF1);
+
+/// Uppercase, dimmed section labels ("MESH", "BROKER", …).
+pub fn label() -> Style {
+    maybe(Style::default().fg(FOG))
+}
+/// The accent — active dispatch, interactive, verified integrity.
+pub fn signal() -> Style {
+    maybe(Style::default().fg(SIGNAL))
+}
+pub fn signal_bold() -> Style {
+    maybe(Style::default().fg(SIGNAL).add_modifier(Modifier::BOLD))
+}
+/// A big key metric that matters.
+pub fn metric() -> Style {
+    maybe(Style::default().fg(BRIGHT_C).add_modifier(Modifier::BOLD))
+}
+/// Cache-hit / healthy / verified state.
+pub fn verified() -> Style {
+    maybe(Style::default().fg(VERIFIED))
+}
+/// Warning / degraded state.
+pub fn amber() -> Style {
+    maybe(Style::default().fg(AMBER))
+}
+/// Blocked / failed / the clinical hard-block red line.
+pub fn halt() -> Style {
+    maybe(Style::default().fg(HALT).add_modifier(Modifier::BOLD))
+}
+/// Hairline panel borders.
+pub fn panel_border() -> Style {
+    maybe(Style::default().fg(LINE))
+}
+/// Active tab in the console tab bar (phase-2 drill-down navigation).
+#[allow(dead_code)]
+pub fn tab_active() -> Style {
+    maybe(
+        Style::default()
+            .fg(SIGNAL_BRIGHT)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
