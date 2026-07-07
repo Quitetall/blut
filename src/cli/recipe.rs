@@ -389,7 +389,16 @@ fn compile_declared_recipe(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let args_given = args_json.trim() != "{}";
+    // "given" = the user passed real args, semantically (not a string compare
+    // against "{}", so `--args "{ }"` / `{}\n` aren't false positives). An
+    // unparseable value counts as given so the error surfaces on the arm that
+    // actually uses it.
+    let args_given = match serde_json::from_str::<serde_json::Value>(args_json) {
+        Ok(serde_json::Value::Null) => false,
+        Ok(serde_json::Value::Object(o)) => !o.is_empty(),
+        Ok(_) => true,
+        Err(_) => true,
+    };
     match ext.as_str() {
         "toml" => {
             if args_given {
@@ -424,7 +433,6 @@ fn compile_declared_recipe(
     }
 }
 
-/// The `.star` arm of [`compile_declared_recipe`], gated on the `dsl` feature.
 /// The `.star` arm of [`compile_declared_recipe`] (ADR 0078). Starlark runs
 /// OUT OF PROCESS: the engine shells out to the `blut-dsl` binary (which
 /// links `starlark`, and hence its `serde_json/arbitrary_precision` feature,
@@ -1088,6 +1096,22 @@ mod declare_dispatch_tests {
             err.to_string().contains("unsupported recipe extension"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn empty_args_variants_do_not_trip_the_toml_guard() {
+        // `{ }`, `{}\n`, and `null` are all "no args" — they must NOT be
+        // mistaken for real args on a .toml recipe (semantic, not string, cmp).
+        let td = tempfile::tempdir().unwrap();
+        let toml = write(td.path(), "r.toml", "name=\"x\"\n[[stages]]\nstage=\"a\"\n");
+        for a in ["{ }", "{}\n", "null"] {
+            let err = expect_err(compile_declared_recipe(&Registry::new(), &toml, a));
+            // Reaches stage resolution (unknown stage 'a'), NOT the --args guard.
+            assert!(
+                !err.to_string().contains("--args is only for"),
+                "empty args `{a}` wrongly tripped the guard: {err}"
+            );
+        }
     }
 
     #[test]

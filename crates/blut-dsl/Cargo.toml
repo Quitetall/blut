@@ -25,3 +25,4 @@ thiserror = "1"
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
+proptest = "1"

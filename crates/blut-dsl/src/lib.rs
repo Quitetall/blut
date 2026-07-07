@@ -263,4 +263,20 @@ def build(args):
         assert_eq!(spec.nodes.len(), 4);
         assert_eq!(spec.edges, vec![(0, 1), (0, 2), (1, 3), (2, 3)]);
     }
+
+    proptest::proptest! {
+        // Any list of tier ints drives the demo fan-out: N tiers -> N+2 nodes,
+        // and evaluation never panics for arbitrary arg values.
+        #[test]
+        fn fan_out_width_tracks_args(tiers in proptest::collection::vec(0i64..1000, 0..20)) {
+            let src = include_str!("../examples/demo.star");
+            let spec = evaluate_script(
+                src,
+                "demo.star",
+                &json!({ "corpus": "c", "tiers": tiers.clone() }),
+            )
+            .expect("demo.star evaluates for any tier list");
+            proptest::prop_assert_eq!(spec.nodes.len(), tiers.len() + 2);
+        }
+    }
 }
