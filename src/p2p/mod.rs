@@ -11,6 +11,7 @@
 //! Gated behind `#[cfg(feature = "p2p")]`.
 
 pub mod bundle;
+pub mod chunkstore;
 pub mod coordinator;
 pub mod crypto;
 pub mod dispatch;
@@ -24,6 +25,7 @@ pub mod transport;
 pub mod trust;
 
 pub use bundle::{BlobDir, BundleError, BundleManifest, bundle, unbundle};
+pub use chunkstore::{ChunkError, ChunkIndex, ChunkStore};
 pub use coordinator::Coordinator;
 pub use crypto::{EncryptedPayload, KeyPair};
 pub use dispatch::{DefaultDispatchPolicy, DispatchPolicy, DispatchVerdict};
