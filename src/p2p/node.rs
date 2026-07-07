@@ -136,6 +136,12 @@ impl MeshNode {
         self.caps
     }
 
+    /// This node's LOCAL reputation for a peer (0.0–1.0), or `None` if unknown.
+    /// Local-only (A6) — never shared over the wire.
+    pub async fn peer_reputation(&self, id: &PeerId) -> Option<f64> {
+        self.server.peers.read().await.get(id).map(|p| p.reputation)
+    }
+
     /// Dial a seed/peer node and return the connection to dispatch over. The
     /// mutual-TLS handshake (A1) binds the peer's identity; `server_pubkey`
     /// pins the peer we intend to reach.
@@ -219,7 +225,20 @@ impl MeshNode {
     async fn serve_connection(self: Arc<Self>, peer: PeerId, conn: quinn::Connection) {
         // Loops until `accept_request` errors (connection closed / reset).
         while let Ok((frame, mut send)) = accept_request(&conn).await {
-            let response = self.handle_frame(frame).await;
+            let (response, score) = self.handle_frame(frame).await;
+            // Mutual reputation (A6): a worker also scores the SCHEDULER it
+            // served, via the same local EMA the scheduler uses on the worker —
+            // so "whom to accept work from" uses the same signal as "whom to
+            // dispatch to". `score` is None when the outcome isn't the
+            // scheduler's doing (e.g. our own missing worker capability).
+            // Local-only: no reputation ever crosses the wire (ADR 0079).
+            if let Some(ok) = score {
+                let mut peers = self.server.peers.write().await;
+                peers.update_reputation(&peer, ok);
+                if let Err(e) = peers.save() {
+                    tracing::warn!("mesh node: persist reputation for {peer} failed: {e}");
+                }
+            }
             if let Err(e) = write_frame(&mut send, &response).await {
                 tracing::debug!("mesh node: reply to {peer} failed: {e}");
             }
@@ -236,33 +255,55 @@ impl MeshNode {
         }
     }
 
-    /// Produce the response frame for one request. The worker capability gates
-    /// task execution; a `Task` to a scheduler-only node is a clean `Error`.
-    async fn handle_frame(&self, frame: MeshFrame) -> MeshFrame {
+    /// Produce the response frame for one request, plus an optional
+    /// scheduler-reputation signal (A6): `Some(true)` = the peer sent us valid
+    /// work we served, `Some(false)` = the peer misbehaved, `None` = the
+    /// outcome isn't attributable to the peer (our own limitation / a
+    /// non-task request). The worker capability gates task execution; a `Task`
+    /// to a scheduler-only node is a clean `Error`.
+    async fn handle_frame(&self, frame: MeshFrame) -> (MeshFrame, Option<bool>) {
         match frame {
-            MeshFrame::Ping { nonce } => MeshFrame::Pong { nonce },
-            MeshFrame::Hello(_) => MeshFrame::HelloAck {
-                peer_id: self.node_id.clone(),
-                // TODO(A4): fold in the registry-derived trust for the calling
-                // peer. Until then the ack reports Anonymous; the dispatch
-                // matrix (fail-closed) is the real gate, so a peer must NOT
-                // treat this as a trust grant.
-                trust: TrustLevel::Anonymous,
-            },
+            MeshFrame::Ping { nonce } => (MeshFrame::Pong { nonce }, None),
+            MeshFrame::Hello(_) => (
+                MeshFrame::HelloAck {
+                    peer_id: self.node_id.clone(),
+                    // TODO(A4): fold in the registry-derived trust for the
+                    // calling peer. Until then the ack reports Anonymous; the
+                    // dispatch matrix (fail-closed) is the real gate, so a peer
+                    // must NOT treat this as a trust grant.
+                    trust: TrustLevel::Anonymous,
+                },
+                None,
+            ),
             MeshFrame::Task(task) => match &self.runner {
                 Some(runner) => match runner.run(*task).await {
-                    Ok(result) => MeshFrame::Result(Box::new(result)),
-                    Err(e) => MeshFrame::Error {
-                        message: format!("task execution failed: {e}"),
+                    // Served the scheduler's work → a positive signal for it.
+                    Ok(result) => (MeshFrame::Result(Box::new(result)), Some(true)),
+                    // A runner error is OUR side (stage crash / resource) — not
+                    // the scheduler's fault, so don't score it.
+                    Err(e) => (
+                        MeshFrame::Error {
+                            message: format!("task execution failed: {e}"),
+                        },
+                        None,
+                    ),
+                },
+                // Refused for our OWN missing capability — not the scheduler's
+                // fault. (Abuse penalties for unauthorized tasks attach at the
+                // A4 trust gate.)
+                None => (
+                    MeshFrame::Error {
+                        message: "node lacks the worker capability (task refused)".into(),
                     },
-                },
-                None => MeshFrame::Error {
-                    message: "node lacks the worker capability (task refused)".into(),
-                },
+                    None,
+                ),
             },
-            other => MeshFrame::Error {
-                message: format!("unsupported request: {}", other.kind()),
-            },
+            other => (
+                MeshFrame::Error {
+                    message: format!("unsupported request: {}", other.kind()),
+                },
+                None,
+            ),
         }
     }
 }
@@ -435,6 +476,70 @@ mod tests {
         assert!(
             format!("{err}").contains("worker capability"),
             "clean capability error, got: {err}"
+        );
+    }
+
+    /// A6: after serving a scheduler's task, the WORKER scores that scheduler
+    /// (mutual, local-only). C starts A at the 0.5 prior; a served task nudges
+    /// it up.
+    #[tokio::test]
+    async fn worker_scores_scheduler_after_serving() {
+        let c_keypair = Arc::new(KeyPair::generate());
+        let dir = tempfile::tempdir().unwrap();
+        let peers = PeerRegistry::load(&dir.path().join("peers.json")).unwrap();
+        std::mem::forget(dir);
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let runner: Arc<dyn MeshTaskRunner> = Arc::new(EchoRunner {
+            keypair: c_keypair.clone(),
+        });
+        let c = MeshNode::bind(
+            addr,
+            c_keypair.clone(),
+            peers,
+            NodeCapabilities {
+                worker: true,
+                scheduler: false,
+            },
+            Some(runner),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let (a, a_kp) = spawn_node(
+            NodeCapabilities {
+                worker: false,
+                scheduler: true,
+            },
+            None,
+        )
+        .await;
+        let a_id = a.node_id().clone();
+
+        let conn = a
+            .connect_to(c.local_addr().unwrap(), c_keypair.verifying.to_bytes())
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            a.dispatch(&conn, echo_task(&a_id, &a_kp)),
+        )
+        .await
+        .expect("no hang")
+        .expect("served");
+
+        // Give C's serve loop a moment to record the outcome after replying.
+        let mut rep = None;
+        for _ in 0..50 {
+            rep = c.peer_reputation(&a_id).await;
+            if rep.is_some_and(|r| r > 0.5) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            rep.is_some_and(|r| r > 0.5),
+            "worker C should have scored scheduler A up from the 0.5 prior, got {rep:?}"
         );
     }
 
