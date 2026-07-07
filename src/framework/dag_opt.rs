@@ -110,6 +110,13 @@ fn eliminate_dead_code(plan: CompiledPlan) -> CompiledPlan {
     if n == 0 {
         return plan;
     }
+    // A plan with runtime `map_output` expansions (ADR 0078) is skipped: a map
+    // parent's output can drive a fan-out with NO downstream plan edge, so it
+    // would look "dead" here, and remapping node ids would stale the
+    // expansions' `parent`. Forgoing DCE on a dynamic plan is safe.
+    if !plan.expansions.is_empty() {
+        return plan;
+    }
 
     // Build adjacency: successors and predecessors
     let mut successors: Vec<Vec<NodeId>> = vec![Vec::new(); n];
@@ -201,6 +208,8 @@ fn eliminate_dead_code(plan: CompiledPlan) -> CompiledPlan {
         edges: new_edges,
         initial: new_initial,
         recipe_args: plan.recipe_args,
+        // Unreachable with expansions (early-returned above); always empty here.
+        expansions: Vec::new(),
     }
 }
 
@@ -412,6 +421,7 @@ mod tests {
             edges,
             initial: HashMap::new(),
             recipe_args: serde_json::Value::Null,
+            expansions: Vec::new(),
         }
     }
 

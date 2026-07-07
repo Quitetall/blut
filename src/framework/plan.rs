@@ -42,6 +42,7 @@ use crate::framework::stage::{ErasedArtifact, Stage, StageDyn};
 /// 0-indexed identifier for nodes inside one plan.
 pub type NodeId = u32;
 
+#[derive(Clone)]
 pub(crate) struct PlanNode {
     pub id: NodeId,
     pub stage: Arc<dyn StageDyn>,
@@ -493,6 +494,7 @@ impl<B: TrainingBackend> Plan<(), B> {
             edges: self.edges,
             initial: self.initial,
             recipe_args: self.recipe_args,
+            expansions: Vec::new(),
         }
     }
 }
@@ -507,6 +509,41 @@ pub struct CompiledPlan {
     pub(crate) edges: Vec<PlanEdge>,
     pub(crate) initial: HashMap<NodeId, ErasedArtifact>,
     pub(crate) recipe_args: serde_json::Value,
+    /// Typed runtime fan-outs (ADR 0078 `map_output`): when node `parent`
+    /// completes with a `list` output, the executor spawns one instance of
+    /// `template` per element, seeded with that element. Empty for every plan
+    /// that has no map (the common case).
+    pub(crate) expansions: Vec<MapExpansion>,
+}
+
+/// One compiled runtime fan-out (ADR 0078). Attached to a [`CompiledPlan`];
+/// the executor consults it on the completion seam.
+// dead_code: the fields are read by the executor's completion-seam expander,
+// which lands in the next sub-phase (Phase 4c); tests read them already.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub(crate) struct MapExpansion {
+    /// The node whose `list` output drives the fan-out.
+    pub parent: NodeId,
+    /// The sub-plan instantiated once per list element (its single root is
+    /// seeded with the element instead of the unit graph input).
+    pub template: Arc<CompiledTemplate>,
+    /// Optional display label; spawned instances are labelled `label[i]`.
+    pub label: Option<String>,
+}
+
+/// A kind-checked map template: like a [`CompiledPlan`] but its single root
+/// consumes a list ELEMENT (kind `elem_kind`) supplied at runtime, so it
+/// carries no `initial` seeding. Cloned per element at expansion time.
+// dead_code: consumed by the executor's expander in Phase 4c (see above).
+#[allow(dead_code)]
+pub(crate) struct CompiledTemplate {
+    /// The sole root node (0 predecessors), which takes the element.
+    pub root: NodeId,
+    pub nodes: Vec<PlanNode>,
+    pub edges: Vec<PlanEdge>,
+    /// The element `KIND` the root consumes (== the parent's element kind).
+    pub elem_kind: String,
 }
 
 impl CompiledPlan {
@@ -521,6 +558,14 @@ impl CompiledPlan {
     }
     pub fn recipe_args(&self) -> &serde_json::Value {
         &self.recipe_args
+    }
+
+    /// The plan's runtime `map_output` expansions (ADR 0078). Crate-internal
+    /// (the executor + tests read it); empty for a plain DAG.
+    // dead_code: the executor reads this on the completion seam in Phase 4c.
+    #[allow(dead_code)]
+    pub(crate) fn expansions(&self) -> &[MapExpansion] {
+        &self.expansions
     }
 
     /// Replace the recipe-args provenance blob (audit-only; the executor uses
@@ -715,6 +760,8 @@ impl CompiledPlan {
                 edges,
                 initial,
                 recipe_args: base_args,
+                // Merged components (HPO fan-out) carry no map expansions.
+                expansions: Vec::new(),
             },
             node_offsets,
         )
@@ -797,6 +844,7 @@ impl CompiledPlan {
             edges,
             initial,
             recipe_args,
+            expansions: Vec::new(),
         })
     }
 
@@ -927,10 +975,135 @@ impl CompiledPlan {
             edges: plan_edges,
             initial,
             recipe_args,
+            expansions: Vec::new(),
         };
         // Reject cycles (reuses the Kahn walk + `PlanError::Cycle`).
         plan.topo_order()?;
         Ok(plan)
+    }
+
+    /// Attach runtime `map_output` expansions (ADR 0078). Builder used by
+    /// `PlanSpec::compile` after `from_erased_graph`; every other path leaves
+    /// `expansions` empty.
+    pub(crate) fn with_expansions(mut self, expansions: Vec<MapExpansion>) -> Self {
+        self.expansions = expansions;
+        self
+    }
+
+    /// Compile a map TEMPLATE (ADR 0078): an arbitrary-topology sub-plan whose
+    /// SINGLE root consumes a list element of kind `elem_kind` (supplied at
+    /// runtime, so no `initial` seeding). Kind-checks exactly like
+    /// `from_erased_graph` except the root takes `elem_kind` instead of the
+    /// unit graph input, and there must be exactly one root (the element
+    /// consumer). Returns a [`CompiledTemplate`] the executor clones per list
+    /// element.
+    pub(crate) fn from_erased_template(
+        elem_kind: &str,
+        nodes: Vec<(Arc<dyn StageDyn>, serde_json::Value)>,
+        edges: Vec<(NodeId, NodeId)>,
+    ) -> Result<CompiledTemplate, crate::framework::error::PlanError> {
+        use crate::framework::error::PlanError;
+        let n = nodes.len();
+        if n == 0 {
+            return Err(PlanError::Empty);
+        }
+        let mut seen_edges = std::collections::HashSet::new();
+        for &(from, to) in &edges {
+            if from as usize >= n || to as usize >= n {
+                return Err(PlanError::EdgeOutOfRange {
+                    from,
+                    to,
+                    n_nodes: n,
+                });
+            }
+            if !seen_edges.insert((from, to)) {
+                return Err(PlanError::DuplicateEdge { from, to });
+            }
+        }
+        let mut preds: Vec<Vec<NodeId>> = vec![Vec::new(); n];
+        for &(from, to) in &edges {
+            preds[to as usize].push(from);
+        }
+        // Kind-check; collect the root(s).
+        let mut roots: Vec<NodeId> = Vec::new();
+        for (id, (stage, _)) in nodes.iter().enumerate() {
+            let in_kind = stage.input_kind();
+            match preds[id].as_slice() {
+                [] => {
+                    // A template root consumes the ELEMENT, not `()`.
+                    if in_kind != elem_kind {
+                        return Err(PlanError::KindBreak {
+                            from_stage: format!("<list element '{elem_kind}'>"),
+                            out_kind: elem_kind.to_string(),
+                            to_stage: stage.name().to_string(),
+                            in_kind: in_kind.to_string(),
+                        });
+                    }
+                    roots.push(id as NodeId);
+                }
+                [only] => {
+                    let out_kind = nodes[*only as usize].0.output_kind();
+                    if out_kind != in_kind {
+                        return Err(PlanError::KindBreak {
+                            from_stage: nodes[*only as usize].0.name().to_string(),
+                            out_kind: out_kind.to_string(),
+                            to_stage: stage.name().to_string(),
+                            in_kind: in_kind.to_string(),
+                        });
+                    }
+                }
+                many => {
+                    let k = many.len();
+                    if in_kind != format!("tuple<{k}>") {
+                        return Err(PlanError::BadMergeArity {
+                            stage: stage.name().to_string(),
+                            expected_kind: in_kind.to_string(),
+                            got: k,
+                        });
+                    }
+                }
+            }
+        }
+        // Exactly one root — the element feeds a single consumer.
+        if roots.len() != 1 {
+            return Err(PlanError::Other(format!(
+                "a map template must have exactly one root (the element consumer), found {}",
+                roots.len()
+            )));
+        }
+        let root = roots[0];
+        let plan_nodes: Vec<PlanNode> = nodes
+            .into_iter()
+            .enumerate()
+            .map(|(i, (stage, args))| PlanNode {
+                id: i as NodeId,
+                canon_args: CacheHandle::canonical_json_bytes(&args),
+                stage,
+                args,
+                retry: None,
+                timeout: None,
+            })
+            .collect();
+        let plan_edges: Vec<PlanEdge> = edges
+            .into_iter()
+            .map(|(from, to)| PlanEdge { from, to })
+            .collect();
+        // Acyclicity: reuse the CompiledPlan Kahn walk on a throwaway.
+        let probe = CompiledPlan {
+            name: String::new(),
+            nodes: plan_nodes.clone(),
+            edges: plan_edges.clone(),
+            initial: HashMap::new(),
+            recipe_args: serde_json::Value::Null,
+            expansions: Vec::new(),
+        };
+        probe.topo_order()?;
+        Ok(CompiledTemplate {
+            root,
+            nodes: plan_nodes,
+            edges: plan_edges,
+            elem_kind: elem_kind.to_string(),
+        })
     }
 }
 
@@ -1346,6 +1519,7 @@ mod tests {
                 .collect(),
             initial: HashMap::new(),
             recipe_args: serde_json::json!({}),
+            expansions: Vec::new(),
         }
     }
 

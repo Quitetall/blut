@@ -36,6 +36,13 @@ fn default_version() -> u32 {
     PLAN_SPEC_VERSION
 }
 
+/// Registry-resolved erased nodes: `(stage, args)` pairs ready for
+/// `CompiledPlan::from_erased_graph`/`from_erased_template`.
+type ResolvedNodes = Vec<(
+    std::sync::Arc<dyn crate::framework::stage::StageDyn>,
+    serde_json::Value,
+)>;
+
 /// One node of a [`PlanSpec`]: a registered stage name + its args JSON.
 ///
 /// Per-node retry/timeout are intentionally NOT in v1 (the engine's
@@ -52,6 +59,21 @@ pub struct SpecNode {
     pub args: serde_json::Value,
 }
 
+/// A typed runtime fan-out (ADR 0078 `map_output`): when the node at index
+/// `parent` completes with a `list` output, the executor runs `template` once
+/// per element, seeding the template's single root with that element.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MapSpec {
+    /// Index into the enclosing plan's `nodes` — the list-producing parent.
+    pub parent: u32,
+    /// The sub-plan instantiated per element (its single root consumes the
+    /// element; nested maps are not allowed in v1).
+    pub template: PlanSpec,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
 /// The plan IR. `nodes` are dense (indices `0..nodes.len()` are node ids);
 /// `edges` are `(producer_index, consumer_index)`, and their **order is the
 /// tuple element order** a merge node's `gather_input` will assemble.
@@ -62,6 +84,9 @@ pub struct PlanSpec {
     pub nodes: Vec<SpecNode>,
     #[serde(default)]
     pub edges: Vec<(u32, u32)>,
+    /// Typed runtime fan-outs (ADR 0078). Empty for a plain DAG.
+    #[serde(default)]
+    pub expansions: Vec<MapSpec>,
     /// IR version (see [`PLAN_SPEC_VERSION`]). Defaulted so pre-versioned
     /// JSON still parses.
     #[serde(default = "default_version")]
@@ -84,6 +109,14 @@ pub enum PlanSpecError {
         name: String,
         #[source]
         source: PlanError,
+    },
+    /// A `map_output` expansion is malformed (bad parent index, a parent whose
+    /// output isn't a `list`, a nested map, or a template kind-check failure).
+    #[error("plan spec '{name}': map over node {parent}: {detail}")]
+    BadMap {
+        name: String,
+        parent: u32,
+        detail: String,
     },
 }
 
@@ -122,15 +155,10 @@ impl PlanSpec {
         crate::framework::artifact::ContentHash::of_bytes(&buf)
     }
 
-    /// Resolve every node's stage by name against `reg`, then build a
-    /// fully kind-checked [`CompiledPlan`]. An unknown stage or a wiring
-    /// break is a precise [`PlanSpecError`]; nothing executes until this
-    /// returns `Ok`.
-    pub fn compile(&self, reg: &Registry) -> Result<CompiledPlan, PlanSpecError> {
-        let mut nodes: Vec<(
-            std::sync::Arc<dyn crate::framework::stage::StageDyn>,
-            serde_json::Value,
-        )> = Vec::with_capacity(self.nodes.len());
+    /// Resolve this spec's node stage-names against `reg` (registered stages
+    /// only — no dynamic loading). Returns the erased `(stage, args)` pairs.
+    fn resolve_nodes(&self, reg: &Registry) -> Result<ResolvedNodes, PlanSpecError> {
+        let mut nodes = Vec::with_capacity(self.nodes.len());
         for sn in &self.nodes {
             let ctor =
                 reg.find_erased_stage(&sn.stage)
@@ -140,6 +168,61 @@ impl PlanSpec {
                     })?;
             nodes.push((ctor(), sn.args.clone()));
         }
+        Ok(nodes)
+    }
+
+    /// Resolve every node's stage by name against `reg`, then build a
+    /// fully kind-checked [`CompiledPlan`] — including any runtime `map_output`
+    /// expansions (ADR 0078). An unknown stage, a wiring break, or a malformed
+    /// map is a precise [`PlanSpecError`]; nothing executes until this returns
+    /// `Ok`.
+    pub fn compile(&self, reg: &Registry) -> Result<CompiledPlan, PlanSpecError> {
+        let nodes = self.resolve_nodes(reg)?;
+
+        // Compile every map expansion BEFORE the main plan is consumed — each
+        // needs its parent node's declared element kind for the template
+        // kind-check.
+        let mut expansions = Vec::with_capacity(self.expansions.len());
+        for m in &self.expansions {
+            let bad = |detail: String| PlanSpecError::BadMap {
+                name: self.name.clone(),
+                parent: m.parent,
+                detail,
+            };
+            let parent = m.parent as usize;
+            if parent >= nodes.len() {
+                return Err(bad(format!(
+                    "parent index out of range (plan has {} nodes)",
+                    nodes.len()
+                )));
+            }
+            // The parent must produce a `list`; its element kind drives the
+            // template root's type check.
+            let elem_kind = nodes[parent].0.output_element_kind().ok_or_else(|| {
+                bad(format!(
+                    "parent stage '{}' does not output a list (its output is '{}')",
+                    nodes[parent].0.name(),
+                    nodes[parent].0.output_kind()
+                ))
+            })?;
+            // v1: no nested maps.
+            if !m.template.expansions.is_empty() {
+                return Err(bad("nested map templates are not supported (v1)".into()));
+            }
+            let template_nodes = m.template.resolve_nodes(reg)?;
+            let template = CompiledPlan::from_erased_template(
+                elem_kind,
+                template_nodes,
+                m.template.edges.clone(),
+            )
+            .map_err(|e| bad(e.to_string()))?;
+            expansions.push(crate::framework::plan::MapExpansion {
+                parent: m.parent,
+                template: std::sync::Arc::new(template),
+                label: m.label.clone(),
+            });
+        }
+
         // recipe_args = provenance for lineage/audit (the executor uses each
         // node's own args). Parallel to the declarative path's blob.
         let recipe_args = serde_json::json!({
@@ -149,11 +232,17 @@ impl PlanSpec {
                 .map(|s| serde_json::json!({ "stage": s.stage, "args": s.args }))
                 .collect::<Vec<_>>(),
         });
-        CompiledPlan::from_erased_graph(self.name.clone(), recipe_args, nodes, self.edges.clone())
-            .map_err(|source| PlanSpecError::Plan {
-                name: self.name.clone(),
-                source,
-            })
+        let plan = CompiledPlan::from_erased_graph(
+            self.name.clone(),
+            recipe_args,
+            nodes,
+            self.edges.clone(),
+        )
+        .map_err(|source| PlanSpecError::Plan {
+            name: self.name.clone(),
+            source,
+        })?;
+        Ok(plan.with_expansions(expansions))
     }
 }
 
@@ -234,9 +323,60 @@ mod tests {
         }
     }
 
+    // Item + a list producer/consumer for map_output tests.
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct Item;
+    impl Artifact for Item {
+        const KIND: &'static str = "spec.item";
+        const SCHEMA: u32 = 1;
+        fn content_hash(&self) -> ContentHash {
+            ContentHash::of_bytes(b"item")
+        }
+        fn primary_path(&self) -> &Path {
+            Path::new(".")
+        }
+    }
+
+    struct Sharder;
+    impl Compatible<LamuTrainerBackend> for Sharder {}
+    #[async_trait]
+    impl Stage for Sharder {
+        const NAME: &'static str = "spec_sharder";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = ();
+        type Output = crate::framework::artifact::ListOf<Item>;
+        type Args = E;
+        async fn run(
+            &self,
+            _c: &StageContext,
+            _i: (),
+            _a: &E,
+        ) -> Result<crate::framework::artifact::ListOf<Item>, StageError> {
+            Ok(crate::framework::artifact::ListOf(vec![Item, Item]))
+        }
+    }
+
+    struct ItemToA;
+    impl Compatible<LamuTrainerBackend> for ItemToA {}
+    #[async_trait]
+    impl Stage for ItemToA {
+        const NAME: &'static str = "spec_item_to_a";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = Item;
+        type Output = A;
+        type Args = E;
+        async fn run(&self, _c: &StageContext, _i: Item, _a: &E) -> Result<A, StageError> {
+            Ok(A)
+        }
+    }
+
     static ERASED: &[(&str, ErasedStageCtor)] = &[
         ("spec_make_a", || Arc::new(MakeA)),
         ("spec_a_to_b", || Arc::new(AToB)),
+        ("spec_sharder", || Arc::new(Sharder)),
+        ("spec_item_to_a", || Arc::new(ItemToA)),
     ];
     static NO_RECIPES: &[&RecipeDef] = &[];
     struct ToyCookbook;
@@ -271,6 +411,7 @@ mod tests {
                 },
             ],
             edges: vec![(0, 1)],
+            expansions: Vec::new(),
             version: PLAN_SPEC_VERSION,
         }
     }
@@ -303,6 +444,7 @@ mod tests {
                 args: serde_json::json!({ "x": 1, "y": 2 }),
             }],
             edges: vec![],
+            expansions: Vec::new(),
             version: 1,
         };
         let b = PlanSpec {
@@ -312,6 +454,7 @@ mod tests {
                 args: serde_json::json!({ "y": 2, "x": 1 }),
             }],
             edges: vec![],
+            expansions: Vec::new(),
             version: 1,
         };
         assert_eq!(a.canonical_bytes(), b.canonical_bytes());
@@ -323,6 +466,7 @@ mod tests {
                 args: serde_json::json!({ "x": 9, "y": 2 }),
             }],
             edges: vec![],
+            expansions: Vec::new(),
             version: 1,
         };
         assert_ne!(a.canonical_bytes(), c.canonical_bytes());
@@ -337,6 +481,7 @@ mod tests {
                 args: serde_json::json!({}),
             }],
             edges: vec![],
+            expansions: Vec::new(),
             version: 1,
         };
         match spec.compile(&Registry::new()) {
@@ -363,6 +508,7 @@ mod tests {
                 },
             ],
             edges: vec![(0, 1)],
+            expansions: Vec::new(),
             version: 1,
         };
         match spec.compile(&toy_registry()) {
@@ -405,5 +551,154 @@ mod tests {
             .await
             .expect("second run");
         assert_eq!(r2.n_cache_hits, 2, "both stages should hit on re-run");
+    }
+
+    // ---- map_output expansions (ADR 0078) ----
+
+    /// A spec: sharder (() -> list<item>) with a map over it whose template
+    /// consumes an item (item -> A).
+    fn map_spec() -> PlanSpec {
+        PlanSpec {
+            name: "m".into(),
+            nodes: vec![SpecNode {
+                stage: "spec_sharder".into(),
+                args: serde_json::json!({}),
+            }],
+            edges: vec![],
+            expansions: vec![MapSpec {
+                parent: 0,
+                template: PlanSpec {
+                    name: "tmpl".into(),
+                    nodes: vec![SpecNode {
+                        stage: "spec_item_to_a".into(),
+                        args: serde_json::json!({}),
+                    }],
+                    edges: vec![],
+                    expansions: Vec::new(),
+                    version: PLAN_SPEC_VERSION,
+                },
+                label: Some("shard".into()),
+            }],
+            version: PLAN_SPEC_VERSION,
+        }
+    }
+
+    #[test]
+    fn map_compiles_and_attaches_one_expansion() {
+        let plan = map_spec().compile(&toy_registry()).unwrap();
+        assert_eq!(plan.n_nodes(), 1);
+        assert_eq!(plan.expansions().len(), 1);
+        let exp = &plan.expansions()[0];
+        assert_eq!(exp.parent, 0);
+        assert_eq!(exp.label.as_deref(), Some("shard"));
+        assert_eq!(exp.template.elem_kind, "spec.item");
+        assert_eq!(exp.template.root, 0);
+    }
+
+    #[test]
+    fn map_over_non_list_parent_is_rejected() {
+        // Parent make_a outputs A (not a list).
+        let spec = PlanSpec {
+            name: "x".into(),
+            nodes: vec![SpecNode {
+                stage: "spec_make_a".into(),
+                args: serde_json::json!({}),
+            }],
+            edges: vec![],
+            expansions: vec![MapSpec {
+                parent: 0,
+                template: PlanSpec {
+                    name: "t".into(),
+                    nodes: vec![SpecNode {
+                        stage: "spec_item_to_a".into(),
+                        args: serde_json::json!({}),
+                    }],
+                    edges: vec![],
+                    expansions: Vec::new(),
+                    version: PLAN_SPEC_VERSION,
+                },
+                label: None,
+            }],
+            version: PLAN_SPEC_VERSION,
+        };
+        match spec.compile(&toy_registry()) {
+            Err(PlanSpecError::BadMap { detail, .. }) => {
+                assert!(detail.contains("does not output a list"), "{detail}");
+            }
+            Err(e) => panic!("expected BadMap, got {e:?}"),
+            Ok(_) => panic!("expected BadMap, got Ok"),
+        }
+    }
+
+    #[test]
+    fn map_template_root_wrong_kind_is_rejected() {
+        // Template root make_a takes `()`, not the element kind `spec.item`.
+        let spec = PlanSpec {
+            name: "x".into(),
+            nodes: vec![SpecNode {
+                stage: "spec_sharder".into(),
+                args: serde_json::json!({}),
+            }],
+            edges: vec![],
+            expansions: vec![MapSpec {
+                parent: 0,
+                template: PlanSpec {
+                    name: "t".into(),
+                    nodes: vec![SpecNode {
+                        stage: "spec_make_a".into(),
+                        args: serde_json::json!({}),
+                    }],
+                    edges: vec![],
+                    expansions: Vec::new(),
+                    version: PLAN_SPEC_VERSION,
+                },
+                label: None,
+            }],
+            version: PLAN_SPEC_VERSION,
+        };
+        assert!(matches!(
+            spec.compile(&toy_registry()),
+            Err(PlanSpecError::BadMap { .. })
+        ));
+    }
+
+    #[test]
+    fn map_parent_out_of_range_is_rejected() {
+        let mut spec = map_spec();
+        spec.expansions[0].parent = 9;
+        match spec.compile(&toy_registry()) {
+            Err(PlanSpecError::BadMap { detail, .. }) => {
+                assert!(detail.contains("out of range"), "{detail}")
+            }
+            Err(e) => panic!("expected BadMap, got {e:?}"),
+            Ok(_) => panic!("expected BadMap, got Ok"),
+        }
+    }
+
+    #[test]
+    fn nested_map_template_is_rejected() {
+        let mut spec = map_spec();
+        // Give the template its own (empty-parent) expansion → nested map.
+        spec.expansions[0].template.expansions = vec![MapSpec {
+            parent: 0,
+            template: PlanSpec {
+                name: "inner".into(),
+                nodes: vec![SpecNode {
+                    stage: "spec_item_to_a".into(),
+                    args: serde_json::json!({}),
+                }],
+                edges: vec![],
+                expansions: Vec::new(),
+                version: PLAN_SPEC_VERSION,
+            },
+            label: None,
+        }];
+        match spec.compile(&toy_registry()) {
+            Err(PlanSpecError::BadMap { detail, .. }) => {
+                assert!(detail.contains("nested"), "{detail}")
+            }
+            Err(e) => panic!("expected BadMap, got {e:?}"),
+            Ok(_) => panic!("expected BadMap, got Ok"),
+        }
     }
 }
