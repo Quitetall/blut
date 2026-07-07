@@ -25,7 +25,7 @@ impl PlanDraft {
         // Node ids are u32; the evaluator's tick cap bounds node count far
         // below u32::MAX, so this only fires on a corrupt invariant.
         debug_assert!(
-            self.nodes.len() < u32::MAX as usize,
+            self.nodes.len() <= u32::MAX as usize,
             "plan node count exceeds u32"
         );
         let id = self.nodes.len() as u32;
