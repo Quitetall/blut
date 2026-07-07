@@ -28,13 +28,18 @@ pub(super) enum RecipeCommand {
     /// `~/.config/blut/recipes/*.toml` ($BLUT_USER_RECIPES_DIR). Resolves
     /// stages from the registered cookbooks' `stages_erased()` registries.
     Declare {
-        /// Path to a `.toml` recipe (omit to list discovered recipes).
+        /// Path to a recipe file — `.toml` (linear chain), `.star` (Starlark
+        /// script, evaluated by the `blut-dsl` helper binary), or `.json` (a
+        /// PlanSpec). Omit to list discovered recipes.
         file: Option<std::path::PathBuf>,
-        /// LAUNCH the `.toml` recipe (C3): after it compiles + kind-checks,
-        /// execute it end-to-end through the SAME admission-gated, cgroup-
-        /// contained, cache-honouring path as `recipe run`. Without `--run`
-        /// (default) the DAG is only rendered — nothing executes. Requires a
-        /// `<file>`.
+        /// Args JSON passed to a `.star` script's `build(args)` (`.json`/`.toml`
+        /// recipes carry their own args; `--args` is rejected for those).
+        #[arg(long, default_value = "{}")]
+        args: String,
+        /// LAUNCH the recipe: after it compiles + kind-checks, execute it
+        /// end-to-end through the SAME admission-gated, cgroup-contained,
+        /// cache-honouring path as `recipe run`. Without `--run` (default) the
+        /// DAG is only rendered — nothing executes. Requires a `<file>`.
         #[arg(long, default_value_t = false)]
         run: bool,
         /// Promote this run's outputs to the global cache (only with `--run`).
@@ -173,21 +178,18 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
         }
         RecipeCommand::Declare {
             file,
+            args,
             run,
             shared_cache,
             no_cache,
         } => {
-            use crate::recipes::declarative::{
-                DeclarativeRecipe, scan_user_recipes, user_recipes_dir,
-            };
+            use crate::recipes::declarative::{scan_user_recipes, user_recipes_dir};
             match file {
                 None => {
                     if run {
-                        return Err(anyhow!(
-                            "--run requires a <file> (a .toml recipe to launch)"
-                        ));
+                        return Err(anyhow!("--run requires a <file> (a recipe to launch)"));
                     }
-                    // F4 discovery: list ~/.config/blut/recipes/*.toml.
+                    // F4 discovery: list ~/.config/blut/recipes/{*.toml,*.star,*.json}.
                     let found = scan_user_recipes();
                     let dir = user_recipes_dir()
                         .map(|d| d.display().to_string())
@@ -202,23 +204,21 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                     }
                 }
                 Some(path) => {
-                    // Compile + kind-check the .toml against the cookbook's
-                    // stages_erased registry.
-                    let recipe = DeclarativeRecipe::load(&path).map_err(|e| anyhow!("{e}"))?;
-                    let n = recipe.stages.len();
-                    let plan = recipe.compile(reg).map_err(|e| anyhow!("{e}"))?;
+                    // Compile + kind-check the recipe (dispatch by extension:
+                    // .toml chain / .star script / .json PlanSpec) into a
+                    // runnable plan, then render or launch it.
+                    let (name, plan, n) = compile_declared_recipe(reg, &path, &args)?;
                     if run {
-                        // C3 LAUNCH: execute the compiled plan through the same
-                        // admission-gated / cgroup-contained / cache-honouring
-                        // core as `recipe run`. No RecipeMarker (declarative
-                        // recipes don't resume by registry name); `Local`
-                        // placement (clusters target registry recipes only).
+                        // LAUNCH: execute through the same admission-gated /
+                        // cgroup-contained / cache-honouring core as `recipe
+                        // run`. No RecipeMarker (declared recipes don't resume
+                        // by registry name); `Local` placement (clusters target
+                        // registry recipes only).
                         println!(
-                            "✓ '{}' compiles + kind-checks ({n} ingredient(s)); launching…",
-                            recipe.name
+                            "✓ '{name}' compiles + kind-checks ({n} ingredient(s)); launching…"
                         );
                         launch_compiled_plan(
-                            &recipe.name,
+                            &name,
                             plan,
                             None,
                             None,
@@ -231,10 +231,7 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                     } else {
                         // Render-only (default): print the runnable DAG, no exec.
                         print!("{}", plan.render_ascii().map_err(|e| anyhow!("{e}"))?);
-                        println!(
-                            "✓ '{}' compiles + kind-checks ({n} ingredient(s)).",
-                            recipe.name
-                        );
+                        println!("✓ '{name}' compiles + kind-checks ({n} ingredient(s)).");
                     }
                 }
             }
@@ -373,6 +370,131 @@ pub(super) async fn run_one_recipe(
         no_cache,
     )
     .await
+}
+
+/// Compile a declared recipe FILE into a runnable plan, dispatching on its
+/// extension (ADR 0078): `.toml` → the linear declarative chain; `.star` → a
+/// Starlark script (needs the `dsl` feature) evaluated with `args_json` then
+/// compiled through the same `PlanSpec` path; `.json` → a `PlanSpec` read
+/// verbatim. All three resolve stage NAMES against the registry (no dynamic
+/// code loading) and are fully kind-checked before returning. Returns
+/// `(plan_name, plan, n_nodes)`.
+fn compile_declared_recipe(
+    reg: &crate::framework::Registry,
+    path: &std::path::Path,
+    args_json: &str,
+) -> Result<(String, crate::framework::plan::CompiledPlan, usize)> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let args_given = args_json.trim() != "{}";
+    match ext.as_str() {
+        "toml" => {
+            if args_given {
+                return Err(anyhow!(
+                    "--args is only for .star recipes; a .toml recipe carries its own per-stage args"
+                ));
+            }
+            let recipe = crate::recipes::declarative::DeclarativeRecipe::load(path)
+                .map_err(|e| anyhow!("{e}"))?;
+            let n = recipe.stages.len();
+            let plan = recipe.compile(reg).map_err(|e| anyhow!("{e}"))?;
+            Ok((recipe.name, plan, n))
+        }
+        "json" => {
+            if args_given {
+                return Err(anyhow!(
+                    "--args is only for .star recipes; a .json PlanSpec is already fully specified"
+                ));
+            }
+            let body = std::fs::read_to_string(path)
+                .with_context(|| format!("read PlanSpec {}", path.display()))?;
+            let spec: crate::framework::plan_spec::PlanSpec = serde_json::from_str(&body)
+                .with_context(|| format!("parse PlanSpec {}", path.display()))?;
+            let n = spec.nodes.len();
+            let plan = spec.compile(reg).map_err(|e| anyhow!("{e}"))?;
+            Ok((spec.name, plan, n))
+        }
+        "star" => compile_star_recipe(reg, path, args_json),
+        other => Err(anyhow!(
+            "unsupported recipe extension '.{other}' — expected .toml, .star, or .json"
+        )),
+    }
+}
+
+/// The `.star` arm of [`compile_declared_recipe`], gated on the `dsl` feature.
+/// The `.star` arm of [`compile_declared_recipe`] (ADR 0078). Starlark runs
+/// OUT OF PROCESS: the engine shells out to the `blut-dsl` binary (which
+/// links `starlark`, and hence its `serde_json/arbitrary_precision` feature,
+/// away from the engine), captures the emitted `PlanSpec` JSON, then compiles
+/// it against the registry through the same path a `.json` recipe uses. The
+/// engine binary itself never links Starlark.
+fn compile_star_recipe(
+    reg: &crate::framework::Registry,
+    path: &std::path::Path,
+    args_json: &str,
+) -> Result<(String, crate::framework::plan::CompiledPlan, usize)> {
+    let args: serde_json::Value =
+        serde_json::from_str(args_json).with_context(|| "parse --args as JSON")?;
+    let src =
+        std::fs::read_to_string(path).with_context(|| format!("read script {}", path.display()))?;
+    let label = path.display().to_string();
+
+    // Run `blut-dsl <script> --args <json>` and capture its PlanSpec JSON.
+    let bin = blut_dsl_binary();
+    let out = std::process::Command::new(&bin)
+        .arg(path)
+        .arg("--args")
+        .arg(args_json)
+        .output()
+        .with_context(|| {
+            format!(
+                "run the Starlark evaluator `{}` for {label} — is `blut-dsl` installed? \
+                 (set $BLUT_DSL_BIN to its path, or author the recipe as `.json`)",
+                bin.display()
+            )
+        })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow!("blut-dsl failed on {label}: {}", stderr.trim()));
+    }
+    let spec: crate::framework::plan_spec::PlanSpec = serde_json::from_slice(&out.stdout)
+        .with_context(|| format!("parse the PlanSpec blut-dsl emitted for {label}"))?;
+
+    let n = spec.nodes.len();
+    let fingerprint = spec.provenance_fingerprint(&src, &args);
+    let plan = spec.compile(reg).map_err(|e| anyhow!("{e}"))?;
+    // Stamp richer provenance than PlanSpec::compile's default blob: the
+    // script path + content-hash fingerprint + the args it was built with, so
+    // lineage records exactly what produced this plan.
+    let plan = plan.override_recipe_args(serde_json::json!({
+        "starlark": true,
+        "script_path": label,
+        "plan_fingerprint": fingerprint.to_hex(),
+        "version": crate::framework::plan_spec::PLAN_SPEC_VERSION,
+        "args": args,
+    }));
+    Ok((spec.name, plan, n))
+}
+
+/// Locate the `blut-dsl` evaluator binary: `$BLUT_DSL_BIN` if set, else a
+/// sibling of the current executable (the usual install layout), else bare
+/// `blut-dsl` resolved on `$PATH`.
+fn blut_dsl_binary() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("BLUT_DSL_BIN") {
+        return std::path::PathBuf::from(p);
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let sibling = dir.join("blut-dsl");
+        if sibling.exists() {
+            return sibling;
+        }
+    }
+    std::path::PathBuf::from("blut-dsl")
 }
 
 /// Launch an ALREADY-COMPILED plan end-to-end: footprint → job dir → ExecCtx →
@@ -841,6 +963,7 @@ mod recipe_declare_flag_tests {
                 cmd:
                     RecipeCommand::Declare {
                         file,
+                        args: _,
                         run,
                         shared_cache,
                         no_cache,
@@ -877,5 +1000,122 @@ mod recipe_declare_flag_tests {
             "--force",
         ]);
         assert!(run && sc && nc, "--force aliases --no-cache");
+    }
+
+    #[test]
+    fn declare_args_flag_parses() {
+        match Cli::try_parse_from([
+            "blut",
+            "recipe",
+            "declare",
+            "r.star",
+            "--args",
+            r#"{"n":1}"#,
+        ])
+        .expect("parse")
+        .command
+        {
+            Some(Command::Recipe {
+                cmd: RecipeCommand::Declare { args, .. },
+            }) => assert_eq!(args, r#"{"n":1}"#),
+            other => panic!("expected declare, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod declare_dispatch_tests {
+    //! `compile_declared_recipe` routes by extension and validates inputs
+    //! (ADR 0078). These need no real stages — they exercise routing + the
+    //! `--args` guards against an EMPTY registry (so a resolvable graph fails
+    //! at stage lookup, which is the expected error).
+    use super::compile_declared_recipe;
+    use crate::framework::Registry;
+
+    fn write(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    // The Ok type holds a CompiledPlan (no Debug), so `unwrap_err` can't be
+    // used — pull the error out by hand.
+    fn expect_err(
+        r: super::Result<(String, crate::framework::plan::CompiledPlan, usize)>,
+    ) -> anyhow::Error {
+        match r {
+            Ok(_) => panic!("expected an Err, got Ok"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn json_planspec_routes_and_resolves_against_registry() {
+        let td = tempfile::tempdir().unwrap();
+        let p = write(
+            td.path(),
+            "s.json",
+            r#"{"name":"js","nodes":[{"stage":"nope"}],"edges":[]}"#,
+        );
+        // Routes to the .json arm, parses, then fails at unknown stage.
+        let err = expect_err(compile_declared_recipe(&Registry::new(), &p, "{}"));
+        assert!(
+            err.to_string().contains("nope"),
+            "names the unknown stage: {err}"
+        );
+    }
+
+    #[test]
+    fn args_rejected_for_toml_and_json() {
+        let td = tempfile::tempdir().unwrap();
+        let toml = write(td.path(), "r.toml", "name=\"x\"\n[[stages]]\nstage=\"a\"\n");
+        let json = write(td.path(), "r.json", r#"{"name":"x","nodes":[],"edges":[]}"#);
+        for p in [toml, json] {
+            let err = expect_err(compile_declared_recipe(&Registry::new(), &p, r#"{"n":1}"#));
+            assert!(
+                err.to_string().contains("--args is only for .star"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_extension_is_rejected() {
+        let td = tempfile::tempdir().unwrap();
+        let p = write(td.path(), "r.yaml", "nope");
+        let err = expect_err(compile_declared_recipe(&Registry::new(), &p, "{}"));
+        assert!(
+            err.to_string().contains("unsupported recipe extension"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn star_route_reports_missing_evaluator_clearly() {
+        // `.star` is evaluated OUT OF PROCESS by `blut-dsl` (ADR 0078). When
+        // that binary can't be found, the error must be actionable (name the
+        // binary + the .json escape hatch), not a raw ENOENT. Point
+        // BLUT_DSL_BIN at a path that certainly doesn't exist. (This engine
+        // test binary no longer links starlark, so there is no pre-main thread
+        // and this scoped env set is sound; TEST_ENV_LOCK serializes it.)
+        let _g = crate::TEST_ENV_LOCK.lock().unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let p = write(td.path(), "r.star", "def build(args):\n    add(\"x\")\n");
+        let prev = std::env::var("BLUT_DSL_BIN").ok();
+        unsafe {
+            std::env::set_var("BLUT_DSL_BIN", td.path().join("no-such-blut-dsl"));
+        }
+        let err = expect_err(compile_declared_recipe(&Registry::new(), &p, "{}"));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("BLUT_DSL_BIN", v),
+                None => std::env::remove_var("BLUT_DSL_BIN"),
+            }
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("blut-dsl") && msg.contains(".json"),
+            "actionable evaluator-missing error: {msg}"
+        );
     }
 }

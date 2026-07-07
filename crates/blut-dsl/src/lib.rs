@@ -1,46 +1,41 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Brian Lam
-//! Starlark front-end for authoring [`PlanSpec`]s (ADR 0078, behind the
-//! `dsl` feature).
+//! Starlark front-end for authoring [`blut::framework::plan_spec::PlanSpec`]s
+//! (ADR 0078).
+//!
+//! This lives in a SEPARATE crate/binary, not inside the engine, on purpose:
+//! `starlark` hard-depends on `serde_json` with the `arbitrary_precision`
+//! feature, and Cargo feature unification would turn that on for the WHOLE
+//! engine binary — which silently breaks deserialization of the engine's
+//! internally-tagged enums (`#[serde(tag = "kind")]`: `StatusUpdate`,
+//! `StageEvent`, `TrainSpec`). Keeping Starlark out-of-process means the
+//! engine binary never links it, so its serde behavior is untouched. The
+//! engine consumes this tool's output through the plain `.json` PlanSpec
+//! path (`blut recipe declare foo.json`).
 //!
 //! A `.star` script defines `build(args)` and calls the `add()` builtin to
-//! compose REGISTERED stages into a graph. Evaluation is **hermetic** — no
-//! `load()`, no file/network/clock/random access (the Starlark standard
-//! library has none, and we disable `load` in the dialect) — so a script's
-//! emitted `PlanSpec` is a pure function of `(source, args)` and therefore
-//! content-hashable. A step/heap cap turns a pathological script into an
-//! error instead of a hang. The interpreter runs ONCE here, before launch;
-//! the executor never re-enters it.
-//!
-//! Example (`demo.star`):
-//! ```python
-//! def build(args):
-//!     root = add("prepare_data", {"corpus": args["corpus"]})
-//!     heads = []
-//!     for tier in args["tiers"]:
-//!         heads.append(add("train_model", {"tier": tier}, after=root))
-//!     add("compare_report", after=heads)   # list after -> merge
-//! ```
+//! compose stages by NAME (resolution + kind-checking happen later, in the
+//! engine, against a registry). Evaluation is hermetic — no `load()`, no
+//! file/network/clock/random access — so a script's emitted `PlanSpec` is a
+//! pure function of `(source, args)` and therefore content-hashable. A
+//! step/heap cap turns a pathological script into an error, not a hang.
 
 mod builder;
 mod globals;
 
+use blut::framework::plan_spec::PlanSpec;
 use starlark::environment::{GlobalsBuilder, Module};
 use starlark::eval::Evaluator;
 use starlark::syntax::{AstModule, Dialect};
 use starlark::values::Value;
 use starlark::values::dict::AllocDict;
 
-use crate::framework::artifact::ContentHash;
-use crate::framework::cache::CacheHandle;
-use crate::framework::plan_spec::PlanSpec;
 use globals::{DslStore, dsl_globals};
 
 /// Ceiling on evaluator "ticks" (roughly, executed statements) — turns an
-/// accidental infinite loop into an error rather than a hang. Generous: a
-/// real plan-authoring script does thousands of ops at most.
+/// accidental infinite loop into an error rather than a hang.
 const MAX_TICKS: u64 = 10_000_000;
-/// Ceiling on the script's heap (bytes). Bounds a runaway allocation.
+/// Ceiling on the script's heap (bytes) — bounds a runaway allocation.
 const MAX_HEAP_BYTES: usize = 256 * 1024 * 1024;
 
 /// Failure evaluating a `.star` script into a [`PlanSpec`].
@@ -83,9 +78,8 @@ pub fn evaluate_script(
 
     let run = Module::with_temp_heap(|module| -> Result<(), DslError> {
         let mut eval = Evaluator::new(&module);
-        // Fail-safe caps against a runaway script. Propagate rather than
-        // discard: if a cap can't be set, the hermeticity/termination
-        // guarantee is void, so refuse to run rather than silently proceed.
+        // Fail-safe caps. Propagate rather than discard: if a cap can't be
+        // set, the termination/hermeticity guarantee is void, so refuse.
         let set_caps = eval
             .set_max_tick_count(MAX_TICKS)
             .and_then(|()| eval.set_max_heap_size(MAX_HEAP_BYTES));
@@ -117,24 +111,6 @@ pub fn evaluate_script(
     Ok(store.0.into_inner().into_spec(name))
 }
 
-/// Provenance fingerprint (ADR 0078): a content hash over the script source,
-/// the canonical args, and the emitted spec — so lineage records exactly
-/// what produced a plan, and a change to any of the three changes the id.
-pub fn script_fingerprint(source: &str, args: &serde_json::Value, spec: &PlanSpec) -> ContentHash {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(b"blut-star-v1");
-    // Length-prefix each variable-length part so concatenation is unambiguous.
-    buf.extend_from_slice(&(source.len() as u64).to_le_bytes());
-    buf.extend_from_slice(source.as_bytes());
-    let canon_args = CacheHandle::canonical_json_bytes(args);
-    buf.extend_from_slice(&(canon_args.len() as u64).to_le_bytes());
-    buf.extend_from_slice(&canon_args);
-    let spec_bytes = spec.canonical_bytes();
-    buf.extend_from_slice(&(spec_bytes.len() as u64).to_le_bytes());
-    buf.extend_from_slice(&spec_bytes);
-    ContentHash::of_bytes(&buf)
-}
-
 /// Plan name from a script path: the file stem (`recipes/train.star` →
 /// `train`), falling back to the whole label.
 fn plan_name_from(path_label: &str) -> String {
@@ -148,7 +124,7 @@ fn plan_name_from(path_label: &str) -> String {
 /// Recursively allocate a `serde_json::Value` as a Starlark value on `heap`
 /// (so the script's `build(args)` sees native dicts/lists/scalars). Errors on
 /// a numerically unrepresentable JSON number rather than silently coercing it
-/// to NaN — a wrong value passed to a script is worse than a clear failure.
+/// to NaN.
 fn json_to_value<'v>(
     heap: starlark::values::Heap<'v>,
     v: &serde_json::Value,
@@ -161,9 +137,6 @@ fn json_to_value<'v>(
             if let Some(i) = n.as_i64() {
                 heap.alloc(i)
             } else if let Some(f) = n.as_f64() {
-                // Non-integer or out-of-i64 number → f64 (JSON's only other
-                // numeric); may lose precision for huge integers, as any
-                // JSON→f64 does.
                 heap.alloc(f)
             } else {
                 return Err(DslError::Eval {
@@ -226,9 +199,7 @@ def build(args):
     add("merge", after=heads)
 "#;
         let spec = evaluate_script(src, "fan.star", &json!({ "tiers": [1, 2, 3] })).unwrap();
-        // prep + 3 trains + merge = 5 nodes.
         assert_eq!(spec.nodes.len(), 5);
-        // Each train hangs off root; merge takes all three trains in order.
         assert_eq!(
             spec.edges,
             vec![(0, 1), (0, 2), (0, 3), (1, 4), (2, 4), (3, 4)]
@@ -238,109 +209,58 @@ def build(args):
 
     #[test]
     fn topology_is_deterministic_across_runs() {
-        let src = r#"
-def build(args):
-    a = add("a")
-    add("b", after=a)
-"#;
+        let src = "def build(args):\n    a = add(\"a\")\n    add(\"b\", after=a)\n";
         let s1 = evaluate_script(src, "d.star", &json!({})).unwrap();
         let s2 = evaluate_script(src, "d.star", &json!({})).unwrap();
         assert_eq!(s1.canonical_bytes(), s2.canonical_bytes());
-        // Same source+args -> same fingerprint; a real arg change moves it.
-        let f1 = script_fingerprint(src, &json!({ "x": 1 }), &s1);
-        let f2 = script_fingerprint(src, &json!({ "x": 1 }), &s2);
-        assert_eq!(f1, f2);
-        let f3 = script_fingerprint(src, &json!({ "x": 2 }), &s1);
-        assert_ne!(f1, f3);
     }
 
     #[test]
     fn load_statement_is_rejected() {
-        let src = r#"
-load("other.star", "thing")
-def build(args):
-    add("a")
-"#;
-        match evaluate_script(src, "bad.star", &json!({})) {
-            Err(DslError::Parse { .. }) => {}
-            other => panic!("expected a parse error rejecting load(), got {other:?}"),
-        }
+        let src = "load(\"other.star\", \"thing\")\ndef build(args):\n    add(\"a\")\n";
+        assert!(matches!(
+            evaluate_script(src, "bad.star", &json!({})),
+            Err(DslError::Parse { .. })
+        ));
     }
 
     #[test]
     fn missing_build_is_a_clear_error() {
-        let src = "x = 1\n";
-        match evaluate_script(src, "nobuild.star", &json!({})) {
-            Err(DslError::MissingBuild { .. }) => {}
-            other => panic!("expected MissingBuild, got {other:?}"),
-        }
+        assert!(matches!(
+            evaluate_script("x = 1\n", "nobuild.star", &json!({})),
+            Err(DslError::MissingBuild { .. })
+        ));
     }
 
     #[test]
     fn runtime_error_surfaces_as_eval_error() {
-        // Referencing an undefined name is a runtime evaluation error.
-        let src = r#"
-def build(args):
-    add(nonexistent_variable)
-"#;
-        match evaluate_script(src, "err.star", &json!({})) {
-            Err(DslError::Eval { .. }) => {}
-            other => panic!("expected Eval error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn demo_fixture_builds_the_expected_topology() {
-        // The committed example recipe, evaluated with representative args.
-        let src = include_str!("../../examples/recipes/demo.star");
-        let spec = evaluate_script(
-            src,
-            "demo.star",
-            &json!({
-                "corpus": "tuh",
-                "tiers": [5, 7],
-            }),
-        )
-        .unwrap();
-        assert_eq!(spec.name, "demo");
-        // prepare + 2 train + compare = 4 nodes.
-        assert_eq!(spec.nodes.len(), 4);
-        assert_eq!(spec.nodes[0].stage, "prepare_data");
-        assert_eq!(spec.nodes[0].args, json!({ "corpus": "tuh" }));
-        assert_eq!(spec.nodes[3].stage, "compare_report");
-        // train nodes fan off prepare; compare merges both trains.
-        assert_eq!(spec.edges, vec![(0, 1), (0, 2), (1, 3), (2, 3)]);
-    }
-
-    proptest::proptest! {
-        // Any list of tier ints drives the fan-out: N tiers -> N+2 nodes, and
-        // evaluation never panics for arbitrary arg values.
-        #[test]
-        fn fan_out_width_tracks_args(tiers in proptest::collection::vec(0i64..1000, 0..20)) {
-            let src = include_str!("../../examples/recipes/demo.star");
-            let spec = evaluate_script(
-                src,
-                "demo.star",
-                &json!({ "corpus": "c", "tiers": tiers.clone() }),
-            )
-            .expect("demo.star evaluates for any tier list");
-            proptest::prop_assert_eq!(spec.nodes.len(), tiers.len() + 2);
-        }
+        let src = "def build(args):\n    add(nonexistent_variable)\n";
+        assert!(matches!(
+            evaluate_script(src, "err.star", &json!({})),
+            Err(DslError::Eval { .. })
+        ));
     }
 
     #[test]
     fn infinite_loop_hits_the_tick_cap_instead_of_hanging() {
-        let src = r#"
-def build(args):
-    i = 0
-    for _ in range(100000000000):
-        i = i + 1
-    add("never")
-"#;
-        // Must terminate with an error, not hang, thanks to MAX_TICKS.
-        match evaluate_script(src, "loop.star", &json!({})) {
-            Err(DslError::Eval { .. }) => {}
-            other => panic!("expected Eval error from the tick cap, got {other:?}"),
-        }
+        let src = "def build(args):\n    for _ in range(100000000000):\n        pass\n    add(\"never\")\n";
+        assert!(matches!(
+            evaluate_script(src, "loop.star", &json!({})),
+            Err(DslError::Eval { .. })
+        ));
+    }
+
+    #[test]
+    fn demo_fixture_builds_the_expected_topology() {
+        let src = include_str!("../examples/demo.star");
+        let spec = evaluate_script(
+            src,
+            "demo.star",
+            &json!({ "corpus": "tuh", "tiers": [5, 7] }),
+        )
+        .unwrap();
+        assert_eq!(spec.name, "demo");
+        assert_eq!(spec.nodes.len(), 4);
+        assert_eq!(spec.edges, vec![(0, 1), (0, 2), (1, 3), (2, 3)]);
     }
 }

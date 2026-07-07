@@ -98,6 +98,30 @@ impl PlanSpec {
         CacheHandle::canonical_json_bytes(&v)
     }
 
+    /// Provenance fingerprint (ADR 0078): a content hash over the authoring
+    /// `source` (e.g. a `.star` script), the canonical `args`, and this spec
+    /// — so lineage records exactly what produced a plan, and a change to any
+    /// of the three moves the id. Length-prefixed so the concatenation is
+    /// unambiguous. Computed in the ENGINE (not the DSL tool) so the engine
+    /// owns provenance regardless of how the spec was authored.
+    pub fn provenance_fingerprint(
+        &self,
+        source: &str,
+        args: &serde_json::Value,
+    ) -> crate::framework::artifact::ContentHash {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"blut-star-v1");
+        buf.extend_from_slice(&(source.len() as u64).to_le_bytes());
+        buf.extend_from_slice(source.as_bytes());
+        let canon_args = CacheHandle::canonical_json_bytes(args);
+        buf.extend_from_slice(&(canon_args.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&canon_args);
+        let spec_bytes = self.canonical_bytes();
+        buf.extend_from_slice(&(spec_bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&spec_bytes);
+        crate::framework::artifact::ContentHash::of_bytes(&buf)
+    }
+
     /// Resolve every node's stage by name against `reg`, then build a
     /// fully kind-checked [`CompiledPlan`]. An unknown stage or a wiring
     /// break is a precise [`PlanSpecError`]; nothing executes until this

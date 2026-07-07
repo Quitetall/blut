@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 
-use crate::framework::plan_spec::{PLAN_SPEC_VERSION, PlanSpec, SpecNode};
+use blut::framework::plan_spec::{PLAN_SPEC_VERSION, PlanSpec, SpecNode};
 
 /// Nodes + edges collected while a script runs. Each `add()` appends one
 /// node and wires its `after` predecessors immediately, so all edges into a

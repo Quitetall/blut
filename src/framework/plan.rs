@@ -523,6 +523,15 @@ impl CompiledPlan {
         &self.recipe_args
     }
 
+    /// Replace the recipe-args provenance blob (audit-only; the executor uses
+    /// each node's own args, never this). Used by the CLI to stamp richer
+    /// provenance — e.g. a `.star` script's path + fingerprint — onto a plan
+    /// compiled from a `PlanSpec`.
+    pub fn override_recipe_args(mut self, recipe_args: serde_json::Value) -> Self {
+        self.recipe_args = recipe_args;
+        self
+    }
+
     pub fn render_ascii(&self) -> Result<String, crate::framework::error::PlanError> {
         let order = self.topo_order()?;
         let mut out = String::new();

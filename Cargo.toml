@@ -95,11 +95,6 @@ rcgen = { version = "0.13", optional = true }
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.28", optional = true }
 fuzzy-matcher = { version = "0.3", optional = true }
-# Starlark scripting for typed dynamic DAGs (ADR 0078). Hermetic by
-# construction (no I/O / clock / randomness), so a script's emitted PlanSpec
-# is a pure function of (source, args) — content-hashable. Off by default so
-# the lean CLI build doesn't pull it; cookbook binaries opt in.
-starlark = { version = "0.14", optional = true }
 
 [features]
 default = ["tui"]
@@ -108,8 +103,14 @@ default = ["tui"]
 tui = ["dep:ratatui", "dep:crossterm", "dep:fuzzy-matcher"]
 # P2P distributed compute — trust model, encryption, task dispatch.
 p2p = ["dep:ed25519-dalek", "dep:aes-gcm", "dep:x25519-dalek", "dep:blake3", "dep:hkdf", "dep:quinn", "dep:rustls", "dep:webpki", "dep:rcgen"]
-# Starlark front-end for authoring PlanSpecs from `.star` scripts (ADR 0078).
-dsl = ["dep:starlark"]
+
+# NOTE (ADR 0078): the Starlark DSL is NOT a feature of this crate. `starlark`
+# hard-depends on `serde_json/arbitrary_precision`, which Cargo feature
+# unification would enable for the whole engine binary and silently break
+# deserialization of the engine's internally-tagged enums (StatusUpdate /
+# StageEvent / TrainSpec). The `.star` front-end therefore lives in a
+# SEPARATE binary, `crates/blut-dsl`, that the engine shells out to; the
+# engine consumes its output through the plain `.json` PlanSpec path.
 
 [dev-dependencies]
 tempfile = "3"

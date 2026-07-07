@@ -60,13 +60,17 @@ jobs:
           cargo clippy -p blut --features p2p --all-targets -- -D warnings
           cargo test -p blut --features p2p
 
-      # The Starlark DSL (ADR 0078) is off-by-default (it pulls the starlark
-      # crate); gate it so src/dsl and the recipe .star path stay compiled +
-      # tested in CI.
-      - name: Clippy + test the dsl feature
+      # crates/blut-dsl is a STANDALONE workspace (path-deps on the engine).
+      # It links `starlark` — and its `serde_json/arbitrary_precision` feature
+      # — which is exactly why it lives OUTSIDE the engine (ADR 0078). Gate it
+      # explicitly so it can't rot.
+      - name: Build + lint + test blut-dsl (standalone workspace)
+        working-directory: crates/blut-dsl
         run: |
-          cargo clippy -p blut --features dsl --all-targets -- -D warnings
-          cargo test -p blut --features dsl
+          cargo fmt --all -- --check
+          cargo build --all-targets
+          cargo clippy --all-targets -- -D warnings
+          cargo test
 
       # crates/blut-worker is a STANDALONE workspace (it path-depends on the
       # engine but is not a member of the root [workspace]), so none of the

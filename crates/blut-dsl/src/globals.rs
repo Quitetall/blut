@@ -23,7 +23,7 @@ use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::values::Value;
 
-use super::builder::PlanDraft;
+use crate::builder::PlanDraft;
 
 /// Evaluator-`extra` state: the plan draft the `add()` builtin appends to.
 #[derive(Debug, Default, ProvidesStaticType)]

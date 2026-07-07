@@ -161,7 +161,10 @@ pub fn scan_user_recipes() -> Vec<(String, PathBuf)> {
 
 /// Path-injectable [`scan_user_recipes`] (the default scans
 /// [`user_recipes_dir`]). Lets tests drive a tempdir without mutating the
-/// process environment.
+/// process environment. Lists `.toml` chains, `.star` scripts, and `.json`
+/// PlanSpecs (ADR 0078). The listed name is the recipe's declared name for
+/// `.toml`/`.json`, else the file stem (a `.star` name isn't known without
+/// evaluating it, which needs args).
 pub fn scan_user_recipes_at(dir: &Path) -> Vec<(String, PathBuf)> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -169,12 +172,31 @@ pub fn scan_user_recipes_at(dir: &Path) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
     for entry in rd.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-            continue;
-        }
-        match DeclarativeRecipe::load(&path) {
-            Ok(r) => out.push((r.name, path)),
-            Err(e) => tracing::warn!("skipping declarative recipe {}: {e}", path.display()),
+        let stem = || {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string()
+        };
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("toml") => match DeclarativeRecipe::load(&path) {
+                Ok(r) => out.push((r.name, path)),
+                Err(e) => tracing::warn!("skipping declarative recipe {}: {e}", path.display()),
+            },
+            Some("star") => out.push((stem(), path)),
+            Some("json") => {
+                // Prefer the PlanSpec's declared name; fall back to the stem
+                // (a non-PlanSpec .json is listed by stem, not skipped).
+                let name = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|b| {
+                        serde_json::from_str::<crate::framework::plan_spec::PlanSpec>(&b).ok()
+                    })
+                    .map(|s| s.name)
+                    .unwrap_or_else(stem);
+                out.push((name, path));
+            }
+            _ => continue,
         }
     }
     out.sort();
@@ -254,5 +276,35 @@ mod tests {
         // Only the parseable .toml surfaces; garbage is skipped, .txt ignored.
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, "good");
+    }
+
+    #[test]
+    fn scan_lists_star_and_json_recipes() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::write(
+            td.path().join("t.toml"),
+            "name = \"tchain\"\n[[stages]]\nstage = \"x\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            td.path().join("fan.star"),
+            "def build(args):\n    add(\"a\")\n",
+        )
+        .unwrap();
+        std::fs::write(
+            td.path().join("spec.json"),
+            r#"{"name":"jspec","nodes":[{"stage":"a"}],"edges":[]}"#,
+        )
+        .unwrap();
+        let found = scan_user_recipes_at(td.path());
+        let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
+        // .star listed by file stem; .json + .toml by declared name.
+        assert!(names.contains(&"fan"), "star listed by stem: {names:?}");
+        assert!(
+            names.contains(&"jspec"),
+            "json listed by PlanSpec name: {names:?}"
+        );
+        assert!(names.contains(&"tchain"), "toml listed by name: {names:?}");
+        assert_eq!(found.len(), 3);
     }
 }
