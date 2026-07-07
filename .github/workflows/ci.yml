@@ -94,6 +94,18 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test
 
+      # crates/blut-operator is a STANDALONE workspace (kube-rs + k8s-openapi
+      # live ONLY here — the engine has zero kube dep, ADR 0037). Gate it or the
+      # CRD derives / reconcilers rot silently. The kind/MinIO end-to-end smoke
+      # is a separate, heavier job (not per-PR).
+      - name: Build + lint + test blut-operator (standalone workspace)
+        working-directory: crates/blut-operator
+        run: |
+          cargo fmt --all -- --check
+          cargo build --all-targets
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
   macos-build:
     name: macOS compile-check (containment degrades)
     runs-on: macos-latest
