@@ -54,6 +54,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fuzz_plan_spec"
+path = "fuzz_targets/fuzz_plan_spec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_erased_artifact"
 path = "fuzz_targets/fuzz_erased_artifact.rs"
 test = false

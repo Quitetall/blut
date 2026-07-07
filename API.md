@@ -61,6 +61,69 @@ A `RecipeDef` carries `name`, `description`, `backend_id`, `category`,
 `input_kinds`, `output_kind`, an args JSON-schema fn, and a compile fn that
 parses args → a backend-erased `CompiledPlan`.
 
+## Declared recipes: `.toml` / `.json` / `.star` (ADR 0078)
+
+Beyond compiled `RecipeDef`s, `blut recipe declare <file>` compiles a recipe
+authored as data, dispatching by extension. All three resolve stage **names**
+against the registered cookbooks (no dynamic code loading) and are fully
+kind-checked before anything runs.
+
+| Extension | Shape | Notes |
+|---|---|---|
+| `.toml` | a linear chain of `{stage, args}` | the original declarative path (`DeclarativeRecipe`) |
+| `.json` | a `PlanSpec` (arbitrary DAG + map fan-outs) | the engine-native IR — also the Python-SDK door |
+| `.star` | a Starlark script | evaluated OUT OF PROCESS by the `blut-dsl` binary |
+
+**`PlanSpec` (v1)** — `framework::plan_spec::{PlanSpec, SpecNode, MapSpec}`, the
+stable, versioned wire IR. Evolve additive-only (`#[serde(default)]`); bump
+`version` only on a breaking change.
+
+```json
+{
+  "name": "demo",
+  "nodes": [ {"stage": "prepare_data", "args": {"corpus": "tuh"}},
+             {"stage": "train_model",  "args": {"tier": 5}} ],
+  "edges": [ [0, 1] ],
+  "expansions": [
+    { "parent": 0,
+      "template": {"name": "t", "nodes": [{"stage": "eval_shard"}], "edges": [], "expansions": []},
+      "label": "shard" }
+  ],
+  "version": 1
+}
+```
+
+- `edges` are `[producer, consumer]` index pairs; **edge order into a node is
+  the tuple-element order** a merge consumes (`tuple<N>` input).
+- `expansions` are typed runtime fan-outs (`map_output`): when `nodes[parent]`
+  completes with a `ListOf<E>` output, the engine runs `template` once per
+  element, seeding its single root with the element. The template's root must
+  take `E` (kind-checked at compile); nested maps are rejected in v1.
+- `PlanSpec::compile(&Registry) -> CompiledPlan`; `provenance_fingerprint`
+  hashes `(source, args, spec)` for lineage.
+
+**`.star` contract** (evaluated by `blut-dsl`, hermetic — no `load()`/IO/clock/
+randomness, so a script's plan is a pure function of `(source, args)`):
+
+```python
+def build(args):                       # required entry point
+    root = add("prepare_data", {"corpus": args["corpus"]})   # -> handle (int)
+    heads = []
+    for t in args["tiers"]:            # compile-time fan-out: a plain loop
+        heads.append(add("train", {"tier": t}, after=root))
+    merged = add("compare", after=heads)                     # list after = merge
+    def per_shard():                   # a map template (its first add = the root)
+        add("eval_item")               # consumes the list element at runtime
+    map_output(root_producing_a_list, per_shard, label="shard")
+```
+
+`add(stage, args=None, *, after=None) -> int` and
+`map_output(parent, body, *, label=None)` are the whole surface; handles are
+plain ints. The `blut-dsl` binary emits the resulting `PlanSpec` JSON on
+stdout, which the engine consumes via the `.json` path. (Starlark is kept
+out-of-process because it forces `serde_json/arbitrary_precision`, which would
+break the engine's internally-tagged enums — see ADR 0078.)
+
 ## Config (`config/`) — Hydra compose, sweeps, launchers
 
 Native, in-tree **Hydra-style config compose** (`config::hydra` —

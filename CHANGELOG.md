@@ -10,6 +10,22 @@ depend on this crate.
 
 ## [Unreleased]
 
+### Added
+- **Typed dynamic DAGs (ADR 0078).** `blut recipe declare` now accepts a
+  `.json` [`PlanSpec`](API.md) (arbitrary kind-checked DAG) and a `.star`
+  Starlark script alongside the existing linear `.toml`. `PlanSpec` is the
+  engine-native, versioned plan IR — also the door for a future Python SDK.
+  - `CompiledPlan::from_erased_graph` extends the before-execution kind check
+    from linear chains to arbitrary fork/merge DAGs.
+  - **`map_output`** typed runtime fan-out: a stage whose output is a
+    `ListOf<E>` fans out one sub-plan (template) per element, executed on the
+    parallel executor's completion seam with cache-stable shard keys.
+  - The Starlark front-end ships as a SEPARATE binary, `crates/blut-dsl`
+    (`blut-dsl <script.star> --args <json>` → `PlanSpec` JSON), which the
+    engine shells out to. `starlark` is kept out of the engine binary because
+    it forces `serde_json/arbitrary_precision` — incompatible with the
+    engine's internally-tagged enums under Cargo feature unification.
+
 ## [1.0.0] — 2026-06-19
 
 **First public release (crates.io).** The engine is now a pure, decoupled,

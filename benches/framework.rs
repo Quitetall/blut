@@ -429,6 +429,31 @@ fn bench_plan_compile(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+
+    // from_erased_graph — the typed dynamic-DAG path (ADR 0078): the
+    // full-topology kind-check + acyclicity walk on a 1k-node plan. Bounds the
+    // compile cost a scripted/JSON PlanSpec pays before execution.
+    c.bench_function("plan from_erased_graph (1k linear)", |b| {
+        b.iter_batched(
+            || {
+                let a = serde_json::json!({});
+                let mut nodes: Vec<(Arc<dyn StageDyn>, serde_json::Value)> =
+                    vec![(Arc::new(MakeA), a.clone())];
+                for _ in 1..1000 {
+                    nodes.push((Arc::new(AToA), a.clone()));
+                }
+                let edges: Vec<(u32, u32)> = (1..1000u32).map(|i| (i - 1, i)).collect();
+                (nodes, edges)
+            },
+            |(nodes, edges)| {
+                let plan =
+                    CompiledPlan::from_erased_graph("g", serde_json::json!({}), nodes, edges)
+                        .unwrap();
+                black_box(plan);
+            },
+            BatchSize::SmallInput,
+        );
+    });
 }
 
 fn bench_status_emit(c: &mut Criterion) {
