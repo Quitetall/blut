@@ -518,9 +518,6 @@ pub struct CompiledPlan {
 
 /// One compiled runtime fan-out (ADR 0078). Attached to a [`CompiledPlan`];
 /// the executor consults it on the completion seam.
-// dead_code: the fields are read by the executor's completion-seam expander,
-// which lands in the next sub-phase (Phase 4c); tests read them already.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct MapExpansion {
     /// The node whose `list` output drives the fan-out.
@@ -535,8 +532,6 @@ pub(crate) struct MapExpansion {
 /// A kind-checked map template: like a [`CompiledPlan`] but its single root
 /// consumes a list ELEMENT (kind `elem_kind`) supplied at runtime, so it
 /// carries no `initial` seeding. Cloned per element at expansion time.
-// dead_code: consumed by the executor's expander in Phase 4c (see above).
-#[allow(dead_code)]
 pub(crate) struct CompiledTemplate {
     /// The sole root node (0 predecessors), which takes the element.
     pub root: NodeId,
@@ -544,6 +539,23 @@ pub(crate) struct CompiledTemplate {
     pub edges: Vec<PlanEdge>,
     /// The element `KIND` the root consumes (== the parent's element kind).
     pub elem_kind: String,
+}
+
+impl CompiledTemplate {
+    /// Instantiate this template as a standalone [`CompiledPlan`] (cloning its
+    /// nodes/edges). The root's input is supplied at injection time via
+    /// `SpawnDelta::root_seeds`, so `initial` is empty. Cheap: `PlanNode`
+    /// clones are `Arc`-backed.
+    pub(crate) fn instantiate(&self, name: String) -> CompiledPlan {
+        CompiledPlan {
+            name,
+            nodes: self.nodes.clone(),
+            edges: self.edges.clone(),
+            initial: HashMap::new(),
+            recipe_args: serde_json::Value::Null,
+            expansions: Vec::new(),
+        }
+    }
 }
 
 impl CompiledPlan {
@@ -562,8 +574,6 @@ impl CompiledPlan {
 
     /// The plan's runtime `map_output` expansions (ADR 0078). Crate-internal
     /// (the executor + tests read it); empty for a plain DAG.
-    // dead_code: the executor reads this on the completion seam in Phase 4c.
-    #[allow(dead_code)]
     pub(crate) fn expansions(&self) -> &[MapExpansion] {
         &self.expansions
     }

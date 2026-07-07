@@ -43,8 +43,10 @@ pub enum Control {
     /// Inject a new sub-plan into the running graph (its nodes become new
     /// graph nodes; its graph-inputs seed the roots). For PBT a perturbed
     /// clone's `--resume-from` is baked into the sub-plan's args by the
-    /// policy's factory, so the executor stays oblivious to resume.
-    Spawn(SpawnDelta),
+    /// policy's factory, so the executor stays oblivious to resume. Boxed so
+    /// the common `Continue`/`KillBranch` returns aren't a big-`SpawnDelta`
+    /// wide value.
+    Spawn(Box<SpawnDelta>),
 }
 
 /// PartialEq for `Control` compares the control INTENT: the unit variants by
@@ -71,6 +73,32 @@ pub struct SpawnDelta {
     pub subplan: crate::framework::plan::CompiledPlan,
     /// Optional provenance label (e.g. a PBT child trial id) for logging.
     pub label: Option<String>,
+    /// Root seeds (ADR 0078 `map_output`): `(local_root_id, artifact,
+    /// logical_hash)` triples that seed the sub-plan's roots with a SPECIFIC
+    /// input instead of the unit graph input. Empty for a disconnected spawn
+    /// (PBT/TPE) — then the sub-plan's own `initial` seeds its roots, exactly
+    /// as before. Non-empty for a map element: the element artifact.
+    pub root_seeds: Vec<(
+        crate::framework::plan::NodeId,
+        crate::framework::stage::ErasedArtifact,
+        crate::framework::artifact::ContentHash,
+    )>,
+    /// The global node id whose `list` output produced this spawn (map
+    /// provenance); `None` for PBT/TPE spawns.
+    pub provenance_parent: Option<crate::framework::plan::NodeId>,
+}
+
+impl SpawnDelta {
+    /// A plain disconnected sub-plan spawn (PBT/TPE): no root seeds, no map
+    /// provenance. The sub-plan's own graph-inputs seed its roots.
+    pub fn new(subplan: crate::framework::plan::CompiledPlan, label: Option<String>) -> Self {
+        Self {
+            subplan,
+            label,
+            root_seeds: Vec::new(),
+            provenance_parent: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for SpawnDelta {

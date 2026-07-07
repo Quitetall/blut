@@ -245,10 +245,10 @@ impl ControlPolicy for PbtPolicy {
             PbtDecision::Continue => Control::Continue,
             PbtDecision::Kill => Control::KillBranch,
             PbtDecision::Spawn { overlay, resume } => match (self.factory)(&overlay, &resume) {
-                Ok(subplan) => Control::Spawn(SpawnDelta {
+                Ok(subplan) => Control::Spawn(Box::new(SpawnDelta::new(
                     subplan,
-                    label: Some(format!("pbt-clone<-t{}", resume.winner_trial)),
-                }),
+                    Some(format!("pbt-clone<-t{}", resume.winner_trial)),
+                ))),
                 Err(e) => {
                     tracing::warn!("pbt clone factory failed: {e}");
                     Control::Continue

@@ -401,10 +401,10 @@ impl ControlPolicy for TpePolicy {
         match self.decide(trial, obj, budget) {
             TpeDecision::Continue => Control::Continue,
             TpeDecision::Spawn(overlay) => match (self.factory)(&overlay) {
-                Ok(subplan) => Control::Spawn(SpawnDelta {
+                Ok(subplan) => Control::Spawn(Box::new(SpawnDelta::new(
                     subplan,
-                    label: Some("tpe-suggest".into()),
-                }),
+                    Some("tpe-suggest".into()),
+                ))),
                 Err(e) => {
                     tracing::warn!("tpe suggest factory failed: {e}");
                     Control::Continue

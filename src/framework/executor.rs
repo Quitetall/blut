@@ -1506,7 +1506,11 @@ fn inject_spawn(
     logical_outputs: &mut HashMap<NodeId, ContentHash>,
 ) -> Result<usize, PlanError> {
     use crate::framework::plan::PlanEdge;
-    let subplan = delta.subplan;
+    let crate::framework::control::SpawnDelta {
+        subplan,
+        root_seeds,
+        ..
+    } = delta;
     // Local topo order (also the cycle/empty check) BEFORE we mutate anything.
     let local_order = subplan.topo_order()?;
     let base = (orig_n + appended.len()) as NodeId;
@@ -1543,6 +1547,15 @@ fn inject_spawn(
         let lh = content_hash_from_erased(&art);
         outputs.insert(gid, art);
         logical_outputs.insert(gid, lh);
+    }
+    // Seed explicit root inputs (ADR 0078 `map_output`: the list element).
+    // The seed carries its OWN logical hash (derived from the parent's logical
+    // hash + element index) so children of a nondeterministic parent keep
+    // stable cache keys across reruns.
+    for (local_id, art, logical) in root_seeds {
+        let gid = base + local_id;
+        outputs.insert(gid, art);
+        logical_outputs.insert(gid, logical);
     }
     // Extend topo order (node_idx == position) in the sub-plan's topo order.
     for &lid in &local_order {
@@ -1682,7 +1695,12 @@ pub async fn execute_plan(plan: CompiledPlan, mut ctx: ExecCtx) -> Result<PlanRe
     {
         ctx = ctx.with_control(Arc::new(crate::framework::control::KillOnNaN));
     }
+    // Runtime `map_output` fan-out (ADR 0078) is injected on the parallel
+    // executor's completion seam (the sequential executor has no dynamic-spawn
+    // machinery), so a plan with expansions forces parallel — just as a
+    // control policy does.
     let parallel = ctx.control.is_some()
+        || !plan.expansions().is_empty()
         || std::env::var("BLUT_EXECUTOR")
             .map(|v| v.eq_ignore_ascii_case("parallel"))
             .unwrap_or(false);
@@ -2005,8 +2023,18 @@ impl ParallelExecutor {
             if first_error.is_none() && !pending_spawns.is_empty() {
                 for delta in pending_spawns.drain(..) {
                     if spawns_total >= MAX_RUNTIME_SPAWNS {
+                        // A map_output shard hitting the cap is a WRONG ANSWER
+                        // (a dropped element), so fail the plan loudly — unlike
+                        // an HPO trial, which is best-effort and may be dropped.
+                        if delta.provenance_parent.is_some() {
+                            first_error = Some(PlanError::Other(format!(
+                                "map fan-out exceeded the runtime spawn cap \
+                                 ({MAX_RUNTIME_SPAWNS} nodes); a dropped shard would be a wrong answer"
+                            )));
+                            break;
+                        }
                         tracing::warn!(
-                            "runtime spawn cap {MAX_RUNTIME_SPAWNS} reached; dropping further spawns"
+                            "runtime spawn cap {MAX_RUNTIME_SPAWNS} reached; dropping further HPO spawns"
                         );
                         break;
                     }
@@ -2385,7 +2413,7 @@ impl ParallelExecutor {
                                                     if spawns_total + pending_spawns.len()
                                                         < MAX_RUNTIME_SPAWNS
                                                     {
-                                                        pending_spawns.push(delta);
+                                                        pending_spawns.push(*delta);
                                                     } else {
                                                         tracing::warn!(
                                                             "runtime spawn cap reached; dropping a Spawn from node {node_idx}"
@@ -2512,6 +2540,65 @@ impl ParallelExecutor {
                                         ready.insert(s);
                                     }
                                 }
+                            }
+                        }
+                    }
+
+                    // ADR 0078 `map_output`: if this node drives a fan-out,
+                    // queue one template instance per list element. This runs
+                    // on the LOSSLESS completion seam (the output is promoted
+                    // into `outputs` above) — never a dropped step event — so a
+                    // fan-out can't be missed. The deltas are injected at the
+                    // top of the next loop iteration (the single-threaded
+                    // schedule-mutation seam) via `pending_spawns`.
+                    if first_error.is_none() {
+                        for exp in plan.expansions() {
+                            if exp.parent != outcome.node_id {
+                                continue;
+                            }
+                            // Decode the parent's `list` output into its
+                            // element artifacts (erased — the executor doesn't
+                            // know the concrete element type).
+                            let list_env = match outputs.get(&outcome.node_id) {
+                                Some(a) => a.clone(),
+                                None => continue,
+                            };
+                            let elements = match crate::framework::artifact::decode_list_children(
+                                list_env,
+                            ) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    first_error = Some(PlanError::Other(format!(
+                                        "map over node {}: parent output is not a valid list: {e}",
+                                        outcome.node_id
+                                    )));
+                                    break;
+                                }
+                            };
+                            let parent_logical = logical_outputs
+                                .get(&outcome.node_id)
+                                .copied()
+                                .unwrap_or_else(|| ContentHash::of_bytes(&[]));
+                            let base_label = exp.label.clone().unwrap_or_else(|| "map".into());
+                            for (i, elem) in elements.into_iter().enumerate() {
+                                // Invariant: each element's kind is the element
+                                // kind the template was compiled against (the
+                                // parent produced `ListOf<Item>` where
+                                // `Item::KIND == elem_kind`). Cheap guard
+                                // against a producer/template kind drift.
+                                debug_assert_eq!(
+                                    elem.kind, exp.template.elem_kind,
+                                    "map element kind must match the template's element kind"
+                                );
+                                let label = format!("{base_label}[{i}]");
+                                let subplan = exp.template.instantiate(label.clone());
+                                let elem_logical = map_element_logical(&parent_logical, i);
+                                pending_spawns.push(crate::framework::control::SpawnDelta {
+                                    subplan,
+                                    label: Some(label),
+                                    root_seeds: vec![(exp.template.root, elem, elem_logical)],
+                                    provenance_parent: Some(outcome.node_id),
+                                });
                             }
                         }
                     }
@@ -2730,6 +2817,21 @@ fn content_hash_from_erased(art: &ErasedArtifact) -> ContentHash {
     h.update(art.kind.as_bytes());
     h.update(art.schema.to_le_bytes());
     h.update(&art.payload);
+    ContentHash(h.finalize().into())
+}
+
+/// Logical hash for map element `i` (ADR 0078): derived from the parent's
+/// LOGICAL hash + the index, domain-separated. Using the parent's logical
+/// hash (which is the synthesized-stable fingerprint for a nondeterministic
+/// parent) rather than the element's raw content keeps a shard's downstream
+/// cache key stable across reruns even when the sharder isn't deterministic —
+/// matching the executor's existing DETERMINISTIC=false discipline.
+fn map_element_logical(parent_logical: &ContentHash, i: usize) -> ContentHash {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(b"map-elem");
+    h.update(parent_logical.0);
+    h.update((i as u64).to_le_bytes());
     ContentHash(h.finalize().into())
 }
 

@@ -337,6 +337,15 @@ mod tests {
         }
     }
 
+    fn default_width() -> usize {
+        2
+    }
+    #[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+    struct ShardArgs {
+        #[serde(default = "default_width")]
+        width: usize,
+    }
+
     struct Sharder;
     impl Compatible<LamuTrainerBackend> for Sharder {}
     #[async_trait]
@@ -346,14 +355,14 @@ mod tests {
         const RESOURCES: &'static [Resource] = &[Resource::Cpu];
         type Input = ();
         type Output = crate::framework::artifact::ListOf<Item>;
-        type Args = E;
+        type Args = ShardArgs;
         async fn run(
             &self,
             _c: &StageContext,
             _i: (),
-            _a: &E,
+            a: &ShardArgs,
         ) -> Result<crate::framework::artifact::ListOf<Item>, StageError> {
-            Ok(crate::framework::artifact::ListOf(vec![Item, Item]))
+            Ok(crate::framework::artifact::ListOf(vec![Item; a.width]))
         }
     }
 
@@ -700,5 +709,59 @@ mod tests {
             Err(e) => panic!("expected BadMap, got {e:?}"),
             Ok(_) => panic!("expected BadMap, got Ok"),
         }
+    }
+
+    // ---- map_output runtime execution (ADR 0078, executor 3/n) ----
+
+    #[tokio::test]
+    async fn map_output_fans_out_one_child_per_element() {
+        use crate::framework::executor::{ExecCtx, execute_plan};
+        let reg = toy_registry();
+        let td = tempfile::tempdir().unwrap();
+        // sharder (width-2 list) + a map(item -> A): 1 + 2 spawned children.
+        let plan = map_spec().compile(&reg).unwrap();
+        let r = execute_plan(plan, ExecCtx::new(td.path().to_path_buf()))
+            .await
+            .expect("run");
+        assert_eq!(r.n_stages, 3, "sharder + one child per element");
+        assert!(r.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn map_output_empty_list_spawns_nothing() {
+        use crate::framework::executor::{ExecCtx, execute_plan};
+        let mut spec = map_spec();
+        spec.nodes[0].args = serde_json::json!({ "width": 0 });
+        let reg = toy_registry();
+        let td = tempfile::tempdir().unwrap();
+        let plan = spec.compile(&reg).unwrap();
+        let r = execute_plan(plan, ExecCtx::new(td.path().to_path_buf()))
+            .await
+            .expect("run");
+        assert_eq!(r.n_stages, 1, "empty list → only the sharder runs");
+    }
+
+    #[tokio::test]
+    async fn map_output_children_cache_hit_on_rerun() {
+        use crate::framework::executor::{ExecCtx, execute_plan};
+        let reg = toy_registry();
+        let td = tempfile::tempdir().unwrap();
+        let r1 = execute_plan(
+            map_spec().compile(&reg).unwrap(),
+            ExecCtx::new(td.path().to_path_buf()),
+        )
+        .await
+        .expect("run1");
+        assert_eq!(r1.n_stages, 3);
+        // Second run in the SAME job dir: the sharder AND both shards hit the
+        // cache. The shards' keys are stable because each element's logical
+        // hash derives from the (deterministic) parent's logical hash + index.
+        let r2 = execute_plan(
+            map_spec().compile(&reg).unwrap(),
+            ExecCtx::new(td.path().to_path_buf()),
+        )
+        .await
+        .expect("run2");
+        assert_eq!(r2.n_cache_hits, 3, "sharder + both shards hit on re-run");
     }
 }

@@ -2618,10 +2618,10 @@ impl crate::framework::control::ControlPolicy for SpawnOnce {
         if self.fired.swap(true, Ordering::SeqCst) {
             return Control::Continue;
         }
-        Control::Spawn(crate::framework::control::SpawnDelta {
-            subplan: spawn_subplan(true),
-            label: Some("child".into()),
-        })
+        Control::Spawn(Box::new(crate::framework::control::SpawnDelta::new(
+            spawn_subplan(true),
+            Some("child".into()),
+        )))
     }
 }
 
@@ -2630,10 +2630,10 @@ impl crate::framework::control::ControlPolicy for SpawnOnce {
 struct SpawnEveryStep;
 impl crate::framework::control::ControlPolicy for SpawnEveryStep {
     fn on_step(&self, _m: &StepMetrics) -> Control {
-        Control::Spawn(crate::framework::control::SpawnDelta {
-            subplan: spawn_subplan(false),
-            label: None,
-        })
+        Control::Spawn(Box::new(crate::framework::control::SpawnDelta::new(
+            spawn_subplan(false),
+            None,
+        )))
     }
 }
 
