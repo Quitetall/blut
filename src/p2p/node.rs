@@ -70,6 +70,10 @@ pub trait MeshTaskRunner: Send + Sync {
     async fn run(&self, task: TaskManifest) -> Result<TaskResult, TrainError>;
 }
 
+/// Max distinct peers the gossip address book will hold — a memory bound
+/// against a flood of distinct keys gossiped over many exchanges (A5).
+const MAX_ADDR_BOOK: usize = 4096;
+
 /// A symmetric mesh node.
 pub struct MeshNode {
     server: Arc<P2pServer>,
@@ -80,6 +84,10 @@ pub struct MeshNode {
     runner: Option<Arc<dyn MeshTaskRunner>>,
     /// Live inbound connections, keyed by the peer that dialed us.
     connections: Arc<RwLock<HashMap<PeerId, quinn::Connection>>>,
+    /// Addresses learned via gossip (A5): peer id → last-advertised address.
+    /// Gossip teaches only WHERE a peer is; its identity + keys are confirmed
+    /// at connect time by mutual TLS (A1), never asserted in the gossip itself.
+    addr_book: Arc<RwLock<HashMap<PeerId, SocketAddr>>>,
 }
 
 impl MeshNode {
@@ -115,6 +123,7 @@ impl MeshNode {
             caps,
             runner,
             connections: Arc::new(RwLock::new(HashMap::new())),
+            addr_book: Arc::new(RwLock::new(HashMap::new())),
         });
         let accept = node.clone();
         tokio::spawn(async move { accept.accept_loop().await });
@@ -140,6 +149,28 @@ impl MeshNode {
     /// Local-only (A6) — never shared over the wire.
     pub async fn peer_reputation(&self, id: &PeerId) -> Option<f64> {
         self.server.peers.read().await.get(id).map(|p| p.reputation)
+    }
+
+    /// The address learned for a peer via gossip (A5), if any.
+    pub async fn learned_addr(&self, id: &PeerId) -> Option<SocketAddr> {
+        self.addr_book.read().await.get(id).copied()
+    }
+
+    /// Send a signed peer exchange (A5) to a connected peer. The responder
+    /// verifies + learns the advertised addresses and replies `Ack`.
+    pub async fn send_gossip(
+        &self,
+        conn: &quinn::Connection,
+        exchange: crate::p2p::gossip::PeerExchange,
+    ) -> Result<(), TrainError> {
+        match mesh_request(conn, &MeshFrame::PeerExchange(Box::new(exchange))).await? {
+            MeshFrame::Ack => Ok(()),
+            MeshFrame::Error { message } => Err(TrainError::other(message)),
+            other => Err(TrainError::other(format!(
+                "unexpected gossip response: {}",
+                other.kind()
+            ))),
+        }
     }
 
     /// Dial a seed/peer node and return the connection to dispatch over. The
@@ -298,6 +329,9 @@ impl MeshNode {
                     None,
                 ),
             },
+            // The Ack IS the response (sent by serve_connection's write_frame);
+            // None here is the reputation signal, not "no reply".
+            MeshFrame::PeerExchange(ex) => (self.handle_peer_exchange(*ex).await, None),
             other => (
                 MeshFrame::Error {
                     message: format!("unsupported request: {}", other.kind()),
@@ -305,6 +339,57 @@ impl MeshNode {
                 None,
             ),
         }
+    }
+
+    /// A5: verify a gossiped peer exchange against the SENDER's registry key,
+    /// then learn each advertised address. Gossip populates only the address
+    /// book — identities are confirmed by mutual TLS when the peer is actually
+    /// dialed, so a gossip can widen reachability but never confer trust.
+    async fn handle_peer_exchange(&self, ex: crate::p2p::gossip::PeerExchange) -> MeshFrame {
+        // Bound the message before any work: a single (authenticated but only
+        // Anonymous) peer must not flood us in one exchange.
+        if !ex.within_size_limit() {
+            return MeshFrame::Error {
+                message: "peer exchange exceeds the record limit (rejected)".into(),
+            };
+        }
+        // Drop stale replays (issued_at is a finite-window guard).
+        if !ex.is_fresh(chrono::Utc::now().timestamp()) {
+            return MeshFrame::Error {
+                message: "peer exchange is stale or future-dated (rejected)".into(),
+            };
+        }
+        // We can only verify gossip from a peer we already know (its pubkey is
+        // in our registry). An unknown sender ⇒ can't verify ⇒ reject.
+        let sender_pubkey = {
+            let peers = self.server.peers.read().await;
+            peers.get(&ex.from).map(|p| p.pubkey)
+        };
+        let Some(pubkey) = sender_pubkey else {
+            return MeshFrame::Error {
+                message: "peer exchange from an unknown sender (rejected)".into(),
+            };
+        };
+        if !ex.verify(&pubkey) {
+            return MeshFrame::Error {
+                message: "peer exchange signature failed to verify (rejected)".into(),
+            };
+        }
+        let mut book = self.addr_book.write().await;
+        for record in &ex.records {
+            let id = record.peer_id();
+            // Never learn our own address back from a peer.
+            if id == self.node_id {
+                continue;
+            }
+            // Cap total growth: refresh a known peer's address, but stop taking
+            // NEW ids once the book is full (bounds memory against a flood of
+            // distinct keys across many exchanges).
+            if book.contains_key(&id) || book.len() < MAX_ADDR_BOOK {
+                book.insert(id, record.addr);
+            }
+        }
+        MeshFrame::Ack
     }
 }
 
@@ -540,6 +625,66 @@ mod tests {
         assert!(
             rep.is_some_and(|r| r > 0.5),
             "worker C should have scored scheduler A up from the 0.5 prior, got {rep:?}"
+        );
+    }
+
+    /// A5: a node verifies a gossiped peer exchange from a KNOWN sender and
+    /// learns the advertised addresses; a forged/unknown-sender exchange is
+    /// rejected and teaches nothing.
+    #[tokio::test]
+    async fn gossip_learns_addresses_from_known_sender_only() {
+        use crate::p2p::gossip::{PeerExchange, PeerRecord};
+
+        let (server, server_kp) = spawn_node(NodeCapabilities::default(), {
+            let r: Arc<dyn MeshTaskRunner> = Arc::new(EchoRunner {
+                keypair: Arc::new(KeyPair::generate()),
+            });
+            Some(r)
+        })
+        .await;
+        // Client A dials the server, so the server registers A (mutual TLS) and
+        // can therefore verify A's gossip.
+        let (client, client_kp) = spawn_node(
+            NodeCapabilities {
+                worker: false,
+                scheduler: true,
+            },
+            None,
+        )
+        .await;
+        let conn = client
+            .connect_to(server.local_addr().unwrap(), server_kp.verifying.to_bytes())
+            .await
+            .unwrap();
+
+        // A advertises a (fabricated) peer's address.
+        let advertised_kp = KeyPair::generate();
+        let advertised_id = PeerId::from_pubkey(&advertised_kp.verifying);
+        let record = PeerRecord {
+            pubkey: advertised_kp.verifying,
+            addr: "203.0.113.7:9100".parse().unwrap(),
+        };
+        let now = chrono::Utc::now().timestamp();
+        let ex = PeerExchange::create(&client_kp, now, vec![record]);
+        client
+            .send_gossip(&conn, ex)
+            .await
+            .expect("valid gossip accepted");
+        assert_eq!(
+            server.learned_addr(&advertised_id).await,
+            Some("203.0.113.7:9100".parse().unwrap()),
+            "server learned the gossiped address"
+        );
+
+        // A forged exchange (signed by A but CLAIMING to be from a stranger)
+        // is rejected — the server verifies `from` against its registry.
+        let stranger = KeyPair::generate();
+        let mut forged = PeerExchange::create(&client_kp, now, vec![]);
+        forged.from = PeerId::from_pubkey(&stranger.verifying); // lie about origin
+        let err = client.send_gossip(&conn, forged).await.unwrap_err();
+        assert!(
+            format!("{err}").contains("unknown sender") || format!("{err}").contains("verify"),
+            "forged-origin gossip rejected, got: {err}"
         );
     }
 

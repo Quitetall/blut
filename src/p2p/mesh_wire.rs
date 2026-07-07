@@ -107,6 +107,8 @@ pub enum MeshFrame {
     ChunkIndex(ChunkIndex),
     /// Request the chunks at these index positions (the receiver's missing set).
     ChunkRequest { needed: Vec<u32> },
+    /// A signed peer-address gossip (A5). One-way — the responder just `Ack`s.
+    PeerExchange(Box<crate::p2p::gossip::PeerExchange>),
     /// Generic acknowledgement.
     Ack,
     /// A protocol-level error (either direction).
@@ -126,6 +128,7 @@ impl MeshFrame {
             MeshFrame::Cancel { .. } => "Cancel",
             MeshFrame::ChunkIndex(_) => "ChunkIndex",
             MeshFrame::ChunkRequest { .. } => "ChunkRequest",
+            MeshFrame::PeerExchange(_) => "PeerExchange",
             MeshFrame::Ack => "Ack",
             MeshFrame::Error { .. } => "Error",
         }
@@ -299,6 +302,11 @@ mod tests {
                 total_len: 0,
                 chunk_hashes: Vec::new(),
             }),
+            MeshFrame::PeerExchange(Box::new(crate::p2p::gossip::PeerExchange::create(
+                &KeyPair::generate(),
+                1000,
+                Vec::new(),
+            ))),
             MeshFrame::Ack,
             MeshFrame::Error {
                 message: "boom".into(),
