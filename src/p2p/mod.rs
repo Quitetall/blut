@@ -17,6 +17,7 @@ pub mod crypto;
 pub mod dispatch;
 pub mod job;
 pub mod mesh_wire;
+pub mod node;
 pub mod peer;
 pub mod peer_exec;
 pub mod registry;
@@ -34,6 +35,7 @@ pub use job::P2pJob;
 pub use mesh_wire::{
     MeshFrame, MeshHello, PROTOCOL_VERSION, Wire, accept_request, mesh_request, negotiate,
 };
+pub use node::{MeshNode, MeshTaskRunner, NodeCapabilities};
 pub use peer::{PeerCapabilities, PeerId, PeerInfo};
 pub use registry::PeerRegistry;
 pub use task::{ResourceRequest, TaskManifest, TaskResult};

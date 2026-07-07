@@ -317,6 +317,10 @@ pub struct P2pServer {
     /// mutual TLS auth. `--allow-legacy-peers` turns it on for one transition
     /// release.
     allow_legacy: bool,
+    /// Set by [`shutdown`](Self::shutdown) so an accept loop can tell a
+    /// terminal close from a transient per-connection error and stop cleanly
+    /// instead of spinning.
+    closing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl P2pServer {
@@ -348,7 +352,14 @@ impl P2pServer {
             endpoint,
             peers: Arc::new(RwLock::new(peers)),
             allow_legacy,
+            closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// Whether [`shutdown`](Self::shutdown) has been called — a terminal signal
+    /// for an accept loop (vs. a transient per-connection error).
+    pub fn is_endpoint_closed(&self) -> bool {
+        self.closing.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Accept the next incoming peer connection. Returns the peer's ID
@@ -487,6 +498,8 @@ impl P2pServer {
 
     /// Shut down the server.
     pub fn shutdown(&self) {
+        self.closing
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.endpoint.close(0u32.into(), b"shutdown");
     }
 
