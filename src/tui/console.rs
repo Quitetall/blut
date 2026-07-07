@@ -25,6 +25,46 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::framework::status::{HostedEvent, StageEvent};
 use crate::tui::theme;
 
+/// Which console surface is shown: the at-a-glance home, or a full-screen
+/// drill-down for one instrument. Switched by the number keys.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ConsoleTab {
+    #[default]
+    Home,
+    Plan,
+    Mesh,
+    Broker,
+    Privacy,
+    Cache,
+}
+
+impl ConsoleTab {
+    const ALL: [ConsoleTab; 6] = [
+        ConsoleTab::Home,
+        ConsoleTab::Plan,
+        ConsoleTab::Mesh,
+        ConsoleTab::Broker,
+        ConsoleTab::Privacy,
+        ConsoleTab::Cache,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            ConsoleTab::Home => "Home",
+            ConsoleTab::Plan => "Plan",
+            ConsoleTab::Mesh => "Mesh",
+            ConsoleTab::Broker => "Broker",
+            ConsoleTab::Privacy => "Privacy",
+            ConsoleTab::Cache => "Cache",
+        }
+    }
+    /// Map a `0`–`5` digit to a tab, else `None`.
+    pub(crate) fn from_digit(c: char) -> Option<ConsoleTab> {
+        Self::ALL
+            .get((c as u8).wrapping_sub(b'0') as usize)
+            .copied()
+    }
+}
+
 /// Coarse plan lifecycle phase. The full vocabulary is matched by the renderer;
 /// the demo model only exercises `Running` — live loaders (a completed / failed
 /// run) construct the rest.
@@ -533,22 +573,56 @@ fn node_marker(state: NodeState) -> Span<'static> {
 
 // ── the home dashboard ────────────────────────────────────────────────────
 
-/// Render the console home: status strip, plan pipeline, instrument row, gov.
-pub fn draw_console(f: &mut Frame<'_>, area: Rect, m: &ConsoleModel) {
+/// Render the console: the persistent status strip + tab bar + governance
+/// footer, with the body being either the at-a-glance home or a full-screen
+/// drill-down for `tab`.
+pub fn draw_console(f: &mut Frame<'_>, area: Rect, m: &ConsoleModel, tab: ConsoleTab) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // status strip
-            Constraint::Min(9),    // plan pipeline
-            Constraint::Min(8),    // instruments
+            Constraint::Length(1), // tab bar
+            Constraint::Min(8),    // body (home or drill-down)
             Constraint::Length(1), // governance footer
         ])
         .split(area);
 
     draw_strip(f, rows[0], m);
-    draw_plan(f, rows[1], m);
-    draw_instruments(f, rows[2], m);
+    draw_tabbar(f, rows[1], tab);
+    let body = rows[2];
+    match tab {
+        ConsoleTab::Home => {
+            let b = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(9), Constraint::Min(8)])
+                .split(body);
+            draw_plan(f, b[0], m);
+            draw_instruments(f, b[1], m);
+        }
+        ConsoleTab::Plan => draw_plan(f, body, m),
+        ConsoleTab::Mesh => draw_mesh(f, body, m),
+        ConsoleTab::Broker => draw_broker(f, body, m),
+        ConsoleTab::Privacy => draw_privacy(f, body, m),
+        ConsoleTab::Cache => draw_cache(f, body, m),
+    }
     draw_gov(f, rows[3], m);
+}
+
+fn draw_tabbar(f: &mut Frame<'_>, area: Rect, active: ConsoleTab) {
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    for (i, t) in ConsoleTab::ALL.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", theme::panel_border()));
+        }
+        let cell = format!("{i} {}", t.label());
+        if *t == active {
+            spans.push(Span::styled(cell, theme::tab_active()));
+        } else {
+            spans.push(Span::styled(cell, theme::label()));
+        }
+    }
+    spans.push(Span::styled("   (0–5 switch)", theme::panel_border()));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_strip(f: &mut Frame<'_>, area: Rect, m: &ConsoleModel) {
@@ -890,7 +964,8 @@ mod tests {
         for (w, h) in [(120u16, 40u16), (80, 30), (200, 60), (60, 24)] {
             let backend = TestBackend::new(w, h);
             let mut term = Terminal::new(backend).unwrap();
-            term.draw(|f| draw_console(f, f.area(), &m)).unwrap();
+            term.draw(|f| draw_console(f, f.area(), &m, ConsoleTab::Home))
+                .unwrap();
         }
     }
 
@@ -956,12 +1031,33 @@ mod tests {
     }
 
     #[test]
+    fn every_tab_draws_without_panicking() {
+        theme::detect("always", "unicode");
+        let m = ConsoleModel::demo();
+        for tab in ConsoleTab::ALL {
+            let backend = TestBackend::new(120, 40);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| draw_console(f, f.area(), &m, tab)).unwrap();
+        }
+    }
+
+    #[test]
+    fn from_digit_maps_0_to_5() {
+        assert_eq!(ConsoleTab::from_digit('0'), Some(ConsoleTab::Home));
+        assert_eq!(ConsoleTab::from_digit('2'), Some(ConsoleTab::Mesh));
+        assert_eq!(ConsoleTab::from_digit('5'), Some(ConsoleTab::Cache));
+        assert_eq!(ConsoleTab::from_digit('6'), None);
+        assert_eq!(ConsoleTab::from_digit('x'), None);
+    }
+
+    #[test]
     fn ascii_fallback_draws() {
         theme::detect("never", "ascii");
         let m = ConsoleModel::demo();
         let backend = TestBackend::new(100, 36);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| draw_console(f, f.area(), &m)).unwrap();
+        term.draw(|f| draw_console(f, f.area(), &m, ConsoleTab::Home))
+            .unwrap();
         theme::detect("auto", "auto");
     }
 }

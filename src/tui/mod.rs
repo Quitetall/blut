@@ -393,6 +393,9 @@ const MAX_LOG_LINES: usize = 2000;
 struct App {
     /// The engine-console model (mesh / DAG / broker / ledger / cache / gov).
     console: console::ConsoleModel,
+    /// Which console surface is shown (Home or a drill-down), when `view` is
+    /// `Console`. Switched by the number keys.
+    console_tab: console::ConsoleTab,
     jobs: Vec<JobSummary>,
     selected: ListState,
     log_lines: Vec<String>,
@@ -465,6 +468,7 @@ impl App {
         let catalog: Vec<&'static crate::recipes::RecipeDef> = registry.all().collect();
         Self {
             console: console::ConsoleModel::demo(),
+            console_tab: console::ConsoleTab::Home,
             jobs: Vec::new(),
             selected,
             log_lines: Vec::new(),
@@ -1647,6 +1651,13 @@ fn handle_key_main(app: &mut App, k: event::KeyEvent) {
     match k.code {
         KeyCode::Char('E') => return app.set_view(View::Console),
         KeyCode::Char('K') => return app.set_view(View::Cockpit),
+        // On the Console, 0–5 switch the drill-down tab.
+        KeyCode::Char(c @ '0'..='5') if app.view == View::Console => {
+            if let Some(t) = console::ConsoleTab::from_digit(c) {
+                app.console_tab = t;
+            }
+            return;
+        }
         KeyCode::Char('J') => return app.set_view(View::Jobs),
         KeyCode::Char('L') => return app.set_view(View::Log),
         KeyCode::Char('Y') => return app.set_view(View::System),

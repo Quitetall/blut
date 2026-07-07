@@ -27,6 +27,27 @@ fn ctrl(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
 }
 
+// ── Console drill-down tabs ──
+
+#[test]
+fn console_digit_keys_switch_tabs() {
+    use super::console::ConsoleTab;
+    super::isolate_datasets_db_for_tests();
+    let mut a = App::new(test_registry());
+    // The default landing is the Console home.
+    assert_eq!(a.view, super::View::Console);
+    assert_eq!(a.console_tab, ConsoleTab::Home);
+    handle_key(&mut a, key('2'));
+    assert_eq!(a.console_tab, ConsoleTab::Mesh, "2 → Mesh drill-down");
+    handle_key(&mut a, key('5'));
+    assert_eq!(a.console_tab, ConsoleTab::Cache, "5 → Cache");
+    handle_key(&mut a, key('0'));
+    assert_eq!(a.console_tab, ConsoleTab::Home, "0 → Home");
+    // A digit outside 0–5 is ignored (stays on Home).
+    handle_key(&mut a, key('9'));
+    assert_eq!(a.console_tab, ConsoleTab::Home);
+}
+
 // ── Overlay transitions: None → Picker → Editor → Esc → Ctrl-C ──
 
 #[test]
