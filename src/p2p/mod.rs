@@ -22,6 +22,7 @@ pub mod mesh_wire;
 pub mod node;
 pub mod peer;
 pub mod peer_exec;
+pub mod privacy;
 pub mod registry;
 pub mod smoke;
 pub mod task;
@@ -41,6 +42,7 @@ pub use mesh_wire::{
 };
 pub use node::{MeshNode, MeshTaskRunner, NodeCapabilities};
 pub use peer::{PeerCapabilities, PeerId, PeerInfo};
+pub use privacy::{DpConfig, GradientStatus, PrivacyLedger, gate_gradient_dispatch};
 pub use registry::PeerRegistry;
 pub use task::{ResourceRequest, TaskManifest, TaskResult};
 pub use transport::{P2pClient, P2pServer};
