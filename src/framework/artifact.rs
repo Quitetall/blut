@@ -320,6 +320,13 @@ pub trait Artifact: Send + Sync + serde::Serialize + serde::de::DeserializeOwned
     /// reuse when the change is internal.
     const SCHEMA: u32;
 
+    /// For a LIST artifact (`ListOf<E>`), the `KIND` of its elements;
+    /// `None` for every scalar/tuple artifact. Reported up the erased
+    /// layer as `StageDyn::output_element_kind()` so a typed runtime
+    /// `map_output` fan-out (ADR 0078) can kind-check the template's root
+    /// against the element type before it runs.
+    const ELEMENT_KIND: Option<&'static str> = None;
+
     /// Whether the artifact's `content_hash()` should walk on-disk
     /// bytes (true) or use a cheap fingerprint of path + size +
     /// mtime (false). Default true matches small artifacts where
@@ -698,6 +705,132 @@ fn decode_tuple_children<const N: usize>(
     Ok(children)
 }
 
+// ---------------------------------------------------------------------------
+// ListOf<E> — a homogeneous LIST artifact (ADR 0078 typed `map_output`).
+// ---------------------------------------------------------------------------
+//
+// A stage whose `Output = ListOf<Item>` emits a variable-width list; a
+// runtime `map_output` fan-out spawns one template instance per element. The
+// erased envelope mirrors the tuple envelope (a bincode `Vec<ErasedArtifact>`,
+// one framed element each) EXCEPT the arity is data, not part of the kind:
+// `KIND` is the constant `"list"` and the element type is carried separately
+// via `ELEMENT_KIND` (so the executor can kind-check the map template without
+// knowing the concrete `Item`). The `content_hash` is a merkle over element
+// hashes, domain-separated by `b"list"` + a `u32` count so lists of different
+// lengths can't collide and an empty list has a stable, distinct hash.
+
+const LIST_DOMAIN: &[u8] = b"list";
+
+/// A homogeneous list of artifacts. `KIND = "list"`; the element kind is
+/// reported via [`Artifact::ELEMENT_KIND`]. Produced by a stage that fans a
+/// runtime-sized collection out to a `map_output` template. The `E: Artifact`
+/// bound lives on the impls, not the struct, so the serde derive generates
+/// clean `E: Serialize`/`E: Deserialize` bounds (an `E: Artifact` bound here
+/// would give the derive two ambiguous routes to those traits).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ListOf<E>(pub Vec<E>);
+
+impl<E> ListOf<E> {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<E: Artifact> Artifact for ListOf<E> {
+    const KIND: &'static str = "list";
+    const SCHEMA: u32 = crate::framework::stage::LIST_ENVELOPE_SCHEMA;
+    const ELEMENT_KIND: Option<&'static str> = Some(E::KIND);
+
+    fn content_hash(&self) -> ContentHash {
+        let mut hasher = Sha256::new();
+        hasher.update(LIST_DOMAIN);
+        hasher.update((self.0.len() as u32).to_le_bytes());
+        for e in &self.0 {
+            hasher.update(e.content_hash().0);
+        }
+        let arr: [u8; 32] = hasher.finalize().into();
+        ContentHash(arr)
+    }
+
+    fn primary_path(&self) -> &Path {
+        // Convention: the first element's path (empty list → empty path).
+        // Consumers of a list address elements individually.
+        self.0
+            .first()
+            .map(|e| e.primary_path())
+            .unwrap_or(Path::new(""))
+    }
+
+    fn recompute_content_hash(&self) -> std::io::Result<ContentHash> {
+        // Composite: recompute the merkle from each element's ON-DISK bytes
+        // (the default would see only `primary_path()` and miss the rest).
+        let mut hasher = Sha256::new();
+        hasher.update(LIST_DOMAIN);
+        hasher.update((self.0.len() as u32).to_le_bytes());
+        for e in &self.0 {
+            hasher.update(e.recompute_content_hash()?.0);
+        }
+        let arr: [u8; 32] = hasher.finalize().into();
+        Ok(ContentHash(arr))
+    }
+
+    fn encode_erased(
+        &self,
+    ) -> Result<crate::framework::stage::ErasedArtifact, crate::framework::stage::ErasedEncodeError>
+    {
+        use crate::framework::stage::{ErasedArtifact, ErasedEncodeError};
+        let children = self
+            .0
+            .iter()
+            .map(|e| e.encode_erased())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ErasedArtifact {
+            kind: Self::KIND.to_string(),
+            schema: Self::SCHEMA,
+            payload: bincode::serialize(&children).map_err(ErasedEncodeError::Serialize)?,
+        })
+    }
+
+    fn decode_erased(
+        e: crate::framework::stage::ErasedArtifact,
+    ) -> Result<Self, crate::framework::stage::ErasedDecodeError> {
+        let children = decode_list_children(e)?;
+        let items = children
+            .into_iter()
+            .map(E::decode_erased)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ListOf(items))
+    }
+}
+
+/// Validate a `list` envelope's kind + schema and return its element
+/// `ErasedArtifact`s (arity is data, so any count is valid). This is the
+/// erased-level unpack the executor's runtime fan-out uses — it must split a
+/// list into elements WITHOUT knowing the concrete element type.
+pub(crate) fn decode_list_children(
+    e: crate::framework::stage::ErasedArtifact,
+) -> Result<Vec<crate::framework::stage::ErasedArtifact>, crate::framework::stage::ErasedDecodeError>
+{
+    use crate::framework::stage::ErasedDecodeError;
+    let expected_kind = <ListOf<()> as Artifact>::KIND;
+    if e.kind != expected_kind {
+        return Err(ErasedDecodeError::Kind {
+            expected: expected_kind,
+            got: e.kind,
+        });
+    }
+    if e.schema != crate::framework::stage::LIST_ENVELOPE_SCHEMA {
+        return Err(ErasedDecodeError::Schema {
+            expected: crate::framework::stage::LIST_ENVELOPE_SCHEMA,
+            got: e.schema,
+        });
+    }
+    bincode::deserialize(&e.payload).map_err(ErasedDecodeError::Deserialize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -968,6 +1101,86 @@ mod tests {
                 expected: 2,
                 got: 1
             })
+        ));
+    }
+
+    // --------- ListOf<E> envelope (ADR 0078) ----------------------
+
+    fn art(byte: u8) -> TestArt {
+        TestArt {
+            byte,
+            path: PathBuf::from(format!("/{byte}")),
+        }
+    }
+
+    #[test]
+    fn list_envelope_round_trips_and_reports_element_kind() {
+        use crate::framework::stage::LIST_ENVELOPE_SCHEMA;
+        let list = ListOf(vec![art(1), art(2), art(3)]);
+        assert_eq!(<ListOf<TestArt> as Artifact>::KIND, "list");
+        assert_eq!(
+            <ListOf<TestArt> as Artifact>::ELEMENT_KIND,
+            Some("test.art")
+        );
+        let env = list.encode_erased().unwrap();
+        assert_eq!(env.kind, "list");
+        assert_eq!(env.schema, LIST_ENVELOPE_SCHEMA);
+        let back: ListOf<TestArt> = ListOf::decode_erased(env).unwrap();
+        assert_eq!(back.len(), 3);
+        assert_eq!(back.0[1].byte, 2);
+    }
+
+    #[test]
+    fn empty_list_round_trips_with_a_distinct_stable_hash() {
+        let empty = ListOf::<TestArt>(vec![]);
+        assert!(empty.is_empty());
+        let env = empty.encode_erased().unwrap();
+        let back: ListOf<TestArt> = ListOf::decode_erased(env).unwrap();
+        assert_eq!(back.len(), 0);
+        // Empty list's hash is stable and differs from a 1-element list.
+        assert_eq!(
+            empty.content_hash(),
+            ListOf::<TestArt>(vec![]).content_hash()
+        );
+        assert_ne!(empty.content_hash(), ListOf(vec![art(1)]).content_hash());
+    }
+
+    #[test]
+    fn list_content_hash_is_order_and_length_sensitive() {
+        let ab = ListOf(vec![art(1), art(2)]).content_hash();
+        let ba = ListOf(vec![art(2), art(1)]).content_hash();
+        let a = ListOf(vec![art(1)]).content_hash();
+        assert_ne!(ab, ba, "order-sensitive");
+        assert_ne!(ab, a, "length-sensitive");
+    }
+
+    #[test]
+    fn decode_list_children_splits_without_the_element_type() {
+        // The erased-level unpack the executor's fan-out uses.
+        let list = ListOf(vec![art(5), art(6)]);
+        let env = list.encode_erased().unwrap();
+        let children = super::decode_list_children(env).unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].kind, "test.art");
+    }
+
+    #[test]
+    fn decode_list_children_rejects_a_non_list_envelope() {
+        use crate::framework::stage::{ErasedArtifact, ErasedDecodeError};
+        let tup = (art(1), art(2)).encode_erased().unwrap();
+        assert!(matches!(
+            super::decode_list_children(tup),
+            Err(ErasedDecodeError::Kind { got, .. }) if got == "tuple<2>"
+        ));
+        // Wrong schema on a list-kinded envelope is also caught.
+        let bad = ErasedArtifact {
+            kind: "list".into(),
+            schema: 999,
+            payload: bincode::serialize(&Vec::<ErasedArtifact>::new()).unwrap(),
+        };
+        assert!(matches!(
+            super::decode_list_children(bad),
+            Err(ErasedDecodeError::Schema { .. })
         ));
     }
 

@@ -76,6 +76,14 @@ pub struct ErasedArtifact {
 /// envelopes it builds — keep them equal.
 pub const TUPLE_ENVELOPE_SCHEMA: u32 = 2;
 
+/// Envelope schema for the `list` artifact (`ListOf<E>`): a bincode
+/// `Vec<ErasedArtifact>`, one framed element each. The [`ListOf`] `Artifact`
+/// impl and the executor's runtime-fan-out decoder stamp/expect this value —
+/// keep them equal. (ADR 0078 typed `map_output`.)
+///
+/// [`ListOf`]: crate::framework::artifact::ListOf
+pub const LIST_ENVELOPE_SCHEMA: u32 = 1;
+
 impl ErasedArtifact {
     /// Wrap a concrete typed artifact for transit across the
     /// `StageDyn` boundary. Delegates to [`Artifact::encode_erased`]
@@ -470,6 +478,13 @@ pub trait StageDyn: Send + Sync + 'static {
     }
     fn input_kind(&self) -> &'static str;
     fn output_kind(&self) -> &'static str;
+    /// If this stage's output is a `list` (`ListOf<E>`), the element `KIND`;
+    /// `None` otherwise. Used by a typed runtime `map_output` fan-out to
+    /// kind-check the template's root against the element type (ADR 0078).
+    /// Defaulted `None` so manual `StageDyn` impls need not opt in.
+    fn output_element_kind(&self) -> Option<&'static str> {
+        None
+    }
     fn args_schema(&self) -> serde_json::Value;
     fn retry(&self) -> crate::framework::retry::RetryPolicy;
     fn timeout(&self) -> crate::framework::retry::StageTimeout;
@@ -660,6 +675,9 @@ impl<S: Stage> StageDyn for S {
     }
     fn output_kind(&self) -> &'static str {
         <S::Output as Artifact>::KIND
+    }
+    fn output_element_kind(&self) -> Option<&'static str> {
+        <S::Output as Artifact>::ELEMENT_KIND
     }
     fn args_schema(&self) -> serde_json::Value {
         // schemars 0.8: schema_for! is a proc macro requiring a

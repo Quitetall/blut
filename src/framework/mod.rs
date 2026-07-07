@@ -46,7 +46,7 @@ pub mod retry;
 pub mod stage;
 pub mod status;
 
-pub use artifact::{Artifact, ArtifactMetadata, ContentHash};
+pub use artifact::{Artifact, ArtifactMetadata, ContentHash, ListOf};
 pub use cache::{CacheHandle, CacheHit, lru_prune};
 pub use compat::Compatible;
 pub use cookbook::{ArtifactDescriptor, Cookbook, Registry, StageDescriptor};
