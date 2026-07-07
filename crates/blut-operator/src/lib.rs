@@ -10,6 +10,7 @@
 //! called in-process here.
 
 pub mod crds;
+pub mod reconcile;
 
 pub use crds::{
     BlutPlan, BlutPlanSpec, BlutPlanStatus, BlutWorkerPool, BlutWorkerPoolSpec,
