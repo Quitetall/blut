@@ -390,6 +390,29 @@ impl ConsoleModel {
         true
     }
 
+    /// Overlay the real broker memory-admission state: the box-fit budget
+    /// (`MemTotal − floor`), the headroom the gate can still admit
+    /// (`MemAvailable − floor`), and the held remainder. This is the never-OOM
+    /// guarantee visualized. Names the top holder as the running stage, if any.
+    pub fn apply_broker(&mut self) {
+        use crate::broker::admission::DEFAULT_FLOOR_GIB;
+        use crate::broker::probe::ResourceSnapshot;
+        let snap = ResourceSnapshot::probe();
+        if snap.mem_total_gb <= 0.0 {
+            return; // probe unavailable (non-Linux) — keep the representative panel
+        }
+        let budget = (snap.mem_total_gb - DEFAULT_FLOOR_GIB).max(0.0);
+        let headroom = (snap.mem_avail_gb - DEFAULT_FLOOR_GIB).max(0.0);
+        let held = (budget - headroom).max(0.0);
+        self.broker.budget_gib = budget.round() as u32;
+        self.broker.headroom_gib = headroom.round() as u32;
+        self.broker.held_gib = held.round() as u32;
+        self.broker.top_stage = match self.dag.iter().find(|n| n.state == NodeState::Running) {
+            Some(n) => format!("{} + system", n.name),
+            None => "system".into(),
+        };
+    }
+
     /// Overlay the real symmetric mesh from the peer registry (`peers.json`),
     /// if present + non-empty. Peers only (the local node isn't in the
     /// registry). No-op when the `p2p` feature is off.

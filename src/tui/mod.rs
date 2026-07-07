@@ -989,6 +989,7 @@ impl App {
                 m.plan = name.clone();
             }
         }
+        m.apply_broker();
         // Overlay the real mesh + ε budgets when the p2p plane is compiled in.
         #[cfg(feature = "p2p")]
         {
