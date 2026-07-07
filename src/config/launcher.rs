@@ -934,6 +934,11 @@ pub enum LaunchTarget {
     Ray,
     /// P2P distributed compute (peer GPUs over QUIC).
     P2P,
+    /// A Kubernetes cluster via a generated `BlutPlan` (`kubectl apply -f -`).
+    /// K8s is an adapter (ADR 0037): the engine emits the manifest textually
+    /// and shells `kubectl` — zero kube deps in the engine; the operator crate
+    /// owns the reconcile loop.
+    K8s,
 }
 
 impl std::str::FromStr for LaunchTarget {
@@ -944,8 +949,9 @@ impl std::str::FromStr for LaunchTarget {
             "slurm" => Ok(Self::Slurm),
             "ray" => Ok(Self::Ray),
             "p2p" => Ok(Self::P2P),
+            "k8s" | "kubernetes" => Ok(Self::K8s),
             other => Err(TrainError::other(format!(
-                "unknown launcher '{other}' (expected local|slurm|ray|p2p)"
+                "unknown launcher '{other}' (expected local|slurm|ray|p2p|k8s|kubernetes)"
             ))),
         }
     }
@@ -978,6 +984,10 @@ pub fn launcher_for(target: LaunchTarget) -> Box<dyn Launcher> {
         // P2P dispatch is handled by DispatchSubmitter, not Launcher.
         // Fall through to LocalSystemd for local process management.
         LaunchTarget::P2P => Box::new(LocalSystemd::default()),
+        // K8s submits a whole BlutPlan manifest (see `k8s::submit_plan`), not a
+        // wrapped local process; fall through to LocalSystemd for any local
+        // process management on the submitting side.
+        LaunchTarget::K8s => Box::new(LocalSystemd::default()),
     }
 }
 
@@ -1111,7 +1121,8 @@ mod tests {
         );
         assert_eq!(LaunchTarget::from_str("RAY").unwrap(), LaunchTarget::Ray);
         assert_eq!(LaunchTarget::from_str("").unwrap(), LaunchTarget::Local);
-        assert!(LaunchTarget::from_str("k8s").is_err());
+        assert_eq!(LaunchTarget::from_str("k8s").unwrap(), LaunchTarget::K8s);
+        assert!(LaunchTarget::from_str("mesos").is_err());
         // The factory maps target → the matching launcher kind.
         assert_eq!(
             launcher_for(LaunchTarget::Slurm)

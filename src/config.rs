@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use crate::error::{Result, TrainError};
 
 pub mod hydra;
+pub mod k8s;
 pub mod launcher;
 pub mod partition;
 pub mod sweep;
