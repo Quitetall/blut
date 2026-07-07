@@ -15,6 +15,7 @@ pub mod chunkstore;
 pub mod coordinator;
 pub mod crypto;
 pub mod dispatch;
+pub mod introduction;
 pub mod job;
 pub mod mesh_wire;
 pub mod node;
@@ -31,6 +32,7 @@ pub use chunkstore::{ChunkError, ChunkIndex, ChunkStore};
 pub use coordinator::Coordinator;
 pub use crypto::{EncryptedPayload, KeyPair};
 pub use dispatch::{DefaultDispatchPolicy, DispatchPolicy, DispatchVerdict};
+pub use introduction::{IntroError, Introduction, MAX_INTRODUCED_TRUST};
 pub use job::P2pJob;
 pub use mesh_wire::{
     MeshFrame, MeshHello, PROTOCOL_VERSION, Wire, accept_request, mesh_request, negotiate,
