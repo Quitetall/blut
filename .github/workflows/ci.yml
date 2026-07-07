@@ -60,6 +60,16 @@ jobs:
           cargo clippy -p blut --features p2p --all-targets -- -D warnings
           cargo test -p blut --features p2p
 
+      # The S3 object-store backend is off-by-default (it pulls the
+      # object_store client + a TLS stack). Gate build + clippy so the
+      # #[cfg(feature = "s3")] S3BlobStore + async bridge can't rot. The MinIO
+      # round-trip test is #[ignore]d (needs an endpoint) — run via
+      # scripts/minio_smoke.sh, not here.
+      - name: Clippy + build the s3 feature
+        run: |
+          cargo clippy -p blut --features s3 --all-targets -- -D warnings
+          cargo test -p blut --features s3 --lib object_store --no-run
+
       # crates/blut-dsl is a STANDALONE workspace (path-deps on the engine).
       # It links `starlark` — and its `serde_json/arbitrary_precision` feature
       # — which is exactly why it lives OUTSIDE the engine (ADR 0078). Gate it

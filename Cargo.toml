@@ -68,6 +68,10 @@ schemars = "0.8"
 tokio-util = "0.7"
 rayon = "1"
 which = "6"
+# S3-compatible object store client (behind the `s3` feature). One dep covers
+# S3/R2/GCS/MinIO. Client only — no HTTP-server surface.
+object_store = { version = "0.11", features = ["aws"], optional = true }
+bytes = { version = "1", optional = true }
 # Local-time quiet-hours (honours host TZ + DST). Minimal: no default
 # features (drops the heavy `oldtime`/`serde`/`wasm` baggage), `clock`
 # pulls only the local-tz lookup.
@@ -103,6 +107,11 @@ default = ["tui"]
 tui = ["dep:ratatui", "dep:crossterm", "dep:fuzzy-matcher"]
 # P2P distributed compute — trust model, encryption, task dispatch.
 p2p = ["dep:ed25519-dalek", "dep:aes-gcm", "dep:x25519-dalek", "dep:blake3", "dep:hkdf", "dep:quinn", "dep:rustls", "dep:webpki", "dep:rcgen"]
+# S3-compatible object store (S3/R2/GCS/MinIO) for the cache's remote tier
+# (ADR 0067 T4.2). An object-store CLIENT — not an HTTP server — so it honors
+# the ADR 0034 no-server charter (scope-guard verified). Non-default: the lean
+# CLI and the firmware/no_std paths never pull it in.
+s3 = ["dep:object_store", "dep:bytes"]
 
 # NOTE (ADR 0078): the Starlark DSL is NOT a feature of this crate. `starlark`
 # hard-depends on `serde_json/arbitrary_precision`, which Cargo feature
