@@ -166,6 +166,35 @@ impl PeerRegistry {
         }
     }
 
+    /// Apply a signed introduction (A4): promote the subject to the trust it
+    /// grants, but NEVER demote (an introduction can't lower an operator-set
+    /// `Trusted` peer). Both the introducer AND the subject must already be
+    /// known — identities are established by mutual TLS on connect (the
+    /// gossip→dial→register→promote flow), so an introduction elevates a peer
+    /// you've met, it doesn't conjure one from keys alone. Returns the subject's
+    /// resulting trust, or an error explaining why nothing changed.
+    pub fn apply_introduction(
+        &mut self,
+        intro: &crate::p2p::introduction::Introduction,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<TrustLevel, TrainError> {
+        let introducer = self
+            .get(&intro.introducer)
+            .ok_or_else(|| TrainError::other("introduction: unknown introducer"))?
+            .clone();
+        let granted = intro
+            .evaluate(&introducer, now)
+            .map_err(|e| TrainError::other(format!("introduction rejected: {e}")))?;
+        let subject = self.get_mut(&intro.subject).ok_or_else(|| {
+            TrainError::other("introduction: subject not yet known (connect first)")
+        })?;
+        // Promote only — never demote.
+        if granted.level() > subject.trust.level() {
+            subject.trust = granted;
+        }
+        Ok(subject.trust)
+    }
+
     /// Number of registered peers.
     pub fn len(&self) -> usize {
         self.peers.len()
@@ -191,6 +220,86 @@ mod tests {
             trust,
             PeerCapabilities::default(),
         )
+    }
+
+    fn peer_from(kp: &KeyPair, trust: TrustLevel) -> PeerInfo {
+        PeerInfo::new(
+            kp.verifying,
+            kp.x25519_public,
+            trust,
+            PeerCapabilities::default(),
+        )
+    }
+
+    fn empty_registry() -> PeerRegistry {
+        PeerRegistry {
+            peers: HashMap::new(),
+            path: PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn apply_introduction_promotes_known_anonymous_subject() {
+        use crate::p2p::introduction::Introduction;
+        let introducer_kp = KeyPair::generate();
+        let subject_kp = KeyPair::generate();
+        let mut reg = empty_registry();
+        reg.upsert(peer_from(&introducer_kp, TrustLevel::Trusted));
+        reg.upsert(peer_from(&subject_kp, TrustLevel::Anonymous));
+
+        let intro = Introduction::create(
+            &introducer_kp,
+            subject_kp.verifying,
+            TrustLevel::Registered,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        );
+        let granted = reg.apply_introduction(&intro, chrono::Utc::now()).unwrap();
+        assert_eq!(granted, TrustLevel::Registered);
+        assert_eq!(
+            reg.get(&intro.subject).unwrap().trust,
+            TrustLevel::Registered
+        );
+    }
+
+    #[test]
+    fn apply_introduction_never_demotes() {
+        use crate::p2p::introduction::Introduction;
+        let introducer_kp = KeyPair::generate();
+        let subject_kp = KeyPair::generate();
+        let mut reg = empty_registry();
+        reg.upsert(peer_from(&introducer_kp, TrustLevel::Trusted));
+        // Subject is already operator-set Trusted.
+        reg.upsert(peer_from(&subject_kp, TrustLevel::Trusted));
+
+        let intro = Introduction::create(
+            &introducer_kp,
+            subject_kp.verifying,
+            TrustLevel::Registered,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        );
+        let granted = reg.apply_introduction(&intro, chrono::Utc::now()).unwrap();
+        // Stays Trusted — an introduction can't lower it.
+        assert_eq!(granted, TrustLevel::Trusted);
+    }
+
+    #[test]
+    fn apply_introduction_rejects_unknown_subject_and_introducer() {
+        use crate::p2p::introduction::Introduction;
+        let introducer_kp = KeyPair::generate();
+        let subject_kp = KeyPair::generate();
+        let intro = Introduction::create(
+            &introducer_kp,
+            subject_kp.verifying,
+            TrustLevel::Registered,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        );
+        // Neither known.
+        let mut reg = empty_registry();
+        assert!(reg.apply_introduction(&intro, chrono::Utc::now()).is_err());
+        // Introducer known but not Trusted → evaluate rejects.
+        reg.upsert(peer_from(&introducer_kp, TrustLevel::Registered));
+        reg.upsert(peer_from(&subject_kp, TrustLevel::Anonymous));
+        assert!(reg.apply_introduction(&intro, chrono::Utc::now()).is_err());
     }
 
     #[test]
