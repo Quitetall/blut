@@ -307,6 +307,191 @@ pub async fn recv_blob(
     }
 }
 
+// ── Deduped + resumable blob transfer (ADR 0067 T4.1 · D1.1) ──────────────────
+
+/// Cap on a control frame (the index / needed-set) before allocation.
+const MAX_CONTROL_FRAME: usize = 16 * 1024 * 1024;
+
+/// Length-prefixed write: `[u32-le len][bytes]`.
+async fn write_lp(stream: &mut quinn::SendStream, bytes: &[u8]) -> Result<(), TrainError> {
+    stream
+        .write_all(&(bytes.len() as u32).to_le_bytes())
+        .await
+        .map_err(|e| TrainError::other(format!("write lp len: {e}")))?;
+    stream
+        .write_all(bytes)
+        .await
+        .map_err(|e| TrainError::other(format!("write lp body: {e}")))
+}
+
+/// Length-prefixed read, capped before allocation.
+async fn read_lp(stream: &mut quinn::RecvStream, cap: usize) -> Result<Vec<u8>, TrainError> {
+    let mut len = [0u8; 4];
+    stream
+        .read_exact(&mut len)
+        .await
+        .map_err(|e| TrainError::other(format!("read lp len: {e}")))?;
+    let n = u32::from_le_bytes(len) as usize;
+    if n > cap {
+        return Err(TrainError::other(format!(
+            "lp frame too large: {n} > {cap}"
+        )));
+    }
+    let mut buf = vec![0u8; n];
+    stream
+        .read_exact(&mut buf)
+        .await
+        .map_err(|e| TrainError::other(format!("read lp body: {e}")))?;
+    Ok(buf)
+}
+
+/// Send a blob with dedup + resume (ADR 0079 data plane): publish it into the
+/// sender's chunk store, offer the [`ChunkIndex`] over a bi-stream, and stream
+/// back ONLY the chunks the receiver says it's missing. A receiver that already
+/// holds chunks (a prior transfer, or a resumed one) requests fewer — so a
+/// re-send of unchanged content moves ~0 bytes.
+pub async fn send_blob_deduped(
+    conn: &QuinnConnection,
+    store: &crate::p2p::chunkstore::ChunkStore,
+    blob: &[u8],
+) -> Result<(), TrainError> {
+    let index = store
+        .put_blob(blob)
+        .map_err(|e| TrainError::other(format!("chunk blob: {e}")))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| TrainError::other(format!("open blob bi-stream: {e}")))?;
+
+    // 1. Offer the index.
+    let idx_bytes = bincode::serialize(&index)
+        .map_err(|e| TrainError::other(format!("serialize chunk index: {e}")))?;
+    write_lp(&mut send, &idx_bytes).await?;
+
+    // 2. Learn the receiver's missing set.
+    let needed_bytes = read_lp(&mut recv, MAX_CONTROL_FRAME).await?;
+    let needed: Vec<u32> = bincode::deserialize(&needed_bytes)
+        .map_err(|e| TrainError::other(format!("decode needed set: {e}")))?;
+    // Fail fast on an implausible request: a receiver can't need more chunks
+    // than the blob has (guards against a bogus/amplifying `needed`).
+    if needed.len() > index.chunk_hashes.len() {
+        return Err(TrainError::other(format!(
+            "receiver requested {} chunks but the blob has {}",
+            needed.len(),
+            index.chunk_hashes.len()
+        )));
+    }
+
+    // 3. Stream only those chunks: `[u32-le seq]` then the length-prefixed bytes.
+    for &seq in &needed {
+        let hash = *index.chunk_hashes.get(seq as usize).ok_or_else(|| {
+            TrainError::other(format!("receiver requested out-of-range chunk {seq}"))
+        })?;
+        let bytes = store
+            .get_chunk(hash)
+            .map_err(|e| TrainError::other(format!("read chunk: {e}")))?
+            .ok_or_else(|| TrainError::other("sender missing a chunk it offered"))?;
+        send.write_all(&seq.to_le_bytes())
+            .await
+            .map_err(|e| TrainError::other(format!("write chunk seq: {e}")))?;
+        write_lp(&mut send, &bytes).await?;
+    }
+    send.finish()
+        .map_err(|e| TrainError::other(format!("finish blob stream: {e}")))?;
+
+    // 4. Completion barrier: wait for the receiver's 1-byte ack (it has
+    //    reassembled + verified) before returning — so neither side tears the
+    //    connection down while stream data is still in flight (esp. the 0-chunk
+    //    resend, where the receiver never reads our send half to EOF).
+    let mut ack = [0u8; 1];
+    recv.read_exact(&mut ack)
+        .await
+        .map_err(|e| TrainError::other(format!("read completion ack: {e}")))?;
+    Ok(())
+}
+
+/// Receive a deduped blob (companion of [`send_blob_deduped`]). Chunks already
+/// in the local `store` are NOT re-fetched; received chunks are hash-verified
+/// on store, so a partially-completed transfer resumes cheaply on reconnect.
+///
+/// Like [`recv_blob`], the caller should wrap this in a timeout: a sender that
+/// stalls mid-transfer leaves this awaiting the next chunk until the connection
+/// dies or the deadline fires.
+pub async fn recv_blob_deduped(
+    conn: &QuinnConnection,
+    store: &crate::p2p::chunkstore::ChunkStore,
+    max_blob_size: u64,
+) -> Result<Vec<u8>, TrainError> {
+    let (mut send, mut recv) = conn
+        .accept_bi()
+        .await
+        .map_err(|e| TrainError::other(format!("accept blob bi-stream: {e}")))?;
+
+    // 1. Read + validate the offered index.
+    let idx_bytes = read_lp(&mut recv, MAX_CONTROL_FRAME).await?;
+    let index: crate::p2p::chunkstore::ChunkIndex = bincode::deserialize(&idx_bytes)
+        .map_err(|e| TrainError::other(format!("decode chunk index: {e}")))?;
+    index
+        .validate()
+        .map_err(|e| TrainError::other(format!("chunk index: {e}")))?;
+    if index.total_len > max_blob_size {
+        return Err(TrainError::other(format!(
+            "blob {} exceeds cap {max_blob_size}",
+            index.total_len
+        )));
+    }
+
+    // 2. Reply the positions we're missing (dedup: skip chunks we already hold).
+    let missing = store
+        .missing(&index)
+        .map_err(|e| TrainError::other(format!("compute missing: {e}")))?;
+    let needed: Vec<u32> = missing.iter().map(|&i| i as u32).collect();
+    // Keep our send half OPEN (don't finish here) — the completion ack rides it.
+    write_lp(
+        &mut send,
+        &bincode::serialize(&needed)
+            .map_err(|e| TrainError::other(format!("serialize needed: {e}")))?,
+    )
+    .await?;
+
+    // 3. Receive exactly the requested chunks; store_chunk verifies each hash.
+    //    Track the still-outstanding positions so a sender that sends a chunk
+    //    we DIDN'T request (or a DUPLICATE) is rejected — otherwise it could
+    //    satisfy a fixed loop count while leaving a real gap, and reassembly
+    //    would fail confusingly. Every requested chunk must arrive exactly once.
+    let mut outstanding: std::collections::HashSet<usize> = missing.iter().copied().collect();
+    while !outstanding.is_empty() {
+        let mut seqb = [0u8; 4];
+        recv.read_exact(&mut seqb)
+            .await
+            .map_err(|e| TrainError::other(format!("read chunk seq: {e}")))?;
+        let seq = u32::from_le_bytes(seqb) as usize;
+        if !outstanding.remove(&seq) {
+            return Err(TrainError::other(format!(
+                "sender sent chunk {seq} that was not outstanding (unrequested or duplicate)"
+            )));
+        }
+        let bytes = read_lp(&mut recv, CHUNK_MAX).await?;
+        // `seq` came from `outstanding` ⊆ the index range, so this is in range.
+        store
+            .store_chunk(index.chunk_hashes[seq], &bytes)
+            .map_err(|e| TrainError::other(format!("store chunk: {e}")))?;
+    }
+
+    // 4. Reassemble from local chunks (deduped + freshly received).
+    let blob = store
+        .reassemble(&index)
+        .map_err(|e| TrainError::other(format!("reassemble blob: {e}")))?;
+
+    // 5. Ack completion so the sender returns cleanly (completion barrier).
+    send.write_all(&[1u8])
+        .await
+        .map_err(|e| TrainError::other(format!("write completion ack: {e}")))?;
+    send.finish()
+        .map_err(|e| TrainError::other(format!("finish ack stream: {e}")))?;
+    Ok(blob)
+}
+
 /// P2P QUIC server — runs on the coordinator, accepts peer connections.
 pub struct P2pServer {
     endpoint: Endpoint,
@@ -1226,6 +1411,73 @@ mod pinned_verifier_tests {
             "server bound the TLS-authenticated identity"
         );
         assert_eq!(client_side_id, expected, "client's own view agrees");
+    }
+
+    /// D1.1: the deduped transfer round-trips a multi-chunk blob over a real
+    /// QUIC bi-stream, and a receiver that ALREADY holds the chunks transfers
+    /// zero of them (the resend/dedup case) yet still reconstructs the blob.
+    #[tokio::test]
+    async fn deduped_blob_transfer_round_trips_and_dedups() {
+        use crate::p2p::chunkstore::{ChunkIndex, ChunkStore};
+        use crate::p2p::transport::{recv_blob_deduped, send_blob_deduped};
+
+        // A 2.5-chunk blob (ragged final chunk).
+        let blob: Vec<u8> = (0..(CHUNK_MAX * 2 + 77)).map(|i| (i % 251) as u8).collect();
+
+        for preseed_all in [false, true] {
+            let (server, server_kp) = bind_loopback_server().await;
+            let addr = server.local_addr().unwrap();
+
+            let recv_dir = tempfile::tempdir().unwrap();
+            let recv_store = ChunkStore::new(recv_dir.path().to_path_buf());
+            if preseed_all {
+                // Receiver already has every chunk → the resend transfers none.
+                recv_store.put_blob(&blob).unwrap();
+            }
+            let index = ChunkIndex::of(&blob);
+            let expected_missing = if preseed_all { 0 } else { index.len() };
+
+            let client_kp = std::sync::Arc::new(KeyPair::generate());
+            let client = P2pClient::with_coordinator_pin(client_kp, server_kp.verifying.to_bytes());
+            let send_dir = tempfile::tempdir().unwrap();
+            let send_store = ChunkStore::new(send_dir.path().to_path_buf());
+
+            // Establish BOTH connections first (accept + connect must overlap —
+            // connect() waits for the ack accept_peer() sends).
+            let (accept_r, connect_r) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    tokio::join!(server.accept_peer(), client.connect(addr))
+                })
+                .await
+                .expect("handshake must not hang");
+            let (_peer, server_conn) = accept_r.expect("accept_peer");
+            let (client_conn, _id) = connect_r.expect("mutual-auth connect");
+
+            let missing_before = recv_store.missing(&index).unwrap().len();
+            // Run both transfer halves concurrently, holding BOTH connections
+            // alive through the join — so the completion ack can't race a
+            // connection teardown.
+            let (send_r, recv_r) =
+                tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                    tokio::join!(
+                        send_blob_deduped(&client_conn, &send_store, &blob),
+                        recv_blob_deduped(&server_conn, &recv_store, u64::MAX),
+                    )
+                })
+                .await
+                .expect("transfer must not hang");
+
+            send_r.expect("send_blob_deduped");
+            let got = recv_r.expect("recv_blob_deduped");
+            assert_eq!(
+                got, blob,
+                "reassembled blob matches (preseed={preseed_all})"
+            );
+            assert_eq!(
+                missing_before, expected_missing,
+                "dedup: preseeded receiver needs 0 chunks (preseed={preseed_all})"
+            );
+        }
     }
 }
 

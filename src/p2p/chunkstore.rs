@@ -157,6 +157,12 @@ impl ChunkStore {
         self.inner.head(hash).map_err(ChunkError::Io)
     }
 
+    /// Fetch a locally-stored chunk's bytes (for the SENDER to transmit a chunk
+    /// the receiver requested). `None` if absent.
+    pub fn get_chunk(&self, hash: ContentHash) -> Result<Option<Vec<u8>>, ChunkError> {
+        self.inner.get(hash).map_err(ChunkError::Io)
+    }
+
     /// Reassemble the full blob from locally-stored chunks. Fails if any chunk
     /// is missing (call [`missing`] first) or the reconstructed length doesn't
     /// match `index.total_len`.
