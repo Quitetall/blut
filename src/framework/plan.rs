@@ -828,7 +828,10 @@ impl CompiledPlan {
             return Err(PlanError::Empty);
         }
         // Edge endpoints must be in range (a dangling index is caught here,
-        // not by a later panic on `nodes[idx]`).
+        // not by a later panic on `nodes[idx]`), and no edge may repeat (a
+        // duplicate would give a merge two copies of one producer instead of
+        // distinct tuple elements).
+        let mut seen_edges = std::collections::HashSet::new();
         for &(from, to) in &edges {
             if from as usize >= n || to as usize >= n {
                 return Err(PlanError::EdgeOutOfRange {
@@ -836,6 +839,9 @@ impl CompiledPlan {
                     to,
                     n_nodes: n,
                 });
+            }
+            if !seen_edges.insert((from, to)) {
+                return Err(PlanError::DuplicateEdge { from, to });
             }
         }
         // Predecessors per node, in EDGE-INSERTION order (= tuple element
@@ -873,7 +879,7 @@ impl CompiledPlan {
                     if in_kind != format!("tuple<{k}>") {
                         return Err(PlanError::BadMergeArity {
                             stage: stage.name().to_string(),
-                            expected: input_arity_of(in_kind),
+                            expected_kind: in_kind.to_string(),
                             got: k,
                         });
                     }
@@ -916,22 +922,6 @@ impl CompiledPlan {
         // Reject cycles (reuses the Kahn walk + `PlanError::Cycle`).
         plan.topo_order()?;
         Ok(plan)
-    }
-}
-
-/// The input arity a stage's `input_kind` implies: `tuple<N>` → N, `()` → 0,
-/// any other single kind → 1. Used only to phrase a `BadMergeArity` error
-/// ("expects an M-tuple but has N predecessors").
-fn input_arity_of(kind: &str) -> usize {
-    if kind == <() as Artifact>::KIND {
-        0
-    } else if let Some(inner) = kind
-        .strip_prefix("tuple<")
-        .and_then(|s| s.strip_suffix('>'))
-    {
-        inner.parse().unwrap_or(1)
-    } else {
-        1
     }
 }
 
@@ -1481,12 +1471,31 @@ mod tests {
             vec![(0, 2), (1, 2)],
         ));
         match err {
-            crate::framework::error::PlanError::BadMergeArity { expected, got, .. } => {
-                assert_eq!(expected, 1);
+            crate::framework::error::PlanError::BadMergeArity {
+                expected_kind, got, ..
+            } => {
+                // AToB's real input kind is shown, not a misleading "1-tuple".
+                assert_eq!(expected_kind, "test.data_a");
                 assert_eq!(got, 2);
             }
             other => panic!("expected BadMergeArity, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn from_erased_graph_rejects_duplicate_edge() {
+        // The same (0,1) edge twice would give node 1 two copies of node 0's
+        // output instead of distinct inputs — rejected up front.
+        let err = expect_err(CompiledPlan::from_erased_graph(
+            "d",
+            serde_json::json!({}),
+            vec![erased(MakeA), erased(AToA)],
+            vec![(0, 1), (0, 1)],
+        ));
+        assert!(matches!(
+            err,
+            crate::framework::error::PlanError::DuplicateEdge { from: 0, to: 1 }
+        ));
     }
 
     #[test]

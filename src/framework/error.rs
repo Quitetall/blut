@@ -174,22 +174,30 @@ pub enum PlanError {
         to_stage: String,
         in_kind: String,
     },
-    /// A merge node has N predecessors but its stage does not accept
+    /// A merge node has N predecessors but its stage's input kind is not
     /// `tuple<N>` (element kinds are re-verified at decode time, exactly as
     /// the typed `merge` path relies on — this checks arity only).
-    /// (`from_erased_graph`, ADR 0078.)
+    /// `expected_kind` is the stage's actual input kind so the author sees
+    /// precisely what it wants. (`from_erased_graph`, ADR 0078.)
     #[error(
-        "merge arity mismatch — stage '{stage}' expects a {expected}-tuple input but has {got} predecessors"
+        "merge arity mismatch — stage '{stage}' expects input '{expected_kind}' but has {got} predecessors"
     )]
     BadMergeArity {
         stage: String,
-        expected: usize,
+        expected_kind: String,
         got: usize,
     },
     /// A `PlanSpec` edge references a node index outside `0..n_nodes`.
     /// (`from_erased_graph`, ADR 0078.)
     #[error("plan edge ({from}, {to}) references a node out of range (plan has {n_nodes} nodes)")]
     EdgeOutOfRange { from: u32, to: u32, n_nodes: usize },
+    /// The same edge `(from, to)` appears more than once. A duplicate
+    /// producer→consumer edge is meaningless in a DAG and would corrupt a
+    /// merge node's tuple (two copies of one producer's output instead of
+    /// distinct inputs), so it is rejected up front rather than failing
+    /// confusingly at decode time. (`from_erased_graph`, ADR 0078.)
+    #[error("plan has a duplicate edge ({from}, {to})")]
+    DuplicateEdge { from: u32, to: u32 },
     #[error("plan: {0}")]
     Other(String),
 }
