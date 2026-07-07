@@ -311,6 +311,12 @@ pub async fn recv_blob(
 pub struct P2pServer {
     endpoint: Endpoint,
     pub peers: Arc<RwLock<PeerRegistry>>,
+    /// When true, accept peers that present NO client cert and skip binding the
+    /// handshake `PeerId` to a TLS-authenticated key (the pre-ADR-0079
+    /// self-asserted-identity behavior). Off by default: the mesh requires
+    /// mutual TLS auth. `--allow-legacy-peers` turns it on for one transition
+    /// release.
+    allow_legacy: bool,
 }
 
 impl P2pServer {
@@ -321,12 +327,27 @@ impl P2pServer {
         keypair: Arc<KeyPair>,
         peers: PeerRegistry,
     ) -> Result<Self, TrainError> {
-        let server_config = Self::make_server_config(&keypair)?;
+        // Secure default: require mutual TLS auth (ADR 0079 A1).
+        Self::bind_with_options(addr, keypair, peers, false).await
+    }
+
+    /// Like [`bind`](Self::bind), but `allow_legacy` accepts peers that present
+    /// no client certificate (falling back to self-asserted identity). Used by
+    /// the deprecated `serve` path during the transition; the mesh `node` binds
+    /// with `allow_legacy = false`.
+    pub async fn bind_with_options(
+        addr: SocketAddr,
+        keypair: Arc<KeyPair>,
+        peers: PeerRegistry,
+        allow_legacy: bool,
+    ) -> Result<Self, TrainError> {
+        let server_config = Self::make_server_config(&keypair, allow_legacy)?;
         let endpoint = Endpoint::server(server_config, addr)
             .map_err(|e| TrainError::other(format!("bind QUIC endpoint: {e}")))?;
         Ok(Self {
             endpoint,
             peers: Arc::new(RwLock::new(peers)),
+            allow_legacy,
         })
     }
 
@@ -341,6 +362,16 @@ impl P2pServer {
             .await
             .map_err(|e| TrainError::other(format!("accept connection: {e}")))?;
 
+        // The key TLS mutually authenticated for this connection (None only in
+        // legacy mode, where the peer presented no client cert).
+        let tls_pubkey = tls_authenticated_pubkey(&conn);
+        if !self.allow_legacy && tls_pubkey.is_none() {
+            return Err(TrainError::other(
+                "peer presented no client certificate (mutual TLS required; \
+                 use --allow-legacy-peers to accept legacy peers)",
+            ));
+        }
+
         // Read the handshake message.
         let mut stream = conn
             .accept_uni()
@@ -354,6 +385,17 @@ impl P2pServer {
                 x25519_pub,
                 capabilities,
             } => {
+                // Bind the self-asserted handshake identity to the key TLS
+                // actually authenticated (ADR 0079 A1). A peer can no longer
+                // claim a `pubkey` it doesn't hold the private half of.
+                if let Some(tls_key) = tls_pubkey
+                    && tls_key != pubkey
+                {
+                    return Err(TrainError::other(
+                        "handshake pubkey does not match the TLS-authenticated \
+                         client identity (rejected)",
+                    ));
+                }
                 let verifying = ed25519_dalek::VerifyingKey::from_bytes(&pubkey)
                     .map_err(|e| TrainError::other(format!("invalid pubkey: {e}")))?;
                 let x25519_pub = x25519_dalek::PublicKey::from(x25519_pub);
@@ -448,7 +490,10 @@ impl P2pServer {
         self.endpoint.close(0u32.into(), b"shutdown");
     }
 
-    fn make_server_config(keypair: &KeyPair) -> Result<ServerConfig, TrainError> {
+    fn make_server_config(
+        keypair: &KeyPair,
+        allow_legacy: bool,
+    ) -> Result<ServerConfig, TrainError> {
         // Derive the TLS leaf cert's key pair FROM the coordinator's Ed25519
         // identity key (rather than an unrelated, freshly-random one) so the
         // cert's SubjectPublicKeyInfo IS `keypair.verifying`. This is what
@@ -459,10 +504,16 @@ impl P2pServer {
         // see `identity_cert`.
         let (cert_der, key_der) = identity_cert(keypair)?;
 
-        let mut server_crypto = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key_der.into())
-            .map_err(|e| TrainError::other(format!("TLS config: {e}")))?;
+        // Mutual auth (ADR 0079 A1): require + verify a client cert unless the
+        // operator opted into legacy no-client-auth for the transition.
+        let builder = rustls::ServerConfig::builder();
+        let mut server_crypto = if allow_legacy {
+            builder.with_no_client_auth()
+        } else {
+            builder.with_client_cert_verifier(Arc::new(MeshClientVerifier))
+        }
+        .with_single_cert(vec![cert_der], key_der.into())
+        .map_err(|e| TrainError::other(format!("TLS config: {e}")))?;
         server_crypto.alpn_protocols = vec![b"blut-p2p".to_vec()];
 
         Ok(ServerConfig::with_crypto(Arc::new(
@@ -539,16 +590,49 @@ fn ed25519_pkcs8_der(seed: &[u8; 32]) -> Vec<u8> {
 /// (built by `identity_cert`) therefore matches byte-for-byte, while an
 /// attacker's unrelated self-signed cert does not.
 fn ed25519_spki_der(pubkey: &[u8; 32]) -> Vec<u8> {
-    #[rustfmt::skip]
-    const PREFIX: [u8; 12] = [
-        0x30, 0x2a,                               // SEQUENCE, len 42
-        0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, // AlgorithmIdentifier: OID 1.3.101.112 (id-Ed25519)
-        0x03, 0x21, 0x00,                         // BIT STRING, len 33, 0 unused bits
-    ];
-    let mut der = Vec::with_capacity(PREFIX.len() + 32);
-    der.extend_from_slice(&PREFIX);
+    let mut der = Vec::with_capacity(ED25519_SPKI_PREFIX.len() + 32);
+    der.extend_from_slice(&ED25519_SPKI_PREFIX);
     der.extend_from_slice(pubkey);
     der
+}
+
+/// The fixed 12-byte RFC 8410 SPKI prefix for an Ed25519 public key. A full
+/// Ed25519 SPKI is exactly this prefix followed by the raw 32-byte key (44
+/// bytes total).
+#[rustfmt::skip]
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a,                               // SEQUENCE, len 42
+    0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, // AlgorithmIdentifier: OID 1.3.101.112 (id-Ed25519)
+    0x03, 0x21, 0x00,                         // BIT STRING, len 33, 0 unused bits
+];
+
+/// Recover the raw 32-byte Ed25519 public key from a `SubjectPublicKeyInfo`
+/// DER blob, or `None` if it isn't a well-formed Ed25519 SPKI. The inverse of
+/// [`ed25519_spki_der`].
+fn ed25519_pubkey_from_spki(spki: &[u8]) -> Option<[u8; 32]> {
+    let plen = ED25519_SPKI_PREFIX.len();
+    if spki.len() != plen + 32 || spki[..plen] != ED25519_SPKI_PREFIX {
+        return None;
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&spki[plen..plen + 32]);
+    Some(key)
+}
+
+/// Extract the Ed25519 identity that TLS mutually authenticated for `conn` —
+/// i.e. the public key the peer PROVED it holds the private half of during the
+/// handshake (via its client cert + `CertificateVerify`). `None` if the peer
+/// presented no cert (legacy peer) or a non-Ed25519 cert. This is the value
+/// `accept_peer` binds the handshake-asserted `PeerId` against, closing the
+/// self-asserted-identity hole.
+fn tls_authenticated_pubkey(conn: &QuinnConnection) -> Option<[u8; 32]> {
+    let identity = conn.peer_identity()?;
+    let certs = identity
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .ok()?;
+    let leaf = certs.first()?;
+    let cert = webpki::EndEntityCert::try_from(leaf).ok()?;
+    ed25519_pubkey_from_spki(cert.subject_public_key_info().as_ref())
 }
 
 /// P2P QUIC client — runs on a peer, connects to the coordinator.
@@ -583,7 +667,7 @@ impl P2pClient {
         &self,
         coordinator_addr: SocketAddr,
     ) -> Result<(QuinnConnection, PeerId), TrainError> {
-        let client_config = Self::make_client_config(self.coordinator_pubkey)?;
+        let client_config = Self::make_client_config(&self.keypair, self.coordinator_pubkey)?;
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
             .map_err(|e| TrainError::other(format!("create client endpoint: {e}")))?;
         endpoint.set_default_client_config(client_config);
@@ -673,6 +757,7 @@ impl P2pClient {
     }
 
     fn make_client_config(
+        keypair: &KeyPair,
         coordinator_pubkey: Option<[u8; 32]>,
     ) -> Result<quinn::ClientConfig, TrainError> {
         // If a coordinator pubkey is provided, pin it — reject connections
@@ -687,10 +772,16 @@ impl P2pClient {
                 Arc::new(InsecureVerifier)
             };
 
+        // Present OUR identity cert (ADR 0079 A1) so a mutual-auth server can
+        // bind our PeerId to the TLS-proven key. Derived from our Ed25519
+        // identity via the same `identity_cert` the server uses, so the SPKI
+        // the server extracts equals our `keypair.verifying`.
+        let (cert_der, key_der) = identity_cert(keypair)?;
         let mut crypto = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth();
+            .with_client_auth_cert(vec![cert_der], key_der.into())
+            .map_err(|e| TrainError::other(format!("TLS client cert: {e}")))?;
         crypto.alpn_protocols = vec![b"blut-p2p".to_vec()];
 
         Ok(quinn::ClientConfig::new(Arc::new(
@@ -746,6 +837,92 @@ impl rustls::client::danger::ServerCertVerifier for PinnedVerifier {
             ));
         }
         Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Server-side TLS verifier that authenticates a peer's CLIENT certificate for
+/// the symmetric mesh (ADR 0079 A1). Unlike [`PinnedVerifier`] (which pins ONE
+/// expected identity on the client side), the server accepts ANY well-formed
+/// self-signed Ed25519 client cert — it can't know who will dial ahead of time
+/// — but *requires* one and verifies the handshake signature, so the presented
+/// identity is CRYPTOGRAPHICALLY PROVEN rather than self-asserted. `accept_peer`
+/// then reads that authenticated key via [`tls_authenticated_pubkey`] and binds
+/// it to the handshake-claimed `PeerId`, closing the hole where the old
+/// `with_no_client_auth` server trusted whatever pubkey a peer typed into its
+/// `Handshake`.
+///
+/// `verify_tls1{2,3}_signature` is load-bearing exactly as in `PinnedVerifier`:
+/// it proves the client holds the private key for the cert it presented, so an
+/// attacker can't replay someone else's (public) cert.
+///
+/// REVOCATION: identity certs are self-signed and long-lived, so revocation is
+/// NOT at the cert layer — it is the peer registry + trust matrix. A compromised
+/// or retired key is handled by demoting/removing that `PeerId` (the dispatch
+/// matrix then fail-closed-blocks it); cert-level short-lived-credential
+/// rotation is a documented later extension (ADR 0079).
+#[derive(Debug)]
+struct MeshClientVerifier;
+
+impl rustls::server::danger::ClientCertVerifier for MeshClientVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        // Self-signed identity certs — no CA roots to advertise.
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        // Accept any cert that parses as a well-formed Ed25519 leaf. The
+        // identity *binding* (does this key match the handshake?) is enforced
+        // in `accept_peer`; here we only require a structurally valid cert so
+        // `tls_authenticated_pubkey` has something to extract. A cert whose
+        // SPKI isn't Ed25519 is refused up front.
+        let cert = webpki::EndEntityCert::try_from(end_entity).map_err(|_| {
+            rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+        })?;
+        if ed25519_pubkey_from_spki(cert.subject_public_key_info().as_ref()).is_none() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ));
+        }
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -861,6 +1038,49 @@ mod pinned_verifier_tests {
         );
     }
 
+    /// A1 (mutual TLS): the SPKI extraction helper is the exact inverse of the
+    /// builder, so the key the server binds equals the client's identity key.
+    #[test]
+    fn ed25519_pubkey_from_spki_round_trips() {
+        let k = KeyPair::generate();
+        let pk = k.verifying.to_bytes();
+        let spki = ed25519_spki_der(&pk);
+        assert_eq!(ed25519_pubkey_from_spki(&spki), Some(pk));
+        // Garbage / wrong-length / wrong-prefix ⇒ None, never a partial key.
+        assert_eq!(ed25519_pubkey_from_spki(b"too short"), None);
+        assert_eq!(ed25519_pubkey_from_spki(&[0u8; 44]), None); // right len, wrong prefix
+        let mut mangled = spki.clone();
+        mangled.push(0);
+        assert_eq!(ed25519_pubkey_from_spki(&mangled), None); // wrong len
+    }
+
+    /// A1: the server-side verifier accepts a real Ed25519 identity cert and
+    /// refuses a structurally-valid cert whose key isn't Ed25519.
+    #[test]
+    fn mesh_client_verifier_requires_ed25519_cert() {
+        use rustls::server::danger::ClientCertVerifier as _;
+        let peer = KeyPair::generate();
+        let (cert_der, _key) = identity_cert(&peer).unwrap();
+        let now = rustls::pki_types::UnixTime::now();
+        assert!(
+            MeshClientVerifier
+                .verify_client_cert(&cert_der, &[], now)
+                .is_ok(),
+            "a well-formed Ed25519 identity cert must be accepted"
+        );
+        // A non-Ed25519 self-signed cert (RSA/ECDSA) → rejected. Build a P-256
+        // cert via rcgen's default (ECDSA) to exercise the non-Ed25519 path.
+        let params = rcgen::CertificateParams::new(vec!["blut-p2p".into()]).unwrap();
+        let ec_key = rcgen::KeyPair::generate().unwrap(); // ECDSA P-256 by default
+        let ec_cert = params.self_signed(&ec_key).unwrap();
+        let ec_der = ec_cert.der().clone();
+        let res = MeshClientVerifier.verify_client_cert(&ec_der, &[], now);
+        assert!(
+            matches!(res, Err(rustls::Error::InvalidCertificate(_))),
+            "a non-Ed25519 client cert must be a hard InvalidCertificate rejection, got {res:?}"
+        );
+    }
+
     /// `InsecureVerifier` (the no-pin, trust-on-first-use fallback used when
     /// `--coordinator-pubkey` is NOT passed) must stay deliberately
     /// permissive — this fix must not change behavior on that path.
@@ -954,6 +1174,45 @@ mod pinned_verifier_tests {
             "connecting with the WRONG --coordinator-pubkey must be rejected \
              (regression test for the PinnedVerifier stub that accepted any cert)"
         );
+    }
+
+    /// A1 end-to-end: a mutual-auth server binds the accepted `PeerId` to the
+    /// key TLS actually authenticated. The `PeerId` `accept_peer` returns must
+    /// be the client's identity — proving the handshake `pubkey` was checked
+    /// against the client cert, not merely trusted as self-asserted.
+    #[tokio::test]
+    async fn mutual_auth_binds_peer_id_to_tls_identity() {
+        let (server, server_keypair) = bind_loopback_server().await;
+        let addr = server.local_addr().unwrap();
+
+        let accept = tokio::spawn(async move {
+            let (peer_id, conn) = server.accept_peer().await?;
+            // Hold the connection open briefly so the ack lands (see the
+            // correct-pin test's rationale).
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
+            Ok::<_, TrainError>(peer_id)
+        });
+
+        let client_keypair = std::sync::Arc::new(KeyPair::generate());
+        let expected = PeerId::from_pubkey(&client_keypair.verifying);
+        let client =
+            P2pClient::with_coordinator_pin(client_keypair, server_keypair.verifying.to_bytes());
+        let (_conn, client_side_id) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), client.connect(addr))
+                .await
+                .expect("connect must not hang")
+                .expect("mutual-auth connect must succeed");
+
+        let bound = tokio::time::timeout(std::time::Duration::from_secs(10), accept)
+            .await
+            .expect("accept must not hang")
+            .unwrap()
+            .expect("accept_peer must succeed under mutual auth");
+        assert_eq!(
+            bound, expected,
+            "server bound the TLS-authenticated identity"
+        );
+        assert_eq!(client_side_id, expected, "client's own view agrees");
     }
 }
 
