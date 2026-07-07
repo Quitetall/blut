@@ -229,6 +229,34 @@ def build(args):
     }
 
     #[test]
+    fn fed_round_wires_shard_fanout_and_aggregate() {
+        let src = r#"
+def build(args):
+    fed_round(
+        "fed-shard", "fed-local-train", "fed-aggregate",
+        shard_args={"participants": args["n"]},
+        train_args={"noise_multiplier": 1.1},
+        aggregate_args={"min_clients": 2},
+    )
+"#;
+        let spec = evaluate_script(src, "fed.star", &json!({ "n": 3 })).unwrap();
+        // Main plan: shard (source) + aggregate (after shard).
+        assert_eq!(spec.nodes.len(), 2);
+        assert_eq!(spec.nodes[0].stage, "fed-shard");
+        assert_eq!(spec.nodes[0].args, json!({ "participants": 3 }));
+        assert_eq!(spec.nodes[1].stage, "fed-aggregate");
+        assert_eq!(spec.edges, vec![(0, 1)], "aggregate runs after the shard");
+        // One fan-out expansion over the shard → local-train template.
+        assert_eq!(spec.expansions.len(), 1);
+        let m = &spec.expansions[0];
+        assert_eq!(m.parent, 0);
+        assert_eq!(m.label.as_deref(), Some("fed-local-train"));
+        assert_eq!(m.template.nodes.len(), 1);
+        assert_eq!(m.template.nodes[0].stage, "fed-local-train");
+        assert_eq!(m.template.nodes[0].args, json!({ "noise_multiplier": 1.1 }));
+    }
+
+    #[test]
     fn map_output_body_error_does_not_corrupt_the_stack() {
         // A body that raises must still leave a well-formed (failed) result,
         // not a dangling template scope.

@@ -162,4 +162,64 @@ pub(crate) fn dsl_globals(builder: &mut GlobalsBuilder) {
             });
         Ok(NoneType)
     }
+
+    /// fed_round(shard, local_train, aggregate, *, shard_args=None,
+    ///           train_args=None, aggregate_args=None) -> int
+    ///
+    /// One federated round (ADR 0080 C4): a convenience over `add` +
+    /// `map_output` that wires the canonical shape —
+    ///
+    ///   shard (→ list of participants) → map_output(local_train × N) → aggregate
+    ///
+    /// `shard` produces the participant list; the engine fans `local_train` out
+    /// once per participant (client-side DP-SGD); `aggregate` runs on the
+    /// initiator after the fan-out to FedAvg the deltas + emit the round
+    /// artifact. Returns the aggregate node's handle so the caller can chain the
+    /// next round (the round LOOP is host-driven dynamic-DAG generation). Every
+    /// gradient dispatch is still gated fail-closed at runtime (C1).
+    fn fed_round<'v>(
+        #[starlark(require = pos)] shard: String,
+        #[starlark(require = pos)] local_train: String,
+        #[starlark(require = pos)] aggregate: String,
+        #[starlark(require = named)] shard_args: Option<Value<'v>>,
+        #[starlark(require = named)] train_args: Option<Value<'v>>,
+        #[starlark(require = named)] aggregate_args: Option<Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<i32> {
+        let to_json = |v: Option<Value<'v>>, what: &str| -> anyhow::Result<serde_json::Value> {
+            match v {
+                Some(v) => v
+                    .to_json_value()
+                    .with_context(|| format!("fed_round: `{what}` must be JSON-serializable")),
+                None => Ok(serde_json::Value::Null),
+            }
+        };
+        let shard_json = to_json(shard_args, "shard_args")?;
+        let train_json = to_json(train_args, "train_args")?;
+        let agg_json = to_json(aggregate_args, "aggregate_args")?;
+
+        let store = eval
+            .extra
+            .and_then(|e| e.downcast_ref::<DslStore>())
+            .ok_or_else(|| anyhow!("internal: DSL builder state missing from evaluator"))?;
+        let mut drafts = store.0.borrow_mut();
+        let scope = drafts
+            .last_mut()
+            .ok_or_else(|| anyhow!("internal: no active plan scope for fed_round"))?;
+
+        // 1. shard: a graph source producing the participant list.
+        let shard_id = scope.add(shard, shard_json, &[]);
+        // 2. the fan-out template: one local-train per participant element.
+        let mut template = PlanDraft::default();
+        template.add(local_train, train_json, &[]);
+        scope.expansions.push(MapSpec {
+            parent: shard_id,
+            template: template.into_spec("<fed-local-train>".into()),
+            label: Some("fed-local-train".into()),
+        });
+        // 3. aggregate on the initiator, after the shard (+ its fan-out).
+        let agg_id = scope.add(aggregate, agg_json, &[shard_id]);
+
+        i32::try_from(agg_id).map_err(|_| anyhow!("plan too large: node id {agg_id} overflows i32"))
+    }
 }
