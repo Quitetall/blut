@@ -41,11 +41,16 @@ use serde::{Deserialize, Serialize};
 use crate::framework::artifact::ContentHash;
 use crate::framework::stage::ErasedArtifact;
 
-/// Per-job + (commit-5) global cache handle.
+/// Per-job + (commit-5) global + (Tier-4) remote cache handle.
 #[derive(Clone, Debug)]
 pub struct CacheHandle {
     pub job_local: PathBuf,
     pub global: Option<PathBuf>,
+    /// Optional content-addressed REMOTE tier (ADR 0067 T4.2): checked LAST on
+    /// lookup (after the local dirs), and — on a remote hit — written through
+    /// to `job_local` so the entry is a real local `CacheHit`. `insert` writes
+    /// through to it too (best-effort). A shared cache across machines / pods.
+    pub remote: Option<std::sync::Arc<dyn crate::framework::object_store::BlobStore>>,
 }
 
 impl CacheHandle {
@@ -54,6 +59,7 @@ impl CacheHandle {
         Self {
             job_local: path,
             global: None,
+            remote: None,
         }
     }
 
@@ -63,6 +69,18 @@ impl CacheHandle {
     pub fn with_global(self, global: PathBuf) -> Self {
         Self {
             global: Some(global),
+            ..self
+        }
+    }
+
+    /// Attach a content-addressed remote tier (a shared object store / RWX
+    /// PVC). Checked after the local dirs on lookup; written through on insert.
+    pub fn with_remote(
+        self,
+        remote: std::sync::Arc<dyn crate::framework::object_store::BlobStore>,
+    ) -> Self {
+        Self {
+            remote: Some(remote),
             ..self
         }
     }
@@ -183,6 +201,54 @@ impl CacheHandle {
                 }
             }
         }
+        // Remote tier (T4.2): local dirs missed — try the shared object store.
+        // On a hit, write the bytes through to `job_local` so this becomes a
+        // real local CacheHit (with a `from_path` a stage can read), and later
+        // lookups in this job skip the network. A remote error degrades to a
+        // miss (never a wrong answer).
+        if let Some(remote) = &self.remote {
+            match remote.get(key) {
+                Ok(Some(body)) => match bincode::deserialize::<ErasedArtifact>(&body) {
+                    Ok(art) => {
+                        // Write through so `from_path` names a file that
+                        // EXISTS. If that write fails, fall through to a miss
+                        // rather than return a hit whose `from_path` points at
+                        // nothing — every returned CacheHit has a readable
+                        // path, and the entry is still on the remote for a
+                        // later attempt.
+                        let dest = self.job_local.join(key.to_hex()).join("output.bin");
+                        match write_atomic(&dest, &body) {
+                            Ok(()) => {
+                                return Some(CacheHit {
+                                    artifact: art,
+                                    from_path: dest,
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "cache: remote hit but local write-through failed at {}: \
+                                     {e}; treating as miss",
+                                    dest.display()
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "cache: corrupt remote entry for {}: {e}; miss",
+                            key.to_hex()
+                        );
+                    }
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "cache: remote lookup for {}: {e}; treating as miss",
+                        key.to_hex()
+                    );
+                }
+            }
+        }
         None
     }
 
@@ -199,7 +265,16 @@ impl CacheHandle {
                 format!("serialize cache entry: {e}"),
             )
         })?;
-        write_atomic(&dest, &body)
+        write_atomic(&dest, &body)?;
+        // Write through to the remote tier (T4.2) so other machines/pods share
+        // this result. Best-effort: a remote failure is logged, not fatal — the
+        // local write already succeeded, so the run is unaffected.
+        if let Some(remote) = &self.remote
+            && let Err(e) = remote.put(key, &body)
+        {
+            tracing::warn!("cache: remote write-through for {}: {e}", key.to_hex());
+        }
+        Ok(())
     }
 
     /// Search order for lookups: global first when `--shared-cache`
@@ -380,7 +455,7 @@ pub struct CacheRecord {
     pub artifact: ErasedArtifact,
 }
 
-fn write_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -637,6 +712,44 @@ mod tests {
             .unwrap();
         // Entry must exist under the global path.
         assert!(global.join(key.to_hex()).join("output.bin").exists());
+    }
+
+    #[test]
+    fn remote_tier_write_through_and_hit() {
+        use crate::framework::object_store::{BlobStore, FsBlobStore};
+        let td = tempfile::tempdir().unwrap();
+        let remote = std::sync::Arc::new(FsBlobStore::new(td.path().join("remote")));
+        let key = ContentHash::of_bytes(b"k");
+
+        // Machine A: insert → writes local AND through to the remote store.
+        let a_job = td.path().join("a");
+        let h_a = CacheHandle::job_local(a_job).with_remote(remote.clone());
+        h_a.insert(key, &fake_erased(serde_json::json!({ "v": 1 })))
+            .unwrap();
+        assert!(remote.head(key).unwrap(), "insert wrote through to remote");
+
+        // Machine B: cold local, same remote → lookup hits the remote and
+        // writes it through to B's job dir (a real CacheHit with a path).
+        let b_job = td.path().join("b");
+        let h_b = CacheHandle::job_local(b_job.clone()).with_remote(remote.clone());
+        let hit = h_b.lookup(key).expect("remote tier serves the entry");
+        assert_eq!(hit.artifact.kind, fake_erased(serde_json::json!({})).kind);
+        assert!(
+            b_job.join(key.to_hex()).join("output.bin").exists(),
+            "remote hit was written through to the local job dir"
+        );
+    }
+
+    #[test]
+    fn remote_error_degrades_to_a_miss() {
+        // A remote whose root can't be read → lookup is a miss, not a panic.
+        use crate::framework::object_store::FsBlobStore;
+        let td = tempfile::tempdir().unwrap();
+        // FsBlobStore over a missing dir returns None (a miss), never errors on
+        // get; the handle must simply report no hit.
+        let remote = std::sync::Arc::new(FsBlobStore::new(PathBuf::from("/no-such-remote-xyz")));
+        let h = CacheHandle::job_local(td.path().join("job")).with_remote(remote);
+        assert!(h.lookup(ContentHash::of_bytes(b"absent")).is_none());
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub mod executor;
 pub mod gpu_sampler;
 pub mod graph;
 pub mod lineage;
+pub mod object_store;
 pub mod plan;
 pub mod plan_spec;
 pub mod resource;
@@ -58,6 +59,7 @@ pub use error_domain::{
 };
 pub use executor::{ExecCtx, ParallelExecutor, PlanResult, SequentialExecutor, execute_plan};
 pub use graph::{GraphSnapshot, NodeStatus, PlanGraph, graph_snapshot};
+pub use object_store::{BlobStore, FsBlobStore};
 pub use plan::{CompiledPlan, NodeId, Plan};
 pub use plan_spec::{PLAN_SPEC_VERSION, PlanSpec, PlanSpecError, SpecNode};
 pub use resource::Resource;
