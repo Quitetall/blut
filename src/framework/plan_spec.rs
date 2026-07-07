@@ -1,0 +1,385 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Brian Lam
+//! `PlanSpec` — the serde plan IR (ADR 0078).
+//!
+//! `PlanSpec` is the single, plain-data contract between plan *authors* and
+//! the engine. Three front-ends emit it:
+//!   * Starlark scripts (`.star`, behind the `dsl` feature) — hermetic eval;
+//!   * raw `.json` — the future Python SDK's entry point (this module is that
+//!     door: `serde_json::from_str::<PlanSpec>` then [`PlanSpec::compile`]);
+//!   * (unchanged) declarative TOML, via the existing linear
+//!     [`crate::recipes::declarative`] path.
+//!
+//! A `PlanSpec` is a graph of `{stage-name, args}` nodes plus `(from, to)`
+//! edges. [`PlanSpec::compile`] resolves each stage name against a
+//! [`Registry`] (registered stages ONLY — no dynamic code loading) and builds
+//! a fully kind-checked [`CompiledPlan`] via
+//! [`CompiledPlan::from_erased_graph`]. Every wiring break is a typed error
+//! before anything executes; the produced plan runs through the SAME executor
+//! as any compiled recipe.
+//!
+//! The struct is a STABLE, versioned wire contract — evolve it additive-only
+//! (new fields `#[serde(default)]`) so an older `PlanSpec` JSON keeps parsing.
+
+use serde::{Deserialize, Serialize};
+
+use crate::framework::Registry;
+use crate::framework::cache::CacheHandle;
+use crate::framework::error::PlanError;
+use crate::framework::plan::CompiledPlan;
+
+/// IR version stamped into every `PlanSpec`. Bump only on a
+/// backward-incompatible change (additive fields do NOT bump it).
+pub const PLAN_SPEC_VERSION: u32 = 1;
+
+fn default_version() -> u32 {
+    PLAN_SPEC_VERSION
+}
+
+/// One node of a [`PlanSpec`]: a registered stage name + its args JSON.
+///
+/// Per-node retry/timeout are intentionally NOT in v1 (the engine's
+/// `RetryPolicy`/`StageTimeout` aren't serde types); they are a planned
+/// additive field. Omitted `args` default to JSON `null`, matching the
+/// declarative TOML path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpecNode {
+    /// Stage name — must resolve via [`Registry::find_erased_stage`].
+    pub stage: String,
+    /// Per-stage args (validated against the stage's schema at run time).
+    #[serde(default)]
+    pub args: serde_json::Value,
+}
+
+/// The plan IR. `nodes` are dense (indices `0..nodes.len()` are node ids);
+/// `edges` are `(producer_index, consumer_index)`, and their **order is the
+/// tuple element order** a merge node's `gather_input` will assemble.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanSpec {
+    pub name: String,
+    pub nodes: Vec<SpecNode>,
+    #[serde(default)]
+    pub edges: Vec<(u32, u32)>,
+    /// IR version (see [`PLAN_SPEC_VERSION`]). Defaulted so pre-versioned
+    /// JSON still parses.
+    #[serde(default = "default_version")]
+    pub version: u32,
+}
+
+/// Failure compiling a [`PlanSpec`] into a runnable plan.
+#[derive(Debug, thiserror::Error)]
+pub enum PlanSpecError {
+    /// A named stage is in no registered cookbook (dynamic loading is
+    /// forbidden — the author must name a compiled-in stage).
+    #[error(
+        "plan spec '{name}': stage '{stage}' is not in any registered cookbook (see `blut stage list`)"
+    )]
+    UnknownStage { name: String, stage: String },
+    /// The graph failed structural/kind validation (delegated to
+    /// [`CompiledPlan::from_erased_graph`]).
+    #[error("plan spec '{name}': {source}")]
+    Plan {
+        name: String,
+        #[source]
+        source: PlanError,
+    },
+}
+
+impl PlanSpec {
+    /// Canonical byte encoding of this spec — key order normalized so two
+    /// specs that differ only in JSON key ordering hash identically. Used for
+    /// the plan provenance fingerprint (ADR 0078) and golden snapshots.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        // A PlanSpec always serializes (all fields are plain data); the
+        // canonicalizer is the same one the cache uses for stage args.
+        let v = serde_json::to_value(self).expect("PlanSpec serializes to JSON");
+        CacheHandle::canonical_json_bytes(&v)
+    }
+
+    /// Resolve every node's stage by name against `reg`, then build a
+    /// fully kind-checked [`CompiledPlan`]. An unknown stage or a wiring
+    /// break is a precise [`PlanSpecError`]; nothing executes until this
+    /// returns `Ok`.
+    pub fn compile(&self, reg: &Registry) -> Result<CompiledPlan, PlanSpecError> {
+        let mut nodes: Vec<(
+            std::sync::Arc<dyn crate::framework::stage::StageDyn>,
+            serde_json::Value,
+        )> = Vec::with_capacity(self.nodes.len());
+        for sn in &self.nodes {
+            let ctor =
+                reg.find_erased_stage(&sn.stage)
+                    .ok_or_else(|| PlanSpecError::UnknownStage {
+                        name: self.name.clone(),
+                        stage: sn.stage.clone(),
+                    })?;
+            nodes.push((ctor(), sn.args.clone()));
+        }
+        // recipe_args = provenance for lineage/audit (the executor uses each
+        // node's own args). Parallel to the declarative path's blob.
+        let recipe_args = serde_json::json!({
+            "plan_spec": true,
+            "version": self.version,
+            "nodes": self.nodes.iter()
+                .map(|s| serde_json::json!({ "stage": s.stage, "args": s.args }))
+                .collect::<Vec<_>>(),
+        });
+        CompiledPlan::from_erased_graph(self.name.clone(), recipe_args, nodes, self.edges.clone())
+            .map_err(|source| PlanSpecError::Plan {
+                name: self.name.clone(),
+                source,
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::LamuTrainerBackend;
+    use crate::framework::Compatible;
+    use crate::framework::artifact::{Artifact, ContentHash};
+    use crate::framework::cookbook::Cookbook;
+    use crate::framework::error::StageError;
+    use crate::framework::resource::Resource;
+    use crate::framework::stage::{ErasedStageCtor, Stage, StageContext};
+    use crate::recipes::recipe::RecipeDef;
+    use async_trait::async_trait;
+    use serde::{Deserialize, Serialize};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    // Toy artifacts + stages: () -> A -> B, plus a join (A,B) -> C.
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct A;
+    impl Artifact for A {
+        const KIND: &'static str = "spec.a";
+        const SCHEMA: u32 = 1;
+        fn content_hash(&self) -> ContentHash {
+            ContentHash::of_bytes(b"a")
+        }
+        fn primary_path(&self) -> &Path {
+            Path::new(".")
+        }
+    }
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct B;
+    impl Artifact for B {
+        const KIND: &'static str = "spec.b";
+        const SCHEMA: u32 = 1;
+        fn content_hash(&self) -> ContentHash {
+            ContentHash::of_bytes(b"b")
+        }
+        fn primary_path(&self) -> &Path {
+            Path::new(".")
+        }
+    }
+
+    // Empty-braces (not a unit struct) so it deserializes from `{}` — the
+    // natural args a PlanSpec author writes for a no-required-args stage.
+    #[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+    struct E {}
+
+    struct MakeA;
+    impl Compatible<LamuTrainerBackend> for MakeA {}
+    #[async_trait]
+    impl Stage for MakeA {
+        const NAME: &'static str = "spec_make_a";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = ();
+        type Output = A;
+        type Args = E;
+        async fn run(&self, _c: &StageContext, _i: (), _a: &E) -> Result<A, StageError> {
+            Ok(A)
+        }
+    }
+
+    struct AToB;
+    impl Compatible<LamuTrainerBackend> for AToB {}
+    #[async_trait]
+    impl Stage for AToB {
+        const NAME: &'static str = "spec_a_to_b";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = A;
+        type Output = B;
+        type Args = E;
+        async fn run(&self, _c: &StageContext, _i: A, _a: &E) -> Result<B, StageError> {
+            Ok(B)
+        }
+    }
+
+    static ERASED: &[(&str, ErasedStageCtor)] = &[
+        ("spec_make_a", || Arc::new(MakeA)),
+        ("spec_a_to_b", || Arc::new(AToB)),
+    ];
+    static NO_RECIPES: &[&RecipeDef] = &[];
+    struct ToyCookbook;
+    impl Cookbook for ToyCookbook {
+        fn name(&self) -> &'static str {
+            "spec_toy"
+        }
+        fn recipes(&self) -> &'static [&'static RecipeDef] {
+            NO_RECIPES
+        }
+        fn stages_erased(&self) -> &'static [(&'static str, ErasedStageCtor)] {
+            ERASED
+        }
+    }
+    fn toy_registry() -> Registry {
+        let mut reg = Registry::new();
+        reg.register(Box::new(ToyCookbook));
+        reg
+    }
+
+    fn linear_spec() -> PlanSpec {
+        PlanSpec {
+            name: "chain".into(),
+            nodes: vec![
+                SpecNode {
+                    stage: "spec_make_a".into(),
+                    args: serde_json::json!({}),
+                },
+                SpecNode {
+                    stage: "spec_a_to_b".into(),
+                    args: serde_json::json!({}),
+                },
+            ],
+            edges: vec![(0, 1)],
+            version: PLAN_SPEC_VERSION,
+        }
+    }
+
+    #[test]
+    fn json_round_trip_and_deny_unknown_fields() {
+        let spec = linear_spec();
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: PlanSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.nodes.len(), 2);
+        assert_eq!(back.edges, vec![(0, 1)]);
+        assert_eq!(back.version, PLAN_SPEC_VERSION);
+        // An unknown field is rejected (the wire contract is closed).
+        let bad = r#"{"name":"x","nodes":[],"surprise":true}"#;
+        assert!(serde_json::from_str::<PlanSpec>(bad).is_err());
+        // A pre-versioned spec (no `version`) still parses (defaulted).
+        let noversion = r#"{"name":"x","nodes":[{"stage":"spec_make_a"}]}"#;
+        let p: PlanSpec = serde_json::from_str(noversion).unwrap();
+        assert_eq!(p.version, PLAN_SPEC_VERSION);
+        assert!(p.nodes[0].args.is_null()); // omitted args -> null
+    }
+
+    #[test]
+    fn canonical_bytes_are_key_order_stable() {
+        // Same graph, args keys in different source order -> identical bytes.
+        let a = PlanSpec {
+            name: "n".into(),
+            nodes: vec![SpecNode {
+                stage: "s".into(),
+                args: serde_json::json!({ "x": 1, "y": 2 }),
+            }],
+            edges: vec![],
+            version: 1,
+        };
+        let b = PlanSpec {
+            name: "n".into(),
+            nodes: vec![SpecNode {
+                stage: "s".into(),
+                args: serde_json::json!({ "y": 2, "x": 1 }),
+            }],
+            edges: vec![],
+            version: 1,
+        };
+        assert_eq!(a.canonical_bytes(), b.canonical_bytes());
+        // A real difference DOES change the bytes.
+        let c = PlanSpec {
+            name: "n".into(),
+            nodes: vec![SpecNode {
+                stage: "s".into(),
+                args: serde_json::json!({ "x": 9, "y": 2 }),
+            }],
+            edges: vec![],
+            version: 1,
+        };
+        assert_ne!(a.canonical_bytes(), c.canonical_bytes());
+    }
+
+    #[test]
+    fn compile_unknown_stage_names_it() {
+        let spec = PlanSpec {
+            name: "x".into(),
+            nodes: vec![SpecNode {
+                stage: "no_such".into(),
+                args: serde_json::json!({}),
+            }],
+            edges: vec![],
+            version: 1,
+        };
+        match spec.compile(&Registry::new()) {
+            Err(PlanSpecError::UnknownStage { stage, .. }) => assert_eq!(stage, "no_such"),
+            Err(e) => panic!("expected UnknownStage, got {e:?}"),
+            Ok(_) => panic!("expected UnknownStage, got Ok"),
+        }
+    }
+
+    #[test]
+    fn compile_kind_break_is_reported() {
+        // make_a -> make_a: the second is a graph-input stage fed a
+        // predecessor's output; kind break (A != ()).
+        let spec = PlanSpec {
+            name: "x".into(),
+            nodes: vec![
+                SpecNode {
+                    stage: "spec_make_a".into(),
+                    args: serde_json::json!({}),
+                },
+                SpecNode {
+                    stage: "spec_make_a".into(),
+                    args: serde_json::json!({}),
+                },
+            ],
+            edges: vec![(0, 1)],
+            version: 1,
+        };
+        match spec.compile(&toy_registry()) {
+            Err(PlanSpecError::Plan {
+                source: PlanError::KindBreak { in_kind, .. },
+                ..
+            }) => assert_eq!(in_kind, "()"),
+            Err(e) => panic!("expected KindBreak, got {e:?}"),
+            Ok(_) => panic!("expected KindBreak, got Ok"),
+        }
+    }
+
+    #[test]
+    fn compile_success_shape() {
+        let plan = linear_spec().compile(&toy_registry()).unwrap();
+        assert_eq!(plan.n_nodes(), 2);
+        assert_eq!(plan.n_edges(), 1);
+        assert_eq!(plan.topo_order().unwrap(), vec![0, 1]);
+        // Provenance blob is stamped.
+        assert_eq!(plan.recipe_args()["plan_spec"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn compiled_spec_executes_and_second_run_is_cached() {
+        use crate::framework::executor::{ExecCtx, execute_plan};
+        let reg = toy_registry();
+        let td = tempfile::tempdir().unwrap();
+
+        let plan1 = linear_spec().compile(&reg).unwrap();
+        let r1 = execute_plan(plan1, ExecCtx::new(td.path().to_path_buf()))
+            .await
+            .expect("first run");
+        assert_eq!(r1.n_stages, 2);
+
+        // Second run in the SAME job dir: both stages hit the content cache
+        // (topology was never part of a stage cache key — a graph-built plan
+        // caches exactly like a chain-built one).
+        let plan2 = linear_spec().compile(&reg).unwrap();
+        let r2 = execute_plan(plan2, ExecCtx::new(td.path().to_path_buf()))
+            .await
+            .expect("second run");
+        assert_eq!(r2.n_cache_hits, 2, "both stages should hit on re-run");
+    }
+}

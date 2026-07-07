@@ -39,6 +39,7 @@ pub mod gpu_sampler;
 pub mod graph;
 pub mod lineage;
 pub mod plan;
+pub mod plan_spec;
 pub mod resource;
 pub mod resume;
 pub mod retry;
@@ -58,6 +59,7 @@ pub use error_domain::{
 pub use executor::{ExecCtx, ParallelExecutor, PlanResult, SequentialExecutor, execute_plan};
 pub use graph::{GraphSnapshot, NodeStatus, PlanGraph, graph_snapshot};
 pub use plan::{CompiledPlan, NodeId, Plan};
+pub use plan_spec::{PLAN_SPEC_VERSION, PlanSpec, PlanSpecError, SpecNode};
 pub use resource::Resource;
 pub use retry::{Backoff, RetryEvent, RetryHook, RetryOn, RetryPolicy, StageTimeout};
 pub use stage::{ErasedArtifact, ErasedDecodeError, Stage, StageContext, StageDyn};

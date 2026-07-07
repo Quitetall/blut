@@ -790,6 +790,149 @@ impl CompiledPlan {
             recipe_args,
         })
     }
+
+    /// Build an ARBITRARY-topology erased plan from `nodes` + `edges` — the
+    /// typed dynamic-DAG path (ADR 0078). This is `from_erased_chain`
+    /// generalized from a linear chain to a full DAG: it extends the same
+    /// runtime kind-check guarantee to fork/merge/map topologies so a
+    /// `PlanSpec` authored by a Starlark script or raw JSON is checked before
+    /// it runs. Nodes get dense ids `0..n` in slice order; `edges` are
+    /// `(producer_index, consumer_index)` and their **insertion order is the
+    /// tuple element order** the executor's `gather_input` will assemble for a
+    /// merge node.
+    ///
+    /// Per-node kind contract (checked before any execution):
+    ///   * a node with 0 predecessors (a graph source) must be graph-input
+    ///     (`input_kind() == "()"`) and is seeded the unit artifact;
+    ///   * a node with 1 predecessor must have `input_kind()` equal to that
+    ///     predecessor's `output_kind()`;
+    ///   * a node with N ≥ 2 predecessors must take `tuple<N>` (element kinds
+    ///     are re-verified at `decode_erased`, exactly as the typed `merge`
+    ///     path relies on — this checks arity here).
+    ///
+    /// A break is a precise [`PlanError`] naming the offending stage(s)/kinds;
+    /// a cycle or empty plan is rejected too (reusing [`topo_order`]). Never
+    /// panics on bad input — every malformed graph is a typed `Err`.
+    /// `from_erased_chain` is left untouched (the declarative TOML path keeps
+    /// its own byte-equal test surface).
+    pub fn from_erased_graph(
+        name: impl Into<String>,
+        recipe_args: serde_json::Value,
+        nodes: Vec<(Arc<dyn StageDyn>, serde_json::Value)>,
+        edges: Vec<(NodeId, NodeId)>,
+    ) -> Result<CompiledPlan, crate::framework::error::PlanError> {
+        use crate::framework::error::PlanError;
+        let name = name.into();
+        let n = nodes.len();
+        if n == 0 {
+            return Err(PlanError::Empty);
+        }
+        // Edge endpoints must be in range (a dangling index is caught here,
+        // not by a later panic on `nodes[idx]`).
+        for &(from, to) in &edges {
+            if from as usize >= n || to as usize >= n {
+                return Err(PlanError::EdgeOutOfRange {
+                    from,
+                    to,
+                    n_nodes: n,
+                });
+            }
+        }
+        // Predecessors per node, in EDGE-INSERTION order (= tuple element
+        // order the executor assembles — keep this in lockstep with
+        // `gather_input`).
+        let mut preds: Vec<Vec<NodeId>> = vec![Vec::new(); n];
+        for &(from, to) in &edges {
+            preds[to as usize].push(from);
+        }
+        // Kind-check every node against its predecessor set.
+        for (id, (stage, _)) in nodes.iter().enumerate() {
+            let in_kind = stage.input_kind();
+            match preds[id].as_slice() {
+                [] => {
+                    if in_kind != <() as Artifact>::KIND {
+                        return Err(PlanError::RootNotGraphInput {
+                            stage: stage.name().to_string(),
+                            got: in_kind.to_string(),
+                        });
+                    }
+                }
+                [only] => {
+                    let out_kind = nodes[*only as usize].0.output_kind();
+                    if out_kind != in_kind {
+                        return Err(PlanError::KindBreak {
+                            from_stage: nodes[*only as usize].0.name().to_string(),
+                            out_kind: out_kind.to_string(),
+                            to_stage: stage.name().to_string(),
+                            in_kind: in_kind.to_string(),
+                        });
+                    }
+                }
+                many => {
+                    let k = many.len();
+                    if in_kind != format!("tuple<{k}>") {
+                        return Err(PlanError::BadMergeArity {
+                            stage: stage.name().to_string(),
+                            expected: input_arity_of(in_kind),
+                            got: k,
+                        });
+                    }
+                }
+            }
+        }
+        // Materialize. Ids are dense `0..n` by slice position; each source is
+        // seeded the unit graph input exactly as `from_erased_chain` seeds
+        // node 0.
+        let mut plan_nodes: Vec<PlanNode> = Vec::with_capacity(n);
+        let mut initial: HashMap<NodeId, ErasedArtifact> = HashMap::new();
+        for (i, (stage, args)) in nodes.into_iter().enumerate() {
+            let id = i as NodeId;
+            let canon_args = CacheHandle::canonical_json_bytes(&args);
+            if preds[i].is_empty() {
+                let unit = ErasedArtifact::from_typed(&())
+                    .map_err(|e| PlanError::Other(format!("encode unit graph input: {e}")))?;
+                initial.insert(id, unit);
+            }
+            plan_nodes.push(PlanNode {
+                id,
+                stage,
+                args,
+                canon_args,
+                retry: None,
+                timeout: None,
+            });
+        }
+        let plan_edges: Vec<PlanEdge> = edges
+            .into_iter()
+            .map(|(from, to)| PlanEdge { from, to })
+            .collect();
+        let plan = CompiledPlan {
+            name,
+            nodes: plan_nodes,
+            edges: plan_edges,
+            initial,
+            recipe_args,
+        };
+        // Reject cycles (reuses the Kahn walk + `PlanError::Cycle`).
+        plan.topo_order()?;
+        Ok(plan)
+    }
+}
+
+/// The input arity a stage's `input_kind` implies: `tuple<N>` → N, `()` → 0,
+/// any other single kind → 1. Used only to phrase a `BadMergeArity` error
+/// ("expects an M-tuple but has N predecessors").
+fn input_arity_of(kind: &str) -> usize {
+    if kind == <() as Artifact>::KIND {
+        0
+    } else if let Some(inner) = kind
+        .strip_prefix("tuple<")
+        .and_then(|s| s.strip_suffix('>'))
+    {
+        inner.parse().unwrap_or(1)
+    } else {
+        1
+    }
 }
 
 #[cfg(test)]
@@ -908,6 +1051,88 @@ mod tests {
             _args: &EmptyArgs,
         ) -> Result<DataC, StageError> {
             Ok(DataC)
+        }
+    }
+
+    // Extra toy stages exercising the graph (non-linear) paths:
+    //   MakeB: () -> B   (a second graph source, for a join)
+    //   JoinAB: (A, B) -> C   (an N-predecessor merge node)
+    //   AToA: A -> A   (kind-stable, so a cycle passes the kind-check and
+    //                   reaches topo_order — used to test cycle rejection)
+    struct MakeB;
+    impl Compatible<LamuTrainerBackend> for MakeB {}
+    #[async_trait]
+    impl Stage for MakeB {
+        const NAME: &'static str = "make_b";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = ();
+        type Output = DataB;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            _input: (),
+            _args: &EmptyArgs,
+        ) -> Result<DataB, StageError> {
+            Ok(DataB)
+        }
+    }
+
+    struct JoinAB;
+    impl Compatible<LamuTrainerBackend> for JoinAB {}
+    #[async_trait]
+    impl Stage for JoinAB {
+        const NAME: &'static str = "join_ab";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = (DataA, DataB);
+        type Output = DataC;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            _input: (DataA, DataB),
+            _args: &EmptyArgs,
+        ) -> Result<DataC, StageError> {
+            Ok(DataC)
+        }
+    }
+
+    struct AToA;
+    impl Compatible<LamuTrainerBackend> for AToA {}
+    #[async_trait]
+    impl Stage for AToA {
+        const NAME: &'static str = "a_to_a";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = DataA;
+        type Output = DataA;
+        type Args = EmptyArgs;
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            _input: DataA,
+            _args: &EmptyArgs,
+        ) -> Result<DataA, StageError> {
+            Ok(DataA)
+        }
+    }
+
+    // Convenience: an erased node tuple for from_erased_graph tests.
+    fn erased<S: StageDyn + 'static>(s: S) -> (Arc<dyn StageDyn>, serde_json::Value) {
+        (Arc::new(s) as Arc<dyn StageDyn>, serde_json::json!({}))
+    }
+
+    // `CompiledPlan` has no `Debug` (deliberate), so `Result::unwrap_err`
+    // (which needs the Ok type to be `Debug`) can't be used — pull the error
+    // out by hand.
+    fn expect_err(
+        r: Result<CompiledPlan, crate::framework::error::PlanError>,
+    ) -> crate::framework::error::PlanError {
+        match r {
+            Ok(_) => panic!("expected an Err, got Ok(CompiledPlan)"),
+            Err(e) => e,
         }
     }
 
@@ -1164,6 +1389,171 @@ mod tests {
             }
             (n, edges)
         })
+    }
+
+    // ---- from_erased_graph (ADR 0078) ----
+
+    #[test]
+    fn from_erased_graph_linear_matches_typed_shape() {
+        // () -> A -> B -> C via the graph constructor == the typed builder.
+        let plan = CompiledPlan::from_erased_graph(
+            "g",
+            serde_json::json!({}),
+            vec![erased(MakeA), erased(AToB), erased(BToC)],
+            vec![(0, 1), (1, 2)],
+        )
+        .expect("linear graph compiles");
+        assert_eq!(plan.n_nodes(), 3);
+        assert_eq!(plan.n_edges(), 2);
+        assert_eq!(plan.topo_order().unwrap(), vec![0, 1, 2]);
+        // The sole root is seeded the unit graph input.
+        assert!(plan.initial.contains_key(&0));
+        assert_eq!(plan.initial.len(), 1);
+    }
+
+    #[test]
+    fn from_erased_graph_join_two_sources_into_a_merge() {
+        // MakeA, MakeB -> JoinAB((A,B)->C). Edge order (0,2),(1,2) = tuple order.
+        let plan = CompiledPlan::from_erased_graph(
+            "j",
+            serde_json::json!({}),
+            vec![erased(MakeA), erased(MakeB), erased(JoinAB)],
+            vec![(0, 2), (1, 2)],
+        )
+        .expect("join graph compiles");
+        assert_eq!(plan.n_nodes(), 3);
+        assert_eq!(plan.n_edges(), 2);
+        // Both sources are graph-input seeded; the merge is not.
+        assert!(plan.initial.contains_key(&0));
+        assert!(plan.initial.contains_key(&1));
+        assert!(!plan.initial.contains_key(&2));
+        let order = plan.topo_order().unwrap();
+        assert_eq!(*order.last().unwrap(), 2, "merge runs last");
+    }
+
+    #[test]
+    fn from_erased_graph_rejects_kind_break() {
+        // MakeA outputs A; BToC expects B.
+        let err = expect_err(CompiledPlan::from_erased_graph(
+            "k",
+            serde_json::json!({}),
+            vec![erased(MakeA), erased(BToC)],
+            vec![(0, 1)],
+        ));
+        match err {
+            crate::framework::error::PlanError::KindBreak {
+                from_stage,
+                out_kind,
+                to_stage,
+                in_kind,
+            } => {
+                assert_eq!(from_stage, "make_a");
+                assert_eq!(out_kind, "test.data_a");
+                assert_eq!(to_stage, "b_to_c");
+                assert_eq!(in_kind, "test.data_b");
+            }
+            other => panic!("expected KindBreak, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_erased_graph_rejects_non_root_source() {
+        // AToB expects A but has no predecessor (it is a graph source).
+        let err = expect_err(CompiledPlan::from_erased_graph(
+            "r",
+            serde_json::json!({}),
+            vec![erased(AToB)],
+            vec![],
+        ));
+        assert!(matches!(
+            err,
+            crate::framework::error::PlanError::RootNotGraphInput { .. }
+        ));
+    }
+
+    #[test]
+    fn from_erased_graph_rejects_bad_merge_arity() {
+        // AToB expects a single A (arity 1) but is fed two predecessors.
+        let err = expect_err(CompiledPlan::from_erased_graph(
+            "m",
+            serde_json::json!({}),
+            vec![erased(MakeA), erased(MakeB), erased(AToB)],
+            vec![(0, 2), (1, 2)],
+        ));
+        match err {
+            crate::framework::error::PlanError::BadMergeArity { expected, got, .. } => {
+                assert_eq!(expected, 1);
+                assert_eq!(got, 2);
+            }
+            other => panic!("expected BadMergeArity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_erased_graph_rejects_out_of_range_edge() {
+        let err = expect_err(CompiledPlan::from_erased_graph(
+            "e",
+            serde_json::json!({}),
+            vec![erased(MakeA)],
+            vec![(0, 5)],
+        ));
+        assert!(matches!(
+            err,
+            crate::framework::error::PlanError::EdgeOutOfRange { .. }
+        ));
+    }
+
+    #[test]
+    fn from_erased_graph_rejects_empty() {
+        let err = expect_err(CompiledPlan::from_erased_graph(
+            "z",
+            serde_json::json!({}),
+            vec![],
+            vec![],
+        ));
+        assert!(matches!(err, crate::framework::error::PlanError::Empty));
+    }
+
+    #[test]
+    fn from_erased_graph_rejects_cycle() {
+        // Two A->A nodes wired in a cycle: kinds line up (A==A) so the
+        // per-node check passes, and topo_order catches the cycle.
+        let err = expect_err(CompiledPlan::from_erased_graph(
+            "c",
+            serde_json::json!({}),
+            vec![erased(AToA), erased(AToA)],
+            vec![(0, 1), (1, 0)],
+        ));
+        assert!(matches!(err, crate::framework::error::PlanError::Cycle(_)));
+    }
+
+    proptest::proptest! {
+        // A () -> A -> A -> ... chain (MakeA then AToA×) is always kind-valid,
+        // so from_erased_graph must accept it at any length.
+        #[test]
+        fn from_erased_graph_accepts_any_valid_atoa_chain(n in 1usize..12) {
+            let mut nodes: Vec<(Arc<dyn StageDyn>, serde_json::Value)> = vec![erased(MakeA)];
+            for _ in 1..n { nodes.push(erased(AToA)); }
+            let edges: Vec<(NodeId, NodeId)> = (1..n as NodeId).map(|i| (i - 1, i)).collect();
+            let plan = CompiledPlan::from_erased_graph("p", serde_json::json!({}), nodes, edges)
+                .expect("valid chain must compile");
+            proptest::prop_assert_eq!(plan.n_nodes(), n);
+        }
+
+        // Arbitrary extra edges on top of a valid chain must always return a
+        // Result (Ok or a typed Err) — never panic.
+        #[test]
+        fn from_erased_graph_never_panics_on_arbitrary_edges(
+            n in 1usize..8,
+            extra in proptest::collection::vec((0u32..8, 0u32..8), 0..6),
+        ) {
+            let mut nodes: Vec<(Arc<dyn StageDyn>, serde_json::Value)> = vec![erased(MakeA)];
+            for _ in 1..n { nodes.push(erased(AToA)); }
+            let mut edges: Vec<(NodeId, NodeId)> = (1..n as NodeId).map(|i| (i - 1, i)).collect();
+            edges.extend(extra);
+            // Just exercise it — the assertion is "does not panic".
+            let _ = CompiledPlan::from_erased_graph("p", serde_json::json!({}), nodes, edges);
+        }
     }
 
     proptest::proptest! {

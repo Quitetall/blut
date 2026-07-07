@@ -153,6 +153,43 @@ pub enum PlanError {
     DeadlineExceeded { elapsed: std::time::Duration },
     #[error("plan io: {0}")]
     Io(#[from] std::io::Error),
+    /// A root node (no predecessors) does not take the unit graph input.
+    /// Every source of a graph must be a graph-input stage
+    /// (`input_kind() == "()"`), exactly as the first stage of a linear
+    /// chain must be. (`from_erased_graph`, ADR 0078.)
+    #[error(
+        "plan root stage '{stage}' must be graph-input (input_kind \"()\"), but it expects '{got}'"
+    )]
+    RootNotGraphInput { stage: String, got: String },
+    /// A DAG edge's producer output kind does not match the consumer's
+    /// input kind (the 1-predecessor case). Names both stages and both
+    /// kinds so a script/JSON author sees exactly where the wiring breaks.
+    /// (`from_erased_graph`, ADR 0078.)
+    #[error(
+        "kind break — stage '{from_stage}' outputs '{out_kind}' but stage '{to_stage}' expects '{in_kind}'"
+    )]
+    KindBreak {
+        from_stage: String,
+        out_kind: String,
+        to_stage: String,
+        in_kind: String,
+    },
+    /// A merge node has N predecessors but its stage does not accept
+    /// `tuple<N>` (element kinds are re-verified at decode time, exactly as
+    /// the typed `merge` path relies on — this checks arity only).
+    /// (`from_erased_graph`, ADR 0078.)
+    #[error(
+        "merge arity mismatch — stage '{stage}' expects a {expected}-tuple input but has {got} predecessors"
+    )]
+    BadMergeArity {
+        stage: String,
+        expected: usize,
+        got: usize,
+    },
+    /// A `PlanSpec` edge references a node index outside `0..n_nodes`.
+    /// (`from_erased_graph`, ADR 0078.)
+    #[error("plan edge ({from}, {to}) references a node out of range (plan has {n_nodes} nodes)")]
+    EdgeOutOfRange { from: u32, to: u32, n_nodes: usize },
     #[error("plan: {0}")]
     Other(String),
 }
