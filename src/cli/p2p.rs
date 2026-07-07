@@ -51,6 +51,30 @@ pub(super) enum P2pCommand {
         #[arg(long)]
         key: Option<std::path::PathBuf>,
     },
+    /// Run a symmetric MESH NODE (ADR 0079): one process that is a QUIC server,
+    /// a worker, and an optional scheduler at once. Supersedes the role-locked
+    /// `serve` (coordinator) / `connect` (worker) split. Runs until Ctrl-C.
+    Node {
+        /// Listen address (host:port). 0.0.0.0:9320 by default.
+        #[arg(long, default_value = "0.0.0.0:9320")]
+        listen: String,
+        /// Seed peers to dial on start, as `addr@pubkey-hex` (repeatable).
+        #[arg(long = "seed")]
+        seeds: Vec<String>,
+        /// Don't accept + run dispatched tasks (a scheduler-only node).
+        #[arg(long, default_value_t = false)]
+        no_worker: bool,
+        /// Don't dispatch tasks to peers (a worker-only node, e.g. a k8s pool).
+        #[arg(long, default_value_t = false)]
+        no_scheduler: bool,
+        /// Accept legacy peers that present no client cert (the A1 escape hatch,
+        /// one transition release).
+        #[arg(long, default_value_t = false)]
+        allow_legacy_peers: bool,
+        /// Identity key file (defaults to the standard p2p key path).
+        #[arg(long)]
+        key: Option<std::path::PathBuf>,
+    },
     /// Peer registry: list / set-trust / remove.
     Peers {
         #[command(subcommand)]
@@ -262,6 +286,26 @@ pub(super) async fn run_p2p_cmd(
             let path = key.map(Ok).unwrap_or_else(default_key_path)?;
             let kp = load_keypair(&path)?;
             run_p2p_connect(&reg, coordinator, coordinator_pubkey, kp).await
+        }
+        P2pCommand::Node {
+            listen,
+            seeds,
+            no_worker,
+            no_scheduler,
+            allow_legacy_peers,
+            key,
+        } => {
+            let path = key.map(Ok).unwrap_or_else(default_key_path)?;
+            let kp = std::sync::Arc::new(load_keypair(&path)?);
+            run_p2p_node(
+                listen,
+                seeds,
+                !no_worker,
+                !no_scheduler,
+                allow_legacy_peers,
+                kp,
+            )
+            .await
         }
         P2pCommand::Peers { cmd } => {
             let reg_path = default_registry_path()?;
@@ -503,6 +547,114 @@ pub(super) fn clone_keypair(kp: &crate::p2p::crypto::KeyPair) -> crate::p2p::cry
     crate::p2p::crypto::KeyPair::from_bytes(&kp.to_bytes())
 }
 
+/// Parse a `--seed` spec `addr@ed25519-pubkey-hex` into its parts (the pubkey
+/// pins the peer's TLS identity when dialing, A1).
+#[cfg(feature = "p2p")]
+fn parse_seed(spec: &str) -> Result<(std::net::SocketAddr, [u8; 32])> {
+    let (addr, hex) = spec
+        .split_once('@')
+        .ok_or_else(|| anyhow!("seed must be 'addr@pubkey-hex', got '{spec}'"))?;
+    let addr: std::net::SocketAddr = addr
+        .parse()
+        .with_context(|| format!("seed address '{addr}'"))?;
+    let mut pubkey = [0u8; 32];
+    faster_hex::hex_decode(hex.as_bytes(), &mut pubkey)
+        .map_err(|e| anyhow!("seed pubkey hex: {e}"))?;
+    Ok((addr, pubkey))
+}
+
+/// A connectivity/smoke worker runner (ADR 0079 A3): returns a signed result
+/// echoing the task's expected output hash. Proves the mesh dispatch→execute→
+/// result round-trip end-to-end. Production stage execution over the mesh
+/// (materialize input → run cookbook stage → seal output) rides the chunked
+/// blob transfer (D1.1) + the cookbook registry, wired separately.
+#[cfg(feature = "p2p")]
+struct SmokeRunner {
+    keypair: std::sync::Arc<crate::p2p::crypto::KeyPair>,
+}
+
+#[cfg(feature = "p2p")]
+#[async_trait::async_trait]
+impl crate::p2p::node::MeshTaskRunner for SmokeRunner {
+    async fn run(
+        &self,
+        task: crate::p2p::task::TaskManifest,
+    ) -> std::result::Result<crate::p2p::task::TaskResult, crate::error::TrainError> {
+        // Build with a zero signature, then sign (sign_payload never reads the
+        // signature field — no wasted signing pass).
+        let mut result = crate::p2p::task::TaskResult {
+            task_id: task.task_id,
+            peer_id: crate::p2p::peer::PeerId::from_pubkey(&self.keypair.verifying),
+            output_hash: task.expected_output_hash,
+            encrypted_output: None,
+            wall_time_ms: 0,
+            signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
+        };
+        result.signature = self.keypair.sign(&result.sign_payload());
+        Ok(result)
+    }
+}
+
+/// Run a symmetric mesh node until Ctrl-C (ADR 0079 A3).
+#[cfg(feature = "p2p")]
+pub(super) async fn run_p2p_node(
+    listen: String,
+    seeds: Vec<String>,
+    worker: bool,
+    scheduler: bool,
+    allow_legacy: bool,
+    keypair: std::sync::Arc<crate::p2p::crypto::KeyPair>,
+) -> Result<()> {
+    use crate::p2p::node::{MeshNode, MeshTaskRunner, NodeCapabilities};
+    use crate::p2p::registry::PeerRegistry;
+
+    let sockaddr: std::net::SocketAddr = listen
+        .parse()
+        .with_context(|| format!("parse listen addr '{listen}'"))?;
+    let reg_path = p2p_cli::default_registry_path()?;
+    let peers = PeerRegistry::load(&reg_path).map_err(|e| anyhow!("load peer registry: {e}"))?;
+
+    let caps = NodeCapabilities { worker, scheduler };
+    let runner: Option<std::sync::Arc<dyn MeshTaskRunner>> = if worker {
+        Some(std::sync::Arc::new(SmokeRunner {
+            keypair: keypair.clone(),
+        }))
+    } else {
+        None
+    };
+
+    let node = MeshNode::bind(sockaddr, keypair.clone(), peers, caps, runner, allow_legacy)
+        .await
+        .map_err(|e| anyhow!("bind mesh node: {e}"))?;
+    let bound = node.local_addr().map_err(|e| anyhow!("{e}"))?;
+    eprintln!("mesh node {} listening on {bound}", node.node_id());
+    eprintln!("pubkey       {}", p2p_pubkey_hex(&keypair));
+    eprintln!("capabilities worker={worker} scheduler={scheduler} allow_legacy={allow_legacy}");
+
+    // Dial seeds (best-effort — a down/hung seed must not block the others, so
+    // each dial is time-bounded).
+    for spec in &seeds {
+        match parse_seed(spec) {
+            Ok((addr, pubkey)) => {
+                let dial = node.connect_to(addr, pubkey);
+                match tokio::time::timeout(std::time::Duration::from_secs(10), dial).await {
+                    Ok(Ok(_conn)) => eprintln!("connected to seed {addr}"),
+                    Ok(Err(e)) => eprintln!("seed {addr}: {e}"),
+                    Err(_) => eprintln!("seed {addr}: dial timed out"),
+                }
+            }
+            Err(e) => eprintln!("bad --seed '{spec}': {e}"),
+        }
+    }
+
+    eprintln!("node running — Ctrl-C to stop");
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        eprintln!("signal wait failed: {e}");
+    }
+    eprintln!("shutting down mesh node");
+    Ok(())
+}
+
 #[cfg(all(test, feature = "p2p"))]
 mod p2p_cli_tests {
     use super::{Cli, Command, P2pCommand, P2pKeysCommand, P2pPeersCommand};
@@ -529,6 +681,54 @@ mod p2p_cli_tests {
     fn serve_defaults_addr() {
         match p2p_of(&["blut", "p2p", "serve"]) {
             P2pCommand::Serve { addr, .. } => assert_eq!(addr, "0.0.0.0:9320"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn node_parses_capabilities_and_seeds() {
+        match p2p_of(&[
+            "blut",
+            "p2p",
+            "node",
+            "--listen",
+            "0.0.0.0:9999",
+            "--no-scheduler",
+            "--seed",
+            "1.2.3.4:9320@abcd",
+            "--seed",
+            "5.6.7.8:9320@ef01",
+        ]) {
+            P2pCommand::Node {
+                listen,
+                seeds,
+                no_worker,
+                no_scheduler,
+                allow_legacy_peers,
+                ..
+            } => {
+                assert_eq!(listen, "0.0.0.0:9999");
+                assert_eq!(seeds.len(), 2);
+                assert!(!no_worker);
+                assert!(no_scheduler, "--no-scheduler set");
+                assert!(!allow_legacy_peers);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn node_defaults_are_full_peer() {
+        match p2p_of(&["blut", "p2p", "node"]) {
+            P2pCommand::Node {
+                listen,
+                no_worker,
+                no_scheduler,
+                ..
+            } => {
+                assert_eq!(listen, "0.0.0.0:9320");
+                assert!(!no_worker && !no_scheduler, "default = worker + scheduler");
+            }
             other => panic!("got {other:?}"),
         }
     }
