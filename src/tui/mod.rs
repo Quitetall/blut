@@ -969,6 +969,29 @@ impl App {
         }
     }
 
+    /// Rebuild the engine-console model. Starts from the representative demo,
+    /// then overlays the newest RUNNING job's real DAG / cache / phase from its
+    /// `status.jsonl` (the mesh / broker / ε loaders land in the next slice, so
+    /// those panels stay representative until then).
+    fn refresh_console(&mut self) {
+        let mut m = console::ConsoleModel::demo();
+        let job = self
+            .jobs
+            .iter()
+            .find(|j| matches!(j.state, JobState::Running))
+            .or_else(|| self.jobs.first());
+        if let Some(job) = job
+            && let Ok(dir) = jobs::job_dir_path(&job.id)
+            && m.apply_status_jsonl(&dir.join("status.jsonl"))
+        {
+            m.run_id = job.id.chars().take(8).collect();
+            if let Some(name) = &job.output_name {
+                m.plan = name.clone();
+            }
+        }
+        self.console = m;
+    }
+
     fn refresh_system(&mut self) {
         self.system = system::SystemSnapshot::probe();
     }
@@ -1050,6 +1073,7 @@ impl App {
     /// and — if a diagnostic view is active — its scanned rows.
     fn refresh_all(&mut self) {
         self.refresh_jobs();
+        self.refresh_console();
         self.refresh_system();
         self.refresh_log();
         // Re-pull whatever the active view shows (keeps a running job's DAG /

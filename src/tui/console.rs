@@ -14,18 +14,22 @@
 //! the privacy ledger, the broker footprint) — [`ConsoleModel::demo`] stands in
 //! when there is no live run.
 
+use std::collections::HashMap;
+use std::path::Path;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use crate::framework::status::{HostedEvent, StageEvent};
 use crate::tui::theme;
 
 /// Coarse plan lifecycle phase. The full vocabulary is matched by the renderer;
 /// the demo model only exercises `Running` — live loaders (a completed / failed
 /// run) construct the rest.
 #[allow(dead_code)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
     Pending,
     Running,
@@ -34,7 +38,7 @@ pub enum Phase {
 }
 
 /// A peer's local trust level (ADR 0079).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Trust {
     Anonymous,
     Registered,
@@ -44,7 +48,7 @@ pub enum Trust {
 /// A node in the executing typed DAG. `Blocked` (a fail-closed gate refusal) is
 /// rendered but not present in the demo — a live gate denial constructs it.
 #[allow(dead_code)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NodeState {
     Cached,
     Done,
@@ -231,6 +235,159 @@ impl ConsoleModel {
             ],
             gov_violations: 0,
         }
+    }
+
+    /// Overlay REAL DAG / cache / phase state parsed from a run's
+    /// `status.jsonl` (the host-tagged `HostedEvent` stream, D5). Malformed
+    /// lines are skipped; a missing/unreadable file leaves the model untouched
+    /// (so a live run replaces the demo DAG while the mesh/broker/ε panels keep
+    /// their loaders' data — those land next). Returns whether it applied.
+    pub fn apply_status_jsonl(&mut self, path: &Path) -> bool {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        // Latest lifecycle state per node index (later events win).
+        let mut nodes: HashMap<u32, DagNode> = HashMap::new();
+        let mut cache: Vec<CacheEvent> = Vec::new();
+        let (mut hits, mut ran) = (0u32, 0u32);
+        let mut any_fail = false;
+
+        let short = |h: crate::framework::artifact::ContentHash| {
+            h.to_hex().chars().take(8).collect::<String>()
+        };
+        let set = |nodes: &mut HashMap<u32, DagNode>, idx, name: String, st, note: String| {
+            nodes.insert(
+                idx,
+                DagNode {
+                    name,
+                    state: st,
+                    note,
+                },
+            );
+        };
+
+        for line in text.lines() {
+            let Ok(h) = serde_json::from_str::<HostedEvent>(line) else {
+                continue;
+            };
+            match h.event {
+                StageEvent::StageBegin {
+                    node_idx,
+                    stage_name,
+                    input_hash,
+                } => set(
+                    &mut nodes,
+                    node_idx,
+                    stage_name,
+                    NodeState::Running,
+                    format!("{} · running", short(input_hash)),
+                ),
+                StageEvent::StageEnd {
+                    node_idx,
+                    stage_name,
+                    output_hash,
+                    elapsed,
+                } => {
+                    ran += 1;
+                    cache.push(CacheEvent {
+                        hit: false,
+                        stage: stage_name.clone(),
+                        hash: short(output_hash),
+                        note: format!("ran {:.1}s", elapsed.as_secs_f64()),
+                    });
+                    set(
+                        &mut nodes,
+                        node_idx,
+                        stage_name,
+                        NodeState::Done,
+                        short(output_hash),
+                    );
+                }
+                StageEvent::StageSkipped {
+                    node_idx,
+                    stage_name,
+                    cache_key,
+                } => {
+                    hits += 1;
+                    cache.push(CacheEvent {
+                        hit: true,
+                        stage: stage_name.clone(),
+                        hash: short(cache_key),
+                        note: "reused".into(),
+                    });
+                    set(
+                        &mut nodes,
+                        node_idx,
+                        stage_name,
+                        NodeState::Cached,
+                        format!("{} · reused", short(cache_key)),
+                    );
+                }
+                StageEvent::StageFailed {
+                    node_idx,
+                    stage_name,
+                    error,
+                    ..
+                } => {
+                    any_fail = true;
+                    set(
+                        &mut nodes,
+                        node_idx,
+                        stage_name,
+                        NodeState::Blocked,
+                        error.chars().take(28).collect(),
+                    );
+                }
+                StageEvent::StageBlocked {
+                    node_idx,
+                    stage_name,
+                    resource,
+                } => set(
+                    &mut nodes,
+                    node_idx,
+                    stage_name,
+                    NodeState::Queued,
+                    format!("waiting · {resource:?}"),
+                ),
+                _ => {}
+            }
+        }
+
+        if nodes.is_empty() {
+            return false;
+        }
+        // Assemble in topological order (node_idx is the topo index).
+        let mut idxs: Vec<u32> = nodes.keys().copied().collect();
+        idxs.sort_unstable();
+        self.dag = idxs
+            .into_iter()
+            .map(|i| nodes.remove(&i).unwrap())
+            .collect();
+
+        let running = self.dag.iter().any(|n| n.state == NodeState::Running);
+        self.stages_total = self.dag.len() as u32;
+        self.stages_done = self
+            .dag
+            .iter()
+            .filter(|n| matches!(n.state, NodeState::Done | NodeState::Cached))
+            .count() as u32;
+        self.phase = if any_fail {
+            Phase::Failed
+        } else if running {
+            Phase::Running
+        } else if self.stages_done == self.stages_total {
+            Phase::Succeeded
+        } else {
+            Phase::Pending
+        };
+
+        // Keep the most recent cache events; hit rate from this run.
+        let total = hits + ran;
+        self.cache_hit_pct = (hits * 100).checked_div(total).unwrap_or(0).min(100);
+        self.cache_mibs = 0; // throughput isn't in the event stream (yet)
+        let keep = cache.len().saturating_sub(6);
+        self.cache = cache.split_off(keep);
+        true
     }
 }
 
@@ -645,6 +802,67 @@ mod tests {
             let mut term = Terminal::new(backend).unwrap();
             term.draw(|f| draw_console(f, f.area(), &m)).unwrap();
         }
+    }
+
+    #[test]
+    fn applies_a_real_status_jsonl() {
+        use crate::framework::artifact::ContentHash;
+        use std::time::Duration;
+        let h = |e| HostedEvent {
+            host: None,
+            event: e,
+        };
+        let lines = [
+            h(StageEvent::StageSkipped {
+                node_idx: 0,
+                stage_name: "codec_ready".into(),
+                cache_key: ContentHash::of_bytes(b"a"),
+            }),
+            h(StageEvent::StageBegin {
+                node_idx: 1,
+                stage_name: "train_joint".into(),
+                input_hash: ContentHash::of_bytes(b"b"),
+            }),
+            h(StageEvent::StageEnd {
+                node_idx: 1,
+                stage_name: "train_joint".into(),
+                output_hash: ContentHash::of_bytes(b"c"),
+                elapsed: Duration::from_secs(4),
+            }),
+            h(StageEvent::StageBegin {
+                node_idx: 2,
+                stage_name: "eval".into(),
+                input_hash: ContentHash::of_bytes(b"d"),
+            }),
+        ];
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("status.jsonl");
+        let body: String = lines
+            .iter()
+            .map(|l| serde_json::to_string(l).unwrap() + "\n")
+            .collect();
+        std::fs::write(&path, body).unwrap();
+
+        let mut m = ConsoleModel::demo();
+        assert!(m.apply_status_jsonl(&path));
+        // 3 nodes in topo order: cached, done, running.
+        assert_eq!(m.dag.len(), 3);
+        assert_eq!(m.dag[0].state, NodeState::Cached);
+        assert_eq!(m.dag[1].state, NodeState::Done);
+        assert_eq!(m.dag[2].state, NodeState::Running);
+        assert_eq!(m.phase, Phase::Running, "a node is still running");
+        assert_eq!(m.stages_done, 2);
+        assert_eq!(m.stages_total, 3);
+        // Cache: 1 hit (skipped) + 1 miss (ended) = 50%.
+        assert_eq!(m.cache_hit_pct, 50);
+    }
+
+    #[test]
+    fn missing_status_jsonl_is_a_noop() {
+        let mut m = ConsoleModel::demo();
+        let before = m.dag.len();
+        assert!(!m.apply_status_jsonl(Path::new("/no/such/status.jsonl")));
+        assert_eq!(m.dag.len(), before, "demo model untouched");
     }
 
     #[test]
