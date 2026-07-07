@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# BLUT Kubernetes operator image (ADR 0067 T4.5 · B1).
+#
+# Runs the reconcile loop that maintains BlutWorkerPool StatefulSets and runs
+# BlutPlan Jobs. This is the ONLY image that carries kube-rs (ADR 0037: k8s is
+# an adapter, the engine has zero kube dep).
+#
+#   docker build -f docker/Dockerfile.operator -t ghcr.io/lamquant/blut-operator:latest .
+
+# ---- builder ----------------------------------------------------------------
+FROM rust:1-bookworm AS builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY src/ src/
+COPY scripts/ scripts/
+COPY benches/ benches/
+RUN cargo build --release --manifest-path crates/blut-operator/Cargo.toml --bin blut-operator
+
+# ---- runtime ----------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/target/release/blut-operator /usr/local/bin/blut-operator
+ENTRYPOINT ["blut-operator"]
+CMD ["run"]

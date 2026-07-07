@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# BLUT engine + cookbook runtime image (ADR 0067 T4.5 · B1).
+#
+# Pods run `blut p2p node` over QUIC (the mesh IS the runtime, ADR 0079) — NOT
+# the axum blut-worker (that stays the cloud-queue agent for T3.1). The Python
+# cookbook runtime rides on the CUDA base so dispatched stages can execute.
+#
+#   docker build -f docker/Dockerfile.blut -t ghcr.io/lamquant/blut:latest .
+#
+# Multi-stage: a Rust builder compiles the engine with the p2p + s3 features,
+# then a slim CUDA runtime carries the binary + the Python cookbook deps.
+
+# ---- builder ----------------------------------------------------------------
+FROM rust:1-bookworm AS builder
+WORKDIR /src
+# Cache deps: copy manifests first.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY src/ src/
+COPY scripts/ scripts/
+COPY benches/ benches/
+# The mesh needs p2p; the shared cache tier needs s3.
+RUN cargo build --release --features p2p,s3 --bin blut
+RUN cargo build --release --manifest-path crates/blut-dsl/Cargo.toml --bin blut-dsl
+
+# ---- runtime ----------------------------------------------------------------
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
+# Python cookbook runtime (torch et al. are installed by the cookbook layer;
+# kept minimal here — the concrete deps come from the cookbook requirements).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 python3-pip ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/target/release/blut /usr/local/bin/blut
+COPY --from=builder /src/target/release/blut-dsl /usr/local/bin/blut-dsl
+# The DSL front-end is shelled out to by the engine; make it discoverable.
+ENV BLUT_DSL_BIN=/usr/local/bin/blut-dsl
+# Mesh QUIC listener.
+EXPOSE 9320/udp
+ENTRYPOINT ["blut"]
+# Default: a worker node with no scheduler (a BlutWorkerPool pod). Override the
+# CMD for a scheduler node or a one-shot BlutPlan dispatcher Job.
+CMD ["p2p", "node", "--no-scheduler", "--listen", "0.0.0.0:9320"]
