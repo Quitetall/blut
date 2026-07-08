@@ -324,6 +324,14 @@ struct EditorField {
 /// properties, with an optional raw-JSON fallback toggle.
 enum Overlay {
     None,
+    /// Console cookbook selector: pick a registered cookbook's TUI to open
+    /// (or Esc to stay in BLUT). `items` are the detected `(label, about)`
+    /// captured at open, in `registry.cookbook_tuis()` order — `cursor` indexes
+    /// both, so the selection maps straight to the launch index.
+    CookbookPicker {
+        cursor: usize,
+        items: Vec<(String, String)>,
+    },
     Picker {
         query: String,
         cursor: usize,
@@ -396,6 +404,17 @@ struct App {
     /// Which console surface is shown (Home or a drill-down), when `view` is
     /// `Console`. Switched by the number keys.
     console_tab: console::ConsoleTab,
+    /// Set when the operator picks a cookbook's TUI to open from the console
+    /// selector: index into `registry.cookbook_tuis()`. The run loop returns
+    /// [`ConsoleOutcome::OpenCookbookTui`] and the CLI launches it, then
+    /// re-enters the console.
+    launch_cookbook: Option<usize>,
+    /// `true` when this App instance is a cookbook's training cockpit (launched
+    /// via [`run_cockpit`]), `false` for the BLUT engine console. Gates the key
+    /// map: the cockpit surface owns the training-view switches + recipe picker;
+    /// the console owns the drill-down tabs + the cookbook selector. Keeps the
+    /// two surfaces from leaking each other's navigation.
+    cookbook_mode: bool,
     jobs: Vec<JobSummary>,
     selected: ListState,
     log_lines: Vec<String>,
@@ -431,7 +450,7 @@ struct App {
     /// composes it). Source of the recipe catalog + per-recipe default
     /// args — the TUI indexes the composed catalog, not any static slice,
     /// so it is domain-agnostic. [[project_blut_cookbook_split]]
-    registry: crate::framework::Registry,
+    registry: std::sync::Arc<crate::framework::Registry>,
     /// Flat recipe catalog (union of the registry's cookbooks), collected
     /// once at startup. `filter_recipes` / `recipe_menu` index into this.
     catalog: Vec<&'static crate::recipes::RecipeDef>,
@@ -459,7 +478,8 @@ const RESET_ROWS: &[views::ResetAction] = &[
 ];
 
 impl App {
-    fn new(registry: crate::framework::Registry) -> Self {
+    fn new(registry: impl Into<std::sync::Arc<crate::framework::Registry>>) -> Self {
+        let registry = registry.into();
         let mut selected = ListState::default();
         selected.select(Some(0));
         // Collect the catalog once: the union of the registered cookbooks'
@@ -469,6 +489,8 @@ impl App {
         Self {
             console: console::ConsoleModel::demo(),
             console_tab: console::ConsoleTab::Home,
+            launch_cookbook: None,
+            cookbook_mode: false,
             jobs: Vec::new(),
             selected,
             log_lines: Vec::new(),
@@ -512,6 +534,28 @@ impl App {
             self.reset_armed = None;
         }
         self.set_status(format!("view: {}", view.title()));
+    }
+
+    /// Open the console cookbook selector. Detects the registered cookbooks that
+    /// ship a TUI; if exactly one, launches it directly; if several, opens the
+    /// picker; if none, says so (BLUT is then the whole surface).
+    fn open_cookbook_picker(&mut self) {
+        let items: Vec<(String, String)> = self
+            .registry
+            .cookbook_tuis()
+            .iter()
+            .map(|t| (t.label().to_string(), t.about().to_string()))
+            .collect();
+        match items.len() {
+            0 => {
+                self.set_status("no cookbook TUIs detected — BLUT is the whole surface".to_string())
+            }
+            1 => {
+                self.launch_cookbook = Some(0);
+                self.quit = true;
+            }
+            _ => self.overlay = Overlay::CookbookPicker { cursor: 0, items },
+        }
     }
 
     /// (Re)load the data the given view renders. Split from `set_view` so the
@@ -1310,7 +1354,54 @@ fn assemble_fields(fields: &[EditorField]) -> String {
 /// Entrypoint registered as `blut tui`. The caller (the cookbook binary)
 /// supplies the composed cookbook [`Registry`]; the cockpit's recipe
 /// catalog comes from it, not a static slice.
-pub async fn run(registry: crate::framework::Registry) -> Result<()> {
+/// Why the console/cockpit event loop returned.
+pub enum ConsoleOutcome {
+    /// The operator quit BLUT.
+    Quit,
+    /// The operator chose to open a cookbook's TUI from the console selector —
+    /// the index into [`crate::framework::Registry::cookbook_tuis`]. The CLI
+    /// launches that TUI, then re-enters the console.
+    OpenCookbookTui(usize),
+}
+
+/// Open the BLUT engine console (the default surface). Returns whether the
+/// operator quit or asked to launch a cookbook's TUI; the CLI owns the
+/// console↔cookbook loop so the registry survives across launches.
+pub async fn run(registry: std::sync::Arc<crate::framework::Registry>) -> Result<ConsoleOutcome> {
+    run_surface(registry, View::Console).await
+}
+
+/// Open a cookbook's built-in training cockpit (the retired surface, now a
+/// cookbook's TUI — see [`crate::framework::CookbookTui`]). Owns the terminal
+/// for its lifetime; returns when the operator leaves the cockpit.
+pub async fn run_cockpit(registry: std::sync::Arc<crate::framework::Registry>) -> Result<()> {
+    run_surface(registry, View::Cockpit).await.map(|_| ())
+}
+
+/// The BLUT interactive entry point: open the console, and whenever the operator
+/// picks a cookbook's TUI from the selector, launch it and return to the console
+/// on exit. The registry is shared (`Arc`) so it survives across launches. Loops
+/// until the operator quits BLUT from the console.
+pub async fn run_console_loop(registry: std::sync::Arc<crate::framework::Registry>) -> Result<()> {
+    loop {
+        match run(registry.clone()).await? {
+            ConsoleOutcome::Quit => return Ok(()),
+            ConsoleOutcome::OpenCookbookTui(idx) => {
+                // Re-detect each time: the list is cheap and stable per registry.
+                if let Some(t) = registry.cookbook_tuis().get(idx) {
+                    t.run(registry.clone()).await?;
+                }
+            }
+        }
+    }
+}
+
+/// Shared terminal setup/teardown around [`run_app`], parameterised by the
+/// surface it opens on.
+async fn run_surface(
+    registry: std::sync::Arc<crate::framework::Registry>,
+    initial_view: View,
+) -> Result<ConsoleOutcome> {
     // Detect NO_COLOR / TERM=dumb / locale once before the first draw so
     // every theme getter returns the right style.
     theme::detect("auto", "auto");
@@ -1320,7 +1411,7 @@ pub async fn run(registry: crate::framework::Registry) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut term = Terminal::new(backend).context("terminal")?;
 
-    let result = run_app(&mut term, registry).await;
+    let result = run_app(&mut term, registry, initial_view).await;
 
     // Always restore the terminal, even on error.
     disable_raw_mode().ok();
@@ -1339,7 +1430,7 @@ pub async fn run(registry: crate::framework::Registry) -> Result<()> {
 /// every view headless to a `TestBackend`, asserting each produces a non-blank
 /// buffer; exits 0 on success. Lets CI / an operator verify the cockpit builds
 /// + every view draws without entering raw mode.
-pub fn check(registry: crate::framework::Registry) -> Result<()> {
+pub fn check(registry: impl Into<std::sync::Arc<crate::framework::Registry>>) -> Result<()> {
     use ratatui::backend::TestBackend;
     let views = [
         View::Console,
@@ -1453,9 +1544,12 @@ fn render_overlay_check(
 
 async fn run_app<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
-    registry: crate::framework::Registry,
-) -> Result<()> {
+    registry: std::sync::Arc<crate::framework::Registry>,
+    initial_view: View,
+) -> Result<ConsoleOutcome> {
     let mut app = App::new(registry);
+    app.view = initial_view;
+    app.cookbook_mode = initial_view != View::Console;
     app.refresh_jobs();
     app.refresh_system();
     app.refresh_log();
@@ -1490,7 +1584,10 @@ async fn run_app<B: ratatui::backend::Backend>(
             }
         }
     }
-    Ok(())
+    Ok(match app.launch_cookbook {
+        Some(idx) => ConsoleOutcome::OpenCookbookTui(idx),
+        None => ConsoleOutcome::Quit,
+    })
 }
 
 fn handle_key(app: &mut App, k: event::KeyEvent) {
@@ -1500,6 +1597,25 @@ fn handle_key(app: &mut App, k: event::KeyEvent) {
         return;
     }
     match &mut app.overlay {
+        Overlay::CookbookPicker { cursor, items } => match k.code {
+            // Esc stays in BLUT (the console is the whole surface).
+            KeyCode::Esc => app.overlay = Overlay::None,
+            KeyCode::Up | KeyCode::Char('k') => *cursor = cursor.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                let last = items.len().saturating_sub(1);
+                *cursor = (*cursor + 1).min(last);
+            }
+            KeyCode::Enter => {
+                // Copy the index out so the `app.overlay` borrow ends before we
+                // mutate `app`; quitting the loop makes run_app return
+                // OpenCookbookTui(idx) and the CLI launches that cookbook's TUI.
+                let idx = *cursor;
+                app.overlay = Overlay::None;
+                app.launch_cookbook = Some(idx);
+                app.quit = true;
+            }
+            _ => {}
+        },
         Overlay::Editor {
             fields,
             focus,
@@ -1649,27 +1765,36 @@ fn handle_key_main(app: &mut App, k: event::KeyEvent) {
     // Capital letters jump straight to a detail view. Chosen so they
     // don't collide with the lowercase recipe-hotkey pool (1-9,a-z).
     match k.code {
-        KeyCode::Char('E') => return app.set_view(View::Console),
-        KeyCode::Char('K') => return app.set_view(View::Cockpit),
-        // On the Console, 0–5 switch the drill-down tab.
-        KeyCode::Char(c @ '0'..='5') if app.view == View::Console => {
+        // ── BLUT console keys (engine surface) ──────────────────────
+        // 0–5 switch the drill-down tab; `c` opens the cookbook selector
+        // (open a cookbook's TUI, or Esc to stay in BLUT).
+        KeyCode::Char(c @ '0'..='5') if !app.cookbook_mode && app.view == View::Console => {
             if let Some(t) = console::ConsoleTab::from_digit(c) {
                 app.console_tab = t;
             }
             return;
         }
-        KeyCode::Char('J') => return app.set_view(View::Jobs),
-        KeyCode::Char('L') => return app.set_view(View::Log),
-        KeyCode::Char('Y') => return app.set_view(View::System),
-        KeyCode::Char('H') => return app.set_view(View::History),
-        KeyCode::Char('B') => return app.set_view(View::Leaderboard),
-        KeyCode::Char('C') => return app.set_view(View::Compare),
-        KeyCode::Char('G') => return app.set_view(View::Dag),
-        KeyCode::Char('I') => return app.set_view(View::Lineage),
-        KeyCode::Char('A') => return app.set_view(View::Artifacts),
-        KeyCode::Char('M') => return app.set_view(View::Metrics),
-        KeyCode::Char('P') => return app.set_view(View::Catalog),
-        KeyCode::Char('X') => return app.set_view(View::Reset),
+        KeyCode::Char('c') if !app.cookbook_mode && app.view == View::Console => {
+            app.open_cookbook_picker();
+            return;
+        }
+        // ── Cookbook cockpit keys (training surface only) ───────────
+        // Capital letters jump straight to a training view. Gated to the
+        // cockpit surface so they don't leak into the BLUT console. (The
+        // cockpit is reached from the console via the `c` selector, not an
+        // in-app switch — the retired K→Cockpit fallback is gone.)
+        KeyCode::Char('J') if app.cookbook_mode => return app.set_view(View::Jobs),
+        KeyCode::Char('L') if app.cookbook_mode => return app.set_view(View::Log),
+        KeyCode::Char('Y') if app.cookbook_mode => return app.set_view(View::System),
+        KeyCode::Char('H') if app.cookbook_mode => return app.set_view(View::History),
+        KeyCode::Char('B') if app.cookbook_mode => return app.set_view(View::Leaderboard),
+        KeyCode::Char('C') if app.cookbook_mode => return app.set_view(View::Compare),
+        KeyCode::Char('G') if app.cookbook_mode => return app.set_view(View::Dag),
+        KeyCode::Char('I') if app.cookbook_mode => return app.set_view(View::Lineage),
+        KeyCode::Char('A') if app.cookbook_mode => return app.set_view(View::Artifacts),
+        KeyCode::Char('M') if app.cookbook_mode => return app.set_view(View::Metrics),
+        KeyCode::Char('P') if app.cookbook_mode => return app.set_view(View::Catalog),
+        KeyCode::Char('X') if app.cookbook_mode => return app.set_view(View::Reset),
         // Ctrl-C handled by caller; q always quits.
         KeyCode::Char('q') => {
             app.quit = true;
@@ -1730,7 +1855,7 @@ fn handle_key_cockpit(app: &mut App, k: event::KeyEvent) {
 /// to the cockpit.
 fn handle_key_detail(app: &mut App, k: event::KeyEvent) {
     match k.code {
-        KeyCode::Esc | KeyCode::Char('b') => app.set_view(View::Console),
+        KeyCode::Esc | KeyCode::Char('b') => app.set_view(View::Cockpit),
         KeyCode::Up | KeyCode::Char('k') => {
             if matches!(app.view, View::Jobs | View::Log) {
                 app.move_selection(-1);

@@ -290,6 +290,48 @@ pub(super) fn centered_rect(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
 pub(super) fn draw_overlay(f: &mut Frame<'_>, app: &App) {
     match &app.overlay {
         Overlay::None => {}
+        Overlay::CookbookPicker { cursor, items } => {
+            let area = centered_rect(f.area(), 56, 44);
+            let bg = Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::panel_border())
+                .title(Span::styled(
+                    " open a cookbook TUI  (↑↓ select · Enter open · Esc stay in BLUT) ",
+                    theme::signal_bold(),
+                ));
+            f.render_widget(bg, area);
+            let inner = Rect {
+                x: area.x + 2,
+                y: area.y + 1,
+                width: area.width.saturating_sub(4),
+                height: area.height.saturating_sub(2),
+            };
+            let lines: Vec<Line> = items
+                .iter()
+                .enumerate()
+                .map(|(i, (label, about))| {
+                    let sel = i == *cursor;
+                    let marker = if sel {
+                        if theme::ascii_only() { "> " } else { "▸ " }
+                    } else {
+                        "  "
+                    };
+                    Line::from(vec![
+                        Span::styled(marker, theme::signal_bold()),
+                        Span::styled(
+                            format!("{label:<16}"),
+                            if sel {
+                                theme::tab_active()
+                            } else {
+                                theme::signal()
+                            },
+                        ),
+                        Span::styled(about.clone(), theme::label()),
+                    ])
+                })
+                .collect();
+            f.render_widget(Paragraph::new(lines), inner);
+        }
         Overlay::Picker { query, cursor } => {
             let area = centered_rect(f.area(), 60, 60);
             // Clear by drawing an empty block underneath.
@@ -1220,7 +1262,7 @@ pub(super) fn truncate(s: &str, max: usize) -> String {
 pub(super) fn draw_status(f: &mut Frame<'_>, area: Rect, app: &App) {
     let base = match app.view {
         View::Console => {
-            "q quit • r refresh • 0–5 tabs (Home/Plan/Mesh/Broker/Privacy/Cache) • K cockpit (legacy)"
+            "q quit • r refresh • 0–5 tabs (Home/Plan/Mesh/Broker/Privacy/Cache) • c open a cookbook TUI"
         }
         View::Cockpit => {
             "q quit • ↑↓ select • Enter log • r refresh • c cancel • R recipe • J/L/Y/H/B/C/G/I/A/M/P/X views"

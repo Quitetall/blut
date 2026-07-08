@@ -13,7 +13,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 fn app() -> App {
     super::isolate_datasets_db_for_tests();
     let mut a = App::new(test_registry());
+    // These exercise the cookbook COCKPIT surface (recipe picker / editor /
+    // training-view switches), so put the App in cookbook mode as run_cockpit
+    // does — the training-view keys are gated to that surface.
     a.view = super::View::Cockpit;
+    a.cookbook_mode = true;
     a
 }
 
@@ -46,6 +50,64 @@ fn console_digit_keys_switch_tabs() {
     // A digit outside 0–5 is ignored (stays on Home).
     handle_key(&mut a, key('9'));
     assert_eq!(a.console_tab, ConsoleTab::Home);
+}
+
+#[test]
+fn cookbook_picker_enter_launches_selection() {
+    super::isolate_datasets_db_for_tests();
+    // Fresh App = the BLUT console surface (cookbook_mode = false).
+    let mut a = App::new(test_registry());
+    a.overlay = super::Overlay::CookbookPicker {
+        cursor: 0,
+        items: vec![
+            ("LamQuant".into(), "training cockpit".into()),
+            ("Other".into(), String::new()),
+        ],
+    };
+    handle_key(&mut a, code(KeyCode::Down)); // → index 1
+    handle_key(&mut a, code(KeyCode::Enter));
+    assert_eq!(
+        a.launch_cookbook,
+        Some(1),
+        "Enter records the chosen cookbook"
+    );
+    assert!(
+        a.quit,
+        "selecting a cookbook TUI quits the console loop to launch it"
+    );
+}
+
+#[test]
+fn cookbook_picker_esc_stays_in_blut() {
+    super::isolate_datasets_db_for_tests();
+    let mut a = App::new(test_registry());
+    a.overlay = super::Overlay::CookbookPicker {
+        cursor: 0,
+        items: vec![("X".into(), String::new())],
+    };
+    handle_key(&mut a, code(KeyCode::Esc));
+    assert!(
+        matches!(a.overlay, super::Overlay::None),
+        "Esc closes the picker"
+    );
+    assert!(!a.quit, "Esc stays in BLUT");
+    assert_eq!(a.launch_cookbook, None);
+}
+
+#[test]
+fn c_on_console_with_no_cookbook_tui_shows_status() {
+    super::isolate_datasets_db_for_tests();
+    // The fixture registry has no cookbook exposing a TUI.
+    let mut a = App::new(test_registry());
+    handle_key(&mut a, key('c'));
+    assert!(
+        matches!(a.overlay, super::Overlay::None),
+        "no picker opens when no cookbook ships a TUI"
+    );
+    assert!(
+        a.status_msg.is_some(),
+        "operator is told BLUT is the whole surface"
+    );
 }
 
 // ── Overlay transitions: None → Picker → Editor → Esc → Ctrl-C ──
@@ -611,17 +673,14 @@ fn capital_keys_switch_views() {
 
 #[test]
 fn esc_or_b_returns_detail_view_to_cockpit() {
-    // From a detail view, both Esc and 'b' go back to the Console home.
+    // From a training detail view, both Esc and 'b' go back to the cockpit (the
+    // cookbook surface's home); the BLUT console is a separate surface.
     for back in [code(KeyCode::Esc), key('b')] {
         let mut a = app();
         handle_key(&mut a, key('J')); // → Jobs
         assert_eq!(a.view, View::Jobs);
         handle_key(&mut a, back);
-        assert_eq!(
-            a.view,
-            super::View::Console,
-            "Esc/b should return to the Console home"
-        );
+        assert_eq!(a.view, View::Cockpit, "Esc/b should return to the cockpit");
     }
 }
 

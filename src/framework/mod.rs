@@ -50,7 +50,7 @@ pub mod status;
 pub use artifact::{Artifact, ArtifactMetadata, ContentHash, ListOf};
 pub use cache::{CacheHandle, CacheHit, lru_prune};
 pub use compat::Compatible;
-pub use cookbook::{ArtifactDescriptor, Cookbook, Registry, StageDescriptor};
+pub use cookbook::{ArtifactDescriptor, Cookbook, CookbookTui, Registry, StageDescriptor};
 pub use dag_opt::{DagOptimizer, ScheduleHint};
 pub use error::{PlanError, RecipeError, StageError};
 pub use error_domain::{

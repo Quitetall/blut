@@ -127,6 +127,9 @@ fn populated_app() -> App {
     super::isolate_datasets_db_for_tests();
     theme::detect("always", "unicode");
     let mut app = App::new(test_registry());
+    // The harness exercises the training-cockpit surface (view switches, recipe
+    // picker, per-job panels), so run it in cookbook mode as run_cockpit does.
+    app.cookbook_mode = true;
     app.jobs = vec![
         job("20260618-073012-000000001", JobState::Running),
         job("20260618-070000-000000002", JobState::Done),

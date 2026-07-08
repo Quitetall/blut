@@ -18,6 +18,37 @@
 
 use crate::framework::error_domain::ErrorDomainDef;
 use crate::recipes::recipe::{RecipeCategory, RecipeDef};
+use std::future::Future;
+use std::pin::Pin;
+
+/// A cookbook's optional bespoke TUI, launched from inside the BLUT console.
+///
+/// BLUT's own surface is the engine console (mesh / DAG / broker / ε / cache /
+/// governance). A cookbook MAY additionally ship a domain TUI — a training
+/// cockpit, a dataset browser, a domain dashboard — and expose it here. The
+/// console DETECTS the cookbooks that provide one (via [`Registry::cookbook_tuis`])
+/// and offers them in its selector, so an operator can open a cookbook's TUI or
+/// stay in BLUT. A cookbook without one is still fully usable from the console
+/// (build + inspect a DAG, run via the CLI); the TUI is a convenience, not a
+/// requirement.
+pub trait CookbookTui: Send + Sync {
+    /// Short label shown in the console's cookbook selector (e.g. "LamQuant").
+    fn label(&self) -> &str;
+    /// One-line description of what this cookbook's TUI does.
+    fn about(&self) -> &str {
+        ""
+    }
+    /// Run the cookbook's TUI to completion. It owns the terminal while active
+    /// (BLUT restores its own console on return). `reg` is the live registry
+    /// (the cookbook's ingredients / courses / recipes), passed by shared `Arc`
+    /// so the impl can hand it straight to a `blut::tui` entry that owns it.
+    /// Returned as a boxed future so the trait stays object-safe without an
+    /// `async_trait` dep.
+    fn run<'a>(
+        &'a self,
+        reg: std::sync::Arc<Registry>,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
+}
 
 /// Lightweight descriptor for a stage a cookbook declares. Name /
 /// kind / schema only — NOT an executable handle (extraction
@@ -82,6 +113,12 @@ pub trait Cookbook: Send + Sync + 'static {
     fn error_domains(&self) -> &'static [&'static ErrorDomainDef] {
         &[]
     }
+    /// This cookbook's optional bespoke TUI (see [`CookbookTui`]). Default
+    /// `None` — a cookbook is fully usable from the BLUT console without one.
+    /// The `Some` cookbooks surface in the console's cookbook selector.
+    fn tui(&self) -> Option<Box<dyn CookbookTui>> {
+        None
+    }
 }
 
 /// Runtime registry that ingests cookbooks: holds boxed cookbooks and
@@ -130,6 +167,14 @@ impl Registry {
         self.cookbooks
             .iter()
             .flat_map(|c| c.error_domains().iter().copied())
+    }
+
+    /// Detect the registered cookbooks that ship their own TUI (in registration
+    /// order). BLUT's console lists these in its selector so an operator can open
+    /// a cookbook's TUI or stay in the console. Empty when no cookbook provides
+    /// one — the console is then the whole surface.
+    pub fn cookbook_tuis(&self) -> Vec<Box<dyn CookbookTui>> {
+        self.cookbooks.iter().filter_map(|c| c.tui()).collect()
     }
 
     /// Pre-baked args JSON for a recipe, from whichever registered

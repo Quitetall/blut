@@ -445,14 +445,15 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
             if check {
                 crate::tui::check(reg)
             } else {
-                crate::tui::run(reg).await
+                crate::tui::run_console_loop(std::sync::Arc::new(reg)).await
             }
         }
-        // Bare `blut`: the default (TUI-on) build opens the interactive cockpit.
-        // A `--no-default-features` (CLI-only) build has no interactive mode —
+        // Bare `blut`: the default (TUI-on) build opens the BLUT console; a
+        // cookbook's own TUI is reachable from its selector. A
+        // `--no-default-features` (CLI-only) build has no interactive mode —
         // print help so the user sees the subcommands.
         #[cfg(feature = "tui")]
-        None => crate::tui::run(reg).await,
+        None => crate::tui::run_console_loop(std::sync::Arc::new(reg)).await,
         #[cfg(not(feature = "tui"))]
         None => {
             use clap::CommandFactory;
