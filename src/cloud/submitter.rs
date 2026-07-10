@@ -19,14 +19,14 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde_json::Value;
 
+use super::CloudError;
 use super::job::{CloudJob, JobOutcome};
 use super::queue::{CloudQueue, JobStatus};
 use super::store::BlobStore;
-use super::CloudError;
+use crate::framework::Registry;
 use crate::framework::artifact::ContentHash;
 use crate::framework::stage::ErasedArtifact;
-use crate::framework::Registry;
-use crate::p2p::bundle::{bundle, unbundle, BlobDir};
+use crate::p2p::bundle::{BlobDir, bundle, unbundle};
 use crate::p2p::task::ResourceRequest;
 use crate::p2p::trust::DataClass;
 
@@ -76,7 +76,11 @@ impl CloudSubmitter {
         queue: Arc<dyn CloudQueue>,
         registry: Arc<Registry>,
     ) -> Self {
-        Self { store, queue, registry }
+        Self {
+            store,
+            queue,
+            registry,
+        }
     }
 
     /// Bundle `spec.input`, upload it, and enqueue the job. Returns a handle to poll.
@@ -152,9 +156,9 @@ impl CloudJobHandle {
             JobStatus::Queued | JobStatus::Running => Ok(CloudPoll::Pending),
             JobStatus::Unknown => Ok(CloudPoll::Unknown),
             JobStatus::Done(result) => match result.outcome {
-                JobOutcome::Failed => {
-                    Ok(CloudPoll::Failed(result.error.unwrap_or_else(|| "unknown error".into())))
-                }
+                JobOutcome::Failed => Ok(CloudPoll::Failed(
+                    result.error.unwrap_or_else(|| "unknown error".into()),
+                )),
                 JobOutcome::Cancelled => Ok(CloudPoll::Cancelled),
                 JobOutcome::Succeeded => {
                     let blob_key = result.output_blob_key.ok_or_else(|| {

@@ -22,7 +22,11 @@ pub struct CostModel {
 
 impl Default for CostModel {
     fn default() -> Self {
-        Self { cpu_core_unit: 1.0, gpu_unit: 100.0, mem_gib_unit: 0.5 }
+        Self {
+            cpu_core_unit: 1.0,
+            gpu_unit: 100.0,
+            mem_gib_unit: 0.5,
+        }
     }
 }
 
@@ -57,13 +61,19 @@ pub struct CostLedger {
 
 impl CostLedger {
     pub fn new(model: CostModel) -> Self {
-        Self { model, entries: Mutex::new(Vec::new()) }
+        Self {
+            model,
+            entries: Mutex::new(Vec::new()),
+        }
     }
 
     /// Record `job_id`'s cost from its resources + compute time. Returns the units.
     pub fn record(&self, job_id: &str, resources: &ResourceRequest, wall_time_ms: u64) -> f64 {
         let units = self.model.estimate(resources, wall_time_ms);
-        self.entries.lock().push(CostEntry { job_id: job_id.to_string(), units });
+        self.entries.lock().push(CostEntry {
+            job_id: job_id.to_string(),
+            units,
+        });
         units
     }
 
@@ -86,8 +96,18 @@ mod tests {
     #[test]
     fn gpu_costs_more_than_cpu_for_equal_time() {
         let m = CostModel::default();
-        let gpu = ResourceRequest { cpu_cores: 1, memory_gib: 0, gpu: true, gpu_vram_gib: None };
-        let cpu = ResourceRequest { cpu_cores: 1, memory_gib: 0, gpu: false, gpu_vram_gib: None };
+        let gpu = ResourceRequest {
+            cpu_cores: 1,
+            memory_gib: 0,
+            gpu: true,
+            gpu_vram_gib: None,
+        };
+        let cpu = ResourceRequest {
+            cpu_cores: 1,
+            memory_gib: 0,
+            gpu: false,
+            gpu_vram_gib: None,
+        };
         assert!(m.estimate(&gpu, 1000) > m.estimate(&cpu, 1000));
     }
 
@@ -103,7 +123,12 @@ mod tests {
     #[test]
     fn ledger_records_and_totals() {
         let ledger = CostLedger::new(CostModel::default());
-        let r = ResourceRequest { cpu_cores: 2, memory_gib: 4, gpu: false, gpu_vram_gib: None };
+        let r = ResourceRequest {
+            cpu_cores: 2,
+            memory_gib: 4,
+            gpu: false,
+            gpu_vram_gib: None,
+        };
         ledger.record("job-a", &r, 1000);
         ledger.record("job-b", &r, 2000);
         assert_eq!(ledger.entries().len(), 2);

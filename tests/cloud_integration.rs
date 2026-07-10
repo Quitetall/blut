@@ -15,10 +15,10 @@ use blut::cloud::store::ObjStore;
 use blut::cloud::submitter::{CloudPoll, CloudSubmitSpec, CloudSubmitter};
 use blut::cloud::worker::run_one;
 use blut::framework::artifact::{Artifact, ContentHash};
-use blut::framework::stage::ErasedArtifact;
 use blut::framework::cookbook::Registry;
+use blut::framework::stage::ErasedArtifact;
 use blut::p2p::dispatch::DefaultDispatchPolicy;
-use blut::p2p::smoke::{self, SmokeText, SMOKE_STAGE};
+use blut::p2p::smoke::{self, SMOKE_STAGE, SmokeText};
 use blut::p2p::task::ResourceRequest;
 use blut::p2p::trust::{DataClass, DispatchMatrix, TrustLevel};
 
@@ -96,10 +96,18 @@ async fn cloud_dispatch_round_trips_over_local_object_store() {
     )
     .await
     .expect("worker run");
-    assert_eq!(ran.as_deref(), Some("job-1"), "worker claimed + ran the job");
+    assert_eq!(
+        ran.as_deref(),
+        Some("job-1"),
+        "worker claimed + ran the job"
+    );
     // The job was billed (one ledger entry — the "billed on compute" plumbing fired;
     // p2p-echo is sub-ms so the unit total may round to ~0, hence assert the entry).
-    assert_eq!(ledger.entries().len(), 1, "completed job recorded a cost entry");
+    assert_eq!(
+        ledger.entries().len(),
+        1,
+        "completed job recorded a cost entry"
+    );
 
     // The coordinator downloads + verifies the output (the four bundle gates run,
     // including the bind to expected_output_hash).
@@ -107,8 +115,14 @@ async fn cloud_dispatch_round_trips_over_local_object_store() {
         CloudPoll::Succeeded(output) => {
             let out: SmokeText = output.into_typed().unwrap();
             let body = std::fs::read_to_string(&out.path).unwrap();
-            assert_eq!(body, "HELLO CLOUD", "worker ran the real stage on shipped data");
-            assert!(out.path.starts_with(out_dir.path()), "output materialized locally");
+            assert_eq!(
+                body, "HELLO CLOUD",
+                "worker ran the real stage on shipped data"
+            );
+            assert!(
+                out.path.starts_with(out_dir.path()),
+                "output materialized locally"
+            );
         }
         other => panic!("expected Succeeded, got {:?}", poll_label(&other)),
     }

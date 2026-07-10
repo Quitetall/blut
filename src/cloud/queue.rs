@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
-use super::job::{CloudJob, CloudResult};
 use super::CloudError;
+use super::job::{CloudJob, CloudResult};
 
 /// What the submitter's handle sees when it polls a job.
 #[derive(Clone, Debug)]
@@ -26,8 +26,10 @@ pub enum JobStatus {
     Queued,
     /// Leased to a worker and (presumably) executing.
     Running,
-    /// Finished — carries the worker's result (success or failure).
-    Done(CloudResult),
+    /// Finished — carries the worker's result (success or failure). Boxed:
+    /// `CloudResult` dwarfs the data-free variants (clippy
+    /// `large_enum_variant`), and status values are moved around per poll.
+    Done(Box<CloudResult>),
     /// No such job id (never enqueued, or evicted).
     Unknown,
 }
@@ -42,7 +44,8 @@ pub trait CloudQueue: Send + Sync {
     /// Claim the highest-priority pending job for `worker_id`, leasing it for
     /// `lease_secs`. Returns `None` if nothing is pending. Reclaims expired leases
     /// first, so a crashed worker's job is re-offered here.
-    async fn claim(&self, worker_id: &str, lease_secs: u64) -> Result<Option<CloudJob>, CloudError>;
+    async fn claim(&self, worker_id: &str, lease_secs: u64)
+    -> Result<Option<CloudJob>, CloudError>;
     /// Mark a leased job complete with its result (moves it to `Done`). FENCED on
     /// the lease: only the worker that currently holds the lease may complete it.
     /// A late `complete` from a worker whose lease expired (and was reclaimed +
@@ -132,7 +135,11 @@ impl CloudQueue for MemQueue {
         Ok(())
     }
 
-    async fn claim(&self, worker_id: &str, lease_secs: u64) -> Result<Option<CloudJob>, CloudError> {
+    async fn claim(
+        &self,
+        worker_id: &str,
+        lease_secs: u64,
+    ) -> Result<Option<CloudJob>, CloudError> {
         let now = Instant::now();
         let mut g = self.inner.lock();
         g.reclaim(now); // re-offer crashed workers' jobs before picking
@@ -177,7 +184,7 @@ impl CloudQueue for MemQueue {
     async fn status(&self, job_id: &str) -> Result<JobStatus, CloudError> {
         let g = self.inner.lock();
         if let Some(r) = g.done.get(job_id) {
-            return Ok(JobStatus::Done(r.clone()));
+            return Ok(JobStatus::Done(Box::new(r.clone())));
         }
         if g.leased.contains_key(job_id) {
             return Ok(JobStatus::Running);
@@ -207,7 +214,11 @@ mod tests {
     fn dummy_manifest() -> BundleManifest {
         BundleManifest {
             bundle_version: 1,
-            erased: ErasedArtifact { kind: "test".into(), schema: 1, payload: vec![] },
+            erased: ErasedArtifact {
+                kind: "test".into(),
+                schema: 1,
+                payload: vec![],
+            },
             kind: "test".into(),
             schema: 1,
             content_hash: ContentHash::of_bytes(b""),
@@ -313,7 +324,11 @@ mod tests {
         // Lease 0s → expires immediately; the worker "crashes" (never completes).
         let _ = q.claim("w1", 0).await.unwrap().unwrap();
         assert!(matches!(q.status("a").await.unwrap(), JobStatus::Running));
-        assert_eq!(q.reclaim_expired().await.unwrap(), 1, "expired lease requeued");
+        assert_eq!(
+            q.reclaim_expired().await.unwrap(),
+            1,
+            "expired lease requeued"
+        );
         assert!(matches!(q.status("a").await.unwrap(), JobStatus::Queued));
         // A second worker can now pick it up.
         assert_eq!(q.claim("w2", 30).await.unwrap().unwrap().id, "a");
@@ -322,6 +337,9 @@ mod tests {
     #[tokio::test]
     async fn unknown_job_status() {
         let q = MemQueue::new();
-        assert!(matches!(q.status("ghost").await.unwrap(), JobStatus::Unknown));
+        assert!(matches!(
+            q.status("ghost").await.unwrap(),
+            JobStatus::Unknown
+        ));
     }
 }

@@ -60,7 +60,10 @@ pub struct ObjStore {
 impl ObjStore {
     /// Wrap any `object_store::ObjectStore` (S3, R2, …) with a key prefix.
     pub fn new(inner: Arc<dyn object_store::ObjectStore>, prefix: impl Into<String>) -> Self {
-        Self { inner, prefix: prefix.into() }
+        Self {
+            inner,
+            prefix: prefix.into(),
+        }
     }
 
     /// Local-filesystem backend for dev / loopback tests (no cloud account). The
@@ -150,12 +153,18 @@ mod tests {
         let hash = ContentHash::of_bytes(&pack);
 
         assert!(!store.has_blob(&hash).await.unwrap(), "absent before put");
-        store.put_blob(&hash, Bytes::from(pack.clone())).await.unwrap();
+        store
+            .put_blob(&hash, Bytes::from(pack.clone()))
+            .await
+            .unwrap();
         assert!(store.has_blob(&hash).await.unwrap(), "present after put");
         assert_eq!(store.get_blob(&hash).await.unwrap(), pack, "round-trips");
 
         // Idempotent re-put of identical content-addressed bytes.
-        store.put_blob(&hash, Bytes::from(pack.clone())).await.unwrap();
+        store
+            .put_blob(&hash, Bytes::from(pack.clone()))
+            .await
+            .unwrap();
         assert_eq!(store.get_blob(&hash).await.unwrap(), pack);
     }
 

@@ -30,6 +30,10 @@ pub mod artifacts;
 pub mod backends;
 pub mod broker;
 pub mod cli;
+/// Cloud compute queue (ADR 0082 / 0067 T3.1) — the P2P data plane over an
+/// object store. Gated behind the `cloud` feature (which implies `p2p`).
+#[cfg(feature = "cloud")]
+pub mod cloud;
 pub mod config;
 pub mod containment;
 pub mod datasets_db;
@@ -42,10 +46,6 @@ pub mod lineage_db;
 /// Gated behind the `p2p` feature.
 #[cfg(feature = "p2p")]
 pub mod p2p;
-/// Cloud compute queue (ADR 0082 / 0067 T3.1) — the P2P data plane over an
-/// object store. Gated behind the `cloud` feature (which implies `p2p`).
-#[cfg(feature = "cloud")]
-pub mod cloud;
 pub mod paths;
 pub mod policy;
 pub mod protocol;

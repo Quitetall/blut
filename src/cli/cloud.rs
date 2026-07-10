@@ -113,7 +113,11 @@ pub(super) async fn run_cloud_cmd(
             .context("cloud worker")?;
 
             let out_dir = tempfile::tempdir()?;
-            match handle.poll(out_dir.path()).await.context("poll cloud job")? {
+            match handle
+                .poll(out_dir.path())
+                .await
+                .context("poll cloud job")?
+            {
                 CloudPoll::Succeeded(output) => {
                     let out: SmokeText = output.into_typed().context("decode output")?;
                     let body = std::fs::read_to_string(&out.path)?;
@@ -155,9 +159,11 @@ mod cloud_cli_tests {
 
     #[test]
     fn cloud_smoke_parses_overrides() {
-        match Cli::try_parse_from(["blut", "cloud", "smoke", "--input", "hi", "--store", "/tmp/x"])
-            .expect("parse")
-            .command
+        match Cli::try_parse_from([
+            "blut", "cloud", "smoke", "--input", "hi", "--store", "/tmp/x",
+        ])
+        .expect("parse")
+        .command
         {
             Some(Command::Cloud {
                 cmd: CloudCommand::Smoke { input, store },

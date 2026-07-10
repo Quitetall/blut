@@ -11,6 +11,7 @@
 //!   2. `matrix.can_dispatch(data_class, worker_trust)` — the clinical hard-block.
 //!      A v1 cloud worker is `Registered`, so the default matrix refuses
 //!      `Restricted` (PHI EEG) here even if a job slips into the queue.
+//!
 //! It also re-validates `job.id` as traversal-safe — defense in depth, so the worker
 //! never trusts a foreign queue implementation before joining it into a path.
 
@@ -19,15 +20,15 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use super::job::{CloudJob, CloudResult, JobOutcome};
-use super::queue::{is_safe_job_id, CloudQueue};
-use super::store::BlobStore;
 use super::CloudError;
+use super::job::{CloudJob, CloudResult, JobOutcome};
+use super::queue::{CloudQueue, is_safe_job_id};
+use super::store::BlobStore;
+use crate::framework::Registry;
 use crate::framework::artifact::ContentHash;
 use crate::framework::cache::CacheHandle;
 use crate::framework::stage::StageContext;
-use crate::framework::Registry;
-use crate::p2p::bundle::{bundle, unbundle, BlobDir, BundleManifest};
+use crate::p2p::bundle::{BlobDir, BundleManifest, bundle, unbundle};
 use crate::p2p::dispatch::DispatchPolicy;
 use crate::p2p::trust::{DispatchMatrix, TrustLevel};
 
@@ -53,8 +54,16 @@ pub async fn run_one(
     let job_id = job.id.clone();
     let started = std::time::Instant::now();
 
-    let result = match execute_claimed(store, registry, policy, matrix, worker_trust, work_root, &job)
-        .await
+    let result = match execute_claimed(
+        store,
+        registry,
+        policy,
+        matrix,
+        worker_trust,
+        work_root,
+        &job,
+    )
+    .await
     {
         Ok((out_blob_key, out_manifest, compute_ms)) => CloudResult {
             job_id: job_id.clone(),
@@ -69,7 +78,11 @@ pub async fn run_one(
         },
         // A failed job produced no compute; report total occupied time (for
         // observability) but it is NOT billed (see below).
-        Err(e) => CloudResult::failed(job_id.clone(), started.elapsed().as_millis() as u64, e.to_string()),
+        Err(e) => CloudResult::failed(
+            job_id.clone(),
+            started.elapsed().as_millis() as u64,
+            e.to_string(),
+        ),
     };
 
     // Bill compute-only, and ONLY a successful job — the operator absorbs failed
@@ -103,7 +116,10 @@ async fn execute_claimed(
     }
     // Gate 1: dispatchable stage (training never leaves home).
     if !policy.is_dispatchable(&job.stage_name) {
-        return Err(CloudError::Dispatch(format!("stage '{}' is not dispatchable", job.stage_name)));
+        return Err(CloudError::Dispatch(format!(
+            "stage '{}' is not dispatchable",
+            job.stage_name
+        )));
     }
     // Gate 2: data-class vs worker trust — the clinical hard-block.
     if !matrix.can_dispatch(job.data_class, worker_trust) {
@@ -139,12 +155,24 @@ async fn run_in_dir(
 ) -> Result<(ContentHash, BundleManifest, u64), CloudError> {
     let cache = Arc::new(CacheHandle::job_local(stage_dir.join(".cache")));
     let input_hash = job.input_manifest.content_hash;
-    let ctx = StageContext::for_peer(stage_dir.to_path_buf(), stage_dir.to_path_buf(), cache, input_hash);
+    let ctx = StageContext::for_peer(
+        stage_dir.to_path_buf(),
+        stage_dir.to_path_buf(),
+        cache,
+        input_hash,
+    );
 
     // Download the input pack + unbundle (the four fail-closed gates run here).
     let pack = store.get_blob(&job.input_blob_key).await?;
-    let input = unbundle(stage, &job.input_manifest, &pack, stage_dir, &input_hash, BlobDir::Input)
-        .map_err(|e| CloudError::Dispatch(format!("unbundle input: {e}")))?;
+    let input = unbundle(
+        stage,
+        &job.input_manifest,
+        &pack,
+        stage_dir,
+        &input_hash,
+        BlobDir::Input,
+    )
+    .map_err(|e| CloudError::Dispatch(format!("unbundle input: {e}")))?;
 
     // Run under the job's wall-clock deadline; time ONLY the compute.
     let started = std::time::Instant::now();
@@ -161,9 +189,14 @@ async fn run_in_dir(
     let compute_ms = started.elapsed().as_millis() as u64;
 
     // Bundle the output bound to the job's expected_output_hash, then upload it.
-    let (out_manifest, out_pack) =
-        bundle(stage, output, stage_dir, BlobDir::Output, &job.expected_output_hash)
-            .map_err(|e| CloudError::Dispatch(format!("bundle output: {e}")))?;
+    let (out_manifest, out_pack) = bundle(
+        stage,
+        output,
+        stage_dir,
+        BlobDir::Output,
+        &job.expected_output_hash,
+    )
+    .map_err(|e| CloudError::Dispatch(format!("bundle output: {e}")))?;
     let out_blob_key = ContentHash::of_bytes(&out_pack);
     store.put_blob(&out_blob_key, Bytes::from(out_pack)).await?;
 
