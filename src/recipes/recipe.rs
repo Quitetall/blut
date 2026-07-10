@@ -247,9 +247,16 @@ fn placeholder_for(prop: &serde_json::Value) -> serde_json::Value {
 /// cookbook's `default_args` overlay only adds domain paths + curated
 /// non-default starts on top (see `Registry::prefill_args`).
 pub fn args_template(def: &RecipeDef) -> serde_json::Value {
+    args_template_from_schema(&(def.args_schema_fn)())
+}
+
+/// The same starting-args template as [`args_template`], but from a raw JSON
+/// schema `Value` rather than a `RecipeDef` — so the console DAG builder can
+/// prefill a STAGE's args (via `StageDyn::args_schema`) exactly the way the
+/// recipe editor prefills a recipe's.
+pub fn args_template_from_schema(schema: &serde_json::Value) -> serde_json::Value {
     use serde_json::{Map, Value};
-    let schema = (def.args_schema_fn)();
-    let Some(root) = schema_root(&schema) else {
+    let Some(root) = schema_root(schema) else {
         return Value::Object(Map::new());
     };
     let required: std::collections::HashSet<&str> = root

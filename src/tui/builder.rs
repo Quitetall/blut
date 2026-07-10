@@ -38,12 +38,22 @@ pub enum StatusKind {
 }
 
 /// A node placed on the canvas: the chosen ingredient + its kinds (copied so
-/// the canvas renders without re-resolving the palette).
+/// the canvas renders without re-resolving the palette) + its args JSON
+/// (prefilled from the stage schema, editable with `i`).
 #[derive(Clone, Debug)]
 pub struct BuilderNode {
     pub stage: String,
     pub input_kind: String,
     pub output_kind: String,
+    pub args: serde_json::Value,
+}
+
+/// An in-progress per-node args edit: the target node index + the JSON buffer
+/// being typed (compact single-line so `Enter` = save).
+#[derive(Clone, Debug)]
+pub struct ArgsEdit {
+    pub node: usize,
+    pub buffer: String,
 }
 
 /// The DAG-builder state: the plan being composed + the interaction cursors.
@@ -57,6 +67,8 @@ pub struct DagBuilder {
     pub node_cursor: usize,
     /// The pending edge source while wiring (`e` on a node, then `e` on another).
     pub connect_from: Option<usize>,
+    /// `Some` while editing a node's args JSON (`i`); captures all keys.
+    pub editing: Option<ArgsEdit>,
     pub status: Option<(String, StatusKind)>,
 }
 
@@ -70,6 +82,7 @@ impl Default for DagBuilder {
             palette_cursor: 0,
             node_cursor: 0,
             connect_from: None,
+            editing: None,
             status: None,
         }
     }
@@ -80,18 +93,88 @@ impl DagBuilder {
         self.status = Some((msg.into(), kind));
     }
 
-    /// Append the palette ingredient at `palette_cursor` as a canvas node.
-    fn add_from_palette(&mut self, palette: &[Ingredient]) {
+    /// Append the palette ingredient at `palette_cursor` as a canvas node, with
+    /// its args prefilled from the stage's schema template (serde defaults +
+    /// `<TODO>` placeholders for required fields) — the same start the recipe
+    /// editor uses.
+    fn add_from_palette(&mut self, palette: &[Ingredient], reg: &crate::framework::Registry) {
         let Some(ing) = palette.get(self.palette_cursor) else {
             return;
         };
+        let args = reg
+            .find_erased_stage(&ing.stage)
+            .map(|ctor| crate::recipes::recipe::args_template_from_schema(&ctor().args_schema()))
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
         self.nodes.push(BuilderNode {
             stage: ing.stage.clone(),
             input_kind: ing.input_kind.clone(),
             output_kind: ing.output_kind.clone(),
+            args,
         });
         self.node_cursor = self.nodes.len() - 1;
-        self.set(format!("added '{}'", ing.stage), StatusKind::Info);
+        self.set(
+            format!("added '{}' (i to edit args)", ing.stage),
+            StatusKind::Info,
+        );
+    }
+
+    /// `i` on the canvas: open the args editor for the selected node, seeded with
+    /// its current args as compact JSON.
+    fn edit_args(&mut self) {
+        let Some(n) = self.nodes.get(self.node_cursor) else {
+            return;
+        };
+        let buffer = serde_json::to_string(&n.args).unwrap_or_else(|_| "{}".into());
+        self.editing = Some(ArgsEdit {
+            node: self.node_cursor,
+            buffer,
+        });
+        self.set(
+            "edit args (JSON) · Enter save · Esc cancel",
+            StatusKind::Info,
+        );
+    }
+
+    /// Key handling while the args editor is open: type into the buffer, Enter
+    /// parses + saves it onto the node, Esc cancels.
+    fn handle_edit_key(&mut self, code: crossterm::event::KeyCode) {
+        use crossterm::event::KeyCode;
+        let Some(edit) = self.editing.as_mut() else {
+            return;
+        };
+        match code {
+            KeyCode::Esc => {
+                self.editing = None;
+                self.set("edit cancelled", StatusKind::Info);
+            }
+            KeyCode::Backspace => {
+                edit.buffer.pop();
+            }
+            KeyCode::Char(c) => edit.buffer.push(c),
+            KeyCode::Enter => {
+                let ArgsEdit { node, buffer } = self.editing.take().unwrap();
+                match serde_json::from_str::<serde_json::Value>(&buffer) {
+                    Ok(v) if v.is_object() => {
+                        if let Some(n) = self.nodes.get_mut(node) {
+                            n.args = v;
+                        }
+                        self.set("args updated", StatusKind::Ok);
+                    }
+                    Ok(_) => {
+                        // Valid JSON but not an object — keep the buffer so the
+                        // operator can fix it, same as the parse-error path.
+                        self.editing = Some(ArgsEdit { node, buffer });
+                        self.set("args must be a JSON object", StatusKind::Err);
+                    }
+                    Err(e) => {
+                        // Re-open so the operator can fix the typo, not lose it.
+                        self.editing = Some(ArgsEdit { node, buffer });
+                        self.set(format!("invalid JSON: {e}"), StatusKind::Err);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// `e` on the canvas: first press marks the edge source, second press adds
@@ -158,7 +241,7 @@ impl DagBuilder {
                 .iter()
                 .map(|n| SpecNode {
                     stage: n.stage.clone(),
-                    args: serde_json::Value::Object(Default::default()),
+                    args: n.args.clone(),
                 })
                 .collect(),
             edges: self
@@ -261,6 +344,11 @@ impl DagBuilder {
         reg: &crate::framework::Registry,
     ) -> bool {
         use crossterm::event::KeyCode;
+        // The args editor is a modal: while open it captures every key.
+        if self.editing.is_some() {
+            self.handle_edit_key(code);
+            return true;
+        }
         match code {
             KeyCode::Tab => {
                 self.focus = match self.focus {
@@ -279,7 +367,7 @@ impl DagBuilder {
             }
             KeyCode::Enter | KeyCode::Char('a') => {
                 if self.focus == Focus::Palette {
-                    self.add_from_palette(palette);
+                    self.add_from_palette(palette, reg);
                 } else {
                     self.focus = Focus::Palette;
                 }
@@ -287,6 +375,10 @@ impl DagBuilder {
             }
             KeyCode::Char('e') if self.focus == Focus::Canvas => {
                 self.wire();
+                true
+            }
+            KeyCode::Char('i') if self.focus == Focus::Canvas => {
+                self.edit_args();
                 true
             }
             KeyCode::Char('d') if self.focus == Focus::Canvas => {
@@ -417,6 +509,12 @@ fn draw_canvas(f: &mut Frame<'_>, area: Rect, b: &DagBuilder) {
         } else {
             format!("  ← {}", preds.join(","))
         };
+        let nargs = n.args.as_object().map(|o| o.len()).unwrap_or(0);
+        let args_span = if nargs > 0 {
+            Span::styled(format!("  {{{nargs}}}"), theme::verified())
+        } else {
+            Span::styled("  {}", theme::panel_border())
+        };
         lines.push(Line::from(vec![
             marker,
             Span::styled(format!("{i} "), theme::panel_border()),
@@ -432,6 +530,7 @@ fn draw_canvas(f: &mut Frame<'_>, area: Rect, b: &DagBuilder) {
                 format!("{} {arrow} {}", n.input_kind, n.output_kind),
                 theme::panel_border(),
             ),
+            args_span,
             Span::styled(feed, theme::amber()),
         ]));
     }
@@ -440,8 +539,27 @@ fn draw_canvas(f: &mut Frame<'_>, area: Rect, b: &DagBuilder) {
 }
 
 fn draw_status(f: &mut Frame<'_>, area: Rect, b: &DagBuilder) {
+    // While editing a node's args, the status area becomes the JSON input line.
+    if let Some(edit) = &b.editing {
+        let stage = b
+            .nodes
+            .get(edit.node)
+            .map(|n| n.stage.as_str())
+            .unwrap_or("?");
+        let prompt = Line::from(vec![
+            Span::styled(format!(" args[{stage}] "), theme::signal_bold()),
+            Span::styled(edit.buffer.clone(), theme::metric()),
+            Span::styled("_", theme::signal()),
+        ]);
+        let hint = Line::from(Span::styled(
+            " type JSON · Enter save · Esc cancel",
+            theme::panel_border(),
+        ));
+        f.render_widget(Paragraph::new(vec![prompt, hint]), area);
+        return;
+    }
     let help = Line::from(Span::styled(
-        " Tab pane · ↑↓ move · Enter/a add · e wire · d delete · v validate · w write · x clear",
+        " Tab pane · ↑↓ move · Enter/a add · e wire · i args · d delete · v validate · w write · x clear",
         theme::panel_border(),
     ));
     let status = match &b.status {
@@ -535,6 +653,38 @@ mod tests {
             msg.contains("name must"),
             "expected name-guard error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn edit_args_saves_valid_json_and_rejects_invalid() {
+        let reg = crate::framework::Registry::new();
+        let p = palette();
+        let mut b = DagBuilder::default();
+        b.handle_key(KeyCode::Enter, &p, &reg); // add node 0
+        b.focus = Focus::Canvas;
+        b.node_cursor = 0;
+        b.handle_key(KeyCode::Char('i'), &p, &reg);
+        assert!(b.editing.is_some(), "i opens the args editor");
+        b.editing.as_mut().unwrap().buffer = "{\"lr\":0.01}".into();
+        b.handle_key(KeyCode::Enter, &p, &reg);
+        assert!(b.editing.is_none(), "Enter saves + closes");
+        assert_eq!(b.nodes[0].args["lr"], serde_json::json!(0.01));
+        assert_eq!(
+            b.to_plan_spec().nodes[0].args["lr"],
+            serde_json::json!(0.01)
+        );
+        // Invalid JSON keeps the editor open so the typo can be fixed.
+        b.handle_key(KeyCode::Char('i'), &p, &reg);
+        b.editing.as_mut().unwrap().buffer = "{bad".into();
+        b.handle_key(KeyCode::Enter, &p, &reg);
+        assert!(b.editing.is_some());
+        assert!(matches!(b.status, Some((_, StatusKind::Err))));
+        // Valid JSON that isn't an object also keeps the editor open (buffer
+        // preserved), not silently discarded.
+        b.editing.as_mut().unwrap().buffer = "42".into();
+        b.handle_key(KeyCode::Enter, &p, &reg);
+        assert!(b.editing.is_some(), "non-object JSON keeps the buffer");
+        assert_eq!(b.editing.as_ref().unwrap().buffer, "42");
     }
 
     #[test]

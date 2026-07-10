@@ -36,17 +36,19 @@ pub enum ConsoleTab {
     Broker,
     Privacy,
     Cache,
+    Recipes,
     Build,
 }
 
 impl ConsoleTab {
-    const ALL: [ConsoleTab; 7] = [
+    const ALL: [ConsoleTab; 8] = [
         ConsoleTab::Home,
         ConsoleTab::Plan,
         ConsoleTab::Mesh,
         ConsoleTab::Broker,
         ConsoleTab::Privacy,
         ConsoleTab::Cache,
+        ConsoleTab::Recipes,
         ConsoleTab::Build,
     ];
     fn label(self) -> &'static str {
@@ -57,10 +59,11 @@ impl ConsoleTab {
             ConsoleTab::Broker => "Broker",
             ConsoleTab::Privacy => "Privacy",
             ConsoleTab::Cache => "Cache",
+            ConsoleTab::Recipes => "Recipes",
             ConsoleTab::Build => "Build",
         }
     }
-    /// Map a `0`–`6` digit to a tab, else `None`.
+    /// Map a `0`–`7` digit to a tab, else `None`.
     pub(crate) fn from_digit(c: char) -> Option<ConsoleTab> {
         Self::ALL
             .get((c as u8).wrapping_sub(b'0') as usize)
@@ -586,6 +589,7 @@ pub fn draw_console(
     tab: ConsoleTab,
     builder: &super::builder::DagBuilder,
     palette: &[crate::framework::Ingredient],
+    catalog: &[&'static crate::recipes::RecipeDef],
 ) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -614,6 +618,7 @@ pub fn draw_console(
         ConsoleTab::Broker => draw_broker(f, body, m),
         ConsoleTab::Privacy => draw_privacy(f, body, m),
         ConsoleTab::Cache => draw_cache(f, body, m),
+        ConsoleTab::Recipes => draw_recipes(f, body, catalog),
         ConsoleTab::Build => super::builder::draw_build(f, body, builder, palette),
     }
     draw_gov(f, rows[3], m);
@@ -929,6 +934,64 @@ fn draw_cache(f: &mut Frame<'_>, area: Rect, m: &ConsoleModel) {
     );
 }
 
+/// The cookbook catalog: recipes grouped by `Course` (the culinary taxonomy —
+/// DATA PREPARATION → PRETRAINING → TRAINING → … → USER), each recipe with its
+/// I/O kinds + description. Read-only browse; the Build tab is where you compose
+/// your own from ingredients.
+fn draw_recipes(f: &mut Frame<'_>, area: Rect, catalog: &[&'static crate::recipes::RecipeDef]) {
+    let arrow = if theme::ascii_only() { "->" } else { "→" };
+    let mut lines: Vec<Line> = Vec::new();
+    if catalog.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " no recipes registered — this cookbook exposes ingredients only",
+            theme::panel_border(),
+        )));
+    }
+    // Course order = the lifecycle phase order; stable + exhaustive.
+    let mut courses: Vec<crate::recipes::Course> = catalog.iter().map(|r| r.category).collect();
+    courses.sort_by_key(|c| c.order());
+    courses.dedup();
+    for &course in &courses {
+        lines.push(Line::from(Span::styled(
+            format!(" {} ", course.label()),
+            theme::signal_bold(),
+        )));
+        let mut recs: Vec<&&crate::recipes::RecipeDef> =
+            catalog.iter().filter(|r| r.category == course).collect();
+        recs.sort_by(|a, b| a.name.cmp(b.name));
+        for r in recs {
+            let inb = if r.input_kinds.is_empty() {
+                "seed".to_string()
+            } else {
+                r.input_kinds.join("+")
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("   {:<26}", r.name), theme::signal()),
+                Span::styled(
+                    format!("{inb} {arrow} {:<14}", r.output_kind),
+                    theme::panel_border(),
+                ),
+                Span::styled(
+                    r.description
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .chars()
+                        .take(48)
+                        .collect::<String>(),
+                    theme::label(),
+                ),
+            ]));
+        }
+    }
+    let title = format!(
+        "Recipes · {} across {} courses",
+        catalog.len(),
+        courses.len()
+    );
+    f.render_widget(Paragraph::new(lines).block(panel(&title)), area);
+}
+
 fn draw_gov(f: &mut Frame<'_>, area: Rect, m: &ConsoleModel) {
     let shield = if theme::ascii_only() { "[#]" } else { "◈" };
     let line = Line::from(vec![
@@ -982,6 +1045,7 @@ mod tests {
                     &m,
                     ConsoleTab::Home,
                     &super::super::builder::DagBuilder::default(),
+                    &[],
                     &[],
                 )
             })
@@ -1065,6 +1129,7 @@ mod tests {
                     tab,
                     &super::super::builder::DagBuilder::default(),
                     &[],
+                    &[],
                 )
             })
             .unwrap();
@@ -1076,8 +1141,9 @@ mod tests {
         assert_eq!(ConsoleTab::from_digit('0'), Some(ConsoleTab::Home));
         assert_eq!(ConsoleTab::from_digit('2'), Some(ConsoleTab::Mesh));
         assert_eq!(ConsoleTab::from_digit('5'), Some(ConsoleTab::Cache));
-        assert_eq!(ConsoleTab::from_digit('6'), Some(ConsoleTab::Build));
-        assert_eq!(ConsoleTab::from_digit('7'), None);
+        assert_eq!(ConsoleTab::from_digit('6'), Some(ConsoleTab::Recipes));
+        assert_eq!(ConsoleTab::from_digit('7'), Some(ConsoleTab::Build));
+        assert_eq!(ConsoleTab::from_digit('8'), None);
         assert_eq!(ConsoleTab::from_digit('x'), None);
     }
 
@@ -1094,6 +1160,7 @@ mod tests {
                 &m,
                 ConsoleTab::Home,
                 &super::super::builder::DagBuilder::default(),
+                &[],
                 &[],
             )
         })

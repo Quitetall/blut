@@ -46,10 +46,12 @@ fn console_digit_keys_switch_tabs() {
     handle_key(&mut a, key('5'));
     assert_eq!(a.console_tab, ConsoleTab::Cache, "5 → Cache");
     handle_key(&mut a, key('6'));
-    assert_eq!(a.console_tab, ConsoleTab::Build, "6 → Build");
+    assert_eq!(a.console_tab, ConsoleTab::Recipes, "6 → Recipes");
+    handle_key(&mut a, key('7'));
+    assert_eq!(a.console_tab, ConsoleTab::Build, "7 → Build");
     handle_key(&mut a, key('0'));
     assert_eq!(a.console_tab, ConsoleTab::Home, "0 → Home");
-    // A digit outside 0–6 is ignored (stays on Home).
+    // A digit outside 0–7 is ignored (stays on Home).
     handle_key(&mut a, key('9'));
     assert_eq!(a.console_tab, ConsoleTab::Home);
 }

@@ -1480,7 +1480,7 @@ pub fn check(registry: impl Into<std::sync::Arc<crate::framework::Registry>>) ->
     // empty-palette unit fixture.
     app.view = View::Console;
     let mut tabs_checked = 0usize;
-    for d in ['0', '1', '2', '3', '4', '5', '6'] {
+    for d in ['0', '1', '2', '3', '4', '5', '6', '7'] {
         if let Some(tab) = console::ConsoleTab::from_digit(d) {
             app.console_tab = tab;
             term.draw(|f| draw(f, &mut app))
@@ -1802,9 +1802,9 @@ fn handle_key_main(app: &mut App, k: event::KeyEvent) {
     }
     match k.code {
         // ── BLUT console keys (engine surface) ──────────────────────
-        // 0–6 switch the drill-down tab; `c` opens the cookbook selector
+        // 0–7 switch the drill-down tab; `c` opens the cookbook selector
         // (open a cookbook's TUI, or Esc to stay in BLUT).
-        KeyCode::Char(c @ '0'..='6') if !app.cookbook_mode && app.view == View::Console => {
+        KeyCode::Char(c @ '0'..='7') if !app.cookbook_mode && app.view == View::Console => {
             if let Some(t) = console::ConsoleTab::from_digit(c) {
                 app.console_tab = t;
             }
