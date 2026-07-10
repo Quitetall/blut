@@ -263,7 +263,11 @@ impl PlanSpec {
         let overrides: Vec<_> = self
             .nodes
             .iter()
-            .map(|n| (n.retry, n.timeout, n.priority))
+            .map(|n| crate::framework::plan::ExecutionOverrides {
+                retry: n.retry,
+                timeout: n.timeout,
+                priority: n.priority,
+            })
             .collect();
         plan.apply_execution_overrides(&overrides);
         Ok(plan.with_expansions(expansions))

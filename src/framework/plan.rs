@@ -67,6 +67,19 @@ pub(crate) struct PlanNode {
     pub priority: Option<i32>,
 }
 
+/// Per-node execution-control overrides applied after `from_erased_graph`
+/// (PlanSpec v1.1 retry/timeout — ADR 0088; priority — ADR 0102). Each `Some`
+/// REPLACES the stage's own default; `None` leaves it. Execution-control only:
+/// none of these fields is ever a node cache-key input. A named struct (rather
+/// than a positional tuple) so later 0102 increments (e.g. a `pure` flag for
+/// speculative execution) extend it without churning every call site.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ExecutionOverrides {
+    pub retry: Option<crate::framework::retry::RetryPolicy>,
+    pub timeout: Option<crate::framework::retry::StageTimeout>,
+    pub priority: Option<i32>,
+}
+
 impl std::fmt::Debug for PlanNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PlanNode")
@@ -878,28 +891,21 @@ impl CompiledPlan {
     /// aligns with `nodes` by index; a `Some` retry/timeout REPLACES the stage's
     /// own default, a `None` leaves it. Execution-control only — node cache keys
     /// are untouched (they are over stage code + args + input, never retry/timeout).
-    pub(crate) fn apply_execution_overrides(
-        &mut self,
-        overrides: &[(
-            Option<crate::framework::retry::RetryPolicy>,
-            Option<crate::framework::retry::StageTimeout>,
-            Option<i32>,
-        )],
-    ) {
+    pub(crate) fn apply_execution_overrides(&mut self, overrides: &[ExecutionOverrides]) {
         debug_assert_eq!(
             overrides.len(),
             self.nodes.len(),
             "execution overrides must align 1:1 with nodes"
         );
-        for (node, (retry, timeout, priority)) in self.nodes.iter_mut().zip(overrides) {
-            if retry.is_some() {
-                node.retry = *retry;
+        for (node, ov) in self.nodes.iter_mut().zip(overrides) {
+            if ov.retry.is_some() {
+                node.retry = ov.retry;
             }
-            if timeout.is_some() {
-                node.timeout = *timeout;
+            if ov.timeout.is_some() {
+                node.timeout = ov.timeout;
             }
-            if priority.is_some() {
-                node.priority = *priority;
+            if ov.priority.is_some() {
+                node.priority = ov.priority;
             }
         }
     }
