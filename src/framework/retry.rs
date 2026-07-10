@@ -21,7 +21,7 @@ use crate::framework::error::StageError;
 pub type RetryHook = Arc<dyn Fn(&RetryEvent) + Send + Sync>;
 
 /// How many attempts, with what backoff, and which errors to retry.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RetryPolicy {
     /// Total attempts INCLUDING the first. `1` = no retry.
     pub max_attempts: u32,
@@ -95,7 +95,7 @@ impl RetryPolicy {
 
 /// Backoff schedule between attempts. `mult_x100` is the growth factor
 /// ×100 (200 = ×2) so the whole thing stays `const`-friendly.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Backoff {
     None,
     Fixed(Duration),
@@ -107,7 +107,7 @@ pub enum Backoff {
 }
 
 /// Which errors a policy retries.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RetryOn {
     /// Only transient failures (backend/io/timeout/OOM). Deterministic
     /// errors (bad input, kind/schema mismatch, deserialize, cancelled)
@@ -169,7 +169,7 @@ pub fn is_retryable(err: &StageError, policy: RetryOn) -> bool {
 /// subprocess). A stage that returns Ok AFTER its soft timeout fired is
 /// failed with `StageError::Timeout` and NOT promoted (a possibly-
 /// degraded artifact must not poison the cache).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StageTimeout {
     /// Cooperative deadline: fires the stage's cancel token. ONLY
     /// effective for stages that observe cancellation (subprocess

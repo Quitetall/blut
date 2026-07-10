@@ -242,6 +242,8 @@ impl DagBuilder {
                 .map(|n| SpecNode {
                     stage: n.stage.clone(),
                     args: n.args.clone(),
+                    retry: None,
+                    timeout: None,
                 })
                 .collect(),
             edges: self

@@ -861,6 +861,32 @@ impl CompiledPlan {
         })
     }
 
+    /// Apply PlanSpec v1.1 per-node execution overrides (ADR 0088). `overrides`
+    /// aligns with `nodes` by index; a `Some` retry/timeout REPLACES the stage's
+    /// own default, a `None` leaves it. Execution-control only — node cache keys
+    /// are untouched (they are over stage code + args + input, never retry/timeout).
+    pub(crate) fn apply_execution_overrides(
+        &mut self,
+        overrides: &[(
+            Option<crate::framework::retry::RetryPolicy>,
+            Option<crate::framework::retry::StageTimeout>,
+        )],
+    ) {
+        debug_assert_eq!(
+            overrides.len(),
+            self.nodes.len(),
+            "execution overrides must align 1:1 with nodes"
+        );
+        for (node, (retry, timeout)) in self.nodes.iter_mut().zip(overrides) {
+            if retry.is_some() {
+                node.retry = *retry;
+            }
+            if timeout.is_some() {
+                node.timeout = *timeout;
+            }
+        }
+    }
+
     /// Build an ARBITRARY-topology erased plan from `nodes` + `edges` — the
     /// typed dynamic-DAG path (ADR 0078). This is `from_erased_chain`
     /// generalized from a linear chain to a full DAG: it extends the same

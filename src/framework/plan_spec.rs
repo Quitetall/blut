@@ -43,12 +43,14 @@ type ResolvedNodes = Vec<(
     serde_json::Value,
 )>;
 
-/// One node of a [`PlanSpec`]: a registered stage name + its args JSON.
-///
-/// Per-node retry/timeout are intentionally NOT in v1 (the engine's
-/// `RetryPolicy`/`StageTimeout` aren't serde types); they are a planned
-/// additive field. Omitted `args` default to JSON `null`, matching the
-/// declarative TOML path.
+/// One node of a [`PlanSpec`]: a registered stage name + its args JSON, plus the
+/// optional per-node execution-control knobs added in **PlanSpec v1.1**
+/// (ADR 0088): `retry` and `timeout`. Both are `#[serde(default)]` +
+/// `skip_serializing_if` absent, so a v1 plan (neither field) round-trips + hashes
+/// identically to a v1.1 plan whose fields are unset. Crucially they are
+/// execution-control, NOT computation: they are NOT part of a node's cache key
+/// (which is over stage code + args + input), so adding them never invalidates a
+/// cached artifact. Omitted `args` default to JSON `null` (the declarative path).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpecNode {
@@ -57,6 +59,14 @@ pub struct SpecNode {
     /// Per-stage args (validated against the stage's schema at run time).
     #[serde(default)]
     pub args: serde_json::Value,
+    /// PlanSpec v1.1 (ADR 0088): per-node retry policy. `None` = use the stage's
+    /// own `RETRY` default (v1 behaviour). NOT in the cache key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<crate::framework::retry::RetryPolicy>,
+    /// PlanSpec v1.1 (ADR 0088): per-node soft/hard timeout. `None` = the stage's
+    /// own `TIMEOUT` default (v1 behaviour). NOT in the cache key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<crate::framework::retry::StageTimeout>,
 }
 
 /// A typed runtime fan-out (ADR 0078 `map_output`): when the node at index
@@ -232,7 +242,7 @@ impl PlanSpec {
                 .map(|s| serde_json::json!({ "stage": s.stage, "args": s.args }))
                 .collect::<Vec<_>>(),
         });
-        let plan = CompiledPlan::from_erased_graph(
+        let mut plan = CompiledPlan::from_erased_graph(
             self.name.clone(),
             recipe_args,
             nodes,
@@ -242,6 +252,10 @@ impl PlanSpec {
             name: self.name.clone(),
             source,
         })?;
+        // PlanSpec v1.1 (ADR 0088): thread per-node retry/timeout onto the
+        // compiled nodes. Execution-control only — node cache keys unaffected.
+        let overrides: Vec<_> = self.nodes.iter().map(|n| (n.retry, n.timeout)).collect();
+        plan.apply_execution_overrides(&overrides);
         Ok(plan.with_expansions(expansions))
     }
 }
@@ -413,10 +427,14 @@ mod tests {
                 SpecNode {
                     stage: "spec_make_a".into(),
                     args: serde_json::json!({}),
+                    retry: None,
+                    timeout: None,
                 },
                 SpecNode {
                     stage: "spec_a_to_b".into(),
                     args: serde_json::json!({}),
+                    retry: None,
+                    timeout: None,
                 },
             ],
             edges: vec![(0, 1)],
@@ -444,6 +462,76 @@ mod tests {
     }
 
     #[test]
+    fn planspec_v1_1_additive() {
+        use crate::framework::retry::{Backoff, RetryOn, RetryPolicy, StageTimeout};
+        use std::time::Duration;
+        let reg = toy_registry();
+
+        // (1) A v1 JSON (no retry/timeout) parses; the new fields default None.
+        let v1: PlanSpec =
+            serde_json::from_str(r#"{"name":"c","nodes":[{"stage":"spec_make_a"}],"edges":[]}"#)
+                .unwrap();
+        assert!(v1.nodes[0].retry.is_none() && v1.nodes[0].timeout.is_none());
+
+        // (2) v1.1 with UNSET retry/timeout omits them from the wire
+        // (skip_serializing_if) and hashes byte-identically to the v1 plan.
+        let base = PlanSpec {
+            name: "c".into(),
+            nodes: vec![SpecNode {
+                stage: "spec_make_a".into(),
+                args: serde_json::Value::Null,
+                retry: None,
+                timeout: None,
+            }],
+            edges: vec![],
+            expansions: Vec::new(),
+            version: PLAN_SPEC_VERSION,
+        };
+        assert_eq!(
+            v1.canonical_bytes(),
+            base.canonical_bytes(),
+            "absent retry/timeout hashes identically to v1"
+        );
+        let json = serde_json::to_string(&base).unwrap();
+        assert!(
+            !json.contains("retry") && !json.contains("timeout"),
+            "unset fields are omitted from the wire: {json}"
+        );
+
+        // (3) Setting retry/timeout leaves the node's CACHE-KEY inputs (stage +
+        // args) byte-identical — only the plan fingerprint moves.
+        let mut with = base.clone();
+        with.nodes[0].retry = Some(RetryPolicy {
+            max_attempts: 3,
+            backoff: Backoff::Fixed(Duration::from_secs(1)),
+            retry_on: RetryOn::Transient,
+        });
+        with.nodes[0].timeout = Some(StageTimeout {
+            soft: None,
+            hard: Some(Duration::from_secs(60)),
+        });
+        assert_eq!(with.nodes[0].stage, base.nodes[0].stage);
+        assert_eq!(with.nodes[0].args, base.nodes[0].args);
+        assert_ne!(
+            with.canonical_bytes(),
+            base.canonical_bytes(),
+            "the plan fingerprint reflects retry/timeout"
+        );
+
+        // (4) compile threads them onto the executor's PlanNode; the default
+        // plan leaves them None (the stage's own RETRY/TIMEOUT default).
+        let compiled = with.compile(&reg).unwrap();
+        assert_eq!(compiled.nodes[0].retry.unwrap().max_attempts, 3);
+        assert_eq!(
+            compiled.nodes[0].timeout.unwrap().hard,
+            Some(Duration::from_secs(60))
+        );
+        let compiled_default = base.compile(&reg).unwrap();
+        assert!(compiled_default.nodes[0].retry.is_none());
+        assert!(compiled_default.nodes[0].timeout.is_none());
+    }
+
+    #[test]
     fn canonical_bytes_are_key_order_stable() {
         // Same graph, args keys in different source order -> identical bytes.
         let a = PlanSpec {
@@ -451,6 +539,8 @@ mod tests {
             nodes: vec![SpecNode {
                 stage: "s".into(),
                 args: serde_json::json!({ "x": 1, "y": 2 }),
+                retry: None,
+                timeout: None,
             }],
             edges: vec![],
             expansions: Vec::new(),
@@ -461,6 +551,8 @@ mod tests {
             nodes: vec![SpecNode {
                 stage: "s".into(),
                 args: serde_json::json!({ "y": 2, "x": 1 }),
+                retry: None,
+                timeout: None,
             }],
             edges: vec![],
             expansions: Vec::new(),
@@ -473,6 +565,8 @@ mod tests {
             nodes: vec![SpecNode {
                 stage: "s".into(),
                 args: serde_json::json!({ "x": 9, "y": 2 }),
+                retry: None,
+                timeout: None,
             }],
             edges: vec![],
             expansions: Vec::new(),
@@ -488,6 +582,8 @@ mod tests {
             nodes: vec![SpecNode {
                 stage: "no_such".into(),
                 args: serde_json::json!({}),
+                retry: None,
+                timeout: None,
             }],
             edges: vec![],
             expansions: Vec::new(),
@@ -510,10 +606,14 @@ mod tests {
                 SpecNode {
                     stage: "spec_make_a".into(),
                     args: serde_json::json!({}),
+                    retry: None,
+                    timeout: None,
                 },
                 SpecNode {
                     stage: "spec_make_a".into(),
                     args: serde_json::json!({}),
+                    retry: None,
+                    timeout: None,
                 },
             ],
             edges: vec![(0, 1)],
@@ -572,6 +672,8 @@ mod tests {
             nodes: vec![SpecNode {
                 stage: "spec_sharder".into(),
                 args: serde_json::json!({}),
+                retry: None,
+                timeout: None,
             }],
             edges: vec![],
             expansions: vec![MapSpec {
@@ -581,6 +683,8 @@ mod tests {
                     nodes: vec![SpecNode {
                         stage: "spec_item_to_a".into(),
                         args: serde_json::json!({}),
+                        retry: None,
+                        timeout: None,
                     }],
                     edges: vec![],
                     expansions: Vec::new(),
@@ -612,6 +716,8 @@ mod tests {
             nodes: vec![SpecNode {
                 stage: "spec_make_a".into(),
                 args: serde_json::json!({}),
+                retry: None,
+                timeout: None,
             }],
             edges: vec![],
             expansions: vec![MapSpec {
@@ -621,6 +727,8 @@ mod tests {
                     nodes: vec![SpecNode {
                         stage: "spec_item_to_a".into(),
                         args: serde_json::json!({}),
+                        retry: None,
+                        timeout: None,
                     }],
                     edges: vec![],
                     expansions: Vec::new(),
@@ -647,6 +755,8 @@ mod tests {
             nodes: vec![SpecNode {
                 stage: "spec_sharder".into(),
                 args: serde_json::json!({}),
+                retry: None,
+                timeout: None,
             }],
             edges: vec![],
             expansions: vec![MapSpec {
@@ -656,6 +766,8 @@ mod tests {
                     nodes: vec![SpecNode {
                         stage: "spec_make_a".into(),
                         args: serde_json::json!({}),
+                        retry: None,
+                        timeout: None,
                     }],
                     edges: vec![],
                     expansions: Vec::new(),
@@ -695,6 +807,8 @@ mod tests {
                 nodes: vec![SpecNode {
                     stage: "spec_item_to_a".into(),
                     args: serde_json::json!({}),
+                    retry: None,
+                    timeout: None,
                 }],
                 edges: vec![],
                 expansions: Vec::new(),
