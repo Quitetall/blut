@@ -45,9 +45,11 @@ fn console_digit_keys_switch_tabs() {
     assert_eq!(a.console_tab, ConsoleTab::Mesh, "2 → Mesh drill-down");
     handle_key(&mut a, key('5'));
     assert_eq!(a.console_tab, ConsoleTab::Cache, "5 → Cache");
+    handle_key(&mut a, key('6'));
+    assert_eq!(a.console_tab, ConsoleTab::Build, "6 → Build");
     handle_key(&mut a, key('0'));
     assert_eq!(a.console_tab, ConsoleTab::Home, "0 → Home");
-    // A digit outside 0–5 is ignored (stays on Home).
+    // A digit outside 0–6 is ignored (stays on Home).
     handle_key(&mut a, key('9'));
     assert_eq!(a.console_tab, ConsoleTab::Home);
 }

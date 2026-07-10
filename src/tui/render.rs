@@ -26,7 +26,14 @@ pub(super) fn draw(f: &mut Frame<'_>, app: &mut App) {
         .split(f.area());
     let body = outer[0];
     match app.view {
-        View::Console => super::console::draw_console(f, body, &app.console, app.console_tab),
+        View::Console => super::console::draw_console(
+            f,
+            body,
+            &app.console,
+            app.console_tab,
+            &app.builder,
+            &app.ingredients,
+        ),
         View::Cockpit => draw_cockpit_body(f, body, app),
         View::Jobs => draw_jobs(f, body, app),
         View::Log => draw_log(f, body, app),
@@ -1262,7 +1269,7 @@ pub(super) fn truncate(s: &str, max: usize) -> String {
 pub(super) fn draw_status(f: &mut Frame<'_>, area: Rect, app: &App) {
     let base = match app.view {
         View::Console => {
-            "q quit • r refresh • 0–5 tabs (Home/Plan/Mesh/Broker/Privacy/Cache) • c open a cookbook TUI"
+            "q quit • r refresh • 0–6 tabs (Home/Plan/Mesh/Broker/Privacy/Cache/Build) • c open a cookbook TUI"
         }
         View::Cockpit => {
             "q quit • ↑↓ select • Enter log • r refresh • c cancel • R recipe • J/L/Y/H/B/C/G/I/A/M/P/X views"

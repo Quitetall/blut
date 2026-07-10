@@ -250,6 +250,7 @@ fn isolate_datasets_db_for_tests() {
     }
 }
 
+mod builder;
 mod console;
 mod render;
 mod system;
@@ -404,6 +405,11 @@ struct App {
     /// Which console surface is shown (Home or a drill-down), when `view` is
     /// `Console`. Switched by the number keys.
     console_tab: console::ConsoleTab,
+    /// The console DAG builder (Build tab): a plan composed from `ingredients`.
+    builder: builder::DagBuilder,
+    /// The ingredient palette — every registered stage with its kinds, built
+    /// once from the registry for the Build tab.
+    ingredients: Vec<crate::framework::Ingredient>,
     /// Set when the operator picks a cookbook's TUI to open from the console
     /// selector: index into `registry.cookbook_tuis()`. The run loop returns
     /// [`ConsoleOutcome::OpenCookbookTui`] and the CLI launches it, then
@@ -486,9 +492,12 @@ impl App {
         // recipes. Elements are `&'static`, so the Vec owns no borrow of
         // `registry` and `App` can hold both without a self-referential tie.
         let catalog: Vec<&'static crate::recipes::RecipeDef> = registry.all().collect();
+        let ingredients = registry.ingredient_palette();
         Self {
             console: console::ConsoleModel::demo(),
             console_tab: console::ConsoleTab::Home,
+            builder: builder::DagBuilder::default(),
+            ingredients,
             launch_cookbook: None,
             cookbook_mode: false,
             jobs: Vec::new(),
@@ -1466,6 +1475,21 @@ pub fn check(registry: impl Into<std::sync::Arc<crate::framework::Registry>>) ->
         }
     }
 
+    // Render every console drill-down tab (Home/Plan/…/Build) so the Build tab's
+    // ingredient palette + canvas paint against the LIVE registry, not just the
+    // empty-palette unit fixture.
+    app.view = View::Console;
+    let mut tabs_checked = 0usize;
+    for d in ['0', '1', '2', '3', '4', '5', '6'] {
+        if let Some(tab) = console::ConsoleTab::from_digit(d) {
+            app.console_tab = tab;
+            term.draw(|f| draw(f, &mut app))
+                .with_context(|| format!("draw console tab {tab:?}"))?;
+            tabs_checked += 1;
+        }
+    }
+    app.console_tab = console::ConsoleTab::Home;
+
     // Also render every modal OVERLAY headless so a future break in the recipe
     // Picker, the F2 per-field args form (+ its raw-JSON fallback), or the F3
     // dataset picker is caught by `tui --check`, not just by unit tests.
@@ -1514,7 +1538,7 @@ pub fn check(registry: impl Into<std::sync::Arc<crate::framework::Registry>>) ->
     app.overlay = Overlay::None;
 
     println!(
-        "blut tui --check: OK ({} views + {overlays_checked} overlays render)",
+        "blut tui --check: OK ({} views + {tabs_checked} console tabs + {overlays_checked} overlays render)",
         views.len()
     );
     Ok(())
@@ -1764,11 +1788,23 @@ fn handle_key_main(app: &mut App, k: event::KeyEvent) {
     // ── View switching (works from any view) ───────────────────────
     // Capital letters jump straight to a detail view. Chosen so they
     // don't collide with the lowercase recipe-hotkey pool (1-9,a-z).
+    // On the Build tab, the DAG builder consumes its own keys first (add / wire /
+    // delete / validate / write); anything it ignores (tab digits, `q`) falls
+    // through to the global console keys below.
+    if !app.cookbook_mode
+        && app.view == View::Console
+        && app.console_tab == console::ConsoleTab::Build
+        && app
+            .builder
+            .handle_key(k.code, &app.ingredients, &app.registry)
+    {
+        return;
+    }
     match k.code {
         // ── BLUT console keys (engine surface) ──────────────────────
-        // 0–5 switch the drill-down tab; `c` opens the cookbook selector
+        // 0–6 switch the drill-down tab; `c` opens the cookbook selector
         // (open a cookbook's TUI, or Esc to stay in BLUT).
-        KeyCode::Char(c @ '0'..='5') if !app.cookbook_mode && app.view == View::Console => {
+        KeyCode::Char(c @ '0'..='6') if !app.cookbook_mode && app.view == View::Console => {
             if let Some(t) = console::ConsoleTab::from_digit(c) {
                 app.console_tab = t;
             }

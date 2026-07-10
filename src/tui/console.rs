@@ -36,16 +36,18 @@ pub enum ConsoleTab {
     Broker,
     Privacy,
     Cache,
+    Build,
 }
 
 impl ConsoleTab {
-    const ALL: [ConsoleTab; 6] = [
+    const ALL: [ConsoleTab; 7] = [
         ConsoleTab::Home,
         ConsoleTab::Plan,
         ConsoleTab::Mesh,
         ConsoleTab::Broker,
         ConsoleTab::Privacy,
         ConsoleTab::Cache,
+        ConsoleTab::Build,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -55,9 +57,10 @@ impl ConsoleTab {
             ConsoleTab::Broker => "Broker",
             ConsoleTab::Privacy => "Privacy",
             ConsoleTab::Cache => "Cache",
+            ConsoleTab::Build => "Build",
         }
     }
-    /// Map a `0`–`5` digit to a tab, else `None`.
+    /// Map a `0`–`6` digit to a tab, else `None`.
     pub(crate) fn from_digit(c: char) -> Option<ConsoleTab> {
         Self::ALL
             .get((c as u8).wrapping_sub(b'0') as usize)
@@ -576,7 +579,14 @@ fn node_marker(state: NodeState) -> Span<'static> {
 /// Render the console: the persistent status strip + tab bar + governance
 /// footer, with the body being either the at-a-glance home or a full-screen
 /// drill-down for `tab`.
-pub fn draw_console(f: &mut Frame<'_>, area: Rect, m: &ConsoleModel, tab: ConsoleTab) {
+pub fn draw_console(
+    f: &mut Frame<'_>,
+    area: Rect,
+    m: &ConsoleModel,
+    tab: ConsoleTab,
+    builder: &super::builder::DagBuilder,
+    palette: &[crate::framework::Ingredient],
+) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -604,6 +614,7 @@ pub fn draw_console(f: &mut Frame<'_>, area: Rect, m: &ConsoleModel, tab: Consol
         ConsoleTab::Broker => draw_broker(f, body, m),
         ConsoleTab::Privacy => draw_privacy(f, body, m),
         ConsoleTab::Cache => draw_cache(f, body, m),
+        ConsoleTab::Build => super::builder::draw_build(f, body, builder, palette),
     }
     draw_gov(f, rows[3], m);
 }
@@ -964,8 +975,17 @@ mod tests {
         for (w, h) in [(120u16, 40u16), (80, 30), (200, 60), (60, 24)] {
             let backend = TestBackend::new(w, h);
             let mut term = Terminal::new(backend).unwrap();
-            term.draw(|f| draw_console(f, f.area(), &m, ConsoleTab::Home))
-                .unwrap();
+            term.draw(|f| {
+                draw_console(
+                    f,
+                    f.area(),
+                    &m,
+                    ConsoleTab::Home,
+                    &super::super::builder::DagBuilder::default(),
+                    &[],
+                )
+            })
+            .unwrap();
         }
     }
 
@@ -1037,7 +1057,17 @@ mod tests {
         for tab in ConsoleTab::ALL {
             let backend = TestBackend::new(120, 40);
             let mut term = Terminal::new(backend).unwrap();
-            term.draw(|f| draw_console(f, f.area(), &m, tab)).unwrap();
+            term.draw(|f| {
+                draw_console(
+                    f,
+                    f.area(),
+                    &m,
+                    tab,
+                    &super::super::builder::DagBuilder::default(),
+                    &[],
+                )
+            })
+            .unwrap();
         }
     }
 
@@ -1046,7 +1076,8 @@ mod tests {
         assert_eq!(ConsoleTab::from_digit('0'), Some(ConsoleTab::Home));
         assert_eq!(ConsoleTab::from_digit('2'), Some(ConsoleTab::Mesh));
         assert_eq!(ConsoleTab::from_digit('5'), Some(ConsoleTab::Cache));
-        assert_eq!(ConsoleTab::from_digit('6'), None);
+        assert_eq!(ConsoleTab::from_digit('6'), Some(ConsoleTab::Build));
+        assert_eq!(ConsoleTab::from_digit('7'), None);
         assert_eq!(ConsoleTab::from_digit('x'), None);
     }
 
@@ -1056,8 +1087,17 @@ mod tests {
         let m = ConsoleModel::demo();
         let backend = TestBackend::new(100, 36);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| draw_console(f, f.area(), &m, ConsoleTab::Home))
-            .unwrap();
+        term.draw(|f| {
+            draw_console(
+                f,
+                f.area(),
+                &m,
+                ConsoleTab::Home,
+                &super::super::builder::DagBuilder::default(),
+                &[],
+            )
+        })
+        .unwrap();
         theme::detect("auto", "auto");
     }
 }

@@ -69,6 +69,18 @@ pub struct ArtifactDescriptor {
     pub schema: u32,
 }
 
+/// One ingredient in the DAG-builder palette: a registered stage plus its
+/// resolved artifact kinds. `input_kind == "()"` marks a graph-input (seed)
+/// stage that can start a plan; `element_kind` is `Some` for a list-producing
+/// stage (a `map_output` parent). Produced by [`Registry::ingredient_palette`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ingredient {
+    pub stage: String,
+    pub input_kind: String,
+    pub output_kind: String,
+    pub element_kind: Option<String>,
+}
+
 /// A cookbook is a self-contained bundle of recipes (plus the stages /
 /// artifacts they reference). The seam for ADR-0034 "BLUT owns
 /// recipes / artifacts". blut-core defines the trait; concrete impls
@@ -167,6 +179,31 @@ impl Registry {
         self.cookbooks
             .iter()
             .flat_map(|c| c.error_domains().iter().copied())
+    }
+
+    /// The ingredient palette: every registered stage (across all cookbooks),
+    /// with its resolved input/output kinds, sorted + de-duplicated by name —
+    /// the building blocks the console DAG builder composes into a `PlanSpec`.
+    /// Each stage is constructed once to read its kinds (ctors are trivial
+    /// `Arc::new`); nothing runs.
+    pub fn ingredient_palette(&self) -> Vec<Ingredient> {
+        let mut out: Vec<Ingredient> = self
+            .cookbooks
+            .iter()
+            .flat_map(|c| c.stages_erased().iter().copied())
+            .map(|(name, ctor)| {
+                let s = ctor();
+                Ingredient {
+                    stage: name.to_string(),
+                    input_kind: s.input_kind().to_string(),
+                    output_kind: s.output_kind().to_string(),
+                    element_kind: s.output_element_kind().map(str::to_string),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.stage.cmp(&b.stage));
+        out.dedup_by(|a, b| a.stage == b.stage);
+        out
     }
 
     /// Detect the registered cookbooks that ship their own TUI (in registration
