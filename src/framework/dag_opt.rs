@@ -14,6 +14,11 @@
 //! 4. **Memory-aware scheduling** — compute peak concurrent memory
 //!    for the current schedule and suggest reordering if a cheaper
 //!    order exists.
+//! 5. **User-priority scheduling** (ADR 0102 pass #4) — copy each node's
+//!    optional `PlanNode::priority` into its hint so a latency-critical
+//!    stage jumps bulk work in the executor's ready queue. Flag-gated
+//!    (`priority_aware`, default off); reorders *ready* nodes only, never
+//!    bypassing broker admission.
 //!
 //! The optimizer is conservative: it never changes the DAG's semantic
 //! output, only its execution order and which nodes run at all.
@@ -34,6 +39,13 @@ pub struct ScheduleHint {
     pub peak_concurrent_gib: u32,
     /// True if this node's cache is warm (output already exists).
     pub cache_warm: bool,
+    /// ADR 0102 pass #4: user scheduling priority copied from the node's
+    /// `PlanNode::priority` (0 when unset). Dominates `critical_path_len` in the
+    /// executor's ready-queue ordering, so a latency-critical stage jumps bulk
+    /// work — but only reorders *ready* nodes, never bypassing broker admission.
+    /// Populated solely by the flag-gated `priority_aware` pass; default 0 keeps
+    /// the ready-queue byte-identical to the pre-0102 `(critical_path_len, id)`.
+    pub user_priority: i32,
 }
 
 /// The DAG optimizer. Runs a sequence of passes on a `CompiledPlan`.
@@ -46,6 +58,11 @@ pub struct DagOptimizer {
     pub cache_aware: bool,
     /// Compute memory-aware ordering.
     pub memory_aware: bool,
+    /// ADR 0102 pass #4: honour per-node user `priority` in ready-queue ordering.
+    /// **Off by default** — when off, no hint gets a non-zero `user_priority`, so
+    /// the executor's ready-queue is byte-identical to the pre-0102 behaviour
+    /// (each advanced 0102 pass is flag-gated, default-off, per the ADR).
+    pub priority_aware: bool,
 }
 
 impl DagOptimizer {
@@ -55,6 +72,7 @@ impl DagOptimizer {
             critical_path: true,
             cache_aware: true,
             memory_aware: true,
+            priority_aware: false,
         }
     }
 
@@ -82,6 +100,13 @@ impl DagOptimizer {
         // Pass 4: Memory-aware scheduling
         if self.memory_aware {
             compute_memory_hints(&plan, &mut hints);
+        }
+
+        // Pass 5 (ADR 0102 pass #4): user-priority scheduling. Flag-gated /
+        // default-off, so when disabled every hint keeps `user_priority = 0`
+        // and the ready-queue order is unchanged.
+        if self.priority_aware {
+            compute_priority_hints(&plan, &mut hints);
         }
 
         (plan, hints)
@@ -273,6 +298,25 @@ fn compute_cache_hints(plan: &CompiledPlan, hints: &mut HashMap<NodeId, Schedule
 }
 
 // ---------------------------------------------------------------------------
+// Pass 5 (ADR 0102 pass #4): user-priority scheduling
+// ---------------------------------------------------------------------------
+
+/// Copy each node's user `priority` (from its `PlanNode`, a PlanSpec v1.1
+/// additive field) into its schedule hint. Higher priority runs earlier among
+/// *ready* nodes; `None`/unset stays 0 (neutral). This is the ONLY writer of
+/// `user_priority`, so with the `priority_aware` flag off every hint keeps 0 and
+/// the ready-queue is byte-identical to the pre-0102 order — reordering ready
+/// nodes is sound by the DCE↔hint invariant (ADR 0067) and never touches a
+/// node's output artifact hash (scheduling metadata, not computation, ADR 0078).
+fn compute_priority_hints(plan: &CompiledPlan, hints: &mut HashMap<NodeId, ScheduleHint>) {
+    for node in &plan.nodes {
+        if let Some(p) = node.priority {
+            hints.entry(node.id).or_default().user_priority = p;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pass 4: Memory-aware scheduling
 // ---------------------------------------------------------------------------
 
@@ -407,6 +451,7 @@ mod tests {
                 canon_args: Vec::new(),
                 retry: None,
                 timeout: None,
+                priority: None,
             })
             .collect();
 
@@ -499,5 +544,96 @@ mod tests {
         assert_eq!(hints[&1].peak_concurrent_gib, 8); // level 1: 2 nodes
         assert_eq!(hints[&2].peak_concurrent_gib, 8); // level 1: 2 nodes
         assert_eq!(hints[&3].peak_concurrent_gib, 4); // level 2: 1 node
+    }
+
+    // --- ADR 0102 pass #4: user-priority scheduling ------------------------
+
+    /// Optimizer that runs ONLY the priority pass (isolate it from DCE/critical-
+    /// path/cache/memory so the assertions are unambiguous).
+    fn priority_only_opt() -> DagOptimizer {
+        DagOptimizer {
+            eliminate_dead_code: false,
+            critical_path: false,
+            cache_aware: false,
+            memory_aware: false,
+            priority_aware: true,
+        }
+    }
+
+    #[test]
+    fn dag_opt_priority_pass_sets_user_priority() {
+        // The priority pass copies each node's `PlanNode::priority` into the hint;
+        // unset nodes stay at the neutral 0.
+        let mut plan = make_plan(3, &[(0, 1), (1, 2)]);
+        plan.nodes[2].priority = Some(50);
+        plan.nodes[0].priority = Some(-5); // negative = de-prioritise
+        let (_plan, hints) = priority_only_opt().optimize(plan);
+        assert_eq!(hints[&2].user_priority, 50);
+        assert_eq!(hints[&0].user_priority, -5);
+        assert_eq!(
+            hints.get(&1).map(|h| h.user_priority).unwrap_or(0),
+            0,
+            "an unset node stays neutral"
+        );
+    }
+
+    #[test]
+    fn dag_opt_priority_off_is_byte_identical() {
+        // With `priority_aware` OFF (the default), even a node carrying an explicit
+        // priority yields NO non-zero `user_priority`, so the ready-queue key is
+        // byte-identical to the pre-0102 `(critical_path_len, id)`.
+        let mut plan = make_plan(2, &[(0, 1)]);
+        plan.nodes[1].priority = Some(99);
+        let opt = DagOptimizer::new(); // priority_aware defaults to false
+        let (_plan, hints) = opt.optimize(plan);
+        assert!(
+            hints.values().all(|h| h.user_priority == 0),
+            "no hint may carry priority when the pass is off"
+        );
+    }
+
+    #[test]
+    fn dag_opt_priority_preserves_node_set() {
+        // Equivalence witness: priority is scheduling metadata, so running the
+        // pass leaves the node set, ids, args (== per-node cache-key inputs), and
+        // edges byte-identical — the optimized plan produces the same artifact
+        // hashes as the un-optimized plan (ADR 0078 preserved).
+        let mut plan = make_plan(3, &[(0, 1), (1, 2)]);
+        plan.nodes[1].priority = Some(7);
+        let before_ids: Vec<_> = plan.nodes.iter().map(|n| n.id).collect();
+        let before_args: Vec<_> = plan.nodes.iter().map(|n| n.args.clone()).collect();
+        let before_canon: Vec<_> = plan.nodes.iter().map(|n| n.canon_args.clone()).collect();
+        let before_edges: Vec<_> = plan.edges.iter().map(|e| (e.from, e.to)).collect();
+        let (after, _hints) = priority_only_opt().optimize(plan);
+        assert_eq!(
+            after.nodes.iter().map(|n| n.id).collect::<Vec<_>>(),
+            before_ids
+        );
+        assert_eq!(
+            after
+                .nodes
+                .iter()
+                .map(|n| n.args.clone())
+                .collect::<Vec<_>>(),
+            before_args,
+            "args (a cache-key input) must be untouched"
+        );
+        assert_eq!(
+            after
+                .nodes
+                .iter()
+                .map(|n| n.canon_args.clone())
+                .collect::<Vec<_>>(),
+            before_canon,
+            "canonical cache-key bytes must be untouched"
+        );
+        assert_eq!(
+            after
+                .edges
+                .iter()
+                .map(|e| (e.from, e.to))
+                .collect::<Vec<_>>(),
+            before_edges
+        );
     }
 }

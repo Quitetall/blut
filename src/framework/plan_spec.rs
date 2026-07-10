@@ -67,6 +67,12 @@ pub struct SpecNode {
     /// own `TIMEOUT` default (v1 behaviour). NOT in the cache key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<crate::framework::retry::StageTimeout>,
+    /// ADR 0102 pass #4: optional user scheduling priority (higher runs earlier
+    /// among ready nodes). `None` = neutral (0), byte-identical to a v1 plan.
+    /// Scheduling metadata only — NOT in the cache key (like retry/timeout), and
+    /// `skip_serializing_if` keeps an unset plan's canonical bytes unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
 }
 
 /// A typed runtime fan-out (ADR 0078 `map_output`): when the node at index
@@ -254,7 +260,11 @@ impl PlanSpec {
         })?;
         // PlanSpec v1.1 (ADR 0088): thread per-node retry/timeout onto the
         // compiled nodes. Execution-control only — node cache keys unaffected.
-        let overrides: Vec<_> = self.nodes.iter().map(|n| (n.retry, n.timeout)).collect();
+        let overrides: Vec<_> = self
+            .nodes
+            .iter()
+            .map(|n| (n.retry, n.timeout, n.priority))
+            .collect();
         plan.apply_execution_overrides(&overrides);
         Ok(plan.with_expansions(expansions))
     }
@@ -429,12 +439,14 @@ mod tests {
                     args: serde_json::json!({}),
                     retry: None,
                     timeout: None,
+                    priority: None,
                 },
                 SpecNode {
                     stage: "spec_a_to_b".into(),
                     args: serde_json::json!({}),
                     retry: None,
                     timeout: None,
+                    priority: None,
                 },
             ],
             edges: vec![(0, 1)],
@@ -482,6 +494,7 @@ mod tests {
                 args: serde_json::Value::Null,
                 retry: None,
                 timeout: None,
+                priority: None,
             }],
             edges: vec![],
             expansions: Vec::new(),
@@ -532,6 +545,52 @@ mod tests {
     }
 
     #[test]
+    fn dag_opt_priority_planspec_additive() {
+        // ADR 0102 pass #4: `priority` is an additive PlanSpec field with the same
+        // cache-safety contract as retry/timeout.
+        let reg = toy_registry();
+
+        // (1) A plan without `priority` parses; the field defaults None.
+        let v1: PlanSpec =
+            serde_json::from_str(r#"{"name":"p","nodes":[{"stage":"spec_make_a"}],"edges":[]}"#)
+                .unwrap();
+        assert!(v1.nodes[0].priority.is_none());
+
+        // (2) UNSET priority is omitted from the wire (skip_serializing_if) and
+        // hashes byte-identically to the priority-absent plan.
+        let base = PlanSpec {
+            name: "p".into(),
+            nodes: vec![SpecNode {
+                stage: "spec_make_a".into(),
+                args: serde_json::Value::Null,
+                retry: None,
+                timeout: None,
+                priority: None,
+            }],
+            edges: vec![],
+            expansions: Vec::new(),
+            version: PLAN_SPEC_VERSION,
+        };
+        assert_eq!(v1.canonical_bytes(), base.canonical_bytes());
+        let json = serde_json::to_string(&base).unwrap();
+        assert!(!json.contains("priority"), "unset priority omitted: {json}");
+
+        // (3) Setting priority leaves the node's cache-key inputs (stage + args)
+        // byte-identical; only the plan fingerprint moves.
+        let mut with = base.clone();
+        with.nodes[0].priority = Some(42);
+        assert_eq!(with.nodes[0].stage, base.nodes[0].stage);
+        assert_eq!(with.nodes[0].args, base.nodes[0].args);
+        assert_ne!(with.canonical_bytes(), base.canonical_bytes());
+
+        // (4) compile threads priority onto the executor's PlanNode; the default
+        // plan leaves it None (neutral).
+        let compiled = with.compile(&reg).unwrap();
+        assert_eq!(compiled.nodes[0].priority, Some(42));
+        assert!(base.compile(&reg).unwrap().nodes[0].priority.is_none());
+    }
+
+    #[test]
     fn canonical_bytes_are_key_order_stable() {
         // Same graph, args keys in different source order -> identical bytes.
         let a = PlanSpec {
@@ -541,6 +600,7 @@ mod tests {
                 args: serde_json::json!({ "x": 1, "y": 2 }),
                 retry: None,
                 timeout: None,
+                priority: None,
             }],
             edges: vec![],
             expansions: Vec::new(),
@@ -553,6 +613,7 @@ mod tests {
                 args: serde_json::json!({ "y": 2, "x": 1 }),
                 retry: None,
                 timeout: None,
+                priority: None,
             }],
             edges: vec![],
             expansions: Vec::new(),
@@ -567,6 +628,7 @@ mod tests {
                 args: serde_json::json!({ "x": 9, "y": 2 }),
                 retry: None,
                 timeout: None,
+                priority: None,
             }],
             edges: vec![],
             expansions: Vec::new(),
@@ -584,6 +646,7 @@ mod tests {
                 args: serde_json::json!({}),
                 retry: None,
                 timeout: None,
+                priority: None,
             }],
             edges: vec![],
             expansions: Vec::new(),
@@ -608,12 +671,14 @@ mod tests {
                     args: serde_json::json!({}),
                     retry: None,
                     timeout: None,
+                    priority: None,
                 },
                 SpecNode {
                     stage: "spec_make_a".into(),
                     args: serde_json::json!({}),
                     retry: None,
                     timeout: None,
+                    priority: None,
                 },
             ],
             edges: vec![(0, 1)],
@@ -674,6 +739,7 @@ mod tests {
                 args: serde_json::json!({}),
                 retry: None,
                 timeout: None,
+                priority: None,
             }],
             edges: vec![],
             expansions: vec![MapSpec {
@@ -685,6 +751,7 @@ mod tests {
                         args: serde_json::json!({}),
                         retry: None,
                         timeout: None,
+                        priority: None,
                     }],
                     edges: vec![],
                     expansions: Vec::new(),
@@ -718,6 +785,7 @@ mod tests {
                 args: serde_json::json!({}),
                 retry: None,
                 timeout: None,
+                priority: None,
             }],
             edges: vec![],
             expansions: vec![MapSpec {
@@ -729,6 +797,7 @@ mod tests {
                         args: serde_json::json!({}),
                         retry: None,
                         timeout: None,
+                        priority: None,
                     }],
                     edges: vec![],
                     expansions: Vec::new(),
@@ -757,6 +826,7 @@ mod tests {
                 args: serde_json::json!({}),
                 retry: None,
                 timeout: None,
+                priority: None,
             }],
             edges: vec![],
             expansions: vec![MapSpec {
@@ -768,6 +838,7 @@ mod tests {
                         args: serde_json::json!({}),
                         retry: None,
                         timeout: None,
+                        priority: None,
                     }],
                     edges: vec![],
                     expansions: Vec::new(),
@@ -809,6 +880,7 @@ mod tests {
                     args: serde_json::json!({}),
                     retry: None,
                     timeout: None,
+                    priority: None,
                 }],
                 edges: vec![],
                 expansions: Vec::new(),

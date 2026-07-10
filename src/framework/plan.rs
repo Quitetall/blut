@@ -60,6 +60,11 @@ pub(crate) struct PlanNode {
     /// `Plan::with_timeout`, which apply to the current leading node(s).
     pub retry: Option<crate::framework::retry::RetryPolicy>,
     pub timeout: Option<crate::framework::retry::StageTimeout>,
+    /// PlanSpec v1.1 / ADR 0102 pass #4: optional user scheduling priority.
+    /// `None` == 0 (neutral). Higher runs earlier among *ready* nodes — it
+    /// reorders the ready queue only, never bypassing broker admission, and is
+    /// scheduling metadata (NOT part of a node's cache key, like retry/timeout).
+    pub priority: Option<i32>,
 }
 
 impl std::fmt::Debug for PlanNode {
@@ -148,6 +153,7 @@ impl<B: TrainingBackend> Plan<(), B> {
             canon_args,
             retry: None,
             timeout: None,
+            priority: None,
         });
         // Graph input: provide () as the input artifact.
         let unit = ErasedArtifact::from_typed(&()).expect("() always serializes");
@@ -231,6 +237,7 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
             canon_args,
             retry: None,
             timeout: None,
+            priority: None,
         });
         // Edge from each previous leading node to this one. For
         // linear chains this is always one edge; commit 6's
@@ -311,6 +318,7 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
             canon_args: l_canon,
             retry: None,
             timeout: None,
+            priority: None,
         });
         let r_id = self.nodes.len() as NodeId;
         let r_args_json = serde_json::to_value(&r_args).expect("Stage::Args serialize");
@@ -322,6 +330,7 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
             canon_args: r_canon,
             retry: None,
             timeout: None,
+            priority: None,
         });
         for &from in &self.leading {
             self.edges.push(PlanEdge { from, to: l_id });
@@ -379,6 +388,7 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
                 canon_args,
                 retry: None,
                 timeout: None,
+                priority: None,
             });
             for &from in &self.leading {
                 self.edges.push(PlanEdge { from, to: id });
@@ -414,6 +424,7 @@ impl<A1: Artifact, A2: Artifact, B: TrainingBackend> Plan<(A1, A2), B> {
             canon_args,
             retry: None,
             timeout: None,
+            priority: None,
         });
         for &from in &self.leading {
             self.edges.push(PlanEdge { from, to: id });
@@ -447,6 +458,7 @@ impl<A1: Artifact, A2: Artifact, A3: Artifact, B: TrainingBackend> Plan<(A1, A2,
             canon_args,
             retry: None,
             timeout: None,
+            priority: None,
         });
         for &from in &self.leading {
             self.edges.push(PlanEdge { from, to: id });
@@ -839,6 +851,7 @@ impl CompiledPlan {
                 canon_args,
                 retry: None,
                 timeout: None,
+                priority: None,
             });
             if i > 0 {
                 edges.push(PlanEdge {
@@ -870,6 +883,7 @@ impl CompiledPlan {
         overrides: &[(
             Option<crate::framework::retry::RetryPolicy>,
             Option<crate::framework::retry::StageTimeout>,
+            Option<i32>,
         )],
     ) {
         debug_assert_eq!(
@@ -877,12 +891,15 @@ impl CompiledPlan {
             self.nodes.len(),
             "execution overrides must align 1:1 with nodes"
         );
-        for (node, (retry, timeout)) in self.nodes.iter_mut().zip(overrides) {
+        for (node, (retry, timeout, priority)) in self.nodes.iter_mut().zip(overrides) {
             if retry.is_some() {
                 node.retry = *retry;
             }
             if timeout.is_some() {
                 node.timeout = *timeout;
+            }
+            if priority.is_some() {
+                node.priority = *priority;
             }
         }
     }
@@ -1002,6 +1019,7 @@ impl CompiledPlan {
                 canon_args,
                 retry: None,
                 timeout: None,
+                priority: None,
             });
         }
         let plan_edges: Vec<PlanEdge> = edges
@@ -1121,6 +1139,7 @@ impl CompiledPlan {
                 args,
                 retry: None,
                 timeout: None,
+                priority: None,
             })
             .collect();
         let plan_edges: Vec<PlanEdge> = edges
@@ -1542,6 +1561,7 @@ mod tests {
             canon_args: Vec::new(),
             retry: None,
             timeout: None,
+            priority: None,
         }
     }
 

@@ -244,6 +244,7 @@ impl DagBuilder {
                     args: n.args.clone(),
                     retry: None,
                     timeout: None,
+                    priority: None,
                 })
                 .collect(),
             edges: self

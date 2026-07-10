@@ -1511,8 +1511,11 @@ const MAX_RUNTIME_SPAWNS: usize = 4096;
 ///
 /// Determinism: iteration is driven by the sorted `ready` set and only does
 /// point `get`s into the `HashMap` `hints`; the composite key
-/// `(critical_path_len, Reverse(id))` is unique per node, so the argmax never
-/// depends on `max_by_key`'s tie rule.
+/// `(user_priority, critical_path_len, Reverse(id))` is unique per node (the
+/// `Reverse(id)` tail is a total order), so the argmax never depends on
+/// `max_by_key`'s tie rule. `user_priority` (ADR 0102) is 0 unless the
+/// `priority_aware` pass ran, so the default key is exactly the historical
+/// `(critical_path_len, Reverse(id))`.
 ///
 /// Cost: O(|ready|) per call (a linear argmax), vs the old `ready.iter().next()`
 /// at O(log n). The `max_in_flight` cap bounds calls per loop pass and ML
@@ -1523,8 +1526,14 @@ fn next_ready(
     hints: &HashMap<NodeId, crate::framework::dag_opt::ScheduleHint>,
 ) -> Option<NodeId> {
     ready.iter().copied().max_by_key(|id| {
-        let cp = hints.get(id).map(|h| h.critical_path_len).unwrap_or(0);
-        (cp, std::cmp::Reverse(*id))
+        let h = hints.get(id);
+        // ADR 0102 pass #4: user priority DOMINATES critical-path length, so a
+        // latency-critical stage jumps bulk work. When the `priority_aware` pass
+        // is off, every `user_priority` is 0 and this reduces to the historical
+        // `(critical_path_len, Reverse(id))` key — byte-identical selection.
+        let prio = h.map(|h| h.user_priority).unwrap_or(0);
+        let cp = h.map(|h| h.critical_path_len).unwrap_or(0);
+        (prio, cp, std::cmp::Reverse(*id))
     })
 }
 

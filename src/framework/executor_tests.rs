@@ -100,6 +100,63 @@ fn next_ready_empty_set_is_none() {
     assert_eq!(next_ready(&ready, &hints), None);
 }
 
+// --- ADR 0102 pass #4: user-priority ready-queue scheduling ------------
+
+/// A hint carrying a user priority (and optionally a critical-path length).
+fn prio_hint(
+    user_priority: i32,
+    critical_path_len: u32,
+) -> crate::framework::dag_opt::ScheduleHint {
+    crate::framework::dag_opt::ScheduleHint {
+        critical_path_len,
+        user_priority,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn dag_opt_priority_reorders_ready_queue() {
+    // Node 3 has the LONGEST critical path (100) but node 1 carries an explicit
+    // user priority — priority DOMINATES critical-path length, so 1 wins.
+    let ready: BTreeSet<NodeId> = [1, 2, 3].into_iter().collect();
+    let hints: HashMap<NodeId, _> = [
+        (1, prio_hint(50, 1)),
+        (2, prio_hint(0, 10)),
+        (3, prio_hint(0, 100)),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        next_ready(&ready, &hints),
+        Some(1),
+        "user priority must outrank critical-path length"
+    );
+}
+
+#[test]
+fn dag_opt_priority_zero_is_byte_identical_to_critical_path() {
+    // With all user_priority = 0 (the `priority_aware`-off default), selection
+    // falls back to exactly the historical `(critical_path_len, Reverse(id))`.
+    let ready: BTreeSet<NodeId> = [1, 2].into_iter().collect();
+    let with_prio: HashMap<NodeId, _> = [(1, prio_hint(0, 1)), (2, prio_hint(0, 3))]
+        .into_iter()
+        .collect();
+    let cp_only: HashMap<NodeId, _> = [(1, cp_hint(1)), (2, cp_hint(3))].into_iter().collect();
+    assert_eq!(next_ready(&ready, &with_prio), next_ready(&ready, &cp_only));
+    assert_eq!(next_ready(&ready, &with_prio), Some(2));
+}
+
+#[test]
+fn dag_opt_priority_only_selects_ready_never_bypasses_admission() {
+    // A very-high-priority node that is NOT in `ready` (e.g. deps unmet, or the
+    // broker has not admitted it) is NEVER selected — priority reorders the
+    // ready queue only; it can neither conjure a non-ready node nor bypass the
+    // admission the spawn loop applies AFTER selection.
+    let ready: BTreeSet<NodeId> = [2].into_iter().collect();
+    let hints: HashMap<NodeId, _> = [(5, prio_hint(1000, 1))].into_iter().collect();
+    assert_eq!(next_ready(&ready, &hints), Some(2));
+}
+
 struct MakeOne;
 #[async_trait]
 impl Stage for MakeOne {
