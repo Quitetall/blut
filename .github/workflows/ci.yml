@@ -32,6 +32,13 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # Charter enforcement (ADR 0034): the engine must not reimplement
+      # delegated concerns (HTTP servers, GPU monitoring, plotting, log-agg,
+      # process supervision). Sidecar crates (crates/*) are outside this
+      # guard's scope by design. Runs first — it needs no toolchain.
+      - name: Scope guard (ADR 0034 charter)
+        run: bash scripts/scope_guard.sh
+
       - name: Format check
         run: cargo fmt --all -- --check
 
@@ -69,6 +76,16 @@ jobs:
         run: |
           cargo clippy -p blut --features s3 --all-targets -- -D warnings
           cargo test -p blut --features s3 --lib object_store --no-run
+
+      # The cloud compute queue (ADR 0082) is off-by-default and implies p2p.
+      # Gate clippy + the cloud tests (incl. the end-to-end loopback proof in
+      # tests/cloud_integration.rs — local-fs object store, no cloud account)
+      # so the src/cloud tree can't rot.
+      - name: Clippy + test the cloud feature
+        run: |
+          cargo clippy -p blut --features cloud --all-targets -- -D warnings
+          cargo test -p blut --features cloud --lib cloud
+          cargo test -p blut --features cloud --test cloud_integration
 
       # crates/blut-dsl is a STANDALONE workspace (path-deps on the engine).
       # It links `starlark` — and its `serde_json/arbitrary_precision` feature

@@ -1,0 +1,31 @@
+# scope_guard allowlist — file path suffixes exempted from the guard.
+# PERMANENT (by-design) entries cite the ADR that makes the concern
+# non-delegatable; STAGED entries cite the ADR-0034 migration step (or the
+# roadmap ADR) that will remove them. Blank lines and # comments ignored.
+# One suffix per line (suffix match — 'runner.rs' cannot exempt a sibling).
+
+# --- PERMANENT exemptions (not migration steps) ---
+# The broker IS the admission gate (ADR 0046): it reads /proc/meminfo +
+# nvidia-smi to DECIDE whether a run fits before launch. That probing is its
+# core, non-delegatable function — the very thing the scope guard otherwise
+# tells code to delegate.
+src/broker/probe.rs            # ADR 0046 — admission-gate resource probe (by design)
+# The containment ladder IS the process-containment mechanism (ADR 0046/0047):
+# pre_exec applies RLIMIT_AS / joins the cgroup IN THE CHILD before exec —
+# there is no delegated way to do that (systemd path is the sibling rung).
+src/containment/rlimit.rs      # ADR 0046 — rlimit rung applies caps via pre_exec (by design)
+src/containment/cgroup2.rs     # ADR 0046 — cgroup2-direct rung joins cgroup via pre_exec (by design)
+
+# --- consolidating into the ADR 0087 GPU-inventory seam (M1 roadmap) ---
+# One-shot nvidia-smi PROBES (discovery / per-stage sample), not monitoring
+# loops. ADR 0087 centralizes all GPU probing behind broker::gpu::GpuInventory;
+# these entries then collapse into the probe.rs exemption.
+src/config/launcher.rs         # ADR 0065/0087 — one-shot GPU discovery for DDP placement
+src/framework/gpu_sampler.rs   # ADR 0087 — one-shot per-stage GPU-sat sample for the metric store
+
+# --- pre-existing, scheduled for removal (ADR 0034 migration steps) ---
+src/tui/system.rs              # Step 1 — delete: system/GPU monitoring -> wandb/systemctl
+src/python_kill.rs             # Step 6 — SHED mechanism after Step 4 (systemd-run)
+src/backends/lamquant/runner.rs   # Step 4/5 — REPLACE spawn+tqdm -> systemd-run/journald
+src/backends/hf_trainer/runner.rs # Step 4/5 — REPLACE spawn -> systemd-run
+src/backends/lamu/python_backend.rs # Step 5 — REPLACE StatusUpdate proto -> journald
