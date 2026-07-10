@@ -122,9 +122,15 @@ pub struct ExecCtx {
     pub cancel: CancellationToken,
     /// Per-resource semaphores. Stages acquire all permits in
     /// their `RESOURCES` slice before `run` is called. Default
-    /// limits: Gpu=1 (single-card), Cpu=num_cpus, Network=4,
-    /// Disk=2. Override via ExecCtx::with_resource_limit.
+    /// limits: Cpu=num_cpus, Network=4, Disk=2. GPU is NOT here — it is
+    /// scheduled by [`gpu`](Self::gpu) (ADR 0087). Override via
+    /// ExecCtx::with_resource_limit.
     pub resources: std::collections::HashMap<Resource, Arc<tokio::sync::Semaphore>>,
+    /// GPU-aware scheduler (ADR 0087): per-device exclusive permits + VRAM-aware
+    /// placement, admitted in series with the RAM broker. Default is a single
+    /// device (byte-identical to the legacy `Semaphore::new(1)`); the CLI sizes
+    /// it from the live inventory via `with_gpu_scheduler`.
+    pub gpu: Arc<crate::broker::gpu::GpuScheduler>,
     /// Max concurrently-spawned node tasks (parallel executor only).
     pub max_in_flight: usize,
     /// Optional plan-level deadline (D2). When `Instant::now()` reaches
@@ -211,7 +217,6 @@ impl ExecCtx {
         let cpu_n = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        resources.insert(Resource::Gpu, Arc::new(tokio::sync::Semaphore::new(1)));
         resources.insert(Resource::Cpu, Arc::new(tokio::sync::Semaphore::new(cpu_n)));
         resources.insert(Resource::Network, Arc::new(tokio::sync::Semaphore::new(4)));
         resources.insert(Resource::Disk, Arc::new(tokio::sync::Semaphore::new(2)));
@@ -222,6 +227,11 @@ impl ExecCtx {
             lifecycle_rx: Some(lifecycle_rx),
             cancel,
             resources,
+            // Default 1 device ⇒ byte-identical to the legacy Semaphore::new(1);
+            // the CLI sizes it from the live inventory via with_gpu_scheduler.
+            gpu: Arc::new(crate::broker::gpu::GpuScheduler::new(
+                crate::broker::gpu::GpuInventory::default(),
+            )),
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             deadline: None,
             on_retry: None,
@@ -309,8 +319,25 @@ impl ExecCtx {
     }
 
     pub fn with_resource_limit(mut self, resource: Resource, permits: usize) -> Self {
+        // GPU is no longer a plain semaphore (ADR 0087): sizing the "Gpu limit"
+        // sizes the per-device scheduler to `permits` homogeneous devices, so
+        // existing callers/tests keep the same concurrency semantics.
+        if resource == Resource::Gpu {
+            self.gpu = Arc::new(crate::broker::gpu::GpuScheduler::new(
+                crate::broker::gpu::GpuInventory::homogeneous(permits.max(1), 40960),
+            ));
+            return self;
+        }
         self.resources
             .insert(resource, Arc::new(tokio::sync::Semaphore::new(permits)));
+        self
+    }
+
+    /// Install a GPU scheduler built from the live inventory (ADR 0087) — the
+    /// CLI's production path (VRAM-aware placement). Replaces `with_resource_limit
+    /// (Gpu, …)`'s homogeneous sizing.
+    pub fn with_gpu_scheduler(mut self, sched: crate::broker::gpu::GpuScheduler) -> Self {
+        self.gpu = Arc::new(sched);
         self
     }
 
@@ -394,10 +421,10 @@ struct NodeEnv {
     status: Arc<StatusHub>,
     cancel: CancellationToken,
     resources: HashMap<Resource, Arc<tokio::sync::Semaphore>>,
-    /// Total `Resource::Gpu` permits (== the box's GPU pool / device count). A
-    /// DDP stage's `gpu_permits` is clamped to this so it never asks for more
-    /// GPUs than exist.
-    gpu_pool: usize,
+    /// GPU-aware scheduler (ADR 0087): per-device exclusive permits + VRAM-aware
+    /// placement, in series with the RAM `memory` broker below. Replaces the old
+    /// single `Resource::Gpu` semaphore; sized 1 == the legacy behaviour.
+    gpu: Arc<crate::broker::gpu::GpuScheduler>,
     memory: Arc<tokio::sync::Semaphore>,
     memory_budget_gib: u32,
     launch_target: crate::config::launcher::LaunchTarget,
@@ -748,6 +775,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
             recipe_name: env.recipe_name.clone(),
             launch_target: env.launch_target,
             device_index: env.device_index,
+            gpu_devices: Vec::new(), // set from the GpuScheduler grant below
             fb_warm: env.fb_warm,
             admitted_workers: env.admitted_workers,
             admitted_batch_size: env.admitted_batch_size,
@@ -837,31 +865,13 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
         // set by the CLI via `with_resource_limit`).
         let mut permits = Vec::new();
         for resource in sorted_resources {
+            // GPU is scheduled separately by the GpuScheduler (ADR 0087); it is
+            // no longer in the semaphore map, so `get` skips it here. Every other
+            // resource holds exactly one permit.
             let Some(sem) = env.resources.get(&resource) else {
                 continue;
             };
-            let want = if resource == Resource::Gpu {
-                let n = task.stage.gpu_permits(&task.args).max(1) as usize;
-                // The pool size is the semaphore's total permits; clamp so a
-                // DDP job asking for more GPUs than the box has runs on all of
-                // them rather than deadlocking.
-                let clamped = n.min(env.gpu_pool.max(1));
-                if clamped < n {
-                    // A DDP stage requested more GPUs than the box has — it will
-                    // run DEGRADED (on `clamped` GPUs). Warn loudly so a user
-                    // who thinks they're at full width isn't silently demoted.
-                    tracing::warn!(
-                        "stage '{}' requested {n} GPU permits but the pool has \
-                         only {} — running on {clamped} (DDP width degraded)",
-                        stage_name,
-                        env.gpu_pool
-                    );
-                }
-                clamped
-            } else {
-                1
-            };
-            let permit = match sem.clone().try_acquire_many_owned(want as u32) {
+            let permit = match sem.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
                     env.status.emit(StageEvent::StageBlocked {
@@ -869,7 +879,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
                         stage_name: stage_name.clone(),
                         resource,
                     });
-                    match sem.clone().acquire_many_owned(want as u32).await {
+                    match sem.clone().acquire_owned().await {
                         Ok(p) => p,
                         Err(_) => {
                             let _ = std::fs::remove_dir_all(&tmp_stage_dir);
@@ -882,6 +892,39 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
             };
             permits.push(permit);
         }
+
+        // ── GPU device grant (ADR 0087) ─────────────────────────────
+        // A GPU stage acquires a device SET (per-device exclusive permits +
+        // VRAM-aware placement) held for the run — the VRAM key, in SERIES with
+        // the RAM broker below, never a bypass. The granted device set is
+        // stamped onto the ctx so a launcher-aware backend masks
+        // `CUDA_VISIBLE_DEVICES` to exactly this slice; the exclusive per-device
+        // semaphore is the hard no-collision guarantee regardless of the backend.
+        let _gpu_grant = if task.stage.resources().contains(&Resource::Gpu) {
+            let req = task.stage.gpu_request(&task.args);
+            let grant = match env.gpu.try_acquire(req) {
+                Some(g) => g,
+                None => {
+                    env.status.emit(StageEvent::StageBlocked {
+                        node_idx: idx,
+                        stage_name: stage_name.clone(),
+                        resource: Resource::Gpu,
+                    });
+                    match env.gpu.acquire(req).await {
+                        Ok(g) => g,
+                        Err(e) => {
+                            let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+                            return Err(NodeFailure::Other(format!("GPU admission: {e}")));
+                        }
+                    }
+                }
+            };
+            stage_ctx.device_index = grant.devices.first().copied().or(stage_ctx.device_index);
+            stage_ctx.gpu_devices = grant.devices.clone();
+            Some(grant)
+        } else {
+            None
+        };
 
         // ── Memory admission (Phase 5) ──────────────────────────────
         // Hold MEMORY_GIB permits from the box-fit budget for the whole run, so
@@ -1629,23 +1672,13 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
     }
 
     // MOVE ctx's fields into env — the hub Arc lives only here now.
-    // Snapshot the GPU pool size (total permits) BEFORE any node acquires, so a
-    // DDP stage's gpu_permits clamps to the real device count. ORDERING: this
-    // MUST stay before the `resources: ctx.resources` move below AND before any
-    // node spawns — `available_permits()` reads the CURRENT free count, which
-    // equals the total only while nothing is held (true here in prelude).
-    let gpu_pool = ctx
-        .resources
-        .get(&Resource::Gpu)
-        .map(|s| s.available_permits())
-        .unwrap_or(1);
     let env = Arc::new(NodeEnv {
         job_dir: ctx.job_dir,
         cache: ctx.cache,
         status: ctx.status,
         cancel: ctx.cancel,
         resources: ctx.resources,
-        gpu_pool,
+        gpu: ctx.gpu,
         memory: ctx.memory,
         memory_budget_gib: ctx.memory_budget_gib,
         launch_target: ctx.launch_target,

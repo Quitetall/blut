@@ -576,7 +576,17 @@ pub(super) async fn launch_compiled_plan(
     // 1 → byte-identical to before. `capacity()` probes CUDA_VISIBLE_DEVICES /
     // nvidia-smi for the local launcher; Slurm reports its --gpus allocation.
     let gpu_pool = crate::config::launcher::launcher_for(launch_target).capacity();
-    ctx = ctx.with_resource_limit(crate::framework::Resource::Gpu, gpu_pool.max(1));
+    // ADR 0087: size the GPU-aware scheduler. Prefer the live local inventory
+    // (VRAM-aware placement) when it covers the pool; otherwise (e.g. a Slurm
+    // submit node whose local GPU count is below the allocated `--gpus`) fall
+    // back to `gpu_pool` homogeneous cells so remote concurrency is preserved.
+    let gpu_inv = crate::broker::gpu::GpuInventory::probe();
+    let gpu_inv = if gpu_inv.len() >= gpu_pool.max(1) {
+        gpu_inv
+    } else {
+        crate::broker::gpu::GpuInventory::homogeneous(gpu_pool.max(1), 0)
+    };
+    ctx = ctx.with_gpu_scheduler(crate::broker::gpu::GpuScheduler::new(gpu_inv));
     // Phase 3: thread the warm flag from the recipe's DEFAULTED args (the SAME
     // source `recipe_footprint` reads above) into every StageContext, so a
     // train stage's footprint RECORD keys identically to the admission RESOLVE.

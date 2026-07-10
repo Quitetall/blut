@@ -172,18 +172,9 @@ pub fn local_gpu_count() -> usize {
         let n = v.split(',').filter(|s| !s.trim().is_empty()).count();
         return n.max(1); // ≥1: even with no GPU, a scheduler runs one cell.
     }
-    if let Ok(out) = std::process::Command::new("nvidia-smi").arg("-L").output() {
-        if out.status.success() {
-            let n = String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter(|l| l.trim_start().starts_with("GPU "))
-                .count();
-            if n > 0 {
-                return n;
-            }
-        }
-    }
-    1
+    // GPU discovery now goes through the single consolidated one-shot probe
+    // (ADR 0087) — no separate `nvidia-smi -L` here. Honors BLUT_GPU_INVENTORY.
+    crate::broker::gpu::GpuInventory::probe().len().max(1)
 }
 
 /// The contained-launch helper, embedded into the engine so a published /

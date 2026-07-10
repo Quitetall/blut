@@ -1663,9 +1663,9 @@ async fn divergence_kill_single_attempt_fails_and_frees_gpu() {
     let job_dir = td.path().to_path_buf();
     let ctx = ExecCtx::new(job_dir.clone())
         .with_control(std::sync::Arc::new(crate::framework::control::KillOnNaN));
-    // Clone the GPU semaphore Arc so we can assert the permit is returned
-    // after the diverged node drops it.
-    let gpu = ctx.resources[&Resource::Gpu].clone();
+    // Clone the GPU scheduler Arc so we can assert the device is returned
+    // after the diverged node drops its grant (ADR 0087).
+    let gpu = ctx.gpu.clone();
 
     // MakeOne(Cpu) → Diverger(Gpu, diverges) → Increment(Cpu, downstream).
     let plan = Plan::<(), LamuTrainerBackend>::new("kill", serde_json::json!({}))
@@ -1697,10 +1697,10 @@ async fn divergence_kill_single_attempt_fails_and_frees_gpu() {
         0,
         "downstream Increment must never run (the diverged parent never produced its output)"
     );
-    assert_eq!(
-        gpu.available_permits(),
-        1,
-        "the diverged node's GPU permit must be freed"
+    assert!(
+        gpu.try_acquire(crate::broker::gpu::GpuRequest::default())
+            .is_some(),
+        "the diverged node's GPU device must be freed (re-grantable)"
     );
     // FW-2: a diverged node is NOT promoted → no `<idx>-diverger` stage dir
     // and no leftover tmp.

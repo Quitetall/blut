@@ -42,6 +42,7 @@
 
 pub mod admission;
 pub mod footprint;
+pub mod gpu;
 pub mod probe;
 
 pub use admission::{AdmitDecision, decide, gate};

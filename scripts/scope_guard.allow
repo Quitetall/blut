@@ -16,11 +16,13 @@ src/broker/probe.rs            # ADR 0046 — admission-gate resource probe (by 
 src/containment/rlimit.rs      # ADR 0046 — rlimit rung applies caps via pre_exec (by design)
 src/containment/cgroup2.rs     # ADR 0046 — cgroup2-direct rung joins cgroup via pre_exec (by design)
 
-# --- consolidating into the ADR 0087 GPU-inventory seam (M1 roadmap) ---
-# One-shot nvidia-smi PROBES (discovery / per-stage sample), not monitoring
-# loops. ADR 0087 centralizes all GPU probing behind broker::gpu::GpuInventory;
-# these entries then collapse into the probe.rs exemption.
-src/config/launcher.rs         # ADR 0065/0087 — one-shot GPU discovery for DDP placement
+# --- PERMANENT: the consolidated GPU inventory (ADR 0087, LANDED) ---
+# broker::gpu::GpuInventory is now THE one-shot GPU probe (nvidia-smi/rocm-smi) —
+# the admission gate's GPU half, non-delegatable by design like probe.rs. The old
+# launcher.rs `nvidia-smi -L` discovery probe collapsed into it (its allowlist
+# entry retired). The per-stage GPU-saturation SAMPLE keeps its own one-shot tick
+# probe — a gauge for the metric store, not discovery.
+src/broker/gpu.rs              # ADR 0087 — consolidated one-shot GPU inventory (by design)
 src/framework/gpu_sampler.rs   # ADR 0087 — one-shot per-stage GPU-sat sample for the metric store
 
 # --- pre-existing, scheduled for removal (ADR 0034 migration steps) ---

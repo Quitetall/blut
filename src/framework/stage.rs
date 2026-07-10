@@ -164,7 +164,14 @@ pub struct StageContext {
     /// `None` for the box default). A launcher-aware backend exports
     /// `CUDA_VISIBLE_DEVICES=<idx>` for its trainer subprocess so concurrent
     /// partition cells each run on their OWN GPU. Threaded from `ExecCtx`.
+    /// For a multi-device grant (ADR 0087) this holds the FIRST granted device;
+    /// [`gpu_devices`](Self::gpu_devices) carries the full set.
     pub device_index: Option<usize>,
+    /// ADR 0087: the exact GPU device indices this stage run was granted by the
+    /// `GpuScheduler` (empty for a CPU-only stage). A launcher-aware backend
+    /// exports `CUDA_VISIBLE_DEVICES` from this csv; the per-device exclusive
+    /// grant is the engine's hard no-collision guarantee independent of it.
+    pub gpu_devices: Vec<usize>,
     /// Never-OOM Phase 3: was the per-sample disk cache warmed upstream? A train
     /// stage threads this into its broker footprint (lower per-worker term +
     /// the `|w` calibration key). Carried on the CONTEXT (not the stage Args)
@@ -218,6 +225,7 @@ impl StageContext {
             recipe_name: String::new(),
             launch_target: crate::config::launcher::LaunchTarget::Local,
             device_index: None,
+            gpu_devices: Vec::new(),
             fb_warm: false,
             admitted_workers: None,
             admitted_batch_size: None,
@@ -251,6 +259,7 @@ impl StageContext {
             recipe_name: String::new(),
             launch_target: crate::config::launcher::LaunchTarget::Local,
             device_index: None,
+            gpu_devices: Vec::new(),
             fb_warm: false,
             admitted_workers: None,
             admitted_batch_size: None,
@@ -361,6 +370,18 @@ pub trait Stage: Send + Sync + 'static {
     /// delegates here.
     fn gpu_permits(&self, _args: &Self::Args) -> u32 {
         1
+    }
+
+    /// This stage's GPU ask (ADR 0087). Default derives from
+    /// [`gpu_permits`](Self::gpu_permits) — a whole-device exclusive request for
+    /// each permit, `min_vram_mib = 0` — so an un-annotated stage schedules
+    /// exactly as before. Override to declare a VRAM floor.
+    fn gpu_request(&self, args: &Self::Args) -> crate::broker::gpu::GpuRequest {
+        crate::broker::gpu::GpuRequest {
+            count: self.gpu_permits(args),
+            min_vram_mib: 0,
+            exclusive: true,
+        }
     }
 
     /// Args-aware RAM reservation (default = the const `MEMORY_GIB`). A DDP
@@ -475,6 +496,15 @@ pub trait StageDyn: Send + Sync + 'static {
     /// it owns. Args-aware (nproc comes from the recipe args).
     fn gpu_permits(&self, _args: &serde_json::Value) -> u32 {
         1
+    }
+    /// Erased mirror of [`Stage::gpu_request`] (ADR 0087). Default derives a
+    /// whole-device exclusive ask from [`gpu_permits`](Self::gpu_permits).
+    fn gpu_request(&self, args: &serde_json::Value) -> crate::broker::gpu::GpuRequest {
+        crate::broker::gpu::GpuRequest {
+            count: self.gpu_permits(args),
+            min_vram_mib: 0,
+            exclusive: true,
+        }
     }
     fn input_kind(&self) -> &'static str;
     fn output_kind(&self) -> &'static str;
@@ -662,6 +692,12 @@ impl<S: Stage> StageDyn for S {
                 );
                 1
             }
+        }
+    }
+    fn gpu_request(&self, args: &serde_json::Value) -> crate::broker::gpu::GpuRequest {
+        match serde_json::from_value::<S::Args>(args.clone()) {
+            Ok(typed) => Stage::gpu_request(self, &typed),
+            Err(_) => crate::broker::gpu::GpuRequest::default(),
         }
     }
     fn retry(&self) -> crate::framework::retry::RetryPolicy {
