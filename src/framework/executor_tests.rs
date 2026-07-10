@@ -1438,6 +1438,7 @@ impl Stage for ResumableFlaky {
                 run_id,
                 pid: 0,
                 heartbeat_unix: now,
+                ..Default::default()
             };
             std::fs::write(
                 dir.join("state.json"),
@@ -1844,6 +1845,7 @@ impl Stage for DivergeThenResume {
                 run_id,
                 pid: 0,
                 heartbeat_unix: now,
+                ..Default::default()
             };
             std::fs::write(
                 dir.join("state.json"),
@@ -2072,6 +2074,7 @@ impl Stage for MultiStepDivergeThenResume {
                 run_id,
                 pid: 0,
                 heartbeat_unix: now,
+                ..Default::default()
             };
             std::fs::write(
                 dir.join("state.json"),

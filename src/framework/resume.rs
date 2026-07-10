@@ -36,7 +36,7 @@ const STATUS_FINISHED: &str = "finished";
 /// The run-state marker the trainer writes into the resume dir. The orchestrator
 /// reads it to decide. Forward-compatible: unknown fields are ignored, and a
 /// missing / unparseable marker is treated as "no marker" (⇒ [`ResumeDecision::Fresh`]).
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ResumeState {
     /// `"running"` while a run owns the dir; `"finished"` after a clean exit.
     /// Any other / unknown value is treated as not-finished (a run was here).
@@ -54,6 +54,20 @@ pub struct ResumeState {
     /// [`HEARTBEAT_INTERVAL_SECS`]. On a FOREIGN run_id: a stale heartbeat ⇒ that
     /// run crashed (resume); a fresh one ⇒ it is still alive (refuse).
     pub heartbeat_unix: u64,
+    /// PlanSpec-v1.1 / ADR 0088 mid-epoch durability: the last DURABLE training
+    /// step recorded by the trainer's atomic step-checkpoint (`{epoch, step,
+    /// data_cursor}`). All three are `#[serde(default)]` so an OLDER epoch-only
+    /// marker (pre-0088) still parses — an absent step means the resume falls
+    /// back to epoch-granular (the prior behaviour). On resume the trainer seeks
+    /// its data loader + RNG to `step` instead of replaying the whole epoch.
+    #[serde(default)]
+    pub epoch: Option<u64>,
+    #[serde(default)]
+    pub step: Option<u64>,
+    /// The data-loader cursor (samples consumed) at `step` — where a mid-epoch
+    /// resume re-seeks so it neither repeats nor skips data.
+    #[serde(default)]
+    pub data_cursor: Option<u64>,
 }
 
 impl ResumeState {
@@ -195,7 +209,45 @@ mod tests {
             run_id: run_id.into(),
             pid: 1234,
             heartbeat_unix: hb,
+            ..Default::default()
         }
+    }
+
+    // ── ADR 0088: mid-epoch step-granular resume ──────────────────────
+
+    #[test]
+    fn mid_epoch_resume() {
+        // A step-granular marker round-trips {epoch, step, data_cursor}: the
+        // resume POINT is the last durable STEP, not epoch start.
+        let s = ResumeState {
+            status: "running".into(),
+            run_id: "r1".into(),
+            pid: 42,
+            heartbeat_unix: 1000,
+            epoch: Some(3),
+            step: Some(15_000),
+            data_cursor: Some(1_920_000),
+        };
+        let back: ResumeState = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(
+            back.step,
+            Some(15_000),
+            "resume at the durable STEP, not epoch start"
+        );
+        assert_eq!(back.data_cursor, Some(1_920_000));
+
+        // A pre-0088 epoch-only marker (no step fields) still parses — absent
+        // step ⇒ epoch-granular fallback (the prior behaviour), never a parse fail.
+        let old = r#"{"status":"running","run_id":"r0","pid":7,"heartbeat_unix":900}"#;
+        let parsed: ResumeState = serde_json::from_str(old).unwrap();
+        assert!(parsed.step.is_none() && parsed.data_cursor.is_none() && parsed.epoch.is_none());
+
+        // The crash-gated decision is unchanged — a same-run-id step marker resumes.
+        assert_eq!(
+            decide_resume(Some(&s), "r1", 2000, DEFAULT_STALE_AFTER_SECS),
+            ResumeDecision::Resume
+        );
     }
 
     // ── the 5-row decision table ──────────────────────────────────────
