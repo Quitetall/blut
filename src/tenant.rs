@@ -38,14 +38,6 @@ impl Default for Tenant {
 }
 
 impl Tenant {
-    /// Build from a `project` and optional `domain`.
-    pub fn new(project: impl Into<String>, domain: Option<String>) -> Self {
-        Self {
-            project: project.into(),
-            domain,
-        }
-    }
-
     /// Parse a `project` or `project/domain` string. An empty string is the
     /// default tenant; a trailing/leading slash or a `project//domain` is
     /// rejected (returns `None`) so a tenant can never contain an empty segment.
@@ -105,9 +97,11 @@ impl Tenant {
 
     /// A sealed clinical/PHI namespace (ADR 0061): the `clinical` project, or
     /// the `restricted` project kept for ADR-0085 compatibility. Enforced
-    /// fail-closed at every cross-tenant boundary.
+    /// fail-closed at every cross-tenant boundary. Case-INSENSITIVE so a project
+    /// named `Clinical` / `CLINICAL` can never slip past the sealed boundary.
     pub fn is_restricted(&self) -> bool {
-        self.project == "clinical" || self.project == "restricted"
+        self.project.eq_ignore_ascii_case("clinical")
+            || self.project.eq_ignore_ascii_case("restricted")
     }
 }
 
@@ -149,6 +143,9 @@ mod tests {
     fn clinical_and_restricted_are_sealed() {
         assert!(Tenant::parse("clinical/prod").unwrap().is_restricted());
         assert!(Tenant::parse("restricted").unwrap().is_restricted());
+        // Case-insensitive: a `Clinical`/`RESTRICTED` project can't slip past.
+        assert!(Tenant::parse("Clinical/prod").unwrap().is_restricted());
+        assert!(Tenant::parse("RESTRICTED").unwrap().is_restricted());
         assert!(!Tenant::parse("research/prod").unwrap().is_restricted());
     }
 
