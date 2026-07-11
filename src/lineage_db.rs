@@ -816,6 +816,107 @@ impl LineageDb {
         })
     }
 
+    /// Collate a model artifact's card (ADR 0099): its transitive DATA sources,
+    /// producing recipe + config fingerprint (args identity), headline metrics,
+    /// and gate outcome — a DETERMINISTIC content-addressed card (rebuilding on
+    /// the same rows yields a byte-identical `card_hash`). `exclude_restricted`
+    /// (the export path) drops clinical/restricted data sources; if the model
+    /// itself is restricted, its root is excluded and this returns `None`.
+    /// `None` also for an unknown hash.
+    pub fn model_card(
+        &self,
+        hash: &str,
+        exclude_restricted: bool,
+    ) -> Result<Option<crate::lineage_report::ModelCard>> {
+        let root = hash.to_lowercase();
+        let graph = self.graph_upstream(&root, exclude_restricted)?;
+        // The model's own node must survive (present + indexed) to build a card.
+        let Some(node) = graph.nodes.iter().find(|n| n.content_hash == root) else {
+            return Ok(None);
+        };
+        if node.stage_name.is_none() && graph.edges.is_empty() {
+            return Ok(None); // unknown hash (no indexed artifact, no lineage)
+        }
+        let job_id = node.job_id.clone();
+        let run = match &job_id {
+            Some(j) => self.get_run(j)?,
+            None => None,
+        };
+        let mut metrics = match &job_id {
+            Some(j) => self.final_metrics(j)?,
+            None => Vec::new(),
+        };
+        metrics.sort_by(|a, b| a.0.cmp(&b.0));
+        let data_sources: Vec<String> = graph
+            .sources()
+            .into_iter()
+            .filter(|s| *s != root) // the model itself isn't its own data source
+            .map(|s| s.to_string())
+            .collect();
+        let content = crate::lineage_report::CardContent {
+            model_hash: root,
+            job_id,
+            recipe: run.as_ref().map(|r| r.recipe.clone()),
+            config_fingerprint: run.as_ref().and_then(|r| r.config_fingerprint.clone()),
+            gate_outcome: run.as_ref().and_then(|r| r.outcome.clone()),
+            data_sources,
+            metrics,
+        };
+        Ok(Some(crate::lineage_report::ModelCard::new(content)))
+    }
+
+    /// The symmetric difference of two runs (ADR 0099): only the recipe /
+    /// config-fingerprint / gate-outcome / metric fields that DIFFER. Errors if
+    /// either run is unknown.
+    pub fn run_diff(&self, a: &str, b: &str) -> Result<crate::lineage_report::RunDiff> {
+        let ra = self
+            .get_run(a)?
+            .ok_or_else(|| TrainError::other(format!("run diff: unknown run {a}")))?;
+        let rb = self
+            .get_run(b)?
+            .ok_or_else(|| TrainError::other(format!("run diff: unknown run {b}")))?;
+
+        let diff_opt = |x: &Option<String>, y: &Option<String>| {
+            if x != y {
+                Some((x.clone(), y.clone()))
+            } else {
+                None
+            }
+        };
+        let recipe = if ra.recipe != rb.recipe {
+            Some((Some(ra.recipe.clone()), Some(rb.recipe.clone())))
+        } else {
+            None
+        };
+
+        // Metric deltas: union of names, keep only where a and b differ.
+        let ma: std::collections::HashMap<String, f64> =
+            self.final_metrics(a)?.into_iter().collect();
+        let mb: std::collections::HashMap<String, f64> =
+            self.final_metrics(b)?.into_iter().collect();
+        let mut names: Vec<String> = ma.keys().chain(mb.keys()).cloned().collect();
+        names.sort();
+        names.dedup();
+        let mut metric_deltas = Vec::new();
+        for n in names {
+            let (va, vb) = (ma.get(&n).copied(), mb.get(&n).copied());
+            // Differ if either is missing or the values are not bit-equal
+            // (bit-compare avoids the float-cmp lint + treats NaN consistently).
+            if va.map(f64::to_bits) != vb.map(f64::to_bits) {
+                metric_deltas.push((n, va, vb));
+            }
+        }
+
+        Ok(crate::lineage_report::RunDiff {
+            run_a: a.to_string(),
+            run_b: b.to_string(),
+            recipe,
+            config_fingerprint: diff_opt(&ra.config_fingerprint, &rb.config_fingerprint),
+            gate_outcome: diff_opt(&ra.outcome, &rb.outcome),
+            metric_deltas,
+        })
+    }
+
     /// Number of indexed runs (for `reindex` reporting + tests).
     pub fn run_count(&self) -> Result<i64> {
         self.conn

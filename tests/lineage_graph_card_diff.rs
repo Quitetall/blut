@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Brian Lam
-//! ADR 0099 gate (increment 1 — provenance GRAPH): against a fixture lineage db,
-//! `graph_upstream` returns the full transitive producer set of a leaf artifact
-//! with no missing/extra edges, the DOT export is deterministic, and a
-//! clinical/`restricted`-tenant node is never present in an exported graph
-//! (ADR 0061 fail-closed).
-//!
-//! (Card + run-diff — the other two 0099 capabilities — land in increment 2 and
-//! extend this same test binary.)
+//! ADR 0099 gate (all three read-side capabilities), against a fixture lineage
+//! db: (1) `graph_upstream` returns the full transitive producer set of a leaf
+//! with no missing/extra edges + a deterministic DOT export; (2) `model_card` is
+//! byte-identical across rebuilds (content-addressed) and carries the
+//! data/args/metrics/gate-outcome sections; (3) `run_diff` reports exactly the
+//! seeded recipe/config/gate/metric deltas and nothing else. Clinical/
+//! `restricted`-tenant rows are fail-closed excluded from every export
+//! (ADR 0061), and a set tenant is never downgraded on re-ingest.
 
-use blut::lineage_db::{ArtifactRow, EdgeRow, LineageDb, RunRow};
+use blut::lineage_db::{ArtifactRow, EdgeRow, LineageDb, MetricRow, RunRow};
 
 /// A 64-hex content hash built by repeating `c`.
 fn h(c: char) -> String {
@@ -92,6 +92,94 @@ fn graph_returns_full_transitive_producer_set() {
     let mut sources = g.sources();
     sources.sort_unstable();
     assert_eq!(sources, vec![h('a').as_str(), h('d').as_str()]);
+}
+
+fn final_metric(job: &str, name: &str, value: f64) -> MetricRow {
+    MetricRow {
+        job_id: job.to_string(),
+        node_idx: 0,
+        step: -1, // the per-(job,node) FINAL marker `final_metrics` reads
+        metric: name.to_string(),
+        value,
+        wall_unix: None,
+    }
+}
+
+#[test]
+fn card_is_deterministic_and_excludes_clinical_data() {
+    let (db, _td, leaf) = fixture();
+    // Enrich the research run with args + gate outcome + a headline metric.
+    let mut r = run("job_r", "research/dev");
+    r.recipe = "train_joint".into();
+    r.outcome = Some("PASS".into());
+    r.config_fingerprint = Some("cfg123".into());
+    db.record_run(&r).unwrap();
+    db.record_metrics(&[final_metric("job_r", "val_r", 0.87)])
+        .unwrap();
+
+    let card = db.model_card(&leaf, true).unwrap().unwrap();
+    // All four sections populate: data + args + metrics + gate outcome.
+    assert_eq!(card.content.recipe.as_deref(), Some("train_joint"));
+    assert_eq!(card.content.config_fingerprint.as_deref(), Some("cfg123"));
+    assert_eq!(card.content.gate_outcome.as_deref(), Some("PASS"));
+    assert_eq!(card.content.metrics, vec![("val_r".to_string(), 0.87)]);
+    // The clinical data source is excluded from the export; the research one is in.
+    assert!(
+        card.content.data_sources.contains(&h('a')),
+        "research source present"
+    );
+    assert!(
+        !card.content.data_sources.contains(&h('d')),
+        "clinical data source must be excluded from the card"
+    );
+    // Content-addressed determinism: a rebuild on the same rows is byte-identical.
+    let again = db.model_card(&leaf, true).unwrap().unwrap();
+    assert_eq!(card.card_hash, again.card_hash);
+    assert!(!card.card_hash.is_empty());
+}
+
+#[test]
+fn diff_reports_exactly_the_seeded_deltas() {
+    let td = tempfile::tempdir().unwrap();
+    let db = LineageDb::open_at(td.path().join("lineage.db")).unwrap();
+
+    let mut a = run("run_a", "research/dev");
+    a.recipe = "train".into();
+    a.outcome = Some("PASS".into());
+    a.config_fingerprint = Some("cfgA".into());
+    let mut b = run("run_b", "research/dev");
+    b.recipe = "train".into(); // SAME recipe → no recipe delta
+    b.outcome = Some("FAIL".into());
+    b.config_fingerprint = Some("cfgB".into());
+    db.record_run(&a).unwrap();
+    db.record_run(&b).unwrap();
+    db.record_metrics(&[
+        final_metric("run_a", "val_r", 0.8),
+        final_metric("run_a", "loss", 0.1),
+    ])
+    .unwrap();
+    db.record_metrics(&[
+        final_metric("run_b", "val_r", 0.9),
+        final_metric("run_b", "loss", 0.1),
+    ])
+    .unwrap();
+
+    let d = db.run_diff("run_a", "run_b").unwrap();
+    assert!(d.recipe.is_none(), "identical recipe ⇒ no recipe delta");
+    assert_eq!(
+        d.config_fingerprint,
+        Some((Some("cfgA".into()), Some("cfgB".into())))
+    );
+    assert_eq!(
+        d.gate_outcome,
+        Some((Some("PASS".into()), Some("FAIL".into())))
+    );
+    // Only val_r differs (0.8 vs 0.9); loss is identical (0.1) so it is EXCLUDED.
+    assert_eq!(
+        d.metric_deltas,
+        vec![("val_r".to_string(), Some(0.8), Some(0.9))]
+    );
+    assert!(!d.is_empty());
 }
 
 #[test]

@@ -91,6 +91,125 @@ impl ProvenanceGraph {
     }
 }
 
+// ── model card (ADR 0099 capability 2) ─────────────────────────────
+
+/// The content-addressed part of a [`ModelCard`] — everything the `card_hash`
+/// digests. Kept separate so the hash is over the CONTENT, not itself.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CardContent {
+    /// The model artifact this card describes.
+    pub model_hash: String,
+    /// The producing run, if indexed.
+    pub job_id: Option<String>,
+    /// The recipe that produced it (args identity, part 1).
+    pub recipe: Option<String>,
+    /// The run's config fingerprint (args + input identity, part 2).
+    pub config_fingerprint: Option<String>,
+    /// The acceptance/gate outcome recorded for the run.
+    pub gate_outcome: Option<String>,
+    /// The transitive DATA source artifacts (sorted, content hashes).
+    pub data_sources: Vec<String>,
+    /// The run's headline metrics (sorted by name).
+    pub metrics: Vec<(String, f64)>,
+}
+
+impl CardContent {
+    /// Deterministic content hash over the canonical JSON of this content —
+    /// re-building a card from the same lineage rows yields a byte-identical
+    /// `card_hash` (ADR 0099 determinism requirement). Field order is stable
+    /// (serde struct order) and every vector is pre-sorted by the builder.
+    pub fn content_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_json::to_vec(self).expect("CardContent serializes");
+        let mut h = Sha256::new();
+        h.update(b"blut.model-card.v1");
+        h.update(&bytes);
+        faster_hex::hex_string(&h.finalize())
+    }
+}
+
+/// A deterministic, content-addressed model card (ADR 0099): one model's data
+/// sources, args, metrics, and gate outcome, plus the `card_hash` that
+/// identifies exactly this collation. Clinical/restricted data sources are
+/// excluded upstream (the card is an export).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelCard {
+    #[serde(flatten)]
+    pub content: CardContent,
+    /// Content address of `content` — stable across rebuilds on the same rows.
+    pub card_hash: String,
+}
+
+impl ModelCard {
+    pub fn new(content: CardContent) -> Self {
+        let card_hash = content.content_hash();
+        Self { content, card_hash }
+    }
+
+    /// Render a human-readable card (the CLI's default, non-JSON output).
+    pub fn render(&self) -> String {
+        use std::fmt::Write as _;
+        let c = &self.content;
+        let mut s = String::new();
+        let _ = writeln!(s, "model     : {}", c.model_hash);
+        let _ = writeln!(s, "card_hash : {}", self.card_hash);
+        if let Some(j) = &c.job_id {
+            let _ = writeln!(s, "run       : {j}");
+        }
+        let _ = writeln!(s, "recipe    : {}", c.recipe.as_deref().unwrap_or("-"));
+        let _ = writeln!(
+            s,
+            "config_fp : {}",
+            c.config_fingerprint.as_deref().unwrap_or("-")
+        );
+        let _ = writeln!(
+            s,
+            "gate      : {}",
+            c.gate_outcome.as_deref().unwrap_or("-")
+        );
+        let _ = writeln!(s, "data ({}):", c.data_sources.len());
+        for d in &c.data_sources {
+            let _ = writeln!(s, "  {}", d.get(..12).unwrap_or(d));
+        }
+        let _ = writeln!(s, "metrics ({}):", c.metrics.len());
+        for (k, v) in &c.metrics {
+            let _ = writeln!(s, "  {k} = {v}");
+        }
+        s
+    }
+}
+
+// ── run diff (ADR 0099 capability 3) ───────────────────────────────
+
+/// The symmetric difference of two runs (ADR 0099): only the fields that
+/// DIFFER. A metric present in one and absent in the other shows the missing
+/// side as `None`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunDiff {
+    pub run_a: String,
+    pub run_b: String,
+    /// `(a, b)` recipe names, present only if they differ.
+    pub recipe: Option<(Option<String>, Option<String>)>,
+    /// `(a, b)` config fingerprints (the args + input-artifact identity),
+    /// present only if they differ.
+    pub config_fingerprint: Option<(Option<String>, Option<String>)>,
+    /// `(a, b)` gate outcomes, present only if they differ.
+    pub gate_outcome: Option<(Option<String>, Option<String>)>,
+    /// Per-metric `(name, a_value, b_value)` for every metric whose value
+    /// differs or is missing on one side. Sorted by name.
+    pub metric_deltas: Vec<(String, Option<f64>, Option<f64>)>,
+}
+
+impl RunDiff {
+    /// Whether the two runs are identical across every compared dimension.
+    pub fn is_empty(&self) -> bool {
+        self.recipe.is_none()
+            && self.config_fingerprint.is_none()
+            && self.gate_outcome.is_none()
+            && self.metric_deltas.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -39,6 +39,28 @@ pub(super) enum LineageCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Model CARD (ADR 0099): a deterministic, content-addressed card for a
+    /// model artifact — its data sources, recipe/config, metrics, and gate
+    /// outcome. Rebuilding on the same lineage yields a byte-identical
+    /// `card_hash`. Clinical/`restricted` data is fail-closed excluded (export).
+    Card {
+        /// The model artifact's content hash (full, lowercased).
+        hash: String,
+        /// Emit the typed JSON card instead of the human summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run DIFF (ADR 0099): the symmetric difference of two runs — differing
+    /// recipe, config fingerprint, gate outcome, and headline metrics.
+    Diff {
+        /// First run (job id or unique prefix).
+        run_a: String,
+        /// Second run (job id or unique prefix).
+        run_b: String,
+        /// Emit the typed JSON diff instead of the human summary.
+        #[arg(long)]
+        json: bool,
+    },
     /// Rebuild the lineage index from the job dirs (the DB is a derived index —
     /// safe to delete + reindex).
     Reindex,
@@ -126,11 +148,61 @@ pub(super) fn run_lineage_graph(hash: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// ADR 0099: emit a model artifact's deterministic content-addressed card.
+/// An EXPORT — clinical/`restricted` data is fail-closed excluded.
+pub(super) fn run_lineage_card(hash: &str, json: bool) -> Result<()> {
+    let db = crate::lineage_db::LineageDb::open().map_err(|e| anyhow!("{e}"))?;
+    let card = db
+        .model_card(hash, true)
+        .map_err(|e| anyhow!("{e}"))?
+        .ok_or_else(|| {
+            anyhow!("no exportable card for {hash} (unknown hash, or a restricted model)")
+        })?;
+    if json {
+        emit_json(&card)?;
+    } else {
+        print!("{}", card.render());
+    }
+    Ok(())
+}
+
+/// ADR 0099: report the symmetric difference of two runs.
+pub(super) fn run_lineage_diff(a_query: &str, b_query: &str, json: bool) -> Result<()> {
+    let a = crate::jobs::resolve_job_id(a_query).map_err(|e| anyhow!("{e}"))?;
+    let b = crate::jobs::resolve_job_id(b_query).map_err(|e| anyhow!("{e}"))?;
+    let db = crate::lineage_db::LineageDb::open().map_err(|e| anyhow!("{e}"))?;
+    let diff = db.run_diff(&a, &b).map_err(|e| anyhow!("{e}"))?;
+    if json {
+        emit_json(&diff)?;
+        return Ok(());
+    }
+    if diff.is_empty() {
+        println!("runs {a} and {b} are identical across recipe/config/gate/metrics.");
+        return Ok(());
+    }
+    println!("diff {a} ↔ {b}:");
+    if let Some((x, y)) = &diff.recipe {
+        println!("  recipe    : {:?} → {:?}", x, y);
+    }
+    if let Some((x, y)) = &diff.config_fingerprint {
+        println!("  config_fp : {:?} → {:?}", x, y);
+    }
+    if let Some((x, y)) = &diff.gate_outcome {
+        println!("  gate      : {:?} → {:?}", x, y);
+    }
+    for (m, x, y) in &diff.metric_deltas {
+        println!("  {m:<16}: {x:?} → {y:?}");
+    }
+    Ok(())
+}
+
 pub(super) fn run_lineage_cmd(cmd: LineageCommand) -> Result<()> {
     match cmd {
         LineageCommand::Show { id, json } => run_lineage(&id, json),
         LineageCommand::Trace { hash, json } => run_lineage_trace(&hash, json),
         LineageCommand::Graph { hash, json } => run_lineage_graph(&hash, json),
+        LineageCommand::Card { hash, json } => run_lineage_card(&hash, json),
+        LineageCommand::Diff { run_a, run_b, json } => run_lineage_diff(&run_a, &run_b, json),
         LineageCommand::Reindex => run_lineage_reindex(),
         LineageCommand::Freshness {
             id,
