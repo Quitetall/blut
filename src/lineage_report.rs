@@ -36,6 +36,15 @@ impl ProvenanceGraph {
         h.get(..12).unwrap_or(h)
     }
 
+    /// Escape a string for a DOT double-quoted label — defense-in-depth so a
+    /// stage name containing `"`/`\`/newline can't break out of the label and
+    /// inject DOT attributes into an export.
+    fn dot_escape(s: &str) -> String {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+    }
+
     /// A Graphviz DOT export — deterministic (nodes/edges are pre-sorted). The
     /// root is highlighted. Feed to `dot -Tsvg` or a sidecar renderer.
     pub fn to_dot(&self) -> String {
@@ -43,7 +52,13 @@ impl ProvenanceGraph {
         let mut s = String::from("digraph provenance {\n  rankdir=LR;\n");
         for n in &self.nodes {
             let label = match &n.stage_name {
-                Some(stage) => format!("{}\\n{}", stage, Self::short(&n.content_hash)),
+                Some(stage) => {
+                    format!(
+                        "{}\\n{}",
+                        Self::dot_escape(stage),
+                        Self::short(&n.content_hash)
+                    )
+                }
                 None => Self::short(&n.content_hash).to_string(),
             };
             let shape = if n.content_hash == self.root {
@@ -101,6 +116,28 @@ mod tests {
         assert_eq!(d1, d2, "DOT export is byte-stable");
         assert!(d1.contains("\"aa\" -> \"bb\""));
         assert!(d1.contains("fillcolor=lightblue")); // root highlighted
+    }
+
+    #[test]
+    fn dot_label_escapes_injection() {
+        // A stage name with a quote must not break out of the DOT label.
+        let g = ProvenanceGraph {
+            root: "aa".into(),
+            nodes: vec![GraphNode {
+                content_hash: "aa".into(),
+                stage_name: Some("evil\" ]; hack [x=\"y".into()),
+                kind: None,
+                job_id: None,
+            }],
+            edges: vec![],
+        };
+        let dot = g.to_dot();
+        assert!(
+            dot.contains("evil\\\" ]; hack [x=\\\"y"),
+            "quotes are escaped: {dot}"
+        );
+        // Exactly one node line (no injected statements broke the structure).
+        assert_eq!(dot.matches("[label=").count(), 1);
     }
 
     #[test]

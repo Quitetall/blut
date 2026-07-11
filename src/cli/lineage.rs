@@ -108,7 +108,14 @@ pub(super) fn run_lineage_graph(hash: &str, json: bool) -> Result<()> {
     let graph = db.graph_upstream(hash, true).map_err(|e| anyhow!("{e}"))?;
     if graph.nodes.is_empty() {
         return Err(anyhow!(
-            "no exportable lineage for artifact {hash} (unknown hash, or an all-restricted graph)"
+            "no exportable lineage for artifact {hash} (all-restricted graph, or unknown hash)"
+        ));
+    }
+    // An unknown hash yields a single node with no indexed artifact metadata and
+    // no edges — surface that as a clear error, not a degenerate one-node graph.
+    if graph.nodes.len() == 1 && graph.edges.is_empty() && graph.nodes[0].stage_name.is_none() {
+        return Err(anyhow!(
+            "unknown artifact {hash} — not in the lineage index (typo, or run `blut lineage reindex`)"
         ));
     }
     if json {

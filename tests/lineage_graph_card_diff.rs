@@ -95,6 +95,21 @@ fn graph_returns_full_transitive_producer_set() {
 }
 
 #[test]
+fn tenant_is_never_downgraded_on_reingest() {
+    let td = tempfile::tempdir().unwrap();
+    let db = LineageDb::open_at(td.path().join("lineage.db")).unwrap();
+    // Record a clinical run, then re-ingest it with NO tenant (coerced to
+    // `default`) — the ADR-0061 clinical tenant must survive.
+    db.record_run(&run("job_c", "clinical/prod")).unwrap();
+    db.record_run(&run("job_c", "")).unwrap(); // re-ingest, tenant unset
+    assert_eq!(
+        db.get_run("job_c").unwrap().unwrap().tenant,
+        "clinical/prod",
+        "a re-ingest must not downgrade a set tenant to default"
+    );
+}
+
+#[test]
 fn clinical_node_never_in_exported_graph() {
     let (db, _td, leaf) = fixture();
     // WITH the export boundary (ADR 0061): the clinical node AND its edge are gone.

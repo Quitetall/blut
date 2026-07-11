@@ -283,16 +283,27 @@ impl LineageDb {
         conn.execute_batch(CREATE_SCHEMA)
             .map_err(|e| TrainError::other(format!("create lineage schema: {e}")))?;
         // v2→v3 (ADR 0096): add `runs.tenant` to a pre-existing v2 db. CREATE
-        // TABLE IF NOT EXISTS can't alter an extant table, so ADD COLUMN here;
-        // a "duplicate column name" means a v3 db already has it (idempotent).
-        if let Err(e) = conn.execute(
-            "ALTER TABLE runs ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'",
-            [],
-        ) {
-            let msg = e.to_string();
-            if !msg.contains("duplicate column name") {
-                return Err(TrainError::other(format!("migrate runs.tenant: {e}")));
-            }
+        // TABLE IF NOT EXISTS can't alter an extant table, so ADD COLUMN here.
+        // Probe `PRAGMA table_info` for the column rather than string-matching the
+        // "duplicate column name" error (locale/SQLite-version fragile).
+        let has_tenant = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(runs)")
+                .map_err(|e| TrainError::other(format!("table_info(runs): {e}")))?;
+            let cols = stmt
+                .query_map([], |row| row.get::<_, String>(1)) // col 1 = column name
+                .map_err(|e| TrainError::other(format!("table_info rows: {e}")))?;
+            cols.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| TrainError::other(format!("table_info collect: {e}")))?
+                .iter()
+                .any(|c| c == "tenant")
+        };
+        if !has_tenant {
+            conn.execute(
+                "ALTER TABLE runs ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'",
+                [],
+            )
+            .map_err(|e| TrainError::other(format!("migrate runs.tenant: {e}")))?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| TrainError::other(format!("set user_version: {e}")))?;
@@ -317,7 +328,10 @@ impl LineageDb {
                     gpu_name=COALESCE(excluded.gpu_name, runs.gpu_name),
                     ram_gib=COALESCE(excluded.ram_gib, runs.ram_gib),
                     vram_mib=COALESCE(excluded.vram_mib, runs.vram_mib),
-                    tenant=excluded.tenant",
+                    -- Never DOWNGRADE a set tenant: a re-ingest that supplies
+                    -- `default` (the coerced empty) keeps the existing tenant, so
+                    -- a clinical run can't silently drop its ADR-0061 boundary.
+                    tenant=COALESCE(NULLIF(excluded.tenant, 'default'), runs.tenant)",
                 params![
                     r.job_id, r.recipe, r.config_fingerprint, r.git_sha, r.started_unix,
                     r.ended_unix, r.outcome, r.host, r.gpu_name, r.ram_gib, r.vram_mib,
