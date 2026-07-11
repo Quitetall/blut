@@ -168,7 +168,16 @@ pub fn publish(
         Err(rusqlite::Error::SqliteFailure(e, _))
             if e.code == rusqlite::ErrorCode::ConstraintViolation =>
         {
-            Ok(fp) // lost a publish race for identical content — still idempotent
+            // Lost an insert race for this fingerprint. Re-verify the winner's
+            // tenant: identical content + same tenant is the idempotent no-op;
+            // a DIFFERENT tenant is the very cross-tenant collision we refuse
+            // (the narrow race window that a pre-INSERT check alone can't close).
+            match get_deployment(conn, &fp)? {
+                Some(d) if d.tenant == tenant => Ok(fp),
+                _ => Err(TrainError::other(format!(
+                    "publish refused — fingerprint {fp} already published under a different tenant"
+                ))),
+            }
         }
         Err(e) => Err(TrainError::other(format!("insert deployment: {e}"))),
     }
