@@ -52,6 +52,7 @@ pub mod paths;
 pub mod policy;
 pub mod protocol;
 pub mod python_kill;
+pub mod rbac;
 pub mod recipes;
 pub mod registry;
 pub mod registry_db;
