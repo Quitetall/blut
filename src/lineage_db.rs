@@ -847,12 +847,16 @@ impl LineageDb {
             None => Vec::new(),
         };
         metrics.sort_by(|a, b| a.0.cmp(&b.0));
-        let data_sources: Vec<String> = graph
+        let mut data_sources: Vec<String> = graph
             .sources()
             .into_iter()
             .filter(|s| *s != root) // the model itself isn't its own data source
             .map(|s| s.to_string())
             .collect();
+        // `sources()` already returns sorted, but sort explicitly so the card's
+        // content hash is provably determined HERE (not by an upstream invariant)
+        // — cross-process byte-identical regardless of HashMap iteration order.
+        data_sources.sort();
         let content = crate::lineage_report::CardContent {
             model_hash: root,
             job_id,

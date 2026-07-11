@@ -136,6 +136,7 @@ fn card_is_deterministic_and_excludes_clinical_data() {
     let again = db.model_card(&leaf, true).unwrap().unwrap();
     assert_eq!(card.card_hash, again.card_hash);
     assert!(!card.card_hash.is_empty());
+    assert!(card.verify(), "card_hash must verify against its content");
 }
 
 #[test]

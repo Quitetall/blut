@@ -136,7 +136,10 @@ impl CardContent {
 pub struct ModelCard {
     #[serde(flatten)]
     pub content: CardContent,
-    /// Content address of `content` — stable across rebuilds on the same rows.
+    /// Content address of `content` ONLY (never of the whole envelope) — stable
+    /// across rebuilds on the same rows. A verifier recomputes
+    /// [`CardContent::content_hash`] and compares; it must NOT re-hash the
+    /// flattened JSON (which also carries this field). See [`ModelCard::verify`].
     pub card_hash: String,
 }
 
@@ -144,6 +147,13 @@ impl ModelCard {
     pub fn new(content: CardContent) -> Self {
         let card_hash = content.content_hash();
         Self { content, card_hash }
+    }
+
+    /// Verify the card's content address: recompute the hash over `content` and
+    /// compare to the stored `card_hash`. `false` ⇒ the card was tampered with
+    /// or built by an incompatible version.
+    pub fn verify(&self) -> bool {
+        self.content.content_hash() == self.card_hash
     }
 
     /// Render a human-readable card (the CLI's default, non-JSON output).

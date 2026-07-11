@@ -180,18 +180,20 @@ pub(super) fn run_lineage_diff(a_query: &str, b_query: &str, json: bool) -> Resu
         println!("runs {a} and {b} are identical across recipe/config/gate/metrics.");
         return Ok(());
     }
+    let opt = |o: &Option<String>| o.as_deref().unwrap_or("—").to_string();
+    let optf = |o: &Option<f64>| o.map(|v| v.to_string()).unwrap_or_else(|| "—".into());
     println!("diff {a} ↔ {b}:");
     if let Some((x, y)) = &diff.recipe {
-        println!("  recipe    : {:?} → {:?}", x, y);
+        println!("  recipe    : {} → {}", opt(x), opt(y));
     }
     if let Some((x, y)) = &diff.config_fingerprint {
-        println!("  config_fp : {:?} → {:?}", x, y);
+        println!("  config_fp : {} → {}", opt(x), opt(y));
     }
     if let Some((x, y)) = &diff.gate_outcome {
-        println!("  gate      : {:?} → {:?}", x, y);
+        println!("  gate      : {} → {}", opt(x), opt(y));
     }
     for (m, x, y) in &diff.metric_deltas {
-        println!("  {m:<16}: {x:?} → {y:?}");
+        println!("  {m:<16}: {} → {}", optf(x), optf(y));
     }
     Ok(())
 }
