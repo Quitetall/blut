@@ -264,6 +264,10 @@ pub fn open_tags(path: &std::path::Path) -> Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
     )
     .map_err(|e| TrainError::other(format!("open {}: {e}", path.display())))?;
+    // WAL — a future `blut-web` sidecar may `tag` concurrently with a CLI reader;
+    // best-effort (a failure just leaves the default journal mode).
+    let _ =
+        conn.query_row::<rusqlite::types::Value, _, _>("PRAGMA journal_mode=WAL", [], |r| r.get(0));
     conn.execute_batch(CREATE_TAGS)
         .map_err(|e| TrainError::other(format!("create catalog_tags: {e}")))?;
     Ok(conn)
