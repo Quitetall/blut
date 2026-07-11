@@ -183,13 +183,29 @@ impl Stage for CheckJsonl {
         input: Self::Input,
         args: &Self::Args,
     ) -> Result<Self::Output, StageError> {
-        let body = std::fs::read_to_string(&input.path).map_err(|e| {
+        // Stream the row count on a blocking thread: O(1) memory (never loads
+        // the whole file) and off the async runtime, so a multi-GB JSONL neither
+        // spikes RAM nor stalls the executor's reactor.
+        let path = input.path.clone();
+        let rows = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+            use std::io::BufRead;
+            let f = std::fs::File::open(&path)?;
+            let mut n = 0u64;
+            for line in std::io::BufReader::new(f).lines() {
+                if !line?.trim().is_empty() {
+                    n += 1;
+                }
+            }
+            Ok(n)
+        })
+        .await
+        .map_err(|e| StageError::Backend(anyhow::anyhow!("check_jsonl join: {e}")))?
+        .map_err(|e| {
             StageError::Backend(anyhow::anyhow!(
                 "check_jsonl read {}: {e}",
                 input.path.display()
             ))
         })?;
-        let rows = body.lines().filter(|l| !l.trim().is_empty()).count() as u64;
 
         if let Some(min) = args.min_rows {
             if rows < min {
@@ -271,7 +287,12 @@ pub struct AssertArgs {
     pub op: CmpOp,
     /// The bound to compare against.
     pub expected: f64,
-    /// Absolute tolerance applied to the comparison (default 0).
+    /// Absolute tolerance applied to the comparison (default 0). Band semantics:
+    /// `Ge`/`Gt` relax the bound to `expected - tolerance`; `Le`/`Lt` relax it to
+    /// `expected + tolerance`; `Eq`/`Ne` treat `|actual - expected| <= tolerance`
+    /// as equal. Note a `NaN` `actual` fails every predicate except `Ne` (NaN is
+    /// unequal to everything) — intentional: an unmeasured value never satisfies
+    /// a data-quality floor.
     #[serde(default)]
     pub tolerance: f64,
     /// Breach policy (default: `block`).
@@ -384,10 +405,9 @@ mod tests {
     /// `checks`-domain failure — so the executor skips the downstream.
     #[tokio::test]
     async fn check_jsonl_below_min_blocks_fail_closed() {
-        let tmp = std::env::temp_dir().join(format!("checks_min_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let art = write_jsonl(&tmp, 900);
-        let ctx = test_ctx(&tmp);
+        let tmp = tempfile::tempdir().unwrap();
+        let art = write_jsonl(tmp.path(), 900);
+        let ctx = test_ctx(tmp.path());
         let args = CheckJsonlArgs {
             min_rows: Some(1000),
             max_rows: None,
@@ -401,18 +421,16 @@ mod tests {
         assert_eq!(f.domain, "checks");
         assert_eq!(f.code, "DATA_QUALITY_MIN_ROWS");
         assert_eq!(f.severity, Severity::Major);
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// The passing run returns the input BYTE-IDENTICAL — same path + hash, so a
     /// downstream node's cache key is unchanged.
     #[tokio::test]
     async fn check_jsonl_at_min_passes_through_byte_identical() {
-        let tmp = std::env::temp_dir().join(format!("checks_pass_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let art = write_jsonl(&tmp, 1000);
+        let tmp = tempfile::tempdir().unwrap();
+        let art = write_jsonl(tmp.path(), 1000);
         let (in_path, in_hash) = (art.path.clone(), art.content_hash);
-        let ctx = test_ctx(&tmp);
+        let ctx = test_ctx(tmp.path());
         let args = CheckJsonlArgs {
             min_rows: Some(1000),
             max_rows: None,
@@ -424,17 +442,15 @@ mod tests {
             out.content_hash, in_hash,
             "passthrough keeps the content hash"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// A warn-severity breach records a lineage breach event AND passes through
     /// (the DAG continues).
     #[tokio::test]
     async fn check_jsonl_warn_passes_through_and_records_lineage() {
-        let tmp = std::env::temp_dir().join(format!("checks_warn_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let art = write_jsonl(&tmp, 3);
-        let (in_hash, ctx) = (art.content_hash, test_ctx(&tmp));
+        let tmp = tempfile::tempdir().unwrap();
+        let art = write_jsonl(tmp.path(), 3);
+        let (in_hash, ctx) = (art.content_hash, test_ctx(tmp.path()));
         let mut rx = ctx.status_tx.subscribe();
         let args = CheckJsonlArgs {
             min_rows: Some(1000),
@@ -451,17 +467,15 @@ mod tests {
             }
             other => panic!("expected StageStep breach, got {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// A satisfied assertion passes through; a violated one fail-closes with an
     /// `ASSERT_FAILED` failure.
     #[tokio::test]
     async fn assert_predicate_gates_the_pipeline() {
-        let tmp = std::env::temp_dir().join(format!("checks_assert_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let art = write_jsonl(&tmp, 5);
-        let ctx = test_ctx(&tmp);
+        let tmp = tempfile::tempdir().unwrap();
+        let art = write_jsonl(tmp.path(), 5);
+        let ctx = test_ctx(tmp.path());
 
         // 0.86 >= 0.85 holds → passthrough.
         let ok_args = AssertArgs {
@@ -486,7 +500,6 @@ mod tests {
         let summary = FailureSummary::from(StageFailure::try_extract(a).unwrap());
         assert_eq!(summary.code, "ASSERT_FAILED");
         assert_eq!(summary.domain, "checks");
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// The error domain publishes its data-quality codes for `blut errors list`.
