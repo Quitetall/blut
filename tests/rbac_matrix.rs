@@ -26,12 +26,15 @@ fn capability_matrix_holds_exactly() {
     // (action, viewer, operator, admin, anonymous) — expected `allowed`.
     let matrix = [
         (Action::ReadStatus, true, true, true, true),
+        (Action::ReadLineage, true, true, true, true),
         (Action::Run, false, true, true, false),
         (Action::Cancel, false, true, true, false),
         (Action::Retry, false, true, true, false),
         (Action::PlanPromote, false, false, true, false),
         (Action::PlanRollback, false, false, true, false),
         (Action::SecretSet, false, false, true, false),
+        (Action::TokenAdmin, false, false, true, false),
+        (Action::TenantAdmin, false, false, true, false),
     ];
     for (action, ev, eo, ea, en) in matrix {
         assert_eq!(
@@ -102,7 +105,7 @@ fn every_attempt_allow_or_deny_is_audited() {
     ];
     let (mut allow, mut deny) = (0, 0);
     for (i, (p, action, t)) in attempts.iter().enumerate() {
-        let d = enforce(p.as_ref(), *action, t, &audit, 1000 + i as i64).unwrap();
+        let d = enforce(p.as_ref(), *action, t, &audit, 1000 + i as i64);
         if d.allowed {
             allow += 1;
         } else {

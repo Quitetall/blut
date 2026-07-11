@@ -32,16 +32,6 @@ pub enum Role {
 }
 
 impl Role {
-    /// Capability level — a role authorises an action iff its level ≥ the
-    /// action's required level. (The `Ord` derive matches this order.)
-    pub fn level(self) -> u8 {
-        match self {
-            Role::Viewer => 0,
-            Role::Operator => 1,
-            Role::Admin => 2,
-        }
-    }
-
     pub fn parse(s: &str) -> Option<Role> {
         match s {
             "viewer" => Some(Role::Viewer),
@@ -95,7 +85,7 @@ impl Action {
 
     /// A read action can be served anonymously (viewer scope); a mutation never.
     pub fn is_mutation(self) -> bool {
-        self.required_role().level() > Role::Viewer.level()
+        self.required_role() > Role::Viewer
     }
 }
 
@@ -162,8 +152,9 @@ pub fn authorize(
         }
     }
 
-    // Capability: role must dominate the action's required role.
-    if role.level() < action.required_role().level() {
+    // Capability: role must dominate the action's required role (Ord = the
+    // Viewer < Operator < Admin capability order — one source of truth).
+    if role < action.required_role() {
         return deny(if principal.is_none() && action.is_mutation() {
             "a mutation requires a token (anonymous is viewer-only)"
         } else {
@@ -183,7 +174,10 @@ pub fn authorize(
 
 /// Append an audit record to `path` as one JSON line (`audit.jsonl`). Called for
 /// BOTH allows and denies, BEFORE dispatch. `now_unix` is passed in so the
-/// record is deterministic for tests.
+/// record is deterministic for tests. The whole line (incl. newline) is written
+/// in ONE `write_all` under `O_APPEND`, so concurrent appends of small records
+/// don't interleave (POSIX atomic append ≤ PIPE_BUF). The file is `0600` on
+/// Unix — the log carries token ids / tenants / outcomes.
 pub fn append_audit(
     path: &std::path::Path,
     decision: &AuthDecision,
@@ -202,26 +196,43 @@ pub fn append_audit(
         "action": decision.action,
         "reason": decision.reason,
     });
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    writeln!(f, "{row}")
+    let mut line = row.to_string();
+    line.push('\n');
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(line.as_bytes())
 }
 
 /// Authorise AND audit in one step (the enforcement seam a mutating control
 /// boundary calls): the audit row is written for both allow and deny, so a
-/// denied action is on the record too. Returns the decision.
+/// denied action is on the record too. **Fail-closed by construction**: if the
+/// audit write itself fails (disk full, permissions), this returns a DENIED
+/// decision rather than propagating the error or letting the action proceed
+/// unlogged — a mutation is never permitted without a durable audit row.
 pub fn enforce(
     principal: Option<&Principal>,
     action: Action,
     target_tenant: &Tenant,
     audit_path: &std::path::Path,
     now_unix: i64,
-) -> std::io::Result<AuthDecision> {
+) -> AuthDecision {
     let decision = authorize(principal, action, target_tenant);
-    append_audit(audit_path, &decision, now_unix)?;
-    Ok(decision)
+    if let Err(e) = append_audit(audit_path, &decision, now_unix) {
+        tracing::error!(target: "rbac", "audit write failed, denying fail-closed: {e}");
+        return AuthDecision {
+            allowed: false,
+            reason: format!("audit write failed — fail-closed: {e}"),
+            ..decision
+        };
+    }
+    decision
 }
 
 // ── token store (`~/.blut/web-tokens.toml`) ────────────────────────
@@ -251,9 +262,26 @@ pub struct TokenStore {
 }
 
 impl TokenStore {
-    /// Parse a `web-tokens.toml`.
+    /// Parse a `web-tokens.toml`, validating fail-LOUD: every entry's `role` and
+    /// `tenant` must parse, and no two entries may share a token hash — a
+    /// misconfigured file is a hard error naming the offending id, not a token
+    /// that silently never resolves.
     pub fn parse(toml_str: &str) -> Result<Self, String> {
-        toml::from_str(toml_str).map_err(|e| format!("parse web-tokens.toml: {e}"))
+        let store: TokenStore =
+            toml::from_str(toml_str).map_err(|e| format!("parse web-tokens.toml: {e}"))?;
+        let mut seen = std::collections::HashSet::new();
+        for t in &store.token {
+            if Role::parse(&t.role).is_none() {
+                return Err(format!("token '{}': unknown role '{}'", t.id, t.role));
+            }
+            if Tenant::parse(&t.tenant).is_none() {
+                return Err(format!("token '{}': invalid tenant '{}'", t.id, t.tenant));
+            }
+            if !seen.insert(t.hash.clone()) {
+                return Err(format!("token '{}': duplicate token hash", t.id));
+            }
+        }
+        Ok(store)
     }
 
     /// Resolve a presented token secret to its `Principal` (hash + look up).
@@ -295,5 +323,19 @@ mod tests {
         assert!(store.resolve("wrong").is_none()); // fail-closed
         // The plaintext secret never appears in the store text.
         assert!(!store_toml.contains(secret));
+    }
+
+    #[test]
+    fn token_store_validation_fails_loud() {
+        // Unknown role → hard error naming the id.
+        let bad_role = "[[token]]\nid=\"t1\"\nhash=\"ab\"\nrole=\"root\"\ntenant=\"shared\"\n";
+        assert!(TokenStore::parse(bad_role).unwrap_err().contains("t1"));
+        // Invalid tenant → hard error.
+        let bad_tenant = "[[token]]\nid=\"t2\"\nhash=\"cd\"\nrole=\"admin\"\ntenant=\"../etc\"\n";
+        assert!(TokenStore::parse(bad_tenant).unwrap_err().contains("t2"));
+        // Duplicate token hash → hard error (no silent first-match wins).
+        let dup = "[[token]]\nid=\"t3\"\nhash=\"ff\"\nrole=\"viewer\"\ntenant=\"shared\"\n\
+                   [[token]]\nid=\"t4\"\nhash=\"ff\"\nrole=\"admin\"\ntenant=\"shared\"\n";
+        assert!(TokenStore::parse(dup).unwrap_err().contains("duplicate"));
     }
 }
