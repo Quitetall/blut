@@ -132,6 +132,11 @@ enum Command {
         #[command(subcommand)]
         cmd: ErrorsCommand,
     },
+    /// Data-quality checks (ADR 0091): report a run's guardrail breaches.
+    Checks {
+        #[command(subcommand)]
+        cmd: ChecksCommand,
+    },
     /// Declared, persistent partition key-space over a recipe + per-cell
     /// backfill (Dagster-class partitions, v0.20 Phase G).
     Partition {
@@ -214,6 +219,19 @@ enum Command {
         /// backend, exit 0 if all draw non-blank (no raw mode). For CI / smoke.
         #[arg(long, default_value_t = false)]
         check: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ChecksCommand {
+    /// Report the data-quality breaches (blocked + advisory) recorded in a
+    /// run's lineage. `blut checks report <job> | grep DataQuality`.
+    Report {
+        /// Job id (or unique prefix).
+        job: String,
+        /// Emit the breaches as a JSON array (for scripts/agents).
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -391,6 +409,23 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 /// a serializable value to stdout. Serializing these in-memory values can
 /// only fail on pathological data (e.g. non-string map keys) — surface
 /// that as a CLI error rather than panicking or silently printing nothing.
+/// `blut checks report <job>` — replay a run's `status.jsonl` for its
+/// data-quality breaches (blocked + advisory) and print a grep-friendly report
+/// (ADR 0091). `--json` emits the breach array.
+fn run_checks_cmd(cmd: ChecksCommand) -> Result<()> {
+    match cmd {
+        ChecksCommand::Report { job, json } => {
+            let breaches = crate::checks::report_job(&job)?;
+            if json {
+                emit_json(&breaches)?;
+            } else {
+                print!("{}", crate::checks::render_report(&breaches));
+            }
+            Ok(())
+        }
+    }
+}
+
 pub(super) fn emit_json<T: serde::Serialize>(value: &T) -> Result<()> {
     println!(
         "{}",
@@ -407,6 +442,11 @@ pub(super) fn emit_json<T: serde::Serialize>(value: &T) -> Result<()> {
 pub async fn run(reg: crate::framework::Registry) -> Result<()> {
     init_tracing();
     warn_if_stale_binary();
+    // The engine owns the built-in `checks` cookbook (ADR 0091): augment the
+    // caller's registry so `check_jsonl`/`assert` + the `checks` error domain are
+    // available to every binary (like `p2p-smoke` for the p2p path).
+    let mut reg = reg;
+    crate::checks::register(&mut reg);
     let cli = Cli::parse();
     let result = match cli.command {
         Some(Command::Jobs { json }) => run_jobs(json),
@@ -436,6 +476,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
             run_results(&job, json, &metric, force)
         }
         Some(Command::Errors { cmd }) => run_errors(&reg, cmd),
+        Some(Command::Checks { cmd }) => run_checks_cmd(cmd),
         Some(Command::Partition { cmd }) => run_partition(&reg, cmd).await,
         Some(Command::Artifact { cmd }) => run_artifact_cmd(cmd),
         Some(Command::Schedule { cmd }) => run_schedule_cmd(&reg, cmd),

@@ -378,6 +378,118 @@ pub fn register(reg: &mut Registry) {
     reg.register(Box::new(ChecksCookbook));
 }
 
+// ── report (ADR 0091: `blut checks report`) ────────────────────────
+
+/// One data-quality breach replayed from a run's `status.jsonl` — either a
+/// fail-closed BLOCK (a `checks`-domain `StageFailed`) or an advisory WARN (a
+/// `StageStep` `checks_breach` that the DAG continued past).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Breach {
+    pub node_idx: u32,
+    pub stage: String,
+    pub code: String,
+    /// `"block"` (the node failed, downstream skipped) or `"warn"` (advisory,
+    /// the DAG continued).
+    pub disposition: String,
+    pub detail: String,
+}
+
+impl Breach {
+    /// The breach category. Codes prefixed `DATA_QUALITY` fold into
+    /// `"DataQuality"` — the tag `blut checks report | grep DataQuality` matches
+    /// (ADR 0091 gate); everything else is `"Assertion"`.
+    pub fn category(&self) -> &'static str {
+        if self.code.starts_with("DATA_QUALITY") {
+            "DataQuality"
+        } else {
+            "Assertion"
+        }
+    }
+}
+
+/// Scan `StageEvent`s for checks breaches: a `StageFailed` in the `checks`
+/// domain (fail-closed BLOCK) and a `StageStep` carrying a `checks_breach`
+/// payload (advisory WARN). The pure core, shared by the CLI reader and tests.
+pub fn scan_breaches(events: impl IntoIterator<Item = StageEvent>) -> Vec<Breach> {
+    let mut out = Vec::new();
+    for ev in events {
+        match ev {
+            StageEvent::StageFailed {
+                node_idx,
+                stage_name,
+                failure: Some(f),
+                ..
+            } if f.domain == DOMAIN => {
+                out.push(Breach {
+                    node_idx,
+                    stage: stage_name,
+                    code: f.code,
+                    disposition: "block".to_string(),
+                    detail: f.message,
+                });
+            }
+            StageEvent::StageStep {
+                node_idx,
+                stage_name,
+                update,
+            } => {
+                if let Some(b) = update.get("checks_breach") {
+                    out.push(Breach {
+                        node_idx,
+                        stage: stage_name,
+                        code: b
+                            .get("code")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        disposition: "warn".to_string(),
+                        detail: b
+                            .get("detail")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Replay a job's `status.jsonl` for its checks breaches (the reader
+/// `blut checks report <job>` uses). Tolerant of unparseable lines, exactly like
+/// [`crate::framework::lineage::job_failure`].
+pub fn report_job(job: &str) -> anyhow::Result<Vec<Breach>> {
+    let id = crate::jobs::resolve_job_id(job).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let events = crate::jobs::read_status_lines(&id)?
+        .into_iter()
+        .filter_map(|l| serde_json::from_str::<StageEvent>(&l).ok());
+    Ok(scan_breaches(events))
+}
+
+/// Render breaches as a grep-friendly report. Each line leads with the breach
+/// CATEGORY (`DataQuality` / `Assertion`) so `blut checks report | grep
+/// DataQuality` finds the data-quality breaches (ADR 0091 gate).
+pub fn render_report(breaches: &[Breach]) -> String {
+    if breaches.is_empty() {
+        return "no checks breaches recorded\n".to_string();
+    }
+    let mut s = String::new();
+    for b in breaches {
+        s.push_str(&format!(
+            "[{}] {} @{} (node {}) {} — {}\n",
+            b.category(),
+            b.disposition.to_uppercase(),
+            b.stage,
+            b.node_idx,
+            b.code,
+            b.detail
+        ));
+    }
+    s
+}
+
 // ── tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -510,5 +622,164 @@ mod tests {
         let codes: Vec<_> = reg.all_error_domains().flat_map(|d| d.codes).collect();
         assert!(codes.iter().any(|(c, _)| *c == "DATA_QUALITY_MIN_ROWS"));
         assert!(codes.iter().any(|(c, _)| *c == "ASSERT_FAILED"));
+    }
+
+    // ── end-to-end: the `checks-demo` DAG through the real executor ─────
+    //
+    // gen(rows) → check_jsonl(min_rows=1000) → sink. Proves the fail-closed
+    // contract THROUGH the executor: a block breach skips the downstream sink;
+    // a pass runs it; a warn continues. This is the ADR 0091 gate's `blut run
+    // checks-demo` behaviour — run in-crate because the executor/plan
+    // constructors are `pub(crate)` and the engine ships no binary of its own.
+
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+    struct DemoGenArgs {
+        rows: u64,
+    }
+
+    /// Demo source: write `rows` JSONL lines and hand on a `JsonlArtifact`.
+    struct DemoGen;
+    #[async_trait]
+    impl Stage for DemoGen {
+        const NAME: &'static str = "checks_demo_gen";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = ();
+        type Output = JsonlArtifact;
+        type Args = DemoGenArgs;
+        async fn run(
+            &self,
+            ctx: &StageContext,
+            _input: (),
+            args: &DemoGenArgs,
+        ) -> Result<JsonlArtifact, StageError> {
+            std::fs::create_dir_all(&ctx.stage_dir).ok();
+            let path = ctx.stage_dir.join("data.jsonl");
+            let mut body = String::new();
+            for i in 0..args.rows {
+                body.push_str(&format!("{{\"i\":{i}}}\n"));
+            }
+            std::fs::write(&path, &body)
+                .map_err(|e| StageError::Backend(anyhow::anyhow!("demo gen write: {e}")))?;
+            let content_hash = ContentHash::hash_file(&path)
+                .map_err(|e| StageError::Backend(anyhow::anyhow!("demo gen hash: {e}")))?;
+            Ok(JsonlArtifact { path, content_hash })
+        }
+    }
+
+    /// Demo sink: bump a PER-RUN counter (its execution is the downstream we must
+    /// prove is skipped on a block breach). Each run owns its own `Arc<AtomicUsize>`
+    /// so the tests need no shared static or lock — they run concurrently.
+    struct DemoSink(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Stage for DemoSink {
+        const NAME: &'static str = "checks_demo_sink";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = JsonlArtifact;
+        type Output = ();
+        type Args = ();
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            _input: JsonlArtifact,
+            _args: &(),
+        ) -> Result<(), StageError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Build + run the demo DAG at `rows` with breach policy `on_breach`; return
+    /// the executor result, the captured `StageEvent`s, and how many times the
+    /// downstream sink ran (0 ⇒ skipped).
+    async fn run_demo(
+        rows: u64,
+        on_breach: OnBreach,
+    ) -> (
+        Result<crate::framework::executor::PlanResult, crate::framework::error::PlanError>,
+        Vec<StageEvent>,
+        usize,
+    ) {
+        use crate::framework::executor::{ExecCtx, SequentialExecutor};
+        use crate::framework::plan::CompiledPlan;
+        use crate::framework::stage::StageDyn;
+
+        let td = tempfile::tempdir().unwrap();
+        let sink_ran = Arc::new(AtomicUsize::new(0));
+        let mut check_args = serde_json::json!({ "min_rows": 1000 });
+        check_args["on_breach"] = serde_json::to_value(on_breach).unwrap();
+        let nodes: Vec<(Arc<dyn StageDyn>, serde_json::Value)> = vec![
+            (Arc::new(DemoGen), serde_json::json!({ "rows": rows })),
+            (Arc::new(CheckJsonl), check_args),
+            (
+                Arc::new(DemoSink(sink_ran.clone())),
+                serde_json::Value::Null,
+            ),
+        ];
+        let plan = CompiledPlan::from_erased_graph(
+            "checks-demo",
+            serde_json::json!({}),
+            nodes,
+            vec![(0, 1), (1, 2)],
+        )
+        .expect("demo plan compiles (kinds line up)");
+        let ctx = ExecCtx::new(td.path().to_path_buf());
+        let mut rx = ctx.status.subscribe();
+        let res = SequentialExecutor::execute(plan, ctx).await;
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        (res, events, sink_ran.load(Ordering::SeqCst))
+    }
+
+    /// rows=900 < min_rows=1000, on_breach=block: the run FAILS and the
+    /// downstream sink NEVER runs (fail-closed), and the report shows the
+    /// DataQuality block breach.
+    #[tokio::test]
+    async fn checks_demo_block_skips_downstream() {
+        let (res, events, sink_ran) = run_demo(900, OnBreach::Block).await;
+        assert!(res.is_err(), "a block breach must fail the run");
+        assert_eq!(sink_ran, 0, "downstream sink must be skipped (fail-closed)");
+        let breaches = scan_breaches(events);
+        assert!(
+            breaches
+                .iter()
+                .any(|b| b.disposition == "block" && b.category() == "DataQuality"),
+            "the report must show the blocked DataQuality breach: {breaches:?}"
+        );
+        assert!(render_report(&breaches).contains("DataQuality"));
+    }
+
+    /// rows=1000 >= min_rows: the run SUCCEEDS and the downstream sink runs.
+    #[tokio::test]
+    async fn checks_demo_pass_runs_downstream() {
+        let (res, _events, sink_ran) = run_demo(1000, OnBreach::Block).await;
+        assert!(
+            res.is_ok(),
+            "a passing check must not fail the run: {res:?}"
+        );
+        assert_eq!(sink_ran, 1, "downstream sink runs when the check passes");
+    }
+
+    /// rows=900 with on_breach=warn: the DAG CONTINUES (sink runs) and the
+    /// advisory DataQuality breach is on the record.
+    #[tokio::test]
+    async fn checks_demo_warn_continues_and_records() {
+        let (res, events, sink_ran) = run_demo(900, OnBreach::Warn).await;
+        assert!(res.is_ok(), "a warn breach must NOT fail the run: {res:?}");
+        assert_eq!(sink_ran, 1, "downstream sink runs under a warn breach");
+        let breaches = scan_breaches(events);
+        assert!(
+            breaches
+                .iter()
+                .any(|b| b.disposition == "warn" && b.category() == "DataQuality"),
+            "the report must show the advisory DataQuality breach: {breaches:?}"
+        );
     }
 }
