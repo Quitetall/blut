@@ -475,17 +475,19 @@ pub fn render_report(breaches: &[Breach]) -> String {
     if breaches.is_empty() {
         return "no checks breaches recorded\n".to_string();
     }
+    use std::fmt::Write as _;
     let mut s = String::new();
     for b in breaches {
-        s.push_str(&format!(
-            "[{}] {} @{} (node {}) {} — {}\n",
+        let _ = writeln!(
+            s,
+            "[{}] {} @{} (node {}) {} — {}",
             b.category(),
             b.disposition.to_uppercase(),
             b.stage,
             b.node_idx,
             b.code,
             b.detail
-        ));
+        );
     }
     s
 }

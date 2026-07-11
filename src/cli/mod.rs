@@ -405,10 +405,6 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| format!("{e}"))
 }
 
-/// The uniform `--json` output tail every subcommand shares: pretty-print
-/// a serializable value to stdout. Serializing these in-memory values can
-/// only fail on pathological data (e.g. non-string map keys) — surface
-/// that as a CLI error rather than panicking or silently printing nothing.
 /// `blut checks report <job>` — replay a run's `status.jsonl` for its
 /// data-quality breaches (blocked + advisory) and print a grep-friendly report
 /// (ADR 0091). `--json` emits the breach array.
@@ -426,6 +422,10 @@ fn run_checks_cmd(cmd: ChecksCommand) -> Result<()> {
     }
 }
 
+/// The uniform `--json` output tail every subcommand shares: pretty-print
+/// a serializable value to stdout. Serializing these in-memory values can
+/// only fail on pathological data (e.g. non-string map keys) — surface
+/// that as a CLI error rather than panicking or silently printing nothing.
 pub(super) fn emit_json<T: serde::Serialize>(value: &T) -> Result<()> {
     println!(
         "{}",
