@@ -185,4 +185,27 @@ fn registry_roundtrip() {
         registry_db::resolve_pointer(&conn, "shared", "prod").unwrap(),
         None
     );
+
+    // Boundary 3 — the SAME spec bytes cannot be re-published under a different
+    // tenant (the content fingerprint would otherwise bind to one tenant's row).
+    assert!(
+        registry_db::publish(&conn, &reg, &valid_spec(9), "tester", "shared", None, 6000).is_err(),
+        "a restricted deployment's bytes must not re-publish as shared"
+    );
+
+    // The deploy-URI parser only accepts safe identifier names.
+    assert_eq!(
+        registry_db::parse_pointer_uri("registry://plan@prod"),
+        Some("prod")
+    );
+    assert_eq!(
+        registry_db::parse_pointer_uri("registry://plan@a.b-c_1"),
+        Some("a.b-c_1")
+    );
+    assert_eq!(
+        registry_db::parse_pointer_uri("registry://plan@../etc"),
+        None
+    );
+    assert_eq!(registry_db::parse_pointer_uri("registry://plan@"), None);
+    assert_eq!(registry_db::parse_pointer_uri("/some/file.json"), None);
 }

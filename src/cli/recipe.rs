@@ -49,6 +49,10 @@ pub(super) enum RecipeCommand {
         /// runs even with a warm entry (only with `--run`). Alias: `--force`.
         #[arg(long = "no-cache", alias = "force", default_value_t = false)]
         no_cache: bool,
+        /// Tenant to resolve a `registry://plan@<name>` deploy URI against
+        /// (ADR 0085; default `shared`). Ignored for file recipes.
+        #[arg(long, default_value = "shared")]
+        tenant: String,
     },
     /// Execute a recipe, or a config-driven sweep over it.
     Run {
@@ -182,6 +186,7 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             run,
             shared_cache,
             no_cache,
+            tenant,
         } => {
             use crate::recipes::declarative::{scan_user_recipes, user_recipes_dir};
             match file {
@@ -213,7 +218,7 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                         crate::registry_db::parse_pointer_uri(&path.to_string_lossy())
                     {
                         let conn = crate::registry_db::open().map_err(|e| anyhow!("{e}"))?;
-                        let spec = crate::registry_db::resolve_spec(&conn, "shared", ptr)
+                        let spec = crate::registry_db::resolve_spec(&conn, &tenant, ptr)
                             .map_err(|e| anyhow!("{e}"))?;
                         let plan = spec.compile(reg).map_err(|e| anyhow!("{e}"))?;
                         let n = plan.n_nodes();
@@ -998,6 +1003,7 @@ mod recipe_declare_flag_tests {
                         run,
                         shared_cache,
                         no_cache,
+                        tenant: _,
                     },
             }) => (file, run, shared_cache, no_cache),
             other => panic!("expected recipe declare, got {other:?}"),

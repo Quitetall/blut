@@ -138,19 +138,40 @@ pub fn publish(
         ))
     })?;
     let fp = fingerprint(spec);
-    let bytes = spec.canonical_bytes();
 
-    // Idempotent: identical bytes under the same fingerprint is a no-op. A
-    // fingerprint collision with DIFFERENT bytes is impossible (content hash),
-    // so INSERT OR IGNORE is safe — a re-publish keeps the original row.
-    conn.execute(
-        "INSERT OR IGNORE INTO deployments \
+    // The fingerprint is over spec CONTENT only, so identical bytes published
+    // under two tenants would collide on one immutable row — silently binding the
+    // content to whichever tenant published first. Reject a cross-tenant
+    // re-publish (tenant isolation); a same-tenant re-publish is the idempotent
+    // no-op the ADR promises.
+    if let Some(existing) = get_deployment(conn, &fp)? {
+        if existing.tenant != tenant {
+            return Err(TrainError::other(format!(
+                "publish refused — fingerprint {fp} already published under tenant \
+                 '{}' (not '{tenant}')",
+                existing.tenant
+            )));
+        }
+        return Ok(fp);
+    }
+    // Known-absent → plain INSERT so real errors (disk-full, constraint) surface
+    // instead of being swallowed. A concurrent same-fp insert races to the PK
+    // constraint; treat that lone case as the idempotent no-op (content is equal).
+    let bytes = spec.canonical_bytes();
+    match conn.execute(
+        "INSERT INTO deployments \
          (plan_fingerprint, spec_bytes, publisher, tenant, source, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![fp, bytes, publisher, tenant, source, now_unix],
-    )
-    .map_err(|e| TrainError::other(format!("insert deployment: {e}")))?;
-    Ok(fp)
+    ) {
+        Ok(_) => Ok(fp),
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            Ok(fp) // lost a publish race for identical content — still idempotent
+        }
+        Err(e) => Err(TrainError::other(format!("insert deployment: {e}"))),
+    }
 }
 
 /// Look up an immutable deployment by fingerprint.
@@ -221,8 +242,14 @@ pub fn promote(
 /// the second-most-recent, and records the rollback in the trail. Errors if the
 /// pointer has no prior target. Returns the fingerprint rolled back to.
 pub fn rollback(conn: &mut Connection, tenant: &str, name: &str, now_unix: i64) -> Result<String> {
+    // BEGIN IMMEDIATE: take the write lock up front so the two-most-recent read
+    // and the pointer/history writes see ONE consistent snapshot — a concurrent
+    // promote/rollback can't slip between the read and the write and stale `prev`.
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| TrainError::other(format!("rollback txn: {e}")))?;
     let recent: Vec<String> = {
-        let mut stmt = conn
+        let mut stmt = tx
             .prepare(
                 "SELECT plan_fingerprint FROM pointer_history \
                  WHERE tenant = ?1 AND name = ?2 ORDER BY seq DESC LIMIT 2",
@@ -240,9 +267,18 @@ pub fn rollback(conn: &mut Connection, tenant: &str, name: &str, now_unix: i64) 
         )));
     }
     let prev = recent[1].clone();
-    let tx = conn
-        .transaction()
-        .map_err(|e| TrainError::other(format!("rollback txn: {e}")))?;
+    // Defense-in-depth (matches promote): the target must belong to THIS tenant.
+    // promote already blocks a foreign fingerprint from entering the trail, so
+    // this can only fail on a corrupted/hand-edited DB — fail closed rather than
+    // silently re-point across the clinical boundary (ADR 0061).
+    match get_deployment(&tx, &prev)? {
+        Some(d) if d.tenant == tenant => {}
+        _ => {
+            return Err(TrainError::other(format!(
+                "rollback refused — prior target {prev} is not a '{tenant}'-tenant deployment"
+            )));
+        }
+    }
     tx.execute(
         "UPDATE deployment_pointers SET plan_fingerprint = ?3, updated_at = ?4 \
          WHERE tenant = ?1 AND name = ?2",
@@ -313,8 +349,17 @@ pub fn history(conn: &Connection, tenant: &str, name: &str) -> Result<Vec<Histor
 
 /// Parse a `registry://plan@<name>` deploy URI into its pointer name. Returns
 /// `None` for any non-registry string (so the run dispatcher can fall through to
-/// file-path handling).
+/// file-path handling) OR a name with characters outside the safe identifier set
+/// `[A-Za-z0-9_.-]` — so a pointer name can never carry whitespace, slashes, or
+/// control bytes into an audit log or a future filesystem context.
 pub fn parse_pointer_uri(uri: &str) -> Option<&str> {
-    uri.strip_prefix("registry://plan@")
-        .filter(|n| !n.is_empty())
+    let name = uri.strip_prefix("registry://plan@")?;
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    {
+        return None;
+    }
+    Some(name)
 }
