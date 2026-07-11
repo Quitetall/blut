@@ -137,6 +137,12 @@ enum Command {
         #[command(subcommand)]
         cmd: ChecksCommand,
     },
+    /// Dataset catalog (ADR 0100): search / show / tag / rebuild a read-only
+    /// projection over the datasets registry + lineage.
+    Catalog {
+        #[command(subcommand)]
+        cmd: CatalogCommand,
+    },
     /// Declared, persistent partition key-space over a recipe + per-cell
     /// backfill (Dagster-class partitions, v0.20 Phase G).
     Partition {
@@ -220,6 +226,34 @@ enum Command {
         #[arg(long, default_value_t = false)]
         check: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum CatalogCommand {
+    /// Re-project the catalog index from the datasets registry + lineage
+    /// (verifies each entry's schema against its source); prints the count.
+    Rebuild,
+    /// Filter the catalog: `modality: fs: kind: tag: hash:` terms (AND).
+    Search {
+        /// e.g. `"modality:eeg fs:256 tag:sleep"`.
+        query: String,
+        /// A cloud-surfaced view — exclude clinical/PHI entries (ADR 0061).
+        #[arg(long)]
+        cloud: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one entry's schema + lineage neighborhood (producing stage +
+    /// downstream consumers) + tags. Fails if the entry's schema has drifted
+    /// from its source manifest.
+    Show {
+        /// Dataset `name` or `name@version`.
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Append a tag to a dataset (persists across a rebuild).
+    Tag { name: String, tag: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -439,6 +473,132 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| format!("{e}"))
 }
 
+/// `blut catalog {rebuild,search,show,tag}` (ADR 0100) — a read-only projection
+/// over the datasets registry + lineage, with a persisted tags table.
+fn run_catalog_cmd(cmd: CatalogCommand) -> Result<()> {
+    use crate::catalog;
+    let datasets = crate::datasets_db::open().map_err(|e| anyhow!("{e}"))?;
+    let lineage = crate::lineage_db::LineageDb::open().map_err(|e| anyhow!("{e}"))?;
+    let tags = catalog::open_tags(&catalog::catalog_db_path().map_err(|e| anyhow!("{e}"))?)
+        .map_err(|e| anyhow!("{e}"))?;
+
+    match cmd {
+        CatalogCommand::Rebuild => {
+            // Re-project + verify each entry against its source manifest.
+            let records = crate::datasets_db::list(&datasets).map_err(|e| anyhow!("{e}"))?;
+            let mut n = 0usize;
+            for r in &records {
+                let entry = catalog::project(r, &lineage).map_err(|e| anyhow!("{e}"))?;
+                catalog::verify_consistency(&entry, r).map_err(|e| anyhow!("{e}"))?;
+                n += 1;
+            }
+            println!(
+                "catalog: {n} entr{} projected + verified",
+                if n == 1 { "y" } else { "ies" }
+            );
+            Ok(())
+        }
+        CatalogCommand::Search { query, cloud, json } => {
+            let q = catalog::CatalogQuery::parse(&query).map_err(|e| anyhow!("{e}"))?;
+            let entries = catalog::build_index(&datasets, &lineage).map_err(|e| anyhow!("{e}"))?;
+            let tags_of = |n: &str| catalog::tags_for(&tags, n).unwrap_or_default();
+            let hits = catalog::search(&entries, tags_of, &q, cloud);
+            if json {
+                emit_json(&hits)?;
+            } else if hits.is_empty() {
+                println!("no catalog entries match {query:?}");
+            } else {
+                for e in hits {
+                    let fs = e
+                        .schema
+                        .fs
+                        .map(|f| f.to_string())
+                        .unwrap_or_else(|| "-".into());
+                    println!(
+                        "{:<24} {:<8} modality={} fs={} kind={}",
+                        e.version
+                            .as_ref()
+                            .map(|v| format!("{}@{v}", e.name))
+                            .unwrap_or_else(|| e.name.clone()),
+                        &e.hash.get(..8).unwrap_or(&e.hash),
+                        e.schema.modality.as_deref().unwrap_or("-"),
+                        fs,
+                        e.kind,
+                    );
+                }
+            }
+            Ok(())
+        }
+        CatalogCommand::Show { name, json } => {
+            let bare = name.split_once('@').map(|(n, _)| n).unwrap_or(&name);
+            let record = crate::datasets_db::get_by_name(&datasets, &name)
+                .map_err(|e| anyhow!("{e}"))?
+                .or_else(|| {
+                    crate::datasets_db::get_by_name(&datasets, bare)
+                        .ok()
+                        .flatten()
+                })
+                .ok_or_else(|| anyhow!("no dataset '{name}' in the registry"))?;
+            let entry = catalog::project(&record, &lineage).map_err(|e| anyhow!("{e}"))?;
+            // Fail-closed consistency: a drifted schema is an error, not a serve.
+            catalog::verify_consistency(&entry, &record).map_err(|e| anyhow!("{e}"))?;
+            let entry_tags = catalog::tags_for(&tags, &entry.name).map_err(|e| anyhow!("{e}"))?;
+            if json {
+                emit_json(&serde_json::json!({ "entry": entry, "tags": entry_tags }))?;
+            } else {
+                println!(
+                    "name       : {}{}",
+                    entry.name,
+                    entry
+                        .version
+                        .as_ref()
+                        .map(|v| format!("@{v}"))
+                        .unwrap_or_default()
+                );
+                println!("kind       : {}", entry.kind);
+                println!("hash       : {}", entry.hash);
+                println!(
+                    "modality   : {}",
+                    entry.schema.modality.as_deref().unwrap_or("-")
+                );
+                println!(
+                    "fs         : {}",
+                    entry
+                        .schema
+                        .fs
+                        .map(|f| f.to_string())
+                        .unwrap_or_else(|| "-".into())
+                );
+                println!(
+                    "channels   : {}",
+                    entry
+                        .schema
+                        .channels
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "-".into())
+                );
+                println!("clinical   : {}", entry.clinical);
+                println!(
+                    "produced_by: {}",
+                    entry.produced_by.as_deref().unwrap_or("-")
+                );
+                println!("consumers  : {}", entry.consumers.len());
+                println!("tags       : {}", entry_tags.join(", "));
+            }
+            Ok(())
+        }
+        CatalogCommand::Tag { name, tag } => {
+            let bare = name
+                .split_once('@')
+                .map(|(n, _)| n.to_string())
+                .unwrap_or(name);
+            catalog::add_tag(&tags, &bare, &tag).map_err(|e| anyhow!("{e}"))?;
+            println!("tagged {bare} += {tag}");
+            Ok(())
+        }
+    }
+}
+
 /// `blut checks report <job>` — replay a run's `status.jsonl` for its
 /// data-quality breaches (blocked + advisory) and print a grep-friendly report
 /// (ADR 0091). `--json` emits the breach array.
@@ -511,6 +671,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         }
         Some(Command::Errors { cmd }) => run_errors(&reg, cmd),
         Some(Command::Checks { cmd }) => run_checks_cmd(cmd),
+        Some(Command::Catalog { cmd }) => run_catalog_cmd(cmd),
         Some(Command::Partition { cmd }) => run_partition(&reg, cmd).await,
         Some(Command::Artifact { cmd }) => run_artifact_cmd(cmd),
         Some(Command::Schedule { cmd }) => run_schedule_cmd(&reg, cmd),

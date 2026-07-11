@@ -29,6 +29,7 @@
 pub mod artifacts;
 pub mod backends;
 pub mod broker;
+pub mod catalog;
 pub mod checks;
 pub mod cli;
 /// Cloud compute queue (ADR 0082 / 0067 T3.1) — the P2P data plane over an

@@ -706,6 +706,34 @@ impl LineageDb {
         Ok(chain)
     }
 
+    /// The stage that produced the artifact at `content_hash` (ADR 0100 catalog
+    /// lineage neighborhood — "produced_by"). `None` if the hash isn't indexed.
+    pub fn producing_stage(&self, content_hash: &str) -> Result<Option<String>> {
+        Ok(self
+            .artifact_by_hash(&content_hash.to_lowercase())?
+            .map(|a| a.stage_name))
+    }
+
+    /// The DOWNSTREAM consumer artifact hashes of `content_hash` — the outputs of
+    /// every edge that took it as an input (ADR 0100 catalog neighborhood).
+    /// Distinct, sorted.
+    pub fn consumers_of(&self, content_hash: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT output_hash FROM lineage_edges WHERE input_hash = ?1")
+            .map_err(|e| TrainError::other(format!("consumers_of prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![content_hash.to_lowercase()], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|e| TrainError::other(format!("consumers_of query: {e}")))?;
+        let mut out = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| TrainError::other(format!("consumers_of collect: {e}")))?;
+        out.sort();
+        Ok(out)
+    }
+
     fn artifact_by_hash(&self, content_hash: &str) -> Result<Option<ArtifactRow>> {
         self.conn
             .query_row(
