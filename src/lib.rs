@@ -59,6 +59,7 @@ pub mod schedule;
 pub mod scheduler_lock;
 pub mod sensor;
 pub mod spec;
+pub mod tenant;
 /// The interactive ratatui cockpit. Part of the default-on `tui` feature, so
 /// it ships in 1.0; a `--no-default-features` build drops it and the CLI
 /// (`cli::run`) degrades to printing help for the bare `blut` command.

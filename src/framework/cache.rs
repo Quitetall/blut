@@ -73,6 +73,20 @@ impl CacheHandle {
         }
     }
 
+    /// Namespace the GLOBAL cache tier by tenant (ADR 0096). The tenant is a path
+    /// PREFIX on the store — the ADR-0078 key algorithm is unchanged, so two
+    /// tenants get DISJOINT global roots (neither reads the other's entries) while
+    /// a graph's fingerprint stays byte-identical across tenants. The `default`
+    /// tenant is the flat store, so this is a NO-OP then (single-tenant and every
+    /// existing cache path are byte-identical). `job_local` is per-job and already
+    /// isolated, so it is left untouched.
+    pub fn with_tenant(mut self, tenant: &crate::tenant::Tenant) -> Self {
+        if !tenant.is_default() {
+            self.global = self.global.map(|g| g.join(tenant.as_path()));
+        }
+        self
+    }
+
     /// Attach a content-addressed remote tier (a shared object store / RWX
     /// PVC). Checked after the local dirs on lookup; written through on insert.
     pub fn with_remote(

@@ -236,6 +236,9 @@ pub(super) async fn run_partition(
                             launch_target,
                             Some(dev),
                             false,
+                            // ADR 0096: partition-cell tenant namespacing is a
+                            // follow-up; cells run under the default namespace.
+                            crate::tenant::Tenant::default(),
                         );
                         let (outcome, job_id) = match gated_cell_run(
                             mem_sem.clone(),

@@ -103,6 +103,11 @@ pub(super) enum RecipeCommand {
         /// compute node (NFS/Lustre); local admission still gates (conservative).
         #[arg(long, default_value = "local")]
         launcher: String,
+        /// Tenant (`project[/domain]`, ADR 0096) whose namespace this run's
+        /// shared cache lives under (default `default` = the flat store). A
+        /// `clinical/*` or `restricted` tenant is a sealed clinical namespace.
+        #[arg(long, default_value = "default")]
+        tenant: String,
     },
 }
 
@@ -244,6 +249,8 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                             crate::config::launcher::LaunchTarget::Local,
                             None,
                             no_cache,
+                            crate::tenant::Tenant::parse(&tenant)
+                                .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?,
                         )
                         .await?;
                     } else {
@@ -266,12 +273,16 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             sweep,
             dry_run,
             launcher,
+            tenant,
         } => {
             // #3 distributed: parse placement up front so a typo fails the run
             // BEFORE any job dir / state is written (vs deep in the executor).
             let launch_target: crate::config::launcher::LaunchTarget = launcher
                 .parse()
                 .map_err(|e| anyhow!("invalid --launcher {launcher:?}: {e}"))?;
+            // ADR 0096: parse the tenant up front (same fail-fast discipline).
+            let tenant = crate::tenant::Tenant::parse(&tenant)
+                .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
             // Any of these put us in config mode — so a stray --set / --config-key
             // can't be silently dropped (run_recipe_sweep then errors cleanly if
             // --config-dir/--config-name are missing).
@@ -298,6 +309,7 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                     shared_cache,
                     launch_target,
                     no_cache,
+                    tenant,
                 )
                 .await?;
             } else {
@@ -338,6 +350,7 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                     launch_target,
                     None,
                     no_cache,
+                    tenant,
                 )
                 .await?;
             }
@@ -366,6 +379,8 @@ pub(super) async fn run_one_recipe(
     // INC D (S4): force-recompute. `true` bypasses the stage cache READ so every
     // stage runs even with a warm entry (the fresh result is still cached).
     no_cache: bool,
+    // ADR 0096: the tenant whose namespace this run's shared cache lives under.
+    tenant: crate::tenant::Tenant,
 ) -> Result<String> {
     let r = reg
         .find(name)
@@ -386,6 +401,7 @@ pub(super) async fn run_one_recipe(
         launch_target,
         device_index,
         no_cache,
+        tenant,
     )
     .await
 }
@@ -542,6 +558,7 @@ pub(super) async fn launch_compiled_plan(
     launch_target: crate::config::launcher::LaunchTarget,
     device_index: Option<usize>,
     no_cache: bool,
+    tenant: crate::tenant::Tenant,
 ) -> Result<String> {
     use crate::framework::ExecCtx;
 
@@ -627,9 +644,16 @@ pub(super) async fn launch_compiled_plan(
     ctx = ctx.with_bypass_cache(no_cache);
     if shared_cache {
         if let Some(global) = crate::framework::CacheHandle::default_global_path() {
-            std::fs::create_dir_all(&global)
-                .with_context(|| format!("create global cache dir {}", global.display()))?;
-            let cache_handle = (*ctx.cache).clone().with_global(global);
+            // ADR 0096: namespace the shared cache by tenant (disjoint roots per
+            // tenant; the `default` tenant is the flat store, byte-identical).
+            let cache_handle = (*ctx.cache)
+                .clone()
+                .with_global(global)
+                .with_tenant(&tenant);
+            if let Some(g) = &cache_handle.global {
+                std::fs::create_dir_all(g)
+                    .with_context(|| format!("create global cache dir {}", g.display()))?;
+            }
             ctx.cache = std::sync::Arc::new(cache_handle);
         }
     }
@@ -807,6 +831,8 @@ pub(super) async fn run_recipe_sweep(
     launch_target: crate::config::launcher::LaunchTarget,
     // INC D (S4): force-recompute — threaded into every combo's run_one_recipe.
     no_cache: bool,
+    // ADR 0096: the tenant namespace for every combo's shared cache.
+    tenant: crate::tenant::Tenant,
 ) -> Result<()> {
     // Fail on a bad recipe name before composing anything.
     if reg.find(name).is_none() {
@@ -866,6 +892,7 @@ pub(super) async fn run_recipe_sweep(
             launch_target,
             None,
             no_cache,
+            tenant.clone(),
         )
         .await
         {
