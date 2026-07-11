@@ -43,6 +43,7 @@ pub mod framework;
 pub mod hpo;
 pub mod jobs;
 pub mod lineage_db;
+pub mod lineage_report;
 /// P2P distributed compute — trust model, encryption, task dispatch.
 /// Gated behind the `p2p` feature.
 #[cfg(feature = "p2p")]

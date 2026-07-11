@@ -28,6 +28,17 @@ pub(super) enum LineageCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Provenance GRAPH (ADR 0099): the full transitive upstream DAG of an
+    /// artifact (every input that produced it, recursively). Emits DOT by
+    /// default; `--json` emits typed rows. Clinical/`restricted`-tenant nodes are
+    /// fail-closed excluded from the export (ADR 0061).
+    Graph {
+        /// Output content-hash (full, lowercased — the leaf artifact).
+        hash: String,
+        /// Emit typed JSON rows instead of Graphviz DOT.
+        #[arg(long)]
+        json: bool,
+    },
     /// Rebuild the lineage index from the job dirs (the DB is a derived index —
     /// safe to delete + reindex).
     Reindex,
@@ -88,10 +99,31 @@ pub(super) fn run_lineage(id_query: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// ADR 0099: emit an artifact's transitive UPSTREAM provenance graph — DOT by
+/// default (pipe to `dot -Tsvg` or a sidecar), typed JSON with `--json`. This is
+/// an EXPORT, so clinical/`restricted`-tenant nodes are fail-closed excluded
+/// (ADR 0061) — a graph that is entirely restricted comes back empty.
+pub(super) fn run_lineage_graph(hash: &str, json: bool) -> Result<()> {
+    let db = crate::lineage_db::LineageDb::open().map_err(|e| anyhow!("{e}"))?;
+    let graph = db.graph_upstream(hash, true).map_err(|e| anyhow!("{e}"))?;
+    if graph.nodes.is_empty() {
+        return Err(anyhow!(
+            "no exportable lineage for artifact {hash} (unknown hash, or an all-restricted graph)"
+        ));
+    }
+    if json {
+        emit_json(&graph)?;
+    } else {
+        print!("{}", graph.to_dot());
+    }
+    Ok(())
+}
+
 pub(super) fn run_lineage_cmd(cmd: LineageCommand) -> Result<()> {
     match cmd {
         LineageCommand::Show { id, json } => run_lineage(&id, json),
         LineageCommand::Trace { hash, json } => run_lineage_trace(&hash, json),
+        LineageCommand::Graph { hash, json } => run_lineage_graph(&hash, json),
         LineageCommand::Reindex => run_lineage_reindex(),
         LineageCommand::Freshness {
             id,

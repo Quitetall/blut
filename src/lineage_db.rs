@@ -35,9 +35,10 @@ use crate::error::{Result, TrainError};
 /// Bump when the schema changes in a non-additive way (forces a `reindex`).
 /// v2 adds the additive `metrics` (E1) + `gauges` (E2) tables — they
 /// materialize on existing v1 DBs via `CREATE TABLE IF NOT EXISTS`, so the
-/// 1→2 bump needs NO data migration: the open path just re-stamps an old
-/// db's `user_version` to 2 (see the migration guard in `open_at`).
-const SCHEMA_VERSION: i64 = 2;
+/// 1→2 bump needs NO data migration. v3 (ADR 0096) adds `runs.tenant`; since
+/// `CREATE TABLE IF NOT EXISTS` cannot alter an extant table, the open path runs
+/// an idempotent `ALTER TABLE runs ADD COLUMN tenant … DEFAULT 'default'`.
+const SCHEMA_VERSION: i64 = 3;
 
 const CREATE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS runs (
@@ -51,7 +52,11 @@ CREATE TABLE IF NOT EXISTS runs (
     host               TEXT,
     gpu_name           TEXT,
     ram_gib            INTEGER,
-    vram_mib           INTEGER
+    vram_mib           INTEGER,
+    -- ADR 0096: the owning tenant. `default` = the flat/pre-tenancy namespace.
+    -- A `clinical`/`restricted` tenant's rows are fail-closed excluded from any
+    -- exported graph/card (ADR 0061/0099).
+    tenant             TEXT NOT NULL DEFAULT 'default'
 );
 CREATE TABLE IF NOT EXISTS artifacts (
     job_id        TEXT NOT NULL,
@@ -124,6 +129,11 @@ pub struct RunRow {
     pub gpu_name: Option<String>,
     pub ram_gib: Option<i64>,
     pub vram_mib: Option<i64>,
+    /// ADR 0096 owning tenant (`project[/domain]`). Empty ⇒ recorded as
+    /// `default` (the flat namespace). A `clinical`/`restricted` tenant is
+    /// fail-closed excluded from any export (ADR 0061/0099).
+    #[serde(default)]
+    pub tenant: String,
 }
 
 /// FRESHNESS verdict for a run's code (Phase G): did the code that built
@@ -272,6 +282,18 @@ impl LineageDb {
         }
         conn.execute_batch(CREATE_SCHEMA)
             .map_err(|e| TrainError::other(format!("create lineage schema: {e}")))?;
+        // v2→v3 (ADR 0096): add `runs.tenant` to a pre-existing v2 db. CREATE
+        // TABLE IF NOT EXISTS can't alter an extant table, so ADD COLUMN here;
+        // a "duplicate column name" means a v3 db already has it (idempotent).
+        if let Err(e) = conn.execute(
+            "ALTER TABLE runs ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'",
+            [],
+        ) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(TrainError::other(format!("migrate runs.tenant: {e}")));
+            }
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| TrainError::other(format!("set user_version: {e}")))?;
         Ok(Self { conn })
@@ -282,8 +304,8 @@ impl LineageDb {
         self.conn
             .execute(
                 "INSERT INTO runs (job_id, recipe, config_fingerprint, git_sha,
-                    started_unix, ended_unix, outcome, host, gpu_name, ram_gib, vram_mib)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+                    started_unix, ended_unix, outcome, host, gpu_name, ram_gib, vram_mib, tenant)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
                  ON CONFLICT(job_id) DO UPDATE SET
                     recipe=COALESCE(excluded.recipe, runs.recipe),
                     config_fingerprint=COALESCE(excluded.config_fingerprint, runs.config_fingerprint),
@@ -294,10 +316,12 @@ impl LineageDb {
                     host=COALESCE(excluded.host, runs.host),
                     gpu_name=COALESCE(excluded.gpu_name, runs.gpu_name),
                     ram_gib=COALESCE(excluded.ram_gib, runs.ram_gib),
-                    vram_mib=COALESCE(excluded.vram_mib, runs.vram_mib)",
+                    vram_mib=COALESCE(excluded.vram_mib, runs.vram_mib),
+                    tenant=excluded.tenant",
                 params![
                     r.job_id, r.recipe, r.config_fingerprint, r.git_sha, r.started_unix,
-                    r.ended_unix, r.outcome, r.host, r.gpu_name, r.ram_gib, r.vram_mib
+                    r.ended_unix, r.outcome, r.host, r.gpu_name, r.ram_gib, r.vram_mib,
+                    if r.tenant.is_empty() { "default" } else { r.tenant.as_str() }
                 ],
             )
             .map_err(|e| TrainError::other(format!("record run {}: {e}", r.job_id)))?;
@@ -632,7 +656,7 @@ impl LineageDb {
         self.conn
             .query_row(
                 "SELECT job_id, recipe, config_fingerprint, git_sha, started_unix, ended_unix,
-                        outcome, host, gpu_name, ram_gib, vram_mib
+                        outcome, host, gpu_name, ram_gib, vram_mib, tenant
                  FROM runs WHERE job_id = ?1",
                 params![job_id],
                 row_to_run,
@@ -693,6 +717,91 @@ impl LineageDb {
             .map_err(|e| TrainError::other(format!("input_hash_for_output: {e}")))
     }
 
+    /// ALL input hashes feeding an output (a fan-in/merge stage has several) —
+    /// the multi-branch generalisation of [`input_hash_for_output`] the
+    /// provenance graph walks. Distinct, lowercased.
+    pub fn inputs_for_output(&self, output_hash: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT input_hash FROM lineage_edges WHERE output_hash = ?1")
+            .map_err(|e| TrainError::other(format!("inputs_for_output prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![output_hash.to_lowercase()], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| TrainError::other(format!("inputs_for_output query: {e}")))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| TrainError::other(format!("inputs_for_output collect: {e}")))
+    }
+
+    /// The FULL transitive upstream provenance DAG of `hash` (ADR 0099): every
+    /// artifact reachable by walking input edges backward to the source inputs,
+    /// plus the edges between them. Unlike [`trace`](Self::trace) (a single-input
+    /// linear walk) this follows EVERY input at each fan-in, so a merge node's
+    /// whole ancestry is captured. Cycle-guarded (a content-addressed DAG can't
+    /// truly cycle, but a corrupt db must not loop). `exclude_restricted` drops
+    /// any artifact produced by a `clinical`/`restricted`-tenant run and every
+    /// edge touching it — the fail-closed export boundary (ADR 0061).
+    pub fn graph_upstream(
+        &self,
+        hash: &str,
+        exclude_restricted: bool,
+    ) -> Result<crate::lineage_report::ProvenanceGraph> {
+        use std::collections::VecDeque;
+        let mut nodes: Vec<crate::lineage_report::GraphNode> = Vec::new();
+        let mut edges: Vec<(String, String)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+        queue.push_back(hash.to_lowercase());
+
+        while let Some(cur) = queue.pop_front() {
+            if !seen.insert(cur.clone()) {
+                continue;
+            }
+            // Resolve the artifact + its run; skip a restricted-tenant node (and
+            // any edge into it) when exporting.
+            let artifact = self.artifact_by_hash(&cur)?;
+            let run = match &artifact {
+                Some(a) => self.get_run(&a.job_id)?,
+                None => None,
+            };
+            if exclude_restricted {
+                if let Some(r) = &run {
+                    if crate::tenant::Tenant::parse(&r.tenant).is_some_and(|t| t.is_restricted()) {
+                        // Drop this node entirely — do NOT enqueue its inputs, so
+                        // its whole subtree stays out of the export.
+                        continue;
+                    }
+                }
+            }
+            nodes.push(crate::lineage_report::GraphNode {
+                content_hash: cur.clone(),
+                stage_name: artifact.as_ref().map(|a| a.stage_name.clone()),
+                kind: artifact.as_ref().map(|a| a.kind.clone()),
+                job_id: artifact.as_ref().map(|a| a.job_id.clone()),
+            });
+            for input in self.inputs_for_output(&cur)? {
+                edges.push((input.clone(), cur.clone()));
+                if !seen.contains(&input) {
+                    queue.push_back(input);
+                }
+            }
+        }
+        // A restricted node is dropped, but an edge INTO it was recorded while
+        // walking its consumer (before the exclusion fired). Drop every edge with
+        // an excluded endpoint so no `clinical → …` edge leaks into the export.
+        let kept: HashSet<&str> = nodes.iter().map(|n| n.content_hash.as_str()).collect();
+        edges.retain(|(from, to)| kept.contains(from.as_str()) && kept.contains(to.as_str()));
+        // Deterministic order so a DOT/JSON export is byte-stable across runs.
+        nodes.sort_by(|a, b| a.content_hash.cmp(&b.content_hash));
+        edges.sort();
+        Ok(crate::lineage_report::ProvenanceGraph {
+            root: hash.to_lowercase(),
+            nodes,
+            edges,
+        })
+    }
+
     /// Number of indexed runs (for `reindex` reporting + tests).
     pub fn run_count(&self) -> Result<i64> {
         self.conn
@@ -720,6 +829,9 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
         gpu_name: None,
         ram_gib: Some(snap.mem_total_gb as i64),
         vram_mib: snap.vram_total_mib.map(|v| v as i64),
+        // ADR 0096: threading the run's actual tenant into lineage ingestion is a
+        // follow-up; empty ⇒ `default` (record_run coerces).
+        tenant: String::new(),
     })?;
     for rec in crate::framework::lineage::scan_artifacts(job_id)?.into_iter() {
         db.record_artifact(&ArtifactRow {
@@ -799,6 +911,7 @@ fn row_to_run(row: &rusqlite::Row) -> rusqlite::Result<RunRow> {
         gpu_name: row.get(8)?,
         ram_gib: row.get(9)?,
         vram_mib: row.get(10)?,
+        tenant: row.get(11)?,
     })
 }
 
