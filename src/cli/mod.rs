@@ -257,6 +257,40 @@ enum PlanCommand {
         #[arg(long)]
         args: String,
     },
+    /// Publish a `.json` PlanSpec to the deployment registry (ADR 0085):
+    /// typecheck fail-closed, then store an immutable fingerprint-keyed row.
+    Publish {
+        /// Path to a `.json` PlanSpec.
+        spec: std::path::PathBuf,
+        /// Owning tenant (default `shared`; `restricted` = clinical/PHI).
+        #[arg(long, default_value = "shared")]
+        tenant: String,
+    },
+    /// Promote a published fingerprint onto a named pointer
+    /// (`registry://plan@<name>`), recording the move in the audit trail.
+    Promote {
+        /// The deployment fingerprint to promote.
+        fingerprint: String,
+        /// Target pointer, e.g. `registry://plan@prod`.
+        pointer: String,
+        /// Acting tenant — must match the deployment's tenant.
+        #[arg(long, default_value = "shared")]
+        tenant: String,
+    },
+    /// Roll a pointer back to its previous target atomically.
+    Rollback {
+        /// Pointer, e.g. `registry://plan@prod`.
+        pointer: String,
+        #[arg(long, default_value = "shared")]
+        tenant: String,
+    },
+    /// Print a pointer's deployment audit trail (oldest first).
+    History {
+        /// Pointer, e.g. `registry://plan@prod`.
+        pointer: String,
+        #[arg(long, default_value = "shared")]
+        tenant: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -763,7 +797,76 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             print!("{rendered}");
             Ok(())
         }
+        PlanCommand::Publish { spec, tenant } => {
+            let text = std::fs::read_to_string(&spec)
+                .with_context(|| format!("read PlanSpec {}", spec.display()))?;
+            let plan_spec: crate::framework::plan_spec::PlanSpec =
+                serde_json::from_str(&text).with_context(|| "parse PlanSpec JSON")?;
+            let conn = crate::registry_db::open().map_err(|e| anyhow!("{e}"))?;
+            let fp = crate::registry_db::publish(
+                &conn,
+                reg,
+                &plan_spec,
+                &acting_user(),
+                &tenant,
+                spec.to_str(),
+                now_unix(),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+            println!("published {fp}  (tenant={tenant})");
+            Ok(())
+        }
+        PlanCommand::Promote {
+            fingerprint,
+            pointer,
+            tenant,
+        } => {
+            let name = crate::registry_db::parse_pointer_uri(&pointer)
+                .ok_or_else(|| anyhow!("not a `registry://plan@<name>` URI: {pointer}"))?;
+            let mut conn = crate::registry_db::open().map_err(|e| anyhow!("{e}"))?;
+            crate::registry_db::promote(&mut conn, &fingerprint, &tenant, name, now_unix())
+                .map_err(|e| anyhow!("{e}"))?;
+            println!("promoted {fingerprint} → registry://plan@{name}");
+            Ok(())
+        }
+        PlanCommand::Rollback { pointer, tenant } => {
+            let name = crate::registry_db::parse_pointer_uri(&pointer)
+                .ok_or_else(|| anyhow!("not a `registry://plan@<name>` URI: {pointer}"))?;
+            let mut conn = crate::registry_db::open().map_err(|e| anyhow!("{e}"))?;
+            let prev = crate::registry_db::rollback(&mut conn, &tenant, name, now_unix())
+                .map_err(|e| anyhow!("{e}"))?;
+            println!("rolled back registry://plan@{name} → {prev}");
+            Ok(())
+        }
+        PlanCommand::History { pointer, tenant } => {
+            let name = crate::registry_db::parse_pointer_uri(&pointer)
+                .ok_or_else(|| anyhow!("not a `registry://plan@<name>` URI: {pointer}"))?;
+            let conn = crate::registry_db::open().map_err(|e| anyhow!("{e}"))?;
+            let hist =
+                crate::registry_db::history(&conn, &tenant, name).map_err(|e| anyhow!("{e}"))?;
+            if hist.is_empty() {
+                println!("no history for registry://plan@{name}");
+            }
+            for h in &hist {
+                println!("{}  {}", h.moved_at, h.plan_fingerprint);
+            }
+            Ok(())
+        }
     }
+}
+
+/// The acting user recorded as a deployment's publisher.
+fn acting_user() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// UNIX seconds now (CLI-side; the registry fns take the timestamp explicitly so
+/// they stay pure/deterministic for tests).
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn run_sensor_cmd(cmd: SensorCommand) -> Result<()> {

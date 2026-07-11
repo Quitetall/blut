@@ -204,10 +204,23 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                     }
                 }
                 Some(path) => {
-                    // Compile + kind-check the recipe (dispatch by extension:
-                    // .toml chain / .star script / .json PlanSpec) into a
-                    // runnable plan, then render or launch it.
-                    let (name, plan, n) = compile_declared_recipe(reg, &path, &args)?;
+                    // A `registry://plan@<name>` deploy URI (ADR 0085) resolves
+                    // to a FROZEN PlanSpec from the local registry and dispatches
+                    // that exact graph; otherwise `path` is a recipe file
+                    // (dispatch by extension: .toml chain / .star script / .json
+                    // PlanSpec) into a runnable plan, then render or launch it.
+                    let (name, plan, n) = if let Some(ptr) =
+                        crate::registry_db::parse_pointer_uri(&path.to_string_lossy())
+                    {
+                        let conn = crate::registry_db::open().map_err(|e| anyhow!("{e}"))?;
+                        let spec = crate::registry_db::resolve_spec(&conn, "shared", ptr)
+                            .map_err(|e| anyhow!("{e}"))?;
+                        let plan = spec.compile(reg).map_err(|e| anyhow!("{e}"))?;
+                        let n = plan.n_nodes();
+                        (format!("registry://plan@{ptr}"), plan, n)
+                    } else {
+                        compile_declared_recipe(reg, &path, &args)?
+                    };
                     if run {
                         // LAUNCH: execute through the same admission-gated /
                         // cgroup-contained / cache-honouring core as `recipe
