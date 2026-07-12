@@ -144,10 +144,10 @@ impl Stage for ObjectFetch {
         // user-supplied URI so a `-`-leading value can't be read as a flag.
         let status = tokio::process::Command::new(&args.tool)
             .arg("get")
+            .args(&args.extra) // verbatim tool FLAGS come before `--`
             .arg("--")
             .arg(&input.uri)
             .arg(&dest)
-            .args(&args.extra)
             .status()
             .await
             .map_err(|e| {
@@ -208,10 +208,10 @@ impl Stage for ObjectStore {
             .unwrap_or_else(|| format!("connector://{}", input.content_hash.to_hex()));
         let status = tokio::process::Command::new(&args.tool)
             .arg("put")
+            .args(&args.extra) // verbatim tool FLAGS come before `--`
             .arg("--")
             .arg(&input.path)
             .arg(&uri)
-            .args(&args.extra)
             .status()
             .await
             .map_err(|e| {
