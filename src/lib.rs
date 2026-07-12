@@ -60,6 +60,7 @@ pub mod registry_db;
 pub mod runs;
 pub mod schedule;
 pub mod scheduler_lock;
+pub mod secrets;
 pub mod sensor;
 pub mod spec;
 pub mod tenant;
