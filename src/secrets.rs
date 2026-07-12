@@ -73,11 +73,15 @@ impl Secret {
 
 impl Drop for Secret {
     fn drop(&mut self) {
-        // Best-effort zeroise: overwrite the heap bytes before the Vec frees
-        // (no `zeroize` dep, no `unsafe` — a plain in-place overwrite).
+        // Zeroise the heap bytes before the Vec frees. A plain `= 0` loop to
+        // about-to-be-freed memory is a DEAD STORE the optimiser may elide; no
+        // `zeroize` dep + `unsafe` is denied here, so `black_box` is the safe,
+        // dependency-free barrier — it forces the writes to be observed so they
+        // survive optimisation.
         for b in self.0.iter_mut() {
             *b = 0;
         }
+        std::hint::black_box(&self.0);
     }
 }
 
@@ -149,11 +153,12 @@ impl SecretResolver for EnvResolver {
 /// value is scrubbed before the line is written/streamed. Empty values are
 /// ignored (they would match everything).
 pub fn redact(text: &str, secrets: &[(&str, &str)]) -> String {
+    // Longest value first: if one secret's value is a substring of another's,
+    // scrubbing the shorter first could break the longer's match.
+    let mut ordered: Vec<&(&str, &str)> = secrets.iter().filter(|(_, v)| !v.is_empty()).collect();
+    ordered.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
     let mut out = text.to_string();
-    for (name, value) in secrets {
-        if value.is_empty() {
-            continue;
-        }
+    for (name, value) in ordered {
         out = out.replace(value, &format!("«redacted:{name}»"));
     }
     out

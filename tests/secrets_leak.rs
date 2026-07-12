@@ -13,6 +13,8 @@ use blut::framework::cache::CacheHandle;
 use blut::framework::plan_spec::{PlanSpec, SpecNode};
 use blut::secrets::{EnvResolver, ResolveCtx, SecretError, SecretRef, SecretResolver};
 
+// Env-var names must be UNIQUE per test — `set_var` is process-global and the
+// tests run in parallel (SECRET_LEAK_A / SECRET_LEAK_B / PLAIN are distinct).
 const SENTINEL: &str = "PLAINTEXT-SENTINEL-9f3a2b";
 
 #[derive(serde::Serialize)]
