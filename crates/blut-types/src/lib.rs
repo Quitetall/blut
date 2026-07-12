@@ -8,4 +8,5 @@
 //! The engine RE-EXPORTS these at their old paths, so moving a type here is
 //! zero-churn downstream (ADR 0083 §2).
 
+pub mod gpu;
 pub mod report;

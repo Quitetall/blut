@@ -28,6 +28,11 @@ pub struct PlanSubmission {
     pub args: Option<String>,
     /// Target namespace (`default` if `None`).
     pub namespace: Option<String>,
+    /// GPUs the plan's pod requests — rendered as a `gpus:` spec field the
+    /// operator maps to a `nvidia.com/gpu` resource limit (ADR 0087 distributed
+    /// tail). `0` ⇒ the field is omitted, so the manifest is byte-identical to
+    /// the pre-ADR render.
+    pub gpus: u32,
 }
 
 /// YAML-escape a scalar as a double-quoted string (covers `"`, `\`, and
@@ -88,6 +93,14 @@ pub fn render_blut_plan_manifest(sub: &PlanSubmission) -> Result<String> {
     if let Some(args) = &sub.args {
         y.push_str(&format!("  args: {}\n", yaml_quote(args)));
     }
+    // ADR 0087: only emit `gpus:` when the plan actually asks for GPUs — 0 keeps
+    // the manifest byte-identical to the pre-ADR render. The operator maps this
+    // to a `nvidia.com/gpu` limit on the pod.
+    if sub.gpus > 0 {
+        // `gpus` is a `u32` — safe to render as a bare YAML integer (no
+        // `yaml_quote` needed, unlike the string scalars above).
+        y.push_str(&format!("  gpus: {}\n", sub.gpus));
+    }
     Ok(y)
 }
 
@@ -138,6 +151,7 @@ mod tests {
             data_class_ceiling: "Internal".into(),
             args: None,
             namespace: Some("blut".into()),
+            gpus: 0,
         }
     }
 
@@ -173,5 +187,14 @@ mod tests {
         assert!(!render_blut_plan_manifest(&s).unwrap().contains("args:"));
         s.args = Some("{\"tier\":3}".into());
         assert!(render_blut_plan_manifest(&s).unwrap().contains("args:"));
+    }
+
+    #[test]
+    fn gpus_emitted_only_when_nonzero() {
+        // ADR 0087: gpus=0 keeps the manifest byte-identical to the pre-ADR render.
+        let mut s = sub();
+        assert!(!render_blut_plan_manifest(&s).unwrap().contains("gpus:"));
+        s.gpus = 4;
+        assert!(render_blut_plan_manifest(&s).unwrap().contains("gpus: 4\n"));
     }
 }

@@ -714,6 +714,11 @@ pub struct RayLauncher {
     pub address: Option<String>,
     /// `--runtime-env-json` (deps / env for the job).
     pub runtime_env: Option<String>,
+    /// GPUs the entrypoint reserves — emitted as `--entrypoint-num-gpus` so the
+    /// Ray scheduler places the job on a node with that many GPUs (ADR 0087
+    /// distributed tail; mirrors [`SlurmLauncher::gpus`]). `None` ⇒ no flag, so
+    /// the submitted command is byte-identical to the pre-ADR path.
+    pub num_gpus: Option<u32>,
     /// Verbatim passthrough flags appended before the `--` separator.
     pub extra: Vec<String>,
 }
@@ -734,6 +739,10 @@ impl Launcher for RayLauncher {
         if let Some(re) = &self.runtime_env {
             args.push("--runtime-env-json".to_string());
             args.push(re.clone());
+        }
+        // ADR 0087: a GPU-bearing unit reserves `count` GPUs on the placed node.
+        if let Some(g) = self.num_gpus {
+            args.push(format!("--entrypoint-num-gpus={g}"));
         }
         args.extend(self.extra.iter().filter(|x| *x != "--").cloned());
         args.push("--".to_string());
@@ -973,6 +982,7 @@ pub fn launcher_for(target: LaunchTarget) -> Box<dyn Launcher> {
         LaunchTarget::Ray => Box::new(RayLauncher {
             address: env("RAY_ADDRESS"),
             runtime_env: env("BLUT_RAY_RUNTIME_ENV"),
+            num_gpus: env_u32("BLUT_RAY_NUM_GPUS"),
             extra: Vec::new(),
         }),
         // P2P dispatch is handled by DispatchSubmitter, not Launcher.
@@ -1161,6 +1171,7 @@ mod tests {
         let l = RayLauncher {
             address: Some("http://h:8265".into()),
             runtime_env: Some(r#"{"pip":["torch"]}"#.into()),
+            num_gpus: None,
             extra: vec![],
         };
         let c = l
@@ -1174,7 +1185,27 @@ mod tests {
         assert!(a.contains(&"--runtime-env-json".to_string()));
         let sep = a.iter().position(|x| x == "--").unwrap();
         assert_eq!(&a[sep + 1..], &["python", "-m", "t"]);
+        // num_gpus None ⇒ no GPU flag (byte-identical to the pre-ADR path).
+        assert!(!a.iter().any(|x| x.starts_with("--entrypoint-num-gpus")));
         assert!(RayLauncher::default().build_command("u", &[]).is_err());
+    }
+
+    #[test]
+    fn ray_emits_entrypoint_num_gpus_when_set() {
+        // ADR 0087: a GPU-bearing unit reserves `count` GPUs, and the flag lands
+        // BEFORE the `--` separator (it's a `ray job submit` flag, not a job arg).
+        let l = RayLauncher {
+            num_gpus: Some(2),
+            ..Default::default()
+        };
+        let c = l.build_command("job-g", &["python".into()]).unwrap();
+        let a = argv(&c);
+        let gpu = a
+            .iter()
+            .position(|x| x == "--entrypoint-num-gpus=2")
+            .expect("the GPU flag is emitted");
+        let sep = a.iter().position(|x| x == "--").unwrap();
+        assert!(gpu < sep, "the flag precedes the `--` separator");
     }
 
     #[test]

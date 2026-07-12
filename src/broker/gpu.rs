@@ -20,8 +20,14 @@
 use std::process::Command;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+// ADR 0083: `GpuRequest` is a pure-serde resource-envelope WIRE type (it rides
+// the PlanSpec and crosses to the distributed launchers + the blut-web sidecar),
+// so it lives in the wasm32-safe keystone. Re-exported here at its historical
+// `crate::broker::gpu::GpuRequest` path — zero churn for `stage.rs` / the
+// executor. The runtime `GpuInventory`/`GpuScheduler` below stay engine-side.
+pub use blut_types::gpu::GpuRequest;
 
 /// One physical accelerator, as seen by the one-shot inventory probe. `index`
 /// is the driver's device index (what `CUDA_VISIBLE_DEVICES` names); `uuid`
@@ -33,31 +39,6 @@ pub struct GpuDevice {
     pub vram_total_mib: u64,
     pub vram_free_mib: u64,
     pub model: String,
-}
-
-/// A stage's GPU ask, part of its typed resource envelope. `Default` is the
-/// whole-device exclusive request — an un-annotated stage behaves exactly as
-/// under the legacy single semaphore.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct GpuRequest {
-    /// Devices to hold for the stage's lifetime.
-    pub count: u32,
-    /// Minimum free VRAM (MiB) each granted device must have. `0` = any device.
-    pub min_vram_mib: u64,
-    /// Whole-device exclusivity. v1 is exclusive-only (no fractional sharing —
-    /// see ADR 0087 Alternatives); the field is reserved for a future MIG path.
-    pub exclusive: bool,
-}
-
-impl Default for GpuRequest {
-    fn default() -> Self {
-        Self {
-            count: 1,
-            min_vram_mib: 0,
-            exclusive: true,
-        }
-    }
 }
 
 /// A one-shot snapshot of the box's GPUs. Built once per executor run — never
