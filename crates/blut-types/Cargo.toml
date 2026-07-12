@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# blut-types (ADR 0083) — the wasm32-safe KEYSTONE crate: pure-serde wire types
+# shared by the engine and the (Rust-end-to-end) web/notify sidecars. serde +
+# serde_json are the only structural deps; sha2/faster_hex are pure-Rust
+# content-addressing helpers. NO tokio, rusqlite, filesystem, or engine dep — a
+# required `cargo check --target wasm32-unknown-unknown -p blut-types` CI job
+# keeps this invariant green (the Leptos+WASM UI depends on it).
+[package]
+name = "blut-types"
+version = "1.0.0"
+edition = "2024"
+# Edition 2024 needs Rust 1.85+ — pin the same MSRV as the engine so a downstream
+# consumer gets a clear toolchain error, not a mid-compile edition failure.
+rust-version = "1.85"
+authors = ["Brian Lam"]
+license = "AGPL-3.0-or-later"
+description = "BLUT wasm32-safe wire types — the keystone shared by the engine and its web/notify sidecars (ADR 0083)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# Match the engine's pin (0.10) so the workspace resolves ONE copy of the crate
+# — the content-hash hex is produced identically on both sides of the split.
+# 0.10's SIMD is std/target-gated with a pure fallback, so it wasm32-checks clean
+# (the `wasm32-keystone` CI job is the guard).
+faster-hex = "0.10"

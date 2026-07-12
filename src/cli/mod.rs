@@ -232,6 +232,12 @@ enum Command {
         #[arg(long, default_value_t = false)]
         check: bool,
     },
+    /// A cargo-style EXTERNAL subcommand (ADR 0083): `blut <cmd> …` with no
+    /// built-in match execs `blut-<cmd>` from PATH with the remaining args — the
+    /// seam by which `blut web`/`blut notify` (and eventually `blut tui`) route
+    /// to their SIDECAR binaries the engine never links.
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 #[derive(Subcommand, Debug)]
@@ -495,6 +501,66 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 /// `blut connectors list [--check]` (ADR 0112) — enumerate connector stages +
 /// their typed I/O kinds; `--check` validates the registry (non-zero on a
 /// non-connector kind leaking into an integration graph).
+/// Cargo-style external-subcommand dispatch (ADR 0083): `blut <cmd> <args…>`
+/// with no built-in match execs `blut-<cmd>` from `PATH`, forwarding the
+/// remaining args and propagating its exit status. This is the seam by which
+/// the SIDECAR binaries the engine deliberately never links — `blut-web`
+/// (Leptos+WASM dashboard), `blut-notify`, and eventually `blut-tui` — are
+/// reachable as first-class `blut` subcommands without the engine growing an
+/// in-process server or a dylib-plugin loader (ADR 0034 charter).
+fn run_external(argv: Vec<String>) -> Result<()> {
+    let (name, rest) = argv
+        .split_first()
+        .ok_or_else(|| anyhow!("empty external subcommand"))?;
+    // ALLOWLIST the name (cargo's own convention for `cargo-<cmd>`): only
+    // `[A-Za-z0-9_-]`. Strictly safer than blocklisting separators — no path
+    // component, escape, or platform-specific separator can survive, so the child
+    // is always a plain `blut-<name>` resolved on PATH, never a path.
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(anyhow!("unknown subcommand `{name}`"));
+    }
+    let bin = format!("blut-{name}");
+    // Inherits the parent's stdio (no capture) — a sidecar's own output reaches
+    // the terminal directly; diagnostics that must survive a pipe go to stderr.
+    let status = std::process::Command::new(&bin)
+        .args(rest)
+        .status()
+        .map_err(|e| {
+            anyhow!(
+                "`{bin}` could not be executed — `blut {name}` dispatches to the \
+                 `{bin}` sidecar binary (ADR 0083); install it or check PATH: {e}"
+            )
+        })?;
+    if !status.success() {
+        return Err(anyhow!(
+            "`{bin}` exited with {}",
+            exit_status_reason(&status)
+        ));
+    }
+    Ok(())
+}
+
+/// Human-readable failure reason for a child `ExitStatus` — the code when it
+/// exited normally, or the terminating signal (Unix) so an OOM-killed sidecar
+/// reports e.g. `signal 9` rather than an opaque "signal".
+fn exit_status_reason(status: &std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("status {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return format!("signal {sig}");
+        }
+    }
+    "an unknown status".to_string()
+}
+
 fn run_connectors_cmd(cmd: ConnectorsCommand) -> Result<()> {
     match cmd {
         ConnectorsCommand::List { check, json } => {
@@ -749,6 +815,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
                 crate::tui::run_console_loop(std::sync::Arc::new(reg)).await
             }
         }
+        Some(Command::External(argv)) => run_external(argv),
         // Bare `blut`: the default (TUI-on) build opens the BLUT console; a
         // cookbook's own TUI is reachable from its selector. A
         // `--no-default-features` (CLI-only) build has no interactive mode —
@@ -807,6 +874,45 @@ fn print_stage_failure_detail(err: &anyhow::Error) {
     }
     if let Some(ingredient) = &sf.ingredient {
         eprintln!("    · ingredient: {ingredient}");
+    }
+}
+
+#[cfg(test)]
+mod external_subcommand_tests {
+    //! ADR 0083 — the cargo-style external-subcommand seam. `blut <cmd>` with no
+    //! built-in match execs `blut-<cmd>` from PATH. These pin the two
+    //! fail-closed guards without needing a real sidecar on PATH.
+    use super::run_external;
+
+    #[test]
+    fn rejects_path_traversal_names() {
+        for bad in ["../evil", "a/b", "..", "sub\\dir"] {
+            let err = run_external(vec![bad.to_string()])
+                .expect_err("a name with a path separator or `..` must be rejected");
+            assert!(
+                err.to_string().contains("unknown subcommand"),
+                "expected traversal rejection for {bad:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_argv_is_an_error() {
+        let err = run_external(vec![]).expect_err("empty external subcommand must error");
+        assert!(err.to_string().contains("empty external subcommand"));
+    }
+
+    #[test]
+    fn missing_sidecar_reports_the_binary_name() {
+        // A name that resolves to no `blut-<name>` binary on PATH: the error must
+        // name the sidecar and cite the dispatch, not silently succeed.
+        let err = run_external(vec!["nonexistent-sidecar-xyz".to_string()])
+            .expect_err("a missing sidecar must be a hard error, never a silent no-op");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("blut-nonexistent-sidecar-xyz") && msg.contains("could not be executed"),
+            "error must name the sidecar binary + the dispatch: {msg}"
+        );
     }
 }
 

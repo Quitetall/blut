@@ -150,3 +150,33 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
       - name: Build (lib + all targets)
         run: cargo build --workspace --all-targets
+
+  wasm32-keystone:
+    name: blut-types wasm32 keystone (ADR 0083)
+    runs-on: ubuntu-latest
+    # ADR 0083: `blut-types` is the wasm32-SAFE keystone crate — the pure-serde
+    # wire types shared by the engine and the Leptos+WASM `blut-web` sidecar. It
+    # must NEVER pull in tokio / rusqlite / filesystem / an engine dep, or the
+    # browser UI can't depend on it. This job is the fail-closed guard: a PR that
+    # adds a non-wasm dependency to blut-types breaks the `wasm32-unknown-unknown`
+    # check here before it can reach main.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Cache cargo registry + git + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-wasm-
+      - name: Check blut-types on wasm32-unknown-unknown
+        run: cargo check -p blut-types --target wasm32-unknown-unknown
+      - name: blut-types host tests
+        run: cargo test -p blut-types

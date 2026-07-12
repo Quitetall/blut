@@ -273,6 +273,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "blake3",
+ "blut-types",
  "bytes",
  "chrono",
  "clap",
@@ -313,6 +314,16 @@ dependencies = [
  "uuid",
  "which",
  "x25519-dalek",
+]
+
+[[package]]
+name = "blut-types"
+version = "1.0.0"
+dependencies = [
+ "faster-hex",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
