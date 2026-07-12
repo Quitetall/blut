@@ -375,7 +375,10 @@ enum ModelCommand {
         source: Option<String>,
     },
     /// Promote a registered hash onto `model://<name>@<alias>`, recording the
-    /// move in the audit trail.
+    /// move in the audit trail. Promotion to a GOVERNED alias (default `prod`,
+    /// override `$BLUT_MODEL_GOVERNED_ALIASES`) fail-closes on a governance gate
+    /// (`--gate-cmd` / `$BLUT_MODEL_GATE_CMD`) + `--change-id` (ADR 0090) — so
+    /// `@prod` can never point at an unvetted checkpoint.
     Promote {
         /// The checkpoint hash to promote.
         hash: String,
@@ -384,6 +387,14 @@ enum ModelCommand {
         /// Acting tenant — must match the model's tenant.
         #[arg(long, default_value = "shared")]
         tenant: String,
+        /// Change-request id for a governed-alias promotion (fed to the gate).
+        #[arg(long)]
+        change_id: Option<String>,
+        /// Governance gate argv (e.g. `"python …/pccp_gate.py --candidate {hash}
+        /// --model {name} --change-id {change_id}"`). Falls back to
+        /// `$BLUT_MODEL_GATE_CMD`. Required to promote onto a governed alias.
+        #[arg(long)]
+        gate_cmd: Option<String>,
     },
     /// Roll an alias back to its previous target atomically.
     Rollback {
@@ -1261,11 +1272,61 @@ fn run_model_cmd(cmd: ModelCommand) -> Result<()> {
             hash,
             pointer,
             tenant,
+            change_id,
+            gate_cmd,
         } => {
             let (name, alias) = parse(&pointer)?;
+            // Governed-alias set: `$BLUT_MODEL_GOVERNED_ALIASES` (comma-separated)
+            // overrides the default `["prod"]`.
+            let gov_env = std::env::var("BLUT_MODEL_GOVERNED_ALIASES").ok();
+            let governed: Vec<&str> = match &gov_env {
+                Some(s) => {
+                    let set: Vec<&str> = s
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|x| !x.is_empty())
+                        .collect();
+                    // Fail-SAFE: a blank/empty override must NOT silently disable
+                    // governance (ungovern @prod) — fall back to the default. The
+                    // env can only WIDEN the governed set, never empty it.
+                    if set.is_empty() {
+                        mr::DEFAULT_GOVERNED_ALIASES.to_vec()
+                    } else {
+                        set
+                    }
+                }
+                None => mr::DEFAULT_GOVERNED_ALIASES.to_vec(),
+            };
+            // For a governed alias, RUN the caller-supplied gate (flag or env) and
+            // compute a verdict; otherwise the verdict is unused. Fail-closed: a
+            // governed alias with no gate/change-id yields NotConfigured → refuse.
+            let verdict = if mr::is_governed(&alias, &governed) {
+                let gate_spec = gate_cmd.or_else(|| std::env::var("BLUT_MODEL_GATE_CMD").ok());
+                match (
+                    gate_spec.as_deref().and_then(mr::GateCmd::parse),
+                    &change_id,
+                ) {
+                    (Some(gate), Some(cid)) => {
+                        eprintln!("running governance gate for model://{name}@{alias} …");
+                        Some(mr::run_gate(&gate, &hash, &name, &alias, cid))
+                    }
+                    _ => Some(mr::GateVerdict::NotConfigured),
+                }
+            } else {
+                None
+            };
             let mut conn = mr::open().map_err(|e| anyhow!("{e}"))?;
-            mr::promote(&mut conn, &hash, &tenant, &name, &alias, now_unix())
-                .map_err(|e| anyhow!("{e}"))?;
+            mr::promote_governed(
+                &mut conn,
+                &hash,
+                &tenant,
+                &name,
+                &alias,
+                &governed,
+                verdict.as_ref(),
+                now_unix(),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
             println!("promoted {hash} → model://{name}@{alias}");
             Ok(())
         }

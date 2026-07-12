@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Brian Lam
-//! Local **model registry** (ADR 0090, increment 1) — a named, promotable,
+//! Local **model registry** (ADR 0090, increments 1–2) — a named, promotable,
 //! rollback-able surface over checkpoint content hashes, sharing the frozen
 //! ADR-0085 `~/.blut/registry.db` and mirroring its pattern verb-for-verb.
 //!
@@ -23,10 +23,14 @@
 //! A Restricted-tenant checkpoint can never be promoted onto another tenant's
 //! pointer (ADR 0061/0096 clinical boundary), exactly as in 0085.
 //!
-//! Increment 2 (own gate) adds the PCCP fail-close: promotion to a governed
-//! alias (`@prod`) will shell out to `pccp_gate.py --change-id` so `@prod` can
-//! never point at an unpromoted checkpoint. This increment is the pure-engine
-//! registry mechanism; it deliberately does not yet call Python.
+//! Increment 2 adds the governance fail-close: promotion to a GOVERNED alias
+//! (default `prod`) must clear a governance gate first, so `@prod` can never
+//! point at an unvetted checkpoint. The engine stays domain-AGNOSTIC — it never
+//! names `pccp_gate.py`; it runs a CALLER-supplied gate command (the LamQuant
+//! cookbook wires PCCP via `--gate-cmd` / `$BLUT_MODEL_GATE_CMD`), exactly as
+//! ADR-0112 connectors delegate a verb to an external tool. The DB-mutating
+//! `promote_governed` stays pure (it takes an already-computed verdict); the
+//! impure subprocess runner `run_gate` is separate.
 
 use rusqlite::{Connection, params};
 
@@ -280,6 +284,146 @@ pub fn promote(
     Ok(())
 }
 
+// ── governance: PCCP fail-close on governed aliases (ADR 0090 incr 2) ──────────
+//
+// Promotion to a GOVERNED alias (default `prod`) must clear a domain governance
+// gate first, so `@prod` can never point at an unvetted checkpoint. The engine
+// is domain-AGNOSTIC: it never names `pccp_gate.py`. It runs a CALLER-SUPPLIED
+// gate command (the LamQuant cookbook / operator wires PCCP via `--gate-cmd` or
+// `$BLUT_MODEL_GATE_CMD`), exactly as ADR-0112 connectors delegate a verb to an
+// external tool. The DB-mutating `promote_governed` stays PURE — it takes an
+// already-computed [`GateVerdict`] (DI) so it is unit-testable without a
+// subprocess; the impure gate runner ([`run_gate`]) is separate.
+
+/// The default governed-alias set when none is configured: only `prod`.
+pub const DEFAULT_GOVERNED_ALIASES: &[&str] = &["prod"];
+
+/// Is `alias` governed (requires a passing gate before promotion)?
+pub fn is_governed(alias: &str, governed: &[&str]) -> bool {
+    governed.contains(&alias)
+}
+
+/// A checkpoint's verdict from the domain governance gate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GateVerdict {
+    /// The gate ran and PASSED — the checkpoint may enter a governed alias.
+    Pass,
+    /// The gate ran and REFUSED, or could not be run — fail-closed, with why.
+    Fail(String),
+    /// No gate was configured for a governed alias — fail-closed (a governed
+    /// alias can never be promoted onto without a gate).
+    NotConfigured,
+}
+
+/// A caller-supplied governance gate command. `args` may contain the
+/// placeholders `{hash}`, `{name}`, `{alias}`, `{change_id}`, substituted at run
+/// time. The engine never hardcodes a domain gate — the cookbook supplies e.g.
+/// `program="python", args=["…/pccp_gate.py","--candidate","{hash}","--model","{name}","--change-id","{change_id}"]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GateCmd {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+impl GateCmd {
+    /// Parse a whitespace-split command string (`"python x/pccp_gate.py --candidate {hash}"`)
+    /// into a `GateCmd`. Empty ⇒ `None`. This is the `$BLUT_MODEL_GATE_CMD` /
+    /// `--gate-cmd` surface; it does NOT invoke a shell, so no metacharacters are
+    /// interpreted — the string is a plain argv.
+    ///
+    /// LIMITATION: split is on whitespace with NO quoting, so a program path or
+    /// an argument that itself CONTAINS whitespace is not expressible here — wrap
+    /// such a gate in a space-free launcher script and point `--gate-cmd` at that.
+    pub fn parse(s: &str) -> Option<Self> {
+        let mut it = s.split_whitespace().map(str::to_string);
+        let program = it.next()?;
+        Some(Self {
+            program,
+            args: it.collect(),
+        })
+    }
+}
+
+/// Run a governance gate for a candidate and return its verdict. Impure (spawns
+/// a subprocess) — kept out of the DB path. Substitutes the placeholders into
+/// each arg, runs the command with NO shell (explicit program + argv, so the
+/// validated `{hash}`/`{name}`/`{alias}`/`{change_id}` can't inject), and maps
+/// exit-0 ⇒ `Pass`, non-zero ⇒ `Fail(stderr)`. A spawn failure is `Fail` too —
+/// fail-closed: a gate that can't run never yields `Pass`.
+///
+/// BLOCKING with NO timeout: call from a blocking context (the sync CLI). A
+/// runaway gate must be interrupted by the caller (Ctrl-C on the CLI). A bounded
+/// timeout + an async variant are a follow-up for automated (non-interactive)
+/// promotion callers.
+pub fn run_gate(
+    gate: &GateCmd,
+    model_hash: &str,
+    name: &str,
+    alias: &str,
+    change_id: &str,
+) -> GateVerdict {
+    let subst = |a: &str| -> String {
+        a.replace("{hash}", model_hash)
+            .replace("{name}", name)
+            .replace("{alias}", alias)
+            .replace("{change_id}", change_id)
+    };
+    let args: Vec<String> = gate.args.iter().map(|a| subst(a)).collect();
+    match std::process::Command::new(&gate.program)
+        .args(&args)
+        .output()
+    {
+        Ok(out) if out.status.success() => GateVerdict::Pass,
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let tail: String = stderr.trim().chars().take(500).collect();
+            GateVerdict::Fail(format!(
+                "gate `{}` exited {} — {tail}",
+                gate.program,
+                out.status.code().map_or("signal".into(), |c| c.to_string())
+            ))
+        }
+        Err(e) => GateVerdict::Fail(format!("gate `{}` could not run: {e}", gate.program)),
+    }
+}
+
+/// Promote WITH governance: if `alias` is governed, the supplied `verdict` MUST
+/// be `Pass` — else refuse fail-closed (a governed alias like `@prod` can never
+/// point at a checkpoint that hasn't cleared the domain gate, ADR 0090). If
+/// `alias` is ungoverned, `verdict` is ignored and this is byte-identical to
+/// [`promote`]. Pure + DB-only — the caller runs the gate ([`run_gate`]) and
+/// passes the verdict in, so this stays unit-testable without a subprocess.
+#[allow(clippy::too_many_arguments)]
+pub fn promote_governed(
+    conn: &mut Connection,
+    model_hash: &str,
+    tenant: &str,
+    name: &str,
+    alias: &str,
+    governed: &[&str],
+    verdict: Option<&GateVerdict>,
+    now_unix: i64,
+) -> Result<()> {
+    if is_governed(alias, governed) {
+        match verdict {
+            Some(GateVerdict::Pass) => {} // cleared — fall through to promote
+            Some(GateVerdict::Fail(why)) => {
+                return Err(TrainError::other(format!(
+                    "promote refused — governed alias '{alias}' gate did not pass: {why}"
+                )));
+            }
+            Some(GateVerdict::NotConfigured) | None => {
+                return Err(TrainError::other(format!(
+                    "promote refused — alias '{alias}' is governed (ADR 0090): promotion \
+                     requires a passing governance gate (--gate-cmd / $BLUT_MODEL_GATE_CMD) \
+                     and --change-id; none configured"
+                )));
+            }
+        }
+    }
+    promote(conn, model_hash, tenant, name, alias, now_unix)
+}
+
 /// Roll an alias back to its previous target atomically (one `BEGIN IMMEDIATE`
 /// transaction): read the two most-recent history entries, set the pointer to
 /// the second-most-recent, record the rollback. Errors if the alias has no prior
@@ -520,6 +664,130 @@ mod tests {
         promote(&mut c, HASH_A, SHARED_TENANT, "enc", "prod", 10).unwrap();
         // Only ONE entry in the trail → no prior to roll back to.
         assert!(rollback(&mut c, SHARED_TENANT, "enc", "prod", 20).is_err());
+    }
+
+    #[test]
+    fn governed_alias_requires_passing_gate() {
+        let mut c = db();
+        register(&c, HASH_A, "enc", SHARED_TENANT, None, 1).unwrap();
+        let gov = DEFAULT_GOVERNED_ALIASES; // ["prod"]
+
+        // Governed alias + no verdict → refused fail-closed (can't promote @prod
+        // without a gate).
+        assert!(
+            promote_governed(&mut c, HASH_A, SHARED_TENANT, "enc", "prod", gov, None, 10).is_err()
+        );
+        assert!(
+            resolve_pointer(&c, SHARED_TENANT, "enc", "prod")
+                .unwrap()
+                .is_none(),
+            "a refused governed promote must not create the pointer"
+        );
+        // Governed alias + NotConfigured → refused.
+        assert!(
+            promote_governed(
+                &mut c,
+                HASH_A,
+                SHARED_TENANT,
+                "enc",
+                "prod",
+                gov,
+                Some(&GateVerdict::NotConfigured),
+                11
+            )
+            .is_err()
+        );
+        // Governed alias + Fail → refused, error carries the reason.
+        let err = promote_governed(
+            &mut c,
+            HASH_A,
+            SHARED_TENANT,
+            "enc",
+            "prod",
+            gov,
+            Some(&GateVerdict::Fail("PRD 0.31 < floor 0.42".into())),
+            12,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("PRD 0.31 < floor 0.42"));
+        // Governed alias + Pass → promotes.
+        promote_governed(
+            &mut c,
+            HASH_A,
+            SHARED_TENANT,
+            "enc",
+            "prod",
+            gov,
+            Some(&GateVerdict::Pass),
+            13,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_pointer(&c, SHARED_TENANT, "enc", "prod")
+                .unwrap()
+                .as_deref(),
+            Some(HASH_A)
+        );
+    }
+
+    #[test]
+    fn ungoverned_alias_ignores_verdict() {
+        // An ungoverned alias (`staging`) promotes regardless of the verdict —
+        // byte-identical to plain `promote`, even with a Fail verdict passed in.
+        let mut c = db();
+        register(&c, HASH_A, "enc", SHARED_TENANT, None, 1).unwrap();
+        promote_governed(
+            &mut c,
+            HASH_A,
+            SHARED_TENANT,
+            "enc",
+            "staging",
+            DEFAULT_GOVERNED_ALIASES,
+            Some(&GateVerdict::Fail("irrelevant".into())),
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_pointer(&c, SHARED_TENANT, "enc", "staging")
+                .unwrap()
+                .as_deref(),
+            Some(HASH_A)
+        );
+    }
+
+    #[test]
+    fn gate_cmd_parse_and_run() {
+        assert_eq!(GateCmd::parse("   "), None);
+        let g = GateCmd::parse("python gate.py --candidate {hash}").unwrap();
+        assert_eq!(g.program, "python");
+        assert_eq!(g.args, vec!["gate.py", "--candidate", "{hash}"]);
+
+        // `true` exits 0 ⇒ Pass; `false` exits 1 ⇒ Fail; a missing binary ⇒ Fail
+        // (fail-closed: a gate that can't run never yields Pass).
+        let pass = GateCmd {
+            program: "true".into(),
+            args: vec![],
+        };
+        assert_eq!(
+            run_gate(&pass, HASH_A, "enc", "prod", "chg-1"),
+            GateVerdict::Pass
+        );
+        let fail = GateCmd {
+            program: "false".into(),
+            args: vec![],
+        };
+        assert!(matches!(
+            run_gate(&fail, HASH_A, "enc", "prod", "chg-1"),
+            GateVerdict::Fail(_)
+        ));
+        let missing = GateCmd {
+            program: "blut-no-such-gate-xyz".into(),
+            args: vec![],
+        };
+        assert!(matches!(
+            run_gate(&missing, HASH_A, "enc", "prod", "chg-1"),
+            GateVerdict::Fail(_)
+        ));
     }
 
     #[test]
