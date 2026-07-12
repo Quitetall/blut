@@ -83,6 +83,80 @@ impl PartitionStatus {
     }
 }
 
+/// The richer per-cell status matrix (ADR 0101): derived from the recorded
+/// outcome + the clinical flag + whether an upstream partition's artifact hash
+/// changed. `--missing`/`--stale` backfill selectors target exactly the cells in
+/// those states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CellStatus {
+    /// Done AND its upstreams unchanged — a re-run is a cache hit (free).
+    Materialized,
+    /// Done, but an upstream partition's artifact hash changed — needs a re-run.
+    Stale,
+    /// Ran and did not complete (outcome ≠ `done`).
+    Failed,
+    /// A clinical/PHI (ADR 0061) cell — never surfaced as materialized in a
+    /// cloud view, and a backfill refuses it fail-closed.
+    Restricted,
+    /// Never run.
+    Missing,
+}
+
+impl CellStatus {
+    /// Derive a cell's status. Clinical dominates (checked first, fail-closed):
+    /// a `restricted` cell is `Restricted` regardless of its run state.
+    pub fn derive(
+        recorded: Option<&PartitionStatus>,
+        restricted: bool,
+        upstream_stale: bool,
+    ) -> CellStatus {
+        if restricted {
+            return CellStatus::Restricted;
+        }
+        match recorded {
+            None => CellStatus::Missing,
+            Some(s) if !s.is_materialized() => CellStatus::Failed,
+            Some(_) if upstream_stale => CellStatus::Stale,
+            Some(_) => CellStatus::Materialized,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CellStatus::Materialized => "materialized",
+            CellStatus::Stale => "stale",
+            CellStatus::Failed => "failed",
+            CellStatus::Restricted => "restricted",
+            CellStatus::Missing => "missing",
+        }
+    }
+}
+
+/// Build the status matrix for a set's cells: each cell → its derived
+/// [`CellStatus`]. `restricted_of` flags a clinical cell (ADR 0061); `stale_of`
+/// reports whether a materialized cell's upstreams drifted (the ADR-0100/lineage
+/// hash comparison — injected so this stays a pure, testable derivation).
+pub fn status_matrix(
+    cells: &[PartitionCell],
+    latest: &std::collections::BTreeMap<String, PartitionStatus>,
+    restricted_of: impl Fn(&str) -> bool,
+    stale_of: impl Fn(&str) -> bool,
+) -> Vec<(String, CellStatus)> {
+    cells
+        .iter()
+        .map(|c| {
+            let recorded = latest.get(&c.key);
+            // Short-circuit: the (potentially DB/lineage-costly) stale check is
+            // only relevant for a materialized cell — a Missing/Failed/Restricted
+            // cell never reaches the stale branch of `derive`.
+            let stale = recorded.is_some_and(PartitionStatus::is_materialized) && stale_of(&c.key);
+            let status = CellStatus::derive(recorded, restricted_of(&c.key), stale);
+            (c.key.clone(), status)
+        })
+        .collect()
+}
+
 /// Hard ceiling on a partition's cell count — `validate()` rejects above it so
 /// an accidental product (many dims × many values) can't explode a backfill.
 const MAX_CELLS: usize = 100_000;
@@ -357,6 +431,50 @@ impl PartitionSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cell_status_matrix_derives_all_states() {
+        use std::collections::BTreeMap;
+        let cells: Vec<PartitionCell> = ["a", "b", "c", "d", "phi"]
+            .iter()
+            .map(|k| PartitionCell {
+                key: k.to_string(),
+                overrides: vec![],
+            })
+            .collect();
+        let done = |k: &str| PartitionStatus {
+            key: k.into(),
+            job_id: "j".into(),
+            outcome: "done".into(),
+            recorded_at: 1,
+        };
+        let mut latest = BTreeMap::new();
+        latest.insert("a".to_string(), done("a")); // materialized (fresh)
+        latest.insert("b".to_string(), done("b")); // materialized but stale
+        latest.insert(
+            "c".to_string(),
+            PartitionStatus {
+                key: "c".into(),
+                job_id: "j".into(),
+                outcome: "failed".into(),
+                recorded_at: 1,
+            },
+        ); // failed
+        // "d" has no record → missing. "phi" is restricted → restricted (even done).
+        latest.insert("phi".to_string(), done("phi"));
+
+        let restricted = |k: &str| k == "phi";
+        let stale = |k: &str| k == "b";
+        let m: std::collections::BTreeMap<_, _> = status_matrix(&cells, &latest, restricted, stale)
+            .into_iter()
+            .collect();
+        assert_eq!(m["a"], CellStatus::Materialized);
+        assert_eq!(m["b"], CellStatus::Stale);
+        assert_eq!(m["c"], CellStatus::Failed);
+        assert_eq!(m["d"], CellStatus::Missing);
+        // Clinical dominates: restricted even though it recorded `done`.
+        assert_eq!(m["phi"], CellStatus::Restricted);
+    }
 
     fn set() -> PartitionSet {
         PartitionSet {
