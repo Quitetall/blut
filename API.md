@@ -182,11 +182,12 @@ Windows is unsupported.
 
 ---
 
-## Stable surface (the 1.0 contract)
+## Preview surface (targeted for the 1.0 contract)
 
-From **1.0.0**, the following are the public API blut promises to keep
-semver-stable. Minor releases are **additive-only**; a breaking change to any of
-these requires a major bump. Cookbooks should pin `blut = "1"`.
+The current `0.2.0-alpha.1` line is a development preview, not a semver-stable
+1.0 release. The following surface is the intended 1.0 contract, but it may
+still change before the M6 release gate. Cookbooks should pin the exact preview
+version while the campaign is in progress.
 
 - **Traits:** `framework::Stage`, `framework::Artifact`, `framework::Compatible`,
   `recipes::recipe::Recipe`, `framework::Cookbook`, `backends::TrainingBackend`,
@@ -202,10 +203,10 @@ these requires a major bump. Cookbooks should pin `blut = "1"`.
 - **CLI entry:** `cli::run(Registry)`.
 
 **Not yet stable** (may change before they're promoted): the cockpit's internal
-`tui` module surface (the cockpit ships in 1.0, but it is driven entirely
-through the stable `cli::run` entry — the `View`/drawer internals are not a
-public contract); the `Slurm` / `Ray` launchers (deferred); the
+`tui` module surface (the cockpit is included in the preview, but it is driven
+entirely through the intended `cli::run` entry — the `View`/drawer internals are
+not a public contract); the `Slurm` / `Ray` launchers (deferred); the
 `broker::Drivers` footprint-driver shape (a planned post-1.0 refactor moves its
 domain-specific arg parsing into cookbooks — additive, but the `Drivers` fields
-may change). Treat anything not listed under "Stable surface" as subject to
+may change). Treat anything not listed under "Preview surface" as subject to
 change.

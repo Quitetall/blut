@@ -288,11 +288,12 @@ dependencies = [
 
 [[package]]
 name = "blut"
-version = "1.0.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "anyhow",
  "async-trait",
  "bincode",
+ "blut-types",
  "chrono",
  "clap",
  "crossterm 0.28.1",
@@ -326,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "blut-dsl"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "anyhow",
  "blut",
@@ -335,6 +336,16 @@ dependencies = [
  "serde_json",
  "starlark",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "blut-types"
+version = "0.2.0-alpha.1"
+dependencies = [
+ "faster-hex",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

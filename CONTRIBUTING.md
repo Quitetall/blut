@@ -44,16 +44,17 @@ will be redirected to a cookbook crate. If you think the engine is
 missing a *generic* seam that your domain needs, open an issue describing
 the seam, not the domain.
 
-## API stability
+## API preview
 
-The public 1.0 surface is a stability contract — see the "Stable surface"
-section in [`API.md`](API.md).
+The current `0.2.0-alpha.1` surface is a preview of the intended 1.0 contract —
+see the "Preview surface" section in [`API.md`](API.md). Until the M6 release
+gate, downstream cookbooks should pin the exact preview version.
 
-- **Additive changes only on minor versions.** New items, new optional
-  arguments, new variants behind `#[non_exhaustive]` — fine.
-- **Breaking changes need a major bump and discussion first.** Open an
-  issue describing the break and the migration before writing the PR.
-  Silent signature changes to stable items will be rejected.
+- **Prefer additive changes.** New items, new optional arguments, and new
+  variants behind `#[non_exhaustive]` reduce preview churn.
+- **Breaking preview changes need discussion first.** Open an issue describing
+  the break and migration before writing the PR. Once 1.0 ships, breaking
+  changes require a major bump.
 
 ## Commit style
 

@@ -31,7 +31,13 @@ impl PlanDraft {
             "plan node count exceeds u32"
         );
         let id = self.nodes.len() as u32;
-        self.nodes.push(SpecNode { stage, args });
+        self.nodes.push(SpecNode {
+            stage,
+            args,
+            retry: None,
+            timeout: None,
+            priority: None,
+        });
         for &p in after {
             self.edges.push((p, id));
         }
@@ -68,6 +74,9 @@ mod tests {
         let spec = d.into_spec("p".into());
         assert_eq!(spec.nodes.len(), 3);
         assert_eq!(spec.nodes[1].args, json!({ "k": 1 }));
+        assert!(spec.nodes.iter().all(|node| {
+            node.retry.is_none() && node.timeout.is_none() && node.priority.is_none()
+        }));
         assert_eq!(spec.version, PLAN_SPEC_VERSION);
     }
 }

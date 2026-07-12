@@ -2,7 +2,7 @@
 
 [package]
 name = "blut-worker"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 edition = "2024"
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
@@ -13,7 +13,7 @@ name = "blut-worker"
 path = "src/main.rs"
 
 [dependencies]
-blut = { path = "../.." }
+blut = { path = "../..", version = "0.2.0-alpha.1" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

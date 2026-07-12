@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "blut"
-version = "1.0.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "blut-types"
-version = "1.0.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "faster-hex",
  "serde",

@@ -68,7 +68,7 @@ let result = ParallelExecutor::execute(plan.into_compiled(), ctx).await?;
 
 ## Key features
 
-### v1.0.0 — current release ([CHANGELOG](CHANGELOG.md))
+### v0.2.0-alpha.1 — current development preview ([CHANGELOG](CHANGELOG.md))
 
 | Feature | What |
 |---------|------|
@@ -177,8 +177,9 @@ blut::cli::run(registry()).await
 
 ## Status
 
-**Released: 1.0.0** (crates.io) — typed DAG, content-addressed cache,
-containment + admission, durable resume, observability, TUI cockpit.
+**Development tree: 0.2.0-alpha.1.** The latest crates.io `blut` release is
+0.1.0; this preview has not been published. Local 1.x tags are preserved as
+internal milestone history, not public-release evidence.
 
 **On main, unreleased:** P2P module, DDP launch wiring, DAG optimizer, and
 the experimental cloud worker are end-to-end runnable and CI-gated; per-rung

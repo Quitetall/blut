@@ -10,6 +10,12 @@ depend on this crate.
 
 ## [Unreleased]
 
+### Changed
+- **Version truth repair.** The package family is reset to
+  `0.2.0-alpha.1`. The local 1.x tags are retained as internal milestone
+  history; they were not crates.io releases. A real 1.0 remains gated on the
+  M6 release train.
+
 ### Added
 - **Typed dynamic DAGs (ADR 0078).** `blut recipe declare` now accepts a
   `.json` [`PlanSpec`](API.md) (arbitrary kind-checked DAG) and a `.star`
@@ -26,11 +32,11 @@ depend on this crate.
     it forces `serde_json/arbitrary_precision` — incompatible with the
     engine's internally-tagged enums under Cargo feature unification.
 
-## [1.0.0] — 2026-06-19
+## [1.0.0] — 2026-06-19 (historical internal milestone; never published)
 
-**First public release (crates.io).** The engine is now a pure, decoupled,
-publishable framework — a clean line between the domain-agnostic orchestrator
-and any cookbook built on it.
+This local milestone recorded the engine carve. It was not a public crates.io
+release; the package version was later corrected to the `0.2.0-alpha.1`
+development line. The architectural changes below remain historical facts.
 
 ### Changed
 - **License: AGPL-3.0-or-later** (with a commercial license offered separately).
@@ -43,8 +49,8 @@ and any cookbook built on it.
   drops `ratatui`/`crossterm`/`fuzzy-matcher` for a lean CLI-only binary (bare
   `blut` then prints help). The cockpit is fully domain-clean and covered by a
   headless render/interaction test harness (`tui --check` + 57 unit tests).
-- **Stable surface contract.** From 1.0, minor releases are additive-only — see
-  the "Stable surface" section in `API.md`.
+- **Proposed stable surface contract.** This milestone drafted the future 1.0
+  additive-only contract; the current preview terms live in `API.md`.
 
 ### Removed
 - The bundled generic-LLM cookbook (concrete stages + lamu/hf backends + the

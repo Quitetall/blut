@@ -230,8 +230,8 @@ enum Command {
     /// presets / live-metrics / reset views. Keys: ↑↓ select, Enter log,
     /// c cancel, R recipe picker, J/L/Y/H/B/K/P/M/X switch views, q quit.
     ///
-    /// Behind the `tui` feature — DEFAULT-ON since 1.0 (bare `blut` opens
-    /// the cockpit); `--no-default-features` builds a lean CLI-only binary.
+    /// Behind the `tui` feature — DEFAULT-ON in the 0.2 preview (bare `blut`
+    /// opens the cockpit); `--no-default-features` builds a lean CLI-only binary.
     #[cfg(feature = "tui")]
     Tui {
         /// Headless self-check: build the cockpit + render every view to a test

@@ -68,7 +68,7 @@ pub mod sensor;
 pub mod spec;
 pub mod tenant;
 /// The interactive ratatui cockpit. Part of the default-on `tui` feature, so
-/// it ships in 1.0; a `--no-default-features` build drops it and the CLI
+/// it ships in the 0.2 preview; a `--no-default-features` build drops it and the CLI
 /// (`cli::run`) degrades to printing help for the bare `blut` command.
 #[cfg(feature = "tui")]
 pub mod tui;
@@ -77,7 +77,7 @@ pub mod tui;
 // the `backend` trait + concrete backends (`backends::{lamu,hf_trainer}`),
 // `convert`, and `conversations` — moved to the `blut-backends` crate.
 // `backends` here keeps ONLY the abstract `TrainingBackend` trait (the
-// public 1.0 backend-identity seam). The engine RETAINS `spec` /
+// intended public backend-identity seam). The engine RETAINS `spec` /
 // `protocol` / `python_kill` because the framework's job-persistence
 // layer (`jobs.rs`) reads the on-disk `TrainSpec` / `StatusUpdate`
 // schema and uses the subprocess-group lifecycle primitives.

@@ -49,7 +49,7 @@ use blut::backends::TrainingBackend;
 use blut::broker::{Drivers, FootprintSource, FootprintStore, ResourceSnapshot, decide};
 
 /// Local backend fixture for the framework benches. The engine ships
-/// no concrete backend after the v1.0 carve, and the in-crate test
+/// no concrete backend after the engine-carve milestone, and the in-crate test
 /// fixture is `#[cfg(test)]`-only (invisible to benches, which compile
 /// against the public non-test API). The benches need a
 /// `TrainingBackend` to parameterize `Plan<Out, B>` + the toy stages'

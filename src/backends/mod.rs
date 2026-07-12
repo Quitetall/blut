@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Brian Lam
-//! Backend abstraction — the public 1.0 backend-identity seam.
+//! Backend abstraction — the intended public backend-identity seam.
 //!
 //! BLUT is an orchestrator. Concrete training engines (HuggingFace
 //! Trainer, the LAMU `trainer.py` wire, plus domain backends supplied
 //! by cookbook crates) implement [`TrainingBackend`] and live OUTSIDE
-//! the engine: at the engine-only v1.0 carve the concrete identity
+//! the engine: at the engine-carve milestone the concrete identity
 //! structs (`HfTrainerBackend`, `LamuTrainerBackend`) + their runners /
 //! stages moved to the `blut-backends` crate. The engine keeps only the
 //! abstract trait here so a domain cookbook can tag its own backend
@@ -49,7 +49,7 @@ pub trait TrainingBackend: Send + Sync + 'static {
 
 // The concrete `HfTrainerBackend` / `LamuTrainerBackend` identities +
 // their subprocess runners + typed stages live in the `blut-backends`
-// crate (engine carve, v1.0). The LamQuant kernel backend lives in the
+// crate (engine-carve milestone). The LamQuant kernel backend lives in the
 // `cookbook-lamquant` crate. The engine ships ZERO concrete backends.
 
 /// Test-only concrete backend identity. The engine ships no concrete

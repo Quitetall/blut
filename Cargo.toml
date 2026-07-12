@@ -5,7 +5,7 @@
 # interactive TUI cockpit, and the CLI orchestration. Cookbooks that
 # supply recipes + the user-facing binaries are SEPARATE crates depending
 # on this one; the generic-LLM stages + backends live in `blut-backends`.
-# The TUI cockpit ships in 1.0 (default-on `tui` feature); build with
+# The TUI cockpit ships in the 0.2 preview (default-on `tui` feature); build with
 # `--no-default-features` for a lean CLI-only binary. See README.md / API.md.
 
 # Standalone crate: declare our own (empty) workspace so the engine builds
@@ -16,7 +16,7 @@
 
 [package]
 name = "blut"
-version = "1.0.0"
+version = "0.2.0-alpha.1"
 edition = "2024"
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
@@ -44,7 +44,7 @@ path = "src/lib.rs"
 [dependencies]
 # ADR 0083: the wasm32-safe keystone. The engine re-exports its types at their
 # old paths, so this is zero-churn downstream.
-blut-types = { path = "crates/blut-types" }
+blut-types = { path = "crates/blut-types", version = "0.2.0-alpha.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -105,7 +105,8 @@ fuzzy-matcher = { version = "0.3", optional = true }
 [features]
 default = ["tui"]
 # The interactive ratatui cockpit (`blut tui`, and bare `blut`). On by default
-# in 1.0; drop it with `blut = { ..., default-features = false }` for CLI-only.
+# in the 0.2 preview; drop it with `blut = { ..., default-features = false }`
+# for CLI-only.
 tui = ["dep:ratatui", "dep:crossterm", "dep:fuzzy-matcher"]
 # P2P distributed compute — trust model, encryption, task dispatch.
 p2p = ["dep:ed25519-dalek", "dep:aes-gcm", "dep:x25519-dalek", "dep:blake3", "dep:hkdf", "dep:quinn", "dep:rustls", "dep:webpki", "dep:rcgen"]
