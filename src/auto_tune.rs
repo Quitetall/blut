@@ -68,7 +68,10 @@ pub fn auto_batch(
     admissible_ceiling: u32,
     floor_batch: u32,
 ) -> Option<TuneProposal> {
-    if admissible_ceiling < floor_batch || admissible_ceiling == current_batch {
+    if admissible_ceiling == 0
+        || admissible_ceiling < floor_batch
+        || admissible_ceiling == current_batch
+    {
         return None;
     }
     Some(TuneProposal::new(
@@ -155,8 +158,9 @@ pub enum AmpDtype {
 /// Propose an AMP dtype: `bf16` where supported, else `fp16` (with a loss
 /// scaler), else off. REFUSES (returns `None`) for a stage the numerics-guard
 /// marks fp32-only (e.g. ternary-QAT calibration) — the tuner never proposes AMP
-/// where it would break numerics.
-pub fn auto_amp(bf16_supported: bool, fp32_only: bool) -> Option<TuneProposal> {
+/// where it would break numerics. `None` too when the proposed dtype already
+/// equals `current` (no no-op audit rows); `current` is recorded as `old`.
+pub fn auto_amp(bf16_supported: bool, fp32_only: bool, current: AmpDtype) -> Option<TuneProposal> {
     if fp32_only {
         return None;
     }
@@ -165,10 +169,13 @@ pub fn auto_amp(bf16_supported: bool, fp32_only: bool) -> Option<TuneProposal> {
     } else {
         AmpDtype::Fp16
     };
+    if dtype == current {
+        return None;
+    }
     Some(TuneProposal::new(
         "auto_amp",
         "amp",
-        serde_json::json!(AmpDtype::Off),
+        serde_json::to_value(current).unwrap(),
         serde_json::to_value(dtype).unwrap(),
         format!("capability probe → {dtype:?}"),
     ))
@@ -206,6 +213,8 @@ pub fn loss_spike(window: &[f64], z_threshold: f64, backoff: f64) -> SpikeAction
     }
     let n = prior.len() as f64;
     let mean = prior.iter().sum::<f64>() / n;
+    // Population variance (÷n, not the Bessel ÷(n-1)) — intentional: for a
+    // conservative z-score spike heuristic the tighter estimate is fine.
     let var = prior.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
     let sd = var.sqrt();
     if sd < f64::EPSILON {
@@ -222,7 +231,9 @@ pub fn loss_spike(window: &[f64], z_threshold: f64, backoff: f64) -> SpikeAction
 // ── tuning.jsonl audit ─────────────────────────────────────────────
 
 /// Append a proposal + the broker's verdict to `path` as one JSON line — the
-/// run's tuning audit trail (ADR 0110). One atomic `write_all` under `O_APPEND`.
+/// run's tuning audit trail (ADR 0110). One `write_all` under `O_APPEND` (POSIX
+/// guarantees atomic append for records ≤ PIPE_BUF; a single tuning line is well
+/// under that).
 pub fn append_tuning(
     path: &std::path::Path,
     proposal: &TuneProposal,
@@ -277,6 +288,8 @@ mod tests {
             auto_batch(64, 4, 8).is_none(),
             "ceiling < floor ⇒ no proposal (fail-closed)"
         );
+        // A zero ceiling (nothing fits) never proposes a zero batch.
+        assert!(auto_batch(5, 0, 1).is_none(), "ceiling 0 ⇒ no proposal");
     }
 
     #[test]
@@ -311,17 +324,20 @@ mod tests {
 
     #[test]
     fn auto_amp_prefers_bf16_refuses_fp32_only() {
+        let p = auto_amp(true, false, AmpDtype::Off).unwrap();
+        assert_eq!(p.new, serde_json::to_value(AmpDtype::Bf16).unwrap());
+        assert_eq!(p.old, serde_json::to_value(AmpDtype::Off).unwrap());
         assert_eq!(
-            auto_amp(true, false).unwrap().new,
-            serde_json::to_value(AmpDtype::Bf16).unwrap()
-        );
-        assert_eq!(
-            auto_amp(false, false).unwrap().new,
+            auto_amp(false, false, AmpDtype::Off).unwrap().new,
             serde_json::to_value(AmpDtype::Fp16).unwrap()
         );
         assert!(
-            auto_amp(true, true).is_none(),
+            auto_amp(true, true, AmpDtype::Off).is_none(),
             "fp32-only stage refuses AMP"
+        );
+        assert!(
+            auto_amp(true, false, AmpDtype::Bf16).is_none(),
+            "already bf16 ⇒ no no-op proposal"
         );
     }
 
