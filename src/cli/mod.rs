@@ -185,6 +185,13 @@ enum Command {
         #[command(subcommand)]
         cmd: PlanCommand,
     },
+    /// Model registry (ADR 0090): bind a name + alias to a checkpoint hash and
+    /// move that binding under audit — `model://<name>@<alias>`. Same verbs as
+    /// `plan`.
+    Model {
+        #[command(subcommand)]
+        cmd: ModelCommand,
+    },
     /// Inspect / prune the BLUT cache.
     Cache {
         #[command(subcommand)]
@@ -346,6 +353,55 @@ enum PlanCommand {
     /// Print a pointer's deployment audit trail (oldest first).
     History {
         /// Pointer, e.g. `registry://plan@prod`.
+        pointer: String,
+        #[arg(long, default_value = "shared")]
+        tenant: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ModelCommand {
+    /// Register a checkpoint hash under a model name (immutable candidate row).
+    Register {
+        /// The checkpoint sha256 (lowercase 64-hex — as the cache/lineage emits).
+        hash: String,
+        /// Model name, e.g. `encoder-v1`.
+        name: String,
+        /// Owning tenant (default `shared`; `restricted` = clinical/PHI).
+        #[arg(long, default_value = "shared")]
+        tenant: String,
+        /// Freeform provenance note (recipe, run id, …).
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Promote a registered hash onto `model://<name>@<alias>`, recording the
+    /// move in the audit trail.
+    Promote {
+        /// The checkpoint hash to promote.
+        hash: String,
+        /// Target pointer, e.g. `model://encoder-v1@prod`.
+        pointer: String,
+        /// Acting tenant — must match the model's tenant.
+        #[arg(long, default_value = "shared")]
+        tenant: String,
+    },
+    /// Roll an alias back to its previous target atomically.
+    Rollback {
+        /// Pointer, e.g. `model://encoder-v1@prod`.
+        pointer: String,
+        #[arg(long, default_value = "shared")]
+        tenant: String,
+    },
+    /// Resolve `model://<name>@<alias>` to the checkpoint hash it points at.
+    Resolve {
+        /// Pointer, e.g. `model://encoder-v1@prod`.
+        pointer: String,
+        #[arg(long, default_value = "shared")]
+        tenant: String,
+    },
+    /// Print an alias's audit trail (oldest first).
+    History {
+        /// Pointer, e.g. `model://encoder-v1@prod`.
         pointer: String,
         #[arg(long, default_value = "shared")]
         tenant: String,
@@ -800,6 +856,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Policy { cmd }) => run_policy(cmd),
         Some(Command::Recipe { cmd }) => run_recipe(&reg, cmd).await,
         Some(Command::Plan { cmd }) => run_plan_cmd(&reg, cmd).await,
+        Some(Command::Model { cmd }) => run_model_cmd(cmd),
         Some(Command::Cache { cmd }) => run_cache_cmd(cmd),
         Some(Command::Footprint { cmd }) => run_footprint_cmd(cmd),
         Some(Command::Sensor { cmd }) => run_sensor_cmd(cmd),
@@ -1171,6 +1228,77 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             }
             for h in &hist {
                 println!("{}  {}", h.moved_at, h.plan_fingerprint);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `blut model` — the ADR-0090 model registry, mirroring `blut plan`'s verbs.
+/// Sync (no recipe registry needed — a model is an opaque checkpoint hash, not a
+/// typechecked PlanSpec). A pointer is `model://<name>@<alias>`.
+fn run_model_cmd(cmd: ModelCommand) -> Result<()> {
+    use crate::model_registry as mr;
+    let parse = |pointer: &str| -> Result<(String, String)> {
+        mr::parse_model_uri(pointer)
+            .map(|(n, a)| (n.to_string(), a.to_string()))
+            .ok_or_else(|| anyhow!("not a `model://<name>@<alias>` URI: {pointer}"))
+    };
+    match cmd {
+        ModelCommand::Register {
+            hash,
+            name,
+            tenant,
+            source,
+        } => {
+            let conn = mr::open().map_err(|e| anyhow!("{e}"))?;
+            mr::register(&conn, &hash, &name, &tenant, source.as_deref(), now_unix())
+                .map_err(|e| anyhow!("{e}"))?;
+            println!("registered {hash} as model '{name}'  (tenant={tenant})");
+            Ok(())
+        }
+        ModelCommand::Promote {
+            hash,
+            pointer,
+            tenant,
+        } => {
+            let (name, alias) = parse(&pointer)?;
+            let mut conn = mr::open().map_err(|e| anyhow!("{e}"))?;
+            mr::promote(&mut conn, &hash, &tenant, &name, &alias, now_unix())
+                .map_err(|e| anyhow!("{e}"))?;
+            println!("promoted {hash} → model://{name}@{alias}");
+            Ok(())
+        }
+        ModelCommand::Rollback { pointer, tenant } => {
+            let (name, alias) = parse(&pointer)?;
+            let mut conn = mr::open().map_err(|e| anyhow!("{e}"))?;
+            let prev = mr::rollback(&mut conn, &tenant, &name, &alias, now_unix())
+                .map_err(|e| anyhow!("{e}"))?;
+            println!("rolled back model://{name}@{alias} → {prev}");
+            Ok(())
+        }
+        ModelCommand::Resolve { pointer, tenant } => {
+            let (name, alias) = parse(&pointer)?;
+            let conn = mr::open().map_err(|e| anyhow!("{e}"))?;
+            match mr::resolve_pointer(&conn, &tenant, &name, &alias).map_err(|e| anyhow!("{e}"))? {
+                Some(hash) => {
+                    println!("{hash}");
+                    Ok(())
+                }
+                None => Err(anyhow!(
+                    "no pointer model://{name}@{alias} (tenant={tenant})"
+                )),
+            }
+        }
+        ModelCommand::History { pointer, tenant } => {
+            let (name, alias) = parse(&pointer)?;
+            let conn = mr::open().map_err(|e| anyhow!("{e}"))?;
+            let hist = mr::history(&conn, &tenant, &name, &alias).map_err(|e| anyhow!("{e}"))?;
+            if hist.is_empty() {
+                println!("no history for model://{name}@{alias}");
+            }
+            for h in &hist {
+                println!("{}  {}", h.moved_at, h.model_hash);
             }
             Ok(())
         }
