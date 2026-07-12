@@ -143,6 +143,12 @@ enum Command {
         #[command(subcommand)]
         cmd: CatalogCommand,
     },
+    /// Ecosystem connectors (ADR 0112): list the registered connector stages +
+    /// their typed I/O kinds, and validate the registry.
+    Connectors {
+        #[command(subcommand)]
+        cmd: ConnectorsCommand,
+    },
     /// Declared, persistent partition key-space over a recipe + per-cell
     /// backfill (Dagster-class partitions, v0.20 Phase G).
     Partition {
@@ -225,6 +231,19 @@ enum Command {
         /// backend, exit 0 if all draw non-blank (no raw mode). For CI / smoke.
         #[arg(long, default_value_t = false)]
         check: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConnectorsCommand {
+    /// List the registered connectors (name + typed input→output kinds).
+    List {
+        /// Validate the registry: exit non-zero if any connector declares a
+        /// non-connector I/O kind.
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -473,6 +492,38 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| format!("{e}"))
 }
 
+/// `blut connectors list [--check]` (ADR 0112) — enumerate connector stages +
+/// their typed I/O kinds; `--check` validates the registry (non-zero on a
+/// non-connector kind leaking into an integration graph).
+fn run_connectors_cmd(cmd: ConnectorsCommand) -> Result<()> {
+    match cmd {
+        ConnectorsCommand::List { check, json } => {
+            let list = crate::connectors::list();
+            if json {
+                emit_json(&list)?;
+            } else {
+                for d in &list {
+                    println!("{:<20} {:<24} → {}", d.name, d.input_kind, d.output_kind);
+                }
+            }
+            if check {
+                let problems = crate::connectors::check();
+                if !problems.is_empty() {
+                    for p in &problems {
+                        eprintln!("connector check FAILED: {p}");
+                    }
+                    return Err(anyhow!(
+                        "{} connector(s) declare a non-connector kind",
+                        problems.len()
+                    ));
+                }
+                eprintln!("connectors: registry healthy ({} connectors)", list.len());
+            }
+            Ok(())
+        }
+    }
+}
+
 /// `blut catalog {rebuild,search,show,tag}` (ADR 0100) — a read-only projection
 /// over the datasets registry + lineage, with a persisted tags table.
 fn run_catalog_cmd(cmd: CatalogCommand) -> Result<()> {
@@ -641,6 +692,9 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
     // available to every binary (like `p2p-smoke` for the p2p path).
     let mut reg = reg;
     crate::checks::register(&mut reg);
+    // ADR 0112: the built-in `connectors` cookbook so an integration graph
+    // (`blut recipe declare s3_roundtrip.json`) resolves + kind-checks.
+    crate::connectors::register(&mut reg);
     let cli = Cli::parse();
     let result = match cli.command {
         Some(Command::Jobs { json }) => run_jobs(json),
@@ -672,6 +726,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Errors { cmd }) => run_errors(&reg, cmd),
         Some(Command::Checks { cmd }) => run_checks_cmd(cmd),
         Some(Command::Catalog { cmd }) => run_catalog_cmd(cmd),
+        Some(Command::Connectors { cmd }) => run_connectors_cmd(cmd),
         Some(Command::Partition { cmd }) => run_partition(&reg, cmd).await,
         Some(Command::Artifact { cmd }) => run_artifact_cmd(cmd),
         Some(Command::Schedule { cmd }) => run_schedule_cmd(&reg, cmd),
