@@ -27,6 +27,7 @@
 #![cfg_attr(not(test), deny(unsafe_code))]
 
 pub mod artifacts;
+pub mod auto_tune;
 pub mod backends;
 pub mod broker;
 pub mod catalog;
