@@ -110,6 +110,11 @@ impl Stage for DeclareObject {
 pub struct ToolArgs {
     /// The external tool to delegate to (e.g. `aws`, `rclone`, `duckdb`).
     pub tool: String,
+    /// For `connector_store`: the destination object-store URI to PUT to (the
+    /// returned `ObjectRef.uri`). `None` ⇒ a content-addressed
+    /// `connector://<hash>` sink (round-trippable only within this store).
+    #[serde(default)]
+    pub dest_uri: Option<String>,
     /// Extra args threaded verbatim after the verb.
     #[serde(default)]
     pub extra: Vec<String>,
@@ -134,13 +139,17 @@ impl Stage for ObjectFetch {
     ) -> Result<DatasetRef, StageError> {
         std::fs::create_dir_all(&ctx.stage_dir).ok();
         let dest = ctx.stage_dir.join("data");
-        // Delegate the verb to the external tool (subprocess, never a dylib).
-        let status = std::process::Command::new(&args.tool)
+        // Delegate the verb to the external tool (subprocess, never a dylib) on a
+        // blocking-safe async spawn. `--` separates the fixed verb from the
+        // user-supplied URI so a `-`-leading value can't be read as a flag.
+        let status = tokio::process::Command::new(&args.tool)
             .arg("get")
+            .arg("--")
             .arg(&input.uri)
             .arg(&dest)
             .args(&args.extra)
             .status()
+            .await
             .map_err(|e| {
                 StageError::Backend(anyhow::anyhow!("spawn connector tool '{}': {e}", args.tool))
             })?;
@@ -152,8 +161,22 @@ impl Stage for ObjectFetch {
                 status.code()
             )));
         }
+        // Content-address integrity: the fetched bytes MUST hash to the declared
+        // identity — a corrupt/tampered download must never silently produce a
+        // DatasetRef with the wrong bytes but the declared hash (which would
+        // poison every downstream cache key).
+        let got = ContentHash::hash_file(&dest)
+            .map_err(|e| StageError::Backend(anyhow::anyhow!("hash fetched object: {e}")))?;
+        if got != input.content_hash {
+            return Err(StageError::Backend(anyhow::anyhow!(
+                "connector fetch integrity: {} hashed {} but the ref declared {}",
+                input.uri,
+                got.to_hex(),
+                input.content_hash.to_hex()
+            )));
+        }
         Ok(DatasetRef {
-            content_hash: input.content_hash, // fetched-by-identity: same hash
+            content_hash: got,
             path: dest,
         })
     }
@@ -176,13 +199,21 @@ impl Stage for ObjectStore {
         input: DatasetRef,
         args: &ToolArgs,
     ) -> Result<ObjectRef, StageError> {
-        let uri = format!("connector://{}", input.content_hash.to_hex());
-        let status = std::process::Command::new(&args.tool)
+        // The REAL destination the object lands at (returned so a later
+        // `connector_fetch` can round-trip it). Defaults to the content-addressed
+        // sink only when the recipe didn't name one.
+        let uri = args
+            .dest_uri
+            .clone()
+            .unwrap_or_else(|| format!("connector://{}", input.content_hash.to_hex()));
+        let status = tokio::process::Command::new(&args.tool)
             .arg("put")
+            .arg("--")
             .arg(&input.path)
             .arg(&uri)
             .args(&args.extra)
             .status()
+            .await
             .map_err(|e| {
                 StageError::Backend(anyhow::anyhow!("spawn connector tool '{}': {e}", args.tool))
             })?;
@@ -195,7 +226,8 @@ impl Stage for ObjectStore {
         }
         std::fs::create_dir_all(&ctx.stage_dir).ok();
         let path = ctx.stage_dir.join("stored.ref.json");
-        std::fs::write(&path, serde_json::json!({ "uri": uri }).to_string()).ok();
+        std::fs::write(&path, serde_json::json!({ "uri": uri }).to_string())
+            .map_err(|e| StageError::Backend(anyhow::anyhow!("write stored manifest: {e}")))?;
         Ok(ObjectRef {
             uri,
             content_hash: input.content_hash,
@@ -242,7 +274,11 @@ pub fn list() -> Vec<ConnectorDescriptor> {
 pub fn check() -> Vec<String> {
     let ok = |k: &str| k == "()" || CONNECTOR_KINDS.contains(&k);
     let mut problems = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for d in list() {
+        if !seen.insert(d.name) {
+            problems.push(format!("{}: duplicate connector name", d.name));
+        }
         if !ok(d.input_kind) {
             problems.push(format!(
                 "{}: input kind '{}' not a connector kind",
