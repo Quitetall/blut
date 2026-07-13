@@ -13,6 +13,9 @@
 //! `Authorization: Bearer <token>`. Running token-less is only permitted
 //! on a loopback bind (enforced at startup in `main.rs`, fail-closed).
 
+use std::fmt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -26,7 +29,58 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
+
+/// Traversal-safe, portable identifier used in every worker filesystem path.
+///
+/// IDs are flat ASCII names: one alphanumeric prefix followed by at most 127
+/// alphanumeric, dot, underscore, or hyphen bytes. Separators, percent escapes,
+/// Unicode lookalikes, and dot-only components are rejected at trust boundaries.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub(crate) struct JobId(String);
+
+impl JobId {
+    pub(crate) fn parse(raw: &str) -> Result<Self, &'static str> {
+        let bytes = raw.as_bytes();
+        if bytes.is_empty() || bytes.len() > 128 {
+            return Err("job id must contain 1..=128 ASCII bytes");
+        }
+        if !bytes[0].is_ascii_alphanumeric()
+            || !bytes
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
+            return Err("job id must match [A-Za-z0-9][A-Za-z0-9._-]{0,127}");
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
+    fn generated() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for JobId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for JobId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
 
 /// Shared API state.
 #[derive(Clone)]
@@ -37,7 +91,7 @@ pub struct ApiState {
     /// Worker identity reported by `/health` (the real one, not a placeholder).
     pub worker_id: String,
     /// Bearer token required on the job routes. `None` = token-less
-    /// loopback-only mode (main.rs refuses non-loopback binds without it).
+    /// loopback-only mode (`main.rs` refuses every non-loopback bind).
     pub token: Option<Arc<str>>,
 }
 
@@ -134,15 +188,45 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+fn private_create_new() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+}
+
+#[cfg(unix)]
+async fn sync_dir(path: &std::path::Path) -> std::io::Result<()> {
+    fs::File::open(path).await?.sync_all().await
+}
+
+#[cfg(not(unix))]
+async fn sync_dir(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// POST /jobs — submit a new job.
 async fn submit_job(
     State(state): State<ApiState>,
     Json(req): Json<SubmitJob>,
 ) -> impl IntoResponse {
-    let job_id = req.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let job_id = match req.id {
+        Some(raw) => match JobId::parse(&raw) {
+            Ok(id) => id,
+            Err(message) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": message})),
+                )
+                    .into_response();
+            }
+        },
+        None => JobId::generated(),
+    };
 
     let job = serde_json::json!({
-        "id": job_id,
+        "id": job_id.as_str(),
         "recipe": req.recipe,
         "args": req.args,
         "resources": {
@@ -152,7 +236,6 @@ async fn submit_job(
         }
     });
 
-    let job_path = state.queue_dir.join(format!("{job_id}.json"));
     let content = match serde_json::to_string_pretty(&job) {
         Ok(c) => c,
         Err(e) => {
@@ -164,17 +247,148 @@ async fn submit_job(
         }
     };
 
-    if let Err(e) = fs::write(&job_path, &content).await {
+    // Reserve IDs independently of transient queue/result filenames. Polling
+    // renames and removes `<id>.json`; without this durable marker the same ID
+    // could reuse a live work directory or overwrite result provenance.
+    let reservation_dir = state.queue_dir.join(".job-ids");
+    if let Err(e) = fs::create_dir_all(&reservation_dir).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to create job-id ledger: {e}")})),
+        )
+            .into_response();
+    }
+    #[cfg(unix)]
+    if let Err(e) =
+        fs::set_permissions(&reservation_dir, std::fs::Permissions::from_mode(0o700)).await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to secure job-id ledger: {e}")})),
+        )
+            .into_response();
+    }
+    if let Err(e) = sync_dir(&state.queue_dir).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to sync queue directory: {e}")})),
+        )
+            .into_response();
+    }
+    let reservation_path = reservation_dir.join(job_id.as_str());
+    let mut reservation = match private_create_new().open(&reservation_path).await {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "job id already exists"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("failed to reserve job id: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    if let Err(e) = reservation.write_all(b"reserved\n").await {
+        drop(reservation);
+        let _ = fs::remove_file(&reservation_path).await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                serde_json::json!({"error": format!("failed to persist job-id reservation: {e}")}),
+            ),
+        )
+            .into_response();
+    }
+    if let Err(e) = reservation.sync_all().await {
+        drop(reservation);
+        let _ = fs::remove_file(&reservation_path).await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to sync job-id reservation: {e}")})),
+        )
+            .into_response();
+    }
+    drop(reservation);
+    if let Err(e) = sync_dir(&reservation_dir).await {
+        let _ = fs::remove_file(&reservation_path).await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to sync job-id ledger: {e}")})),
+        )
+            .into_response();
+    }
+
+    // Write under a non-queue extension, fsync, then publish the complete inode
+    // with a no-replace hard link. Poller never observes empty/partial JSON.
+    let job_path = state.queue_dir.join(format!("{job_id}.json"));
+    let pending_path = state
+        .queue_dir
+        .join(format!(".{job_id}.{}.pending", uuid::Uuid::new_v4()));
+    let mut file = match private_create_new().open(&pending_path).await {
+        Ok(file) => file,
+        Err(e) => {
+            let _ = fs::remove_file(&reservation_path).await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("failed to create pending job: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    if let Err(e) = file.write_all(content.as_bytes()).await {
+        drop(file);
+        let _ = fs::remove_file(&pending_path).await;
+        let _ = fs::remove_file(&reservation_path).await;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("failed to write job: {e}")})),
         )
             .into_response();
     }
+    if let Err(e) = file.sync_all().await {
+        drop(file);
+        let _ = fs::remove_file(&pending_path).await;
+        let _ = fs::remove_file(&reservation_path).await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to sync job: {e}")})),
+        )
+            .into_response();
+    }
+    drop(file);
+    if let Err(e) = fs::hard_link(&pending_path, &job_path).await {
+        let _ = fs::remove_file(&pending_path).await;
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            let _ = fs::remove_file(&reservation_path).await;
+        }
+        let status = if e.kind() == std::io::ErrorKind::AlreadyExists {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return (
+            status,
+            Json(serde_json::json!({"error": format!("failed to publish job: {e}")})),
+        )
+            .into_response();
+    }
+    let _ = fs::remove_file(&pending_path).await;
+    if let Err(e) = sync_dir(&state.queue_dir).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to sync published job: {e}")})),
+        )
+            .into_response();
+    }
 
     // Track in memory
     state.jobs.write().await.push(JobStatus {
-        id: job_id.clone(),
+        id: job_id.to_string(),
         recipe: req.recipe,
         status: "queued".to_string(),
         result: None,
@@ -182,7 +396,7 @@ async fn submit_job(
 
     (
         StatusCode::CREATED,
-        Json(serde_json::json!({"id": job_id, "status": "queued"})),
+        Json(serde_json::json!({"id": job_id.as_str(), "status": "queued"})),
     )
         .into_response()
 }
@@ -195,9 +409,19 @@ async fn list_jobs(State(state): State<ApiState>) -> impl IntoResponse {
 
 /// GET /jobs/:id — get job status.
 async fn get_job(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
+    let id = match JobId::parse(&id) {
+        Ok(id) => id,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": message})),
+            )
+                .into_response();
+        }
+    };
     // Check in-memory list first
     let jobs = state.jobs.read().await;
-    if let Some(job) = jobs.iter().find(|j| j.id == id) {
+    if let Some(job) = jobs.iter().find(|j| j.id == id.as_str()) {
         return Json(job.clone()).into_response();
     }
 
@@ -209,7 +433,7 @@ async fn get_job(State(state): State<ApiState>, Path(id): Path<String>) -> impl 
     {
         let status = result["status"].as_str().unwrap_or("unknown");
         return Json(JobStatus {
-            id: id.clone(),
+            id: id.to_string(),
             recipe: String::new(),
             status: status.to_string(),
             result: Some(result),
@@ -221,7 +445,7 @@ async fn get_job(State(state): State<ApiState>, Path(id): Path<String>) -> impl 
     let queue_path = state.queue_dir.join(format!("{id}.json"));
     if queue_path.exists() {
         return Json(JobStatus {
-            id: id.clone(),
+            id: id.to_string(),
             recipe: String::new(),
             status: "queued".to_string(),
             result: None,
@@ -326,6 +550,10 @@ mod tests {
     }
 
     fn post_job(bearer: Option<&str>) -> HttpRequest<Body> {
+        post_job_json(bearer, r#"{"recipe": "noop"}"#)
+    }
+
+    fn post_job_json(bearer: Option<&str>, body: &'static str) -> HttpRequest<Body> {
         let mut b = HttpRequest::builder()
             .method("POST")
             .uri("/jobs")
@@ -333,7 +561,15 @@ mod tests {
         if let Some(t) = bearer {
             b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
         }
-        b.body(Body::from(r#"{"recipe": "noop"}"#)).unwrap()
+        b.body(Body::from(body)).unwrap()
+    }
+
+    fn queued_json_count(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .count()
     }
 
     #[tokio::test]
@@ -347,7 +583,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
         let res = app.oneshot(post_job(Some("wrong"))).await.unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-        let queued = std::fs::read_dir(td.path()).unwrap().count();
+        let queued = queued_json_count(td.path());
         assert_eq!(queued, 0, "rejected submissions must not enqueue a job");
     }
 
@@ -357,8 +593,96 @@ mod tests {
         let app = router(state(Some("s3cret"), td.path()));
         let res = app.oneshot(post_job(Some("s3cret"))).await.unwrap();
         assert_eq!(res.status(), StatusCode::CREATED);
-        let queued = std::fs::read_dir(td.path()).unwrap().count();
+        let queued = queued_json_count(td.path());
         assert_eq!(queued, 1, "accepted submission writes one queue file");
+        let job: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                td.path().join(
+                    std::fs::read_dir(td.path())
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .find(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                        .unwrap()
+                        .file_name(),
+                ),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(job["recipe"], "noop");
+        assert!(
+            std::fs::read_dir(td.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| entry.path().extension().is_none_or(|ext| ext != "pending")),
+            "completed request must leave no partially published file"
+        );
+    }
+
+    #[test]
+    fn job_id_accepts_only_flat_ascii_names() {
+        for valid in ["a", "job-001", "A_b.c", &"x".repeat(128)] {
+            assert!(JobId::parse(valid).is_ok(), "should accept {valid:?}");
+        }
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "a/b",
+            r"a\b",
+            "/absolute",
+            "-prefix",
+            "é",
+            "a%2fb",
+            &"x".repeat(129),
+        ] {
+            assert!(JobId::parse(invalid).is_err(), "should reject {invalid:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_rejects_traversal_id_without_writing_outside_queue() {
+        let td = tempfile::tempdir().unwrap();
+        let app = router(state(Some("s3cret"), td.path()));
+        let res = app
+            .oneshot(post_job_json(
+                Some("s3cret"),
+                r#"{"id":"../escape","recipe":"noop"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(!td.path().parent().unwrap().join("escape.json").exists());
+    }
+
+    #[tokio::test]
+    async fn post_rejects_duplicate_id_without_overwrite() {
+        let td = tempfile::tempdir().unwrap();
+        let app = router(state(Some("s3cret"), td.path()));
+        let body = r#"{"id":"same-id","recipe":"noop"}"#;
+        let first = app
+            .clone()
+            .oneshot(post_job_json(Some("s3cret"), body))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let second = app
+            .clone()
+            .oneshot(post_job_json(Some("s3cret"), body))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+
+        // Poller removes/renames queue files while work is active. ID
+        // reservation must outlive that transient filename or a second job can
+        // reuse the work/result paths and overwrite provenance.
+        std::fs::remove_file(td.path().join("same-id.json")).unwrap();
+        let after_dequeue = app
+            .oneshot(post_job_json(Some("s3cret"), body))
+            .await
+            .unwrap();
+        assert_eq!(after_dequeue.status(), StatusCode::CONFLICT);
     }
 
     #[test]

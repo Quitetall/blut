@@ -4,6 +4,8 @@
 name = "blut-operator"
 version = "0.2.0-alpha.1"
 edition = "2024"
+rust-version = "1.89"
+publish = false
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
 description = "BLUT Kubernetes operator — BlutPlan / BlutWorkerPool CRDs + reconcilers. K8s is an adapter, not the control plane (ADR 0037)."

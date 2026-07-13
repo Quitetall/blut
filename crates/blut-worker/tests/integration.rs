@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Brian Lam
 //! Integration tests for the BLUT cloud worker agent.
 //!
-//! Tests the job lifecycle: queue → read → process → result.
+//! Tests legacy JSON format helpers only. Runtime submission is REST-only;
+//! direct queue-file publication is rejected by the worker.
 
 use std::path::PathBuf;
 

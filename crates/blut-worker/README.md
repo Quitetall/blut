@@ -6,6 +6,9 @@
 This crate was the v0 cloud-worker prototype: a file-based job queue plus a
 token-guarded axum REST API. Both halves are superseded:
 
+The retained hardening harness accepts submissions only through its loopback
+REST API. Direct queue-file publication and non-loopback serving are refused.
+
 - **Remote execution** → the `cloud` feature in the engine (`src/cloud/`,
   ADR 0082): an object-store-dispatch queue with *leases* (visibility timeout +
   `reclaim_expired`) and lease-fenced completion — the durability this crate's

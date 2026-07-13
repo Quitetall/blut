@@ -62,12 +62,6 @@ fn default_plan_key() -> String {
 pub enum CacheConfig {
     /// A ReadWriteMany PVC mounted at the global-cache path (FsBlobStore).
     Pvc { claim_name: String },
-    /// An S3-compatible bucket (S3BlobStore via the engine's `s3` feature).
-    S3 {
-        bucket: String,
-        #[serde(default)]
-        prefix: String,
-    },
     /// No shared cache — job-local only (default).
     None {},
 }
@@ -100,7 +94,7 @@ pub struct BlutPlanSpec {
     /// `Restricted` is unrepresentable (ADR 0061).
     #[serde(default)]
     pub data_class_ceiling: DataClassCeiling,
-    /// Shared cache backing (PVC / S3 / none).
+    /// Shared cache backing (PVC or job-local only).
     #[serde(default)]
     pub cache: CacheConfig,
     /// Optional args JSON handed to the plan/recipe.

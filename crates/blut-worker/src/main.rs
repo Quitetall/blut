@@ -2,12 +2,13 @@
 // Copyright (C) 2026 Brian Lam
 //! BLUT cloud worker agent.
 //!
-//! Pulls jobs from a queue, executes BLUT DAGs, and pushes results.
-//! The queue is currently file-based (JSON files in a directory);
-//! this will be replaced with a real queue (Redis, SQS, etc.) later.
+//! Pulls jobs from an internal file queue, executes BLUT DAGs, and writes
+//! results. Jobs are accepted only through the loopback REST API, which owns
+//! durable ID reservation and atomic publication. Directly dropping `.json`
+//! files into the queue is unsupported and rejected.
 //!
 //! Usage:
-//!     blut-worker --queue-dir /tmp/blut-queue --work-dir /tmp/blut-work
+//!     blut-worker --queue-dir /tmp/blut-queue --work-dir /tmp/blut-work --api-port 8080
 //!
 //! Job format (JSON file in queue dir):
 //!     {
@@ -65,11 +66,9 @@ struct Cli {
     #[arg(long)]
     api_port: Option<u16>,
 
-    /// Bind address for the REST API. Defaults to loopback. Binding a
-    /// non-loopback address REQUIRES a bearer token in BLUT_WORKER_TOKEN
-    /// (the API executes recipes — arbitrary code); startup fails closed
-    /// otherwise. The token is env-only, never a CLI flag, so it can't
-    /// leak through /proc/<pid>/cmdline or shell history.
+    /// Bind address for the REST API. This deprecated prototype has no TLS and
+    /// therefore permits loopback only. Use an authenticated local client;
+    /// non-loopback startup fails closed even when a bearer token is present.
     #[arg(long, default_value = "127.0.0.1")]
     api_bind: std::net::IpAddr,
 }
@@ -78,7 +77,7 @@ struct Cli {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Job {
     /// Unique job ID.
-    pub id: String,
+    pub id: api::JobId,
     /// Recipe name to execute.
     pub recipe: String,
     /// Recipe args (passed to the recipe's compile function).
@@ -102,7 +101,7 @@ struct ResourceRequest {
 /// Result of a completed job.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct JobResult {
-    pub job_id: String,
+    pub job_id: api::JobId,
     pub status: JobStatus,
     pub artifacts: Vec<String>,
     pub metrics: Vec<serde_json::Value>,
@@ -144,20 +143,14 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&cli.results_dir).await?;
 
     // Start API server if configured. Fail-closed: POST /jobs executes
-    // recipes (arbitrary code), so a non-loopback bind without a bearer
-    // token is refused at startup rather than warned about.
+    // recipes (arbitrary code), and this deprecated prototype has no TLS.
+    // Bearer auth over plaintext is not adequate for any non-loopback hop.
     if let Some(port) = cli.api_port {
+        validate_api_bind(cli.api_bind)?;
         let token = std::env::var("BLUT_WORKER_TOKEN")
             .ok()
             .filter(|t| !t.is_empty());
-        if !cli.api_bind.is_loopback() && token.is_none() {
-            anyhow::bail!(
-                "refusing to serve the REST API on non-loopback {} without a bearer token: \
-                 POST /jobs executes recipes (arbitrary code). Set BLUT_WORKER_TOKEN, or keep \
-                 the default --api-bind 127.0.0.1.",
-                cli.api_bind
-            );
-        } else if token.is_none() {
+        if token.is_none() {
             tracing::warn!(
                 "REST API is running WITHOUT auth (BLUT_WORKER_TOKEN unset) — \
                  loopback-only mode; any local process can submit jobs"
@@ -207,6 +200,16 @@ async fn main() -> Result<()> {
     }
 }
 
+fn validate_api_bind(bind: std::net::IpAddr) -> Result<()> {
+    if !bind.is_loopback() {
+        anyhow::bail!(
+            "refusing non-loopback REST API bind {bind}: blut-worker is a deprecated \
+             plaintext prototype and bearer credentials would be exposed in transit"
+        );
+    }
+    Ok(())
+}
+
 /// Poll the queue for a job, run it if found. Returns true if work was done.
 async fn poll_and_run(cli: &Cli, worker_id: &str) -> Result<bool> {
     // List job files in the queue directory
@@ -223,8 +226,27 @@ async fn poll_and_run(cli: &Cli, worker_id: &str) -> Result<bool> {
         return Ok(false);
     }
 
-    // Take the first job (FIFO)
+    // Take the first job (FIFO). REST submission creates a durable reservation
+    // before publishing final `.json`; direct file producers are unsupported
+    // because they can expose partial JSON and reuse IDs.
     let job_file = &job_files[0];
+    let Some(stem) = job_file.file_stem().and_then(|s| s.to_str()) else {
+        let bad = job_file.with_extension("json.unreserved");
+        fs::rename(job_file, bad).await.ok();
+        return Ok(true);
+    };
+    let reservation = api::JobId::parse(stem)
+        .ok()
+        .map(|id| cli.queue_dir.join(".job-ids").join(id.as_str()));
+    if !reservation.as_ref().is_some_and(|path| path.is_file()) {
+        tracing::warn!(
+            "refusing unreserved queue file {}: submit through the loopback REST API",
+            job_file.display()
+        );
+        let bad = job_file.with_extension("json.unreserved");
+        fs::rename(job_file, bad).await.ok();
+        return Ok(true);
+    }
     let job: Job = match read_job(job_file).await {
         Ok(j) => j,
         Err(e) => {
@@ -290,7 +312,7 @@ async fn read_job(path: &Path) -> Result<Job> {
 
 /// Execute a job by compiling its recipe and running the DAG.
 async fn run_job(job: &Job, cli: &Cli, _worker_id: &str) -> Result<Vec<String>> {
-    let job_dir = cli.work_dir.join(&job.id);
+    let job_dir = cli.work_dir.join(job.id.as_str());
     fs::create_dir_all(&job_dir).await?;
 
     // Build the execution context
@@ -322,7 +344,7 @@ async fn run_job(job: &Job, cli: &Cli, _worker_id: &str) -> Result<Vec<String>> 
     // Collect artifacts
     let mut artifacts = Vec::new();
     if let Some(final_output) = &result.final_output {
-        artifacts.push(format!("{:?}", final_output));
+        artifacts.push(format!("{final_output:?}"));
     }
 
     Ok(artifacts)
@@ -333,4 +355,47 @@ async fn write_result(results_dir: &Path, result: &JobResult) -> Result<()> {
     let path = results_dir.join(format!("{}.json", result.job_id));
     let content = serde_json::to_string_pretty(result)?;
     fs::write(&path, content).await.context("write result file")
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn api_bind_is_loopback_only_even_when_auth_may_be_configured() {
+        assert!(validate_api_bind("127.0.0.1".parse().unwrap()).is_ok());
+        assert!(validate_api_bind("::1".parse().unwrap()).is_ok());
+        assert!(validate_api_bind("0.0.0.0".parse().unwrap()).is_err());
+        assert!(validate_api_bind("192.0.2.1".parse().unwrap()).is_err());
+    }
+
+    #[tokio::test]
+    async fn poller_quarantines_direct_unreserved_queue_files() {
+        let td = tempfile::tempdir().unwrap();
+        let queue_dir = td.path().join("queue");
+        let work_dir = td.path().join("work");
+        let results_dir = td.path().join("results");
+        fs::create_dir_all(&queue_dir).await.unwrap();
+        fs::create_dir_all(&work_dir).await.unwrap();
+        fs::create_dir_all(&results_dir).await.unwrap();
+        fs::write(
+            queue_dir.join("direct.json"),
+            r#"{"id":"direct","recipe":"noop","args":{},"resources":{}}"#,
+        )
+        .await
+        .unwrap();
+        let cli = Cli {
+            queue_dir: queue_dir.clone(),
+            work_dir,
+            results_dir,
+            poll_interval: 1,
+            worker_id: None,
+            api_port: None,
+            api_bind: "127.0.0.1".parse().unwrap(),
+        };
+
+        assert!(poll_and_run(&cli, "test-worker").await.unwrap());
+        assert!(!queue_dir.join("direct.json").exists());
+        assert!(queue_dir.join("direct.json.unreserved").exists());
+    }
 }

@@ -4,9 +4,11 @@
 name = "blut-worker"
 version = "0.2.0-alpha.1"
 edition = "2024"
+rust-version = "1.88"
+publish = false
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
-description = "BLUT cloud worker agent — pulls jobs from a queue, executes DAGs, pushes results."
+description = "Deprecated internal BLUT cloud-worker prototype. Not distributed."
 
 [[bin]]
 name = "blut-worker"

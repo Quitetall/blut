@@ -81,21 +81,6 @@ fn cache_wiring(cache: &CacheConfig) -> CacheWiring {
                 ..Default::default()
             }],
         },
-        CacheConfig::S3 { bucket, prefix } => CacheWiring {
-            env: vec![
-                EnvVar {
-                    name: "BLUT_CACHE_S3_BUCKET".into(),
-                    value: Some(bucket.clone()),
-                    ..Default::default()
-                },
-                EnvVar {
-                    name: "BLUT_CACHE_S3_PREFIX".into(),
-                    value: Some(prefix.clone()),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        },
         CacheConfig::None {} => CacheWiring::default(),
     }
 }
@@ -432,32 +417,6 @@ mod tests {
             env.iter()
                 .any(|e| e.name == "BLUT_DATA_CLASS_CEILING"
                     && e.value.as_deref() == Some("Internal"))
-        );
-    }
-
-    #[test]
-    fn plan_job_carries_s3_cache_env() {
-        let p = plan(
-            PlanSource::ConfigMapRef {
-                name: "cm".into(),
-                key: "plan.json".into(),
-            },
-            DataClassCeiling::Public,
-            CacheConfig::S3 {
-                bucket: "b".into(),
-                prefix: "pfx".into(),
-            },
-        );
-        let job = build_plan_job(&p);
-        let pod = job.spec.unwrap().template.spec.unwrap();
-        let env = pod.containers[0].env.as_ref().unwrap();
-        assert!(
-            env.iter()
-                .any(|e| e.name == "BLUT_CACHE_S3_BUCKET" && e.value.as_deref() == Some("b"))
-        );
-        assert!(
-            env.iter()
-                .any(|e| e.name == "BLUT_CACHE_S3_PREFIX" && e.value.as_deref() == Some("pfx"))
         );
     }
 
