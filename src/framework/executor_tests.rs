@@ -1518,6 +1518,34 @@ async fn retry_succeeds_after_transient_failures() {
     assert_eq!(retrying, 2, "two retry events for two transient failures");
 }
 
+#[tokio::test]
+async fn retry_hook_runs_after_non_gpu_admission_is_released() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    FLAKY_ATTEMPTS.store(0, Ordering::SeqCst);
+    FLAKY_FAILS.store(1, Ordering::SeqCst);
+    let td = tempfile::tempdir().unwrap();
+    let mut ctx = ExecCtx::new(td.path().to_path_buf())
+        .with_resource_limit(Resource::Cpu, 1)
+        .with_max_in_flight(1);
+    let cpu = ctx.resources[&Resource::Cpu].clone();
+    let released_before_hook = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_observation = released_before_hook.clone();
+    ctx = ctx.with_retry_hook(Arc::new(move |_| {
+        hook_observation.store(cpu.available_permits() == 1, Ordering::SeqCst);
+    }));
+    let plan = Plan::<(), LamuTrainerBackend>::new("retry-release", serde_json::json!({}))
+        .start(Flaky, EmptyArgs)
+        .finish()
+        .into_compiled();
+
+    ParallelExecutor::execute(plan, ctx).await.unwrap();
+
+    assert!(
+        released_before_hook.load(Ordering::SeqCst),
+        "ordinary CPU admission must be released before the retry hook runs"
+    );
+}
+
 // ── S3 auto-resume: a retry injects --resume from the checkpoint ──
 static RESUMABLE_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 static RESUMABLE_SAW_RESUME: std::sync::atomic::AtomicBool =

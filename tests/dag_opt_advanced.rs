@@ -2,16 +2,17 @@
 // Copyright (C) 2026 Brian Lam
 //! Named progress gate for ADR 0102's landed advanced-optimizer slice.
 //!
-//! User-priority scheduling and live cache-warm ready-queue ordering have
-//! landed. Fusion, speculation, and pipeline parallelism remain later,
-//! independently gated increments.
+//! User-priority scheduling, live cache-warm ready ordering, and the first
+//! conservative whole-plan linear coalescing slice have landed. General
+//! internal-subchain fusion, speculation, and pipeline parallelism remain
+//! later, independently gated increments.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use blut::framework::artifact::{Artifact, ArtifactMetadata, ContentHash};
-use blut::framework::cache::CacheHandle;
+use blut::framework::cache::{CacheHandle, CacheProof};
 use blut::framework::cookbook::{Cookbook, Registry};
 use blut::framework::dag_opt::DagOptimizer;
 use blut::framework::executor::{ExecCtx, ParallelExecutor};
@@ -23,11 +24,31 @@ use blut::framework::stage::{ErasedStageCtor, Stage, StageContext};
 use blut::framework::status::StageEvent;
 use blut::framework::{PlanError, StageError};
 use blut::recipes::recipe::RecipeDef;
+use futures::FutureExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 static EXECUTION_ORDER: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static FUSION_TASK_IDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static FUSION_ROOT_STARTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+static FUSION_RELEASE_ROOT: tokio::sync::Notify = tokio::sync::Notify::const_new();
+static FUSION_WAITER_STARTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+static FUSION_RELEASE_WAITER: tokio::sync::Notify = tokio::sync::Notify::const_new();
+static FUSION_WAITER_ACQUIRED: AtomicBool = AtomicBool::new(false);
+static DIRECT_ARTIFACT_BINARY_DESERIALIZES: AtomicUsize = AtomicUsize::new(0);
+
+fn record_fusion_task(label: &str) {
+    if label.starts_with("fuse-") {
+        let task = tokio::task::try_id()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "outside-tokio-task".into());
+        FUSION_TASK_IDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(task);
+    }
+}
 
 #[derive(Debug)]
 struct CountingMissStore {
@@ -108,6 +129,97 @@ impl Artifact for OrderArtifact {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct DirectArtifact {
+    value: u32,
+    content_hash: ContentHash,
+}
+
+#[derive(Deserialize)]
+struct DirectArtifactWire {
+    value: u32,
+    content_hash: ContentHash,
+}
+
+impl<'de> Deserialize<'de> for DirectArtifact {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let is_binary = !deserializer.is_human_readable();
+        let wire = DirectArtifactWire::deserialize(deserializer)?;
+        if is_binary {
+            DIRECT_ARTIFACT_BINARY_DESERIALIZES.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(Self {
+            value: wire.value,
+            content_hash: wire.content_hash,
+        })
+    }
+}
+
+impl Artifact for DirectArtifact {
+    const KIND: &'static str = "test.direct-artifact";
+    const SCHEMA: u32 = 1;
+
+    fn content_hash(&self) -> ContentHash {
+        self.content_hash
+    }
+
+    fn primary_path(&self) -> &std::path::Path {
+        std::path::Path::new(".")
+    }
+}
+
+struct DirectRoot;
+
+#[async_trait]
+impl Stage for DirectRoot {
+    const NAME: &'static str = "direct_root";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    type Input = ();
+    type Output = DirectArtifact;
+    type Args = OrderArgs;
+
+    async fn run(
+        &self,
+        _ctx: &StageContext,
+        _input: (),
+        _args: &OrderArgs,
+    ) -> Result<DirectArtifact, StageError> {
+        Ok(DirectArtifact {
+            value: 1,
+            content_hash: ContentHash::of_bytes(&1u32.to_le_bytes()),
+        })
+    }
+}
+
+struct DirectAfter;
+
+#[async_trait]
+impl Stage for DirectAfter {
+    const NAME: &'static str = "direct_after";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    type Input = DirectArtifact;
+    type Output = DirectArtifact;
+    type Args = OrderArgs;
+
+    async fn run(
+        &self,
+        _ctx: &StageContext,
+        input: DirectArtifact,
+        _args: &OrderArgs,
+    ) -> Result<DirectArtifact, StageError> {
+        let value = input.value + 1;
+        Ok(DirectArtifact {
+            value,
+            content_hash: ContentHash::of_bytes(&value.to_le_bytes()),
+        })
+    }
+}
+
 struct RecordOrder;
 
 #[async_trait]
@@ -125,6 +237,11 @@ impl Stage for RecordOrder {
         _input: (),
         args: &OrderArgs,
     ) -> Result<OrderArtifact, StageError> {
+        record_fusion_task(&args.label);
+        if args.label == "fuse-admission-root" {
+            FUSION_ROOT_STARTED.notify_one();
+            FUSION_RELEASE_ROOT.notified().await;
+        }
         EXECUTION_ORDER
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -158,6 +275,7 @@ impl Stage for RecordAfter {
         _input: OrderArtifact,
         args: &OrderArgs,
     ) -> Result<OrderArtifact, StageError> {
+        record_fusion_task(&args.label);
         EXECUTION_ORDER
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -171,6 +289,91 @@ impl Stage for RecordAfter {
             content_hash: ContentHash::of_bytes(args.label.as_bytes()),
             path,
         })
+    }
+}
+
+struct RecordNondeterministic;
+
+#[async_trait]
+impl Stage for RecordNondeterministic {
+    const NAME: &'static str = "record_nondeterministic";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const DETERMINISTIC: bool = false;
+    type Input = OrderArtifact;
+    type Output = OrderArtifact;
+    type Args = OrderArgs;
+
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        input: OrderArtifact,
+        args: &OrderArgs,
+    ) -> Result<OrderArtifact, StageError> {
+        RecordAfter.run(ctx, input, args).await
+    }
+}
+
+struct RecordPanicking;
+
+#[async_trait]
+impl Stage for RecordPanicking {
+    const NAME: &'static str = "record_panicking";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    type Input = OrderArtifact;
+    type Output = OrderArtifact;
+    type Args = OrderArgs;
+
+    async fn run(
+        &self,
+        _ctx: &StageContext,
+        _input: OrderArtifact,
+        _args: &OrderArgs,
+    ) -> Result<OrderArtifact, StageError> {
+        panic!("simulated fused-stage panic");
+    }
+}
+
+struct RecordFailing;
+
+#[async_trait]
+impl Stage for RecordFailing {
+    const NAME: &'static str = "record_failing";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    type Input = OrderArtifact;
+    type Output = OrderArtifact;
+    type Args = OrderArgs;
+
+    async fn run(
+        &self,
+        _ctx: &StageContext,
+        _input: OrderArtifact,
+        _args: &OrderArgs,
+    ) -> Result<OrderArtifact, StageError> {
+        Err(StageError::BadInput("simulated fused-stage failure".into()))
+    }
+}
+
+struct RecordNetworkAfter;
+
+#[async_trait]
+impl Stage for RecordNetworkAfter {
+    const NAME: &'static str = "record_network_after";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Network];
+    type Input = OrderArtifact;
+    type Output = OrderArtifact;
+    type Args = OrderArgs;
+
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        input: OrderArtifact,
+        args: &OrderArgs,
+    ) -> Result<OrderArtifact, StageError> {
+        RecordAfter.run(ctx, input, args).await
     }
 }
 
@@ -189,6 +392,14 @@ impl Cookbook for GateCookbook {
         static STAGES: &[(&str, ErasedStageCtor)] = &[
             ("record_order", || Arc::new(RecordOrder)),
             ("record_after", || Arc::new(RecordAfter)),
+            ("record_nondeterministic", || {
+                Arc::new(RecordNondeterministic)
+            }),
+            ("record_panicking", || Arc::new(RecordPanicking)),
+            ("record_failing", || Arc::new(RecordFailing)),
+            ("record_network_after", || Arc::new(RecordNetworkAfter)),
+            ("direct_root", || Arc::new(DirectRoot)),
+            ("direct_after", || Arc::new(DirectAfter)),
         ];
         STAGES
     }
@@ -236,6 +447,7 @@ fn priority_only(enabled: bool) -> DagOptimizer {
         cache_aware: false,
         memory_aware: false,
         priority_aware: enabled,
+        stage_fusion: false,
     }
 }
 
@@ -246,6 +458,18 @@ fn cache_only(enabled: bool) -> DagOptimizer {
         cache_aware: enabled,
         memory_aware: false,
         priority_aware: false,
+        stage_fusion: false,
+    }
+}
+
+fn fusion_only(enabled: bool) -> DagOptimizer {
+    DagOptimizer {
+        eliminate_dead_code: false,
+        critical_path: false,
+        cache_aware: false,
+        memory_aware: false,
+        priority_aware: false,
+        stage_fusion: enabled,
     }
 }
 
@@ -328,7 +552,7 @@ async fn run_cache_order_fixture(
     )
 }
 
-fn materialized_hashes(job_dir: &std::path::Path) -> Vec<ContentHash> {
+fn materialized_stage_dirs(job_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut stage_dirs: Vec<std::path::PathBuf> = std::fs::read_dir(job_dir.join("stages"))
         .expect("read materialized stage dirs")
         .map(|entry| entry.expect("read stage-dir entry").path())
@@ -336,6 +560,10 @@ fn materialized_hashes(job_dir: &std::path::Path) -> Vec<ContentHash> {
         .collect();
     stage_dirs.sort();
     stage_dirs
+}
+
+fn materialized_hashes(job_dir: &std::path::Path) -> Vec<ContentHash> {
+    materialized_stage_dirs(job_dir)
         .into_iter()
         .map(|stage_dir| {
             let body = std::fs::read(stage_dir.join("output.metadata.json"))
@@ -345,6 +573,450 @@ fn materialized_hashes(job_dir: &std::path::Path) -> Vec<ContentHash> {
                 .content_hash
         })
         .collect()
+}
+
+fn materialized_cache_keys(job_dir: &std::path::Path) -> Vec<ContentHash> {
+    materialized_stage_dirs(job_dir)
+        .into_iter()
+        .map(|stage_dir| {
+            CacheProof::read_from(&stage_dir.join("cache-proof.json"))
+                .expect("read materialized cache proof")
+                .key
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn dag_opt_advanced_gate_fuses_linear_chain_without_changing_artifact_identity() {
+    let _guard = TEST_LOCK.lock().await;
+    assert!(
+        !DagOptimizer::new().stage_fusion,
+        "stage fusion must remain opt-in"
+    );
+    let temp = tempfile::tempdir().expect("fusion tempdir");
+    let plan = || {
+        compiled_graph(
+            &[
+                ("record_order", "fuse-root", None),
+                ("record_after", "fuse-middle", None),
+                ("record_after", "fuse-terminal", None),
+            ],
+            &[(0, 1), (1, 2)],
+        )
+    };
+
+    let run = |name: &str, enabled: bool| {
+        let job_dir = temp.path().join(name);
+        let mut ctx = ExecCtx::new(job_dir.clone()).with_max_in_flight(1);
+        ctx.dag_optimizer = Some(fusion_only(enabled));
+        async move {
+            FUSION_TASK_IDS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            let result = ParallelExecutor::execute(plan(), ctx)
+                .await
+                .expect("execute fusion equivalence fixture");
+            let task_ids = FUSION_TASK_IDS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            (
+                result,
+                materialized_hashes(&job_dir),
+                materialized_cache_keys(&job_dir),
+                task_ids,
+            )
+        }
+    };
+
+    let (unfused, unfused_hashes, unfused_keys, unfused_tasks) = run("unfused", false).await;
+    let (fused, fused_hashes, fused_keys, fused_tasks) = run("fused", true).await;
+    let unfused_output: OrderArtifact = unfused
+        .final_output
+        .expect("unfused terminal output")
+        .into_typed()
+        .expect("decode unfused output");
+    let fused_output: OrderArtifact = fused
+        .final_output
+        .expect("fused terminal output")
+        .into_typed()
+        .expect("decode fused output");
+
+    assert_eq!(fused.n_stages, 3);
+    assert_eq!((fused.n_cache_hits, fused.n_cache_misses), (0, 3));
+    assert_eq!(
+        fused_hashes, unfused_hashes,
+        "fusion must preserve every stage's ordinary artifact identity"
+    );
+    assert_eq!(fused_output.content_hash, unfused_output.content_hash);
+    assert_eq!(
+        fused_keys, unfused_keys,
+        "fusion must reuse every ordinary node key, including the terminal key"
+    );
+    assert_eq!(
+        fused_tasks
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        1,
+        "the eligible chain must execute inside one executor task"
+    );
+    assert_eq!(
+        unfused_tasks
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3,
+        "the default-off path must retain one spawned task per stage"
+    );
+}
+
+#[tokio::test]
+async fn dag_opt_advanced_gate_fused_chain_uses_direct_typed_handoffs() {
+    let _guard = TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().expect("direct fusion tempdir");
+    let plan = || {
+        compiled_graph(
+            &[
+                ("direct_root", "direct-root", None),
+                ("direct_after", "direct-middle", None),
+                ("direct_after", "direct-terminal", None),
+            ],
+            &[(0, 1), (1, 2)],
+        )
+    };
+    let run = |name: &str, enabled: bool| {
+        let mut ctx = ExecCtx::new(temp.path().join(name)).with_max_in_flight(1);
+        ctx.dag_optimizer = Some(fusion_only(enabled));
+        async move {
+            DIRECT_ARTIFACT_BINARY_DESERIALIZES.store(0, Ordering::SeqCst);
+            let result = ParallelExecutor::execute(plan(), ctx)
+                .await
+                .expect("execute direct fusion fixture");
+            let decodes = DIRECT_ARTIFACT_BINARY_DESERIALIZES.load(Ordering::SeqCst);
+            (
+                result.final_output.expect("terminal direct artifact"),
+                decodes,
+            )
+        }
+    };
+
+    let (unfused, unfused_decodes) = run("unfused", false).await;
+    let (fused, fused_decodes) = run("fused", true).await;
+    assert!(
+        unfused_decodes > 0,
+        "the ordinary StageDyn boundary must exercise the bincode-decode witness"
+    );
+    assert_eq!(
+        fused_decodes, 0,
+        "a fused miss chain must hand typed artifacts directly between stages without bincode-decoding the handoff"
+    );
+    assert_eq!(fused.kind, unfused.kind);
+    assert_eq!(fused.schema, unfused.schema);
+    assert_eq!(fused.payload, unfused.payload);
+}
+
+#[tokio::test]
+async fn dag_opt_advanced_gate_fused_chain_holds_one_admission() {
+    let _guard = TEST_LOCK.lock().await;
+    EXECUTION_ORDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    FUSION_WAITER_ACQUIRED.store(false, Ordering::SeqCst);
+
+    let temp = tempfile::tempdir().expect("fusion admission tempdir");
+    let mut ctx = ExecCtx::new(temp.path().join("job"))
+        .with_resource_limit(Resource::Cpu, 1)
+        .with_max_in_flight(1);
+    let cpu = ctx.resources[&Resource::Cpu].clone();
+    ctx.dag_optimizer = Some(fusion_only(true));
+    let execution = tokio::spawn(ParallelExecutor::execute(
+        compiled_graph(
+            &[
+                ("record_order", "fuse-admission-root", None),
+                ("record_after", "fuse-admission-middle", None),
+                ("record_after", "fuse-admission-terminal", None),
+            ],
+            &[(0, 1), (1, 2)],
+        ),
+        ctx,
+    ));
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        FUSION_ROOT_STARTED.notified(),
+    )
+    .await
+    .expect("root starts while holding CPU admission");
+    let waiter = tokio::spawn(async move {
+        FUSION_WAITER_STARTED.notify_one();
+        let permit = cpu.acquire_owned().await.expect("CPU semaphore stays open");
+        FUSION_WAITER_ACQUIRED.store(true, Ordering::SeqCst);
+        FUSION_RELEASE_WAITER.notified().await;
+        drop(permit);
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        FUSION_WAITER_STARTED.notified(),
+    )
+    .await
+    .expect("external waiter reaches the CPU acquire");
+    tokio::task::yield_now().await;
+    FUSION_RELEASE_ROOT.notify_one();
+
+    let held_continuously = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if EXECUTION_ORDER
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|label| label == "fuse-admission-middle")
+            {
+                break true;
+            }
+            if FUSION_WAITER_ACQUIRED.load(Ordering::SeqCst) {
+                break false;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("either the fused middle or the external waiter makes progress");
+
+    FUSION_RELEASE_WAITER.notify_one();
+    execution
+        .await
+        .expect("fusion execution task joins")
+        .expect("fusion admission fixture executes");
+    waiter.await.expect("external CPU waiter joins");
+    assert!(
+        held_continuously,
+        "a fused chain must not release and reacquire its broker admission between stages"
+    );
+}
+
+#[tokio::test]
+async fn dag_opt_advanced_gate_fused_cache_hits_need_no_admission() {
+    let _guard = TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().expect("fusion cache tempdir");
+    let cache_root = temp.path().join("shared-cache");
+    let plan = || {
+        compiled_graph(
+            &[
+                ("record_order", "fuse-cache-root", None),
+                ("record_after", "fuse-cache-middle", None),
+                ("record_after", "fuse-cache-terminal", None),
+            ],
+            &[(0, 1), (1, 2)],
+        )
+    };
+    let make_cache = |job_dir: &std::path::Path| {
+        Arc::new(CacheHandle::job_local(job_dir.join("_cache")).with_global(cache_root.clone()))
+    };
+
+    let prewarm_dir = temp.path().join("prewarm");
+    let mut prewarm = ExecCtx::new(prewarm_dir.clone());
+    prewarm.cache = make_cache(&prewarm_dir);
+    ParallelExecutor::execute(plan(), prewarm)
+        .await
+        .expect("prewarm fused cache fixture");
+
+    let measured_dir = temp.path().join("measured");
+    let mut measured = ExecCtx::new(measured_dir.clone())
+        .with_resource_limit(Resource::Cpu, 0)
+        .with_max_in_flight(1);
+    measured.cache = make_cache(&measured_dir);
+    measured.dag_optimizer = Some(fusion_only(true));
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        ParallelExecutor::execute(plan(), measured),
+    )
+    .await
+    .expect("a fully warm fused chain must not wait for an unavailable CPU permit")
+    .expect("execute fully warm fused chain");
+    assert_eq!((result.n_cache_hits, result.n_cache_misses), (3, 0));
+}
+
+#[tokio::test]
+async fn dag_opt_advanced_gate_fusion_falls_back_for_branches_and_nondeterministic_nodes() {
+    let _guard = TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().expect("fusion fallback tempdir");
+
+    let run = |name: &str, plan: CompiledPlan, optimizer: DagOptimizer| {
+        let job_dir = temp.path().join(name);
+        let mut ctx = ExecCtx::new(job_dir).with_max_in_flight(1);
+        ctx.dag_optimizer = Some(optimizer);
+        async move {
+            FUSION_TASK_IDS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            let result = ParallelExecutor::execute(plan, ctx)
+                .await
+                .expect("execute fusion fallback fixture");
+            let unique_tasks = FUSION_TASK_IDS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            (result, unique_tasks)
+        }
+    };
+
+    let (branched, branched_tasks) = run(
+        "branched",
+        compiled_graph(
+            &[
+                ("record_order", "fuse-branch-root", None),
+                ("record_after", "fuse-branch-left", None),
+                ("record_after", "fuse-branch-right", None),
+            ],
+            &[(0, 1), (0, 2)],
+        ),
+        fusion_only(true),
+    )
+    .await;
+    assert_eq!(branched.n_stages, 3);
+    assert_eq!(
+        branched_tasks, 3,
+        "an externally consumed fork must not fuse"
+    );
+
+    let (nondeterministic, nondeterministic_tasks) = run(
+        "nondeterministic",
+        compiled_graph(
+            &[
+                ("record_order", "fuse-nondeterministic-root", None),
+                (
+                    "record_nondeterministic",
+                    "fuse-nondeterministic-middle",
+                    None,
+                ),
+                ("record_after", "fuse-nondeterministic-terminal", None),
+            ],
+            &[(0, 1), (1, 2)],
+        ),
+        fusion_only(true),
+    )
+    .await;
+    assert_eq!(nondeterministic.n_stages, 3);
+    assert_eq!(
+        nondeterministic_tasks, 3,
+        "a non-deterministic node must keep ordinary executor boundaries"
+    );
+
+    let (mixed_admission, mixed_admission_tasks) = run(
+        "mixed-admission",
+        compiled_graph(
+            &[
+                ("record_order", "fuse-mixed-root", None),
+                ("record_network_after", "fuse-mixed-middle", None),
+                ("record_after", "fuse-mixed-terminal", None),
+            ],
+            &[(0, 1), (1, 2)],
+        ),
+        fusion_only(true),
+    )
+    .await;
+    assert_eq!(mixed_admission.n_stages, 3);
+    assert_eq!(
+        mixed_admission_tasks, 3,
+        "a mixed resource envelope must fall back instead of reserving a later stage's resources early"
+    );
+
+    let mut cache_aware_fusion = fusion_only(true);
+    cache_aware_fusion.cache_aware = true;
+    let (cache_aware, cache_aware_tasks) = run(
+        "cache-aware",
+        compiled_graph(
+            &[
+                ("record_order", "fuse-cache-aware-root", None),
+                ("record_after", "fuse-cache-aware-middle", None),
+                ("record_after", "fuse-cache-aware-terminal", None),
+            ],
+            &[(0, 1), (1, 2)],
+        ),
+        cache_aware_fusion,
+    )
+    .await;
+    assert_eq!(cache_aware.n_stages, 3);
+    assert_eq!(
+        cache_aware_tasks, 3,
+        "cache-aware mode must retain its deadline-aware probe path"
+    );
+}
+
+#[tokio::test]
+async fn dag_opt_advanced_gate_fused_panic_returns_plan_error() {
+    let _guard = TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().expect("fusion panic tempdir");
+    let mut ctx = ExecCtx::new(temp.path().join("job")).with_max_in_flight(1);
+    ctx.dag_optimizer = Some(fusion_only(true));
+    let caught = std::panic::AssertUnwindSafe(ParallelExecutor::execute(
+        compiled_graph(
+            &[
+                ("record_order", "fuse-panic-root", None),
+                ("record_panicking", "fuse-panic-middle", None),
+                ("record_after", "fuse-panic-terminal", None),
+            ],
+            &[(0, 1), (1, 2)],
+        ),
+        ctx,
+    ))
+    .catch_unwind()
+    .await;
+    let result = caught.expect("a fused stage panic must not unwind the executor caller");
+    match result {
+        Err(PlanError::Other(message)) => assert!(
+            message.contains("panicked"),
+            "panic must retain the established plan-level classification: {message}"
+        ),
+        other => panic!("expected PlanError::Other for fused panic, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dag_opt_advanced_gate_fused_failure_matches_cancellation_semantics() {
+    let _guard = TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().expect("fusion failure tempdir");
+    let run = |name: &str, enabled: bool| {
+        let mut ctx = ExecCtx::new(temp.path().join(name)).with_max_in_flight(1);
+        ctx.dag_optimizer = Some(fusion_only(enabled));
+        let cancel = ctx.cancel.clone();
+        async move {
+            let result = ParallelExecutor::execute(
+                compiled_graph(
+                    &[
+                        ("record_order", "fuse-failure-root", None),
+                        ("record_failing", "fuse-failure-middle", None),
+                        ("record_after", "fuse-failure-terminal", None),
+                    ],
+                    &[(0, 1), (1, 2)],
+                ),
+                ctx,
+            )
+            .await;
+            (result, cancel.is_cancelled())
+        }
+    };
+
+    let (unfused, unfused_cancelled) = run("unfused", false).await;
+    let (fused, fused_cancelled) = run("fused", true).await;
+    assert!(
+        matches!(unfused, Err(PlanError::StageFailed { ref stage, .. }) if stage == "record_failing")
+    );
+    assert!(
+        matches!(fused, Err(PlanError::StageFailed { ref stage, .. }) if stage == "record_failing")
+    );
+    assert!(unfused_cancelled, "ordinary failure cancels the plan token");
+    assert!(
+        fused_cancelled,
+        "fused failure must cancel the same caller-visible plan token"
+    );
 }
 
 async fn run_downstream_cache_fixture(

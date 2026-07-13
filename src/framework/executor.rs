@@ -49,7 +49,7 @@ use crate::framework::control::{Control, ControlPolicy, StepMetrics};
 use crate::framework::error::{PlanError, StageError};
 use crate::framework::plan::{CompiledPlan, NodeId};
 use crate::framework::resource::Resource;
-use crate::framework::stage::{ErasedArtifact, StageContext, StageDyn};
+use crate::framework::stage::{ErasedArtifact, InProcessArtifact, StageContext, StageDyn};
 use crate::framework::status::{StageEvent, StatusHub, spawn_status_writer};
 
 /// Default bound on concurrently-spawned node tasks in the parallel
@@ -545,8 +545,16 @@ struct NodeTask {
 struct NodeOutcome {
     node_id: NodeId,
     output: ErasedArtifact,
+    /// Present only on the fused fast path. The next stage consumes this box
+    /// directly instead of decoding `output` through bincode again.
+    in_process_output: Option<InProcessArtifact>,
     logical: ContentHash,
     cache_hit: bool,
+}
+
+struct StageRunOutput {
+    erased: ErasedArtifact,
+    in_process: Option<InProcessArtifact>,
 }
 
 /// How a node run failed. The coordinator maps this to a `PlanError`;
@@ -680,7 +688,169 @@ async fn cache_lookup_off_thread(
     tokio::task::spawn_blocking(move || cache.lookup(key)).await
 }
 
-async fn run_node(mut task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, NodeFailure> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AdmissionRequest {
+    resources: Vec<Resource>,
+    gpu: Option<crate::broker::gpu::GpuRequest>,
+    memory_gib: u32,
+}
+
+impl AdmissionRequest {
+    fn for_stage(stage: &dyn StageDyn, args: &serde_json::Value, memory_budget_gib: u32) -> Self {
+        let mut resources: Vec<Resource> = stage
+            .resources()
+            .iter()
+            .copied()
+            .filter(|resource| *resource != Resource::Gpu)
+            .collect();
+        resources.sort();
+        Self {
+            resources,
+            gpu: stage
+                .resources()
+                .contains(&Resource::Gpu)
+                .then(|| stage.gpu_request(args)),
+            memory_gib: stage.memory_gib_for(args).min(memory_budget_gib),
+        }
+    }
+
+    fn for_task(task: &NodeTask, memory_budget_gib: u32) -> Self {
+        Self::for_stage(task.stage.as_ref(), &task.args, memory_budget_gib)
+    }
+
+    fn for_chain(
+        nodes: &[crate::framework::plan::PlanNode],
+        memory_budget_gib: u32,
+    ) -> Option<Self> {
+        let request_for = |node: &crate::framework::plan::PlanNode| {
+            Self::for_stage(node.stage.as_ref(), &node.args, memory_budget_gib)
+        };
+        let mut requests = nodes.iter().map(request_for);
+        let first = requests.next()?;
+        // A chain-wide union would reserve resources for a later node before
+        // its input-dependent cache lookup is possible. If that node is warm,
+        // fusion could block or fail on a GPU/network/memory envelope it never
+        // uses. The first conservative slice therefore fuses only identical
+        // envelopes; one shared grant is then exactly what every miss would
+        // have requested, never a synthetic or premature superset.
+        requests.all(|request| request == first).then_some(first)
+    }
+}
+
+struct AdmissionLease {
+    resources: Vec<tokio::sync::OwnedSemaphorePermit>,
+    gpu: Option<crate::broker::gpu::GpuGrant>,
+    _memory: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl AdmissionLease {
+    fn release_non_gpu_resources(&mut self) {
+        self.resources.clear();
+    }
+}
+
+struct FusionAdmission {
+    request: AdmissionRequest,
+    lease: Option<AdmissionLease>,
+}
+
+impl FusionAdmission {
+    fn new(request: AdmissionRequest) -> Self {
+        Self {
+            request,
+            lease: None,
+        }
+    }
+
+    async fn ensure_acquired(
+        &mut self,
+        env: &NodeEnv,
+        idx: u32,
+        stage_name: &str,
+    ) -> Result<&AdmissionLease, NodeFailure> {
+        if self.lease.is_none() {
+            self.lease = Some(acquire_admission(&self.request, env, idx, stage_name).await?);
+        }
+        Ok(self.lease.as_ref().expect("fusion admission initialized"))
+    }
+}
+
+async fn acquire_admission(
+    request: &AdmissionRequest,
+    env: &NodeEnv,
+    idx: u32,
+    stage_name: &str,
+) -> Result<AdmissionLease, NodeFailure> {
+    let mut permits = Vec::with_capacity(request.resources.len());
+    for &resource in &request.resources {
+        let Some(sem) = env.resources.get(&resource) else {
+            continue;
+        };
+        let permit = match sem.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                env.status.emit(StageEvent::StageBlocked {
+                    node_idx: idx,
+                    stage_name: stage_name.to_string(),
+                    resource,
+                });
+                sem.clone().acquire_owned().await.map_err(|_| {
+                    NodeFailure::Other(format!("resource '{resource}' semaphore closed"))
+                })?
+            }
+        };
+        permits.push(permit);
+    }
+
+    let gpu = if let Some(request) = request.gpu {
+        let grant = match env.gpu.try_acquire(request) {
+            Some(grant) => grant,
+            None => {
+                env.status.emit(StageEvent::StageBlocked {
+                    node_idx: idx,
+                    stage_name: stage_name.to_string(),
+                    resource: Resource::Gpu,
+                });
+                env.gpu
+                    .acquire(request)
+                    .await
+                    .map_err(|error| NodeFailure::Other(format!("GPU admission: {error}")))?
+            }
+        };
+        Some(grant)
+    } else {
+        None
+    };
+
+    let memory = if request.memory_gib > 0 {
+        Some(
+            env.memory
+                .clone()
+                .acquire_many_owned(request.memory_gib)
+                .await
+                .map_err(|_| NodeFailure::Other("memory semaphore closed".into()))?,
+        )
+    } else {
+        None
+    };
+
+    Ok(AdmissionLease {
+        resources: permits,
+        gpu,
+        _memory: memory,
+    })
+}
+
+async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, NodeFailure> {
+    run_node_with_admission(task, env, None, None).await
+}
+
+async fn run_node_with_admission(
+    mut task: NodeTask,
+    env: Arc<NodeEnv>,
+    mut shared_admission: Option<&mut FusionAdmission>,
+    mut in_process_input: Option<InProcessArtifact>,
+) -> Result<NodeOutcome, NodeFailure> {
     let idx = task.node_idx;
     let stage_name = task.stage.name().to_string();
 
@@ -749,6 +919,7 @@ async fn run_node(mut task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, 
         return Ok(NodeOutcome {
             node_id: task.node_id,
             output: hit.artifact,
+            in_process_output: None,
             logical,
             cache_hit: true,
         });
@@ -773,8 +944,9 @@ async fn run_node(mut task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, 
     let final_stage_dir = stages_root.join(format!("{idx}-{stage_name}"));
     let tmp_stage_dir = stages_root.join(format!(".tmp-{idx}-{stage_name}-{}", task.key.to_hex()));
 
+    let fused_handoff = shared_admission.is_some() && task.stage.supports_in_process_handoff();
     let mut attempt = 0u32;
-    let (output, run_elapsed) = loop {
+    let (stage_output, run_elapsed) = loop {
         attempt += 1;
         // Backoff before a re-attempt — cancellable (a backing-off stage
         // must drop the GPU/permits, which it already has by here).
@@ -920,99 +1092,51 @@ async fn run_node(mut task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, 
             }
         }
 
-        // ── Resource permits ────────────────────────────────────────
-        // Acquire in canonical (sorted) order so two concurrent stages
-        // can never deadlock on the same pair in opposite orders.
-        // `try_acquire` first; only emit `StageBlocked` on contention.
-        let mut sorted_resources: Vec<Resource> = task.stage.resources().to_vec();
-        sorted_resources.sort();
-        // A DDP stage holds `nproc` GPU permits (sized to the box's GPU pool);
-        // every other resource holds 1. Clamp to the pool so a request for more
-        // permits than exist can't park forever (the GPU pool == device count,
-        // set by the CLI via `with_resource_limit`).
-        let mut permits = Vec::new();
-        for resource in sorted_resources {
-            // GPU is scheduled separately by the GpuScheduler (ADR 0087); it is
-            // no longer in the semaphore map, so `get` skips it here. Every other
-            // resource holds exactly one permit.
-            let Some(sem) = env.resources.get(&resource) else {
-                continue;
-            };
-            let permit = match sem.clone().try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
-                    env.status.emit(StageEvent::StageBlocked {
-                        node_idx: idx,
-                        stage_name: stage_name.clone(),
-                        resource,
-                    });
-                    match sem.clone().acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => {
-                            let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-                            return Err(NodeFailure::Other(format!(
-                                "resource '{resource}' semaphore closed"
-                            )));
-                        }
-                    }
-                }
-            };
-            permits.push(permit);
-        }
-
-        // ── GPU device grant (ADR 0087) ─────────────────────────────
-        // A GPU stage acquires a device SET (per-device exclusive permits +
-        // VRAM-aware placement) held for the run — the VRAM key, in SERIES with
-        // the RAM broker below, never a bypass. The granted device set is
-        // stamped onto the ctx so a launcher-aware backend masks
-        // `CUDA_VISIBLE_DEVICES` to exactly this slice; the exclusive per-device
-        // semaphore is the hard no-collision guarantee regardless of the backend.
-        let _gpu_grant = if task.stage.resources().contains(&Resource::Gpu) {
-            let req = task.stage.gpu_request(&task.args);
-            let grant = match env.gpu.try_acquire(req) {
-                Some(g) => g,
-                None => {
-                    env.status.emit(StageEvent::StageBlocked {
-                        node_idx: idx,
-                        stage_name: stage_name.clone(),
-                        resource: Resource::Gpu,
-                    });
-                    match env.gpu.acquire(req).await {
-                        Ok(g) => g,
-                        Err(e) => {
-                            let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-                            return Err(NodeFailure::Other(format!("GPU admission: {e}")));
-                        }
-                    }
-                }
-            };
-            stage_ctx.device_index = grant.devices.first().copied().or(stage_ctx.device_index);
-            stage_ctx.gpu_devices = grant.devices.clone();
-            Some(grant)
-        } else {
-            None
-        };
-
-        // ── Memory admission (Phase 5) ──────────────────────────────
-        // Hold MEMORY_GIB permits from the box-fit budget for the whole run, so
-        // the SUM of concurrent stages can't exceed the box (never-OOM-the-BOX
-        // under the parallel executor). Clamp to the budget so a stage needing
-        // the whole box runs alone instead of deadlocking. `0` = no reservation.
-        let mem_want = task
-            .stage
-            .memory_gib_for(&task.args)
-            .min(env.memory_budget_gib);
-        let _mem_permit = if mem_want > 0 {
-            match env.memory.clone().acquire_many_owned(mem_want).await {
-                Ok(p) => Some(p),
-                Err(_) => {
+        // ── Resource/GPU/memory admission ───────────────────────────
+        // Ordinary nodes acquire their own canonical envelope per attempt. A
+        // fused linear chain supplies one pre-acquired identical lease instead,
+        // so its stages cannot release/reacquire between boundaries. Both paths
+        // use this same helper: fusion changes lease lifetime, never admission
+        // policy or the StageContext device assignment.
+        let mut owned_admission = None;
+        let admission = if let Some(shared) = shared_admission.as_deref_mut() {
+            shared
+                .ensure_acquired(&env, idx, &stage_name)
+                .await
+                .inspect_err(|_| {
                     let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-                    return Err(NodeFailure::Other("memory semaphore closed".into()));
-                }
-            }
+                })?
         } else {
-            None
+            owned_admission = Some(
+                acquire_admission(
+                    &AdmissionRequest::for_task(&task, env.memory_budget_gib),
+                    &env,
+                    idx,
+                    &stage_name,
+                )
+                .await
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+                })?,
+            );
+            owned_admission
+                .as_ref()
+                .expect("ordinary admission initialized")
         };
+        if task.stage.resources().contains(&Resource::Gpu)
+            && let Some(grant) = &admission.gpu
+        {
+            // Mirror `GpuScheduler::effective_need`: a degenerate GPU stage
+            // declaring count=0 is still admitted as one device, exactly like
+            // the pre-refactor path that exposed the scheduler's whole grant.
+            let requested = task.stage.gpu_request(&task.args).count.max(1) as usize;
+            stage_ctx.gpu_devices = grant.devices.iter().copied().take(requested).collect();
+            stage_ctx.device_index = stage_ctx
+                .gpu_devices
+                .first()
+                .copied()
+                .or(stage_ctx.device_index);
+        }
 
         let stage_started = Instant::now();
 
@@ -1033,9 +1157,34 @@ async fn run_node(mut task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, 
             )
         });
 
-        let run_fut = task
-            .stage
-            .run_erased(&stage_ctx, task.input.clone(), task.args.clone());
+        let run_fut = async {
+            if fused_handoff {
+                // The typed predecessor value is single-owner and is consumed
+                // by the first attempt. A retry intentionally decodes the
+                // canonical erased input: the prior attempt may have consumed
+                // or mutated its typed value before failing.
+                task.stage
+                    .run_in_process(
+                        &stage_ctx,
+                        task.input.clone(),
+                        in_process_input.take(),
+                        task.args.clone(),
+                    )
+                    .await
+                    .map(|(erased, in_process)| StageRunOutput {
+                        erased,
+                        in_process: Some(in_process),
+                    })
+            } else {
+                task.stage
+                    .run_erased(&stage_ctx, task.input.clone(), task.args.clone())
+                    .await
+                    .map(|erased| StageRunOutput {
+                        erased,
+                        in_process: None,
+                    })
+            }
+        };
         let timed_fut = run_with_timeout(
             run_fut,
             &stage_cancel,
@@ -1061,13 +1210,15 @@ async fn run_node(mut task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, 
                 if let Some(h) = gpu_sampler {
                     h.stop().await;
                 }
+                if let Some(owned) = owned_admission.as_mut() {
+                    owned.release_non_gpu_resources();
+                }
                 // Match every other error exit from this attempt (see the
                 // sibling `let _ = std::fs::remove_dir_all(&tmp_stage_dir)`
                 // calls above/below): a caught panic must not skip cleanup
                 // of this attempt's tmp dir either, or it lingers on disk
                 // until process exit.
                 let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-                drop(permits);
                 drop(stage_ctx);
                 std::panic::resume_unwind(panic_payload);
             }
@@ -1080,9 +1231,14 @@ async fn run_node(mut task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, 
         if let Some(h) = gpu_sampler {
             h.stop().await;
         }
-        // Permits drop here, releasing the resource for queued stages
-        // (including during a backoff before the next attempt).
-        drop(permits);
+        // Preserve the historical ordinary-node boundary: CPU/network/disk
+        // permits are available to other work before divergence classification
+        // and the synchronous retry hook. GPU and memory stay scoped to this
+        // attempt as before. A shared fusion lease is only borrowed here and
+        // remains held by the fused-plan driver across every stage in the chain.
+        if let Some(owned) = owned_admission.as_mut() {
+            owned.release_non_gpu_resources();
+        }
         drop(stage_ctx);
 
         // ── Divergence (S1 / P7) ────────────────────────────────────
@@ -1109,10 +1265,10 @@ async fn run_node(mut task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, 
         let err: StageError = match run_result {
             Ok(o) => {
                 debug_assert_eq!(
-                    o.kind,
+                    o.erased.kind,
                     task.stage.output_kind(),
                     "stage '{stage_name}' produced kind '{}' but declares output_kind '{}'",
-                    o.kind,
+                    o.erased.kind,
                     task.stage.output_kind()
                 );
                 // A cancel observed during the run must NOT be promoted /
@@ -1283,12 +1439,23 @@ async fn run_node(mut task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, 
         });
     }
 
-    // Re-point tmp-rooted absolute paths in the output handle at the
-    // promoted final dir so downstream (and a later cache hit) read the
-    // files where they now live.
-    let output = task
-        .stage
-        .rebase_output_paths(output, &tmp_stage_dir, &final_stage_dir);
+    // Re-point tmp-rooted absolute paths in the output handle at the promoted
+    // final dir. A fused stage finishes this from the just-produced typed value
+    // (no bincode decode at the inter-stage boundary); if that internal seam
+    // declines, fall back to the established erased path.
+    let StageRunOutput { erased, in_process } = stage_output;
+    let (output, in_process_output, known_output_hash) = match in_process.and_then(|typed| {
+        task.stage
+            .promote_in_process_output(typed, &tmp_stage_dir, &final_stage_dir)
+    }) {
+        Some((output, typed, output_hash)) => (output, Some(typed), Some(output_hash)),
+        None => (
+            task.stage
+                .rebase_output_paths(erased, &tmp_stage_dir, &final_stage_dir),
+            None,
+            None,
+        ),
+    };
 
     // Sidecar metadata next to the promoted payload. Record the CONTENT hash
     // (the FW-1 fix path, same as the downstream logical hash uses) so the
@@ -1297,10 +1464,11 @@ async fn run_node(mut task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, 
     // handle, which embeds the producer's absolute paths. Falls back to the
     // handle hash for non-deterministic / tuple outputs (the same well-tested
     // fallback `compute_logical_output_hash` uses).
-    let output_hash = task
-        .stage
-        .output_content_hash(&output)
-        .unwrap_or_else(|| content_hash_from_erased(&output));
+    let output_hash = known_output_hash.unwrap_or_else(|| {
+        task.stage
+            .output_content_hash(&output)
+            .unwrap_or_else(|| content_hash_from_erased(&output))
+    });
     let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, output_hash)
         .with_stage(stage_name.clone());
     if let Err(e) = metadata.write_to(&final_stage_dir.join("output.metadata.json")) {
@@ -1336,18 +1504,23 @@ async fn run_node(mut task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, 
         elapsed: run_elapsed,
     });
 
-    let logical = compute_logical_output_hash(
-        task.stage.as_ref(),
-        &output,
-        task.stage.deterministic(),
-        &stage_name,
-        task.stage.schema(),
-        task.input_hash,
-        &task.canon_args,
-    );
+    let logical = if known_output_hash.is_some() && task.stage.deterministic() {
+        output_hash
+    } else {
+        compute_logical_output_hash(
+            task.stage.as_ref(),
+            &output,
+            task.stage.deterministic(),
+            &stage_name,
+            task.stage.schema(),
+            task.input_hash,
+            &task.canon_args,
+        )
+    };
     Ok(NodeOutcome {
         node_id: task.node_id,
         output,
+        in_process_output,
         logical,
         cache_hit: false,
     })
@@ -1360,13 +1533,13 @@ async fn run_node(mut task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, 
 /// exceeded budget and must not be promoted). The HARD deadline drops
 /// the run future (its `kill_on_drop` subprocess is reaped) and returns
 /// `Timeout`.
-async fn run_with_timeout(
-    run_fut: impl std::future::Future<Output = Result<ErasedArtifact, StageError>>,
+async fn run_with_timeout<T>(
+    run_fut: impl std::future::Future<Output = Result<T, StageError>>,
     stage_cancel: &CancellationToken,
     soft: Option<std::time::Duration>,
     hard: Option<std::time::Duration>,
     started: Instant,
-) -> Result<ErasedArtifact, StageError> {
+) -> Result<T, StageError> {
     if soft.is_none() && hard.is_none() {
         return run_fut.await;
     }
@@ -2099,6 +2272,160 @@ impl SequentialExecutor {
     }
 }
 
+/// Conservative ADR 0102 fusion eligibility for the first fused executor path.
+/// A full-plan chain has no sibling that could observe an intermediate and no
+/// competing same-plan key flight that would need the parallel coordinator.
+/// Dynamic expansion, advisory semantics, and non-deterministic stages stay on
+/// the established scheduler until their own equivalence contracts exist.
+fn full_linear_fusion_order(plan: &CompiledPlan) -> Option<Vec<NodeId>> {
+    if plan.nodes.len() < 2
+        || !plan.expansions.is_empty()
+        || plan.nodes.iter().any(|node| {
+            !node.stage.deterministic()
+                || node.stage.is_advisory()
+                || !node.stage.supports_in_process_handoff()
+        })
+    {
+        return None;
+    }
+    let order = plan.topo_order().ok()?;
+    if plan.edges.len() != order.len().saturating_sub(1)
+        || !order.windows(2).all(|pair| {
+            plan.edges
+                .iter()
+                .any(|edge| edge.from == pair[0] && edge.to == pair[1])
+        })
+        || plan
+            .initial
+            .keys()
+            .any(|node_id| Some(node_id) != order.first())
+    {
+        return None;
+    }
+    Some(order)
+}
+
+#[cfg(feature = "p2p")]
+fn fusion_runtime_is_local(ctx: &ExecCtx) -> bool {
+    ctx.dispatch_policy.is_none() && ctx.dispatcher.is_none()
+}
+
+#[cfg(not(feature = "p2p"))]
+fn fusion_runtime_is_local(_ctx: &ExecCtx) -> bool {
+    true
+}
+
+/// Execute one eligible linear plan without returning to the ready-queue
+/// coordinator between nodes. Every node still goes through `build_task` and
+/// `run_node`, so its normal cache key, FW-2 promotion, sidecars, events, and
+/// output artifact remain the source of truth. One lazily-acquired shared
+/// admission lease spans every actual stage run in the chain; all-hit chains
+/// acquire nothing.
+async fn execute_fused_linear_plan(
+    plan: CompiledPlan,
+    ctx: ExecCtx,
+    order: Vec<NodeId>,
+    admission_request: AdmissionRequest,
+    started: Instant,
+) -> Result<PlanResult, PlanError> {
+    let view = plan.exec_view();
+    let deadline = ctx.deadline;
+    let Prelude {
+        writer_handle,
+        env,
+        mut outputs,
+        mut logical_outputs,
+    } = prelude(ctx, &plan)?;
+    let mut n_hits = 0usize;
+    let mut n_misses = 0usize;
+    let mut admission = FusionAdmission::new(admission_request);
+    let mut in_process_input = None;
+
+    if env.cancel.is_cancelled() {
+        env.status.emit(StageEvent::StageFailed {
+            node_idx: 0,
+            stage_name: "<cancelled>".into(),
+            error: "plan cancelled before stage".into(),
+            failure: None,
+        });
+        finish_writer(env, writer_handle).await;
+        return Err(PlanError::Cancelled);
+    }
+
+    for (idx, node_id) in order.iter().enumerate() {
+        if let Some(error) = plan_stop_error(deadline, started, &env.cancel) {
+            env.cancel.cancel();
+            drop(admission);
+            finish_writer(env, writer_handle).await;
+            return Err(error);
+        }
+        let node = &view.nodes[*node_id as usize];
+        let task = match build_task(
+            node,
+            idx as u32,
+            view.edges,
+            &outputs,
+            &logical_outputs,
+            KillSlot::new(env.cancel.child_token()),
+        ) {
+            Ok(task) => task,
+            Err(error) => {
+                env.cancel.cancel();
+                drop(admission);
+                finish_writer(env, writer_handle).await;
+                return Err(error);
+            }
+        };
+        let fused_stage_name = task.stage.name();
+        let run_result = std::panic::AssertUnwindSafe(run_node_with_admission(
+            task,
+            env.clone(),
+            Some(&mut admission),
+            in_process_input.take(),
+        ))
+        .catch_unwind()
+        .await;
+        match run_result {
+            Ok(Ok(mut outcome)) => {
+                if outcome.cache_hit {
+                    n_hits += 1;
+                } else {
+                    n_misses += 1;
+                }
+                in_process_input = outcome.in_process_output.take();
+                outputs.insert(outcome.node_id, outcome.output);
+                logical_outputs.insert(outcome.node_id, outcome.logical);
+            }
+            Ok(Err(failure)) => {
+                env.cancel.cancel();
+                drop(admission);
+                finish_writer(env, writer_handle).await;
+                return Err(plan_error_of(failure));
+            }
+            Err(_) => {
+                env.cancel.cancel();
+                drop(admission);
+                finish_writer(env, writer_handle).await;
+                return Err(PlanError::Other(format!(
+                    "node task panicked in fused node {idx} ({fused_stage_name})"
+                )));
+            }
+        }
+    }
+
+    let final_output = order.last().and_then(|id| outputs.remove(id));
+    drop(admission);
+    finish_writer(env, writer_handle).await;
+    Ok(PlanResult {
+        final_output,
+        n_stages: order.len(),
+        n_cache_hits: n_hits,
+        n_cache_misses: n_misses,
+        elapsed: started.elapsed(),
+        warnings: Vec::new(),
+    })
+}
+
 // ════════════════════════════════════════════════════════════════════
 // Parallel executor — ready-set scheduling, JoinSet workers.
 // ════════════════════════════════════════════════════════════════════
@@ -2137,11 +2464,30 @@ impl ParallelExecutor {
             .dag_optimizer
             .as_ref()
             .is_some_and(|optimizer| optimizer.cache_aware);
+        let stage_fusion = ctx
+            .dag_optimizer
+            .as_ref()
+            .is_some_and(|optimizer| optimizer.stage_fusion);
         let (plan, mut schedule_hints) = if let Some(ref optimizer) = ctx.dag_optimizer {
             optimizer.optimize(plan)
         } else {
             (plan, std::collections::HashMap::new())
         };
+
+        // Cache-aware mode retains its deadline/cancellation-aware ready probe
+        // path. A linear chain has no ready-order choice, so composing it with
+        // fusion has no scheduling upside; fall back rather than weakening the
+        // increment-2 slow-store deadline guarantee.
+        if stage_fusion
+            && !cache_aware
+            && ctx.control.is_none()
+            && fusion_runtime_is_local(&ctx)
+            && let Some(order) = full_linear_fusion_order(&plan)
+            && let Some(admission_request) =
+                AdmissionRequest::for_chain(&plan.nodes, ctx.memory_budget_gib)
+        {
+            return execute_fused_linear_plan(plan, ctx, order, admission_request, started).await;
+        }
 
         // `mut`: runtime `Spawn` (PBT/TPE) extends the topo order at runtime.
         let mut order = plan.topo_order()?; // also the cycle check
@@ -2575,6 +2921,7 @@ impl ParallelExecutor {
                                                             Ok(NodeOutcome {
                                                                 node_id,
                                                                 output: hit.artifact,
+                                                                in_process_output: None,
                                                                 logical,
                                                                 cache_hit: false,
                                                             })

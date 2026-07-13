@@ -68,6 +68,33 @@ pub struct ErasedArtifact {
     pub payload: Vec<u8>,
 }
 
+/// Executor-internal typed artifact used to hand a value directly between
+/// fused stages. Cookbooks continue implementing [`Stage`] normally; the
+/// blanket [`StageDyn`] implementation creates and consumes this box.
+///
+/// The type is public only because it appears on the public object-safe
+/// `StageDyn` seam. Its payload is intentionally opaque and has no public
+/// constructor, so it is not a second artifact API.
+#[doc(hidden)]
+pub struct InProcessArtifact {
+    value: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl InProcessArtifact {
+    fn new<A: Artifact>(value: A) -> Self {
+        Self {
+            value: Box::new(value),
+        }
+    }
+
+    fn into_typed<A: Artifact>(self) -> Result<A, Self> {
+        match self.value.downcast::<A>() {
+            Ok(value) => Ok(*value),
+            Err(value) => Err(Self { value }),
+        }
+    }
+}
+
 /// Wire-format version of the `tuple<N>` merge envelope. Bumped from 1
 /// (the old bincode-concat form) to 2 (a length-prefixed
 /// `Vec<ErasedArtifact>` carrying each child's kind+schema, validated
@@ -566,6 +593,45 @@ pub trait StageDyn: Send + Sync + 'static {
         args: serde_json::Value,
     ) -> Result<ErasedArtifact, StageError>;
 
+    /// Whether this stage can consume/produce the executor's direct typed
+    /// handoff. Default false preserves hand-written `StageDyn` implementors;
+    /// the blanket `impl<S: Stage>` enables it for every normal cookbook stage.
+    #[doc(hidden)]
+    fn supports_in_process_handoff(&self) -> bool {
+        false
+    }
+
+    /// Fused-stage counterpart to [`StageDyn::run_erased`]. `erased_input`
+    /// remains available for retry/fallback; `in_process_input` avoids decoding
+    /// the preceding stage's bincode envelope on the successful fast path.
+    #[doc(hidden)]
+    async fn run_in_process(
+        &self,
+        _ctx: &StageContext,
+        _erased_input: ErasedArtifact,
+        _in_process_input: Option<InProcessArtifact>,
+        _args: serde_json::Value,
+    ) -> Result<(ErasedArtifact, InProcessArtifact), StageError> {
+        Err(StageError::BadInput(format!(
+            "stage '{}' does not support in-process fusion",
+            self.name()
+        )))
+    }
+
+    /// Finish FW-2 promotion without decoding the just-produced bincode
+    /// envelope. Returns the rebased erased handle, the typed value for the
+    /// next fused stage, and its content hash. `None` falls back safely to the
+    /// established erased promotion path.
+    #[doc(hidden)]
+    fn promote_in_process_output(
+        &self,
+        _in_process: InProcessArtifact,
+        _from: &std::path::Path,
+        _to: &std::path::Path,
+    ) -> Option<(ErasedArtifact, InProcessArtifact, ContentHash)> {
+        None
+    }
+
     /// Erased [`Stage::preflight`]: deserialize `args` → typed, run the stage's
     /// submit-time validation. An args-deserialize failure IS a preflight
     /// failure (the recipe handed the stage args it can't parse).
@@ -651,6 +717,44 @@ pub trait StageDyn: Send + Sync + 'static {
     fn recompute_output_hash(&self, _art: &ErasedArtifact) -> Option<std::io::Result<ContentHash>> {
         None
     }
+}
+
+fn decode_stage_input<S: Stage>(input: ErasedArtifact) -> Result<S::Input, StageError> {
+    input.into_typed::<S::Input>().map_err(|error| match error {
+        ErasedDecodeError::Kind { expected, got } => StageError::KindMismatch {
+            stage: S::NAME,
+            expected,
+            got,
+        },
+        ErasedDecodeError::Schema { expected, got } => StageError::BadInput(format!(
+            "input schema for stage '{}' expected v{expected}, got v{got}",
+            S::NAME
+        )),
+        ErasedDecodeError::Arity { expected, got } => StageError::BadInput(format!(
+            "merge input for stage '{}' expected {expected} tuple children, got {got}",
+            S::NAME
+        )),
+        ErasedDecodeError::Deserialize(source) => StageError::InputDeserialize {
+            stage: S::NAME,
+            source,
+        },
+    })
+}
+
+fn decode_stage_args<S: Stage>(args: serde_json::Value) -> Result<S::Args, StageError> {
+    serde_json::from_value(args).map_err(|source| StageError::ArgsDeserialize {
+        stage: S::NAME,
+        source,
+    })
+}
+
+fn encode_stage_output<S: Stage>(output: &S::Output) -> Result<ErasedArtifact, StageError> {
+    ErasedArtifact::from_typed(output).map_err(|error| match error {
+        ErasedEncodeError::Serialize(source) => StageError::OutputSerialize {
+            stage: S::NAME,
+            source,
+        },
+    })
 }
 
 #[async_trait]
@@ -790,48 +894,71 @@ impl<S: Stage> StageDyn for S {
         // 1. Decode input → typed S::Input. KindMismatch /
         //    InputDeserialize translate the ErasedDecodeError
         //    into the StageError variants the executor expects.
-        let typed_input: S::Input = input.into_typed::<S::Input>().map_err(|e| match e {
-            ErasedDecodeError::Kind { expected, got } => StageError::KindMismatch {
-                stage: S::NAME,
-                expected,
-                got,
-            },
-            ErasedDecodeError::Schema { expected, got } => StageError::BadInput(format!(
-                "input schema for stage '{}' expected v{expected}, got v{got}",
-                S::NAME
-            )),
-            ErasedDecodeError::Arity { expected, got } => StageError::BadInput(format!(
-                "merge input for stage '{}' expected {expected} tuple children, got {got}",
-                S::NAME
-            )),
-            ErasedDecodeError::Deserialize(source) => StageError::InputDeserialize {
-                stage: S::NAME,
-                source,
-            },
-        })?;
+        let typed_input = decode_stage_input::<S>(input)?;
 
         // 2. Decode args. Args validation is the stage's own
         //    concern beyond serde — we just deserialize. Distinct
         //    error variant from input deserialization so log
         //    readers can disambiguate "bad recipe args" from "bad
         //    upstream artifact".
-        let typed_args: S::Args =
-            serde_json::from_value(args).map_err(|source| StageError::ArgsDeserialize {
-                stage: S::NAME,
-                source,
-            })?;
+        let typed_args = decode_stage_args::<S>(args)?;
 
         // 3. Call the typed run. This is where the stage actually
         //    does work.
         let output: S::Output = self.run(ctx, typed_input, &typed_args).await?;
 
         // 4. Re-encode output for the next erased edge.
-        ErasedArtifact::from_typed(&output).map_err(|e| match e {
-            ErasedEncodeError::Serialize(source) => StageError::OutputSerialize {
-                stage: S::NAME,
-                source,
+        encode_stage_output::<S>(&output)
+    }
+
+    fn supports_in_process_handoff(&self) -> bool {
+        true
+    }
+
+    async fn run_in_process(
+        &self,
+        ctx: &StageContext,
+        erased_input: ErasedArtifact,
+        in_process_input: Option<InProcessArtifact>,
+        args: serde_json::Value,
+    ) -> Result<(ErasedArtifact, InProcessArtifact), StageError> {
+        let typed_input = match in_process_input {
+            Some(value) => match value.into_typed::<S::Input>() {
+                Ok(typed) => typed,
+                // A mismatched box is an executor-internal fast-path miss, not
+                // a user-visible semantic change. Decode the canonical erased
+                // input and let its established typed error win if malformed.
+                Err(_) => decode_stage_input::<S>(erased_input)?,
             },
-        })
+            None => decode_stage_input::<S>(erased_input)?,
+        };
+        let typed_args = decode_stage_args::<S>(args)?;
+        let output: S::Output = self.run(ctx, typed_input, &typed_args).await?;
+        let erased = encode_stage_output::<S>(&output)?;
+        Ok((erased, InProcessArtifact::new(output)))
+    }
+
+    fn promote_in_process_output(
+        &self,
+        in_process: InProcessArtifact,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> Option<(ErasedArtifact, InProcessArtifact, ContentHash)> {
+        let typed: S::Output = in_process.into_typed().ok()?;
+        let mut value = serde_json::to_value(&typed).ok()?;
+        rebase_path_strings(
+            &mut value,
+            from.to_string_lossy().as_ref(),
+            to.to_string_lossy().as_ref(),
+        );
+        // Match the established erased FW-2 path exactly: every output takes
+        // the same JSON projection/reconstruction even when no path changes.
+        // The fused win is specifically that the NEXT stage consumes this
+        // typed value directly instead of bincode-decoding the envelope.
+        let typed = serde_json::from_value::<S::Output>(value).ok()?;
+        let content_hash = typed.content_hash();
+        let erased = ErasedArtifact::from_typed(&typed).ok()?;
+        Some((erased, InProcessArtifact::new(typed), content_hash))
     }
 
     async fn preflight_erased(&self, args: &serde_json::Value) -> Result<(), StageError> {
@@ -994,8 +1121,8 @@ fn rebase_path_strings(value: &mut serde_json::Value, from: &str, to: &str) {
             }
         }
         Value::Object(map) => {
-            for (_k, v) in map.iter_mut() {
-                rebase_path_strings(v, from, to);
+            for value in map.values_mut() {
+                rebase_path_strings(value, from, to);
             }
         }
         _ => {}

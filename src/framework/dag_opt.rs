@@ -19,6 +19,10 @@
 //!    stage jumps bulk work in the executor's ready queue. Flag-gated
 //!    (`priority_aware`, default off); reorders *ready* nodes only, never
 //!    bypassing broker admission.
+//! 6. **Full-linear fusion slice** (ADR 0102) — opt an eligible whole-plan
+//!    deterministic chain into the executor's fused-chain path, preserving
+//!    every ordinary node/cache identity while removing coordinator task and
+//!    bincode-handoff boundaries. Internal subchain rewriting remains later.
 //!
 //! The optimizer is conservative: it never changes the DAG's semantic
 //! output, only its execution order and which nodes run at all.
@@ -66,6 +70,11 @@ pub struct DagOptimizer {
     /// the executor's ready-queue is byte-identical to the pre-0102 behaviour
     /// (each advanced 0102 pass is flag-gated, default-off, per the ADR).
     pub priority_aware: bool,
+    /// ADR 0102's first stage-fusion slice. **Off by default.** The executor may
+    /// coalesce an eligible whole-plan linear deterministic chain into one task
+    /// while retaining every node's normal artifact and cache key. This does
+    /// not yet rewrite eligible internal subchains into fused plan nodes.
+    pub stage_fusion: bool,
 }
 
 impl DagOptimizer {
@@ -76,6 +85,7 @@ impl DagOptimizer {
             cache_aware: false,
             memory_aware: true,
             priority_aware: false,
+            stage_fusion: false,
         }
     }
 
@@ -545,6 +555,7 @@ mod tests {
             cache_aware: false,
             memory_aware: false,
             priority_aware: true,
+            stage_fusion: false,
         }
     }
 
