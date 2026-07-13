@@ -430,7 +430,7 @@ fn dir_size(path: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CacheHit {
     pub artifact: ErasedArtifact,
     pub from_path: PathBuf,

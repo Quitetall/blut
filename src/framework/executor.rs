@@ -38,13 +38,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::launcher::JobState;
 use crate::framework::artifact::{ArtifactMetadata, ContentHash};
-use crate::framework::cache::CacheHandle;
+use crate::framework::cache::{CacheHandle, CacheHit};
 use crate::framework::control::{Control, ControlPolicy, StepMetrics};
 use crate::framework::error::{PlanError, StageError};
 use crate::framework::plan::{CompiledPlan, NodeId};
@@ -206,9 +206,9 @@ pub struct ExecCtx {
     /// P2P dispatch: submits tasks to the remote compute network.
     #[cfg(feature = "p2p")]
     pub dispatcher: Option<Arc<dyn DispatchSubmitter>>,
-    /// DAG optimizer. When set, the executor runs the optimizer pass
-    /// on the plan before execution (dead code elimination, critical
-    /// path scheduling, cache-aware ordering). Default: enabled.
+    /// DAG optimizer. When set, the executor runs its enabled passes before
+    /// execution. The established DCE/critical-path/memory passes default on;
+    /// advanced cache-aware and user-priority ordering default off.
     pub dag_optimizer: Option<crate::framework::dag_opt::DagOptimizer>,
 }
 
@@ -525,6 +525,10 @@ struct NodeTask {
     input: ErasedArtifact,
     input_hash: ContentHash,
     key: ContentHash,
+    /// Cache artifact already decoded by cache-aware ready-queue probing. The
+    /// parallel executor carries it into `run_node` so a warm node is read once
+    /// and can short-circuit before optional remote dispatch.
+    prepared_cache_hit: Option<Arc<CacheHit>>,
     /// Resolved retry policy + timeout (node override, else stage const).
     retry: crate::framework::retry::RetryPolicy,
     timeout: crate::framework::retry::StageTimeout,
@@ -669,7 +673,14 @@ fn record_divergence_and_kill(
 /// events. The single home of the FW-2 atomicity contract. Emits
 /// lifecycle events via `env.status`; never manages the status
 /// writer's lifecycle (the coordinator owns that).
-async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, NodeFailure> {
+async fn cache_lookup_off_thread(
+    cache: Arc<CacheHandle>,
+    key: ContentHash,
+) -> Result<Option<CacheHit>, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || cache.lookup(key)).await
+}
+
+async fn run_node(mut task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, NodeFailure> {
     let idx = task.node_idx;
     let stage_name = task.stage.name().to_string();
 
@@ -677,9 +688,22 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
     // INC D (S4): `bypass_cache` forces a recompute — skip the READ so the
     // stage always runs even with a warm entry. The fresh result is still
     // inserted into the cache below the run path, so later runs hit again.
-    if !env.bypass_cache
-        && let Some(hit) = env.cache.lookup(task.key)
-    {
+    let cache_hit: Option<Arc<CacheHit>> = if env.bypass_cache {
+        None
+    } else if let Some(hit) = task.prepared_cache_hit.take() {
+        Some(hit)
+    } else {
+        cache_lookup_off_thread(env.cache.clone(), task.key)
+            .await
+            .map_err(|error| {
+                NodeFailure::Other(format!(
+                    "cache lookup worker failed for {stage_name}: {error}"
+                ))
+            })?
+            .map(Arc::new)
+    };
+    if let Some(hit) = cache_hit {
+        let hit = Arc::try_unwrap(hit).unwrap_or_else(|shared| (*shared).clone());
         env.status.emit(StageEvent::StageSkipped {
             node_idx: idx,
             stage_name: stage_name.clone(),
@@ -1382,6 +1406,25 @@ async fn sleep_until_opt(at: Option<Instant>) {
     }
 }
 
+/// Return the plan-level stop reason that forbids another node launch.
+/// Deadline dominates cancellation when both become observable together,
+/// matching the coordinator's outer-loop and cache-probe `select!` ordering.
+fn plan_stop_error(
+    deadline: Option<Instant>,
+    started: Instant,
+    cancel: &CancellationToken,
+) -> Option<PlanError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        Some(PlanError::DeadlineExceeded {
+            elapsed: started.elapsed(),
+        })
+    } else if cancel.is_cancelled() {
+        Some(PlanError::Cancelled)
+    } else {
+        None
+    }
+}
+
 /// Predecessor node ids of `node_id`, in edge order (which preserves
 /// the order a recipe author called `fork`/`merge`).
 fn predecessors(edges: &[crate::framework::plan::PlanEdge], node_id: NodeId) -> Vec<NodeId> {
@@ -1507,15 +1550,7 @@ fn build_task(
     let preds = predecessors(edges, node.id);
     let input = gather_input(node.id, &preds, outputs)?;
     let input_hash = gather_input_hash(node.id, &preds, logical_outputs)?;
-    let code_sha = node_code_sha(node.stage.as_ref());
-    let key = CacheHandle::key_for_canon_bytes_partitioned(
-        node.stage.name(),
-        node.stage.schema(),
-        input_hash,
-        &node.canon_args,
-        &code_sha,
-        node.partition.as_ref(),
-    );
+    let key = node_cache_key(node, input_hash);
     // Resolve retry/timeout: a per-node override wins over the stage const.
     let retry = node.retry.unwrap_or_else(|| node.stage.retry());
     let timeout = node.timeout.unwrap_or_else(|| node.stage.timeout());
@@ -1528,10 +1563,26 @@ fn build_task(
         input,
         input_hash,
         key,
+        prepared_cache_hit: None,
         retry,
         timeout,
         node_cancel,
     })
+}
+
+/// Exact ADR-0078/0101 cache key for one node after predecessor hashes resolve.
+/// Scheduling probes and `build_task` share this function, so cache-aware order
+/// cannot drift from the key `run_node` later reads and writes.
+fn node_cache_key(node: &crate::framework::plan::PlanNode, input_hash: ContentHash) -> ContentHash {
+    let code_sha = node_code_sha(node.stage.as_ref());
+    CacheHandle::key_for_canon_bytes_partitioned(
+        node.stage.name(),
+        node.stage.schema(),
+        input_hash,
+        &node.canon_args,
+        &code_sha,
+        node.partition.as_ref(),
+    )
 }
 
 /// Resolve a node id to its `PlanNode` across the ORIGINAL plan (borrowed
@@ -1557,22 +1608,122 @@ fn node_at<'a>(
 /// Real PBT/TPE runs spawn O(trials), far below this; it only guards a bug.
 const MAX_RUNTIME_SPAWNS: usize = 4096;
 
-/// Pick the ready node with the LONGEST critical path to the terminal, so the
-/// critical path is never starved behind a cheap side branch. Ties are broken
-/// by ascending `NodeId` — which makes the no-optimizer / all-equal-priority
-/// case byte-identical to the historical `ready.iter().next()` (smallest id),
-/// since `ready` is a `BTreeSet`. Nodes absent from `hints` (runtime-injected
-/// sub-plans, or no optimizer configured) default to `critical_path_len = 0`,
-/// so they schedule after any positive-priority original node but are never
-/// dropped — `cap` keeps draining them.
+/// Resolve real cache warmth for every currently-ready node. Ready means every
+/// predecessor logical hash exists, so the exact input-dependent key is known.
+/// [`CacheHandle::lookup`] requires a live, decodable entry and matches the read
+/// path `run_node` uses. Exact-key results are memoized for the run and a miss is
+/// invalidated only when that key completes, avoiding quadratic
+/// remote/filesystem probes on wide DAGs. Blocking I/O runs off the coordinator.
+/// Force-recompute makes every node cold without touching the cache.
+const MAX_CACHE_PROBE_CONCURRENCY: usize = 8;
+
+#[allow(clippy::too_many_arguments)]
+async fn refresh_cache_warm_hints(
+    ready: &BTreeSet<NodeId>,
+    pruned: &HashSet<NodeId>,
+    view: &crate::framework::plan::ExecView<'_>,
+    appended: &[crate::framework::plan::PlanNode],
+    orig_n: usize,
+    edges: &[crate::framework::plan::PlanEdge],
+    logical_outputs: &HashMap<NodeId, ContentHash>,
+    cache: Arc<CacheHandle>,
+    bypass_cache: bool,
+    cancel: &CancellationToken,
+    deadline: Option<Instant>,
+    started: Instant,
+    hints: &mut HashMap<NodeId, crate::framework::dag_opt::ScheduleHint>,
+    probes: &mut HashMap<ContentHash, Option<Arc<CacheHit>>>,
+    prepared_hits: &mut HashMap<NodeId, Arc<CacheHit>>,
+) -> Result<(), PlanError> {
+    prepared_hits.clear();
+    if bypass_cache {
+        for &node_id in ready {
+            if !pruned.contains(&node_id) {
+                hints.entry(node_id).or_default().cache_warm = false;
+            }
+        }
+        return Ok(());
+    }
+
+    let mut node_keys = Vec::with_capacity(ready.len());
+    let mut unseen_keys = Vec::new();
+    let mut unseen = HashSet::new();
+    for &node_id in ready {
+        // A control-policy-pruned descendant can be re-added to `ready` when a
+        // different parent completes. Its killed input intentionally has no
+        // logical hash; the spawn loop will discard it, so do not probe it.
+        if pruned.contains(&node_id) {
+            continue;
+        }
+        let node = node_at(view, appended, orig_n, node_id);
+        let preds = predecessors(edges, node_id);
+        let input_hash = gather_input_hash(node_id, &preds, logical_outputs)?;
+        let key = node_cache_key(node, input_hash);
+        node_keys.push((node_id, key));
+        if !probes.contains_key(&key) && unseen.insert(key) {
+            unseen_keys.push(key);
+        }
+    }
+
+    let completed = futures::stream::iter(unseen_keys.into_iter().map(|key| {
+        let cache = cache.clone();
+        async move { (key, cache_lookup_off_thread(cache, key).await) }
+    }))
+    .buffer_unordered(MAX_CACHE_PROBE_CONCURRENCY)
+    .collect::<Vec<_>>();
+    tokio::pin!(completed);
+    let completed = tokio::select! {
+        // If deadline and cancellation become ready together, preserve the
+        // deadline error the loop's pre-probe check would have reported.
+        biased;
+        _ = sleep_until_opt(deadline), if deadline.is_some() => {
+            return Err(PlanError::DeadlineExceeded {
+                elapsed: started.elapsed(),
+            });
+        }
+        _ = cancel.cancelled() => return Err(PlanError::Cancelled),
+        completed = &mut completed => completed,
+    };
+    for (key, result) in completed {
+        let hit = result.map_err(|error| {
+            PlanError::Other(format!(
+                "cache-aware probe worker failed for {}: {error}",
+                key.to_hex()
+            ))
+        })?;
+        probes.insert(key, hit.map(Arc::new));
+    }
+
+    for (node_id, key) in node_keys {
+        let hit = probes.get(&key).and_then(Option::as_ref);
+        hints.entry(node_id).or_default().cache_warm = hit.is_some();
+        if let Some(hit) = hit {
+            prepared_hits.insert(node_id, hit.clone());
+        }
+    }
+    // `completed` may win immediately before expiry/cancellation, and the
+    // synchronous result + hint loops above can still take time on a wide DAG.
+    // Recheck after that work so a probe cannot return launchable hints after
+    // the plan has stopped accepting new stages.
+    if let Some(error) = plan_stop_error(deadline, started, cancel) {
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Pick a real cache hit first when ADR 0102's cache-aware pass is enabled,
+/// then highest user priority, then longest critical path. Ties use ascending
+/// `NodeId`, keeping no-optimizer/all-neutral order byte-identical to historical
+/// `ready.iter().next()`. Nodes absent from hints remain fully neutral.
 ///
 /// Determinism: iteration is driven by the sorted `ready` set and only does
 /// point `get`s into the `HashMap` `hints`; the composite key
-/// `(user_priority, critical_path_len, Reverse(id))` is unique per node (the
+/// `(cache_warm, user_priority, critical_path_len, Reverse(id))` is unique per
+/// node (the
 /// `Reverse(id)` tail is a total order), so the argmax never depends on
 /// `max_by_key`'s tie rule. `user_priority` (ADR 0102) is 0 unless the
-/// `priority_aware` pass ran, so the default key is exactly the historical
-/// `(critical_path_len, Reverse(id))`.
+/// `priority_aware` pass ran, and `cache_warm` is false unless the cache-aware
+/// pass ran, so default selection remains historical.
 ///
 /// Cost: O(|ready|) per call (a linear argmax), vs the old `ready.iter().next()`
 /// at O(log n). The `max_in_flight` cap bounds calls per loop pass and ML
@@ -1584,13 +1735,12 @@ fn next_ready(
 ) -> Option<NodeId> {
     ready.iter().copied().max_by_key(|id| {
         let h = hints.get(id);
-        // ADR 0102 pass #4: user priority DOMINATES critical-path length, so a
-        // latency-critical stage jumps bulk work. When the `priority_aware` pass
-        // is off, every `user_priority` is 0 and this reduces to the historical
-        // `(critical_path_len, Reverse(id))` key — byte-identical selection.
+        // ADR 0102: a real cache hit is cheapest progress and dominates user
+        // priority. Both fields stay neutral unless their default-off passes ran.
+        let warm = h.map(|h| h.cache_warm).unwrap_or(false);
         let prio = h.map(|h| h.user_priority).unwrap_or(0);
         let cp = h.map(|h| h.critical_path_len).unwrap_or(0);
-        (prio, cp, std::cmp::Reverse(*id))
+        (warm, prio, cp, std::cmp::Reverse(*id))
     })
 }
 
@@ -1980,7 +2130,14 @@ impl ParallelExecutor {
         // loop (longest critical path first); with no optimizer the map is
         // empty and `next_ready` falls back to smallest-NodeId order, which
         // is byte-identical to the historical `ready.iter().next()`.
-        let (plan, schedule_hints) = if let Some(ref optimizer) = ctx.dag_optimizer {
+        // Cache warmth needs resolved predecessor hashes plus this run's
+        // tenant-scoped CacheHandle, neither of which exists at static optimizer
+        // time. Preserve the default-off flag for the ready-queue seam below.
+        let cache_aware = ctx
+            .dag_optimizer
+            .as_ref()
+            .is_some_and(|optimizer| optimizer.cache_aware);
+        let (plan, mut schedule_hints) = if let Some(ref optimizer) = ctx.dag_optimizer {
             optimizer.optimize(plan)
         } else {
             (plan, std::collections::HashMap::new())
@@ -2086,6 +2243,11 @@ impl ParallelExecutor {
         let mut inflight_keys: HashSet<ContentHash> = HashSet::new();
         let mut node_key_of: HashMap<NodeId, ContentHash> = HashMap::new();
         let mut deferred: HashMap<ContentHash, Vec<NodeId>> = HashMap::new();
+        // ADR 0102 cache-aware scheduling state. `None` means a probed miss;
+        // absence means unprobed. Prepared hits are cheap Arc clones rebuilt
+        // for the current ready set and consumed by selected tasks.
+        let mut cache_probes: HashMap<ContentHash, Option<Arc<CacheHit>>> = HashMap::new();
+        let mut prepared_cache_hits: HashMap<NodeId, Arc<CacheHit>> = HashMap::new();
 
         let mut join: tokio::task::JoinSet<Result<NodeOutcome, NodeFailure>> =
             tokio::task::JoinSet::new();
@@ -2183,10 +2345,43 @@ impl ParallelExecutor {
             // Spawn ready nodes up to the in-flight cap (unless we're
             // already failing — then stop spawning and just drain).
             if first_error.is_none() {
-                while in_flight.load(std::sync::atomic::Ordering::Relaxed) < max_in_flight {
-                    // Critical-path-first among ready nodes (longest path to the
-                    // terminal wins); ties → smallest NodeId, byte-identical to the
-                    // historical `ready.iter().next()` when priorities are equal.
+                if cache_aware
+                    && let Err(error) = refresh_cache_warm_hints(
+                        &ready,
+                        &pruned,
+                        &view,
+                        &appended,
+                        orig_n,
+                        &all_edges,
+                        &logical_outputs,
+                        env.cache.clone(),
+                        env.bypass_cache,
+                        &env.cancel,
+                        deadline,
+                        started,
+                        &mut schedule_hints,
+                        &mut cache_probes,
+                        &mut prepared_cache_hits,
+                    )
+                    .await
+                {
+                    first_error.get_or_insert(error);
+                    env.cancel.cancel();
+                }
+                while first_error.is_none()
+                    && in_flight.load(std::sync::atomic::Ordering::Relaxed) < max_in_flight
+                {
+                    // A wide ready set can keep this loop busy across the plan
+                    // deadline, and external cancellation can race the probe's
+                    // final check. Check before readiness work, then again at
+                    // the concrete dispatch/spawn boundaries below.
+                    if let Some(error) = plan_stop_error(deadline, started, &env.cancel) {
+                        first_error = Some(error);
+                        env.cancel.cancel();
+                        break;
+                    }
+                    // Cache-hit first when enabled, then user priority and
+                    // critical path; ties retain historical smallest NodeId.
                     let Some(node_id) = next_ready(&ready, &schedule_hints) else {
                         break;
                     };
@@ -2204,7 +2399,7 @@ impl ParallelExecutor {
                     // retained in `node_tokens` so the control watcher can fire
                     // it alone (and a divergence retry can re-arm it).
                     let node_cancel = KillSlot::new(env.cancel.child_token());
-                    let task = match build_task(
+                    let mut task = match build_task(
                         node,
                         node_idx,
                         &all_edges,
@@ -2234,6 +2429,7 @@ impl ParallelExecutor {
                         deferred.entry(task.key).or_default().push(node_id);
                         continue;
                     }
+                    task.prepared_cache_hit = prepared_cache_hits.remove(&node_id);
                     inflight_keys.insert(task.key);
                     node_key_of.insert(node_id, task.key);
                     // Retain the kill token only for an actually-spawned node
@@ -2252,12 +2448,13 @@ impl ParallelExecutor {
                         node_stages.insert(node_id, task.stage.clone());
                     }
 
-                    // P2P dispatch: if the stage is dispatchable and a
-                    // dispatcher is available, offload to a peer instead
-                    // of running locally.
+                    // P2P dispatch: a prepared cache hit is already complete
+                    // locally and must reach `run_node`'s skip path. Only a
+                    // genuine miss may be offloaded to a peer.
                     #[cfg(feature = "p2p")]
-                    if let (Some(policy), Some(dispatcher)) =
-                        (env.dispatch_policy.as_ref(), env.dispatcher.as_ref())
+                    if task.prepared_cache_hit.is_none()
+                        && let (Some(policy), Some(dispatcher)) =
+                            (env.dispatch_policy.as_ref(), env.dispatcher.as_ref())
                     {
                         // Restricted tenant custody dominates a cookbook's data
                         // classification. Even a buggy/custom policy that labels
@@ -2286,6 +2483,11 @@ impl ParallelExecutor {
                                 data_class,
                                 tenant: &env.tenant,
                             };
+                            if let Some(error) = plan_stop_error(deadline, started, &env.cancel) {
+                                first_error = Some(error);
+                                env.cancel.cancel();
+                                break;
+                            }
                             match dispatcher.submit(request) {
                                 Ok(handle) => {
                                     tracing::info!(
@@ -2337,8 +2539,13 @@ impl ParallelExecutor {
                                                     // peer claimed success but never delivered the
                                                     // artifact — fail closed instead of returning a
                                                     // phantom `Ok` with no real output.
-                                                    return match cache.lookup(key) {
-                                                        Some(hit) => {
+                                                    return match cache_lookup_off_thread(
+                                                        cache.clone(),
+                                                        key,
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(Some(hit)) => {
                                                             let logical = compute_logical_output_hash(
                                                                 stage.as_ref(),
                                                                 &hit.artifact,
@@ -2372,10 +2579,26 @@ impl ParallelExecutor {
                                                                 cache_hit: false,
                                                             })
                                                         }
-                                                        None => {
+                                                        Ok(None) => {
                                                             let msg = format!(
                                                                 "P2P dispatch reported success for node {node_idx} ({stage_name}) but no artifact was found in the cache for key {}",
                                                                 key.to_hex()
+                                                            );
+                                                            status.emit(StageEvent::StageFailed {
+                                                                node_idx,
+                                                                stage_name: stage_name.clone(),
+                                                                error: msg.clone(),
+                                                                failure: None,
+                                                            });
+                                                            Err(NodeFailure::Stage {
+                                                                idx: node_idx,
+                                                                stage: stage_name,
+                                                                source: StageError::Backend(anyhow::anyhow!(msg)),
+                                                            })
+                                                        }
+                                                        Err(error) => {
+                                                            let msg = format!(
+                                                                "P2P cache lookup worker failed for node {node_idx} ({stage_name}): {error}"
                                                             );
                                                             status.emit(StageEvent::StageFailed {
                                                                 node_idx,
@@ -2467,6 +2690,11 @@ impl ParallelExecutor {
                     }
 
                     let env_c = env.clone();
+                    if let Some(error) = plan_stop_error(deadline, started, &env.cancel) {
+                        first_error = Some(error);
+                        env.cancel.cancel();
+                        break;
+                    }
                     join.spawn(async move { run_node(task, env_c).await });
                     in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -2627,7 +2855,8 @@ impl ParallelExecutor {
             match res {
                 Ok(outcome) => {
                     completed += 1;
-                    if outcome.cache_hit {
+                    let was_cache_hit = outcome.cache_hit;
+                    if was_cache_hit {
                         n_hits += 1;
                     } else {
                         n_misses += 1;
@@ -2651,6 +2880,12 @@ impl ParallelExecutor {
                     // Release any nodes deferred behind this key — they
                     // can now cache-hit. Re-add them to the ready set.
                     if let Some(k) = key {
+                        // Completion is the only relevant cache transition for
+                        // this exact key. Always invalidate it: even a cache hit
+                        // may have raced a prior scheduling miss, and retaining
+                        // that stale `None` could misorder or remotely dispatch
+                        // a same-key waiter. Unrelated keys remain memoized.
+                        cache_probes.remove(&k);
                         inflight_keys.remove(&k);
                         if let Some(waiters) = deferred.remove(&k) {
                             for w in waiters {

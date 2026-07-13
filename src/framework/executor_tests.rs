@@ -47,10 +47,9 @@ static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 static MAKE_RUN_COUNT: AtomicU32 = AtomicU32::new(0);
 
-// --- next_ready: critical-path-first ready-node selection (B1) ---------
+// --- next_ready: cache/priority/critical-path ready-node selection -------
 
-/// Build a `ScheduleHint` carrying only a critical-path length (the only
-/// field `next_ready` reads).
+/// Build a `ScheduleHint` carrying only a non-neutral critical-path length.
 fn cp_hint(critical_path_len: u32) -> crate::framework::dag_opt::ScheduleHint {
     crate::framework::dag_opt::ScheduleHint {
         critical_path_len,
@@ -156,6 +155,52 @@ fn dag_opt_priority_only_selects_ready_never_bypasses_admission() {
     let ready: BTreeSet<NodeId> = [2].into_iter().collect();
     let hints: HashMap<NodeId, _> = [(5, prio_hint(1000, 1))].into_iter().collect();
     assert_eq!(next_ready(&ready, &hints), Some(2));
+}
+
+#[tokio::test]
+async fn cache_warm_probe_skips_control_pruned_ready_nodes() {
+    // A completing second parent may re-add a descendant after another parent
+    // was intentionally killed. The spawn loop discards that pruned node; the
+    // cache probe must not demand the killed parent's absent logical hash first.
+    let plan = Plan::<(), LamuTrainerBackend>::new("pruned_probe", serde_json::json!({}))
+        .start(MakeOne, EmptyArgs)
+        .finish()
+        .into_compiled();
+    let view = plan.exec_view();
+    let ready: BTreeSet<NodeId> = [0].into_iter().collect();
+    let pruned: HashSet<NodeId> = [0].into_iter().collect();
+    let appended = Vec::new();
+    let logical_outputs = HashMap::new();
+    let temp = tempfile::tempdir().unwrap();
+    let cache = Arc::new(CacheHandle::job_local(temp.path().join("cache")));
+    let mut hints = HashMap::new();
+    let mut probes = HashMap::new();
+    let mut prepared_hits = HashMap::new();
+    let cancel = CancellationToken::new();
+    let started = Instant::now();
+
+    refresh_cache_warm_hints(
+        &ready,
+        &pruned,
+        &view,
+        &appended,
+        view.nodes.len(),
+        view.edges,
+        &logical_outputs,
+        cache,
+        false,
+        &cancel,
+        None,
+        started,
+        &mut hints,
+        &mut probes,
+        &mut prepared_hits,
+    )
+    .await
+    .expect("a pruned ready node is intentionally unprobeable");
+    assert!(hints.is_empty());
+    assert!(probes.is_empty());
+    assert!(prepared_hits.is_empty());
 }
 
 struct MakeOne;
@@ -3106,6 +3151,56 @@ impl Stage for DispatchableStage {
 }
 #[cfg(feature = "p2p")]
 impl Compatible<LamuTrainerBackend> for DispatchableStage {}
+
+#[cfg(feature = "p2p")]
+#[tokio::test]
+async fn cache_aware_warm_node_skips_p2p_dispatch() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let td = tempfile::tempdir().unwrap();
+    let cache = Arc::new(CacheHandle::job_local(td.path().join("shared-cache")));
+    let make_plan = || {
+        Plan::<(), LamuTrainerBackend>::new("p2p_cache_hit", serde_json::json!({}))
+            .start(DispatchableStage, EmptyArgs)
+            .finish()
+            .into_compiled()
+    };
+
+    let mut prewarm = ExecCtx::new(td.path().join("prewarm"));
+    prewarm.cache = cache.clone();
+    let first = ParallelExecutor::execute(make_plan(), prewarm)
+        .await
+        .expect("prewarm dispatchable stage locally");
+    assert_eq!((first.n_cache_hits, first.n_cache_misses), (0, 1));
+
+    let submit_count = Arc::new(AtomicU32::new(0));
+    let submitter = Arc::new(MockDispatchSubmitter {
+        cache: cache.clone(),
+        polls_before_terminal: 0,
+        terminal: MockTerminal::Succeeded,
+        succeed_with: Counter { n: 42 },
+        poll_count: Arc::new(AtomicU32::new(0)),
+        submit_count: submit_count.clone(),
+    });
+    let policy = Arc::new(MockDispatchPolicy {
+        dispatchable: "dispatchable_thing",
+    });
+    let mut ctx = ExecCtx::new(td.path().join("measured"));
+    ctx.cache = cache;
+    ctx.dag_optimizer
+        .as_mut()
+        .expect("default optimizer")
+        .cache_aware = true;
+    let result = ParallelExecutor::execute(make_plan(), ctx.with_dispatch(policy, submitter))
+        .await
+        .expect("warm dispatchable stage must finish from cache");
+
+    assert_eq!((result.n_cache_hits, result.n_cache_misses), (1, 0));
+    assert_eq!(
+        submit_count.load(Ordering::SeqCst),
+        0,
+        "a prepared local cache hit must short-circuit before remote dispatch"
+    );
+}
 
 #[cfg(feature = "p2p")]
 #[tokio::test]

@@ -9,8 +9,8 @@
 //!    never consumed by any downstream stage.
 //! 2. **Critical path priority** — compute the critical path length
 //!    for each node and store it as a scheduling hint.
-//! 3. **Cache-aware ordering** — among nodes with equal priority,
-//!    prefer those with warm caches (already computed).
+//! 3. **Cache-aware ordering** (ADR 0102) — opt in to executor-side live cache
+//!    probes once a node is ready and its exact input-dependent key is known.
 //! 4. **Memory-aware scheduling** — compute peak concurrent memory
 //!    for the current schedule and suggest reordering if a cheaper
 //!    order exists.
@@ -37,7 +37,8 @@ pub struct ScheduleHint {
     /// Estimated peak memory (GiB) if this node and all its
     /// concurrent siblings run together.
     pub peak_concurrent_gib: u32,
-    /// True if this node's cache is warm (output already exists).
+    /// True only after the executor resolves this ready node's exact cache key
+    /// against its live [`CacheHandle`](super::cache::CacheHandle).
     pub cache_warm: bool,
     /// ADR 0102 pass #4: user scheduling priority copied from the node's
     /// `PlanNode::priority` (0 when unset). Dominates `critical_path_len` in the
@@ -54,7 +55,9 @@ pub struct DagOptimizer {
     pub eliminate_dead_code: bool,
     /// Compute critical path priorities.
     pub critical_path: bool,
-    /// Prefer cache-warm nodes.
+    /// Prefer nodes with a live, decodable cache entry. **Off by default**;
+    /// actual probing happens in the executor because only it owns resolved
+    /// predecessor hashes and the run's tenant-scoped `CacheHandle`.
     pub cache_aware: bool,
     /// Compute memory-aware ordering.
     pub memory_aware: bool,
@@ -70,7 +73,7 @@ impl DagOptimizer {
         Self {
             eliminate_dead_code: true,
             critical_path: true,
-            cache_aware: true,
+            cache_aware: false,
             memory_aware: true,
             priority_aware: false,
         }
@@ -92,10 +95,10 @@ impl DagOptimizer {
             compute_critical_paths(&plan, &mut hints);
         }
 
-        // Pass 3: Cache-aware hints
-        if self.cache_aware {
-            compute_cache_hints(&plan, &mut hints);
-        }
+        // Pass 3 (ADR 0102): cache-aware ordering is resolved later by the
+        // executor. At optimizer time downstream input hashes are not known and
+        // no tenant-scoped CacheHandle exists, so any static "warm" claim would
+        // be a determinism proxy rather than cache evidence.
 
         // Pass 4: Memory-aware scheduling
         if self.memory_aware {
@@ -278,22 +281,6 @@ fn compute_critical_paths(plan: &CompiledPlan, hints: &mut HashMap<NodeId, Sched
     // Store in hints
     for (i, &len) in cp_len.iter().enumerate() {
         hints.entry(i as NodeId).or_default().critical_path_len = len;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Pass 3: Cache-aware hints
-// ---------------------------------------------------------------------------
-
-/// Mark nodes whose caches are warm (output already exists).
-fn compute_cache_hints(plan: &CompiledPlan, hints: &mut HashMap<NodeId, ScheduleHint>) {
-    for node in &plan.nodes {
-        // A node's cache is warm if it's deterministic and the cache
-        // has an entry. We can't check the cache here without the
-        // CacheHandle, so we mark based on the DETERMINISTIC flag.
-        // The executor will check the actual cache at spawn time.
-        let hint = hints.entry(node.id).or_default();
-        hint.cache_warm = node.stage.deterministic();
     }
 }
 
