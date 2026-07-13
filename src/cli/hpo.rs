@@ -76,6 +76,9 @@ pub(super) enum HpoCommand {
         /// lineage row, and RAM sub-envelope.
         #[arg(long, default_value = "default")]
         tenant: String,
+        /// Experiment/campaign name for lineage grouping. Defaults to the recipe.
+        #[arg(long)]
+        experiment: Option<String>,
     },
     /// Leaderboard for an HPO job: per-trial best objective + status, sorted
     /// best-first. Reconstructed from `<job_dir>/hpo.json` + the durable
@@ -129,6 +132,7 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
         shared_cache,
         launcher,
         tenant,
+        experiment,
     } = cmd
     else {
         unreachable!("non-Run HpoCommand variants dispatched above")
@@ -137,6 +141,7 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
     // Base args (the fixed part; search dims overlay each trial).
     let base_args: serde_json::Value =
         serde_json::from_str(&args).map_err(|e| anyhow!("--args is not valid JSON: {e}"))?;
+    let source_args = base_args.clone();
 
     // Search space: YAML file (if any) then inline --param (later wins), validate.
     let mut sp = match &space {
@@ -176,6 +181,22 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
         launcher.parse().map_err(|e| anyhow!("{e}"))?;
     let tenant = crate::tenant::Tenant::parse(&tenant)
         .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
+    let base_args = crate::registry_args::resolve_recipe_args(base_args, &tenant, launch_target)
+        .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
+    for (dimension, distribution) in &mut sp.dims {
+        if let crate::hpo::Dist::Choice { choices } = distribution {
+            for choice in choices {
+                *choice = crate::registry_args::resolve_recipe_args(
+                    std::mem::take(choice),
+                    &tenant,
+                    launch_target,
+                )
+                .map_err(|e| {
+                    anyhow!("registry arg resolution for HPO dimension '{dimension}': {e}")
+                })?;
+            }
+        }
+    }
     let tenant_admission = crate::broker::tenant_quota::TenantAdmission::prepare(tenant.clone())
         .map_err(|e| anyhow!("tenant admission: {e}"))?;
 
@@ -212,6 +233,7 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
     let job_id = crate::jobs::new_job_id();
     let job_dir = crate::paths::job_dir(&job_id)?;
     crate::jobs::write_tenant(&job_id, &tenant)?;
+    crate::jobs::write_experiment(&job_id, experiment.as_deref().unwrap_or(&name))?;
     let mut ctx = ExecCtx::new(job_dir.clone());
     ctx = ctx.with_tenant(tenant.clone());
 
@@ -443,6 +465,7 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
     RecipeMarker {
         name: name.to_string(),
         args: base_args.clone(),
+        source_args: Some(source_args),
     }
     .write_to(&job_dir)?;
     crate::jobs::write_state(&job_id, JobState::Running)

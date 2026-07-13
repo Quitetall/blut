@@ -53,6 +53,9 @@ pub(super) enum RecipeCommand {
         /// with `--run`, to own the launched job (ADR 0085/0096).
         #[arg(long, default_value = "default")]
         tenant: String,
+        /// Experiment/campaign name for lineage grouping. Defaults to the recipe.
+        #[arg(long)]
+        experiment: Option<String>,
     },
     /// Execute a recipe, or a config-driven sweep over it.
     Run {
@@ -108,6 +111,9 @@ pub(super) enum RecipeCommand {
         /// `clinical/*` or `restricted` tenant is a sealed clinical namespace.
         #[arg(long, default_value = "default")]
         tenant: String,
+        /// Experiment/campaign name for lineage grouping. Defaults to the recipe.
+        #[arg(long)]
+        experiment: Option<String>,
     },
 }
 
@@ -192,6 +198,7 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             shared_cache,
             no_cache,
             tenant,
+            experiment,
         } => {
             use crate::recipes::declarative::{scan_user_recipes, user_recipes_dir};
             match file {
@@ -214,6 +221,9 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                     }
                 }
                 Some(path) => {
+                    let tenant = crate::tenant::Tenant::parse(&tenant)
+                        .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
+                    let launch_target = crate::config::launcher::LaunchTarget::Local;
                     // A `registry://plan@<name>` deploy URI (ADR 0085) resolves
                     // to a FROZEN PlanSpec from the local registry and dispatches
                     // that exact graph; otherwise `path` is a recipe file
@@ -223,13 +233,15 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                         crate::registry_db::parse_pointer_uri(&path.to_string_lossy())
                     {
                         let conn = crate::registry_db::open().map_err(|e| anyhow!("{e}"))?;
-                        let spec = crate::registry_db::resolve_spec(&conn, &tenant, ptr)
-                            .map_err(|e| anyhow!("{e}"))?;
+                        let mut spec =
+                            crate::registry_db::resolve_spec(&conn, &tenant.to_string(), ptr)
+                                .map_err(|e| anyhow!("{e}"))?;
+                        resolve_plan_spec_registry_args(&mut spec, &tenant, launch_target)?;
                         let plan = spec.compile(reg).map_err(|e| anyhow!("{e}"))?;
                         let n = plan.n_nodes();
                         (format!("registry://plan@{ptr}"), plan, n)
                     } else {
-                        compile_declared_recipe(reg, &path, &args)?
+                        compile_declared_recipe(reg, &path, &args, &tenant, launch_target)?
                     };
                     if run {
                         // LAUNCH: execute through the same admission-gated /
@@ -249,8 +261,8 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                             crate::config::launcher::LaunchTarget::Local,
                             None,
                             no_cache,
-                            crate::tenant::Tenant::parse(&tenant)
-                                .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?,
+                            tenant,
+                            experiment,
                         )
                         .await?;
                     } else {
@@ -274,6 +286,7 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             dry_run,
             launcher,
             tenant,
+            experiment,
         } => {
             // #3 distributed: parse placement up front so a typo fails the run
             // BEFORE any job dir / state is written (vs deep in the executor).
@@ -316,12 +329,16 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                     launch_target,
                     no_cache,
                     tenant,
+                    experiment,
                 )
                 .await?;
             } else {
                 let raw: serde_json::Value = serde_json::from_str(&args)
                     .with_context(|| format!("parse --args as JSON: {args}"))?;
                 if dry_run {
+                    let raw =
+                        crate::registry_args::resolve_recipe_args(raw, &tenant, launch_target)
+                            .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
                     // `--dry-run` is documented as "without running anything". The
                     // config-mode sweep path honors that (run_recipe_sweep), but the
                     // single-invocation `--args` path previously fell straight into
@@ -357,6 +374,7 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                     None,
                     no_cache,
                     tenant,
+                    experiment,
                 )
                 .await?;
             }
@@ -387,7 +405,12 @@ pub(super) async fn run_one_recipe(
     no_cache: bool,
     // ADR 0096: the tenant whose namespace this run's shared cache lives under.
     tenant: crate::tenant::Tenant,
+    // ADR 0090: explicit experiment/campaign key; recipe name when absent.
+    experiment: Option<String>,
 ) -> Result<String> {
+    let source_args = args.clone();
+    let args = crate::registry_args::resolve_recipe_args(args, &tenant, launch_target)
+        .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
     let r = reg
         .find(name)
         .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
@@ -401,6 +424,7 @@ pub(super) async fn run_one_recipe(
         Some(RecipeMarker {
             name: name.to_string(),
             args,
+            source_args: Some(source_args),
         }),
         sweep_fp,
         shared_cache,
@@ -408,6 +432,7 @@ pub(super) async fn run_one_recipe(
         device_index,
         no_cache,
         tenant,
+        experiment,
     )
     .await
 }
@@ -423,6 +448,8 @@ fn compile_declared_recipe(
     reg: &crate::framework::Registry,
     path: &std::path::Path,
     args_json: &str,
+    tenant: &crate::tenant::Tenant,
+    launch_target: crate::config::launcher::LaunchTarget,
 ) -> Result<(String, crate::framework::plan::CompiledPlan, usize)> {
     let ext = path
         .extension()
@@ -446,8 +473,9 @@ fn compile_declared_recipe(
                     "--args is only for .star recipes; a .toml recipe carries its own per-stage args"
                 ));
             }
-            let recipe = crate::recipes::declarative::DeclarativeRecipe::load(path)
+            let mut recipe = crate::recipes::declarative::DeclarativeRecipe::load(path)
                 .map_err(|e| anyhow!("{e}"))?;
+            resolve_declarative_registry_args(&mut recipe, tenant, launch_target)?;
             let n = recipe.stages.len();
             let plan = recipe.compile(reg).map_err(|e| anyhow!("{e}"))?;
             Ok((recipe.name, plan, n))
@@ -460,13 +488,14 @@ fn compile_declared_recipe(
             }
             let body = std::fs::read_to_string(path)
                 .with_context(|| format!("read PlanSpec {}", path.display()))?;
-            let spec: crate::framework::plan_spec::PlanSpec = serde_json::from_str(&body)
+            let mut spec: crate::framework::plan_spec::PlanSpec = serde_json::from_str(&body)
                 .with_context(|| format!("parse PlanSpec {}", path.display()))?;
+            resolve_plan_spec_registry_args(&mut spec, tenant, launch_target)?;
             let n = spec.nodes.len();
             let plan = spec.compile(reg).map_err(|e| anyhow!("{e}"))?;
             Ok((spec.name, plan, n))
         }
-        "star" => compile_star_recipe(reg, path, args_json),
+        "star" => compile_star_recipe(reg, path, args_json, tenant, launch_target),
         other => Err(anyhow!(
             "unsupported recipe extension '.{other}' — expected .toml, .star, or .json"
         )),
@@ -483,9 +512,16 @@ fn compile_star_recipe(
     reg: &crate::framework::Registry,
     path: &std::path::Path,
     args_json: &str,
+    tenant: &crate::tenant::Tenant,
+    launch_target: crate::config::launcher::LaunchTarget,
 ) -> Result<(String, crate::framework::plan::CompiledPlan, usize)> {
-    let args: serde_json::Value =
+    let source_args: serde_json::Value =
         serde_json::from_str(args_json).with_context(|| "parse --args as JSON")?;
+    let args =
+        crate::registry_args::resolve_recipe_args(source_args.clone(), tenant, launch_target)
+            .map_err(|e| anyhow!("registry arg resolution for Starlark build args: {e}"))?;
+    let resolved_args_json =
+        serde_json::to_string(&args).context("serialize registry-resolved Starlark build args")?;
     let src =
         std::fs::read_to_string(path).with_context(|| format!("read script {}", path.display()))?;
     let label = path.display().to_string();
@@ -495,7 +531,7 @@ fn compile_star_recipe(
     let out = std::process::Command::new(&bin)
         .arg(path)
         .arg("--args")
-        .arg(args_json)
+        .arg(&resolved_args_json)
         .output()
         .with_context(|| {
             format!(
@@ -508,8 +544,9 @@ fn compile_star_recipe(
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(anyhow!("blut-dsl failed on {label}: {}", stderr.trim()));
     }
-    let spec: crate::framework::plan_spec::PlanSpec = serde_json::from_slice(&out.stdout)
+    let mut spec: crate::framework::plan_spec::PlanSpec = serde_json::from_slice(&out.stdout)
         .with_context(|| format!("parse the PlanSpec blut-dsl emitted for {label}"))?;
+    resolve_plan_spec_registry_args(&mut spec, tenant, launch_target)?;
 
     let n = spec.nodes.len();
     let fingerprint = spec.provenance_fingerprint(&src, &args);
@@ -523,8 +560,60 @@ fn compile_star_recipe(
         "plan_fingerprint": fingerprint.to_hex(),
         "version": crate::framework::plan_spec::PLAN_SPEC_VERSION,
         "args": args,
+        "source_args": source_args,
     }));
     Ok((spec.name, plan, n))
+}
+
+/// Resolve every stage argument in a PlanSpec, including nested `map_output`
+/// templates, before any registered stage receives typed args.
+fn resolve_plan_spec_registry_args(
+    spec: &mut crate::framework::plan_spec::PlanSpec,
+    tenant: &crate::tenant::Tenant,
+    launch_target: crate::config::launcher::LaunchTarget,
+) -> Result<()> {
+    let mut resolve = |args| {
+        crate::registry_args::resolve_recipe_args(args, tenant, launch_target)
+            .map_err(|e| anyhow!("{e}"))
+    };
+    resolve_plan_spec_args_with(spec, &mut resolve)
+}
+
+fn resolve_plan_spec_args_with(
+    spec: &mut crate::framework::plan_spec::PlanSpec,
+    resolve: &mut impl FnMut(serde_json::Value) -> Result<serde_json::Value>,
+) -> Result<()> {
+    for node in &mut spec.nodes {
+        node.args = resolve(std::mem::take(&mut node.args))
+            .map_err(|e| anyhow!("registry arg resolution for stage '{}': {e}", node.stage))?;
+    }
+    for expansion in &mut spec.expansions {
+        resolve_plan_spec_args_with(&mut expansion.template, resolve)?;
+    }
+    Ok(())
+}
+
+fn resolve_declarative_registry_args(
+    recipe: &mut crate::recipes::declarative::DeclarativeRecipe,
+    tenant: &crate::tenant::Tenant,
+    launch_target: crate::config::launcher::LaunchTarget,
+) -> Result<()> {
+    let mut resolve = |args| {
+        crate::registry_args::resolve_recipe_args(args, tenant, launch_target)
+            .map_err(|e| anyhow!("{e}"))
+    };
+    resolve_declarative_args_with(recipe, &mut resolve)
+}
+
+fn resolve_declarative_args_with(
+    recipe: &mut crate::recipes::declarative::DeclarativeRecipe,
+    resolve: &mut impl FnMut(serde_json::Value) -> Result<serde_json::Value>,
+) -> Result<()> {
+    for stage in &mut recipe.stages {
+        stage.args = resolve(std::mem::take(&mut stage.args))
+            .map_err(|e| anyhow!("registry arg resolution for stage '{}': {e}", stage.stage))?;
+    }
+    Ok(())
 }
 
 /// Locate the `blut-dsl` evaluator binary: `$BLUT_DSL_BIN` if set, else a
@@ -565,6 +654,7 @@ pub(super) async fn launch_compiled_plan(
     device_index: Option<usize>,
     no_cache: bool,
     tenant: crate::tenant::Tenant,
+    experiment: Option<String>,
 ) -> Result<String> {
     use crate::framework::ExecCtx;
 
@@ -601,6 +691,8 @@ pub(super) async fn launch_compiled_plan(
     let job_dir = crate::paths::job_dir(&job_id)?;
     crate::jobs::write_tenant(&job_id, &tenant)
         .with_context(|| format!("persist tenant for {job_id}"))?;
+    crate::jobs::write_experiment(&job_id, experiment.as_deref().unwrap_or(name))
+        .with_context(|| format!("persist experiment for {job_id}"))?;
     let mut ctx = ExecCtx::new(job_dir.clone());
     ctx = ctx.with_tenant(tenant.clone());
     // Phase 5: size the executor's memory admission to box-fit (MemTotal −
@@ -854,6 +946,8 @@ pub(super) async fn run_recipe_sweep(
     no_cache: bool,
     // ADR 0096: the tenant namespace for every combo's shared cache.
     tenant: crate::tenant::Tenant,
+    // ADR 0090: one campaign key shared by every sweep combo.
+    experiment: Option<String>,
 ) -> Result<()> {
     // Fail on a bad recipe name before composing anything.
     if reg.find(name).is_none() {
@@ -914,6 +1008,7 @@ pub(super) async fn run_recipe_sweep(
             None,
             no_cache,
             tenant.clone(),
+            experiment.clone(),
         )
         .await
         {
@@ -1052,6 +1147,7 @@ mod recipe_declare_flag_tests {
                         shared_cache,
                         no_cache,
                         tenant: _,
+                        experiment: _,
                     },
             }) => (file, run, shared_cache, no_cache),
             other => panic!("expected recipe declare, got {other:?}"),
@@ -1114,8 +1210,24 @@ mod declare_dispatch_tests {
     //! (ADR 0078). These need no real stages — they exercise routing + the
     //! `--args` guards against an EMPTY registry (so a resolvable graph fails
     //! at stage lookup, which is the expected error).
-    use super::compile_declared_recipe;
+    use super::{
+        compile_declared_recipe, resolve_declarative_args_with, resolve_plan_spec_args_with,
+    };
     use crate::framework::Registry;
+
+    fn compile(
+        reg: &Registry,
+        path: &std::path::Path,
+        args: &str,
+    ) -> super::Result<(String, crate::framework::plan::CompiledPlan, usize)> {
+        compile_declared_recipe(
+            reg,
+            path,
+            args,
+            &crate::tenant::Tenant::default(),
+            crate::config::launcher::LaunchTarget::Local,
+        )
+    }
 
     fn write(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
         let p = dir.join(name);
@@ -1143,7 +1255,7 @@ mod declare_dispatch_tests {
             r#"{"name":"js","nodes":[{"stage":"nope"}],"edges":[]}"#,
         );
         // Routes to the .json arm, parses, then fails at unknown stage.
-        let err = expect_err(compile_declared_recipe(&Registry::new(), &p, "{}"));
+        let err = expect_err(compile(&Registry::new(), &p, "{}"));
         assert!(
             err.to_string().contains("nope"),
             "names the unknown stage: {err}"
@@ -1156,7 +1268,7 @@ mod declare_dispatch_tests {
         let toml = write(td.path(), "r.toml", "name=\"x\"\n[[stages]]\nstage=\"a\"\n");
         let json = write(td.path(), "r.json", r#"{"name":"x","nodes":[],"edges":[]}"#);
         for p in [toml, json] {
-            let err = expect_err(compile_declared_recipe(&Registry::new(), &p, r#"{"n":1}"#));
+            let err = expect_err(compile(&Registry::new(), &p, r#"{"n":1}"#));
             assert!(
                 err.to_string().contains("--args is only for .star"),
                 "{err}"
@@ -1168,11 +1280,76 @@ mod declare_dispatch_tests {
     fn unsupported_extension_is_rejected() {
         let td = tempfile::tempdir().unwrap();
         let p = write(td.path(), "r.yaml", "nope");
-        let err = expect_err(compile_declared_recipe(&Registry::new(), &p, "{}"));
+        let err = expect_err(compile(&Registry::new(), &p, "{}"));
         assert!(
             err.to_string().contains("unsupported recipe extension"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn declarative_and_nested_planspec_args_are_resolved_before_compile() {
+        let mut recipe = crate::recipes::declarative::DeclarativeRecipe::parse(
+            "name='x'\n[[stages]]\nstage='a'\nargs={data='dataset://train@v1'}\n",
+            "x.toml",
+        )
+        .unwrap();
+        let mut resolve = |value: serde_json::Value| {
+            Ok(replace_test_handle(
+                value,
+                "dataset://train@v1",
+                "/verified/train.jsonl",
+            ))
+        };
+        resolve_declarative_args_with(&mut recipe, &mut resolve).unwrap();
+        assert_eq!(recipe.stages[0].args["data"], "/verified/train.jsonl");
+
+        let mut spec: crate::framework::plan_spec::PlanSpec =
+            serde_json::from_value(serde_json::json!({
+                "name": "root",
+                "nodes": [{"stage":"a", "args":{"model":"model://enc@staging"}}],
+                "edges": [],
+                "expansions": [{
+                    "parent": 0,
+                    "template": {
+                        "name":"nested",
+                        "nodes":[{"stage":"b", "args":{"data":"dataset://train@v1"}}],
+                        "edges": []
+                    }
+                }]
+            }))
+            .unwrap();
+        let mut resolve = |value: serde_json::Value| {
+            let value = replace_test_handle(value, "model://enc@staging", "model-hash");
+            Ok(replace_test_handle(
+                value,
+                "dataset://train@v1",
+                "/verified/train.jsonl",
+            ))
+        };
+        resolve_plan_spec_args_with(&mut spec, &mut resolve).unwrap();
+        assert_eq!(spec.nodes[0].args["model"], "model-hash");
+        assert_eq!(
+            spec.expansions[0].template.nodes[0].args["data"],
+            "/verified/train.jsonl"
+        );
+    }
+
+    fn replace_test_handle(value: serde_json::Value, from: &str, to: &str) -> serde_json::Value {
+        match value {
+            serde_json::Value::String(value) if value == from => to.into(),
+            serde_json::Value::Array(values) => values
+                .into_iter()
+                .map(|value| replace_test_handle(value, from, to))
+                .collect::<Vec<_>>()
+                .into(),
+            serde_json::Value::Object(values) => values
+                .into_iter()
+                .map(|(key, value)| (key, replace_test_handle(value, from, to)))
+                .collect::<serde_json::Map<_, _>>()
+                .into(),
+            value => value,
+        }
     }
 
     #[test]
@@ -1182,7 +1359,7 @@ mod declare_dispatch_tests {
         let td = tempfile::tempdir().unwrap();
         let toml = write(td.path(), "r.toml", "name=\"x\"\n[[stages]]\nstage=\"a\"\n");
         for a in ["{ }", "{}\n", "null"] {
-            let err = expect_err(compile_declared_recipe(&Registry::new(), &toml, a));
+            let err = expect_err(compile(&Registry::new(), &toml, a));
             // Reaches stage resolution (unknown stage 'a'), NOT the --args guard.
             assert!(
                 !err.to_string().contains("--args is only for"),
@@ -1206,7 +1383,7 @@ mod declare_dispatch_tests {
         unsafe {
             std::env::set_var("BLUT_DSL_BIN", td.path().join("no-such-blut-dsl"));
         }
-        let err = expect_err(compile_declared_recipe(&Registry::new(), &p, "{}"));
+        let err = expect_err(compile(&Registry::new(), &p, "{}"));
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("BLUT_DSL_BIN", v),

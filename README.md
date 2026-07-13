@@ -80,6 +80,12 @@ let result = ParallelExecutor::execute(plan.into_compiled(), ctx).await?;
 | **Observability** | status.jsonl, metric store, lineage index |
 | **TUI cockpit** | default-on `tui` feature; `--no-default-features` for a lean CLI |
 | **Multi-tenancy** | tenant-scoped cache/registry/lineage/privacy, RAM sub-envelopes, Restricted node-local custody |
+| **Registries** | governed `model://`, immutable `dataset://`, and lineage-backed `experiment://` handles resolved in recipe args |
+
+Registry handles are resolved before typed cookbook/declarative args compile,
+and resumable jobs retain the original handles so datasets are hash-revalidated
+on resume. Model and recipe commands both default to tenant `default`; use
+`--tenant shared` to address model records created under the former default.
 
 ### On `main`, unreleased
 

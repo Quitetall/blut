@@ -55,7 +55,9 @@ fn fixture() -> (LineageDb, tempfile::TempDir, String) {
 
     let (src, mid, leaf, clin) = (h('a'), h('b'), h('c'), h('d'));
 
-    db.record_run(&run("job_r", "research/dev")).unwrap();
+    let mut research_run = run("job_r", "research/dev");
+    research_run.recipe = "train_joint".into();
+    db.record_run(&research_run).unwrap();
     db.record_run(&run("job_c", "clinical/prod")).unwrap();
 
     db.record_artifact(&artifact("job_r", 0, "gen", &src))
@@ -187,15 +189,38 @@ fn diff_reports_exactly_the_seeded_deltas() {
 fn tenant_is_never_downgraded_on_reingest() {
     let td = tempfile::tempdir().unwrap();
     let db = LineageDb::open_at(td.path().join("lineage.db")).unwrap();
-    // Record a clinical run, then re-ingest it with NO tenant (coerced to
-    // `default`) — the ADR-0061 clinical tenant must survive.
+    // Record a clinical run, then attempt to re-ingest it with NO tenant
+    // (coerced to `default`) — the ADR-0061 boundary must fail closed.
     db.record_run(&run("job_c", "clinical/prod")).unwrap();
-    db.record_run(&run("job_c", "")).unwrap(); // re-ingest, tenant unset
+    assert!(
+        db.record_run(&run("job_c", "")).is_err(),
+        "a re-ingest may not relabel a run into the default tenant"
+    );
     assert_eq!(
         db.get_run("job_c").unwrap().unwrap().tenant,
         "clinical/prod",
         "a re-ingest must not downgrade a set tenant to default"
     );
+}
+
+#[test]
+fn generic_run_diff_refuses_cross_tenant_and_restricted_exports() {
+    let td = tempfile::tempdir().unwrap();
+    let db = LineageDb::open_at(td.path().join("lineage.db")).unwrap();
+    db.record_run(&run("research_a", "research/dev")).unwrap();
+    db.record_run(&run("research_b", "research/dev")).unwrap();
+    db.record_run(&run("clinical_a", "clinical/prod")).unwrap();
+    db.record_run(&run("clinical_b", "clinical/prod")).unwrap();
+
+    assert!(
+        db.run_diff("research_a", "clinical_a").is_err(),
+        "generic diffs may not cross tenant boundaries"
+    );
+    assert!(
+        db.run_diff("clinical_a", "clinical_b").is_err(),
+        "generic diffs may not export Restricted args or input hashes"
+    );
+    assert!(db.run_diff("research_a", "research_b").is_ok());
 }
 
 #[test]

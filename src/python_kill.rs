@@ -162,6 +162,135 @@ pub fn pre_exec_setsid() -> std::io::Result<()> {
     }
 }
 
+/// Failure from [`bounded_output`]. Process-generic so governance gates and
+/// other bounded checks reuse this existing supervision seam.
+#[derive(Debug)]
+pub enum BoundedCommandError {
+    Spawn(std::io::Error),
+    Wait(std::io::Error),
+    Timeout(Duration),
+    OutputLimit {
+        stream: &'static str,
+        limit_bytes: usize,
+    },
+}
+
+impl std::fmt::Display for BoundedCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(error) => write!(f, "could not start: {error}"),
+            Self::Wait(error) => write!(f, "could not collect output: {error}"),
+            Self::Timeout(timeout) => write!(f, "timed out after {}ms", timeout.as_millis()),
+            Self::OutputLimit {
+                stream,
+                limit_bytes,
+            } => write!(f, "{stream} exceeded the {limit_bytes}-byte capture limit"),
+        }
+    }
+}
+
+/// Per-stream cap for supervised command output. Governance gates are
+/// untrusted external processes; a time bound alone does not prevent a noisy
+/// gate from exhausting the orchestrator's memory.
+const BOUNDED_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// Run one explicit program+argv with captured output and a hard wall-clock
+/// bound. No shell is inserted. Timeout or cancellation kills the direct child
+/// and, on Unix, its whole process group so grandchildren cannot escape.
+pub async fn bounded_output(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+) -> std::result::Result<std::process::Output, BoundedCommandError> {
+    if timeout.is_zero() {
+        return Err(BoundedCommandError::Timeout(timeout));
+    }
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        // SAFETY: setsid is async-signal-safe and allocates nothing between
+        // fork and exec; every trainer subprocess uses the same hook.
+        #[allow(unsafe_code)]
+        unsafe {
+            command.pre_exec(pre_exec_setsid);
+        }
+    }
+    let mut child = command.spawn().map_err(BoundedCommandError::Spawn)?;
+    let _guard = BoundedProcessGuard { pgid: child.id() };
+    let stdout = child
+        .stdout
+        .take()
+        .expect("stdout is piped before supervised spawn");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("stderr is piped before supervised spawn");
+    let collect = async {
+        let (status, stdout, stderr) = tokio::try_join!(
+            async { child.wait().await.map_err(BoundedCommandError::Wait) },
+            read_capped(stdout, "stdout", BOUNDED_OUTPUT_LIMIT_BYTES),
+            read_capped(stderr, "stderr", BOUNDED_OUTPUT_LIMIT_BYTES),
+        )?;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    };
+    match tokio::time::timeout(timeout, collect).await {
+        Ok(output) => output,
+        Err(_) => Err(BoundedCommandError::Timeout(timeout)),
+    }
+}
+
+async fn read_capped(
+    mut stream: impl tokio::io::AsyncRead + Unpin,
+    stream_name: &'static str,
+    limit_bytes: usize,
+) -> std::result::Result<Vec<u8>, BoundedCommandError> {
+    use tokio::io::AsyncReadExt;
+
+    let mut captured = Vec::with_capacity(limit_bytes.min(8192));
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = stream
+            .read(&mut chunk)
+            .await
+            .map_err(BoundedCommandError::Wait)?;
+        if read == 0 {
+            return Ok(captured);
+        }
+        if captured.len().saturating_add(read) > limit_bytes {
+            return Err(BoundedCommandError::OutputLimit {
+                stream: stream_name,
+                limit_bytes,
+            });
+        }
+        captured.extend_from_slice(&chunk[..read]);
+    }
+}
+
+struct BoundedProcessGuard {
+    pgid: Option<u32>,
+}
+
+impl Drop for BoundedProcessGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            use nix::sys::signal::{Signal, killpg};
+            use nix::unistd::Pid;
+            let _ = killpg(Pid::from_raw(pgid as i32), Signal::SIGKILL);
+        }
+    }
+}
+
 /// Read `starttime` (field 22) from `/proc/<pid>/stat`. Robust to a
 /// process name containing spaces/parentheses: the comm field is
 /// wrapped in the *last* `)`, so we split there first.

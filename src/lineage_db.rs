@@ -35,10 +35,12 @@ use crate::error::{Result, TrainError};
 /// Bump when the schema changes in a non-additive way (forces a `reindex`).
 /// v2 adds the additive `metrics` (E1) + `gauges` (E2) tables — they
 /// materialize on existing v1 DBs via `CREATE TABLE IF NOT EXISTS`, so the
-/// 1→2 bump needs NO data migration. v3 (ADR 0096) adds `runs.tenant`; since
-/// `CREATE TABLE IF NOT EXISTS` cannot alter an extant table, the open path runs
-/// an idempotent `ALTER TABLE runs ADD COLUMN tenant … DEFAULT 'default'`.
-const SCHEMA_VERSION: i64 = 3;
+/// 1→2 bump needs NO data migration. v3 (ADR 0096) adds `runs.tenant`; v4
+/// (ADR 0090) adds `runs.experiment` + `runs.args_json` so comparisons use an
+/// explicit campaign key and report real parameter deltas instead of only an
+/// opaque fingerprint. The open path uses idempotent column checks before each
+/// `ALTER TABLE`.
+const SCHEMA_VERSION: i64 = 4;
 
 const CREATE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS runs (
@@ -56,7 +58,13 @@ CREATE TABLE IF NOT EXISTS runs (
     -- ADR 0096: the owning tenant. `default` = the flat/pre-tenancy namespace.
     -- A `clinical`/`restricted` tenant's rows are fail-closed excluded from any
     -- exported graph/card (ADR 0061/0099).
-    tenant             TEXT NOT NULL DEFAULT 'default'
+    tenant             TEXT NOT NULL DEFAULT 'default',
+    -- Explicit experiment/campaign grouping. NULL legacy rows fall back to the
+    -- recipe name in experiment queries.
+    experiment         TEXT,
+    -- ADR 0090: canonical recipe args persisted at <job>/args.json. Nullable
+    -- for legacy/imported runs whose source file predates this index column.
+    args_json          TEXT
 );
 CREATE TABLE IF NOT EXISTS artifacts (
     job_id        TEXT NOT NULL,
@@ -115,6 +123,18 @@ CREATE TABLE IF NOT EXISTS gauges (
 );
 ";
 
+fn runs_has_column(conn: &Connection, expected: &str) -> Result<bool> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(runs)")
+        .map_err(|e| TrainError::other(format!("table_info(runs): {e}")))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| TrainError::other(format!("table_info rows: {e}")))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| TrainError::other(format!("table_info collect: {e}")))?;
+    Ok(columns.iter().any(|column| column == expected))
+}
+
 /// One run's provenance row.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRow {
@@ -134,6 +154,12 @@ pub struct RunRow {
     /// fail-closed excluded from any export (ADR 0061/0099).
     #[serde(default)]
     pub tenant: String,
+    /// Explicit experiment/campaign name. Legacy rows fall back to `recipe`.
+    #[serde(default)]
+    pub experiment: Option<String>,
+    /// Canonical recipe args JSON. Missing on legacy/imported runs.
+    #[serde(default)]
+    pub args_json: Option<String>,
 }
 
 /// FRESHNESS verdict for a run's code (Phase G): did the code that built
@@ -286,24 +312,24 @@ impl LineageDb {
         // TABLE IF NOT EXISTS can't alter an extant table, so ADD COLUMN here.
         // Probe `PRAGMA table_info` for the column rather than string-matching the
         // "duplicate column name" error (locale/SQLite-version fragile).
-        let has_tenant = {
-            let mut stmt = conn
-                .prepare("PRAGMA table_info(runs)")
-                .map_err(|e| TrainError::other(format!("table_info(runs): {e}")))?;
-            let cols = stmt
-                .query_map([], |row| row.get::<_, String>(1)) // col 1 = column name
-                .map_err(|e| TrainError::other(format!("table_info rows: {e}")))?;
-            cols.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| TrainError::other(format!("table_info collect: {e}")))?
-                .iter()
-                .any(|c| c == "tenant")
-        };
+        let has_tenant = runs_has_column(&conn, "tenant")?;
         if !has_tenant {
             conn.execute(
                 "ALTER TABLE runs ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'",
                 [],
             )
             .map_err(|e| TrainError::other(format!("migrate runs.tenant: {e}")))?;
+        }
+        // v3→v4 (ADR 0090): preserve canonical recipe args for experiment
+        // comparisons. Legacy rows remain NULL and compare as "unknown".
+        let has_args_json = runs_has_column(&conn, "args_json")?;
+        if !has_args_json {
+            conn.execute("ALTER TABLE runs ADD COLUMN args_json TEXT", [])
+                .map_err(|e| TrainError::other(format!("migrate runs.args_json: {e}")))?;
+        }
+        if !runs_has_column(&conn, "experiment")? {
+            conn.execute("ALTER TABLE runs ADD COLUMN experiment TEXT", [])
+                .map_err(|e| TrainError::other(format!("migrate runs.experiment: {e}")))?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| TrainError::other(format!("set user_version: {e}")))?;
@@ -312,13 +338,80 @@ impl LineageDb {
 
     /// Idempotent upsert of a run row (re-ingest = no-op-equivalent overwrite).
     pub fn record_run(&self, r: &RunRow) -> Result<()> {
+        let incoming_tenant = if r.tenant.is_empty() {
+            "default"
+        } else {
+            r.tenant.as_str()
+        };
+        if r.experiment
+            .as_deref()
+            .is_some_and(|name| !crate::experiment_registry::is_safe_experiment_name(name))
+        {
+            return Err(TrainError::other(format!(
+                "record run {}: invalid experiment name",
+                r.job_id
+            )));
+        }
+        let incoming_args: Option<serde_json::Value> = r
+            .args_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| {
+                TrainError::other(format!(
+                    "record run {}: incoming args_json is malformed: {e}",
+                    r.job_id
+                ))
+            })?;
+        if let Some(existing) = self.get_run(&r.job_id)? {
+            let existing_tenant = if existing.tenant.is_empty() {
+                "default"
+            } else {
+                existing.tenant.as_str()
+            };
+            if existing_tenant != incoming_tenant {
+                return Err(TrainError::other(format!(
+                    "record run {} refused: tenant is immutable ('{}' != '{}')",
+                    r.job_id, existing_tenant, incoming_tenant
+                )));
+            }
+            if existing.recipe != r.recipe {
+                return Err(TrainError::other(format!(
+                    "record run {} refused: recipe is immutable ('{}' != '{}')",
+                    r.job_id, existing.recipe, r.recipe
+                )));
+            }
+            if let (Some(current), Some(incoming)) = (&existing.experiment, &r.experiment)
+                && current != incoming
+            {
+                return Err(TrainError::other(format!(
+                    "record run {} refused: experiment is immutable ('{}' != '{}')",
+                    r.job_id, current, incoming
+                )));
+            }
+            if let (Some(current), Some(incoming)) = (&existing.args_json, &incoming_args) {
+                let current: serde_json::Value = serde_json::from_str(current).map_err(|e| {
+                    TrainError::other(format!(
+                        "record run {}: stored args_json is malformed: {e}",
+                        r.job_id
+                    ))
+                })?;
+                if &current != incoming {
+                    return Err(TrainError::other(format!(
+                        "record run {} refused: canonical recipe args are immutable",
+                        r.job_id
+                    )));
+                }
+            }
+        }
         self.conn
             .execute(
                 "INSERT INTO runs (job_id, recipe, config_fingerprint, git_sha,
-                    started_unix, ended_unix, outcome, host, gpu_name, ram_gib, vram_mib, tenant)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+                    started_unix, ended_unix, outcome, host, gpu_name, ram_gib, vram_mib,
+                    tenant, experiment, args_json)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
                  ON CONFLICT(job_id) DO UPDATE SET
-                    recipe=COALESCE(excluded.recipe, runs.recipe),
+                    recipe=runs.recipe,
                     config_fingerprint=COALESCE(excluded.config_fingerprint, runs.config_fingerprint),
                     git_sha=COALESCE(excluded.git_sha, runs.git_sha),
                     started_unix=COALESCE(excluded.started_unix, runs.started_unix),
@@ -328,14 +421,15 @@ impl LineageDb {
                     gpu_name=COALESCE(excluded.gpu_name, runs.gpu_name),
                     ram_gib=COALESCE(excluded.ram_gib, runs.ram_gib),
                     vram_mib=COALESCE(excluded.vram_mib, runs.vram_mib),
-                    -- Never DOWNGRADE a set tenant: a re-ingest that supplies
-                    -- `default` (the coerced empty) keeps the existing tenant, so
-                    -- a clinical run can't silently drop its ADR-0061 boundary.
-                    tenant=COALESCE(NULLIF(excluded.tenant, 'default'), runs.tenant)",
+                    tenant=runs.tenant,
+                    experiment=COALESCE(runs.experiment, excluded.experiment),
+                    args_json=COALESCE(runs.args_json, excluded.args_json)",
                 params![
                     r.job_id, r.recipe, r.config_fingerprint, r.git_sha, r.started_unix,
                     r.ended_unix, r.outcome, r.host, r.gpu_name, r.ram_gib, r.vram_mib,
-                    if r.tenant.is_empty() { "default" } else { r.tenant.as_str() }
+                    incoming_tenant,
+                    r.experiment,
+                    r.args_json,
                 ],
             )
             .map_err(|e| TrainError::other(format!("record run {}: {e}", r.job_id)))?;
@@ -670,13 +764,43 @@ impl LineageDb {
         self.conn
             .query_row(
                 "SELECT job_id, recipe, config_fingerprint, git_sha, started_unix, ended_unix,
-                        outcome, host, gpu_name, ram_gib, vram_mib, tenant
+                        outcome, host, gpu_name, ram_gib, vram_mib, tenant, experiment, args_json
                  FROM runs WHERE job_id = ?1",
                 params![job_id],
                 row_to_run,
             )
             .optional()
             .map_err(|e| TrainError::other(format!("get_run {job_id}: {e}")))
+    }
+
+    /// Newest runs for one explicit experiment in exactly one tenant. Legacy
+    /// rows with no marker use their recipe name as the experiment key.
+    /// The tenant predicate is part of the SQL, not a caller-side filter, so a
+    /// restricted run cannot enter another tenant's comparison candidate set.
+    pub fn runs_for_experiment_tenant(
+        &self,
+        experiment: &str,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<RunRow>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT job_id, recipe, config_fingerprint, git_sha, started_unix, ended_unix,
+                        outcome, host, gpu_name, ram_gib, vram_mib, tenant, experiment, args_json
+                 FROM runs
+                 WHERE COALESCE(experiment, recipe) = ?1 AND tenant = ?2
+                 ORDER BY COALESCE(started_unix, 0) DESC, job_id DESC
+                 LIMIT ?3",
+            )
+            .map_err(|e| TrainError::other(format!("prepare experiment runs: {e}")))?;
+        stmt.query_map(params![experiment, tenant, limit as i64], row_to_run)
+            .map_err(|e| TrainError::other(format!("query experiment runs: {e}")))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| TrainError::other(format!("collect experiment runs: {e}")))
     }
 
     /// Walk the lineage UPSTREAM from a full content hash: this artifact, then
@@ -898,15 +1022,62 @@ impl LineageDb {
     }
 
     /// The symmetric difference of two runs (ADR 0099): only the recipe /
-    /// config-fingerprint / gate-outcome / metric fields that DIFFER. Errors if
-    /// either run is unknown.
+    /// config-fingerprint / input-hash / argument / gate-outcome / metric fields
+    /// that DIFFER. Errors if either run is unknown or persisted args are
+    /// malformed. This generic export refuses cross-tenant and Restricted runs;
+    /// tenant-scoped engine views use [`Self::run_diff_for_tenant`].
     pub fn run_diff(&self, a: &str, b: &str) -> Result<crate::lineage_report::RunDiff> {
+        self.run_diff_scoped(a, b, None)
+    }
+
+    /// Tenant-authorized comparison for the experiment registry. Restricted
+    /// runs may be compared only through this exact-tenant seam; the generic
+    /// lineage export remains fail-closed.
+    pub(crate) fn run_diff_for_tenant(
+        &self,
+        a: &str,
+        b: &str,
+        tenant: &crate::tenant::Tenant,
+    ) -> Result<crate::lineage_report::RunDiff> {
+        self.run_diff_scoped(a, b, Some(tenant))
+    }
+
+    fn run_diff_scoped(
+        &self,
+        a: &str,
+        b: &str,
+        expected_tenant: Option<&crate::tenant::Tenant>,
+    ) -> Result<crate::lineage_report::RunDiff> {
         let ra = self
             .get_run(a)?
             .ok_or_else(|| TrainError::other(format!("run diff: unknown run {a}")))?;
         let rb = self
             .get_run(b)?
             .ok_or_else(|| TrainError::other(format!("run diff: unknown run {b}")))?;
+        let tenant_a = crate::tenant::Tenant::parse(&ra.tenant).ok_or_else(|| {
+            TrainError::other(format!("run diff refused: run {a} has an invalid tenant"))
+        })?;
+        let tenant_b = crate::tenant::Tenant::parse(&rb.tenant).ok_or_else(|| {
+            TrainError::other(format!("run diff refused: run {b} has an invalid tenant"))
+        })?;
+        if tenant_a != tenant_b {
+            return Err(TrainError::other(
+                "run diff refused: runs belong to different tenants",
+            ));
+        }
+        match expected_tenant {
+            Some(expected) if &tenant_a != expected => {
+                return Err(TrainError::other(
+                    "run diff refused: runs do not belong to the requested tenant",
+                ));
+            }
+            None if tenant_a.is_restricted() => {
+                return Err(TrainError::other(
+                    "run diff refused: Restricted run details require an exact tenant-scoped experiment comparison",
+                ));
+            }
+            _ => {}
+        }
 
         let diff_opt = |x: &Option<String>, y: &Option<String>| {
             if x != y {
@@ -920,6 +1091,10 @@ impl LineageDb {
         } else {
             None
         };
+        let inputs_a = self.input_hashes_for_run(a)?;
+        let inputs_b = self.input_hashes_for_run(b)?;
+        let input_hashes = (inputs_a != inputs_b).then_some((inputs_a, inputs_b));
+        let arg_deltas = diff_args_json(ra.args_json.as_deref(), rb.args_json.as_deref(), a, b)?;
 
         // Metric deltas: union of names, keep only where a and b differ.
         let ma: std::collections::HashMap<String, f64> =
@@ -944,9 +1119,27 @@ impl LineageDb {
             run_b: b.to_string(),
             recipe,
             config_fingerprint: diff_opt(&ra.config_fingerprint, &rb.config_fingerprint),
+            input_hashes,
+            arg_deltas,
             gate_outcome: diff_opt(&ra.outcome, &rb.outcome),
             metric_deltas,
         })
+    }
+
+    /// Sorted unique input identities recorded for a run. Each input hash folds
+    /// parent and data-source content identity per the lineage-edge contract.
+    pub fn input_hashes_for_run(&self, job_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT input_hash FROM lineage_edges
+                 WHERE job_id = ?1 ORDER BY input_hash",
+            )
+            .map_err(|e| TrainError::other(format!("prepare run inputs: {e}")))?;
+        stmt.query_map(params![job_id], |row| row.get::<_, String>(0))
+            .map_err(|e| TrainError::other(format!("query run inputs: {e}")))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| TrainError::other(format!("collect run inputs: {e}")))
     }
 
     /// Number of indexed runs (for `reindex` reporting + tests).
@@ -954,6 +1147,67 @@ impl LineageDb {
         self.conn
             .query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))
             .map_err(|e| TrainError::other(format!("run_count: {e}")))
+    }
+}
+
+fn diff_args_json(
+    raw_a: Option<&str>,
+    raw_b: Option<&str>,
+    run_a: &str,
+    run_b: &str,
+) -> Result<Vec<crate::lineage_report::ArgDelta>> {
+    let parse = |raw: Option<&str>, run: &str| -> Result<Option<serde_json::Value>> {
+        raw.map(|body| {
+            serde_json::from_str(body).map_err(|e| {
+                TrainError::other(format!("run diff: malformed args_json for {run}: {e}"))
+            })
+        })
+        .transpose()
+    };
+    let parsed_a = parse(raw_a, run_a)?;
+    let parsed_b = parse(raw_b, run_b)?;
+    let mut leaves_a = std::collections::BTreeMap::new();
+    let mut leaves_b = std::collections::BTreeMap::new();
+    if let Some(value) = parsed_a {
+        flatten_arg_leaves(&value, "$", &mut leaves_a);
+    }
+    if let Some(value) = parsed_b {
+        flatten_arg_leaves(&value, "$", &mut leaves_b);
+    }
+    let paths: std::collections::BTreeSet<String> =
+        leaves_a.keys().chain(leaves_b.keys()).cloned().collect();
+    Ok(paths
+        .into_iter()
+        .filter_map(|path| {
+            let a = leaves_a.get(&path).cloned();
+            let b = leaves_b.get(&path).cloned();
+            (a != b).then_some(crate::lineage_report::ArgDelta { path, a, b })
+        })
+        .collect())
+}
+
+fn flatten_arg_leaves(
+    value: &serde_json::Value,
+    path: &str,
+    out: &mut std::collections::BTreeMap<String, serde_json::Value>,
+) {
+    match value {
+        serde_json::Value::Object(object) if !object.is_empty() => {
+            for (key, child) in object {
+                let escaped = key.replace('~', "~0").replace('/', "~1");
+                let child_path = if path == "$" {
+                    format!("$/{escaped}")
+                } else {
+                    format!("{path}/{escaped}")
+                };
+                flatten_arg_leaves(child, &child_path, out);
+            }
+        }
+        // Arrays remain one leaf. Treating index-level changes as parameter
+        // paths would imply list order is a set; it is not.
+        leaf => {
+            out.insert(path.to_string(), leaf.clone());
+        }
     }
 }
 
@@ -965,6 +1219,23 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
     let db = LineageDb::open()?;
     let snap = crate::broker::ResourceSnapshot::probe();
     let tenant = crate::jobs::read_tenant(job_id)?;
+    let experiment = crate::jobs::read_experiment(job_id)?.unwrap_or_else(|| recipe.to_string());
+    let args_path = crate::paths::job_dir(job_id)?.join("args.json");
+    let args_json = match std::fs::read_to_string(&args_path) {
+        Ok(body) => {
+            serde_json::from_str::<serde_json::Value>(&body).map_err(|e| {
+                TrainError::other(format!("parse persisted args {}: {e}", args_path.display()))
+            })?;
+            Some(body)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(TrainError::Io {
+                path: args_path,
+                source: e,
+            });
+        }
+    };
     db.record_run(&RunRow {
         job_id: job_id.to_string(),
         recipe: recipe.to_string(),
@@ -978,6 +1249,8 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
         ram_gib: Some(snap.mem_total_gb as i64),
         vram_mib: snap.vram_total_mib.map(|v| v as i64),
         tenant: tenant.to_string(),
+        experiment: Some(experiment),
+        args_json,
     })?;
     for rec in crate::framework::lineage::scan_artifacts(job_id)?.into_iter() {
         db.record_artifact(&ArtifactRow {
@@ -1058,6 +1331,8 @@ fn row_to_run(row: &rusqlite::Row) -> rusqlite::Result<RunRow> {
         ram_gib: row.get(9)?,
         vram_mib: row.get(10)?,
         tenant: row.get(11)?,
+        experiment: row.get(12)?,
+        args_json: row.get(13)?,
     })
 }
 
@@ -1246,6 +1521,57 @@ mod tests {
     }
 
     #[test]
+    fn v3_run_rows_migrate_to_experiment_and_args_json() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("lineage-v3.db");
+        let legacy = rusqlite::Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE runs (
+                    job_id TEXT PRIMARY KEY,
+                    recipe TEXT NOT NULL,
+                    config_fingerprint TEXT,
+                    git_sha TEXT,
+                    started_unix INTEGER,
+                    ended_unix INTEGER,
+                    outcome TEXT,
+                    host TEXT,
+                    gpu_name TEXT,
+                    ram_gib INTEGER,
+                    vram_mib INTEGER,
+                    tenant TEXT NOT NULL DEFAULT 'default'
+                 );
+                 INSERT INTO runs (job_id, recipe, tenant)
+                    VALUES ('legacy', 'demo', 'research/dev');
+                 PRAGMA user_version=3;",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let db = LineageDb::open_at(&path).unwrap();
+        let legacy = db.get_run("legacy").unwrap().unwrap();
+        assert_eq!(legacy.tenant, "research/dev");
+        assert_eq!(legacy.experiment, None);
+        assert_eq!(legacy.args_json, None);
+        db.record_run(&RunRow {
+            job_id: "new".into(),
+            recipe: "demo".into(),
+            experiment: Some("campaign-a".into()),
+            args_json: Some("{\"lr\":0.01}".into()),
+            ..RunRow::default()
+        })
+        .unwrap();
+        assert_eq!(
+            db.get_run("new").unwrap().unwrap().args_json.as_deref(),
+            Some("{\"lr\":0.01}")
+        );
+        assert_eq!(
+            db.get_run("new").unwrap().unwrap().experiment.as_deref(),
+            Some("campaign-a")
+        );
+    }
+
+    #[test]
     fn record_and_query_run() {
         let db = db();
         let r = RunRow {
@@ -1290,6 +1616,46 @@ mod tests {
         );
         assert_eq!(got.ended_unix, Some(42));
         assert_eq!(db.run_count().unwrap(), 1, "upsert, not duplicate");
+    }
+
+    #[test]
+    fn record_run_refuses_experiment_or_args_reassignment() {
+        let db = db();
+        db.record_run(&RunRow {
+            job_id: "immutable".into(),
+            recipe: "r".into(),
+            experiment: Some("campaign-a".into()),
+            args_json: Some("{\"lr\":0.01}".into()),
+            ..RunRow::default()
+        })
+        .unwrap();
+        // Formatting-only JSON differences remain idempotent.
+        db.record_run(&RunRow {
+            job_id: "immutable".into(),
+            recipe: "r".into(),
+            experiment: Some("campaign-a".into()),
+            args_json: Some("{ \"lr\" : 0.01 }".into()),
+            ..RunRow::default()
+        })
+        .unwrap();
+        assert!(
+            db.record_run(&RunRow {
+                job_id: "immutable".into(),
+                recipe: "r".into(),
+                experiment: Some("campaign-b".into()),
+                ..RunRow::default()
+            })
+            .is_err()
+        );
+        assert!(
+            db.record_run(&RunRow {
+                job_id: "immutable".into(),
+                recipe: "r".into(),
+                args_json: Some("{\"lr\":0.02}".into()),
+                ..RunRow::default()
+            })
+            .is_err()
+        );
     }
 
     #[test]

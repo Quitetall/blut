@@ -175,12 +175,19 @@ fn persisted_job_tenant_reaches_lineage_and_survives_reindex() {
     let job_id = "tenant-lineage-test";
     let clinical = Tenant::parse("clinical/prod").unwrap();
     blut::jobs::write_tenant(job_id, &clinical).unwrap();
+    blut::jobs::write_experiment(job_id, "campaign-a").unwrap();
     assert_eq!(blut::jobs::read_tenant(job_id).unwrap(), clinical);
+    assert_eq!(
+        blut::jobs::read_experiment(job_id).unwrap().as_deref(),
+        Some("campaign-a")
+    );
+    assert!(blut::jobs::write_experiment(job_id, "../escape").is_err());
     blut::lineage_db::ingest_job(job_id, "tenant-test", "done").unwrap();
 
     let db = blut::lineage_db::LineageDb::open_at(data_dir.join("lineage.db")).unwrap();
     let row = db.get_run(job_id).unwrap().unwrap();
     assert_eq!(row.tenant, "clinical/prod");
+    assert_eq!(row.experiment.as_deref(), Some("campaign-a"));
     // Re-ingest reads the same canonical marker; it must never downgrade the
     // restricted row to `default`.
     blut::lineage_db::ingest_job(job_id, "tenant-test", "done").unwrap();

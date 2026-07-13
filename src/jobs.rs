@@ -141,6 +141,43 @@ pub fn read_tenant(job_id: &str) -> Result<Tenant> {
         })
 }
 
+/// Persist the experiment grouping key used by `experiment://<name>/<run>`.
+/// Safe identifier grammar keeps the marker URI/log-safe and path-free.
+pub fn write_experiment(job_id: &str, experiment: &str) -> Result<()> {
+    if !crate::experiment_registry::is_safe_experiment_name(experiment) {
+        return Err(TrainError::other(format!(
+            "invalid experiment name '{experiment}' (expected [A-Za-z0-9_.-]+)"
+        )));
+    }
+    let path = paths::job_dir(job_id)?.join("experiment");
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, experiment).map_err(|source| TrainError::Io {
+        path: tmp.clone(),
+        source,
+    })?;
+    std::fs::rename(&tmp, &path).map_err(|source| TrainError::Io { path, source })
+}
+
+/// Read an experiment marker. Legacy jobs return `None` and are grouped by
+/// recipe name by the lineage migration/view.
+pub fn read_experiment(job_id: &str) -> Result<Option<String>> {
+    let path = paths::job_dir(job_id)?.join("experiment");
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(TrainError::Io { path, source }),
+    };
+    let experiment = body.trim();
+    if !crate::experiment_registry::is_safe_experiment_name(experiment) || experiment != body {
+        return Err(TrainError::other(format!(
+            "invalid experiment marker '{}' at {}",
+            experiment,
+            path.display()
+        )));
+    }
+    Ok(Some(experiment.to_string()))
+}
+
 /// `status.jsonl` rotation threshold in bytes. `LAMU_STATUS_MAX_MB`
 /// overrides the 64 MiB default (0 disables rotation). A long training
 /// run's per-step spam can otherwise grow the log unbounded.

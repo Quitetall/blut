@@ -351,10 +351,8 @@ impl GateCmd {
 /// exit-0 ⇒ `Pass`, non-zero ⇒ `Fail(stderr)`. A spawn failure is `Fail` too —
 /// fail-closed: a gate that can't run never yields `Pass`.
 ///
-/// BLOCKING with NO timeout: call from a blocking context (the sync CLI). A
-/// runaway gate must be interrupted by the caller (Ctrl-C on the CLI). A bounded
-/// timeout + an async variant are a follow-up for automated (non-interactive)
-/// promotion callers.
+/// BLOCKING with NO timeout, retained for API compatibility. New CLI and
+/// automated callers use [`run_gate_async`], which bounds and reaps the child.
 pub fn run_gate(
     gate: &GateCmd,
     model_hash: &str,
@@ -362,29 +360,64 @@ pub fn run_gate(
     alias: &str,
     change_id: &str,
 ) -> GateVerdict {
-    let subst = |a: &str| -> String {
-        a.replace("{hash}", model_hash)
-            .replace("{name}", name)
-            .replace("{alias}", alias)
-            .replace("{change_id}", change_id)
-    };
-    let args: Vec<String> = gate.args.iter().map(|a| subst(a)).collect();
+    let args = substituted_gate_args(gate, model_hash, name, alias, change_id);
     match std::process::Command::new(&gate.program)
         .args(&args)
         .output()
     {
         Ok(out) if out.status.success() => GateVerdict::Pass,
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let tail: String = stderr.trim().chars().take(500).collect();
-            GateVerdict::Fail(format!(
-                "gate `{}` exited {} — {tail}",
-                gate.program,
-                out.status.code().map_or("signal".into(), |c| c.to_string())
-            ))
-        }
+        Ok(out) => failed_gate_output(&gate.program, &out),
         Err(e) => GateVerdict::Fail(format!("gate `{}` could not run: {e}", gate.program)),
     }
+}
+
+/// Run a governance gate asynchronously with a hard wall-clock bound through
+/// the engine's shared process-group supervision seam. Timeout/cancellation
+/// cannot leave the gate or its descendants running after promotion fails.
+pub async fn run_gate_async(
+    gate: &GateCmd,
+    model_hash: &str,
+    name: &str,
+    alias: &str,
+    change_id: &str,
+    timeout: std::time::Duration,
+) -> GateVerdict {
+    let args = substituted_gate_args(gate, model_hash, name, alias, change_id);
+    match crate::python_kill::bounded_output(&gate.program, &args, timeout).await {
+        Ok(out) if out.status.success() => GateVerdict::Pass,
+        Ok(out) => failed_gate_output(&gate.program, &out),
+        Err(error) => GateVerdict::Fail(format!("gate `{}` {error}", gate.program)),
+    }
+}
+
+fn substituted_gate_args(
+    gate: &GateCmd,
+    model_hash: &str,
+    name: &str,
+    alias: &str,
+    change_id: &str,
+) -> Vec<String> {
+    gate.args
+        .iter()
+        .map(|arg| {
+            arg.replace("{hash}", model_hash)
+                .replace("{name}", name)
+                .replace("{alias}", alias)
+                .replace("{change_id}", change_id)
+        })
+        .collect()
+}
+
+fn failed_gate_output(program: &str, output: &std::process::Output) -> GateVerdict {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let tail: String = stderr.trim().chars().take(500).collect();
+    GateVerdict::Fail(format!(
+        "gate `{program}` exited {} — {tail}",
+        output
+            .status
+            .code()
+            .map_or("signal".into(), |code| code.to_string())
+    ))
 }
 
 /// Promote WITH governance: if `alias` is governed, the supplied `verdict` MUST

@@ -170,6 +170,11 @@ enum Command {
         #[command(subcommand)]
         cmd: DataCommand,
     },
+    /// Immutable, tenant-scoped `dataset://<name>@<version>` bindings (ADR 0090).
+    Dataset {
+        #[command(subcommand)]
+        cmd: DatasetCommand,
+    },
     /// Inspect or modify the auto-trigger policy.
     Policy {
         #[command(subcommand)]
@@ -191,6 +196,12 @@ enum Command {
     Model {
         #[command(subcommand)]
         cmd: ModelCommand,
+    },
+    /// Experiment registry views over lineage (`experiment://<recipe>/<run>`).
+    #[command(name = "exp", visible_alias = "experiment")]
+    Experiment {
+        #[command(subcommand)]
+        cmd: ExperimentCommand,
     },
     /// Inspect / prune the BLUT cache.
     Cache {
@@ -367,8 +378,8 @@ enum ModelCommand {
         hash: String,
         /// Model name, e.g. `encoder-v1`.
         name: String,
-        /// Owning tenant (default `shared`; `restricted` = clinical/PHI).
-        #[arg(long, default_value = "shared")]
+        /// Owning tenant (default `default`; `restricted` = clinical/PHI).
+        #[arg(long, default_value = "default")]
         tenant: String,
         /// Freeform provenance note (recipe, run id, …).
         #[arg(long)]
@@ -385,7 +396,7 @@ enum ModelCommand {
         /// Target pointer, e.g. `model://encoder-v1@prod`.
         pointer: String,
         /// Acting tenant — must match the model's tenant.
-        #[arg(long, default_value = "shared")]
+        #[arg(long, default_value = "default")]
         tenant: String,
         /// Change-request id for a governed-alias promotion (fed to the gate).
         #[arg(long)]
@@ -395,26 +406,29 @@ enum ModelCommand {
         /// `$BLUT_MODEL_GATE_CMD`. Required to promote onto a governed alias.
         #[arg(long)]
         gate_cmd: Option<String>,
+        /// Hard wall-clock bound for the governance process.
+        #[arg(long, default_value = "5m", value_parser = parse_duration)]
+        gate_timeout: Duration,
     },
     /// Roll an alias back to its previous target atomically.
     Rollback {
         /// Pointer, e.g. `model://encoder-v1@prod`.
         pointer: String,
-        #[arg(long, default_value = "shared")]
+        #[arg(long, default_value = "default")]
         tenant: String,
     },
     /// Resolve `model://<name>@<alias>` to the checkpoint hash it points at.
     Resolve {
         /// Pointer, e.g. `model://encoder-v1@prod`.
         pointer: String,
-        #[arg(long, default_value = "shared")]
+        #[arg(long, default_value = "default")]
         tenant: String,
     },
     /// Print an alias's audit trail (oldest first).
     History {
         /// Pointer, e.g. `model://encoder-v1@prod`.
         pointer: String,
-        #[arg(long, default_value = "shared")]
+        #[arg(long, default_value = "default")]
         tenant: String,
     },
 }
@@ -547,6 +561,50 @@ enum DataCommand {
     Rm { name: String },
     /// Print metadata for one dataset as JSON.
     Show { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum DatasetCommand {
+    /// Pin an existing `blut data add` source to an immutable version URI.
+    Pin {
+        /// Existing raw dataset-registry name.
+        source: String,
+        /// Immutable target, e.g. `dataset://tuh@v3`.
+        uri: String,
+        #[arg(long, default_value = "default")]
+        tenant: String,
+    },
+    /// Resolve a version to its hash-verified local path.
+    Resolve {
+        uri: String,
+        #[arg(long, default_value = "default")]
+        tenant: String,
+        /// Intended placement. Restricted datasets resolve only for `local`.
+        #[arg(long, default_value = "local")]
+        launcher: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ExperimentCommand {
+    /// Compare the two newest runs of a recipe in one tenant.
+    Compare {
+        name: String,
+        #[arg(long, default_value = "default")]
+        tenant: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve `experiment://<recipe>/<run>` to its tenant-scoped lineage row.
+    Resolve {
+        uri: String,
+        #[arg(long, default_value = "default")]
+        tenant: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -864,10 +922,12 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::Artifact { cmd }) => run_artifact_cmd(cmd),
         Some(Command::Schedule { cmd }) => run_schedule_cmd(&reg, cmd),
         Some(Command::Data { cmd }) => run_data(cmd),
+        Some(Command::Dataset { cmd }) => run_dataset_cmd(cmd),
         Some(Command::Policy { cmd }) => run_policy(cmd),
         Some(Command::Recipe { cmd }) => run_recipe(&reg, cmd).await,
         Some(Command::Plan { cmd }) => run_plan_cmd(&reg, cmd).await,
-        Some(Command::Model { cmd }) => run_model_cmd(cmd),
+        Some(Command::Model { cmd }) => run_model_cmd(cmd).await,
+        Some(Command::Experiment { cmd }) => run_experiment_cmd(cmd),
         Some(Command::Cache { cmd }) => run_cache_cmd(cmd),
         Some(Command::Footprint { cmd }) => run_footprint_cmd(cmd),
         Some(Command::Sensor { cmd }) => run_sensor_cmd(cmd),
@@ -985,6 +1045,116 @@ mod external_subcommand_tests {
 }
 
 #[cfg(test)]
+mod registry_completion_cli_tests {
+    use super::{
+        Cli, Command, DatasetCommand, ExperimentCommand, ModelCommand, RecipeCommand, RecipeMarker,
+        ensure_resume_registry_snapshot,
+    };
+    use clap::Parser;
+    use std::time::Duration;
+
+    #[test]
+    fn dataset_pin_and_exp_compare_parse_as_builtins() {
+        let dataset = Cli::try_parse_from([
+            "blut",
+            "dataset",
+            "pin",
+            "raw",
+            "dataset://tuh@v3",
+            "--tenant",
+            "research/dev",
+        ])
+        .unwrap();
+        assert!(matches!(
+            dataset.command,
+            Some(Command::Dataset {
+                cmd: DatasetCommand::Pin { source, uri, tenant }
+            }) if source == "raw" && uri == "dataset://tuh@v3" && tenant == "research/dev"
+        ));
+
+        let experiment = Cli::try_parse_from([
+            "blut",
+            "exp",
+            "compare",
+            "codec-train",
+            "--tenant",
+            "research/dev",
+        ])
+        .unwrap();
+        assert!(matches!(
+            experiment.command,
+            Some(Command::Experiment {
+                cmd: ExperimentCommand::Compare { name, tenant, json: false }
+            }) if name == "codec-train" && tenant == "research/dev"
+        ));
+
+        let recipe = Cli::try_parse_from([
+            "blut",
+            "recipe",
+            "run",
+            "codec-train",
+            "--experiment",
+            "campaign-a",
+        ])
+        .unwrap();
+        assert!(matches!(
+            recipe.command,
+            Some(Command::Recipe {
+                cmd: RecipeCommand::Run {
+                    experiment: Some(name),
+                    ..
+                }
+            }) if name == "campaign-a"
+        ));
+    }
+
+    #[test]
+    fn governed_model_promotion_has_a_finite_default_timeout() {
+        let cli = Cli::try_parse_from([
+            "blut",
+            "model",
+            "promote",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "model://encoder@prod",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Model {
+                cmd: ModelCommand::Promote { gate_timeout, tenant, .. }
+            }) if gate_timeout == Duration::from_secs(300) && tenant == "default"
+        ));
+    }
+
+    #[test]
+    fn recipe_marker_preserves_source_handles_and_reads_legacy_markers() {
+        let marker = RecipeMarker {
+            name: "train".into(),
+            args: serde_json::json!({"data":"/verified/data.jsonl"}),
+            source_args: Some(serde_json::json!({"data":"dataset://train@v1"})),
+        };
+        let encoded = serde_json::to_value(&marker).unwrap();
+        assert_eq!(encoded["source_args"]["data"], "dataset://train@v1");
+        assert!(ensure_resume_registry_snapshot(&marker, &marker.args).is_ok());
+        assert!(
+            ensure_resume_registry_snapshot(
+                &marker,
+                &serde_json::json!({"data":"/verified/other.jsonl"}),
+            )
+            .is_err(),
+            "a moved mutable registry pointer must not change a resumed run"
+        );
+
+        let legacy: RecipeMarker = serde_json::from_value(serde_json::json!({
+            "name":"train",
+            "args":{"data":"/legacy/data.jsonl"}
+        }))
+        .unwrap();
+        assert!(legacy.source_args.is_none());
+    }
+}
+
+#[cfg(test)]
 mod chain_preservation_tests {
     //! ADR 0072 A2 regression pin. The three `run_plan_cmd`/`run_hpo`/
     //! `launch_compiled_plan` sites used to do
@@ -1074,7 +1244,14 @@ mod chain_preservation_tests {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RecipeMarker {
     name: String,
+    /// Resolved args used to compile this exact run. Kept for backward
+    /// compatibility and for an auditable launch snapshot.
     args: serde_json::Value,
+    /// Original user args, including immutable registry handles. New markers
+    /// always carry this so resume can re-resolve/revalidate live dataset bytes
+    /// before recompiling. Older markers deserialize with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_args: Option<serde_json::Value>,
 }
 
 impl RecipeMarker {
@@ -1106,12 +1283,19 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             let marker = RecipeMarker::read_from(&job_dir)?;
             let tenant = crate::jobs::read_tenant(&job_id)
                 .with_context(|| format!("read tenant for {job_id}"))?;
+            let source_args = marker.source_args.as_ref().unwrap_or(&marker.args).clone();
+            let args = crate::registry_args::resolve_recipe_args(
+                source_args,
+                &tenant,
+                crate::config::launcher::LaunchTarget::Local,
+            )
+            .map_err(|e| anyhow!("registry arg revalidation: {e}"))?;
+            ensure_resume_registry_snapshot(&marker, &args)?;
             let r = reg
                 .find(&marker.name)
                 .ok_or_else(|| anyhow!("recipe '{}' not in catalog", marker.name))?;
-            let plan =
-                (r.compile_fn)(marker.args.clone()).map_err(|e| anyhow!("recipe compile: {e}"))?;
-            let footprint = recipe_footprint(&marker.name, &marker.args);
+            let plan = (r.compile_fn)(args.clone()).map_err(|e| anyhow!("recipe compile: {e}"))?;
+            let footprint = recipe_footprint(&marker.name, &args);
             let tenant_admission =
                 crate::broker::tenant_quota::TenantAdmission::prepare(tenant.clone())
                     .map_err(|e| anyhow!("tenant admission: {e}"))?;
@@ -1281,10 +1465,22 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
     }
 }
 
+fn ensure_resume_registry_snapshot(
+    marker: &RecipeMarker,
+    revalidated_args: &serde_json::Value,
+) -> Result<()> {
+    if marker.source_args.is_some() && revalidated_args != &marker.args {
+        return Err(anyhow!(
+            "registry arg revalidation refused: one or more handles resolve to a different immutable identity than the original launch"
+        ));
+    }
+    Ok(())
+}
+
 /// `blut model` — the ADR-0090 model registry, mirroring `blut plan`'s verbs.
 /// Sync (no recipe registry needed — a model is an opaque checkpoint hash, not a
 /// typechecked PlanSpec). A pointer is `model://<name>@<alias>`.
-fn run_model_cmd(cmd: ModelCommand) -> Result<()> {
+async fn run_model_cmd(cmd: ModelCommand) -> Result<()> {
     use crate::model_registry as mr;
     let parse = |pointer: &str| -> Result<(String, String)> {
         mr::parse_model_uri(pointer)
@@ -1310,6 +1506,7 @@ fn run_model_cmd(cmd: ModelCommand) -> Result<()> {
             tenant,
             change_id,
             gate_cmd,
+            gate_timeout,
         } => {
             let (name, alias) = parse(&pointer)?;
             // Governed-alias set: `$BLUT_MODEL_GOVERNED_ALIASES` (comma-separated)
@@ -1344,7 +1541,10 @@ fn run_model_cmd(cmd: ModelCommand) -> Result<()> {
                 ) {
                     (Some(gate), Some(cid)) => {
                         eprintln!("running governance gate for model://{name}@{alias} …");
-                        Some(mr::run_gate(&gate, &hash, &name, &alias, cid))
+                        Some(
+                            mr::run_gate_async(&gate, &hash, &name, &alias, cid, gate_timeout)
+                                .await,
+                        )
                     }
                     _ => Some(mr::GateVerdict::NotConfigured),
                 }
@@ -1396,6 +1596,90 @@ fn run_model_cmd(cmd: ModelCommand) -> Result<()> {
             }
             for h in &hist {
                 println!("{}  {}", h.moved_at, h.model_hash);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_dataset_cmd(cmd: DatasetCommand) -> Result<()> {
+    let conn = crate::datasets_db::open().map_err(|e| anyhow!("{e}"))?;
+    match cmd {
+        DatasetCommand::Pin {
+            source,
+            uri,
+            tenant,
+        } => {
+            let tenant = crate::tenant::Tenant::parse(&tenant)
+                .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
+            let binding = crate::dataset_registry::pin(&conn, &source, &uri, &tenant, now_unix())
+                .map_err(|e| anyhow!("{e}"))?;
+            println!(
+                "pinned dataset://{}@{} -> {} ({})",
+                binding.name,
+                binding.version,
+                binding.manifest_sha256,
+                binding.source_path.display()
+            );
+            Ok(())
+        }
+        DatasetCommand::Resolve {
+            uri,
+            tenant,
+            launcher,
+            json,
+        } => {
+            let tenant = crate::tenant::Tenant::parse(&tenant)
+                .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
+            let target: crate::config::launcher::LaunchTarget = launcher
+                .parse()
+                .map_err(|e| anyhow!("invalid --launcher {launcher:?}: {e}"))?;
+            let binding = crate::dataset_registry::resolve_uri(&conn, &uri, &tenant, target)
+                .map_err(|e| anyhow!("{e}"))?;
+            if json {
+                emit_json(&binding)?;
+            } else {
+                println!("{}", binding.source_path.display());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_experiment_cmd(cmd: ExperimentCommand) -> Result<()> {
+    let db = crate::lineage_db::LineageDb::open().map_err(|e| anyhow!("{e}"))?;
+    match cmd {
+        ExperimentCommand::Compare { name, tenant, json } => {
+            let tenant = crate::tenant::Tenant::parse(&tenant)
+                .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
+            let comparison = crate::experiment_registry::compare_latest(&db, &name, &tenant)
+                .map_err(|e| anyhow!("{e}"))?;
+            if json {
+                emit_json(&comparison)?;
+            } else {
+                println!(
+                    "experiment://{}  tenant={}",
+                    comparison.experiment, comparison.tenant
+                );
+                println!("baseline  : {}", comparison.run_a);
+                println!("candidate : {}", comparison.run_b);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&comparison.diff)
+                        .unwrap_or_else(|e| format!("serialize error: {e}"))
+                );
+            }
+            Ok(())
+        }
+        ExperimentCommand::Resolve { uri, tenant, json } => {
+            let tenant = crate::tenant::Tenant::parse(&tenant)
+                .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
+            let run = crate::experiment_registry::resolve_uri(&db, &uri, &tenant)
+                .map_err(|e| anyhow!("{e}"))?;
+            if json {
+                emit_json(&run)?;
+            } else {
+                println!("{}", run.job_id);
             }
             Ok(())
         }

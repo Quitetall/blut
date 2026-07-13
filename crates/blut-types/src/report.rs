@@ -204,6 +204,15 @@ impl ModelCard {
 
 // ── run diff (ADR 0099 capability 3) ───────────────────────────────
 
+/// One differing recipe-argument leaf. `None` means the path is absent on that
+/// side; `Some(null)` remains distinguishable from absence.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ArgDelta {
+    pub path: String,
+    pub a: Option<serde_json::Value>,
+    pub b: Option<serde_json::Value>,
+}
+
 /// The symmetric difference of two runs (ADR 0099): only the fields that
 /// DIFFER. A metric present in one and absent in the other shows the missing
 /// side as `None`.
@@ -216,6 +225,12 @@ pub struct RunDiff {
     /// `(a, b)` config fingerprints (the args + input-artifact identity),
     /// present only if they differ.
     pub config_fingerprint: Option<(Option<String>, Option<String>)>,
+    /// Sorted unique input hashes for each run, present only if they differ.
+    #[serde(default)]
+    pub input_hashes: Option<(Vec<String>, Vec<String>)>,
+    /// Leaf-level recipe-argument differences, sorted by JSON path.
+    #[serde(default)]
+    pub arg_deltas: Vec<ArgDelta>,
     /// `(a, b)` gate outcomes, present only if they differ.
     pub gate_outcome: Option<(Option<String>, Option<String>)>,
     /// Per-metric `(name, a_value, b_value)` for every metric whose value
@@ -228,6 +243,8 @@ impl RunDiff {
     pub fn is_empty(&self) -> bool {
         self.recipe.is_none()
             && self.config_fingerprint.is_none()
+            && self.input_hashes.is_none()
+            && self.arg_deltas.is_empty()
             && self.gate_outcome.is_none()
             && self.metric_deltas.is_empty()
     }

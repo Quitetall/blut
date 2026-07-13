@@ -12,4 +12,6 @@
 // Explicit re-export (not a glob): a new `pub` item added to `blut_types::report`
 // must be named here to enter the engine's `crate::lineage_report` surface — so
 // the keystone can't silently widen the engine's public API.
-pub use blut_types::report::{CardContent, GraphNode, ModelCard, ProvenanceGraph, RunDiff};
+pub use blut_types::report::{
+    ArgDelta, CardContent, GraphNode, ModelCard, ProvenanceGraph, RunDiff,
+};

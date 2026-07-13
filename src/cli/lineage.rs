@@ -51,7 +51,8 @@ pub(super) enum LineageCommand {
         json: bool,
     },
     /// Run DIFF (ADR 0099): the symmetric difference of two runs — differing
-    /// recipe, config fingerprint, gate outcome, and headline metrics.
+    /// recipe, config fingerprint, input hashes, args, gate outcome, and
+    /// headline metrics.
     Diff {
         /// First run (job id or unique prefix).
         run_a: String,
@@ -176,26 +177,54 @@ pub(super) fn run_lineage_diff(a_query: &str, b_query: &str, json: bool) -> Resu
         emit_json(&diff)?;
         return Ok(());
     }
+    print!("{}", render_lineage_diff(&a, &b, &diff));
+    Ok(())
+}
+
+fn render_lineage_diff(a: &str, b: &str, diff: &crate::lineage_report::RunDiff) -> String {
+    use std::fmt::Write;
+
     if diff.is_empty() {
-        println!("runs {a} and {b} are identical across recipe/config/gate/metrics.");
-        return Ok(());
+        return format!(
+            "runs {a} and {b} are identical across recipe/config/inputs/args/gate/metrics.\n"
+        );
     }
     let opt = |o: &Option<String>| o.as_deref().unwrap_or("—").to_string();
     let optf = |o: &Option<f64>| o.map(|v| v.to_string()).unwrap_or_else(|| "—".into());
-    println!("diff {a} ↔ {b}:");
+    let opt_json = |o: &Option<serde_json::Value>| {
+        o.as_ref()
+            .map(|value| serde_json::to_string(value).expect("JSON Value always serializes"))
+            .unwrap_or_else(|| "—".into())
+    };
+    let mut out = String::new();
+    writeln!(&mut out, "diff {a} ↔ {b}:").expect("write to String");
     if let Some((x, y)) = &diff.recipe {
-        println!("  recipe    : {} → {}", opt(x), opt(y));
+        writeln!(&mut out, "  recipe    : {} → {}", opt(x), opt(y)).expect("write to String");
     }
     if let Some((x, y)) = &diff.config_fingerprint {
-        println!("  config_fp : {} → {}", opt(x), opt(y));
+        writeln!(&mut out, "  config_fp : {} → {}", opt(x), opt(y)).expect("write to String");
+    }
+    if let Some((x, y)) = &diff.input_hashes {
+        writeln!(&mut out, "  inputs    : {} → {}", x.join(","), y.join(","))
+            .expect("write to String");
+    }
+    for delta in &diff.arg_deltas {
+        writeln!(
+            &mut out,
+            "  arg {:<11}: {} → {}",
+            delta.path,
+            opt_json(&delta.a),
+            opt_json(&delta.b)
+        )
+        .expect("write to String");
     }
     if let Some((x, y)) = &diff.gate_outcome {
-        println!("  gate      : {} → {}", opt(x), opt(y));
+        writeln!(&mut out, "  gate      : {} → {}", opt(x), opt(y)).expect("write to String");
     }
     for (m, x, y) in &diff.metric_deltas {
-        println!("  {m:<16}: {} → {}", optf(x), optf(y));
+        writeln!(&mut out, "  {m:<16}: {} → {}", optf(x), optf(y)).expect("write to String");
     }
-    Ok(())
+    out
 }
 
 pub(super) fn run_lineage_cmd(cmd: LineageCommand) -> Result<()> {
@@ -387,4 +416,31 @@ pub(super) fn run_lineage_reindex() -> Result<()> {
     }
     eprintln!("reindexed {indexed} run(s), skipped {skipped}");
     Ok(())
+}
+
+#[cfg(test)]
+mod lineage_diff_render_tests {
+    use super::render_lineage_diff;
+
+    #[test]
+    fn human_diff_renders_input_and_argument_deltas() {
+        let diff = crate::lineage_report::RunDiff {
+            run_a: "a".into(),
+            run_b: "b".into(),
+            recipe: None,
+            config_fingerprint: None,
+            input_hashes: Some((vec!["input-a".into()], vec!["input-b".into()])),
+            arg_deltas: vec![crate::lineage_report::ArgDelta {
+                path: "$/lr".into(),
+                a: Some(serde_json::json!(0.01)),
+                b: Some(serde_json::json!(0.02)),
+            }],
+            gate_outcome: None,
+            metric_deltas: Vec::new(),
+        };
+        let rendered = render_lineage_diff("a", "b", &diff);
+        assert!(rendered.contains("input-a → input-b"));
+        assert!(rendered.contains("$/lr"));
+        assert!(rendered.contains("0.01 → 0.02"));
+    }
 }

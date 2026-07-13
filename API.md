@@ -193,7 +193,11 @@ refuses to wire a stage tagged for a different backend.
 | `hpo` | hyperparameter search (TPE / median / PBT samplers + schedulers) over a recipe |
 | `lineage_db` | content-addressed artifact lineage index |
 | `tenant` | validated `project[/domain]` isolation axis; `clinical`/`restricted` are sealed |
-| `datasets_db` | dataset registry |
+| `datasets_db` | raw local dataset source records |
+| `dataset_registry` | immutable tenant-scoped `dataset://name@version` bindings with live hash verification |
+| `model_registry` | governed `model://name@alias` checkpoint pointers with append-only history |
+| `experiment_registry` | tenant-scoped `experiment://recipe/run` lineage views and latest-run comparison |
+| `registry_args` | recursive registry-URI resolution before recipe args are typed/deserialized |
 | `sensor`, `schedule`, `policy` | named freshness sensors, systemd-timer schedules, the auto-retrain policy |
 | `config::launcher::Launcher` | placement abstraction (local / cluster) |
 | `error::TrainError` | top-level error type |
@@ -206,6 +210,21 @@ cookbook binary supplies its `Registry` and delegates the whole CLI to it
 `schedule`, `sensor`, `policy`, …). The interactive `tui` subcommand + the
 bare-command cockpit ship in the default build (the default-on `tui` feature);
 `--no-default-features` yields a lean CLI-only binary (bare `blut` prints help).
+
+`blut dataset pin` binds an existing raw source to an immutable
+`dataset://name@version`; `blut exp compare` compares the two newest lineage
+runs for an explicit `--experiment` campaign and tenant (falling back to the
+recipe name for legacy/default runs); and governed `blut model promote`
+processes run asynchronously under `--gate-timeout` (default five minutes).
+`recipe run`, resumable recipe markers, HPO, declarative TOML, JSON PlanSpecs,
+frozen registry PlanSpecs, and Starlark build/stage args resolve these URIs
+recursively before cookbook-defined typed args are deserialized. Dataset
+handles become a live hash-verified local path, model handles become the
+immutable checkpoint hash, and experiment handles become the tenant-scoped run
+id. Restricted dataset/model handles refuse every non-local launcher. Model
+commands default to the same `default` tenant as recipe launches; records made
+under the older `shared` default remain reachable with explicit `--tenant
+shared`.
 
 ## Platform
 
