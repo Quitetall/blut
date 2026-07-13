@@ -1071,8 +1071,27 @@ impl LineageDb {
             let Some(artifact) = self.artifact_by_hash(&current)? else {
                 break;
             };
-            let run = self.get_run(&artifact.job_id)?;
-            chain.push(TraceStep { artifact, run });
+            let run = self.get_run(&artifact.job_id)?.ok_or_else(|| {
+                TrainError::other(format!(
+                    "lineage trace refused: artifact {} has no run custody metadata",
+                    artifact.content_hash
+                ))
+            })?;
+            let tenant = crate::tenant::Tenant::parse(&run.tenant).ok_or_else(|| {
+                TrainError::other(format!(
+                    "lineage trace refused: run {} has invalid tenant metadata",
+                    run.job_id
+                ))
+            })?;
+            if tenant.is_restricted() {
+                return Err(TrainError::other(
+                    "lineage trace refused: Restricted provenance requires an exact tenant-scoped view",
+                ));
+            }
+            chain.push(TraceStep {
+                artifact,
+                run: Some(run),
+            });
             // The input hash of the edge that produced `current`.
             match self.input_hash_for_output(&current)? {
                 Some(input) => current = input,
@@ -1967,6 +1986,31 @@ mod tests {
     }
 
     #[test]
+    fn generic_trace_refuses_restricted_provenance() {
+        let db = db();
+        db.record_run(&RunRow {
+            job_id: "clinical-job".into(),
+            recipe: "r".into(),
+            tenant: "clinical/prod".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.record_artifact(&art("clinical-job", 0, "restrictedhash"))
+            .unwrap();
+        let error = db.trace("restrictedhash").unwrap_err().to_string();
+        assert!(error.contains("Restricted provenance"));
+    }
+
+    #[test]
+    fn generic_trace_refuses_artifact_without_run_custody() {
+        let db = db();
+        db.record_artifact(&art("orphan-job", 0, "orphanhash"))
+            .unwrap();
+        let error = db.trace("orphanhash").unwrap_err().to_string();
+        assert!(error.contains("no run custody metadata"));
+    }
+
+    #[test]
     fn stage_idx_parsed_from_sidecar_path() {
         assert_eq!(
             stage_idx_of(Path::new("/j/stages/0-make/output.metadata.json")),
@@ -1985,6 +2029,12 @@ mod tests {
     #[test]
     fn trace_is_cycle_guarded() {
         let db = db();
+        db.record_run(&RunRow {
+            job_id: "j".into(),
+            recipe: "r".into(),
+            ..Default::default()
+        })
+        .unwrap();
         db.record_artifact(&art("j", 0, "a")).unwrap();
         db.record_artifact(&art("j", 1, "b")).unwrap();
         // A pathological cycle a→b→a must terminate, not hang.

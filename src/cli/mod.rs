@@ -1051,7 +1051,7 @@ mod external_subcommand_tests {
 mod registry_completion_cli_tests {
     use super::{
         Cli, Command, DatasetCommand, ExperimentCommand, ModelCommand, PlanCommand, RecipeCommand,
-        RecipeMarker, ensure_resume_registry_snapshot,
+        RecipeMarker, ensure_resume_registry_snapshot, governed_aliases,
     };
     use clap::Parser;
     use std::time::Duration;
@@ -1145,6 +1145,17 @@ mod registry_completion_cli_tests {
                 cmd: PlanCommand::Resume { sync_io: true, .. }
             })
         ));
+    }
+
+    #[test]
+    fn governed_alias_override_can_only_widen_prod_boundary() {
+        assert_eq!(governed_aliases(None), vec!["prod"]);
+        assert_eq!(governed_aliases(Some("")), vec!["prod"]);
+        assert_eq!(governed_aliases(Some("staging")), vec!["prod", "staging"]);
+        assert_eq!(
+            governed_aliases(Some("staging,prod,canary,staging")),
+            vec!["prod", "staging", "canary"]
+        );
     }
 
     #[test]
@@ -1562,27 +1573,10 @@ async fn run_model_cmd(cmd: ModelCommand) -> Result<()> {
             gate_timeout,
         } => {
             let (name, alias) = parse(&pointer)?;
-            // Governed-alias set: `$BLUT_MODEL_GOVERNED_ALIASES` (comma-separated)
-            // overrides the default `["prod"]`.
+            // Governed-alias set: `$BLUT_MODEL_GOVERNED_ALIASES` can only add
+            // aliases. The built-in `prod` boundary is never removable.
             let gov_env = std::env::var("BLUT_MODEL_GOVERNED_ALIASES").ok();
-            let governed: Vec<&str> = match &gov_env {
-                Some(s) => {
-                    let set: Vec<&str> = s
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|x| !x.is_empty())
-                        .collect();
-                    // Fail-SAFE: a blank/empty override must NOT silently disable
-                    // governance (ungovern @prod) — fall back to the default. The
-                    // env can only WIDEN the governed set, never empty it.
-                    if set.is_empty() {
-                        mr::DEFAULT_GOVERNED_ALIASES.to_vec()
-                    } else {
-                        set
-                    }
-                }
-                None => mr::DEFAULT_GOVERNED_ALIASES.to_vec(),
-            };
+            let governed = governed_aliases(gov_env.as_deref());
             // For a governed alias, RUN the caller-supplied gate (flag or env) and
             // compute a verdict; otherwise the verdict is unused. Fail-closed: a
             // governed alias with no gate/change-id yields NotConfigured → refuse.
@@ -1746,6 +1740,22 @@ fn acting_user() -> String {
 
 /// UNIX seconds now (CLI-side; the registry fns take the timestamp explicitly so
 /// they stay pure/deterministic for tests).
+fn governed_aliases(raw: Option<&str>) -> Vec<&str> {
+    let mut governed = crate::model_registry::DEFAULT_GOVERNED_ALIASES.to_vec();
+    if let Some(raw) = raw {
+        for alias in raw
+            .split(',')
+            .map(str::trim)
+            .filter(|alias| !alias.is_empty())
+        {
+            if !governed.contains(&alias) {
+                governed.push(alias);
+            }
+        }
+    }
+    governed
+}
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

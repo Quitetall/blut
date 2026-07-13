@@ -213,11 +213,12 @@ pub struct ExecCtx {
     /// broker's OOM-escalation here; the framework stays broker-agnostic.
     pub on_retry: Option<crate::framework::retry::RetryHook>,
     /// Capacity-aware memory admission (Phase 5). A stage holds
-    /// `Stage::MEMORY_GIB` permits from this for its whole run; the budget is
-    /// the box-fit GiB (`MemTotal − floor`). Concurrent stages can't acquire
-    /// more than the budget in total → memory-admission under the parallel
-    /// executor. Default budget is effectively unlimited (no gating); the CLI
-    /// sizes it to box-fit via `with_memory_budget`.
+    /// `Stage::MEMORY_GIB` permits from this for its whole run. The CLI caps the
+    /// budget to the whole-job RAM reservation (and never above the tenant
+    /// ceiling), so concurrent stages cannot spend more declared RAM than the
+    /// job acquired. This is admission accounting, not an OOM guarantee:
+    /// declarations can be wrong and the default budget is effectively
+    /// unlimited for direct library callers.
     pub memory: Arc<tokio::sync::Semaphore>,
     pub memory_budget_gib: u32,
     /// Where stages place their work (#3). `Local` (default) = this box; a
@@ -232,24 +233,14 @@ pub struct ExecCtx {
     /// `BLUT_KILL_ON_NAN=1` (or call `with_control`) to wire the built-in
     /// `KillOnNaN`.
     pub control: Option<Arc<dyn ControlPolicy>>,
-    /// Never-OOM Phase 3: was the per-sample disk cache warmed upstream? Threaded
-    /// into every `StageContext` so a train stage bills the warm (lower)
-    /// per-worker footprint + the `|w` calibration key. Set by the CLI from the
-    /// recipe's `warm_fb_cache` arg (the SAME source the admission gate reads),
-    /// so RECORD and RESOLVE never disagree. Default false (cold). NOT a stage
-    /// Arg — warm doesn't change the trained output, so it stays out of the
-    /// checkpoint cache key.
+    /// Transitional LamQuant compatibility signal for a warmed per-sample
+    /// cache. The generic CLI leaves it false and never interprets recipe keys.
     pub fb_warm: bool,
-    /// Auto-tuned decode worker count (ADR 0071 A2), cached at admission so the
-    /// cookbook train stage (RECORD) launches the SAME count the cli sized (RESOLVE)
-    /// — parity + memory-admission. `None` ⇒ the conservative cap (unchanged behaviour).
+    /// Transitional LamQuant compatibility override for decode workers. The
+    /// generic CLI leaves it `None`.
     pub admitted_workers: Option<u32>,
-    /// Auto-tuned batch size, extending ADR 0071's fit-and-saturate auto-tune
-    /// to a second knob (E2). Resolved from the SAME admission snapshot as
-    /// `admitted_workers` (batch is searched against the residual budget
-    /// AFTER workers is fixed — see `batch_size_to_fit`'s doc comment for why
-    /// this reaches the same result a joint search would). `None` ⇒ the
-    /// recipe's requested batch, unchanged (no auto-tune ran).
+    /// Transitional LamQuant compatibility override for batch size. The
+    /// generic CLI leaves it `None`.
     pub admitted_batch_size: Option<u32>,
     /// ADR 0103 node-keyed effective profiles. Selection is resolved once from
     /// immutable launch hints before scheduling; each StageContext sees only
@@ -341,7 +332,7 @@ impl ExecCtx {
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             deadline: None,
             on_retry: None,
-            // Effectively unlimited until the CLI sizes it to box-fit; a stage
+            // Effectively unlimited until the CLI binds it to the job reservation; a stage
             // requesting MEMORY_GIB ≪ this never blocks, so default = no gating.
             memory: Arc::new(tokio::sync::Semaphore::new(UNLIMITED_MEM_GIB as usize)),
             memory_budget_gib: UNLIMITED_MEM_GIB,
@@ -392,22 +383,18 @@ impl ExecCtx {
         self
     }
 
-    /// Mark the per-sample cache as warmed upstream (Phase 3). Threaded into every
-    /// `StageContext.fb_warm` so a train stage bills the warm footprint.
+    /// Set the transitional LamQuant warm-cache compatibility signal.
     pub fn with_fb_warm(mut self, warm: bool) -> Self {
         self.fb_warm = warm;
         self
     }
-    /// Set the auto-tuned decode worker count (ADR 0071 A2). Threaded into every
-    /// `StageContext.admitted_workers` so the cookbook train stage launches it.
+    /// Set the transitional LamQuant decode-worker compatibility override.
     pub fn with_admitted_workers(mut self, workers: u32) -> Self {
         self.admitted_workers = Some(workers);
         self
     }
 
-    /// Set the auto-tuned batch size (E2, extends ADR 0071's fit-and-saturate
-    /// to a second knob). Threaded into every `StageContext.admitted_batch_size`
-    /// so the cookbook train stage launches it.
+    /// Set the transitional LamQuant batch-size compatibility override.
     pub fn with_admitted_batch_size(mut self, batch_size: u32) -> Self {
         self.admitted_batch_size = Some(batch_size);
         self
@@ -504,7 +491,7 @@ impl ExecCtx {
         self
     }
 
-    /// Size the memory admission budget to `gib` (box-fit = `MemTotal − floor`).
+    /// Size the concurrent-stage memory budget to `gib`.
     /// A stage's `MEMORY_GIB` is clamped to this, so a stage needing the whole
     /// box runs alone rather than deadlocking.
     pub fn with_memory_budget(mut self, gib: u32) -> Self {
@@ -4323,14 +4310,17 @@ impl std::fmt::Display for SpawnInjectionError {
 /// (`base = orig_n + appended.len()`), its nodes moved into `appended`, its
 /// edges/in-degrees/successors/topo-order extended, its graph-inputs seeded as
 /// root outputs, and its roots inserted into `ready`. Returns the count
-/// injected. Structural HPO errors remain best-effort; training-I/O admission
-/// errors are distinguished so the caller can fail closed before a child runs.
+/// injected. Rejects cyclic/empty sub-plans and any declaration larger than the
+/// RAM envelope reserved before this execution began. Structural HPO errors
+/// remain best-effort; training-I/O admission errors are distinguished so the
+/// caller can fail closed before a child runs.
 #[allow(clippy::too_many_arguments)]
 fn inject_spawn(
     delta: crate::framework::control::SpawnDelta,
     resolved_training_io: Option<HashMap<NodeId, ResolvedTrainingIoNode>>,
     inherited_partition: Option<blut_types::partition::PartitionKey>,
     env: &NodeEnv,
+    memory_budget_gib: u32,
     orig_n: usize,
     appended: &mut Vec<crate::framework::plan::PlanNode>,
     all_edges: &mut Vec<crate::framework::plan::PlanEdge>,
@@ -4354,6 +4344,26 @@ fn inject_spawn(
     if let Some(partition) = inherited_partition {
         subplan = subplan.with_partition(partition);
     }
+    // Reject a runtime sub-plan whose largest declared stage exceeds the
+    // whole-job RAM reservation. Silently clamping that stage to the smaller
+    // semaphore would not reduce its real memory use and would let TPE/PBT
+    // suggestions escape the envelope acquired before execution began.
+    let spawn_gib = subplan
+        .declared_footprint()
+        .ram_bytes
+        .div_ceil(crate::broker::footprint::GIB)
+        .clamp(1, u64::from(u32::MAX)) as u32;
+    if spawn_gib > memory_budget_gib {
+        // STRUCTURAL, not TrainingIo: an oversized best-effort HPO suggestion is
+        // dropped with a warning (the search continues), while the same error on
+        // a REQUIRED map shard fails the plan — the map_spawn arm downstream
+        // distinguishes the two. TrainingIo would make every oversized
+        // suggestion fatal.
+        return Err(SpawnInjectionError::Structural(PlanError::Other(format!(
+            "runtime spawn requires {spawn_gib} GiB but this job reserved only {memory_budget_gib} GiB"
+        ))));
+    }
+
     // Local topo order (also the cycle/empty check) BEFORE we mutate anything.
     let local_order = subplan
         .topo_order()
@@ -5425,6 +5435,7 @@ impl ParallelExecutor {
                         resolved_training_io,
                         inherited_partition,
                         &env,
+                        env.memory_budget_gib,
                         orig_n,
                         &mut appended,
                         &mut all_edges,

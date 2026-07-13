@@ -6,12 +6,11 @@
 //! shippable slice — containment-first), this module ships ONLY the
 //! pieces that give the hard floor:
 //!
-//!   1. [`footprint`] — a SCALING RAM-footprint estimator (not a
-//!      constant): conservative-high RAM bytes as a function of the
-//!      cost drivers (dataloader `workers × prefetch` dominant, then
-//!      batch, tier, latent_dim). Used BOTH by the launch-path
-//!      admission gate (blut) and by the train stage (blut-lamquant,
-//!      which also feeds it into the cgroup `MemoryMax` cap).
+//!   1. [`footprint`] — the calibrated footprint store plus a legacy
+//!      LamQuant-specific scaling model. Generic launch admission uses typed
+//!      stage resource declarations; it never interprets recipe JSON fields.
+//!      The compatibility model remains available to `blut-lamquant` for its
+//!      train-stage cgroup `MemoryMax` cap and measured calibration keys.
 //!   2. [`probe`] — a cheap, best-effort `ResourceSnapshot` of free
 //!      RAM (`/proc/meminfo` MemAvailable) + free VRAM (`nvidia-smi`).
 //!      Independent of the TUI's `SystemSnapshot` so the broker has no
@@ -24,9 +23,8 @@
 //!
 //! SLICE-2 adds the [`footprint::FootprintStore`] calibration store:
 //! measured cgroup-attributed peak RAM (recorded at job exit by the
-//! cookbook runner) MAX-merged per `(recipe,tier,batch,workers)` key, so
-//! `resolve()` admits a calibrated key at its real ~20G instead of the
-//! conservative ~35G estimate that over-refuses legit runs.
+//! cookbook runner) MAX-merged per `(recipe,tier,batch,workers)` key. This is a
+//! transitional cookbook compatibility surface, not a generic engine contract.
 //!
 //! DEFERRED to later slices (NOT built here): VRAM byte-ledger /
 //! per-GPU iteration, OOM-detect+retry, auto-tune-up. The store carries
@@ -37,8 +35,8 @@
 //! `MemoryMax` containment applied on the train path (see
 //! `blut-lamquant`'s `LamquantInvocation.contained` /
 //! `cgroup_memmax`). Admission only reduces *job-level* OOM-kills and
-//! only against blut-launched load. This module is the admission half;
-//! containment is enforced in the cookbook's runner.
+//! only against blut-launched load. Containment is enforced in the cookbook's
+//! runner.
 
 pub mod admission;
 pub mod footprint;

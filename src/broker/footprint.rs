@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Brian Lam
-//! Footprint estimation — the SCALING RAM model (ADR 0046, hole #3/#4).
+//! LamQuant compatibility footprint model and generic calibration store.
 //!
-//! The blueprint's "constant 40-50G hint" is rejected by the review:
+//! Generic engine launch admission uses typed stage resource declarations and
+//! does not call this recipe-key parser. The compatibility model remains public
+//! for the downstream LamQuant cookbook's containment and calibration path.
+//!
+//! The original blueprint's "constant 40-50G hint" is rejected by the review:
 //! it is not an upper bound across tier / batch / latent-dim, so a
 //! larger config can admit then OOM. The real driver of the RAM OOMs
 //! on this box is the dataloader: `num_workers × per-worker prefetch
@@ -25,13 +29,9 @@ use serde::{Deserialize, Serialize};
 pub const GIB: u64 = 1024 * 1024 * 1024;
 
 /// Conservative default batch billed when a recipe leaves `batch_size`
-/// to the kernel default. SHARED between the cli admission gate
-/// (`recipe_footprint`) and the train stage (`train_containment`) so
-/// the admission `need` and the cgroup `cap = need + 2G` are computed
-/// from the SAME inputs — otherwise admission could pass a job on a
-/// smaller estimate than the cap it then runs under, breaching the OS
-/// floor admission promised. Conservative-high so the cap is never
-/// under-sized for an unspecified batch.
+/// to the kernel default. Used by the LamQuant compatibility containment and
+/// calibration path. Conservative-high so its cap is never under-sized for an
+/// unspecified batch.
 pub const DEFAULT_BATCH: u32 = 32;
 
 /// Conservative DataLoader worker cap for a train-shaped stage (ADR 0046
@@ -41,13 +41,9 @@ pub const DEFAULT_BATCH: u32 = 32;
 /// ~9 GiB swap under a 25 GiB cap and OOM-killed under added pressure.
 /// Cap at **2**: ~20 GiB real demand, under the cap with headroom.
 ///
-/// THE cross-crate contract: the cli admission gate (RESOLVE) clamps its
-/// `workers` driver to `1..=UNCALIBRATED_WORKER_CAP` and the cookbook
-/// train stage (RECORD) launches exactly this many — if the two ever
-/// disagreed, the calibration key would never hit and the broker would
-/// over-refuse forever. Lives here (the shared crate) so neither side
-/// can drift from it (the prior copy lived in the cookbook and the cli
-/// hard-coded a different `1..=4` clamp — a live parity bug).
+/// Cross-crate compatibility contract for the LamQuant cookbook's resolve and
+/// record paths. The generic engine CLI does not derive worker counts from
+/// recipe JSON.
 pub const UNCALIBRATED_WORKER_CAP: u32 = 2;
 
 /// Upper bound on auto-tuned DataLoader workers (ADR 0071). Decode saturates the
@@ -55,10 +51,8 @@ pub const UNCALIBRATED_WORKER_CAP: u32 = 2;
 /// multi-GiB prefetch buffer, so raising past this just burns RAM for no throughput.
 pub const MAX_AUTO_WORKERS: u32 = 16;
 
-/// The footprint cost drivers for a train-shaped recipe/stage, plus THE
-/// single extraction from a recipe's args JSON. Both the cli admission
-/// gate (RESOLVE) and the cookbook train stage (RECORD) build their
-/// calibration key from this so the keys are byte-identical.
+/// Compatibility footprint cost drivers for the LamQuant cookbook. This shape
+/// is not part of the generic engine launch contract and may move before 1.0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Drivers {
     /// DataLoader workers (the dominant RAM term), clamped
@@ -118,9 +112,8 @@ pub fn in_ch_from_detail_bands(mode: &str) -> u32 {
 /// wins; else `SNN_DETAIL_BANDS=<bands>` in `extra_env` (empty ⇒ none ⇒ 21);
 /// else the kernel default `detail_bands='all'` ⇒ [`DEFAULT_IN_CH`] (168).
 ///
-/// THE single shared derivation: the cli RESOLVE side (`from_args_json`) and the
-/// cookbook RECORD side (the train stage) both call this so the billed in_ch —
-/// hence the estimate — matches.
+/// Shared derivation for LamQuant's compatibility resolve/record path so its
+/// billed input width and containment estimate match.
 pub fn in_ch_from_args(extra_args: &[&str], extra_env: &[&str]) -> u32 {
     for (i, &tok) in extra_args.iter().enumerate() {
         for flag in ["--detail-bands", "--n"] {
@@ -153,7 +146,7 @@ pub fn in_ch_from_args(extra_args: &[&str], extra_env: &[&str]) -> u32 {
     DEFAULT_IN_CH
 }
 
-/// `in_ch` from a recipe args JSON (the RESOLVE side) — extracts the
+/// `in_ch` from LamQuant compatibility args JSON. Extracts the
 /// `extra_args`/`extra_env` string arrays and defers to [`in_ch_from_args`].
 fn in_ch_from_args_json(raw: &serde_json::Value) -> u32 {
     let strs = |key: &str| -> Vec<&str> {
@@ -166,7 +159,8 @@ fn in_ch_from_args_json(raw: &serde_json::Value) -> u32 {
 }
 
 impl Drivers {
-    /// Extract the cost drivers from a recipe's args JSON. Workers
+    /// Extract LamQuant compatibility cost drivers from recipe args JSON.
+    /// The generic engine launch path does not call this parser. Workers
     /// defaults to and is clamped by [`UNCALIBRATED_WORKER_CAP`] (the
     /// value the train stage actually launches), `batch` to
     /// [`DEFAULT_BATCH`], `tier` to 3 (the train-recipe default), and
@@ -196,9 +190,8 @@ impl Drivers {
             .unwrap_or(0);
         // `warm_fb_cache` (Phase 2/3): present + true on the warm-by-default
         // train recipe; ABSENT ⇒ false (the conservative cold term) so a recipe
-        // that doesn't warm is never under-billed. The cli RESOLVE side reads
-        // it here; the cookbook RECORD side reads the same flag off the train
-        // stage's args — they must agree or the calibration key never hits.
+        // that doesn't warm is never under-billed. Downstream compatibility
+        // resolve and record paths must agree or their calibration key misses.
         let warm = raw
             .get("warm_fb_cache")
             .and_then(|v| v.as_bool())
@@ -216,9 +209,9 @@ impl Drivers {
         }
     }
 
-    /// Build directly from the resolved drivers a train stage launches
-    /// with (RECORD side). Clamps `workers` to the cap so a stage that
-    /// passes a raw count still keys identically to the cli.
+    /// Build directly from the resolved drivers a compatibility train stage
+    /// launches. Clamps `workers` to the cap so its resolve and record keys
+    /// cannot diverge on an out-of-range raw count.
     pub fn new(workers: u32, batch: u32, tier: u32, latent: u32, warm: bool, in_ch: u32) -> Self {
         Self {
             workers: workers.clamp(1, UNCALIBRATED_WORKER_CAP),
@@ -408,11 +401,10 @@ impl FootprintSource {
     }
 }
 
-/// Stable composite key for the calibration store. `recipe` is the
-/// RECIPE name (e.g. `train_model`), NOT the stage name — the
-/// cli admission gate resolves from the recipe it was asked to run, and
-/// the stage records under the SAME recipe name (threaded via
-/// `StageContext.recipe_name`) so the RESOLVE and RECORD keys match.
+/// Stable composite key for the compatibility calibration store. `recipe` is
+/// the recipe name (e.g. `train_model`), not the stage name. The cookbook
+/// threads it through `StageContext.recipe_name` so its own resolve and record
+/// keys match.
 /// `tier`/`batch`/`workers` are the cost drivers the footprint scales
 /// on (latent is folded into the estimate, not the key — it rarely
 /// varies and would fragment the calibration).
@@ -457,12 +449,9 @@ impl FootprintKey {
     }
 }
 
-/// Build the calibration key from a recipe name + the cost drivers.
-/// THE single shared constructor: both the cli admission gate (RESOLVE)
-/// and the train stage (RECORD) call this so the keys are byte-identical
-/// — if they diverged the calibration would never be hit and the broker
-/// would over-refuse forever. `workers`/`batch`/`tier`/`warm` MUST be the
-/// same values fed to [`estimate`].
+/// Build a compatibility calibration key from a recipe name and its cost
+/// drivers. A cookbook's resolve and record paths must supply the same values;
+/// `workers`/`batch`/`tier`/`warm` must also match those fed to [`estimate`].
 pub fn footprint_key(
     recipe: &str,
     workers: u32,
@@ -643,10 +632,8 @@ pub fn warm_workers_for_budget(requested: u32, budget_bytes: u64) -> u32 {
 /// (probe unavailable) ⇒ the conservative [`UNCALIBRATED_WORKER_CAP`], so a box we
 /// can't size to behaves exactly as before.
 ///
-/// The cross-crate parity contract (see [`UNCALIBRATED_WORKER_CAP`]) is preserved by
-/// computing the count ONCE at admission and caching it (the cli sets
-/// `BLUT_ADMITTED_WORKERS`; the cookbook train stage reads it), so RESOLVE and RECORD
-/// build the SAME `FootprintKey`.
+/// A downstream compatibility path that uses this helper must compute the
+/// count once and pass the same value to containment and calibration.
 pub fn workers_to_fit_and_saturate(
     cpu_count: u32,
     avail_bytes: u64,
@@ -686,8 +673,8 @@ pub fn workers_to_fit_and_saturate(
 /// Always ≥ 1. `avail_bytes == 0` (probe unavailable) ⇒ returns the
 /// recipe's requested batch unchanged (mirrors `workers_to_fit_and_saturate`'s
 /// uncalibrated-box behavior — a box we can't size to behaves as before, no
-/// silent shrink). Same cross-crate parity contract as workers: compute ONCE
-/// at admission, thread the resolved value so RESOLVE and RECORD agree.
+/// silent shrink). As with workers, a downstream compatibility path must pass
+/// the same resolved value to containment and calibration.
 pub fn batch_size_to_fit(
     resolved_workers: u32,
     avail_bytes: u64,
@@ -1165,7 +1152,7 @@ mod tests {
 
     #[test]
     fn drivers_from_args_reads_warm_flag() {
-        // RESOLVE side: the warm flag comes off the recipe args JSON. Absent ⇒
+        // Compatibility resolve side: warm comes from recipe JSON. Absent ⇒
         // cold (conservative). Present+true ⇒ warm.
         let cold = Drivers::from_args_json(&serde_json::json!({"tier": 3}));
         assert!(!cold.warm, "absent warm_fb_cache ⇒ cold");

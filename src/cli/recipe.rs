@@ -364,10 +364,8 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                     let def = reg
                         .find(&name)
                         .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
-                    if let Err(e) = (def.compile_fn)(raw.clone()) {
-                        return Err(anyhow!("{e}")); // RecipeError already names the cause
-                    }
-                    let fp = recipe_footprint(&name, &raw);
+                    let plan = (def.compile_fn)(raw.clone()).map_err(|e| anyhow!("{e}"))?;
+                    let fp = plan.declared_footprint();
                     let gib = fp.ram_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
                     println!(
                         "[dry-run] recipe={name} resolved RAM footprint ≈ {gib:.1}G \

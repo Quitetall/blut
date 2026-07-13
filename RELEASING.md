@@ -27,7 +27,7 @@ bash scripts/run_benchmarks.sh compare
 Also gate detached workspaces:
 
 ```bash
-(cd crates/blut-dsl && cargo +1.88 fmt --all -- --check && cargo +1.88 clippy --locked --all-targets -- -D warnings && cargo +1.88 test --locked)
+(cd crates/blut-dsl && cargo +1.88 fmt --all -- --check && cargo +1.88 clippy --locked --all-targets -- -D warnings && cargo +1.88 test --locked && RUSTDOCFLAGS="-D warnings" cargo +1.88 doc --locked --no-deps)
 (cd crates/blut-worker && cargo +1.88 fmt --all -- --check && cargo +1.88 clippy --locked --all-targets -- -D warnings && cargo +1.88 test --locked)
 (cd crates/blut-operator && cargo +1.89 fmt --all -- --check && cargo +1.89 clippy --locked --all-targets -- -D warnings && cargo +1.89 test --locked)
 ```
@@ -40,6 +40,17 @@ Every commit in the candidate range must also have a recorded `PASS` or
 unavailable reviewer is a release blocker, not a waiver. The benchmark command
 above requires the committed `release-0.2` quiet-host baseline; establish it
 with `bash scripts/run_benchmarks.sh --save` only on the designated quiet host.
+
+## Public source gate
+
+Crates.io publication must not precede source availability:
+
+```bash
+test "$(gh repo view Quitetall/blut --json visibility --jq .visibility)" = PUBLIC
+```
+
+Verify the README, security policy, CLA, and immutable validation links from an
+unauthenticated browser before continuing. A private repository is a hard stop.
 
 ## Registry sequence
 

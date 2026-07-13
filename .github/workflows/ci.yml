@@ -53,29 +53,29 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Build (all targets)
-        run: cargo build --workspace --all-targets
+        run: cargo build --locked --workspace --all-targets
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       # The cockpit's `tui` feature is default-on in the preview, but pin it
       # explicitly so a future change to the default feature set can't
       # silently drop the cockpit from CI coverage.
       - name: Clippy + test the tui feature
         run: |
-          cargo clippy -p blut --features tui --all-targets -- -D warnings
-          cargo test -p blut --features tui
+          cargo clippy --locked -p blut --features tui --all-targets -- -D warnings
+          cargo test --locked -p blut --features tui
 
       # P2P distributed compute is off-by-default; without an explicit gate
       # the entire src/p2p tree (and the executor's #[cfg(feature = "p2p")]
       # dispatch path) never compiles in CI and rots silently.
       - name: Clippy + test the p2p feature
         run: |
-          cargo clippy -p blut --features p2p --all-targets -- -D warnings
-          cargo test -p blut --features p2p
+          cargo clippy --locked -p blut --features p2p --all-targets -- -D warnings
+          cargo test --locked -p blut --features p2p
 
       # The cloud compute queue (ADR 0082) is off-by-default and implies p2p.
       # Gate clippy + the cloud tests (incl. the end-to-end loopback proof in
@@ -83,9 +83,9 @@ jobs:
       # so the src/cloud tree can't rot.
       - name: Clippy + test the cloud feature
         run: |
-          cargo clippy -p blut --features cloud --all-targets -- -D warnings
-          cargo test -p blut --features cloud --lib cloud
-          cargo test -p blut --features cloud --test cloud_integration
+          cargo clippy --locked -p blut --features cloud --all-targets -- -D warnings
+          cargo test --locked -p blut --features cloud --lib cloud
+          cargo test --locked -p blut --features cloud --test cloud_integration
 
       # crates/blut-dsl is a STANDALONE workspace (path-deps on the engine).
       # It links `starlark` — and its `serde_json/arbitrary_precision` feature
@@ -95,9 +95,10 @@ jobs:
         working-directory: crates/blut-dsl
         run: |
           cargo fmt --all -- --check
-          cargo build --all-targets
-          cargo clippy --all-targets -- -D warnings
-          cargo test
+          cargo build --locked --all-targets
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 
       # crates/blut-worker is a STANDALONE workspace (it path-depends on the
       # engine but is not a member of the root [workspace]), so none of the
@@ -107,9 +108,9 @@ jobs:
         working-directory: crates/blut-worker
         run: |
           cargo fmt --all -- --check
-          cargo build --all-targets
-          cargo clippy --all-targets -- -D warnings
-          cargo test
+          cargo build --locked --all-targets
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
 
       # ADR 0096: the notification boundary is a separate sidecar crate, and
       # its Restricted refusal is load-bearing enough to gate explicitly even
@@ -128,17 +129,17 @@ jobs:
 
       - name: Staged public package surface and tarballs
         run: |
-          cargo package --locked --allow-dirty --list > /tmp/blut-package.txt
+          cargo package --locked --list > /tmp/blut-package.txt
           ! grep -E '^(\.claude/|docker/|docs/|scripts/(k8s_kind|minio)_smoke\.sh)' /tmp/blut-package.txt
-          cargo publish --dry-run --locked --allow-dirty --manifest-path crates/blut-types/Cargo.toml
-          cargo package --locked --allow-dirty --list --manifest-path crates/blut-dsl/Cargo.toml > /tmp/blut-dsl-package.txt
+          cargo publish --dry-run --locked --manifest-path crates/blut-types/Cargo.toml
+          cargo package --locked --list --manifest-path crates/blut-dsl/Cargo.toml > /tmp/blut-dsl-package.txt
           if cargo info blut-types@0.2.0-alpha.1 >/dev/null 2>&1; then
-            cargo package --locked --allow-dirty
+            cargo package --locked
           else
             echo "::notice::blut tarball verification awaits blut-types 0.2.0-alpha.1 indexing; rerun this exact SHA after publishing blut-types"
           fi
           if cargo info blut@0.2.0-alpha.1 >/dev/null 2>&1; then
-            cargo package --locked --allow-dirty --manifest-path crates/blut-dsl/Cargo.toml
+            cargo package --locked --manifest-path crates/blut-dsl/Cargo.toml
           else
             echo "::notice::blut-dsl tarball verification awaits blut 0.2.0-alpha.1 indexing; rerun this exact SHA after publishing blut"
           fi
@@ -196,7 +197,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       - name: Build (lib + all targets)
-        run: cargo build --workspace --all-targets
+        run: cargo build --locked --workspace --all-targets
 
   wasm32-keystone:
     name: blut-types wasm32 keystone (ADR 0083)
@@ -227,9 +228,9 @@ jobs:
           key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-wasm-
       - name: Check blut-types on wasm32-unknown-unknown
-        run: cargo check -p blut-types --target wasm32-unknown-unknown
+        run: cargo check --locked -p blut-types --target wasm32-unknown-unknown
       - name: blut-types host tests
-        run: cargo test -p blut-types
+        run: cargo test --locked -p blut-types
 
   security:
     name: advisories · licenses · secrets

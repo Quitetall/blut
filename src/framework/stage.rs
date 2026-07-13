@@ -292,13 +292,10 @@ pub struct StageContext {
     /// sidecars use this single axis for tenant-scoped persistence and egress
     /// policy. Defaults to the flat `default` namespace in test/legacy paths.
     pub tenant: crate::tenant::Tenant,
-    /// Name of the RECIPE this plan was compiled from (ADR 0046
-    /// slice-2). Threaded from the plan so a train stage can build the
-    /// SAME `broker::FootprintKey` the cli admission gate resolves under
-    /// — keying the calibration store by recipe (not stage) name keeps
-    /// the engine cli from needing to know cookbook stage names. Empty
-    /// for `for_test` contexts (a calibration miss → conservative hint,
-    /// which is benign).
+    /// Name of the recipe this plan was compiled from. Transitional cookbook
+    /// compatibility code may use it to build a recipe-scoped calibration key;
+    /// the generic engine admission path uses typed stage declarations instead.
+    /// Empty for `for_test` contexts.
     pub recipe_name: String,
     /// Where to place this stage's work (#3). `Local` (default) = this box;
     /// a launcher-aware backend submits to Slurm/Ray when set. Threaded from
@@ -316,22 +313,16 @@ pub struct StageContext {
     /// exports `CUDA_VISIBLE_DEVICES` from this csv; the per-device exclusive
     /// grant is the engine's hard no-collision guarantee independent of it.
     pub gpu_devices: Vec<usize>,
-    /// Memory-admission Phase 3: was the per-sample disk cache warmed upstream? A train
-    /// stage threads this into its broker footprint (lower per-worker term +
-    /// the `|w` calibration key). Carried on the CONTEXT (not the stage Args)
-    /// on purpose — warm does NOT change the trained output, so it must not
-    /// enter the stage's cache key (a warm and a cold run share the checkpoint
-    /// cache). Set by the CLI from the recipe's `warm_fb_cache` arg via
-    /// `ExecCtx`, so the RECORD side and the cli RESOLVE side read ONE source.
+    /// Transitional LamQuant compatibility signal for a warmed per-sample
+    /// cache. Generic engine launch admission does not derive or set it from
+    /// recipe JSON. It stays out of the stage cache key because warming does
+    /// not change the trained output.
     pub fb_warm: bool,
-    /// Auto-tuned decode worker count (ADR 0071 A2). Set by the cli at admission
-    /// (RESOLVE) via `ExecCtx` so the train stage (RECORD) launches the SAME count
-    /// the broker sized — parity + memory-admission. `None` ⇒ the conservative cap.
+    /// Transitional LamQuant compatibility override for decode workers.
+    /// Generic engine launch admission leaves this `None`.
     pub admitted_workers: Option<u32>,
-    /// Auto-tuned batch size (E2, extends ADR 0071's fit-and-saturate to a
-    /// second knob). Set by the cli at admission via `ExecCtx`, resolved
-    /// against the SAME snapshot as `admitted_workers`. `None` ⇒ the recipe's
-    /// requested batch, unchanged.
+    /// Transitional LamQuant compatibility override for batch size. Generic
+    /// engine launch admission leaves this `None`.
     pub admitted_batch_size: Option<u32>,
     /// ADR 0103: the one concrete async-I/O profile admitted for THIS node.
     /// `None` preserves the legacy behavior for stages that declare no

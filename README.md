@@ -168,9 +168,10 @@ public-release evidence.
 active validation; per-rung status lives in the
 [distributed-validation ledger](https://github.com/Quitetall/blut/blob/v0.2.0-alpha.1/docs/DISTRIBUTED_VALIDATION.md).
 
-Engine integration, property, and fuzz targets run in CI; exact counts live in
-CI, not this README. Deprecated worker and experimental operator prototypes are
-not part of the public preview or published packages.
+Engine integration and property tests run in CI; exact counts live in CI, not
+this README. The standalone fuzz workspace is not yet CI-gated. Deprecated
+worker and experimental operator prototypes are not part of the public preview
+or published packages.
 
 ## License
 

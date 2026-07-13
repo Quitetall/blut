@@ -3140,6 +3140,7 @@ async fn divergence_kill_does_not_affect_concurrent_sibling() {
 // ── #4 runtime Spawn (PBT/TPE) ──────────────────────────────────────
 static SPAWN_MARKER_RAN: AtomicU32 = AtomicU32::new(0);
 static SPAWN_CHILD_RAN: AtomicU32 = AtomicU32::new(0);
+static OVERSIZED_SPAWN_RAN: AtomicU32 = AtomicU32::new(0);
 
 /// A spawned sub-plan ROOT (Input = ()): increments a counter so a test can
 /// prove an injected node actually executed.
@@ -3163,6 +3164,30 @@ impl Stage for SpawnMarker {
     }
 }
 impl Compatible<LamuTrainerBackend> for SpawnMarker {}
+
+/// A runtime suggestion larger than the whole-job reservation. It must be
+/// rejected before injection; semaphore clamping is not memory containment.
+struct OversizedSpawn;
+#[async_trait]
+impl Stage for OversizedSpawn {
+    const NAME: &'static str = "oversized_spawn";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const MEMORY_GIB: u32 = 8;
+    type Input = ();
+    type Output = Counter;
+    type Args = EmptyArgs;
+    async fn run(
+        &self,
+        _ctx: &StageContext,
+        _input: (),
+        _args: &EmptyArgs,
+    ) -> Result<Counter, StageError> {
+        OVERSIZED_SPAWN_RAN.fetch_add(1, Ordering::SeqCst);
+        Ok(Counter { n: 8 })
+    }
+}
+impl Compatible<LamuTrainerBackend> for OversizedSpawn {}
 
 /// A spawned sub-plan CHILD (depends on the root) — proves intra-delta edges
 /// + the successor-decrement path work for injected nodes.
@@ -3653,6 +3678,25 @@ async fn conditional_advisory_failure_falls_back_to_data_ancestor() {
     assert_eq!(output.n, 1);
 }
 
+struct SpawnOversizedOnce {
+    fired: std::sync::atomic::AtomicBool,
+}
+impl crate::framework::control::ControlPolicy for SpawnOversizedOnce {
+    fn on_step(&self, _m: &StepMetrics) -> Control {
+        if self.fired.swap(true, Ordering::SeqCst) {
+            return Control::Continue;
+        }
+        let subplan = Plan::<(), LamuTrainerBackend>::new("oversized", serde_json::json!({}))
+            .start(OversizedSpawn, EmptyArgs)
+            .finish()
+            .into_compiled();
+        Control::Spawn(Box::new(crate::framework::control::SpawnDelta::new(
+            subplan,
+            Some("oversized".into()),
+        )))
+    }
+}
+
 #[tokio::test]
 async fn spawn_injects_subplan_and_runs_to_completion() {
     let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -3774,6 +3818,34 @@ async fn repeated_spawns_stay_bounded_and_terminate() {
         "spawn count bounded, no runaway: n_stages={}",
         result.n_stages
     );
+}
+
+#[tokio::test]
+async fn runtime_hpo_spawn_larger_than_job_reservation_is_rejected() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    OVERSIZED_SPAWN_RAN.store(0, Ordering::SeqCst);
+    let (_td, base) = fresh_ctx();
+    let ctx = base
+        .with_memory_budget(4)
+        .with_control(std::sync::Arc::new(SpawnOversizedOnce {
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }));
+
+    let plan = Plan::<(), LamuTrainerBackend>::new("spawn_guard", serde_json::json!({}))
+        .start(MakeOne, EmptyArgs)
+        .then(StepThenSleep, EmptyArgs)
+        .finish()
+        .into_compiled();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ParallelExecutor::execute(plan, ctx),
+    )
+    .await
+    .expect("guarded spawn run must terminate")
+    .expect("an oversized best-effort HPO suggestion is dropped, not fatal");
+
+    assert_eq!(OVERSIZED_SPAWN_RAN.load(Ordering::SeqCst), 0);
+    assert_eq!(result.n_stages, 2, "oversized sub-plan was never injected");
 }
 
 // --- CompositePolicy integration (B2): safety layered under a spawner ---

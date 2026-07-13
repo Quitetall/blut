@@ -13,16 +13,16 @@ them locally first:
 
 ```bash
 cargo fmt --all
-cargo build
-cargo test
-cargo clippy --all-targets -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+cargo build --locked
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 ```
 
 Then sanity-check the core path end to end:
 
 ```bash
-cargo run --example first_cookbook
+cargo run --locked --example first_cookbook
 ```
 
 `first_cookbook` builds a tiny typed plan, runs it, and runs it again to

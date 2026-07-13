@@ -796,6 +796,32 @@ impl CompiledPlan {
         self
     }
 
+    /// Generic pre-launch resource envelope derived from the plan's typed stage
+    /// declarations. The maximum single-stage ask: used by the dry-run report
+    /// and by the runtime-spawn guard (a sub-plan whose largest declared stage
+    /// exceeds the whole-job RAM reservation is rejected, never silently
+    /// clamped). Undeclared plans receive a small 2 GiB compatibility estimate;
+    /// the engine never infers domain meaning from recipe JSON keys.
+    pub(crate) fn declared_footprint(&self) -> crate::broker::Footprint {
+        fn visit(nodes: &[PlanNode], ram_gib: &mut u32, vram_mib: &mut u64) {
+            for node in nodes {
+                *ram_gib = (*ram_gib).max(node.stage.memory_gib_for(&node.args));
+                *vram_mib = (*vram_mib).max(node.stage.gpu_request(&node.args).min_vram_mib);
+            }
+        }
+
+        let mut ram_gib = 0;
+        let mut vram_mib = 0;
+        visit(&self.nodes, &mut ram_gib, &mut vram_mib);
+        for expansion in &self.expansions {
+            visit(&expansion.template.nodes, &mut ram_gib, &mut vram_mib);
+        }
+        crate::broker::Footprint {
+            ram_bytes: u64::from(ram_gib.max(2)).saturating_mul(crate::broker::footprint::GIB),
+            vram_mib,
+        }
+    }
+
     /// The plan's runtime `map_output` expansions (ADR 0078). Crate-internal
     /// (the executor + tests read it); empty for a plain DAG.
     pub(crate) fn expansions(&self) -> &[MapExpansion] {
@@ -1559,6 +1585,34 @@ mod tests {
         }
     }
 
+    struct MemoryA;
+    impl Compatible<LamuTrainerBackend> for MemoryA {}
+    #[async_trait]
+    impl Stage for MemoryA {
+        const NAME: &'static str = "memory_a";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Gpu];
+        const MEMORY_GIB: u32 = 7;
+        type Input = ();
+        type Output = DataA;
+        type Args = EmptyArgs;
+        fn gpu_request(&self, _args: &EmptyArgs) -> crate::broker::gpu::GpuRequest {
+            crate::broker::gpu::GpuRequest {
+                count: 1,
+                min_vram_mib: 4096,
+                exclusive: true,
+            }
+        }
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            _input: (),
+            _args: &EmptyArgs,
+        ) -> Result<DataA, StageError> {
+            Ok(DataA)
+        }
+    }
+
     struct AToB;
     #[async_trait]
     impl Stage for AToB {
@@ -1684,6 +1738,34 @@ mod tests {
         let p = Plan::<(), LamuTrainerBackend>::new("empty", serde_json::json!({})).into_compiled();
         let r = p.topo_order();
         assert!(matches!(r, Err(crate::framework::error::PlanError::Empty)));
+    }
+
+    #[test]
+    fn declared_footprint_uses_typed_stage_resources_not_recipe_field_names() {
+        let plan = Plan::<(), LamuTrainerBackend>::new(
+            "resources",
+            serde_json::json!({"tier": 999, "warm_fb_cache": true}),
+        )
+        .start(MemoryA, EmptyArgs)
+        .finish()
+        .into_compiled();
+        let footprint = plan.declared_footprint();
+        assert_eq!(footprint.ram_bytes, 7 * crate::broker::footprint::GIB);
+        assert_eq!(footprint.vram_mib, 4096);
+    }
+
+    #[test]
+    fn undeclared_plan_gets_small_generic_compatibility_envelope() {
+        let plan = Plan::<(), LamuTrainerBackend>::new(
+            "generic",
+            serde_json::json!({"tier": 999, "batch_size": 999}),
+        )
+        .start(MakeA, EmptyArgs)
+        .finish()
+        .into_compiled();
+        let footprint = plan.declared_footprint();
+        assert_eq!(footprint.ram_bytes, 2 * crate::broker::footprint::GIB);
+        assert_eq!(footprint.vram_mib, 0);
     }
 
     #[test]
