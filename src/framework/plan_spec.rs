@@ -488,6 +488,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     // Toy artifacts + stages: () -> A -> B, plus a join (A,B) -> C.
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -661,6 +662,24 @@ mod tests {
         }
     }
 
+    static OVERSIZED_MAP_SHARD_RAN: AtomicU32 = AtomicU32::new(0);
+    struct OversizedItemToA;
+    impl Compatible<LamuTrainerBackend> for OversizedItemToA {}
+    #[async_trait]
+    impl Stage for OversizedItemToA {
+        const NAME: &'static str = "spec_oversized_item_to_a";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        const MEMORY_GIB: u32 = 8;
+        type Input = Item;
+        type Output = A;
+        type Args = E;
+        async fn run(&self, _c: &StageContext, _i: Item, _a: &E) -> Result<A, StageError> {
+            OVERSIZED_MAP_SHARD_RAN.fetch_add(1, Ordering::SeqCst);
+            Ok(A)
+        }
+    }
+
     static ERASED: &[(&str, ErasedStageCtor)] = &[
         ("spec_make_a", || Arc::new(MakeA)),
         ("spec_safe_make_a", || Arc::new(SafeMakeA)),
@@ -671,6 +690,7 @@ mod tests {
         ("spec_a_to_b", || Arc::new(AToB)),
         ("spec_sharder", || Arc::new(Sharder)),
         ("spec_item_to_a", || Arc::new(ItemToA)),
+        ("spec_oversized_item_to_a", || Arc::new(OversizedItemToA)),
     ];
     static NO_RECIPES: &[&RecipeDef] = &[];
     struct ToyCookbook;
@@ -1395,6 +1415,34 @@ mod tests {
             .await
             .expect("run");
         assert_eq!(r.n_stages, 1, "empty list → only the sharder runs");
+    }
+
+    #[tokio::test]
+    async fn oversized_required_map_shard_fails_instead_of_being_dropped() {
+        use crate::framework::error::PlanError;
+        use crate::framework::executor::{ExecCtx, execute_plan};
+        OVERSIZED_MAP_SHARD_RAN.store(0, Ordering::SeqCst);
+        let mut spec = map_spec();
+        spec.expansions[0].template.nodes[0].stage = "spec_oversized_item_to_a".into();
+        let reg = toy_registry();
+        let td = tempfile::tempdir().unwrap();
+        let error = execute_plan(
+            spec.compile(&reg).unwrap(),
+            ExecCtx::new(td.path().to_path_buf()).with_memory_budget(4),
+        )
+        .await
+        .expect_err("dropping a required map shard would produce a wrong answer");
+        match error {
+            PlanError::Other(message) => {
+                assert!(
+                    message.contains("runtime spawn requires 8 GiB"),
+                    "{message}"
+                );
+                assert!(message.contains("reserved only 4 GiB"), "{message}");
+            }
+            other => panic!("expected an admission PlanError::Other, got {other:?}"),
+        }
+        assert_eq!(OVERSIZED_MAP_SHARD_RAN.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
