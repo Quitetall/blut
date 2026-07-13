@@ -111,6 +111,16 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test
 
+      # ADR 0096: the notification boundary is a separate sidecar crate, and
+      # its Restricted refusal is load-bearing enough to gate explicitly even
+      # though the root workspace also discovers it through the acceptance test.
+      - name: Build + lint + test blut-notify
+        run: |
+          cargo fmt -p blut-notify -- --check
+          cargo build -p blut-notify --all-targets
+          cargo clippy -p blut-notify --all-targets -- -D warnings
+          cargo test -p blut-notify
+
       # crates/blut-operator is a STANDALONE workspace (kube-rs + k8s-openapi
       # live ONLY here — the engine has zero kube dep, ADR 0037). Gate it or the
       # CRD derives / reconcilers rot silently. The kind/MinIO end-to-end smoke

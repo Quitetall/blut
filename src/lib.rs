@@ -70,6 +70,7 @@ pub mod secrets;
 pub mod sensor;
 pub mod spec;
 pub mod tenant;
+pub mod trust;
 /// The interactive ratatui cockpit. Part of the default-on `tui` feature, so
 /// it ships in the 0.2 preview; a `--no-default-features` build drops it and the CLI
 /// (`cli::run`) degrades to printing help for the bare `blut` command.

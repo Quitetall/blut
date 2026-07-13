@@ -132,6 +132,7 @@ cloud = ["p2p", "dep:object_store", "dep:bytes"]
 
 [dev-dependencies]
 tempfile = "3"
+blut-notify = { path = "crates/blut-notify", version = "0.2.0-alpha.1" }
 criterion = { version = "0.5", features = ["async_tokio"] }
 # Property-based testing (ADR 0072 A7) — monotonicity / soundness / never-panics
 # properties over random inputs, layered on top of the hand-written unit tests.

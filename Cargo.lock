@@ -273,6 +273,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "blake3",
+ "blut-notify",
  "blut-types",
  "bytes",
  "chrono",
@@ -314,6 +315,17 @@ dependencies = [
  "uuid",
  "which",
  "x25519-dalek",
+]
+
+[[package]]
+name = "blut-notify"
+version = "0.2.0-alpha.1"
+dependencies = [
+ "anyhow",
+ "blut-types",
+ "clap",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -102,6 +102,7 @@ capability is tracked in [DISTRIBUTED_VALIDATION.md](docs/DISTRIBUTED_VALIDATION
 | **Multi-GPU discovery** | Per-GPU VRAM via nvidia-smi + rocm-smi |
 | **DAG optimizer** | Dead code elimination, critical path scheduling, cache/memory-aware ordering |
 | **Cloud worker** | `crates/blut-worker`: file-based queue + token-guarded REST API (experimental) |
+| **Notify sidecar** | `crates/blut-notify`: stdin envelope → custody gate → sink; Restricted is node-local |
 
 ## Scaling ladder
 

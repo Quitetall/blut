@@ -193,6 +193,7 @@ refuses to wire a stage tagged for a different backend.
 | `hpo` | hyperparameter search (TPE / median / PBT samplers + schedulers) over a recipe |
 | `lineage_db` | content-addressed artifact lineage index |
 | `tenant` | validated `project[/domain]` isolation axis; `clinical`/`restricted` are sealed |
+| `trust` | transport-independent `DataClass`/`TrustLevel` custody matrix; Restricted is always node-local |
 | `datasets_db` | raw local dataset source records |
 | `dataset_registry` | immutable tenant-scoped `dataset://name@version` bindings with live hash verification |
 | `model_registry` | governed `model://name@alias` checkpoint pointers with append-only history |
@@ -201,6 +202,11 @@ refuses to wire a stage tagged for a different backend.
 | `sensor`, `schedule`, `policy` | named freshness sensors, systemd-timer schedules, the auto-retrain policy |
 | `config::launcher::Launcher` | placement abstraction (local / cluster) |
 | `error::TrainError` | top-level error type |
+
+The separate `crates/blut-notify` sidecar consumes the same keystone-owned
+`Tenant` and `DataClass` wire types. Its `deliver` function checks custody
+before a sink receives an envelope; Restricted payloads may stay local but
+cannot cross an off-box boundary.
 
 ## CLI (`cli`)
 

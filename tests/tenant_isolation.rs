@@ -20,6 +20,7 @@ use blut::framework::Registry;
 use blut::framework::artifact::ContentHash;
 use blut::framework::cookbook::Cookbook;
 use blut::framework::error::StageError;
+use blut::framework::executor::SequentialExecutor;
 use blut::framework::plan_spec::{PlanSpec, SpecNode};
 use blut::framework::resource::Resource;
 use blut::framework::stage::{ErasedStageCtor, Stage, StageContext};
@@ -215,12 +216,10 @@ fn restricted_tenant_is_threaded_to_executor_and_stage_boundary() {
     assert!(ctx.tenant.is_restricted());
 }
 
-#[cfg(feature = "p2p")]
 #[test]
-fn restricted_mesh_and_privacy_boundaries_refuse_cross_node_or_cross_tenant_use() {
-    use blut::p2p::crypto::KeyPair;
-    use blut::p2p::privacy::PrivacyLedger;
-    use blut::p2p::trust::{DataClass, DispatchMatrix, TrustLevel};
+fn restricted_mesh_and_notify_boundaries_refuse_cross_node_delivery() {
+    use blut::trust::{DataClass, DispatchMatrix, TrustLevel};
+    use blut_notify::{NotificationEnvelope, NotifySink, SinkBoundary, deliver};
 
     let mut matrix = DispatchMatrix::default();
     matrix.set(DataClass::Restricted, TrustLevel::Trusted, true);
@@ -228,6 +227,41 @@ fn restricted_mesh_and_privacy_boundaries_refuse_cross_node_or_cross_tenant_use(
         !matrix.can_dispatch(DataClass::Restricted, TrustLevel::Trusted),
         "Restricted must stay node-local even under a custom trust matrix"
     );
+
+    struct OffBoxSink {
+        calls: usize,
+    }
+
+    impl NotifySink for OffBoxSink {
+        fn boundary(&self) -> SinkBoundary {
+            SinkBoundary::OffBox
+        }
+
+        fn send(&mut self, _envelope: &NotificationEnvelope) -> Result<(), String> {
+            self.calls += 1;
+            Ok(())
+        }
+    }
+
+    let mut sink = OffBoxSink { calls: 0 };
+    let envelope = NotificationEnvelope {
+        tenant: Tenant::parse("clinical/prod").unwrap(),
+        data_class: DataClass::Public,
+        summary: "patient-name-must-not-leak".into(),
+    };
+    let error = deliver(&mut sink, &envelope).unwrap_err();
+    assert_eq!(
+        sink.calls, 0,
+        "refusal must happen before the sink sees PHI"
+    );
+    assert!(!error.to_string().contains(&envelope.summary));
+}
+
+#[cfg(feature = "p2p")]
+#[test]
+fn restricted_privacy_ledger_refuses_cross_tenant_use() {
+    use blut::p2p::crypto::KeyPair;
+    use blut::p2p::privacy::PrivacyLedger;
 
     let td = tempfile::tempdir().unwrap();
     let clinical = Tenant::parse("clinical/prod").unwrap();
@@ -241,8 +275,8 @@ fn restricted_mesh_and_privacy_boundaries_refuse_cross_node_or_cross_tenant_use(
     assert!(PrivacyLedger::load_for_tenant(path, &kp.verifying, &research).is_err());
 }
 
-#[test]
-fn tenant_cache_namespacing_is_disjoint_and_key_stable() {
+#[tokio::test]
+async fn same_graph_executes_in_disjoint_tenant_cache_namespaces() {
     let td = tempfile::tempdir().unwrap();
     let base = td.path().join("cache");
     let job = td.path().join("job");
@@ -250,12 +284,12 @@ fn tenant_cache_namespacing_is_disjoint_and_key_stable() {
     let research = Tenant::parse("research/dev").unwrap();
     let clinical = Tenant::parse("clinical/prod").unwrap();
 
-    let make = |t: &Tenant| {
-        CacheHandle::job_local(job.clone())
+    let make = |t: &Tenant, local: &str| {
+        CacheHandle::job_local(job.join(local).join("_cache"))
             .with_global(base.clone())
             .with_tenant(t)
     };
-    let (h_research, h_clinical) = (make(&research), make(&clinical));
+    let (h_research, h_clinical) = (make(&research, "research"), make(&clinical, "clinical"));
 
     // 1. Disjoint global roots, neither an ancestor of the other.
     let gr = h_research.global.clone().unwrap();
@@ -266,31 +300,104 @@ fn tenant_cache_namespacing_is_disjoint_and_key_stable() {
 
     // 2. The `default` tenant is the flat store — byte-identical to no prefix,
     //    so a single-tenant deployment is unchanged.
-    let h_default = make(&Tenant::default());
+    let h_default = make(&Tenant::default(), "default");
     assert_eq!(h_default.global.clone().unwrap(), base);
 
-    // 3. The ADR-0078 key is tenant-INDEPENDENT: the SAME graph hashes to the
-    //    SAME key under both tenants; only the parent dir differs.
-    let key = CacheHandle::key_for(
-        "stage",
-        1,
-        ContentHash([7u8; 32]),
-        &serde_json::json!({ "x": 1 }),
-        b"code",
-    );
-    let hex = key.to_hex();
-    let entry_research = gr.join(&hex);
-    let entry_clinical = gc.join(&hex);
-    assert_ne!(entry_research, entry_clinical, "same key, disjoint roots");
+    // 3. Execute the SAME graph through the real compiler/executor path under
+    //    both tenant contexts. The shared cache base is identical; only the
+    //    tenant namespace differs.
+    let mut reg = Registry::new();
+    reg.register(Box::new(TestCookbook));
+    blut::checks::register(&mut reg);
 
-    // 4. Cross-tenant read denied by construction: an entry written under
-    //    research's root is not visible under clinical's.
-    std::fs::create_dir_all(&entry_research).unwrap();
-    std::fs::write(entry_research.join("output.bin"), b"research-only").unwrap();
-    assert!(
-        !entry_clinical.join("output.bin").exists(),
-        "clinical must never see research's cache entry"
+    let mut research_ctx = ExecCtx::new(job.join("research")).with_tenant(research.clone());
+    research_ctx.cache = Arc::new(h_research);
+    let research_result = SequentialExecutor::execute(
+        spec().compile(&reg).expect("research plan compiles"),
+        research_ctx,
+    )
+    .await
+    .expect("research plan executes");
+
+    let mut clinical_ctx = ExecCtx::new(job.join("clinical")).with_tenant(clinical.clone());
+    clinical_ctx.cache = Arc::new(h_clinical);
+    let clinical_result = SequentialExecutor::execute(
+        spec().compile(&reg).expect("clinical plan compiles"),
+        clinical_ctx,
+    )
+    .await
+    .expect("clinical plan executes");
+
+    // If clinical could read research's namespace, its identical second run
+    // would report cache hits. Both stages must instead execute in each tenant.
+    assert_eq!(
+        (research_result.n_cache_hits, research_result.n_cache_misses),
+        (0, 2)
     );
+    assert_eq!(
+        (clinical_result.n_cache_hits, clinical_result.n_cache_misses),
+        (0, 2)
+    );
+
+    // ADR-0078 keys remain tenant-independent: the two real executions create
+    // the same key names below different tenant roots.
+    let entry_names = |root: &std::path::Path| {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let research_keys = entry_names(&gr);
+    let clinical_keys = entry_names(&gc);
+    assert_eq!(research_keys.len(), 2, "both graph stages must materialize");
+    assert_eq!(
+        research_keys, clinical_keys,
+        "same graph must keep the same keys"
+    );
+}
+
+#[cfg(feature = "p2p")]
+#[tokio::test]
+async fn restricted_tenant_is_refused_by_real_coordinator_submit() {
+    use blut::framework::executor::{DispatchRequest, DispatchSubmitter, ResourceRequest};
+    use blut::p2p::Coordinator;
+    use blut::p2p::crypto::KeyPair;
+    use blut::p2p::dispatch::DefaultDispatchPolicy;
+    use blut::p2p::registry::PeerRegistry;
+    use blut::trust::DispatchMatrix;
+
+    let td = tempfile::tempdir().unwrap();
+    let registry = PeerRegistry::load(&td.path().join("peers.json")).unwrap();
+    let coordinator = Coordinator::start(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::new(KeyPair::generate()),
+        Arc::new(DefaultDispatchPolicy::new(DispatchMatrix::default())),
+        registry,
+    )
+    .await
+    .unwrap();
+
+    let tenant = Tenant::parse("clinical/prod").unwrap();
+    let args = serde_json::json!({"payload": "patient-name-must-not-leak"});
+    let request = DispatchRequest {
+        stage_name: "warm_fb_cache",
+        stage_schema: 1,
+        input_hash: ContentHash::of_bytes(b"input"),
+        args_hash: ContentHash::of_bytes(b"args"),
+        args: &args,
+        expected_output_hash: ContentHash::of_bytes(b"output"),
+        resource_request: ResourceRequest::default(),
+        data_class: 0,
+        tenant: &tenant,
+    };
+    let refusal = match DispatchSubmitter::submit(&coordinator, request) {
+        Ok(_) => panic!("clinical work reached the real coordinator dispatch path"),
+        Err(error) => error,
+    };
+    let visible = refusal.to_string();
+    assert!(visible.contains("P2P dispatch DENIED"));
+    assert!(!visible.contains("patient-name-must-not-leak"));
+    coordinator.shutdown();
 }
 
 // ── registry cross-tenant boundary keyed by Tenant (ties 0096 ↔ 0085) ──
