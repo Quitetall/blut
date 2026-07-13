@@ -6,14 +6,13 @@
 //! gates, the dispatch seam (`DispatchSubmitter`/`DispatchHandle`), and the trust
 //! matrix (`crate::p2p::trust`) are all transport-agnostic and reused verbatim;
 //! only the blob transport changes — `crate::p2p::transport::{send_blob,recv_blob}`
-//! over QUIC becomes [`store::BlobStore::put_blob`]/`get_blob` over an object store.
+//! over QUIC becomes `BlobStore::put_blob`/`BlobStore::get_blob` over an object store.
 //!
-//! v1 builds on the `object_store` crate. The `aws` feature compiles the local
-//! filesystem + any S3-compatible store (AWS S3, Cloudflare R2, MinIO) behind one
-//! trait, so the whole queue is dev-testable on the local filesystem with no cloud
-//! account; a real provider is a config swap (GCS/Azure are one more cargo feature). Clinical/PHI EEG is hard-blocked
-//! from cloud in v1: cloud workers are capped at `Registered` trust, so the reused
-//! `DispatchMatrix` refuses `DataClass::Restricted` to any cloud worker.
+//! The public preview builds on `object_store`'s local-filesystem backend only.
+//! Network providers are deferred until their dependency, TLS, secret-handling,
+//! and provider-integration gates pass. Clinical/PHI EEG remains hard-blocked:
+//! cloud workers are capped at `Registered` trust, so the reused `DispatchMatrix`
+//! refuses `DataClass::Restricted` to every cloud worker.
 
 pub mod cost;
 pub mod job;

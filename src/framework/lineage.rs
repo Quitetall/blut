@@ -157,7 +157,7 @@ pub fn job_failure(job_id: &str) -> Result<JobFailureLookup> {
 /// Fold a job's `status.jsonl` `StageStep` events into metric rows for the
 /// queryable metric store (E1) — the sibling of [`job_lineage`], NO new writer.
 /// Each finite numeric leaf of a step's `update` payload (`val_r`, `train_loss`,
-/// `lr`, `grad_norm`, …) becomes a [`MetricRow`] at the step's coordinate
+/// `lr`, `grad_norm`, …) becomes a [`crate::lineage_db::MetricRow`] at the step's coordinate
 /// (`step`/`epoch`, else a per-node counter); the coordinate keys themselves are
 /// not recorded as metrics. The LATEST value per (node, metric) is also emitted
 /// at `step = -1` (the run's headline, what `final_metric` reads).

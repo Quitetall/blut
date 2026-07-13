@@ -2,17 +2,19 @@
 // Copyright (C) 2026 Brian Lam
 //! BLUT — Brian Lam's Universal Trainer.
 //!
-//! A standalone, domain-agnostic Rust framework for orchestrating
-//! local ML training workloads (SFT, DPO, distillation, evaluation)
-//! via typed ingredients, plans, and recipes. Compile-time DAG enforcement
+//! A standalone, domain-agnostic Rust framework for orchestrating ML workflows
+//! via typed stages, plans, and recipes. Compile-time DAG enforcement
 //! via PhantomData on `Plan<Out>` — wrong ingredient wiring = `cargo build`
 //! error, not runtime panic.
 //!
 //! Public surface:
 //!
 //!   - `framework::*` — Artifact / Stage / Plan / Executor + cache.
-//!   - concrete ingredient impls (materialize, train, convert, register,
-//!     eval) and saved plans for common workflows.
+//!   - built-in policy/check/connector stages shared by downstream cookbooks.
+//!   - CLI/TUI orchestration seams used by cookbook-owned binaries.
+//!
+//! Domain training stages (materialize, train, convert, register, evaluate)
+//! and their recipes live in downstream cookbook crates.
 //!
 //! The library has no upward dependency on any host application;
 //! integration with an outer tool is via the CLI driver's stdio
@@ -72,8 +74,8 @@ pub mod spec;
 pub mod tenant;
 pub mod trust;
 /// The interactive ratatui cockpit. Part of the default-on `tui` feature, so
-/// it ships in the 0.2 preview; a `--no-default-features` build drops it and the CLI
-/// (`cli::run`) degrades to printing help for the bare `blut` command.
+/// it ships in the 0.2 preview. A `--no-default-features` build drops it from
+/// the library; downstream cookbook binaries still own their executable surface.
 #[cfg(feature = "tui")]
 pub mod tui;
 

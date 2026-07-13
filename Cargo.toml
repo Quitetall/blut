@@ -1,12 +1,12 @@
 # blut — the domain-agnostic BLUT engine, a lib-only crate. Ships ZERO
 # recipes, concrete stages, backends, or Python: only the framework
 # (Stage / Plan / Recipe / Registry / Cookbook trait), the content-
-# addressed cache, the never-OOM resource broker, HPO, lineage, the
-# interactive TUI cockpit, and the CLI orchestration. Cookbooks that
+# addressed cache, memory-admission broker, HPO, lineage, the optional
+# interactive TUI module, and shared CLI orchestration. Cookbooks that
 # supply recipes + the user-facing binaries are SEPARATE crates depending
 # on this one; the generic-LLM stages + backends live in `blut-backends`.
-# The TUI cockpit ships in the 0.2 preview (default-on `tui` feature); build with
-# `--no-default-features` for a lean CLI-only binary. See README.md / API.md.
+# The TUI module ships in the 0.2 preview (default-on `tui` feature); downstream
+# cookbook binaries select whether to expose it. See README.md / API.md.
 
 # Standalone crate: declare our own (empty) workspace so the engine builds
 # independently of whatever parent tree it's vendored or nested under (it lives
@@ -23,19 +23,32 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/Quitetall/blut"
 homepage = "https://github.com/Quitetall/blut"
 documentation = "https://docs.rs/blut"
-rust-version = "1.85"
-description = "BLUT — Brian Lam's Universal Trainer. Stage→Plan→Recipe orchestrator framework for local ML training (SFT, DPO, distillation, eval)."
+rust-version = "1.88"
+publish = ["crates-io"]
+description = "Typed DAG orchestration, caching, containment, and observability for ML training workflows."
 readme = "README.md"
 keywords = ["ml", "training", "fine-tune", "lora", "orchestrator"]
-categories = ["command-line-utilities", "development-tools"]
-# Trim the published package to the crate itself. NOTE: `scripts/` is KEPT —
-# `src/config/launcher.rs` `include_str!`s `scripts/run_contained.sh` at compile
-# time, so excluding it would break the build from a packaged tarball.
-exclude = [
-    "bench-baselines/",   # 92 Criterion baseline JSONs (~632 KB dev artifacts)
-    ".github/",           # CI config — not useful to crate consumers
-    "docs/",              # internal design specs
-    "signatures/",        # CLA signature bookkeeping — not crate content
+categories = ["asynchronous", "development-tools"]
+# Fail-closed package surface. `scripts/run_contained.sh` is required because
+# `src/config/launcher.rs` embeds it with `include_str!` at compile time.
+include = [
+    "/src/**",
+    "/scripts/run_contained.sh",
+    "/examples/**",
+    "/tests/**",
+    "/benches/framework.rs",
+    "/build.rs",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/API.md",
+    "/CHANGELOG.md",
+    "/CONTRIBUTING.md",
+    "/CLA.md",
+    "/SECURITY.md",
+    "/RELEASING.md",
+    "/LICENSE",
+    "/LICENSE.md",
 ]
 
 [lib]
@@ -44,7 +57,7 @@ path = "src/lib.rs"
 [dependencies]
 # ADR 0083: the wasm32-safe keystone. The engine re-exports its types at their
 # old paths, so this is zero-churn downstream.
-blut-types = { path = "crates/blut-types", version = "0.2.0-alpha.1" }
+blut-types = { path = "crates/blut-types", version = "=0.2.0-alpha.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -71,9 +84,10 @@ schemars = "0.8"
 tokio-util = "0.7"
 rayon = "1"
 which = "6"
-# S3-compatible object store client (behind the `s3` feature). One dep covers
-# S3/R2/GCS/MinIO. Client only — no HTTP-server surface.
-object_store = { version = "0.11", features = ["aws"], optional = true }
+# Local-filesystem object store used by the experimental cloud queue. Public
+# preview excludes network providers until their XML dependency chain clears
+# the advisory gate.
+object_store = { version = "0.14", default-features = false, features = ["fs"], optional = true }
 bytes = { version = "1", optional = true }
 # Local-time quiet-hours (honours host TZ + DST). Minimal: no default
 # features (drops the heavy `oldtime`/`serde`/`wasm` baggage), `clock`
@@ -97,24 +111,18 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc"], optional = true }
 rcgen = { version = "0.13", optional = true }
 # TUI deps — optional, behind the default-on `tui` feature. Building with
-# `--no-default-features` drops these three from the dependency tree and
-# yields a lean CLI-only binary.
+# `--no-default-features` drops these three from the library dependency tree.
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.28", optional = true }
 fuzzy-matcher = { version = "0.3", optional = true }
 [features]
 default = ["tui"]
-# The interactive ratatui cockpit (`blut tui`, and bare `blut`). On by default
-# in the 0.2 preview; drop it with `blut = { ..., default-features = false }`
-# for CLI-only.
+# The shared interactive ratatui cockpit used by downstream cookbook binaries.
+# On by default in the 0.2 preview; downstream crates can drop it with
+# `blut = { ..., default-features = false }`.
 tui = ["dep:ratatui", "dep:crossterm", "dep:fuzzy-matcher"]
 # P2P distributed compute — trust model, encryption, task dispatch.
 p2p = ["dep:ed25519-dalek", "dep:aes-gcm", "dep:x25519-dalek", "dep:blake3", "dep:hkdf", "dep:quinn", "dep:rustls", "dep:webpki", "dep:rcgen"]
-# S3-compatible object store (S3/R2/GCS/MinIO) for the cache's remote tier
-# (ADR 0067 T4.2). An object-store CLIENT — not an HTTP server — so it honors
-# the ADR 0034 no-server charter (scope-guard verified). Non-default: the lean
-# CLI and the firmware/no_std paths never pull it in.
-s3 = ["dep:object_store", "dep:bytes"]
 # Cloud compute queue (T3.1 / ADR 0082) — "submit a job, get the result back,
 # billed on compute". Reuses the entire P2P data plane (bundle/verify, dispatch
 # seam, trust matrix, peer-exec choreography, bundle-at-rest encryption) with an

@@ -73,7 +73,7 @@ pub enum StageEvent {
         cache_key: ContentHash,
     },
     /// Stage failed. `error` is the `Display` form of the
-    /// `StageError`. When the error chain contains a [`StageFailure`],
+    /// `StageError`. When the error chain contains a [`crate::framework::error_domain::StageFailure`],
     /// `failure` carries the structured summary (code, severity,
     /// context) for lineage storage and machine parsing.
     StageFailed {
@@ -664,7 +664,7 @@ mod tests {
                 assert_eq!(f.ingredient.as_deref(), Some("trainer"));
                 assert_eq!(f.message, "e2e recon mismatch");
             }
-            other => panic!("wrong variant: {:?}", other),
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 
@@ -690,7 +690,7 @@ mod tests {
                 assert_eq!(node_idx, 1);
                 assert_eq!(stage_name, "filter_dataset");
             }
-            other => panic!("wrong variant: {:?}", other),
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 

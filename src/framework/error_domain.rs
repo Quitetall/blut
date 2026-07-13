@@ -108,9 +108,9 @@ pub trait ErrorDomain: Send + Sync + 'static {
 /// Associated consts (`NAME`/`CODES`) block `ErrorDomain` from being
 /// object-safe, so a registry can't hold `Vec<Box<dyn ErrorDomain>>` the
 /// way [`crate::framework::cookbook::Cookbook`] holds trait objects.
-/// [`register_error_domain!`] copies the consts into this plain struct at
+/// [`macro@crate::register_error_domain`] copies the consts into this plain struct at
 /// the registration site instead — the exact move
-/// [`crate::recipes::recipe::register_recipe!`] makes for `Recipe` →
+/// [`macro@crate::register_recipe`] makes for `Recipe` →
 /// `RecipeDef`. This is what actually travels through
 /// [`crate::framework::cookbook::Cookbook::error_domains`] and
 /// [`crate::framework::cookbook::Registry::all_error_domains`] for
@@ -123,7 +123,7 @@ pub struct ErrorDomainDef {
 
 /// Emit a cookbook's `pub static ERROR_DOMAIN_DEF: ErrorDomainDef` from its
 /// [`ErrorDomain`] impl, so `blut errors list` can discover it. Mirrors
-/// [`crate::recipes::recipe::register_recipe!`]'s shape:
+/// [`macro@crate::register_recipe`]'s shape:
 ///
 /// ```ignore
 /// pub struct EagleErrorDomain;
@@ -140,7 +140,7 @@ pub struct ErrorDomainDef {
 /// `blut errors list` prints "no error domains registered" until then,
 /// rather than assuming a catalog exists.
 ///
-/// One error domain per module: like [`crate::recipes::recipe::register_recipe!`],
+/// One error domain per module: like [`macro@crate::register_recipe`],
 /// this emits an unnamespaced `pub static ERROR_DOMAIN_DEF`, so a second
 /// invocation in the same module is a duplicate-symbol error.
 #[macro_export]

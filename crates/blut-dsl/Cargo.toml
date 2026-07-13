@@ -4,9 +4,16 @@
 name = "blut-dsl"
 version = "0.2.0-alpha.1"
 edition = "2024"
+rust-version = "1.88"
+publish = ["crates-io"]
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
 description = "BLUT Starlark front-end — evaluates a .star recipe to a PlanSpec JSON. Runs OUT OF PROCESS from the engine so starlark's serde_json/arbitrary_precision feature (which breaks the engine's internally-tagged enums via Cargo feature unification) never reaches the engine binary."
+repository = "https://github.com/Quitetall/blut"
+homepage = "https://github.com/Quitetall/blut"
+documentation = "https://docs.rs/blut-dsl"
+readme = "README.md"
+include = ["/src/**", "/examples/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
 
 [[bin]]
 name = "blut-dsl"
@@ -17,7 +24,7 @@ name = "blut_dsl"
 path = "src/lib.rs"
 
 [dependencies]
-blut = { path = "../..", version = "0.2.0-alpha.1" }
+blut = { path = "../..", version = "=0.2.0-alpha.1" }
 starlark = "0.14"
 serde_json = "1"
 anyhow = "1"

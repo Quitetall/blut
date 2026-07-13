@@ -9,20 +9,30 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-test-lint:
     name: build · test · clippy · fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install stable toolchain (clippy + rustfmt)
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          persist-credentials: false
+
+      - name: Install MSRV toolchain (clippy + rustfmt)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
+        with:
+          toolchain: 1.88.0
           components: clippy, rustfmt
 
       - name: Cache cargo registry + git + target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry/index
@@ -51,7 +61,7 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-      # The cockpit's `tui` feature is default-on since 1.0, but pin it
+      # The cockpit's `tui` feature is default-on in the preview, but pin it
       # explicitly so a future change to the default feature set can't
       # silently drop the cockpit from CI coverage.
       - name: Clippy + test the tui feature
@@ -66,16 +76,6 @@ jobs:
         run: |
           cargo clippy -p blut --features p2p --all-targets -- -D warnings
           cargo test -p blut --features p2p
-
-      # The S3 object-store backend is off-by-default (it pulls the
-      # object_store client + a TLS stack). Gate build + clippy so the
-      # #[cfg(feature = "s3")] S3BlobStore + async bridge can't rot. The MinIO
-      # round-trip test is #[ignore]d (needs an endpoint) — run via
-      # scripts/minio_smoke.sh, not here.
-      - name: Clippy + build the s3 feature
-        run: |
-          cargo clippy -p blut --features s3 --all-targets -- -D warnings
-          cargo test -p blut --features s3 --lib object_store --no-run
 
       # The cloud compute queue (ADR 0082) is off-by-default and implies p2p.
       # Gate clippy + the cloud tests (incl. the end-to-end loopback proof in
@@ -121,17 +121,50 @@ jobs:
           cargo clippy -p blut-notify --all-targets -- -D warnings
           cargo test -p blut-notify
 
-      # crates/blut-operator is a STANDALONE workspace (kube-rs + k8s-openapi
-      # live ONLY here — the engine has zero kube dep, ADR 0037). Gate it or the
-      # CRD derives / reconcilers rot silently. The kind/MinIO end-to-end smoke
-      # is a separate, heavier job (not per-PR).
-      - name: Build + lint + test blut-operator (standalone workspace)
+      - name: Rustdoc (deny broken public docs)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --all-features --no-deps
+
+      - name: Staged public package surface and tarballs
+        run: |
+          cargo package --locked --allow-dirty --list > /tmp/blut-package.txt
+          ! grep -E '^(\.claude/|docker/|docs/|scripts/(k8s_kind|minio)_smoke\.sh)' /tmp/blut-package.txt
+          cargo publish --dry-run --locked --allow-dirty --manifest-path crates/blut-types/Cargo.toml
+          cargo package --locked --allow-dirty --list --manifest-path crates/blut-dsl/Cargo.toml > /tmp/blut-dsl-package.txt
+          if cargo info blut-types@0.2.0-alpha.1 >/dev/null 2>&1; then
+            cargo package --locked --allow-dirty
+          else
+            echo "::notice::blut tarball verification awaits blut-types 0.2.0-alpha.1 indexing; rerun this exact SHA after publishing blut-types"
+          fi
+          if cargo info blut@0.2.0-alpha.1 >/dev/null 2>&1; then
+            cargo package --locked --allow-dirty --manifest-path crates/blut-dsl/Cargo.toml
+          else
+            echo "::notice::blut-dsl tarball verification awaits blut 0.2.0-alpha.1 indexing; rerun this exact SHA after publishing blut"
+          fi
+
+      - name: In-tree public example smoke
+        run: cargo run --locked --example first_cookbook
+
+  operator-internal:
+    name: unpublished operator · Rust 1.89
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install operator MSRV
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
+        with:
+          toolchain: 1.89.0
+          components: clippy, rustfmt
+      - name: Gate unpublished operator
         working-directory: crates/blut-operator
         run: |
           cargo fmt --all -- --check
-          cargo build --all-targets
-          cargo clippy --all-targets -- -D warnings
-          cargo test
+          cargo build --locked --all-targets
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
 
   macos-build:
     name: macOS compile-check (containment degrades)
@@ -145,11 +178,15 @@ jobs:
     env:
       RUSTFLAGS: ""
     steps:
-      - uses: actions/checkout@v4
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
+        with:
+          toolchain: 1.88.0
       - name: Cache cargo registry + git + target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry/index
@@ -171,13 +208,16 @@ jobs:
     # adds a non-wasm dependency to blut-types breaks the `wasm32-unknown-unknown`
     # check here before it can reach main.
     steps:
-      - uses: actions/checkout@v4
-      - name: Install stable toolchain + wasm32 target
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          persist-credentials: false
+      - name: Install MSRV toolchain + wasm32 target
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
+        with:
+          toolchain: 1.88.0
           targets: wasm32-unknown-unknown
       - name: Cache cargo registry + git + target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry/index
@@ -190,3 +230,28 @@ jobs:
         run: cargo check -p blut-types --target wasm32-unknown-unknown
       - name: blut-types host tests
         run: cargo test -p blut-types
+
+  security:
+    name: advisories · licenses · secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
+        with:
+          toolchain: 1.88.0
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: Dependency policy
+        run: |
+          cargo deny --locked check
+          cargo deny --locked --manifest-path crates/blut-dsl/Cargo.toml --config deny.toml check
+          cargo deny --locked --manifest-path crates/blut-worker/Cargo.toml --config deny.toml check
+          cargo deny --locked --manifest-path crates/blut-operator/Cargo.toml --config deny.toml check
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

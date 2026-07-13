@@ -316,7 +316,7 @@ pub struct StageContext {
     /// exports `CUDA_VISIBLE_DEVICES` from this csv; the per-device exclusive
     /// grant is the engine's hard no-collision guarantee independent of it.
     pub gpu_devices: Vec<usize>,
-    /// Never-OOM Phase 3: was the per-sample disk cache warmed upstream? A train
+    /// Memory-admission Phase 3: was the per-sample disk cache warmed upstream? A train
     /// stage threads this into its broker footprint (lower per-worker term +
     /// the `|w` calibration key). Carried on the CONTEXT (not the stage Args)
     /// on purpose — warm does NOT change the trained output, so it must not
@@ -326,7 +326,7 @@ pub struct StageContext {
     pub fb_warm: bool,
     /// Auto-tuned decode worker count (ADR 0071 A2). Set by the cli at admission
     /// (RESOLVE) via `ExecCtx` so the train stage (RECORD) launches the SAME count
-    /// the broker sized — parity + never-OOM. `None` ⇒ the conservative cap.
+    /// the broker sized — parity + memory-admission. `None` ⇒ the conservative cap.
     pub admitted_workers: Option<u32>,
     /// Auto-tuned batch size (E2, extends ADR 0071's fit-and-saturate to a
     /// second knob). Set by the cli at admission via `ExecCtx`, resolved
@@ -588,10 +588,10 @@ pub trait Stage: Send + Sync + 'static {
     /// Conservative peak RAM this stage holds while running, in GiB. `0`
     /// (default) = no memory reservation. The parallel executor gates the SUM
     /// of in-flight stages' `MEMORY_GIB` against a box-fit budget (`MemTotal −
-    /// floor`), so concurrent stages can't stack past the box — never-OOM-the-
-    /// BOX under the parallel executor (the per-`Resource` type tags above only
-    /// serialize by KIND, not by capacity). Heavy stages (training) set a
-    /// conservative upper bound; light stages leave it `0`.
+    /// floor`), so declared reservations cannot stack past that configured
+    /// budget (the per-`Resource` type tags above serialize by KIND, not by
+    /// capacity). This is not an OOM guarantee; declarations and host snapshots
+    /// can be wrong. Heavy stages set a conservative bound; light stages use `0`.
     const MEMORY_GIB: u32 = 0;
 
     /// Whether re-running this stage with the same input + args

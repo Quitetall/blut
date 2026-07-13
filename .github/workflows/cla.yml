@@ -1,8 +1,8 @@
 name: CLA Assistant
 
 # Contributors grant rights under both the repo's open-source license and
-# the OH! Tech LLC Enterprise License. See central CLA at:
-# https://github.com/Quitetall/LamQuant/blob/main/CLA.md
+# the OH! Tech LLC Enterprise License. See CLA.md in this repository:
+# https://github.com/Quitetall/blut/blob/main/CLA.md
 # Self-hosted (CLA Assistant Lite) — signatures stored in-repo.
 #
 # Security notes:
@@ -39,7 +39,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           path-to-signatures: 'signatures/cla.json'
-          path-to-document: 'https://github.com/Quitetall/LamQuant/blob/main/CLA.md'
+          path-to-document: 'https://github.com/Quitetall/blut/blob/main/CLA.md'
           branch: 'main'
           # Enumerate specific bots — no wildcard bypass.
           allowlist: 'dependabot[bot],renovate[bot]'
@@ -52,7 +52,7 @@ jobs:
 
             The CLA is a **license grant, not a copyright assignment** — you keep full ownership of your work. It allows OH! Tech LLC to distribute your contribution under both the open-source license and a commercial Enterprise License.
 
-            ✍️ **To sign:** read the [CLA Document](https://github.com/Quitetall/LamQuant/blob/main/CLA.md), then post a comment on this PR containing exactly:
+            ✍️ **To sign:** read the [CLA Document](https://github.com/Quitetall/blut/blob/main/CLA.md), then post a comment on this PR containing exactly:
 
             > I have read the CLA Document and I hereby sign the CLA
 

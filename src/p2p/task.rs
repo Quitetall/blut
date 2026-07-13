@@ -18,7 +18,7 @@ use crate::p2p::trust::DataClass;
 /// A task to be executed by a remote peer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskManifest {
-    /// Unique task identifier: "blut-<job>-<node_idx>".
+    /// Unique task identifier: `blut-<job>-<node_idx>`.
     pub task_id: String,
     /// Coordinator's peer ID (so the peer knows who sent this).
     pub coordinator_id: PeerId,

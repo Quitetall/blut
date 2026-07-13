@@ -8,7 +8,7 @@
 //! stage, bundle the output, and ship it back. Everything the loop needs from
 //! the lower layers already exists:
 //!
-//! - [`crate::p2p::bundle`] — `BundleManifest` (un)packing + the four
+//! - [`mod@crate::p2p::bundle`] — `BundleManifest` (un)packing + the four
 //!   fail-closed verification gates.
 //! - [`crate::p2p::transport`] — `recv_task` / `send_result` / the blob
 //!   side-stream (`recv_blob` / `send_blob`).

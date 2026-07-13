@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Brian Lam
-//! GPU-aware scheduling (ADR 0087) — the never-OOM broker still gates RAM.
+//! GPU-aware scheduling (ADR 0087) — the memory-admission broker still gates RAM.
 //!
 //! This module centralizes ALL GPU discovery behind [`GpuInventory`] (a
 //! one-shot probe — charter-safe, no monitoring loop, ADR 0034) and replaces the

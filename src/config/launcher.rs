@@ -183,7 +183,7 @@ pub fn local_gpu_count() -> usize {
 /// meta-repo). It is materialized to a cache dir at first contained launch.
 const RUN_CONTAINED_SH: &str = include_str!("../../scripts/run_contained.sh");
 
-/// Whether the never-OOM cgroup containment can be applied: it needs Linux +
+/// Whether the memory-admission cgroup containment can be applied: it needs Linux +
 /// systemd `--user`, and the user must not have opted out. Off-systemd hosts
 /// (macOS / a container without systemd) and `BLUT_NO_CONTAIN` degrade to a
 /// bare spawn — see [`LocalSystemd::wrap`].
@@ -289,7 +289,7 @@ impl Launcher for LocalSystemd {
     fn wrap(&self, unit: &str, inner: &[String]) -> Result<WrappedCommand> {
         // Containment needs Linux + systemd `--user`. Off-systemd (macOS / a
         // container without systemd) or with `BLUT_NO_CONTAIN` set, degrade to a
-        // BARE spawn with a warning — the never-OOM cgroup cap is then NOT
+        // BARE spawn with a warning — the memory-admission cgroup cap is then NOT
         // enforced (admission's box-fit refusal still gates, and the kernel OOM
         // killer is the only hard backstop).
         if !containment_available() {
@@ -925,7 +925,7 @@ impl RayLauncher {
 /// Where to place a unit of work, selected by `--launcher`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum LaunchTarget {
-    /// This box, broker-gated + cgroup-contained (the never-OOM path).
+    /// This box, broker-gated + cgroup-contained (the memory-admission path).
     #[default]
     Local,
     /// A Slurm allocation (`srun`).

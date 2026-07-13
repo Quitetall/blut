@@ -215,7 +215,7 @@ pub struct ExecCtx {
     /// Capacity-aware memory admission (Phase 5). A stage holds
     /// `Stage::MEMORY_GIB` permits from this for its whole run; the budget is
     /// the box-fit GiB (`MemTotal − floor`). Concurrent stages can't acquire
-    /// more than the budget in total → never-OOM-the-BOX under the parallel
+    /// more than the budget in total → memory-admission under the parallel
     /// executor. Default budget is effectively unlimited (no gating); the CLI
     /// sizes it to box-fit via `with_memory_budget`.
     pub memory: Arc<tokio::sync::Semaphore>,
@@ -242,7 +242,7 @@ pub struct ExecCtx {
     pub fb_warm: bool,
     /// Auto-tuned decode worker count (ADR 0071 A2), cached at admission so the
     /// cookbook train stage (RECORD) launches the SAME count the cli sized (RESOLVE)
-    /// — parity + never-OOM. `None` ⇒ the conservative cap (unchanged behaviour).
+    /// — parity + memory-admission. `None` ⇒ the conservative cap (unchanged behaviour).
     pub admitted_workers: Option<u32>,
     /// Auto-tuned batch size, extending ADR 0071's fit-and-saturate auto-tune
     /// to a second knob (E2). Resolved from the SAME admission snapshot as

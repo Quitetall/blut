@@ -555,7 +555,7 @@ fn value_ok(v: &str) -> bool {
 impl PartitionSet {
     /// Validate the set: name/recipe well-formed, ≥1 dim, axes unique +
     /// well-formed, every dim has ≥1 metachar-free value, and the cell count is
-    /// within [`MAX_CELLS`]. Returns the (bounded) cell count on Ok.
+    /// within `MAX_CELLS`. Returns the (bounded) cell count on Ok.
     pub fn validate(&self) -> Result<usize> {
         if !name_ok(&self.name) {
             return Err(TrainError::other(format!(

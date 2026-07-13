@@ -1077,7 +1077,7 @@ async fn stage_failure_propagates_as_plan_error() {
             assert_eq!(stage, "always_fail");
             assert!(matches!(source, StageError::BadInput(_)));
         }
-        other => panic!("unexpected: {:?}", other),
+        other => panic!("unexpected: {other:?}"),
     }
 }
 

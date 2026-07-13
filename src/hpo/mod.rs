@@ -3,7 +3,7 @@
 //! BLUT v0.20 — native hyperparameter optimization (HPO).
 //!
 //! Trials are parallel nodes in ONE plan, reusing the existing machinery: the
-//! never-OOM broker + GPU semaphore gate concurrency, a trial's overlaid args
+//! memory-admission broker + GPU semaphore gate concurrency, a trial's overlaid args
 //! give it a distinct cache key + durable-resume dir for free, and the
 //! `ControlPolicy`/`KillBranch` runtime-control path drives early-stop. See the
 //! v0.20 plan for the full architecture + phasing.

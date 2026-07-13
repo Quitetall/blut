@@ -16,6 +16,7 @@ cargo fmt --all
 cargo build
 cargo test
 cargo clippy --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
 
 Then sanity-check the core path end to end:
@@ -88,5 +89,5 @@ Linux+systemd answer matters — it changes which code path ran.
 
 `blut` is licensed under **AGPL-3.0-or-later**. By submitting a contribution
 you agree it is licensed under those same terms. Because the project also
-offers a commercial license, contributions may additionally require signing
-the project's Contributor License Agreement before they can be merged.
+offers a commercial license, contributions require signing this repository's
+[`CLA.md`](CLA.md) before they can be merged.

@@ -9,7 +9,7 @@
 //! Survivors are simply NOT killed, so they keep training to `max_budget`
 //! ("promotion = not killed") — no resume, no executor surgery; ASHA rides the
 //! existing `KillBranch`. The per-rung "top `1/eta`" cut is exactly a percentile
-//! threshold at `(1 − 1/eta)·100`, so it reuses [`super::median::percentile`].
+//! threshold at `(1 − 1/eta)·100`, so it reuses `super::median::percentile`.
 //!
 //! Async (vs synchronous SHA): a trial is judged the moment it reaches a rung
 //! against whoever has reached it so far — no global barrier, so a slow trial

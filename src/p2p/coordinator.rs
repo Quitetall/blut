@@ -140,8 +140,7 @@ impl Coordinator {
             let mut pending = self.pending.write();
             pending.remove(&task_id);
             return Err(TrainError::other(format!(
-                "peer {} not connected (task {})",
-                peer_id, task_id
+                "peer {peer_id} not connected (task {task_id})"
             )));
         }
 

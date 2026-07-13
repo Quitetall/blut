@@ -6,7 +6,8 @@
 //! The A3 node core made task execution pluggable ([`MeshTaskRunner`]); the CLI
 //! ships a smoke runner. This is the REAL one: it executes a dispatched cookbook
 //! stage, sourcing its input and sinking its output through a shared
-//! [`BlobStore`] (the cache's remote tier — an RWX PVC or S3/MinIO), keyed by
+//! [`BlobStore`] (the cache's remote tier — a shared filesystem/RWX PVC in the
+//! public preview), keyed by
 //! content hash. No per-task blob transfer is needed: the scheduler
 //! [`publish_input`]s the bundle under `input_hash`, the worker reads it, runs
 //! the stage, writes the output bundle under `output_hash`, and returns a

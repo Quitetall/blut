@@ -3,7 +3,7 @@
 //! Named SENSORS (Phase G / G2): observe external state, yield a typed
 //! outcome.
 //!
-//! A [`Sensor`] is the READ/observe sibling of [`framework::control`]
+//! A [`Sensor`] is the READ/observe sibling of [`crate::framework::control`]
 //! (which MUTATES a running plan). It reconciles the scattered
 //! "should I proceed right now?" checks — the cross-process GPU
 //! scheduler lock, and the auto-train [`policy`](crate::policy) gates —

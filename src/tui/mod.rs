@@ -1361,7 +1361,7 @@ fn assemble_fields(fields: &[EditorField]) -> String {
 }
 
 /// Entrypoint registered as `blut tui`. The caller (the cookbook binary)
-/// supplies the composed cookbook [`Registry`]; the cockpit's recipe
+/// supplies the composed cookbook [`crate::framework::cookbook::Registry`]; the cockpit's recipe
 /// catalog comes from it, not a static slice.
 /// Why the console/cockpit event loop returned.
 pub enum ConsoleOutcome {

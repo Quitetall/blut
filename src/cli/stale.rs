@@ -10,12 +10,13 @@
 /// Warn (once, at startup) if the running binary was built from a DIFFERENT
 /// commit than its source tree's CURRENT HEAD — the "git pull, forgot to
 /// rebuild/reinstall, silently ran the stale binary" trap. The in_ch /
-/// warm-containment never-OOM fixes only go live after a rebuild; a human who
+/// warm-containment memory-admission fixes only go live after a rebuild; a human who
 /// `git pull`s and runs the old `~/.cargo/bin/blut` would otherwise get the
 /// stale admission/footprint/containment logic with no signal.
 ///
-/// build.rs stamps the build-time hash (`BLUT_GIT_HASH`) + the source dir
-/// (`BLUT_SRC_DIR`); this re-resolves that dir's live HEAD at RUNTIME and warns
+/// Local builds with `BLUT_EMBED_SRC_DIR=1` stamp the build-time hash
+/// (`BLUT_GIT_HASH`) + source dir (`BLUT_SRC_DIR`); this re-resolves that dir's
+/// live HEAD at RUNTIME and warns
 /// on mismatch. SILENT when up to date, when the source tree is gone (binary
 /// copied off the build box), when git is unavailable, or when the build was
 /// not stamped (`unknown`) — a missing signal must never become noise or a
@@ -65,13 +66,14 @@ pub(super) fn detect_stale_binary() -> Option<StaleInfo> {
 /// Warn (once, at startup) if the running binary was built from a DIFFERENT
 /// commit than its source tree's CURRENT HEAD — the "git pull, forgot to
 /// rebuild/reinstall, silently ran the stale binary" trap. The in_ch /
-/// warm-containment never-OOM fixes only go live after a rebuild; a human who
+/// warm-containment memory-admission fixes only go live after a rebuild; a human who
 /// `git pull`s and runs the old `~/.cargo/bin/blut` would otherwise get the
 /// stale admission/footprint/containment logic with no signal.
 ///
-/// build.rs stamps the build-time hash (`BLUT_GIT_HASH`) + the source dir
-/// (`BLUT_SRC_DIR`); [`detect_stale_binary`] re-resolves that dir's live HEAD at
-/// RUNTIME. When `BLUT_AUTO_REBUILD=1` (opt-in, ADR 0071 A4) a stale binary is
+/// Local builds with `BLUT_EMBED_SRC_DIR=1` stamp the build-time hash and source
+/// dir; [`detect_stale_binary`] re-resolves that dir's live HEAD at runtime.
+/// Registry builds never embed a host path. When `BLUT_AUTO_REBUILD=1` (opt-in,
+/// ADR 0071 A4) a stale binary is
 /// rebuilt + re-exec'd instead of merely warned; default OFF (warn-only) so
 /// there are no surprise rebuilds.
 pub(super) fn warn_if_stale_binary() {

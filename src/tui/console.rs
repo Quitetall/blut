@@ -4,7 +4,7 @@
 //!
 //! This is the redesigned TUI surface: not a training cockpit (that moved to
 //! the cookbook), but mission control for the BLUT ENGINE — the symmetric mesh,
-//! the typed DAG executing, the never-OOM broker, the DP privacy ledger, the
+//! the typed DAG executing, the memory-admission broker, the DP privacy ledger, the
 //! content-addressed cache, and the fail-closed clinical governance.
 //!
 //! [`ConsoleModel`] is the data; [`draw_console`] renders the at-a-glance home:
@@ -455,7 +455,7 @@ impl ConsoleModel {
 
     /// Overlay the real broker memory-admission state: the box-fit budget
     /// (`MemTotal − floor`), the headroom the gate can still admit
-    /// (`MemAvailable − floor`), and the held remainder. This is the never-OOM
+    /// (`MemAvailable − floor`), and the held remainder. This is the memory-admission
     /// guarantee visualized. Names the top holder as the running stage, if any.
     pub fn apply_broker(&mut self) {
         use crate::broker::admission::DEFAULT_FLOOR_GIB;
@@ -745,7 +745,7 @@ fn draw_strip(f: &mut Frame<'_>, area: Rect, m: &ConsoleModel) {
                 Span::styled(format!("{}", m.broker.headroom_gib), theme::metric()),
                 Span::styled(" GiB", theme::label()),
             ],
-            "never-OOM",
+            "memory-admission",
         ),
         cells[4],
     );
@@ -877,9 +877,9 @@ fn draw_broker(f: &mut Frame<'_>, area: Rect, m: &ConsoleModel) {
         Line::from(""),
         Line::from(Span::styled(
             if theme::ascii_only() {
-                "over-budget refused - never OOMs the box"
+                "over-budget refused - estimate only"
             } else {
-                "✓ over-budget refused — never OOMs the box"
+                "✓ over-budget refused — estimate only"
             },
             theme::verified(),
         )),

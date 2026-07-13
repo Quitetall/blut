@@ -757,7 +757,7 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
 
     // Admission gate on a SINGLE trial's footprint — the executor's per-stage
     // memory admission gates concurrency ACROSS trials, so the box can't OOM
-    // even with the full fan-out in flight (never-OOM-the-box, unchanged).
+    // even with the full fan-out in flight (memory-admission, unchanged).
     let _tenant_reservation =
         match tenant_admission.reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB) {
             Ok(reservation) => reservation,

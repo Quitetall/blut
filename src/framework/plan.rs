@@ -990,7 +990,7 @@ impl CompiledPlan {
     /// Merge N independent compiled plans into one (HPO fan-out, v0.20). Each
     /// component becomes a disjoint connected sub-graph with its node ids offset
     /// by the running total, so the executor runs all N in parallel (up to the
-    /// concurrency cap), gated by the GPU semaphore + never-OOM admission
+    /// concurrency cap), gated by the GPU semaphore + memory-admission admission
     /// exactly as today. The merged `recipe_args` is the supplied `base_args`
     /// for job provenance, while each component's defaulted recipe args are
     /// retained privately on its nodes for admission-only launch drivers that

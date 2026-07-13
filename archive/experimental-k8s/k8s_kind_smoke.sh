@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# ARCHIVED: depends on the retired Dockerfile.blut prototype and cannot run
+# against the library-only engine. Retained only as historical design evidence.
 # End-to-end kind smoke for the BLUT operator (ADR 0067 T4.5 · B5).
 #
 # Stands up a throwaway kind cluster + MinIO, installs the CRDs, runs the

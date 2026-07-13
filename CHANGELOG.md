@@ -10,11 +10,23 @@ depend on this crate.
 
 ## [Unreleased]
 
+No changes yet.
+
+## 0.2.0-alpha.1
+
 ### Changed
 - **Version truth repair.** The package family is reset to
   `0.2.0-alpha.1`. The local 1.x tags are retained as internal milestone
   history; they were not crates.io releases. A real 1.0 remains gated on the
   M6 release train.
+- **Public preview boundary.** `blut-types`, `blut`, and `blut-dsl` form the
+  publishable preview. Deprecated worker and experimental operator crates are
+  explicitly unpublished. Network object-store support is deferred; the cloud
+  queue keeps its local-filesystem proof path.
+- **MSRV.** Public preview crates now require and test Rust 1.88. The
+  unpublished operator requires Rust 1.89.
+- **Package hygiene.** Crate contents use a fail-closed allowlist; internal
+  agent memory, deployment fixtures, and private host paths are excluded.
 
 ### Added
 - **Typed dynamic DAGs (ADR 0078).** `blut recipe declare` now accepts a
@@ -31,6 +43,39 @@ depend on this crate.
     engine shells out to. `starlark` is kept out of the engine binary because
     it forces `serde_json/arbitrary_precision` — incompatible with the
     engine's internally-tagged enums under Cargo feature unification.
+- **Runtime governance.** Tenant-namespaced cache and admission, capability
+  RBAC, audited `SecretRef` handling, deployment/model registries, built-in
+  fail-closed checks, typed connectors, model cards, provenance graphs, and
+  run-diff reporting.
+- **Scheduling and recovery.** GPU-aware per-device admission, per-node retry
+  and timeout overrides, step-granular resume state, partition status cells,
+  user-priority DAG scheduling, and opt-in auto-tune proposals.
+- **Engine console.** Live run, broker, cache, lineage, mesh, privacy, recipe,
+  and plan-builder views plus cookbook TUI extension hooks.
+- **Public release gates.** Rustdoc with warnings denied, declared-MSRV builds,
+  package-content checks, dependency/advisory/license policy, secret scanning,
+  and in-tree public-example coverage.
+
+### Fixed
+- P2P certificate pinning, signed-task argument coverage, authenticated receive
+  ordering, encrypted blob transfer, dispatch races, and peer-registry
+  persistence now fail closed.
+- Cache atomic writes preserve `fsync` failures; containment cleans failed
+  cgroup setup; lineage, tenant, registry, RBAC, connector, and auto-tune edge
+  cases now preserve their safety invariants.
+- Public documentation, packaged links, version claims, and rustdoc links match
+  the library-only preview surface.
+
+### Security
+- Deprecated worker job IDs are validated as flat ASCII identifiers at API and
+  queue boundaries; duplicate submissions cannot overwrite files. Its
+  plaintext prototype now refuses every non-loopback bind.
+- Absolute source paths are no longer embedded by default. Local stale-source
+  detection requires explicit `BLUT_EMBED_SRC_DIR=1` opt-in.
+- Locked dependencies were updated for active RustSec findings. `bincode 1.3`
+  remains temporarily under a documented unmaintained-only exception because
+  replacement changes cache and P2P wire formats; migration is required before
+  1.0.
 
 ## [1.0.0] — 2026-06-19 (historical internal milestone; never published)
 
@@ -182,12 +227,12 @@ published, so the milestone moves forward rather than down to a `0.9.0` marker.
 ## [0.10.0] — 2026-06-12
 
 First tagged release. The engine has graduated from the early `0.1` prototype
-to a never-OOM-the-box, parallel DAG orchestrator with a distributed launch
+to a memory-admitting, parallel DAG orchestrator with a distributed launch
 seam, run lineage, and declarative scheduling.
 
 ### Highlights
 
-- **Never-OOM-the-box resource broker (ADR 0046).** Every memory-spending
+- **Memory-admission resource broker (ADR 0046).** Every memory-spending
   stage runs inside a cgroup-capped systemd unit sized from a *scaling*
   footprint model, gated by a live admission probe. A wrong (too-small)
   estimate is caught by the cgroup as a clean unit kill — never the OS OOM
@@ -264,5 +309,4 @@ seam, run lineage, and declarative scheduling.
 - The LamQuant python payload still lives under this crate's `python/`
   transitionally; it moves to `blut-lamquant` in a later migration.
 
-[0.11.0]: https://github.com/Quitetall/blut/releases/tag/v0.11.0
-[0.10.0]: https://github.com/Quitetall/blut/releases/tag/v0.10.0
+[Unreleased]: https://github.com/Quitetall/blut/commits/main

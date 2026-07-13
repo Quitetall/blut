@@ -1,15 +1,16 @@
 //! Build-time git stamp for the blut binary.
 //!
-//! Embeds the source tree's commit + dirty flag + path at compile time so the
+//! Embeds the source tree's commit + dirty flag at compile time so the
 //! running binary can (a) report exactly which commit it was built from
-//! (`blut --version`) and (b) WARN at startup if the source tree has since
+//! (`blut --version`) and, for opted-in local builds, (b) WARN at startup if
+//! the source tree has since
 //! moved past it — the "git pull, forgot to rebuild/reinstall, silently ran the
 //! stale binary" trap (the in_ch fix needed `cargo install --force` to go live,
 //! and a human who just `git pull`s would not have noticed). The runtime stale
 //! check (cli.rs `warn_if_stale_binary`) compares the EMBEDDED hash here to the
 //! source tree's LIVE HEAD; this script only stamps the embedded values.
 //!
-//! Always emits the three vars (falling back to `unknown` / `0`) so the
+//! Always emits the three vars (falling back to `unknown` / empty) so the
 //! `env!` reads in cli.rs compile even with no git / a tarball build.
 
 use std::env;
@@ -47,9 +48,17 @@ fn main() {
     let pkg = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0".into());
     let version = format!("{pkg}+{hash}{}", if dirty { "-dirty" } else { "" });
 
+    // Absolute build paths are private host data and make registry artifacts
+    // less reproducible. Local path installs may explicitly opt into the
+    // stale-source probe; crates.io and ordinary source builds embed no path.
+    println!("cargo:rerun-if-env-changed=BLUT_EMBED_SRC_DIR");
+    let embedded_src = match env::var("BLUT_EMBED_SRC_DIR").as_deref() {
+        Ok("1") => manifest.as_str(),
+        _ => "",
+    };
     println!("cargo:rustc-env=BLUT_GIT_HASH={hash}");
     println!("cargo:rustc-env=BLUT_VERSION={version}");
-    println!("cargo:rustc-env=BLUT_SRC_DIR={manifest}");
+    println!("cargo:rustc-env=BLUT_SRC_DIR={embedded_src}");
 
     // Re-stamp the embedded hash when HEAD moves (a new commit / checkout).
     // Resolve the REAL HEAD + index paths via `git rev-parse --git-path` so this

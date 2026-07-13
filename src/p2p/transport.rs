@@ -346,7 +346,7 @@ async fn read_lp(stream: &mut quinn::RecvStream, cap: usize) -> Result<Vec<u8>, 
 }
 
 /// Send a blob with dedup + resume (ADR 0079 data plane): publish it into the
-/// sender's chunk store, offer the [`ChunkIndex`] over a bi-stream, and stream
+/// sender's chunk store, offer the [`crate::p2p::chunkstore::ChunkIndex`] over a bi-stream, and stream
 /// back ONLY the chunks the receiver says it's missing. A receiver that already
 /// holds chunks (a prior transfer, or a resumed one) requests fewer — so a
 /// re-send of unchanged content moves ~0 bytes.

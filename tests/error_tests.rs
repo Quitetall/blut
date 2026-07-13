@@ -20,7 +20,7 @@ fn serde_json_error_maps_to_other_with_json_prefix() {
     let je = serde_json::from_str::<i32>("not json").unwrap_err();
     let e: TrainError = je.into();
     assert!(matches!(e, TrainError::Other(_)), "got {e:?}");
-    assert!(e.to_string().starts_with("json:"), "got {}", e);
+    assert!(e.to_string().starts_with("json:"), "got {e}");
 }
 
 #[test]

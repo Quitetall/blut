@@ -1,3 +1,6 @@
+# ARCHIVED: this prototype expected an engine-owned `blut` binary and `s3`
+# feature. Both were removed from the public engine boundary. It is retained
+# only as design history and must not be used as a deployment recipe.
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # BLUT engine + cookbook runtime image (ADR 0067 T4.5 · B1).
 #

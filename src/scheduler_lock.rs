@@ -232,8 +232,7 @@ pub async fn await_unlock(timeout: Duration) -> Result<()> {
         }
         if Instant::now() >= deadline {
             return Err(Error::Other(format!(
-                "timed out after {:?} waiting for GPU lock release",
-                timeout
+                "timed out after {timeout:?} waiting for GPU lock release"
             )));
         }
         tokio::time::sleep(Duration::from_millis(500)).await;

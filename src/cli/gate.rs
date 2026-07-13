@@ -269,16 +269,14 @@ pub(super) fn admitted_workers_for(
     if avail <= floor {
         return None;
     }
-    // never-OOM-the-BOX is the cgroup cap's job (ADR 0047), not admission's: this
-    // single snapshot is serialized blut-vs-blut by the scheduler lock and nets out
-    // other processes via MemAvailable; a residual drift only ever cgroup-kills the
-    // contained unit, never the box. workers_to_fit_and_saturate is ≥1 (never 0) and
-    // saturating, so no underflow / zero-worker admission.
+    // This snapshot is serialized BLUT-vs-BLUT by the scheduler lock and nets
+    // out other processes via MemAvailable. It reduces over-admission risk but
+    // cannot guarantee against drift or uncontained processes.
     let base = crate::broker::Drivers::from_args_json(raw);
     let w = crate::broker::footprint::workers_to_fit_and_saturate(cpu, avail, floor, &base);
     if w != crate::broker::footprint::UNCALIBRATED_WORKER_CAP {
         eprintln!(
-            "admission: recipe '{name}' decode workers {} → {w} to fit {:.0}G available + {} cores (auto-tuned, never-OOM)",
+            "admission: recipe '{name}' decode workers {} → {w} to fit {:.0}G available + {} cores (auto-tuned estimate)",
             crate::broker::footprint::UNCALIBRATED_WORKER_CAP,
             snap.mem_avail_gb,
             cpu
@@ -321,14 +319,14 @@ pub(super) fn admitted_batch_size_for(
         return None; // already fits — no override needed
     }
     eprintln!(
-        "admission: recipe '{name}' batch size {requested} → {b} to fit {:.0}G available at {resolved_workers} workers (auto-tuned, never-OOM)",
+        "admission: recipe '{name}' batch size {requested} → {b} to fit {:.0}G available at {resolved_workers} workers (auto-tuned estimate)",
         snap.mem_avail_gb
     );
     Some(b)
 }
 
 /// Run one scheduled cell under a shared cross-cell RAM semaphore so the SUM of
-/// concurrently-running cells can't overcommit the box (never-OOM-the-BOX for
+/// concurrently-running cells cannot exceed the declared budget (memory admission for
 /// the parallel partition backfill). MIRRORS the `ParallelExecutor`'s per-node
 /// memory admission (`executor::run_node`): acquire `footprint_gib` permits
 /// (GiB units, matching `NodeEnv::memory`), CLAMPED to the budget so a single
@@ -376,7 +374,7 @@ where
 /// adaptively early-stops via the control policy. Phase 2 ships `--algo random`
 /// (a parallel random search, control=None); other algos error until their
 /// slice lands. Mirrors `run_one_recipe`'s job/admission/lock setup so HPO runs
-/// are never-OOM-gated + scheduler-arbitrated exactly like a normal recipe run.
+/// are memory-admission-gated + scheduler-arbitrated exactly like a normal recipe run.
 /// Layer the broad `KillOnNaN` safety net UNDER an HPO policy. `with_control`
 /// REPLACES the executor's default `KillOnNaN`, so wiring an HPO policy raw
 /// would drop the payload-wide non-finite kill (HPO policies only watch their

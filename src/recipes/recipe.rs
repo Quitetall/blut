@@ -24,7 +24,7 @@ pub trait Recipe: Send + Sync + 'static {
     const DESCRIPTION: &'static str;
     /// Cockpit menu bucket (`blut recipe list --category`, TUI sections).
     /// Defaulted so the trait extension stays additive; every shipped recipe
-    /// overrides it in its `impl Recipe` ([`register_recipe!`] just copies it
+    /// overrides it in its `impl Recipe` ([`macro@crate::register_recipe`] just copies it
     /// into the `RecipeDef`).
     const CATEGORY: RecipeCategory = RecipeCategory::User;
     /// Artifact `Kind` IDs the first stage consumes. Default none

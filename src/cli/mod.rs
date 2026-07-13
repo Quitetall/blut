@@ -491,7 +491,7 @@ enum FootprintCommand {
     /// reflects reality — e.g. after a memory fix dropped the true peak below
     /// the recorded OOM cap, which the monotone rank can never demote). Pass an
     /// exact `<key>` (e.g. `train_model|3|16|2|w`) OR `--recipe <name>`
-    /// to clear every key for a recipe. Never-OOM holds: admission then uses the
+    /// to clear every key for a recipe. Admission remains conservative: it then uses the
     /// conservative Default + the cgroup cap still bounds the next run.
     Forget {
         /// Exact flat key to remove (omit when using --recipe).
@@ -875,10 +875,9 @@ pub(super) fn emit_json<T: serde::Serialize>(value: &T) -> Result<()> {
 }
 
 /// BLUT CLI entrypoint. The recipe catalog is supplied by the caller as
-/// a composed [`Registry`] (the binary — in a cookbook crate — registers
-/// the cookbooks it ships and passes them here). This is the lib seam
-/// that lets blut-core stay domain-agnostic: a bare blut engine binary
-/// would pass an empty registry; the cookbook binaries pass theirs.
+/// a composed [`crate::framework::cookbook::Registry`] (the binary — in a cookbook crate — registers
+/// the cookbooks it ships and passes them here). This is the library seam that
+/// keeps the engine domain-agnostic; the engine crate itself has no binary.
 pub async fn run(reg: crate::framework::Registry) -> Result<()> {
     init_tracing();
     warn_if_stale_binary();

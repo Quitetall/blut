@@ -15,7 +15,7 @@
 
 use std::fmt;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -188,12 +188,28 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn private_create_new() -> fs::OpenOptions {
+fn exclusive_private_file() -> fs::OpenOptions {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
     options
+}
+
+#[cfg(unix)]
+async fn create_private_dir_all(path: &std::path::Path) -> std::io::Result<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(path)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+#[cfg(not(unix))]
+async fn create_private_dir_all(path: &std::path::Path) -> std::io::Result<()> {
+    fs::create_dir_all(path).await
 }
 
 #[cfg(unix)]
@@ -251,7 +267,7 @@ async fn submit_job(
     // renames and removes `<id>.json`; without this durable marker the same ID
     // could reuse a live work directory or overwrite result provenance.
     let reservation_dir = state.queue_dir.join(".job-ids");
-    if let Err(e) = fs::create_dir_all(&reservation_dir).await {
+    if let Err(e) = create_private_dir_all(&reservation_dir).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("failed to create job-id ledger: {e}")})),
@@ -276,7 +292,7 @@ async fn submit_job(
             .into_response();
     }
     let reservation_path = reservation_dir.join(job_id.as_str());
-    let mut reservation = match private_create_new().open(&reservation_path).await {
+    let mut reservation = match exclusive_private_file().open(&reservation_path).await {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             return (
@@ -329,7 +345,7 @@ async fn submit_job(
     let pending_path = state
         .queue_dir
         .join(format!(".{job_id}.{}.pending", uuid::Uuid::new_v4()));
-    let mut file = match private_create_new().open(&pending_path).await {
+    let mut file = match exclusive_private_file().open(&pending_path).await {
         Ok(file) => file,
         Err(e) => {
             let _ = fs::remove_file(&reservation_path).await;
@@ -617,6 +633,16 @@ mod tests {
                 .all(|entry| entry.path().extension().is_none_or(|ext| ext != "pending")),
             "completed request must leave no partially published file"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let ledger_mode = std::fs::metadata(td.path().join(".job-ids"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(ledger_mode, 0o700);
+        }
     }
 
     #[test]

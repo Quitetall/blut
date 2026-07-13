@@ -82,7 +82,7 @@ pub enum DeclarativeError {
 }
 
 impl DeclarativeRecipe {
-    /// Parse a `.toml` file (does NOT resolve stages — see [`compile`]).
+    /// Parse a `.toml` file (does NOT resolve stages — see [`Self::compile`]).
     pub fn load(path: &Path) -> Result<Self, DeclarativeError> {
         let body = std::fs::read_to_string(path).map_err(|e| DeclarativeError::Io {
             path: path.display().to_string(),

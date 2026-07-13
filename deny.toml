@@ -1,0 +1,60 @@
+[graph]
+all-features = true
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3 is unmaintained but has no known vulnerability; replacing the cache and P2P wire codec requires an explicit compatibility migration before 1.0" },
+    { id = "RUSTSEC-2023-0089", reason = "unmaintained-only atomic-polyfill is transitive through starlark 0.14; no known vulnerability, replace with the next audited starlark release" },
+    { id = "RUSTSEC-2024-0388", reason = "unmaintained-only derivative is transitive through starlark 0.14; no known vulnerability, replace with the next audited starlark release" },
+    { id = "RUSTSEC-2025-0057", reason = "unmaintained-only fxhash is transitive through starlark 0.14; no known vulnerability, replace with the next audited starlark release" },
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained-only paste is transitive through starlark 0.14; no known vulnerability, replace with the next audited starlark release" },
+    { id = "RUSTSEC-2025-0012", reason = "unmaintained-only backoff is transitive through unpublished kube 0.96 operator; replace when operator is revived" },
+    { id = "RUSTSEC-2024-0384", reason = "unmaintained-only instant is transitive through unpublished kube 0.96 operator; replace when operator is revived" },
+    { id = "RUSTSEC-2025-0134", reason = "unmaintained-only rustls-pemfile is transitive through unpublished kube 0.96 operator; replace when operator is revived" },
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "AGPL-3.0-or-later",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "WTFPL",
+    "Zlib",
+]
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+allow-workspace = true
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

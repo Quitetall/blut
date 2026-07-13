@@ -107,7 +107,7 @@ pub(super) enum RecipeCommand {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
         /// #3 distributed placement: `local` (default) runs broker-gated +
-        /// cgroup-contained on THIS box (the never-OOM path); `slurm`/`ray`
+        /// cgroup-contained on THIS box (the memory-admission path); `slurm`/`ray`
         /// submit each train stage to a cluster via the configured launcher
         /// (`BLUT_SLURM_*` / `RAY_ADDRESS` env). SHARED-FS CONTRACT: the
         /// content-addressed cache + job dirs must be reachable from the

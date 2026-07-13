@@ -13,7 +13,7 @@
 //! subsequent step (any still-running trial keeps the stream alive until the
 //! population converges).
 //!
-//! The decision core ([`PbtPolicy::decide`]) is pure + unit-tested; `on_step`
+//! The decision core (`PbtPolicy::decide`) is pure + unit-tested; `on_step`
 //! only wraps it with the `CompiledPlan` factory call.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};

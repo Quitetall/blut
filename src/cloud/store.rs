@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use object_store::ObjectStoreExt;
 
 use super::CloudError;
 use crate::framework::artifact::ContentHash;
@@ -48,7 +49,8 @@ pub trait BlobStore: Send + Sync {
 }
 
 /// `object_store`-backed [`BlobStore`]: one trait over the local filesystem and
-/// any S3-compatible store (AWS S3 / Cloudflare R2 / MinIO) with the `aws` feature.
+/// any provider adapter implementing the same trait. Public preview enables
+/// only local filesystem storage.
 /// The provider is chosen at construction, so the cloud queue is provider-agnostic
 /// and dev-testable on the local filesystem.
 pub struct ObjStore {
@@ -58,7 +60,7 @@ pub struct ObjStore {
 }
 
 impl ObjStore {
-    /// Wrap any `object_store::ObjectStore` (S3, R2, …) with a key prefix.
+    /// Wrap an `object_store::ObjectStore` implementation with a key prefix.
     pub fn new(inner: Arc<dyn object_store::ObjectStore>, prefix: impl Into<String>) -> Self {
         Self {
             inner,
@@ -113,7 +115,7 @@ impl BlobStore for ObjStore {
             .head(&path)
             .await
             .map_err(|e| CloudError::Store(format!("head {}: {e}", hash.to_hex())))?;
-        if meta.size as u64 > MAX_BLOB_SIZE {
+        if meta.size > MAX_BLOB_SIZE {
             return Err(CloudError::Store(format!(
                 "blob {} exceeds MAX_BLOB_SIZE ({} > {MAX_BLOB_SIZE})",
                 hash.to_hex(),

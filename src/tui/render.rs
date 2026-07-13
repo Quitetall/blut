@@ -538,8 +538,8 @@ pub(super) fn draw_jobs(f: &mut Frame<'_>, area: Rect, app: &mut App) {
                 ListItem::new(Line::from(vec![
                     Span::styled(format!("{:<22} ", j.id), theme::normal()),
                     Span::styled(format!("{:<9} ", j.state.as_str()), state_style),
-                    Span::styled(format!("pid={:<6} ", pid), theme::normal()),
-                    Span::styled(format!("out={:<18} ", output), theme::normal()),
+                    Span::styled(format!("pid={pid:<6} "), theme::normal()),
+                    Span::styled(format!("out={output:<18} "), theme::normal()),
                     Span::styled(last, theme::dim()),
                 ]))
             })

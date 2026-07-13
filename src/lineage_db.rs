@@ -1136,7 +1136,7 @@ impl LineageDb {
     }
 
     /// ALL input hashes feeding an output (a fan-in/merge stage has several) —
-    /// the multi-branch generalisation of [`input_hash_for_output`] the
+    /// the multi-branch generalisation of `input_hash_for_output` the
     /// provenance graph walks. Distinct, lowercased.
     pub fn inputs_for_output(&self, output_hash: &str) -> Result<Vec<String>> {
         let mut stmt = self

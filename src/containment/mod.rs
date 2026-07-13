@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Brian Lam
-//! Pluggable process-containment — the "enforce the memory cap" half of the
-//! never-OOM guarantee (the broker is the "suggest the cap" half).
+//! Pluggable process containment. Where a hard backend is available it enforces
+//! the selected memory cap; the broker separately estimates admission. Neither
+//! layer is an OOM-proof guarantee, and the bare fallback applies no cap.
 //!
 //! BLUT's original containment was hardcoded to `systemd-run --user` + cgroup
 //! v2. That works on a developer's systemd Linux box but FAILS on cloud /
@@ -21,7 +22,7 @@
 //!     of the whole tree) but a REAL cap.
 //!   - [`bare::Bare`] — no cap; the admission gate is the only floor. Last
 //!     resort, loud warning.
-//!   - [`windows::WindowsJobObject`] — stub for a future Windows Job Object
+//!   - `windows::WindowsJobObject` — stub for a future Windows Job Object
 //!     cap (`#[cfg(windows)]`).
 //!
 //! The `Launcher` trait (in `config::launcher`) is ORTHOGONAL: it answers

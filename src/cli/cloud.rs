@@ -14,7 +14,7 @@ pub(super) enum CloudCommand {
     /// Turnkey end-to-end smoke: submit the built-in `p2p-echo` stage through the
     /// cloud queue over an object store, run one worker, and print the
     /// content-verified output. Proves the whole data plane with NO cloud account.
-    /// Point `--store` at a MinIO/S3 mount to exercise the real object-store path.
+    /// Point `--store` at a durable local or network-mounted directory.
     Smoke {
         /// Object-store root directory (local filesystem; created if absent).
         #[arg(long, default_value = "/tmp/blut-cloud-smoke")]

@@ -71,7 +71,7 @@ pub struct Drivers {
     /// Model latent width (0 ⇒ billed as the 256-wide default).
     /// Folded into the estimate, NOT the calibration key.
     pub latent: u32,
-    /// Never-OOM Phase 3: the per-sample disk cache is warmed upstream
+    /// Memory-admission Phase 3: the per-sample disk cache is warmed upstream
     /// (`warm_fb_cache` recipe arg). Lowers the per-worker term (the warm worker
     /// holds no whole-input decode) AND is part of the calibration key, so a
     /// warm `Measured` peak can never resolve a cold run (and vice versa).
@@ -267,7 +267,7 @@ impl Drivers {
 const PREFETCH_PER_WORKER_BYTES: u64 = 4 * GIB;
 
 /// Per-DataLoader-worker RAM when the per-sample disk cache is WARM
-/// (never-OOM Phase 2: the warm-cache stage ran upstream). With every used
+/// (memory-admission Phase 2: the warm-cache stage ran upstream). With every used
 /// sample already on disk, the adapter's disk tier hits FIRST and the in-proc
 /// whole-input LRU stays EMPTY, so the per-worker resident set collapses to
 /// CoW-fork + a reclaimable mmap page + the small per-sample LRU — NOT a whole
@@ -422,7 +422,7 @@ pub struct FootprintKey {
     pub tier: u32,
     pub batch: u32,
     pub workers: u32,
-    /// Never-OOM Phase 3: whether the run warmed the per-sample disk cache. A
+    /// Memory-admission Phase 3: whether the run warmed the per-sample disk cache. A
     /// warm run's per-worker footprint is much lower, so warm + cold runs MUST
     /// key separately — else a warm `Measured` peak resolves a cold run and
     /// under-sizes it (and an OomCorrected cold bound over-refuses a warm run).
@@ -499,10 +499,10 @@ impl Footprint {
 /// - `tier`: model tier (1..=4); larger tier ⇒ more model/opt RAM.
 /// - `latent_dim`: model latent width (0 ⇒ default, billed as 256).
 /// - `warm`: the per-sample disk cache was warmed upstream (Phase 2) ⇒ the
-///   per-worker term drops to [`PREFETCH_PER_WORKER_BYTES_WARM`] (no
+///   per-worker term drops to `PREFETCH_PER_WORKER_BYTES_WARM` (no
 ///   whole-input decode held).
 /// - `in_ch`: model input channels (21 = narrow baseline, 168 = full input
-///   width) ⇒ a `(in_ch/21 − 1) × `[`PER_INCH_GROUP_BYTES`] full-width term, so a
+///   width) ⇒ a `(in_ch/21 − 1) × PER_INCH_GROUP_BYTES` full-width term, so a
 ///   168-ch run is no longer billed like a 21-ch run.
 pub fn estimate_ram_bytes(
     workers: u32,
@@ -573,7 +573,7 @@ pub fn estimate(
 // cgroup cap to catch the overshoot). The warm stage now bills + caps from this
 // model, exactly as the train stage does from `estimate`.
 
-/// Never-OOM cap on warm fork workers (the warm-side analogue of
+/// Memory-admission cap on warm fork workers (the warm-side analogue of
 /// [`UNCALIBRATED_WORKER_CAP`]). The warm is a one-time precompute, so
 /// box-survival dominates throughput: 4 workers is near the validated ~5.5×
 /// speedup knee, and [`warm_workers_for_budget`] drops it further on a box that
@@ -636,7 +636,7 @@ pub fn warm_workers_for_budget(requested: u32, budget_bytes: u64) -> u32 {
 /// `w ∈ 1..=target` whose train footprint `estimate_ram_bytes(w, …)` fits the RAM
 /// budget `avail_bytes − floor_bytes`, where `target` is the CPU-bound throughput
 /// goal (`cpu_count − 2`, clamped to [`MAX_AUTO_WORKERS`]). So it RAISES workers to
-/// saturate decode up to what RAM allows, and LOWERS them to fit — never-OOM-the-box.
+/// saturate decode up to what RAM allows, and LOWERS them to fit — memory-admission.
 ///
 /// Always ≥ 1. If even one worker doesn't fit, returns 1 (the admission gate then
 /// refuses on box-capacity — there is NO silent OOM-cap fallback). `avail_bytes == 0`
@@ -940,7 +940,7 @@ impl FootprintStore {
     /// The SANCTIONED, audited way to clear a stale `OomCorrected` bound that no
     /// longer reflects reality (e.g. after a data-pipeline memory fix dropped the
     /// true peak below the recorded OOM cap, which `record`'s monotone rank can
-    /// never demote). Never-OOM is preserved: after a forget, `resolve` falls
+    /// never demote). Conservative admission is preserved: after a forget, `resolve` falls
     /// back to the conservative `Default` hint and the cgroup cap still
     /// hard-bounds the run, so the next clean exit records a fresh `Measured`.
     pub fn forget(&mut self, key_flat: &str) -> std::io::Result<bool> {
@@ -1094,7 +1094,7 @@ mod tests {
         // R3 regression pin: at the capped worker count (UNCALIBRATED_WORKER_CAP
         // = 2 in blut-lamquant), the COLD tier-3 cap must exceed the MEASURED
         // workers=2 true working set (~16-20 GiB, DEV_LOG 2026-06-10 db39698),
-        // so a cold run never OOMs at the cap. A future constant tweak that
+        // so a cold run stays within the declared cap estimate. A future constant tweak that
         // re-under-sizes the hint (the 51bcc43 bug) trips this test.
         let cold_cap = estimate(2, 32, 3, 256, false, 21).memmax_bytes();
         // 6 + 2×4 + 3×2 + 1 + 32×64MiB = 23 GiB estimate, +2 GiB headroom = 25 GiB.
@@ -1245,7 +1245,7 @@ mod tests {
         );
     }
 
-    // ── warm-stage footprint model (never-OOM hole: uncontained warm) ──
+    // ── warm-stage footprint model (memory-admission hole: uncontained warm) ──
 
     #[test]
     fn warm_ram_is_base_plus_per_worker_monotone() {
@@ -1324,7 +1324,7 @@ mod tests {
         let target = (64u32 - 2).min(MAX_AUTO_WORKERS);
         let w = workers_to_fit_and_saturate(64, avail, floor, &d);
         assert!(w >= 1 && w <= target);
-        assert!(est(w) <= budget, "fits the RAM budget (never-OOM)");
+        assert!(est(w) <= budget, "fits the RAM budget (memory-admission)");
         if w < target {
             assert!(
                 est(w + 1) > budget,
@@ -1372,7 +1372,7 @@ mod tests {
         let budget = avail - floor;
         let b = batch_size_to_fit(4, avail, floor, &d);
         assert!((1..=64).contains(&b));
-        assert!(est(b) <= budget, "fits the RAM budget (never-OOM)");
+        assert!(est(b) <= budget, "fits the RAM budget (memory-admission)");
         if b < 64 {
             assert!(
                 est(b + 1) > budget,

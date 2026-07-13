@@ -4,8 +4,7 @@
 //! stage (`p2p-echo`) is dispatched through `CloudSubmitter` over a LOCAL-FILESYSTEM
 //! object store + an in-process `MemQueue`, executed by `cloud::worker::run_one`,
 //! and the output is downloaded + content-hash-verified — the whole data plane, with
-//! no cloud account. Points the same code at S3/R2/MinIO by swapping `ObjStore::local`
-//! for an `AmazonS3Builder` store.
+//! no cloud account. Network provider adapters are outside the public preview.
 #![cfg(feature = "cloud")]
 
 use std::sync::Arc;

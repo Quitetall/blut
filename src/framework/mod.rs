@@ -66,8 +66,6 @@ pub use error_domain::{
 };
 pub use executor::{ExecCtx, ParallelExecutor, PlanResult, SequentialExecutor, execute_plan};
 pub use graph::{GraphSnapshot, NodeStatus, PlanGraph, graph_snapshot};
-#[cfg(feature = "s3")]
-pub use object_store::S3BlobStore;
 pub use object_store::{BlobStore, FsBlobStore};
 pub use plan::{CompiledPlan, NodeId, Plan};
 pub use plan_spec::{ConditionGateSpec, PLAN_SPEC_VERSION, PlanSpec, PlanSpecError, SpecNode};

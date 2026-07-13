@@ -6,7 +6,7 @@
 //! independent sub-plan over the base recipe args (a sampled overlay → distinct
 //! cache key + durable-resume dir for free), and merges them into ONE
 //! [`CompiledPlan`] via [`CompiledPlan::from_components`]. The executor then
-//! runs all trials in parallel under the existing GPU semaphore + never-OOM
+//! runs all trials in parallel under the existing GPU semaphore + memory-admission
 //! admission.
 
 use serde_json::Value;

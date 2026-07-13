@@ -587,8 +587,7 @@ mod tests {
         );
         assert!(
             wait_dead(grandchild, Duration::from_secs(5)),
-            "grandchild pid {} survived group kill (orphaned — the bug)",
-            grandchild
+            "grandchild pid {grandchild} survived group kill (orphaned — the bug)"
         );
     }
 
