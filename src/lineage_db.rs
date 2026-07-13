@@ -38,9 +38,9 @@ use crate::error::{Result, TrainError};
 /// 1→2 bump needs NO data migration. v3 (ADR 0096) adds `runs.tenant`; v4
 /// (ADR 0090) adds `runs.experiment` + `runs.args_json` so comparisons use an
 /// explicit campaign key and report real parameter deltas instead of only an
-/// opaque fingerprint. The open path uses idempotent column checks before each
-/// `ALTER TABLE`.
-const SCHEMA_VERSION: i64 = 4;
+/// opaque fingerprint. v5 (ADR 0101) adds the partition-status matrix index.
+/// The open path uses idempotent column checks before each `ALTER TABLE`.
+const SCHEMA_VERSION: i64 = 5;
 
 const CREATE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS runs (
@@ -121,18 +121,38 @@ CREATE TABLE IF NOT EXISTS gauges (
     host_disk_free_mib REAL,
     PRIMARY KEY (job_id, node_idx, wall_unix)
 );
+-- v5 / ADR 0101: latest materialization record per tenant/set/key. This is a
+-- rebuildable index over the append-only partition status log + job lineage,
+-- not a new source of truth.
+CREATE TABLE IF NOT EXISTS partition_status (
+    tenant             TEXT NOT NULL,
+    recipe             TEXT NOT NULL,
+    partition_set      TEXT NOT NULL,
+    partition_key      TEXT NOT NULL,
+    job_id              TEXT NOT NULL,
+    outcome             TEXT NOT NULL,
+    resolved_args_json  TEXT NOT NULL,
+    input_fingerprint   TEXT NOT NULL,
+    recorded_unix       INTEGER NOT NULL,
+    PRIMARY KEY (tenant, recipe, partition_set, partition_key)
+);
+CREATE INDEX IF NOT EXISTS idx_partition_status_job ON partition_status(job_id);
 ";
 
-fn runs_has_column(conn: &Connection, expected: &str) -> Result<bool> {
+fn table_has_column(conn: &Connection, table: &str, expected: &str) -> Result<bool> {
     let mut stmt = conn
-        .prepare("PRAGMA table_info(runs)")
-        .map_err(|e| TrainError::other(format!("table_info(runs): {e}")))?;
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| TrainError::other(format!("table_info({table}): {e}")))?;
     let columns = stmt
         .query_map([], |row| row.get::<_, String>(1))
         .map_err(|e| TrainError::other(format!("table_info rows: {e}")))?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| TrainError::other(format!("table_info collect: {e}")))?;
     Ok(columns.iter().any(|column| column == expected))
+}
+
+fn runs_has_column(conn: &Connection, expected: &str) -> Result<bool> {
+    table_has_column(conn, "runs", expected)
 }
 
 /// One run's provenance row.
@@ -160,6 +180,22 @@ pub struct RunRow {
     /// Canonical recipe args JSON. Missing on legacy/imported runs.
     #[serde(default)]
     pub args_json: Option<String>,
+}
+
+/// Latest indexed materialization for one partition cell (ADR 0101). The
+/// append-only `<recipe>~<set>.status.jsonl` plus the referenced job remain the
+/// canonical record; this row is the query-optimized projection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionStatusRow {
+    pub tenant: String,
+    pub recipe: String,
+    pub partition_set: String,
+    pub partition_key: String,
+    pub job_id: String,
+    pub outcome: String,
+    pub resolved_args_json: String,
+    pub input_fingerprint: String,
+    pub recorded_unix: i64,
 }
 
 /// FRESHNESS verdict for a run's code (Phase G): did the code that built
@@ -331,6 +367,18 @@ impl LineageDb {
             conn.execute("ALTER TABLE runs ADD COLUMN experiment TEXT", [])
                 .map_err(|e| TrainError::other(format!("migrate runs.experiment: {e}")))?;
         }
+        // Pre-landing v5 development databases may have the additive table
+        // without the later input fingerprint. Empty means unverifiable and is
+        // therefore surfaced as stale until rematerialized.
+        if !table_has_column(&conn, "partition_status", "input_fingerprint")? {
+            conn.execute(
+                "ALTER TABLE partition_status ADD COLUMN input_fingerprint TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .map_err(|e| {
+                TrainError::other(format!("migrate partition_status.input_fingerprint: {e}"))
+            })?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| TrainError::other(format!("set user_version: {e}")))?;
         Ok(Self { conn })
@@ -434,6 +482,210 @@ impl LineageDb {
             )
             .map_err(|e| TrainError::other(format!("record run {}: {e}", r.job_id)))?;
         Ok(())
+    }
+
+    /// Upsert the latest derived partition materialization. Older concurrent
+    /// completions cannot overwrite a newer row.
+    pub fn record_partition_status(&self, row: &PartitionStatusRow) -> Result<()> {
+        let args: serde_json::Value =
+            serde_json::from_str(&row.resolved_args_json).map_err(|e| {
+                TrainError::other(format!(
+                    "record partition status {}/{} {}: malformed resolved args: {e}",
+                    row.recipe, row.partition_set, row.partition_key
+                ))
+            })?;
+        let canonical_args = serde_json::to_string(&args)
+            .map_err(|e| TrainError::other(format!("canonicalize partition args: {e}")))?;
+        self.conn
+            .execute(
+                "INSERT INTO partition_status
+                    (tenant, recipe, partition_set, partition_key, job_id, outcome,
+                     resolved_args_json, input_fingerprint, recorded_unix)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                 ON CONFLICT(tenant, recipe, partition_set, partition_key) DO UPDATE SET
+                    job_id=excluded.job_id,
+                    outcome=excluded.outcome,
+                    resolved_args_json=excluded.resolved_args_json,
+                    input_fingerprint=excluded.input_fingerprint,
+                    recorded_unix=excluded.recorded_unix
+                 WHERE excluded.recorded_unix >= partition_status.recorded_unix",
+                params![
+                    row.tenant,
+                    row.recipe,
+                    row.partition_set,
+                    row.partition_key,
+                    row.job_id,
+                    row.outcome,
+                    canonical_args,
+                    row.input_fingerprint,
+                    row.recorded_unix,
+                ],
+            )
+            .map_err(|e| TrainError::other(format!("record partition status: {e}")))?;
+        Ok(())
+    }
+
+    /// Replace one disposable projection row from the canonical append-only
+    /// partition log. Unlike [`Self::record_partition_status`], this does not
+    /// compare timestamps: an index row can be corrupt or clock-skewed into
+    /// the future, but it must never outrank canonical JSONL history.
+    pub(crate) fn reconcile_partition_status(&self, row: &PartitionStatusRow) -> Result<()> {
+        let args: serde_json::Value =
+            serde_json::from_str(&row.resolved_args_json).map_err(|e| {
+                TrainError::other(format!(
+                    "reconcile partition status {}/{} {}: malformed resolved args: {e}",
+                    row.recipe, row.partition_set, row.partition_key
+                ))
+            })?;
+        let canonical_args = serde_json::to_string(&args)
+            .map_err(|e| TrainError::other(format!("canonicalize partition args: {e}")))?;
+        self.conn
+            .execute(
+                "INSERT INTO partition_status
+                    (tenant, recipe, partition_set, partition_key, job_id, outcome,
+                     resolved_args_json, input_fingerprint, recorded_unix)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                 ON CONFLICT(tenant, recipe, partition_set, partition_key) DO UPDATE SET
+                    job_id=excluded.job_id,
+                    outcome=excluded.outcome,
+                    resolved_args_json=excluded.resolved_args_json,
+                    input_fingerprint=excluded.input_fingerprint,
+                    recorded_unix=excluded.recorded_unix",
+                params![
+                    row.tenant,
+                    row.recipe,
+                    row.partition_set,
+                    row.partition_key,
+                    row.job_id,
+                    row.outcome,
+                    canonical_args,
+                    row.input_fingerprint,
+                    row.recorded_unix,
+                ],
+            )
+            .map_err(|e| TrainError::other(format!("reconcile partition status: {e}")))?;
+        Ok(())
+    }
+
+    /// Latest indexed rows for exactly one tenant and named partition set.
+    pub fn partition_statuses(
+        &self,
+        tenant: &str,
+        recipe: &str,
+        partition_set: &str,
+    ) -> Result<std::collections::BTreeMap<String, PartitionStatusRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT tenant, recipe, partition_set, partition_key, job_id, outcome,
+                        resolved_args_json, input_fingerprint, recorded_unix
+                 FROM partition_status
+                 WHERE tenant=?1 AND recipe=?2 AND partition_set=?3
+                 ORDER BY partition_key",
+            )
+            .map_err(|e| TrainError::other(format!("prepare partition statuses: {e}")))?;
+        let rows = stmt
+            .query_map(params![tenant, recipe, partition_set], |row| {
+                Ok(PartitionStatusRow {
+                    tenant: row.get(0)?,
+                    recipe: row.get(1)?,
+                    partition_set: row.get(2)?,
+                    partition_key: row.get(3)?,
+                    job_id: row.get(4)?,
+                    outcome: row.get(5)?,
+                    resolved_args_json: row.get(6)?,
+                    input_fingerprint: row.get(7)?,
+                    recorded_unix: row.get(8)?,
+                })
+            })
+            .map_err(|e| TrainError::other(format!("query partition statuses: {e}")))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| TrainError::other(format!("collect partition statuses: {e}")))
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| (row.partition_key.clone(), row))
+                    .collect()
+            })
+    }
+
+    /// Derive the operator-visible matrix state from the indexed cell record,
+    /// its owning run, and live content-addressed output. Any missing or
+    /// contradictory lineage is stale, never silently materialized.
+    pub fn derive_partition_status(
+        &self,
+        row: Option<&PartitionStatusRow>,
+        tenant: &str,
+        recipe: &str,
+        current_resolved_args: &serde_json::Value,
+        current_input_fingerprint: &str,
+        restricted: bool,
+    ) -> Result<crate::config::partition::CellStatus> {
+        use crate::config::partition::CellStatus;
+        if restricted {
+            return Ok(CellStatus::Restricted);
+        }
+        let Some(row) = row else {
+            return Ok(CellStatus::Missing);
+        };
+        if row.outcome != "done" {
+            return Ok(CellStatus::Failed);
+        }
+        let recorded_args: serde_json::Value = match serde_json::from_str(&row.resolved_args_json) {
+            Ok(args) => args,
+            Err(_) => return Ok(CellStatus::Stale),
+        };
+        if row.tenant != tenant || row.recipe != recipe || recorded_args != *current_resolved_args {
+            return Ok(CellStatus::Stale);
+        }
+        if row.input_fingerprint != current_input_fingerprint {
+            return Ok(CellStatus::Stale);
+        }
+        let Some(run) = self.get_run(&row.job_id)? else {
+            return Ok(CellStatus::Stale);
+        };
+        let run_args = run
+            .args_json
+            .as_deref()
+            .and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok());
+        if run.tenant != tenant
+            || run.recipe != recipe
+            || run.outcome.as_deref() != Some("done")
+            || run_args.as_ref() != Some(current_resolved_args)
+        {
+            return Ok(CellStatus::Stale);
+        }
+        if matches!(
+            self.code_freshness(&row.job_id)?,
+            CodeFreshness::Stale { .. }
+        ) {
+            return Ok(CellStatus::Stale);
+        }
+        let live = self
+            .terminal_artifact(&row.job_id)?
+            .is_some_and(|artifact| {
+                let Some(path) = artifact.sidecar_path else {
+                    return false;
+                };
+                let path = Path::new(&path);
+                let metadata_live = crate::framework::ArtifactMetadata::read_from(path)
+                    .map(|metadata| metadata.content_hash.to_hex() == artifact.content_hash)
+                    .unwrap_or(false);
+                let cache_live = path
+                    .parent()
+                    .and_then(|parent| {
+                        crate::framework::cache::CacheProof::read_from(
+                            &parent.join("cache-proof.json"),
+                        )
+                        .ok()
+                    })
+                    .is_some_and(|proof| proof.is_live());
+                metadata_live && cache_live
+            });
+        Ok(if live {
+            CellStatus::Materialized
+        } else {
+            CellStatus::Stale
+        })
     }
 
     /// Idempotent upsert of an artifact row (keyed by job_id+stage_idx).

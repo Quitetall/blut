@@ -20,12 +20,14 @@
 //!
 //! ## Persistence (`~/.config/blut/partitions/`)
 //! - definition: `<recipe>~<set>.json`
-//! - materialization log: `<recipe>~<set>.status.jsonl` (append-only, last-wins)
+//! - materialization log:
+//!   `tenants/<tenant>/<recipe>~<set>.status.jsonl` (append-only, last-wins)
+//! - legacy default-tenant logs at the old root path remain readable
 //!
-//! ## Scope (slice 1)
+//! ## Cell mapping
 //! Cells map to **scalar** `axis=value` overrides (top-level recipe-arg fields),
-//! reusing the executor's existing `--set` application. Path/template mapping
-//! and config-fingerprint stale-detection are deliberately out of this slice.
+//! reusing the executor's existing `--set` application. Typed time and
+//! categorical specs are expanded to that finite persisted key-space.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -33,6 +35,11 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, TrainError};
+
+/// WASM-safe wire contracts are re-exported through the engine so cookbook
+/// crates need only their normal `blut` dependency, not a second direct
+/// dependency on the keystone crate.
+pub use blut_types::partition::{PartitionKey, PartitionSpec, PartitionValue, TimeGranularity};
 
 /// One partition axis: a recipe-arg field and the discrete values it ranges
 /// over. `axis` is the dotted arg path the cell renders as a `--set` override
@@ -66,15 +73,44 @@ pub struct PartitionCell {
     pub overrides: Vec<String>,
 }
 
+impl PartitionCell {
+    /// Typed wire identity used by the executor/cache seam.
+    pub fn partition_key(&self) -> Result<blut_types::partition::PartitionKey> {
+        let values = self
+            .overrides
+            .iter()
+            .map(|item| {
+                let (dimension, value) = item.split_once('=').ok_or_else(|| {
+                    TrainError::other(format!("malformed partition override '{item}'"))
+                })?;
+                Ok(blut_types::partition::PartitionValue::new(dimension, value))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        blut_types::partition::PartitionKey::new(values)
+            .map_err(|e| TrainError::other(format!("invalid partition key '{}': {e}", self.key)))
+    }
+}
+
 /// One materialization record (append-only; last-wins per `key`).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PartitionStatus {
+    /// Owning tenant. Legacy records deserialize as `default`.
+    #[serde(default = "default_partition_tenant")]
+    pub tenant: String,
     pub key: String,
     pub job_id: String,
     /// `"done"` materializes the cell; anything else (e.g. `"failed"`) does not.
     pub outcome: String,
     /// Unix epoch seconds when recorded.
     pub recorded_at: i64,
+    /// Canonical identity of source handles plus the compiled/resolved recipe
+    /// args. Missing on legacy records, which therefore cannot prove freshness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_fingerprint: Option<String>,
+}
+
+fn default_partition_tenant() -> String {
+    crate::tenant::DEFAULT_PROJECT.to_string()
 }
 
 impl PartitionStatus {
@@ -101,6 +137,319 @@ pub enum CellStatus {
     Restricted,
     /// Never run.
     Missing,
+}
+
+/// Which cells a backfill should expose to admission. Restricted cells are
+/// deliberately included by `Force`: the caller must refuse them explicitly,
+/// never make them disappear as though they were already materialized.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackfillSelector {
+    #[default]
+    Default,
+    Force,
+    Missing,
+    Stale,
+}
+
+/// Select cells from an already-derived status matrix while preserving the
+/// partition set's declared cell order.
+pub fn select_backfill_targets(
+    cells: &[PartitionCell],
+    matrix: &BTreeMap<String, CellStatus>,
+    selector: BackfillSelector,
+) -> Vec<PartitionCell> {
+    cells
+        .iter()
+        .filter(|cell| {
+            let status = matrix
+                .get(&cell.key)
+                .copied()
+                .unwrap_or(CellStatus::Missing);
+            match selector {
+                BackfillSelector::Force => true,
+                BackfillSelector::Missing => status == CellStatus::Missing,
+                BackfillSelector::Stale => status == CellStatus::Stale,
+                BackfillSelector::Default => matches!(
+                    status,
+                    CellStatus::Missing | CellStatus::Stale | CellStatus::Failed
+                ),
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+/// Fail-closed classification for one cell's source args. Tenant policy
+/// dominates; otherwise cookbooks can expose an explicit per-cell marker via a
+/// `restricted=true` flag or a classification field. This keeps the policy in
+/// ordinary recipe data instead of forcing authors into a BLUT-specific UI.
+pub fn partition_args_are_restricted(
+    args: &serde_json::Value,
+    tenant: &crate::tenant::Tenant,
+) -> bool {
+    if tenant.is_restricted() {
+        return true;
+    }
+    fn visit(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
+                let key = key.to_ascii_lowercase();
+                (key == "restricted" && value.as_bool() == Some(true))
+                    || (matches!(
+                        key.as_str(),
+                        "classification" | "data_class" | "security_class" | "access_class"
+                    ) && value.as_str().is_some_and(|class| {
+                        matches!(
+                            class.to_ascii_lowercase().as_str(),
+                            "restricted" | "clinical" | "phi"
+                        )
+                    }))
+                    || visit(value)
+            }),
+            serde_json::Value::Array(values) => values.iter().any(visit),
+            _ => false,
+        }
+    }
+    visit(args)
+}
+
+/// Stable identity used by the lineage matrix to decide whether the inputs a
+/// cell would consume still match its last materialization. Source args retain
+/// immutable registry handles (`dataset://`, `model://`, `experiment://`),
+/// while compiled args carry their live resolution and cookbook defaults.
+pub fn partition_input_fingerprint(
+    source_args: &serde_json::Value,
+    compiled_args: &serde_json::Value,
+) -> String {
+    partition_input_fingerprint_with_execution(source_args, compiled_args, "")
+}
+
+pub(crate) fn partition_input_fingerprint_with_execution(
+    source_args: &serde_json::Value,
+    compiled_args: &serde_json::Value,
+    execution_fingerprint: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"blut.partition.input.v1");
+    hasher.update((execution_fingerprint.len() as u64).to_le_bytes());
+    hasher.update(execution_fingerprint.as_bytes());
+    for value in [source_args, compiled_args] {
+        let canonical = crate::framework::CacheHandle::canonical_json_bytes(value);
+        hasher.update((canonical.len() as u64).to_le_bytes());
+        hasher.update(canonical);
+    }
+    faster_hex::hex_string(&hasher.finalize())
+}
+
+/// Convert a typed wire spec into the persisted finite dimensions used by the
+/// backfill scheduler. Time specs require a finite inclusive range.
+pub fn dims_from_spec(spec: &PartitionSpec, time_range: Option<&str>) -> Result<Vec<PartitionDim>> {
+    fn append(
+        spec: &PartitionSpec,
+        time_range: Option<&str>,
+        out: &mut Vec<PartitionDim>,
+    ) -> Result<()> {
+        match spec {
+            PartitionSpec::Categorical { dimension, values } => out.push(PartitionDim {
+                axis: dimension.clone(),
+                values: values.clone(),
+            }),
+            PartitionSpec::Time {
+                dimension,
+                granularity,
+                tz,
+            } => {
+                if !matches!(tz.as_str(), "UTC" | "Etc/UTC" | "Z") {
+                    return Err(TrainError::other(format!(
+                        "time partition timezone '{tz}' is unsupported; use UTC"
+                    )));
+                }
+                let range = time_range.ok_or_else(|| {
+                    TrainError::other("a time PartitionSpec requires --partitions START:END")
+                })?;
+                out.push(PartitionDim {
+                    axis: dimension.clone(),
+                    values: expand_time_range(range, *granularity)?,
+                });
+            }
+            PartitionSpec::Multi { dimensions } => {
+                if dimensions.is_empty() {
+                    return Err(TrainError::other(
+                        "a Multi PartitionSpec needs at least one dimension",
+                    ));
+                }
+                let time_count = dimensions
+                    .iter()
+                    .filter(|dimension| matches!(dimension, PartitionSpec::Time { .. }))
+                    .count();
+                if time_count > 1 {
+                    return Err(TrainError::other(
+                        "a Multi PartitionSpec supports at most one time dimension",
+                    ));
+                }
+                for dimension in dimensions {
+                    if matches!(dimension, PartitionSpec::Multi { .. }) {
+                        return Err(TrainError::other(
+                            "nested Multi PartitionSpec values are not supported",
+                        ));
+                    }
+                    append(dimension, time_range, out)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let mut dims = Vec::new();
+    append(spec, time_range, &mut dims)?;
+    Ok(dims)
+}
+
+fn expand_time_range(range: &str, granularity: TimeGranularity) -> Result<Vec<String>> {
+    let (start, end) = range.split_once(':').ok_or_else(|| {
+        TrainError::other("--partitions time range must be START:END (inclusive)")
+    })?;
+    let mut values = Vec::new();
+    match granularity {
+        TimeGranularity::Day | TimeGranularity::Week => {
+            let mut current = chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d")
+                .map_err(|e| TrainError::other(format!("invalid time range start: {e}")))?;
+            let end = chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d")
+                .map_err(|e| TrainError::other(format!("invalid time range end: {e}")))?;
+            let step = if granularity == TimeGranularity::Day {
+                1
+            } else {
+                7
+            };
+            while current <= end {
+                values.push(current.format("%Y-%m-%d").to_string());
+                current = current
+                    .checked_add_days(chrono::Days::new(step))
+                    .ok_or_else(|| TrainError::other("time partition range overflow"))?;
+                if values.len() > MAX_CELLS {
+                    return Err(TrainError::other(
+                        "time partition range exceeds cell ceiling",
+                    ));
+                }
+            }
+        }
+        TimeGranularity::Hour => {
+            let mut current = chrono::NaiveDateTime::parse_from_str(start, "%Y-%m-%dT%H")
+                .map_err(|e| TrainError::other(format!("invalid hourly range start: {e}")))?;
+            let end = chrono::NaiveDateTime::parse_from_str(end, "%Y-%m-%dT%H")
+                .map_err(|e| TrainError::other(format!("invalid hourly range end: {e}")))?;
+            while current <= end {
+                values.push(current.format("%Y-%m-%dT%H").to_string());
+                current = current
+                    .checked_add_signed(chrono::Duration::hours(1))
+                    .ok_or_else(|| TrainError::other("hourly partition range overflow"))?;
+                if values.len() > MAX_CELLS {
+                    return Err(TrainError::other(
+                        "time partition range exceeds cell ceiling",
+                    ));
+                }
+            }
+        }
+        TimeGranularity::Month => {
+            let parse = |value: &str| -> Result<(i32, u32)> {
+                let date = chrono::NaiveDate::parse_from_str(&format!("{value}-01"), "%Y-%m-%d")
+                    .map_err(|e| TrainError::other(format!("invalid monthly range: {e}")))?;
+                use chrono::Datelike;
+                Ok((date.year(), date.month()))
+            };
+            let (mut year, mut month) = parse(start)?;
+            let end = parse(end)?;
+            while (year, month) <= end {
+                values.push(format!("{year:04}-{month:02}"));
+                if month == 12 {
+                    year = year
+                        .checked_add(1)
+                        .ok_or_else(|| TrainError::other("monthly partition range overflow"))?;
+                    month = 1;
+                } else {
+                    month += 1;
+                }
+                if values.len() > MAX_CELLS {
+                    return Err(TrainError::other(
+                        "time partition range exceeds cell ceiling",
+                    ));
+                }
+            }
+        }
+    }
+    if values.is_empty() {
+        return Err(TrainError::other(
+            "--partitions range end must not precede its start",
+        ));
+    }
+    Ok(values)
+}
+
+/// Restrict a declared cell space by an explicit comma-separated set or an
+/// inclusive first-dimension range. Full stable keys and first-axis values are
+/// accepted; unknown tokens fail closed.
+pub fn select_partition_cells(
+    cells: &[PartitionCell],
+    selection: &str,
+) -> Result<Vec<PartitionCell>> {
+    if let Some((start, end)) = selection.split_once(':') {
+        let selected: Vec<_> = cells
+            .iter()
+            .filter(|cell| {
+                cell.overrides
+                    .first()
+                    .and_then(|item| item.split_once('='))
+                    .is_some_and(|(_, value)| value >= start && value <= end)
+            })
+            .cloned()
+            .collect();
+        if selected.is_empty() {
+            return Err(TrainError::other(format!(
+                "--partitions range '{selection}' selects no declared cells"
+            )));
+        }
+        return Ok(selected);
+    }
+    let requested: std::collections::BTreeSet<_> = selection
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect();
+    if requested.is_empty() {
+        return Err(TrainError::other("--partitions explicit set is empty"));
+    }
+    let selected: Vec<_> = cells
+        .iter()
+        .filter(|cell| {
+            requested.contains(cell.key.as_str())
+                || cell
+                    .overrides
+                    .first()
+                    .and_then(|item| item.split_once('='))
+                    .is_some_and(|(_, value)| requested.contains(value))
+        })
+        .cloned()
+        .collect();
+    let mut matched = std::collections::BTreeSet::new();
+    for cell in &selected {
+        if requested.contains(cell.key.as_str()) {
+            matched.insert(cell.key.as_str());
+        }
+        if let Some((_, value)) = cell.overrides.first().and_then(|item| item.split_once('='))
+            && requested.contains(value)
+        {
+            matched.insert(value);
+        }
+    }
+    let unknown: Vec<_> = requested.difference(&matched).copied().collect();
+    if !unknown.is_empty() {
+        return Err(TrainError::other(format!(
+            "--partitions names undeclared cell(s): {}",
+            unknown.join(", ")
+        )));
+    }
+    Ok(selected)
 }
 
 impl CellStatus {
@@ -316,6 +665,17 @@ impl PartitionSet {
         Ok(Self::dir()?.join(format!("{recipe}{SEP}{name}.status.jsonl")))
     }
 
+    fn tenant_status_path(recipe: &str, name: &str, tenant: &str) -> Result<PathBuf> {
+        Self::guard_identity(recipe, name)?;
+        let tenant = crate::tenant::Tenant::parse(tenant).ok_or_else(|| {
+            TrainError::other(format!("invalid partition status tenant '{tenant}'"))
+        })?;
+        Ok(Self::dir()?
+            .join("tenants")
+            .join(tenant.as_path())
+            .join(format!("{recipe}{SEP}{name}.status.jsonl")))
+    }
+
     /// Persist this set's definition. Validates first. A plain write: it
     /// overwrites any existing file at the same `<recipe>~<name>` path —
     /// guarding against clobbering a DIFFERENT set is the caller's concern.
@@ -371,10 +731,12 @@ impl PartitionSet {
 
     /// Append a materialization record (append-only; never rewrites history).
     pub fn record_status(&self, status: &PartitionStatus) -> Result<()> {
-        let dir = Self::dir()?;
-        std::fs::create_dir_all(&dir)
+        let path = Self::tenant_status_path(&self.recipe, &self.name, &status.tenant)?;
+        let dir = path
+            .parent()
+            .ok_or_else(|| TrainError::other("partition status path has no parent"))?;
+        std::fs::create_dir_all(dir)
             .map_err(|e| TrainError::other(format!("mkdir {dir:?}: {e}")))?;
-        let path = Self::status_path(&self.recipe, &self.name)?;
         let line = serde_json::to_string(status)
             .map_err(|e| TrainError::other(format!("serialize status: {e}")))?;
         use std::io::Write;
@@ -389,21 +751,36 @@ impl PartitionSet {
 
     /// Latest status per key (last-wins). Missing log = empty map.
     pub fn statuses(&self) -> Result<BTreeMap<String, PartitionStatus>> {
-        let path = Self::status_path(&self.recipe, &self.name)?;
-        let body = match std::fs::read_to_string(&path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-            Err(e) => return Err(TrainError::other(format!("read {path:?}: {e}"))),
-        };
+        self.statuses_for_tenant(crate::tenant::DEFAULT_PROJECT)
+    }
+
+    /// Tenant-scoped canonical last-wins view. Default-tenant reads merge the
+    /// pre-tenancy legacy file first, then the scoped file, so migration is
+    /// additive and a later scoped record wins.
+    pub fn statuses_for_tenant(&self, tenant: &str) -> Result<BTreeMap<String, PartitionStatus>> {
         let mut map = BTreeMap::new();
-        for line in body.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            // Tolerate a corrupt trailing line (partial append) — skip it.
-            if let Ok(rec) = serde_json::from_str::<PartitionStatus>(line) {
-                map.insert(rec.key.clone(), rec);
+        let mut paths = Vec::new();
+        if tenant == crate::tenant::DEFAULT_PROJECT {
+            paths.push(Self::status_path(&self.recipe, &self.name)?);
+        }
+        paths.push(Self::tenant_status_path(&self.recipe, &self.name, tenant)?);
+        for path in paths {
+            let body = match std::fs::read_to_string(&path) {
+                Ok(body) => body,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(TrainError::other(format!("read {path:?}: {e}"))),
+            };
+            for line in body.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                // Tolerate a corrupt trailing line (partial append) — skip it.
+                if let Ok(rec) = serde_json::from_str::<PartitionStatus>(line)
+                    && rec.tenant == tenant
+                {
+                    map.insert(rec.key.clone(), rec);
+                }
             }
         }
         Ok(map)
@@ -443,10 +820,12 @@ mod tests {
             })
             .collect();
         let done = |k: &str| PartitionStatus {
+            tenant: crate::tenant::DEFAULT_PROJECT.into(),
             key: k.into(),
             job_id: "j".into(),
             outcome: "done".into(),
             recorded_at: 1,
+            input_fingerprint: None,
         };
         let mut latest = BTreeMap::new();
         latest.insert("a".to_string(), done("a")); // materialized (fresh)
@@ -454,10 +833,12 @@ mod tests {
         latest.insert(
             "c".to_string(),
             PartitionStatus {
+                tenant: crate::tenant::DEFAULT_PROJECT.into(),
                 key: "c".into(),
                 job_id: "j".into(),
                 outcome: "failed".into(),
                 recorded_at: 1,
+                input_fingerprint: None,
             },
         ); // failed
         // "d" has no record → missing. "phi" is restricted → restricted (even done).
@@ -529,6 +910,59 @@ mod tests {
         let mut s3 = set();
         s3.dims[0].values = vec!["a=b".into()];
         assert!(s3.validate().is_err(), "'=' in value rejected");
+    }
+
+    #[test]
+    fn typed_specs_expand_categorical_multi_and_utc_time() {
+        let categorical = PartitionSpec::Categorical {
+            dimension: "corpus".into(),
+            values: vec!["tuh".into(), "chbmit".into()],
+        };
+        assert_eq!(dims_from_spec(&categorical, None).unwrap().len(), 1);
+
+        let multi = PartitionSpec::Multi {
+            dimensions: vec![
+                categorical,
+                PartitionSpec::Time {
+                    dimension: "day".into(),
+                    granularity: TimeGranularity::Day,
+                    tz: "UTC".into(),
+                },
+            ],
+        };
+        let dims = dims_from_spec(&multi, Some("2026-07-01:2026-07-03")).unwrap();
+        assert_eq!(dims[0].values, ["tuh", "chbmit"]);
+        assert_eq!(dims[1].values, ["2026-07-01", "2026-07-02", "2026-07-03"]);
+        assert!(
+            dims_from_spec(
+                &PartitionSpec::Time {
+                    dimension: "day".into(),
+                    granularity: TimeGranularity::Day,
+                    tz: "America/New_York".into(),
+                },
+                Some("2026-07-01:2026-07-02")
+            )
+            .is_err(),
+            "unsupported timezone must fail closed"
+        );
+    }
+
+    #[test]
+    fn explicit_and_range_partition_selection_are_exact() {
+        let cells = set().cells();
+        let explicit = select_partition_cells(&cells, "tusz").unwrap();
+        assert_eq!(explicit.len(), 3);
+        assert!(
+            explicit
+                .iter()
+                .all(|cell| cell.key.starts_with("corpus=tusz/"))
+        );
+
+        let range = select_partition_cells(&cells, "chbmit:tusz").unwrap();
+        assert_eq!(range.len(), 6);
+        let full = select_partition_cells(&cells, "corpus=tusz/fold=1").unwrap();
+        assert_eq!(full.len(), 1);
+        assert!(select_partition_cells(&cells, "unknown").is_err());
     }
 
     #[test]
@@ -671,10 +1105,12 @@ mod tests {
         // materialize two cells
         for key in ["corpus=tusz/fold=0", "corpus=chbmit/fold=1"] {
             s.record_status(&PartitionStatus {
+                tenant: crate::tenant::DEFAULT_PROJECT.into(),
                 key: key.into(),
                 job_id: "job-1".into(),
                 outcome: "done".into(),
                 recorded_at: 1,
+                input_fingerprint: None,
             })
             .unwrap();
         }
@@ -683,10 +1119,12 @@ mod tests {
         assert!(!remaining.iter().any(|c| c.key == "corpus=tusz/fold=0"));
         // a FAILED status does NOT materialize
         s.record_status(&PartitionStatus {
+            tenant: crate::tenant::DEFAULT_PROJECT.into(),
             key: "corpus=tusz/fold=1".into(),
             job_id: "job-2".into(),
             outcome: "failed".into(),
             recorded_at: 2,
+            input_fingerprint: None,
         })
         .unwrap();
         assert_eq!(
@@ -704,21 +1142,57 @@ mod tests {
         let s = set();
         let k = "corpus=tusz/fold=0";
         s.record_status(&PartitionStatus {
+            tenant: crate::tenant::DEFAULT_PROJECT.into(),
             key: k.into(),
             job_id: "a".into(),
             outcome: "failed".into(),
             recorded_at: 1,
+            input_fingerprint: None,
         })
         .unwrap();
         s.record_status(&PartitionStatus {
+            tenant: crate::tenant::DEFAULT_PROJECT.into(),
             key: k.into(),
             job_id: "b".into(),
             outcome: "done".into(),
             recorded_at: 2,
+            input_fingerprint: None,
         })
         .unwrap();
         let st = s.statuses().unwrap();
         assert_eq!(st.get(k).unwrap().job_id, "b");
         assert!(st.get(k).unwrap().is_materialized());
+    }
+
+    #[test]
+    fn canonical_status_history_is_tenant_isolated() {
+        let _g = tmp_env();
+        let s = set();
+        let key = "corpus=tusz/fold=0";
+        for (tenant, job_id, outcome) in [
+            (crate::tenant::DEFAULT_PROJECT, "default-job", "done"),
+            ("research/dev", "research-job", "failed"),
+            ("clinical/phi", "clinical-job", "failed"),
+        ] {
+            s.record_status(&PartitionStatus {
+                tenant: tenant.into(),
+                key: key.into(),
+                job_id: job_id.into(),
+                outcome: outcome.into(),
+                recorded_at: 1,
+                input_fingerprint: Some(format!("fingerprint-{tenant}")),
+            })
+            .unwrap();
+        }
+
+        assert_eq!(s.statuses().unwrap()[key].job_id, "default-job");
+        assert_eq!(
+            s.statuses_for_tenant("research/dev").unwrap()[key].job_id,
+            "research-job"
+        );
+        assert_eq!(
+            s.statuses_for_tenant("clinical/phi").unwrap()[key].job_id,
+            "clinical-job"
+        );
     }
 }

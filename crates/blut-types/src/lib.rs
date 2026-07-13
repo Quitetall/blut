@@ -9,4 +9,5 @@
 //! zero-churn downstream (ADR 0083 §2).
 
 pub mod gpu;
+pub mod partition;
 pub mod report;

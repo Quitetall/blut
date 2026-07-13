@@ -19,6 +19,7 @@ use crate::framework::compat::Compatible;
 use crate::framework::plan::Plan;
 use crate::framework::stage::Stage;
 use async_trait::async_trait;
+use blut_types::partition::{PartitionKey, PartitionValue};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -363,6 +364,46 @@ async fn cache_hit_skips_run_on_repeat_execution() {
     assert_eq!(r2.n_cache_misses, 0);
     assert_eq!(MAKE_RUN_COUNT.load(Ordering::SeqCst), 1);
     assert_eq!(INC_RUN_COUNT.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn partitioned_plans_do_not_share_cache_entries() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    MAKE_RUN_COUNT.store(0, Ordering::SeqCst);
+    let (_td, ctx) = fresh_ctx();
+    let cache = ctx.cache.clone();
+    let key = |value| {
+        PartitionKey::new(vec![PartitionValue::new("site", value)]).expect("valid partition key")
+    };
+    let plan = |value| {
+        Plan::<(), LamuTrainerBackend>::new("partitioned", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .finish()
+            .into_compiled()
+            .with_partition(key(value))
+    };
+
+    let first = SequentialExecutor::execute(plan("tuh"), ctx).await.unwrap();
+    assert_eq!(first.n_cache_misses, 1);
+
+    let second_ctx = ExecCtx {
+        cache: cache.clone(),
+        ..ExecCtx::new(tempfile::tempdir().unwrap().keep())
+    };
+    let second = SequentialExecutor::execute(plan("chb"), second_ctx)
+        .await
+        .unwrap();
+    assert_eq!(second.n_cache_misses, 1, "a different partition is cold");
+
+    let repeat_ctx = ExecCtx {
+        cache,
+        ..ExecCtx::new(tempfile::tempdir().unwrap().keep())
+    };
+    let repeat = SequentialExecutor::execute(plan("tuh"), repeat_ctx)
+        .await
+        .unwrap();
+    assert_eq!(repeat.n_cache_hits, 1, "the same partition is warm");
+    assert_eq!(MAKE_RUN_COUNT.load(Ordering::SeqCst), 2);
 }
 
 /// INC D (S4): `with_bypass_cache(true)` forces a recompute — a stage with a
@@ -2736,6 +2777,47 @@ async fn spawn_injects_subplan_and_runs_to_completion() {
     assert_eq!(
         result.n_stages, 4,
         "order grew to include the spawned nodes"
+    );
+}
+
+#[tokio::test]
+async fn spawned_nodes_inherit_partition_cache_identity() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    SPAWN_MARKER_RAN.store(0, Ordering::SeqCst);
+    SPAWN_CHILD_RAN.store(0, Ordering::SeqCst);
+    let td = tempfile::tempdir().unwrap();
+    let shared_cache = std::sync::Arc::new(crate::framework::cache::CacheHandle::job_local(
+        td.path().join("shared-cache"),
+    ));
+
+    for (job, corpus) in [("job-a", "a"), ("job-b", "b")] {
+        let mut ctx = ExecCtx::new(td.path().join(job));
+        ctx.cache = shared_cache.clone();
+        let ctx = ctx.with_control(std::sync::Arc::new(SpawnOnce {
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }));
+        let partition = blut_types::partition::PartitionKey::new(vec![
+            blut_types::partition::PartitionValue::new("corpus", corpus),
+        ])
+        .unwrap();
+        let plan = Plan::<(), LamuTrainerBackend>::new("spawn_partitioned", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .then(StepThenSleep, EmptyArgs)
+            .finish()
+            .into_compiled()
+            .with_partition(partition);
+        ParallelExecutor::execute(plan, ctx).await.unwrap();
+    }
+
+    assert_eq!(
+        SPAWN_MARKER_RAN.load(Ordering::SeqCst),
+        2,
+        "spawn roots from different partitions must not share cache entries"
+    );
+    assert_eq!(
+        SPAWN_CHILD_RAN.load(Ordering::SeqCst),
+        2,
+        "spawn children from different partitions must not share cache entries"
     );
 }
 

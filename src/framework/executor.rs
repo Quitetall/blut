@@ -694,6 +694,34 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
             task.input_hash,
             &task.canon_args,
         );
+        // A cache hit is still a materialization of THIS job. Mirror a small
+        // sidecar + cache proof into its stage directory so lineage ingestion
+        // and partition status do not produce artifact-less "done" jobs.
+        let stage_dir = env
+            .job_dir
+            .join("stages")
+            .join(format!("{idx}-{stage_name}"));
+        if let Err(e) = std::fs::create_dir_all(&stage_dir) {
+            tracing::warn!("cache-hit stage dir {}: {e}", stage_dir.display());
+        } else {
+            let output_hash = task
+                .stage
+                .output_content_hash(&hit.artifact)
+                .unwrap_or_else(|| content_hash_from_erased(&hit.artifact));
+            let metadata =
+                ArtifactMetadata::new(hit.artifact.kind.clone(), hit.artifact.schema, output_hash)
+                    .with_stage(stage_name.clone());
+            if let Err(e) = metadata.write_to(&stage_dir.join("output.metadata.json")) {
+                tracing::warn!("cache-hit sidecar {}: {e}", stage_dir.display());
+            }
+            let proof = crate::framework::cache::CacheProof {
+                key: task.key,
+                entry_path: hit.from_path,
+            };
+            if let Err(e) = proof.write_to(&stage_dir.join("cache-proof.json")) {
+                tracing::warn!("cache-hit proof {}: {e}", stage_dir.display());
+            }
+        }
         return Ok(NodeOutcome {
             node_id: task.node_id,
             output: hit.artifact,
@@ -1260,8 +1288,21 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
     // Cache insert — STRICTLY after the atomic promote (the load-bearing
     // FW-2 ordering: the resume oracle appears only once the output is
     // fully in place).
-    if let Err(e) = env.cache.insert(task.key, &output) {
-        tracing::warn!("executor: cache insert for stage '{stage_name}' failed: {e}; continuing");
+    match env.cache.insert(task.key, &output) {
+        Ok(()) => {
+            let proof = crate::framework::cache::CacheProof {
+                key: task.key,
+                entry_path: env.cache.entry_path_for_write(task.key),
+            };
+            if let Err(e) = proof.write_to(&final_stage_dir.join("cache-proof.json")) {
+                tracing::warn!("executor: cache proof for stage '{stage_name}' failed: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "executor: cache insert for stage '{stage_name}' failed: {e}; continuing"
+            );
+        }
     }
 
     env.status.emit(StageEvent::StageEnd {
@@ -1467,12 +1508,13 @@ fn build_task(
     let input = gather_input(node.id, &preds, outputs)?;
     let input_hash = gather_input_hash(node.id, &preds, logical_outputs)?;
     let code_sha = node_code_sha(node.stage.as_ref());
-    let key = CacheHandle::key_for_canon_bytes(
+    let key = CacheHandle::key_for_canon_bytes_partitioned(
         node.stage.name(),
         node.stage.schema(),
         input_hash,
         &node.canon_args,
         &code_sha,
+        node.partition.as_ref(),
     );
     // Resolve retry/timeout: a per-node override wins over the stage const.
     let retry = node.retry.unwrap_or_else(|| node.stage.retry());
@@ -1561,6 +1603,7 @@ fn next_ready(
 #[allow(clippy::too_many_arguments)]
 fn inject_spawn(
     delta: crate::framework::control::SpawnDelta,
+    inherited_partition: Option<blut_types::partition::PartitionKey>,
     orig_n: usize,
     appended: &mut Vec<crate::framework::plan::PlanNode>,
     all_edges: &mut Vec<crate::framework::plan::PlanEdge>,
@@ -1574,10 +1617,16 @@ fn inject_spawn(
 ) -> Result<usize, PlanError> {
     use crate::framework::plan::PlanEdge;
     let crate::framework::control::SpawnDelta {
-        subplan,
+        mut subplan,
         root_seeds,
         ..
     } = delta;
+    // A runtime-created node is still part of the partitioned execution that
+    // created it. Bind the whole sub-plan before extracting its nodes so PBT,
+    // TPE, and map shards cannot reuse another cell's cache entries.
+    if let Some(partition) = inherited_partition {
+        subplan = subplan.with_partition(partition);
+    }
     // Local topo order (also the cycle/empty check) BEFORE we mutate anything.
     let local_order = subplan.topo_order()?;
     let base = (orig_n + appended.len()) as NodeId;
@@ -2101,8 +2150,20 @@ impl ParallelExecutor {
                         );
                         break;
                     }
+                    let inherited_partition = delta
+                        .provenance_parent
+                        .and_then(|parent| {
+                            node_at(&view, &appended, orig_n, parent).partition.clone()
+                        })
+                        .or_else(|| {
+                            view.nodes
+                                .iter()
+                                .chain(appended.iter())
+                                .find_map(|node| node.partition.clone())
+                        });
                     match inject_spawn(
                         delta,
+                        inherited_partition,
                         orig_n,
                         &mut appended,
                         &mut all_edges,

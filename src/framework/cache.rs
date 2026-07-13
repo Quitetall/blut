@@ -123,13 +123,28 @@ impl CacheHandle {
         args: &serde_json::Value,
         code_sha: &[u8],
     ) -> ContentHash {
+        Self::key_for_partitioned(stage_name, stage_schema, input_hash, args, code_sha, None)
+    }
+
+    /// Partition-aware cache identity (ADR 0101). `None` is byte-identical to
+    /// [`Self::key_for`]; a concrete key is appended as the final, domain-
+    /// separated input so cells cannot collide.
+    pub fn key_for_partitioned(
+        stage_name: &str,
+        stage_schema: u32,
+        input_hash: ContentHash,
+        args: &serde_json::Value,
+        code_sha: &[u8],
+        partition: Option<&blut_types::partition::PartitionKey>,
+    ) -> ContentHash {
         let canon = canonical_json(args);
-        Self::key_for_canon_bytes(
+        Self::key_for_canon_bytes_partitioned(
             stage_name,
             stage_schema,
             input_hash,
             canon.as_bytes(),
             code_sha,
+            partition,
         )
     }
 
@@ -143,6 +158,24 @@ impl CacheHandle {
         input_hash: ContentHash,
         canon_args: &[u8],
         code_sha: &[u8],
+    ) -> ContentHash {
+        Self::key_for_canon_bytes_partitioned(
+            stage_name,
+            stage_schema,
+            input_hash,
+            canon_args,
+            code_sha,
+            None,
+        )
+    }
+
+    pub(crate) fn key_for_canon_bytes_partitioned(
+        stage_name: &str,
+        stage_schema: u32,
+        input_hash: ContentHash,
+        canon_args: &[u8],
+        code_sha: &[u8],
+        partition: Option<&blut_types::partition::PartitionKey>,
     ) -> ContentHash {
         // v1→v2 (S4): `code_sha` (build git hash + the stage's script content
         // hash) now keys the cache, so editing a kernel with identical args
@@ -163,6 +196,14 @@ impl CacheHandle {
         hasher.update((code_sha.len() as u64).to_le_bytes());
         hasher.update(code_sha);
         hasher.update(canon_args);
+        if let Some(partition) = partition {
+            let value = serde_json::to_value(partition).expect("PartitionKey serializes");
+            let canonical = canonical_json(&value);
+            hasher.update([0u8]);
+            hasher.update(b"partition");
+            hasher.update((canonical.len() as u64).to_le_bytes());
+            hasher.update(canonical.as_bytes());
+        }
         let arr: [u8; 32] = hasher.finalize().into();
         ContentHash(arr)
     }
@@ -291,6 +332,11 @@ impl CacheHandle {
         Ok(())
     }
 
+    /// Exact local entry path an insert writes for this handle/key.
+    pub(crate) fn entry_path_for_write(&self, key: ContentHash) -> PathBuf {
+        self.write_target().join(key.to_hex()).join("output.bin")
+    }
+
     /// Search order for lookups: global first when `--shared-cache`
     /// promoted it, then job-local. Writes always go to
     /// `write_target` (job-local unless `--shared-cache`).
@@ -388,6 +434,55 @@ fn dir_size(path: &Path) -> std::io::Result<u64> {
 pub struct CacheHit {
     pub artifact: ErasedArtifact,
     pub from_path: PathBuf,
+}
+
+/// Durable proof tying a completed stage to the cache entry that made it
+/// skippable. Written inside the current job's stage dir on both hits and
+/// misses so lineage remains complete for all-cache-hit jobs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CacheProof {
+    pub key: ContentHash,
+    pub entry_path: PathBuf,
+}
+
+impl CacheProof {
+    pub fn write_to(&self, path: &Path) -> std::io::Result<()> {
+        let body = serde_json::to_vec(self).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("serialize cache proof: {e}"),
+            )
+        })?;
+        write_atomic(path, &body)
+    }
+
+    pub fn read_from(path: &Path) -> std::io::Result<Self> {
+        let body = std::fs::read(path)?;
+        serde_json::from_slice(&body).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("parse cache proof: {e}"),
+            )
+        })
+    }
+
+    pub fn is_live(&self) -> bool {
+        let key_hex = self.key.to_hex();
+        if self.entry_path.file_name().and_then(|name| name.to_str()) != Some("output.bin")
+            || self
+                .entry_path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                != Some(key_hex.as_str())
+        {
+            return false;
+        }
+        std::fs::read(&self.entry_path)
+            .ok()
+            .and_then(|body| bincode::deserialize::<ErasedArtifact>(&body).ok())
+            .is_some()
+    }
 }
 
 /// Produce a canonical JSON form: object keys sorted

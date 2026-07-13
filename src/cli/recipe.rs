@@ -411,10 +411,88 @@ pub(super) async fn run_one_recipe(
     let source_args = args.clone();
     let args = crate::registry_args::resolve_recipe_args(args, &tenant, launch_target)
         .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
+    run_one_recipe_resolved(
+        reg,
+        name,
+        source_args,
+        args,
+        sweep_fp,
+        shared_cache,
+        launch_target,
+        device_index,
+        no_cache,
+        tenant,
+        experiment,
+        None,
+    )
+    .await
+    .map(|(job_id, _, _)| job_id)
+}
+
+/// Partition entry point: resolve registry handles exactly once, bind the
+/// typed partition key to every compiled node, and return the exact resolved
+/// args that the executor persisted for lineage indexing.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_one_partitioned_recipe(
+    reg: &crate::framework::Registry,
+    name: &str,
+    source_args: serde_json::Value,
+    shared_cache: bool,
+    launch_target: crate::config::launcher::LaunchTarget,
+    device_index: Option<usize>,
+    no_cache: bool,
+    tenant: crate::tenant::Tenant,
+    partition: blut_types::partition::PartitionKey,
+) -> Result<(String, serde_json::Value, String)> {
+    let resolved_args =
+        crate::registry_args::resolve_recipe_args(source_args.clone(), &tenant, launch_target)
+            .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
+    run_one_recipe_resolved(
+        reg,
+        name,
+        source_args,
+        resolved_args.clone(),
+        None,
+        shared_cache,
+        launch_target,
+        device_index,
+        no_cache,
+        tenant,
+        None,
+        Some(partition),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_one_recipe_resolved(
+    reg: &crate::framework::Registry,
+    name: &str,
+    source_args: serde_json::Value,
+    args: serde_json::Value,
+    sweep_fp: Option<crate::framework::ContentHash>,
+    shared_cache: bool,
+    launch_target: crate::config::launcher::LaunchTarget,
+    device_index: Option<usize>,
+    no_cache: bool,
+    tenant: crate::tenant::Tenant,
+    experiment: Option<String>,
+    partition: Option<blut_types::partition::PartitionKey>,
+) -> Result<(String, serde_json::Value, String)> {
     let r = reg
         .find(name)
         .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
-    let plan = (r.compile_fn)(args.clone()).map_err(|e| anyhow!("recipe compile failed: {e}"))?;
+    let mut plan =
+        (r.compile_fn)(args.clone()).map_err(|e| anyhow!("recipe compile failed: {e}"))?;
+    if let Some(partition) = partition {
+        plan = plan.with_partition(partition);
+    }
+    let persisted_args = plan.recipe_args().clone();
+    let input_fingerprint = crate::config::partition::partition_input_fingerprint_with_execution(
+        &source_args,
+        &persisted_args,
+        &plan.execution_fingerprint(),
+    );
     // A registry recipe CAN resume by name+args (the RecipeMarker is the resume
     // oracle for `blut plan resume`). Declarative `.toml` launches pass `None`
     // (no registry recipe to re-compile from) — see `launch_compiled_plan`.
@@ -435,6 +513,7 @@ pub(super) async fn run_one_recipe(
         experiment,
     )
     .await
+    .map(|job_id| (job_id, persisted_args, input_fingerprint))
 }
 
 /// Compile a declared recipe FILE into a runnable plan, dispatching on its

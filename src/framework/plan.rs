@@ -65,6 +65,10 @@ pub(crate) struct PlanNode {
     /// reorders the ready queue only, never bypassing broker admission, and is
     /// scheduling metadata (NOT part of a node's cache key, like retry/timeout).
     pub priority: Option<i32>,
+    /// Optional partition identity. This is data identity, not scheduling
+    /// metadata: the executor appends it to the cache key after every legacy
+    /// cache-key input. `None` therefore preserves the exact pre-partition key.
+    pub partition: Option<blut_types::partition::PartitionKey>,
 }
 
 /// Per-node execution-control overrides applied after `from_erased_graph`
@@ -88,6 +92,7 @@ impl std::fmt::Debug for PlanNode {
             .field("input_kind", &self.stage.input_kind())
             .field("output_kind", &self.stage.output_kind())
             .field("args", &self.args)
+            .field("partition", &self.partition)
             .finish()
     }
 }
@@ -167,6 +172,7 @@ impl<B: TrainingBackend> Plan<(), B> {
             retry: None,
             timeout: None,
             priority: None,
+            partition: None,
         });
         // Graph input: provide () as the input artifact.
         let unit = ErasedArtifact::from_typed(&()).expect("() always serializes");
@@ -251,6 +257,7 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
             retry: None,
             timeout: None,
             priority: None,
+            partition: None,
         });
         // Edge from each previous leading node to this one. For
         // linear chains this is always one edge; commit 6's
@@ -332,6 +339,7 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
             retry: None,
             timeout: None,
             priority: None,
+            partition: None,
         });
         let r_id = self.nodes.len() as NodeId;
         let r_args_json = serde_json::to_value(&r_args).expect("Stage::Args serialize");
@@ -344,6 +352,7 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
             retry: None,
             timeout: None,
             priority: None,
+            partition: None,
         });
         for &from in &self.leading {
             self.edges.push(PlanEdge { from, to: l_id });
@@ -402,6 +411,7 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
                 retry: None,
                 timeout: None,
                 priority: None,
+                partition: None,
             });
             for &from in &self.leading {
                 self.edges.push(PlanEdge { from, to: id });
@@ -438,6 +448,7 @@ impl<A1: Artifact, A2: Artifact, B: TrainingBackend> Plan<(A1, A2), B> {
             retry: None,
             timeout: None,
             priority: None,
+            partition: None,
         });
         for &from in &self.leading {
             self.edges.push(PlanEdge { from, to: id });
@@ -472,6 +483,7 @@ impl<A1: Artifact, A2: Artifact, A3: Artifact, B: TrainingBackend> Plan<(A1, A2,
             retry: None,
             timeout: None,
             priority: None,
+            partition: None,
         });
         for &from in &self.leading {
             self.edges.push(PlanEdge { from, to: id });
@@ -557,6 +569,7 @@ pub(crate) struct MapExpansion {
 /// A kind-checked map template: like a [`CompiledPlan`] but its single root
 /// consumes a list ELEMENT (kind `elem_kind`) supplied at runtime, so it
 /// carries no `initial` seeding. Cloned per element at expansion time.
+#[derive(Clone)]
 pub(crate) struct CompiledTemplate {
     /// The sole root node (0 predecessors), which takes the element.
     pub root: NodeId,
@@ -598,6 +611,69 @@ impl CompiledPlan {
     }
     pub fn recipe_args(&self) -> &serde_json::Value {
         &self.recipe_args
+    }
+
+    /// Stable identity of the executable graph excluding the logical
+    /// partition key itself. Includes build code, stage-provided external-code
+    /// fingerprints, node args, topology, and runtime map templates. The
+    /// partition status matrix combines this with source/compiled recipe args
+    /// so code drift reads stale exactly as the executor's cache would miss.
+    pub fn execution_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        fn add_node(hasher: &mut Sha256, node: &PlanNode) {
+            hasher.update(node.id.to_le_bytes());
+            hasher.update(node.stage.name().as_bytes());
+            hasher.update([0]);
+            hasher.update(node.stage.schema().to_le_bytes());
+            hasher.update((node.canon_args.len() as u64).to_le_bytes());
+            hasher.update(&node.canon_args);
+            if let Some(code) = node.stage.code_fingerprint() {
+                hasher.update((code.len() as u64).to_le_bytes());
+                hasher.update(code);
+            } else {
+                hasher.update(0u64.to_le_bytes());
+            }
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"blut.plan.execution.v1");
+        hasher.update(env!("BLUT_GIT_HASH").as_bytes());
+        for node in &self.nodes {
+            add_node(&mut hasher, node);
+        }
+        for edge in &self.edges {
+            hasher.update(edge.from.to_le_bytes());
+            hasher.update(edge.to.to_le_bytes());
+        }
+        for expansion in &self.expansions {
+            hasher.update(expansion.parent.to_le_bytes());
+            for node in &expansion.template.nodes {
+                add_node(&mut hasher, node);
+            }
+            for edge in &expansion.template.edges {
+                hasher.update(edge.from.to_le_bytes());
+                hasher.update(edge.to.to_le_bytes());
+            }
+        }
+        faster_hex::hex_string(&hasher.finalize())
+    }
+
+    /// Bind this compiled run to one partition cell.
+    ///
+    /// Partition identity is attached to every node, including nodes inside
+    /// runtime map templates, so no stage can reuse an artifact produced for a
+    /// different cell. Plans default to `None`, which emits no new cache-key
+    /// bytes and preserves the exact pre-partition behavior.
+    pub fn with_partition(mut self, partition: blut_types::partition::PartitionKey) -> Self {
+        for node in &mut self.nodes {
+            node.partition = Some(partition.clone());
+        }
+        for expansion in &mut self.expansions {
+            for node in &mut Arc::make_mut(&mut expansion.template).nodes {
+                node.partition = Some(partition.clone());
+            }
+        }
+        self
     }
 
     /// The plan's runtime `map_output` expansions (ADR 0078). Crate-internal
@@ -865,6 +941,7 @@ impl CompiledPlan {
                 retry: None,
                 timeout: None,
                 priority: None,
+                partition: None,
             });
             if i > 0 {
                 edges.push(PlanEdge {
@@ -1026,6 +1103,7 @@ impl CompiledPlan {
                 retry: None,
                 timeout: None,
                 priority: None,
+                partition: None,
             });
         }
         let plan_edges: Vec<PlanEdge> = edges
@@ -1146,6 +1224,7 @@ impl CompiledPlan {
                 retry: None,
                 timeout: None,
                 priority: None,
+                partition: None,
             })
             .collect();
         let plan_edges: Vec<PlanEdge> = edges
@@ -1568,6 +1647,7 @@ mod tests {
             retry: None,
             timeout: None,
             priority: None,
+            partition: None,
         }
     }
 

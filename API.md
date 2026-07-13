@@ -226,6 +226,17 @@ commands default to the same `default` tenant as recipe launches; records made
 under the older `shared` default remain reachable with explicit `--tenant
 shared`.
 
+`blut partition define` persists a finite set from repeatable `--dim
+axis=v1,v2` flags or a WASM-safe `PartitionSpec` JSON (`time`, `categorical`,
+or `multi`; time windows are UTC and use `--partitions START:END`). `partition
+backfill` accepts explicit keys/first-axis values, an inclusive range,
+`--missing`, or `--stale`. Every selected cell is an ordinary broker-admitted
+recipe run with its `PartitionKey` appended to the cache key; unpartitioned
+keys remain byte-identical. `partition status` derives its five-state matrix
+from the canonical status log plus the rebuildable lineage SQLite index.
+Restricted policy is evaluated per cell: selecting one refuses before launch
+without blocking unrelated safe selector targets.
+
 ## Platform
 
 Containment (per-stage systemd-cgroup `MemoryMax`) requires **Linux + systemd**.
@@ -248,7 +259,9 @@ version while the campaign is in progress.
 - **Types:** `framework::{Plan, CompiledPlan, NodeId, ExecCtx, PlanResult,
   Resource, ContentHash, ArtifactMetadata, StageContext}`,
   `framework::{SequentialExecutor, ParallelExecutor}`,
-  `recipes::recipe::{RecipeDef, Course}`, `error::TrainError`.
+  `recipes::recipe::{RecipeDef, Course}`,
+  `config::partition::{PartitionSpec, PartitionKey, PartitionValue}`,
+  `error::TrainError`.
 - **Error enums (all variants):** `framework::{StageError, PlanError}`,
   `recipes::recipe::RecipeError`.
 - **Macro:** `register_recipe!` and the `RecipeDef` field shape it emits

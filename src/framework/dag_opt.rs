@@ -452,6 +452,7 @@ mod tests {
                 retry: None,
                 timeout: None,
                 priority: None,
+                partition: None,
             })
             .collect();
 
