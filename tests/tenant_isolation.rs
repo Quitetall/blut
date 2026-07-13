@@ -397,6 +397,26 @@ async fn restricted_tenant_is_refused_by_real_coordinator_submit() {
     let visible = refusal.to_string();
     assert!(visible.contains("P2P dispatch DENIED"));
     assert!(!visible.contains("patient-name-must-not-leak"));
+
+    let research = Tenant::parse("research/dev").unwrap();
+    let restricted_request = DispatchRequest {
+        stage_name: "warm_fb_cache",
+        stage_schema: 1,
+        input_hash: ContentHash::of_bytes(b"input"),
+        args_hash: ContentHash::of_bytes(b"args"),
+        args: &args,
+        expected_output_hash: ContentHash::of_bytes(b"output"),
+        resource_request: ResourceRequest::default(),
+        data_class: 2,
+        tenant: &research,
+    };
+    let refusal = match DispatchSubmitter::submit(&coordinator, restricted_request) {
+        Ok(_) => panic!("Restricted data reached the real coordinator dispatch path"),
+        Err(error) => error,
+    };
+    let visible = refusal.to_string();
+    assert!(visible.contains("P2P dispatch DENIED"));
+    assert!(!visible.contains("patient-name-must-not-leak"));
     coordinator.shutdown();
 }
 

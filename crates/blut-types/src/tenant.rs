@@ -28,8 +28,10 @@ impl Default for Tenant {
 
 impl Tenant {
     /// Parse a `project` or `project/domain`. Empty means `default`.
-    /// Segments are restricted to `[A-Za-z0-9_.-]`; empty segments and the
-    /// traversal tokens `.`/`..` are refused.
+    /// Segments are restricted to `[A-Za-z0-9_.-]`; empty segments, the
+    /// traversal tokens `.`/`..`, and leading/trailing dots are refused.
+    /// Dots remain valid inside names such as `model-v1.2`, but never at a
+    /// filesystem-normalized edge where two tenant identities could alias.
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim();
         if s.is_empty() {
@@ -45,6 +47,8 @@ impl Tenant {
             !segment.is_empty()
                 && segment != "."
                 && segment != ".."
+                && !segment.starts_with('.')
+                && !segment.ends_with('.')
                 && segment
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
@@ -141,7 +145,12 @@ mod tests {
         assert!(Tenant::parse("a/b/c").is_none());
         assert!(Tenant::parse("a//b").is_none());
         assert!(Tenant::parse("../etc").is_none());
+        assert!(Tenant::parse(".clinical").is_none());
+        assert!(Tenant::parse("clinical.").is_none());
+        assert!(Tenant::parse("clinical/.prod").is_none());
+        assert!(Tenant::parse("clinical/prod.").is_none());
         assert!(Tenant::parse("a b").is_none());
+        assert!(Tenant::parse("model-v1.2/dev").is_some());
     }
 
     #[test]

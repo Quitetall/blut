@@ -13,7 +13,8 @@ printf '%s' '{"tenant":"research/dev","data_class":"Internal","summary":"run com
 ```
 
 The current executable sink is stdout, which is sufficient for process piping
-and the custody acceptance gate. Webhook/SMTP/SLA sinks remain additive work
-under ADR 0094; each must implement `NotifySink` and therefore pass through the
-same `deliver` chokepoint. This sidecar does not constrain cookbook TUIs or
-their Ratatui architecture.
+and the custody acceptance gate. With `--boundary local`, the caller assumes
+custody of stdout and must not pipe it to an off-box or uncontrolled log sink.
+Webhook/SMTP/SLA sinks remain additive work under ADR 0094; each must implement
+`NotifySink` and therefore pass through the same `deliver` chokepoint. This
+sidecar does not constrain cookbook TUIs or their Ratatui architecture.

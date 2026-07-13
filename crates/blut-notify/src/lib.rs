@@ -62,6 +62,8 @@ impl std::error::Error for NotifyError {}
 
 pub trait NotifySink {
     fn boundary(&self) -> SinkBoundary;
+    /// Deliver an already-authorized envelope. Error strings may reach logs or
+    /// stderr and therefore must never contain envelope fields or payload data.
     fn send(&mut self, envelope: &NotificationEnvelope) -> Result<(), String>;
 }
 

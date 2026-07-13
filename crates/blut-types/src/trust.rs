@@ -58,6 +58,9 @@ impl DispatchMatrix {
         self.allowed[class_index(data)][trust.level() as usize]
     }
 
+    /// Update the serialized policy cell. Restricted-row values are retained
+    /// for wire compatibility, but can never override [`Self::can_dispatch`]'s
+    /// fail-closed custody rule.
     pub fn set(&mut self, data: DataClass, trust: TrustLevel, allowed: bool) {
         self.allowed[class_index(data)][trust.level() as usize] = allowed;
     }
