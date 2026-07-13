@@ -36,6 +36,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, TrainError};
 
+// Device chains in one backfill append concurrently. Hold one process-wide
+// guard and issue one complete record write so formatted JSON cannot interleave
+// at a line boundary inside this process.
+static STATUS_APPEND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// WASM-safe wire contracts are re-exported through the engine so cookbook
 /// crates need only their normal `blut` dependency, not a second direct
 /// dependency on the keystone crate.
@@ -190,27 +195,33 @@ pub fn partition_args_are_restricted(
     if tenant.is_restricted() {
         return true;
     }
-    fn visit(value: &serde_json::Value) -> bool {
+    let mut pending = vec![args];
+    while let Some(value) = pending.pop() {
         match value {
-            serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
-                let key = key.to_ascii_lowercase();
-                (key == "restricted" && value.as_bool() == Some(true))
-                    || (matches!(
-                        key.as_str(),
-                        "classification" | "data_class" | "security_class" | "access_class"
-                    ) && value.as_str().is_some_and(|class| {
-                        matches!(
-                            class.to_ascii_lowercase().as_str(),
-                            "restricted" | "clinical" | "phi"
-                        )
-                    }))
-                    || visit(value)
-            }),
-            serde_json::Value::Array(values) => values.iter().any(visit),
-            _ => false,
+            serde_json::Value::Object(object) => {
+                for (key, value) in object {
+                    let key = key.to_ascii_lowercase();
+                    if (key == "restricted" && value.as_bool() == Some(true))
+                        || (matches!(
+                            key.as_str(),
+                            "classification" | "data_class" | "security_class" | "access_class"
+                        ) && value.as_str().is_some_and(|class| {
+                            matches!(
+                                class.to_ascii_lowercase().as_str(),
+                                "restricted" | "clinical" | "phi"
+                            )
+                        }))
+                    {
+                        return true;
+                    }
+                    pending.push(value);
+                }
+            }
+            serde_json::Value::Array(values) => pending.extend(values),
+            _ => {}
         }
     }
-    visit(args)
+    false
 }
 
 /// Stable identity used by the lineage matrix to decide whether the inputs a
@@ -731,21 +742,26 @@ impl PartitionSet {
 
     /// Append a materialization record (append-only; never rewrites history).
     pub fn record_status(&self, status: &PartitionStatus) -> Result<()> {
+        let _append_guard = STATUS_APPEND_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let path = Self::tenant_status_path(&self.recipe, &self.name, &status.tenant)?;
         let dir = path
             .parent()
             .ok_or_else(|| TrainError::other("partition status path has no parent"))?;
         std::fs::create_dir_all(dir)
             .map_err(|e| TrainError::other(format!("mkdir {dir:?}: {e}")))?;
-        let line = serde_json::to_string(status)
+        let mut line = serde_json::to_vec(status)
             .map_err(|e| TrainError::other(format!("serialize status: {e}")))?;
+        line.push(b'\n');
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .map_err(|e| TrainError::other(format!("open {path:?}: {e}")))?;
-        writeln!(f, "{line}").map_err(|e| TrainError::other(format!("append {path:?}: {e}")))?;
+        f.write_all(&line)
+            .map_err(|e| TrainError::other(format!("append {path:?}: {e}")))?;
         Ok(())
     }
 
@@ -1162,6 +1178,43 @@ mod tests {
         let st = s.statuses().unwrap();
         assert_eq!(st.get(k).unwrap().job_id, "b");
         assert!(st.get(k).unwrap().is_materialized());
+    }
+
+    #[test]
+    fn concurrent_status_appends_preserve_every_jsonl_record() {
+        let _g = tmp_env();
+        let s = set();
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let set = &s;
+                scope.spawn(move || {
+                    for record in 0..64 {
+                        set.record_status(&PartitionStatus {
+                            tenant: crate::tenant::DEFAULT_PROJECT.into(),
+                            key: format!("worker={worker}/record={record}"),
+                            job_id: format!("job-{worker}-{record}"),
+                            outcome: "done".into(),
+                            recorded_at: record,
+                            input_fingerprint: Some(format!("fp-{worker}-{record}")),
+                        })
+                        .unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(s.statuses().unwrap().len(), 4 * 64);
+    }
+
+    #[test]
+    fn restricted_scan_is_iterative_for_deep_programmatic_args() {
+        let mut args = serde_json::json!({"classification": "phi"});
+        for _ in 0..256 {
+            args = serde_json::json!({"nested": args});
+        }
+        assert!(partition_args_are_restricted(
+            &args,
+            &crate::tenant::Tenant::default()
+        ));
     }
 
     #[test]
