@@ -16,8 +16,8 @@ pub enum DataClass {
     /// Proprietary but non-clinical (lab recordings, dev data).
     /// Registered + Trusted peers only.
     Internal,
-    /// Clinical / PHI (hospital EEG, patient records).
-    /// Trusted peers only.
+    /// Clinical / PHI (hospital EEG, patient records). Node-local through M5;
+    /// no peer trust tier may receive it.
     Restricted,
 }
 
@@ -65,6 +65,12 @@ pub struct DispatchMatrix {
 impl DispatchMatrix {
     /// Can a peer with `trust` level compute a task with `data` class?
     pub fn can_dispatch(&self, data: DataClass, trust: TrustLevel) -> bool {
+        // ADR 0096 M2.1: Restricted data may run locally inside its tenant but
+        // cannot leave the owning node through M5. This hard check dominates
+        // even a deserialized/custom matrix with its Restricted cell set true.
+        if data == DataClass::Restricted {
+            return false;
+        }
         let ci = match data {
             DataClass::Public => 0,
             DataClass::Internal => 1,
@@ -93,14 +99,14 @@ impl Default for DispatchMatrix {
     ///                 Anonymous  Registered  Trusted
     /// Public            ✅         ✅          ✅
     /// Internal          ❌         ✅          ✅
-    /// Restricted        ❌         ❌          ✅
+    /// Restricted        ❌         ❌          ❌  (node-local through M5)
     /// ```
     fn default() -> Self {
         Self {
             allowed: [
-                [true, true, true],   // Public → all
-                [false, true, true],  // Internal → Registered + Trusted
-                [false, false, true], // Restricted → Trusted only
+                [true, true, true],    // Public → all
+                [false, true, true],   // Internal → Registered + Trusted
+                [false, false, false], // Restricted → node-local only
             ],
         }
     }
@@ -127,11 +133,18 @@ mod tests {
     }
 
     #[test]
-    fn default_matrix_restricted_trusted_only() {
+    fn restricted_is_node_local_even_for_trusted_or_custom_matrix() {
         let m = DispatchMatrix::default();
         assert!(!m.can_dispatch(DataClass::Restricted, TrustLevel::Anonymous));
         assert!(!m.can_dispatch(DataClass::Restricted, TrustLevel::Registered));
-        assert!(m.can_dispatch(DataClass::Restricted, TrustLevel::Trusted));
+        assert!(!m.can_dispatch(DataClass::Restricted, TrustLevel::Trusted));
+
+        let mut custom = DispatchMatrix::default();
+        custom.set(DataClass::Restricted, TrustLevel::Trusted, true);
+        assert!(
+            !custom.can_dispatch(DataClass::Restricted, TrustLevel::Trusted),
+            "through M5, no custom trust matrix may override Restricted node-local custody"
+        );
     }
 
     #[test]

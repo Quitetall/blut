@@ -79,6 +79,7 @@ let result = ParallelExecutor::execute(plan.into_compiled(), ctx).await?;
 | **Durable resume** | Crash-gated recovery, epoch-level resume |
 | **Observability** | status.jsonl, metric store, lineage index |
 | **TUI cockpit** | default-on `tui` feature; `--no-default-features` for a lean CLI |
+| **Multi-tenancy** | tenant-scoped cache/registry/lineage/privacy, RAM sub-envelopes, Restricted node-local custody |
 
 ### On `main`, unreleased
 
@@ -174,6 +175,12 @@ fn compile(args: TrainArgs) -> Plan<(), MyBackend> {
 // 4. Run it
 blut::cli::run(registry()).await
 ```
+
+Cookbooks may also expose an arbitrary custom TUI. `CookbookTui` only tells the
+engine how to discover and launch it; it does not replace Ratatui or prescribe a
+widget toolkit, event loop, layout, or component model. A cookbook can ship a
+normal Ratatui application or sidecar binary and use BLUT's generic cockpit only
+as an optional fallback.
 
 ## Status
 

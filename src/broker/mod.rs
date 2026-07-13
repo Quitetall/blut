@@ -44,6 +44,7 @@ pub mod admission;
 pub mod footprint;
 pub mod gpu;
 pub mod probe;
+pub mod tenant_quota;
 
 pub use admission::{AdmitDecision, decide, gate};
 pub use footprint::{

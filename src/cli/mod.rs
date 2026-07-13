@@ -1104,20 +1104,36 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             let job_dir =
                 paths::job_dir(&job_id).with_context(|| format!("resolve job dir for {job_id}"))?;
             let marker = RecipeMarker::read_from(&job_dir)?;
+            let tenant = crate::jobs::read_tenant(&job_id)
+                .with_context(|| format!("read tenant for {job_id}"))?;
             let r = reg
                 .find(&marker.name)
                 .ok_or_else(|| anyhow!("recipe '{}' not in catalog", marker.name))?;
             let plan =
                 (r.compile_fn)(marker.args.clone()).map_err(|e| anyhow!("recipe compile: {e}"))?;
+            let footprint = recipe_footprint(&marker.name, &marker.args);
+            let tenant_admission =
+                crate::broker::tenant_quota::TenantAdmission::prepare(tenant.clone())
+                    .map_err(|e| anyhow!("tenant admission: {e}"))?;
 
             let mut ctx = ExecCtx::new(job_dir.clone());
+            ctx = ctx.with_tenant(tenant.clone());
+            if let Some(budget) = tenant_admission
+                .executor_budget_gib(crate::broker::admission::DEFAULT_FLOOR_GIB)
+                .map_err(|e| anyhow!("tenant admission: {e}"))?
+            {
+                ctx = ctx.with_memory_budget(budget);
+            }
             if shared_cache {
                 match CacheHandle::default_global_path() {
                     Some(global) => {
                         std::fs::create_dir_all(&global).with_context(|| {
                             format!("create global cache dir {}", global.display())
                         })?;
-                        let cache_handle = (*ctx.cache).clone().with_global(global);
+                        let cache_handle = (*ctx.cache)
+                            .clone()
+                            .with_global(global)
+                            .with_tenant(&tenant);
                         ctx.cache = std::sync::Arc::new(cache_handle);
                     }
                     None => eprintln!(
@@ -1129,6 +1145,19 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
 
             crate::jobs::write_state(&job_id, JobState::Running)
                 .with_context(|| format!("write Running state for {job_id}"))?;
+
+            let _tenant_reservation = match tenant_admission
+                .reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
+            {
+                Ok(reservation) => reservation,
+                Err(reason) => {
+                    let _ = crate::jobs::write_state(&job_id, JobState::Failed);
+                    return Err(anyhow!(
+                        "resume '{}' admission refused: {reason}",
+                        marker.name
+                    ));
+                }
+            };
 
             // GPU lock — same arbitration as initial runs. Without
             // this, two resumes (or a resume + a fresh recipe run)
@@ -1160,11 +1189,18 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                         "done — {} ingredients, {} cache hits, {} misses, elapsed {:?}",
                         r.n_stages, r.n_cache_hits, r.n_cache_misses, r.elapsed
                     );
+                    if let Err(e) = crate::lineage_db::ingest_job(&job_id, &marker.name, "done") {
+                        tracing::warn!("lineage index {job_id}: {e}");
+                    }
                     Ok(())
                 }
                 Err(e) => {
                     if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
                         tracing::warn!("write Failed state for {job_id}: {se}");
+                    }
+                    if let Err(ie) = crate::lineage_db::ingest_job(&job_id, &marker.name, "failed")
+                    {
+                        tracing::warn!("lineage index {job_id}: {ie}");
                     }
                     // `.context()` (not `anyhow!("...: {e}")`) — preserves `e` as the
                     // source() of the new error, so a StageFailure buried in the

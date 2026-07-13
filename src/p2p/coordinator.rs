@@ -373,6 +373,12 @@ impl crate::framework::executor::DispatchSubmitter for Coordinator {
         &self,
         req: crate::framework::executor::DispatchRequest<'_>,
     ) -> Result<Box<dyn crate::framework::executor::DispatchHandle>, crate::error::TrainError> {
+        if req.tenant.is_restricted() {
+            return Err(TrainError::other(format!(
+                "P2P dispatch DENIED: tenant '{}' is Restricted and node-local through M5",
+                req.tenant
+            )));
+        }
         let task_id = format!("p2p-{}", uuid::Uuid::new_v4());
         let data_class = match req.data_class {
             0 => crate::p2p::trust::DataClass::Public,

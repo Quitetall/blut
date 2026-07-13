@@ -128,11 +128,11 @@ async fn task_result_sign_verify_roundtrip() {
 }
 
 #[tokio::test]
-async fn dispatch_matrix_blocks_restricted_for_anonymous() {
+async fn dispatch_matrix_keeps_restricted_node_local_for_every_trust_tier() {
     let matrix = DispatchMatrix::default();
     assert!(!matrix.can_dispatch(DataClass::Restricted, TrustLevel::Anonymous));
     assert!(!matrix.can_dispatch(DataClass::Restricted, TrustLevel::Registered));
-    assert!(matrix.can_dispatch(DataClass::Restricted, TrustLevel::Trusted));
+    assert!(!matrix.can_dispatch(DataClass::Restricted, TrustLevel::Trusted));
 }
 
 #[tokio::test]

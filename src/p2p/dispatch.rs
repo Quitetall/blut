@@ -65,9 +65,9 @@ pub struct DefaultDispatchPolicy {
     /// Stage names eligible for remote dispatch.
     pub dispatchable_stages: HashSet<String>,
     /// Explicit per-stage data classifications. A stage NOT in this map
-    /// classifies as `DataClass::Restricted` (fail-closed): its data can
-    /// only reach Trusted peers until an operator explicitly declares it
-    /// less sensitive via [`classify`](Self::classify).
+    /// classifies as `DataClass::Restricted` (fail-closed): its data remains
+    /// node-local until an operator explicitly declares it less sensitive via
+    /// [`classify`](Self::classify).
     pub stage_classes: std::collections::HashMap<String, DataClass>,
 }
 
@@ -138,7 +138,7 @@ impl DispatchPolicy for DefaultDispatchPolicy {
 
     fn classify_stage(&self, stage_name: &str, _args: &serde_json::Value) -> DataClass {
         // FAIL-CLOSED: an unclassified stage is treated as Restricted
-        // (Trusted peers only). Defaulting to Public here would silently
+        // (node-local). Defaulting to Public here would silently
         // ship potentially-clinical corpus data to anonymous peers the
         // moment a stage is marked dispatchable. Domain policies override
         // per stage via `classify` (or their own DispatchPolicy impl).
@@ -294,6 +294,21 @@ mod tests {
         let resources = ResourceRequest::default();
         let selected = policy.select_peer("warm_fb_cache", &resources, DataClass::Internal, &peers);
         assert_eq!(selected, Some(registered.id.clone()));
+    }
+
+    #[test]
+    fn select_peer_never_dispatches_restricted_to_trusted_peer() {
+        let mut matrix = DispatchMatrix::default();
+        matrix.set(DataClass::Restricted, TrustLevel::Trusted, true);
+        let policy = DefaultDispatchPolicy::new(matrix);
+        let trusted = make_peer(TrustLevel::Trusted, 1.0);
+        let selected = policy.select_peer(
+            "warm_fb_cache",
+            &ResourceRequest::default(),
+            DataClass::Restricted,
+            &[trusted],
+        );
+        assert!(selected.is_none());
     }
 
     #[test]

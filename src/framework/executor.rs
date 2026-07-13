@@ -87,6 +87,9 @@ pub struct DispatchRequest<'a> {
     pub expected_output_hash: ContentHash,
     pub resource_request: ResourceRequest,
     pub data_class: u8, // 0=Public, 1=Internal, 2=Restricted
+    /// Owning tenant. Dispatchers must refuse restricted tenants even if a
+    /// cookbook accidentally classifies the individual stage as Public.
+    pub tenant: &'a crate::tenant::Tenant,
 }
 
 pub trait DispatchSubmitter: Send + Sync {
@@ -113,6 +116,9 @@ pub struct ResourceRequest {
 pub struct ExecCtx {
     pub job_dir: PathBuf,
     pub cache: Arc<CacheHandle>,
+    /// Owning tenant, threaded into every StageContext and remote-dispatch
+    /// decision. Restricted tenants are node-local through M5.
+    pub tenant: crate::tenant::Tenant,
     /// Status fan-out hub. Subscribe a live receiver via
     /// `ctx.status.subscribe()`; the executor emits through it.
     pub status: Arc<StatusHub>,
@@ -223,6 +229,7 @@ impl ExecCtx {
         Self {
             job_dir,
             cache,
+            tenant: crate::tenant::Tenant::default(),
             status,
             lifecycle_rx: Some(lifecycle_rx),
             cancel,
@@ -257,6 +264,12 @@ impl ExecCtx {
     /// Place stages on `target` (#3). Default `Local`.
     pub fn with_launch_target(mut self, target: crate::config::launcher::LaunchTarget) -> Self {
         self.launch_target = target;
+        self
+    }
+
+    /// Bind this execution to a tenant (ADR 0096).
+    pub fn with_tenant(mut self, tenant: crate::tenant::Tenant) -> Self {
+        self.tenant = tenant;
         self
     }
 
@@ -418,6 +431,7 @@ fn strict_advisory() -> bool {
 struct NodeEnv {
     job_dir: PathBuf,
     cache: Arc<CacheHandle>,
+    tenant: crate::tenant::Tenant,
     status: Arc<StatusHub>,
     cancel: CancellationToken,
     resources: HashMap<Resource, Arc<tokio::sync::Semaphore>>,
@@ -772,6 +786,7 @@ async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, Node
             status_tx: env.status.broadcast_sender(),
             cancel: stage_cancel.clone(),
             cache: env.cache.clone(),
+            tenant: env.tenant.clone(),
             recipe_name: env.recipe_name.clone(),
             launch_target: env.launch_target,
             device_index: env.device_index,
@@ -1684,6 +1699,7 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
     let env = Arc::new(NodeEnv {
         job_dir: ctx.job_dir,
         cache: ctx.cache,
+        tenant: ctx.tenant,
         status: ctx.status,
         cancel: ctx.cancel,
         resources: ctx.resources,
@@ -2182,7 +2198,11 @@ impl ParallelExecutor {
                     if let (Some(policy), Some(dispatcher)) =
                         (env.dispatch_policy.as_ref(), env.dispatcher.as_ref())
                     {
-                        if policy.is_dispatchable(task.stage.name()) {
+                        // Restricted tenant custody dominates a cookbook's data
+                        // classification. Even a buggy/custom policy that labels
+                        // a clinical stage Public cannot move it off-node.
+                        if !env.tenant.is_restricted() && policy.is_dispatchable(task.stage.name())
+                        {
                             let args_hash = ContentHash::of_bytes(&task.canon_args);
                             let stage_resources = task.stage.resources();
                             let has_gpu = stage_resources.contains(&Resource::Gpu);
@@ -2203,6 +2223,7 @@ impl ParallelExecutor {
                                 expected_output_hash: task.key,
                                 resource_request,
                                 data_class,
+                                tenant: &env.tenant,
                             };
                             match dispatcher.submit(request) {
                                 Ok(handle) => {

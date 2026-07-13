@@ -37,6 +37,7 @@ use crate::p2p::crypto::{self, KeyPair};
 use crate::p2p::dispatch::DispatchPolicy;
 use crate::p2p::task::{TaskManifest, TaskResult};
 use crate::p2p::transport::{self, MAX_BLOB_SIZE, P2pClient};
+use crate::p2p::trust::DataClass;
 
 /// The coordinator's public identity a peer needs to trust a dispatch and reply.
 pub struct CoordinatorKeys {
@@ -165,6 +166,15 @@ async fn execute_one(
     if task.coordinator_id != PeerId::from_pubkey(&coordinator.verifying) {
         return Err(TrainError::other(
             "task coordinator_id != connected coordinator",
+        ));
+    }
+    // Defense in depth at the receiving mesh boundary. The coordinator's
+    // DispatchMatrix already refuses Restricted tasks, but a malicious or stale
+    // coordinator could send a correctly signed manifest directly. Through M5,
+    // Restricted data is node-local regardless of peer trust or encryption.
+    if task.data_class == DataClass::Restricted {
+        return Err(TrainError::other(
+            "remote task DENIED: Restricted data is node-local through M5 (ADR 0096)",
         ));
     }
     // Belt-and-suspenders: sign_payload() now covers `args` directly (a prior

@@ -72,6 +72,10 @@ pub(super) enum HpoCommand {
         /// Placement: local (default) | slurm | ray (per-trial; see `recipe run`).
         #[arg(long, default_value = "local")]
         launcher: String,
+        /// Tenant (`project[/domain]`, ADR 0096) that owns this HPO job, cache,
+        /// lineage row, and RAM sub-envelope.
+        #[arg(long, default_value = "default")]
+        tenant: String,
     },
     /// Leaderboard for an HPO job: per-trial best objective + status, sorted
     /// best-first. Reconstructed from `<job_dir>/hpo.json` + the durable
@@ -124,6 +128,7 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
         percentile,
         shared_cache,
         launcher,
+        tenant,
     } = cmd
     else {
         unreachable!("non-Run HpoCommand variants dispatched above")
@@ -169,6 +174,10 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
 
     let launch_target: crate::config::launcher::LaunchTarget =
         launcher.parse().map_err(|e| anyhow!("{e}"))?;
+    let tenant = crate::tenant::Tenant::parse(&tenant)
+        .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
+    let tenant_admission = crate::broker::tenant_quota::TenantAdmission::prepare(tenant.clone())
+        .map_err(|e| anyhow!("tenant admission: {e}"))?;
 
     // Fan-out: N sampled trials → one merged plan.
     let (plan, trials) = crate::hpo::plan_build::build_hpo_plan(
@@ -202,7 +211,9 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
         });
     let job_id = crate::jobs::new_job_id();
     let job_dir = crate::paths::job_dir(&job_id)?;
+    crate::jobs::write_tenant(&job_id, &tenant)?;
     let mut ctx = ExecCtx::new(job_dir.clone());
+    ctx = ctx.with_tenant(tenant.clone());
 
     // Trial→topo map, computed ONCE: the executor emits a StageStep's topo
     // `node_idx`, and both the early-stop scheduler (below) and `blut hpo
@@ -244,13 +255,11 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
             .write_to(&job_dir)
             .with_context(|| format!("write hpo manifest for {job_id}"))?;
     }
+    if let Some(budget) = tenant_admission
+        .executor_budget_gib(crate::broker::admission::DEFAULT_FLOOR_GIB)
+        .map_err(|e| anyhow!("tenant admission: {e}"))?
     {
-        let snap = crate::broker::ResourceSnapshot::probe();
-        if snap.mem_total_gb > 0.0 {
-            let box_fit =
-                (snap.mem_total_gb - crate::broker::admission::DEFAULT_FLOOR_GIB).max(1.0) as u32;
-            ctx = ctx.with_memory_budget(box_fit);
-        }
+        ctx = ctx.with_memory_budget(budget);
     }
     ctx = ctx.with_launch_target(launch_target);
     ctx = ctx.with_fb_warm(crate::broker::Drivers::from_args_json(&base_args).warm);
@@ -258,7 +267,10 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
         if let Some(global) = crate::framework::CacheHandle::default_global_path() {
             std::fs::create_dir_all(&global)
                 .with_context(|| format!("create global cache dir {}", global.display()))?;
-            let cache_handle = (*ctx.cache).clone().with_global(global);
+            let cache_handle = (*ctx.cache)
+                .clone()
+                .with_global(global)
+                .with_tenant(&tenant);
             ctx.cache = std::sync::Arc::new(cache_handle);
         }
     }
@@ -441,11 +453,15 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
     // Admission gate on a SINGLE trial's footprint — the executor's per-stage
     // memory admission gates concurrency ACROSS trials, so the box can't OOM
     // even with the full fan-out in flight (never-OOM-the-box, unchanged).
-    if let Err(reason) = crate::broker::gate(&format!("hpo '{name}'"), &footprint) {
-        crate::python_kill::unbind_current_job();
-        let _ = crate::jobs::write_state(&job_id, JobState::Failed);
-        return Err(anyhow!("{reason}"));
-    }
+    let _tenant_reservation =
+        match tenant_admission.reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB) {
+            Ok(reservation) => reservation,
+            Err(reason) => {
+                crate::python_kill::unbind_current_job();
+                let _ = crate::jobs::write_state(&job_id, JobState::Failed);
+                return Err(anyhow!("hpo '{name}' admission refused: {reason}"));
+            }
+        };
     let lock =
         match scheduler_lock::acquire_exclusive(format!("blut-hpo:{job_id}"), LockKind::Training) {
             Ok(l) => l,
@@ -467,6 +483,9 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
         Ok(_) => {
             crate::jobs::write_state(&job_id, JobState::Done)
                 .with_context(|| format!("write Done state for {job_id}"))?;
+            if let Err(e) = crate::lineage_db::ingest_job(&job_id, &name, "done") {
+                tracing::warn!("lineage index {job_id}: {e}");
+            }
             eprintln!(
                 "hpo done: {} trials ran (job {job_id}). Leaderboard: `blut hpo show {job_id}`; \
                  winning config: `blut hpo best {job_id}`.",
@@ -476,6 +495,9 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
         }
         Err(e) => {
             let _ = crate::jobs::write_state(&job_id, JobState::Failed);
+            if let Err(ie) = crate::lineage_db::ingest_job(&job_id, &name, "failed") {
+                tracing::warn!("lineage index {job_id}: {ie}");
+            }
             // See the `plan execution failed` site in `run_plan_cmd` — same
             // chain-preservation rationale (ADR 0072 A2).
             Err(anyhow::Error::from(e).context("hpo plan execution failed"))

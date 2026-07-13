@@ -33,6 +33,12 @@ crates that depend on `blut`.
 
 See `examples/first_cookbook.rs` for one of each, runnable.
 
+A cookbook's optional `CookbookTui` is discovery/lifecycle glue, not a widget
+framework. It may launch any normal Ratatui application or sidecar binary with
+its own event loop, layout, component model, and dependency choices. The generic
+BLUT cockpit is only a fallback; cookbook authors do not rewrite bespoke TUIs in
+BLUT-owned widgets.
+
 ## Framework (`framework/`) — the engine
 
 | Item | Role |
@@ -135,6 +141,25 @@ freezes a composed tree to JSON + a content fingerprint; `config::sweep` expands
 `RayJobSubmit` are present but deferred) builds the OS command, optionally inside
 a resource-capped systemd unit.
 
+`config::tenants::TenantQuotaPolicy` loads `$BLUT_TENANTS_CONFIG` or
+`~/.config/blut/tenants.toml`. One file chooses either static equal shares:
+
+```toml
+tenants = ["research/dev", "clinical/prod"]
+```
+
+or explicit fractions:
+
+```toml
+[fractions]
+"research/dev" = 0.75
+"clinical/prod" = 0.25
+```
+
+Without a file, only `default` exists and owns 100% of usable RAM. Explicit
+files fail closed on malformed/duplicate tenants, invalid or overcommitted
+fractions, mixed modes, and unknown launch tenants.
+
 ## Broker (`broker/`) — never-OOM admission
 
 `broker::{decide, Drivers, Footprint, FootprintStore}` size a per-stage RAM
@@ -145,6 +170,14 @@ not admitted-then-killed. A recipe invoked with **no args** is billed a light
 base footprint (a heavy data-trainer always declares required args); everything
 else uses the conservative `Drivers` estimate. A first-class **per-recipe
 declared footprint** is a planned post-1.0 addition (see "Not yet stable").
+
+`broker::tenant_quota::TenantQuotaTracker` atomically reserves each admitted
+job's resolved footprint against its tenant sub-envelope. Its RAII reservation
+releases on success, error, cancellation, or unwind. The executor memory
+semaphore is also sized to that tenant ceiling, so one HPO/wide-DAG job cannot
+exceed its share through concurrent stages. `ExecCtx::with_tenant` threads the
+same tenant into every `StageContext`; cookbook persistence and sidecars should
+scope themselves with `ctx.tenant`.
 
 ## Backends (`backends/`)
 
@@ -159,6 +192,7 @@ refuses to wire a stage tagged for a different backend.
 |---|---|
 | `hpo` | hyperparameter search (TPE / median / PBT samplers + schedulers) over a recipe |
 | `lineage_db` | content-addressed artifact lineage index |
+| `tenant` | validated `project[/domain]` isolation axis; `clinical`/`restricted` are sealed |
 | `datasets_db` | dataset registry |
 | `sensor`, `schedule`, `policy` | named freshness sensors, systemd-timer schedules, the auto-retrain policy |
 | `config::launcher::Launcher` | placement abstraction (local / cluster) |

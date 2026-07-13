@@ -148,6 +148,10 @@ pub struct StageContext {
     pub cancel: CancellationToken,
     /// Cache handle for read/write.
     pub cache: Arc<CacheHandle>,
+    /// Owning tenant for this invocation (ADR 0096). Cookbook stages and
+    /// sidecars use this single axis for tenant-scoped persistence and egress
+    /// policy. Defaults to the flat `default` namespace in test/legacy paths.
+    pub tenant: crate::tenant::Tenant,
     /// Name of the RECIPE this plan was compiled from (ADR 0046
     /// slice-2). Threaded from the plan so a train stage can build the
     /// SAME `broker::FootprintKey` the cli admission gate resolves under
@@ -222,6 +226,7 @@ impl StageContext {
             status_tx: crate::framework::status::make_broadcast(),
             cancel: CancellationToken::new(),
             cache: Arc::new(CacheHandle::job_local(PathBuf::from("/tmp/_cache_test"))),
+            tenant: crate::tenant::Tenant::default(),
             recipe_name: String::new(),
             launch_target: crate::config::launcher::LaunchTarget::Local,
             device_index: None,
@@ -256,6 +261,7 @@ impl StageContext {
             status_tx: crate::framework::status::make_broadcast(),
             cancel: CancellationToken::new(),
             cache,
+            tenant: crate::tenant::Tenant::default(),
             recipe_name: String::new(),
             launch_target: crate::config::launcher::LaunchTarget::Local,
             device_index: None,

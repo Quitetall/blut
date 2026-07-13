@@ -21,7 +21,7 @@
 //! [`record`]: PrivacyLedger::record
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,8 @@ use crate::p2p::trust::DataClass;
 
 /// Domain-separation tag for a ledger round's signature.
 const LEDGER_SIG_DOMAIN: &[u8] = b"blut-privacy-ledger-v1";
+const LEDGER_SIG_DOMAIN_V2: &[u8] = b"blut-privacy-ledger-v2";
+const LEDGER_SCHEMA_V2: u32 = 2;
 
 /// The DP configuration a gradient-bearing task must carry. `noise_multiplier`
 /// is the Gaussian-mechanism σ; it MUST be > 0 (DP is mandatory — zero noise is
@@ -89,16 +91,65 @@ impl LedgerRound {
         buf
     }
 
+    fn signing_bytes_v2(
+        tenant: &str,
+        corpus_id: &str,
+        epsilon_cost: f64,
+        index: u64,
+        prev_hash: &ContentHash,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(LEDGER_SIG_DOMAIN_V2);
+        buf.extend_from_slice(&(tenant.len() as u64).to_le_bytes());
+        buf.extend_from_slice(tenant.as_bytes());
+        buf.extend_from_slice(&(corpus_id.len() as u64).to_le_bytes());
+        buf.extend_from_slice(corpus_id.as_bytes());
+        buf.extend_from_slice(&epsilon_cost.to_le_bytes());
+        buf.extend_from_slice(&index.to_le_bytes());
+        buf.extend_from_slice(&prev_hash.0);
+        buf
+    }
+
+    fn signing_bytes_for(
+        schema_version: u32,
+        tenant: &str,
+        corpus_id: &str,
+        epsilon_cost: f64,
+        index: u64,
+        prev_hash: &ContentHash,
+    ) -> Result<Vec<u8>, TrainError> {
+        match schema_version {
+            1 => Ok(Self::signing_bytes(
+                corpus_id,
+                epsilon_cost,
+                index,
+                prev_hash,
+            )),
+            LEDGER_SCHEMA_V2 => Ok(Self::signing_bytes_v2(
+                tenant,
+                corpus_id,
+                epsilon_cost,
+                index,
+                prev_hash,
+            )),
+            other => Err(TrainError::other(format!(
+                "privacy ledger schema v{other} is unsupported"
+            ))),
+        }
+    }
+
     /// This round's hash, chaining the next round's `prev_hash`.
-    fn hash(&self) -> ContentHash {
-        let mut bytes = Self::signing_bytes(
+    fn hash(&self, schema_version: u32, tenant: &str) -> Result<ContentHash, TrainError> {
+        let mut bytes = Self::signing_bytes_for(
+            schema_version,
+            tenant,
             &self.corpus_id,
             self.epsilon_cost,
             self.index,
             &self.prev_hash,
-        );
+        )?;
         bytes.extend_from_slice(&self.signature.to_bytes());
-        ContentHash::of_bytes(&bytes)
+        Ok(ContentHash::of_bytes(&bytes))
     }
 }
 
@@ -117,25 +168,73 @@ pub struct CorpusBudget {
 pub struct PrivacyLedger {
     #[serde(skip)]
     path: PathBuf,
+    /// v1 omitted tenant from signed rounds. New ledgers use v2, which binds
+    /// every round and hash-chain edge to the owning tenant. Missing = legacy v1.
+    #[serde(default = "legacy_ledger_schema")]
+    schema_version: u32,
+    /// Owning tenant (`project[/domain]`). Missing on legacy ledgers means the
+    /// flat `default` namespace. Enforcement loaders require an exact match.
+    #[serde(default = "default_tenant_label")]
+    tenant: String,
     budgets: HashMap<String, CorpusBudget>,
     rounds: Vec<LedgerRound>,
+}
+
+fn default_tenant_label() -> String {
+    crate::tenant::Tenant::default().to_string()
+}
+
+fn legacy_ledger_schema() -> u32 {
+    1
 }
 
 impl PrivacyLedger {
     /// A new empty ledger backed by `path`.
     pub fn new(path: PathBuf) -> Self {
+        Self::new_for_tenant(path, &crate::tenant::Tenant::default())
+    }
+
+    /// A new empty ledger bound to `tenant`.
+    pub fn new_for_tenant(path: PathBuf, tenant: &crate::tenant::Tenant) -> Self {
         Self {
             path,
+            schema_version: LEDGER_SCHEMA_V2,
+            tenant: tenant.to_string(),
             budgets: HashMap::new(),
             rounds: Vec::new(),
         }
     }
 
+    /// Canonical ledger path below a P2P state root. `default` keeps the legacy
+    /// flat path; every other tenant gets a disjoint namespace prefix.
+    pub fn path_for_tenant(root: &Path, tenant: &crate::tenant::Tenant) -> PathBuf {
+        if tenant.is_default() {
+            root.join("privacy_ledger.json")
+        } else {
+            root.join(tenant.as_path()).join("privacy_ledger.json")
+        }
+    }
+
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
     /// Load a ledger from disk (empty if absent), VERIFYING the signed chain
     /// against `owner`. A tampered or forged chain is rejected fail-closed.
     pub fn load(path: PathBuf, owner: &VerifyingKey) -> Result<Self, TrainError> {
+        Self::load_for_tenant(path, owner, &crate::tenant::Tenant::default())
+    }
+
+    /// Load and verify a ledger for an exact tenant. A valid signed chain under
+    /// another tenant is still refused: cryptographic ownership does not grant a
+    /// cross-namespace read.
+    pub fn load_for_tenant(
+        path: PathBuf,
+        owner: &VerifyingKey,
+        expected_tenant: &crate::tenant::Tenant,
+    ) -> Result<Self, TrainError> {
         if !path.exists() {
-            return Ok(Self::new(path));
+            return Ok(Self::new_for_tenant(path, expected_tenant));
         }
         let data = std::fs::read_to_string(&path).map_err(|e| TrainError::Io {
             path: path.clone(),
@@ -145,6 +244,7 @@ impl PrivacyLedger {
             TrainError::other(format!("corrupt privacy ledger {}: {e}", path.display()))
         })?;
         ledger.path = path;
+        ledger.verify_tenant(expected_tenant)?;
         ledger.verify_chain(owner)?;
         Ok(ledger)
     }
@@ -169,8 +269,16 @@ impl PrivacyLedger {
     /// ENFORCES the budget must go through [`load`](Self::load) +
     /// [`verify_chain`](Self::verify_chain) instead.
     pub fn load_readonly(path: PathBuf) -> Result<Self, TrainError> {
+        Self::load_readonly_for_tenant(path, &crate::tenant::Tenant::default())
+    }
+
+    /// Read-only display load with the same tenant boundary as enforcement.
+    pub fn load_readonly_for_tenant(
+        path: PathBuf,
+        expected_tenant: &crate::tenant::Tenant,
+    ) -> Result<Self, TrainError> {
         if !path.exists() {
-            return Ok(Self::new(path));
+            return Ok(Self::new_for_tenant(path, expected_tenant));
         }
         let data = std::fs::read_to_string(&path).map_err(|e| TrainError::Io {
             path: path.clone(),
@@ -180,7 +288,26 @@ impl PrivacyLedger {
             TrainError::other(format!("corrupt privacy ledger {}: {e}", path.display()))
         })?;
         ledger.path = path;
+        ledger.verify_tenant(expected_tenant)?;
         Ok(ledger)
+    }
+
+    fn verify_tenant(&self, expected: &crate::tenant::Tenant) -> Result<(), TrainError> {
+        let actual = crate::tenant::Tenant::parse(&self.tenant)
+            .filter(|tenant| tenant.to_string() == self.tenant)
+            .ok_or_else(|| {
+                TrainError::other(format!(
+                    "privacy ledger has invalid tenant '{}' (fail-closed)",
+                    self.tenant
+                ))
+            })?;
+        if &actual != expected {
+            return Err(TrainError::other(format!(
+                "privacy ledger tenant mismatch: stored '{}' != requested '{}' (cross-tenant read denied)",
+                actual, expected
+            )));
+        }
+        Ok(())
     }
 
     /// `(corpus_id, ε spent, ε budget)` for every known corpus — for read-only
@@ -235,14 +362,20 @@ impl PrivacyLedger {
     ) -> Result<(), TrainError> {
         self.admit(corpus_id, cost)?;
         let index = self.rounds.len() as u64;
-        let prev_hash = self
-            .rounds
-            .last()
-            .map(|r| r.hash())
-            .unwrap_or(ContentHash([0u8; 32]));
-        let sig = owner.sign(&LedgerRound::signing_bytes(
-            corpus_id, cost, index, &prev_hash,
-        ));
+        let prev_hash = if let Some(round) = self.rounds.last() {
+            round.hash(self.schema_version, &self.tenant)?
+        } else {
+            ContentHash([0u8; 32])
+        };
+        let signing_bytes = LedgerRound::signing_bytes_for(
+            self.schema_version,
+            &self.tenant,
+            corpus_id,
+            cost,
+            index,
+            &prev_hash,
+        )?;
+        let sig = owner.sign(&signing_bytes);
         self.rounds.push(LedgerRound {
             corpus_id: corpus_id.to_string(),
             epsilon_cost: cost,
@@ -260,6 +393,12 @@ impl PrivacyLedger {
     /// Verify the whole signed chain against `owner`: every round's signature,
     /// its monotonic index, and its `prev_hash` linkage. Any break ⇒ error.
     pub fn verify_chain(&self, owner: &VerifyingKey) -> Result<(), TrainError> {
+        if !matches!(self.schema_version, 1 | LEDGER_SCHEMA_V2) {
+            return Err(TrainError::other(format!(
+                "privacy ledger schema v{} is unsupported",
+                self.schema_version
+            )));
+        }
         let mut prev = ContentHash([0u8; 32]);
         for (i, round) in self.rounds.iter().enumerate() {
             if round.index != i as u64 {
@@ -273,24 +412,33 @@ impl PrivacyLedger {
                     "privacy ledger: round {i} prev_hash chain break"
                 )));
             }
-            let bytes = LedgerRound::signing_bytes(
+            let bytes = LedgerRound::signing_bytes_for(
+                self.schema_version,
+                &self.tenant,
                 &round.corpus_id,
                 round.epsilon_cost,
                 round.index,
                 &round.prev_hash,
-            );
+            )?;
             if !verify(owner, &bytes, &round.signature) {
                 return Err(TrainError::other(format!(
                     "privacy ledger: round {i} signature invalid (tampered?)"
                 )));
             }
-            prev = round.hash();
+            prev = round.hash(self.schema_version, &self.tenant)?;
         }
         Ok(())
     }
 
     /// Persist to disk (atomic temp + rename).
     pub fn save(&self) -> Result<(), TrainError> {
+        let tenant = crate::tenant::Tenant::parse(&self.tenant).ok_or_else(|| {
+            TrainError::other(format!(
+                "privacy ledger has invalid tenant '{}' (refusing save)",
+                self.tenant
+            ))
+        })?;
+        self.verify_tenant(&tenant)?;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| TrainError::Io {
                 path: parent.to_path_buf(),
@@ -604,6 +752,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_v1_default_ledger_still_reloads() {
+        let kp = KeyPair::generate();
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("legacy-ledger.json");
+        let mut ledger = PrivacyLedger::new(path.clone());
+        ledger.schema_version = 1;
+        ledger.set_budget("c", 2.0);
+        ledger.record("c", 0.5, &kp).unwrap();
+        ledger.save().unwrap();
+
+        let loaded = PrivacyLedger::load(path, &kp.verifying).unwrap();
+        assert_eq!(loaded.schema_version, 1);
+        assert_eq!(loaded.tenant(), "default");
+        assert_eq!(loaded.rounds.len(), 1);
+    }
+
+    #[test]
     fn reload_with_wrong_owner_is_rejected() {
         let kp = KeyPair::generate();
         let wrong = KeyPair::generate();
@@ -614,5 +779,35 @@ mod tests {
         l.record("c", 1.0, &kp).unwrap();
         l.save().unwrap();
         assert!(PrivacyLedger::load(path, &wrong.verifying).is_err());
+    }
+
+    #[test]
+    fn ledger_is_tenant_bound_and_cross_tenant_load_is_refused() {
+        let kp = KeyPair::generate();
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path().join("p2p");
+        let clinical = crate::tenant::Tenant::parse("clinical/prod").unwrap();
+        let research = crate::tenant::Tenant::parse("research/dev").unwrap();
+        let path = PrivacyLedger::path_for_tenant(&root, &clinical);
+        assert!(path.ends_with("clinical/prod/privacy_ledger.json"));
+
+        let mut ledger = PrivacyLedger::new_for_tenant(path.clone(), &clinical);
+        ledger.set_budget("corpus", 5.0);
+        ledger.record("corpus", 1.0, &kp).unwrap();
+        ledger.save().unwrap();
+
+        let loaded = PrivacyLedger::load_for_tenant(path.clone(), &kp.verifying, &clinical)
+            .expect("owning tenant can load its ledger");
+        assert_eq!(loaded.tenant(), "clinical/prod");
+        let mut relabeled = loaded.clone();
+        relabeled.tenant = "research/dev".into();
+        assert!(
+            relabeled.verify_chain(&kp.verifying).is_err(),
+            "v2 round signatures must bind the tenant label"
+        );
+        assert!(
+            PrivacyLedger::load_for_tenant(path, &kp.verifying, &research).is_err(),
+            "a tenant ledger must never load into another tenant's namespace"
+        );
     }
 }

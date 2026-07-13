@@ -14,6 +14,7 @@ pub mod launcher;
 pub mod partition;
 pub mod sweep;
 pub mod sweep_index;
+pub mod tenants;
 
 // Native, blut-owned Hydra-style compose (replaces the former `lerna`
 // git-dependency so the engine can publish to crates.io). See `hydra.rs`.

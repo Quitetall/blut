@@ -26,6 +26,7 @@ use crate::error::{Result, TrainError};
 use crate::paths;
 use crate::protocol::StatusUpdate;
 use crate::spec::TrainSpec;
+use crate::tenant::Tenant;
 
 /// Compact, sortable job id: `YYYYMMDD-HHMMSS-NNNNNNNNN`.
 ///
@@ -103,6 +104,41 @@ pub fn read_spec(job_id: &str) -> Result<TrainSpec> {
         source: e,
     })?;
     serde_json::from_slice(&body).map_err(|e| TrainError::other(format!("parse spec.json: {e}")))
+}
+
+/// Persist the owning tenant beside the job's other canonical filesystem
+/// records. Lineage is a rebuildable index, so it must be able to recover the
+/// tenant from disk rather than from an in-memory launch argument.
+pub fn write_tenant(job_id: &str, tenant: &Tenant) -> Result<()> {
+    let path = paths::job_dir(job_id)?.join("tenant");
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, tenant.to_string()).map_err(|source| TrainError::Io {
+        path: tmp.clone(),
+        source,
+    })?;
+    std::fs::rename(&tmp, &path).map_err(|source| TrainError::Io { path, source })
+}
+
+/// Read a job's owning tenant. Jobs created before ADR 0096 have no marker and
+/// belong to the flat `default` namespace. A present but invalid marker is
+/// refused fail-closed; it is never silently coerced to default.
+pub fn read_tenant(job_id: &str) -> Result<Tenant> {
+    let path = paths::job_dir(job_id)?.join("tenant");
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Tenant::default()),
+        Err(source) => return Err(TrainError::Io { path, source }),
+    };
+    let label = body.trim();
+    Tenant::parse(label)
+        .filter(|tenant| tenant.to_string() == label)
+        .ok_or_else(|| {
+            TrainError::other(format!(
+                "invalid tenant marker '{}' at {}",
+                label,
+                path.display()
+            ))
+        })
 }
 
 /// `status.jsonl` rotation threshold in bytes. `LAMU_STATUS_MAX_MB`

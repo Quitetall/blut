@@ -964,6 +964,7 @@ impl LineageDb {
 pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
     let db = LineageDb::open()?;
     let snap = crate::broker::ResourceSnapshot::probe();
+    let tenant = crate::jobs::read_tenant(job_id)?;
     db.record_run(&RunRow {
         job_id: job_id.to_string(),
         recipe: recipe.to_string(),
@@ -976,9 +977,7 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
         gpu_name: None,
         ram_gib: Some(snap.mem_total_gb as i64),
         vram_mib: snap.vram_total_mib.map(|v| v as i64),
-        // ADR 0096: threading the run's actual tenant into lineage ingestion is a
-        // follow-up; empty ⇒ `default` (record_run coerces).
-        tenant: String::new(),
+        tenant: tenant.to_string(),
     })?;
     for rec in crate::framework::lineage::scan_artifacts(job_id)?.into_iter() {
         db.record_artifact(&ArtifactRow {

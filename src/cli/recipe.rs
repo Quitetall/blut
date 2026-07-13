@@ -49,9 +49,9 @@ pub(super) enum RecipeCommand {
         /// runs even with a warm entry (only with `--run`). Alias: `--force`.
         #[arg(long = "no-cache", alias = "force", default_value_t = false)]
         no_cache: bool,
-        /// Tenant to resolve a `registry://plan@<name>` deploy URI against
-        /// (ADR 0085; default `shared`). Ignored for file recipes.
-        #[arg(long, default_value = "shared")]
+        /// Tenant to resolve a `registry://plan@<name>` deploy URI against and,
+        /// with `--run`, to own the launched job (ADR 0085/0096).
+        #[arg(long, default_value = "default")]
         tenant: String,
     },
     /// Execute a recipe, or a config-driven sweep over it.
@@ -283,6 +283,12 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             // ADR 0096: parse the tenant up front (same fail-fast discipline).
             let tenant = crate::tenant::Tenant::parse(&tenant)
                 .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
+            // M2.1: fail before compilation or job-dir creation when the tenant
+            // is unknown to the active quota policy. With no config, only the
+            // flat `default` tenant exists and owns 100% of usable RAM.
+            crate::config::tenants::TenantQuotaPolicy::load()?
+                .fraction_for(&tenant)
+                .map_err(|e| anyhow!("{e}"))?;
             // Any of these put us in config mode — so a stray --set / --config-key
             // can't be silently dropped (run_recipe_sweep then errors cleanly if
             // --config-dir/--config-name are missing).
@@ -562,6 +568,13 @@ pub(super) async fn launch_compiled_plan(
 ) -> Result<String> {
     use crate::framework::ExecCtx;
 
+    // Validate quota configuration and resolve the tenant BEFORE creating any
+    // job state. This function is also called by declarative and sweep paths,
+    // so it is the authoritative enforcement seam even when a caller bypasses
+    // the `recipe run` command arm's earlier UX-oriented check.
+    let tenant_admission = crate::broker::tenant_quota::TenantAdmission::prepare(tenant.clone())
+        .map_err(|e| anyhow!("tenant admission: {e}"))?;
+
     // ADR 0046 slice-1: resolve the RAM footprint from the recipe's DEFAULTED
     // args (the plan re-serialized them with serde defaults applied) — NOT raw
     // user args — so a defaulted driver like `warm_fb_cache` (Phase 3) and
@@ -586,17 +599,21 @@ pub(super) async fn launch_compiled_plan(
 
     let job_id = crate::jobs::new_job_id();
     let job_dir = crate::paths::job_dir(&job_id)?;
+    crate::jobs::write_tenant(&job_id, &tenant)
+        .with_context(|| format!("persist tenant for {job_id}"))?;
     let mut ctx = ExecCtx::new(job_dir.clone());
+    ctx = ctx.with_tenant(tenant.clone());
     // Phase 5: size the executor's memory admission to box-fit (MemTotal −
     // floor) so the parallel executor can't stack concurrent stages past the
     // box. Sequential runs one stage at a time, so this is a no-op there.
+    if let Some(budget) = tenant_admission
+        .executor_budget_gib(crate::broker::admission::DEFAULT_FLOOR_GIB)
+        .map_err(|e| anyhow!("tenant admission: {e}"))?
     {
-        let snap = crate::broker::ResourceSnapshot::probe();
-        if snap.mem_total_gb > 0.0 {
-            let box_fit =
-                (snap.mem_total_gb - crate::broker::admission::DEFAULT_FLOOR_GIB).max(1.0) as u32;
-            ctx = ctx.with_memory_budget(box_fit);
-        }
+        // The executor semaphore is the tenant sub-envelope too. This is
+        // load-bearing for HPO/wide DAGs: one job may run many concurrent
+        // stages, but their summed declared RAM cannot exceed its share.
+        ctx = ctx.with_memory_budget(budget);
     }
     // #3 distributed: thread placement into the ExecCtx → every StageContext
     // built by the executor carries it → a lamquant train stage routes to the
@@ -683,13 +700,17 @@ pub(super) async fn launch_compiled_plan(
     // footprint can't fit free RAM, refuse CLEANLY: no launch, no transient
     // unit, no OOM. Best-effort: args with no cost drivers fall back to the
     // conservative default footprint, which still gates oversubscription.
-    if let Err(reason) = crate::broker::gate(&format!("recipe '{name}'"), &footprint) {
-        crate::python_kill::unbind_current_job();
-        if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-            tracing::warn!("write Failed state for {job_id}: {se}");
-        }
-        return Err(anyhow!("{reason}"));
-    }
+    let _tenant_reservation =
+        match tenant_admission.reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB) {
+            Ok(reservation) => reservation,
+            Err(reason) => {
+                crate::python_kill::unbind_current_job();
+                if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
+                    tracing::warn!("write Failed state for {job_id}: {se}");
+                }
+                return Err(anyhow!("recipe '{name}' admission refused: {reason}"));
+            }
+        };
 
     // Cross-process GPU arbitration — recipes that don't hit GPU still pay the
     // (cheap) lock cost. Phase-G: a device-pinned run takes its PER-DEVICE
