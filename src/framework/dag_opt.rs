@@ -29,6 +29,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::plan::{CompiledConditionGate, CompiledPlan, FusedSubchain, NodeId, PlanEdge, PlanNode};
+use super::stage::StageExecutionBoundary;
 
 /// Scheduling hints computed by the optimizer. Stored per-node and
 /// read by the executor's spawn loop.
@@ -145,6 +146,7 @@ impl DagOptimizer {
 fn fusion_candidate(node: &PlanNode) -> bool {
     node.stage.deterministic()
         && !node.stage.is_advisory()
+        && node.stage.execution_boundary() == StageExecutionBoundary::InProcess
         && node.stage.supports_in_process_handoff()
 }
 

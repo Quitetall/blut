@@ -29,7 +29,7 @@ use crate::framework::cookbook::{Cookbook, Registry};
 use crate::framework::error::StageError;
 use crate::framework::error_domain::{ErrorDomain, ErrorDomainDef, Severity, StageFailure};
 use crate::framework::resource::Resource;
-use crate::framework::stage::{ErasedStageCtor, Stage, StageContext};
+use crate::framework::stage::{ErasedStageCtor, Stage, StageContext, StageExecutionBoundary};
 use crate::framework::status::StageEvent;
 use crate::recipes::recipe::RecipeDef;
 
@@ -173,6 +173,7 @@ impl Stage for CheckJsonl {
     const NAME: &'static str = CHECK_JSONL;
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
     type Input = JsonlArtifact;
     type Output = JsonlArtifact;
     type Args = CheckJsonlArgs;
@@ -313,6 +314,7 @@ impl Stage for Assert {
     const NAME: &'static str = ASSERT;
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
     type Input = JsonlArtifact;
     type Output = JsonlArtifact;
     type Args = AssertArgs;

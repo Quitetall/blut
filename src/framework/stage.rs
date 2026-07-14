@@ -303,6 +303,26 @@ impl StageContext {
     }
 }
 
+/// Where a stage's work actually crosses an execution boundary.
+///
+/// The default is deliberately [`Opaque`](Self::Opaque): implementing the typed
+/// [`Stage`] trait proves artifact types, not that `run` stays in this process.
+/// Optimizer passes that change task/admission lifetime may act only on an
+/// explicit [`InProcess`](Self::InProcess) declaration. [`Subprocess`](Self::Subprocess)
+/// records a known child-process boundary for audit and future policies; it is
+/// never inferred from a stage name or command-line arguments.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StageExecutionBoundary {
+    /// The engine has no proof about where this stage performs its work.
+    #[default]
+    Opaque,
+    /// The stage performs its work inside the engine process.
+    InProcess,
+    /// The stage owns an external child process.
+    Subprocess,
+}
+
 /// Typed user-facing trait. Implementors are concrete stages.
 ///
 /// Constants:
@@ -352,6 +372,14 @@ pub trait Stage: Send + Sync + 'static {
     /// input_hash) — stable across re-runs so a downstream stage
     /// doesn't re-execute just because its upstream was retrained.
     const DETERMINISTIC: bool = true;
+
+    /// Execution-boundary declaration consumed by optimizer policy.
+    ///
+    /// Default `Opaque` preserves the normal per-stage executor boundary. A
+    /// stage may opt into fusion only by declaring `InProcess`; stages that own
+    /// an external child should declare `Subprocess`. This metadata never enters
+    /// artifact or cache identity.
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::Opaque;
 
     /// Whether the stage implementation is safe to execute before a branch
     /// decision is known (ADR 0102). Default false is fail-closed.
@@ -512,6 +540,11 @@ pub trait StageDyn: Send + Sync + 'static {
     fn name(&self) -> &'static str;
     fn schema(&self) -> u32;
     fn deterministic(&self) -> bool;
+    /// Erased mirror of [`Stage::EXECUTION_BOUNDARY`]. Manual `StageDyn`
+    /// implementations remain opaque unless they explicitly classify it.
+    fn execution_boundary(&self) -> StageExecutionBoundary {
+        StageExecutionBoundary::Opaque
+    }
     /// Erased mirror of [`Stage::SPECULATION_SAFE`]. Manual `StageDyn`
     /// implementations remain ineligible unless they explicitly opt in.
     fn speculation_safe(&self) -> bool {
@@ -782,6 +815,9 @@ impl<S: Stage> StageDyn for S {
     }
     fn deterministic(&self) -> bool {
         S::DETERMINISTIC
+    }
+    fn execution_boundary(&self) -> StageExecutionBoundary {
+        S::EXECUTION_BOUNDARY
     }
     fn speculation_safe(&self) -> bool {
         S::SPECULATION_SAFE
@@ -1439,6 +1475,7 @@ mod tests {
         assert_eq!(s.name(), "word_count");
         assert_eq!(s.schema(), 1);
         assert_eq!(s.resources(), &[Resource::Cpu]);
+        assert_eq!(s.execution_boundary(), StageExecutionBoundary::Opaque);
         assert_eq!(s.input_kind(), "test.words");
         assert_eq!(s.output_kind(), "test.count");
         // args_schema returns SOMETHING valid (not Null) for a

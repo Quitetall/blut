@@ -43,7 +43,7 @@ BLUT-owned widgets.
 
 | Item | Role |
 |---|---|
-| `framework::stage::{Stage, StageContext, StageError, StageEvent}` | a typed `Input → Output` unit of work + its run context |
+| `framework::stage::{Stage, StageContext, StageExecutionBoundary, StageError, StageEvent}` | a typed `Input → Output` unit of work + its run context |
 | `framework::compat::Compatible<B>` | compile-time gate: a stage may only join a `Plan<_, B>` it is `Compatible` with |
 | `framework::artifact::{Artifact, ArtifactMetadata, ContentHash}` | typed handle to on-disk bytes, content-hashed |
 | `framework::plan::{Plan, CompiledPlan, NodeId, PlanError}` | the typed DAG builder (`.start().then().finish().into_compiled()`) |
@@ -54,6 +54,16 @@ BLUT-owned widgets.
 | `framework::status::{StatusHub, StageEvent, make_broadcast, spawn_status_writer}` | the `status.jsonl` event stream |
 | `framework::cookbook::{Cookbook, Registry, StageDescriptor, ArtifactDescriptor}` | the domain-pack seam |
 | `framework::graph::{PlanGraph, GraphSnapshot, NodeStatus, graph_snapshot}` | DAG inspection |
+
+`StageExecutionBoundary` is fail-closed optimizer metadata. Its default is
+`Opaque`, so an existing or third-party cookbook stage continues to run as an
+ordinary executor task but is never silently folded into another stage's
+admission/lifecycle boundary. A stage that performs all work in the current
+process may explicitly declare `Stage::EXECUTION_BOUNDARY = InProcess`; a stage
+that owns a child process should declare `Subprocess`. Internal fusion requires
+`InProcess` in addition to the existing determinism, advisory, resource, and
+typed-handoff checks. The engine never infers this property from a stage name,
+arguments, or a cookbook's UI implementation.
 
 ## Recipes (`recipes/`) — the named catalog
 
@@ -291,7 +301,8 @@ version while the campaign is in progress.
   `recipes::recipe::Recipe`, `framework::Cookbook`, `backends::TrainingBackend`,
   `config::launcher::Launcher`, `framework::control::ControlPolicy`.
 - **Types:** `framework::{Plan, CompiledPlan, NodeId, ExecCtx, PlanResult,
-  Resource, ContentHash, ArtifactMetadata, StageContext}`,
+  Resource, ContentHash, ArtifactMetadata, StageContext,
+  StageExecutionBoundary}`,
   `framework::{SequentialExecutor, ParallelExecutor}`,
   `recipes::recipe::{RecipeDef, Course}`,
   `config::partition::{PartitionSpec, PartitionKey, PartitionValue}`,

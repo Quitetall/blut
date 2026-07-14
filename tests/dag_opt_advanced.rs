@@ -20,7 +20,7 @@ use blut::framework::object_store::BlobStore;
 use blut::framework::plan::CompiledPlan;
 use blut::framework::plan_spec::{PLAN_SPEC_VERSION, PlanSpec, SpecNode};
 use blut::framework::resource::Resource;
-use blut::framework::stage::{ErasedStageCtor, Stage, StageContext};
+use blut::framework::stage::{ErasedStageCtor, Stage, StageContext, StageExecutionBoundary};
 use blut::framework::status::StageEvent;
 use blut::framework::{PlanError, StageError};
 use blut::recipes::recipe::RecipeDef;
@@ -181,6 +181,7 @@ impl Stage for DirectRoot {
     const NAME: &'static str = "direct_root";
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
     type Input = ();
     type Output = DirectArtifact;
     type Args = OrderArgs;
@@ -205,6 +206,7 @@ impl Stage for DirectAfter {
     const NAME: &'static str = "direct_after";
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
     type Input = DirectArtifact;
     type Output = DirectArtifact;
     type Args = OrderArgs;
@@ -230,6 +232,7 @@ impl Stage for DirectIdentity {
     const NAME: &'static str = "direct_identity";
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
     type Input = DirectArtifact;
     type Output = DirectArtifact;
     type Args = OrderArgs;
@@ -252,6 +255,7 @@ impl Stage for DirectCountedSlow {
     const NAME: &'static str = "direct_counted_slow";
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
     type Input = DirectArtifact;
     type Output = DirectArtifact;
     type Args = OrderArgs;
@@ -280,6 +284,7 @@ impl Stage for RecordOrder {
     const NAME: &'static str = "record_order";
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
     type Input = ();
     type Output = OrderArtifact;
     type Args = OrderArgs;
@@ -318,6 +323,7 @@ impl Stage for RecordAfter {
     const NAME: &'static str = "record_after";
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
     type Input = OrderArtifact;
     type Output = OrderArtifact;
     type Args = OrderArgs;
@@ -345,6 +351,55 @@ impl Stage for RecordAfter {
     }
 }
 
+/// A deterministic typed stage that intentionally leaves its execution
+/// boundary at the framework default. The optimizer must preserve that opaque
+/// boundary instead of inferring in-process safety from the blanket StageDyn
+/// implementation.
+struct RecordOpaqueBoundary;
+
+#[async_trait]
+impl Stage for RecordOpaqueBoundary {
+    const NAME: &'static str = "record_opaque_boundary";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    type Input = OrderArtifact;
+    type Output = OrderArtifact;
+    type Args = OrderArgs;
+
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        input: OrderArtifact,
+        args: &OrderArgs,
+    ) -> Result<OrderArtifact, StageError> {
+        RecordAfter.run(ctx, input, args).await
+    }
+}
+
+/// Known child-process ownership remains a hard optimizer boundary even when
+/// the stage is deterministic and implements the typed handoff mechanism.
+struct RecordSubprocessBoundary;
+
+#[async_trait]
+impl Stage for RecordSubprocessBoundary {
+    const NAME: &'static str = "record_subprocess_boundary";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::Subprocess;
+    type Input = OrderArtifact;
+    type Output = OrderArtifact;
+    type Args = OrderArgs;
+
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        input: OrderArtifact,
+        args: &OrderArgs,
+    ) -> Result<OrderArtifact, StageError> {
+        RecordAfter.run(ctx, input, args).await
+    }
+}
+
 struct RecordNondeterministic;
 
 #[async_trait]
@@ -353,6 +408,7 @@ impl Stage for RecordNondeterministic {
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Cpu];
     const DETERMINISTIC: bool = false;
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
     type Input = OrderArtifact;
     type Output = OrderArtifact;
     type Args = OrderArgs;
@@ -374,6 +430,7 @@ impl Stage for RecordSlowAfter {
     const NAME: &'static str = "record_slow_after";
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
     type Input = OrderArtifact;
     type Output = OrderArtifact;
     type Args = OrderArgs;
@@ -404,6 +461,7 @@ impl Stage for RecordPanicking {
     const NAME: &'static str = "record_panicking";
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
     type Input = OrderArtifact;
     type Output = OrderArtifact;
     type Args = OrderArgs;
@@ -425,6 +483,7 @@ impl Stage for RecordFailing {
     const NAME: &'static str = "record_failing";
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
     type Input = OrderArtifact;
     type Output = OrderArtifact;
     type Args = OrderArgs;
@@ -446,6 +505,7 @@ impl Stage for RecordNetworkAfter {
     const NAME: &'static str = "record_network_after";
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Network];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
     type Input = OrderArtifact;
     type Output = OrderArtifact;
     type Args = OrderArgs;
@@ -475,6 +535,10 @@ impl Cookbook for GateCookbook {
         static STAGES: &[(&str, ErasedStageCtor)] = &[
             ("record_order", || Arc::new(RecordOrder)),
             ("record_after", || Arc::new(RecordAfter)),
+            ("record_opaque_boundary", || Arc::new(RecordOpaqueBoundary)),
+            ("record_subprocess_boundary", || {
+                Arc::new(RecordSubprocessBoundary)
+            }),
             ("record_nondeterministic", || {
                 Arc::new(RecordNondeterministic)
             }),
@@ -856,6 +920,46 @@ fn dag_opt_advanced_gate_emits_internal_fusion_plan_witness() {
     assert!(
         default_off.fused_subchains().next().is_none(),
         "the default-off plan must carry no fused execution groups"
+    );
+}
+
+#[test]
+fn dag_opt_advanced_gate_preserves_default_opaque_stage_boundary() {
+    let (optimized, _) = fusion_only(true).optimize(compiled_graph(
+        &[
+            ("record_order", "opaque-root", None),
+            ("record_after", "opaque-left", None),
+            ("record_opaque_boundary", "opaque-middle", None),
+            ("record_after", "opaque-right-a", None),
+            ("record_after", "opaque-right-b", None),
+        ],
+        &[(0, 1), (1, 2), (2, 3), (3, 4)],
+    ));
+
+    assert_eq!(
+        optimized.fused_subchains().collect::<Vec<_>>(),
+        vec![&[0, 1][..], &[3, 4][..]],
+        "an unclassified typed stage must split otherwise eligible fusion witnesses"
+    );
+}
+
+#[test]
+fn dag_opt_advanced_gate_preserves_declared_subprocess_boundary() {
+    let (optimized, _) = fusion_only(true).optimize(compiled_graph(
+        &[
+            ("record_order", "subprocess-root", None),
+            ("record_after", "subprocess-left", None),
+            ("record_subprocess_boundary", "subprocess-middle", None),
+            ("record_after", "subprocess-right-a", None),
+            ("record_after", "subprocess-right-b", None),
+        ],
+        &[(0, 1), (1, 2), (2, 3), (3, 4)],
+    ));
+
+    assert_eq!(
+        optimized.fused_subchains().collect::<Vec<_>>(),
+        vec![&[0, 1][..], &[3, 4][..]],
+        "a declared subprocess stage must split otherwise eligible fusion witnesses"
     );
 }
 

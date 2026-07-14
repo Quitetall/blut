@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Brian Lam
 //! Ecosystem connectors (ADR 0112) — a compiled-in `connectors` cookbook whose
-//! stages delegate an external verb to a SUBPROCESS (ADR 0034) and exchange data
-//! through content-addressed artifacts with a CLOSED set of typed I/O kinds. No
-//! dynamic library loading; the `from_erased_graph` kind-checker (ADR 0078)
-//! type-checks an integration graph exactly as it checks a native one.
+//! transfer stages delegate an external verb to a SUBPROCESS (ADR 0034), while
+//! the source stage creates an in-process reference manifest. They exchange
+//! data through content-addressed artifacts with a CLOSED set of typed I/O
+//! kinds. No dynamic library loading; the `from_erased_graph` kind-checker (ADR
+//! 0078) type-checks an integration graph exactly as it checks a native one.
 //!
 //! The four kinds carry IDENTITY + HASH, never bulk data — an `ObjectRef` is an
 //! object-store URI + content fingerprint, so the cache key
@@ -20,7 +21,7 @@ use crate::framework::artifact::{Artifact, ContentHash};
 use crate::framework::cookbook::{Cookbook, Registry};
 use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
-use crate::framework::stage::{ErasedStageCtor, Stage, StageContext};
+use crate::framework::stage::{ErasedStageCtor, Stage, StageContext, StageExecutionBoundary};
 use crate::recipes::recipe::RecipeDef;
 
 // ── the closed set of connector I/O kinds ──────────────────────────
@@ -63,7 +64,7 @@ pub const CONNECTOR_KINDS: &[&str] = &[
     Blob::KIND,
 ];
 
-// ── connector stages (each delegates to a subprocess) ──────────────
+// ── connector stages (transfers delegate to a subprocess) ──────────
 
 /// Declare an object-store reference from args (a graph SOURCE) — the entry
 /// point of a connector graph (`input = ()`).
@@ -81,6 +82,7 @@ impl Stage for DeclareObject {
     const NAME: &'static str = "connector_object";
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
     type Input = ();
     type Output = ObjectRef;
     type Args = ObjectRefArgs;
@@ -128,6 +130,7 @@ impl Stage for ObjectFetch {
     const NAME: &'static str = "connector_fetch";
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Cpu, Resource::Network];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::Subprocess;
     type Input = ObjectRef;
     type Output = DatasetRef;
     type Args = ToolArgs;
@@ -190,6 +193,7 @@ impl Stage for ObjectStore {
     const NAME: &'static str = "connector_store";
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Cpu, Resource::Network];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::Subprocess;
     type Input = DatasetRef;
     type Output = ObjectRef;
     type Args = ToolArgs;
@@ -338,6 +342,22 @@ mod tests {
         assert!(check().is_empty(), "registry problems: {:?}", check());
         // list() enumerates the three connector stages.
         assert_eq!(list().len(), 3);
+    }
+
+    #[test]
+    fn connector_execution_boundaries_are_explicit() {
+        assert_eq!(
+            DeclareObject::EXECUTION_BOUNDARY,
+            StageExecutionBoundary::InProcess
+        );
+        assert_eq!(
+            ObjectFetch::EXECUTION_BOUNDARY,
+            StageExecutionBoundary::Subprocess
+        );
+        assert_eq!(
+            ObjectStore::EXECUTION_BOUNDARY,
+            StageExecutionBoundary::Subprocess
+        );
     }
 
     #[test]

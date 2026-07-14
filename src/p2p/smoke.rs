@@ -28,7 +28,9 @@ use crate::framework::artifact::{Artifact, ContentHash};
 use crate::framework::cookbook::{Cookbook, Registry};
 use crate::framework::error::StageError;
 use crate::framework::resource::Resource;
-use crate::framework::stage::{ErasedArtifact, ErasedStageCtor, Stage, StageContext};
+use crate::framework::stage::{
+    ErasedArtifact, ErasedStageCtor, Stage, StageContext, StageExecutionBoundary,
+};
 use crate::recipes::recipe::RecipeDef;
 
 /// The stage name of the built-in connectivity probe.
@@ -65,6 +67,7 @@ impl Stage for SmokeEcho {
     const NAME: &'static str = SMOKE_STAGE;
     const SCHEMA: u32 = 1;
     const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
     type Input = SmokeText;
     type Output = SmokeText;
     type Args = SmokeArgs;
