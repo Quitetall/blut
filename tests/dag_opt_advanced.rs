@@ -37,6 +37,9 @@ static FUSION_WAITER_STARTED: tokio::sync::Notify = tokio::sync::Notify::const_n
 static FUSION_RELEASE_WAITER: tokio::sync::Notify = tokio::sync::Notify::const_new();
 static FUSION_WAITER_ACQUIRED: AtomicBool = AtomicBool::new(false);
 static DIRECT_ARTIFACT_BINARY_DESERIALIZES: AtomicUsize = AtomicUsize::new(0);
+static FUSION_DUPLICATE_RUNS: AtomicUsize = AtomicUsize::new(0);
+static FUSION_BOUNDARY_DEADLINE: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
 
 fn record_fusion_task(label: &str) {
     if label.starts_with("fuse-") {
@@ -220,6 +223,56 @@ impl Stage for DirectAfter {
     }
 }
 
+struct DirectIdentity;
+
+#[async_trait]
+impl Stage for DirectIdentity {
+    const NAME: &'static str = "direct_identity";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    type Input = DirectArtifact;
+    type Output = DirectArtifact;
+    type Args = OrderArgs;
+
+    async fn run(
+        &self,
+        _ctx: &StageContext,
+        input: DirectArtifact,
+        args: &OrderArgs,
+    ) -> Result<DirectArtifact, StageError> {
+        record_fusion_task(&args.label);
+        Ok(input)
+    }
+}
+
+struct DirectCountedSlow;
+
+#[async_trait]
+impl Stage for DirectCountedSlow {
+    const NAME: &'static str = "direct_counted_slow";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    type Input = DirectArtifact;
+    type Output = DirectArtifact;
+    type Args = OrderArgs;
+
+    async fn run(
+        &self,
+        _ctx: &StageContext,
+        input: DirectArtifact,
+        args: &OrderArgs,
+    ) -> Result<DirectArtifact, StageError> {
+        record_fusion_task(&args.label);
+        FUSION_DUPLICATE_RUNS.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let value = input.value + 1;
+        Ok(DirectArtifact {
+            value,
+            content_hash: ContentHash::of_bytes(&value.to_le_bytes()),
+        })
+    }
+}
+
 struct RecordOrder;
 
 #[async_trait]
@@ -314,6 +367,36 @@ impl Stage for RecordNondeterministic {
     }
 }
 
+struct RecordSlowAfter;
+
+#[async_trait]
+impl Stage for RecordSlowAfter {
+    const NAME: &'static str = "record_slow_after";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    type Input = OrderArtifact;
+    type Output = OrderArtifact;
+    type Args = OrderArgs;
+
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        input: OrderArtifact,
+        args: &OrderArgs,
+    ) -> Result<OrderArtifact, StageError> {
+        let deadline = *FUSION_BOUNDARY_DEADLINE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(deadline) = deadline {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(
+                deadline + std::time::Duration::from_millis(25),
+            ))
+            .await;
+        }
+        RecordAfter.run(ctx, input, args).await
+    }
+}
+
 struct RecordPanicking;
 
 #[async_trait]
@@ -395,11 +478,14 @@ impl Cookbook for GateCookbook {
             ("record_nondeterministic", || {
                 Arc::new(RecordNondeterministic)
             }),
+            ("record_slow_after", || Arc::new(RecordSlowAfter)),
             ("record_panicking", || Arc::new(RecordPanicking)),
             ("record_failing", || Arc::new(RecordFailing)),
             ("record_network_after", || Arc::new(RecordNetworkAfter)),
             ("direct_root", || Arc::new(DirectRoot)),
             ("direct_after", || Arc::new(DirectAfter)),
+            ("direct_identity", || Arc::new(DirectIdentity)),
+            ("direct_counted_slow", || Arc::new(DirectCountedSlow)),
         ];
         STAGES
     }
@@ -673,6 +759,220 @@ async fn dag_opt_advanced_gate_fuses_linear_chain_without_changing_artifact_iden
 }
 
 #[tokio::test]
+async fn dag_opt_advanced_gate_fuses_internal_linear_subchain_in_branched_plan() {
+    let _guard = TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().expect("internal fusion tempdir");
+    let plan = || {
+        compiled_graph(
+            &[
+                ("record_order", "fuse-subchain-root", None),
+                ("record_after", "fuse-subchain-left-a", None),
+                ("record_after", "fuse-subchain-left-b", None),
+                ("record_after", "fuse-subchain-right", None),
+            ],
+            &[(0, 1), (1, 2), (0, 3)],
+        )
+    };
+
+    let run = |name: &str, enabled: bool| {
+        let job_dir = temp.path().join(name);
+        let mut ctx = ExecCtx::new(job_dir.clone()).with_max_in_flight(1);
+        ctx.dag_optimizer = Some(fusion_only(enabled));
+        async move {
+            FUSION_TASK_IDS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            let result = ParallelExecutor::execute(plan(), ctx)
+                .await
+                .expect("execute internal fusion fixture");
+            let task_ids = FUSION_TASK_IDS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            (
+                result,
+                materialized_hashes(&job_dir),
+                materialized_cache_keys(&job_dir),
+                task_ids,
+            )
+        }
+    };
+
+    let (unfused, unfused_hashes, unfused_keys, unfused_tasks) =
+        run("unfused-subchain", false).await;
+    let (fused, fused_hashes, fused_keys, fused_tasks) = run("fused-subchain", true).await;
+
+    assert_eq!(fused.n_stages, 4);
+    assert_eq!((fused.n_cache_hits, fused.n_cache_misses), (0, 4));
+    assert_eq!(fused_hashes, unfused_hashes);
+    assert_eq!(fused_keys, unfused_keys);
+    let fused_output: OrderArtifact = fused
+        .final_output
+        .expect("fused terminal output")
+        .into_typed()
+        .expect("decode fused terminal output");
+    let unfused_output: OrderArtifact = unfused
+        .final_output
+        .expect("unfused terminal output")
+        .into_typed()
+        .expect("decode unfused terminal output");
+    assert_eq!(fused_output.content_hash, unfused_output.content_hash);
+    assert_eq!(unfused_tasks.len(), 4);
+    assert_eq!(fused_tasks.len(), 4);
+    assert_ne!(unfused_tasks[1], unfused_tasks[2]);
+    assert_eq!(
+        fused_tasks[1], fused_tasks[2],
+        "eligible internal chain must run inside one executor task"
+    );
+    assert_ne!(fused_tasks[0], fused_tasks[1]);
+    assert_ne!(fused_tasks[2], fused_tasks[3]);
+}
+
+#[test]
+fn dag_opt_advanced_gate_emits_internal_fusion_plan_witness() {
+    let plan = || {
+        compiled_graph(
+            &[
+                ("record_order", "fuse-witness-root", None),
+                ("record_after", "fuse-witness-left-a", None),
+                ("record_after", "fuse-witness-left-b", None),
+                ("record_after", "fuse-witness-right", None),
+            ],
+            &[(0, 1), (1, 2), (0, 3)],
+        )
+    };
+
+    let (optimized, _) = fusion_only(true).optimize(plan());
+    assert_eq!(
+        optimized.fused_subchains().collect::<Vec<_>>(),
+        vec![&[1, 2][..]],
+        "the stage-fusion pass must represent the internal chain on the optimized plan"
+    );
+
+    let (default_off, _) = fusion_only(false).optimize(plan());
+    assert!(
+        default_off.fused_subchains().next().is_none(),
+        "the default-off plan must carry no fused execution groups"
+    );
+}
+
+#[tokio::test]
+async fn dag_opt_advanced_gate_dce_dense_renumbers_middle_hole_before_fusion() {
+    let _guard = TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().expect("DCE dense-id tempdir");
+    let mut optimizer = fusion_only(true);
+    optimizer.eliminate_dead_code = true;
+    let mut ctx = ExecCtx::new(temp.path().join("job")).with_max_in_flight(1);
+    ctx.dag_optimizer = Some(optimizer);
+
+    let result = ParallelExecutor::execute(
+        compiled_graph(
+            &[
+                ("record_order", "fuse-dce-root", None),
+                ("record_order", "fuse-dce-disconnected", None),
+                ("record_after", "fuse-dce-terminal", None),
+            ],
+            &[(0, 2)],
+        ),
+        ctx,
+    )
+    .await
+    .expect("post-DCE dense plan must execute");
+
+    assert_eq!(result.n_stages, 2);
+    let output: OrderArtifact = result
+        .final_output
+        .expect("DCE terminal output")
+        .into_typed()
+        .expect("decode DCE terminal output");
+    assert_eq!(
+        output.content_hash,
+        ContentHash::of_bytes(b"fuse-dce-terminal")
+    );
+}
+
+#[tokio::test]
+async fn dag_opt_advanced_gate_stops_at_internal_fusion_deadline_boundary() {
+    let _guard = TEST_LOCK.lock().await;
+    EXECUTION_ORDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    let temp = tempfile::tempdir().expect("internal fusion deadline tempdir");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    *FUSION_BOUNDARY_DEADLINE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(deadline);
+
+    let mut ctx = ExecCtx::new(temp.path().join("job")).with_max_in_flight(1);
+    ctx.deadline = Some(deadline);
+    ctx.dag_optimizer = Some(fusion_only(true));
+    let result = ParallelExecutor::execute(
+        compiled_graph(
+            &[
+                ("record_order", "fuse-deadline-root", None),
+                ("record_slow_after", "fuse-deadline-slow", None),
+                ("record_after", "fuse-deadline-tail", None),
+                ("record_after", "fuse-deadline-sibling", None),
+            ],
+            &[(0, 1), (1, 2), (0, 3)],
+        ),
+        ctx,
+    )
+    .await;
+    *FUSION_BOUNDARY_DEADLINE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+
+    assert!(matches!(result, Err(PlanError::DeadlineExceeded { .. })));
+    let order = EXECUTION_ORDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert!(
+        order.iter().any(|label| label == "fuse-deadline-slow"),
+        "the deadline fixture must expire while the first internal fused stage is running: {order:?}"
+    );
+    assert!(
+        !order.iter().any(|label| label == "fuse-deadline-tail"),
+        "a fused group must re-check the plan deadline before its next stage: {order:?}"
+    );
+}
+
+#[tokio::test]
+async fn dag_opt_advanced_gate_internal_fusion_preserves_cache_single_flight() {
+    let _guard = TEST_LOCK.lock().await;
+    FUSION_DUPLICATE_RUNS.store(0, Ordering::SeqCst);
+    let temp = tempfile::tempdir().expect("internal fusion single-flight tempdir");
+    let mut ctx = ExecCtx::new(temp.path().join("job")).with_max_in_flight(2);
+    ctx.dag_optimizer = Some(fusion_only(true));
+
+    let result = ParallelExecutor::execute(
+        compiled_graph(
+            &[
+                ("direct_root", "fuse-single-flight-root", None),
+                ("direct_identity", "fuse-single-flight-identity", None),
+                ("direct_counted_slow", "fuse-single-flight-shared", None),
+                ("direct_counted_slow", "fuse-single-flight-shared", None),
+            ],
+            &[(0, 1), (1, 2), (0, 3)],
+        ),
+        ctx,
+    )
+    .await
+    .expect("execute internal fusion single-flight fixture");
+
+    assert_eq!(result.n_stages, 4);
+    assert_eq!(
+        FUSION_DUPLICATE_RUNS.load(Ordering::SeqCst),
+        1,
+        "a fused tail and ordinary sibling with the same exact cache key must not both execute"
+    );
+    assert_eq!((result.n_cache_hits, result.n_cache_misses), (1, 3));
+}
+
+#[tokio::test]
 async fn dag_opt_advanced_gate_fused_chain_uses_direct_typed_handoffs() {
     let _guard = TEST_LOCK.lock().await;
     let temp = tempfile::tempdir().expect("direct fusion tempdir");
@@ -794,6 +1094,47 @@ async fn dag_opt_advanced_gate_fused_chain_holds_one_admission() {
     assert!(
         held_continuously,
         "a fused chain must not release and reacquire its broker admission between stages"
+    );
+}
+
+#[tokio::test]
+async fn dag_opt_advanced_gate_splits_heterogeneous_envelopes_into_equal_groups() {
+    let _guard = TEST_LOCK.lock().await;
+    FUSION_TASK_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    let temp = tempfile::tempdir().expect("heterogeneous fusion tempdir");
+    let mut ctx = ExecCtx::new(temp.path().join("job")).with_max_in_flight(1);
+    ctx.dag_optimizer = Some(fusion_only(true));
+
+    ParallelExecutor::execute(
+        compiled_graph(
+            &[
+                ("record_order", "fuse-hetero-cpu-root", None),
+                ("record_after", "fuse-hetero-cpu-a", None),
+                ("record_network_after", "fuse-hetero-net-a", None),
+                ("record_network_after", "fuse-hetero-net-b", None),
+                ("record_after", "fuse-hetero-cpu-tail", None),
+            ],
+            &[(0, 1), (1, 2), (2, 3), (3, 4)],
+        ),
+        ctx,
+    )
+    .await
+    .expect("execute heterogeneous fusion fixture");
+
+    let tasks = FUSION_TASK_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert_eq!(tasks.len(), 5);
+    assert_eq!(tasks[0], tasks[1], "equal CPU envelopes should fuse");
+    assert_eq!(tasks[2], tasks[3], "equal network envelopes should fuse");
+    assert_ne!(tasks[1], tasks[2], "an envelope change must split groups");
+    assert_ne!(
+        tasks[3], tasks[4],
+        "a trailing one-node envelope segment must retain its ordinary boundary"
     );
 }
 
@@ -947,6 +1288,27 @@ async fn dag_opt_advanced_gate_fusion_falls_back_for_branches_and_nondeterminist
     assert_eq!(
         cache_aware_tasks, 3,
         "cache-aware mode must retain its deadline-aware probe path"
+    );
+
+    let mut priority_fusion = fusion_only(true);
+    priority_fusion.priority_aware = true;
+    let (priority_aware, priority_aware_tasks) = run(
+        "priority-aware",
+        compiled_graph(
+            &[
+                ("record_order", "fuse-priority-root", Some(0)),
+                ("record_after", "fuse-priority-middle", Some(-10)),
+                ("record_after", "fuse-priority-terminal", Some(-20)),
+            ],
+            &[(0, 1), (1, 2)],
+        ),
+        priority_fusion,
+    )
+    .await;
+    assert_eq!(priority_aware.n_stages, 3);
+    assert_eq!(
+        priority_aware_tasks, 3,
+        "explicit per-node priority must retain coordinator scheduling boundaries"
     );
 }
 
