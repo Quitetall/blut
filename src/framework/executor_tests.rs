@@ -16,7 +16,7 @@ use super::*;
 use crate::backends::LamuTrainerBackend;
 use crate::framework::artifact::Artifact;
 use crate::framework::compat::Compatible;
-use crate::framework::plan::Plan;
+use crate::framework::plan::{CompiledConditionGate, Plan};
 use crate::framework::stage::Stage;
 use async_trait::async_trait;
 use blut_types::partition::{PartitionKey, PartitionValue};
@@ -2809,6 +2809,158 @@ impl crate::framework::control::ControlPolicy for SpawnEveryStep {
             None,
         )))
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct ConditionalDecisionArgs {
+    value: bool,
+}
+
+/// A load-bearing boolean selector that emits one step so the runtime control
+/// watcher can append a disconnected sub-plan before the selector completes.
+struct ConditionalStepDecision;
+#[async_trait]
+impl Stage for ConditionalStepDecision {
+    const NAME: &'static str = "conditional_step_decision";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    type Input = ();
+    type Output = BranchDecision;
+    type Args = ConditionalDecisionArgs;
+
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        _input: (),
+        args: &ConditionalDecisionArgs,
+    ) -> Result<BranchDecision, StageError> {
+        let _ = ctx.status_tx.send(StageEvent::StageStep {
+            node_idx: ctx.node_idx,
+            stage_name: Self::NAME.to_string(),
+            update: serde_json::json!({ "loss": 0.5, "step": 1 }),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        Ok(BranchDecision { value: args.value })
+    }
+}
+impl Compatible<LamuTrainerBackend> for ConditionalStepDecision {}
+
+fn conditional_selector(value: bool) -> CompiledPlan {
+    Plan::<(), LamuTrainerBackend>::new("selector", serde_json::json!({}))
+        .start(ConditionalStepDecision, ConditionalDecisionArgs { value })
+        .finish()
+        .into_compiled()
+}
+
+fn conditional_spawn_parent(decision: bool) -> CompiledPlan {
+    let data_path = Plan::<(), LamuTrainerBackend>::new("data", serde_json::json!({}))
+        .start(MakeOne, EmptyArgs)
+        .then(Increment, EmptyArgs)
+        .finish()
+        .into_compiled();
+    let (plan, offsets) = CompiledPlan::from_components(
+        "conditional_spawn_parent".into(),
+        serde_json::json!({}),
+        vec![conditional_selector(decision), data_path],
+    );
+    plan.with_condition_gates(vec![CompiledConditionGate {
+        condition: offsets[0],
+        target: offsets[1] + 1,
+        when: true,
+    }])
+    .expect("selector and data terminal form an acyclic condition gate")
+}
+
+fn conditional_advisory_parent() -> CompiledPlan {
+    let data_path = Plan::<(), LamuTrainerBackend>::new("data", serde_json::json!({}))
+        .start(MakeOne, EmptyArgs)
+        .then(AdvisoryGate, EmptyArgs)
+        .finish()
+        .into_compiled();
+    let (plan, offsets) = CompiledPlan::from_components(
+        "conditional_advisory_parent".into(),
+        serde_json::json!({}),
+        vec![conditional_selector(true), data_path],
+    );
+    plan.with_condition_gates(vec![CompiledConditionGate {
+        condition: offsets[0],
+        target: offsets[1] + 1,
+        when: true,
+    }])
+    .expect("selector and advisory terminal form an acyclic condition gate")
+}
+
+#[tokio::test]
+async fn conditional_runtime_spawn_cannot_replace_original_terminal() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    for decision in [true, false] {
+        MAKE_RUN_COUNT.store(0, Ordering::SeqCst);
+        INC_RUN_COUNT.store(0, Ordering::SeqCst);
+        SPAWN_MARKER_RAN.store(0, Ordering::SeqCst);
+        SPAWN_CHILD_RAN.store(0, Ordering::SeqCst);
+        let (_td, base) = fresh_ctx();
+        let ctx = base.with_control(std::sync::Arc::new(SpawnOnce {
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            execute_plan(conditional_spawn_parent(decision), ctx),
+        )
+        .await
+        .expect("conditional spawn run must terminate")
+        .expect("a disconnected runtime spawn is not a plan failure");
+
+        assert_eq!(
+            SPAWN_MARKER_RAN.load(Ordering::SeqCst),
+            1,
+            "the spawned root must run for decision={decision}"
+        );
+        assert_eq!(
+            SPAWN_CHILD_RAN.load(Ordering::SeqCst),
+            1,
+            "the spawned child must run for decision={decision}"
+        );
+        assert_eq!(result.n_stages, 5, "three static plus two spawned nodes");
+
+        if decision {
+            let output: Counter = result
+                .final_output
+                .expect("selected conditional terminal must produce output")
+                .into_typed()
+                .expect("conditional terminal output remains a Counter");
+            assert_eq!(
+                output.n, 2,
+                "the appended spawn's Counter(7) must not replace the original terminal"
+            );
+        } else {
+            assert!(
+                result.final_output.is_none(),
+                "a pruned original terminal stays output-less even after a spawn completes"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_advisory_failure_falls_back_to_data_ancestor() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    MAKE_RUN_COUNT.store(0, Ordering::SeqCst);
+    let (_td, ctx) = fresh_ctx();
+
+    let result = execute_plan(conditional_advisory_parent(), ctx)
+        .await
+        .expect("a selected advisory terminal remains non-fatal");
+
+    assert_eq!(result.warnings.len(), 1);
+    assert_eq!(result.warnings[0].stage, AdvisoryGate::NAME);
+    let output: Counter = result
+        .final_output
+        .expect("advisory failure must preserve the latest data ancestor")
+        .into_typed()
+        .expect("fallback must not return the selector's BranchDecision");
+    assert_eq!(output.n, 1);
 }
 
 #[tokio::test]

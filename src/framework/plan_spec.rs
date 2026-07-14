@@ -36,6 +36,10 @@ fn default_version() -> u32 {
     PLAN_SPEC_VERSION
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Registry-resolved erased nodes: `(stage, args)` pairs ready for
 /// `CompiledPlan::from_erased_graph`/`from_erased_template`.
 type ResolvedNodes = Vec<(
@@ -73,6 +77,25 @@ pub struct SpecNode {
     /// `skip_serializing_if` keeps an unset plan's canonical bytes unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i32>,
+    /// ADR 0102: author request for speculative execution. Default false and
+    /// omitted from the wire for byte-identical legacy plans. Compile accepts
+    /// `true` only when the registered stage independently declares
+    /// `Stage::SPECULATION_SAFE`; neither side can authorize speculation alone.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pure: bool,
+}
+
+/// A control dependency distinct from typed data edges (ADR 0102).
+///
+/// `condition` must produce [`BranchDecision`](crate::framework::artifact::BranchDecision).
+/// The `target` keeps its ordinary data predecessors and cache identity; this
+/// relation only decides whether that data-ready node may run.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConditionGateSpec {
+    pub condition: u32,
+    pub target: u32,
+    pub when: bool,
 }
 
 /// A typed runtime fan-out (ADR 0078 `map_output`): when the node at index
@@ -103,6 +126,11 @@ pub struct PlanSpec {
     /// Typed runtime fan-outs (ADR 0078). Empty for a plain DAG.
     #[serde(default)]
     pub expansions: Vec<MapSpec>,
+    /// Boolean control gates. Empty/omitted preserves the legacy plan bytes.
+    /// The first implementation slice accepts one exclusive, non-reconvergent
+    /// gated branch per plan; richer phi/select semantics require a later IR.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub condition_gates: Vec<ConditionGateSpec>,
     /// IR version (see [`PLAN_SPEC_VERSION`]). Defaulted so pre-versioned
     /// JSON still parses.
     #[serde(default = "default_version")]
@@ -133,6 +161,25 @@ pub enum PlanSpecError {
         name: String,
         parent: u32,
         detail: String,
+    },
+    /// A condition gate is malformed or outside the deliberately narrow v1
+    /// non-reconvergent branch contract.
+    #[error("plan spec '{name}': condition {condition} -> target {target}: {detail}")]
+    BadCondition {
+        name: String,
+        condition: u32,
+        target: u32,
+        detail: String,
+    },
+    /// A raw plan author requested purity for a stage whose implementation did
+    /// not independently certify deterministic speculation safety.
+    #[error(
+        "plan spec '{name}': node {node} stage '{stage}' requests pure=true but the stage is not deterministic and speculation-safe"
+    )]
+    UnsafePure {
+        name: String,
+        node: u32,
+        stage: String,
     },
 }
 
@@ -187,6 +234,128 @@ impl PlanSpec {
         Ok(nodes)
     }
 
+    fn compile_condition_gates(
+        &self,
+        nodes: &ResolvedNodes,
+    ) -> Result<Vec<crate::framework::plan::CompiledConditionGate>, PlanSpecError> {
+        for (index, (spec, (stage, _))) in self.nodes.iter().zip(nodes).enumerate() {
+            if spec.pure && (!stage.speculation_safe() || !stage.deterministic()) {
+                return Err(PlanSpecError::UnsafePure {
+                    name: self.name.clone(),
+                    node: index as u32,
+                    stage: stage.name().to_string(),
+                });
+            }
+        }
+
+        let Some(&gate) = self.condition_gates.first() else {
+            return Ok(Vec::new());
+        };
+        let bad = |detail: String| PlanSpecError::BadCondition {
+            name: self.name.clone(),
+            condition: gate.condition,
+            target: gate.target,
+            detail,
+        };
+        if self.condition_gates.len() != 1 {
+            return Err(bad(
+                "v1 supports one exclusive condition gate per plan; use a later phi/select IR for multiple arms"
+                    .into(),
+            ));
+        }
+        if !self.expansions.is_empty() {
+            return Err(bad(
+                "condition gates cannot be composed with map_output expansions in v1".into(),
+            ));
+        }
+        let n = nodes.len();
+        if gate.condition as usize >= n || gate.target as usize >= n {
+            return Err(bad(format!("node index out of range (plan has {n} nodes)")));
+        }
+        if gate.condition == gate.target {
+            return Err(bad("a condition cannot gate itself".into()));
+        }
+        let decision_kind = <crate::framework::artifact::BranchDecision as crate::framework::artifact::Artifact>::KIND;
+        let got_kind = nodes[gate.condition as usize].0.output_kind();
+        if got_kind != decision_kind {
+            return Err(bad(format!(
+                "condition stage '{}' outputs '{got_kind}', expected '{decision_kind}'",
+                nodes[gate.condition as usize].0.name()
+            )));
+        }
+        if nodes[gate.condition as usize].0.is_advisory() {
+            return Err(bad(
+                "the condition stage cannot be advisory because its decision is load-bearing"
+                    .into(),
+            ));
+        }
+        if self
+            .edges
+            .iter()
+            .any(|&(from, to)| from == gate.condition && to == gate.target)
+        {
+            return Err(bad(
+                "the condition relation must not also be a typed data edge".into(),
+            ));
+        }
+
+        let mut successors = vec![Vec::<u32>::new(); n];
+        let mut predecessors = vec![Vec::<u32>::new(); n];
+        for &(from, to) in &self.edges {
+            if from as usize >= n || to as usize >= n {
+                return Err(bad(format!(
+                    "data edge {from}->{to} is out of range (plan has {n} nodes)"
+                )));
+            }
+            successors[from as usize].push(to);
+            predecessors[to as usize].push(from);
+        }
+
+        // The losing arm is pruned as the target plus its data descendants.
+        // Reject a descendant with an incoming edge from outside that set: it
+        // would be a reconvergent/phi node whose missing input has no v1 meaning.
+        let mut branch = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::from([gate.target]);
+        while let Some(id) = queue.pop_front() {
+            if !branch.insert(id) {
+                continue;
+            }
+            queue.extend(successors[id as usize].iter().copied());
+        }
+        for &id in &branch {
+            if id == gate.target {
+                continue;
+            }
+            if let Some(&outside) = predecessors[id as usize]
+                .iter()
+                .find(|pred| !branch.contains(pred))
+            {
+                return Err(bad(format!(
+                    "reconvergent node {id} also depends on outside node {outside}; v1 has no phi/select semantics"
+                )));
+            }
+        }
+
+        // Existing PlanResult selects one terminal output. Keep that contract
+        // unambiguous: aside from the decision node, the gated branch owns the
+        // plan's sole data terminal. A false decision therefore yields None;
+        // a true decision yields the same terminal artifact as an ungated run.
+        let terminals: Vec<u32> = (0..n as u32)
+            .filter(|id| *id != gate.condition && successors[*id as usize].is_empty())
+            .collect();
+        if terminals.len() != 1 || !branch.contains(&terminals[0]) {
+            return Err(bad(format!(
+                "v1 requires one gated terminal output, found terminals {terminals:?}"
+            )));
+        }
+
+        Ok(vec![crate::framework::plan::CompiledConditionGate {
+            condition: gate.condition,
+            target: gate.target,
+            when: gate.when,
+        }])
+    }
+
     /// Resolve every node's stage by name against `reg`, then build a
     /// fully kind-checked [`CompiledPlan`] — including any runtime `map_output`
     /// expansions (ADR 0078). An unknown stage, a wiring break, or a malformed
@@ -194,6 +363,7 @@ impl PlanSpec {
     /// `Ok`.
     pub fn compile(&self, reg: &Registry) -> Result<CompiledPlan, PlanSpecError> {
         let nodes = self.resolve_nodes(reg)?;
+        let condition_gates = self.compile_condition_gates(&nodes)?;
 
         // Compile every map expansion BEFORE the main plan is consumed — each
         // needs its parent node's declared element kind for the template
@@ -221,9 +391,17 @@ impl PlanSpec {
                     nodes[parent].0.output_kind()
                 ))
             })?;
-            // v1: no nested maps.
-            if !m.template.expansions.is_empty() {
-                return Err(bad("nested map templates are not supported (v1)".into()));
+            // v1: no nested maps, conditional templates, or speculative map
+            // members. Reject purity rather than silently dropping it when the
+            // template is lowered to `CompiledTemplate`.
+            if !m.template.expansions.is_empty()
+                || !m.template.condition_gates.is_empty()
+                || m.template.nodes.iter().any(|node| node.pure)
+            {
+                return Err(bad(
+                    "nested maps, condition gates, and pure template nodes are not supported (v1)"
+                        .into(),
+                ));
             }
             let template_nodes = m.template.resolve_nodes(reg)?;
             let template = CompiledPlan::from_erased_template(
@@ -241,13 +419,26 @@ impl PlanSpec {
 
         // recipe_args = provenance for lineage/audit (the executor uses each
         // node's own args). Parallel to the declarative path's blob.
-        let recipe_args = serde_json::json!({
+        let recipe_nodes = self
+            .nodes
+            .iter()
+            .map(|s| {
+                let mut node = serde_json::json!({ "stage": s.stage, "args": s.args });
+                if s.pure {
+                    node["pure"] = serde_json::Value::Bool(true);
+                }
+                node
+            })
+            .collect::<Vec<_>>();
+        let mut recipe_args = serde_json::json!({
             "plan_spec": true,
             "version": self.version,
-            "nodes": self.nodes.iter()
-                .map(|s| serde_json::json!({ "stage": s.stage, "args": s.args }))
-                .collect::<Vec<_>>(),
+            "nodes": recipe_nodes,
         });
+        if !self.condition_gates.is_empty() {
+            recipe_args["condition_gates"] =
+                serde_json::to_value(&self.condition_gates).expect("condition gates serialize");
+        }
         let mut plan = CompiledPlan::from_erased_graph(
             self.name.clone(),
             recipe_args,
@@ -267,9 +458,16 @@ impl PlanSpec {
                 retry: n.retry,
                 timeout: n.timeout,
                 priority: n.priority,
+                pure: n.pure,
             })
             .collect();
         plan.apply_execution_overrides(&overrides);
+        plan = plan
+            .with_condition_gates(condition_gates)
+            .map_err(|source| PlanSpecError::Plan {
+                name: self.name.clone(),
+                source,
+            })?;
         Ok(plan.with_expansions(expansions))
     }
 }
@@ -279,7 +477,7 @@ mod tests {
     use super::*;
     use crate::backends::LamuTrainerBackend;
     use crate::framework::Compatible;
-    use crate::framework::artifact::{Artifact, ContentHash};
+    use crate::framework::artifact::{Artifact, BranchDecision, ContentHash};
     use crate::framework::cookbook::Cookbook;
     use crate::framework::error::StageError;
     use crate::framework::resource::Resource;
@@ -328,6 +526,59 @@ mod tests {
         const NAME: &'static str = "spec_make_a";
         const SCHEMA: u32 = 1;
         const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = ();
+        type Output = A;
+        type Args = E;
+        async fn run(&self, _c: &StageContext, _i: (), _a: &E) -> Result<A, StageError> {
+            Ok(A)
+        }
+    }
+
+    struct SafeMakeA;
+    impl Compatible<LamuTrainerBackend> for SafeMakeA {}
+    #[async_trait]
+    impl Stage for SafeMakeA {
+        const NAME: &'static str = "spec_safe_make_a";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        const SPECULATION_SAFE: bool = true;
+        type Input = ();
+        type Output = A;
+        type Args = E;
+        async fn run(&self, _c: &StageContext, _i: (), _a: &E) -> Result<A, StageError> {
+            Ok(A)
+        }
+    }
+
+    struct Decide;
+    impl Compatible<LamuTrainerBackend> for Decide {}
+    #[async_trait]
+    impl Stage for Decide {
+        const NAME: &'static str = "spec_decide";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = ();
+        type Output = BranchDecision;
+        type Args = E;
+        async fn run(
+            &self,
+            _c: &StageContext,
+            _i: (),
+            _a: &E,
+        ) -> Result<BranchDecision, StageError> {
+            Ok(BranchDecision { value: true })
+        }
+    }
+
+    struct NondeterministicSafeMakeA;
+    impl Compatible<LamuTrainerBackend> for NondeterministicSafeMakeA {}
+    #[async_trait]
+    impl Stage for NondeterministicSafeMakeA {
+        const NAME: &'static str = "spec_nondeterministic_safe_make_a";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        const DETERMINISTIC: bool = false;
+        const SPECULATION_SAFE: bool = true;
         type Input = ();
         type Output = A;
         type Args = E;
@@ -411,6 +662,11 @@ mod tests {
 
     static ERASED: &[(&str, ErasedStageCtor)] = &[
         ("spec_make_a", || Arc::new(MakeA)),
+        ("spec_safe_make_a", || Arc::new(SafeMakeA)),
+        ("spec_nondeterministic_safe_make_a", || {
+            Arc::new(NondeterministicSafeMakeA)
+        }),
+        ("spec_decide", || Arc::new(Decide)),
         ("spec_a_to_b", || Arc::new(AToB)),
         ("spec_sharder", || Arc::new(Sharder)),
         ("spec_item_to_a", || Arc::new(ItemToA)),
@@ -444,6 +700,7 @@ mod tests {
                     retry: None,
                     timeout: None,
                     priority: None,
+                    pure: false,
                 },
                 SpecNode {
                     stage: "spec_a_to_b".into(),
@@ -451,10 +708,44 @@ mod tests {
                     retry: None,
                     timeout: None,
                     priority: None,
+                    pure: false,
                 },
             ],
             edges: vec![(0, 1)],
             expansions: Vec::new(),
+            condition_gates: Vec::new(),
+            version: PLAN_SPEC_VERSION,
+        }
+    }
+
+    fn condition_spec(condition: &str, target: &str) -> PlanSpec {
+        PlanSpec {
+            name: "conditional".into(),
+            nodes: vec![
+                SpecNode {
+                    stage: condition.into(),
+                    args: serde_json::json!({}),
+                    retry: None,
+                    timeout: None,
+                    priority: None,
+                    pure: false,
+                },
+                SpecNode {
+                    stage: target.into(),
+                    args: serde_json::json!({}),
+                    retry: None,
+                    timeout: None,
+                    priority: None,
+                    pure: false,
+                },
+            ],
+            edges: Vec::new(),
+            expansions: Vec::new(),
+            condition_gates: vec![ConditionGateSpec {
+                condition: 0,
+                target: 1,
+                when: true,
+            }],
             version: PLAN_SPEC_VERSION,
         }
     }
@@ -475,6 +766,137 @@ mod tests {
         let p: PlanSpec = serde_json::from_str(noversion).unwrap();
         assert_eq!(p.version, PLAN_SPEC_VERSION);
         assert!(p.nodes[0].args.is_null()); // omitted args -> null
+    }
+
+    #[test]
+    fn purity_and_condition_fields_are_additive_for_legacy_json() {
+        let legacy = r#"{"name":"legacy","nodes":[{"stage":"spec_make_a"}],"edges":[],"expansions":[],"version":1}"#;
+        let parsed: PlanSpec = serde_json::from_str(legacy).unwrap();
+
+        assert!(!parsed.nodes[0].pure);
+        assert!(parsed.condition_gates.is_empty());
+        assert_eq!(
+            String::from_utf8(parsed.canonical_bytes()).unwrap(),
+            r#"{"edges":[],"expansions":[],"name":"legacy","nodes":[{"args":null,"stage":"spec_make_a"}],"version":1}"#,
+            "default purity/control fields must not perturb legacy canonical bytes"
+        );
+
+        let encoded = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            !encoded.contains("pure"),
+            "default pure=false omitted: {encoded}"
+        );
+        assert!(
+            !encoded.contains("condition_gates"),
+            "empty condition gates omitted: {encoded}"
+        );
+    }
+
+    #[test]
+    fn pure_request_requires_independent_stage_capability() {
+        let mut unsafe_spec = condition_spec("spec_decide", "spec_make_a");
+        unsafe_spec.condition_gates.clear();
+        unsafe_spec.nodes.remove(0);
+        unsafe_spec.nodes[0].pure = true;
+        match unsafe_spec.compile(&toy_registry()) {
+            Err(PlanSpecError::UnsafePure { node, stage, .. }) => {
+                assert_eq!(node, 0);
+                assert_eq!(stage, "spec_make_a");
+            }
+            Err(e) => panic!("expected UnsafePure, got {e:?}"),
+            Ok(_) => panic!("expected UnsafePure, got Ok"),
+        }
+
+        let mut safe_spec = unsafe_spec;
+        safe_spec.nodes[0].stage = "spec_safe_make_a".into();
+        let compiled = safe_spec.compile(&toy_registry()).expect("certified stage");
+        assert!(compiled.nodes[0].pure);
+
+        let mut nondeterministic = linear_spec();
+        nondeterministic.nodes.truncate(1);
+        nondeterministic.edges.clear();
+        nondeterministic.nodes[0].stage = "spec_nondeterministic_safe_make_a".into();
+        nondeterministic.nodes[0].pure = true;
+        assert!(matches!(
+            nondeterministic.compile(&toy_registry()),
+            Err(PlanSpecError::UnsafePure { .. })
+        ));
+    }
+
+    #[test]
+    fn typed_condition_gate_compiles_separately_from_data_edges() {
+        let plan = condition_spec("spec_decide", "spec_make_a")
+            .compile(&toy_registry())
+            .expect("typed condition gate");
+
+        assert_eq!(plan.n_edges(), 0, "control relation is not a data edge");
+        assert_eq!(
+            plan.condition_gates().collect::<Vec<_>>(),
+            vec![(0, 1, true)]
+        );
+        let graph = plan.graph_structure().unwrap();
+        assert!(graph.edges.is_empty());
+        assert_eq!(graph.condition_gates.len(), 1);
+        assert_eq!(graph.condition_gates[0].condition, 0);
+        assert_eq!(graph.condition_gates[0].target, 1);
+        assert!(graph.condition_gates[0].when);
+    }
+
+    #[test]
+    fn condition_gate_rejects_non_decision_stage() {
+        match condition_spec("spec_make_a", "spec_safe_make_a").compile(&toy_registry()) {
+            Err(PlanSpecError::BadCondition { detail, .. }) => {
+                assert!(
+                    detail.contains("expected 'blut.branch-decision'"),
+                    "{detail}"
+                );
+            }
+            Err(e) => panic!("expected BadCondition, got {e:?}"),
+            Ok(_) => panic!("expected BadCondition, got Ok"),
+        }
+    }
+
+    #[test]
+    fn condition_gate_rejects_out_of_range_node() {
+        let mut spec = condition_spec("spec_decide", "spec_make_a");
+        spec.condition_gates[0].target = 9;
+        match spec.compile(&toy_registry()) {
+            Err(PlanSpecError::BadCondition { detail, .. }) => {
+                assert!(detail.contains("out of range"), "{detail}");
+            }
+            Err(e) => panic!("expected BadCondition, got {e:?}"),
+            Ok(_) => panic!("expected BadCondition, got Ok"),
+        }
+    }
+
+    #[test]
+    fn condition_gate_rejects_reconvergent_branch() {
+        let mut spec = condition_spec("spec_decide", "spec_make_a");
+        spec.nodes.push(SpecNode {
+            stage: "spec_make_a".into(),
+            args: serde_json::json!({}),
+            retry: None,
+            timeout: None,
+            priority: None,
+            pure: false,
+        });
+        spec.nodes.push(SpecNode {
+            stage: "spec_a_to_b".into(),
+            args: serde_json::json!({}),
+            retry: None,
+            timeout: None,
+            priority: None,
+            pure: false,
+        });
+        spec.edges = vec![(1, 3), (2, 3)];
+
+        match spec.compile(&toy_registry()) {
+            Err(PlanSpecError::BadCondition { detail, .. }) => {
+                assert!(detail.contains("reconvergent node 3"), "{detail}");
+            }
+            Err(e) => panic!("expected BadCondition, got {e:?}"),
+            Ok(_) => panic!("expected BadCondition, got Ok"),
+        }
     }
 
     #[test]
@@ -499,9 +921,11 @@ mod tests {
                 retry: None,
                 timeout: None,
                 priority: None,
+                pure: false,
             }],
             edges: vec![],
             expansions: Vec::new(),
+            condition_gates: Vec::new(),
             version: PLAN_SPEC_VERSION,
         };
         assert_eq!(
@@ -570,9 +994,11 @@ mod tests {
                 retry: None,
                 timeout: None,
                 priority: None,
+                pure: false,
             }],
             edges: vec![],
             expansions: Vec::new(),
+            condition_gates: Vec::new(),
             version: PLAN_SPEC_VERSION,
         };
         assert_eq!(v1.canonical_bytes(), base.canonical_bytes());
@@ -605,9 +1031,11 @@ mod tests {
                 retry: None,
                 timeout: None,
                 priority: None,
+                pure: false,
             }],
             edges: vec![],
             expansions: Vec::new(),
+            condition_gates: Vec::new(),
             version: 1,
         };
         let b = PlanSpec {
@@ -618,9 +1046,11 @@ mod tests {
                 retry: None,
                 timeout: None,
                 priority: None,
+                pure: false,
             }],
             edges: vec![],
             expansions: Vec::new(),
+            condition_gates: Vec::new(),
             version: 1,
         };
         assert_eq!(a.canonical_bytes(), b.canonical_bytes());
@@ -633,9 +1063,11 @@ mod tests {
                 retry: None,
                 timeout: None,
                 priority: None,
+                pure: false,
             }],
             edges: vec![],
             expansions: Vec::new(),
+            condition_gates: Vec::new(),
             version: 1,
         };
         assert_ne!(a.canonical_bytes(), c.canonical_bytes());
@@ -651,9 +1083,11 @@ mod tests {
                 retry: None,
                 timeout: None,
                 priority: None,
+                pure: false,
             }],
             edges: vec![],
             expansions: Vec::new(),
+            condition_gates: Vec::new(),
             version: 1,
         };
         match spec.compile(&Registry::new()) {
@@ -676,6 +1110,7 @@ mod tests {
                     retry: None,
                     timeout: None,
                     priority: None,
+                    pure: false,
                 },
                 SpecNode {
                     stage: "spec_make_a".into(),
@@ -683,10 +1118,12 @@ mod tests {
                     retry: None,
                     timeout: None,
                     priority: None,
+                    pure: false,
                 },
             ],
             edges: vec![(0, 1)],
             expansions: Vec::new(),
+            condition_gates: Vec::new(),
             version: 1,
         };
         match spec.compile(&toy_registry()) {
@@ -744,6 +1181,7 @@ mod tests {
                 retry: None,
                 timeout: None,
                 priority: None,
+                pure: false,
             }],
             edges: vec![],
             expansions: vec![MapSpec {
@@ -756,13 +1194,16 @@ mod tests {
                         retry: None,
                         timeout: None,
                         priority: None,
+                        pure: false,
                     }],
                     edges: vec![],
                     expansions: Vec::new(),
+                    condition_gates: Vec::new(),
                     version: PLAN_SPEC_VERSION,
                 },
                 label: Some("shard".into()),
             }],
+            condition_gates: Vec::new(),
             version: PLAN_SPEC_VERSION,
         }
     }
@@ -790,6 +1231,7 @@ mod tests {
                 retry: None,
                 timeout: None,
                 priority: None,
+                pure: false,
             }],
             edges: vec![],
             expansions: vec![MapSpec {
@@ -802,13 +1244,16 @@ mod tests {
                         retry: None,
                         timeout: None,
                         priority: None,
+                        pure: false,
                     }],
                     edges: vec![],
                     expansions: Vec::new(),
+                    condition_gates: Vec::new(),
                     version: PLAN_SPEC_VERSION,
                 },
                 label: None,
             }],
+            condition_gates: Vec::new(),
             version: PLAN_SPEC_VERSION,
         };
         match spec.compile(&toy_registry()) {
@@ -831,6 +1276,7 @@ mod tests {
                 retry: None,
                 timeout: None,
                 priority: None,
+                pure: false,
             }],
             edges: vec![],
             expansions: vec![MapSpec {
@@ -843,13 +1289,16 @@ mod tests {
                         retry: None,
                         timeout: None,
                         priority: None,
+                        pure: false,
                     }],
                     edges: vec![],
                     expansions: Vec::new(),
+                    condition_gates: Vec::new(),
                     version: PLAN_SPEC_VERSION,
                 },
                 label: None,
             }],
+            condition_gates: Vec::new(),
             version: PLAN_SPEC_VERSION,
         };
         assert!(matches!(
@@ -885,9 +1334,11 @@ mod tests {
                     retry: None,
                     timeout: None,
                     priority: None,
+                    pure: false,
                 }],
                 edges: vec![],
                 expansions: Vec::new(),
+                condition_gates: Vec::new(),
                 version: PLAN_SPEC_VERSION,
             },
             label: None,
@@ -897,6 +1348,20 @@ mod tests {
                 assert!(detail.contains("nested"), "{detail}")
             }
             Err(e) => panic!("expected BadMap, got {e:?}"),
+            Ok(_) => panic!("expected BadMap, got Ok"),
+        }
+    }
+
+    #[test]
+    fn pure_map_template_node_is_rejected_in_v1() {
+        let mut spec = map_spec();
+        spec.expansions[0].template.nodes[0].pure = true;
+
+        match spec.compile(&toy_registry()) {
+            Err(PlanSpecError::BadMap { detail, .. }) => {
+                assert!(detail.contains("pure template nodes"), "{detail}")
+            }
+            Err(error) => panic!("expected BadMap, got {error:?}"),
             Ok(_) => panic!("expected BadMap, got Ok"),
         }
     }

@@ -56,6 +56,7 @@ fn graph(n: usize) -> crate::framework::GraphSnapshot {
         N::Pending,
         N::Blocked,
         N::Killed,
+        N::NotSelected,
         N::Pruned,
         N::Ready,
     ];
@@ -84,6 +85,7 @@ fn graph(n: usize) -> crate::framework::GraphSnapshot {
         name: "demo_plan".into(),
         nodes,
         edges,
+        condition_gates: Vec::new(),
     }
 }
 

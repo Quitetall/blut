@@ -43,7 +43,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::launcher::JobState;
-use crate::framework::artifact::{ArtifactMetadata, ContentHash};
+use crate::framework::artifact::{ArtifactMetadata, BranchDecision, ContentHash};
 use crate::framework::cache::{CacheHandle, CacheHit};
 use crate::framework::control::{Control, ControlPolicy, StepMetrics};
 use crate::framework::error::{PlanError, StageError};
@@ -1957,7 +1957,7 @@ fn inject_spawn(
     // Local topo order (also the cycle/empty check) BEFORE we mutate anything.
     let local_order = subplan.topo_order()?;
     let base = (orig_n + appended.len()) as NodeId;
-    let (nodes, edges, initial) = subplan.into_parts();
+    let (nodes, edges, initial) = subplan.into_parts()?;
     let k = nodes.len();
 
     // Move nodes in LOCAL-ID ORDER so `appended[base - orig_n + l].id == base + l`
@@ -2135,6 +2135,7 @@ pub async fn execute_plan(plan: CompiledPlan, mut ctx: ExecCtx) -> Result<PlanRe
     // machinery), so a plan with expansions forces parallel — just as a
     // control policy does.
     let parallel = ctx.control.is_some()
+        || plan.has_condition_gates()
         || !plan.expansions().is_empty()
         || std::env::var("BLUT_EXECUTOR")
             .map(|v| v.eq_ignore_ascii_case("parallel"))
@@ -2155,6 +2156,13 @@ pub struct SequentialExecutor;
 impl SequentialExecutor {
     /// Execute the plan to completion, one stage at a time.
     pub async fn execute(plan: CompiledPlan, ctx: ExecCtx) -> Result<PlanResult, PlanError> {
+        // Conditional control is implemented on the parallel coordinator's
+        // ready-set seam. Keep this public entry point semantically safe for
+        // direct callers instead of letting the sequential topo walk execute a
+        // losing branch.
+        if plan.has_condition_gates() {
+            return ParallelExecutor::execute(plan, ctx).await;
+        }
         let started = Instant::now();
         let order = plan.topo_order()?;
         let view = plan.exec_view();
@@ -2163,7 +2171,6 @@ impl SequentialExecutor {
             view.nodes.len(),
             "topo_order must cover all nodes"
         );
-
         let deadline = ctx.deadline;
         let Prelude {
             writer_handle,
@@ -2605,12 +2612,19 @@ impl ParallelExecutor {
         } else {
             (plan, std::collections::HashMap::new())
         };
+        // Conditional control is deliberately separate from typed data edges:
+        // it orders selector before target without contributing an input or a
+        // cache-key component. The PlanSpec compiler currently admits one
+        // non-reconvergent gate, but keep the scheduler state keyed generically
+        // so widening the validated IR does not require changing this seam.
+        let has_condition_gates = plan.has_condition_gates();
 
         // Cache-aware mode retains its deadline/cancellation-aware ready probe
         // path. A linear chain has no ready-order choice, so composing it with
         // fusion has no scheduling upside; fall back rather than weakening the
         // increment-2 slow-store deadline guarantee.
         if stage_fusion
+            && !has_condition_gates
             && !cache_aware
             && ctx.control.is_none()
             && fusion_runtime_is_local(&ctx)
@@ -2622,6 +2636,7 @@ impl ParallelExecutor {
         }
 
         let internal_fusion_groups = if stage_fusion
+            && !has_condition_gates
             && !cache_aware
             && ctx.control.is_none()
             && fusion_runtime_is_local(&ctx)
@@ -2638,11 +2653,39 @@ impl ParallelExecutor {
         // `mut`: runtime `Spawn` (PBT/TPE) extends the topo order at runtime.
         let mut order = plan.topo_order()?; // also the cycle check
         let view = plan.exec_view();
+        let condition_gates: Vec<_> = view
+            .condition_gates
+            .iter()
+            .map(|gate| (gate.condition, gate.target, gate.when))
+            .collect();
         debug_assert_eq!(
             order.len(),
             view.nodes.len(),
             "topo_order must cover all nodes"
         );
+        // PlanSpec validation gives a conditional plan one unambiguous data
+        // terminal. Capture it before runtime `Spawn` appends unrelated nodes
+        // to `order`; spawned work must never become the conditional result.
+        let conditional_terminal = has_condition_gates.then(|| {
+            *order
+                .last()
+                .expect("a compiled conditional plan is never empty")
+        });
+        let conditional_output_candidates = conditional_terminal.map(|terminal| {
+            let mut ancestors = HashSet::new();
+            let mut stack = vec![terminal];
+            while let Some(node_id) = stack.pop() {
+                if ancestors.insert(node_id) {
+                    stack.extend(
+                        view.edges
+                            .iter()
+                            .filter(|edge| edge.to == node_id)
+                            .map(|edge| edge.from),
+                    );
+                }
+            }
+            ancestors
+        });
 
         // node_idx = topo position (stable status key).
         let mut node_idx_of: HashMap<NodeId, u32> = HashMap::new();
@@ -2661,6 +2704,21 @@ impl ParallelExecutor {
             *indeg.entry(e.to).or_insert(0) += 1;
             succs.entry(e.from).or_default().push(e.to);
         }
+        let condition_by_target: HashMap<NodeId, (NodeId, bool)> = condition_gates
+            .iter()
+            .map(|&(condition, target, when)| (target, (condition, when)))
+            .collect();
+        let mut condition_targets: HashMap<NodeId, Vec<(NodeId, bool)>> = HashMap::new();
+        for &(condition, target, when) in &condition_gates {
+            condition_targets
+                .entry(condition)
+                .or_default()
+                .push((target, when));
+        }
+        // A target is absent until its selector has completed with the matching
+        // decision. Losing targets are placed in `pruned` with all data
+        // descendants and therefore never enter this set.
+        let mut enabled_condition_targets: HashSet<NodeId> = HashSet::new();
 
         let max_in_flight = ctx.max_in_flight;
         let deadline = ctx.deadline;
@@ -2683,12 +2741,10 @@ impl ParallelExecutor {
         let mut control_rx: Option<broadcast::Receiver<StageEvent>> =
             control.as_ref().map(|_| env.status.subscribe());
         let mut node_tokens: HashMap<NodeId, KillSlot> = HashMap::new();
-        // S1 / P7: the coordinator does not keep the stage after spawn, but it
-        // must consult the EMITTING node's `Stage::divergence_check` on each live
-        // step. Hold an `Arc<dyn StageDyn>` clone per in-flight node here (the
-        // stage is a zero-sized marker, so the clone is just a refcount bump),
-        // keyed the same as `node_tokens`, and drop it alongside the token on
-        // completion/kill so it never leaks across nodes. Empty without a policy.
+        // The coordinator does not otherwise keep the stage after spawn. Hold
+        // one cheap `Arc<dyn StageDyn>` clone per in-flight node for both live
+        // divergence checks and advisory-failure classification, keyed like
+        // `node_tokens`, then drop it on completion/kill.
         let mut node_stages: HashMap<NodeId, Arc<dyn StageDyn>> = HashMap::new();
         // S1 race fix: per-node kill latch. A node is inserted here when the
         // coordinator issues a divergence kill for it (in `record_divergence_and_kill`)
@@ -2722,7 +2778,7 @@ impl ParallelExecutor {
         // deterministic spawn order.
         let mut ready: BTreeSet<NodeId> = indeg
             .iter()
-            .filter(|(_, d)| **d == 0)
+            .filter(|(id, d)| **d == 0 && !condition_by_target.contains_key(id))
             .map(|(id, _)| *id)
             .collect();
 
@@ -2928,17 +2984,11 @@ impl ParallelExecutor {
                     // (a deferred node `continue`s above; its token is dropped
                     // and a fresh one is built when it re-enters `ready`).
                     node_tokens.insert(node_id, node_cancel);
-                    // S1: retain a stage handle for the live `divergence_check`
-                    // (only when a control policy watches — otherwise the watcher
-                    // never runs, so the clone would be dead weight). COUPLING:
-                    // the sole `divergence_check` invocation lives inside the
-                    // `control_rx` select arm, which only exists when
-                    // `control.is_some()` — so this guard and that arm must stay
-                    // in lockstep (a future non-control divergence path would
-                    // need to populate `node_stages` unconditionally).
-                    if control.is_some() {
-                        node_stages.insert(node_id, task.stage.clone());
-                    }
+                    // Retain unconditionally: the control watcher uses it for
+                    // divergence checks, and the completion path uses it to
+                    // preserve advisory-stage semantics even when conditional
+                    // control forced the parallel executor without a policy.
+                    node_stages.insert(node_id, task.stage.clone());
 
                     // P2P dispatch: a prepared cache hit is already complete
                     // locally and must reach `run_node`'s skip path. Only a
@@ -3413,10 +3463,90 @@ impl ParallelExecutor {
                                 for &s in ss {
                                     if let Some(d) = indeg.get_mut(&s) {
                                         *d -= 1;
-                                        if *d == 0 && !fused_internal_nodes.contains(&s) {
+                                        let condition_allows = !condition_by_target
+                                            .contains_key(&s)
+                                            || enabled_condition_targets.contains(&s);
+                                        if *d == 0
+                                            && condition_allows
+                                            && !fused_internal_nodes.contains(&s)
+                                        {
                                             ready.insert(s);
                                         }
                                     }
+                                }
+                            }
+                        }
+
+                        // Resolve boolean control only after the selector's
+                        // ordinary artifact has been published. A matching
+                        // target becomes schedulable once its data inputs are
+                        // ready; a losing target and every data descendant are
+                        // accounted as pruned without running or emitting a
+                        // lifecycle event. The control relation never enters
+                        // `all_edges`, `build_task`, or the node cache key.
+                        if first_error.is_none()
+                            && let Some(targets) = condition_targets.get(&outcome.node_id)
+                        {
+                            let decision = outputs
+                                .get(&outcome.node_id)
+                                .cloned()
+                                .expect("completed selector output was just inserted")
+                                .into_typed::<BranchDecision>();
+                            match decision {
+                                Ok(decision) => {
+                                    for &(target, when) in targets {
+                                        if decision.value == when {
+                                            enabled_condition_targets.insert(target);
+                                            if indeg.get(&target).copied() == Some(0)
+                                                && !pruned.contains(&target)
+                                            {
+                                                ready.insert(target);
+                                            }
+                                        } else {
+                                            let reason = format!(
+                                                "condition node {} resolved to {}, expected {}",
+                                                outcome.node_id, decision.value, when
+                                            );
+                                            let mut stack = vec![target];
+                                            while let Some(node_id) = stack.pop() {
+                                                if pruned.insert(node_id) {
+                                                    ready.remove(&node_id);
+                                                    // Graph-input nodes are pre-seeded with their
+                                                    // INPUT envelope under the same id. Remove it
+                                                    // when the branch is rejected so final-output
+                                                    // selection cannot mistake an unexecuted root's
+                                                    // unit input for a produced artifact.
+                                                    outputs.remove(&node_id);
+                                                    logical_outputs.remove(&node_id);
+                                                    if let Some(&node_idx) =
+                                                        node_idx_of.get(&node_id)
+                                                    {
+                                                        let node = node_at(
+                                                            &view, &appended, orig_n, node_id,
+                                                        );
+                                                        env.status.emit(StageEvent::StagePruned {
+                                                            node_idx,
+                                                            stage_name: node
+                                                                .stage
+                                                                .name()
+                                                                .to_string(),
+                                                            reason: reason.clone(),
+                                                        });
+                                                    }
+                                                    if let Some(children) = succs.get(&node_id) {
+                                                        stack.extend(children.iter().copied());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    first_error = Some(PlanError::Other(format!(
+                                        "condition node {} produced an invalid BranchDecision: {error}",
+                                        outcome.node_id
+                                    )));
+                                    env.cancel.cancel();
                                 }
                             }
                         }
@@ -3522,8 +3652,17 @@ impl ParallelExecutor {
                     while let Some(d) = stack.pop() {
                         if pruned.insert(d) {
                             ready.remove(&d);
+                            // Graph-input roots carry a prelude seed under their
+                            // own id. Once control pruning reaches one, that seed
+                            // is not a produced result and must not survive into
+                            // final-output selection.
+                            outputs.remove(&d);
+                            logical_outputs.remove(&d);
                             if let Some(ss) = succs.get(&d) {
                                 stack.extend(ss.iter().copied());
+                            }
+                            if let Some(targets) = condition_targets.get(&d) {
+                                stack.extend(targets.iter().map(|(target, _)| *target));
                             }
                         }
                     }
@@ -3590,8 +3729,13 @@ impl ParallelExecutor {
                         while let Some(d) = stack.pop() {
                             if pruned.insert(d) {
                                 ready.remove(&d);
+                                outputs.remove(&d);
+                                logical_outputs.remove(&d);
                                 if let Some(ss) = succs.get(&d) {
                                     stack.extend(ss.iter().copied());
+                                }
+                                if let Some(targets) = condition_targets.get(&d) {
+                                    stack.extend(targets.iter().map(|(target, _)| *target));
                                 }
                             }
                         }
@@ -3640,7 +3784,15 @@ impl ParallelExecutor {
         // node in topo order (the upstream train ckpt for a linear train→gate plan)
         // so the operator gets it live.
         let final_output = if warnings.is_empty() {
-            order.last().and_then(|id| outputs.remove(id))
+            conditional_terminal
+                .or_else(|| order.last().copied())
+                .and_then(|id| outputs.remove(&id))
+        } else if let Some(candidates) = conditional_output_candidates.as_ref() {
+            order
+                .iter()
+                .rev()
+                .filter(|id| candidates.contains(id))
+                .find_map(|id| outputs.remove(id))
         } else {
             order.iter().rev().find_map(|id| outputs.remove(id))
         };

@@ -572,6 +572,34 @@ impl Artifact for () {
     }
 }
 
+/// Closed boolean artifact used by PlanSpec condition gates (ADR 0102).
+///
+/// A condition is control metadata, never a typed data predecessor: the
+/// executor decodes this artifact only to decide whether a gated node becomes
+/// runnable. Keeping one engine-owned kind avoids interpreting arbitrary JSON
+/// or cookbook-specific truthiness at the scheduling boundary.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BranchDecision {
+    pub value: bool,
+}
+
+impl Artifact for BranchDecision {
+    const KIND: &'static str = "blut.branch-decision";
+    const SCHEMA: u32 = 1;
+
+    fn content_hash(&self) -> ContentHash {
+        ContentHash::of_bytes(&[u8::from(self.value)])
+    }
+
+    fn primary_path(&self) -> &Path {
+        Path::new("")
+    }
+
+    fn recompute_content_hash(&self) -> std::io::Result<ContentHash> {
+        Ok(self.content_hash())
+    }
+}
+
 // Tuple hashes are domain-separated by arity: every tuple's hash
 // starts with `b"tuple"` and the arity as a u8. Without this, a
 // 2-tuple and a 3-tuple whose concatenated child-hashes happen to

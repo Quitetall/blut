@@ -71,6 +71,7 @@ fn valid_spec(min_rows: u64) -> PlanSpec {
                 retry: None,
                 timeout: None,
                 priority: None,
+                pure: false,
             },
             SpecNode {
                 stage: "check_jsonl".into(),
@@ -78,9 +79,11 @@ fn valid_spec(min_rows: u64) -> PlanSpec {
                 retry: None,
                 timeout: None,
                 priority: None,
+                pure: false,
             },
         ],
         edges: vec![(0, 1)],
+        condition_gates: Vec::new(),
         expansions: Vec::new(),
         version: 1,
     }
@@ -154,8 +157,10 @@ fn registry_roundtrip() {
             retry: None,
             timeout: None,
             priority: None,
+            pure: false,
         }],
         edges: vec![],
+        condition_gates: Vec::new(),
         expansions: Vec::new(),
         version: 1,
     };

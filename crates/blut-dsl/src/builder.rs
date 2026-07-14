@@ -37,6 +37,7 @@ impl PlanDraft {
             retry: None,
             timeout: None,
             priority: None,
+            pure: false,
         });
         for &p in after {
             self.edges.push((p, id));
@@ -51,6 +52,7 @@ impl PlanDraft {
             name,
             nodes: self.nodes,
             edges: self.edges,
+            condition_gates: Vec::new(),
             expansions: self.expansions,
             version: PLAN_SPEC_VERSION,
         }

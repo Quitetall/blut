@@ -245,6 +245,7 @@ impl DagBuilder {
                     retry: None,
                     timeout: None,
                     priority: None,
+                    pure: false,
                 })
                 .collect(),
             edges: self
@@ -252,6 +253,7 @@ impl DagBuilder {
                 .iter()
                 .map(|&(a, b)| (a as u32, b as u32))
                 .collect(),
+            condition_gates: Vec::new(),
             expansions: Vec::new(),
             version: PLAN_SPEC_VERSION,
         }

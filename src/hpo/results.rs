@@ -90,7 +90,7 @@ pub fn reconstruct(manifest: &HpoManifest, status_lines: &[String]) -> Vec<Trial
     let maximize = manifest.maximize();
     let n = manifest.trials.len();
     let mut best: Vec<Option<f64>> = vec![None; n];
-    let mut finished: Vec<u32> = vec![0; n]; // StageEnd + StageSkipped count
+    let mut finished: Vec<u32> = vec![0; n]; // successful output/cache/control terminals
     let mut began: Vec<bool> = vec![false; n];
     let mut killed: Vec<bool> = vec![false; n]; // scheduler/control kill or plan cancel
     let mut failed: Vec<bool> = vec![false; n]; // genuine crash (OOM/code/timeout)
@@ -131,7 +131,10 @@ pub fn reconstruct(manifest: &HpoManifest, status_lines: &[String]) -> Vec<Trial
                 }
             }
             "stage_begin" => began[t] = true,
-            "stage_end" | "stage_skipped" => finished[t] += 1,
+            // A control-pruned stage is an expected terminal outcome for the
+            // selected execution path. It contributes no objective and is not
+            // a scheduler kill or a failure.
+            "stage_end" | "stage_skipped" | "stage_pruned" => finished[t] += 1,
             "stage_failed" => {
                 // A retry emits `stage_retrying`, NOT `stage_failed` (verified in
                 // executor.rs), so a `stage_failed` is always terminal. EVERY
@@ -278,6 +281,43 @@ mod tests {
             out[1].status, "failed",
             "OOM-killer 'Killed process' is a crash, not a scheduler kill"
         );
+    }
+
+    #[test]
+    fn control_pruned_nodes_complete_a_trial_without_marking_failure() {
+        let mut m = manifest();
+        m.trials.truncate(1);
+        m.trials[0].n_nodes = 2;
+        m.trial_of_topo = vec![Some(0), Some(0)];
+        let lines = [
+            json!({"kind":"stage_end","node_idx":0,"stage_name":"decision","output_hash":"h","elapsed":1}),
+            json!({"kind":"stage_pruned","node_idx":1,"stage_name":"guarded","reason":"condition false"}),
+        ]
+        .iter()
+        .map(|event| event.to_string())
+        .collect::<Vec<_>>();
+
+        let out = reconstruct(&m, &lines);
+        assert_eq!(out[0].status, "done");
+        assert_eq!(out[0].objective, None);
+    }
+
+    #[test]
+    fn failure_and_cancel_override_terminal_control_accounting() {
+        let m = manifest();
+        let lines = [
+            json!({"kind":"stage_pruned","node_idx":0,"stage_name":"a","reason":"condition false"}),
+            json!({"kind":"stage_failed","node_idx":0,"stage_name":"a","error":"cancelled by control"}),
+            json!({"kind":"stage_pruned","node_idx":1,"stage_name":"b","reason":"condition false"}),
+            json!({"kind":"stage_failed","node_idx":1,"stage_name":"b","error":"boom"}),
+        ]
+        .iter()
+        .map(|event| event.to_string())
+        .collect::<Vec<_>>();
+
+        let out = reconstruct(&m, &lines);
+        assert_eq!(out[0].status, "killed");
+        assert_eq!(out[1].status, "failed");
     }
 
     #[test]

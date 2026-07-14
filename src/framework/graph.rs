@@ -23,6 +23,10 @@ pub struct PlanGraph {
     pub name: String,
     pub nodes: Vec<PlanGraphNode>,
     pub edges: Vec<PlanGraphEdge>,
+    /// Control-flow relations kept separate from artifact/data dependencies.
+    /// Indices are topological positions, matching [`PlanGraphEdge`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub condition_gates: Vec<PlanGraphConditionGate>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -38,6 +42,18 @@ pub struct PlanGraphNode {
 pub struct PlanGraphEdge {
     pub from: usize,
     pub to: usize,
+}
+
+/// A conditional control-flow relation in persisted topological indices.
+///
+/// `target` is eligible only when the `condition` node's branch decision
+/// equals `when`. This is intentionally not a [`PlanGraphEdge`]: condition
+/// gates do not carry artifacts and must not alter data-dependency semantics.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanGraphConditionGate {
+    pub condition: usize,
+    pub target: usize,
+    pub when: bool,
 }
 
 impl PlanGraph {
@@ -112,6 +128,8 @@ pub enum NodeStatus {
     Skipped,
     /// Stopped by the scheduler (HPO early-stop) or a plan cancel.
     Killed,
+    /// Intentionally did not run because a boolean condition chose another path.
+    NotSelected,
     /// Never ran because an upstream node was killed/failed.
     Pruned,
 }
@@ -127,6 +145,7 @@ impl NodeStatus {
             NodeStatus::Failed => "failed",
             NodeStatus::Skipped => "skipped",
             NodeStatus::Killed => "killed",
+            NodeStatus::NotSelected => "not_selected",
             NodeStatus::Pruned => "pruned",
         }
     }
@@ -138,6 +157,10 @@ impl NodeStatus {
             self,
             NodeStatus::Killed | NodeStatus::Failed | NodeStatus::Pruned
         )
+    }
+
+    fn is_terminal(self) -> bool {
+        self.is_terminal_good() || self.is_terminal_bad() || self == NodeStatus::NotSelected
     }
 }
 
@@ -174,6 +197,8 @@ pub struct GraphSnapshot {
     pub name: String,
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<PlanGraphEdge>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub condition_gates: Vec<PlanGraphConditionGate>,
 }
 
 /// Per-node accumulator while folding the status stream.
@@ -214,10 +239,7 @@ fn fold_status(lines: &[String], n_nodes: usize) -> Vec<Obs> {
             continue;
         };
         // A terminal state is final — a stray later event can't revive it.
-        let terminal = o
-            .status
-            .map(|s| s.is_terminal_good() || s.is_terminal_bad())
-            .unwrap_or(false);
+        let terminal = o.status.map(NodeStatus::is_terminal).unwrap_or(false);
         match kind {
             "stage_begin" => {
                 if let Some(h) = ev.get("input_hash").and_then(|v| v.as_str()) {
@@ -263,6 +285,9 @@ fn fold_status(lines: &[String], n_nodes: usize) -> Vec<Obs> {
                     NodeStatus::Failed
                 });
             }
+            "stage_pruned" if !terminal => {
+                o.status = Some(NodeStatus::NotSelected);
+            }
             _ => {}
         }
     }
@@ -304,6 +329,11 @@ pub fn graph_snapshot(job_id: &str) -> Result<GraphSnapshot, String> {
             preds[e.to].push(e.from);
         }
     }
+    for gate in &plan.condition_gates {
+        if gate.target < n && gate.condition < n {
+            preds[gate.target].push(gate.condition);
+        }
+    }
 
     // Derive a concrete status for every node. plan.nodes are in topo order
     // (ascending idx), so a node's predecessors are resolved before it — the
@@ -322,6 +352,11 @@ pub fn graph_snapshot(job_id: &str) -> Result<GraphSnapshot, String> {
                 // preds and no events is Ready (it simply hasn't started).
                 if preds[i].iter().any(|&p| status[p].is_terminal_bad()) {
                     NodeStatus::Pruned
+                } else if preds[i]
+                    .iter()
+                    .any(|&p| status[p] == NodeStatus::NotSelected)
+                {
+                    NodeStatus::NotSelected
                 } else if preds[i].iter().all(|&p| status[p].is_terminal_good()) {
                     NodeStatus::Ready
                 } else {
@@ -356,6 +391,7 @@ pub fn graph_snapshot(job_id: &str) -> Result<GraphSnapshot, String> {
         name: plan.name,
         nodes,
         edges: plan.edges,
+        condition_gates: plan.condition_gates,
     })
 }
 
@@ -376,8 +412,9 @@ mod tests {
             json!({"kind":"stage_skipped","node_idx":1,"stage_name":"b","cache_key":"cc"}),
             json!({"kind":"stage_failed","node_idx":2,"stage_name":"c","error":"cancelled during stage"}),
             json!({"kind":"stage_failed","node_idx":3,"stage_name":"d","error":"Out of memory: Killed process 9"}),
+            json!({"kind":"stage_pruned","node_idx":4,"stage_name":"e","reason":"condition false"}),
         ]);
-        let o = fold_status(&l, 4);
+        let o = fold_status(&l, 5);
         assert_eq!(o[0].status, Some(NodeStatus::Done));
         assert_eq!(o[0].output_hash.as_deref(), Some("bb"));
         assert_eq!(o[0].elapsed_secs, Some(3.5));
@@ -385,6 +422,7 @@ mod tests {
         assert!(o[1].cache_hit);
         assert_eq!(o[2].status, Some(NodeStatus::Killed), "cancel → killed");
         assert_eq!(o[3].status, Some(NodeStatus::Failed), "OOM-killer → failed");
+        assert_eq!(o[4].status, Some(NodeStatus::NotSelected));
     }
 
     #[test]
@@ -396,6 +434,18 @@ mod tests {
         ]);
         let o = fold_status(&l, 1);
         assert_eq!(o[0].status, Some(NodeStatus::Done));
+    }
+
+    #[test]
+    fn control_prune_is_terminal_and_not_revived() {
+        let l = lines(&[
+            json!({"kind":"stage_pruned","node_idx":0,"stage_name":"a","reason":"condition false"}),
+            json!({"kind":"stage_begin","node_idx":0,"stage_name":"a","input_hash":"late"}),
+            json!({"kind":"stage_end","node_idx":0,"stage_name":"a","output_hash":"late","elapsed":{"secs":1,"nanos":0}}),
+        ]);
+        let o = fold_status(&l, 1);
+        assert_eq!(o[0].status, Some(NodeStatus::NotSelected));
+        assert!(o[0].output_hash.is_none());
     }
 
     #[test]
@@ -428,5 +478,64 @@ mod tests {
         assert!(s.contains("epochs=10"));
         assert!(s.contains("tag=run"));
         assert!(!s.contains("nested"), "nested objects elided");
+    }
+
+    #[test]
+    fn plan_graph_condition_gates_are_backward_compatible() {
+        let old = json!({
+            "name": "old",
+            "nodes": [],
+            "edges": []
+        });
+        let graph: PlanGraph = serde_json::from_value(old).unwrap();
+        assert!(graph.condition_gates.is_empty());
+        assert!(
+            serde_json::to_value(graph)
+                .unwrap()
+                .get("condition_gates")
+                .is_none(),
+            "empty condition metadata stays absent from the persisted format"
+        );
+    }
+
+    #[test]
+    fn plan_graph_condition_gates_round_trip_separately_from_data_edges() {
+        let graph = PlanGraph {
+            name: "conditional".into(),
+            nodes: Vec::new(),
+            edges: vec![PlanGraphEdge { from: 0, to: 1 }],
+            condition_gates: vec![PlanGraphConditionGate {
+                condition: 1,
+                target: 2,
+                when: true,
+            }],
+        };
+
+        let value = serde_json::to_value(&graph).unwrap();
+        assert_eq!(value["edges"], json!([{"from": 0, "to": 1}]));
+        assert_eq!(
+            value["condition_gates"],
+            json!([{"condition": 1, "target": 2, "when": true}])
+        );
+        let decoded: PlanGraph = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.condition_gates, graph.condition_gates);
+    }
+
+    #[test]
+    fn graph_snapshot_condition_gates_are_backward_compatible() {
+        let old = json!({
+            "job": "job-1",
+            "name": "old",
+            "nodes": [],
+            "edges": []
+        });
+        let snapshot: GraphSnapshot = serde_json::from_value(old).unwrap();
+        assert!(snapshot.condition_gates.is_empty());
+        assert!(
+            serde_json::to_value(snapshot)
+                .unwrap()
+                .get("condition_gates")
+                .is_none()
+        );
     }
 }

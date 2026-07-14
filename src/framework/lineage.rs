@@ -33,7 +33,10 @@ pub struct LineageNode {
 
 /// Replay a job's `status.jsonl` `StageEvent`s into a per-node lineage
 /// (ordered by `node_idx`). Tolerant: non-`StageEvent` lines (a legacy
-/// bare-spawn job's `StatusUpdate` stream) are skipped.
+/// bare-spawn job's `StatusUpdate` stream) are skipped. `StagePruned` is
+/// intentionally omitted: an unselected stage did not consume or produce an
+/// artifact, so manufacturing a lineage row for it would be misleading. Its
+/// control outcome remains visible through the graph and console status views.
 pub fn job_lineage(job_id: &str) -> Result<Vec<LineageNode>> {
     let id = jobs::resolve_job_id(job_id)?;
     let mut by_idx: BTreeMap<u32, LineageNode> = BTreeMap::new();

@@ -35,7 +35,7 @@ use crate::framework::resource::Resource;
 /// Note: lifecycle events (everything but `StageStep`) DO NOT ride this
 /// lossy channel to the writer — they go through the [`StatusHub`]'s
 /// separate lossless mpsc, so a writer that falls behind on Step spam
-/// can never drop a `StageBegin`/`StageEnd`/`StageFailed` from the
+/// can never drop a `StageBegin`/`StageEnd`/`StageFailed`/`StagePruned` from the
 /// audit trail. The broadcast is for the live UI only.
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 4096;
 
@@ -74,6 +74,14 @@ pub enum StageEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         failure: Option<FailureSummary>,
     },
+    /// The scheduler proved this stage is unreachable for the selected
+    /// conditional path. Unlike `StageFailed`, this is a successful control
+    /// decision and the stage never entered its run body.
+    StagePruned {
+        node_idx: u32,
+        stage_name: String,
+        reason: String,
+    },
     /// Stage is blocked on a resource semaphore. Useful for the TUI
     /// to show "waiting on GPU" instead of "running".
     StageBlocked {
@@ -109,7 +117,7 @@ pub enum StageEvent {
 
 impl StageEvent {
     /// Lifecycle events — the structurally important audit trail
-    /// (begin/end/skipped/failed/blocked). These ride the LOSSLESS
+    /// (begin/end/skipped/failed/pruned/blocked). These ride the LOSSLESS
     /// channel; `StageStep` (and the writer-generated `StepGap`) are
     /// the lossy, high-volume class.
     pub fn is_lifecycle(&self) -> bool {
@@ -596,6 +604,14 @@ mod tests {
             .is_lifecycle()
         );
         assert!(!StageEvent::StepGap { dropped: 3 }.is_lifecycle());
+        assert!(
+            StageEvent::StagePruned {
+                node_idx: 1,
+                stage_name: "guarded".into(),
+                reason: "condition false".into(),
+            }
+            .is_lifecycle()
+        );
     }
 
     #[tokio::test]

@@ -516,10 +516,12 @@ fn compiled_graph(nodes: &[(&str, &str, Option<i32>)], edges: &[(u32, u32)]) -> 
                 retry: None,
                 timeout: None,
                 priority: *priority,
+                pure: false,
             })
             .collect(),
         edges: edges.to_vec(),
         expansions: Vec::new(),
+        condition_gates: Vec::new(),
         version: PLAN_SPEC_VERSION,
     }
     .compile(&registry)

@@ -885,7 +885,7 @@ pub(super) fn node_status_style(s: crate::framework::NodeStatus) -> ratatui::sty
         N::Running => theme::key_hint(),
         N::Failed | N::Killed | N::Pruned => theme::error(),
         N::Blocked => theme::warning(),
-        N::Pending | N::Ready => theme::dim(),
+        N::Pending | N::Ready | N::NotSelected => theme::dim(),
     }
 }
 
@@ -923,7 +923,7 @@ pub(super) fn draw_dag(f: &mut Frame<'_>, area: Rect, app: &App) {
                     .unwrap_or_else(|| "—".into());
                 let cache = if n.cache_hit { "  (cache hit)" } else { "" };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  [{:>7}] ", n.status.as_str()), node_status_style(n.status)),
+                    Span::styled(format!("  [{:>12}] ", n.status.as_str()), node_status_style(n.status)),
                     Span::styled(format!("{:>2} ", n.idx), theme::dim()),
                     Span::styled(
                         format!("{:<28} ", truncate(&n.stage_name, 28)),
@@ -1350,6 +1350,14 @@ mod render_tests {
     /// Symbol at a cell as an owned `String`.
     fn sym(buf: &Buffer, x: u16, y: u16) -> String {
         buf[(x, y)].symbol().to_string()
+    }
+
+    #[test]
+    fn not_selected_uses_neutral_status_style() {
+        use crate::framework::NodeStatus;
+
+        assert_eq!(node_status_style(NodeStatus::NotSelected), theme::dim());
+        assert_ne!(node_status_style(NodeStatus::NotSelected), theme::error());
     }
 
     #[test]

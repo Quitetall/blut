@@ -47,7 +47,7 @@ pub mod retry;
 pub mod stage;
 pub mod status;
 
-pub use artifact::{Artifact, ArtifactMetadata, ContentHash, ListOf};
+pub use artifact::{Artifact, ArtifactMetadata, BranchDecision, ContentHash, ListOf};
 pub use cache::{CacheHandle, CacheHit, lru_prune};
 pub use compat::Compatible;
 pub use cookbook::{
@@ -65,7 +65,7 @@ pub use graph::{GraphSnapshot, NodeStatus, PlanGraph, graph_snapshot};
 pub use object_store::S3BlobStore;
 pub use object_store::{BlobStore, FsBlobStore};
 pub use plan::{CompiledPlan, NodeId, Plan};
-pub use plan_spec::{PLAN_SPEC_VERSION, PlanSpec, PlanSpecError, SpecNode};
+pub use plan_spec::{ConditionGateSpec, PLAN_SPEC_VERSION, PlanSpec, PlanSpecError, SpecNode};
 pub use resource::Resource;
 pub use retry::{Backoff, RetryEvent, RetryHook, RetryOn, RetryPolicy, StageTimeout};
 pub use stage::{ErasedArtifact, ErasedDecodeError, Stage, StageContext, StageDyn};

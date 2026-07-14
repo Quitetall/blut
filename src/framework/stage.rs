@@ -353,6 +353,16 @@ pub trait Stage: Send + Sync + 'static {
     /// doesn't re-execute just because its upstream was retrained.
     const DETERMINISTIC: bool = true;
 
+    /// Whether the stage implementation is safe to execute before a branch
+    /// decision is known (ADR 0102). Default false is fail-closed.
+    ///
+    /// This is deliberately distinct from [`DETERMINISTIC`](Self::DETERMINISTIC):
+    /// byte-equal output does not prove absence of network writes, subprocess
+    /// effects, global mutation, or writes outside `StageContext::stage_dir`.
+    /// A PlanSpec node must also opt in with `pure: true`; neither declaration
+    /// authorizes speculation by itself.
+    const SPECULATION_SAFE: bool = false;
+
     /// CPU cores this stage keeps busy while running. Default 1 (a
     /// single-threaded or GPU-bound stage). Used by the p2p dispatch
     /// path to size the `ResourceRequest` sent to peers — a rayon/
@@ -502,6 +512,11 @@ pub trait StageDyn: Send + Sync + 'static {
     fn name(&self) -> &'static str;
     fn schema(&self) -> u32;
     fn deterministic(&self) -> bool;
+    /// Erased mirror of [`Stage::SPECULATION_SAFE`]. Manual `StageDyn`
+    /// implementations remain ineligible unless they explicitly opt in.
+    fn speculation_safe(&self) -> bool {
+        false
+    }
     fn resources(&self) -> &'static [Resource];
     fn memory_gib(&self) -> u32;
     /// Args-aware RAM reservation. Defaults to the const `memory_gib()`; a
@@ -767,6 +782,9 @@ impl<S: Stage> StageDyn for S {
     }
     fn deterministic(&self) -> bool {
         S::DETERMINISTIC
+    }
+    fn speculation_safe(&self) -> bool {
+        S::SPECULATION_SAFE
     }
     fn is_advisory(&self) -> bool {
         S::ADVISORY

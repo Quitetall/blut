@@ -62,8 +62,10 @@ fn plaintext_absent_from_all_four_surfaces() {
             retry: None,
             timeout: None,
             priority: None,
+            pure: false,
         }],
         edges: vec![],
+        condition_gates: Vec::new(),
         expansions: Vec::new(),
         version: 1,
     };

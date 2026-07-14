@@ -98,6 +98,7 @@ pub enum Trust {
 pub enum NodeState {
     Cached,
     Done,
+    NotSelected,
     Running,
     Queued,
     Blocked,
@@ -384,6 +385,17 @@ impl ConsoleModel {
                         error.chars().take(28).collect(),
                     );
                 }
+                StageEvent::StagePruned {
+                    node_idx,
+                    stage_name,
+                    reason,
+                } => set(
+                    &mut nodes,
+                    node_idx,
+                    stage_name,
+                    NodeState::NotSelected,
+                    reason.chars().take(28).collect(),
+                ),
                 StageEvent::StageBlocked {
                     node_idx,
                     stage_name,
@@ -415,7 +427,12 @@ impl ConsoleModel {
         self.stages_done = self
             .dag
             .iter()
-            .filter(|n| matches!(n.state, NodeState::Done | NodeState::Cached))
+            .filter(|n| {
+                matches!(
+                    n.state,
+                    NodeState::Done | NodeState::Cached | NodeState::NotSelected
+                )
+            })
             .count() as u32;
         self.phase = if any_fail {
             Phase::Failed
@@ -559,6 +576,7 @@ fn node_marker(state: NodeState) -> Span<'static> {
     let (g, st) = match state {
         NodeState::Cached => ("✓", theme::verified()),
         NodeState::Done => ("•", theme::label()),
+        NodeState::NotSelected => ("–", theme::panel_border()),
         NodeState::Running => ("⟳", theme::signal_bold()),
         NodeState::Queued => ("○", theme::panel_border()),
         NodeState::Blocked => ("⨯", theme::halt()),
@@ -567,6 +585,7 @@ fn node_marker(state: NodeState) -> Span<'static> {
         match state {
             NodeState::Cached => "x",
             NodeState::Done => "*",
+            NodeState::NotSelected => "-",
             NodeState::Running => "~",
             NodeState::Queued => "o",
             NodeState::Blocked => "!",
@@ -759,6 +778,7 @@ fn draw_plan(f: &mut Frame<'_>, area: Rect, m: &ConsoleModel) {
             NodeState::Running => theme::signal_bold(),
             NodeState::Cached => theme::verified(),
             NodeState::Blocked => theme::halt(),
+            NodeState::NotSelected => theme::panel_border(),
             _ => theme::label(),
         };
         pipeline.push(Span::styled(n.name.clone(), name_style));
@@ -769,6 +789,7 @@ fn draw_plan(f: &mut Frame<'_>, area: Rect, m: &ConsoleModel) {
         let state_txt = match n.state {
             NodeState::Cached => "cache hit",
             NodeState::Done => "done",
+            NodeState::NotSelected => "not selected",
             NodeState::Running => "running",
             NodeState::Queued => "queued",
             NodeState::Blocked => "blocked",
@@ -777,7 +798,7 @@ fn draw_plan(f: &mut Frame<'_>, area: Rect, m: &ConsoleModel) {
             Span::raw(" "),
             node_marker(n.state),
             Span::styled(format!(" {:<22}", n.name), theme::signal()),
-            Span::styled(format!("{state_txt:<11}"), theme::label()),
+            Span::styled(format!("{state_txt:<12}"), theme::label()),
             Span::styled(n.note.clone(), theme::panel_border()),
         ]));
     }
@@ -1104,6 +1125,47 @@ mod tests {
         assert_eq!(m.stages_total, 3);
         // Cache: 1 hit (skipped) + 1 miss (ended) = 50%.
         assert_eq!(m.cache_hit_pct, 50);
+    }
+
+    #[test]
+    fn control_prune_is_a_successful_accounted_stage() {
+        use crate::framework::artifact::ContentHash;
+        use std::time::Duration;
+
+        let events = [
+            HostedEvent {
+                host: None,
+                event: StageEvent::StageEnd {
+                    node_idx: 0,
+                    stage_name: "decision".into(),
+                    output_hash: ContentHash::of_bytes(b"decision"),
+                    elapsed: Duration::from_millis(1),
+                },
+            },
+            HostedEvent {
+                host: None,
+                event: StageEvent::StagePruned {
+                    node_idx: 1,
+                    stage_name: "guarded".into(),
+                    reason: "condition false".into(),
+                },
+            },
+        ];
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("status.jsonl");
+        let body = events
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap() + "\n")
+            .collect::<String>();
+        std::fs::write(&path, body).unwrap();
+
+        let mut model = ConsoleModel::demo();
+        assert!(model.apply_status_jsonl(&path));
+        assert_eq!(model.dag[1].state, NodeState::NotSelected);
+        assert_eq!((model.stages_done, model.stages_total), (2, 2));
+        assert_eq!(model.phase, Phase::Succeeded);
+        assert_eq!(model.cache_hit_pct, 0);
+        assert_eq!(model.cache.len(), 1, "the pruned stage adds no cache event");
     }
 
     #[test]

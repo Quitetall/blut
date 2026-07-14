@@ -351,6 +351,7 @@ mod tests {
             retry: None,
             timeout: None,
             priority: None,
+            pure: false,
         };
         let tool = serde_json::json!({ "tool": "true" });
         // object → fetch → store: ObjectRef → DatasetRef → ObjectRef. Kind-checks.
@@ -365,6 +366,7 @@ mod tests {
                 node("connector_store", tool.clone()),
             ],
             edges: vec![(0, 1), (1, 2)],
+            condition_gates: Vec::new(),
             expansions: Vec::new(),
             version: 1,
         };
@@ -385,6 +387,7 @@ mod tests {
                 node("connector_fetch", tool),
             ],
             edges: vec![(0, 1), (1, 2)],
+            condition_gates: Vec::new(),
             expansions: Vec::new(),
             version: 1,
         };

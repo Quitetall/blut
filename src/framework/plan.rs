@@ -65,6 +65,11 @@ pub(crate) struct PlanNode {
     /// reorders the ready queue only, never bypassing broker admission, and is
     /// scheduling metadata (NOT part of a node's cache key, like retry/timeout).
     pub priority: Option<i32>,
+    /// Author-side speculation request. This remains separate from the stage's
+    /// own `Stage::SPECULATION_SAFE` capability: plan compilation requires
+    /// both before speculative execution is eligible. Execution metadata only
+    /// and therefore never a node cache-key input.
+    pub pure: bool,
     /// Optional partition identity. This is data identity, not scheduling
     /// metadata: the executor appends it to the cache key after every legacy
     /// cache-key input. `None` therefore preserves the exact pre-partition key.
@@ -82,6 +87,7 @@ pub(crate) struct ExecutionOverrides {
     pub retry: Option<crate::framework::retry::RetryPolicy>,
     pub timeout: Option<crate::framework::retry::StageTimeout>,
     pub priority: Option<i32>,
+    pub pure: bool,
 }
 
 impl std::fmt::Debug for PlanNode {
@@ -92,6 +98,7 @@ impl std::fmt::Debug for PlanNode {
             .field("input_kind", &self.stage.input_kind())
             .field("output_kind", &self.stage.output_kind())
             .field("args", &self.args)
+            .field("pure", &self.pure)
             .field("partition", &self.partition)
             .finish()
     }
@@ -101,6 +108,19 @@ impl std::fmt::Debug for PlanNode {
 pub(crate) struct PlanEdge {
     pub from: NodeId,
     pub to: NodeId,
+}
+
+/// A boolean control dependency distinct from the plan's typed data edges.
+///
+/// `condition` produces a `BranchDecision`; `target` retains its ordinary data
+/// predecessors and may run only when the decision equals `when`. Keeping this
+/// relation out of `PlanEdge` prevents control flow from changing typed inputs
+/// or node cache identities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CompiledConditionGate {
+    pub(crate) condition: NodeId,
+    pub(crate) target: NodeId,
+    pub(crate) when: bool,
 }
 
 /// Typed DAG. `Out` is the type at the leading edge; `B` is the
@@ -172,6 +192,7 @@ impl<B: TrainingBackend> Plan<(), B> {
             retry: None,
             timeout: None,
             priority: None,
+            pure: false,
             partition: None,
         });
         // Graph input: provide () as the input artifact.
@@ -257,6 +278,7 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
             retry: None,
             timeout: None,
             priority: None,
+            pure: false,
             partition: None,
         });
         // Edge from each previous leading node to this one. For
@@ -339,6 +361,7 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
             retry: None,
             timeout: None,
             priority: None,
+            pure: false,
             partition: None,
         });
         let r_id = self.nodes.len() as NodeId;
@@ -352,6 +375,7 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
             retry: None,
             timeout: None,
             priority: None,
+            pure: false,
             partition: None,
         });
         for &from in &self.leading {
@@ -411,6 +435,7 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
                 retry: None,
                 timeout: None,
                 priority: None,
+                pure: false,
                 partition: None,
             });
             for &from in &self.leading {
@@ -448,6 +473,7 @@ impl<A1: Artifact, A2: Artifact, B: TrainingBackend> Plan<(A1, A2), B> {
             retry: None,
             timeout: None,
             priority: None,
+            pure: false,
             partition: None,
         });
         for &from in &self.leading {
@@ -483,6 +509,7 @@ impl<A1: Artifact, A2: Artifact, A3: Artifact, B: TrainingBackend> Plan<(A1, A2,
             retry: None,
             timeout: None,
             priority: None,
+            pure: false,
             partition: None,
         });
         for &from in &self.leading {
@@ -514,6 +541,7 @@ impl<A1: Artifact, A2: Artifact, A3: Artifact, B: TrainingBackend> Plan<(A1, A2,
 pub(crate) struct ExecView<'a> {
     pub nodes: &'a [PlanNode],
     pub edges: &'a [PlanEdge],
+    pub condition_gates: &'a [CompiledConditionGate],
     pub initial: &'a HashMap<NodeId, ErasedArtifact>,
     pub recipe_args: &'a serde_json::Value,
 }
@@ -533,6 +561,7 @@ impl<B: TrainingBackend> Plan<(), B> {
             recipe_args: self.recipe_args,
             expansions: Vec::new(),
             fused_subchains: Vec::new(),
+            condition_gates: Vec::new(),
         }
     }
 }
@@ -564,6 +593,9 @@ pub struct CompiledPlan {
     /// ADR 0102 stage-fusion `Plan -> Plan` witness. Empty unless the
     /// flag-gated optimizer pass identified eligible static subchains.
     pub(crate) fused_subchains: Vec<FusedSubchain>,
+    /// Boolean control dependencies. They participate in topological ordering
+    /// and plan identity, but never in typed input gathering or node cache keys.
+    pub(crate) condition_gates: Vec<CompiledConditionGate>,
 }
 
 /// One compiled runtime fan-out (ADR 0078). Attached to a [`CompiledPlan`];
@@ -609,6 +641,7 @@ impl CompiledTemplate {
             recipe_args: serde_json::Value::Null,
             expansions: Vec::new(),
             fused_subchains: Vec::new(),
+            condition_gates: Vec::new(),
         }
     }
 }
@@ -657,6 +690,7 @@ impl CompiledPlan {
             } else {
                 hasher.update(0u64.to_le_bytes());
             }
+            hasher.update([u8::from(node.pure)]);
         }
 
         let mut hasher = Sha256::new();
@@ -668,6 +702,15 @@ impl CompiledPlan {
         for edge in &self.edges {
             hasher.update(edge.from.to_le_bytes());
             hasher.update(edge.to.to_le_bytes());
+        }
+        if !self.condition_gates.is_empty() {
+            hasher.update(b"blut.condition-gates.v1");
+            hasher.update((self.condition_gates.len() as u64).to_le_bytes());
+            for gate in &self.condition_gates {
+                hasher.update(gate.condition.to_le_bytes());
+                hasher.update(gate.target.to_le_bytes());
+                hasher.update([u8::from(gate.when)]);
+            }
         }
         for expansion in &self.expansions {
             hasher.update(expansion.parent.to_le_bytes());
@@ -704,6 +747,19 @@ impl CompiledPlan {
     /// (the executor + tests read it); empty for a plain DAG.
     pub(crate) fn expansions(&self) -> &[MapExpansion] {
         &self.expansions
+    }
+
+    /// Boolean control gates in compiled node-id space. This hidden read-only
+    /// surface is intended for execution/status tooling, not plan authoring.
+    #[doc(hidden)]
+    pub fn condition_gates(&self) -> impl Iterator<Item = (NodeId, NodeId, bool)> + '_ {
+        self.condition_gates
+            .iter()
+            .map(|gate| (gate.condition, gate.target, gate.when))
+    }
+
+    pub(crate) fn has_condition_gates(&self) -> bool {
+        !self.condition_gates.is_empty()
     }
 
     /// Replace the recipe-args provenance blob (audit-only; the executor uses
@@ -758,9 +814,15 @@ impl CompiledPlan {
         for e in &self.edges {
             indeg[e.to as usize] += 1;
         }
+        for gate in &self.condition_gates {
+            indeg[gate.target as usize] += 1;
+        }
         let mut adj: Vec<Vec<NodeId>> = vec![Vec::new(); n];
         for e in &self.edges {
             adj[e.from as usize].push(e.to);
+        }
+        for gate in &self.condition_gates {
+            adj[gate.condition as usize].push(gate.target);
         }
         let mut ready: std::collections::VecDeque<NodeId> = (0..n as NodeId)
             .filter(|&i| indeg[i as usize] == 0)
@@ -789,6 +851,7 @@ impl CompiledPlan {
         ExecView {
             nodes: &self.nodes,
             edges: &self.edges,
+            condition_gates: &self.condition_gates,
             initial: &self.initial,
             recipe_args: &self.recipe_args,
         }
@@ -800,12 +863,20 @@ impl CompiledPlan {
     #[allow(clippy::type_complexity)]
     pub(crate) fn into_parts(
         self,
-    ) -> (
-        Vec<PlanNode>,
-        Vec<PlanEdge>,
-        HashMap<NodeId, ErasedArtifact>,
-    ) {
-        (self.nodes, self.edges, self.initial)
+    ) -> Result<
+        (
+            Vec<PlanNode>,
+            Vec<PlanEdge>,
+            HashMap<NodeId, ErasedArtifact>,
+        ),
+        crate::framework::error::PlanError,
+    > {
+        if !self.condition_gates.is_empty() {
+            return Err(crate::framework::error::PlanError::Other(
+                "runtime Spawn injection does not support conditional sub-plans".into(),
+            ));
+        }
+        Ok((self.nodes, self.edges, self.initial))
     }
 
     /// Serializable plan STRUCTURE for the DAG backend (v0.20): nodes laid out
@@ -817,7 +888,9 @@ impl CompiledPlan {
     pub fn graph_structure(
         &self,
     ) -> Result<crate::framework::graph::PlanGraph, crate::framework::error::PlanError> {
-        use crate::framework::graph::{PlanGraph, PlanGraphEdge, PlanGraphNode};
+        use crate::framework::graph::{
+            PlanGraph, PlanGraphConditionGate, PlanGraphEdge, PlanGraphNode,
+        };
         let order = self.topo_order()?;
         // NodeId → topo position (the inverse of `order`).
         let mut pos = vec![0usize; self.nodes.len()];
@@ -844,10 +917,20 @@ impl CompiledPlan {
                 to: pos[e.to as usize],
             })
             .collect();
+        let condition_gates = self
+            .condition_gates
+            .iter()
+            .map(|gate| PlanGraphConditionGate {
+                condition: pos[gate.condition as usize],
+                target: pos[gate.target as usize],
+                when: gate.when,
+            })
+            .collect();
         Ok(PlanGraph {
             name: self.name.clone(),
             nodes,
             edges,
+            condition_gates,
         })
     }
 
@@ -869,6 +952,7 @@ impl CompiledPlan {
     ) -> (CompiledPlan, Vec<NodeId>) {
         let mut nodes: Vec<PlanNode> = Vec::new();
         let mut edges: Vec<PlanEdge> = Vec::new();
+        let mut condition_gates: Vec<CompiledConditionGate> = Vec::new();
         let mut initial: HashMap<NodeId, ErasedArtifact> = HashMap::new();
         let mut node_offsets: Vec<NodeId> = Vec::with_capacity(components.len());
         let mut offset: NodeId = 0;
@@ -884,6 +968,13 @@ impl CompiledPlan {
                 edges.push(PlanEdge {
                     from: e.from + offset,
                     to: e.to + offset,
+                });
+            }
+            for gate in comp.condition_gates {
+                condition_gates.push(CompiledConditionGate {
+                    condition: gate.condition + offset,
+                    target: gate.target + offset,
+                    when: gate.when,
                 });
             }
             for (id, art) in comp.initial {
@@ -903,6 +994,7 @@ impl CompiledPlan {
                 // Optimization runs after component assembly; never preserve
                 // component-local ids as if they were global fusion groups.
                 fused_subchains: Vec::new(),
+                condition_gates,
             },
             node_offsets,
         )
@@ -968,6 +1060,7 @@ impl CompiledPlan {
                 retry: None,
                 timeout: None,
                 priority: None,
+                pure: false,
                 partition: None,
             });
             if i > 0 {
@@ -989,6 +1082,7 @@ impl CompiledPlan {
             recipe_args,
             expansions: Vec::new(),
             fused_subchains: Vec::new(),
+            condition_gates: Vec::new(),
         })
     }
 
@@ -1012,6 +1106,7 @@ impl CompiledPlan {
             if ov.priority.is_some() {
                 node.priority = ov.priority;
             }
+            node.pure = ov.pure;
         }
     }
 
@@ -1131,6 +1226,7 @@ impl CompiledPlan {
                 retry: None,
                 timeout: None,
                 priority: None,
+                pure: false,
                 partition: None,
             });
         }
@@ -1146,6 +1242,7 @@ impl CompiledPlan {
             recipe_args,
             expansions: Vec::new(),
             fused_subchains: Vec::new(),
+            condition_gates: Vec::new(),
         };
         // Reject cycles (reuses the Kahn walk + `PlanError::Cycle`).
         plan.topo_order()?;
@@ -1161,6 +1258,30 @@ impl CompiledPlan {
         }
         self.expansions = expansions;
         self
+    }
+
+    /// Attach already kind-checked boolean control gates and validate the
+    /// resulting combined data/control graph before it can reach execution.
+    pub(crate) fn with_condition_gates(
+        mut self,
+        condition_gates: Vec<CompiledConditionGate>,
+    ) -> Result<Self, crate::framework::error::PlanError> {
+        let n = self.nodes.len();
+        for gate in &condition_gates {
+            if gate.condition as usize >= n || gate.target as usize >= n {
+                return Err(crate::framework::error::PlanError::EdgeOutOfRange {
+                    from: gate.condition,
+                    to: gate.target,
+                    n_nodes: n,
+                });
+            }
+        }
+        if !condition_gates.is_empty() {
+            self.fused_subchains.clear();
+        }
+        self.condition_gates = condition_gates;
+        self.topo_order()?;
+        Ok(self)
     }
 
     /// Compile a map TEMPLATE (ADR 0078): an arbitrary-topology sub-plan whose
@@ -1256,6 +1377,7 @@ impl CompiledPlan {
                 retry: None,
                 timeout: None,
                 priority: None,
+                pure: false,
                 partition: None,
             })
             .collect();
@@ -1272,6 +1394,7 @@ impl CompiledPlan {
             recipe_args: serde_json::Value::Null,
             expansions: Vec::new(),
             fused_subchains: Vec::new(),
+            condition_gates: Vec::new(),
         };
         probe.topo_order()?;
         Ok(CompiledTemplate {
@@ -1680,6 +1803,7 @@ mod tests {
             retry: None,
             timeout: None,
             priority: None,
+            pure: false,
             partition: None,
         }
     }
@@ -1699,7 +1823,99 @@ mod tests {
             recipe_args: serde_json::json!({}),
             expansions: Vec::new(),
             fused_subchains: Vec::new(),
+            condition_gates: Vec::new(),
         }
+    }
+
+    #[test]
+    fn condition_gate_participates_in_topology_and_fingerprint() {
+        let plain = make_compiled_plan(2, vec![]);
+        let plain_fingerprint = plain.execution_fingerprint();
+        let gated = make_compiled_plan(2, vec![])
+            .with_condition_gates(vec![CompiledConditionGate {
+                condition: 1,
+                target: 0,
+                when: true,
+            }])
+            .expect("valid control edge");
+
+        assert_eq!(gated.topo_order().unwrap(), vec![1, 0]);
+        assert_eq!(
+            gated.condition_gates().collect::<Vec<_>>(),
+            vec![(1, 0, true)]
+        );
+        assert!(gated.has_condition_gates());
+        assert_ne!(plain_fingerprint, gated.execution_fingerprint());
+    }
+
+    #[test]
+    fn execution_override_threads_author_purity() {
+        let mut plan = make_compiled_plan(1, vec![]);
+        let default_fingerprint = plan.execution_fingerprint();
+        assert!(!plan.nodes[0].pure);
+
+        plan.apply_execution_overrides(&[ExecutionOverrides {
+            pure: true,
+            ..ExecutionOverrides::default()
+        }]);
+
+        assert!(plan.nodes[0].pure);
+        assert_ne!(default_fingerprint, plan.execution_fingerprint());
+    }
+
+    #[test]
+    fn condition_gate_cycle_is_rejected() {
+        let err = make_compiled_plan(2, vec![(0, 1)])
+            .with_condition_gates(vec![CompiledConditionGate {
+                condition: 1,
+                target: 0,
+                when: true,
+            }])
+            .err()
+            .expect("data/control cycle must fail");
+        assert!(matches!(err, crate::framework::error::PlanError::Cycle(_)));
+    }
+
+    #[test]
+    fn from_components_remaps_condition_gates() {
+        let component = || {
+            make_compiled_plan(2, vec![])
+                .with_condition_gates(vec![CompiledConditionGate {
+                    condition: 1,
+                    target: 0,
+                    when: false,
+                }])
+                .unwrap()
+        };
+        let (merged, offsets) = CompiledPlan::from_components(
+            "conditional-components".into(),
+            serde_json::Value::Null,
+            vec![component(), component()],
+        );
+
+        assert_eq!(offsets, vec![0, 2]);
+        assert_eq!(
+            merged.condition_gates().collect::<Vec<_>>(),
+            vec![(1, 0, false), (3, 2, false)]
+        );
+        assert!(merged.topo_order().is_ok());
+    }
+
+    #[test]
+    fn conditional_plan_cannot_be_spawn_injected() {
+        let gated = make_compiled_plan(2, vec![])
+            .with_condition_gates(vec![CompiledConditionGate {
+                condition: 0,
+                target: 1,
+                when: true,
+            }])
+            .unwrap();
+
+        let err = match gated.into_parts() {
+            Err(error) => error,
+            Ok(_) => panic!("conditional sub-plan injection must fail closed"),
+        };
+        assert!(format!("{err}").contains("does not support conditional"));
     }
 
     /// Strategy: a random small DAG (5..=10 nodes) with a sparse random

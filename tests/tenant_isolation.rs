@@ -471,6 +471,7 @@ fn spec() -> PlanSpec {
                 retry: None,
                 timeout: None,
                 priority: None,
+                pure: false,
             },
             SpecNode {
                 stage: "check_jsonl".into(),
@@ -478,9 +479,11 @@ fn spec() -> PlanSpec {
                 retry: None,
                 timeout: None,
                 priority: None,
+                pure: false,
             },
         ],
         edges: vec![(0, 1)],
+        condition_gates: Vec::new(),
         expansions: Vec::new(),
         version: 1,
     }

@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use super::plan::{CompiledPlan, FusedSubchain, NodeId, PlanEdge, PlanNode};
+use super::plan::{CompiledConditionGate, CompiledPlan, FusedSubchain, NodeId, PlanEdge, PlanNode};
 
 /// Scheduling hints computed by the optimizer. Stored per-node and
 /// read by the executor's spawn loop.
@@ -153,7 +153,12 @@ fn fusion_candidate(node: &PlanNode) -> bool {
 /// lineage are the equivalence witness. The executor may only refine these
 /// candidates; it does not rediscover topology independently.
 fn find_fused_subchains(plan: &CompiledPlan) -> Vec<FusedSubchain> {
-    if !plan.expansions.is_empty() {
+    // A condition gate is a semantic scheduling boundary: the selector must
+    // complete before the target can become ready and the target may never
+    // execute. Until fused execution can preserve that boundary explicitly,
+    // fail closed instead of letting a data-only subchain witness cross or
+    // obscure conditional control flow.
+    if !plan.expansions.is_empty() || !plan.condition_gates.is_empty() {
         return Vec::new();
     }
     let Ok(order) = plan.topo_order() else {
@@ -232,13 +237,11 @@ fn eliminate_dead_code(plan: CompiledPlan) -> CompiledPlan {
         return plan;
     }
 
-    // Build adjacency: successors and predecessors
-    let mut successors: Vec<Vec<NodeId>> = vec![Vec::new(); n];
-    let mut predecessors: Vec<Vec<NodeId>> = vec![Vec::new(); n];
-    for edge in &plan.edges {
-        successors[edge.from as usize].push(edge.to);
-        predecessors[edge.to as usize].push(edge.from);
-    }
+    // Build the executable topology. Condition gates are control arcs rather
+    // than artifact-carrying `PlanEdge`s, but they still participate in
+    // reachability and root discovery: dropping a selector while retaining its
+    // gated target would leave stale metadata and change execution semantics.
+    let (successors, predecessors) = plan_adjacency(&plan);
 
     // Find roots (no predecessors) that have at least one successor.
     // A root with no successors and no predecessors is a disconnected
@@ -309,6 +312,21 @@ fn eliminate_dead_code(plan: CompiledPlan) -> CompiledPlan {
         .map(|(id, art)| (old_to_new[&id], art))
         .collect();
 
+    // A gate's endpoints are connected by the control arc included in the
+    // liveness walk above, so a live gate is remapped atomically with both
+    // endpoint nodes. Filtering remains fail-safe for internally-constructed
+    // plans that bypass normal PlanSpec validation.
+    let new_condition_gates: Vec<CompiledConditionGate> = plan
+        .condition_gates
+        .into_iter()
+        .filter(|gate| live.contains(&gate.condition) && live.contains(&gate.target))
+        .map(|gate| CompiledConditionGate {
+            condition: old_to_new[&gate.condition],
+            target: old_to_new[&gate.target],
+            when: gate.when,
+        })
+        .collect();
+
     let eliminated = n - new_nodes.len();
     if eliminated > 0 {
         tracing::info!(
@@ -327,7 +345,27 @@ fn eliminate_dead_code(plan: CompiledPlan) -> CompiledPlan {
         // Unreachable with expansions (early-returned above); always empty here.
         expansions: Vec::new(),
         fused_subchains: Vec::new(),
+        condition_gates: new_condition_gates,
     }
+}
+
+/// Build adjacency for the executable DAG. Data edges carry artifacts;
+/// condition gates carry control only, but both constrain execution order.
+fn plan_adjacency(plan: &CompiledPlan) -> (Vec<Vec<NodeId>>, Vec<Vec<NodeId>>) {
+    let n = plan.nodes.len();
+    let mut successors = vec![Vec::new(); n];
+    let mut predecessors = vec![Vec::new(); n];
+
+    for edge in &plan.edges {
+        successors[edge.from as usize].push(edge.to);
+        predecessors[edge.to as usize].push(edge.from);
+    }
+    for gate in &plan.condition_gates {
+        successors[gate.condition as usize].push(gate.target);
+        predecessors[gate.target as usize].push(gate.condition);
+    }
+
+    (successors, predecessors)
 }
 
 // ---------------------------------------------------------------------------
@@ -342,11 +380,8 @@ fn compute_critical_paths(plan: &CompiledPlan, hints: &mut HashMap<NodeId, Sched
         return;
     }
 
-    // Build adjacency (successors)
-    let mut successors: Vec<Vec<NodeId>> = vec![Vec::new(); n];
-    for edge in &plan.edges {
-        successors[edge.from as usize].push(edge.to);
-    }
+    // Control gates constrain the executable topology just like data edges.
+    let (successors, _) = plan_adjacency(plan);
 
     // Dynamic programming: critical_path[node] = 1 + max(critical_path[successors])
     // Process in reverse topo order
@@ -404,13 +439,8 @@ fn compute_memory_hints(plan: &CompiledPlan, hints: &mut HashMap<NodeId, Schedul
         return;
     }
 
-    // Build adjacency
-    let mut successors: Vec<Vec<NodeId>> = vec![Vec::new(); n];
-    let mut predecessors: Vec<Vec<NodeId>> = vec![Vec::new(); n];
-    for edge in &plan.edges {
-        successors[edge.from as usize].push(edge.to);
-        predecessors[edge.to as usize].push(edge.from);
-    }
+    // Control gates constrain the executable topology just like data edges.
+    let (successors, predecessors) = plan_adjacency(plan);
 
     // For each node, estimate peak concurrent memory as the sum of
     // memory_gib for all nodes that could run simultaneously.
@@ -528,6 +558,7 @@ mod tests {
                 retry: None,
                 timeout: None,
                 priority: None,
+                pure: false,
                 partition: None,
             })
             .collect();
@@ -545,6 +576,7 @@ mod tests {
             recipe_args: serde_json::Value::Null,
             expansions: Vec::new(),
             fused_subchains: Vec::new(),
+            condition_gates: Vec::new(),
         }
     }
 
@@ -574,6 +606,51 @@ mod tests {
         let opt = DagOptimizer::new();
         let (optimized, _) = opt.optimize(plan);
         assert_eq!(optimized.n_nodes(), 4, "diamond should be preserved");
+    }
+
+    #[test]
+    fn dead_code_elim_remaps_condition_control_arc() {
+        // Nodes 0 and 4 are disconnected. The only path keeping selector 1
+        // live is its control gate to data chain 2 -> 3.
+        let mut plan = make_plan(5, &[(2, 3)]);
+        plan.condition_gates.push(CompiledConditionGate {
+            condition: 1,
+            target: 2,
+            when: true,
+        });
+
+        let (optimized, _) = DagOptimizer::new().optimize(plan);
+
+        assert_eq!(optimized.n_nodes(), 3);
+        assert_eq!(optimized.n_edges(), 1);
+        assert_eq!(optimized.edges[0].from, 1);
+        assert_eq!(optimized.edges[0].to, 2);
+        assert_eq!(optimized.condition_gates.len(), 1);
+        assert_eq!(optimized.condition_gates[0].condition, 0);
+        assert_eq!(optimized.condition_gates[0].target, 1);
+        assert!(optimized.condition_gates[0].when);
+    }
+
+    #[test]
+    fn fusion_is_disabled_for_conditional_plan() {
+        let mut plan = make_plan(3, &[(0, 1)]);
+        plan.condition_gates.push(CompiledConditionGate {
+            condition: 2,
+            target: 0,
+            when: true,
+        });
+        let opt = DagOptimizer {
+            eliminate_dead_code: false,
+            critical_path: false,
+            cache_aware: false,
+            memory_aware: false,
+            priority_aware: false,
+            stage_fusion: true,
+        };
+
+        let (optimized, _) = opt.optimize(plan);
+
+        assert!(optimized.fused_subchains.is_empty());
     }
 
     #[test]
