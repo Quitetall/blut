@@ -7,29 +7,28 @@
 //!
 //! 1. **Dead code elimination** — remove stages whose outputs are
 //!    never consumed by any downstream stage.
-//! 2. **Critical path priority** — compute the critical path length
+//! 2. **Stage fusion** (ADR 0102) — record eligible maximal linear subchains
+//!    as optimized-plan execution groups. The executor may conservatively
+//!    refine these groups without changing semantic nodes or cache identity.
+//! 3. **Critical path priority** — compute the critical path length
 //!    for each node and store it as a scheduling hint.
-//! 3. **Cache-aware ordering** (ADR 0102) — opt in to executor-side live cache
+//! 4. **Cache-aware ordering** (ADR 0102) — opt in to executor-side live cache
 //!    probes once a node is ready and its exact input-dependent key is known.
-//! 4. **Memory-aware scheduling** — compute peak concurrent memory
+//! 5. **Memory-aware scheduling** — compute peak concurrent memory
 //!    for the current schedule and suggest reordering if a cheaper
 //!    order exists.
-//! 5. **User-priority scheduling** (ADR 0102 pass #4) — copy each node's
+//! 6. **User-priority scheduling** (ADR 0102 pass #4) — copy each node's
 //!    optional `PlanNode::priority` into its hint so a latency-critical
 //!    stage jumps bulk work in the executor's ready queue. Flag-gated
 //!    (`priority_aware`, default off); reorders *ready* nodes only, never
 //!    bypassing broker admission.
-//! 6. **Full-linear fusion slice** (ADR 0102) — opt an eligible whole-plan
-//!    deterministic chain into the executor's fused-chain path, preserving
-//!    every ordinary node/cache identity while removing coordinator task and
-//!    bincode-handoff boundaries. Internal subchain rewriting remains later.
 //!
 //! The optimizer is conservative: it never changes the DAG's semantic
 //! output, only its execution order and which nodes run at all.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use super::plan::{CompiledPlan, NodeId, PlanEdge, PlanNode};
+use super::plan::{CompiledPlan, FusedSubchain, NodeId, PlanEdge, PlanNode};
 
 /// Scheduling hints computed by the optimizer. Stored per-node and
 /// read by the executor's spawn loop.
@@ -70,10 +69,10 @@ pub struct DagOptimizer {
     /// the executor's ready-queue is byte-identical to the pre-0102 behaviour
     /// (each advanced 0102 pass is flag-gated, default-off, per the ADR).
     pub priority_aware: bool,
-    /// ADR 0102's first stage-fusion slice. **Off by default.** The executor may
-    /// coalesce an eligible whole-plan linear deterministic chain into one task
-    /// while retaining every node's normal artifact and cache key. This does
-    /// not yet rewrite eligible internal subchains into fused plan nodes.
+    /// ADR 0102 stage fusion. **Off by default.** The optimizer records maximal
+    /// eligible deterministic linear subchains on the compiled plan; the
+    /// executor may coalesce conservative runtime subsets into one task while
+    /// retaining every semantic node's normal artifact and cache key.
     pub stage_fusion: bool,
 }
 
@@ -93,6 +92,9 @@ impl DagOptimizer {
     /// Returns the optimized plan and per-node schedule hints.
     pub fn optimize(&self, plan: CompiledPlan) -> (CompiledPlan, HashMap<NodeId, ScheduleHint>) {
         let mut plan = plan;
+        // Optimization witnesses always belong to this exact post-DCE id
+        // space. Clear a prior run before any transform can renumber nodes.
+        plan.fused_subchains.clear();
         let mut hints: HashMap<NodeId, ScheduleHint> = HashMap::new();
 
         // Pass 1: Dead code elimination
@@ -100,22 +102,32 @@ impl DagOptimizer {
             plan = eliminate_dead_code(plan);
         }
 
-        // Pass 2: Critical path computation
+        // Pass 2 (ADR 0102): emit maximal structural fusion candidates onto
+        // the optimized plan. Runtime policy may conservatively split or skip
+        // them for admission, cache single-flight, control, or placement, but
+        // it may never fuse outside this Plan -> Plan witness. Cache-aware and
+        // explicit user-priority scheduling retain per-node boundaries: an
+        // atomic group would otherwise hide a ready-queue decision.
+        if self.stage_fusion && !self.cache_aware && !self.priority_aware {
+            plan.fused_subchains = find_fused_subchains(&plan);
+        }
+
+        // Pass 3: Critical path computation
         if self.critical_path {
             compute_critical_paths(&plan, &mut hints);
         }
 
-        // Pass 3 (ADR 0102): cache-aware ordering is resolved later by the
+        // Pass 4 (ADR 0102): cache-aware ordering is resolved later by the
         // executor. At optimizer time downstream input hashes are not known and
         // no tenant-scoped CacheHandle exists, so any static "warm" claim would
         // be a determinism proxy rather than cache evidence.
 
-        // Pass 4: Memory-aware scheduling
+        // Pass 5: Memory-aware scheduling
         if self.memory_aware {
             compute_memory_hints(&plan, &mut hints);
         }
 
-        // Pass 5 (ADR 0102 pass #4): user-priority scheduling. Flag-gated /
+        // Pass 6 (ADR 0102 pass #4): user-priority scheduling. Flag-gated /
         // default-off, so when disabled every hint keeps `user_priority = 0`
         // and the ready-queue order is unchanged.
         if self.priority_aware {
@@ -124,6 +136,70 @@ impl DagOptimizer {
 
         (plan, hints)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pass 2 (ADR 0102): static stage-fusion representation
+// ---------------------------------------------------------------------------
+
+fn fusion_candidate(node: &PlanNode) -> bool {
+    node.stage.deterministic()
+        && !node.stage.is_advisory()
+        && node.stage.supports_in_process_handoff()
+}
+
+/// Record maximal linear subchains in the post-DCE node-id space. Semantic
+/// nodes are deliberately retained: their normal keys, artifacts, events, and
+/// lineage are the equivalence witness. The executor may only refine these
+/// candidates; it does not rediscover topology independently.
+fn find_fused_subchains(plan: &CompiledPlan) -> Vec<FusedSubchain> {
+    if !plan.expansions.is_empty() {
+        return Vec::new();
+    }
+    let Ok(order) = plan.topo_order() else {
+        return Vec::new();
+    };
+    let n = plan.nodes.len();
+    let mut preds = vec![Vec::<NodeId>::new(); n];
+    let mut succs = vec![Vec::<NodeId>::new(); n];
+    for edge in &plan.edges {
+        preds[edge.to as usize].push(edge.from);
+        succs[edge.from as usize].push(edge.to);
+    }
+
+    let mut claimed = HashSet::new();
+    let mut groups = Vec::new();
+    for start in order {
+        if claimed.contains(&start) || !fusion_candidate(&plan.nodes[start as usize]) {
+            continue;
+        }
+        let joins_predecessor = if preds[start as usize].len() == 1 {
+            let predecessor = preds[start as usize][0];
+            succs[predecessor as usize].len() == 1
+                && fusion_candidate(&plan.nodes[predecessor as usize])
+        } else {
+            false
+        };
+        if joins_predecessor {
+            continue;
+        }
+
+        let mut members = vec![start];
+        let mut current = start;
+        while succs[current as usize].len() == 1 {
+            let next = succs[current as usize][0];
+            if preds[next as usize].len() != 1 || !fusion_candidate(&plan.nodes[next as usize]) {
+                break;
+            }
+            members.push(next);
+            current = next;
+        }
+        if members.len() >= 2 {
+            claimed.extend(members.iter().copied());
+            groups.push(FusedSubchain { members });
+        }
+    }
+    groups
 }
 
 impl Default for DagOptimizer {
@@ -205,9 +281,11 @@ fn eliminate_dead_code(plan: CompiledPlan) -> CompiledPlan {
     // Build old→new index mapping
     let mut old_to_new: HashMap<NodeId, NodeId> = HashMap::new();
     let mut new_nodes: Vec<PlanNode> = Vec::new();
-    for (old_id, node) in plan.nodes.into_iter().enumerate() {
+    for (old_id, mut node) in plan.nodes.into_iter().enumerate() {
         if live.contains(&(old_id as NodeId)) {
-            old_to_new.insert(old_id as NodeId, new_nodes.len() as NodeId);
+            let new_id = new_nodes.len() as NodeId;
+            old_to_new.insert(old_id as NodeId, new_id);
+            node.id = new_id;
             new_nodes.push(node);
         }
     }
@@ -248,11 +326,12 @@ fn eliminate_dead_code(plan: CompiledPlan) -> CompiledPlan {
         recipe_args: plan.recipe_args,
         // Unreachable with expansions (early-returned above); always empty here.
         expansions: Vec::new(),
+        fused_subchains: Vec::new(),
     }
 }
 
 // ---------------------------------------------------------------------------
-// Pass 2: Critical path computation
+// Pass 3: Critical path computation
 // ---------------------------------------------------------------------------
 
 /// Compute the critical path length from each node to the terminal.
@@ -295,7 +374,7 @@ fn compute_critical_paths(plan: &CompiledPlan, hints: &mut HashMap<NodeId, Sched
 }
 
 // ---------------------------------------------------------------------------
-// Pass 5 (ADR 0102 pass #4): user-priority scheduling
+// Pass 6 (ADR 0102 pass #4): user-priority scheduling
 // ---------------------------------------------------------------------------
 
 /// Copy each node's user `priority` (from its `PlanNode`, a PlanSpec v1.1
@@ -314,7 +393,7 @@ fn compute_priority_hints(plan: &CompiledPlan, hints: &mut HashMap<NodeId, Sched
 }
 
 // ---------------------------------------------------------------------------
-// Pass 4: Memory-aware scheduling
+// Pass 5: Memory-aware scheduling
 // ---------------------------------------------------------------------------
 
 /// Compute peak concurrent memory for each node based on its
@@ -465,6 +544,7 @@ mod tests {
             initial: HashMap::new(),
             recipe_args: serde_json::Value::Null,
             expansions: Vec::new(),
+            fused_subchains: Vec::new(),
         }
     }
 

@@ -532,8 +532,18 @@ impl<B: TrainingBackend> Plan<(), B> {
             initial: self.initial,
             recipe_args: self.recipe_args,
             expansions: Vec::new(),
+            fused_subchains: Vec::new(),
         }
     }
+}
+
+/// Optimizer-produced execution grouping. Semantic nodes remain individually
+/// addressable so their artifacts, cache keys, status events, and lineage do
+/// not change; `members` names the maximal linear subchain an executor may run
+/// as one atomic task when its runtime admission policy also permits it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FusedSubchain {
+    pub members: Vec<NodeId>,
 }
 
 /// Backend-erased plan, ready for execution. Produced from a
@@ -551,6 +561,9 @@ pub struct CompiledPlan {
     /// `template` per element, seeded with that element. Empty for every plan
     /// that has no map (the common case).
     pub(crate) expansions: Vec<MapExpansion>,
+    /// ADR 0102 stage-fusion `Plan -> Plan` witness. Empty unless the
+    /// flag-gated optimizer pass identified eligible static subchains.
+    pub(crate) fused_subchains: Vec<FusedSubchain>,
 }
 
 /// One compiled runtime fan-out (ADR 0078). Attached to a [`CompiledPlan`];
@@ -595,6 +608,7 @@ impl CompiledTemplate {
             initial: HashMap::new(),
             recipe_args: serde_json::Value::Null,
             expansions: Vec::new(),
+            fused_subchains: Vec::new(),
         }
     }
 }
@@ -611,6 +625,16 @@ impl CompiledPlan {
     }
     pub fn recipe_args(&self) -> &serde_json::Value {
         &self.recipe_args
+    }
+
+    /// Maximal semantic-node subchains selected by the flag-gated ADR 0102
+    /// fusion pass. This is an equivalence/audit witness, not a second authoring
+    /// surface: cookbook authors still build ordinary typed stages and plans.
+    #[doc(hidden)]
+    pub fn fused_subchains(&self) -> impl Iterator<Item = &[NodeId]> {
+        self.fused_subchains
+            .iter()
+            .map(|subchain| subchain.members.as_slice())
     }
 
     /// Stable identity of the executable graph excluding the logical
@@ -876,6 +900,9 @@ impl CompiledPlan {
                 recipe_args: base_args,
                 // Merged components (HPO fan-out) carry no map expansions.
                 expansions: Vec::new(),
+                // Optimization runs after component assembly; never preserve
+                // component-local ids as if they were global fusion groups.
+                fused_subchains: Vec::new(),
             },
             node_offsets,
         )
@@ -961,6 +988,7 @@ impl CompiledPlan {
             initial,
             recipe_args,
             expansions: Vec::new(),
+            fused_subchains: Vec::new(),
         })
     }
 
@@ -1117,6 +1145,7 @@ impl CompiledPlan {
             initial,
             recipe_args,
             expansions: Vec::new(),
+            fused_subchains: Vec::new(),
         };
         // Reject cycles (reuses the Kahn walk + `PlanError::Cycle`).
         plan.topo_order()?;
@@ -1127,6 +1156,9 @@ impl CompiledPlan {
     /// `PlanSpec::compile` after `from_erased_graph`; every other path leaves
     /// `expansions` empty.
     pub(crate) fn with_expansions(mut self, expansions: Vec<MapExpansion>) -> Self {
+        if !expansions.is_empty() {
+            self.fused_subchains.clear();
+        }
         self.expansions = expansions;
         self
     }
@@ -1239,6 +1271,7 @@ impl CompiledPlan {
             initial: HashMap::new(),
             recipe_args: serde_json::Value::Null,
             expansions: Vec::new(),
+            fused_subchains: Vec::new(),
         };
         probe.topo_order()?;
         Ok(CompiledTemplate {
@@ -1665,6 +1698,7 @@ mod tests {
             initial: HashMap::new(),
             recipe_args: serde_json::json!({}),
             expansions: Vec::new(),
+            fused_subchains: Vec::new(),
         }
     }
 
