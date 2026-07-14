@@ -576,6 +576,10 @@ enum NodeFailure {
         stage: String,
         source: StageError,
     },
+    /// A plan-level stop or coordinator invariant detected inside a grouped
+    /// execution boundary. Preserve its exact public classification when the
+    /// grouped task rejoins the coordinator.
+    Plan(PlanError),
     /// An executor-internal failure (e.g. a closed semaphore).
     Other(String),
 }
@@ -2022,6 +2026,7 @@ fn plan_error_of(f: NodeFailure) -> PlanError {
         // pruned branch is a caller-requested stop, never a stage error.
         NodeFailure::Killed { .. } => PlanError::Cancelled,
         NodeFailure::Stage { idx, stage, source } => PlanError::StageFailed { idx, stage, source },
+        NodeFailure::Plan(error) => error,
         NodeFailure::Other(s) => PlanError::Other(s),
     }
 }
@@ -2272,37 +2277,86 @@ impl SequentialExecutor {
     }
 }
 
-/// Conservative ADR 0102 fusion eligibility for the first fused executor path.
-/// A full-plan chain has no sibling that could observe an intermediate and no
-/// competing same-plan key flight that would need the parallel coordinator.
-/// Dynamic expansion, advisory semantics, and non-deterministic stages stay on
-/// the established scheduler until their own equivalence contracts exist.
+/// Resolve the optimizer's explicit Plan -> Plan witness into the special
+/// whole-plan fast path. Runtime policy may refine a witness, never invent one.
 fn full_linear_fusion_order(plan: &CompiledPlan) -> Option<Vec<NodeId>> {
-    if plan.nodes.len() < 2
-        || !plan.expansions.is_empty()
-        || plan.nodes.iter().any(|node| {
-            !node.stage.deterministic()
-                || node.stage.is_advisory()
-                || !node.stage.supports_in_process_handoff()
-        })
-    {
-        return None;
-    }
-    let order = plan.topo_order().ok()?;
-    if plan.edges.len() != order.len().saturating_sub(1)
-        || !order.windows(2).all(|pair| {
-            plan.edges
-                .iter()
-                .any(|edge| edge.from == pair[0] && edge.to == pair[1])
-        })
+    let mut groups = plan.fused_subchains();
+    let members = groups.next()?;
+    if groups.next().is_some()
+        || members.len() != plan.nodes.len()
         || plan
             .initial
             .keys()
-            .any(|node_id| Some(node_id) != order.first())
+            .any(|node_id| Some(node_id) != members.first())
     {
         return None;
     }
-    Some(order)
+    Some(members.to_vec())
+}
+
+#[derive(Clone)]
+struct FusionGroup {
+    node_ids: Vec<NodeId>,
+    admission: AdmissionRequest,
+}
+
+/// Refine optimizer-recorded structural candidates into maximal equal-admission
+/// runtime groups. A fixed dummy input produces a digest of every static cache
+/// key component; tails whose identity also exists outside their group retain
+/// ordinary coordinator boundaries so duplicate-key single-flight cannot race.
+fn internal_linear_fusion_groups(
+    plan: &CompiledPlan,
+    memory_budget_gib: u32,
+) -> HashMap<NodeId, FusionGroup> {
+    let request_for = |id: NodeId| {
+        let node = &plan.nodes[id as usize];
+        AdmissionRequest::for_stage(node.stage.as_ref(), &node.args, memory_budget_gib)
+    };
+    let static_ids: Vec<ContentHash> = plan
+        .nodes
+        .iter()
+        .map(|node| node_cache_key(node, ContentHash([0; 32])))
+        .collect();
+    let mut global_counts = HashMap::<ContentHash, usize>::new();
+    for identity in &static_ids {
+        *global_counts.entry(*identity).or_default() += 1;
+    }
+    let mut groups = HashMap::new();
+
+    for candidate in plan.fused_subchains() {
+        let mut start = 0;
+        while start < candidate.len() {
+            let admission = request_for(candidate[start]);
+            let mut end = start + 1;
+            while end < candidate.len() && request_for(candidate[end]) == admission {
+                end += 1;
+            }
+            let node_ids = candidate[start..end].to_vec();
+            if node_ids.len() >= 2 {
+                let mut local_counts = HashMap::<ContentHash, usize>::new();
+                for node_id in &node_ids {
+                    *local_counts
+                        .entry(static_ids[*node_id as usize])
+                        .or_default() += 1;
+                }
+                let tail_can_collide = node_ids.iter().skip(1).any(|node_id| {
+                    let identity = static_ids[*node_id as usize];
+                    global_counts[&identity] > local_counts[&identity]
+                });
+                if !tail_can_collide {
+                    groups.insert(
+                        node_ids[0],
+                        FusionGroup {
+                            node_ids,
+                            admission,
+                        },
+                    );
+                }
+            }
+            start = end;
+        }
+    }
+    groups
 }
 
 #[cfg(feature = "p2p")]
@@ -2426,6 +2480,85 @@ async fn execute_fused_linear_plan(
     })
 }
 
+/// Execute one coordinator-selected internal fusion group. The first task is
+/// built by the coordinator from external predecessor state; later tasks are
+/// built here from the preceding fused outcomes. All outcomes return together
+/// so scheduler mutation remains coordinator-owned.
+async fn run_fused_group(
+    first_task: NodeTask,
+    remaining: Vec<(crate::framework::plan::PlanNode, u32)>,
+    env: Arc<NodeEnv>,
+    admission_request: AdmissionRequest,
+    deadline: Option<Instant>,
+    started: Instant,
+) -> Result<Vec<NodeOutcome>, NodeFailure> {
+    let mut admission = FusionAdmission::new(admission_request);
+    let mut outputs = HashMap::new();
+    let mut logical_outputs = HashMap::new();
+    let mut outcomes = Vec::with_capacity(remaining.len() + 1);
+    let mut in_process_input = None;
+    let mut next_task = Some(first_task);
+    let mut remaining = remaining.into_iter();
+
+    loop {
+        if let Some(error) = plan_stop_error(deadline, started, &env.cancel) {
+            return Err(NodeFailure::Plan(error));
+        }
+        let task = next_task.take().expect("fusion group task initialized");
+        let node_idx = task.node_idx;
+        let stage_name = task.stage.name().to_string();
+        let run_result = std::panic::AssertUnwindSafe(run_node_with_admission(
+            task,
+            env.clone(),
+            Some(&mut admission),
+            in_process_input.take(),
+        ))
+        .catch_unwind()
+        .await;
+        let mut outcome = match run_result {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(NodeFailure::Other(format!(
+                    "node task panicked in fused node {node_idx} ({stage_name})"
+                )));
+            }
+        };
+        in_process_input = outcome.in_process_output.take();
+
+        let Some((node, next_idx)) = remaining.next() else {
+            outcomes.push(outcome);
+            break;
+        };
+        // The optimizer proves a linear subchain, so the next fused member has
+        // exactly this outcome as its sole predecessor. Keep scratch maps only
+        // for task construction, then clear them: `outcomes` is the one retained
+        // copy returned to the coordinator, matching ordinary-path residency.
+        let predecessor = outcome.node_id;
+        outputs.insert(predecessor, outcome.output.clone());
+        logical_outputs.insert(predecessor, outcome.logical);
+        let edge = [crate::framework::plan::PlanEdge {
+            from: predecessor,
+            to: node.id,
+        }];
+        next_task = Some(
+            build_task(
+                &node,
+                next_idx,
+                &edge,
+                &outputs,
+                &logical_outputs,
+                KillSlot::new(env.cancel.child_token()),
+            )
+            .map_err(NodeFailure::Plan)?,
+        );
+        outputs.clear();
+        logical_outputs.clear();
+        outcomes.push(outcome);
+    }
+
+    Ok(outcomes)
+}
+
 // ════════════════════════════════════════════════════════════════════
 // Parallel executor — ready-set scheduling, JoinSet workers.
 // ════════════════════════════════════════════════════════════════════
@@ -2464,10 +2597,9 @@ impl ParallelExecutor {
             .dag_optimizer
             .as_ref()
             .is_some_and(|optimizer| optimizer.cache_aware);
-        let stage_fusion = ctx
-            .dag_optimizer
-            .as_ref()
-            .is_some_and(|optimizer| optimizer.stage_fusion);
+        let stage_fusion = ctx.dag_optimizer.as_ref().is_some_and(|optimizer| {
+            optimizer.stage_fusion && !optimizer.cache_aware && !optimizer.priority_aware
+        });
         let (plan, mut schedule_hints) = if let Some(ref optimizer) = ctx.dag_optimizer {
             optimizer.optimize(plan)
         } else {
@@ -2488,6 +2620,20 @@ impl ParallelExecutor {
         {
             return execute_fused_linear_plan(plan, ctx, order, admission_request, started).await;
         }
+
+        let internal_fusion_groups = if stage_fusion
+            && !cache_aware
+            && ctx.control.is_none()
+            && fusion_runtime_is_local(&ctx)
+        {
+            internal_linear_fusion_groups(&plan, ctx.memory_budget_gib)
+        } else {
+            HashMap::new()
+        };
+        let fused_internal_nodes: HashSet<NodeId> = internal_fusion_groups
+            .values()
+            .flat_map(|group| group.node_ids.iter().skip(1).copied())
+            .collect();
 
         // `mut`: runtime `Spawn` (PBT/TPE) extends the topo order at runtime.
         let mut order = plan.topo_order()?; // also the cycle check
@@ -2595,7 +2741,7 @@ impl ParallelExecutor {
         let mut cache_probes: HashMap<ContentHash, Option<Arc<CacheHit>>> = HashMap::new();
         let mut prepared_cache_hits: HashMap<NodeId, Arc<CacheHit>> = HashMap::new();
 
-        let mut join: tokio::task::JoinSet<Result<NodeOutcome, NodeFailure>> =
+        let mut join: tokio::task::JoinSet<Result<Vec<NodeOutcome>, NodeFailure>> =
             tokio::task::JoinSet::new();
         let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut n_hits = 0usize;
@@ -2918,13 +3064,13 @@ impl ParallelExecutor {
                                                                 output_hash,
                                                                 elapsed: start.elapsed(),
                                                             });
-                                                            Ok(NodeOutcome {
+                                                            Ok(vec![NodeOutcome {
                                                                 node_id,
                                                                 output: hit.artifact,
                                                                 in_process_output: None,
                                                                 logical,
                                                                 cache_hit: false,
-                                                            })
+                                                            }])
                                                         }
                                                         Ok(None) => {
                                                             let msg = format!(
@@ -3042,7 +3188,26 @@ impl ParallelExecutor {
                         env.cancel.cancel();
                         break;
                     }
-                    join.spawn(async move { run_node(task, env_c).await });
+                    if let Some(group) = internal_fusion_groups.get(&node_id).cloned() {
+                        let remaining = group
+                            .node_ids
+                            .iter()
+                            .skip(1)
+                            .map(|id| (view.nodes[*id as usize].clone(), node_idx_of[id]))
+                            .collect();
+                        join.spawn(run_fused_group(
+                            task,
+                            remaining,
+                            env_c,
+                            group.admission,
+                            deadline,
+                            started,
+                        ));
+                    } else {
+                        join.spawn(async move {
+                            run_node(task, env_c).await.map(|outcome| vec![outcome])
+                        });
+                    }
                     in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -3200,124 +3365,126 @@ impl ParallelExecutor {
             };
 
             match res {
-                Ok(outcome) => {
-                    completed += 1;
-                    let was_cache_hit = outcome.cache_hit;
-                    if was_cache_hit {
-                        n_hits += 1;
-                    } else {
-                        n_misses += 1;
-                    }
-                    // Token no longer needed once the node is done (#4).
-                    node_tokens.remove(&outcome.node_id);
-                    // S1: drop the stage handle alongside (no leak across nodes).
-                    node_stages.remove(&outcome.node_id);
-                    // S1 race fix: clear any leftover kill latch. A
-                    // divergence-then-recovered node was flagged on each diverging
-                    // attempt and cleared at the following `StageRetrying`; the
-                    // successful attempt set no flag, so this is usually a no-op —
-                    // but the explicit remove keeps the set from leaking across
-                    // nodes regardless of the per-attempt history.
-                    kill_flagged.remove(&outcome.node_id);
-                    // O(1) reverse lookup of the key this node ran under.
-                    let key = node_key_of.remove(&outcome.node_id);
-                    outputs.insert(outcome.node_id, outcome.output);
-                    logical_outputs.insert(outcome.node_id, outcome.logical);
+                Ok(outcomes) => {
+                    for outcome in outcomes {
+                        completed += 1;
+                        let was_cache_hit = outcome.cache_hit;
+                        if was_cache_hit {
+                            n_hits += 1;
+                        } else {
+                            n_misses += 1;
+                        }
+                        // Token no longer needed once the node is done (#4).
+                        node_tokens.remove(&outcome.node_id);
+                        // S1: drop the stage handle alongside (no leak across nodes).
+                        node_stages.remove(&outcome.node_id);
+                        // S1 race fix: clear any leftover kill latch. A
+                        // divergence-then-recovered node was flagged on each diverging
+                        // attempt and cleared at the following `StageRetrying`; the
+                        // successful attempt set no flag, so this is usually a no-op —
+                        // but the explicit remove keeps the set from leaking across
+                        // nodes regardless of the per-attempt history.
+                        kill_flagged.remove(&outcome.node_id);
+                        // O(1) reverse lookup of the key this node ran under.
+                        let key = node_key_of.remove(&outcome.node_id);
+                        outputs.insert(outcome.node_id, outcome.output);
+                        logical_outputs.insert(outcome.node_id, outcome.logical);
 
-                    // Release any nodes deferred behind this key — they
-                    // can now cache-hit. Re-add them to the ready set.
-                    if let Some(k) = key {
-                        // Completion is the only relevant cache transition for
-                        // this exact key. Always invalidate it: even a cache hit
-                        // may have raced a prior scheduling miss, and retaining
-                        // that stale `None` could misorder or remotely dispatch
-                        // a same-key waiter. Unrelated keys remain memoized.
-                        cache_probes.remove(&k);
-                        inflight_keys.remove(&k);
-                        if let Some(waiters) = deferred.remove(&k) {
-                            for w in waiters {
-                                ready.insert(w);
+                        // Release any nodes deferred behind this key — they
+                        // can now cache-hit. Re-add them to the ready set.
+                        if let Some(k) = key {
+                            // Completion is the only relevant cache transition for
+                            // this exact key. Always invalidate it: even a cache hit
+                            // may have raced a prior scheduling miss, and retaining
+                            // that stale `None` could misorder or remotely dispatch
+                            // a same-key waiter. Unrelated keys remain memoized.
+                            cache_probes.remove(&k);
+                            inflight_keys.remove(&k);
+                            if let Some(waiters) = deferred.remove(&k) {
+                                for w in waiters {
+                                    ready.insert(w);
+                                }
                             }
                         }
-                    }
 
-                    // Decrement successors' in-degrees; newly-zero → ready.
-                    if first_error.is_none() {
-                        if let Some(ss) = succs.get(&outcome.node_id) {
-                            for &s in ss {
-                                if let Some(d) = indeg.get_mut(&s) {
-                                    *d -= 1;
-                                    if *d == 0 {
-                                        ready.insert(s);
+                        // Decrement successors' in-degrees; newly-zero → ready.
+                        if first_error.is_none() {
+                            if let Some(ss) = succs.get(&outcome.node_id) {
+                                for &s in ss {
+                                    if let Some(d) = indeg.get_mut(&s) {
+                                        *d -= 1;
+                                        if *d == 0 && !fused_internal_nodes.contains(&s) {
+                                            ready.insert(s);
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    // ADR 0078 `map_output`: if this node drives a fan-out,
-                    // queue one template instance per list element. This runs
-                    // on the LOSSLESS completion seam (the output is promoted
-                    // into `outputs` above) — never a dropped step event — so a
-                    // fan-out can't be missed. The deltas are injected at the
-                    // top of the next loop iteration (the single-threaded
-                    // schedule-mutation seam) via `pending_spawns`.
-                    if first_error.is_none() {
-                        for exp in plan.expansions() {
-                            if exp.parent != outcome.node_id {
-                                continue;
-                            }
-                            // The parent's output + logical hash were promoted
-                            // into the maps immediately above; a miss is an
-                            // internal invariant break, not a silent skip (a
-                            // fallback would collide unrelated fan-outs' cache
-                            // keys).
-                            let (Some(list_env), Some(parent_logical)) = (
-                                outputs.get(&outcome.node_id).cloned(),
-                                logical_outputs.get(&outcome.node_id).copied(),
-                            ) else {
-                                first_error = Some(PlanError::Other(format!(
-                                    "map over node {}: parent output/logical-hash missing after \
-                                     its completion (internal invariant)",
-                                    outcome.node_id
-                                )));
-                                break;
-                            };
-                            // Decode the parent's `list` output into its element
-                            // artifacts (erased — the executor doesn't know the
-                            // concrete element type).
-                            let elements = match crate::framework::artifact::decode_list_children(
-                                list_env,
-                            ) {
-                                Ok(v) => v,
-                                Err(e) => {
+                        // ADR 0078 `map_output`: if this node drives a fan-out,
+                        // queue one template instance per list element. This runs
+                        // on the LOSSLESS completion seam (the output is promoted
+                        // into `outputs` above) — never a dropped step event — so a
+                        // fan-out can't be missed. The deltas are injected at the
+                        // top of the next loop iteration (the single-threaded
+                        // schedule-mutation seam) via `pending_spawns`.
+                        if first_error.is_none() {
+                            for exp in plan.expansions() {
+                                if exp.parent != outcome.node_id {
+                                    continue;
+                                }
+                                // The parent's output + logical hash were promoted
+                                // into the maps immediately above; a miss is an
+                                // internal invariant break, not a silent skip (a
+                                // fallback would collide unrelated fan-outs' cache
+                                // keys).
+                                let (Some(list_env), Some(parent_logical)) = (
+                                    outputs.get(&outcome.node_id).cloned(),
+                                    logical_outputs.get(&outcome.node_id).copied(),
+                                ) else {
                                     first_error = Some(PlanError::Other(format!(
-                                        "map over node {}: parent output is not a valid list: {e}",
+                                        "map over node {}: parent output/logical-hash missing after \
+                                     its completion (internal invariant)",
                                         outcome.node_id
                                     )));
                                     break;
+                                };
+                                // Decode the parent's `list` output into its element
+                                // artifacts (erased — the executor doesn't know the
+                                // concrete element type).
+                                let elements =
+                                    match crate::framework::artifact::decode_list_children(list_env)
+                                    {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            first_error = Some(PlanError::Other(format!(
+                                                "map over node {}: parent output is not a valid list: {e}",
+                                                outcome.node_id
+                                            )));
+                                            break;
+                                        }
+                                    };
+                                let base_label = exp.label.clone().unwrap_or_else(|| "map".into());
+                                for (i, elem) in elements.into_iter().enumerate() {
+                                    // Invariant: each element's kind is the element
+                                    // kind the template was compiled against (the
+                                    // parent produced `ListOf<Item>` where
+                                    // `Item::KIND == elem_kind`). Cheap guard
+                                    // against a producer/template kind drift.
+                                    debug_assert_eq!(
+                                        elem.kind, exp.template.elem_kind,
+                                        "map element kind must match the template's element kind"
+                                    );
+                                    let label = format!("{base_label}[{i}]");
+                                    let subplan = exp.template.instantiate(label.clone());
+                                    let elem_logical = map_element_logical(&parent_logical, i);
+                                    pending_spawns.push(crate::framework::control::SpawnDelta {
+                                        subplan,
+                                        label: Some(label),
+                                        root_seeds: vec![(exp.template.root, elem, elem_logical)],
+                                        provenance_parent: Some(outcome.node_id),
+                                    });
                                 }
-                            };
-                            let base_label = exp.label.clone().unwrap_or_else(|| "map".into());
-                            for (i, elem) in elements.into_iter().enumerate() {
-                                // Invariant: each element's kind is the element
-                                // kind the template was compiled against (the
-                                // parent produced `ListOf<Item>` where
-                                // `Item::KIND == elem_kind`). Cheap guard
-                                // against a producer/template kind drift.
-                                debug_assert_eq!(
-                                    elem.kind, exp.template.elem_kind,
-                                    "map element kind must match the template's element kind"
-                                );
-                                let label = format!("{base_label}[{i}]");
-                                let subplan = exp.template.instantiate(label.clone());
-                                let elem_logical = map_element_logical(&parent_logical, i);
-                                pending_spawns.push(crate::framework::control::SpawnDelta {
-                                    subplan,
-                                    label: Some(label),
-                                    root_seeds: vec![(exp.template.root, elem, elem_logical)],
-                                    provenance_parent: Some(outcome.node_id),
-                                });
                             }
                         }
                     }
