@@ -80,7 +80,8 @@ kind-checked before anything runs.
 | `.json` | a `PlanSpec` (arbitrary DAG + map fan-outs) | the engine-native IR — also the Python-SDK door |
 | `.star` | a Starlark script | evaluated OUT OF PROCESS by the `blut-dsl` binary |
 
-**`PlanSpec` (v1)** — `framework::plan_spec::{PlanSpec, SpecNode, MapSpec}`, the
+**`PlanSpec` (v1)** —
+`framework::plan_spec::{PlanSpec, SpecNode, MapSpec, ConditionGateSpec}`, the
 stable, versioned wire IR. Evolve additive-only (`#[serde(default)]`); bump
 `version` only on a breaking change.
 
@@ -105,6 +106,33 @@ stable, versioned wire IR. Evolve additive-only (`#[serde(default)]`); bump
   completes with a `ListOf<E>` output, the engine runs `template` once per
   element, seeding its single root with the element. The template's root must
   take `E` (kind-checked at compile); nested maps are rejected in v1.
+- `condition_gates` are boolean control relations, separate from typed data
+  edges. The selector must produce `BranchDecision`; the target keeps its
+  ordinary data inputs and cache key, but runs only when the decision equals
+  `when`. V1 accepts one exclusive, non-reconvergent gate and rejects composing
+  it with `map_output` rather than guessing at phi/select semantics:
+
+  ```json
+  {
+    "name": "guarded-eval",
+    "nodes": [
+      {"stage": "choose_eval"},
+      {"stage": "prepare_eval"},
+      {"stage": "run_eval"}
+    ],
+    "edges": [[1, 2]],
+    "condition_gates": [{"condition": 0, "target": 2, "when": true}],
+    "version": 1
+  }
+  ```
+
+  An unselected target and its exclusive descendants do not run or populate
+  cache/lineage; status views report them as `not_selected`.
+- `SpecNode.pure` is default-false scheduling metadata for the separate
+  default-off speculation pass. It is only an author request: compilation also
+  requires the registered stage to declare both deterministic output and
+  `Stage::SPECULATION_SAFE = true`. `pure` and condition relations do not enter
+  node cache keys.
 - `PlanSpec::compile(&Registry) -> CompiledPlan`; `provenance_fingerprint`
   hashes `(source, args, spec)` for lineage.
 
