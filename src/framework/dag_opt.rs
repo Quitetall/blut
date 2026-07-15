@@ -28,7 +28,10 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use super::plan::{CompiledConditionGate, CompiledPlan, FusedSubchain, NodeId, PlanEdge, PlanNode};
+use super::plan::{
+    CompiledConditionGate, CompiledPlan, FusedSubchain, NodeId, PlanEdge, PlanNode,
+    SpeculationCandidate,
+};
 use super::stage::StageExecutionBoundary;
 
 /// Scheduling hints computed by the optimizer. Stored per-node and
@@ -75,6 +78,10 @@ pub struct DagOptimizer {
     /// executor may coalesce conservative runtime subsets into one task while
     /// retaining every semantic node's normal artifact and cache key.
     pub stage_fusion: bool,
+    /// ADR 0102 speculative execution. **Off by default.** The optimizer emits
+    /// candidates only for conditional targets with both node-requested purity
+    /// and independent deterministic/speculation-safe stage certification.
+    pub speculative_execution: bool,
 }
 
 impl DagOptimizer {
@@ -86,6 +93,7 @@ impl DagOptimizer {
             memory_aware: true,
             priority_aware: false,
             stage_fusion: false,
+            speculative_execution: false,
         }
     }
 
@@ -96,6 +104,7 @@ impl DagOptimizer {
         // Optimization witnesses always belong to this exact post-DCE id
         // space. Clear a prior run before any transform can renumber nodes.
         plan.fused_subchains.clear();
+        plan.speculation_candidates.clear();
         let mut hints: HashMap<NodeId, ScheduleHint> = HashMap::new();
 
         // Pass 1: Dead code elimination
@@ -111,6 +120,13 @@ impl DagOptimizer {
         // atomic group would otherwise hide a ready-queue decision.
         if self.stage_fusion && !self.cache_aware && !self.priority_aware {
             plan.fused_subchains = find_fused_subchains(&plan);
+        }
+
+        // Pass 2b (ADR 0102): the optimizer is the sole owner of speculative
+        // eligibility. The executor may decline these post-DCE candidates for
+        // capacity, placement, or control reasons; it may never invent one.
+        if self.speculative_execution {
+            plan.speculation_candidates = find_speculation_candidates(&plan);
         }
 
         // Pass 3: Critical path computation
@@ -207,6 +223,22 @@ fn find_fused_subchains(plan: &CompiledPlan) -> Vec<FusedSubchain> {
         }
     }
     groups
+}
+
+fn find_speculation_candidates(plan: &CompiledPlan) -> Vec<SpeculationCandidate> {
+    if !plan.expansions.is_empty() {
+        return Vec::new();
+    }
+    plan.condition_gates
+        .iter()
+        .filter_map(|gate| {
+            let target = plan.nodes.get(gate.target as usize)?;
+            (target.pure && target.stage.deterministic() && target.stage.speculation_safe())
+                .then_some(SpeculationCandidate {
+                    target: gate.target,
+                })
+        })
+        .collect()
 }
 
 impl Default for DagOptimizer {
@@ -347,6 +379,7 @@ fn eliminate_dead_code(plan: CompiledPlan) -> CompiledPlan {
         // Unreachable with expansions (early-returned above); always empty here.
         expansions: Vec::new(),
         fused_subchains: Vec::new(),
+        speculation_candidates: Vec::new(),
         condition_gates: new_condition_gates,
     }
 }
@@ -537,6 +570,7 @@ mod tests {
             const RESOURCES: &'static [crate::framework::resource::Resource] = &[];
             const MEMORY_GIB: u32 = 4; // matches the test expectation
             const DETERMINISTIC: bool = true;
+            const SPECULATION_SAFE: bool = true;
             type Input = ();
             type Output = ();
             type Args = ();
@@ -578,6 +612,7 @@ mod tests {
             recipe_args: serde_json::Value::Null,
             expansions: Vec::new(),
             fused_subchains: Vec::new(),
+            speculation_candidates: Vec::new(),
             condition_gates: Vec::new(),
         }
     }
@@ -648,11 +683,101 @@ mod tests {
             memory_aware: false,
             priority_aware: false,
             stage_fusion: true,
+            speculative_execution: false,
         };
 
         let (optimized, _) = opt.optimize(plan);
 
         assert!(optimized.fused_subchains.is_empty());
+    }
+
+    #[test]
+    fn speculation_witness_is_default_off_and_requires_node_purity() {
+        let mut plan = make_plan(2, &[]);
+        plan.condition_gates.push(CompiledConditionGate {
+            condition: 0,
+            target: 1,
+            when: true,
+        });
+        plan.nodes[1].pure = true;
+
+        let (default_off, _) = DagOptimizer::new().optimize(plan);
+        assert!(default_off.speculation_candidates().next().is_none());
+
+        let mut impure = make_plan(2, &[]);
+        impure.condition_gates.push(CompiledConditionGate {
+            condition: 0,
+            target: 1,
+            when: true,
+        });
+        let optimizer = DagOptimizer {
+            speculative_execution: true,
+            ..DagOptimizer::new()
+        };
+        let (impure, _) = optimizer.optimize(impure);
+        assert!(impure.speculation_candidates().next().is_none());
+
+        struct UnsafeStage;
+        #[async_trait::async_trait]
+        impl crate::framework::stage::Stage for UnsafeStage {
+            const NAME: &'static str = "unsafe_speculation_dummy";
+            const SCHEMA: u32 = 1;
+            const RESOURCES: &'static [crate::framework::resource::Resource] = &[];
+            type Input = ();
+            type Output = ();
+            type Args = ();
+
+            async fn run(
+                &self,
+                _ctx: &crate::framework::stage::StageContext,
+                _input: (),
+                _args: &(),
+            ) -> Result<(), crate::framework::error::StageError> {
+                Ok(())
+            }
+        }
+        let mut unsafe_stage = make_plan(2, &[]);
+        unsafe_stage.nodes[1].pure = true;
+        unsafe_stage.nodes[1].stage = Arc::new(UnsafeStage);
+        unsafe_stage.condition_gates.push(CompiledConditionGate {
+            condition: 0,
+            target: 1,
+            when: true,
+        });
+        let optimizer = DagOptimizer {
+            speculative_execution: true,
+            ..DagOptimizer::new()
+        };
+        let (unsafe_stage, _) = optimizer.optimize(unsafe_stage);
+        assert!(
+            unsafe_stage.speculation_candidates().next().is_none(),
+            "node-requested purity cannot replace stage-owned safety certification"
+        );
+    }
+
+    #[test]
+    fn speculation_witness_uses_post_dce_node_ids() {
+        // Disconnected nodes 0 and 4 disappear. Selector 1 and pure target 2
+        // remain linked by control, and data target 2 -> tail 3 remains live.
+        let mut plan = make_plan(5, &[(2, 3)]);
+        plan.nodes[2].pure = true;
+        plan.condition_gates.push(CompiledConditionGate {
+            condition: 1,
+            target: 2,
+            when: true,
+        });
+        let optimizer = DagOptimizer {
+            speculative_execution: true,
+            ..DagOptimizer::new()
+        };
+
+        let (optimized, _) = optimizer.optimize(plan);
+
+        assert_eq!(
+            optimized.speculation_candidates().collect::<Vec<_>>(),
+            vec![1],
+            "the optimizer alone must publish the candidate in post-DCE id space"
+        );
     }
 
     #[test]
@@ -715,6 +840,7 @@ mod tests {
             memory_aware: false,
             priority_aware: true,
             stage_fusion: false,
+            speculative_execution: false,
         }
     }
 

@@ -16,13 +16,119 @@ use super::*;
 use crate::backends::LamuTrainerBackend;
 use crate::framework::artifact::Artifact;
 use crate::framework::compat::Compatible;
-use crate::framework::plan::{CompiledConditionGate, Plan};
+use crate::framework::plan::{CompiledConditionGate, ExecutionOverrides, Plan};
 use crate::framework::stage::Stage;
 use async_trait::async_trait;
 use blut_types::partition::{PartitionKey, PartitionValue};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+fn speculative_admission_fixture() -> (
+    HashMap<Resource, Arc<tokio::sync::Semaphore>>,
+    crate::broker::gpu::GpuScheduler,
+    Arc<tokio::sync::Semaphore>,
+) {
+    let resources = HashMap::from([
+        (Resource::Cpu, Arc::new(tokio::sync::Semaphore::new(1))),
+        (Resource::Network, Arc::new(tokio::sync::Semaphore::new(1))),
+        (Resource::Disk, Arc::new(tokio::sync::Semaphore::new(1))),
+    ]);
+    let gpu = crate::broker::gpu::GpuScheduler::new(crate::broker::gpu::GpuInventory::homogeneous(
+        1, 40_960,
+    ));
+    let memory = Arc::new(tokio::sync::Semaphore::new(4));
+    (resources, gpu, memory)
+}
+
+fn speculative_admission_request() -> AdmissionRequest {
+    AdmissionRequest {
+        resources: vec![Resource::Cpu, Resource::Network, Resource::Disk],
+        gpu: Some(crate::broker::gpu::GpuRequest::default()),
+        memory_gib: 3,
+    }
+}
+
+#[test]
+fn speculative_admission_try_holds_and_releases_complete_envelope() {
+    let (resources, gpu, memory) = speculative_admission_fixture();
+    let lease =
+        try_acquire_admission_from(&speculative_admission_request(), &resources, &gpu, &memory)
+            .expect("the complete idle envelope is immediately available");
+
+    assert!(resources.values().all(|sem| sem.available_permits() == 0));
+    assert_eq!(memory.available_permits(), 1);
+    assert!(
+        gpu.try_acquire(crate::broker::gpu::GpuRequest::default())
+            .is_none()
+    );
+
+    drop(lease);
+    assert!(resources.values().all(|sem| sem.available_permits() == 1));
+    assert_eq!(memory.available_permits(), 4);
+    assert!(
+        gpu.try_acquire(crate::broker::gpu::GpuRequest::default())
+            .is_some()
+    );
+}
+
+#[test]
+fn speculative_admission_try_resource_contention_touches_later_gates() {
+    let (resources, gpu, memory) = speculative_admission_fixture();
+    let held_cpu = resources[&Resource::Cpu]
+        .clone()
+        .try_acquire_owned()
+        .expect("hold CPU");
+
+    assert!(
+        try_acquire_admission_from(&speculative_admission_request(), &resources, &gpu, &memory,)
+            .is_none()
+    );
+    assert_eq!(resources[&Resource::Network].available_permits(), 1);
+    assert_eq!(resources[&Resource::Disk].available_permits(), 1);
+    assert_eq!(memory.available_permits(), 4);
+    assert!(
+        gpu.try_acquire(crate::broker::gpu::GpuRequest::default())
+            .is_some()
+    );
+    drop(held_cpu);
+}
+
+#[test]
+fn speculative_admission_try_gpu_contention_rolls_back_resources() {
+    let (resources, gpu, memory) = speculative_admission_fixture();
+    let held_gpu = gpu
+        .try_acquire(crate::broker::gpu::GpuRequest::default())
+        .expect("hold GPU");
+
+    assert!(
+        try_acquire_admission_from(&speculative_admission_request(), &resources, &gpu, &memory,)
+            .is_none()
+    );
+    assert!(resources.values().all(|sem| sem.available_permits() == 1));
+    assert_eq!(memory.available_permits(), 4);
+    drop(held_gpu);
+}
+
+#[test]
+fn speculative_admission_try_memory_contention_rolls_back_resources_and_gpu() {
+    let (resources, gpu, memory) = speculative_admission_fixture();
+    let held_memory = memory
+        .clone()
+        .try_acquire_many_owned(4)
+        .expect("hold memory");
+
+    assert!(
+        try_acquire_admission_from(&speculative_admission_request(), &resources, &gpu, &memory,)
+            .is_none()
+    );
+    assert!(resources.values().all(|sem| sem.available_permits() == 1));
+    assert!(
+        gpu.try_acquire(crate::broker::gpu::GpuRequest::default())
+            .is_some()
+    );
+    drop(held_memory);
+}
 
 // Toy artifacts.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2814,6 +2920,219 @@ impl crate::framework::control::ControlPolicy for SpawnEveryStep {
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct ConditionalDecisionArgs {
     value: bool,
+}
+
+static SPARE_SELECTOR_STARTED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static SPARE_SELECTOR_RELEASE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static SPARE_ORDINARY_STARTED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static SPARE_ORDINARY_RELEASE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static SPARE_SPECULATION_STARTED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+
+struct HeldSpareDecision;
+
+#[async_trait]
+impl Stage for HeldSpareDecision {
+    const NAME: &'static str = "held_spare_decision";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[];
+    type Input = ();
+    type Output = BranchDecision;
+    type Args = ConditionalDecisionArgs;
+
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        _input: (),
+        args: &ConditionalDecisionArgs,
+    ) -> Result<BranchDecision, StageError> {
+        SPARE_SELECTOR_STARTED.add_permits(1);
+        tokio::select! {
+            permit = SPARE_SELECTOR_RELEASE.acquire() => {
+                permit.expect("spare selector release open").forget();
+            }
+            _ = ctx.cancel.cancelled() => return Err(StageError::Cancelled),
+        }
+        Ok(BranchDecision { value: args.value })
+    }
+}
+impl Compatible<LamuTrainerBackend> for HeldSpareDecision {}
+
+struct HeldOrdinarySibling;
+
+#[async_trait]
+impl Stage for HeldOrdinarySibling {
+    const NAME: &'static str = "held_ordinary_sibling";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Network];
+    type Input = Counter;
+    type Output = Counter;
+    type Args = EmptyArgs;
+
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        input: Counter,
+        _args: &EmptyArgs,
+    ) -> Result<Counter, StageError> {
+        SPARE_ORDINARY_STARTED.add_permits(1);
+        tokio::select! {
+            permit = SPARE_ORDINARY_RELEASE.acquire() => {
+                permit.expect("spare ordinary release open").forget();
+            }
+            _ = ctx.cancel.cancelled() => return Err(StageError::Cancelled),
+        }
+        Ok(input)
+    }
+}
+impl Compatible<LamuTrainerBackend> for HeldOrdinarySibling {}
+
+struct SpareSpeculationTarget;
+
+#[async_trait]
+impl Stage for SpareSpeculationTarget {
+    const NAME: &'static str = "spare_speculation_target";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Network];
+    const SPECULATION_SAFE: bool = true;
+    type Input = Counter;
+    type Output = Counter;
+    type Args = EmptyArgs;
+
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        mut input: Counter,
+        _args: &EmptyArgs,
+    ) -> Result<Counter, StageError> {
+        if ctx
+            .job_dir
+            .parent()
+            .and_then(std::path::Path::file_name)
+            .is_some_and(|name| name == ".speculation")
+        {
+            SPARE_SPECULATION_STARTED.add_permits(1);
+        }
+        input.n += 1;
+        Ok(input)
+    }
+}
+impl Compatible<LamuTrainerBackend> for SpareSpeculationTarget {}
+
+fn spare_speculation_plan() -> CompiledPlan {
+    let selector = Plan::<(), LamuTrainerBackend>::new("selector", serde_json::json!({}))
+        .start(HeldSpareDecision, ConditionalDecisionArgs { value: true })
+        .finish()
+        .into_compiled();
+    let data = Plan::<(), LamuTrainerBackend>::new("data", serde_json::json!({}))
+        .start(MakeOne, EmptyArgs)
+        .fork(
+            SpareSpeculationTarget,
+            EmptyArgs,
+            HeldOrdinarySibling,
+            EmptyArgs,
+        )
+        .finish()
+        .into_compiled();
+    let (mut plan, offsets) = CompiledPlan::from_components(
+        "spare-after-ordinary".into(),
+        serde_json::Value::Null,
+        vec![selector, data],
+    );
+    let target = offsets[1] + 1;
+    let mut overrides = vec![ExecutionOverrides::default(); plan.exec_view().nodes.len()];
+    overrides[target as usize].pure = true;
+    plan.apply_execution_overrides(&overrides);
+    plan.with_condition_gates(vec![CompiledConditionGate {
+        condition: offsets[0],
+        target,
+        when: true,
+    }])
+    .expect("attach spare-capacity condition gate")
+}
+
+#[tokio::test]
+async fn speculation_uses_slot_left_after_ordinary_ready_work_is_offered() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let plan = spare_speculation_plan();
+
+    let (_td, mut ctx) = fresh_ctx();
+    ctx.max_in_flight = 3;
+    ctx.dag_optimizer = Some(crate::framework::dag_opt::DagOptimizer {
+        speculative_execution: true,
+        ..crate::framework::dag_opt::DagOptimizer::new()
+    });
+    let handle = tokio::spawn(ParallelExecutor::execute(plan, ctx));
+    SPARE_SELECTOR_STARTED
+        .acquire()
+        .await
+        .expect("selector started")
+        .forget();
+    SPARE_ORDINARY_STARTED
+        .acquire()
+        .await
+        .expect("ordinary sibling started")
+        .forget();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        SPARE_SPECULATION_STARTED.acquire(),
+    )
+    .await
+    .expect("spare slot must start speculation in the same scheduler turn")
+    .expect("speculation signal open")
+    .forget();
+
+    SPARE_SELECTOR_RELEASE.add_permits(1);
+    SPARE_ORDINARY_RELEASE.add_permits(1);
+    handle
+        .await
+        .expect("spare-capacity executor task")
+        .expect("spare-capacity plan succeeds");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn speculation_cannot_take_an_ordinary_tasks_only_resource_permit() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let plan = spare_speculation_plan();
+
+    let (_td, mut ctx) = fresh_ctx();
+    ctx = ctx.with_resource_limit(Resource::Network, 1);
+    ctx.max_in_flight = 3;
+    ctx.bypass_cache = true;
+    ctx.dag_optimizer = Some(crate::framework::dag_opt::DagOptimizer {
+        speculative_execution: true,
+        ..crate::framework::dag_opt::DagOptimizer::new()
+    });
+    let handle = tokio::spawn(ParallelExecutor::execute(plan, ctx));
+    SPARE_SELECTOR_STARTED
+        .acquire()
+        .await
+        .expect("selector started")
+        .forget();
+
+    tokio::select! {
+        ordinary = SPARE_ORDINARY_STARTED.acquire() => {
+            ordinary.expect("ordinary signal open").forget();
+        }
+        speculation = SPARE_SPECULATION_STARTED.acquire() => {
+            speculation.expect("speculation signal open").forget();
+            panic!("speculation took the only network permit before offered ordinary work");
+        }
+    }
+
+    assert!(
+        SPARE_SPECULATION_STARTED.try_acquire().is_err(),
+        "the only permit is not spare while the ordinary sibling holds it"
+    );
+    SPARE_ORDINARY_RELEASE.add_permits(1);
+    SPARE_SELECTOR_RELEASE.add_permits(1);
+    handle
+        .await
+        .expect("ordinary-first executor task")
+        .expect("ordinary-first plan succeeds");
+    assert!(
+        SPARE_SPECULATION_STARTED.try_acquire().is_err(),
+        "a capacity decline must fall back to ordinary execution, not retry speculation"
+    );
 }
 
 /// A load-bearing boolean selector that emits one step so the runtime control

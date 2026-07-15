@@ -307,10 +307,56 @@ impl CacheHandle {
         None
     }
 
+    /// Side-effect-free presence probe used by optional scheduler work.
+    ///
+    /// This deliberately does not deserialize, fetch, hydrate, or contact a
+    /// shared provider. A false positive (for example, a corrupt local file or
+    /// merely having a global/remote tier configured) only suppresses optional
+    /// speculation; the ordinary path still performs the authoritative
+    /// [`lookup`](Self::lookup). Shared tiers are treated as "possibly present"
+    /// because even a metadata/HEAD request may block the single coordinator.
+    pub(crate) fn probe_presence(&self, key: ContentHash) -> std::io::Result<bool> {
+        let path = self.job_local.join(key.to_hex()).join("output.bin");
+        match std::fs::metadata(path) {
+            Ok(metadata) => {
+                if metadata.is_file() {
+                    return Ok(true);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if self.global.is_some() || self.remote.is_some() {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Insert an output for the given key. Atomic: writes to a
     /// sibling `.tmp.<pid>.<nanos>` and renames into place. Encoded
     /// as bincode — see `lookup` for rationale.
     pub fn insert(&self, key: ContentHash, output: &ErasedArtifact) -> std::io::Result<()> {
+        self.insert_with_policy(key, output, false)
+    }
+
+    /// Insert for optional work whose plugin boundary must not unwind the
+    /// coordinator. The ordinary/default-off cache contract stays unchanged;
+    /// only a remote write-through panic is contained after the local atomic
+    /// entry has succeeded.
+    pub(crate) fn insert_optional(
+        &self,
+        key: ContentHash,
+        output: &ErasedArtifact,
+    ) -> std::io::Result<()> {
+        self.insert_with_policy(key, output, true)
+    }
+
+    fn insert_with_policy(
+        &self,
+        key: ContentHash,
+        output: &ErasedArtifact,
+        contain_remote_panic: bool,
+    ) -> std::io::Result<()> {
         let dir = self.write_target().join(key.to_hex());
         std::fs::create_dir_all(&dir)?;
         let dest = dir.join("output.bin");
@@ -325,9 +371,25 @@ impl CacheHandle {
         // this result. Best-effort: a remote failure is logged, not fatal — the
         // local write already succeeded, so the run is unaffected.
         if let Some(remote) = &self.remote
-            && let Err(e) = remote.put(key, &body)
+            && contain_remote_panic
         {
-            tracing::warn!("cache: remote write-through for {}: {e}", key.to_hex());
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| remote.put(key, &body)))
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!("cache: remote write-through for {}: {error}", key.to_hex());
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "cache: remote write-through for {} panicked; local entry retained",
+                        key.to_hex()
+                    );
+                }
+            }
+        } else if let Some(remote) = &self.remote
+            && let Err(error) = remote.put(key, &body)
+        {
+            tracing::warn!("cache: remote write-through for {}: {error}", key.to_hex());
         }
         Ok(())
     }
@@ -606,6 +668,23 @@ pub(crate) fn write_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct PanicHeadStore;
+
+    impl crate::framework::object_store::BlobStore for PanicHeadStore {
+        fn get(&self, _key: ContentHash) -> std::io::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn put(&self, _key: ContentHash, _bytes: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn head(&self, _key: ContentHash) -> std::io::Result<bool> {
+            panic!("optional presence probe called remote head");
+        }
+    }
+
     fn fake_erased(payload: serde_json::Value) -> ErasedArtifact {
         // Payload bytes are bincode of the JSON STRING form of the
         // value. `serde_json::Value` itself requires `deserialize_any`
@@ -846,6 +925,60 @@ mod tests {
         assert!(
             b_job.join(key.to_hex()).join("output.bin").exists(),
             "remote hit was written through to the local job dir"
+        );
+    }
+
+    #[test]
+    fn presence_probe_sees_remote_without_hydrating_job_cache() {
+        use crate::framework::object_store::FsBlobStore;
+        let td = tempfile::tempdir().unwrap();
+        let remote = std::sync::Arc::new(FsBlobStore::new(td.path().join("remote")));
+        let key = ContentHash::of_bytes(b"probe-remote");
+        CacheHandle::job_local(td.path().join("producer"))
+            .with_remote(remote.clone())
+            .insert(key, &fake_erased(serde_json::json!({ "v": 1 })))
+            .unwrap();
+
+        let consumer = td.path().join("consumer");
+        let handle = CacheHandle::job_local(consumer.clone()).with_remote(remote);
+        assert!(handle.probe_presence(key).unwrap());
+        assert!(
+            !consumer.join(key.to_hex()).join("output.bin").exists(),
+            "an optional presence check must not hydrate canonical job state"
+        );
+        assert!(handle.lookup(key).is_some());
+        assert!(consumer.join(key.to_hex()).join("output.bin").is_file());
+    }
+
+    #[test]
+    fn presence_probe_treats_shared_tier_as_unknown_without_provider_io() {
+        let td = tempfile::tempdir().unwrap();
+        let key = ContentHash::of_bytes(b"probe-remote-provider");
+        let handle = CacheHandle::job_local(td.path().join("consumer"))
+            .with_remote(std::sync::Arc::new(PanicHeadStore));
+
+        assert!(
+            handle.probe_presence(key).unwrap(),
+            "unknown shared state must conservatively suppress optional work"
+        );
+        assert!(handle.lookup(key).is_none());
+    }
+
+    #[test]
+    fn presence_probe_suppresses_optional_work_without_parsing_corrupt_bytes() {
+        let td = tempfile::tempdir().unwrap();
+        let key = ContentHash::of_bytes(b"probe-corrupt");
+        let path = td.path().join(key.to_hex()).join("output.bin");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = [0xFF, 0x01, 0x02];
+        std::fs::write(&path, bytes).unwrap();
+        let handle = CacheHandle::job_local(td.path().to_path_buf());
+
+        assert!(handle.probe_presence(key).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(
+            handle.lookup(key).is_none(),
+            "ordinary lookup remains the authoritative validity check"
         );
     }
 

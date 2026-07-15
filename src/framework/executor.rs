@@ -33,9 +33,10 @@
 //! error cancels in-flight siblings, drains them (so their FW-2 tmp
 //! cleanup runs), then reports the first error.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 use futures::{FutureExt, StreamExt};
@@ -50,7 +51,9 @@ use crate::framework::error::{PlanError, StageError};
 use crate::framework::plan::{CompiledPlan, NodeId};
 use crate::framework::resource::Resource;
 use crate::framework::stage::{ErasedArtifact, InProcessArtifact, StageContext, StageDyn};
-use crate::framework::status::{StageEvent, StatusHub, spawn_status_writer};
+use crate::framework::status::{
+    DEFAULT_BROADCAST_CAPACITY, StageEvent, StatusHub, spawn_status_writer,
+};
 
 /// Default bound on concurrently-spawned node tasks in the parallel
 /// executor. The real throttle is the per-`Resource` semaphores; this
@@ -63,6 +66,8 @@ pub const DEFAULT_MAX_IN_FLIGHT: usize = 8;
 /// box-fit. Picked large enough to never gate, small enough to stay a valid
 /// `tokio::Semaphore` permit count.
 pub const UNLIMITED_MEM_GIB: u32 = 1_000_000;
+
+static SPECULATION_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// Handle to a dispatched remote task. The executor polls this to
 /// determine when the task completes.
@@ -557,6 +562,141 @@ struct StageRunOutput {
     in_process: Option<InProcessArtifact>,
 }
 
+/// A private speculative result. Until this value is consumed by
+/// `publish_speculative`, every byte and status event remains under the scratch
+/// root and is invisible to the canonical job/cache/lineage surfaces.
+struct SpeculativePrepared {
+    _scratch: SpeculationScratch,
+    scratch_stage_dir: PathBuf,
+    node_id: NodeId,
+    node_idx: u32,
+    stage: Arc<dyn StageDyn>,
+    stage_name: String,
+    input_hash: ContentHash,
+    canon_args: Vec<u8>,
+    key: ContentHash,
+    output: ErasedArtifact,
+    elapsed: std::time::Duration,
+    buffered_steps: Vec<StageEvent>,
+}
+
+impl SpeculativePrepared {
+    fn discard(self) -> Result<(), NodeFailure> {
+        let path = self._scratch.0.clone();
+        self._scratch
+            .cleanup()
+            .map_err(|source| NodeFailure::SpeculationCleanup { path, source })
+    }
+}
+
+/// Removes all private work on rejection, failure, cancellation, or plan exit.
+struct SpeculationScratch(PathBuf);
+
+impl SpeculationScratch {
+    fn reset(&self) -> std::io::Result<()> {
+        match std::fs::remove_dir_all(&self.0) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        std::fs::create_dir_all(&self.0)
+    }
+
+    fn cleanup(&self) -> std::io::Result<()> {
+        match std::fs::remove_dir_all(&self.0) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if let Some(parent) = self.0.parent() {
+            match std::fs::remove_dir(parent) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SpeculationScratch {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            tracing::error!(
+                "executor: failed to remove private speculation scratch {}: {error}",
+                self.0.display()
+            );
+        }
+    }
+}
+
+/// Removes a renamed stage directory if selected publication unwinds before
+/// its canonical cache/status commit is complete.
+struct SpeculativePublishGuard {
+    final_stage_dir: PathBuf,
+    committed: bool,
+    rollback_failure: Arc<std::sync::Mutex<Option<std::io::Error>>>,
+}
+
+impl SpeculativePublishGuard {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SpeculativePublishGuard {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Err(error) = std::fs::remove_dir_all(&self.final_stage_dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::error!(
+                "executor: failed to roll back speculative publication {}: {error}",
+                self.final_stage_dir.display()
+            );
+            let mut failure = self
+                .rollback_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if failure.is_none() {
+                *failure = Some(error);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpeculationDisposition {
+    Pending,
+    Selected,
+    Rejected,
+    Superseded,
+}
+
+enum SpeculationState {
+    Eligible,
+    Running {
+        cancel: CancellationToken,
+        disposition: SpeculationDisposition,
+    },
+    Prepared(Box<SpeculativePrepared>),
+    Declined,
+    Rejected,
+}
+
+enum SchedulerTaskResult {
+    Ordinary(Result<Vec<NodeOutcome>, NodeFailure>),
+    Speculative {
+        target: NodeId,
+        key: ContentHash,
+        result: Result<Box<SpeculativePrepared>, NodeFailure>,
+    },
+}
+
 /// How a node run failed. The coordinator maps this to a `PlanError`;
 /// the `StageFailed`/cancel status event is already emitted by
 /// `run_node` before it returns.
@@ -582,6 +722,20 @@ enum NodeFailure {
     Plan(PlanError),
     /// An executor-internal failure (e.g. a closed semaphore).
     Other(String),
+    /// Optional work could not restore its private scratch boundary. This is
+    /// fatal even when the computation itself was disposable: returning plan
+    /// success with observable residue would violate discard equivalence.
+    SpeculationCleanup {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// A selected result was renamed into its canonical stage path, then a
+    /// publication hook failed and that incomplete path could not be removed.
+    SpeculationRollback {
+        path: PathBuf,
+        source: std::io::Error,
+        cause: String,
+    },
 }
 
 /// Classify a cancel observed inside `run_node`: a targeted KILL (this
@@ -692,6 +846,13 @@ async fn cache_lookup_off_thread(
     tokio::task::spawn_blocking(move || cache.lookup(key)).await
 }
 
+async fn cache_presence_probe_off_thread(
+    cache: Arc<CacheHandle>,
+    key: ContentHash,
+) -> Result<std::io::Result<bool>, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || cache.probe_presence(key)).await
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AdmissionRequest {
     resources: Vec<Resource>,
@@ -751,6 +912,106 @@ impl AdmissionLease {
     fn release_non_gpu_resources(&mut self) {
         self.resources.clear();
     }
+}
+
+/// Try to acquire a complete speculative envelope without waiting or emitting
+/// normal lifecycle events. Any failed component drops all earlier permits
+/// before returning `None`.
+fn try_acquire_admission_from(
+    request: &AdmissionRequest,
+    resources: &HashMap<Resource, Arc<tokio::sync::Semaphore>>,
+    gpu_scheduler: &crate::broker::gpu::GpuScheduler,
+    memory: &Arc<tokio::sync::Semaphore>,
+) -> Option<AdmissionLease> {
+    let mut permits = Vec::with_capacity(request.resources.len());
+    for resource in &request.resources {
+        let semaphore = resources.get(resource)?;
+        permits.push(semaphore.clone().try_acquire_owned().ok()?);
+    }
+
+    let gpu = match request.gpu {
+        Some(request) => Some(gpu_scheduler.try_acquire(request)?),
+        None => None,
+    };
+    let memory = match request.memory_gib {
+        0 => None,
+        count => Some(memory.clone().try_acquire_many_owned(count).ok()?),
+    };
+
+    Some(AdmissionLease {
+        resources: permits,
+        gpu,
+        _memory: memory,
+    })
+}
+
+/// Whether a speculative request can fit after reserving every ordinary
+/// in-flight request against the permits visible right now.
+///
+/// Ordinary tasks acquire after their authoritative cache lookup, so merely
+/// spawning one does not immediately move the underlying semaphores. Counting
+/// its full envelope here prevents optional work from taking that unclaimed
+/// capacity first. A task that already owns permits is conservatively counted
+/// twice (once in `available_permits`, once here); that may decline speculation
+/// but can never delay ordinary work.
+fn admission_is_spare_after_ordinary(
+    candidate: &AdmissionRequest,
+    ordinary: &HashMap<NodeId, AdmissionRequest>,
+    resources: &HashMap<Resource, Arc<tokio::sync::Semaphore>>,
+    gpu: &crate::broker::gpu::GpuScheduler,
+    memory: &tokio::sync::Semaphore,
+) -> bool {
+    let candidate_resources: HashSet<Resource> = candidate.resources.iter().copied().collect();
+    for resource in candidate_resources {
+        let Some(semaphore) = resources.get(&resource) else {
+            return false;
+        };
+        let candidate_need = candidate
+            .resources
+            .iter()
+            .filter(|&&item| item == resource)
+            .count();
+        let ordinary_need: usize = ordinary
+            .values()
+            .map(|request| {
+                request
+                    .resources
+                    .iter()
+                    .filter(|&&item| item == resource)
+                    .count()
+            })
+            .sum();
+        if semaphore.available_permits() < ordinary_need.saturating_add(candidate_need) {
+            return false;
+        }
+    }
+
+    if let Some(request) = candidate.gpu {
+        let capacity = gpu.device_count();
+        let effective_need = |count: u32| (count.max(1) as usize).min(capacity);
+        let candidate_need = effective_need(request.count);
+        let ordinary_need: usize = ordinary
+            .values()
+            .filter_map(|request| request.gpu)
+            .map(|request| effective_need(request.count))
+            .sum();
+        if gpu.available_device_count() < ordinary_need.saturating_add(candidate_need) {
+            return false;
+        }
+    }
+
+    if candidate.memory_gib > 0 {
+        let ordinary_need: usize = ordinary
+            .values()
+            .map(|request| request.memory_gib as usize)
+            .sum();
+        if memory.available_permits() < ordinary_need.saturating_add(candidate.memory_gib as usize)
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 struct FusionAdmission {
@@ -846,13 +1107,14 @@ async fn acquire_admission(
 }
 
 async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, NodeFailure> {
-    run_node_with_admission(task, env, None, None).await
+    run_node_with_admission(task, env, None, false, None).await
 }
 
 async fn run_node_with_admission(
     mut task: NodeTask,
     env: Arc<NodeEnv>,
     mut shared_admission: Option<&mut FusionAdmission>,
+    allow_in_process_handoff: bool,
     mut in_process_input: Option<InProcessArtifact>,
 ) -> Result<NodeOutcome, NodeFailure> {
     let idx = task.node_idx;
@@ -948,7 +1210,7 @@ async fn run_node_with_admission(
     let final_stage_dir = stages_root.join(format!("{idx}-{stage_name}"));
     let tmp_stage_dir = stages_root.join(format!(".tmp-{idx}-{stage_name}-{}", task.key.to_hex()));
 
-    let fused_handoff = shared_admission.is_some() && task.stage.supports_in_process_handoff();
+    let fused_handoff = allow_in_process_handoff && task.stage.supports_in_process_handoff();
     let mut attempt = 0u32;
     let (stage_output, run_elapsed) = loop {
         attempt += 1;
@@ -1530,6 +1792,403 @@ async fn run_node_with_admission(
     })
 }
 
+/// Execute one optimizer-authorized target against a job-private scratch
+/// environment. The canonical status hub, cache, stage directory, retry hook,
+/// and lineage surfaces are intentionally absent. The caller owns the already
+/// acquired all-or-none admission lease and decides whether to publish or drop
+/// the returned value after its condition resolves.
+async fn prepare_speculative(
+    mut task: NodeTask,
+    canonical_env: Arc<NodeEnv>,
+    cancel: CancellationToken,
+    lease: AdmissionLease,
+    scratch_root: PathBuf,
+) -> Result<SpeculativePrepared, NodeFailure> {
+    let node_id = task.node_id;
+    let node_idx = task.node_idx;
+    let stage = task.stage.clone();
+    let stage_name = stage.name().to_string();
+    let input_hash = task.input_hash;
+    let canon_args = task.canon_args.clone();
+    let key = task.key;
+    let scratch_stage_dir = scratch_root
+        .join("stages")
+        .join(format!("{node_idx}-{stage_name}"));
+
+    // Arm cleanup before the first filesystem mutation so a partial mkdir also
+    // has an owner if setup fails.
+    let scratch = SpeculationScratch(scratch_root.clone());
+    if let Err(source) = scratch.reset() {
+        if let Err(cleanup_source) = scratch.cleanup() {
+            return Err(NodeFailure::SpeculationCleanup {
+                path: scratch_root,
+                source: cleanup_source,
+            });
+        }
+        return Err(NodeFailure::Stage {
+            idx: node_idx,
+            stage: stage_name.clone(),
+            source: StageError::Io {
+                path: scratch_root,
+                source,
+            },
+        });
+    }
+
+    // One private attempt only. If it fails, normal selection owns the stage's
+    // configured retries and retry hook.
+    task.retry = crate::framework::retry::RetryPolicy::NONE;
+    task.prepared_cache_hit = None;
+
+    let (status, mut lifecycle_rx) = StatusHub::new();
+    let mut live_rx = status.subscribe();
+    let private_env = Arc::new(NodeEnv {
+        job_dir: scratch_root.clone(),
+        cache: Arc::new(CacheHandle::job_local(scratch_root.join("_cache"))),
+        tenant: canonical_env.tenant.clone(),
+        status,
+        cancel,
+        resources: canonical_env.resources.clone(),
+        gpu: canonical_env.gpu.clone(),
+        memory: canonical_env.memory.clone(),
+        memory_budget_gib: canonical_env.memory_budget_gib,
+        launch_target: crate::config::launcher::LaunchTarget::Local,
+        device_index: canonical_env.device_index,
+        fb_warm: canonical_env.fb_warm,
+        admitted_workers: canonical_env.admitted_workers,
+        admitted_batch_size: canonical_env.admitted_batch_size,
+        bypass_cache: true,
+        recipe_name: canonical_env.recipe_name.clone(),
+        on_retry: None,
+        diverged: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        #[cfg(feature = "p2p")]
+        dispatch_policy: None,
+        #[cfg(feature = "p2p")]
+        dispatcher: None,
+    });
+    let request = AdmissionRequest::for_task(&task, canonical_env.memory_budget_gib);
+    let mut admission = FusionAdmission {
+        request,
+        lease: Some(lease),
+    };
+    let started = Instant::now();
+    // Keep the explicit scratch owner outside the unwind boundary. If plugin
+    // code panics, cleanup must still be checked while that owner is alive;
+    // relying on Drop here would turn an undeletable private tree into a log
+    // while the ordinary plan continued successfully.
+    let run_result = std::panic::AssertUnwindSafe(run_node_with_admission(
+        task,
+        private_env,
+        Some(&mut admission),
+        false,
+        None,
+    ))
+    .catch_unwind()
+    .await;
+    let outcome = match run_result {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(failure)) => {
+            if let Err(source) = scratch.cleanup() {
+                return Err(NodeFailure::SpeculationCleanup {
+                    path: scratch_root,
+                    source,
+                });
+            }
+            return Err(failure);
+        }
+        Err(_) => {
+            if let Err(source) = scratch.cleanup() {
+                return Err(NodeFailure::SpeculationCleanup {
+                    path: scratch_root,
+                    source,
+                });
+            }
+            return Err(NodeFailure::Other(format!(
+                "speculative node task panicked for target {node_id}"
+            )));
+        }
+    };
+
+    let mut elapsed = started.elapsed();
+    while let Ok(event) = lifecycle_rx.try_recv() {
+        if let StageEvent::StageEnd {
+            elapsed: stage_elapsed,
+            ..
+        } = event
+        {
+            elapsed = stage_elapsed;
+        }
+    }
+    let buffered_steps = drain_speculative_steps(&mut live_rx);
+
+    Ok(SpeculativePrepared {
+        _scratch: scratch,
+        scratch_stage_dir,
+        node_id,
+        node_idx,
+        stage,
+        stage_name,
+        input_hash,
+        canon_args,
+        key,
+        output: outcome.output,
+        elapsed,
+        buffered_steps,
+    })
+}
+
+/// Drain the private lossy status stream without turning a lag notification
+/// into silent truncation. The replay reserves canonical broadcast slots for
+/// Begin, one exact Gap marker, and End so this synchronous burst cannot itself
+/// overwrite retained steps before the status writer gets polled.
+fn drain_speculative_steps(rx: &mut broadcast::Receiver<StageEvent>) -> Vec<StageEvent> {
+    let mut steps = VecDeque::new();
+    let mut dropped_steps = 0u64;
+    let mut saw_lag = false;
+    loop {
+        match rx.try_recv() {
+            Ok(event @ StageEvent::StageStep { .. }) => steps.push_back(event),
+            Ok(_) => {}
+            Err(broadcast::error::TryRecvError::Lagged(dropped)) => {
+                // A successful one-attempt private run emits exactly one
+                // lifecycle message before its steps (`StageBegin`). If the
+                // stopped producer overflowed, that oldest message is included
+                // in Tokio's lag count but is not a dropped StageStep.
+                let dropped = if saw_lag {
+                    dropped
+                } else {
+                    saw_lag = true;
+                    dropped.saturating_sub(1)
+                };
+                dropped_steps = dropped_steps.saturating_add(dropped);
+            }
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                break;
+            }
+        }
+    }
+
+    let max_without_gap = DEFAULT_BROADCAST_CAPACITY.saturating_sub(2);
+    let needs_gap = dropped_steps > 0 || steps.len() > max_without_gap;
+    let max_steps = if needs_gap {
+        DEFAULT_BROADCAST_CAPACITY.saturating_sub(3)
+    } else {
+        max_without_gap
+    };
+    while steps.len() > max_steps {
+        steps.pop_front();
+        dropped_steps = dropped_steps.saturating_add(1);
+    }
+
+    let mut buffered = Vec::with_capacity(steps.len() + usize::from(dropped_steps > 0));
+    if dropped_steps > 0 {
+        buffered.push(StageEvent::StepGap {
+            dropped: dropped_steps,
+        });
+    }
+    buffered.extend(steps);
+    buffered
+}
+
+fn discard_speculation_result(
+    result: Result<Box<SpeculativePrepared>, NodeFailure>,
+) -> Result<(), NodeFailure> {
+    match result {
+        Ok(prepared) => prepared.discard(),
+        Err(failure @ NodeFailure::SpeculationCleanup { .. }) => Err(failure),
+        Err(_) => Ok(()),
+    }
+}
+
+/// Explicitly close every retained private result before any terminal return.
+/// Drop remains a last-resort diagnostic guard, but a plan outcome may not hide
+/// undeletable speculative residue behind best-effort destruction.
+fn discard_retained_speculation(
+    speculation: &mut HashMap<NodeId, SpeculationState>,
+    speculative_keys: &mut HashMap<ContentHash, NodeId>,
+) -> Result<(), NodeFailure> {
+    let mut first_failure = None;
+    for (_, state) in std::mem::take(speculation) {
+        match state {
+            SpeculationState::Prepared(prepared) => {
+                if let Err(failure) = prepared.discard()
+                    && first_failure.is_none()
+                {
+                    first_failure = Some(failure);
+                }
+            }
+            SpeculationState::Running { cancel, .. } => cancel.cancel(),
+            SpeculationState::Eligible
+            | SpeculationState::Declined
+            | SpeculationState::Rejected => {}
+        }
+    }
+    speculative_keys.clear();
+    first_failure.map_or(Ok(()), Err)
+}
+
+/// Commit a selected private result through the same canonical FW-2 ordering as
+/// an ordinary miss: begin, same-filesystem rename, path rebase, sidecar, cache
+/// proof, buffered steps, end, then scheduler visibility.
+fn publish_speculative(
+    prepared: SpeculativePrepared,
+    env: &NodeEnv,
+) -> Result<NodeOutcome, NodeFailure> {
+    let idx = prepared.node_idx;
+    let stage_name = prepared.stage_name.clone();
+    let final_stage_dir = env
+        .job_dir
+        .join("stages")
+        .join(format!("{idx}-{stage_name}"));
+    let rollback_failure = Arc::new(std::sync::Mutex::new(None));
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        publish_speculative_inner(prepared, env, rollback_failure.clone())
+    }));
+    let rollback_failure = rollback_failure
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(source) = rollback_failure {
+        let cause = match &caught {
+            Err(_) => format!("speculative publication panicked for node {idx} ({stage_name})"),
+            Ok(Err(_)) => {
+                format!("speculative publication failed for node {idx} ({stage_name})")
+            }
+            Ok(Ok(_)) => {
+                format!("speculative publication rollback fired for node {idx} ({stage_name})")
+            }
+        };
+        return Err(NodeFailure::SpeculationRollback {
+            path: final_stage_dir,
+            source,
+            cause,
+        });
+    }
+    match caught {
+        Ok(result) => result,
+        Err(_) => Err(NodeFailure::Other(format!(
+            "speculative publication panicked for node {idx} ({stage_name})"
+        ))),
+    }
+}
+
+fn publish_speculative_inner(
+    prepared: SpeculativePrepared,
+    env: &NodeEnv,
+    rollback_failure: Arc<std::sync::Mutex<Option<std::io::Error>>>,
+) -> Result<NodeOutcome, NodeFailure> {
+    let idx = prepared.node_idx;
+    let stage_name = prepared.stage_name.clone();
+    let stages_root = env.job_dir.join("stages");
+    let final_stage_dir = stages_root.join(format!("{idx}-{stage_name}"));
+    if let Err(source) = std::fs::create_dir_all(&stages_root) {
+        return Err(NodeFailure::Stage {
+            idx,
+            stage: stage_name,
+            source: StageError::Io {
+                path: stages_root,
+                source,
+            },
+        });
+    }
+    let _ = std::fs::remove_dir_all(&final_stage_dir);
+    if let Err(source) = std::fs::rename(&prepared.scratch_stage_dir, &final_stage_dir) {
+        return Err(NodeFailure::Stage {
+            idx,
+            stage: stage_name,
+            source: StageError::Io {
+                path: final_stage_dir,
+                source,
+            },
+        });
+    }
+    let publish_guard = SpeculativePublishGuard {
+        final_stage_dir: final_stage_dir.clone(),
+        committed: false,
+        rollback_failure,
+    };
+    // The private run wrote a proof for its disposable scratch cache. Never let
+    // that path survive selection if the canonical insert below degrades.
+    let _ = std::fs::remove_file(final_stage_dir.join("cache-proof.json"));
+
+    let output = prepared.stage.rebase_output_paths(
+        prepared.output.clone(),
+        &prepared.scratch_stage_dir,
+        &final_stage_dir,
+    );
+    let output_hash = prepared
+        .stage
+        .output_content_hash(&output)
+        .unwrap_or_else(|| content_hash_from_erased(&output));
+    let logical = compute_logical_output_hash(
+        prepared.stage.as_ref(),
+        &output,
+        prepared.stage.deterministic(),
+        &prepared.stage_name,
+        prepared.stage.schema(),
+        prepared.input_hash,
+        &prepared.canon_args,
+    );
+    if let Err(source) = prepared._scratch.cleanup() {
+        return Err(NodeFailure::SpeculationCleanup {
+            path: prepared._scratch.0.clone(),
+            source,
+        });
+    }
+    let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, output_hash)
+        .with_stage(prepared.stage_name.clone());
+    if let Err(error) = metadata.write_to(&final_stage_dir.join("output.metadata.json")) {
+        tracing::warn!(
+            "executor: speculative sidecar write for stage '{}' failed: {error}",
+            prepared.stage_name
+        );
+    }
+    match env.cache.insert_optional(prepared.key, &output) {
+        Ok(()) => {
+            let proof = crate::framework::cache::CacheProof {
+                key: prepared.key,
+                entry_path: env.cache.entry_path_for_write(prepared.key),
+            };
+            if let Err(error) = proof.write_to(&final_stage_dir.join("cache-proof.json")) {
+                tracing::warn!(
+                    "executor: speculative cache proof for stage '{}' failed: {error}",
+                    prepared.stage_name
+                );
+            }
+        }
+        Err(error) => tracing::warn!(
+            "executor: speculative cache insert for stage '{}' failed: {error}; continuing",
+            prepared.stage_name
+        ),
+    }
+    // Publish lifecycle only after every stage/plugin hook and canonical
+    // filesystem/cache operation that can unwind has completed. The rollback
+    // guard removes the renamed directory on any earlier panic/error, so a
+    // failed publication cannot strand an orphan StageBegin.
+    env.status.emit(StageEvent::StageBegin {
+        node_idx: idx,
+        stage_name: stage_name.clone(),
+        input_hash: prepared.input_hash,
+    });
+    for event in prepared.buffered_steps.iter().cloned() {
+        env.status.emit(event);
+    }
+    env.status.emit(StageEvent::StageEnd {
+        node_idx: idx,
+        stage_name: prepared.stage_name.clone(),
+        output_hash,
+        elapsed: prepared.elapsed,
+    });
+    publish_guard.commit();
+    Ok(NodeOutcome {
+        node_id: prepared.node_id,
+        output,
+        in_process_output: None,
+        logical,
+        cache_hit: false,
+    })
+}
+
 /// Bound one stage attempt by an optional soft/hard timeout (D2). With
 /// neither set, awaits the run directly. The SOFT deadline fires
 /// `stage_cancel` (cooperative wind-down — a Python trainer SIGTERMs its
@@ -2028,6 +2687,18 @@ fn plan_error_of(f: NodeFailure) -> PlanError {
         NodeFailure::Stage { idx, stage, source } => PlanError::StageFailed { idx, stage, source },
         NodeFailure::Plan(error) => error,
         NodeFailure::Other(s) => PlanError::Other(s),
+        NodeFailure::SpeculationCleanup { path, source } => PlanError::Other(format!(
+            "failed to remove private speculation scratch {}: {source}",
+            path.display()
+        )),
+        NodeFailure::SpeculationRollback {
+            path,
+            source,
+            cause,
+        } => PlanError::Other(format!(
+            "{cause}; failed to roll back speculative publication {}: {source}",
+            path.display()
+        )),
     }
 }
 
@@ -2442,6 +3113,7 @@ async fn execute_fused_linear_plan(
             task,
             env.clone(),
             Some(&mut admission),
+            true,
             in_process_input.take(),
         ))
         .catch_unwind()
@@ -2518,6 +3190,7 @@ async fn run_fused_group(
             task,
             env.clone(),
             Some(&mut admission),
+            true,
             in_process_input.take(),
         ))
         .catch_unwind()
@@ -2612,6 +3285,12 @@ impl ParallelExecutor {
         } else {
             (plan, std::collections::HashMap::new())
         };
+        let mut speculation_candidates: Vec<NodeId> = plan.speculation_candidates().collect();
+        speculation_candidates.sort_unstable();
+        let speculation_runtime_enabled = !speculation_candidates.is_empty()
+            && ctx.control.is_none()
+            && ctx.launch_target == crate::config::launcher::LaunchTarget::Local
+            && fusion_runtime_is_local(&ctx);
         // Conditional control is deliberately separate from typed data edges:
         // it orders selector before target without contributing an input or a
         // cache-key component. The PlanSpec compiler currently admits one
@@ -2719,6 +3398,22 @@ impl ParallelExecutor {
         // decision. Losing targets are placed in `pruned` with all data
         // descendants and therefore never enter this set.
         let mut enabled_condition_targets: HashSet<NodeId> = HashSet::new();
+        let mut speculation: HashMap<NodeId, SpeculationState> = if speculation_runtime_enabled {
+            speculation_candidates
+                .iter()
+                .copied()
+                .filter(|target| condition_by_target.contains_key(target))
+                .map(|target| (target, SpeculationState::Eligible))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        let mut speculative_keys: HashMap<ContentHash, NodeId> = HashMap::new();
+        // Shadow every ordinary in-flight envelope even before its task reaches
+        // post-cache admission. Optional speculation must leave this demand
+        // untouched; entries disappear only when ordinary work completes or is
+        // intentionally pruned.
+        let mut ordinary_admission_demands: HashMap<NodeId, AdmissionRequest> = HashMap::new();
 
         let max_in_flight = ctx.max_in_flight;
         let deadline = ctx.deadline;
@@ -2797,8 +3492,7 @@ impl ParallelExecutor {
         let mut cache_probes: HashMap<ContentHash, Option<Arc<CacheHit>>> = HashMap::new();
         let mut prepared_cache_hits: HashMap<NodeId, Arc<CacheHit>> = HashMap::new();
 
-        let mut join: tokio::task::JoinSet<Result<Vec<NodeOutcome>, NodeFailure>> =
-            tokio::task::JoinSet::new();
+        let mut join: tokio::task::JoinSet<SchedulerTaskResult> = tokio::task::JoinSet::new();
         let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut n_hits = 0usize;
         let mut n_misses = 0usize;
@@ -2971,6 +3665,60 @@ impl ParallelExecutor {
                             break;
                         }
                     };
+                    // Ordinary work always wins. If an unrelated ready node has
+                    // the same cache identity as private speculative work,
+                    // cancel/drop the private copy before normal single-flight
+                    // admission. A selected target will later reuse the ordinary
+                    // cache transition instead of duplicating the computation.
+                    let mut superseded_selected = None;
+                    let mut supersession_cleanup_failure = None;
+                    if let Some(spec_target) = speculative_keys.remove(&task.key)
+                        && let Some(state) = speculation.get_mut(&spec_target)
+                    {
+                        match state {
+                            SpeculationState::Running {
+                                cancel,
+                                disposition,
+                            } => {
+                                let was_selected = *disposition == SpeculationDisposition::Selected;
+                                cancel.cancel();
+                                *disposition = SpeculationDisposition::Superseded;
+                                if was_selected {
+                                    superseded_selected = Some(spec_target);
+                                }
+                            }
+                            SpeculationState::Prepared(_) => {
+                                let prepared =
+                                    match std::mem::replace(state, SpeculationState::Declined) {
+                                        SpeculationState::Prepared(prepared) => prepared,
+                                        _ => unreachable!("matched prepared speculation state"),
+                                    };
+                                if let Err(failure) = prepared.discard() {
+                                    supersession_cleanup_failure = Some(failure);
+                                }
+                            }
+                            SpeculationState::Eligible
+                            | SpeculationState::Declined
+                            | SpeculationState::Rejected => {}
+                        }
+                    }
+                    if let Some(failure) = supersession_cleanup_failure {
+                        first_error = Some(plan_error_of(failure));
+                        env.cancel.cancel();
+                        break;
+                    }
+                    // A selected target was deliberately withheld from `ready`
+                    // while its private attempt ran. If ordinary work takes
+                    // ownership of the same key, put that target back into the
+                    // normal single-flight path so it later consumes the
+                    // ordinary cache transition instead of vanishing.
+                    if let Some(target) = superseded_selected
+                        && enabled_condition_targets.contains(&target)
+                        && indeg.get(&target).copied() == Some(0)
+                        && !pruned.contains(&target)
+                    {
+                        ready.insert(target);
+                    }
                     // Single-flight: if this exact key is already running,
                     // defer until it completes (then it cache-hits).
                     if inflight_keys.contains(&task.key) {
@@ -3216,7 +3964,8 @@ impl ParallelExecutor {
                                                 }
                                             }
                                         }
-                                    });
+                                    }
+                                    .map(SchedulerTaskResult::Ordinary));
                                     in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     continue; // skip local spawn
                                 }
@@ -3238,6 +3987,12 @@ impl ParallelExecutor {
                         env.cancel.cancel();
                         break;
                     }
+                    if speculation_runtime_enabled {
+                        ordinary_admission_demands.insert(
+                            node_id,
+                            AdmissionRequest::for_task(&task, env.memory_budget_gib),
+                        );
+                    }
                     if let Some(group) = internal_fusion_groups.get(&node_id).cloned() {
                         let remaining = group
                             .node_ids
@@ -3245,20 +4000,138 @@ impl ParallelExecutor {
                             .skip(1)
                             .map(|id| (view.nodes[*id as usize].clone(), node_idx_of[id]))
                             .collect();
-                        join.spawn(run_fused_group(
-                            task,
-                            remaining,
-                            env_c,
-                            group.admission,
-                            deadline,
-                            started,
-                        ));
+                        join.spawn(
+                            run_fused_group(
+                                task,
+                                remaining,
+                                env_c,
+                                group.admission,
+                                deadline,
+                                started,
+                            )
+                            .map(SchedulerTaskResult::Ordinary),
+                        );
                     } else {
-                        join.spawn(async move {
-                            run_node(task, env_c).await.map(|outcome| vec![outcome])
-                        });
+                        join.spawn(
+                            async move { run_node(task, env_c).await.map(|outcome| vec![outcome]) }
+                                .map(SchedulerTaskResult::Ordinary),
+                        );
                     }
                     in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+
+            // Speculation is strictly opportunistic: ordinary ready work is
+            // offered first, and only a task slot still spare after exhausting
+            // that ready set may host a data-ready private candidate. The
+            // optimizer witness is necessary but runtime admission/cache state
+            // may still decline without changing plan semantics.
+            if first_error.is_none()
+                && in_flight.load(std::sync::atomic::Ordering::Relaxed) < max_in_flight
+            {
+                let candidate = speculation_candidates.iter().copied().find(|target| {
+                    matches!(speculation.get(target), Some(SpeculationState::Eligible))
+                        && indeg.get(target).copied() == Some(0)
+                        && !pruned.contains(target)
+                        && !enabled_condition_targets.contains(target)
+                });
+                if let Some(target) = candidate {
+                    let node = node_at(&view, &appended, orig_n, target);
+                    let node_idx = node_idx_of[&target];
+                    let cancel = env.cancel.child_token();
+                    let task = build_task(
+                        node,
+                        node_idx,
+                        &all_edges,
+                        &outputs,
+                        &logical_outputs,
+                        KillSlot::new(cancel.clone()),
+                    );
+                    match task {
+                        Err(_) => {
+                            speculation.insert(target, SpeculationState::Declined);
+                        }
+                        Ok(task)
+                            if inflight_keys.contains(&task.key)
+                                || speculative_keys.contains_key(&task.key) =>
+                        {
+                            speculation.insert(target, SpeculationState::Declined);
+                        }
+                        Ok(task) => {
+                            let key = task.key;
+                            let request = AdmissionRequest::for_task(&task, env.memory_budget_gib);
+                            if !admission_is_spare_after_ordinary(
+                                &request,
+                                &ordinary_admission_demands,
+                                &env.resources,
+                                env.gpu.as_ref(),
+                                env.memory.as_ref(),
+                            ) {
+                                speculation.insert(target, SpeculationState::Declined);
+                                continue;
+                            }
+                            let cache_cold = env.bypass_cache
+                                || matches!(
+                                    cache_presence_probe_off_thread(env.cache.clone(), key).await,
+                                    Ok(Ok(false))
+                                );
+                            if let Some(error) = plan_stop_error(deadline, started, &env.cancel) {
+                                speculation.insert(target, SpeculationState::Declined);
+                                first_error = Some(error);
+                                env.cancel.cancel();
+                                continue;
+                            }
+                            if !cache_cold {
+                                speculation.insert(target, SpeculationState::Declined);
+                            } else if let Some(lease) = try_acquire_admission_from(
+                                &request,
+                                &env.resources,
+                                env.gpu.as_ref(),
+                                &env.memory,
+                            ) {
+                                let scratch_root = env.job_dir.join(".speculation").join(format!(
+                                    "{target}-{}-{}",
+                                    key.to_hex(),
+                                    SPECULATION_NONCE.fetch_add(1, AtomicOrdering::Relaxed)
+                                ));
+                                speculation.insert(
+                                    target,
+                                    SpeculationState::Running {
+                                        cancel: cancel.clone(),
+                                        disposition: SpeculationDisposition::Pending,
+                                    },
+                                );
+                                speculative_keys.insert(key, target);
+                                let env_c = env.clone();
+                                join.spawn(async move {
+                                    let result =
+                                        match std::panic::AssertUnwindSafe(prepare_speculative(
+                                            task,
+                                            env_c,
+                                            cancel,
+                                            lease,
+                                            scratch_root,
+                                        ))
+                                        .catch_unwind()
+                                        .await
+                                        {
+                                            Ok(result) => result.map(Box::new),
+                                            Err(_) => Err(NodeFailure::Other(format!(
+                                                "speculative node task panicked for target {target}"
+                                            ))),
+                                        };
+                                    SchedulerTaskResult::Speculative {
+                                        target,
+                                        key,
+                                        result,
+                                    }
+                                });
+                                in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                speculation.insert(target, SpeculationState::Declined);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -3402,8 +4275,8 @@ impl ParallelExecutor {
                 }
             };
             in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            let res = match joined {
-                Some(Ok(r)) => r,
+            let completion = match joined {
+                Some(Ok(completion)) => completion,
                 Some(Err(join_err)) => {
                     // Task panicked. Record as the first error, cancel.
                     first_error
@@ -3413,10 +4286,135 @@ impl ParallelExecutor {
                 }
                 None => break,
             };
+            let res = match completion {
+                SchedulerTaskResult::Ordinary(result) => result,
+                SchedulerTaskResult::Speculative {
+                    target,
+                    key,
+                    result,
+                } => {
+                    let state = speculation
+                        .remove(&target)
+                        .unwrap_or(SpeculationState::Declined);
+                    match state {
+                        SpeculationState::Running {
+                            disposition: SpeculationDisposition::Pending,
+                            ..
+                        } => match result {
+                            Ok(prepared) => {
+                                speculation.insert(target, SpeculationState::Prepared(prepared));
+                                continue;
+                            }
+                            Err(failure @ NodeFailure::SpeculationCleanup { .. }) => {
+                                if speculative_keys.get(&key).copied() == Some(target) {
+                                    speculative_keys.remove(&key);
+                                }
+                                Err(failure)
+                            }
+                            Err(_) => {
+                                if speculative_keys.get(&key).copied() == Some(target) {
+                                    speculative_keys.remove(&key);
+                                }
+                                speculation.insert(target, SpeculationState::Declined);
+                                continue;
+                            }
+                        },
+                        SpeculationState::Running {
+                            disposition: SpeculationDisposition::Selected,
+                            ..
+                        } => {
+                            if speculative_keys.get(&key).copied() == Some(target) {
+                                speculative_keys.remove(&key);
+                            }
+                            match result {
+                                Ok(prepared) => {
+                                    if let Some(error) =
+                                        plan_stop_error(deadline, started, &env.cancel)
+                                    {
+                                        match prepared.discard() {
+                                            Ok(()) => Err(NodeFailure::Plan(error)),
+                                            Err(failure) => Err(failure),
+                                        }
+                                    } else {
+                                        match publish_speculative(*prepared, &env) {
+                                            Ok(outcome) => {
+                                                node_key_of.insert(target, key);
+                                                Ok(vec![outcome])
+                                            }
+                                            Err(error) => Err(error),
+                                        }
+                                    }
+                                }
+                                Err(failure @ NodeFailure::SpeculationCleanup { .. }) => {
+                                    Err(failure)
+                                }
+                                Err(_) => {
+                                    speculation.insert(target, SpeculationState::Declined);
+                                    if indeg.get(&target).copied() == Some(0)
+                                        && !pruned.contains(&target)
+                                    {
+                                        ready.insert(target);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        SpeculationState::Running {
+                            disposition: SpeculationDisposition::Rejected,
+                            ..
+                        }
+                        | SpeculationState::Rejected => {
+                            if speculative_keys.get(&key).copied() == Some(target) {
+                                speculative_keys.remove(&key);
+                            }
+                            speculation.insert(target, SpeculationState::Rejected);
+                            match discard_speculation_result(result) {
+                                Ok(()) => continue,
+                                Err(failure) => Err(failure),
+                            }
+                        }
+                        SpeculationState::Running {
+                            disposition: SpeculationDisposition::Superseded,
+                            ..
+                        } => {
+                            if speculative_keys.get(&key).copied() == Some(target) {
+                                speculative_keys.remove(&key);
+                            }
+                            speculation.insert(target, SpeculationState::Declined);
+                            match discard_speculation_result(result) {
+                                Ok(()) => continue,
+                                Err(failure) => Err(failure),
+                            }
+                        }
+                        SpeculationState::Prepared(prepared) => {
+                            if speculative_keys.get(&key).copied() == Some(target) {
+                                speculative_keys.remove(&key);
+                            }
+                            let retained_cleanup = prepared.discard();
+                            let result_cleanup = discard_speculation_result(result);
+                            match retained_cleanup.and(result_cleanup) {
+                                Ok(()) => continue,
+                                Err(failure) => Err(failure),
+                            }
+                        }
+                        SpeculationState::Eligible | SpeculationState::Declined => {
+                            if speculative_keys.get(&key).copied() == Some(target) {
+                                speculative_keys.remove(&key);
+                            }
+                            match discard_speculation_result(result) {
+                                Ok(()) => continue,
+                                Err(failure) => Err(failure),
+                            }
+                        }
+                    }
+                }
+            };
 
             match res {
                 Ok(outcomes) => {
-                    for outcome in outcomes {
+                    let mut outcomes = VecDeque::from(outcomes);
+                    while let Some(outcome) = outcomes.pop_front() {
+                        ordinary_admission_demands.remove(&outcome.node_id);
                         completed += 1;
                         let was_cache_hit = outcome.cache_hit;
                         if was_cache_hit {
@@ -3497,12 +4495,133 @@ impl ParallelExecutor {
                                     for &(target, when) in targets {
                                         if decision.value == when {
                                             enabled_condition_targets.insert(target);
-                                            if indeg.get(&target).copied() == Some(0)
+                                            let mut schedule_ordinary = true;
+                                            if let Some(state) = speculation.remove(&target) {
+                                                match state {
+                                                    SpeculationState::Prepared(prepared) => {
+                                                        let key = prepared.key;
+                                                        if speculative_keys.get(&key).copied()
+                                                            == Some(target)
+                                                        {
+                                                            speculative_keys.remove(&key);
+                                                        }
+                                                        if let Some(error) = plan_stop_error(
+                                                            deadline,
+                                                            started,
+                                                            &env.cancel,
+                                                        ) {
+                                                            first_error =
+                                                                Some(match prepared.discard() {
+                                                                    Ok(()) => error,
+                                                                    Err(failure) => {
+                                                                        plan_error_of(failure)
+                                                                    }
+                                                                });
+                                                            env.cancel.cancel();
+                                                            break;
+                                                        }
+                                                        match publish_speculative(*prepared, &env) {
+                                                            Ok(outcome) => {
+                                                                node_key_of.insert(target, key);
+                                                                outcomes.push_back(outcome);
+                                                                schedule_ordinary = false;
+                                                            }
+                                                            Err(error) => {
+                                                                first_error =
+                                                                    Some(plan_error_of(error));
+                                                                env.cancel.cancel();
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                    SpeculationState::Running {
+                                                        cancel,
+                                                        disposition: SpeculationDisposition::Pending,
+                                                    } => {
+                                                        speculation.insert(
+                                                            target,
+                                                            SpeculationState::Running {
+                                                                cancel,
+                                                                disposition:
+                                                                    SpeculationDisposition::Selected,
+                                                            },
+                                                        );
+                                                        schedule_ordinary = false;
+                                                    }
+                                                    SpeculationState::Running {
+                                                        cancel,
+                                                        disposition,
+                                                    } => {
+                                                        speculation.insert(
+                                                            target,
+                                                            SpeculationState::Running {
+                                                                cancel,
+                                                                disposition,
+                                                            },
+                                                        );
+                                                        schedule_ordinary = disposition
+                                                            == SpeculationDisposition::Superseded;
+                                                    }
+                                                    SpeculationState::Eligible
+                                                    | SpeculationState::Declined
+                                                    | SpeculationState::Rejected => {
+                                                        speculation.insert(
+                                                            target,
+                                                            SpeculationState::Declined,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            if schedule_ordinary
+                                                && indeg.get(&target).copied() == Some(0)
                                                 && !pruned.contains(&target)
                                             {
                                                 ready.insert(target);
                                             }
                                         } else {
+                                            if let Some(state) = speculation.remove(&target) {
+                                                match state {
+                                                    SpeculationState::Running {
+                                                        cancel, ..
+                                                    } => {
+                                                        cancel.cancel();
+                                                        speculation.insert(
+                                                            target,
+                                                            SpeculationState::Running {
+                                                                cancel,
+                                                                disposition:
+                                                                    SpeculationDisposition::Rejected,
+                                                            },
+                                                        );
+                                                    }
+                                                    SpeculationState::Prepared(prepared) => {
+                                                        let key = prepared.key;
+                                                        if speculative_keys.get(&key).copied()
+                                                            == Some(target)
+                                                        {
+                                                            speculative_keys.remove(&key);
+                                                        }
+                                                        if let Err(failure) = prepared.discard() {
+                                                            first_error =
+                                                                Some(plan_error_of(failure));
+                                                            env.cancel.cancel();
+                                                            break;
+                                                        }
+                                                        speculation.insert(
+                                                            target,
+                                                            SpeculationState::Rejected,
+                                                        );
+                                                    }
+                                                    SpeculationState::Eligible
+                                                    | SpeculationState::Declined
+                                                    | SpeculationState::Rejected => {
+                                                        speculation.insert(
+                                                            target,
+                                                            SpeculationState::Rejected,
+                                                        );
+                                                    }
+                                                }
+                                            }
                                             let reason = format!(
                                                 "condition node {} resolved to {}, expected {}",
                                                 outcome.node_id, decision.value, when
@@ -3625,6 +4744,7 @@ impl ParallelExecutor {
                     // GPU/memory permits already dropped when run_node returned.
                     node_tokens.remove(&node_id);
                     node_stages.remove(&node_id);
+                    ordinary_admission_demands.remove(&node_id);
                     // S1 race fix: clear the kill latch for the pruned node.
                     kill_flagged.remove(&node_id);
                     // Free its single-flight key. Same-key deferred waiters are
@@ -3694,6 +4814,7 @@ impl ParallelExecutor {
                                 && !strict_advisory();
                             node_tokens.remove(&nid);
                             node_stages.remove(&nid);
+                            ordinary_admission_demands.remove(&nid);
                             kill_flagged.remove(&nid);
                             if is_adv {
                                 advisory = Some((*idx, stage.clone(), source.to_string(), nid));
@@ -3739,6 +4860,19 @@ impl ParallelExecutor {
                                 }
                             }
                         }
+                    } else if matches!(
+                        &f,
+                        NodeFailure::SpeculationCleanup { .. }
+                            | NodeFailure::SpeculationRollback { .. }
+                    ) {
+                        let cleanup_error = plan_error_of(f);
+                        first_error = Some(match first_error.take() {
+                            Some(error) => PlanError::Other(format!(
+                                "{error}; additionally, speculative cleanup failed: {cleanup_error}"
+                            )),
+                            None => cleanup_error,
+                        });
+                        env.cancel.cancel();
                     } else if first_error.is_none() {
                         first_error = Some(plan_error_of(f));
                         env.cancel.cancel(); // fail-fast: cancel siblings
@@ -3749,7 +4883,21 @@ impl ParallelExecutor {
             }
         }
 
-        // All tasks drained.
+        // All tasks drained. Prepared optional work has no JoinSet entry, so it
+        // must be closed explicitly on both success and failure paths. If an
+        // earlier error exists, preserve it in the aggregate while making the
+        // cleanup integrity failure visible to the caller.
+        if let Err(failure) = discard_retained_speculation(&mut speculation, &mut speculative_keys)
+        {
+            let cleanup_error = plan_error_of(failure);
+            first_error = Some(match first_error.take() {
+                Some(error) => PlanError::Other(format!(
+                    "{error}; additionally, speculative cleanup failed: {cleanup_error}"
+                )),
+                None => cleanup_error,
+            });
+        }
+
         if let Some(err) = first_error {
             finish_writer(env, writer_handle).await;
             return Err(err);

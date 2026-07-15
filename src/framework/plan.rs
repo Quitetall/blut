@@ -561,6 +561,7 @@ impl<B: TrainingBackend> Plan<(), B> {
             recipe_args: self.recipe_args,
             expansions: Vec::new(),
             fused_subchains: Vec::new(),
+            speculation_candidates: Vec::new(),
             condition_gates: Vec::new(),
         }
     }
@@ -573,6 +574,14 @@ impl<B: TrainingBackend> Plan<(), B> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FusedSubchain {
     pub members: Vec<NodeId>,
+}
+
+/// Optimizer-produced permission to attempt one conditional target before its
+/// selector resolves. Runtime policy may decline this candidate, but may never
+/// speculate a node absent from this post-DCE witness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SpeculationCandidate {
+    pub target: NodeId,
 }
 
 /// Backend-erased plan, ready for execution. Produced from a
@@ -593,6 +602,9 @@ pub struct CompiledPlan {
     /// ADR 0102 stage-fusion `Plan -> Plan` witness. Empty unless the
     /// flag-gated optimizer pass identified eligible static subchains.
     pub(crate) fused_subchains: Vec<FusedSubchain>,
+    /// ADR 0102 speculative-execution `Plan -> Plan` witness. Empty unless the
+    /// default-off optimizer pass certified a pure conditional target.
+    pub(crate) speculation_candidates: Vec<SpeculationCandidate>,
     /// Boolean control dependencies. They participate in topological ordering
     /// and plan identity, but never in typed input gathering or node cache keys.
     pub(crate) condition_gates: Vec<CompiledConditionGate>,
@@ -641,6 +653,7 @@ impl CompiledTemplate {
             recipe_args: serde_json::Value::Null,
             expansions: Vec::new(),
             fused_subchains: Vec::new(),
+            speculation_candidates: Vec::new(),
             condition_gates: Vec::new(),
         }
     }
@@ -668,6 +681,15 @@ impl CompiledPlan {
         self.fused_subchains
             .iter()
             .map(|subchain| subchain.members.as_slice())
+    }
+
+    /// Pure conditional targets selected by the default-off ADR 0102
+    /// speculation pass. This is an optimizer witness, not an authoring API.
+    #[doc(hidden)]
+    pub fn speculation_candidates(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.speculation_candidates
+            .iter()
+            .map(|candidate| candidate.target)
     }
 
     /// Stable identity of the executable graph excluding the logical
@@ -994,6 +1016,7 @@ impl CompiledPlan {
                 // Optimization runs after component assembly; never preserve
                 // component-local ids as if they were global fusion groups.
                 fused_subchains: Vec::new(),
+                speculation_candidates: Vec::new(),
                 condition_gates,
             },
             node_offsets,
@@ -1082,6 +1105,7 @@ impl CompiledPlan {
             recipe_args,
             expansions: Vec::new(),
             fused_subchains: Vec::new(),
+            speculation_candidates: Vec::new(),
             condition_gates: Vec::new(),
         })
     }
@@ -1108,6 +1132,10 @@ impl CompiledPlan {
             }
             node.pure = ov.pure;
         }
+        // `pure` is an input to optimizer-owned speculation eligibility. A
+        // caller mutating overrides after optimization must not retain a stale
+        // witness for the old declaration.
+        self.speculation_candidates.clear();
     }
 
     /// Build an ARBITRARY-topology erased plan from `nodes` + `edges` — the
@@ -1242,6 +1270,7 @@ impl CompiledPlan {
             recipe_args,
             expansions: Vec::new(),
             fused_subchains: Vec::new(),
+            speculation_candidates: Vec::new(),
             condition_gates: Vec::new(),
         };
         // Reject cycles (reuses the Kahn walk + `PlanError::Cycle`).
@@ -1253,9 +1282,8 @@ impl CompiledPlan {
     /// `PlanSpec::compile` after `from_erased_graph`; every other path leaves
     /// `expansions` empty.
     pub(crate) fn with_expansions(mut self, expansions: Vec<MapExpansion>) -> Self {
-        if !expansions.is_empty() {
-            self.fused_subchains.clear();
-        }
+        self.fused_subchains.clear();
+        self.speculation_candidates.clear();
         self.expansions = expansions;
         self
     }
@@ -1276,9 +1304,8 @@ impl CompiledPlan {
                 });
             }
         }
-        if !condition_gates.is_empty() {
-            self.fused_subchains.clear();
-        }
+        self.fused_subchains.clear();
+        self.speculation_candidates.clear();
         self.condition_gates = condition_gates;
         self.topo_order()?;
         Ok(self)
@@ -1394,6 +1421,7 @@ impl CompiledPlan {
             recipe_args: serde_json::Value::Null,
             expansions: Vec::new(),
             fused_subchains: Vec::new(),
+            speculation_candidates: Vec::new(),
             condition_gates: Vec::new(),
         };
         probe.topo_order()?;
@@ -1823,6 +1851,7 @@ mod tests {
             recipe_args: serde_json::json!({}),
             expansions: Vec::new(),
             fused_subchains: Vec::new(),
+            speculation_candidates: Vec::new(),
             condition_gates: Vec::new(),
         }
     }

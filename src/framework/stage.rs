@@ -387,6 +387,14 @@ pub trait Stage: Send + Sync + 'static {
     /// This is deliberately distinct from [`DETERMINISTIC`](Self::DETERMINISTIC):
     /// byte-equal output does not prove absence of network writes, subprocess
     /// effects, global mutation, or writes outside `StageContext::stage_dir`.
+    /// An implementation opting in must keep every externally visible write and
+    /// every returned backing file beneath `stage_dir`, must not inspect the
+    /// canonical job root, sibling stage directories, or canonical cache, and
+    /// must produce the same result when `job_dir` and `cache` are private
+    /// scratch equivalents. Long-running work must cooperate with cancellation
+    /// so a rejected branch can be drained and deleted. It must not change the
+    /// ownership/permissions of scratch paths or create entries the engine
+    /// cannot remove during rejection cleanup.
     /// A PlanSpec node must also opt in with `pure: true`; neither declaration
     /// authorizes speculation by itself.
     const SPECULATION_SAFE: bool = false;

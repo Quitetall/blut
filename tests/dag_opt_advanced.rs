@@ -2,23 +2,22 @@
 // Copyright (C) 2026 Brian Lam
 //! Named progress gate for ADR 0102's landed advanced-optimizer slice.
 //!
-//! User-priority scheduling, live cache-warm ready ordering, and the first
-//! conservative whole-plan linear coalescing slice have landed. General
-//! internal-subchain fusion, speculation, and pipeline parallelism remain
-//! later, independently gated increments.
+//! User-priority scheduling, live cache-warm ready ordering, conservative
+//! linear coalescing, and private conditional speculation have landed.
+//! Pipeline parallelism remains a later, independently gated increment.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use blut::framework::artifact::{Artifact, ArtifactMetadata, ContentHash};
+use blut::framework::artifact::{Artifact, ArtifactMetadata, BranchDecision, ContentHash};
 use blut::framework::cache::{CacheHandle, CacheProof};
 use blut::framework::cookbook::{Cookbook, Registry};
 use blut::framework::dag_opt::DagOptimizer;
 use blut::framework::executor::{ExecCtx, ParallelExecutor};
 use blut::framework::object_store::BlobStore;
 use blut::framework::plan::CompiledPlan;
-use blut::framework::plan_spec::{PLAN_SPEC_VERSION, PlanSpec, SpecNode};
+use blut::framework::plan_spec::{ConditionGateSpec, PLAN_SPEC_VERSION, PlanSpec, SpecNode};
 use blut::framework::resource::Resource;
 use blut::framework::stage::{ErasedStageCtor, Stage, StageContext, StageExecutionBoundary};
 use blut::framework::status::StageEvent;
@@ -40,6 +39,10 @@ static DIRECT_ARTIFACT_BINARY_DESERIALIZES: AtomicUsize = AtomicUsize::new(0);
 static FUSION_DUPLICATE_RUNS: AtomicUsize = AtomicUsize::new(0);
 static FUSION_BOUNDARY_DEADLINE: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
+static SPEC_GATE_DECISION_STARTED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static SPEC_GATE_DECISION_RELEASE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static SPEC_GATE_TARGET_FINISHED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static SPEC_GATE_TARGET_RUNS: AtomicUsize = AtomicUsize::new(0);
 
 fn record_fusion_task(label: &str) {
     if label.starts_with("fuse-") {
@@ -520,6 +523,72 @@ impl Stage for RecordNetworkAfter {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+struct GateDecisionArgs {
+    value: bool,
+}
+
+struct HeldGateDecision;
+
+#[async_trait]
+impl Stage for HeldGateDecision {
+    const NAME: &'static str = "held_gate_decision";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[];
+    type Input = ();
+    type Output = BranchDecision;
+    type Args = GateDecisionArgs;
+
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        _input: (),
+        args: &GateDecisionArgs,
+    ) -> Result<BranchDecision, StageError> {
+        SPEC_GATE_DECISION_STARTED.add_permits(1);
+        tokio::select! {
+            permit = SPEC_GATE_DECISION_RELEASE.acquire() => {
+                permit.expect("speculation gate decision release open").forget();
+            }
+            _ = ctx.cancel.cancelled() => return Err(StageError::Cancelled),
+        }
+        Ok(BranchDecision { value: args.value })
+    }
+}
+
+struct RecordSpeculativeAfter;
+
+#[async_trait]
+impl Stage for RecordSpeculativeAfter {
+    const NAME: &'static str = "record_speculative_after";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Network];
+    const SPECULATION_SAFE: bool = true;
+    type Input = OrderArtifact;
+    type Output = OrderArtifact;
+    type Args = OrderArgs;
+
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        input: OrderArtifact,
+        args: &OrderArgs,
+    ) -> Result<OrderArtifact, StageError> {
+        SPEC_GATE_TARGET_RUNS.fetch_add(1, Ordering::SeqCst);
+        std::fs::create_dir_all(&ctx.stage_dir)
+            .map_err(|error| StageError::Backend(error.into()))?;
+        let path = ctx.stage_dir.join(format!("{}.txt", args.label));
+        std::fs::write(&path, input.content_hash.to_hex())
+            .map_err(|error| StageError::Backend(error.into()))?;
+        let output = OrderArtifact {
+            content_hash: ContentHash::of_bytes(args.label.as_bytes()),
+            path,
+        };
+        SPEC_GATE_TARGET_FINISHED.add_permits(1);
+        Ok(output)
+    }
+}
+
 struct GateCookbook;
 
 impl Cookbook for GateCookbook {
@@ -546,6 +615,10 @@ impl Cookbook for GateCookbook {
             ("record_panicking", || Arc::new(RecordPanicking)),
             ("record_failing", || Arc::new(RecordFailing)),
             ("record_network_after", || Arc::new(RecordNetworkAfter)),
+            ("held_gate_decision", || Arc::new(HeldGateDecision)),
+            ("record_speculative_after", || {
+                Arc::new(RecordSpeculativeAfter)
+            }),
             ("direct_root", || Arc::new(DirectRoot)),
             ("direct_after", || Arc::new(DirectAfter)),
             ("direct_identity", || Arc::new(DirectIdentity)),
@@ -592,6 +665,50 @@ fn compiled_graph(nodes: &[(&str, &str, Option<i32>)], edges: &[(u32, u32)]) -> 
     .expect("compile gate plan")
 }
 
+fn speculation_discard_plan() -> CompiledPlan {
+    let mut registry = Registry::new();
+    registry.register(Box::new(GateCookbook));
+    PlanSpec {
+        name: "speculation-discard-gate".into(),
+        nodes: vec![
+            SpecNode {
+                stage: "held_gate_decision".into(),
+                args: serde_json::json!({ "value": false }),
+                retry: None,
+                timeout: None,
+                priority: None,
+                pure: false,
+            },
+            SpecNode {
+                stage: "record_order".into(),
+                args: serde_json::json!({ "label": "spec-source" }),
+                retry: None,
+                timeout: None,
+                priority: None,
+                pure: false,
+            },
+            SpecNode {
+                stage: "record_speculative_after".into(),
+                args: serde_json::json!({ "label": "must-discard" }),
+                retry: None,
+                timeout: None,
+                priority: None,
+                pure: true,
+            },
+        ],
+        edges: vec![(1, 2)],
+        expansions: Vec::new(),
+        condition_gates: vec![ConditionGateSpec {
+            condition: 0,
+            target: 2,
+            when: true,
+        }],
+        version: PLAN_SPEC_VERSION,
+    }
+    .compile(&registry)
+    .expect("compile speculation discard gate")
+}
+
 fn priority_only(enabled: bool) -> DagOptimizer {
     DagOptimizer {
         eliminate_dead_code: false,
@@ -600,6 +717,7 @@ fn priority_only(enabled: bool) -> DagOptimizer {
         memory_aware: false,
         priority_aware: enabled,
         stage_fusion: false,
+        speculative_execution: false,
     }
 }
 
@@ -611,6 +729,7 @@ fn cache_only(enabled: bool) -> DagOptimizer {
         memory_aware: false,
         priority_aware: false,
         stage_fusion: false,
+        speculative_execution: false,
     }
 }
 
@@ -622,6 +741,7 @@ fn fusion_only(enabled: bool) -> DagOptimizer {
         memory_aware: false,
         priority_aware: false,
         stage_fusion: enabled,
+        speculative_execution: false,
     }
 }
 
@@ -736,6 +856,96 @@ fn materialized_cache_keys(job_dir: &std::path::Path) -> Vec<ContentHash> {
                 .key
         })
         .collect()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dag_opt_advanced_gate_discards_private_speculation_without_identity_drift() {
+    let _guard = TEST_LOCK.lock().await;
+    SPEC_GATE_TARGET_RUNS.store(0, Ordering::SeqCst);
+
+    let optimizer = DagOptimizer {
+        speculative_execution: true,
+        ..DagOptimizer::new()
+    };
+    let (default_off, _) = DagOptimizer::new().optimize(speculation_discard_plan());
+    assert!(
+        default_off.speculation_candidates().next().is_none(),
+        "the named gate must prove speculation remains default-off"
+    );
+    let (witnessed, _) = optimizer.optimize(speculation_discard_plan());
+    assert_eq!(
+        witnessed.speculation_candidates().collect::<Vec<_>>(),
+        vec![2],
+        "only the optimizer may authorize the certified conditional target"
+    );
+
+    let temp = tempfile::tempdir().expect("speculation discard gate tempdir");
+    let baseline_dir = temp.path().join("baseline");
+    let baseline = tokio::spawn(ParallelExecutor::execute(
+        speculation_discard_plan(),
+        ExecCtx::new(baseline_dir.clone()).with_max_in_flight(3),
+    ));
+    SPEC_GATE_DECISION_STARTED
+        .acquire()
+        .await
+        .expect("baseline decision started")
+        .forget();
+    SPEC_GATE_DECISION_RELEASE.add_permits(1);
+    let baseline = baseline
+        .await
+        .expect("baseline discard task joins")
+        .expect("baseline discard plan succeeds");
+    assert_eq!(SPEC_GATE_TARGET_RUNS.load(Ordering::SeqCst), 0);
+
+    let speculative_dir = temp.path().join("speculative");
+    let mut speculative_ctx = ExecCtx::new(speculative_dir.clone()).with_max_in_flight(3);
+    speculative_ctx.dag_optimizer = Some(optimizer);
+    let speculative = tokio::spawn(ParallelExecutor::execute(
+        speculation_discard_plan(),
+        speculative_ctx,
+    ));
+    SPEC_GATE_DECISION_STARTED
+        .acquire()
+        .await
+        .expect("speculative decision started")
+        .forget();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        SPEC_GATE_TARGET_FINISHED.acquire(),
+    )
+    .await
+    .expect("private target must finish before the false selector is released")
+    .expect("private target signal open")
+    .forget();
+    SPEC_GATE_DECISION_RELEASE.add_permits(1);
+    let speculative = speculative
+        .await
+        .expect("speculative discard task joins")
+        .expect("speculative discard plan succeeds");
+
+    assert_eq!(SPEC_GATE_TARGET_RUNS.load(Ordering::SeqCst), 1);
+    assert!(baseline.final_output.is_none());
+    assert!(speculative.final_output.is_none());
+    assert_eq!(
+        materialized_hashes(&baseline_dir),
+        materialized_hashes(&speculative_dir),
+        "discarded optional work must not change any canonical output hash"
+    );
+    assert_eq!(
+        materialized_cache_keys(&baseline_dir),
+        materialized_cache_keys(&speculative_dir),
+        "discarded optional work must not change any canonical cache identity"
+    );
+    assert!(
+        !speculative_dir
+            .join("stages/2-record_speculative_after")
+            .exists(),
+        "discarded target must not materialize a canonical stage directory"
+    );
+    assert!(
+        !speculative_dir.join(".speculation").exists(),
+        "discarded target scratch must be deleted"
+    );
 }
 
 #[tokio::test]

@@ -295,6 +295,13 @@ impl GpuScheduler {
         self.devices.len()
     }
 
+    /// Device permits currently unclaimed by a live grant. The executor uses
+    /// this only for conservative optional-work admission; authoritative
+    /// placement still goes through [`try_acquire`](Self::try_acquire).
+    pub(crate) fn available_device_count(&self) -> usize {
+        self.avail.available_permits()
+    }
+
     /// The count actually schedulable: clamped to the device pool. Warns (as the
     /// pre-ADR path did) when a DDP request exceeds the pool and runs degraded, so
     /// a demotion from full width isn't silent.

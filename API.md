@@ -141,8 +141,15 @@ stable, versioned wire IR. Evolve additive-only (`#[serde(default)]`); bump
 - `SpecNode.pure` is default-false scheduling metadata for the separate
   default-off speculation pass. It is only an author request: compilation also
   requires the registered stage to declare both deterministic output and
-  `Stage::SPECULATION_SAFE = true`. `pure` and condition relations do not enter
-  node cache keys.
+  `Stage::SPECULATION_SAFE = true`. A certified stage keeps all writes and
+  backing files under `StageContext::stage_dir`, cooperates with cancellation,
+  and leaves scratch ownership/permissions removable by the engine. `pure` and
+  condition relations do not enter node cache keys.
+- ADR 0102 approves additional default-off optimizer flags during the alpha
+  preview. Each added public field is source-breaking for exhaustive struct
+  literals; construct with
+  `DagOptimizer { speculative_execution: true, ..DagOptimizer::new() }` so the
+  documented migration also tolerates later preview passes.
 - `PlanSpec::compile(&Registry) -> CompiledPlan`; `provenance_fingerprint`
   hashes `(source, args, spec)` for lineage.
 
