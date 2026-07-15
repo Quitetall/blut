@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::framework::artifact::{Artifact, ContentHash};
@@ -111,6 +111,28 @@ pub const TUPLE_ENVELOPE_SCHEMA: u32 = 2;
 /// [`ListOf`]: crate::framework::artifact::ListOf
 pub const LIST_ENVELOPE_SCHEMA: u32 = 1;
 
+/// Ordered content-address manifest for a producer's pipeline-safe list.
+///
+/// The manifest is execution metadata only: it lets the executor validate
+/// early element emissions before committing any child result. It does not
+/// alter artifact schemas, cache keys, or the authoritative `ListOf` returned
+/// by [`Stage::run`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PipelineManifest {
+    /// One hash per final list element, in authoritative output order.
+    pub element_hashes: Vec<ContentHash>,
+}
+
+impl PipelineManifest {
+    /// Build a manifest from the exact final list order. The returned hashes
+    /// are only an early-execution witness; [`Stage::run`] must still return the
+    /// authoritative [`ListOf`](crate::framework::artifact::ListOf).
+    pub fn new(element_hashes: Vec<ContentHash>) -> Self {
+        Self { element_hashes }
+    }
+}
+
 impl ErasedArtifact {
     /// Wrap a concrete typed artifact for transit across the
     /// `StageDyn` boundary. Delegates to [`Artifact::encode_erased`]
@@ -144,6 +166,96 @@ pub enum ErasedDecodeError {
     Arity { expected: usize, got: usize },
     #[error("bincode deserialize: {0}")]
     Deserialize(#[source] Box<bincode::ErrorKind>),
+}
+
+/// One early list element retained in the executor's bounded semantic lane.
+/// The slot permit deliberately travels with the queued/running item, so the
+/// declared capacity covers both states rather than only transport backlog.
+pub(crate) struct PipelineEmission {
+    pub(crate) index: usize,
+    pub(crate) artifact: ErasedArtifact,
+    pub(crate) content_hash: ContentHash,
+    pub(crate) _slot: OwnedSemaphorePermit,
+}
+
+/// A payload sink whose heap capacity is reserved from the admitted item
+/// envelope before serialization and can never grow past it. This is the
+/// engine-enforced half of `Artifact::PIPELINE_STANDARD_ENCODING`; ordinary
+/// erased encoders are intentionally not involved.
+struct BoundedPipelinePayload {
+    bytes: Vec<u8>,
+    max_len: usize,
+    exceeded: bool,
+}
+
+impl BoundedPipelinePayload {
+    fn try_new(max_len: usize) -> Option<Self> {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(max_len).ok()?;
+        Some(Self {
+            bytes,
+            max_len,
+            exceeded: false,
+        })
+    }
+}
+
+impl std::io::Write for BoundedPipelinePayload {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let Some(next_len) = self.bytes.len().checked_add(buf.len()) else {
+            self.exceeded = true;
+            return Err(std::io::Error::other("pipeline payload length overflow"));
+        };
+        if next_len > self.max_len {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "pipeline payload exceeds admitted item envelope",
+            ));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Producer handle installed into one [`StageContext`] by the executor.
+#[derive(Clone)]
+pub(crate) struct PipelineEmitter {
+    slots: Arc<Semaphore>,
+    tx: mpsc::UnboundedSender<PipelineEmission>,
+    element_kind: &'static str,
+    producer_name: &'static str,
+    max_item_bytes: u64,
+}
+
+pub(crate) type PipelineReceiver = mpsc::UnboundedReceiver<PipelineEmission>;
+
+/// Create a semantic pipeline lane whose retained item count is bounded by
+/// `capacity`. The transport itself is unbounded only because every send owns
+/// a semaphore permit acquired before encoding; the permit remains inside the
+/// emission until the consumer finishes or drops it.
+pub(crate) fn pipeline_channel(
+    capacity: u32,
+    max_item_bytes: u64,
+    element_kind: &'static str,
+    producer_name: &'static str,
+) -> (PipelineEmitter, PipelineReceiver) {
+    let capacity = usize::try_from(capacity).expect("u32 pipeline capacity must fit usize");
+    assert!(capacity > 0, "bounded pipeline capacity must be positive");
+    let (tx, rx) = mpsc::unbounded_channel();
+    (
+        PipelineEmitter {
+            slots: Arc::new(Semaphore::new(capacity)),
+            tx,
+            element_kind,
+            producer_name,
+            max_item_bytes,
+        },
+        rx,
+    )
 }
 
 /// Per-stage execution context. Holds everything `Stage::run`
@@ -226,6 +338,12 @@ pub struct StageContext {
     /// candidates. This is execution policy only and never participates in
     /// args, schemas, cache keys, logical hashes, or artifact identity.
     pub training_io_profile: Option<crate::framework::async_io::TrainingIoProfile>,
+    /// Executor-owned producer handle for ADR 0102 bounded pipeline overlap.
+    /// Absent on the ordinary/default-off path and intentionally inaccessible
+    /// outside this crate; cookbook stages interact only through
+    /// [`pipeline_enabled`](Self::pipeline_enabled) and
+    /// [`emit_pipeline_item`](Self::emit_pipeline_item).
+    pub(crate) pipeline_emitter: Option<PipelineEmitter>,
     /// This stage invocation's CACHE KEY (the engine's canonical "same input +
     /// same args + same schema" fingerprint). Threaded so a durable-resume train
     /// stage can derive a STABLE per-config resume directory (via
@@ -268,6 +386,7 @@ impl StageContext {
             admitted_workers: None,
             admitted_batch_size: None,
             training_io_profile: None,
+            pipeline_emitter: None,
             cache_key: crate::framework::artifact::ContentHash([0u8; 32]),
             attempt: 1,
             resume_from: None,
@@ -304,10 +423,122 @@ impl StageContext {
             admitted_workers: None,
             admitted_batch_size: None,
             training_io_profile: None,
+            pipeline_emitter: None,
             cache_key,
             attempt: 1,
             resume_from: None,
         }
+    }
+
+    /// Whether this invocation has an open executor-owned early-item lane.
+    pub fn pipeline_enabled(&self) -> bool {
+        self.pipeline_emitter
+            .as_ref()
+            .is_some_and(|emitter| !emitter.tx.is_closed())
+    }
+
+    /// Emit one manifest-indexed list element into the bounded semantic lane.
+    ///
+    /// `Ok(false)` is a conservative decline: the ordinary authoritative list
+    /// remains the only output when no lane is installed, the receiver closed,
+    /// the element kind is wrong, or the exact erased envelope exceeds the
+    /// admitted item bound. Serialization failures remain real stage errors;
+    /// cancellation while waiting for a slot returns [`StageError::Cancelled`].
+    pub async fn emit_pipeline_item<A: Artifact>(
+        &self,
+        index: usize,
+        item: &A,
+    ) -> Result<bool, StageError> {
+        let Some(emitter) = self.pipeline_emitter.as_ref() else {
+            return Ok(false);
+        };
+        if emitter.tx.is_closed()
+            || A::KIND != emitter.element_kind
+            || !A::PIPELINE_STANDARD_ENCODING
+        {
+            return Ok(false);
+        }
+        // The producer's attempt directory is atomically renamed when the
+        // parent commits. Require the artifact itself to certify every
+        // embedded backing, then retain a primary-path defense in depth for an
+        // incomplete implementation.
+        if !item.pipeline_storage_is_stable(&self.stage_dir) {
+            return Ok(false);
+        }
+        let primary_path = item.primary_path();
+        if !primary_path.as_os_str().is_empty() && primary_path.starts_with(&self.stage_dir) {
+            return Ok(false);
+        }
+
+        // Compute the standard envelope's fixed framing, then reserve a writer
+        // capped to the remaining admitted bytes. Unlike a size-then-serialize
+        // pass, the writer remains bounded even for stateful/custom serde
+        // implementations that report or emit different lengths across calls.
+        // Custom `encode_erased` hooks are never invoked here.
+        // A struct and tuple serialize as the same ordered field sequence under
+        // bincode. Borrow the static kind and an empty slice so an adversarially
+        // long KIND cannot allocate before the admitted framing check rejects it.
+        let framing_bytes =
+            bincode::serialized_size(&(A::KIND, A::SCHEMA, &[] as &[u8])).map_err(|source| {
+                StageError::OutputSerialize {
+                    stage: emitter.producer_name,
+                    source,
+                }
+            })?;
+        let Some(payload_limit) = emitter.max_item_bytes.checked_sub(framing_bytes) else {
+            return Ok(false);
+        };
+        let Ok(payload_limit) = usize::try_from(payload_limit) else {
+            return Ok(false);
+        };
+
+        let permit = tokio::select! {
+            _ = self.cancel.cancelled() => return Err(StageError::Cancelled),
+            permit = Arc::clone(&emitter.slots).acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return Ok(false),
+            },
+        };
+        if self.cancel.is_cancelled() {
+            return Err(StageError::Cancelled);
+        }
+        if emitter.tx.is_closed() {
+            return Ok(false);
+        }
+
+        let Some(mut payload) = BoundedPipelinePayload::try_new(payload_limit) else {
+            return Ok(false);
+        };
+        if let Err(source) = bincode::serialize_into(&mut payload, item) {
+            if payload.exceeded {
+                return Ok(false);
+            }
+            return Err(StageError::OutputSerialize {
+                stage: emitter.producer_name,
+                source,
+            });
+        }
+        let artifact = ErasedArtifact {
+            kind: A::KIND.to_string(),
+            schema: A::SCHEMA,
+            payload: payload.bytes,
+        };
+        let serialized_bytes =
+            bincode::serialized_size(&artifact).map_err(|source| StageError::OutputSerialize {
+                stage: emitter.producer_name,
+                source,
+            })?;
+        if serialized_bytes > emitter.max_item_bytes {
+            return Ok(false);
+        }
+
+        let emission = PipelineEmission {
+            index,
+            artifact,
+            content_hash: item.content_hash(),
+            _slot: permit,
+        };
+        Ok(emitter.tx.send(emission).is_ok())
     }
 }
 
@@ -407,6 +638,39 @@ pub trait Stage: Send + Sync + 'static {
     /// authorizes speculation by itself.
     const SPECULATION_SAFE: bool = false;
 
+    /// Whether this producer may expose ordered output elements before
+    /// [`run`](Self::run) returns its authoritative list (ADR 0102).
+    ///
+    /// Default false is fail-closed. Opting in promises that every early item
+    /// is immutable, content-addressed, emitted in the manifest's index space,
+    /// and still appears byte-identically in the final `ListOf`. Each element
+    /// type must separately opt into
+    /// [`Artifact::PIPELINE_STANDARD_ENCODING`] and every value must certify
+    /// all embedded backing handles through
+    /// [`Artifact::pipeline_storage_is_stable`]; attempt-local handles are
+    /// declined because parent promotion renames that directory while a
+    /// consumer could still be reading it. The executor validates the complete
+    /// sequence before committing any overlapped child; a mismatch discards
+    /// private work and falls back to ordinary fan-out.
+    const PIPELINE_OUTPUT_SAFE: bool = false;
+
+    /// Whether this consumer may run privately on a certified producer item
+    /// before that producer returns its authoritative list.
+    ///
+    /// This is deliberately separate from [`SPECULATION_SAFE`](Self::SPECULATION_SAFE):
+    /// existing stages may have opted into condition-gated speculation under
+    /// its two-key plan-author contract without consenting to `map_output`
+    /// overlap. Default false keeps those cookbooks ordinary until they review
+    /// and explicitly certify this lifecycle. The same private-discard
+    /// obligations apply: all writes and returned backings stay beneath the
+    /// supplied private `stage_dir`; the stage performs no network, global,
+    /// canonical-cache, job-root, or sibling effects; it behaves identically
+    /// with private scratch `job_dir`/`cache` handles; long-running work honors
+    /// cancellation; and every created path remains removable by the engine.
+    /// Unlike condition speculation, this certificate does not use a
+    /// PlanSpec `pure` bit because map templates cannot currently request it.
+    const PIPELINE_INPUT_SAFE: bool = false;
+
     /// CPU cores this stage keeps busy while running. Default 1 (a
     /// single-threaded or GPU-bound stage). Used by the p2p dispatch
     /// path to size the `ResourceRequest` sent to peers — a rayon/
@@ -505,6 +769,18 @@ pub trait Stage: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Declare the exact ordered element hashes this run may emit early.
+    /// `None` keeps the ordinary post-completion `ListOf` fan-out even when the
+    /// stage type is pipeline-certified. The manifest is execution metadata
+    /// only and must not participate in artifact or cache identity.
+    fn pipeline_manifest(
+        &self,
+        _input: &Self::Input,
+        _args: &Self::Args,
+    ) -> Option<PipelineManifest> {
+        None
+    }
+
     /// Run the stage. Pure function over `(input, args)` plus
     /// whatever side effects the stage's nature requires (reading
     /// `ctx.job_dir`, writing to `ctx.stage_dir`, etc.).
@@ -593,6 +869,25 @@ pub trait StageDyn: Send + Sync + 'static {
     /// implementations remain ineligible unless they explicitly opt in.
     fn speculation_safe(&self) -> bool {
         false
+    }
+    /// Erased mirror of [`Stage::PIPELINE_OUTPUT_SAFE`]. Manual `StageDyn`
+    /// implementations remain ineligible unless they explicitly opt in.
+    fn pipeline_output_safe(&self) -> bool {
+        false
+    }
+    /// Erased mirror of [`Stage::PIPELINE_INPUT_SAFE`].
+    fn pipeline_input_safe(&self) -> bool {
+        false
+    }
+    /// Erased mirror of [`Stage::pipeline_manifest`]. The blanket
+    /// implementation decodes both typed inputs before asking the producer;
+    /// manual implementations conservatively decline by default.
+    fn pipeline_manifest_erased(
+        &self,
+        _input: &ErasedArtifact,
+        _args: &serde_json::Value,
+    ) -> Result<Option<PipelineManifest>, StageError> {
+        Ok(None)
     }
     fn resources(&self) -> &'static [Resource];
     fn memory_gib(&self) -> u32;
@@ -883,6 +1178,21 @@ impl<S: Stage> StageDyn for S {
     }
     fn speculation_safe(&self) -> bool {
         S::SPECULATION_SAFE
+    }
+    fn pipeline_output_safe(&self) -> bool {
+        S::PIPELINE_OUTPUT_SAFE
+    }
+    fn pipeline_input_safe(&self) -> bool {
+        S::PIPELINE_INPUT_SAFE
+    }
+    fn pipeline_manifest_erased(
+        &self,
+        input: &ErasedArtifact,
+        args: &serde_json::Value,
+    ) -> Result<Option<PipelineManifest>, StageError> {
+        let typed_input = decode_stage_input::<S>(input.clone())?;
+        let typed_args = decode_stage_args::<S>(args.clone())?;
+        Ok(Stage::pipeline_manifest(self, &typed_input, &typed_args))
     }
     fn is_advisory(&self) -> bool {
         S::ADVISORY
@@ -1282,9 +1592,10 @@ fn rebase_path_strings(value: &mut serde_json::Value, from: &str, to: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::framework::artifact::ContentHash;
+    use crate::framework::artifact::{ContentHash, ListOf};
     use serde::{Deserialize, Serialize};
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ── A toy artifact + a toy stage to exercise erased dispatch ──
 
@@ -1312,11 +1623,114 @@ mod tests {
     impl Artifact for Count {
         const KIND: &'static str = "test.count";
         const SCHEMA: u32 = 1;
+        const PIPELINE_STANDARD_ENCODING: bool = true;
+        fn pipeline_storage_is_stable(&self, _producer_stage_dir: &Path) -> bool {
+            true
+        }
         fn content_hash(&self) -> ContentHash {
             ContentHash::of_bytes(&self.n.to_le_bytes())
         }
         fn primary_path(&self) -> &Path {
             Path::new(".")
+        }
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    struct FailsSerialize;
+
+    impl Serialize for FailsSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom(
+                "intentional pipeline test failure",
+            ))
+        }
+    }
+
+    impl Artifact for FailsSerialize {
+        const KIND: &'static str = "test.fails_serialize";
+        const SCHEMA: u32 = 1;
+        const PIPELINE_STANDARD_ENCODING: bool = true;
+
+        fn pipeline_storage_is_stable(&self, _producer_stage_dir: &Path) -> bool {
+            true
+        }
+
+        fn content_hash(&self) -> ContentHash {
+            ContentHash::of_bytes(b"never reached")
+        }
+
+        fn primary_path(&self) -> &Path {
+            Path::new(".")
+        }
+    }
+
+    static OVERSIZED_ENCODE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static CUSTOM_ENCODE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct OversizedEncodeProbe {
+        bytes: Vec<u8>,
+    }
+
+    impl Artifact for OversizedEncodeProbe {
+        const KIND: &'static str = "test.oversized_encode_probe";
+        const SCHEMA: u32 = 1;
+        const PIPELINE_STANDARD_ENCODING: bool = true;
+
+        fn pipeline_storage_is_stable(&self, _producer_stage_dir: &Path) -> bool {
+            true
+        }
+
+        fn content_hash(&self) -> ContentHash {
+            ContentHash::of_bytes(&self.bytes)
+        }
+
+        fn primary_path(&self) -> &Path {
+            Path::new(".")
+        }
+
+        fn encode_erased(&self) -> Result<ErasedArtifact, ErasedEncodeError> {
+            OVERSIZED_ENCODE_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(ErasedArtifact {
+                kind: Self::KIND.into(),
+                schema: Self::SCHEMA,
+                payload: self.bytes.clone(),
+            })
+        }
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct CustomEncodeBomb {
+        marker: u8,
+    }
+
+    impl Artifact for CustomEncodeBomb {
+        const KIND: &'static str = "test.custom_encode_bomb";
+        const SCHEMA: u32 = 1;
+        const PIPELINE_STANDARD_ENCODING: bool = true;
+
+        fn pipeline_storage_is_stable(&self, _producer_stage_dir: &Path) -> bool {
+            true
+        }
+
+        fn content_hash(&self) -> ContentHash {
+            ContentHash::of_bytes(&[self.marker])
+        }
+
+        fn primary_path(&self) -> &Path {
+            Path::new(".")
+        }
+
+        fn encode_erased(&self) -> Result<ErasedArtifact, ErasedEncodeError> {
+            CUSTOM_ENCODE_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(ErasedArtifact {
+                kind: Self::KIND.into(),
+                schema: Self::SCHEMA,
+                payload: vec![self.marker; 1024 * 1024],
+            })
         }
     }
 
@@ -1345,6 +1759,50 @@ mod tests {
         ) -> Result<Self::Output, StageError> {
             let n = input.text.split(args.delimiter.as_str()).count();
             Ok(Count { n })
+        }
+    }
+
+    /// Pipeline-certified list producer used to prove the typed/erased
+    /// manifest seam without changing the minimal default stage above.
+    struct PipelineWordLengths;
+
+    #[async_trait]
+    impl Stage for PipelineWordLengths {
+        const NAME: &'static str = "pipeline_word_lengths";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        const PIPELINE_OUTPUT_SAFE: bool = true;
+        type Input = Words;
+        type Output = ListOf<Count>;
+        type Args = WordCountArgs;
+
+        fn pipeline_manifest(
+            &self,
+            input: &Self::Input,
+            args: &Self::Args,
+        ) -> Option<PipelineManifest> {
+            Some(PipelineManifest::new(
+                input
+                    .text
+                    .split(args.delimiter.as_str())
+                    .map(|word| Count { n: word.len() }.content_hash())
+                    .collect(),
+            ))
+        }
+
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            input: Self::Input,
+            args: &Self::Args,
+        ) -> Result<Self::Output, StageError> {
+            Ok(ListOf(
+                input
+                    .text
+                    .split(args.delimiter.as_str())
+                    .map(|word| Count { n: word.len() })
+                    .collect(),
+            ))
         }
     }
 
@@ -1572,6 +2030,8 @@ mod tests {
         assert_eq!(s.schema(), 1);
         assert_eq!(s.resources(), &[Resource::Cpu]);
         assert_eq!(s.execution_boundary(), StageExecutionBoundary::Opaque);
+        assert!(!s.pipeline_output_safe());
+        assert!(!s.pipeline_input_safe());
         assert_eq!(s.input_kind(), "test.words");
         assert_eq!(s.output_kind(), "test.count");
         // args_schema returns SOMETHING valid (not Null) for a
@@ -1581,6 +2041,218 @@ mod tests {
             schema != serde_json::Value::Null,
             "args_schema unexpectedly null"
         );
+    }
+
+    #[test]
+    fn stagedyn_decodes_the_typed_pipeline_manifest() {
+        let stage: Box<dyn StageDyn> = Box::new(PipelineWordLengths);
+        let input = ErasedArtifact::from_typed(&Words {
+            text: "a,three".into(),
+        })
+        .unwrap();
+        let args = serde_json::json!({"delimiter": ","});
+
+        assert!(stage.pipeline_output_safe());
+        let manifest = stage
+            .pipeline_manifest_erased(&input, &args)
+            .unwrap()
+            .expect("certified producer declares a manifest");
+        assert_eq!(
+            manifest.element_hashes,
+            vec![Count { n: 1 }.content_hash(), Count { n: 5 }.content_hash()]
+        );
+    }
+
+    #[test]
+    fn default_pipeline_manifest_is_inert() {
+        let stage: Box<dyn StageDyn> = Box::new(WordCount);
+        let input = ErasedArtifact::from_typed(&Words { text: "a b".into() }).unwrap();
+        let args = serde_json::json!({"delimiter": " "});
+
+        assert!(!stage.pipeline_output_safe());
+        assert_eq!(stage.pipeline_manifest_erased(&input, &args).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn pipeline_slot_is_held_across_queued_and_running_states() {
+        let first = Count { n: 7 };
+        let envelope = ErasedArtifact::from_typed(&first).unwrap();
+        let max_item_bytes = u64::try_from(bincode::serialize(&envelope).unwrap().len()).unwrap();
+        let (emitter, mut receiver) =
+            pipeline_channel(1, max_item_bytes, Count::KIND, "pipeline_word_lengths");
+        let mut ctx = ctx();
+        ctx.pipeline_emitter = Some(emitter);
+
+        assert!(ctx.pipeline_enabled());
+        assert!(ctx.emit_pipeline_item(4, &first).await.unwrap());
+        let running = receiver.recv().await.expect("first emission");
+        assert_eq!(running.index, 4);
+        assert_eq!(running.artifact.kind, Count::KIND);
+        assert_eq!(running.content_hash, first.content_hash());
+
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            ctx.emit_pipeline_item(5, &Count { n: 8 }),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "running item must continue holding its slot"
+        );
+
+        drop(running);
+        assert!(ctx.emit_pipeline_item(5, &Count { n: 8 }).await.unwrap());
+        assert_eq!(receiver.recv().await.expect("second emission").index, 5);
+    }
+
+    #[tokio::test]
+    async fn pipeline_slot_wait_honors_stage_cancellation() {
+        let item = Count { n: 7 };
+        let envelope = ErasedArtifact::from_typed(&item).unwrap();
+        let max_item_bytes = u64::try_from(bincode::serialize(&envelope).unwrap().len()).unwrap();
+        let (emitter, mut receiver) =
+            pipeline_channel(1, max_item_bytes, Count::KIND, "pipeline_word_lengths");
+        let mut ctx = ctx();
+        ctx.pipeline_emitter = Some(emitter);
+        assert!(ctx.emit_pipeline_item(0, &item).await.unwrap());
+        let running = receiver.recv().await.expect("slot-holding emission");
+
+        let cancel = ctx.cancel.clone();
+        let cancel_task = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            cancel.cancel();
+        });
+        assert!(matches!(
+            ctx.emit_pipeline_item(1, &item).await,
+            Err(StageError::Cancelled)
+        ));
+        cancel_task.await.unwrap();
+        drop(running);
+    }
+
+    #[tokio::test]
+    async fn pipeline_declines_absent_closed_wrong_kind_and_oversize_lanes() {
+        let mut ctx = ctx();
+        let item = Count { n: 11 };
+        assert!(!ctx.pipeline_enabled());
+        assert!(!ctx.emit_pipeline_item(0, &item).await.unwrap());
+
+        let envelope = ErasedArtifact::from_typed(&item).unwrap();
+        let exact = u64::try_from(bincode::serialize(&envelope).unwrap().len()).unwrap();
+        let (emitter, mut receiver) =
+            pipeline_channel(1, exact, Count::KIND, "pipeline_word_lengths");
+        ctx.pipeline_emitter = Some(emitter);
+        assert!(
+            !ctx.emit_pipeline_item(
+                0,
+                &Words {
+                    text: "wrong".into()
+                }
+            )
+            .await
+            .unwrap()
+        );
+        assert!(ctx.emit_pipeline_item(0, &item).await.unwrap());
+        drop(receiver.recv().await.expect("exact-size emission"));
+
+        let (emitter, receiver) =
+            pipeline_channel(1, exact - 1, Count::KIND, "pipeline_word_lengths");
+        ctx.pipeline_emitter = Some(emitter);
+        assert!(!ctx.emit_pipeline_item(0, &item).await.unwrap());
+
+        drop(receiver);
+        assert!(!ctx.pipeline_enabled());
+        assert!(!ctx.emit_pipeline_item(0, &item).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn pipeline_propagates_artifact_serialization_errors() {
+        let (emitter, _receiver) =
+            pipeline_channel(1, 4096, FailsSerialize::KIND, "pipeline_word_lengths");
+        let mut ctx = ctx();
+        ctx.pipeline_emitter = Some(emitter);
+
+        assert!(matches!(
+            ctx.emit_pipeline_item(0, &FailsSerialize).await,
+            Err(StageError::OutputSerialize {
+                stage: "pipeline_word_lengths",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn pipeline_bounded_encoder_refuses_oversize_before_allocation() {
+        OVERSIZED_ENCODE_CALLS.store(0, Ordering::SeqCst);
+        let (emitter, _receiver) =
+            pipeline_channel(1, 16, OversizedEncodeProbe::KIND, "pipeline_word_lengths");
+        let mut ctx = ctx();
+        ctx.pipeline_emitter = Some(emitter);
+        let item = OversizedEncodeProbe {
+            bytes: vec![7; 4096],
+        };
+
+        assert!(!ctx.emit_pipeline_item(0, &item).await.unwrap());
+        assert_eq!(
+            OVERSIZED_ENCODE_CALLS.load(Ordering::SeqCst),
+            0,
+            "the engine must reject a normal oversized payload before encode_erased allocates"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_bounded_encoder_bypasses_unbounded_custom_hook() {
+        CUSTOM_ENCODE_CALLS.store(0, Ordering::SeqCst);
+        let item = CustomEncodeBomb { marker: 7 };
+        let standard = ErasedArtifact {
+            kind: CustomEncodeBomb::KIND.into(),
+            schema: CustomEncodeBomb::SCHEMA,
+            payload: bincode::serialize(&item).unwrap(),
+        };
+        let exact = bincode::serialized_size(&standard).unwrap();
+        let (emitter, mut receiver) =
+            pipeline_channel(1, exact, CustomEncodeBomb::KIND, "pipeline_word_lengths");
+        let mut ctx = ctx();
+        ctx.pipeline_emitter = Some(emitter);
+
+        assert!(ctx.emit_pipeline_item(0, &item).await.unwrap());
+        let emitted = receiver.recv().await.expect("bounded standard envelope");
+        assert_eq!(emitted.artifact.payload, standard.payload);
+        assert_eq!(
+            CUSTOM_ENCODE_CALLS.load(Ordering::SeqCst),
+            0,
+            "pipeline emission must never invoke an unbounded custom encoder"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_declines_producer_attempt_local_file_handles() {
+        let mut ctx = ctx();
+        let item = PathyOut {
+            content: 9,
+            path: ctx.stage_dir.join("chunk.bin"),
+        };
+        let (emitter, mut receiver) =
+            pipeline_channel(1, u64::MAX, PathyOut::KIND, "pipeline_word_lengths");
+        ctx.pipeline_emitter = Some(emitter);
+
+        assert!(!ctx.emit_pipeline_item(0, &item).await.unwrap());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn pipeline_declines_uncertified_composite_with_hidden_local_backing() {
+        let mut ctx = ctx();
+        let item = CompositePathOut {
+            primary: std::path::PathBuf::from("/stable/shared/chunk.bin"),
+            secondary: ctx.stage_dir.join("hidden-index.bin"),
+        };
+        let (emitter, mut receiver) =
+            pipeline_channel(1, u64::MAX, CompositePathOut::KIND, "pipeline_word_lengths");
+        ctx.pipeline_emitter = Some(emitter);
+
+        assert!(!ctx.emit_pipeline_item(0, &item).await.unwrap());
+        assert!(receiver.try_recv().is_err());
     }
 
     // ── StageContext constructible for tests ─────────────────────
@@ -1616,9 +2288,36 @@ mod tests {
         content: u8,
         path: std::path::PathBuf,
     }
+
+    /// Composite whose `primary_path` hides another serialized backing. It
+    /// deliberately keeps the default fail-closed pipeline storage contract.
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct CompositePathOut {
+        primary: std::path::PathBuf,
+        secondary: std::path::PathBuf,
+    }
+
+    impl Artifact for CompositePathOut {
+        const KIND: &'static str = "test.composite-pathy";
+        const SCHEMA: u32 = 1;
+        const PIPELINE_STANDARD_ENCODING: bool = true;
+
+        fn content_hash(&self) -> ContentHash {
+            ContentHash::of_bytes(self.secondary.as_os_str().as_encoded_bytes())
+        }
+
+        fn primary_path(&self) -> &Path {
+            &self.primary
+        }
+    }
     impl Artifact for PathyOut {
         const KIND: &'static str = "test.pathy";
         const SCHEMA: u32 = 1;
+        const PIPELINE_STANDARD_ENCODING: bool = true;
+
+        fn pipeline_storage_is_stable(&self, producer_stage_dir: &Path) -> bool {
+            !self.path.starts_with(producer_stage_dir)
+        }
         fn content_hash(&self) -> ContentHash {
             ContentHash::of_bytes(&[self.content])
         }

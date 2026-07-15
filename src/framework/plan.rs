@@ -648,6 +648,10 @@ pub(crate) struct MapExpansion {
     pub template: Arc<CompiledTemplate>,
     /// Optional display label; spawned instances are labelled `label[i]`.
     pub label: Option<String>,
+    /// ADR 0102 optimizer-owned witness for the conservative bounded pipeline
+    /// lane. Authoring never sets this bit; every optimizer run clears it
+    /// before re-proving eligibility in the current post-DCE plan.
+    pub pipeline: bool,
 }
 
 /// A kind-checked map template: like a [`CompiledPlan`] but its single root

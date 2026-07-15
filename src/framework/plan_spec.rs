@@ -414,6 +414,7 @@ impl PlanSpec {
                 parent: m.parent,
                 template: std::sync::Arc::new(template),
                 label: m.label.clone(),
+                pipeline: false,
             });
         }
 

@@ -340,6 +340,34 @@ pub trait Artifact: Send + Sync + serde::Serialize + serde::de::DeserializeOwned
     /// fingerprint instead of bytes.
     const HASH_CONTENTS: bool = true;
 
+    /// Whether ADR 0102 may encode an early element with the standard bounded
+    /// bincode-of-self representation.
+    ///
+    /// The pipeline lane deliberately bypasses [`encode_erased`](Self::encode_erased):
+    /// a custom encoder receives no allocator bound and could create a payload
+    /// larger than the admitted lane before the executor can inspect it. Set
+    /// this only when the artifact's erased element representation is the
+    /// default `KIND`/`SCHEMA` envelope containing `bincode::serialize(self)`.
+    /// Tuple/list envelopes and custom wire formats remain on the ordinary
+    /// path unless a future bounded custom-encoder API is added.
+    const PIPELINE_STANDARD_ENCODING: bool = false;
+
+    /// Certify that every backing referenced by this concrete value is safe to
+    /// consume before its producing stage commits.
+    ///
+    /// ADR 0102's private pipeline can overlap a list producer with one
+    /// consumer. The producer attempt directory is renamed atomically at
+    /// commit, so an early element must not contain *any* path rooted there --
+    /// including secondary paths that [`primary_path`](Self::primary_path)
+    /// does not expose. Implementors should return `true` only for value-only
+    /// artifacts or after checking every embedded file/directory handle is in
+    /// stable, immutable storage for the duration of the consumer. The
+    /// fail-closed default keeps existing artifact implementations on the
+    /// ordinary authoritative path.
+    fn pipeline_storage_is_stable(&self, _producer_stage_dir: &Path) -> bool {
+        false
+    }
+
     /// Stable content hash. For file-backed artifacts this is the
     /// SHA-256 of the canonical bytes; for composite artifacts a
     /// merkle of children. Idempotent — same content ⇒ same hash
@@ -749,6 +777,25 @@ fn decode_tuple_children<const N: usize>(
 
 const LIST_DOMAIN: &[u8] = b"list";
 
+/// Compute the canonical `ListOf<E>` Merkle root from its ordered element
+/// content hashes without requiring the concrete element type. The pipeline
+/// executor uses this to validate an early manifest against the authoritative
+/// list returned by the producer.
+pub(crate) fn list_content_hash_from_element_hashes<I>(element_hashes: I) -> ContentHash
+where
+    I: IntoIterator<Item = ContentHash>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let element_hashes = element_hashes.into_iter();
+    let mut hasher = Sha256::new();
+    hasher.update(LIST_DOMAIN);
+    hasher.update((element_hashes.len() as u32).to_le_bytes());
+    for hash in element_hashes {
+        hasher.update(hash.0);
+    }
+    ContentHash(hasher.finalize().into())
+}
+
 /// A homogeneous list of artifacts. `KIND = "list"`; the element kind is
 /// reported via [`Artifact::ELEMENT_KIND`]. Produced by a stage that fans a
 /// runtime-sized collection out to a `map_output` template. The `E: Artifact`
@@ -773,14 +820,7 @@ impl<E: Artifact> Artifact for ListOf<E> {
     const ELEMENT_KIND: Option<&'static str> = Some(E::KIND);
 
     fn content_hash(&self) -> ContentHash {
-        let mut hasher = Sha256::new();
-        hasher.update(LIST_DOMAIN);
-        hasher.update((self.0.len() as u32).to_le_bytes());
-        for e in &self.0 {
-            hasher.update(e.content_hash().0);
-        }
-        let arr: [u8; 32] = hasher.finalize().into();
-        ContentHash(arr)
+        list_content_hash_from_element_hashes(self.0.iter().map(Artifact::content_hash))
     }
 
     fn primary_path(&self) -> &Path {
@@ -1180,6 +1220,22 @@ mod tests {
         let a = ListOf(vec![art(1)]).content_hash();
         assert_ne!(ab, ba, "order-sensitive");
         assert_ne!(ab, a, "length-sensitive");
+    }
+
+    #[test]
+    fn list_hash_helper_matches_the_typed_list_merkle_root() {
+        let items = vec![art(3), art(5), art(8)];
+        let element_hashes = items.iter().map(Artifact::content_hash).collect::<Vec<_>>();
+        let from_hashes =
+            super::list_content_hash_from_element_hashes(element_hashes.iter().copied());
+
+        // Independent worked vector from the pre-refactor wire formula:
+        // SHA-256("list" || 3_u32_le || sha256([3]) || sha256([5]) || sha256([8])).
+        assert_eq!(
+            from_hashes.to_hex(),
+            "dd0c208cd5cef579ba15cef1a31f85df50722b4bd3bb02c3c723c533fb8063ea"
+        );
+        assert_eq!(from_hashes, ListOf(items).content_hash());
     }
 
     #[test]

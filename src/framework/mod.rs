@@ -74,6 +74,7 @@ pub use plan_spec::{ConditionGateSpec, PLAN_SPEC_VERSION, PlanSpec, PlanSpecErro
 pub use resource::Resource;
 pub use retry::{Backoff, RetryEvent, RetryHook, RetryOn, RetryPolicy, StageTimeout};
 pub use stage::{
-    ErasedArtifact, ErasedDecodeError, Stage, StageContext, StageDyn, StageExecutionBoundary,
+    ErasedArtifact, ErasedDecodeError, PipelineManifest, Stage, StageContext, StageDyn,
+    StageExecutionBoundary,
 };
 pub use status::{HostedEvent, StageEvent, StatusHub, make_broadcast, spawn_status_writer};

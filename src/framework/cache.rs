@@ -41,6 +41,34 @@ use serde::{Deserialize, Serialize};
 use crate::framework::artifact::ContentHash;
 use crate::framework::stage::ErasedArtifact;
 
+#[cfg(test)]
+type OptionalLocalInsertHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+
+#[cfg(test)]
+fn optional_local_insert_hook() -> &'static std::sync::Mutex<Option<OptionalLocalInsertHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<OptionalLocalInsertHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn set_optional_local_insert_hook(hook: Option<OptionalLocalInsertHook>) {
+    *optional_local_insert_hook()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+}
+
+#[cfg(test)]
+fn run_optional_local_insert_hook(path: &Path) {
+    let hook = optional_local_insert_hook()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
 /// Per-job + (commit-5) global + (Tier-4) remote cache handle.
 #[derive(Clone, Debug)]
 pub struct CacheHandle {
@@ -339,16 +367,26 @@ impl CacheHandle {
         self.insert_with_policy(key, output, false)
     }
 
-    /// Insert for optional work whose plugin boundary must not unwind the
-    /// coordinator. The ordinary/default-off cache contract stays unchanged;
-    /// only a remote write-through panic is contained after the local atomic
-    /// entry has succeeded.
-    pub(crate) fn insert_optional(
+    /// Commit only the local/global filesystem tier for selected optional work.
+    /// The executor keeps this write behind its publication rollback guard and
+    /// calls [`replicate_optional`](Self::replicate_optional) only after the
+    /// canonical stage/lifecycle commit.
+    pub(crate) fn insert_optional_local(
         &self,
         key: ContentHash,
         output: &ErasedArtifact,
-    ) -> std::io::Result<()> {
-        self.insert_with_policy(key, output, true)
+    ) -> std::io::Result<Vec<u8>> {
+        let body = self.insert_local(key, output)?;
+        #[cfg(test)]
+        run_optional_local_insert_hook(&self.entry_path_for_write(key));
+        Ok(body)
+    }
+
+    /// Best-effort remote replication after an optional result is canonical.
+    /// Plugin panics and remote errors remain contained; the committed local
+    /// entry is already sufficient for correctness.
+    pub(crate) fn replicate_optional(&self, key: ContentHash, body: &[u8]) {
+        self.replicate(key, body, true);
     }
 
     fn insert_with_policy(
@@ -357,24 +395,28 @@ impl CacheHandle {
         output: &ErasedArtifact,
         contain_remote_panic: bool,
     ) -> std::io::Result<()> {
+        let body = self.insert_local(key, output)?;
+        self.replicate(key, &body, contain_remote_panic);
+        Ok(())
+    }
+
+    fn insert_local(&self, key: ContentHash, output: &ErasedArtifact) -> std::io::Result<Vec<u8>> {
         let dir = self.write_target().join(key.to_hex());
         std::fs::create_dir_all(&dir)?;
         let dest = dir.join("output.bin");
-        let body = bincode::serialize(output).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("serialize cache entry: {e}"),
-            )
-        })?;
+        let body = encode_entry(output)?;
         write_atomic(&dest, &body)?;
+        Ok(body)
+    }
+
+    fn replicate(&self, key: ContentHash, body: &[u8], contain_remote_panic: bool) {
         // Write through to the remote tier (T4.2) so other machines/pods share
         // this result. Best-effort: a remote failure is logged, not fatal — the
         // local write already succeeded, so the run is unaffected.
         if let Some(remote) = &self.remote
             && contain_remote_panic
         {
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| remote.put(key, &body)))
-            {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| remote.put(key, body))) {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     tracing::warn!("cache: remote write-through for {}: {error}", key.to_hex());
@@ -387,11 +429,10 @@ impl CacheHandle {
                 }
             }
         } else if let Some(remote) = &self.remote
-            && let Err(error) = remote.put(key, &body)
+            && let Err(error) = remote.put(key, body)
         {
             tracing::warn!("cache: remote write-through for {}: {error}", key.to_hex());
         }
-        Ok(())
     }
 
     /// Exact local entry path an insert writes for this handle/key.
@@ -422,6 +463,15 @@ impl CacheHandle {
             None => &self.job_local,
         }
     }
+}
+
+fn encode_entry(output: &ErasedArtifact) -> std::io::Result<Vec<u8>> {
+    bincode::serialize(output).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("serialize cache entry: {error}"),
+        )
+    })
 }
 
 /// LRU prune: scan the cache root, sort entries by atime, delete

@@ -334,6 +334,7 @@ impl Stage for ProbeGuardedStage {
                 decode_workers: 1,
                 prefetch_per_worker: 1,
                 cuda_staging_slots: 1,
+                pipeline: IoMode::Inline,
                 metrics: IoMode::Bounded {
                     capacity: 1,
                     max_item_bytes: 1,
@@ -348,6 +349,7 @@ impl Stage for ProbeGuardedStage {
                 decode_workers: 0,
                 prefetch_per_worker: 0,
                 cuda_staging_slots: 0,
+                pipeline: IoMode::Inline,
                 metrics: IoMode::Inline,
                 checkpoints: IoMode::Inline,
                 batch_bytes: Some(0),

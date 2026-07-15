@@ -49,6 +49,7 @@ fn inline_candidate() -> TrainingIoCandidate {
         decode_workers: 0,
         prefetch_per_worker: 0,
         cuda_staging_slots: 0,
+        pipeline: IoMode::Inline,
         metrics: IoMode::Inline,
         checkpoints: IoMode::Inline,
         batch_bytes: Some(0),
@@ -63,6 +64,7 @@ fn bounded_candidate(batch_bytes: Option<u64>) -> TrainingIoCandidate {
         decode_workers: 2,
         prefetch_per_worker: 2,
         cuda_staging_slots: 1,
+        pipeline: IoMode::Inline,
         metrics: IoMode::Bounded {
             capacity: 2,
             max_item_bytes: 5 * MIB,
@@ -85,6 +87,7 @@ fn selects_first_complete_profile_that_fits_checked_byte_envelope() {
         decode_workers: 1,
         prefetch_per_worker: 1,
         cuda_staging_slots: 0,
+        pipeline: IoMode::Inline,
         metrics: IoMode::Inline,
         checkpoints: IoMode::Inline,
         batch_bytes: Some(10 * MIB),

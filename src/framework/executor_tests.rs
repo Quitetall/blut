@@ -270,6 +270,313 @@ fn next_ready_empty_set_is_none() {
     assert_eq!(next_ready(&ready, &hints), None);
 }
 
+#[test]
+fn dag_opt_advanced_gate_pipeline_abandoned_predicted_key_requeues_deferred_waiter() {
+    let key = ContentHash::of_bytes(b"abandoned-pipeline-key");
+    let mut inflight_keys = HashSet::from([key]);
+    let mut node_key_of = HashMap::from([(11, key)]);
+    let mut deferred = HashMap::from([(key, vec![21, 22])]);
+    let mut cache_probes = HashMap::from([(key, None)]);
+    let mut prepared_cache_hits = HashMap::new();
+    let mut ready = BTreeSet::new();
+    let pruned = HashSet::from([22]);
+
+    abandon_inflight_key(
+        11,
+        key,
+        &mut inflight_keys,
+        &mut node_key_of,
+        &mut deferred,
+        &mut cache_probes,
+        &mut prepared_cache_hits,
+        &mut ready,
+        &pruned,
+    );
+
+    assert!(!inflight_keys.contains(&key));
+    assert!(!node_key_of.contains_key(&11));
+    assert!(!deferred.contains_key(&key));
+    assert!(!cache_probes.contains_key(&key));
+    assert_eq!(ready, BTreeSet::from([21]));
+}
+
+#[derive(Debug)]
+struct PipelinePublicationRemoteProbe {
+    puts: Arc<AtomicU32>,
+}
+
+impl crate::framework::object_store::BlobStore for PipelinePublicationRemoteProbe {
+    fn get(&self, _key: ContentHash) -> std::io::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    fn put(&self, _key: ContentHash, _bytes: &[u8]) -> std::io::Result<()> {
+        self.puts.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn head(&self, _key: ContentHash) -> std::io::Result<bool> {
+        Ok(false)
+    }
+}
+
+struct OptionalLocalInsertHookReset;
+
+impl Drop for OptionalLocalInsertHookReset {
+    fn drop(&mut self) {
+        crate::framework::cache::set_optional_local_insert_hook(None);
+    }
+}
+
+#[test]
+fn dag_opt_advanced_gate_pipeline_cancel_after_cache_rename_rolls_back_before_lifecycle() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let job_dir = temp.path().join("job");
+    let remote_puts = Arc::new(AtomicU32::new(0));
+    let cache = Arc::new(
+        CacheHandle::job_local(job_dir.join("_cache")).with_remote(Arc::new(
+            PipelinePublicationRemoteProbe {
+                puts: remote_puts.clone(),
+            },
+        )),
+    );
+    let mut ctx = ExecCtx::new(job_dir.clone());
+    ctx.cache = cache.clone();
+    let training_io_resolver = TrainingIoResolver::from_ctx(&ctx).unwrap();
+    let mut events = ctx.status.subscribe();
+    let env = NodeEnv {
+        job_dir: ctx.job_dir,
+        cache: ctx.cache,
+        tenant: ctx.tenant,
+        status: ctx.status,
+        cancel: ctx.cancel,
+        resources: ctx.resources,
+        gpu: ctx.gpu,
+        memory: ctx.memory,
+        memory_budget_gib: ctx.memory_budget_gib,
+        launch_target: ctx.launch_target,
+        device_index: ctx.device_index,
+        fb_warm: ctx.fb_warm,
+        admitted_workers: ctx.admitted_workers,
+        admitted_batch_size: ctx.admitted_batch_size,
+        training_io_profiles: std::sync::RwLock::new(HashMap::new()),
+        training_io_resolver,
+        bypass_cache: false,
+        recipe_name: "pipeline-publication-test".into(),
+        on_retry: None,
+        diverged: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        #[cfg(feature = "p2p")]
+        dispatch_policy: None,
+        #[cfg(feature = "p2p")]
+        dispatcher: None,
+    };
+
+    let parent_key = ContentHash::of_bytes(b"pipeline-parent-key");
+    let child_key = ContentHash::of_bytes(b"pipeline-child-key");
+    let parent_output = ErasedArtifact::from_typed(&Counter { n: 0 }).unwrap();
+    cache.insert(parent_key, &parent_output).unwrap();
+    remote_puts.store(0, Ordering::SeqCst);
+    let parent_cache_path = cache.entry_path_for_write(parent_key);
+    let child_cache_path = cache.entry_path_for_write(child_key);
+    let parent_stage_dir = job_dir.join("stages/0-parent");
+    std::fs::create_dir_all(&parent_stage_dir).unwrap();
+    std::fs::write(parent_stage_dir.join("kept"), b"parent").unwrap();
+
+    let scratch_root = job_dir.join(".pipeline/private-child");
+    let scratch_stage_dir = scratch_root.join("stages/1-make_one");
+    std::fs::create_dir_all(&scratch_stage_dir).unwrap();
+    std::fs::write(scratch_stage_dir.join("private"), b"child").unwrap();
+    let prepared = SpeculativePrepared {
+        _scratch: SpeculationScratch(scratch_root.clone()),
+        scratch_stage_dir,
+        node_id: 1,
+        node_idx: 1,
+        stage: Arc::new(MakeOne),
+        stage_name: MakeOne::NAME.into(),
+        input_hash: ContentHash::of_bytes(b"pipeline-child-input"),
+        canon_args: b"{}".to_vec(),
+        key: child_key,
+        output: ErasedArtifact::from_typed(&Counter { n: 1 }).unwrap(),
+        elapsed: std::time::Duration::from_millis(1),
+        training_io_profile: None,
+        buffered_steps: vec![StageEvent::StageStep {
+            node_idx: 1,
+            stage_name: MakeOne::NAME.into(),
+            update: serde_json::json!({"private": true}),
+        }],
+    };
+
+    let cancel = env.cancel.clone();
+    let expected_child_path = child_cache_path.clone();
+    crate::framework::cache::set_optional_local_insert_hook(Some(Arc::new(move |path| {
+        assert_eq!(path, expected_child_path);
+        cancel.cancel();
+    })));
+    let _hook_reset = OptionalLocalInsertHookReset;
+    let error = match publish_speculative(prepared, &env, None, Instant::now(), true) {
+        Ok(_) => panic!("cache-boundary cancellation must reject private publication"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, NodeFailure::Plan(PlanError::Cancelled)));
+    assert!(!child_cache_path.exists());
+    assert!(!child_cache_path.parent().unwrap().exists());
+    assert!(parent_cache_path.is_file());
+    assert_eq!(
+        std::fs::read(parent_stage_dir.join("kept")).unwrap(),
+        b"parent"
+    );
+    assert!(!job_dir.join("stages/1-make_one").exists());
+    assert!(!scratch_root.exists());
+    assert_eq!(remote_puts.load(Ordering::SeqCst), 0);
+    assert!(events.try_recv().is_err());
+}
+
+#[test]
+fn ordinary_speculation_cache_insert_is_the_cancellation_linearization_point() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let job_dir = temp.path().join("job");
+    let remote_puts = Arc::new(AtomicU32::new(0));
+    let cache = Arc::new(
+        CacheHandle::job_local(job_dir.join("_cache")).with_remote(Arc::new(
+            PipelinePublicationRemoteProbe {
+                puts: remote_puts.clone(),
+            },
+        )),
+    );
+    let mut ctx = ExecCtx::new(job_dir.clone());
+    ctx.cache = cache.clone();
+    let training_io_resolver = TrainingIoResolver::from_ctx(&ctx).unwrap();
+    let mut events = ctx.status.subscribe();
+    let env = NodeEnv {
+        job_dir: ctx.job_dir,
+        cache: ctx.cache,
+        tenant: ctx.tenant,
+        status: ctx.status,
+        cancel: ctx.cancel,
+        resources: ctx.resources,
+        gpu: ctx.gpu,
+        memory: ctx.memory,
+        memory_budget_gib: ctx.memory_budget_gib,
+        launch_target: ctx.launch_target,
+        device_index: ctx.device_index,
+        fb_warm: ctx.fb_warm,
+        admitted_workers: ctx.admitted_workers,
+        admitted_batch_size: ctx.admitted_batch_size,
+        training_io_profiles: std::sync::RwLock::new(HashMap::new()),
+        training_io_resolver,
+        bypass_cache: false,
+        recipe_name: "ordinary-publication-test".into(),
+        on_retry: None,
+        diverged: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        #[cfg(feature = "p2p")]
+        dispatch_policy: None,
+        #[cfg(feature = "p2p")]
+        dispatcher: None,
+    };
+
+    let child_key = ContentHash::of_bytes(b"ordinary-speculative-child-key");
+    let child_cache_path = cache.entry_path_for_write(child_key);
+    let scratch_root = job_dir.join(".speculative/private-child");
+    let scratch_stage_dir = scratch_root.join("stages/1-make_one");
+    std::fs::create_dir_all(&scratch_stage_dir).unwrap();
+    std::fs::write(scratch_stage_dir.join("private"), b"child").unwrap();
+    let prepared = SpeculativePrepared {
+        _scratch: SpeculationScratch(scratch_root.clone()),
+        scratch_stage_dir,
+        node_id: 1,
+        node_idx: 1,
+        stage: Arc::new(MakeOne),
+        stage_name: MakeOne::NAME.into(),
+        input_hash: ContentHash::of_bytes(b"ordinary-speculative-child-input"),
+        canon_args: b"{}".to_vec(),
+        key: child_key,
+        output: ErasedArtifact::from_typed(&Counter { n: 1 }).unwrap(),
+        elapsed: std::time::Duration::from_millis(1),
+        training_io_profile: None,
+        buffered_steps: vec![StageEvent::StageStep {
+            node_idx: 1,
+            stage_name: MakeOne::NAME.into(),
+            update: serde_json::json!({"private": true}),
+        }],
+    };
+
+    let cancel = env.cancel.clone();
+    let expected_child_path = child_cache_path.clone();
+    crate::framework::cache::set_optional_local_insert_hook(Some(Arc::new(move |path| {
+        assert_eq!(path, expected_child_path);
+        cancel.cancel();
+    })));
+    let _hook_reset = OptionalLocalInsertHookReset;
+    let outcome = match publish_speculative(prepared, &env, None, Instant::now(), false) {
+        Ok(outcome) => outcome,
+        Err(_) => panic!("ordinary publication already linearized at its local cache insert"),
+    };
+
+    assert_eq!(outcome.node_id, 1);
+    assert!(child_cache_path.is_file());
+    assert!(job_dir.join("stages/1-make_one/private").is_file());
+    assert!(!scratch_root.exists());
+    assert_eq!(remote_puts.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        events.try_recv(),
+        Ok(StageEvent::StageBegin { node_idx: 1, .. })
+    ));
+    assert!(matches!(
+        events.try_recv(),
+        Ok(StageEvent::StageStep { node_idx: 1, .. })
+    ));
+    assert!(matches!(
+        events.try_recv(),
+        Ok(StageEvent::StageEnd { node_idx: 1, .. })
+    ));
+}
+
+#[test]
+fn dag_opt_advanced_gate_pipeline_corrupt_spill_cleanup_failure_is_fatal() {
+    let temp = tempfile::tempdir().unwrap();
+    let scratch_root = temp.path().join(".blut-test-pipeline-cleanup-failure");
+    std::fs::create_dir_all(&scratch_root).unwrap();
+    let spilled = SpilledPipelinePrepared {
+        _scratch: SpeculationScratch(scratch_root.clone()),
+        scratch_stage_dir: scratch_root.join("stage"),
+        input_path: scratch_root.join("pipeline-input.bin"),
+        payload_path: scratch_root.join("pipeline-prepared.bin"),
+        node_id: 1,
+        node_idx: 1,
+        stage: Arc::new(MakeOne),
+        stage_name: MakeOne::NAME.into(),
+        input_hash: ContentHash::of_bytes(b"input"),
+        canon_args: Vec::new(),
+        key: ContentHash::of_bytes(b"key"),
+        elapsed: std::time::Duration::ZERO,
+        training_io_profile: None,
+        max_spill_bytes: 4096,
+    };
+
+    let load_failure = match spilled.load_failure(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "corrupt spill",
+    )) {
+        Ok(_) => panic!("injected cleanup refusal must dominate spill corruption"),
+        Err(failure) => failure,
+    };
+    assert!(matches!(
+        allow_pipeline_load_fallback(load_failure),
+        Err(NodeFailure::SpeculationCleanup { path, .. }) if path == scratch_root
+    ));
+}
+
+#[test]
+fn dag_opt_advanced_gate_pipeline_corrupt_spill_falls_back_without_partial_publication() {
+    assert!(
+        allow_pipeline_load_fallback(NodeFailure::Other("corrupt private spill".into())).is_ok(),
+        "ordinary spill corruption is optional-work failure and may fall back before publication"
+    );
+}
+
 // --- ADR 0102 pass #4: user-priority ready-queue scheduling ------------
 
 /// A hint carrying a user priority (and optionally a critical-path length).

@@ -18,12 +18,16 @@ use serde::{Deserialize, Serialize};
 /// `Bounded { capacity: 1, .. }` is still asynchronous. `Inline` is the only
 /// synchronous mode and serializes with capacity/max-item values of zero in
 /// [`TrainingIoProfile::env_pairs`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum IoMode {
+    #[default]
     Inline,
-    Bounded { capacity: u32, max_item_bytes: u64 },
+    Bounded {
+        capacity: u32,
+        max_item_bytes: u64,
+    },
 }
 
 impl IoMode {
@@ -56,6 +60,32 @@ impl IoMode {
                 .ok_or(CandidateFailure::ArithmeticOverflow),
         }
     }
+
+    /// Retained envelope bound for the cross-stage pipeline lane.
+    ///
+    /// Capacity covers each queued/running [`PipelineEmission`](crate::framework::stage::PipelineEmission).
+    /// The one running item is also retained by `NodeTask` for retry-safe
+    /// dispatch and by the erased stage call while it decodes. After the call,
+    /// the latter allowance becomes the cap for that child's engine-private
+    /// output/status spill. Those two single-consumer records are independent
+    /// of queue width, so the engine-side envelope bound is
+    /// `(capacity + 2) * max_item_bytes`.
+    fn pipeline_retained_bytes(&self) -> Result<u64, CandidateFailure> {
+        match self {
+            Self::Inline => Ok(0),
+            Self::Bounded { capacity: 0, .. }
+            | Self::Bounded {
+                max_item_bytes: 0, ..
+            } => Err(CandidateFailure::UnknownSize),
+            Self::Bounded {
+                capacity,
+                max_item_bytes,
+            } => u64::from(*capacity)
+                .checked_add(2)
+                .and_then(|copies| copies.checked_mul(*max_item_bytes))
+                .ok_or(CandidateFailure::ArithmeticOverflow),
+        }
+    }
 }
 
 /// One stage-owned candidate before optional size measurements are resolved.
@@ -63,6 +93,11 @@ impl IoMode {
 /// `None` is an honest unknown. It never becomes zero silently: a candidate
 /// that needs that measurement is skipped and the explicit inline tail is
 /// selected instead.
+///
+/// Alpha migration note: ADR 0102 added the required `pipeline` lane to this
+/// public literal-built struct. Existing external literals must add
+/// `pipeline: IoMode::Inline` or migrate to `..TrainingIoCandidate::default()`.
+/// The latter is the forward-compatible authoring form for optional lanes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrainingIoCandidate {
     /// Number of independent data-pipeline replicas retaining prefetched and
@@ -72,6 +107,8 @@ pub struct TrainingIoCandidate {
     pub decode_workers: u32,
     pub prefetch_per_worker: u32,
     pub cuda_staging_slots: u32,
+    /// Bounded retained-item lane used by cross-stage pipeline overlap.
+    pub pipeline: IoMode,
     pub metrics: IoMode,
     pub checkpoints: IoMode,
     pub batch_bytes: Option<u64>,
@@ -84,11 +121,33 @@ pub struct TrainingIoCandidate {
     pub fixed_overhead_bytes: Option<u64>,
 }
 
+impl Default for TrainingIoCandidate {
+    /// Fully-inline, measurement-free candidate suitable as the explicit tail
+    /// and as the update base for cookbook literals. Cookbook authors should
+    /// prefer `..TrainingIoCandidate::default()` so future optional lanes do
+    /// not create another source migration.
+    fn default() -> Self {
+        Self {
+            data_replicas: 1,
+            decode_workers: 0,
+            prefetch_per_worker: 0,
+            cuda_staging_slots: 0,
+            pipeline: IoMode::Inline,
+            metrics: IoMode::Inline,
+            checkpoints: IoMode::Inline,
+            batch_bytes: None,
+            checkpoint_snapshot_bytes: None,
+            fixed_overhead_bytes: None,
+        }
+    }
+}
+
 impl TrainingIoCandidate {
     fn is_inline_tail(&self) -> bool {
         self.decode_workers == 0
             && self.prefetch_per_worker == 0
             && self.cuda_staging_slots == 0
+            && self.pipeline.is_inline()
             && self.metrics.is_inline()
             && self.checkpoints.is_inline()
     }
@@ -133,6 +192,7 @@ impl TrainingIoCandidate {
             .checked_mul(batch_bytes)
             .and_then(|bytes| bytes.checked_mul(u64::from(self.data_replicas)))
             .ok_or(CandidateFailure::ArithmeticOverflow)?;
+        let pipeline_bytes = self.pipeline.pipeline_retained_bytes()?;
         let metrics_bytes = self.metrics.retained_bytes()?;
         let checkpoint_bytes = self.checkpoints.retained_bytes()?;
         let fixed_overhead_bytes = fixed_overhead_bytes_per_replica
@@ -141,6 +201,7 @@ impl TrainingIoCandidate {
         let billed_overhead_bytes = [
             prefetch_bytes,
             cuda_bytes,
+            pipeline_bytes,
             metrics_bytes,
             checkpoint_bytes,
             fixed_overhead_bytes,
@@ -158,6 +219,7 @@ impl TrainingIoCandidate {
             decode_workers: self.decode_workers,
             prefetch_per_worker: self.prefetch_per_worker,
             cuda_staging_slots: self.cuda_staging_slots,
+            pipeline: self.pipeline.clone(),
             metrics: self.metrics.clone(),
             checkpoints: self.checkpoints.clone(),
             batch_bytes,
@@ -205,6 +267,10 @@ pub enum TrainingIoDowngradeReason {
     UserForced,
     SnapshotUnavailable,
     UnsupportedLauncher,
+    /// The compiled optimizer witness does not authorize the cross-stage
+    /// pipeline lane for this node, so bounded pipeline candidates were
+    /// excluded before selection.
+    PipelineUnavailable,
     UnknownSize,
     ArithmeticOverflow,
     BudgetPressure,
@@ -223,6 +289,9 @@ pub struct TrainingIoProfile {
     pub decode_workers: u32,
     pub prefetch_per_worker: u32,
     pub cuda_staging_slots: u32,
+    /// Effective cross-stage pipeline lane selected by admission.
+    #[serde(default)]
+    pub pipeline: IoMode,
     pub metrics: IoMode,
     pub checkpoints: IoMode,
     pub batch_bytes: u64,
@@ -241,6 +310,7 @@ impl TrainingIoProfile {
         self.decode_workers == 0
             && self.prefetch_per_worker == 0
             && self.cuda_staging_slots == 0
+            && self.pipeline.is_inline()
             && self.metrics.is_inline()
             && self.checkpoints.is_inline()
             && self.fixed_overhead_bytes == 0
@@ -251,9 +321,24 @@ impl TrainingIoProfile {
     /// (for example a trainer's worker/prefetch names) are intentionally left
     /// to that cookbook adapter.
     pub fn env_pairs(&self) -> BTreeMap<&'static str, String> {
+        let (pipeline_capacity, pipeline_max_item) = self.pipeline.capacity_and_max_item();
         let (metrics_capacity, metrics_max_item) = self.metrics.capacity_and_max_item();
         let (checkpoint_capacity, checkpoint_max_item) = self.checkpoints.capacity_and_max_item();
         BTreeMap::from([
+            (
+                "BLUT_IO_PIPELINE_MODE",
+                if self.pipeline.is_inline() {
+                    "inline"
+                } else {
+                    "bounded"
+                }
+                .to_string(),
+            ),
+            ("BLUT_IO_PIPELINE_CAPACITY", pipeline_capacity.to_string()),
+            (
+                "BLUT_IO_PIPELINE_MAX_ITEM_BYTES",
+                pipeline_max_item.to_string(),
+            ),
             (
                 "BLUT_IO_METRICS_MODE",
                 if self.metrics.is_inline() {
@@ -403,4 +488,161 @@ pub(crate) fn select_training_io_profile_with_reason(
     // The synchronous base was proven to fit above, so reaching this point
     // means the advertised inline tail was not actually complete/zero-cost.
     Err(TrainingIoAdmissionError::InvalidInlineFallback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        IoMode, TrainingIoCandidate, TrainingIoDowngradeReason, TrainingIoProfile,
+        profile_is_declared, select_training_io_profile,
+    };
+
+    fn inline_candidate() -> TrainingIoCandidate {
+        TrainingIoCandidate {
+            data_replicas: 1,
+            decode_workers: 0,
+            prefetch_per_worker: 0,
+            cuda_staging_slots: 0,
+            pipeline: IoMode::Inline,
+            metrics: IoMode::Inline,
+            checkpoints: IoMode::Inline,
+            batch_bytes: Some(0),
+            checkpoint_snapshot_bytes: Some(0),
+            fixed_overhead_bytes: Some(0),
+        }
+    }
+
+    fn bounded_pipeline_candidate() -> TrainingIoCandidate {
+        TrainingIoCandidate {
+            data_replicas: 1,
+            decode_workers: 0,
+            prefetch_per_worker: 0,
+            cuda_staging_slots: 0,
+            pipeline: IoMode::Bounded {
+                capacity: 3,
+                max_item_bytes: 5,
+            },
+            metrics: IoMode::Inline,
+            checkpoints: IoMode::Inline,
+            batch_bytes: Some(0),
+            checkpoint_snapshot_bytes: Some(0),
+            fixed_overhead_bytes: Some(0),
+        }
+    }
+
+    #[test]
+    fn pipeline_lane_bills_queued_and_running_erased_residency() {
+        let candidates = [bounded_pipeline_candidate(), inline_candidate()];
+        let profile = select_training_io_profile(100, 125, &candidates, false)
+            .expect("bounded pipeline fits exactly");
+
+        assert!(!profile.is_inline());
+        assert_eq!(profile.billed_overhead_bytes, 25);
+        assert!(profile_is_declared(&profile, &candidates));
+        let env = profile.env_pairs();
+        assert_eq!(
+            env.get("BLUT_IO_PIPELINE_MODE"),
+            Some(&"bounded".to_string())
+        );
+        assert_eq!(env.get("BLUT_IO_PIPELINE_CAPACITY"), Some(&"3".to_string()));
+        assert_eq!(
+            env.get("BLUT_IO_PIPELINE_MAX_ITEM_BYTES"),
+            Some(&"5".to_string())
+        );
+
+        let mut undeclared = profile.clone();
+        undeclared.pipeline = IoMode::Inline;
+        assert!(!profile_is_declared(&undeclared, &candidates));
+    }
+
+    #[test]
+    fn pipeline_lane_downgrades_on_budget_or_overflow() {
+        let candidates = [bounded_pipeline_candidate(), inline_candidate()];
+        let budget_limited =
+            select_training_io_profile(100, 124, &candidates, false).expect("inline tail fits");
+        assert!(budget_limited.is_inline());
+        assert_eq!(
+            budget_limited.downgrade_reason,
+            Some(TrainingIoDowngradeReason::BudgetPressure)
+        );
+
+        let mut overflowing = bounded_pipeline_candidate();
+        overflowing.pipeline = IoMode::Bounded {
+            capacity: u32::MAX,
+            max_item_bytes: u64::MAX,
+        };
+        let overflowed =
+            select_training_io_profile(0, u64::MAX, &[overflowing, inline_candidate()], false)
+                .expect("overflow selects inline tail");
+        assert!(overflowed.is_inline());
+        assert_eq!(
+            overflowed.downgrade_reason,
+            Some(TrainingIoDowngradeReason::ArithmeticOverflow)
+        );
+
+        let mut zero_capacity = bounded_pipeline_candidate();
+        zero_capacity.pipeline = IoMode::Bounded {
+            capacity: 0,
+            max_item_bytes: 5,
+        };
+        let unknown =
+            select_training_io_profile(0, 15, &[zero_capacity, inline_candidate()], false)
+                .expect("invalid bounded lane selects inline tail");
+        assert!(unknown.is_inline());
+        assert_eq!(
+            unknown.downgrade_reason,
+            Some(TrainingIoDowngradeReason::UnknownSize)
+        );
+    }
+
+    #[test]
+    fn force_inline_disables_pipeline_lane_and_exports_zero_capacity() {
+        let profile = select_training_io_profile(
+            100,
+            115,
+            &[bounded_pipeline_candidate(), inline_candidate()],
+            true,
+        )
+        .expect("forced inline tail fits");
+
+        assert!(profile.is_inline());
+        assert_eq!(profile.pipeline, IoMode::Inline);
+        assert_eq!(
+            profile.downgrade_reason,
+            Some(TrainingIoDowngradeReason::UserForced)
+        );
+        let env = profile.env_pairs();
+        assert_eq!(
+            env.get("BLUT_IO_PIPELINE_MODE"),
+            Some(&"inline".to_string())
+        );
+        assert_eq!(env.get("BLUT_IO_PIPELINE_CAPACITY"), Some(&"0".to_string()));
+        assert_eq!(
+            env.get("BLUT_IO_PIPELINE_MAX_ITEM_BYTES"),
+            Some(&"0".to_string())
+        );
+    }
+
+    #[test]
+    fn legacy_profile_without_pipeline_lane_decodes_as_inline() {
+        let profile: TrainingIoProfile = serde_json::from_str(
+            r#"{
+                "sync_base_bytes": 100,
+                "data_replicas": 1,
+                "decode_workers": 0,
+                "prefetch_per_worker": 0,
+                "cuda_staging_slots": 0,
+                "metrics": {"mode": "inline"},
+                "checkpoints": {"mode": "inline"},
+                "batch_bytes": 0,
+                "checkpoint_snapshot_bytes": 0,
+                "fixed_overhead_bytes": 0,
+                "billed_overhead_bytes": 0
+            }"#,
+        )
+        .expect("pre-pipeline status profile remains readable");
+
+        assert_eq!(profile.pipeline, IoMode::Inline);
+        assert!(profile.is_inline());
+    }
 }

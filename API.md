@@ -77,6 +77,41 @@ Direct framework callers without an explicit local selection-budget snapshot,
 and callers using an unsupported remote launcher, receive the declared Inline
 tail with a distinct downgrade reason.
 
+Bounded `map_output` overlap is a separate, fully opt-in ADR 0102 lane. A
+cookbook enables it by doing all of the following:
+
+1. Construct the optimizer with
+   `DagOptimizer { pipeline_parallelism: true, ..DagOptimizer::new() }`.
+2. Give the list producer a `TrainingIoCandidate` whose `pipeline` is
+   `IoMode::Bounded { capacity, max_item_bytes }`, followed by an explicit
+   Inline candidate. The three effective environment keys are
+   `BLUT_IO_PIPELINE_MODE`, `BLUT_IO_PIPELINE_CAPACITY`, and
+   `BLUT_IO_PIPELINE_MAX_ITEM_BYTES`.
+3. Certify the deterministic, non-advisory, in-process producer with
+   `Stage::PIPELINE_OUTPUT_SAFE = true`; return an ordered
+   `PipelineManifest::new(element_hashes)`; and call
+   `StageContext::emit_pipeline_item(index, &item)` as items become final.
+4. Certify the one-node, no-retry map consumer independently with
+   `Stage::PIPELINE_INPUT_SAFE = true` and
+   `StageExecutionBoundary::InProcess`.
+5. On the emitted element artifact, opt into the engine's bounded standard
+   bincode wire with `Artifact::PIPELINE_STANDARD_ENCODING = true` and make
+   `pipeline_storage_is_stable` reject every producer-attempt-local backing
+   path. Composite artifacts must inspect all of their backing storage.
+
+The queue capacity covers queued plus running items, and the byte cap covers
+the complete erased item envelope. The same cap bounds each engine-private
+serialized input and prepared child output/status record; an oversized private
+record declines overlap and reruns that child through ordinary fan-out. The
+executor revalidates kind, content hash, manifest cardinality, and the
+producer's authoritative `ListOf` before making any child result canonical. A
+warm cache entry, unsupported launcher, resource pressure, failed certificate,
+invalid manifest, cancellation, or private-spill corruption declines or
+discards overlap and retains ordinary fan-out semantics; an undeletable private
+spill is an integrity failure and remains fatal.
+The v1 lane is local-only, CPU/in-process, one expansion and one sequential
+private consumer; it does not add a `PlanSpec` field or a BLUT-owned TUI API.
+
 A declaring cache miss emits lossless `StageEvent::StageIoConfigured` before
 its canonical `StageBegin`; selected speculative work replays the same order.
 `StageContext` and `StageEvent` are non-exhaustive so additive execution fields

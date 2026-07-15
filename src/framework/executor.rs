@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 
+use bincode::Options;
 use futures::{FutureExt, StreamExt};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -734,6 +735,10 @@ struct NodeTask {
     /// retry. With no control policy it holds one token for the node's whole life
     /// → behaviour is identical to the pre-#4 single-token path.
     node_cancel: KillSlot,
+    /// Present only for an optimizer-witnessed, runtime-admitted map parent.
+    /// The stage must explicitly emit manifest-indexed items through this
+    /// semantic lane; ordinary/default-off tasks retain `None`.
+    pipeline_emitter: Option<crate::framework::stage::PipelineEmitter>,
 }
 
 /// A node's result, fed back to the coordinator to advance scheduling.
@@ -771,6 +776,246 @@ struct SpeculativePrepared {
     buffered_steps: Vec<StageEvent>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PipelinePreparedPayload {
+    output: ErasedArtifact,
+    buffered_steps: Vec<StageEvent>,
+}
+
+struct BoundedPipelineSpillWriter<W> {
+    inner: W,
+    remaining: u64,
+}
+
+impl<W: std::io::Write> std::io::Write for BoundedPipelineSpillWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let byte_count = u64::try_from(bytes.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pipeline spill write length cannot be represented",
+            )
+        })?;
+        if byte_count > self.remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pipeline spill exceeds the admitted item bound",
+            ));
+        }
+        let written = self.inner.write(bytes)?;
+        self.remaining = self
+            .remaining
+            .checked_sub(written as u64)
+            .expect("writer cannot report more bytes than it received");
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn write_pipeline_spill<T: serde::Serialize>(
+    path: &std::path::Path,
+    value: &T,
+    max_bytes: u64,
+) -> std::io::Result<()> {
+    let file = std::fs::File::create(path)?;
+    let mut writer = BoundedPipelineSpillWriter {
+        inner: std::io::BufWriter::new(file),
+        remaining: max_bytes,
+    };
+    bincode::serialize_into(&mut writer, value).map_err(std::io::Error::other)?;
+    std::io::Write::flush(&mut writer)
+}
+
+fn read_pipeline_spill<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+    max_bytes: u64,
+) -> std::io::Result<T> {
+    let file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "pipeline spill is {file_len} bytes, above its {max_bytes}-byte admitted bound"
+            ),
+        ));
+    }
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(max_bytes)
+        .deserialize_from(std::io::BufReader::new(file))
+        .map_err(std::io::Error::other)
+}
+
+/// Disk-backed private child result. A producer may emit thousands of map
+/// items before it returns its authoritative `ListOf`; retaining every child
+/// output/status buffer in RAM until that validation point would make the
+/// pipeline queue bounded in name only. Each completed child is therefore
+/// spilled under its already-private scratch root before the lane slot is
+/// returned to the producer.
+struct SpilledPipelinePrepared {
+    _scratch: SpeculationScratch,
+    scratch_stage_dir: PathBuf,
+    input_path: PathBuf,
+    payload_path: PathBuf,
+    node_id: NodeId,
+    node_idx: u32,
+    stage: Arc<dyn StageDyn>,
+    stage_name: String,
+    input_hash: ContentHash,
+    canon_args: Vec<u8>,
+    key: ContentHash,
+    elapsed: std::time::Duration,
+    training_io_profile: Option<crate::framework::async_io::TrainingIoProfile>,
+    max_spill_bytes: u64,
+}
+
+impl SpilledPipelinePrepared {
+    fn spill(
+        prepared: SpeculativePrepared,
+        input: &ErasedArtifact,
+        max_spill_bytes: u64,
+    ) -> Result<Self, NodeFailure> {
+        let SpeculativePrepared {
+            _scratch,
+            scratch_stage_dir,
+            node_id,
+            node_idx,
+            stage,
+            stage_name,
+            input_hash,
+            canon_args,
+            key,
+            output,
+            elapsed,
+            training_io_profile,
+            buffered_steps,
+        } = prepared;
+        let input_path = _scratch.0.join("pipeline-input.bin");
+        let payload_path = _scratch.0.join("pipeline-prepared.bin");
+        let write = || -> std::io::Result<()> {
+            write_pipeline_spill(&input_path, input, max_spill_bytes)?;
+            write_pipeline_spill(
+                &payload_path,
+                &PipelinePreparedPayload {
+                    output,
+                    buffered_steps,
+                },
+                max_spill_bytes,
+            )
+        };
+        if let Err(source) = write() {
+            let path = _scratch.0.clone();
+            if let Err(cleanup_source) = _scratch.cleanup() {
+                return Err(NodeFailure::SpeculationCleanup {
+                    path,
+                    source: cleanup_source,
+                });
+            }
+            return Err(NodeFailure::Other(format!(
+                "pipeline private-result spill at {} failed: {source}",
+                path.display()
+            )));
+        }
+        Ok(Self {
+            _scratch,
+            scratch_stage_dir,
+            input_path,
+            payload_path,
+            node_id,
+            node_idx,
+            stage,
+            stage_name,
+            input_hash,
+            canon_args,
+            key,
+            elapsed,
+            training_io_profile,
+            max_spill_bytes,
+        })
+    }
+
+    fn input_matches(
+        &self,
+        expected: &ErasedArtifact,
+        producer: &dyn StageDyn,
+        producer_tmp_stage_dir: &std::path::Path,
+        producer_final_stage_dir: &std::path::Path,
+    ) -> Result<bool, NodeFailure> {
+        let actual: ErasedArtifact = read_pipeline_spill(&self.input_path, self.max_spill_bytes)
+            .map_err(|source| {
+                NodeFailure::Other(format!(
+                    "pipeline input spill {} could not be decoded: {source}",
+                    self.input_path.display()
+                ))
+            })?;
+        let actual =
+            producer.rebase_output_paths(actual, producer_tmp_stage_dir, producer_final_stage_dir);
+        Ok(actual.kind == expected.kind
+            && actual.schema == expected.schema
+            && actual.payload == expected.payload)
+    }
+
+    fn validate_payload(&self) -> Result<(), NodeFailure> {
+        read_pipeline_spill::<PipelinePreparedPayload>(&self.payload_path, self.max_spill_bytes)
+            .map(|_| ())
+            .map_err(|source| {
+                NodeFailure::Other(format!(
+                    "pipeline private-result spill {} could not be decoded: {source}",
+                    self.payload_path.display()
+                ))
+            })
+    }
+
+    fn into_resident(self) -> Result<SpeculativePrepared, NodeFailure> {
+        let payload: PipelinePreparedPayload =
+            match read_pipeline_spill(&self.payload_path, self.max_spill_bytes) {
+                Ok(payload) => payload,
+                Err(source) => return self.load_failure(source),
+            };
+        Ok(SpeculativePrepared {
+            _scratch: self._scratch,
+            scratch_stage_dir: self.scratch_stage_dir,
+            node_id: self.node_id,
+            node_idx: self.node_idx,
+            stage: self.stage,
+            stage_name: self.stage_name,
+            input_hash: self.input_hash,
+            canon_args: self.canon_args,
+            key: self.key,
+            output: payload.output,
+            elapsed: self.elapsed,
+            training_io_profile: self.training_io_profile,
+            buffered_steps: payload.buffered_steps,
+        })
+    }
+
+    fn load_failure(self, source: std::io::Error) -> Result<SpeculativePrepared, NodeFailure> {
+        let path = self._scratch.0.clone();
+        let detail = format!(
+            "pipeline private-result spill {} could not be loaded: {source}",
+            self.payload_path.display()
+        );
+        if let Err(cleanup_source) = self._scratch.cleanup() {
+            return Err(NodeFailure::SpeculationCleanup {
+                path,
+                source: cleanup_source,
+            });
+        }
+        Err(NodeFailure::Other(detail))
+    }
+
+    fn discard(self) -> Result<(), NodeFailure> {
+        let path = self._scratch.0.clone();
+        self._scratch
+            .cleanup()
+            .map_err(|source| NodeFailure::SpeculationCleanup { path, source })
+    }
+}
+
 impl SpeculativePrepared {
     fn discard(self) -> Result<(), NodeFailure> {
         let path = self._scratch.0.clone();
@@ -794,12 +1039,26 @@ impl SpeculationScratch {
     }
 
     fn cleanup(&self) -> std::io::Result<()> {
-        match std::fs::remove_dir_all(&self.0) {
+        Self::cleanup_path(&self.0)
+    }
+
+    fn cleanup_path(path: &std::path::Path) -> std::io::Result<()> {
+        #[cfg(test)]
+        if path
+            .file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new(".blut-test-pipeline-cleanup-failure"))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected pipeline cleanup failure",
+            ));
+        }
+        match std::fs::remove_dir_all(path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        if let Some(parent) = self.0.parent() {
+        if let Some(parent) = path.parent() {
             match std::fs::remove_dir(parent) {
                 Ok(()) => {}
                 Err(error)
@@ -831,6 +1090,69 @@ struct SpeculativePublishGuard {
     final_stage_dir: PathBuf,
     committed: bool,
     rollback_failure: Arc<std::sync::Mutex<Option<std::io::Error>>>,
+}
+
+/// Removes a pipeline-selected cache entry when cancellation, deadline, panic,
+/// or another publication failure wins before the lifecycle commit. Pipeline
+/// launch is disabled for force-recompute and shared cache tiers, and its exact
+/// key was probed cold, so this guard never removes a pre-existing entry.
+struct PipelineCachePublishGuard {
+    entry_path: PathBuf,
+    committed: bool,
+    rollback_failure: Arc<std::sync::Mutex<Option<std::io::Error>>>,
+}
+
+impl PipelineCachePublishGuard {
+    fn new(
+        entry_path: PathBuf,
+        rollback_failure: Arc<std::sync::Mutex<Option<std::io::Error>>>,
+    ) -> Self {
+        Self {
+            entry_path,
+            committed: false,
+            rollback_failure,
+        }
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PipelineCachePublishGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let removal = match std::fs::remove_file(&self.entry_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+        .and_then(|()| {
+            let Some(parent) = self.entry_path.parent() else {
+                return Ok(());
+            };
+            match std::fs::remove_dir(parent) {
+                Ok(()) => Ok(()),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                    ) =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        });
+        if let Err(error) = removal {
+            *self
+                .rollback_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+        }
+    }
 }
 
 impl SpeculativePublishGuard {
@@ -881,11 +1203,65 @@ enum SpeculationState {
 
 enum SchedulerTaskResult {
     Ordinary(Result<Vec<NodeOutcome>, NodeFailure>),
+    Pipeline(Result<PipelineRunResult, NodeFailure>),
     Speculative {
         target: NodeId,
         key: ContentHash,
         result: Result<Box<SpeculativePrepared>, NodeFailure>,
     },
+}
+
+/// Pipeline work occupies two scheduler slots (producer + one private
+/// consumer) even though it returns through one `JoinSet` task. The extra
+/// weighted slot is released on success, error, panic, cancellation, or task
+/// abort, preventing the coordinator from oversubscribing `max_in_flight`.
+struct PipelineInFlightExtra(Arc<std::sync::atomic::AtomicUsize>);
+
+impl PipelineInFlightExtra {
+    fn reserve(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for PipelineInFlightExtra {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+struct PipelineChildSpec {
+    node: crate::framework::plan::PlanNode,
+    node_idx: u32,
+    input_logical: ContentHash,
+    key: ContentHash,
+}
+
+struct PipelineRunResult {
+    /// Keep the exact combined parent-plus-child envelope held through spill
+    /// validation and selected publication, not only while stage futures run.
+    _admission: Arc<AdmissionLease>,
+    parent: NodeOutcome,
+    elements: Vec<ErasedArtifact>,
+    children: Vec<PipelineChildSpec>,
+    profiles: Vec<(NodeId, ResolvedTrainingIoNode)>,
+    prepared: Option<Vec<SpilledPipelinePrepared>>,
+    spawn_capacity: usize,
+}
+
+struct PipelineLaunch {
+    receiver: tokio::sync::mpsc::UnboundedReceiver<crate::framework::stage::PipelineEmission>,
+    admission: Arc<AdmissionLease>,
+    manifest: crate::framework::stage::PipelineManifest,
+    predicted_parent_logical: ContentHash,
+    children: Vec<PipelineChildSpec>,
+    profiles: Vec<(NodeId, ResolvedTrainingIoNode)>,
+    producer_stage: Arc<dyn StageDyn>,
+    producer_tmp_stage_dir: PathBuf,
+    producer_final_stage_dir: PathBuf,
+    spawn_capacity: usize,
+    max_item_bytes: u64,
 }
 
 /// How a node run failed. The coordinator maps this to a `PlanError`;
@@ -1231,7 +1607,13 @@ impl TrainingIoResolver {
         &self,
         plan: &CompiledPlan,
     ) -> Result<HashMap<NodeId, ResolvedTrainingIoNode>, PlanError> {
-        self.resolve_plan_with_global_floor(plan, self.whole_job_base_bytes)
+        let pipeline_parents = plan
+            .expansions
+            .iter()
+            .filter(|expansion| expansion.pipeline)
+            .map(|expansion| expansion.parent)
+            .collect();
+        self.resolve_plan_with_global_floor(plan, self.whole_job_base_bytes, &pipeline_parents)
     }
 
     fn resolve_injected_plan(
@@ -1242,13 +1624,14 @@ impl TrainingIoResolver {
         // not an arbitrary later PBT/TPE/map child. Injected nodes must use
         // their own stage-derived base plus an optional child-specific floor
         // from the captured callback.
-        self.resolve_plan_with_global_floor(plan, None)
+        self.resolve_plan_with_global_floor(plan, None, &HashSet::new())
     }
 
     fn resolve_plan_with_global_floor(
         &self,
         plan: &CompiledPlan,
         whole_job_base_bytes: Option<u64>,
+        pipeline_parents: &HashSet<NodeId>,
     ) -> Result<HashMap<NodeId, ResolvedTrainingIoNode>, PlanError> {
         use crate::framework::async_io::{TrainingIoHints, select_training_io_profile_with_reason};
 
@@ -1280,12 +1663,26 @@ impl TrainingIoResolver {
             let calibrated_floor =
                 decision.and_then(|decision| decision.calibrated_base_floor_bytes);
             let selection_budget = decision.and_then(|decision| decision.selection_budget_bytes);
-            let candidates = node.stage.training_io_candidates(&node.args, hints);
-            declarations.push((node, hints, calibrated_floor, selection_budget, candidates));
+            let mut candidates = node.stage.training_io_candidates(&node.args, hints);
+            let pipeline_filtered = !pipeline_parents.contains(&node.id)
+                && candidates
+                    .iter()
+                    .any(|candidate| !candidate.pipeline.is_inline());
+            if pipeline_filtered {
+                candidates.retain(|candidate| candidate.pipeline.is_inline());
+            }
+            declarations.push((
+                node,
+                hints,
+                calibrated_floor,
+                selection_budget,
+                candidates,
+                pipeline_filtered,
+            ));
         }
         let declaring_count = declarations
             .iter()
-            .filter(|(_, _, _, _, candidates)| !candidates.is_empty())
+            .filter(|(_, _, _, _, candidates, _)| !candidates.is_empty())
             .count();
         if whole_job_base_bytes.is_some() && declaring_count > 1 {
             return Err(PlanError::Other(format!(
@@ -1294,7 +1691,9 @@ impl TrainingIoResolver {
         }
 
         let mut selected_profiles = HashMap::new();
-        for (node, hints, calibrated_floor, selection_budget, candidates) in declarations {
+        for (node, hints, calibrated_floor, selection_budget, candidates, pipeline_filtered) in
+            declarations
+        {
             if candidates.is_empty() {
                 continue;
             }
@@ -1317,7 +1716,7 @@ impl TrainingIoResolver {
             let node_budget = selection_budget
                 .map(|limit| limit.min(self.budget_bytes))
                 .unwrap_or(self.budget_bytes);
-            let selected = select_training_io_profile_with_reason(
+            let mut selected = select_training_io_profile_with_reason(
                 base_bytes,
                 node_budget,
                 &candidates,
@@ -1330,6 +1729,11 @@ impl TrainingIoResolver {
                     node.stage.name()
                 ))
             })?;
+            if pipeline_filtered && selected.downgrade_reason.is_none() {
+                selected.downgrade_reason = Some(
+                    crate::framework::async_io::TrainingIoDowngradeReason::PipelineUnavailable,
+                );
+            }
             selected_profiles.insert(
                 node.id,
                 ResolvedTrainingIoNode {
@@ -1435,6 +1839,21 @@ impl AdmissionRequest {
         requests
             .all(|request| request.as_ref() == Some(&first))
             .then_some(first)
+    }
+
+    /// Exact simultaneous parent + one-consumer envelope for ADR 0102's
+    /// conservative pipeline lane. V1 declines GPU stages because one combined
+    /// heterogeneous device grant cannot be divided into truthful per-stage
+    /// `StageContext` assignments. Repeated CPU/network/disk resources are
+    /// retained as repeated semaphore permits, and memory is summed checked.
+    fn combine_pipeline(mut parent: Self, child: Self, memory_budget_gib: u32) -> Option<Self> {
+        if parent.gpu.is_some() || child.gpu.is_some() {
+            return None;
+        }
+        parent.resources.extend(child.resources);
+        parent.resources.sort();
+        parent.memory_gib = parent.memory_gib.checked_add(child.memory_gib)?;
+        (parent.memory_gib <= memory_budget_gib).then_some(parent)
     }
 }
 
@@ -1647,13 +2066,14 @@ async fn acquire_admission(
 }
 
 async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, NodeFailure> {
-    run_node_with_admission(task, env, None, false, None).await
+    run_node_with_admission(task, env, None, None, false, None).await
 }
 
 async fn run_node_with_admission(
     mut task: NodeTask,
     env: Arc<NodeEnv>,
     mut shared_admission: Option<&mut FusionAdmission>,
+    pre_acquired_admission: Option<Arc<AdmissionLease>>,
     allow_in_process_handoff: bool,
     mut in_process_input: Option<InProcessArtifact>,
 ) -> Result<NodeOutcome, NodeFailure> {
@@ -1845,6 +2265,7 @@ async fn run_node_with_admission(
             training_io_profile: training_io
                 .as_ref()
                 .map(|selected| selected.profile.clone()),
+            pipeline_emitter: task.pipeline_emitter.clone(),
             // Durable resume (Phase D): the stage's cache key is its stable
             // per-config fingerprint — a resume train stage keys its recovery
             // dir on it so a re-run with identical args finds the checkpoint.
@@ -1926,7 +2347,9 @@ async fn run_node_with_admission(
         // use this same helper: fusion changes lease lifetime, never admission
         // policy or the StageContext device assignment.
         let mut owned_admission = None;
-        let admission = if let Some(shared) = shared_admission.as_deref_mut() {
+        let admission = if let Some(pre_acquired) = pre_acquired_admission.as_deref() {
+            pre_acquired
+        } else if let Some(shared) = shared_admission.as_deref_mut() {
             shared
                 .ensure_acquired(&env, idx, &stage_name)
                 .await
@@ -2359,11 +2782,30 @@ async fn run_node_with_admission(
 /// acquired all-or-none admission lease and decides whether to publish or drop
 /// the returned value after its condition resolves.
 async fn prepare_speculative(
-    mut task: NodeTask,
+    task: NodeTask,
     canonical_env: Arc<NodeEnv>,
     cancel: CancellationToken,
     lease: AdmissionLease,
     scratch_root: PathBuf,
+) -> Result<SpeculativePrepared, NodeFailure> {
+    prepare_private(
+        task,
+        canonical_env,
+        cancel,
+        Arc::new(lease),
+        scratch_root,
+        None,
+    )
+    .await
+}
+
+async fn prepare_private(
+    mut task: NodeTask,
+    canonical_env: Arc<NodeEnv>,
+    cancel: CancellationToken,
+    pre_acquired_admission: Arc<AdmissionLease>,
+    scratch_root: PathBuf,
+    training_io_override: Option<ResolvedTrainingIoNode>,
 ) -> Result<SpeculativePrepared, NodeFailure> {
     let node_id = task.node_id;
     let node_idx = task.node_idx;
@@ -2372,7 +2814,7 @@ async fn prepare_speculative(
     let input_hash = task.input_hash;
     let canon_args = task.canon_args.clone();
     let key = task.key;
-    let training_io = canonical_env.training_io_node(node_id);
+    let training_io = training_io_override.or_else(|| canonical_env.training_io_node(node_id));
     let training_io_profile = training_io
         .as_ref()
         .map(|selected| selected.profile.clone());
@@ -2407,6 +2849,10 @@ async fn prepare_speculative(
 
     let (status, mut lifecycle_rx) = StatusHub::new();
     let mut live_rx = status.subscribe();
+    let mut training_io_profiles = canonical_env.training_io_snapshot();
+    if let Some(selected) = training_io.clone() {
+        training_io_profiles.insert(node_id, selected);
+    }
     let private_env = Arc::new(NodeEnv {
         job_dir: scratch_root.clone(),
         cache: Arc::new(CacheHandle::job_local(scratch_root.join("_cache"))),
@@ -2422,7 +2868,7 @@ async fn prepare_speculative(
         fb_warm: canonical_env.fb_warm,
         admitted_workers: canonical_env.admitted_workers,
         admitted_batch_size: canonical_env.admitted_batch_size,
-        training_io_profiles: std::sync::RwLock::new(canonical_env.training_io_snapshot()),
+        training_io_profiles: std::sync::RwLock::new(training_io_profiles),
         training_io_resolver: canonical_env.training_io_resolver.clone(),
         bypass_cache: true,
         recipe_name: canonical_env.recipe_name.clone(),
@@ -2433,11 +2879,6 @@ async fn prepare_speculative(
         #[cfg(feature = "p2p")]
         dispatcher: None,
     });
-    let request = AdmissionRequest::for_task(&task, &canonical_env).map_err(NodeFailure::Other)?;
-    let mut admission = FusionAdmission {
-        request,
-        lease: Some(lease),
-    };
     let started = Instant::now();
     // Keep the explicit scratch owner outside the unwind boundary. If plugin
     // code panics, cleanup must still be checked while that owner is alive;
@@ -2446,7 +2887,8 @@ async fn prepare_speculative(
     let run_result = std::panic::AssertUnwindSafe(run_node_with_admission(
         task,
         private_env,
-        Some(&mut admission),
+        None,
+        Some(pre_acquired_admission),
         false,
         None,
     ))
@@ -2503,6 +2945,302 @@ async fn prepare_speculative(
         elapsed,
         training_io_profile,
         buffered_steps,
+    })
+}
+
+fn discard_pipeline_prepared(
+    prepared: &mut Vec<SpilledPipelinePrepared>,
+) -> Result<(), NodeFailure> {
+    let mut first_failure = None;
+    for child in prepared.drain(..) {
+        if let Err(failure) = child.discard()
+            && first_failure.is_none()
+        {
+            first_failure = Some(failure);
+        }
+    }
+    first_failure.map_or(Ok(()), Err)
+}
+
+/// Only corruption/read failures may conservatively fall back to ordinary
+/// execution. An undeletable private subtree is an integrity failure and must
+/// remain visible even though the pipeline optimization itself is optional.
+fn allow_pipeline_load_fallback(failure: NodeFailure) -> Result<(), NodeFailure> {
+    match failure {
+        failure @ NodeFailure::SpeculationCleanup { .. } => Err(failure),
+        _ => Ok(()),
+    }
+}
+
+/// Run one manifest-certified map producer while consuming its semantic item
+/// lane with one private worker. The combined parent + one-child admission is
+/// already held, so a capacity-one channel cannot deadlock behind a resource
+/// the producer itself owns. Nothing from a child becomes canonical until the
+/// producer's final `ListOf` validates the entire manifest and emitted order.
+async fn run_pipeline_parent(
+    task: NodeTask,
+    env: Arc<NodeEnv>,
+    mut launch: PipelineLaunch,
+    deadline: Option<Instant>,
+    plan_started: Instant,
+) -> Result<PipelineRunResult, NodeFailure> {
+    let parent_id = task.node_id;
+    let parent_cancel = task.node_cancel.current();
+    let admission = launch.admission.clone();
+    let env_for_parent = env.clone();
+    let mut parent_future = Box::pin(run_node_with_admission(
+        task,
+        env_for_parent,
+        None,
+        Some(admission),
+        false,
+        None,
+    ));
+    let mut parent_result: Option<Result<NodeOutcome, NodeFailure>> = None;
+    let mut prepared = Vec::with_capacity(launch.children.len());
+    let mut emitted_count = 0usize;
+    let mut valid = true;
+    let mut fatal_failure = None;
+
+    loop {
+        let emission = if parent_result.is_some() {
+            launch.receiver.recv().await
+        } else {
+            tokio::select! {
+                biased;
+                emission = launch.receiver.recv() => emission,
+                result = &mut parent_future => {
+                    parent_result = Some(result);
+                    continue;
+                }
+            }
+        };
+        let Some(emission) = emission else {
+            break;
+        };
+        let index = emitted_count;
+        emitted_count += 1;
+        if fatal_failure.is_some() || !valid || parent_result.as_ref().is_some_and(Result::is_err) {
+            drop(emission);
+            continue;
+        }
+        let expected_hash = launch.manifest.element_hashes.get(index).copied();
+        if emission.index != index
+            || expected_hash != Some(emission.content_hash)
+            || index >= launch.children.len()
+        {
+            valid = false;
+            if let Err(failure) = discard_pipeline_prepared(&mut prepared) {
+                fatal_failure = Some(failure);
+                env.cancel.cancel();
+                parent_cancel.cancel();
+            }
+            drop(emission);
+            continue;
+        }
+        let child = &launch.children[index];
+        if let Some(error) = plan_stop_error(deadline, plan_started, &env.cancel) {
+            discard_pipeline_prepared(&mut prepared)?;
+            return Err(NodeFailure::Plan(error));
+        }
+        let cache_cold = env.bypass_cache
+            || matches!(
+                cache_presence_probe_off_thread(env.cache.clone(), child.key).await,
+                Ok(Ok(false))
+            );
+        if let Some(error) = plan_stop_error(deadline, plan_started, &env.cancel) {
+            discard_pipeline_prepared(&mut prepared)?;
+            return Err(NodeFailure::Plan(error));
+        }
+        if !cache_cold {
+            valid = false;
+            if let Err(failure) = discard_pipeline_prepared(&mut prepared) {
+                fatal_failure = Some(failure);
+                env.cancel.cancel();
+                parent_cancel.cancel();
+            }
+            drop(emission);
+            continue;
+        }
+        let child_cancel = env.cancel.child_token();
+        let retry = child.node.retry.unwrap_or_else(|| child.node.stage.retry());
+        let timeout = child
+            .node
+            .timeout
+            .unwrap_or_else(|| child.node.stage.timeout());
+        let child_task = NodeTask {
+            node_id: child.node.id,
+            node_idx: child.node_idx,
+            stage: child.node.stage.clone(),
+            args: child.node.args.clone(),
+            canon_args: child.node.canon_args.clone(),
+            input: emission.artifact.clone(),
+            input_hash: child.input_logical,
+            key: child.key,
+            prepared_cache_hit: None,
+            retry,
+            timeout,
+            node_cancel: KillSlot::new(child_cancel.clone()),
+            pipeline_emitter: None,
+        };
+        let scratch_root = env.job_dir.join(".pipeline").join(format!(
+            "{parent_id}-{index}-{}",
+            SPECULATION_NONCE.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        let scratch_cleanup_root = scratch_root.clone();
+        let child_training_io = launch
+            .profiles
+            .iter()
+            .find(|(node_id, _)| *node_id == child.node.id)
+            .map(|(_, selected)| selected.clone());
+        let mut child_future = Box::pin(prepare_private(
+            child_task,
+            env.clone(),
+            child_cancel.clone(),
+            launch.admission.clone(),
+            scratch_root,
+            child_training_io,
+        ));
+        let child_result = loop {
+            if parent_result.as_ref().is_some_and(Result::is_err) {
+                child_cancel.cancel();
+                drop(child_future);
+                break match SpeculationScratch::cleanup_path(&scratch_cleanup_root) {
+                    Ok(()) => Err(NodeFailure::Cancelled),
+                    Err(source) => Err(NodeFailure::SpeculationCleanup {
+                        path: scratch_cleanup_root,
+                        source,
+                    }),
+                };
+            }
+            if parent_result.is_some() {
+                break child_future.await;
+            }
+            tokio::select! {
+                result = &mut child_future => break result,
+                result = &mut parent_future => {
+                    if result.is_err() {
+                        child_cancel.cancel();
+                    }
+                    parent_result = Some(result);
+                }
+                _ = env.cancel.cancelled() => {
+                    child_cancel.cancel();
+                    drop(child_future);
+                    SpeculationScratch::cleanup_path(&scratch_cleanup_root).map_err(|source| {
+                        NodeFailure::SpeculationCleanup {
+                            path: scratch_cleanup_root.clone(),
+                            source,
+                        }
+                    })?;
+                    discard_pipeline_prepared(&mut prepared)?;
+                    return Err(NodeFailure::Plan(
+                        plan_stop_error(deadline, plan_started, &env.cancel)
+                            .unwrap_or(PlanError::Cancelled),
+                    ));
+                }
+            }
+        };
+        match child_result {
+            Ok(child_prepared) => {
+                match SpilledPipelinePrepared::spill(
+                    child_prepared,
+                    &emission.artifact,
+                    launch.max_item_bytes,
+                ) {
+                    Ok(spilled) => prepared.push(spilled),
+                    Err(failure @ NodeFailure::SpeculationCleanup { .. }) => {
+                        fatal_failure = Some(failure);
+                        env.cancel.cancel();
+                        parent_cancel.cancel();
+                    }
+                    Err(_) => {
+                        valid = false;
+                        if let Err(failure) = discard_pipeline_prepared(&mut prepared) {
+                            fatal_failure = Some(failure);
+                            env.cancel.cancel();
+                            parent_cancel.cancel();
+                        }
+                    }
+                }
+            }
+            Err(failure @ NodeFailure::SpeculationCleanup { .. }) => {
+                fatal_failure = Some(failure);
+                env.cancel.cancel();
+                parent_cancel.cancel();
+            }
+            Err(_) => {
+                valid = false;
+                if let Err(failure) = discard_pipeline_prepared(&mut prepared) {
+                    fatal_failure = Some(failure);
+                    env.cancel.cancel();
+                    parent_cancel.cancel();
+                }
+            }
+        }
+        drop(emission);
+    }
+
+    let parent_result = match parent_result {
+        Some(result) => result,
+        None => parent_future.await,
+    };
+    if let Some(failure) = fatal_failure {
+        discard_pipeline_prepared(&mut prepared)?;
+        return Err(failure);
+    }
+    let parent = match parent_result {
+        Ok(parent) => parent,
+        Err(failure) => {
+            discard_pipeline_prepared(&mut prepared)?;
+            return Err(failure);
+        }
+    };
+    let elements = match crate::framework::artifact::decode_list_children(parent.output.clone()) {
+        Ok(elements) => elements,
+        Err(error) => {
+            discard_pipeline_prepared(&mut prepared)?;
+            return Err(NodeFailure::Other(format!(
+                "map over node {parent_id}: parent output is not a valid list: {error}"
+            )));
+        }
+    };
+    valid &= !parent.cache_hit
+        && parent.logical == launch.predicted_parent_logical
+        && emitted_count == launch.manifest.element_hashes.len()
+        && elements.len() == launch.manifest.element_hashes.len()
+        && prepared.len() == elements.len();
+    if valid {
+        for (child, expected) in prepared.iter().zip(&elements) {
+            match child.input_matches(
+                expected,
+                launch.producer_stage.as_ref(),
+                &launch.producer_tmp_stage_dir,
+                &launch.producer_final_stage_dir,
+            ) {
+                Ok(true) => {}
+                Ok(false) | Err(NodeFailure::Other(_)) => {
+                    valid = false;
+                    break;
+                }
+                Err(failure) => {
+                    discard_pipeline_prepared(&mut prepared)?;
+                    return Err(failure);
+                }
+            }
+        }
+    }
+    if !valid {
+        discard_pipeline_prepared(&mut prepared)?;
+    }
+    Ok(PipelineRunResult {
+        _admission: launch.admission,
+        parent,
+        elements,
+        children: launch.children,
+        profiles: launch.profiles,
+        prepared: valid.then_some(prepared),
+        spawn_capacity: launch.spawn_capacity,
     })
 }
 
@@ -2601,7 +3339,13 @@ fn discard_retained_speculation(
 fn publish_speculative(
     prepared: SpeculativePrepared,
     env: &NodeEnv,
+    deadline: Option<Instant>,
+    plan_started: Instant,
+    rollback_cache_on_stop: bool,
 ) -> Result<NodeOutcome, NodeFailure> {
+    if let Some(error) = plan_stop_error(deadline, plan_started, &env.cancel) {
+        return Err(NodeFailure::Plan(error));
+    }
     let idx = prepared.node_idx;
     let stage_name = prepared.stage_name.clone();
     let final_stage_dir = env
@@ -2610,7 +3354,14 @@ fn publish_speculative(
         .join(format!("{idx}-{stage_name}"));
     let rollback_failure = Arc::new(std::sync::Mutex::new(None));
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        publish_speculative_inner(prepared, env, rollback_failure.clone())
+        publish_speculative_inner(
+            prepared,
+            env,
+            deadline,
+            plan_started,
+            rollback_cache_on_stop,
+            rollback_failure.clone(),
+        )
     }));
     let rollback_failure = rollback_failure
         .lock()
@@ -2643,6 +3394,9 @@ fn publish_speculative(
 fn publish_speculative_inner(
     prepared: SpeculativePrepared,
     env: &NodeEnv,
+    deadline: Option<Instant>,
+    plan_started: Instant,
+    rollback_cache_on_stop: bool,
     rollback_failure: Arc<std::sync::Mutex<Option<std::io::Error>>>,
 ) -> Result<NodeOutcome, NodeFailure> {
     let idx = prepared.node_idx;
@@ -2673,7 +3427,7 @@ fn publish_speculative_inner(
     let publish_guard = SpeculativePublishGuard {
         final_stage_dir: final_stage_dir.clone(),
         committed: false,
-        rollback_failure,
+        rollback_failure: rollback_failure.clone(),
     };
     // The private run wrote a proof for its disposable scratch cache. Never let
     // that path survive selection if the canonical insert below degrades.
@@ -2703,6 +3457,13 @@ fn publish_speculative_inner(
             source,
         });
     }
+    // Path rebasing and content hashing are cookbook/plugin code and can be
+    // arbitrarily expensive. If a deadline or external cancellation arrived
+    // while they ran, the still-armed publication guard removes the renamed
+    // directory before any cache entry or lifecycle event becomes visible.
+    if let Some(error) = plan_stop_error(deadline, plan_started, &env.cancel) {
+        return Err(NodeFailure::Plan(error));
+    }
     let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, output_hash)
         .with_stage(prepared.stage_name.clone());
     if let Err(error) = metadata.write_to(&final_stage_dir.join("output.metadata.json")) {
@@ -2711,8 +3472,28 @@ fn publish_speculative_inner(
             prepared.stage_name
         );
     }
-    match env.cache.insert_optional(prepared.key, &output) {
-        Ok(()) => {
+    // Metadata remains inside the guarded stage directory. Recheck immediately
+    // before the first separately-visible cache write, then keep a second guard
+    // for the pipeline lane until lifecycle publication commits.
+    if let Some(error) = plan_stop_error(deadline, plan_started, &env.cancel) {
+        return Err(NodeFailure::Plan(error));
+    }
+    let mut pipeline_cache_guard = None;
+    let mut optional_cache_body = None;
+    match env.cache.insert_optional_local(prepared.key, &output) {
+        Ok(body) => {
+            optional_cache_body = Some(body);
+            if rollback_cache_on_stop {
+                pipeline_cache_guard = Some(PipelineCachePublishGuard::new(
+                    env.cache.entry_path_for_write(prepared.key),
+                    rollback_failure,
+                ));
+            }
+            if rollback_cache_on_stop {
+                if let Some(error) = plan_stop_error(deadline, plan_started, &env.cancel) {
+                    return Err(NodeFailure::Plan(error));
+                }
+            }
             let proof = crate::framework::cache::CacheProof {
                 key: prepared.key,
                 entry_path: env.cache.entry_path_for_write(prepared.key),
@@ -2728,6 +3509,18 @@ fn publish_speculative_inner(
             "executor: speculative cache insert for stage '{}' failed: {error}; continuing",
             prepared.stage_name
         ),
+    }
+    // Pipeline keys are cold, private reservations, so their cache write stays
+    // rollback-capable until lifecycle publication. Ordinary speculation can
+    // race another process or shared writer for the same cache path; once its
+    // local insert succeeds, that insert is its publication linearization point
+    // and cancellation loses rather than leaving a cache entry whose guarded
+    // stage directory is removed. If the insert failed, no separate cache state
+    // exists and the ordinary lane may still stop safely here.
+    if (rollback_cache_on_stop || optional_cache_body.is_none())
+        && let Some(error) = plan_stop_error(deadline, plan_started, &env.cancel)
+    {
+        return Err(NodeFailure::Plan(error));
     }
     // Publish lifecycle only after every stage/plugin hook and canonical
     // filesystem/cache operation that can unwind has completed. The rollback
@@ -2754,7 +3547,16 @@ fn publish_speculative_inner(
         output_hash,
         elapsed: prepared.elapsed,
     });
+    if let Some(cache_guard) = pipeline_cache_guard {
+        cache_guard.commit();
+    }
     publish_guard.commit();
+    // Remote object-store replication is optional acceleration, not part of
+    // the local canonical commit. Run it only after the stage directory, cache
+    // entry, and lifecycle batch are committed; plugin panics stay contained.
+    if let Some(body) = optional_cache_body {
+        env.cache.replicate_optional(prepared.key, &body);
+    }
     Ok(NodeOutcome {
         node_id: prepared.node_id,
         output,
@@ -2978,6 +3780,7 @@ fn build_task(
         retry,
         timeout,
         node_cancel,
+        pipeline_emitter: None,
     })
 }
 
@@ -3155,11 +3958,356 @@ fn next_ready(
     })
 }
 
+/// Release a cache-key reservation that will never produce a completion.
+///
+/// Pipeline prediction is the only path that can abandon an in-flight key.
+/// Ordinary completion performs the same cache-probe invalidation and waiter
+/// wake-up inline. Keeping this operation explicit prevents a waiter deferred
+/// behind a rejected manifest from disappearing permanently.
+#[allow(clippy::too_many_arguments)]
+fn abandon_inflight_key(
+    node_id: NodeId,
+    key: ContentHash,
+    inflight_keys: &mut HashSet<ContentHash>,
+    node_key_of: &mut HashMap<NodeId, ContentHash>,
+    deferred: &mut HashMap<ContentHash, Vec<NodeId>>,
+    cache_probes: &mut HashMap<ContentHash, Option<Arc<CacheHit>>>,
+    prepared_cache_hits: &mut HashMap<NodeId, Arc<CacheHit>>,
+    ready: &mut BTreeSet<NodeId>,
+    pruned: &HashSet<NodeId>,
+) {
+    node_key_of.remove(&node_id);
+    cache_probes.remove(&key);
+    inflight_keys.remove(&key);
+    if let Some(waiters) = deferred.remove(&key) {
+        for waiter in waiters {
+            prepared_cache_hits.remove(&waiter);
+            if !pruned.contains(&waiter) {
+                ready.insert(waiter);
+            }
+        }
+    }
+}
+
 /// Distinguishes a best-effort malformed HPO delta from a fail-closed
 /// training-I/O admission refusal.
 enum SpawnInjectionError {
     Structural(PlanError),
     TrainingIo(PlanError),
+}
+
+/// Reserve the exact canonical node ids/status indices for one manifest-sized
+/// single-node map fan-out before its producer starts. The nodes stay dormant:
+/// no root artifact, ready-set entry, cache write, directory, or lifecycle
+/// event exists until the producer succeeds. Reserving up front gives private
+/// early consumers the same `node_idx` and cache key the ordinary fan-out will
+/// use, while the single-expansion optimizer rule keeps allocation order equal
+/// to the default path.
+struct PreparedPipelineChildren {
+    children: Vec<PipelineChildSpec>,
+    profiles: Vec<(NodeId, ResolvedTrainingIoNode)>,
+}
+
+fn local_pipeline_profiles(
+    profiles: &[(NodeId, ResolvedTrainingIoNode)],
+) -> HashMap<NodeId, ResolvedTrainingIoNode> {
+    profiles
+        .first()
+        .map(|(_, selected)| HashMap::from([(0, selected.clone())]))
+        .unwrap_or_default()
+}
+
+/// Result of the optional pipeline launch probe. `ResolvedFallback` is
+/// distinct from `Declined`: once the child template's cookbook declaration
+/// and calibration callback has run, ordinary fan-out must reuse that immutable
+/// answer rather than invoking user code a second time.
+enum PipelineLaunchDecision {
+    Declined,
+    ResolvedFallback(HashMap<NodeId, ResolvedTrainingIoNode>),
+    Launch(PipelineLaunch),
+}
+
+struct PendingSpawn {
+    delta: crate::framework::control::SpawnDelta,
+    /// `Some(empty)` is meaningful: the template was resolved and declared no
+    /// training-I/O profile. `None` means this is an ordinary control/map spawn
+    /// whose declaration has not run yet.
+    resolved_training_io: Option<HashMap<NodeId, ResolvedTrainingIoNode>>,
+}
+
+struct PipelineReservationContext<'a> {
+    inherited_partition: Option<blut_types::partition::PartitionKey>,
+    env: &'a NodeEnv,
+    orig_n: usize,
+    appended_len: usize,
+    order_len: usize,
+}
+
+struct PipelineLaunchContext<'a> {
+    inherited_partition: Option<blut_types::partition::PartitionKey>,
+    env: &'a NodeEnv,
+    orig_n: usize,
+    appended_len: usize,
+    order_len: usize,
+    inflight_keys: &'a HashSet<ContentHash>,
+    spawn_capacity: usize,
+}
+
+fn prepare_pipeline_children(
+    expansion: &crate::framework::plan::MapExpansion,
+    element_hashes: &[ContentHash],
+    parent_logical: ContentHash,
+    context: PipelineReservationContext<'_>,
+) -> Result<PreparedPipelineChildren, SpawnInjectionError> {
+    if expansion.template.nodes.len() != 1 || !expansion.template.edges.is_empty() {
+        return Err(SpawnInjectionError::Structural(PlanError::Other(
+            "pipeline witness requires a one-node map template".into(),
+        )));
+    }
+    let base = (context.orig_n + context.appended_len) as NodeId;
+    let base_label = expansion.label.clone().unwrap_or_else(|| "map".into());
+    let mut reserved = Vec::with_capacity(element_hashes.len());
+    let mut selected_profiles = Vec::new();
+
+    // Every instance has the same one-node template, arguments, partition,
+    // captured hints, and launch snapshot. Resolve that declaration exactly
+    // once, then clone the concrete immutable profile onto each canonical
+    // instance id. This also lets an invalid manifest cardinality be reconciled
+    // without invoking cookbook calibration a second time.
+    let mut representative = expansion
+        .template
+        .instantiate(format!("{base_label}[pipeline-template]"));
+    if let Some(partition) = context.inherited_partition.clone() {
+        representative = representative.with_partition(partition);
+    }
+    let local_profiles = context
+        .env
+        .training_io_resolver
+        .resolve_injected_plan(&representative)
+        .map_err(SpawnInjectionError::TrainingIo)?;
+    let (mut nodes, edges, initial) = representative
+        .into_parts()
+        .map_err(SpawnInjectionError::Structural)?;
+    if nodes.len() != 1 || !edges.is_empty() || !initial.is_empty() {
+        return Err(SpawnInjectionError::Structural(PlanError::Other(
+            "pipeline map template changed after optimizer certification".into(),
+        )));
+    }
+    if local_profiles.keys().any(|local_id| *local_id != 0) {
+        return Err(SpawnInjectionError::TrainingIo(PlanError::Other(
+            "pipeline template resolved a non-root training I/O profile".into(),
+        )));
+    }
+    let representative_profile = local_profiles.get(&0).cloned();
+    let template_node = nodes.pop().expect("one-node pipeline template");
+
+    // Build the full dormant batch before mutating coordinator topology. Any
+    // structural arithmetic refusal therefore leaves no partial reservation.
+    for (index, _element_hash) in element_hashes.iter().enumerate() {
+        let gid = base + index as NodeId;
+        let mut node = template_node.clone();
+        node.id = gid;
+        let node_idx = context.order_len as u32 + index as u32;
+        let input_logical = map_element_logical(&parent_logical, index);
+        let key = node_cache_key(&node, input_logical);
+        if let Some(selected) = representative_profile.clone() {
+            selected_profiles.push((gid, selected));
+        }
+        reserved.push(PipelineChildSpec {
+            node,
+            node_idx,
+            input_logical,
+            key,
+        });
+    }
+    Ok(PreparedPipelineChildren {
+        children: reserved,
+        profiles: selected_profiles,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_pipeline_children(
+    prepared: PreparedPipelineChildren,
+    env: &NodeEnv,
+    appended: &mut Vec<crate::framework::plan::PlanNode>,
+    order: &mut Vec<NodeId>,
+    node_idx_of: &mut HashMap<NodeId, u32>,
+    indeg: &mut HashMap<NodeId, usize>,
+    succs: &mut HashMap<NodeId, Vec<NodeId>>,
+) -> Result<Vec<PipelineChildSpec>, SpawnInjectionError> {
+    env.install_training_io_profiles(prepared.profiles)
+        .map_err(SpawnInjectionError::TrainingIo)?;
+    let reserved = prepared.children;
+    for child in &reserved {
+        let gid = child.node.id;
+        appended.push(child.node.clone());
+        indeg.insert(gid, 0);
+        succs.insert(gid, Vec::new());
+        node_idx_of.insert(gid, child.node_idx);
+        order.push(gid);
+    }
+    Ok(reserved)
+}
+
+fn try_prepare_pipeline_launch(
+    task: &mut NodeTask,
+    expansion: &crate::framework::plan::MapExpansion,
+    context: PipelineLaunchContext<'_>,
+) -> Result<PipelineLaunchDecision, SpawnInjectionError> {
+    use crate::framework::async_io::IoMode;
+    let PipelineLaunchContext {
+        inherited_partition,
+        env,
+        orig_n,
+        appended_len,
+        order_len,
+        inflight_keys,
+        spawn_capacity,
+    } = context;
+
+    if !expansion.pipeline
+        || task.retry != crate::framework::retry::RetryPolicy::NONE
+        || env.launch_target != crate::config::launcher::LaunchTarget::Local
+    {
+        return Ok(PipelineLaunchDecision::Declined);
+    }
+    let Some(selected) = env.training_io_node(task.node_id) else {
+        return Ok(PipelineLaunchDecision::Declined);
+    };
+    let (capacity, max_item_bytes) = match selected.profile.pipeline {
+        IoMode::Inline => return Ok(PipelineLaunchDecision::Declined),
+        IoMode::Bounded {
+            capacity,
+            max_item_bytes,
+        } if capacity > 0 && max_item_bytes > 0 => (capacity, max_item_bytes),
+        IoMode::Bounded { .. } => return Ok(PipelineLaunchDecision::Declined),
+    };
+    let Some(element_kind) = task.stage.output_element_kind() else {
+        return Ok(PipelineLaunchDecision::Declined);
+    };
+    let manifest_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        task.stage.pipeline_manifest_erased(&task.input, &task.args)
+    }));
+    let manifest = match manifest_result {
+        Err(_) => {
+            tracing::warn!(
+                "pipeline manifest for stage '{}' panicked; declining optional overlap",
+                task.stage.name()
+            );
+            return Ok(PipelineLaunchDecision::Declined);
+        }
+        Ok(result) => match result {
+            Ok(Some(manifest)) if !manifest.element_hashes.is_empty() => manifest,
+            Ok(_) => return Ok(PipelineLaunchDecision::Declined),
+            Err(error) => {
+                tracing::warn!(
+                    "pipeline manifest for stage '{}' declined: {error}",
+                    task.stage.name()
+                );
+                return Ok(PipelineLaunchDecision::Declined);
+            }
+        },
+    };
+    if manifest.element_hashes.len() > spawn_capacity {
+        return Ok(PipelineLaunchDecision::Declined);
+    }
+    let predicted_parent_logical =
+        crate::framework::artifact::list_content_hash_from_element_hashes(
+            manifest.element_hashes.iter().copied(),
+        );
+    let prepared = prepare_pipeline_children(
+        expansion,
+        &manifest.element_hashes,
+        predicted_parent_logical,
+        PipelineReservationContext {
+            inherited_partition,
+            env,
+            orig_n,
+            appended_len,
+            order_len,
+        },
+    )?;
+    let resolved_fallback = || local_pipeline_profiles(&prepared.profiles);
+    let mut predicted_keys = HashSet::with_capacity(prepared.children.len());
+    for child in &prepared.children {
+        if child.key == task.key
+            || inflight_keys.contains(&child.key)
+            || !predicted_keys.insert(child.key)
+            || child.node.retry.unwrap_or_else(|| child.node.stage.retry())
+                != crate::framework::retry::RetryPolicy::NONE
+        {
+            return Ok(PipelineLaunchDecision::ResolvedFallback(resolved_fallback()));
+        }
+    }
+    let profiles: HashMap<NodeId, &ResolvedTrainingIoNode> = prepared
+        .profiles
+        .iter()
+        .map(|(node_id, selected)| (*node_id, selected))
+        .collect();
+    let mut child_request = None;
+    for child in &prepared.children {
+        let request = AdmissionRequest::for_stage(
+            child.node.stage.as_ref(),
+            &child.node.args,
+            env.memory_budget_gib,
+            profiles
+                .get(&child.node.id)
+                .map(|selected| &selected.profile),
+        )
+        .map_err(|error| SpawnInjectionError::Structural(PlanError::Other(error)))?;
+        if child_request
+            .as_ref()
+            .is_some_and(|selected: &AdmissionRequest| selected != &request)
+        {
+            return Ok(PipelineLaunchDecision::ResolvedFallback(resolved_fallback()));
+        }
+        child_request.get_or_insert(request);
+    }
+    let Some(child_request) = child_request else {
+        return Ok(PipelineLaunchDecision::ResolvedFallback(resolved_fallback()));
+    };
+    let parent_request = AdmissionRequest::for_task(task, env)
+        .map_err(|error| SpawnInjectionError::Structural(PlanError::Other(error)))?;
+    let Some(combined) =
+        AdmissionRequest::combine_pipeline(parent_request, child_request, env.memory_budget_gib)
+    else {
+        return Ok(PipelineLaunchDecision::ResolvedFallback(resolved_fallback()));
+    };
+    let Some(lease) = try_acquire_admission_from(&combined, &env.resources, &env.gpu, &env.memory)
+    else {
+        return Ok(PipelineLaunchDecision::ResolvedFallback(resolved_fallback()));
+    };
+    let (emitter, receiver) = crate::framework::stage::pipeline_channel(
+        capacity,
+        max_item_bytes,
+        element_kind,
+        task.stage.name(),
+    );
+    task.pipeline_emitter = Some(emitter);
+    let producer_stage = task.stage.clone();
+    let stages_root = env.job_dir.join("stages");
+    let producer_final_stage_dir =
+        stages_root.join(format!("{}-{}", task.node_idx, task.stage.name()));
+    let producer_tmp_stage_dir = stages_root.join(format!(
+        ".tmp-{}-{}-{}",
+        task.node_idx,
+        task.stage.name(),
+        task.key.to_hex()
+    ));
+    Ok(PipelineLaunchDecision::Launch(PipelineLaunch {
+        receiver,
+        admission: Arc::new(lease),
+        manifest,
+        predicted_parent_logical,
+        children: prepared.children,
+        profiles: prepared.profiles,
+        producer_stage,
+        producer_tmp_stage_dir,
+        producer_final_stage_dir,
+        spawn_capacity,
+        max_item_bytes,
+    }))
 }
 
 impl std::fmt::Display for SpawnInjectionError {
@@ -3180,6 +4328,7 @@ impl std::fmt::Display for SpawnInjectionError {
 #[allow(clippy::too_many_arguments)]
 fn inject_spawn(
     delta: crate::framework::control::SpawnDelta,
+    resolved_training_io: Option<HashMap<NodeId, ResolvedTrainingIoNode>>,
     inherited_partition: Option<blut_types::partition::PartitionKey>,
     env: &NodeEnv,
     orig_n: usize,
@@ -3214,10 +4363,13 @@ fn inject_spawn(
     // the static plan. This happens before any structural mutation or ready-set
     // insertion, so a missing/oversized child profile fails closed rather than
     // running without its retained-byte bill.
-    let local_profiles = env
-        .training_io_resolver
-        .resolve_injected_plan(&subplan)
-        .map_err(SpawnInjectionError::TrainingIo)?;
+    let local_profiles = match resolved_training_io {
+        Some(profiles) => profiles,
+        None => env
+            .training_io_resolver
+            .resolve_injected_plan(&subplan)
+            .map_err(SpawnInjectionError::TrainingIo)?,
+    };
     let (nodes, edges, initial) = subplan
         .into_parts()
         .map_err(SpawnInjectionError::Structural)?;
@@ -3789,6 +4941,7 @@ async fn execute_fused_linear_plan(
             task,
             env.clone(),
             Some(&mut admission),
+            None,
             true,
             in_process_input.take(),
         ))
@@ -3866,6 +5019,7 @@ async fn run_fused_group(
             task,
             env.clone(),
             Some(&mut admission),
+            None,
             true,
             in_process_input.take(),
         ))
@@ -4146,8 +5300,21 @@ impl ParallelExecutor {
         let orig_n = view.nodes.len();
         let mut appended: Vec<crate::framework::plan::PlanNode> = Vec::new();
         let mut all_edges: Vec<crate::framework::plan::PlanEdge> = view.edges.to_vec();
-        let mut pending_spawns: Vec<crate::framework::control::SpawnDelta> = Vec::new();
+        let mut pending_spawns: Vec<PendingSpawn> = Vec::new();
         let mut spawns_total = 0usize;
+        // Parents whose manifest-sized map children were allocated before the
+        // producer started. Their ordinary completion seam must not inject a
+        // second copy; the Pipeline result either publishes private children
+        // or seeds these exact dormant nodes for ordinary fallback.
+        let mut pipeline_reserved_parents: HashSet<NodeId> = HashSet::new();
+        // A runtime pipeline probe may resolve the one-node child template and
+        // then decline at a later collision/admission check. Retain that exact
+        // immutable answer until ordinary fan-out is queued so cookbook
+        // declaration/calibration callbacks still run once.
+        let mut pipeline_fallback_profiles: HashMap<
+            NodeId,
+            HashMap<NodeId, ResolvedTrainingIoNode>,
+        > = HashMap::new();
         // The killed nodes + their pruned descendants. `pruned.len()` (not a
         // parallel counter) is the accounting source of truth — it can't drift
         // out of sync with the set the spawn loop consults.
@@ -4219,8 +5386,12 @@ impl ParallelExecutor {
                 // best-effort HPO spawns, so a soft HPO spawn can't claim the
                 // last cap slot and force a wrong-answer shard to fail. Stable:
                 // relative order within each group is preserved.
-                pending_spawns.sort_by_key(|d| d.provenance_parent.is_none());
-                for delta in pending_spawns.drain(..) {
+                pending_spawns.sort_by_key(|pending| pending.delta.provenance_parent.is_none());
+                for pending in pending_spawns.drain(..) {
+                    let PendingSpawn {
+                        delta,
+                        resolved_training_io,
+                    } = pending;
                     let map_spawn = delta.provenance_parent.is_some();
                     if spawns_total >= MAX_RUNTIME_SPAWNS {
                         // A map_output shard hitting the cap is a WRONG ANSWER
@@ -4251,6 +5422,7 @@ impl ParallelExecutor {
                         });
                     match inject_spawn(
                         delta,
+                        resolved_training_io,
                         inherited_partition,
                         &env,
                         orig_n,
@@ -4342,6 +5514,7 @@ impl ParallelExecutor {
                         continue;
                     }
                     let node = node_at(&view, &appended, orig_n, node_id);
+                    let node_partition = node.partition.clone();
                     let node_idx = node_idx_of[&node_id];
                     // Per-node kill slot: holds a child of the plan token,
                     // retained in `node_tokens` so the control watcher can fire
@@ -4432,6 +5605,75 @@ impl ParallelExecutor {
                         continue;
                     }
                     task.prepared_cache_hit = prepared_cache_hits.remove(&node_id);
+                    let mut pipeline_launch = None;
+                    if control.is_none()
+                        // Force-recompute may intentionally overwrite a warm
+                        // cache entry. Keep that path ordinary so cancellation
+                        // rollback can never delete prior canonical state.
+                        && !env.bypass_cache
+                        // The coordinator counts the parent only after this
+                        // branch. Pipeline overlap also runs one private child,
+                        // so reserve two logical task slots in addition to
+                        // every sibling already in flight.
+                        && in_flight
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            .saturating_add(2)
+                            <= max_in_flight
+                        && ready.is_empty()
+                        && task.prepared_cache_hit.is_none()
+                        && let Some(expansion) = plan
+                            .expansions()
+                            .iter()
+                            .find(|expansion| expansion.parent == node_id && expansion.pipeline)
+                            .cloned()
+                    {
+                        let cache_cold = env.bypass_cache
+                            || matches!(
+                                cache_presence_probe_off_thread(env.cache.clone(), task.key).await,
+                                Ok(Ok(false))
+                            );
+                        if cache_cold {
+                            match try_prepare_pipeline_launch(
+                                &mut task,
+                                &expansion,
+                                PipelineLaunchContext {
+                                    inherited_partition: node_partition,
+                                    env: &env,
+                                    orig_n,
+                                    appended_len: appended.len(),
+                                    order_len: order.len(),
+                                    inflight_keys: &inflight_keys,
+                                    spawn_capacity: MAX_RUNTIME_SPAWNS.saturating_sub(spawns_total),
+                                },
+                            ) {
+                                Ok(PipelineLaunchDecision::Launch(launch)) => {
+                                    for child in &launch.children {
+                                        inflight_keys.insert(child.key);
+                                        node_key_of.insert(child.node.id, child.key);
+                                    }
+                                    pipeline_reserved_parents.insert(node_id);
+                                    pipeline_launch = Some(launch);
+                                }
+                                Ok(PipelineLaunchDecision::ResolvedFallback(profiles)) => {
+                                    debug_assert!(
+                                        pipeline_fallback_profiles
+                                            .insert(node_id, profiles)
+                                            .is_none(),
+                                        "one parent may have only one resolved pipeline fallback"
+                                    );
+                                }
+                                Ok(PipelineLaunchDecision::Declined) => {}
+                                Err(
+                                    SpawnInjectionError::TrainingIo(error)
+                                    | SpawnInjectionError::Structural(error),
+                                ) => {
+                                    first_error = Some(error);
+                                    env.cancel.cancel();
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     inflight_keys.insert(task.key);
                     node_key_of.insert(node_id, task.key);
                     // Retain the kill token only for an actually-spawned node
@@ -4710,7 +5952,15 @@ impl ParallelExecutor {
                             }
                         }
                     }
-                    if let Some(group) = internal_fusion_groups.get(&node_id).cloned() {
+                    if let Some(launch) = pipeline_launch {
+                        let extra = PipelineInFlightExtra::reserve(in_flight.clone());
+                        join.spawn(async move {
+                            let _extra = extra;
+                            SchedulerTaskResult::Pipeline(
+                                run_pipeline_parent(task, env_c, launch, deadline, started).await,
+                            )
+                        });
+                    } else if let Some(group) = internal_fusion_groups.get(&node_id).cloned() {
                         let remaining = group
                             .node_ids
                             .iter()
@@ -4925,7 +6175,10 @@ impl ParallelExecutor {
                                                     if spawns_total + pending_spawns.len()
                                                         < MAX_RUNTIME_SPAWNS
                                                     {
-                                                        pending_spawns.push(*delta);
+                                                        pending_spawns.push(PendingSpawn {
+                                                            delta: *delta,
+                                                            resolved_training_io: None,
+                                                        });
                                                     } else {
                                                         tracing::warn!(
                                                             "runtime spawn cap reached; dropping a Spawn from node {node_idx}"
@@ -5008,6 +6261,251 @@ impl ParallelExecutor {
             };
             let res = match completion {
                 SchedulerTaskResult::Ordinary(result) => result,
+                SchedulerTaskResult::Pipeline(result) => match result {
+                    Err(failure) => Err(failure),
+                    Ok(mut pipeline) => (|| -> Result<Vec<NodeOutcome>, NodeFailure> {
+                        let parent_id = pipeline.parent.node_id;
+                        // The producer task may finish at the same instant as a
+                        // plan deadline/external cancellation. Private spill
+                        // state is still disposable here; reject it before any
+                        // dormant child topology or canonical output becomes
+                        // visible.
+                        if let Some(error) = plan_stop_error(deadline, started, &env.cancel) {
+                            let cleanup =
+                                pipeline.prepared.take().map_or(Ok(()), |mut prepared| {
+                                    discard_pipeline_prepared(&mut prepared)
+                                });
+                            return match cleanup {
+                                Ok(()) => Err(NodeFailure::Plan(error)),
+                                Err(failure) => Err(failure),
+                            };
+                        }
+                        let Some(spilled) = pipeline.prepared.take() else {
+                            // No private batch survived validation. Abandon
+                            // every predicted key through the full
+                            // single-flight wake-up seam before recomputing
+                            // canonical identities from the authoritative list.
+                            for child in &pipeline.children {
+                                abandon_inflight_key(
+                                    child.node.id,
+                                    child.key,
+                                    &mut inflight_keys,
+                                    &mut node_key_of,
+                                    &mut deferred,
+                                    &mut cache_probes,
+                                    &mut prepared_cache_hits,
+                                    &mut ready,
+                                    &pruned,
+                                );
+                            }
+
+                            let actual_len = pipeline.elements.len();
+                            if actual_len > pipeline.spawn_capacity {
+                                pipeline_reserved_parents.remove(&parent_id);
+                                return Err(NodeFailure::Plan(PlanError::Other(format!(
+                                    "map fan-out exceeded the runtime spawn cap \
+                                     ({MAX_RUNTIME_SPAWNS} nodes); a dropped shard would be a wrong answer"
+                                ))));
+                            }
+                            let prototype =
+                                pipeline.children.first().cloned().ok_or_else(|| {
+                                    NodeFailure::Other(
+                                        "non-empty pipeline manifest reserved no child template"
+                                            .into(),
+                                    )
+                                })?;
+                            let base_id = prototype.node.id;
+                            let base_idx = prototype.node_idx;
+                            let profile_prototype = pipeline
+                                .profiles
+                                .first()
+                                .map(|(_, selected)| selected.clone());
+                            pipeline.children = (0..actual_len)
+                                .map(|index| {
+                                    let offset = index as NodeId;
+                                    let mut child = prototype.clone();
+                                    child.node.id = base_id + offset;
+                                    child.node_idx = base_idx + offset;
+                                    child.input_logical =
+                                        map_element_logical(&pipeline.parent.logical, index);
+                                    child.key = node_cache_key(&child.node, child.input_logical);
+                                    child
+                                })
+                                .collect();
+                            pipeline.profiles =
+                                profile_prototype.map_or_else(Vec::new, |selected| {
+                                    pipeline
+                                        .children
+                                        .iter()
+                                        .map(|child| (child.node.id, selected.clone()))
+                                        .collect()
+                                });
+                            let children = commit_pipeline_children(
+                                PreparedPipelineChildren {
+                                    children: pipeline.children,
+                                    profiles: pipeline.profiles,
+                                },
+                                &env,
+                                &mut appended,
+                                &mut order,
+                                &mut node_idx_of,
+                                &mut indeg,
+                                &mut succs,
+                            )
+                            .map_err(|error| match error {
+                                SpawnInjectionError::Structural(error)
+                                | SpawnInjectionError::TrainingIo(error) => {
+                                    NodeFailure::Plan(error)
+                                }
+                            })?;
+                            spawns_total += children.len();
+                            for (child, element) in children.iter().zip(pipeline.elements) {
+                                outputs.insert(child.node.id, element);
+                                logical_outputs.insert(child.node.id, child.input_logical);
+                                ready.insert(child.node.id);
+                            }
+                            return Ok(vec![pipeline.parent]);
+                        };
+                        let mut spilled = VecDeque::from(spilled);
+
+                        // `parent.output` retains the authoritative ListOf just
+                        // as ordinary fan-out does. The separately decoded
+                        // element vector was needed only for manifest/input
+                        // validation in `run_pipeline_parent`; release it before
+                        // child outputs begin accumulating so publication
+                        // replaces input residency instead of retaining both
+                        // complete batches.
+                        drop(std::mem::take(&mut pipeline.elements));
+
+                        // Validate every private payload before committing the
+                        // dynamic nodes, but drop each decoded record before
+                        // opening the next. This preserves ordinary fallback
+                        // for pre-publication corruption without retaining an
+                        // O(manifest cardinality) duplicate batch outside the
+                        // canonical output map.
+                        let load_failure = spilled
+                            .iter()
+                            .find_map(|child| child.validate_payload().err());
+                        if let Some(load_failure) = load_failure {
+                            for child in &pipeline.children {
+                                abandon_inflight_key(
+                                    child.node.id,
+                                    child.key,
+                                    &mut inflight_keys,
+                                    &mut node_key_of,
+                                    &mut deferred,
+                                    &mut cache_probes,
+                                    &mut prepared_cache_hits,
+                                    &mut ready,
+                                    &pruned,
+                                );
+                            }
+                            pipeline_reserved_parents.remove(&parent_id);
+                            let mut remaining = Vec::from(spilled);
+                            discard_pipeline_prepared(&mut remaining)?;
+                            allow_pipeline_load_fallback(load_failure)?;
+                            pipeline_fallback_profiles
+                                .insert(parent_id, local_pipeline_profiles(&pipeline.profiles));
+                            Ok(vec![pipeline.parent])
+                        } else {
+                            // Validation is synchronous and may be substantial.
+                            // Recheck immediately before topology commit;
+                            // cancellation during validation must not publish a
+                            // canonical child.
+                            if let Some(error) = plan_stop_error(deadline, started, &env.cancel) {
+                                for child in &pipeline.children {
+                                    abandon_inflight_key(
+                                        child.node.id,
+                                        child.key,
+                                        &mut inflight_keys,
+                                        &mut node_key_of,
+                                        &mut deferred,
+                                        &mut cache_probes,
+                                        &mut prepared_cache_hits,
+                                        &mut ready,
+                                        &pruned,
+                                    );
+                                }
+                                pipeline_reserved_parents.remove(&parent_id);
+                                let mut remaining = Vec::from(spilled);
+                                return match discard_pipeline_prepared(&mut remaining) {
+                                    Ok(()) => Err(NodeFailure::Plan(error)),
+                                    Err(failure) => Err(failure),
+                                };
+                            }
+                            let child_count = pipeline.children.len();
+                            let committed = commit_pipeline_children(
+                                PreparedPipelineChildren {
+                                    children: pipeline.children,
+                                    profiles: pipeline.profiles,
+                                },
+                                &env,
+                                &mut appended,
+                                &mut order,
+                                &mut node_idx_of,
+                                &mut indeg,
+                                &mut succs,
+                            );
+                            if let Err(error) = committed {
+                                let mut remaining = Vec::from(spilled);
+                                discard_pipeline_prepared(&mut remaining)?;
+                                let error = match error {
+                                    SpawnInjectionError::Structural(error)
+                                    | SpawnInjectionError::TrainingIo(error) => error,
+                                };
+                                return Err(NodeFailure::Plan(error));
+                            }
+                            spawns_total += child_count;
+                            let mut outcomes = Vec::with_capacity(child_count + 1);
+                            outcomes.push(pipeline.parent);
+                            while !spilled.is_empty() {
+                                if let Some(error) = plan_stop_error(deadline, started, &env.cancel)
+                                {
+                                    let mut remaining = Vec::from(spilled);
+                                    return match discard_pipeline_prepared(&mut remaining) {
+                                        Ok(()) => Err(NodeFailure::Plan(error)),
+                                        Err(failure) => Err(failure),
+                                    };
+                                }
+                                let child = spilled
+                                    .pop_front()
+                                    .expect("pipeline spill queue was non-empty");
+                                // The prevalidation pass makes corruption here
+                                // an integrity failure after topology commit,
+                                // not an optional fallback. Rehydrate only this
+                                // child so resident private payload stays O(1).
+                                let prepared = match child.into_resident() {
+                                    Ok(prepared) => prepared,
+                                    Err(failure) => {
+                                        let mut remaining = Vec::from(spilled);
+                                        discard_pipeline_prepared(&mut remaining)?;
+                                        return Err(failure);
+                                    }
+                                };
+                                let child_id = prepared.node_id;
+                                match publish_speculative(prepared, &env, deadline, started, true) {
+                                    Ok(outcome) if outcome.node_id == child_id => {
+                                        outcomes.push(outcome);
+                                    }
+                                    Ok(outcome) => {
+                                        let mut remaining = Vec::from(spilled);
+                                        discard_pipeline_prepared(&mut remaining)?;
+                                        return Err(NodeFailure::Other(format!(
+                                            "pipeline child publication changed node id {child_id} to {}",
+                                            outcome.node_id
+                                        )));
+                                    }
+                                    Err(failure) => {
+                                        let mut remaining = Vec::from(spilled);
+                                        discard_pipeline_prepared(&mut remaining)?;
+                                        return Err(failure);
+                                    }
+                                }
+                            }
+                            Ok(outcomes)
+                        }
+                    })(),
+                },
                 SchedulerTaskResult::Speculative {
                     target,
                     key,
@@ -5056,7 +6554,9 @@ impl ParallelExecutor {
                                             Err(failure) => Err(failure),
                                         }
                                     } else {
-                                        match publish_speculative(*prepared, &env) {
+                                        match publish_speculative(
+                                            *prepared, &env, deadline, started, false,
+                                        ) {
                                             Ok(outcome) => {
                                                 node_key_of.insert(target, key);
                                                 Ok(vec![outcome])
@@ -5240,7 +6740,10 @@ impl ParallelExecutor {
                                                             env.cancel.cancel();
                                                             break;
                                                         }
-                                                        match publish_speculative(*prepared, &env) {
+                                                        match publish_speculative(
+                                                            *prepared, &env, deadline, started,
+                                                            false,
+                                                        ) {
                                                             Ok(outcome) => {
                                                                 node_key_of.insert(target, key);
                                                                 outcomes.push_back(outcome);
@@ -5397,7 +6900,11 @@ impl ParallelExecutor {
                         // fan-out can't be missed. The deltas are injected at the
                         // top of the next loop iteration (the single-threaded
                         // schedule-mutation seam) via `pending_spawns`.
-                        if first_error.is_none() {
+                        if first_error.is_none()
+                            && !pipeline_reserved_parents.contains(&outcome.node_id)
+                        {
+                            let mut resolved_pipeline_fallback =
+                                pipeline_fallback_profiles.remove(&outcome.node_id);
                             for exp in plan.expansions() {
                                 if exp.parent != outcome.node_id {
                                     continue;
@@ -5434,6 +6941,11 @@ impl ParallelExecutor {
                                         }
                                     };
                                 let base_label = exp.label.clone().unwrap_or_else(|| "map".into());
+                                let resolved_training_io = if exp.pipeline {
+                                    resolved_pipeline_fallback.take()
+                                } else {
+                                    None
+                                };
                                 for (i, elem) in elements.into_iter().enumerate() {
                                     // Invariant: each element's kind is the element
                                     // kind the template was compiled against (the
@@ -5447,11 +6959,18 @@ impl ParallelExecutor {
                                     let label = format!("{base_label}[{i}]");
                                     let subplan = exp.template.instantiate(label.clone());
                                     let elem_logical = map_element_logical(&parent_logical, i);
-                                    pending_spawns.push(crate::framework::control::SpawnDelta {
-                                        subplan,
-                                        label: Some(label),
-                                        root_seeds: vec![(exp.template.root, elem, elem_logical)],
-                                        provenance_parent: Some(outcome.node_id),
+                                    pending_spawns.push(PendingSpawn {
+                                        delta: crate::framework::control::SpawnDelta {
+                                            subplan,
+                                            label: Some(label),
+                                            root_seeds: vec![(
+                                                exp.template.root,
+                                                elem,
+                                                elem_logical,
+                                            )],
+                                            provenance_parent: Some(outcome.node_id),
+                                        },
+                                        resolved_training_io: resolved_training_io.clone(),
                                     });
                                 }
                             }

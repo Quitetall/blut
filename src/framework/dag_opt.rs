@@ -57,6 +57,11 @@ pub struct ScheduleHint {
 }
 
 /// The DAG optimizer. Runs a sequence of passes on a `CompiledPlan`.
+///
+/// Alpha migration note: exhaustive external struct literals written before
+/// ADR 0102 must add `pipeline_parallelism: false`. Prefer starting from
+/// [`DagOptimizer::new`] (or using struct update syntax) so future default-off
+/// passes do not require another source edit.
 pub struct DagOptimizer {
     /// Enable dead code elimination.
     pub eliminate_dead_code: bool,
@@ -82,6 +87,12 @@ pub struct DagOptimizer {
     /// candidates only for conditional targets with both node-requested purity
     /// and independent deterministic/speculation-safe stage certification.
     pub speculative_execution: bool,
+    /// ADR 0102 bounded pipeline parallelism. **Off by default.** The
+    /// optimizer marks only one-node `map_output` expansions whose producer
+    /// and consumer independently certify the private early-execution seam.
+    /// Runtime manifest, profile, launcher, cache, and admission checks may
+    /// still decline the optimization and execute the ordinary fan-out.
+    pub pipeline_parallelism: bool,
 }
 
 impl DagOptimizer {
@@ -94,6 +105,7 @@ impl DagOptimizer {
             priority_aware: false,
             stage_fusion: false,
             speculative_execution: false,
+            pipeline_parallelism: false,
         }
     }
 
@@ -105,6 +117,9 @@ impl DagOptimizer {
         // space. Clear a prior run before any transform can renumber nodes.
         plan.fused_subchains.clear();
         plan.speculation_candidates.clear();
+        for expansion in &mut plan.expansions {
+            expansion.pipeline = false;
+        }
         let mut hints: HashMap<NodeId, ScheduleHint> = HashMap::new();
 
         // Pass 1: Dead code elimination
@@ -127,6 +142,15 @@ impl DagOptimizer {
         // capacity, placement, or control reasons; it may never invent one.
         if self.speculative_execution {
             plan.speculation_candidates = find_speculation_candidates(&plan);
+        }
+
+        // Pass 2c (ADR 0102): mark the one conservative runtime fan-out shape
+        // whose items may be consumed privately before the parent completes.
+        // This is an optimizer witness only; runtime must still prove the exact
+        // manifest, bounded admitted lane, local execution, and spare combined
+        // envelope before enabling overlap.
+        if self.pipeline_parallelism {
+            mark_pipeline_expansions(&mut plan);
         }
 
         // Pass 3: Critical path computation
@@ -239,6 +263,35 @@ fn find_speculation_candidates(plan: &CompiledPlan) -> Vec<SpeculationCandidate>
                 })
         })
         .collect()
+}
+
+fn mark_pipeline_expansions(plan: &mut CompiledPlan) {
+    // V1 owns exactly one dynamic producer -> consumer pair. Multiple runtime
+    // fan-outs would make early global node-id allocation depend on completion
+    // order and therefore change status identity relative to the ordinary path.
+    if plan.expansions.len() != 1 || !plan.condition_gates.is_empty() {
+        return;
+    }
+    let expansion = &plan.expansions[0];
+    let Some(parent) = plan.nodes.get(expansion.parent as usize) else {
+        return;
+    };
+    let [consumer] = expansion.template.nodes.as_slice() else {
+        return;
+    };
+    let eligible = expansion.template.edges.is_empty()
+        && expansion.template.root == consumer.id
+        && parent.stage.deterministic()
+        && !parent.stage.is_advisory()
+        && parent.stage.pipeline_output_safe()
+        && parent.stage.execution_boundary() == StageExecutionBoundary::InProcess
+        && consumer.stage.deterministic()
+        && !consumer.stage.is_advisory()
+        && consumer.stage.pipeline_input_safe()
+        && consumer.stage.execution_boundary() == StageExecutionBoundary::InProcess;
+    if eligible {
+        plan.expansions[0].pipeline = true;
+    }
 }
 
 impl Default for DagOptimizer {
@@ -686,6 +739,7 @@ mod tests {
             priority_aware: false,
             stage_fusion: true,
             speculative_execution: false,
+            pipeline_parallelism: false,
         };
 
         let (optimized, _) = opt.optimize(plan);
@@ -783,6 +837,85 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_witness_does_not_inherit_speculation_safety() {
+        use crate::framework::artifact::ListOf;
+        use crate::framework::plan::{CompiledTemplate, MapExpansion};
+        use crate::framework::stage::{Stage, StageContext};
+
+        struct PipelineProducer;
+        #[async_trait::async_trait]
+        impl Stage for PipelineProducer {
+            const NAME: &'static str = "pipeline_producer_dummy";
+            const SCHEMA: u32 = 1;
+            const RESOURCES: &'static [crate::framework::resource::Resource] = &[];
+            const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
+            const PIPELINE_OUTPUT_SAFE: bool = true;
+            type Input = ();
+            type Output = ListOf<()>;
+            type Args = ();
+
+            async fn run(
+                &self,
+                _ctx: &StageContext,
+                _input: (),
+                _args: &(),
+            ) -> Result<Self::Output, crate::framework::error::StageError> {
+                Ok(ListOf(Vec::new()))
+            }
+        }
+
+        struct SpeculationOnlyConsumer;
+        #[async_trait::async_trait]
+        impl Stage for SpeculationOnlyConsumer {
+            const NAME: &'static str = "speculation_only_consumer_dummy";
+            const SCHEMA: u32 = 1;
+            const RESOURCES: &'static [crate::framework::resource::Resource] = &[];
+            const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
+            const SPECULATION_SAFE: bool = true;
+            type Input = ();
+            type Output = ();
+            type Args = ();
+
+            async fn run(
+                &self,
+                _ctx: &StageContext,
+                _input: (),
+                _args: &(),
+            ) -> Result<(), crate::framework::error::StageError> {
+                Ok(())
+            }
+        }
+
+        let mut plan = make_plan(1, &[]);
+        plan.nodes[0].stage = Arc::new(PipelineProducer);
+        let mut template = make_plan(1, &[]);
+        template.nodes[0].stage = Arc::new(SpeculationOnlyConsumer);
+        plan.expansions.push(MapExpansion {
+            parent: 0,
+            template: Arc::new(CompiledTemplate {
+                root: 0,
+                nodes: template.nodes,
+                edges: Vec::new(),
+                elem_kind: <() as crate::framework::artifact::Artifact>::KIND.into(),
+            }),
+            label: None,
+            // Prove optimizer ownership: a stale/authored true is cleared.
+            pipeline: true,
+        });
+
+        let optimizer = DagOptimizer {
+            pipeline_parallelism: true,
+            ..DagOptimizer::new()
+        };
+        let (optimized, _) = optimizer.optimize(plan);
+
+        assert!(
+            !optimized.expansions[0].pipeline,
+            "SPECULATION_SAFE alone must not authorize map pipeline overlap"
+        );
+    }
+
+    #[test]
     fn critical_path_longest_chain() {
         // 0 → 1 → 2 → 3 (linear chain)
         let plan = make_plan(4, &[(0, 1), (1, 2), (2, 3)]);
@@ -843,6 +976,7 @@ mod tests {
             priority_aware: true,
             stage_fusion: false,
             speculative_execution: false,
+            pipeline_parallelism: false,
         }
     }
 

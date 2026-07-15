@@ -3,29 +3,35 @@
 //! Named progress gate for ADR 0102's landed advanced-optimizer slice.
 //!
 //! User-priority scheduling, live cache-warm ready ordering, conservative
-//! linear coalescing, and private conditional speculation have landed.
-//! Pipeline parallelism remains a later, independently gated increment.
+//! linear coalescing, private conditional speculation, and manifest-certified
+//! pipeline parallelism each have an independently named gate.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use blut::framework::artifact::{Artifact, ArtifactMetadata, BranchDecision, ContentHash};
+use blut::framework::artifact::{Artifact, ArtifactMetadata, BranchDecision, ContentHash, ListOf};
+use blut::framework::async_io::{IoMode, TrainingIoCandidate, TrainingIoHints};
 use blut::framework::cache::{CacheHandle, CacheProof};
 use blut::framework::cookbook::{Cookbook, Registry};
 use blut::framework::dag_opt::DagOptimizer;
 use blut::framework::executor::{ExecCtx, ParallelExecutor};
 use blut::framework::object_store::BlobStore;
 use blut::framework::plan::CompiledPlan;
-use blut::framework::plan_spec::{ConditionGateSpec, PLAN_SPEC_VERSION, PlanSpec, SpecNode};
+use blut::framework::plan_spec::{
+    ConditionGateSpec, MapSpec, PLAN_SPEC_VERSION, PlanSpec, SpecNode,
+};
 use blut::framework::resource::Resource;
-use blut::framework::stage::{ErasedStageCtor, Stage, StageContext, StageExecutionBoundary};
+use blut::framework::stage::{
+    ErasedStageCtor, PipelineManifest, Stage, StageContext, StageExecutionBoundary,
+};
 use blut::framework::status::StageEvent;
 use blut::framework::{PlanError, StageError};
 use blut::recipes::recipe::RecipeDef;
 use futures::FutureExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 static EXECUTION_ORDER: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 static FUSION_TASK_IDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -43,6 +49,29 @@ static SPEC_GATE_DECISION_STARTED: tokio::sync::Semaphore = tokio::sync::Semapho
 static SPEC_GATE_DECISION_RELEASE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
 static SPEC_GATE_TARGET_FINISHED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
 static SPEC_GATE_TARGET_RUNS: AtomicUsize = AtomicUsize::new(0);
+static PIPE_PARENT_READY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static PIPE_PARENT_RELEASE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static PIPE_CHILD_STARTED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static PIPE_CHILD_RELEASE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static PIPE_SECOND_SUBMIT_STARTED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static PIPE_SECOND_EMIT_RETURNED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static PIPE_CAP_CHILD_ZERO_STARTED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static PIPE_CAP_CHILD_ZERO_RELEASE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static PIPE_CAP_CHILD_ONE_STARTED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static PIPE_CAP_CHILD_ONE_RELEASE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static PIPE_PRIVATE_CHILD_FINISHED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static PIPE_SIBLING_STARTED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static PIPE_SIBLING_RELEASE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static PIPE_STUCK_CHILD_STARTED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static PIPE_STUCK_CHILD_RELEASE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+static PIPE_CHILD_RUNS: AtomicUsize = AtomicUsize::new(0);
+static PIPE_CHILD_PROFILE_DECLARATIONS: AtomicUsize = AtomicUsize::new(0);
+static PIPE_MISMATCH_ACCEPTED: AtomicBool = AtomicBool::new(false);
+static PIPE_FAILURE_ACCEPTED: AtomicBool = AtomicBool::new(false);
+static PIPE_DEFAULT_OFF_PROFILE_INLINE: AtomicBool = AtomicBool::new(false);
+static PIPE_PUBLICATION_HASH_CALLS: AtomicUsize = AtomicUsize::new(0);
+static PIPE_PUBLICATION_CANCEL: std::sync::Mutex<Option<CancellationToken>> =
+    std::sync::Mutex::new(None);
 
 fn record_fusion_task(label: &str) {
     if label.starts_with("fuse-") {
@@ -589,6 +618,393 @@ impl Stage for RecordSpeculativeAfter {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum PipelineCase {
+    Overlap,
+    Capacity,
+    ManifestMismatch,
+    ManifestTooShort,
+    ManifestTooLong,
+    FailAfterEmission,
+    FailWhileChildBlocked,
+    CancelDuringPublication,
+    CorruptSpill,
+    CorruptInputSpill,
+    OversizePrivateResult,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+struct PipelineParentArgs {
+    case: PipelineCase,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PipelineItem {
+    case: PipelineCase,
+    index: u32,
+    content_hash: ContentHash,
+}
+
+impl Artifact for PipelineItem {
+    const KIND: &'static str = "test.pipeline-item";
+    const SCHEMA: u32 = 1;
+    const PIPELINE_STANDARD_ENCODING: bool = true;
+
+    fn pipeline_storage_is_stable(&self, _producer_stage_dir: &std::path::Path) -> bool {
+        true
+    }
+
+    fn content_hash(&self) -> ContentHash {
+        self.content_hash
+    }
+
+    fn primary_path(&self) -> &std::path::Path {
+        std::path::Path::new(".")
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PipelineChildArtifact {
+    source_index: u32,
+    content_hash: ContentHash,
+    padding: Vec<u8>,
+}
+
+impl Artifact for PipelineChildArtifact {
+    const KIND: &'static str = "test.pipeline-child";
+    const SCHEMA: u32 = 1;
+
+    fn content_hash(&self) -> ContentHash {
+        let cancel = PIPE_PUBLICATION_CANCEL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(cancel) = cancel
+            && PIPE_PUBLICATION_HASH_CALLS.fetch_add(1, Ordering::SeqCst) == 1
+        {
+            // The first call computes the private run's output identity. The
+            // second runs after its scratch directory has been renamed for
+            // selected publication, exercising the rollback/stop boundary.
+            cancel.cancel();
+        }
+        self.content_hash
+    }
+
+    fn primary_path(&self) -> &std::path::Path {
+        std::path::Path::new(".")
+    }
+}
+
+fn pipeline_items(case: PipelineCase) -> Vec<PipelineItem> {
+    let width = usize::from(matches!(
+        case,
+        PipelineCase::Capacity | PipelineCase::ManifestTooShort
+    )) + 1;
+    (0..width)
+        .map(|index| {
+            let identity = format!("pipeline-item:{case:?}:{index}");
+            PipelineItem {
+                case,
+                index: index as u32,
+                content_hash: ContentHash::of_bytes(identity.as_bytes()),
+            }
+        })
+        .collect()
+}
+
+async fn take_pipeline_signal(
+    ctx: &StageContext,
+    semaphore: &'static tokio::sync::Semaphore,
+) -> Result<(), StageError> {
+    tokio::select! {
+        permit = semaphore.acquire() => {
+            permit.expect("pipeline test semaphore remains open").forget();
+            Ok(())
+        }
+        _ = ctx.cancel.cancelled() => Err(StageError::Cancelled),
+    }
+}
+
+struct PipelineParent;
+
+#[async_trait]
+impl Stage for PipelineParent {
+    const NAME: &'static str = "pipeline_parent";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
+    const PIPELINE_OUTPUT_SAFE: bool = true;
+    type Input = ();
+    type Output = ListOf<PipelineItem>;
+    type Args = PipelineParentArgs;
+
+    fn training_io_candidates(
+        &self,
+        _args: &Self::Args,
+        _hints: TrainingIoHints,
+    ) -> Vec<TrainingIoCandidate> {
+        vec![
+            TrainingIoCandidate {
+                data_replicas: 1,
+                decode_workers: 0,
+                prefetch_per_worker: 0,
+                cuda_staging_slots: 0,
+                pipeline: IoMode::Bounded {
+                    capacity: 1,
+                    max_item_bytes: 4096,
+                },
+                metrics: IoMode::Inline,
+                checkpoints: IoMode::Inline,
+                batch_bytes: None,
+                checkpoint_snapshot_bytes: None,
+                fixed_overhead_bytes: Some(0),
+            },
+            TrainingIoCandidate {
+                data_replicas: 1,
+                decode_workers: 0,
+                prefetch_per_worker: 0,
+                cuda_staging_slots: 0,
+                pipeline: IoMode::Inline,
+                metrics: IoMode::Inline,
+                checkpoints: IoMode::Inline,
+                batch_bytes: None,
+                checkpoint_snapshot_bytes: None,
+                fixed_overhead_bytes: None,
+            },
+        ]
+    }
+
+    fn pipeline_manifest(
+        &self,
+        _input: &Self::Input,
+        args: &Self::Args,
+    ) -> Option<PipelineManifest> {
+        let mut element_hashes = pipeline_items(args.case)
+            .into_iter()
+            .map(|item| item.content_hash())
+            .collect::<Vec<_>>();
+        if args.case == PipelineCase::ManifestMismatch {
+            element_hashes[0] = ContentHash::of_bytes(b"deliberately-wrong-pipeline-manifest");
+        } else if args.case == PipelineCase::ManifestTooShort {
+            element_hashes.truncate(1);
+        } else if args.case == PipelineCase::ManifestTooLong {
+            element_hashes.push(ContentHash::of_bytes(b"nonexistent-pipeline-element"));
+        }
+        Some(PipelineManifest::new(element_hashes))
+    }
+
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        _input: (),
+        args: &Self::Args,
+    ) -> Result<ListOf<PipelineItem>, StageError> {
+        let items = pipeline_items(args.case);
+        match args.case {
+            PipelineCase::Overlap => {
+                if ctx.pipeline_enabled() {
+                    let _accepted = ctx.emit_pipeline_item(0, &items[0]).await?;
+                } else {
+                    PIPE_DEFAULT_OFF_PROFILE_INLINE.store(
+                        ctx.training_io_profile
+                            .as_ref()
+                            .is_some_and(|profile| profile.pipeline == IoMode::Inline),
+                        Ordering::SeqCst,
+                    );
+                }
+                PIPE_PARENT_READY.add_permits(1);
+                take_pipeline_signal(ctx, &PIPE_PARENT_RELEASE).await?;
+            }
+            PipelineCase::Capacity => {
+                assert!(
+                    ctx.pipeline_enabled(),
+                    "capacity fixture requires pipeline mode"
+                );
+                let first_accepted = ctx.emit_pipeline_item(0, &items[0]).await?;
+                assert!(first_accepted, "first certified item must enter the lane");
+                PIPE_SECOND_SUBMIT_STARTED.add_permits(1);
+                let second_accepted = ctx.emit_pipeline_item(1, &items[1]).await?;
+                assert!(second_accepted, "second certified item must enter the lane");
+                PIPE_SECOND_EMIT_RETURNED.add_permits(1);
+            }
+            PipelineCase::ManifestMismatch => {
+                if ctx.pipeline_enabled() {
+                    let accepted = ctx.emit_pipeline_item(0, &items[0]).await?;
+                    PIPE_MISMATCH_ACCEPTED.store(accepted, Ordering::SeqCst);
+                }
+            }
+            PipelineCase::ManifestTooShort | PipelineCase::ManifestTooLong => {
+                if ctx.pipeline_enabled() {
+                    for (index, item) in items.iter().enumerate() {
+                        let _ = ctx.emit_pipeline_item(index, item).await?;
+                    }
+                }
+            }
+            PipelineCase::FailAfterEmission => {
+                if ctx.pipeline_enabled() {
+                    let accepted = ctx.emit_pipeline_item(0, &items[0]).await?;
+                    PIPE_FAILURE_ACCEPTED.store(accepted, Ordering::SeqCst);
+                    if accepted {
+                        take_pipeline_signal(ctx, &PIPE_PRIVATE_CHILD_FINISHED).await?;
+                    }
+                }
+                return Err(StageError::BadInput(
+                    "simulated parent failure after pipeline emission".into(),
+                ));
+            }
+            PipelineCase::FailWhileChildBlocked => {
+                assert!(
+                    ctx.pipeline_enabled(),
+                    "blocked-child fixture needs pipeline"
+                );
+                assert!(ctx.emit_pipeline_item(0, &items[0]).await?);
+                take_pipeline_signal(ctx, &PIPE_STUCK_CHILD_STARTED).await?;
+                return Err(StageError::BadInput(
+                    "simulated parent failure while private child is blocked".into(),
+                ));
+            }
+            PipelineCase::CancelDuringPublication => {
+                assert!(ctx.pipeline_enabled());
+                assert!(ctx.emit_pipeline_item(0, &items[0]).await?);
+                take_pipeline_signal(ctx, &PIPE_PRIVATE_CHILD_FINISHED).await?;
+            }
+            PipelineCase::CorruptSpill | PipelineCase::CorruptInputSpill => {
+                assert!(ctx.pipeline_enabled());
+                assert!(ctx.emit_pipeline_item(0, &items[0]).await?);
+                take_pipeline_signal(ctx, &PIPE_PRIVATE_CHILD_FINISHED).await?;
+                let target = if args.case == PipelineCase::CorruptSpill {
+                    "pipeline-prepared.bin"
+                } else {
+                    "pipeline-input.bin"
+                };
+                let mut spill = None;
+                for _ in 0..100 {
+                    spill = find_named_file(&ctx.job_dir.join(".pipeline"), target);
+                    if spill.is_some() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                let Some(spill) = spill else {
+                    return Err(StageError::BadInput(
+                        "pipeline corruption fixture did not observe the private spill".into(),
+                    ));
+                };
+                std::fs::write(spill, b"deliberately-corrupt-private-spill")
+                    .map_err(|error| StageError::Backend(error.into()))?;
+            }
+            PipelineCase::OversizePrivateResult => {
+                assert!(ctx.pipeline_enabled());
+                assert!(ctx.emit_pipeline_item(0, &items[0]).await?);
+            }
+        }
+        Ok(ListOf(items))
+    }
+}
+
+struct PipelineChild;
+
+#[async_trait]
+impl Stage for PipelineChild {
+    const NAME: &'static str = "pipeline_child";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
+    const PIPELINE_INPUT_SAFE: bool = true;
+    type Input = PipelineItem;
+    type Output = PipelineChildArtifact;
+    type Args = OrderArgs;
+
+    fn training_io_candidates(
+        &self,
+        _args: &Self::Args,
+        _hints: TrainingIoHints,
+    ) -> Vec<TrainingIoCandidate> {
+        PIPE_CHILD_PROFILE_DECLARATIONS.fetch_add(1, Ordering::SeqCst);
+        vec![TrainingIoCandidate::default()]
+    }
+
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        input: PipelineItem,
+        _args: &OrderArgs,
+    ) -> Result<PipelineChildArtifact, StageError> {
+        PIPE_CHILD_RUNS.fetch_add(1, Ordering::SeqCst);
+        match input.case {
+            PipelineCase::Overlap => {
+                PIPE_CHILD_STARTED.add_permits(1);
+                take_pipeline_signal(ctx, &PIPE_CHILD_RELEASE).await?;
+            }
+            PipelineCase::Capacity if input.index == 0 => {
+                PIPE_CAP_CHILD_ZERO_STARTED.add_permits(1);
+                take_pipeline_signal(ctx, &PIPE_CAP_CHILD_ZERO_RELEASE).await?;
+            }
+            PipelineCase::Capacity => {
+                PIPE_CAP_CHILD_ONE_STARTED.add_permits(1);
+                take_pipeline_signal(ctx, &PIPE_CAP_CHILD_ONE_RELEASE).await?;
+            }
+            PipelineCase::ManifestMismatch
+            | PipelineCase::ManifestTooShort
+            | PipelineCase::ManifestTooLong
+            | PipelineCase::FailAfterEmission
+            | PipelineCase::CancelDuringPublication
+            | PipelineCase::CorruptSpill
+            | PipelineCase::CorruptInputSpill
+            | PipelineCase::OversizePrivateResult => {
+                PIPE_PRIVATE_CHILD_FINISHED.add_permits(1);
+            }
+            PipelineCase::FailWhileChildBlocked => {
+                PIPE_STUCK_CHILD_STARTED.add_permits(1);
+                PIPE_STUCK_CHILD_RELEASE
+                    .acquire()
+                    .await
+                    .expect("blocked-child test semaphore remains open")
+                    .forget();
+            }
+        }
+        let identity = format!("pipeline-child:{}", input.content_hash.to_hex());
+        Ok(PipelineChildArtifact {
+            source_index: input.index,
+            content_hash: ContentHash::of_bytes(identity.as_bytes()),
+            padding: if input.case == PipelineCase::OversizePrivateResult {
+                vec![7; 8192]
+            } else {
+                Vec::new()
+            },
+        })
+    }
+}
+
+struct PipelineSibling;
+
+#[async_trait]
+impl Stage for PipelineSibling {
+    const NAME: &'static str = "pipeline_sibling";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
+    type Input = ();
+    type Output = PipelineChildArtifact;
+    type Args = OrderArgs;
+
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        _input: (),
+        _args: &OrderArgs,
+    ) -> Result<PipelineChildArtifact, StageError> {
+        PIPE_SIBLING_STARTED.add_permits(1);
+        take_pipeline_signal(ctx, &PIPE_SIBLING_RELEASE).await?;
+        Ok(PipelineChildArtifact {
+            source_index: u32::MAX,
+            content_hash: ContentHash::of_bytes(b"pipeline-sibling"),
+            padding: Vec::new(),
+        })
+    }
+}
+
 struct GateCookbook;
 
 impl Cookbook for GateCookbook {
@@ -619,6 +1035,9 @@ impl Cookbook for GateCookbook {
             ("record_speculative_after", || {
                 Arc::new(RecordSpeculativeAfter)
             }),
+            ("pipeline_parent", || Arc::new(PipelineParent)),
+            ("pipeline_child", || Arc::new(PipelineChild)),
+            ("pipeline_sibling", || Arc::new(PipelineSibling)),
             ("direct_root", || Arc::new(DirectRoot)),
             ("direct_after", || Arc::new(DirectAfter)),
             ("direct_identity", || Arc::new(DirectIdentity)),
@@ -709,6 +1128,98 @@ fn speculation_discard_plan() -> CompiledPlan {
     .expect("compile speculation discard gate")
 }
 
+fn pipeline_plan(case: PipelineCase) -> CompiledPlan {
+    let mut registry = Registry::new();
+    registry.register(Box::new(GateCookbook));
+    PlanSpec {
+        name: format!("pipeline-{case:?}"),
+        nodes: vec![SpecNode {
+            stage: "pipeline_parent".into(),
+            args: serde_json::json!({ "case": case }),
+            retry: None,
+            timeout: None,
+            priority: None,
+            pure: false,
+        }],
+        edges: Vec::new(),
+        expansions: vec![MapSpec {
+            parent: 0,
+            template: PlanSpec {
+                name: "pipeline-child-template".into(),
+                nodes: vec![SpecNode {
+                    stage: "pipeline_child".into(),
+                    args: serde_json::json!({ "label": "pipeline-child" }),
+                    retry: None,
+                    timeout: None,
+                    priority: None,
+                    // PlanSpec v1 rejects pure map templates. The child stage's
+                    // PIPELINE_INPUT_SAFE const is the independent certificate.
+                    pure: false,
+                }],
+                edges: Vec::new(),
+                expansions: Vec::new(),
+                condition_gates: Vec::new(),
+                version: PLAN_SPEC_VERSION,
+            },
+            label: Some("pipeline-item".into()),
+        }],
+        condition_gates: Vec::new(),
+        version: PLAN_SPEC_VERSION,
+    }
+    .compile(&registry)
+    .expect("compile manifest-certified pipeline map")
+}
+
+fn pipeline_with_running_sibling_plan() -> CompiledPlan {
+    let mut registry = Registry::new();
+    registry.register(Box::new(GateCookbook));
+    PlanSpec {
+        name: "pipeline-running-sibling".into(),
+        nodes: vec![
+            SpecNode {
+                stage: "pipeline_sibling".into(),
+                args: serde_json::json!({ "label": "pipeline-sibling" }),
+                retry: None,
+                timeout: None,
+                priority: None,
+                pure: false,
+            },
+            SpecNode {
+                stage: "pipeline_parent".into(),
+                args: serde_json::json!({ "case": PipelineCase::Overlap }),
+                retry: None,
+                timeout: None,
+                priority: None,
+                pure: false,
+            },
+        ],
+        edges: Vec::new(),
+        expansions: vec![MapSpec {
+            parent: 1,
+            template: PlanSpec {
+                name: "pipeline-child-template".into(),
+                nodes: vec![SpecNode {
+                    stage: "pipeline_child".into(),
+                    args: serde_json::json!({ "label": "pipeline-child" }),
+                    retry: None,
+                    timeout: None,
+                    priority: None,
+                    pure: false,
+                }],
+                edges: Vec::new(),
+                expansions: Vec::new(),
+                condition_gates: Vec::new(),
+                version: PLAN_SPEC_VERSION,
+            },
+            label: Some("pipeline-item".into()),
+        }],
+        condition_gates: Vec::new(),
+        version: PLAN_SPEC_VERSION,
+    }
+    .compile(&registry)
+    .expect("compile pipeline plan with running sibling")
+}
+
 fn priority_only(enabled: bool) -> DagOptimizer {
     DagOptimizer {
         eliminate_dead_code: false,
@@ -718,6 +1229,7 @@ fn priority_only(enabled: bool) -> DagOptimizer {
         priority_aware: enabled,
         stage_fusion: false,
         speculative_execution: false,
+        pipeline_parallelism: false,
     }
 }
 
@@ -730,6 +1242,7 @@ fn cache_only(enabled: bool) -> DagOptimizer {
         priority_aware: false,
         stage_fusion: false,
         speculative_execution: false,
+        pipeline_parallelism: false,
     }
 }
 
@@ -742,6 +1255,20 @@ fn fusion_only(enabled: bool) -> DagOptimizer {
         priority_aware: false,
         stage_fusion: enabled,
         speculative_execution: false,
+        pipeline_parallelism: false,
+    }
+}
+
+fn pipeline_only(enabled: bool) -> DagOptimizer {
+    DagOptimizer {
+        eliminate_dead_code: false,
+        critical_path: false,
+        cache_aware: false,
+        memory_aware: false,
+        priority_aware: false,
+        stage_fusion: false,
+        speculative_execution: false,
+        pipeline_parallelism: enabled,
     }
 }
 
@@ -858,6 +1385,659 @@ fn materialized_cache_keys(job_dir: &std::path::Path) -> Vec<ContentHash> {
         .collect()
 }
 
+fn drain_pipeline_signal(semaphore: &'static tokio::sync::Semaphore) {
+    while let Ok(permit) = semaphore.try_acquire() {
+        permit.forget();
+    }
+}
+
+fn find_named_file(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let entries = std::fs::read_dir(path).ok()?;
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.file_name().is_some_and(|candidate| candidate == name) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn reset_pipeline_fixture() {
+    for semaphore in [
+        &PIPE_PARENT_READY,
+        &PIPE_PARENT_RELEASE,
+        &PIPE_CHILD_STARTED,
+        &PIPE_CHILD_RELEASE,
+        &PIPE_SECOND_SUBMIT_STARTED,
+        &PIPE_SECOND_EMIT_RETURNED,
+        &PIPE_CAP_CHILD_ZERO_STARTED,
+        &PIPE_CAP_CHILD_ZERO_RELEASE,
+        &PIPE_CAP_CHILD_ONE_STARTED,
+        &PIPE_CAP_CHILD_ONE_RELEASE,
+        &PIPE_PRIVATE_CHILD_FINISHED,
+        &PIPE_SIBLING_STARTED,
+        &PIPE_SIBLING_RELEASE,
+        &PIPE_STUCK_CHILD_STARTED,
+        &PIPE_STUCK_CHILD_RELEASE,
+    ] {
+        drain_pipeline_signal(semaphore);
+    }
+    PIPE_CHILD_RUNS.store(0, Ordering::SeqCst);
+    PIPE_CHILD_PROFILE_DECLARATIONS.store(0, Ordering::SeqCst);
+    PIPE_MISMATCH_ACCEPTED.store(false, Ordering::SeqCst);
+    PIPE_FAILURE_ACCEPTED.store(false, Ordering::SeqCst);
+    PIPE_DEFAULT_OFF_PROFILE_INLINE.store(false, Ordering::SeqCst);
+    PIPE_PUBLICATION_HASH_CALLS.store(0, Ordering::SeqCst);
+    *PIPE_PUBLICATION_CANCEL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+async fn take_test_pipeline_signal(semaphore: &'static tokio::sync::Semaphore) {
+    semaphore
+        .acquire()
+        .await
+        .expect("pipeline test semaphore remains open")
+        .forget();
+}
+
+fn pipeline_ctx(job_dir: std::path::PathBuf, enabled: bool) -> ExecCtx {
+    let mut ctx = ExecCtx::new(job_dir)
+        .with_max_in_flight(4)
+        .with_resource_limit(Resource::Cpu, 2)
+        .with_memory_budget(4)
+        .with_training_io_selection_budget_bytes(4 * blut::broker::footprint::GIB);
+    ctx.dag_optimizer = Some(pipeline_only(enabled));
+    ctx
+}
+
+fn canonical_pipeline_child_dirs(job_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let stages = job_dir.join("stages");
+    let Ok(entries) = std::fs::read_dir(stages) else {
+        return Vec::new();
+    };
+    let mut children = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("pipeline_child"))
+        })
+        .collect::<Vec<_>>();
+    children.sort();
+    children
+}
+
+fn completed_local_cache_entries(job_dir: &std::path::Path) -> usize {
+    std::fs::read_dir(job_dir.join("_cache"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.join("output.bin").is_file())
+        .count()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dag_opt_advanced_gate_pipeline_default_off_and_enabled_overlap_preserve_canonical_identity()
+ {
+    let _guard = TEST_LOCK.lock().await;
+    assert!(
+        !DagOptimizer::new().pipeline_parallelism,
+        "pipeline parallelism must remain opt-in"
+    );
+    let temp = tempfile::tempdir().expect("pipeline overlap tempdir");
+
+    reset_pipeline_fixture();
+    let baseline_dir = temp.path().join("default-off");
+    let baseline_task = tokio::spawn(ParallelExecutor::execute(
+        pipeline_plan(PipelineCase::Overlap),
+        pipeline_ctx(baseline_dir.clone(), false),
+    ));
+    take_test_pipeline_signal(&PIPE_PARENT_READY).await;
+    assert!(
+        PIPE_CHILD_STARTED.try_acquire().is_err(),
+        "default-off map child cannot begin before its parent returns"
+    );
+    PIPE_PARENT_RELEASE.add_permits(1);
+    take_test_pipeline_signal(&PIPE_CHILD_STARTED).await;
+    PIPE_CHILD_RELEASE.add_permits(1);
+    let baseline = baseline_task
+        .await
+        .expect("default-off task joins")
+        .expect("default-off pipeline fixture succeeds");
+    assert!(
+        PIPE_DEFAULT_OFF_PROFILE_INLINE.load(Ordering::SeqCst),
+        "optimizer-off execution must select an inline pipeline profile instead of billing an unusable lane"
+    );
+    let baseline_hashes = materialized_hashes(&baseline_dir);
+    let baseline_keys = materialized_cache_keys(&baseline_dir);
+
+    reset_pipeline_fixture();
+    let enabled_dir = temp.path().join("enabled");
+    let enabled_task = tokio::spawn(ParallelExecutor::execute(
+        pipeline_plan(PipelineCase::Overlap),
+        pipeline_ctx(enabled_dir.clone(), true),
+    ));
+    take_test_pipeline_signal(&PIPE_PARENT_READY).await;
+    take_test_pipeline_signal(&PIPE_CHILD_STARTED).await;
+    assert!(
+        !enabled_task.is_finished(),
+        "enabled child starts while the parent is still held"
+    );
+    PIPE_CHILD_RELEASE.add_permits(1);
+    PIPE_PARENT_RELEASE.add_permits(1);
+    let enabled = enabled_task
+        .await
+        .expect("enabled task joins")
+        .expect("enabled pipeline fixture succeeds");
+
+    assert_eq!((baseline.n_stages, enabled.n_stages), (2, 2));
+    assert_eq!(materialized_hashes(&enabled_dir), baseline_hashes);
+    assert_eq!(
+        materialized_cache_keys(&enabled_dir),
+        baseline_keys,
+        "private overlap must preserve every ordinary node cache key"
+    );
+    assert_eq!(canonical_pipeline_child_dirs(&enabled_dir).len(), 1);
+    assert!(!enabled_dir.join(".pipeline").exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dag_opt_advanced_gate_pipeline_warm_parent_never_opens_lane() {
+    let _guard = TEST_LOCK.lock().await;
+    reset_pipeline_fixture();
+    let temp = tempfile::tempdir().expect("warm parent tempdir");
+    let job_dir = temp.path().join("warm-parent");
+    let first = tokio::spawn(ParallelExecutor::execute(
+        pipeline_plan(PipelineCase::Overlap),
+        pipeline_ctx(job_dir.clone(), false),
+    ));
+    take_test_pipeline_signal(&PIPE_PARENT_READY).await;
+    PIPE_PARENT_RELEASE.add_permits(1);
+    take_test_pipeline_signal(&PIPE_CHILD_STARTED).await;
+    PIPE_CHILD_RELEASE.add_permits(1);
+    first
+        .await
+        .expect("cache priming task joins")
+        .expect("cache priming succeeds");
+
+    reset_pipeline_fixture();
+    let warm = ParallelExecutor::execute(
+        pipeline_plan(PipelineCase::Overlap),
+        pipeline_ctx(job_dir, true),
+    )
+    .await
+    .expect("warm pipeline plan succeeds");
+
+    assert_eq!((warm.n_cache_hits, warm.n_cache_misses), (2, 0));
+    assert_eq!(PIPE_CHILD_RUNS.load(Ordering::SeqCst), 0);
+    assert!(PIPE_PARENT_READY.try_acquire().is_err());
+    assert!(PIPE_CHILD_STARTED.try_acquire().is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dag_opt_advanced_gate_pipeline_warm_child_falls_back_to_one_cache_hit() {
+    let _guard = TEST_LOCK.lock().await;
+    reset_pipeline_fixture();
+    let temp = tempfile::tempdir().expect("warm child tempdir");
+    let job_dir = temp.path().join("warm-child");
+    let first = tokio::spawn(ParallelExecutor::execute(
+        pipeline_plan(PipelineCase::Overlap),
+        pipeline_ctx(job_dir.clone(), false),
+    ));
+    take_test_pipeline_signal(&PIPE_PARENT_READY).await;
+    PIPE_PARENT_RELEASE.add_permits(1);
+    take_test_pipeline_signal(&PIPE_CHILD_STARTED).await;
+    PIPE_CHILD_RELEASE.add_permits(1);
+    first
+        .await
+        .expect("cache priming task joins")
+        .expect("cache priming succeeds");
+    let keys = materialized_cache_keys(&job_dir);
+    assert_eq!(keys.len(), 2);
+    std::fs::remove_dir_all(job_dir.join("_cache").join(keys[0].to_hex()))
+        .expect("remove only the parent cache entry");
+
+    reset_pipeline_fixture();
+    let second = tokio::spawn(ParallelExecutor::execute(
+        pipeline_plan(PipelineCase::Overlap),
+        pipeline_ctx(job_dir, true),
+    ));
+    take_test_pipeline_signal(&PIPE_PARENT_READY).await;
+    assert!(
+        PIPE_CHILD_STARTED.try_acquire().is_err(),
+        "a warm child suppresses private overlap"
+    );
+    PIPE_PARENT_RELEASE.add_permits(1);
+    let warm_child = second
+        .await
+        .expect("warm-child task joins")
+        .expect("warm-child fallback succeeds");
+
+    assert_eq!((warm_child.n_cache_hits, warm_child.n_cache_misses), (1, 1));
+    assert_eq!(PIPE_CHILD_RUNS.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dag_opt_advanced_gate_pipeline_shared_cache_suppresses_overlap() {
+    let _guard = TEST_LOCK.lock().await;
+    reset_pipeline_fixture();
+    let temp = tempfile::tempdir().expect("shared cache tempdir");
+    let global = temp.path().join("global-cache");
+    let first_dir = temp.path().join("producer-job");
+    let mut first_ctx = pipeline_ctx(first_dir.clone(), false);
+    first_ctx.cache =
+        Arc::new(CacheHandle::job_local(first_dir.join("_cache")).with_global(global.clone()));
+    let first = tokio::spawn(ParallelExecutor::execute(
+        pipeline_plan(PipelineCase::Overlap),
+        first_ctx,
+    ));
+    take_test_pipeline_signal(&PIPE_PARENT_READY).await;
+    PIPE_PARENT_RELEASE.add_permits(1);
+    take_test_pipeline_signal(&PIPE_CHILD_STARTED).await;
+    PIPE_CHILD_RELEASE.add_permits(1);
+    first
+        .await
+        .expect("shared-cache priming task joins")
+        .expect("shared-cache priming succeeds");
+
+    reset_pipeline_fixture();
+    let second_dir = temp.path().join("consumer-job");
+    let mut second_ctx = pipeline_ctx(second_dir.clone(), true);
+    second_ctx.cache =
+        Arc::new(CacheHandle::job_local(second_dir.join("_cache")).with_global(global));
+    let shared = ParallelExecutor::execute(pipeline_plan(PipelineCase::Overlap), second_ctx)
+        .await
+        .expect("shared-cache pipeline plan succeeds");
+
+    assert_eq!((shared.n_cache_hits, shared.n_cache_misses), (2, 0));
+    assert_eq!(PIPE_CHILD_RUNS.load(Ordering::SeqCst), 0);
+    assert!(PIPE_PARENT_READY.try_acquire().is_err());
+    assert!(PIPE_CHILD_STARTED.try_acquire().is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dag_opt_advanced_gate_pipeline_capacity_one_counts_running_and_queued_work() {
+    let _guard = TEST_LOCK.lock().await;
+    reset_pipeline_fixture();
+    let temp = tempfile::tempdir().expect("pipeline capacity tempdir");
+    let job_dir = temp.path().join("capacity-one");
+    let task = tokio::spawn(ParallelExecutor::execute(
+        pipeline_plan(PipelineCase::Capacity),
+        pipeline_ctx(job_dir.clone(), true),
+    ));
+
+    take_test_pipeline_signal(&PIPE_CAP_CHILD_ZERO_STARTED).await;
+    take_test_pipeline_signal(&PIPE_SECOND_SUBMIT_STARTED).await;
+    assert!(
+        PIPE_SECOND_EMIT_RETURNED.try_acquire().is_err(),
+        "capacity one must stay occupied while item zero is running"
+    );
+    PIPE_CAP_CHILD_ZERO_RELEASE.add_permits(1);
+    take_test_pipeline_signal(&PIPE_SECOND_EMIT_RETURNED).await;
+    take_test_pipeline_signal(&PIPE_CAP_CHILD_ONE_STARTED).await;
+    PIPE_CAP_CHILD_ONE_RELEASE.add_permits(1);
+
+    let result = task
+        .await
+        .expect("capacity task joins")
+        .expect("capacity fixture succeeds");
+    assert_eq!(result.n_stages, 3);
+    assert_eq!(PIPE_CHILD_RUNS.load(Ordering::SeqCst), 2);
+    assert_eq!(canonical_pipeline_child_dirs(&job_dir).len(), 2);
+    assert!(!job_dir.join(".pipeline").exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dag_opt_advanced_gate_pipeline_respects_max_in_flight_with_running_sibling() {
+    let _guard = TEST_LOCK.lock().await;
+    reset_pipeline_fixture();
+    let temp = tempfile::tempdir().expect("pipeline in-flight cap tempdir");
+    let job_dir = temp.path().join("running-sibling");
+    let mut ctx = pipeline_ctx(job_dir, true)
+        .with_max_in_flight(2)
+        .with_resource_limit(Resource::Cpu, 3);
+    ctx.dag_optimizer = Some(pipeline_only(true));
+    let task = tokio::spawn(ParallelExecutor::execute(
+        pipeline_with_running_sibling_plan(),
+        ctx,
+    ));
+
+    take_test_pipeline_signal(&PIPE_SIBLING_STARTED).await;
+    take_test_pipeline_signal(&PIPE_PARENT_READY).await;
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            PIPE_CHILD_STARTED.acquire(),
+        )
+        .await
+        .is_err(),
+        "a parent plus private child must not exceed max_in_flight while a sibling runs"
+    );
+
+    PIPE_PARENT_RELEASE.add_permits(1);
+    take_test_pipeline_signal(&PIPE_CHILD_STARTED).await;
+    PIPE_CHILD_RELEASE.add_permits(1);
+    PIPE_SIBLING_RELEASE.add_permits(1);
+    let result = task
+        .await
+        .expect("running-sibling task joins")
+        .expect("running-sibling fixture succeeds by ordinary fallback");
+    assert_eq!(result.n_stages, 3);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dag_opt_advanced_gate_pipeline_late_admission_decline_reuses_resolved_child_profile() {
+    let _guard = TEST_LOCK.lock().await;
+    reset_pipeline_fixture();
+    let temp = tempfile::tempdir().expect("pipeline late-decline tempdir");
+    let job_dir = temp.path().join("late-admission-decline");
+    // The parent and child each need one CPU. A single permit admits either
+    // ordinary stage sequentially but refuses the combined pipeline envelope
+    // only after the child template's profile has been resolved.
+    let ctx = pipeline_ctx(job_dir.clone(), true).with_resource_limit(Resource::Cpu, 1);
+    let task = tokio::spawn(ParallelExecutor::execute(
+        pipeline_plan(PipelineCase::Overlap),
+        ctx,
+    ));
+
+    take_test_pipeline_signal(&PIPE_PARENT_READY).await;
+    assert!(
+        PIPE_CHILD_STARTED.try_acquire().is_err(),
+        "combined admission decline must retain ordinary post-parent fan-out"
+    );
+    PIPE_PARENT_RELEASE.add_permits(1);
+    take_test_pipeline_signal(&PIPE_CHILD_STARTED).await;
+    PIPE_CHILD_RELEASE.add_permits(1);
+
+    let result = task
+        .await
+        .expect("late-decline task joins")
+        .expect("late admission decline falls back ordinarily");
+    assert_eq!(result.n_stages, 2);
+    assert_eq!(PIPE_CHILD_RUNS.load(Ordering::SeqCst), 1);
+    assert_eq!(canonical_pipeline_child_dirs(&job_dir).len(), 1);
+    assert_eq!(
+        PIPE_CHILD_PROFILE_DECLARATIONS.load(Ordering::SeqCst),
+        1,
+        "ordinary fallback must reuse the immutable profile resolved by the pipeline probe"
+    );
+    assert!(!job_dir.join(".pipeline").exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dag_opt_advanced_gate_pipeline_corrupt_spill_fallback_reuses_resolved_child_profile() {
+    let _guard = TEST_LOCK.lock().await;
+    reset_pipeline_fixture();
+    let temp = tempfile::tempdir().expect("pipeline corrupt-spill tempdir");
+    let job_dir = temp.path().join("corrupt-spill");
+
+    let result = ParallelExecutor::execute(
+        pipeline_plan(PipelineCase::CorruptSpill),
+        pipeline_ctx(job_dir.clone(), true),
+    )
+    .await
+    .expect("corrupt optional spill falls back to ordinary fan-out");
+
+    assert_eq!(result.n_stages, 2);
+    assert_eq!(PIPE_CHILD_RUNS.load(Ordering::SeqCst), 2);
+    assert_eq!(canonical_pipeline_child_dirs(&job_dir).len(), 1);
+    assert_eq!(completed_local_cache_entries(&job_dir), 2);
+    assert_eq!(
+        PIPE_CHILD_PROFILE_DECLARATIONS.load(Ordering::SeqCst),
+        1,
+        "spill corruption fallback must reuse the immutable profile resolved by the pipeline probe"
+    );
+    assert!(!job_dir.join(".pipeline").exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dag_opt_advanced_gate_pipeline_corrupt_input_spill_falls_back_without_unbounded_decode() {
+    let _guard = TEST_LOCK.lock().await;
+    reset_pipeline_fixture();
+    let temp = tempfile::tempdir().expect("pipeline corrupt-input tempdir");
+    let job_dir = temp.path().join("corrupt-input");
+
+    let result = ParallelExecutor::execute(
+        pipeline_plan(PipelineCase::CorruptInputSpill),
+        pipeline_ctx(job_dir.clone(), true),
+    )
+    .await
+    .expect("corrupt optional input spill falls back to ordinary fan-out");
+
+    assert_eq!(result.n_stages, 2);
+    assert_eq!(PIPE_CHILD_RUNS.load(Ordering::SeqCst), 2);
+    assert_eq!(PIPE_CHILD_PROFILE_DECLARATIONS.load(Ordering::SeqCst), 1);
+    assert_eq!(canonical_pipeline_child_dirs(&job_dir).len(), 1);
+    assert_eq!(completed_local_cache_entries(&job_dir), 2);
+    assert!(!job_dir.join(".pipeline").exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dag_opt_advanced_gate_pipeline_oversize_private_result_falls_back_within_admission() {
+    let _guard = TEST_LOCK.lock().await;
+    reset_pipeline_fixture();
+    let temp = tempfile::tempdir().expect("pipeline oversize-result tempdir");
+    let job_dir = temp.path().join("oversize-private-result");
+
+    let result = ParallelExecutor::execute(
+        pipeline_plan(PipelineCase::OversizePrivateResult),
+        pipeline_ctx(job_dir.clone(), true),
+    )
+    .await
+    .expect("oversize optional private result falls back ordinarily");
+
+    assert_eq!(result.n_stages, 2);
+    assert_eq!(PIPE_CHILD_RUNS.load(Ordering::SeqCst), 2);
+    assert_eq!(PIPE_CHILD_PROFILE_DECLARATIONS.load(Ordering::SeqCst), 1);
+    assert_eq!(canonical_pipeline_child_dirs(&job_dir).len(), 1);
+    assert_eq!(completed_local_cache_entries(&job_dir), 2);
+    assert!(!job_dir.join(".pipeline").exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dag_opt_advanced_gate_pipeline_manifest_item_mismatch_falls_back_without_duplicate_publication()
+ {
+    let _guard = TEST_LOCK.lock().await;
+    reset_pipeline_fixture();
+    let temp = tempfile::tempdir().expect("pipeline mismatch tempdir");
+    let baseline_dir = temp.path().join("mismatch-default-off");
+    let baseline = ParallelExecutor::execute(
+        pipeline_plan(PipelineCase::ManifestMismatch),
+        pipeline_ctx(baseline_dir.clone(), false),
+    )
+    .await
+    .expect("default-off mismatch fixture succeeds");
+    let baseline_hashes = materialized_hashes(&baseline_dir);
+    let baseline_keys = materialized_cache_keys(&baseline_dir);
+
+    reset_pipeline_fixture();
+    let job_dir = temp.path().join("mismatch");
+    let result = ParallelExecutor::execute(
+        pipeline_plan(PipelineCase::ManifestMismatch),
+        pipeline_ctx(job_dir.clone(), true),
+    )
+    .await
+    .expect("manifest mismatch falls back to ordinary fan-out");
+
+    assert!(
+        PIPE_MISMATCH_ACCEPTED.load(Ordering::SeqCst),
+        "the mismatched item must reach the certified lane before validation rejects it"
+    );
+    assert_eq!(PIPE_CHILD_RUNS.load(Ordering::SeqCst), 1);
+    assert_eq!((baseline.n_stages, result.n_stages), (2, 2));
+    assert_eq!(canonical_pipeline_child_dirs(&job_dir).len(), 1);
+    assert_eq!(materialized_hashes(&job_dir), baseline_hashes);
+    assert_eq!(
+        materialized_cache_keys(&job_dir),
+        baseline_keys,
+        "ordinary fallback must recompute child identity from the authoritative parent hash"
+    );
+    assert_eq!(completed_local_cache_entries(&job_dir), 2);
+    assert!(!job_dir.join(".pipeline").exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dag_opt_advanced_gate_pipeline_manifest_cardinality_mismatch_uses_authoritative_fanout() {
+    let _guard = TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().expect("pipeline cardinality tempdir");
+
+    for case in [
+        PipelineCase::ManifestTooShort,
+        PipelineCase::ManifestTooLong,
+    ] {
+        reset_pipeline_fixture();
+        let baseline_dir = temp.path().join(format!("{case:?}-default-off"));
+        let baseline = ParallelExecutor::execute(
+            pipeline_plan(case),
+            pipeline_ctx(baseline_dir.clone(), false),
+        )
+        .await
+        .expect("default-off cardinality fixture succeeds");
+        let baseline_hashes = materialized_hashes(&baseline_dir);
+        let baseline_keys = materialized_cache_keys(&baseline_dir);
+        let baseline_declarations = PIPE_CHILD_PROFILE_DECLARATIONS.load(Ordering::SeqCst);
+
+        reset_pipeline_fixture();
+        let enabled_dir = temp.path().join(format!("{case:?}-enabled"));
+        let enabled =
+            ParallelExecutor::execute(pipeline_plan(case), pipeline_ctx(enabled_dir.clone(), true))
+                .await
+                .expect("invalid manifest cardinality falls back ordinarily");
+
+        assert_eq!(enabled.n_stages, baseline.n_stages, "case {case:?}");
+        assert_eq!(
+            materialized_hashes(&enabled_dir),
+            baseline_hashes,
+            "case {case:?} artifact identity"
+        );
+        assert_eq!(
+            materialized_cache_keys(&enabled_dir),
+            baseline_keys,
+            "case {case:?} cache identity"
+        );
+        assert_eq!(
+            baseline_declarations,
+            pipeline_items(case).len(),
+            "ordinary fan-out resolves each actual child once for {case:?}"
+        );
+        assert_eq!(
+            PIPE_CHILD_PROFILE_DECLARATIONS.load(Ordering::SeqCst),
+            1,
+            "pipeline resolves the immutable one-node template once and reuses it across manifest reconciliation for {case:?}"
+        );
+        assert!(!enabled_dir.join(".pipeline").exists());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dag_opt_advanced_gate_pipeline_parent_failure_after_emission_leaves_no_canonical_child_state()
+ {
+    let _guard = TEST_LOCK.lock().await;
+    reset_pipeline_fixture();
+    let temp = tempfile::tempdir().expect("pipeline parent failure tempdir");
+    let job_dir = temp.path().join("parent-failure");
+    let error = ParallelExecutor::execute(
+        pipeline_plan(PipelineCase::FailAfterEmission),
+        pipeline_ctx(job_dir.clone(), true),
+    )
+    .await
+    .expect_err("parent fails after its accepted private emission");
+
+    assert!(
+        error
+            .to_string()
+            .contains("simulated parent failure after pipeline emission")
+    );
+    assert!(PIPE_FAILURE_ACCEPTED.load(Ordering::SeqCst));
+    assert_eq!(PIPE_CHILD_RUNS.load(Ordering::SeqCst), 1);
+    assert!(canonical_pipeline_child_dirs(&job_dir).is_empty());
+    assert_eq!(completed_local_cache_entries(&job_dir), 0);
+    assert!(!job_dir.join(".pipeline").exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dag_opt_advanced_gate_pipeline_parent_failure_aborts_noncooperative_private_child() {
+    let _guard = TEST_LOCK.lock().await;
+    reset_pipeline_fixture();
+    let temp = tempfile::tempdir().expect("pipeline blocked-child tempdir");
+    let job_dir = temp.path().join("blocked-child");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        ParallelExecutor::execute(
+            pipeline_plan(PipelineCase::FailWhileChildBlocked),
+            pipeline_ctx(job_dir.clone(), true),
+        ),
+    )
+    .await
+    .expect("parent failure must not await a noncooperative private child forever");
+    let error = result.expect_err("blocked-child parent must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("simulated parent failure while private child is blocked")
+    );
+    assert!(canonical_pipeline_child_dirs(&job_dir).is_empty());
+    assert_eq!(completed_local_cache_entries(&job_dir), 0);
+    assert!(!job_dir.join(".pipeline").exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dag_opt_advanced_gate_pipeline_cancel_during_publication_rolls_back_private_child() {
+    let _guard = TEST_LOCK.lock().await;
+    reset_pipeline_fixture();
+    let temp = tempfile::tempdir().expect("pipeline publication-cancel tempdir");
+    let job_dir = temp.path().join("publication-cancel");
+    let ctx = pipeline_ctx(job_dir.clone(), true);
+    let mut events = ctx.status.subscribe();
+    *PIPE_PUBLICATION_CANCEL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ctx.cancel.clone());
+
+    let error =
+        ParallelExecutor::execute(pipeline_plan(PipelineCase::CancelDuringPublication), ctx)
+            .await
+            .expect_err("publication-time cancellation must fail the plan");
+
+    assert!(matches!(error, PlanError::Cancelled));
+    assert_eq!(
+        PIPE_PUBLICATION_HASH_CALLS.load(Ordering::SeqCst),
+        2,
+        "fixture must cancel at the selected-publication content-hash boundary"
+    );
+    assert!(canonical_pipeline_child_dirs(&job_dir).is_empty());
+    assert_eq!(
+        completed_local_cache_entries(&job_dir),
+        0,
+        "publication cancellation must not leave a selected private cache entry"
+    );
+    let mut child_begin = false;
+    while let Ok(event) = events.try_recv() {
+        child_begin |= matches!(
+            event,
+            StageEvent::StageBegin { stage_name, .. } if stage_name == "pipeline_child"
+        );
+    }
+    assert!(
+        !child_begin,
+        "private child lifecycle must remain unpublished"
+    );
+    assert!(!job_dir.join(".pipeline").exists());
+    *PIPE_PUBLICATION_CANCEL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn dag_opt_advanced_gate_discards_private_speculation_without_identity_drift() {
     let _guard = TEST_LOCK.lock().await;
@@ -865,6 +2045,7 @@ async fn dag_opt_advanced_gate_discards_private_speculation_without_identity_dri
 
     let optimizer = DagOptimizer {
         speculative_execution: true,
+        pipeline_parallelism: false,
         ..DagOptimizer::new()
     };
     let (default_off, _) = DagOptimizer::new().optimize(speculation_discard_plan());
