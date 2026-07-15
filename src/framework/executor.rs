@@ -52,7 +52,7 @@ use crate::framework::plan::{CompiledPlan, NodeId};
 use crate::framework::resource::Resource;
 use crate::framework::stage::{ErasedArtifact, InProcessArtifact, StageContext, StageDyn};
 use crate::framework::status::{
-    DEFAULT_BROADCAST_CAPACITY, StageEvent, StatusHub, spawn_status_writer,
+    DEFAULT_BROADCAST_CAPACITY, StageEvent, StatusHub, spawn_status_writer_checked,
 };
 
 /// Default bound on concurrently-spawned node tasks in the parallel
@@ -68,6 +68,66 @@ pub const DEFAULT_MAX_IN_FLIGHT: usize = 8;
 pub const UNLIMITED_MEM_GIB: u32 = 1_000_000;
 
 static SPECULATION_NONCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreparedExecutorMode {
+    Sequential,
+    Parallel,
+}
+
+/// Private proof that optimization and execution-only profile selection have
+/// already run against this plan's final node-id space.
+struct PreparedExecution {
+    mode: PreparedExecutorMode,
+    schedule_hints: HashMap<NodeId, crate::framework::dag_opt::ScheduleHint>,
+}
+
+/// Per-node launch facts selected by the trusted admission boundary. These are
+/// execution-only and are never exposed as cookbook args or cache inputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TrainingIoNodeAdmission {
+    pub(crate) admitted_decode_workers: Option<u32>,
+    pub(crate) admitted_batch_size: Option<u32>,
+    pub(crate) cache_warm: bool,
+    pub(crate) calibrated_base_floor_bytes: Option<u64>,
+    /// Optional node-local ceiling captured by a launcher that holds a fixed
+    /// whole-job reservation. Runtime HPO children use this to downgrade or
+    /// refuse instead of selecting a profile larger than the initial tenant
+    /// reservation. The global executor/live-snapshot ceiling still applies;
+    /// selection uses the smaller value.
+    pub(crate) selection_budget_bytes: Option<u64>,
+}
+
+/// Optional child-aware admission resolver. It is captured in the same
+/// immutable select-once witness as the resource budget, then applied to both
+/// post-DCE static nodes and runtime-injected PBT/TPE/map nodes. `None` is an
+/// explicit choice to use the launch-wide defaults for an irrelevant stage;
+/// a required node that cannot be calibrated must return `Err` and fail closed.
+pub(crate) type TrainingIoNodeAdmissionResolver = Arc<
+    dyn Fn(
+            &str,
+            &serde_json::Value,
+            &serde_json::Value,
+        ) -> Result<Option<TrainingIoNodeAdmission>, String>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+#[derive(Clone)]
+struct TrainingIoResolver {
+    default_hints: crate::framework::async_io::TrainingIoHints,
+    budget_bytes: u64,
+    force_inline_reason: Option<crate::framework::async_io::TrainingIoDowngradeReason>,
+    whole_job_base_bytes: Option<u64>,
+    node_admission: Option<TrainingIoNodeAdmissionResolver>,
+}
+
+#[derive(Clone)]
+struct ResolvedTrainingIoNode {
+    profile: crate::framework::async_io::TrainingIoProfile,
+    hints: crate::framework::async_io::TrainingIoHints,
+}
 
 /// Handle to a dispatched remote task. The executor polls this to
 /// determine when the task completes.
@@ -190,6 +250,39 @@ pub struct ExecCtx {
     /// this reaches the same result a joint search would). `None` ⇒ the
     /// recipe's requested batch, unchanged (no auto-tune ran).
     pub admitted_batch_size: Option<u32>,
+    /// ADR 0103 node-keyed effective profiles. Selection is resolved once from
+    /// immutable launch hints before scheduling; each StageContext sees only
+    /// its own node's value. Empty preserves legacy behavior.
+    pub(crate) training_io_profiles: HashMap<NodeId, crate::framework::async_io::TrainingIoProfile>,
+    training_io_node_hints: HashMap<NodeId, crate::framework::async_io::TrainingIoHints>,
+    /// One private immutable resolver shared by static preparation and runtime
+    /// graph injection. Populated only by `prepare_plan_with_mode`.
+    training_io_resolver: Option<TrainingIoResolver>,
+    /// Optional launcher/HPO calibration callback captured into the resolver.
+    /// It receives actual post-DCE or injected node args and must fail closed
+    /// when a required child-specific floor cannot be produced.
+    training_io_node_admission_resolver: Option<TrainingIoNodeAdmissionResolver>,
+    /// Force every declaring stage onto its explicit Inline candidate.
+    pub sync_io: bool,
+    /// Optional live-availability ceiling used only while selecting a profile.
+    /// Executor permits still use `memory_budget_gib`; this tighter byte value
+    /// prevents choosing a fast profile that whole-job admission would
+    /// immediately refuse under the same resource snapshot.
+    pub training_io_selection_budget_bytes: Option<u64>,
+    /// Calibrated/OOM-corrected whole-job synchronous-base FLOOR used for
+    /// profile selection when the production launcher has one declaring node.
+    /// Stage-owned structure (for example DDP rank replication) may raise it.
+    /// `None` lets each stage derive its exact base from args + immutable hints.
+    pub training_io_whole_job_base_bytes: Option<u64>,
+    /// Explicit conservative downgrade selected by the launch boundary. The
+    /// framework derives the same reason for direct callers when this is absent.
+    training_io_downgrade_reason: Option<crate::framework::async_io::TrainingIoDowngradeReason>,
+    /// Select-once witness consumed by the chosen executor implementation.
+    prepared_execution: Option<PreparedExecution>,
+    #[cfg(test)]
+    status_writer_failure: Option<std::io::ErrorKind>,
+    #[cfg(test)]
+    status_writer_started: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Phase-G scheduler: the GPU DEVICE index this whole job is pinned to,
     /// or `None` for the box default. Threaded into every `StageContext` so a
     /// launcher-aware backend exports `CUDA_VISIBLE_DEVICES=<idx>` for the
@@ -256,6 +349,19 @@ impl ExecCtx {
             fb_warm: false,
             admitted_workers: None,
             admitted_batch_size: None,
+            training_io_profiles: HashMap::new(),
+            training_io_node_hints: HashMap::new(),
+            training_io_resolver: None,
+            training_io_node_admission_resolver: None,
+            sync_io: false,
+            training_io_selection_budget_bytes: None,
+            training_io_whole_job_base_bytes: None,
+            training_io_downgrade_reason: None,
+            prepared_execution: None,
+            #[cfg(test)]
+            status_writer_failure: None,
+            #[cfg(test)]
+            status_writer_started: None,
             device_index: None,
             bypass_cache: false,
             #[cfg(feature = "p2p")]
@@ -304,6 +410,44 @@ impl ExecCtx {
     pub fn with_admitted_batch_size(mut self, batch_size: u32) -> Self {
         self.admitted_batch_size = Some(batch_size);
         self
+    }
+
+    /// Force every stage with async-I/O candidates onto its explicit fully
+    /// inline tail. This is execution-only and cache-neutral.
+    pub fn with_sync_io(mut self, sync_io: bool) -> Self {
+        self.sync_io = sync_io;
+        self
+    }
+
+    pub fn with_training_io_selection_budget_bytes(mut self, budget_bytes: u64) -> Self {
+        self.training_io_selection_budget_bytes = Some(budget_bytes);
+        self
+    }
+
+    /// Select a single declaring stage against at least this calibrated
+    /// whole-job base. Resolution rejects ambiguity if more than one node
+    /// declares profiles.
+    pub fn with_training_io_whole_job_base_bytes(mut self, base_bytes: u64) -> Self {
+        self.training_io_whole_job_base_bytes = Some(base_bytes);
+        self
+    }
+
+    /// Install a launch-owned child-aware hints/calibration resolver.
+    /// Crate-private by design: cookbook authors declare candidates and stage
+    /// structure, while the trusted launch admission path owns calibration.
+    pub(crate) fn with_training_io_node_admission_resolver(
+        mut self,
+        resolver: TrainingIoNodeAdmissionResolver,
+    ) -> Self {
+        self.training_io_node_admission_resolver = Some(resolver);
+        self
+    }
+
+    pub(crate) fn set_training_io_downgrade_reason(
+        &mut self,
+        reason: Option<crate::framework::async_io::TrainingIoDowngradeReason>,
+    ) {
+        self.training_io_downgrade_reason = reason;
     }
 
     /// Set the P2P dispatch policy and submitter. When both are set,
@@ -451,6 +595,11 @@ struct NodeEnv {
     fb_warm: bool,
     admitted_workers: Option<u32>,
     admitted_batch_size: Option<u32>,
+    /// Insert-once node profiles. Runtime Spawn extends this registry on the
+    /// single-threaded coordinator seam before a new node becomes ready; task
+    /// threads can only clone an already-resolved immutable profile.
+    training_io_profiles: std::sync::RwLock<HashMap<NodeId, ResolvedTrainingIoNode>>,
+    training_io_resolver: TrainingIoResolver,
     /// Force-recompute (INC D / S4). When true, `run_node` skips the cache READ
     /// so the stage always runs; the fresh result is still cached.
     bypass_cache: bool,
@@ -473,6 +622,47 @@ struct NodeEnv {
     dispatch_policy: Option<Arc<dyn crate::p2p::dispatch::DispatchPolicy>>,
     #[cfg(feature = "p2p")]
     dispatcher: Option<Arc<dyn DispatchSubmitter>>,
+}
+
+impl NodeEnv {
+    fn training_io_node(&self, node_id: NodeId) -> Option<ResolvedTrainingIoNode> {
+        self.training_io_profiles
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&node_id)
+            .cloned()
+    }
+
+    /// Install a fully-resolved batch for fresh global node ids. No caller can
+    /// update an existing entry: one node receives one immutable profile for
+    /// its whole cache/admission/execution lifecycle.
+    fn install_training_io_profiles(
+        &self,
+        profiles: impl IntoIterator<Item = (NodeId, ResolvedTrainingIoNode)>,
+    ) -> Result<(), PlanError> {
+        let profiles: Vec<_> = profiles.into_iter().collect();
+        let mut selected = self
+            .training_io_profiles
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((node_id, _)) = profiles
+            .iter()
+            .find(|(node_id, _)| selected.contains_key(node_id))
+        {
+            return Err(PlanError::Other(format!(
+                "training I/O profile for runtime node {node_id} was already resolved"
+            )));
+        }
+        selected.extend(profiles);
+        Ok(())
+    }
+
+    fn training_io_snapshot(&self) -> HashMap<NodeId, ResolvedTrainingIoNode> {
+        self.training_io_profiles
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 /// A REPLACEABLE per-node kill token (#4 / S1). Shared between the coordinator
@@ -577,6 +767,7 @@ struct SpeculativePrepared {
     key: ContentHash,
     output: ErasedArtifact,
     elapsed: std::time::Duration,
+    training_io_profile: Option<crate::framework::async_io::TrainingIoProfile>,
     buffered_steps: Vec<StageEvent>,
 }
 
@@ -853,6 +1044,305 @@ async fn cache_presence_probe_off_thread(
     tokio::task::spawn_blocking(move || cache.probe_presence(key)).await
 }
 
+fn install_builtin_control(ctx: &mut ExecCtx) {
+    if ctx.control.is_none()
+        && std::env::var("BLUT_KILL_ON_NAN")
+            .map(|value| value == "1")
+            .unwrap_or(false)
+    {
+        ctx.control = Some(Arc::new(crate::framework::control::KillOnNaN));
+    }
+}
+
+fn plan_requires_parallel(plan: &CompiledPlan, ctx: &ExecCtx) -> bool {
+    ctx.control.is_some() || plan.has_condition_gates() || !plan.expansions().is_empty()
+}
+
+fn auto_executor_mode(plan: &CompiledPlan, ctx: &ExecCtx) -> PreparedExecutorMode {
+    if plan_requires_parallel(plan, ctx)
+        || std::env::var("BLUT_EXECUTOR")
+            .map(|value| value.eq_ignore_ascii_case("parallel"))
+            .unwrap_or(false)
+    {
+        PreparedExecutorMode::Parallel
+    } else {
+        PreparedExecutorMode::Sequential
+    }
+}
+
+fn requested_executor_mode(
+    requested: PreparedExecutorMode,
+    plan: &CompiledPlan,
+    ctx: &ExecCtx,
+) -> PreparedExecutorMode {
+    if requested == PreparedExecutorMode::Parallel || plan_requires_parallel(plan, ctx) {
+        PreparedExecutorMode::Parallel
+    } else {
+        PreparedExecutorMode::Sequential
+    }
+}
+
+/// Optimize (when parallel), select every training-I/O profile exactly once,
+/// and retain the executor/scheduling witness privately on `ctx`.
+pub(crate) fn prepare_plan_for_execution(
+    plan: CompiledPlan,
+    ctx: &mut ExecCtx,
+) -> Result<CompiledPlan, PlanError> {
+    install_builtin_control(ctx);
+    let mode = auto_executor_mode(&plan, ctx);
+    prepare_plan_with_mode(plan, ctx, mode)
+}
+
+/// Crate-private prepared-plan seam for launchers whose scheduling contract is
+/// intrinsically parallel even when the runtime control policy is absent (for
+/// example a static HPO trial batch). It still executes the exact same
+/// optimize/select-once path and records one private mode witness for
+/// `execute_plan`; this is not a second profile-selection mechanism.
+pub(crate) fn prepare_plan_for_parallel_execution(
+    plan: CompiledPlan,
+    ctx: &mut ExecCtx,
+) -> Result<CompiledPlan, PlanError> {
+    prepare_plan_for_requested_executor(plan, ctx, PreparedExecutorMode::Parallel)
+}
+
+fn prepare_plan_for_requested_executor(
+    plan: CompiledPlan,
+    ctx: &mut ExecCtx,
+    requested: PreparedExecutorMode,
+) -> Result<CompiledPlan, PlanError> {
+    install_builtin_control(ctx);
+    let mode = requested_executor_mode(requested, &plan, ctx);
+    prepare_plan_with_mode(plan, ctx, mode)
+}
+
+fn prepare_plan_with_mode(
+    plan: CompiledPlan,
+    ctx: &mut ExecCtx,
+    mode: PreparedExecutorMode,
+) -> Result<CompiledPlan, PlanError> {
+    if ctx.prepared_execution.is_some() {
+        return Err(PlanError::Other(
+            "execution context already owns a prepared plan witness".into(),
+        ));
+    }
+    if !ctx.training_io_profiles.is_empty() {
+        return Err(PlanError::Other(
+            "training I/O profiles are executor-selected and cannot be preloaded".into(),
+        ));
+    }
+    if ctx.training_io_resolver.is_some() {
+        return Err(PlanError::Other(
+            "training I/O resolver is executor-owned and cannot be preloaded".into(),
+        ));
+    }
+
+    // The optimizer is the sole owner of post-DCE node ids. Candidate methods
+    // therefore run only after this transform and never need a second pass.
+    let (plan, schedule_hints) = match mode {
+        PreparedExecutorMode::Sequential => (plan, HashMap::new()),
+        PreparedExecutorMode::Parallel => match ctx.dag_optimizer.as_ref() {
+            Some(optimizer) => optimizer.optimize(plan),
+            None => (plan, HashMap::new()),
+        },
+    };
+    resolve_training_io_profiles_once(&plan, ctx)?;
+    ctx.prepared_execution = Some(PreparedExecution {
+        mode,
+        schedule_hints,
+    });
+    Ok(plan)
+}
+
+fn take_prepared_execution(
+    ctx: &mut ExecCtx,
+    expected: PreparedExecutorMode,
+) -> Result<PreparedExecution, PlanError> {
+    let prepared = ctx.prepared_execution.take().ok_or_else(|| {
+        PlanError::Other("executor received a plan without a preparation witness".into())
+    })?;
+    if prepared.mode != expected {
+        return Err(PlanError::Other(format!(
+            "prepared executor mode mismatch: expected {expected:?}, found {:?}",
+            prepared.mode
+        )));
+    }
+    Ok(prepared)
+}
+
+fn resolve_training_io_profiles_once(
+    plan: &CompiledPlan,
+    ctx: &mut ExecCtx,
+) -> Result<(), PlanError> {
+    let resolver = TrainingIoResolver::from_ctx(ctx)?;
+    let selected_nodes = resolver.resolve_static_plan(plan)?;
+    ctx.training_io_profiles = selected_nodes
+        .iter()
+        .map(|(&node_id, selected)| (node_id, selected.profile.clone()))
+        .collect();
+    ctx.training_io_node_hints = selected_nodes
+        .into_iter()
+        .map(|(node_id, selected)| (node_id, selected.hints))
+        .collect();
+    ctx.training_io_resolver = Some(resolver);
+    Ok(())
+}
+
+impl TrainingIoResolver {
+    fn from_ctx(ctx: &ExecCtx) -> Result<Self, PlanError> {
+        use crate::framework::async_io::{TrainingIoDowngradeReason, TrainingIoHints};
+
+        let hints = TrainingIoHints {
+            admitted_decode_workers: ctx.admitted_workers,
+            admitted_batch_size: ctx.admitted_batch_size,
+            cache_warm: ctx.fb_warm,
+        };
+        let executor_budget_bytes = u64::from(ctx.memory_budget_gib)
+            .checked_mul(crate::broker::footprint::GIB)
+            .ok_or_else(|| PlanError::Other("training I/O memory budget overflow".into()))?;
+        let budget_bytes = ctx
+            .training_io_selection_budget_bytes
+            .map_or(executor_budget_bytes, |live| {
+                live.min(executor_budget_bytes)
+            });
+
+        let force_inline_reason = if ctx.sync_io {
+            Some(TrainingIoDowngradeReason::UserForced)
+        } else if ctx.launch_target != crate::config::launcher::LaunchTarget::Local {
+            Some(TrainingIoDowngradeReason::UnsupportedLauncher)
+        } else if ctx.training_io_selection_budget_bytes.is_none() {
+            Some(TrainingIoDowngradeReason::SnapshotUnavailable)
+        } else {
+            ctx.training_io_downgrade_reason.clone()
+        };
+
+        Ok(Self {
+            default_hints: hints,
+            budget_bytes,
+            force_inline_reason,
+            whole_job_base_bytes: ctx.training_io_whole_job_base_bytes,
+            node_admission: ctx.training_io_node_admission_resolver.clone(),
+        })
+    }
+
+    /// Resolve a complete node batch from the already-captured launch facts.
+    /// Candidate declaration and optional calibration each run exactly once per
+    /// declaring node. This method performs no resource/snapshot probe.
+    fn resolve_static_plan(
+        &self,
+        plan: &CompiledPlan,
+    ) -> Result<HashMap<NodeId, ResolvedTrainingIoNode>, PlanError> {
+        self.resolve_plan_with_global_floor(plan, self.whole_job_base_bytes)
+    }
+
+    fn resolve_injected_plan(
+        &self,
+        plan: &CompiledPlan,
+    ) -> Result<HashMap<NodeId, ResolvedTrainingIoNode>, PlanError> {
+        // A launcher's one whole-job floor describes the prepared parent job,
+        // not an arbitrary later PBT/TPE/map child. Injected nodes must use
+        // their own stage-derived base plus an optional child-specific floor
+        // from the captured callback.
+        self.resolve_plan_with_global_floor(plan, None)
+    }
+
+    fn resolve_plan_with_global_floor(
+        &self,
+        plan: &CompiledPlan,
+        whole_job_base_bytes: Option<u64>,
+    ) -> Result<HashMap<NodeId, ResolvedTrainingIoNode>, PlanError> {
+        use crate::framework::async_io::{TrainingIoHints, select_training_io_profile_with_reason};
+
+        let mut declarations = Vec::with_capacity(plan.nodes.len());
+        for node in &plan.nodes {
+            let admission_recipe_args = node
+                .admission_scope_args
+                .as_deref()
+                .or(node.admission_recipe_args.as_deref())
+                .unwrap_or(plan.recipe_args());
+            let decision = self
+                .node_admission
+                .as_ref()
+                .map(|resolve| resolve(node.stage.name(), &node.args, admission_recipe_args))
+                .transpose()
+                .map_err(|error| {
+                    PlanError::Other(format!(
+                        "node {} ({}) training I/O calibration refused: {error}",
+                        node.id,
+                        node.stage.name()
+                    ))
+                })?
+                .flatten();
+            let hints = decision.map_or(self.default_hints, |decision| TrainingIoHints {
+                admitted_decode_workers: decision.admitted_decode_workers,
+                admitted_batch_size: decision.admitted_batch_size,
+                cache_warm: decision.cache_warm,
+            });
+            let calibrated_floor =
+                decision.and_then(|decision| decision.calibrated_base_floor_bytes);
+            let selection_budget = decision.and_then(|decision| decision.selection_budget_bytes);
+            let candidates = node.stage.training_io_candidates(&node.args, hints);
+            declarations.push((node, hints, calibrated_floor, selection_budget, candidates));
+        }
+        let declaring_count = declarations
+            .iter()
+            .filter(|(_, _, _, _, candidates)| !candidates.is_empty())
+            .count();
+        if whole_job_base_bytes.is_some() && declaring_count > 1 {
+            return Err(PlanError::Other(format!(
+                "calibrated whole-job async-I/O admission supports exactly one declaring node, found {declaring_count}"
+            )));
+        }
+
+        let mut selected_profiles = HashMap::new();
+        for (node, hints, calibrated_floor, selection_budget, candidates) in declarations {
+            if candidates.is_empty() {
+                continue;
+            }
+
+            let stage_base_bytes = node.stage.training_io_sync_base_bytes(&node.args, hints);
+            // Calibration is a conservative floor, not a replacement for
+            // stage-owned structure such as DDP rank replication. The same
+            // rule applies to a global launcher floor and a child-aware HPO
+            // floor captured in this resolver.
+            let base_bytes = [
+                Some(stage_base_bytes),
+                whole_job_base_bytes,
+                calibrated_floor,
+            ]
+            .into_iter()
+            .flatten()
+            .max()
+            .expect("stage base is always present");
+
+            let node_budget = selection_budget
+                .map(|limit| limit.min(self.budget_bytes))
+                .unwrap_or(self.budget_bytes);
+            let selected = select_training_io_profile_with_reason(
+                base_bytes,
+                node_budget,
+                &candidates,
+                self.force_inline_reason.clone(),
+            )
+            .map_err(|error| {
+                PlanError::Other(format!(
+                    "node {} ({}) training I/O admission refused: {error}",
+                    node.id,
+                    node.stage.name()
+                ))
+            })?;
+            selected_profiles.insert(
+                node.id,
+                ResolvedTrainingIoNode {
+                    profile: selected,
+                    hints,
+                },
+            );
+        }
+
+        Ok(selected_profiles)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AdmissionRequest {
     resources: Vec<Resource>,
@@ -861,7 +1351,12 @@ struct AdmissionRequest {
 }
 
 impl AdmissionRequest {
-    fn for_stage(stage: &dyn StageDyn, args: &serde_json::Value, memory_budget_gib: u32) -> Self {
+    fn for_stage(
+        stage: &dyn StageDyn,
+        args: &serde_json::Value,
+        memory_budget_gib: u32,
+        profile: Option<&crate::framework::async_io::TrainingIoProfile>,
+    ) -> Result<Self, String> {
         let mut resources: Vec<Resource> = stage
             .resources()
             .iter()
@@ -869,18 +1364,57 @@ impl AdmissionRequest {
             .filter(|resource| *resource != Resource::Gpu)
             .collect();
         resources.sort();
-        Self {
+        if profile.is_none() {
+            // A stage that declares no profile keeps the exact historical
+            // admission behavior. ADR 0103's fail-closed byte envelope applies
+            // only after a cookbook opts into the new profile contract.
+            return Ok(Self {
+                resources,
+                gpu: stage
+                    .resources()
+                    .contains(&Resource::Gpu)
+                    .then(|| stage.gpu_request(args)),
+                memory_gib: stage.memory_gib_for(args).min(memory_budget_gib),
+            });
+        }
+        let base_bytes = profile.map_or_else(
+            || u64::from(stage.memory_gib_for(args)) * crate::broker::footprint::GIB,
+            |profile| profile.sync_base_bytes,
+        );
+        let overhead_bytes = profile.map_or(0, |profile| profile.billed_overhead_bytes);
+        let total_bytes = base_bytes
+            .checked_add(overhead_bytes)
+            .ok_or_else(|| format!("stage '{}' memory envelope overflow", stage.name()))?;
+        let memory_gib = total_bytes
+            .checked_add(crate::broker::footprint::GIB - 1)
+            .ok_or_else(|| format!("stage '{}' rounded memory envelope overflow", stage.name()))?
+            / crate::broker::footprint::GIB;
+        let memory_gib = u32::try_from(memory_gib)
+            .map_err(|_| format!("stage '{}' memory envelope exceeds u32 GiB", stage.name()))?;
+        if memory_gib > memory_budget_gib {
+            return Err(format!(
+                "stage '{}' memory envelope {memory_gib} GiB exceeds memory budget {memory_budget_gib} GiB",
+                stage.name()
+            ));
+        }
+        Ok(Self {
             resources,
             gpu: stage
                 .resources()
                 .contains(&Resource::Gpu)
                 .then(|| stage.gpu_request(args)),
-            memory_gib: stage.memory_gib_for(args).min(memory_budget_gib),
-        }
+            memory_gib,
+        })
     }
 
-    fn for_task(task: &NodeTask, memory_budget_gib: u32) -> Self {
-        Self::for_stage(task.stage.as_ref(), &task.args, memory_budget_gib)
+    fn for_task(task: &NodeTask, env: &NodeEnv) -> Result<Self, String> {
+        let selected = env.training_io_node(task.node_id);
+        Self::for_stage(
+            task.stage.as_ref(),
+            &task.args,
+            env.memory_budget_gib,
+            selected.as_ref().map(|selected| &selected.profile),
+        )
     }
 
     fn for_chain(
@@ -888,17 +1422,19 @@ impl AdmissionRequest {
         memory_budget_gib: u32,
     ) -> Option<Self> {
         let request_for = |node: &crate::framework::plan::PlanNode| {
-            Self::for_stage(node.stage.as_ref(), &node.args, memory_budget_gib)
+            Self::for_stage(node.stage.as_ref(), &node.args, memory_budget_gib, None).ok()
         };
         let mut requests = nodes.iter().map(request_for);
-        let first = requests.next()?;
+        let first = requests.next()??;
         // A chain-wide union would reserve resources for a later node before
         // its input-dependent cache lookup is possible. If that node is warm,
         // fusion could block or fail on a GPU/network/memory envelope it never
         // uses. The first conservative slice therefore fuses only identical
         // envelopes; one shared grant is then exactly what every miss would
         // have requested, never a synthetic or premature superset.
-        requests.all(|request| request == first).then_some(first)
+        requests
+            .all(|request| request.as_ref() == Some(&first))
+            .then_some(first)
     }
 }
 
@@ -987,15 +1523,19 @@ fn admission_is_spare_after_ordinary(
     }
 
     if let Some(request) = candidate.gpu {
+        // A count-only shadow cannot reserve the right devices on a
+        // heterogeneous box: a permissive speculative request could otherwise
+        // take the sole high-VRAM device before an ordinary request reaches
+        // authoritative admission. Optional work may always decline, so keep
+        // the ordinary path dominant until a residual-device reservation can be
+        // acquired atomically with the speculative grant.
+        if ordinary.values().any(|request| request.gpu.is_some()) {
+            return false;
+        }
         let capacity = gpu.device_count();
         let effective_need = |count: u32| (count.max(1) as usize).min(capacity);
         let candidate_need = effective_need(request.count);
-        let ordinary_need: usize = ordinary
-            .values()
-            .filter_map(|request| request.gpu)
-            .map(|request| effective_need(request.count))
-            .sum();
-        if gpu.available_device_count() < ordinary_need.saturating_add(candidate_need) {
+        if gpu.available_device_count() < candidate_need {
             return false;
         }
     }
@@ -1192,6 +1732,14 @@ async fn run_node_with_admission(
     }
 
     // ── Miss → run ──────────────────────────────────────────────────
+    let training_io = env.training_io_node(task.node_id);
+    if let Some(profile) = training_io.as_ref().map(|selected| &selected.profile) {
+        env.status.emit(StageEvent::StageIoConfigured {
+            node_idx: idx,
+            stage_name: stage_name.clone(),
+            profile: profile.clone(),
+        });
+    }
     env.status.emit(StageEvent::StageBegin {
         node_idx: idx,
         stage_name: stage_name.clone(),
@@ -1281,9 +1829,22 @@ async fn run_node_with_admission(
             launch_target: env.launch_target,
             device_index: env.device_index,
             gpu_devices: Vec::new(), // set from the GpuScheduler grant below
-            fb_warm: env.fb_warm,
-            admitted_workers: env.admitted_workers,
-            admitted_batch_size: env.admitted_batch_size,
+            fb_warm: training_io
+                .as_ref()
+                .map_or(env.fb_warm, |selected| selected.hints.cache_warm),
+            admitted_workers: training_io
+                .as_ref()
+                .map_or(env.admitted_workers, |selected| {
+                    selected.hints.admitted_decode_workers
+                }),
+            admitted_batch_size: training_io
+                .as_ref()
+                .map_or(env.admitted_batch_size, |selected| {
+                    selected.hints.admitted_batch_size
+                }),
+            training_io_profile: training_io
+                .as_ref()
+                .map(|selected| selected.profile.clone()),
             // Durable resume (Phase D): the stage's cache key is its stable
             // per-config fingerprint — a resume train stage keys its recovery
             // dir on it so a re-run with identical args finds the checkpoint.
@@ -1375,7 +1936,7 @@ async fn run_node_with_admission(
         } else {
             owned_admission = Some(
                 acquire_admission(
-                    &AdmissionRequest::for_task(&task, env.memory_budget_gib),
+                    &AdmissionRequest::for_task(&task, &env).map_err(NodeFailure::Other)?,
                     &env,
                     idx,
                     &stage_name,
@@ -1811,6 +2372,10 @@ async fn prepare_speculative(
     let input_hash = task.input_hash;
     let canon_args = task.canon_args.clone();
     let key = task.key;
+    let training_io = canonical_env.training_io_node(node_id);
+    let training_io_profile = training_io
+        .as_ref()
+        .map(|selected| selected.profile.clone());
     let scratch_stage_dir = scratch_root
         .join("stages")
         .join(format!("{node_idx}-{stage_name}"));
@@ -1857,6 +2422,8 @@ async fn prepare_speculative(
         fb_warm: canonical_env.fb_warm,
         admitted_workers: canonical_env.admitted_workers,
         admitted_batch_size: canonical_env.admitted_batch_size,
+        training_io_profiles: std::sync::RwLock::new(canonical_env.training_io_snapshot()),
+        training_io_resolver: canonical_env.training_io_resolver.clone(),
         bypass_cache: true,
         recipe_name: canonical_env.recipe_name.clone(),
         on_retry: None,
@@ -1866,7 +2433,7 @@ async fn prepare_speculative(
         #[cfg(feature = "p2p")]
         dispatcher: None,
     });
-    let request = AdmissionRequest::for_task(&task, canonical_env.memory_budget_gib);
+    let request = AdmissionRequest::for_task(&task, &canonical_env).map_err(NodeFailure::Other)?;
     let mut admission = FusionAdmission {
         request,
         lease: Some(lease),
@@ -1919,7 +2486,8 @@ async fn prepare_speculative(
             elapsed = stage_elapsed;
         }
     }
-    let buffered_steps = drain_speculative_steps(&mut live_rx);
+    let pre_step_lifecycle_count = 1 + usize::from(training_io_profile.is_some());
+    let buffered_steps = drain_speculative_steps(&mut live_rx, pre_step_lifecycle_count);
 
     Ok(SpeculativePrepared {
         _scratch: scratch,
@@ -1933,6 +2501,7 @@ async fn prepare_speculative(
         key,
         output: outcome.output,
         elapsed,
+        training_io_profile,
         buffered_steps,
     })
 }
@@ -1941,26 +2510,23 @@ async fn prepare_speculative(
 /// into silent truncation. The replay reserves canonical broadcast slots for
 /// Begin, one exact Gap marker, and End so this synchronous burst cannot itself
 /// overwrite retained steps before the status writer gets polled.
-fn drain_speculative_steps(rx: &mut broadcast::Receiver<StageEvent>) -> Vec<StageEvent> {
+fn drain_speculative_steps(
+    rx: &mut broadcast::Receiver<StageEvent>,
+    pre_step_lifecycle_count: usize,
+) -> Vec<StageEvent> {
     let mut steps = VecDeque::new();
     let mut dropped_steps = 0u64;
-    let mut saw_lag = false;
+    let mut remaining_pre_step_lifecycle = pre_step_lifecycle_count as u64;
     loop {
         match rx.try_recv() {
             Ok(event @ StageEvent::StageStep { .. }) => steps.push_back(event),
-            Ok(_) => {}
+            Ok(_) => {
+                remaining_pre_step_lifecycle = remaining_pre_step_lifecycle.saturating_sub(1);
+            }
             Err(broadcast::error::TryRecvError::Lagged(dropped)) => {
-                // A successful one-attempt private run emits exactly one
-                // lifecycle message before its steps (`StageBegin`). If the
-                // stopped producer overflowed, that oldest message is included
-                // in Tokio's lag count but is not a dropped StageStep.
-                let dropped = if saw_lag {
-                    dropped
-                } else {
-                    saw_lag = true;
-                    dropped.saturating_sub(1)
-                };
-                dropped_steps = dropped_steps.saturating_add(dropped);
+                let lifecycle = dropped.min(remaining_pre_step_lifecycle);
+                remaining_pre_step_lifecycle -= lifecycle;
+                dropped_steps = dropped_steps.saturating_add(dropped - lifecycle);
             }
             Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
                 break;
@@ -1968,10 +2534,12 @@ fn drain_speculative_steps(rx: &mut broadcast::Receiver<StageEvent>) -> Vec<Stag
         }
     }
 
-    let max_without_gap = DEFAULT_BROADCAST_CAPACITY.saturating_sub(2);
+    // Canonical replay emits every pre-step lifecycle record plus StageEnd.
+    let lifecycle_replay_count = pre_step_lifecycle_count.saturating_add(1);
+    let max_without_gap = DEFAULT_BROADCAST_CAPACITY.saturating_sub(lifecycle_replay_count);
     let needs_gap = dropped_steps > 0 || steps.len() > max_without_gap;
     let max_steps = if needs_gap {
-        DEFAULT_BROADCAST_CAPACITY.saturating_sub(3)
+        DEFAULT_BROADCAST_CAPACITY.saturating_sub(lifecycle_replay_count.saturating_add(1))
     } else {
         max_without_gap
     };
@@ -2165,6 +2733,13 @@ fn publish_speculative_inner(
     // filesystem/cache operation that can unwind has completed. The rollback
     // guard removes the renamed directory on any earlier panic/error, so a
     // failed publication cannot strand an orphan StageBegin.
+    if let Some(profile) = prepared.training_io_profile.clone() {
+        env.status.emit(StageEvent::StageIoConfigured {
+            node_idx: idx,
+            stage_name: stage_name.clone(),
+            profile,
+        });
+    }
     env.status.emit(StageEvent::StageBegin {
         node_idx: idx,
         stage_name: stage_name.clone(),
@@ -2580,16 +3155,33 @@ fn next_ready(
     })
 }
 
+/// Distinguishes a best-effort malformed HPO delta from a fail-closed
+/// training-I/O admission refusal.
+enum SpawnInjectionError {
+    Structural(PlanError),
+    TrainingIo(PlanError),
+}
+
+impl std::fmt::Display for SpawnInjectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Structural(error) | Self::TrainingIo(error) => error.fmt(formatter),
+        }
+    }
+}
+
 /// Inject a `Spawn` delta into the running parallel schedule (v0.20). The
 /// sub-plan's local node ids `0..k` are relabelled to globals `base + l`
 /// (`base = orig_n + appended.len()`), its nodes moved into `appended`, its
 /// edges/in-degrees/successors/topo-order extended, its graph-inputs seeded as
 /// root outputs, and its roots inserted into `ready`. Returns the count
-/// injected. Errors only if the sub-plan is cyclic/empty (caller logs + skips).
+/// injected. Structural HPO errors remain best-effort; training-I/O admission
+/// errors are distinguished so the caller can fail closed before a child runs.
 #[allow(clippy::too_many_arguments)]
 fn inject_spawn(
     delta: crate::framework::control::SpawnDelta,
     inherited_partition: Option<blut_types::partition::PartitionKey>,
+    env: &NodeEnv,
     orig_n: usize,
     appended: &mut Vec<crate::framework::plan::PlanNode>,
     all_edges: &mut Vec<crate::framework::plan::PlanEdge>,
@@ -2600,7 +3192,7 @@ fn inject_spawn(
     ready: &mut BTreeSet<NodeId>,
     outputs: &mut HashMap<NodeId, ErasedArtifact>,
     logical_outputs: &mut HashMap<NodeId, ContentHash>,
-) -> Result<usize, PlanError> {
+) -> Result<usize, SpawnInjectionError> {
     use crate::framework::plan::PlanEdge;
     let crate::framework::control::SpawnDelta {
         mut subplan,
@@ -2614,10 +3206,28 @@ fn inject_spawn(
         subplan = subplan.with_partition(partition);
     }
     // Local topo order (also the cycle/empty check) BEFORE we mutate anything.
-    let local_order = subplan.topo_order()?;
+    let local_order = subplan
+        .topo_order()
+        .map_err(SpawnInjectionError::Structural)?;
     let base = (orig_n + appended.len()) as NodeId;
-    let (nodes, edges, initial) = subplan.into_parts()?;
+    // Resolve every declaring node from the SAME immutable launch witness as
+    // the static plan. This happens before any structural mutation or ready-set
+    // insertion, so a missing/oversized child profile fails closed rather than
+    // running without its retained-byte bill.
+    let local_profiles = env
+        .training_io_resolver
+        .resolve_injected_plan(&subplan)
+        .map_err(SpawnInjectionError::TrainingIo)?;
+    let (nodes, edges, initial) = subplan
+        .into_parts()
+        .map_err(SpawnInjectionError::Structural)?;
     let k = nodes.len();
+    env.install_training_io_profiles(
+        local_profiles
+            .into_iter()
+            .map(|(local_id, selected)| (base + local_id, selected)),
+    )
+    .map_err(SpawnInjectionError::TrainingIo)?;
 
     // Move nodes in LOCAL-ID ORDER so `appended[base - orig_n + l].id == base + l`
     // — the invariant `node_at` relies on. (Compiled sub-plans have node.id == its
@@ -2702,14 +3312,14 @@ fn plan_error_of(f: NodeFailure) -> PlanError {
     }
 }
 
-/// Shared coordinator setup: validate, spawn the status writer, persist
-/// args.json, and seed the initial outputs. CONSUMES `ctx`, MOVING the
+/// Shared coordinator setup: validate and persist every fallible static input,
+/// then spawn the status writer and seed the initial outputs. CONSUMES `ctx`, MOVING the
 /// `StatusHub` into the one `NodeEnv` — when the last `Arc<NodeEnv>`
 /// drops, the hub (and its lifecycle Sender) drop, the writer's
 /// lifecycle channel closes, and the writer exits. The lossless
 /// lifecycle receiver is handed to the writer here.
 struct Prelude {
-    writer_handle: tokio::task::JoinHandle<()>,
+    writer_handle: tokio::task::JoinHandle<std::io::Result<()>>,
     env: Arc<NodeEnv>,
     outputs: HashMap<NodeId, ErasedArtifact>,
     logical_outputs: HashMap<NodeId, ContentHash>,
@@ -2721,14 +3331,6 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
         "ExecCtx must declare resource semaphores"
     );
     std::fs::create_dir_all(&ctx.job_dir)?;
-    // Hand the writer the lossless lifecycle receiver + a broadcast
-    // subscription (taken inside spawn_status_writer).
-    let lifecycle_rx = ctx
-        .lifecycle_rx
-        .take()
-        .ok_or_else(|| PlanError::Other("ExecCtx.lifecycle_rx already consumed".into()))?;
-    let writer_handle = spawn_status_writer(&ctx.status, lifecycle_rx, &ctx.job_dir)?;
-
     let view = plan.exec_view();
     let args_path = ctx.job_dir.join("args.json");
     let args_body = serde_json::to_vec_pretty(view.recipe_args)
@@ -2742,6 +3344,51 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
         outputs.insert(*id, art.clone());
         logical_outputs.insert(*id, lh);
     }
+
+    let training_io_resolver = ctx.training_io_resolver.take().ok_or_else(|| {
+        PlanError::Other("prepared execution is missing its training I/O resolver witness".into())
+    })?;
+    let mut training_io_node_hints = std::mem::take(&mut ctx.training_io_node_hints);
+    let mut training_io_profiles = HashMap::with_capacity(ctx.training_io_profiles.len());
+    for (node_id, profile) in std::mem::take(&mut ctx.training_io_profiles) {
+        let hints = training_io_node_hints.remove(&node_id).ok_or_else(|| {
+            PlanError::Other(format!(
+                "training I/O profile for node {node_id} is missing its resolved launch hints"
+            ))
+        })?;
+        training_io_profiles.insert(node_id, ResolvedTrainingIoNode { profile, hints });
+    }
+    if let Some(node_id) = training_io_node_hints.keys().next() {
+        return Err(PlanError::Other(format!(
+            "training I/O launch hints for node {node_id} have no resolved profile"
+        )));
+    }
+
+    // Only after every fallible setup step above succeeds do we hand the
+    // lifecycle receiver to a spawned writer. An args/provenance failure can
+    // therefore never detach a writer whose eventual error no caller awaits.
+    let lifecycle_rx = ctx
+        .lifecycle_rx
+        .take()
+        .ok_or_else(|| PlanError::Other("ExecCtx.lifecycle_rx already consumed".into()))?;
+    #[cfg(test)]
+    let writer_handle = if let Some(kind) = ctx.status_writer_failure.take() {
+        if let Some(started) = ctx.status_writer_started.take() {
+            started.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        tokio::spawn(async move {
+            let mut lifecycle_rx = lifecycle_rx;
+            while lifecycle_rx.recv().await.is_some() {}
+            Err(std::io::Error::new(
+                kind,
+                "injected lifecycle persistence failure",
+            ))
+        })
+    } else {
+        spawn_status_writer_checked(&ctx.status, lifecycle_rx, &ctx.job_dir)?
+    };
+    #[cfg(not(test))]
+    let writer_handle = spawn_status_writer_checked(&ctx.status, lifecycle_rx, &ctx.job_dir)?;
 
     // MOVE ctx's fields into env — the hub Arc lives only here now.
     let env = Arc::new(NodeEnv {
@@ -2759,6 +3406,8 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
         fb_warm: ctx.fb_warm,
         admitted_workers: ctx.admitted_workers,
         admitted_batch_size: ctx.admitted_batch_size,
+        training_io_profiles: std::sync::RwLock::new(training_io_profiles),
+        training_io_resolver,
         bypass_cache: ctx.bypass_cache,
         recipe_name: plan.name().to_string(),
         on_retry: ctx.on_retry,
@@ -2781,9 +3430,37 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
 /// await the writer to flush the tail events. The caller MUST have
 /// dropped every other `Arc<NodeEnv>` first (the parallel JoinSet must
 /// be fully drained), or this hangs.
-async fn finish_writer(env: Arc<NodeEnv>, writer_handle: tokio::task::JoinHandle<()>) {
+async fn finish_writer(
+    env: Arc<NodeEnv>,
+    writer_handle: tokio::task::JoinHandle<std::io::Result<()>>,
+) -> Result<(), PlanError> {
     drop(env);
-    let _ = writer_handle.await;
+    await_status_writer(writer_handle).await
+}
+
+async fn finish_writer_after_error(
+    env: Arc<NodeEnv>,
+    writer_handle: tokio::task::JoinHandle<std::io::Result<()>>,
+    primary: PlanError,
+) -> PlanError {
+    match finish_writer(env, writer_handle).await {
+        Ok(()) => primary,
+        Err(status_error) => PlanError::Other(format!("{primary}; additionally, {status_error}")),
+    }
+}
+
+async fn await_status_writer(
+    writer_handle: tokio::task::JoinHandle<std::io::Result<()>>,
+) -> Result<(), PlanError> {
+    match writer_handle.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(PlanError::Other(format!(
+            "status lifecycle persistence failed: {error}"
+        ))),
+        Err(error) => Err(PlanError::Other(format!(
+            "status lifecycle writer task failed: {error}"
+        ))),
+    }
 }
 
 /// Dispatch a plan to the configured executor. Default is
@@ -2791,30 +3468,25 @@ async fn finish_writer(env: Arc<NodeEnv>, writer_handle: tokio::task::JoinHandle
 /// path); set `BLUT_EXECUTOR=parallel` to opt into [`ParallelExecutor`].
 /// One seam so the CLI/TUI launch sites don't each branch on the env.
 pub async fn execute_plan(plan: CompiledPlan, mut ctx: ExecCtx) -> Result<PlanResult, PlanError> {
-    // #4: `BLUT_KILL_ON_NAN=1` wires the built-in KillOnNaN policy (unless a
-    // caller already set one). Runtime control needs the live step watcher,
-    // which only the PARALLEL executor runs — so a policy forces parallel.
-    if ctx.control.is_none()
-        && std::env::var("BLUT_KILL_ON_NAN")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    {
-        ctx = ctx.with_control(Arc::new(crate::framework::control::KillOnNaN));
-    }
-    // Runtime `map_output` fan-out (ADR 0078) is injected on the parallel
-    // executor's completion seam (the sequential executor has no dynamic-spawn
-    // machinery), so a plan with expansions forces parallel — just as a
-    // control policy does.
-    let parallel = ctx.control.is_some()
-        || plan.has_condition_gates()
-        || !plan.expansions().is_empty()
-        || std::env::var("BLUT_EXECUTOR")
-            .map(|v| v.eq_ignore_ascii_case("parallel"))
-            .unwrap_or(false);
-    if parallel {
-        ParallelExecutor::execute(plan, ctx).await
+    let plan = if ctx.prepared_execution.is_some() {
+        plan
     } else {
-        SequentialExecutor::execute(plan, ctx).await
+        prepare_plan_for_execution(plan, &mut ctx)?
+    };
+    execute_prepared_plan(plan, ctx).await
+}
+
+async fn execute_prepared_plan(plan: CompiledPlan, ctx: ExecCtx) -> Result<PlanResult, PlanError> {
+    let mode = ctx
+        .prepared_execution
+        .as_ref()
+        .map(|prepared| prepared.mode)
+        .ok_or_else(|| {
+            PlanError::Other("executor received a plan without a preparation witness".into())
+        })?;
+    match mode {
+        PreparedExecutorMode::Sequential => SequentialExecutor::execute_prepared(plan, ctx).await,
+        PreparedExecutorMode::Parallel => ParallelExecutor::execute_prepared(plan, ctx).await,
     }
 }
 
@@ -2826,14 +3498,21 @@ pub struct SequentialExecutor;
 
 impl SequentialExecutor {
     /// Execute the plan to completion, one stage at a time.
-    pub async fn execute(plan: CompiledPlan, ctx: ExecCtx) -> Result<PlanResult, PlanError> {
-        // Conditional control is implemented on the parallel coordinator's
-        // ready-set seam. Keep this public entry point semantically safe for
-        // direct callers instead of letting the sequential topo walk execute a
-        // losing branch.
-        if plan.has_condition_gates() {
-            return ParallelExecutor::execute(plan, ctx).await;
-        }
+    pub async fn execute(plan: CompiledPlan, mut ctx: ExecCtx) -> Result<PlanResult, PlanError> {
+        let plan = if ctx.prepared_execution.is_some() {
+            plan
+        } else {
+            prepare_plan_for_requested_executor(plan, &mut ctx, PreparedExecutorMode::Sequential)?
+        };
+        execute_prepared_plan(plan, ctx).await
+    }
+
+    async fn execute_prepared(
+        plan: CompiledPlan,
+        mut ctx: ExecCtx,
+    ) -> Result<PlanResult, PlanError> {
+        let prepared = take_prepared_execution(&mut ctx, PreparedExecutorMode::Sequential)?;
+        debug_assert!(prepared.schedule_hints.is_empty());
         let started = Instant::now();
         let order = plan.topo_order()?;
         let view = plan.exec_view();
@@ -2860,10 +3539,10 @@ impl SequentialExecutor {
             if let Some(dl) = deadline {
                 if Instant::now() >= dl {
                     env.cancel.cancel();
-                    finish_writer(env, writer_handle).await;
-                    return Err(PlanError::DeadlineExceeded {
+                    let error = PlanError::DeadlineExceeded {
                         elapsed: started.elapsed(),
-                    });
+                    };
+                    return Err(finish_writer_after_error(env, writer_handle, error).await);
                 }
             }
             if env.cancel.is_cancelled() {
@@ -2873,8 +3552,9 @@ impl SequentialExecutor {
                     error: "plan cancelled before stage".into(),
                     failure: None,
                 });
-                finish_writer(env, writer_handle).await;
-                return Err(PlanError::Cancelled);
+                return Err(
+                    finish_writer_after_error(env, writer_handle, PlanError::Cancelled).await,
+                );
             }
 
             let node = &view.nodes[*node_id as usize];
@@ -2892,8 +3572,7 @@ impl SequentialExecutor {
             ) {
                 Ok(t) => t,
                 Err(e) => {
-                    finish_writer(env, writer_handle).await;
-                    return Err(e);
+                    return Err(finish_writer_after_error(env, writer_handle, e).await);
                 }
             };
 
@@ -2928,8 +3607,8 @@ impl SequentialExecutor {
                             break;
                         }
                     }
-                    finish_writer(env, writer_handle).await;
-                    return Err(plan_error_of(f));
+                    let error = plan_error_of(f);
+                    return Err(finish_writer_after_error(env, writer_handle, error).await);
                 }
             }
         }
@@ -2942,7 +3621,7 @@ impl SequentialExecutor {
         } else {
             order.iter().rev().find_map(|id| outputs.remove(id))
         };
-        finish_writer(env, writer_handle).await;
+        finish_writer(env, writer_handle).await?;
 
         Ok(PlanResult {
             final_output,
@@ -2988,7 +3667,7 @@ fn internal_linear_fusion_groups(
 ) -> HashMap<NodeId, FusionGroup> {
     let request_for = |id: NodeId| {
         let node = &plan.nodes[id as usize];
-        AdmissionRequest::for_stage(node.stage.as_ref(), &node.args, memory_budget_gib)
+        AdmissionRequest::for_stage(node.stage.as_ref(), &node.args, memory_budget_gib, None).ok()
     };
     let static_ids: Vec<ContentHash> = plan
         .nodes
@@ -3021,7 +3700,7 @@ fn internal_linear_fusion_groups(
                     let identity = static_ids[*node_id as usize];
                     global_counts[&identity] > local_counts[&identity]
                 });
-                if !tail_can_collide {
+                if !tail_can_collide && let Some(admission) = admission {
                     groups.insert(
                         node_ids[0],
                         FusionGroup {
@@ -3080,16 +3759,14 @@ async fn execute_fused_linear_plan(
             error: "plan cancelled before stage".into(),
             failure: None,
         });
-        finish_writer(env, writer_handle).await;
-        return Err(PlanError::Cancelled);
+        return Err(finish_writer_after_error(env, writer_handle, PlanError::Cancelled).await);
     }
 
     for (idx, node_id) in order.iter().enumerate() {
         if let Some(error) = plan_stop_error(deadline, started, &env.cancel) {
             env.cancel.cancel();
             drop(admission);
-            finish_writer(env, writer_handle).await;
-            return Err(error);
+            return Err(finish_writer_after_error(env, writer_handle, error).await);
         }
         let node = &view.nodes[*node_id as usize];
         let task = match build_task(
@@ -3104,8 +3781,7 @@ async fn execute_fused_linear_plan(
             Err(error) => {
                 env.cancel.cancel();
                 drop(admission);
-                finish_writer(env, writer_handle).await;
-                return Err(error);
+                return Err(finish_writer_after_error(env, writer_handle, error).await);
             }
         };
         let fused_stage_name = task.stage.name();
@@ -3132,23 +3808,23 @@ async fn execute_fused_linear_plan(
             Ok(Err(failure)) => {
                 env.cancel.cancel();
                 drop(admission);
-                finish_writer(env, writer_handle).await;
-                return Err(plan_error_of(failure));
+                let error = plan_error_of(failure);
+                return Err(finish_writer_after_error(env, writer_handle, error).await);
             }
             Err(_) => {
                 env.cancel.cancel();
                 drop(admission);
-                finish_writer(env, writer_handle).await;
-                return Err(PlanError::Other(format!(
+                let error = PlanError::Other(format!(
                     "node task panicked in fused node {idx} ({fused_stage_name})"
-                )));
+                ));
+                return Err(finish_writer_after_error(env, writer_handle, error).await);
             }
         }
     }
 
     let final_output = order.last().and_then(|id| outputs.remove(id));
     drop(admission);
-    finish_writer(env, writer_handle).await;
+    finish_writer(env, writer_handle).await?;
     Ok(PlanResult {
         final_output,
         n_stages: order.len(),
@@ -3261,15 +3937,26 @@ impl ParallelExecutor {
     /// (so their FW-2 tmp cleanup runs), and returns the FIRST error —
     /// sibling `Cancelled` results never mask it. This keeps the two
     /// executors observably equivalent.
-    pub async fn execute(plan: CompiledPlan, ctx: ExecCtx) -> Result<PlanResult, PlanError> {
+    pub async fn execute(plan: CompiledPlan, mut ctx: ExecCtx) -> Result<PlanResult, PlanError> {
+        let plan = if ctx.prepared_execution.is_some() {
+            plan
+        } else {
+            prepare_plan_for_requested_executor(plan, &mut ctx, PreparedExecutorMode::Parallel)?
+        };
+        execute_prepared_plan(plan, ctx).await
+    }
+
+    async fn execute_prepared(
+        plan: CompiledPlan,
+        mut ctx: ExecCtx,
+    ) -> Result<PlanResult, PlanError> {
+        let prepared = take_prepared_execution(&mut ctx, PreparedExecutorMode::Parallel)?;
+        let mut schedule_hints = prepared.schedule_hints;
         let started = Instant::now();
 
-        // DAG optimization pass: dead code elimination, critical path
-        // scheduling, cache-aware ordering. Runs before topo_sort. The
-        // per-node `schedule_hints` drive ready-node priority in the spawn
-        // loop (longest critical path first); with no optimizer the map is
-        // empty and `next_ready` falls back to smallest-NodeId order, which
-        // is byte-identical to the historical `ready.iter().next()`.
+        // Static optimization and async-I/O profile selection already ran in
+        // the select-once preparation pass. The retained post-DCE hints drive
+        // ready-node priority; an empty map keeps historical NodeId ordering.
         // Cache warmth needs resolved predecessor hashes plus this run's
         // tenant-scoped CacheHandle, neither of which exists at static optimizer
         // time. Preserve the default-off flag for the ready-queue seam below.
@@ -3280,11 +3967,6 @@ impl ParallelExecutor {
         let stage_fusion = ctx.dag_optimizer.as_ref().is_some_and(|optimizer| {
             optimizer.stage_fusion && !optimizer.cache_aware && !optimizer.priority_aware
         });
-        let (plan, mut schedule_hints) = if let Some(ref optimizer) = ctx.dag_optimizer {
-            optimizer.optimize(plan)
-        } else {
-            (plan, std::collections::HashMap::new())
-        };
         let mut speculation_candidates: Vec<NodeId> = plan.speculation_candidates().collect();
         speculation_candidates.sort_unstable();
         let speculation_runtime_enabled = !speculation_candidates.is_empty()
@@ -3303,6 +3985,7 @@ impl ParallelExecutor {
         // fusion has no scheduling upside; fall back rather than weakening the
         // increment-2 slow-store deadline guarantee.
         if stage_fusion
+            && ctx.training_io_profiles.is_empty()
             && !has_condition_gates
             && !cache_aware
             && ctx.control.is_none()
@@ -3315,6 +3998,7 @@ impl ParallelExecutor {
         }
 
         let internal_fusion_groups = if stage_fusion
+            && ctx.training_io_profiles.is_empty()
             && !has_condition_gates
             && !cache_aware
             && ctx.control.is_none()
@@ -3508,8 +4192,7 @@ impl ParallelExecutor {
                 error: "plan cancelled before stage".into(),
                 failure: None,
             });
-            finish_writer(env, writer_handle).await;
-            return Err(PlanError::Cancelled);
+            return Err(finish_writer_after_error(env, writer_handle, PlanError::Cancelled).await);
         }
 
         loop {
@@ -3538,6 +4221,7 @@ impl ParallelExecutor {
                 // relative order within each group is preserved.
                 pending_spawns.sort_by_key(|d| d.provenance_parent.is_none());
                 for delta in pending_spawns.drain(..) {
+                    let map_spawn = delta.provenance_parent.is_some();
                     if spawns_total >= MAX_RUNTIME_SPAWNS {
                         // A map_output shard hitting the cap is a WRONG ANSWER
                         // (a dropped element), so fail the plan loudly — unlike
@@ -3568,6 +4252,7 @@ impl ParallelExecutor {
                     match inject_spawn(
                         delta,
                         inherited_partition,
+                        &env,
                         orig_n,
                         &mut appended,
                         &mut all_edges,
@@ -3580,7 +4265,28 @@ impl ParallelExecutor {
                         &mut logical_outputs,
                     ) {
                         Ok(k) => spawns_total += k,
-                        Err(e) => tracing::warn!("ignored malformed spawn delta: {e}"),
+                        Err(SpawnInjectionError::TrainingIo(error)) => {
+                            // A child profile/calibration refusal is an
+                            // admission failure, not a best-effort HPO shape
+                            // error. Succeeding after silently dropping that
+                            // trial would make the admitted search differ from
+                            // the executed search, so fail the plan before any
+                            // child node reaches the ready set.
+                            first_error = Some(error);
+                            env.cancel.cancel();
+                            break;
+                        }
+                        Err(SpawnInjectionError::Structural(error)) if map_spawn => {
+                            // A malformed map shard is a wrong answer (one list
+                            // element would disappear), so it is fatal just like
+                            // the map spawn-cap path above.
+                            first_error = Some(error);
+                            env.cancel.cancel();
+                            break;
+                        }
+                        Err(SpawnInjectionError::Structural(error)) => {
+                            tracing::warn!("ignored malformed spawn delta: {error}");
+                        }
                     }
                 }
             }
@@ -3740,9 +4446,14 @@ impl ParallelExecutor {
 
                     // P2P dispatch: a prepared cache hit is already complete
                     // locally and must reach `run_node`'s skip path. Only a
-                    // genuine miss may be offloaded to a peer.
+                    // genuine miss may be offloaded to a peer. A declaring
+                    // stage also stays local: DispatchRequest has no checked
+                    // TrainingIoProfile wire, so sending it would lose both the
+                    // selected bounded policy and its exact retained-byte bill.
+                    // The local path emits the profile losslessly before Begin.
                     #[cfg(feature = "p2p")]
                     if task.prepared_cache_hit.is_none()
+                        && env.training_io_node(task.node_id).is_none()
                         && let (Some(policy), Some(dispatcher)) =
                             (env.dispatch_policy.as_ref(), env.dispatcher.as_ref())
                     {
@@ -3988,10 +4699,16 @@ impl ParallelExecutor {
                         break;
                     }
                     if speculation_runtime_enabled {
-                        ordinary_admission_demands.insert(
-                            node_id,
-                            AdmissionRequest::for_task(&task, env.memory_budget_gib),
-                        );
+                        match AdmissionRequest::for_task(&task, &env) {
+                            Ok(request) => {
+                                ordinary_admission_demands.insert(node_id, request);
+                            }
+                            Err(error) => {
+                                first_error = Some(PlanError::Other(error));
+                                env.cancel.cancel();
+                                break;
+                            }
+                        }
                     }
                     if let Some(group) = internal_fusion_groups.get(&node_id).cloned() {
                         let remaining = group
@@ -4059,7 +4776,10 @@ impl ParallelExecutor {
                         }
                         Ok(task) => {
                             let key = task.key;
-                            let request = AdmissionRequest::for_task(&task, env.memory_budget_gib);
+                            let Ok(request) = AdmissionRequest::for_task(&task, &env) else {
+                                speculation.insert(target, SpeculationState::Declined);
+                                continue;
+                            };
                             if !admission_is_spare_after_ordinary(
                                 &request,
                                 &ordinary_admission_demands,
@@ -4899,8 +5619,7 @@ impl ParallelExecutor {
         }
 
         if let Some(err) = first_error {
-            finish_writer(env, writer_handle).await;
-            return Err(err);
+            return Err(finish_writer_after_error(env, writer_handle, err).await);
         }
 
         // On the success path every node is either completed OR pruned by a
@@ -4944,7 +5663,7 @@ impl ParallelExecutor {
         } else {
             order.iter().rev().find_map(|id| outputs.remove(id))
         };
-        finish_writer(env, writer_handle).await;
+        finish_writer(env, writer_handle).await?;
 
         Ok(PlanResult {
             final_output,

@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use blut_types::partition::{PartitionKey, PartitionValue};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 fn speculative_admission_fixture() -> (
     HashMap<Resource, Arc<tokio::sync::Semaphore>>,
@@ -128,6 +128,70 @@ fn speculative_admission_try_memory_contention_rolls_back_resources_and_gpu() {
             .is_some()
     );
     drop(held_memory);
+}
+
+#[test]
+fn speculative_admission_preserves_ordinary_heterogeneous_vram_device() {
+    let resources = HashMap::new();
+    let gpu = crate::broker::gpu::GpuScheduler::new(
+        crate::broker::gpu::GpuInventory::from_devices(vec![
+            crate::broker::gpu::GpuDevice {
+                index: 0,
+                uuid: "GPU-40G".into(),
+                vram_total_mib: 40_960,
+                vram_free_mib: 40_960,
+                model: "40 GiB fixture".into(),
+            },
+            crate::broker::gpu::GpuDevice {
+                index: 1,
+                uuid: "GPU-8G".into(),
+                vram_total_mib: 8_192,
+                vram_free_mib: 8_192,
+                model: "8 GiB fixture".into(),
+            },
+        ]),
+    );
+    let memory = Arc::new(tokio::sync::Semaphore::new(0));
+    let candidate = AdmissionRequest {
+        resources: Vec::new(),
+        gpu: Some(crate::broker::gpu::GpuRequest {
+            count: 1,
+            min_vram_mib: 0,
+            exclusive: true,
+        }),
+        memory_gib: 0,
+    };
+    let ordinary = AdmissionRequest {
+        resources: Vec::new(),
+        gpu: Some(crate::broker::gpu::GpuRequest {
+            count: 1,
+            min_vram_mib: 32_768,
+            exclusive: true,
+        }),
+        memory_gib: 0,
+    };
+    let ordinary_demands = HashMap::from([(7, ordinary.clone())]);
+
+    let speculative_lease =
+        admission_is_spare_after_ordinary(&candidate, &ordinary_demands, &resources, &gpu, &memory)
+            .then(|| try_acquire_admission_from(&candidate, &resources, &gpu, &memory))
+            .flatten();
+    assert!(
+        speculative_lease.is_none(),
+        "optional work must not seize the only device satisfying an ordinary request"
+    );
+
+    let ordinary_lease = try_acquire_admission_from(&ordinary, &resources, &gpu, &memory)
+        .expect("the ordinary request must acquire its qualifying device");
+    assert_eq!(
+        ordinary_lease
+            .gpu
+            .as_ref()
+            .expect("ordinary GPU request has a grant")
+            .devices,
+        vec![0],
+        "the 32 GiB ordinary request must receive the 40 GiB device"
+    );
 }
 
 // Toy artifacts.
@@ -3886,4 +3950,82 @@ async fn panicking_gpu_stage_is_reported_and_does_not_hang() {
         }
         other => panic!("expected PlanError::Other(\"node task panicked...\"), got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn checked_status_writer_failure_prevents_success() {
+    let handle = tokio::spawn(async {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "injected lifecycle persistence failure",
+        ))
+    });
+    let error = await_status_writer(handle)
+        .await
+        .expect_err("authoritative status persistence failure must be fatal on success");
+    assert!(
+        error
+            .to_string()
+            .contains("injected lifecycle persistence failure")
+    );
+}
+
+#[tokio::test]
+async fn status_writer_failure_is_aggregated_with_stage_failure() {
+    let _g = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_td, mut ctx) = fresh_ctx();
+    ctx.status_writer_failure = Some(std::io::ErrorKind::WriteZero);
+    let plan = Plan::<(), LamuTrainerBackend>::new("double_failure", serde_json::json!({}))
+        .start(AlwaysFail, EmptyArgs)
+        .finish()
+        .into_compiled();
+
+    let error = SequentialExecutor::execute(plan, ctx)
+        .await
+        .expect_err("both the stage and lifecycle writer fail");
+    let message = error.to_string();
+    assert!(
+        message.contains("forced failure"),
+        "primary failure was lost: {message}"
+    );
+    assert!(
+        message.contains("injected lifecycle persistence failure"),
+        "status persistence failure was lost: {message}"
+    );
+}
+
+#[tokio::test]
+async fn args_setup_failure_precedes_and_never_detaches_the_status_writer() {
+    let _g = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (td, mut ctx) = fresh_ctx();
+    std::fs::create_dir(td.path().join("args.json")).expect("plant args.json directory collision");
+    let writer_started = Arc::new(AtomicBool::new(false));
+    ctx.status_writer_failure = Some(std::io::ErrorKind::WriteZero);
+    ctx.status_writer_started = Some(writer_started.clone());
+    let plan = Plan::<(), LamuTrainerBackend>::new("setup_failure", serde_json::json!({}))
+        .start(MakeOne, EmptyArgs)
+        .finish()
+        .into_compiled();
+
+    let error = SequentialExecutor::execute(plan, ctx)
+        .await
+        .expect_err("args.json setup must fail before any lifecycle task exists");
+    assert!(
+        matches!(error, PlanError::Io(_)),
+        "the setup error remains primary and typed: {error}"
+    );
+    assert!(
+        !writer_started.load(Ordering::SeqCst),
+        "the injected failing writer must never be spawned or detached"
+    );
+    assert!(
+        !error
+            .to_string()
+            .contains("injected lifecycle persistence failure"),
+        "an unstarted writer cannot contribute a synthetic secondary error"
+    );
 }

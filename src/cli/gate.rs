@@ -95,16 +95,166 @@ pub(super) fn recipe_footprint_tuned(
     crate::broker::FootprintStore::load().resolve(&key, hint)
 }
 
+/// Synchronous/base half of a train-shaped footprint for ADR 0103 profiles.
+/// The selected profile separately bills worker process RSS and every retained
+/// async queue payload, so this intentionally evaluates the existing model at
+/// zero workers to avoid counting those bytes twice. Batch/model/tier/input
+/// terms remain in the base because they exist on the inline path too.
+pub(super) fn recipe_footprint_sync_base(
+    raw: &serde_json::Value,
+    batch: Option<u32>,
+    resolved_workers: u32,
+    resolved: crate::broker::Footprint,
+) -> crate::broker::Footprint {
+    if raw.is_null() || raw.as_object().is_some_and(|object| object.is_empty()) {
+        return crate::broker::Footprint {
+            ram_bytes: resolved.ram_bytes.max(2 * 1024 * 1024 * 1024),
+            vram_mib: resolved.vram_mib,
+        };
+    }
+    let mut drivers = crate::broker::Drivers::from_args_json(raw);
+    if let Some(batch) = batch {
+        drivers.batch = batch;
+    }
+    let formula_sync = crate::broker::footprint::estimate(
+        0,
+        drivers.batch,
+        drivers.tier,
+        drivers.latent,
+        drivers.warm,
+        drivers.in_ch,
+    );
+    let formula_with_workers = crate::broker::footprint::estimate(
+        resolved_workers,
+        drivers.batch,
+        drivers.tier,
+        drivers.latent,
+        drivers.warm,
+        drivers.in_ch,
+    );
+    let known_worker_term = formula_with_workers
+        .ram_bytes
+        .saturating_sub(formula_sync.ram_bytes);
+    // Preserve calibration/OOM-correction conservatively. Removing only the
+    // known formula worker term leaves every unexplained measured excess in
+    // the synchronous base; the profile then adds its explicit worker/queue
+    // terms without discarding a previously raised safety bound.
+    let resolved_minus_worker = resolved.ram_bytes.saturating_sub(known_worker_term);
+    crate::broker::Footprint {
+        ram_bytes: formula_sync.ram_bytes.max(resolved_minus_worker),
+        vram_mib: formula_sync.vram_mib.max(resolved.vram_mib),
+    }
+}
+
+pub(super) fn training_io_live_budget_bytes(
+    snapshot: &crate::broker::ResourceSnapshot,
+    launch_target: crate::config::launcher::LaunchTarget,
+) -> Option<u64> {
+    let snapshot_available = snapshot.mem_total_gb.is_finite()
+        && snapshot.mem_total_gb > 0.0
+        && snapshot.mem_avail_gb.is_finite()
+        && snapshot.mem_avail_gb > 0.0;
+    if !snapshot_available || launch_target != crate::config::launcher::LaunchTarget::Local {
+        return None;
+    }
+    let gib = crate::broker::footprint::GIB as f64;
+    let available_bytes = (snapshot.mem_avail_gb * gib) as u64;
+    let floor_bytes = (crate::broker::admission::DEFAULT_FLOOR_GIB * gib) as u64;
+    Some(available_bytes.saturating_sub(floor_bytes))
+}
+
+/// Resolve ADR 0103 profile admission from the same immutable snapshot and
+/// calibrated footprint used by the tenant gate. This is shared by fresh runs
+/// and resume so their downgrade/refusal behavior cannot drift.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn configure_training_io_admission(
+    label: &str,
+    plan: crate::framework::plan::CompiledPlan,
+    ctx: &mut crate::framework::ExecCtx,
+    raw: &serde_json::Value,
+    admitted_workers: Option<u32>,
+    admitted_batch_size: Option<u32>,
+    resolved_footprint: crate::broker::Footprint,
+    snapshot: &crate::broker::ResourceSnapshot,
+    launch_target: crate::config::launcher::LaunchTarget,
+) -> anyhow::Result<(
+    crate::framework::plan::CompiledPlan,
+    crate::broker::Footprint,
+)> {
+    use crate::framework::TrainingIoDowngradeReason;
+
+    // Fresh launch and resume must derive cache warmth from the same defaulted
+    // recipe args before candidates/base bytes are evaluated. Keeping this in
+    // their shared helper prevents resume from silently reverting to the cold
+    // profile for an otherwise identical recipe.
+    ctx.fb_warm = crate::broker::Drivers::from_args_json(raw).warm;
+    let live_budget_bytes = training_io_live_budget_bytes(snapshot, launch_target);
+    ctx.training_io_selection_budget_bytes = live_budget_bytes;
+    let downgrade_reason = if ctx.sync_io {
+        Some(TrainingIoDowngradeReason::UserForced)
+    } else if launch_target != crate::config::launcher::LaunchTarget::Local {
+        Some(TrainingIoDowngradeReason::UnsupportedLauncher)
+    } else if live_budget_bytes.is_none() {
+        Some(TrainingIoDowngradeReason::SnapshotUnavailable)
+    } else {
+        None
+    };
+    ctx.set_training_io_downgrade_reason(downgrade_reason);
+
+    let resolved_workers =
+        admitted_workers.unwrap_or_else(|| crate::broker::Drivers::from_args_json(raw).workers);
+    let sync_footprint = recipe_footprint_sync_base(
+        raw,
+        admitted_batch_size,
+        resolved_workers,
+        resolved_footprint,
+    );
+    // The production launch path deliberately supports one declaring stage,
+    // so its fastest-fit decision must use the WHOLE calibrated/OOM-corrected
+    // synchronous base that tenant admission and containment will enforce.
+    ctx.training_io_whole_job_base_bytes = Some(sync_footprint.ram_bytes);
+    let plan = crate::framework::executor::prepare_plan_for_execution(plan, ctx)
+        .map_err(|error| anyhow::anyhow!("{label} execution preparation: {error}"))?;
+    if ctx.training_io_profiles.len() > 1 {
+        return Err(anyhow::anyhow!(
+            "{label} declares async-I/O profiles on {} nodes; whole-job admission currently supports exactly one declaring training node",
+            ctx.training_io_profiles.len()
+        ));
+    }
+
+    let Some(profile) = ctx.training_io_profiles.values().next() else {
+        // The base override is unused when no stage opts into the profile seam;
+        // preserve the exact legacy footprint.
+        return Ok((plan, resolved_footprint));
+    };
+    if profile.sync_base_bytes < sync_footprint.ram_bytes {
+        return Err(anyhow::anyhow!(
+            "{label} selected profile base {} bytes is below calibrated floor {} bytes",
+            profile.sync_base_bytes,
+            sync_footprint.ram_bytes
+        ));
+    }
+    let mut admitted = sync_footprint;
+    admitted.ram_bytes = profile
+        .sync_base_bytes
+        .checked_add(profile.billed_overhead_bytes)
+        .ok_or_else(|| anyhow::anyhow!("{label} async-I/O whole-job footprint overflow"))?;
+    Ok((plan, admitted))
+}
+
 /// ADR 0071 A2: auto-tune the decode worker count to FIT-AND-SATURATE from a SINGLE
 /// memory snapshot. Returns `Some(W)` for a train-shaped recipe (so RESOLVE +
 /// RECORD share the cached count), or `None` for a light/arg-less recipe or when
 /// the mem probe is unavailable (keep the conservative cap = unchanged behaviour).
 /// Prints the `workers N→W` admission note when it changes the count.
-pub(super) fn admitted_workers_for(name: &str, raw: &serde_json::Value) -> Option<u32> {
+pub(super) fn admitted_workers_for(
+    name: &str,
+    raw: &serde_json::Value,
+    snap: &crate::broker::ResourceSnapshot,
+) -> Option<u32> {
     if raw.is_null() || raw.as_object().is_some_and(|o| o.is_empty()) {
         return None; // light recipe — no decode workers to tune
     }
-    let snap = crate::broker::ResourceSnapshot::probe();
     if snap.mem_total_gb <= 0.0 {
         return None; // no probe → leave the conservative cap
     }
@@ -150,11 +300,11 @@ pub(super) fn admitted_batch_size_for(
     name: &str,
     raw: &serde_json::Value,
     resolved_workers: u32,
+    snap: &crate::broker::ResourceSnapshot,
 ) -> Option<u32> {
     if raw.is_null() || raw.as_object().is_some_and(|o| o.is_empty()) {
         return None; // light recipe — no batch to tune
     }
-    let snap = crate::broker::ResourceSnapshot::probe();
     if snap.mem_total_gb <= 0.0 {
         return None; // no probe → leave the requested batch
     }
@@ -177,23 +327,6 @@ pub(super) fn admitted_batch_size_for(
     Some(b)
 }
 
-/// The box-fit RAM budget (GiB) for a scheduler / executor that runs cells
-/// concurrently. MIRRORS the executor's Phase-5 sizing (cli.rs `run_hpo` /
-/// `launch_compiled_plan`): `MemTotal − floor`, clamped `>= 1`. Box-fit TOTAL
-/// (minus the standard reserve), NOT live-free — the per-cell broker admission
-/// already nets out transient other-consumers via `MemAvailable`; this budget
-/// bounds the SUM of concurrently SCHEDULED cells to the box. A `0` total
-/// (non-Linux / sandbox where `/proc/meminfo` is unreadable) ⇒ `None`: caller
-/// degrades to the per-cell gate alone (the old behaviour), never a bogus cap.
-pub(super) fn scheduler_box_fit_budget_gib() -> Option<u32> {
-    let snap = crate::broker::ResourceSnapshot::probe();
-    if snap.mem_total_gb > 0.0 {
-        Some((snap.mem_total_gb - crate::broker::admission::DEFAULT_FLOOR_GIB).max(1.0) as u32)
-    } else {
-        None
-    }
-}
-
 /// Run one scheduled cell under a shared cross-cell RAM semaphore so the SUM of
 /// concurrently-running cells can't overcommit the box (never-OOM-the-BOX for
 /// the parallel partition backfill). MIRRORS the `ParallelExecutor`'s per-node
@@ -203,9 +336,9 @@ pub(super) fn scheduler_box_fit_budget_gib() -> Option<u32> {
 /// permit for the cell's ENTIRE run, and release it on drop AFTER `run`
 /// completes so the next queued cell can proceed.
 ///
-/// Defense-in-depth: this bounds the scheduled-cell SUM; the per-cell broker
-/// admission inside `launch_compiled_plan` still gates on LIVE free RAM
-/// (incl. non-scheduler consumers) — both stay in force.
+/// Defense-in-depth: this bounds the scheduled-cell SUM; each prepared launch
+/// still reserves its exact footprint through the same immutable
+/// [`crate::broker::tenant_quota::TenantAdmission`] — both stay in force.
 ///
 /// `budget_gib == 0` is treated as "no budget known" (the probe failed): run
 /// ungated, exactly as before this slice. A non-zero budget always admits at
@@ -261,6 +394,42 @@ pub(super) fn with_nan_safety(
 
 #[cfg(test)]
 mod footprint_resolve_tests {
+    use super::training_io_live_budget_bytes;
+
+    #[test]
+    fn async_profiles_require_local_launcher_and_available_snapshot() {
+        let available = crate::broker::ResourceSnapshot {
+            mem_total_gb: 64.0,
+            mem_avail_gb: 32.0,
+            ..Default::default()
+        };
+        assert!(
+            training_io_live_budget_bytes(&available, crate::config::launcher::LaunchTarget::Local)
+                .is_some()
+        );
+        assert!(
+            training_io_live_budget_bytes(&available, crate::config::launcher::LaunchTarget::Slurm)
+                .is_none(),
+            "remote retained-memory/cgroup contract is not proven"
+        );
+        assert!(
+            training_io_live_budget_bytes(
+                &crate::broker::ResourceSnapshot::default(),
+                crate::config::launcher::LaunchTarget::Local
+            )
+            .is_none()
+        );
+        let unknown = crate::broker::ResourceSnapshot {
+            mem_total_gb: f64::NAN,
+            mem_avail_gb: f64::NAN,
+            ..Default::default()
+        };
+        assert!(
+            training_io_live_budget_bytes(&unknown, crate::config::launcher::LaunchTarget::Local)
+                .is_none()
+        );
+    }
+
     /// RESOLVE-side cost-driver extraction for `lamquant_joint_codec`
     /// DEFAULTS (`tier`/`batch_size` absent) — the over-refuse target the
     /// slice fixes. The tuple here MUST equal the RECORD-side

@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use blut::framework::artifact::{Artifact, BranchDecision, ContentHash};
+use blut::framework::async_io::{IoMode, TrainingIoCandidate, TrainingIoHints};
 use blut::framework::cache::{CacheHandle, CacheProof};
 use blut::framework::cookbook::{Cookbook, Registry};
 use blut::framework::dag_opt::DagOptimizer;
@@ -55,6 +56,7 @@ struct ProbeSignals {
     hold_target: AtomicBool,
     panic_first_target: AtomicBool,
     seal_target_scratch: AtomicBool,
+    profile_target: AtomicBool,
     target_steps: AtomicUsize,
 }
 
@@ -73,6 +75,7 @@ impl ProbeSignals {
             hold_target: AtomicBool::new(false),
             panic_first_target: AtomicBool::new(false),
             seal_target_scratch: AtomicBool::new(false),
+            profile_target: AtomicBool::new(false),
             target_steps: AtomicUsize::new(1),
         })
     }
@@ -312,6 +315,47 @@ impl Stage for ProbeGuardedStage {
     type Input = TestValue;
     type Output = TestValue;
     type Args = GuardArgs;
+
+    fn training_io_sync_base_bytes(&self, _args: &Self::Args, _hints: TrainingIoHints) -> u64 {
+        1
+    }
+
+    fn training_io_candidates(
+        &self,
+        _args: &Self::Args,
+        _hints: TrainingIoHints,
+    ) -> Vec<TrainingIoCandidate> {
+        if !probe_signals().profile_target.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+        vec![
+            TrainingIoCandidate {
+                data_replicas: 1,
+                decode_workers: 1,
+                prefetch_per_worker: 1,
+                cuda_staging_slots: 1,
+                metrics: IoMode::Bounded {
+                    capacity: 1,
+                    max_item_bytes: 1,
+                },
+                checkpoints: IoMode::Inline,
+                batch_bytes: Some(1),
+                checkpoint_snapshot_bytes: Some(0),
+                fixed_overhead_bytes: Some(1),
+            },
+            TrainingIoCandidate {
+                data_replicas: 1,
+                decode_workers: 0,
+                prefetch_per_worker: 0,
+                cuda_staging_slots: 0,
+                metrics: IoMode::Inline,
+                checkpoints: IoMode::Inline,
+                batch_bytes: Some(0),
+                checkpoint_snapshot_bytes: Some(0),
+                fixed_overhead_bytes: Some(0),
+            },
+        ]
+    }
 
     async fn run(
         &self,
@@ -713,7 +757,10 @@ fn materializes_stage(event: &StageEvent, expected: &str) -> bool {
         | StageEvent::StageBlocked { stage_name, .. }
         | StageEvent::StageStep { stage_name, .. }
         | StageEvent::StageRetrying { stage_name, .. } => stage_name == expected,
-        StageEvent::StagePruned { .. } | StageEvent::StepGap { .. } => false,
+        StageEvent::StageIoConfigured { .. }
+        | StageEvent::StagePruned { .. }
+        | StageEvent::StepGap { .. } => false,
+        _ => false,
     }
 }
 
@@ -1518,6 +1565,7 @@ async fn selected_running_speculation_does_not_publish_after_plan_deadline() {
 async fn selected_speculation_replays_step_gap_after_private_overflow() {
     let _guard = SPECULATION_TEST_LOCK.lock().await;
     let signals = ProbeSignals::new();
+    signals.profile_target.store(true, Ordering::SeqCst);
     signals.target_steps.store(5_000, Ordering::SeqCst);
     install_probe_signals(signals.clone());
     let temp = tempfile::tempdir().expect("speculative step overflow tempdir");
@@ -1526,7 +1574,7 @@ async fn selected_speculation_replays_step_gap_after_private_overflow() {
         speculation_spec(true)
             .compile(&registry())
             .expect("compile speculative step overflow plan"),
-        speculation_ctx(job_dir.clone(), true),
+        speculation_ctx(job_dir.clone(), true).with_training_io_selection_budget_bytes(1024 * 1024),
     ));
 
     take_signal(&signals.decision_started).await;
@@ -1540,7 +1588,36 @@ async fn selected_speculation_replays_step_gap_after_private_overflow() {
         .expect("selected overflow plan succeeds");
 
     let events = status_events(&job_dir);
-    let expected_retained = DEFAULT_BROADCAST_CAPACITY - 3;
+    let configured: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event {
+            StageEvent::StageIoConfigured {
+                stage_name,
+                profile,
+                ..
+            } if stage_name == PROBE_GUARDED_STAGE => Some((index, profile)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        configured.len(),
+        1,
+        "selected speculation replays one profile"
+    );
+    assert!(matches!(configured[0].1.metrics, IoMode::Bounded { .. }));
+    let begin_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                StageEvent::StageBegin { stage_name, .. } if stage_name == PROBE_GUARDED_STAGE
+            )
+        })
+        .expect("selected speculation replays StageBegin");
+    assert!(configured[0].0 < begin_index);
+
+    let expected_retained = DEFAULT_BROADCAST_CAPACITY - 4;
     let expected_dropped = 5_000 - expected_retained;
     assert!(
         events

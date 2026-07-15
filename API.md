@@ -48,10 +48,11 @@ BLUT-owned widgets.
 | `framework::artifact::{Artifact, ArtifactMetadata, ContentHash}` | typed handle to on-disk bytes, content-hashed |
 | `framework::plan::{Plan, CompiledPlan, NodeId, PlanError}` | the typed DAG builder (`.start().then().finish().into_compiled()`) |
 | `framework::executor::{ExecCtx, SequentialExecutor, ParallelExecutor, PlanResult, execute_plan}` | run a `CompiledPlan` with per-`Resource` + memory-admission semaphores |
+| `framework::async_io::{TrainingIoCandidate, TrainingIoHints, TrainingIoProfile, IoMode}` | checked, execution-only retained-I/O admission selected once before execution |
 | `framework::cache::{CacheHandle, CacheHit, lru_prune}` | `(stage, schema, input_hash, args_hash)` → output |
 | `framework::resource::Resource` | `Gpu \| Cpu \| Network \| Disk` capacity declarations |
 | `framework::retry::{RetryPolicy, Backoff, RetryOn, StageTimeout, RetryHook}` | per-stage retry / timeout / backoff |
-| `framework::status::{StatusHub, StageEvent, make_broadcast, spawn_status_writer}` | the `status.jsonl` event stream |
+| `framework::status::{StatusHub, StageEvent, make_broadcast, spawn_status_writer, spawn_status_writer_checked}` | the `status.jsonl` event stream; the checked writer surfaces flush failures |
 | `framework::cookbook::{Cookbook, Registry, StageDescriptor, ArtifactDescriptor}` | the domain-pack seam |
 | `framework::graph::{PlanGraph, GraphSnapshot, NodeStatus, graph_snapshot}` | DAG inspection |
 
@@ -64,6 +65,25 @@ that owns a child process should declare `Subprocess`. Internal fusion requires
 `InProcess` in addition to the existing determinism, advisory, resource, and
 typed-handoff checks. The engine never infers this property from a stage name,
 arguments, or a cookbook's UI implementation.
+
+Stages may declare async-I/O candidates through
+`Stage::training_io_candidates(args, hints)` and an exact synchronous envelope
+through `Stage::training_io_sync_base_bytes(args, hints)`. Parallel execution
+runs the built-in DAG optimizer first, then calls each surviving stage's
+candidate method exactly once and stores the selected `TrainingIoProfile` on
+that node's `StageContext::training_io_profile`. The profile is execution-only:
+it does not enter args, schemas, cache keys, logical hashes, or artifacts.
+Direct framework callers without an explicit local selection-budget snapshot,
+and callers using an unsupported remote launcher, receive the declared Inline
+tail with a distinct downgrade reason.
+
+A declaring cache miss emits lossless `StageEvent::StageIoConfigured` before
+its canonical `StageBegin`; selected speculative work replays the same order.
+`StageContext` and `StageEvent` are non-exhaustive so additive execution fields
+and lifecycle records do not force source changes in cookbook implementations.
+The original `spawn_status_writer` signature remains available; executor code
+uses `spawn_status_writer_checked` so persistence failure is part of the plan
+result, including when it must be aggregated with an existing stage failure.
 
 ## Recipes (`recipes/`) — the named catalog
 
@@ -326,5 +346,5 @@ entirely through the intended `cli::run` entry — the `View`/drawer internals a
 not a public contract); the `Slurm` / `Ray` launchers (deferred); the
 `broker::Drivers` footprint-driver shape (a planned post-1.0 refactor moves its
 domain-specific arg parsing into cookbooks — additive, but the `Drivers` fields
-may change). Treat anything not listed under "Preview surface" as subject to
-change.
+may change); and the non-exhaustive async-I/O profile and status-event variants.
+Treat anything not listed under "Preview surface" as subject to change.

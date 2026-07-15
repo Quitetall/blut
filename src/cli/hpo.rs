@@ -72,6 +72,10 @@ pub(super) enum HpoCommand {
         /// Placement: local (default) | slurm | ray (per-trial; see `recipe run`).
         #[arg(long, default_value = "local")]
         launcher: String,
+        /// Force every declaring training stage onto its explicit Inline I/O
+        /// profile. This is execution-only and does not change trial/cache identity.
+        #[arg(long, default_value_t = false)]
+        sync_io: bool,
         /// Tenant (`project[/domain]`, ADR 0096) that owns this HPO job, cache,
         /// lineage row, and RAM sub-envelope.
         #[arg(long, default_value = "default")]
@@ -100,6 +104,247 @@ pub(super) enum HpoCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HpoTrialAdmission {
+    resolved_footprint: crate::broker::Footprint,
+    sync_footprint: crate::broker::Footprint,
+    node: crate::framework::executor::TrainingIoNodeAdmission,
+}
+
+/// Resolve one trial's launch facts from the HPO job's immutable tenant
+/// snapshot. This is also the callback body retained for runtime PBT/TPE
+/// children, so fresh and injected trials cannot drift or re-probe.
+fn hpo_trial_admission(
+    recipe: &str,
+    recipe_args: &serde_json::Value,
+    snapshot: &crate::broker::ResourceSnapshot,
+) -> HpoTrialAdmission {
+    let admitted_workers = admitted_workers_for(recipe, recipe_args, snapshot);
+    let admitted_batch_size = admitted_workers
+        .and_then(|workers| admitted_batch_size_for(recipe, recipe_args, workers, snapshot));
+    let resolved_footprint = match admitted_workers {
+        Some(workers) => recipe_footprint_tuned(recipe, recipe_args, workers, admitted_batch_size),
+        None => recipe_footprint(recipe, recipe_args),
+    };
+    let resolved_workers = admitted_workers
+        .unwrap_or_else(|| crate::broker::Drivers::from_args_json(recipe_args).workers);
+    let sync_footprint = recipe_footprint_sync_base(
+        recipe_args,
+        admitted_batch_size,
+        resolved_workers,
+        resolved_footprint,
+    );
+    HpoTrialAdmission {
+        resolved_footprint,
+        sync_footprint,
+        node: crate::framework::executor::TrainingIoNodeAdmission {
+            admitted_decode_workers: admitted_workers,
+            admitted_batch_size,
+            cache_warm: crate::broker::Drivers::from_args_json(recipe_args).warm,
+            calibrated_base_floor_bytes: Some(sync_footprint.ram_bytes),
+            selection_budget_bytes: None,
+        },
+    }
+}
+
+fn hpo_trial_recipe_args(
+    plan: &crate::framework::plan::CompiledPlan,
+    trials: &[crate::hpo::TrialPlan],
+) -> anyhow::Result<Vec<std::sync::Arc<serde_json::Value>>> {
+    let nodes = plan.exec_view().nodes;
+    trials
+        .iter()
+        .map(|trial| {
+            nodes
+                .get(trial.node_offset as usize)
+                .and_then(|node| node.admission_scope_args.clone())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "HPO trial {} has no component admission provenance",
+                        trial.trial_id
+                    )
+                })
+        })
+        .collect()
+}
+
+fn hpo_trial_index(
+    node: &crate::framework::plan::PlanNode,
+    trial_recipe_args: &[std::sync::Arc<serde_json::Value>],
+) -> Option<usize> {
+    let admission_args = node.admission_scope_args.as_ref()?;
+    trial_recipe_args
+        .iter()
+        .position(|trial_args| std::sync::Arc::ptr_eq(trial_args, admission_args))
+}
+
+fn hpo_trial_of_topo(
+    plan: &crate::framework::plan::CompiledPlan,
+    trial_recipe_args: &[std::sync::Arc<serde_json::Value>],
+) -> anyhow::Result<Vec<Option<u32>>> {
+    let nodes = plan.exec_view().nodes;
+    plan.topo_order()
+        .map_err(|error| anyhow!("hpo plan topo order: {error}"))?
+        .into_iter()
+        .map(|node_id| {
+            let node = &nodes[node_id as usize];
+            let trial = hpo_trial_index(node, trial_recipe_args).ok_or_else(|| {
+                anyhow!(
+                    "optimized HPO node {} ({}) lost trial admission provenance",
+                    node.id,
+                    node.stage.name()
+                )
+            })?;
+            u32::try_from(trial)
+                .map(Some)
+                .map_err(|_| anyhow!("HPO trial index {trial} exceeds u32"))
+        })
+        .collect()
+}
+
+/// Reserve the worst exact selected trial envelope. The executor gates
+/// concurrency across trials, so HPO holds one whole-job tenant reservation;
+/// its size is the component-wise maximum of the independently selected trial
+/// envelopes. A trial with no declaring stage retains its exact legacy bill.
+fn hpo_selected_footprint(
+    plan: &crate::framework::plan::CompiledPlan,
+    trial_recipe_args: &[std::sync::Arc<serde_json::Value>],
+    trials: &[HpoTrialAdmission],
+    profiles: &std::collections::HashMap<
+        crate::framework::plan::NodeId,
+        crate::framework::TrainingIoProfile,
+    >,
+) -> anyhow::Result<crate::broker::Footprint> {
+    if trial_recipe_args.len() != trials.len() {
+        return Err(anyhow!(
+            "HPO admission bookkeeping mismatch: {} trial args, {} trial envelopes",
+            trial_recipe_args.len(),
+            trials.len()
+        ));
+    }
+    let nodes = plan.exec_view().nodes;
+    let mut selected_ram = vec![None::<u64>; trials.len()];
+    let mut declaring_nodes = vec![0usize; trials.len()];
+    for (&node_id, profile) in profiles {
+        let node = nodes
+            .get(node_id as usize)
+            .ok_or_else(|| anyhow!("selected HPO profile refers to missing node {node_id}"))?;
+        let trial = hpo_trial_index(node, trial_recipe_args).ok_or_else(|| {
+            anyhow!(
+                "selected HPO node {} ({}) has no trial admission provenance",
+                node.id,
+                node.stage.name()
+            )
+        })?;
+        declaring_nodes[trial] += 1;
+        if declaring_nodes[trial] > 1 {
+            return Err(anyhow!(
+                "HPO trial {trial} declares async-I/O profiles on more than one node; exact whole-trial admission currently supports one declaring training node"
+            ));
+        }
+        if profile.sync_base_bytes < trials[trial].sync_footprint.ram_bytes {
+            return Err(anyhow!(
+                "HPO trial {trial} selected profile base {} bytes is below calibrated floor {} bytes",
+                profile.sync_base_bytes,
+                trials[trial].sync_footprint.ram_bytes
+            ));
+        }
+        let exact = profile
+            .sync_base_bytes
+            .checked_add(profile.billed_overhead_bytes)
+            .ok_or_else(|| anyhow!("HPO trial {trial} async-I/O footprint overflow"))?;
+        selected_ram[trial] = Some(exact);
+    }
+
+    let mut worst = crate::broker::Footprint {
+        ram_bytes: 0,
+        vram_mib: 0,
+    };
+    for (trial, selected) in trials.iter().zip(selected_ram) {
+        worst.ram_bytes = worst
+            .ram_bytes
+            .max(selected.unwrap_or(trial.resolved_footprint.ram_bytes));
+        worst.vram_mib = worst.vram_mib.max(trial.resolved_footprint.vram_mib);
+    }
+    Ok(worst)
+}
+
+fn hpo_node_admission_resolver(
+    recipe: String,
+    snapshot: crate::broker::ResourceSnapshot,
+    initial: impl IntoIterator<Item = (std::sync::Arc<serde_json::Value>, HpoTrialAdmission)>,
+    dynamic_limit: std::sync::Arc<std::sync::OnceLock<crate::broker::Footprint>>,
+) -> anyhow::Result<crate::framework::executor::TrainingIoNodeAdmissionResolver> {
+    let mut initial_cache = std::collections::HashMap::new();
+    for (recipe_args, admission) in initial {
+        let key = crate::framework::CacheHandle::canonical_json_bytes(recipe_args.as_ref());
+        if let Some(previous) = initial_cache.insert(key, admission)
+            && previous != admission
+        {
+            return Err(anyhow!(
+                "identical defaulted HPO recipe args resolved to conflicting admission facts"
+            ));
+        }
+    }
+    let cache = std::sync::Arc::new(std::sync::Mutex::new(initial_cache));
+    Ok(std::sync::Arc::new(
+        move |_stage_name, _node_args, recipe_args| {
+            let key = crate::framework::CacheHandle::canonical_json_bytes(recipe_args);
+            let admission = if let Some(admission) = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&key)
+                .copied()
+            {
+                admission
+            } else {
+                let admission = hpo_trial_admission(&recipe, recipe_args, &snapshot);
+                let mut cached = cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *cached.entry(key).or_insert(admission)
+            };
+            constrain_dynamic_hpo_admission(admission, dynamic_limit.get()).map(Some)
+        },
+    ))
+}
+
+/// A runtime PBT/TPE child must fit inside the one immutable reservation held
+/// for this HPO job. Its synchronous/legacy envelope and known VRAM cannot
+/// exceed the initial worst trial, while profile selection receives the same
+/// RAM ceiling so retained async bytes downgrade to Inline or refuse.
+fn constrain_dynamic_hpo_admission(
+    admission: HpoTrialAdmission,
+    limit: Option<&crate::broker::Footprint>,
+) -> Result<crate::framework::executor::TrainingIoNodeAdmission, String> {
+    let mut node = admission.node;
+    let Some(limit) = limit else {
+        return Ok(node);
+    };
+    let required_ram = admission
+        .resolved_footprint
+        .ram_bytes
+        .max(admission.sync_footprint.ram_bytes);
+    if required_ram > limit.ram_bytes {
+        return Err(format!(
+            "runtime HPO child needs {required_ram} RAM bytes, above the held {}-byte tenant reservation",
+            limit.ram_bytes
+        ));
+    }
+    let required_vram = admission
+        .resolved_footprint
+        .vram_mib
+        .max(admission.sync_footprint.vram_mib);
+    if limit.vram_mib != 0 && required_vram > limit.vram_mib {
+        return Err(format!(
+            "runtime HPO child needs {required_vram} MiB VRAM, above the held {}-MiB reservation",
+            limit.vram_mib
+        ));
+    }
+    node.selection_budget_bytes = Some(limit.ram_bytes);
+    Ok(node)
 }
 
 pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()> {
@@ -131,6 +376,7 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
         percentile,
         shared_cache,
         launcher,
+        sync_io,
         tenant,
         experiment,
     } = cmd
@@ -216,67 +462,33 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
         plan.n_nodes()
     );
 
-    // Job + ExecCtx — mirror run_one_recipe (control=None for random search).
-    // Gate on the WORST-CASE trial footprint (max over the sampled overlays):
-    // if the search space tunes a memory driver (batch/tier), a trial's overlaid
-    // footprint can exceed the base, and admission must reflect that. (The
-    // executor's per-stage memory admission is the authoritative never-OOM gate
-    // across concurrent trials; this pre-run gate is the courtesy early-refuse.)
-    let footprint = trials
+    // `from_components` keeps each defaulted trial recipe args behind a private,
+    // admission-only Arc. The Arc identity survives optimization/DCE and remains
+    // distinct even when a sampler repeats an identical overlay.
+    let trial_recipe_args = hpo_trial_recipe_args(&plan, &trials)?;
+    let trial_admissions: Vec<_> = trial_recipe_args
         .iter()
-        .fold(recipe_footprint(&name, &base_args), |acc, t| {
-            let mut a = base_args.clone();
-            crate::hpo::apply_overlay(&mut a, &t.overlay);
-            let f = recipe_footprint(&name, &a);
-            if f.ram_bytes > acc.ram_bytes { f } else { acc }
-        });
+        .map(|args| hpo_trial_admission(&name, args, tenant_admission.snapshot()))
+        .collect();
+    let dynamic_admission_limit = std::sync::Arc::new(std::sync::OnceLock::new());
+    let node_admission = hpo_node_admission_resolver(
+        name.clone(),
+        tenant_admission.snapshot().clone(),
+        trial_recipe_args
+            .iter()
+            .cloned()
+            .zip(trial_admissions.iter().copied()),
+        std::sync::Arc::clone(&dynamic_admission_limit),
+    )?;
+
+    // Job + ExecCtx — mirror run_one_recipe while retaining one immutable HPO
+    // admission witness for both initial and runtime-injected trials.
     let job_id = crate::jobs::new_job_id();
-    let job_dir = crate::paths::job_dir(&job_id)?;
-    crate::jobs::write_tenant(&job_id, &tenant)?;
-    crate::jobs::write_experiment(&job_id, experiment.as_deref().unwrap_or(&name))?;
+    let job_dir = crate::paths::jobs_dir()?.join(&job_id);
     let mut ctx = ExecCtx::new(job_dir.clone());
     ctx = ctx.with_tenant(tenant.clone());
+    ctx = ctx.with_sync_io(sync_io);
 
-    // Trial→topo map, computed ONCE: the executor emits a StageStep's topo
-    // `node_idx`, and both the early-stop scheduler (below) and `blut hpo
-    // show/best` (post-hoc, from status.jsonl) attribute it to a trial via this
-    // map. Written into `<job_dir>/hpo.json` for EVERY algo (random included),
-    // so the leaderboard reconstructs without a DB.
-    let n_nodes = plan.n_nodes() as u32;
-    let offsets: Vec<crate::framework::plan::NodeId> =
-        trials.iter().map(|t| t.node_offset).collect();
-    let topo = plan
-        .topo_order()
-        .map_err(|e| anyhow!("hpo plan topo order: {e}"))?;
-    let trial_of_topo = crate::hpo::build_trial_of_topo(&topo, &offsets, n_nodes);
-    {
-        use crate::hpo::{HpoManifest, TrialRec};
-        let recs: Vec<TrialRec> = trials
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let lo = offsets[i];
-                let hi = offsets.get(i + 1).copied().unwrap_or(n_nodes);
-                TrialRec {
-                    trial_id: t.trial_id,
-                    overlay: t.overlay.clone(),
-                    n_nodes: hi - lo,
-                }
-            })
-            .collect();
-        let manifest = HpoManifest {
-            recipe: name.to_string(),
-            algo: algo.clone(),
-            metric: metric.clone(),
-            mode: mode.clone(),
-            budget_key: metric_budget_key.clone(),
-            trials: recs,
-            trial_of_topo: trial_of_topo.clone(),
-        };
-        manifest
-            .write_to(&job_dir)
-            .with_context(|| format!("write hpo manifest for {job_id}"))?;
-    }
     if let Some(budget) = tenant_admission
         .executor_budget_gib(crate::broker::admission::DEFAULT_FLOOR_GIB)
         .map_err(|e| anyhow!("tenant admission: {e}"))?
@@ -285,6 +497,12 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
     }
     ctx = ctx.with_launch_target(launch_target);
     ctx = ctx.with_fb_warm(crate::broker::Drivers::from_args_json(&base_args).warm);
+    if let Some(budget_bytes) =
+        training_io_live_budget_bytes(tenant_admission.snapshot(), launch_target)
+    {
+        ctx = ctx.with_training_io_selection_budget_bytes(budget_bytes);
+    }
+    ctx = ctx.with_training_io_node_admission_resolver(node_admission);
     if shared_cache {
         if let Some(global) = crate::framework::CacheHandle::default_global_path() {
             std::fs::create_dir_all(&global)
@@ -296,6 +514,57 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
             ctx.cache = std::sync::Arc::new(cache_handle);
         }
     }
+
+    // Force the HPO fan-out through the parallel optimizer, then select every
+    // initial declaring node exactly once in the post-DCE id space. The normal
+    // execute entry point consumes this private witness and cannot prepare a
+    // second time.
+    let plan = crate::framework::executor::prepare_plan_for_parallel_execution(plan, &mut ctx)
+        .map_err(|error| anyhow!("hpo '{name}' execution preparation: {error}"))?;
+    let footprint = hpo_selected_footprint(
+        &plan,
+        &trial_recipe_args,
+        &trial_admissions,
+        &ctx.training_io_profiles,
+    )?;
+    dynamic_admission_limit
+        .set(footprint)
+        .map_err(|_| anyhow!("HPO dynamic admission limit was already initialized"))?;
+
+    // Trial→topo is derived only after optimization because lifecycle node_idx
+    // is a post-DCE topo position. Arc provenance keeps repeated overlays
+    // distinct without putting trial identity into cache keys.
+    let trial_of_topo = hpo_trial_of_topo(&plan, &trial_recipe_args)?;
+    let hpo_manifest = {
+        use crate::hpo::{HpoManifest, TrialRec};
+        let mut nodes_per_trial = vec![0u32; trials.len()];
+        for trial in trial_of_topo.iter().flatten() {
+            let count = nodes_per_trial
+                .get_mut(*trial as usize)
+                .ok_or_else(|| anyhow!("optimized HPO topo refers to unknown trial {trial}"))?;
+            *count = count
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("HPO trial {trial} node count overflow"))?;
+        }
+        let recs: Vec<TrialRec> = trials
+            .iter()
+            .enumerate()
+            .map(|(i, trial)| TrialRec {
+                trial_id: trial.trial_id,
+                overlay: trial.overlay.clone(),
+                n_nodes: nodes_per_trial[i],
+            })
+            .collect();
+        HpoManifest {
+            recipe: name.to_string(),
+            algo: algo.clone(),
+            metric: metric.clone(),
+            mode: mode.clone(),
+            budget_key: metric_budget_key.clone(),
+            trials: recs,
+            trial_of_topo: trial_of_topo.clone(),
+        }
+    };
 
     // Early-stop scheduler. The scheduler maps each StageStep's topo node_idx ->
     // trial, reads the objective + budget, and KillBranch-es underperformers:
@@ -461,6 +730,19 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
             "hpo: tpe (metric={metric} {mode}, complete@{max_budget}, ≤{max_trials} suggested)"
         );
     }
+
+    // Preparation and algorithm validation above are side-effect free with
+    // respect to the job registry. Materialize only when this launch is ready
+    // to enter the same reservation/lock/execution path as a prepared recipe.
+    let materialized_job_dir = crate::paths::job_dir(&job_id)?;
+    debug_assert_eq!(materialized_job_dir, job_dir);
+    crate::jobs::write_tenant(&job_id, &tenant)
+        .with_context(|| format!("persist tenant for {job_id}"))?;
+    crate::jobs::write_experiment(&job_id, experiment.as_deref().unwrap_or(&name))
+        .with_context(|| format!("persist experiment for {job_id}"))?;
+    hpo_manifest
+        .write_to(&job_dir)
+        .with_context(|| format!("write hpo manifest for {job_id}"))?;
 
     RecipeMarker {
         name: name.to_string(),
@@ -639,4 +921,381 @@ pub(super) fn run_hpo_best(job: Option<String>, json: bool) -> Result<()> {
             .unwrap_or_else(|_| "{}".into())
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod hpo_run_flag_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use clap::Parser;
+    use schemars::JsonSchema;
+    use serde::{Deserialize, Serialize};
+
+    use super::{
+        Cli, Command, HpoCommand, HpoTrialAdmission, constrain_dynamic_hpo_admission,
+        hpo_node_admission_resolver, hpo_selected_footprint, hpo_trial_of_topo,
+        hpo_trial_recipe_args,
+    };
+    use crate::broker::Footprint;
+    use crate::framework::artifact::{Artifact, ContentHash};
+    use crate::framework::async_io::{
+        IoMode, TrainingIoCandidate, TrainingIoDowngradeReason, TrainingIoHints,
+    };
+    use crate::framework::error::StageError;
+    use crate::framework::executor::{
+        ExecCtx, TrainingIoNodeAdmission, prepare_plan_for_parallel_execution,
+    };
+    use crate::framework::plan::CompiledPlan;
+    use crate::framework::resource::Resource;
+    use crate::framework::stage::{Stage, StageContext, StageDyn};
+    use crate::hpo::TrialPlan;
+
+    const GIB: u64 = crate::broker::footprint::GIB;
+    const MIB: u64 = 1024 * 1024;
+
+    #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+    struct AdmissionArgs {}
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct AdmissionValue;
+
+    impl Artifact for AdmissionValue {
+        const KIND: &'static str = "hpo-admission-value";
+        const SCHEMA: u32 = 1;
+
+        fn content_hash(&self) -> ContentHash {
+            ContentHash::of_bytes(Self::KIND.as_bytes())
+        }
+
+        fn primary_path(&self) -> &Path {
+            Path::new("")
+        }
+    }
+
+    struct AdmissionStage;
+
+    #[async_trait]
+    impl Stage for AdmissionStage {
+        const NAME: &'static str = "hpo_admission_stage";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = ();
+        type Output = AdmissionValue;
+        type Args = AdmissionArgs;
+
+        fn training_io_sync_base_bytes(&self, _args: &Self::Args, hints: TrainingIoHints) -> u64 {
+            u64::from(hints.admitted_batch_size.unwrap_or(1)) * GIB
+        }
+
+        fn training_io_candidates(
+            &self,
+            _args: &Self::Args,
+            hints: TrainingIoHints,
+        ) -> Vec<TrainingIoCandidate> {
+            let batch_bytes = match hints.admitted_batch_size {
+                Some(2) => 512 * MIB,
+                _ => 256 * MIB,
+            };
+            vec![
+                TrainingIoCandidate {
+                    data_replicas: 1,
+                    decode_workers: 1,
+                    prefetch_per_worker: 1,
+                    cuda_staging_slots: 0,
+                    metrics: IoMode::Inline,
+                    checkpoints: IoMode::Inline,
+                    batch_bytes: Some(batch_bytes),
+                    checkpoint_snapshot_bytes: Some(0),
+                    fixed_overhead_bytes: Some(0),
+                },
+                TrainingIoCandidate {
+                    data_replicas: 1,
+                    decode_workers: 0,
+                    prefetch_per_worker: 0,
+                    cuda_staging_slots: 0,
+                    metrics: IoMode::Inline,
+                    checkpoints: IoMode::Inline,
+                    batch_bytes: Some(0),
+                    checkpoint_snapshot_bytes: Some(0),
+                    fixed_overhead_bytes: Some(0),
+                },
+            ]
+        }
+
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            _input: (),
+            _args: &AdmissionArgs,
+        ) -> Result<AdmissionValue, StageError> {
+            Ok(AdmissionValue)
+        }
+    }
+
+    fn component(recipe_args: serde_json::Value) -> CompiledPlan {
+        let stage: Arc<dyn StageDyn> = Arc::new(AdmissionStage);
+        CompiledPlan::from_erased_chain(
+            "hpo-admission-component",
+            recipe_args,
+            vec![(stage, serde_json::json!({}))],
+        )
+        .expect("compile HPO admission component")
+    }
+
+    fn merged_plan(recipe_args: [serde_json::Value; 2]) -> (CompiledPlan, Vec<TrialPlan>) {
+        let components = recipe_args.into_iter().map(component).collect();
+        let (plan, offsets) = CompiledPlan::from_components(
+            "hpo-admission".into(),
+            serde_json::json!({}),
+            components,
+        );
+        let trials = offsets
+            .into_iter()
+            .enumerate()
+            .map(|(trial, node_offset)| TrialPlan {
+                trial_id: trial as u32,
+                overlay: Vec::new(),
+                node_offset,
+            })
+            .collect();
+        (plan, trials)
+    }
+
+    fn nested_component(recipe_args: serde_json::Value, leaf: u32) -> CompiledPlan {
+        CompiledPlan::from_components(
+            "nested-hpo-component".into(),
+            recipe_args,
+            vec![
+                component(serde_json::json!({"leaf": leaf * 10})),
+                component(serde_json::json!({"leaf": leaf * 10 + 1})),
+            ],
+        )
+        .0
+    }
+
+    fn admission(batch: u32, vram_mib: u64) -> HpoTrialAdmission {
+        let sync_ram = u64::from(batch) * GIB;
+        HpoTrialAdmission {
+            resolved_footprint: Footprint {
+                ram_bytes: sync_ram,
+                vram_mib,
+            },
+            sync_footprint: Footprint {
+                ram_bytes: sync_ram,
+                vram_mib,
+            },
+            node: TrainingIoNodeAdmission {
+                admitted_decode_workers: Some(1),
+                admitted_batch_size: Some(batch),
+                cache_warm: false,
+                calibrated_base_floor_bytes: Some(sync_ram),
+                selection_budget_bytes: None,
+            },
+        }
+    }
+
+    fn sync_io_of(argv: &[&str]) -> bool {
+        match Cli::try_parse_from(argv).expect("parse").command {
+            Some(Command::Hpo {
+                cmd: HpoCommand::Run { sync_io, .. },
+            }) => sync_io,
+            other => panic!("expected hpo run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_io_is_explicit_and_defaults_false() {
+        assert!(!sync_io_of(&[
+            "blut",
+            "hpo",
+            "run",
+            "demo",
+            "--param",
+            "lr=choice(0.1,0.2)",
+        ]));
+        assert!(sync_io_of(&[
+            "blut",
+            "hpo",
+            "run",
+            "demo",
+            "--param",
+            "lr=choice(0.1,0.2)",
+            "--sync-io",
+        ]));
+    }
+
+    #[test]
+    fn repeated_trial_args_keep_distinct_admission_provenance() {
+        let repeated = serde_json::json!({"batch": 1});
+        let (plan, trials) = merged_plan([repeated.clone(), repeated]);
+        let trial_args = hpo_trial_recipe_args(&plan, &trials).expect("trial provenance");
+
+        assert_eq!(trial_args[0].as_ref(), trial_args[1].as_ref());
+        assert!(
+            !Arc::ptr_eq(&trial_args[0], &trial_args[1]),
+            "identical sampled overlays still identify distinct trials"
+        );
+        assert_eq!(
+            hpo_trial_of_topo(&plan, &trial_args).expect("trial topo"),
+            vec![Some(0), Some(1)]
+        );
+    }
+
+    #[test]
+    fn nested_trial_components_keep_the_outer_hpo_attribution() {
+        let outer_args = [
+            serde_json::json!({"trial": 1}),
+            serde_json::json!({"trial": 2}),
+        ];
+        let (plan, offsets) = CompiledPlan::from_components(
+            "nested-hpo".into(),
+            serde_json::json!({}),
+            vec![
+                nested_component(outer_args[0].clone(), 1),
+                nested_component(outer_args[1].clone(), 2),
+            ],
+        );
+        let trials: Vec<_> = offsets
+            .into_iter()
+            .enumerate()
+            .map(|(trial, node_offset)| TrialPlan {
+                trial_id: trial as u32,
+                overlay: Vec::new(),
+                node_offset,
+            })
+            .collect();
+        let trial_args = hpo_trial_recipe_args(&plan, &trials).expect("outer trial provenance");
+
+        assert_eq!(trial_args[0].as_ref(), &outer_args[0]);
+        assert_eq!(trial_args[1].as_ref(), &outer_args[1]);
+        assert_eq!(
+            hpo_trial_of_topo(&plan, &trial_args).expect("nested trial topo"),
+            vec![Some(0), Some(0), Some(1), Some(1)]
+        );
+        assert_eq!(
+            plan.exec_view().nodes[1]
+                .admission_recipe_args
+                .as_deref()
+                .expect("specific leaf provenance remains available"),
+            &serde_json::json!({"leaf": 11})
+        );
+    }
+
+    #[test]
+    fn hpo_profiles_bill_the_worst_exact_selected_trial() {
+        let (plan, trials) = merged_plan([
+            serde_json::json!({"batch": 1}),
+            serde_json::json!({"batch": 2}),
+        ]);
+        let trial_args = hpo_trial_recipe_args(&plan, &trials).expect("trial provenance");
+        let admissions = [admission(1, 1024), admission(2, 2048)];
+        let resolver = hpo_node_admission_resolver(
+            "hpo-admission".into(),
+            crate::broker::ResourceSnapshot::default(),
+            trial_args.iter().cloned().zip(admissions),
+            Arc::new(std::sync::OnceLock::new()),
+        )
+        .expect("node resolver");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut ctx = ExecCtx::new(PathBuf::from(temp.path()))
+            .with_memory_budget(4)
+            .with_training_io_selection_budget_bytes(4 * GIB)
+            .with_training_io_node_admission_resolver(resolver);
+
+        let plan = prepare_plan_for_parallel_execution(plan, &mut ctx).expect("prepare HPO plan");
+        assert_eq!(ctx.training_io_profiles.len(), 2);
+        assert_eq!(
+            hpo_trial_of_topo(&plan, &trial_args).expect("optimized trial topo"),
+            vec![Some(0), Some(1)]
+        );
+        let footprint =
+            hpo_selected_footprint(&plan, &trial_args, &admissions, &ctx.training_io_profiles)
+                .expect("exact selected footprint");
+        assert_eq!(footprint.ram_bytes, 2 * GIB + 512 * MIB);
+        assert_eq!(footprint.vram_mib, 2048);
+    }
+
+    #[test]
+    fn hpo_sync_io_selects_inline_and_bills_only_the_exact_base() {
+        let (plan, trials) = merged_plan([
+            serde_json::json!({"batch": 1}),
+            serde_json::json!({"batch": 2}),
+        ]);
+        let trial_args = hpo_trial_recipe_args(&plan, &trials).expect("trial provenance");
+        let admissions = [admission(1, 1024), admission(2, 2048)];
+        let resolver = hpo_node_admission_resolver(
+            "hpo-admission".into(),
+            crate::broker::ResourceSnapshot::default(),
+            trial_args.iter().cloned().zip(admissions),
+            Arc::new(std::sync::OnceLock::new()),
+        )
+        .expect("node resolver");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut ctx = ExecCtx::new(PathBuf::from(temp.path()))
+            .with_memory_budget(4)
+            .with_training_io_selection_budget_bytes(4 * GIB)
+            .with_sync_io(true)
+            .with_training_io_node_admission_resolver(resolver);
+
+        let plan = prepare_plan_for_parallel_execution(plan, &mut ctx).expect("prepare HPO plan");
+        assert_eq!(ctx.training_io_profiles.len(), 2);
+        assert!(ctx.training_io_profiles.values().all(|profile| {
+            profile.is_inline()
+                && profile.downgrade_reason == Some(TrainingIoDowngradeReason::UserForced)
+        }));
+        let footprint =
+            hpo_selected_footprint(&plan, &trial_args, &admissions, &ctx.training_io_profiles)
+                .expect("inline selected footprint");
+        assert_eq!(footprint.ram_bytes, 2 * GIB);
+        assert_eq!(footprint.vram_mib, 2048);
+    }
+
+    #[test]
+    fn dynamic_hpo_child_cannot_outgrow_the_held_reservation() {
+        let limit = Footprint {
+            ram_bytes: GIB + 128 * MIB,
+            vram_mib: 2048,
+        };
+        let constrained = constrain_dynamic_hpo_admission(admission(1, 1024), Some(&limit))
+            .expect("base fits held reservation");
+        assert_eq!(constrained.selection_budget_bytes, Some(limit.ram_bytes));
+        assert!(
+            constrain_dynamic_hpo_admission(admission(2, 1024), Some(&limit))
+                .expect_err("larger RAM child must fail closed")
+                .contains("above the held")
+        );
+        assert!(
+            constrain_dynamic_hpo_admission(admission(1, 4096), Some(&limit))
+                .expect_err("larger VRAM child must fail closed")
+                .contains("VRAM")
+        );
+
+        let resolver: crate::framework::executor::TrainingIoNodeAdmissionResolver =
+            Arc::new(move |_stage, _node_args, _recipe_args| {
+                constrain_dynamic_hpo_admission(admission(1, 1024), Some(&limit)).map(Some)
+            });
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut ctx = ExecCtx::new(PathBuf::from(temp.path()))
+            .with_memory_budget(4)
+            .with_training_io_selection_budget_bytes(4 * GIB)
+            .with_training_io_node_admission_resolver(resolver);
+        let _plan = prepare_plan_for_parallel_execution(
+            component(serde_json::json!({"batch": 1})),
+            &mut ctx,
+        )
+        .expect("bounded child downgrades inside held reservation");
+        let profile = ctx
+            .training_io_profiles
+            .values()
+            .next()
+            .expect("declaring child profile");
+        assert!(profile.is_inline());
+        assert_eq!(profile.sync_base_bytes, GIB);
+        assert_eq!(
+            profile.downgrade_reason,
+            Some(TrainingIoDowngradeReason::BudgetPressure)
+        );
+    }
 }

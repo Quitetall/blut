@@ -49,6 +49,10 @@ pub(super) enum RecipeCommand {
         /// runs even with a warm entry (only with `--run`). Alias: `--force`.
         #[arg(long = "no-cache", alias = "force", default_value_t = false)]
         no_cache: bool,
+        /// Force all declared async-I/O lanes onto their synchronous Inline
+        /// fallback (execution-only; cache identity is unchanged).
+        #[arg(long, default_value_t = false)]
+        sync_io: bool,
         /// Tenant to resolve a `registry://plan@<name>` deploy URI against and,
         /// with `--run`, to own the launched job (ADR 0085/0096).
         #[arg(long, default_value = "default")]
@@ -74,6 +78,10 @@ pub(super) enum RecipeCommand {
         /// recompute" A/B semantic, NOT a cache wipe. Alias: `--force`.
         #[arg(long = "no-cache", alias = "force", default_value_t = false)]
         no_cache: bool,
+        /// Force all declared async-I/O lanes onto their synchronous Inline
+        /// fallback (execution-only; cache identity is unchanged).
+        #[arg(long, default_value_t = false)]
+        sync_io: bool,
         /// Hydra-style config dir (enables config mode). The composed config's
         /// top-level keys must match the recipe's flat Args fields.
         #[arg(long)]
@@ -197,6 +205,7 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             run,
             shared_cache,
             no_cache,
+            sync_io,
             tenant,
             experiment,
         } => {
@@ -261,6 +270,7 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                             crate::config::launcher::LaunchTarget::Local,
                             None,
                             no_cache,
+                            sync_io,
                             tenant,
                             experiment,
                         )
@@ -278,6 +288,7 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             args,
             shared_cache,
             no_cache,
+            sync_io,
             config_dir,
             config_name,
             config_key,
@@ -328,6 +339,7 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                     shared_cache,
                     launch_target,
                     no_cache,
+                    sync_io,
                     tenant,
                     experiment,
                 )
@@ -373,6 +385,7 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                     launch_target,
                     None,
                     no_cache,
+                    sync_io,
                     tenant,
                     experiment,
                 )
@@ -403,6 +416,8 @@ pub(super) async fn run_one_recipe(
     // INC D (S4): force-recompute. `true` bypasses the stage cache READ so every
     // stage runs even with a warm entry (the fresh result is still cached).
     no_cache: bool,
+    // ADR 0103: force the explicit Inline I/O fallback.
+    sync_io: bool,
     // ADR 0096: the tenant whose namespace this run's shared cache lives under.
     tenant: crate::tenant::Tenant,
     // ADR 0090: explicit experiment/campaign key; recipe name when absent.
@@ -421,6 +436,7 @@ pub(super) async fn run_one_recipe(
         launch_target,
         device_index,
         no_cache,
+        sync_io,
         tenant,
         experiment,
         None,
@@ -433,6 +449,7 @@ pub(super) async fn run_one_recipe(
 /// typed partition key to every compiled node, and return the exact resolved
 /// args that the executor persisted for lineage indexing.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // retained as the single-cell convenience entry point
 pub(super) async fn run_one_partitioned_recipe(
     reg: &crate::framework::Registry,
     name: &str,
@@ -441,27 +458,117 @@ pub(super) async fn run_one_partitioned_recipe(
     launch_target: crate::config::launcher::LaunchTarget,
     device_index: Option<usize>,
     no_cache: bool,
+    sync_io: bool,
     tenant: crate::tenant::Tenant,
     partition: blut_types::partition::PartitionKey,
 ) -> Result<(String, serde_json::Value, String)> {
-    let resolved_args =
-        crate::registry_args::resolve_recipe_args(source_args.clone(), &tenant, launch_target)
-            .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
-    run_one_recipe_resolved(
+    let tenant_admission = std::sync::Arc::new(
+        crate::broker::tenant_quota::TenantAdmission::prepare(tenant.clone())
+            .map_err(|error| anyhow!("tenant admission: {error}"))?,
+    );
+    prepare_one_partitioned_recipe(
         reg,
         name,
         source_args,
-        resolved_args.clone(),
+        shared_cache,
+        launch_target,
+        device_index,
+        no_cache,
+        sync_io,
+        tenant,
+        partition,
+        tenant_admission,
+    )?
+    .execute()
+    .await
+}
+
+pub(super) struct PreparedPartitionedRecipeLaunch {
+    launch: PreparedRecipeLaunch,
+    persisted_args: serde_json::Value,
+    input_fingerprint: String,
+}
+
+impl PreparedPartitionedRecipeLaunch {
+    pub(super) fn footprint_gib(&self) -> u32 {
+        self.launch.footprint_gib()
+    }
+
+    #[cfg(test)]
+    pub(super) fn selected_training_io_profile(
+        &self,
+    ) -> Option<&crate::framework::TrainingIoProfile> {
+        self.launch.selected_training_io_profile()
+    }
+
+    pub(super) async fn execute(self) -> Result<(String, serde_json::Value, String)> {
+        let Self {
+            launch,
+            persisted_args,
+            input_fingerprint,
+        } = self;
+        launch
+            .execute()
+            .await
+            .map(|job_id| (job_id, persisted_args, input_fingerprint))
+    }
+}
+
+/// Resolve, compile, bind partition identity, and select async-I/O exactly
+/// once. The returned object owns both the exact billed footprint used by the
+/// outer backfill semaphore and the executor's private preparation witness.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_one_partitioned_recipe(
+    reg: &crate::framework::Registry,
+    name: &str,
+    source_args: serde_json::Value,
+    shared_cache: bool,
+    launch_target: crate::config::launcher::LaunchTarget,
+    device_index: Option<usize>,
+    no_cache: bool,
+    sync_io: bool,
+    tenant: crate::tenant::Tenant,
+    partition: blut_types::partition::PartitionKey,
+    tenant_admission: std::sync::Arc<crate::broker::tenant_quota::TenantAdmission>,
+) -> Result<PreparedPartitionedRecipeLaunch> {
+    let resolved_args =
+        crate::registry_args::resolve_recipe_args(source_args.clone(), &tenant, launch_target)
+            .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
+    let recipe = reg
+        .find(name)
+        .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+    let plan = (recipe.compile_fn)(resolved_args.clone())
+        .map_err(|error| anyhow!("recipe compile failed: {error}"))?
+        .with_partition(partition);
+    let persisted_args = plan.recipe_args().clone();
+    let input_fingerprint = crate::config::partition::partition_input_fingerprint_with_execution(
+        &source_args,
+        &persisted_args,
+        &plan.execution_fingerprint(),
+    );
+    let launch = prepare_compiled_plan_launch(
+        name,
+        plan,
+        Some(RecipeMarker {
+            name: name.to_string(),
+            args: resolved_args,
+            source_args: Some(source_args),
+        }),
         None,
         shared_cache,
         launch_target,
         device_index,
         no_cache,
+        sync_io,
         tenant,
         None,
-        Some(partition),
-    )
-    .await
+        tenant_admission,
+    )?;
+    Ok(PreparedPartitionedRecipeLaunch {
+        launch,
+        persisted_args,
+        input_fingerprint,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -475,6 +582,7 @@ async fn run_one_recipe_resolved(
     launch_target: crate::config::launcher::LaunchTarget,
     device_index: Option<usize>,
     no_cache: bool,
+    sync_io: bool,
     tenant: crate::tenant::Tenant,
     experiment: Option<String>,
     partition: Option<blut_types::partition::PartitionKey>,
@@ -509,6 +617,7 @@ async fn run_one_recipe_resolved(
         launch_target,
         device_index,
         no_cache,
+        sync_io,
         tenant,
         experiment,
     )
@@ -722,157 +831,92 @@ fn blut_dsl_binary() -> std::path::PathBuf {
 /// difference is `marker`: `Some` for a registry recipe (resumable by
 /// name+args), `None` for a declarative launch (no registry recipe to resume
 /// from, so no marker is written).
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn launch_compiled_plan(
-    name: &str,
+pub(super) struct PreparedRecipeLaunch {
+    name: String,
     plan: crate::framework::plan::CompiledPlan,
     marker: Option<RecipeMarker>,
     sweep_fp: Option<crate::framework::ContentHash>,
-    shared_cache: bool,
-    launch_target: crate::config::launcher::LaunchTarget,
-    device_index: Option<usize>,
-    no_cache: bool,
+    footprint: crate::broker::Footprint,
+    tenant_admission: std::sync::Arc<crate::broker::tenant_quota::TenantAdmission>,
     tenant: crate::tenant::Tenant,
     experiment: Option<String>,
-) -> Result<String> {
-    use crate::framework::ExecCtx;
+    job_id: String,
+    job_dir: std::path::PathBuf,
+    ctx: crate::framework::ExecCtx,
+    device_index: Option<usize>,
+}
 
-    // Validate quota configuration and resolve the tenant BEFORE creating any
-    // job state. This function is also called by declarative and sweep paths,
-    // so it is the authoritative enforcement seam even when a caller bypasses
-    // the `recipe run` command arm's earlier UX-oriented check.
-    let tenant_admission = crate::broker::tenant_quota::TenantAdmission::prepare(tenant.clone())
-        .map_err(|e| anyhow!("tenant admission: {e}"))?;
+impl PreparedRecipeLaunch {
+    /// Whole-GiB charge for outer schedulers. The exact prepared footprint
+    /// includes the selected async-I/O profile; saturation only affects values
+    /// too large for Tokio's `u32` semaphore API, which already run alone.
+    pub(super) fn footprint_gib(&self) -> u32 {
+        let gib = self
+            .footprint
+            .ram_bytes
+            .div_ceil(crate::broker::footprint::GIB);
+        u32::try_from(gib).unwrap_or(u32::MAX)
+    }
 
-    // ADR 0046 slice-1: resolve the RAM footprint from the recipe's DEFAULTED
-    // args (the plan re-serialized them with serde defaults applied) — NOT raw
-    // user args — so a defaulted driver like `warm_fb_cache` (Phase 3) and
-    // tier/batch are read IDENTICALLY to what the train stage records under
-    // (RECORD side), keeping the RESOLVE/RECORD calibration key in parity even
-    // when the user omitted the field.
-    // ADR 0071 A2: auto-tune decode workers to fit-AND-saturate (one knob fixes
-    // both the over-refuse and the GPU-starvation). Compute W from a SINGLE mem
-    // snapshot; the gate's footprint uses W, and W is cached on the ExecCtx below
-    // so the cookbook train stage (RECORD) launches exactly this count.
-    // E2: auto-tune batch size against the SAME snapshot, against the residual
-    // budget after W is fixed (extends the same knob to a second driver).
-    let admitted_workers = admitted_workers_for(name, plan.exec_view().recipe_args);
-    let admitted_batch_size = admitted_workers
-        .and_then(|w| admitted_batch_size_for(name, plan.exec_view().recipe_args, w));
-    let footprint = match admitted_workers {
-        Some(w) => {
-            recipe_footprint_tuned(name, plan.exec_view().recipe_args, w, admitted_batch_size)
+    #[cfg(test)]
+    pub(super) fn selected_training_io_profile(
+        &self,
+    ) -> Option<&crate::framework::TrainingIoProfile> {
+        self.ctx.training_io_profiles.values().next()
+    }
+
+    pub(super) async fn execute(self) -> Result<String> {
+        let Self {
+            name,
+            plan,
+            marker,
+            sweep_fp,
+            footprint,
+            tenant_admission,
+            tenant,
+            experiment,
+            job_id,
+            job_dir,
+            ctx,
+            device_index,
+        } = self;
+
+        // Preparation may wait behind an outer scheduler, so it must not leave
+        // an orphan job directory merely by computing an admission witness.
+        // Materialize persistent job state only once execution actually owns
+        // that scheduler permit.
+        let materialized_job_dir = crate::paths::job_dir(&job_id)?;
+        debug_assert_eq!(materialized_job_dir, job_dir);
+        crate::jobs::write_tenant(&job_id, &tenant)
+            .with_context(|| format!("persist tenant for {job_id}"))?;
+        crate::jobs::write_experiment(&job_id, experiment.as_deref().unwrap_or(&name))
+            .with_context(|| format!("persist experiment for {job_id}"))?;
+
+        // Mark recipe for plan resume — only for a registry recipe (a
+        // declarative `.toml` launch passes `None`: there is no registry recipe
+        // to re-compile from on resume, so writing a marker would be dangling).
+        if let Some(marker) = marker {
+            marker.write_to(&job_dir)?;
         }
-        None => recipe_footprint(name, plan.exec_view().recipe_args),
-    };
 
-    let job_id = crate::jobs::new_job_id();
-    let job_dir = crate::paths::job_dir(&job_id)?;
-    crate::jobs::write_tenant(&job_id, &tenant)
-        .with_context(|| format!("persist tenant for {job_id}"))?;
-    crate::jobs::write_experiment(&job_id, experiment.as_deref().unwrap_or(name))
-        .with_context(|| format!("persist experiment for {job_id}"))?;
-    let mut ctx = ExecCtx::new(job_dir.clone());
-    ctx = ctx.with_tenant(tenant.clone());
-    // Phase 5: size the executor's memory admission to box-fit (MemTotal −
-    // floor) so the parallel executor can't stack concurrent stages past the
-    // box. Sequential runs one stage at a time, so this is a no-op there.
-    if let Some(budget) = tenant_admission
-        .executor_budget_gib(crate::broker::admission::DEFAULT_FLOOR_GIB)
-        .map_err(|e| anyhow!("tenant admission: {e}"))?
-    {
-        // The executor semaphore is the tenant sub-envelope too. This is
-        // load-bearing for HPO/wide DAGs: one job may run many concurrent
-        // stages, but their summed declared RAM cannot exceed its share.
-        ctx = ctx.with_memory_budget(budget);
-    }
-    // #3 distributed: thread placement into the ExecCtx → every StageContext
-    // built by the executor carries it → a lamquant train stage routes to the
-    // cluster. `Local` (default) is a no-op vs the pre-launcher behaviour.
-    ctx = ctx.with_launch_target(launch_target);
-    // Phase-G scheduler: pin this run to a GPU device so the cookbook backend
-    // exports CUDA_VISIBLE_DEVICES for its trainer.
-    ctx = ctx.with_device_index(device_index);
-    // Single-job multi-GPU: size the GPU semaphore pool to the box's device
-    // count so a DDP stage can acquire `nproc` permits (and a single-GPU cell
-    // can't co-schedule onto a device the DDP job owns). On a 1-GPU box this is
-    // 1 → byte-identical to before. `capacity()` probes CUDA_VISIBLE_DEVICES /
-    // nvidia-smi for the local launcher; Slurm reports its --gpus allocation.
-    let gpu_pool = crate::config::launcher::launcher_for(launch_target).capacity();
-    // ADR 0087: size the GPU-aware scheduler. Prefer the live local inventory
-    // (VRAM-aware placement) when it covers the pool; otherwise (e.g. a Slurm
-    // submit node whose local GPU count is below the allocated `--gpus`) fall
-    // back to `gpu_pool` homogeneous cells so remote concurrency is preserved.
-    let gpu_inv = crate::broker::gpu::GpuInventory::probe();
-    let gpu_inv = if gpu_inv.len() >= gpu_pool.max(1) {
-        gpu_inv
-    } else {
-        crate::broker::gpu::GpuInventory::homogeneous(gpu_pool.max(1), 0)
-    };
-    ctx = ctx.with_gpu_scheduler(crate::broker::gpu::GpuScheduler::new(gpu_inv));
-    // Phase 3: thread the warm flag from the recipe's DEFAULTED args (the SAME
-    // source `recipe_footprint` reads above) into every StageContext, so a
-    // train stage's footprint RECORD keys identically to the admission RESOLVE.
-    // Carried on the context (not a stage Arg) so warm never enters the
-    // checkpoint cache key — a warm and a cold run share the trained output.
-    let fb_warm = crate::broker::Drivers::from_args_json(plan.exec_view().recipe_args).warm;
-    ctx = ctx.with_fb_warm(fb_warm);
-    // A2: cache the auto-tuned worker count on the ctx so the cookbook train stage
-    // launches exactly what admission sized (RESOLVE↔RECORD parity, never-OOM).
-    if let Some(w) = admitted_workers {
-        ctx = ctx.with_admitted_workers(w);
-    }
-    // E2: cache the auto-tuned batch size on the ctx so the cookbook train stage
-    // launches exactly what admission sized (RESOLVE↔RECORD parity, never-OOM).
-    if let Some(b) = admitted_batch_size {
-        ctx = ctx.with_admitted_batch_size(b);
-    }
-    // INC D (S4): `--no-cache`/`--force` bypasses the stage cache READ so every
-    // stage recomputes; the fresh result is still written to the cache.
-    ctx = ctx.with_bypass_cache(no_cache);
-    if shared_cache {
-        if let Some(global) = crate::framework::CacheHandle::default_global_path() {
-            // ADR 0096: namespace the shared cache by tenant (disjoint roots per
-            // tenant; the `default` tenant is the flat store, byte-identical).
-            let cache_handle = (*ctx.cache)
-                .clone()
-                .with_global(global)
-                .with_tenant(&tenant);
-            if let Some(g) = &cache_handle.global {
-                std::fs::create_dir_all(g)
-                    .with_context(|| format!("create global cache dir {}", g.display()))?;
-            }
-            ctx.cache = std::sync::Arc::new(cache_handle);
-        }
-    }
-    // Mark recipe for plan resume — only for a registry recipe (a declarative
-    // `.toml` launch passes `None`: there is no registry recipe to re-compile
-    // from on resume, so writing a marker would be a dangling resume oracle).
-    if let Some(m) = marker {
-        m.write_to(&job_dir)?;
-    }
+        crate::jobs::write_state(&job_id, JobState::Running)
+            .with_context(|| format!("write Running state for {job_id}"))?;
 
-    crate::jobs::write_state(&job_id, JobState::Running)
-        .with_context(|| format!("write Running state for {job_id}"))?;
+        // KILL-2/KILL-3: bind this job so backend spawns mirror the python
+        // child's PROCESS GROUP id into the job pid file (not blut's own pid).
+        crate::python_kill::bind_current_job(job_id.clone());
 
-    // KILL-2/KILL-3: bind this job so backend spawns mirror the python child's
-    // PROCESS GROUP id into the job pid file (not blut's own pid). A separate
-    // `blut cancel <id>` reads that pgid and killpg's the whole tree.
-    crate::python_kill::bind_current_job(job_id.clone());
+        // KILL-3: trap SIGTERM/ctrl-c. On signal, cancel the executor token AND
+        // killpg the live child group, then return so the scheduler lock drops.
+        install_cancel_handler(ctx.cancel.clone());
 
-    // KILL-3: trap SIGTERM/ctrl-c. On signal, cancel the executor token AND
-    // killpg the live child group, then let the function return so `lock`
-    // Drops (RAII unlocks the scheduler — fixes the stale-lock-on-SIGTERM case).
-    install_cancel_handler(ctx.cancel.clone());
-
-    // ADR 0046 slice-1 (item 4): RAM-refuse admission gate, BEFORE the lock.
-    // The lock already serializes blut-vs-blut GPU jobs (fail-fast), so this is
-    // a pure single-job over-subscription guard — if the conservative-high
-    // footprint can't fit free RAM, refuse CLEANLY: no launch, no transient
-    // unit, no OOM. Best-effort: args with no cost drivers fall back to the
-    // conservative default footprint, which still gates oversubscription.
-    let _tenant_reservation =
-        match tenant_admission.reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB) {
+        // This reservation consumes the same exact footprint and immutable
+        // TenantAdmission snapshot used during profile selection. In
+        // particular, a prepared partition cell cannot silently re-probe or
+        // resolve a second async-I/O candidate before execution.
+        let _tenant_reservation = match tenant_admission
+            .reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
+        {
             Ok(reservation) => reservation,
             Err(reason) => {
                 crate::python_kill::unbind_current_job();
@@ -883,82 +927,218 @@ pub(super) async fn launch_compiled_plan(
             }
         };
 
-    // Cross-process GPU arbitration — recipes that don't hit GPU still pay the
-    // (cheap) lock cost. Phase-G: a device-pinned run takes its PER-DEVICE
-    // lock, so cells on distinct GPUs run concurrently; an unpinned run keeps
-    // the box-wide lock (one GPU job at a time).
-    let holder = format!("blut-recipe:{job_id}");
-    let lock = match device_index {
-        Some(dev) => scheduler_lock::acquire_exclusive_device(dev, holder, LockKind::Training),
-        None => scheduler_lock::acquire_exclusive(holder, LockKind::Training),
-    };
-    let lock = match lock {
-        Ok(l) => l,
-        Err(e) => {
-            crate::python_kill::unbind_current_job();
-            if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                tracing::warn!("write Failed state for {job_id}: {se}");
-            }
-            return Err(anyhow!("acquire_exclusive: {e}"));
-        }
-    };
-
-    eprintln!("recipe {name}");
-    eprintln!("job    {job_id}");
-    eprintln!("dir    {}", job_dir.display());
-    eprintln!("lock   {}", lock.path().display());
-
-    persist_plan_graph(&plan, &job_dir);
-    let result = crate::framework::execute_plan(plan, ctx).await;
-    drop(lock);
-    crate::python_kill::unbind_current_job();
-    match result {
-        Ok(r) => {
-            crate::jobs::write_state(&job_id, JobState::Done)
-                .with_context(|| format!("write Done state for {job_id}"))?;
-            eprintln!(
-                "done — {} ingredients, {} cache hits, {} misses, elapsed {:?}",
-                r.n_stages, r.n_cache_hits, r.n_cache_misses, r.elapsed
-            );
-            // ADR 0071: advisory stages (e.g. a dry-run/verdict gate) failing do
-            // NOT fail the run — surface them as warnings so a good experiment is
-            // never mis-read as a failure, and point at the preserved output.
-            if !r.warnings.is_empty() {
-                eprintln!(
-                    "⚠ training OK — completed with {} advisory warning(s) (the run did NOT fail):",
-                    r.warnings.len()
-                );
-                for w in &r.warnings {
-                    eprintln!("    · {} (advisory, skipped): {}", w.stage, w.reason);
+        let holder = format!("blut-recipe:{job_id}");
+        let lock = match device_index {
+            Some(dev) => scheduler_lock::acquire_exclusive_device(dev, holder, LockKind::Training),
+            None => scheduler_lock::acquire_exclusive(holder, LockKind::Training),
+        };
+        let lock = match lock {
+            Ok(lock) => lock,
+            Err(error) => {
+                crate::python_kill::unbind_current_job();
+                if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
+                    tracing::warn!("write Failed state for {job_id}: {se}");
                 }
+                return Err(anyhow!("acquire_exclusive: {error}"));
+            }
+        };
+
+        eprintln!("recipe {name}");
+        eprintln!("job    {job_id}");
+        eprintln!("dir    {}", job_dir.display());
+        eprintln!("lock   {}", lock.path().display());
+
+        persist_plan_graph(&plan, &job_dir);
+        // `ctx` owns the private preparation witness, so `execute_plan`
+        // dispatches this exact post-DCE plan/profile without resolving again.
+        let result = crate::framework::execute_plan(plan, ctx).await;
+        drop(lock);
+        crate::python_kill::unbind_current_job();
+        match result {
+            Ok(result) => {
+                crate::jobs::write_state(&job_id, JobState::Done)
+                    .with_context(|| format!("write Done state for {job_id}"))?;
                 eprintln!(
-                    "  the trained output + metrics are preserved — `blut results {job_id}` / `blut lineage show {job_id}`."
+                    "done — {} ingredients, {} cache hits, {} misses, elapsed {:?}",
+                    result.n_stages, result.n_cache_hits, result.n_cache_misses, result.elapsed
                 );
+                if !result.warnings.is_empty() {
+                    eprintln!(
+                        "⚠ training OK — completed with {} advisory warning(s) (the run did NOT fail):",
+                        result.warnings.len()
+                    );
+                    for warning in &result.warnings {
+                        eprintln!(
+                            "    · {} (advisory, skipped): {}",
+                            warning.stage, warning.reason
+                        );
+                    }
+                    eprintln!(
+                        "  the trained output + metrics are preserved — `blut results {job_id}` / `blut lineage show {job_id}`."
+                    );
+                }
+                if let Some(fingerprint) = sweep_fp {
+                    record_sweep_completion(fingerprint, &job_id);
+                }
+                if let Err(error) = crate::lineage_db::ingest_job(&job_id, &name, "done") {
+                    tracing::warn!("lineage index {job_id}: {error}");
+                }
+                Ok(job_id)
             }
-            if let Some(fp) = sweep_fp {
-                record_sweep_completion(fp, &job_id);
+            Err(error) => {
+                if let Err(state_error) = crate::jobs::write_state(&job_id, JobState::Failed) {
+                    tracing::warn!("write Failed state for {job_id}: {state_error}");
+                }
+                if let Err(index_error) = crate::lineage_db::ingest_job(&job_id, &name, "failed") {
+                    tracing::debug!("lineage index (failed) {job_id}: {index_error}");
+                }
+                Err(anyhow::Error::from(error).context("plan execution failed"))
             }
-            // LineageDB index (fail-soft — the sidecars/status.jsonl are
-            // canonical, the DB is a rebuildable index; a failure must not fail
-            // a successful run).
-            if let Err(e) = crate::lineage_db::ingest_job(&job_id, name, "done") {
-                tracing::warn!("lineage index {job_id}: {e}");
-            }
-            Ok(job_id)
-        }
-        Err(e) => {
-            if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                tracing::warn!("write Failed state for {job_id}: {se}");
-            }
-            // Index the failure too (OOM/cache history) — best-effort.
-            if let Err(ie) = crate::lineage_db::ingest_job(&job_id, name, "failed") {
-                tracing::debug!("lineage index (failed) {job_id}: {ie}");
-            }
-            // See the `plan execution failed` site in `run_plan_cmd` — same
-            // chain-preservation rationale (ADR 0072 A2).
-            Err(anyhow::Error::from(e).context("plan execution failed"))
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_compiled_plan_launch(
+    name: &str,
+    plan: crate::framework::plan::CompiledPlan,
+    marker: Option<RecipeMarker>,
+    sweep_fp: Option<crate::framework::ContentHash>,
+    shared_cache: bool,
+    launch_target: crate::config::launcher::LaunchTarget,
+    device_index: Option<usize>,
+    no_cache: bool,
+    sync_io: bool,
+    tenant: crate::tenant::Tenant,
+    experiment: Option<String>,
+    tenant_admission: std::sync::Arc<crate::broker::tenant_quota::TenantAdmission>,
+) -> Result<PreparedRecipeLaunch> {
+    use crate::framework::ExecCtx;
+
+    let admission_snapshot = tenant_admission.snapshot();
+    let admitted_workers =
+        admitted_workers_for(name, plan.exec_view().recipe_args, admission_snapshot);
+    let admitted_batch_size = admitted_workers.and_then(|workers| {
+        admitted_batch_size_for(
+            name,
+            plan.exec_view().recipe_args,
+            workers,
+            admission_snapshot,
+        )
+    });
+    let footprint = match admitted_workers {
+        Some(workers) => recipe_footprint_tuned(
+            name,
+            plan.exec_view().recipe_args,
+            workers,
+            admitted_batch_size,
+        ),
+        None => recipe_footprint(name, plan.exec_view().recipe_args),
+    };
+
+    let job_id = crate::jobs::new_job_id();
+    let job_dir = crate::paths::jobs_dir()?.join(&job_id);
+    let mut ctx = ExecCtx::new(job_dir.clone())
+        .with_tenant(tenant.clone())
+        .with_sync_io(sync_io);
+    if let Some(budget) = tenant_admission
+        .executor_budget_gib(crate::broker::admission::DEFAULT_FLOOR_GIB)
+        .map_err(|error| anyhow!("tenant admission: {error}"))?
+    {
+        ctx = ctx.with_memory_budget(budget);
+    }
+    ctx = ctx
+        .with_launch_target(launch_target)
+        .with_device_index(device_index);
+    let gpu_pool = crate::config::launcher::launcher_for(launch_target).capacity();
+    let gpu_inventory = crate::broker::gpu::GpuInventory::probe();
+    let gpu_inventory = if gpu_inventory.len() >= gpu_pool.max(1) {
+        gpu_inventory
+    } else {
+        crate::broker::gpu::GpuInventory::homogeneous(gpu_pool.max(1), 0)
+    };
+    ctx = ctx.with_gpu_scheduler(crate::broker::gpu::GpuScheduler::new(gpu_inventory));
+    if let Some(workers) = admitted_workers {
+        ctx = ctx.with_admitted_workers(workers);
+    }
+    if let Some(batch_size) = admitted_batch_size {
+        ctx = ctx.with_admitted_batch_size(batch_size);
+    }
+    let plan_args = plan.exec_view().recipe_args.clone();
+    let (plan, footprint) = configure_training_io_admission(
+        &format!("recipe '{name}'"),
+        plan,
+        &mut ctx,
+        &plan_args,
+        admitted_workers,
+        admitted_batch_size,
+        footprint,
+        admission_snapshot,
+        launch_target,
+    )?;
+    ctx = ctx.with_bypass_cache(no_cache);
+    if shared_cache && let Some(global) = crate::framework::CacheHandle::default_global_path() {
+        let cache_handle = (*ctx.cache)
+            .clone()
+            .with_global(global)
+            .with_tenant(&tenant);
+        if let Some(global) = &cache_handle.global {
+            std::fs::create_dir_all(global)
+                .with_context(|| format!("create global cache dir {}", global.display()))?;
+        }
+        ctx.cache = std::sync::Arc::new(cache_handle);
+    }
+
+    Ok(PreparedRecipeLaunch {
+        name: name.to_string(),
+        plan,
+        marker,
+        sweep_fp,
+        footprint,
+        tenant_admission,
+        tenant,
+        experiment,
+        job_id,
+        job_dir,
+        ctx,
+        device_index,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn launch_compiled_plan(
+    name: &str,
+    plan: crate::framework::plan::CompiledPlan,
+    marker: Option<RecipeMarker>,
+    sweep_fp: Option<crate::framework::ContentHash>,
+    shared_cache: bool,
+    launch_target: crate::config::launcher::LaunchTarget,
+    device_index: Option<usize>,
+    no_cache: bool,
+    sync_io: bool,
+    tenant: crate::tenant::Tenant,
+    experiment: Option<String>,
+) -> Result<String> {
+    let tenant_admission = std::sync::Arc::new(
+        crate::broker::tenant_quota::TenantAdmission::prepare(tenant.clone())
+            .map_err(|error| anyhow!("tenant admission: {error}"))?,
+    );
+    prepare_compiled_plan_launch(
+        name,
+        plan,
+        marker,
+        sweep_fp,
+        shared_cache,
+        launch_target,
+        device_index,
+        no_cache,
+        sync_io,
+        tenant,
+        experiment,
+        tenant_admission,
+    )?
+    .execute()
+    .await
 }
 
 /// Best-effort: record a finished sweep combo into the global sweep-completion
@@ -1023,6 +1203,8 @@ pub(super) async fn run_recipe_sweep(
     launch_target: crate::config::launcher::LaunchTarget,
     // INC D (S4): force-recompute — threaded into every combo's run_one_recipe.
     no_cache: bool,
+    // ADR 0103: force every combo onto Inline I/O.
+    sync_io: bool,
     // ADR 0096: the tenant namespace for every combo's shared cache.
     tenant: crate::tenant::Tenant,
     // ADR 0090: one campaign key shared by every sweep combo.
@@ -1086,6 +1268,7 @@ pub(super) async fn run_recipe_sweep(
             launch_target,
             None,
             no_cache,
+            sync_io,
             tenant.clone(),
             experiment.clone(),
         )
@@ -1186,6 +1369,15 @@ mod recipe_run_flag_tests {
         }
     }
 
+    fn sync_io_of(argv: &[&str]) -> bool {
+        match Cli::try_parse_from(argv).expect("parse").command {
+            Some(Command::Recipe {
+                cmd: RecipeCommand::Run { sync_io, .. },
+            }) => sync_io,
+            other => panic!("expected recipe run, got {other:?}"),
+        }
+    }
+
     #[test]
     fn no_cache_defaults_false() {
         assert!(!no_cache_of(&["blut", "recipe", "run", "demo"]));
@@ -1206,6 +1398,12 @@ mod recipe_run_flag_tests {
     fn force_alias_sets_true() {
         assert!(no_cache_of(&["blut", "recipe", "run", "demo", "--force"]));
     }
+
+    #[test]
+    fn sync_io_is_explicit_and_defaults_false() {
+        assert!(!sync_io_of(&["blut", "recipe", "run", "demo"]));
+        assert!(sync_io_of(&["blut", "recipe", "run", "demo", "--sync-io"]));
+    }
 }
 
 #[cfg(test)]
@@ -1215,7 +1413,7 @@ mod recipe_declare_flag_tests {
     use super::{Cli, Command, RecipeCommand};
     use clap::Parser;
 
-    fn declare_of(argv: &[&str]) -> (Option<std::path::PathBuf>, bool, bool, bool) {
+    fn declare_of(argv: &[&str]) -> (Option<std::path::PathBuf>, bool, bool, bool, bool) {
         match Cli::try_parse_from(argv).expect("parse").command {
             Some(Command::Recipe {
                 cmd:
@@ -1225,32 +1423,35 @@ mod recipe_declare_flag_tests {
                         run,
                         shared_cache,
                         no_cache,
+                        sync_io,
                         tenant: _,
                         experiment: _,
                     },
-            }) => (file, run, shared_cache, no_cache),
+            }) => (file, run, shared_cache, no_cache, sync_io),
             other => panic!("expected recipe declare, got {other:?}"),
         }
     }
 
     #[test]
     fn declare_defaults_to_render_only() {
-        let (file, run, sc, nc) = declare_of(&["blut", "recipe", "declare", "r.toml"]);
+        let (file, run, sc, nc, sync_io) = declare_of(&["blut", "recipe", "declare", "r.toml"]);
         assert!(file.is_some());
         assert!(!run, "no --run ⇒ render only (no execution)");
         assert!(!sc);
         assert!(!nc);
+        assert!(!sync_io);
     }
 
     #[test]
     fn declare_run_flag_launches() {
-        let (_f, run, _sc, _nc) = declare_of(&["blut", "recipe", "declare", "r.toml", "--run"]);
+        let (_f, run, _sc, _nc, _sync_io) =
+            declare_of(&["blut", "recipe", "declare", "r.toml", "--run"]);
         assert!(run);
     }
 
     #[test]
     fn declare_run_carries_cache_flags() {
-        let (_f, run, sc, nc) = declare_of(&[
+        let (_f, run, sc, nc, sync_io) = declare_of(&[
             "blut",
             "recipe",
             "declare",
@@ -1258,8 +1459,10 @@ mod recipe_declare_flag_tests {
             "--run",
             "--shared-cache",
             "--force",
+            "--sync-io",
         ]);
         assert!(run && sc && nc, "--force aliases --no-cache");
+        assert!(sync_io);
     }
 
     #[test]

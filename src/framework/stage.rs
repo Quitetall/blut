@@ -153,6 +153,7 @@ pub enum ErasedDecodeError {
 /// it. Stages cannot create their own — that would let them
 /// invent a stage_dir or status sender, which would break audit
 /// integrity.
+#[non_exhaustive]
 pub struct StageContext {
     /// Root job directory. Stages may read from sibling stages'
     /// dirs but should write only to their own `stage_dir`.
@@ -220,6 +221,11 @@ pub struct StageContext {
     /// against the SAME snapshot as `admitted_workers`. `None` ⇒ the recipe's
     /// requested batch, unchanged.
     pub admitted_batch_size: Option<u32>,
+    /// ADR 0103: the one concrete async-I/O profile admitted for THIS node.
+    /// `None` preserves the legacy behavior for stages that declare no
+    /// candidates. This is execution policy only and never participates in
+    /// args, schemas, cache keys, logical hashes, or artifact identity.
+    pub training_io_profile: Option<crate::framework::async_io::TrainingIoProfile>,
     /// This stage invocation's CACHE KEY (the engine's canonical "same input +
     /// same args + same schema" fingerprint). Threaded so a durable-resume train
     /// stage can derive a STABLE per-config resume directory (via
@@ -261,6 +267,7 @@ impl StageContext {
             fb_warm: false,
             admitted_workers: None,
             admitted_batch_size: None,
+            training_io_profile: None,
             cache_key: crate::framework::artifact::ContentHash([0u8; 32]),
             attempt: 1,
             resume_from: None,
@@ -296,6 +303,7 @@ impl StageContext {
             fb_warm: false,
             admitted_workers: None,
             admitted_batch_size: None,
+            training_io_profile: None,
             cache_key,
             attempt: 1,
             resume_from: None,
@@ -469,6 +477,34 @@ pub trait Stage: Send + Sync + 'static {
         Self::MEMORY_GIB
     }
 
+    /// Exact synchronous/base byte envelope used when this stage declares
+    /// training-I/O profiles. Unlike [`memory_gib_for`](Self::memory_gib_for),
+    /// this seam can use immutable launch hints such as an admitted batch size;
+    /// it remains execution-only and does not enter cache identity.
+    ///
+    /// The default preserves the historical whole-GiB reservation exactly.
+    fn training_io_sync_base_bytes(
+        &self,
+        args: &Self::Args,
+        _hints: crate::framework::async_io::TrainingIoHints,
+    ) -> u64 {
+        u64::from(self.memory_gib_for(args)) * crate::broker::footprint::GIB
+    }
+
+    /// Ordered, complete async-I/O candidates for this stage, fastest first,
+    /// with an explicit fully-inline tail. The default is deliberately empty:
+    /// existing cookbook stages retain their exact legacy execution behavior.
+    ///
+    /// Hints are immutable launch-time facts, not stage args, so using them to
+    /// shape execution cannot change cache or artifact identity.
+    fn training_io_candidates(
+        &self,
+        _args: &Self::Args,
+        _hints: crate::framework::async_io::TrainingIoHints,
+    ) -> Vec<crate::framework::async_io::TrainingIoCandidate> {
+        Vec::new()
+    }
+
     /// Run the stage. Pure function over `(input, args)` plus
     /// whatever side effects the stage's nature requires (reading
     /// `ctx.job_dir`, writing to `ctx.stage_dir`, etc.).
@@ -565,6 +601,24 @@ pub trait StageDyn: Send + Sync + 'static {
     /// The executor reserves THIS against the box-fit budget.
     fn memory_gib_for(&self, _args: &serde_json::Value) -> u32 {
         self.memory_gib()
+    }
+    /// Erased mirror of [`Stage::training_io_sync_base_bytes`]. Manual
+    /// implementations retain the historical whole-GiB base by default.
+    fn training_io_sync_base_bytes(
+        &self,
+        args: &serde_json::Value,
+        _hints: crate::framework::async_io::TrainingIoHints,
+    ) -> u64 {
+        u64::from(self.memory_gib_for(args)) * crate::broker::footprint::GIB
+    }
+    /// Erased mirror of [`Stage::training_io_candidates`]. Manual `StageDyn`
+    /// implementations remain legacy/no-profile by default.
+    fn training_io_candidates(
+        &self,
+        _args: &serde_json::Value,
+        _hints: crate::framework::async_io::TrainingIoHints,
+    ) -> Vec<crate::framework::async_io::TrainingIoCandidate> {
+        Vec::new()
     }
     /// CPU cores held while running (`Stage::CPU_CORES`). Defaulted 1 so
     /// manual `StageDyn` impls keep the old semantics; the blanket impl
@@ -848,6 +902,40 @@ impl<S: Stage> StageDyn for S {
         match serde_json::from_value::<S::Args>(args.clone()) {
             Ok(typed) => Stage::memory_gib_for(self, &typed),
             Err(_) => S::MEMORY_GIB,
+        }
+    }
+    fn training_io_sync_base_bytes(
+        &self,
+        args: &serde_json::Value,
+        hints: crate::framework::async_io::TrainingIoHints,
+    ) -> u64 {
+        match serde_json::from_value::<S::Args>(args.clone()) {
+            Ok(typed) => Stage::training_io_sync_base_bytes(self, &typed, hints),
+            Err(error) => {
+                tracing::warn!(
+                    "training_io_sync_base_bytes: args for stage '{}' did not deserialize ({error}); \
+                     retaining the historical whole-GiB base",
+                    S::NAME
+                );
+                u64::from(S::MEMORY_GIB) * crate::broker::footprint::GIB
+            }
+        }
+    }
+    fn training_io_candidates(
+        &self,
+        args: &serde_json::Value,
+        hints: crate::framework::async_io::TrainingIoHints,
+    ) -> Vec<crate::framework::async_io::TrainingIoCandidate> {
+        match serde_json::from_value::<S::Args>(args.clone()) {
+            Ok(typed) => Stage::training_io_candidates(self, &typed, hints),
+            Err(error) => {
+                tracing::warn!(
+                    "training_io_candidates: args for stage '{}' did not deserialize ({error}); \
+                     retaining legacy inline behavior",
+                    S::NAME
+                );
+                Vec::new()
+            }
         }
     }
     fn gpu_permits(&self, args: &serde_json::Value) -> u32 {

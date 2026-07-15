@@ -591,6 +591,8 @@ mod tests {
                 stage: Arc::new(DummyStage) as Arc<dyn StageDyn>,
                 args: serde_json::Value::Null,
                 canon_args: Vec::new(),
+                admission_recipe_args: None,
+                admission_scope_args: None,
                 retry: None,
                 timeout: None,
                 priority: None,

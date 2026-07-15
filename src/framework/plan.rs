@@ -55,6 +55,19 @@ pub(crate) struct PlanNode {
     /// `args` is still used as the JSON payload passed to
     /// `StageDyn::run_erased` and persisted in `args.json`.
     pub canon_args: Vec<u8>,
+    /// Defaulted recipe arguments that owned this node before an HPO component
+    /// merge. This is admission-only provenance: it supplies launch drivers
+    /// (for example cache warmth) that a stage intentionally omits from its
+    /// cache-keyed args. Ordinary plans leave it `None` and use the enclosing
+    /// plan's `recipe_args`; it is never hashed or persisted in graph identity.
+    pub(crate) admission_recipe_args: Option<Arc<serde_json::Value>>,
+    /// Outermost component arguments for one launch-admission scope. Unlike
+    /// `admission_recipe_args`, a later component merge deliberately replaces
+    /// this token on every contained node. HPO uses the shared `Arc` identity
+    /// to attribute optimized nodes to the correct outer trial, including when
+    /// that trial recipe is itself composed from nested plans. Execution and
+    /// cache identity ignore this field.
+    pub(crate) admission_scope_args: Option<Arc<serde_json::Value>>,
     /// Per-node retry/timeout overrides (D1/D2). `None` = use the
     /// stage's `RETRY`/`TIMEOUT` const. Set via `Plan::with_retry` /
     /// `Plan::with_timeout`, which apply to the current leading node(s).
@@ -189,6 +202,8 @@ impl<B: TrainingBackend> Plan<(), B> {
             stage: Arc::new(stage),
             args: args_json,
             canon_args,
+            admission_recipe_args: None,
+            admission_scope_args: None,
             retry: None,
             timeout: None,
             priority: None,
@@ -275,6 +290,8 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
             stage: Arc::new(stage),
             args: args_json,
             canon_args,
+            admission_recipe_args: None,
+            admission_scope_args: None,
             retry: None,
             timeout: None,
             priority: None,
@@ -358,6 +375,8 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
             stage: Arc::new(left),
             args: l_args_json,
             canon_args: l_canon,
+            admission_recipe_args: None,
+            admission_scope_args: None,
             retry: None,
             timeout: None,
             priority: None,
@@ -372,6 +391,8 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
             stage: Arc::new(right),
             args: r_args_json,
             canon_args: r_canon,
+            admission_recipe_args: None,
+            admission_scope_args: None,
             retry: None,
             timeout: None,
             priority: None,
@@ -432,6 +453,8 @@ impl<O: Artifact, B: TrainingBackend> Plan<O, B> {
                 stage,
                 args,
                 canon_args,
+                admission_recipe_args: None,
+                admission_scope_args: None,
                 retry: None,
                 timeout: None,
                 priority: None,
@@ -470,6 +493,8 @@ impl<A1: Artifact, A2: Artifact, B: TrainingBackend> Plan<(A1, A2), B> {
             stage: Arc::new(stage),
             args: args_json,
             canon_args,
+            admission_recipe_args: None,
+            admission_scope_args: None,
             retry: None,
             timeout: None,
             priority: None,
@@ -506,6 +531,8 @@ impl<A1: Artifact, A2: Artifact, A3: Artifact, B: TrainingBackend> Plan<(A1, A2,
             stage: Arc::new(stage),
             args: args_json,
             canon_args,
+            admission_recipe_args: None,
+            admission_scope_args: None,
             retry: None,
             timeout: None,
             priority: None,
@@ -960,13 +987,14 @@ impl CompiledPlan {
     /// component becomes a disjoint connected sub-graph with its node ids offset
     /// by the running total, so the executor runs all N in parallel (up to the
     /// concurrency cap), gated by the GPU semaphore + never-OOM admission
-    /// exactly as today. Per-component `recipe_args` are dropped (each trial's
-    /// args live in its own nodes' `args`/`canon_args`); the merged
-    /// `recipe_args` is the supplied `base_args` (for footprint billing /
-    /// provenance). Returns `(merged, node_offsets)` where `node_offsets[i]` is
-    /// the first global node id of component `i` — the caller maps trial → node
-    /// range with it. Empty `components` yields an empty plan (the caller guards
-    /// against launching it).
+    /// exactly as today. The merged `recipe_args` is the supplied `base_args`
+    /// for job provenance, while each component's defaulted recipe args are
+    /// retained privately on its nodes for admission-only launch drivers that
+    /// the stage intentionally omits from cache-keyed args. Returns `(merged,
+    /// node_offsets)` where `node_offsets[i]` is the first global node id of
+    /// component `i` — the caller maps trial → node range with it. Empty
+    /// `components` yields an empty plan (the caller guards against launching
+    /// it).
     pub fn from_components(
         name: String,
         base_args: serde_json::Value,
@@ -980,10 +1008,16 @@ impl CompiledPlan {
         let mut offset: NodeId = 0;
         for comp in components {
             node_offsets.push(offset);
+            let admission_recipe_args = Arc::new(comp.recipe_args.clone());
+            let admission_scope_args = Arc::clone(&admission_recipe_args);
             let comp_nodes = comp.nodes;
             let n = comp_nodes.len() as NodeId;
             for mut node in comp_nodes {
                 node.id += offset;
+                if node.admission_recipe_args.is_none() {
+                    node.admission_recipe_args = Some(Arc::clone(&admission_recipe_args));
+                }
+                node.admission_scope_args = Some(Arc::clone(&admission_scope_args));
                 nodes.push(node);
             }
             for e in comp.edges {
@@ -1080,6 +1114,8 @@ impl CompiledPlan {
                 stage,
                 args,
                 canon_args,
+                admission_recipe_args: None,
+                admission_scope_args: None,
                 retry: None,
                 timeout: None,
                 priority: None,
@@ -1251,6 +1287,8 @@ impl CompiledPlan {
                 stage,
                 args,
                 canon_args,
+                admission_recipe_args: None,
+                admission_scope_args: None,
                 retry: None,
                 timeout: None,
                 priority: None,
@@ -1401,6 +1439,8 @@ impl CompiledPlan {
                 canon_args: CacheHandle::canonical_json_bytes(&args),
                 stage,
                 args,
+                admission_recipe_args: None,
+                admission_scope_args: None,
                 retry: None,
                 timeout: None,
                 priority: None,
@@ -1661,8 +1701,8 @@ mod tests {
         // Two 2-node components (MakeA -> AToB) → one 4-node plan with ids,
         // edges, and graph-input initials offset, so the executor runs both
         // trials in parallel (the HPO fan-out).
-        let mk = || {
-            Plan::<(), LamuTrainerBackend>::new("c", serde_json::json!({}))
+        let mk = |trial: u32| {
+            Plan::<(), LamuTrainerBackend>::new("c", serde_json::json!({ "trial": trial }))
                 .start(MakeA, EmptyArgs)
                 .then(AToB, EmptyArgs)
                 .finish()
@@ -1671,7 +1711,7 @@ mod tests {
         let (merged, offsets) = CompiledPlan::from_components(
             "hpo".into(),
             serde_json::json!({ "x": 1 }),
-            vec![mk(), mk()],
+            vec![mk(1), mk(2)],
         );
         assert_eq!(merged.n_nodes(), 4);
         assert_eq!(merged.n_edges(), 2);
@@ -1693,7 +1733,84 @@ mod tests {
             "valid DAG, all nodes ordered"
         );
         assert_eq!(merged.recipe_args, serde_json::json!({ "x": 1 }));
+        assert_eq!(
+            merged.nodes[0]
+                .admission_recipe_args
+                .as_deref()
+                .expect("first component provenance"),
+            &serde_json::json!({ "trial": 1 })
+        );
+        assert_eq!(
+            merged.nodes[1]
+                .admission_recipe_args
+                .as_deref()
+                .expect("first component provenance"),
+            &serde_json::json!({ "trial": 1 })
+        );
+        assert_eq!(
+            merged.nodes[2]
+                .admission_recipe_args
+                .as_deref()
+                .expect("second component provenance"),
+            &serde_json::json!({ "trial": 2 })
+        );
+        assert_eq!(
+            merged.nodes[3]
+                .admission_recipe_args
+                .as_deref()
+                .expect("second component provenance"),
+            &serde_json::json!({ "trial": 2 })
+        );
         assert_eq!(merged.name(), "hpo");
+    }
+
+    #[test]
+    fn component_admission_provenance_is_execution_identity_neutral() {
+        let mk = |trial: u32| {
+            Plan::<(), LamuTrainerBackend>::new("c", serde_json::json!({ "trial": trial }))
+                .start(MakeA, EmptyArgs)
+                .then(AToB, EmptyArgs)
+                .finish()
+                .into_compiled()
+        };
+        let (left, _) =
+            CompiledPlan::from_components("hpo".into(), serde_json::json!({ "x": 1 }), vec![mk(1)]);
+        let (right, _) =
+            CompiledPlan::from_components("hpo".into(), serde_json::json!({ "x": 1 }), vec![mk(2)]);
+
+        assert_eq!(
+            left.execution_fingerprint(),
+            right.execution_fingerprint(),
+            "admission-only provenance must not enter execution/cache identity"
+        );
+        assert_eq!(left.nodes[0].canon_args, right.nodes[0].canon_args);
+    }
+
+    #[test]
+    fn nested_component_preserves_most_specific_admission_provenance() {
+        let leaf =
+            Plan::<(), LamuTrainerBackend>::new("leaf", serde_json::json!({ "scope": "leaf" }))
+                .start(MakeA, EmptyArgs)
+                .finish()
+                .into_compiled();
+        let (nested, _) = CompiledPlan::from_components(
+            "nested".into(),
+            serde_json::json!({ "scope": "nested" }),
+            vec![leaf],
+        );
+        let (outer, _) = CompiledPlan::from_components(
+            "outer".into(),
+            serde_json::json!({ "scope": "outer" }),
+            vec![nested],
+        );
+
+        assert_eq!(
+            outer.nodes[0]
+                .admission_recipe_args
+                .as_deref()
+                .expect("leaf admission provenance"),
+            &serde_json::json!({ "scope": "leaf" })
+        );
     }
 
     #[test]
@@ -1828,6 +1945,8 @@ mod tests {
             stage: Arc::new(MakeA),
             args: serde_json::json!({}),
             canon_args: Vec::new(),
+            admission_recipe_args: None,
+            admission_scope_args: None,
             retry: None,
             timeout: None,
             priority: None,

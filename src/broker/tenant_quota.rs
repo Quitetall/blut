@@ -45,9 +45,31 @@ impl TenantAdmission {
         }
     }
 
-    /// Executor semaphore capacity for this tenant. `None` preserves historical
-    /// single-tenant behavior when the platform cannot probe MemTotal. A
-    /// fractional policy cannot be enforced without capacity data and is refused.
+    #[cfg(test)]
+    pub(crate) fn from_snapshot_for_test(
+        tenant: Tenant,
+        fraction: f64,
+        snapshot: ResourceSnapshot,
+    ) -> Self {
+        Self::from_snapshot(tenant, fraction, snapshot)
+    }
+
+    /// The immutable resource snapshot captured for this launch. Worker/batch
+    /// tuning, executor sizing, and quota reservation must all read this same
+    /// value rather than probing independently.
+    pub fn snapshot(&self) -> &ResourceSnapshot {
+        &self.snapshot
+    }
+
+    /// Executor semaphore capacity for this tenant from the one launch
+    /// snapshot. The bound is the smaller of the tenant's total-RAM slice and
+    /// currently available RAM after the OS floor; this prevents concurrent
+    /// stages/cells selected from the same snapshot from each independently
+    /// consuming the full live-free envelope.
+    ///
+    /// `None` preserves historical single-tenant behavior when the platform
+    /// cannot probe MemTotal. A fractional policy cannot be enforced without
+    /// capacity data and is refused.
     pub fn executor_budget_gib(&self, floor_gib: f64) -> Result<Option<u32>> {
         if self.snapshot.mem_total_gb <= 0.0 {
             if self.fraction == 1.0 {
@@ -58,11 +80,19 @@ impl TenantAdmission {
                 self.tenant, self.fraction
             )));
         }
-        let ceiling = TenantQuotaTracker::ceiling_gib(&self.snapshot, floor_gib, self.fraction)?;
+        let tenant_ceiling =
+            TenantQuotaTracker::ceiling_gib(&self.snapshot, floor_gib, self.fraction)?;
+        let live_ceiling =
+            if self.snapshot.mem_avail_gb.is_finite() && self.snapshot.mem_avail_gb > 0.0 {
+                (self.snapshot.mem_avail_gb - floor_gib).max(0.0)
+            } else {
+                0.0
+            };
+        let ceiling = tenant_ceiling.min(live_ceiling);
         if ceiling < 1.0 {
             return Err(TrainError::other(format!(
-                "tenant '{}' RAM ceiling {ceiling:.3} GiB is below the executor's 1 GiB accounting quantum",
-                self.tenant
+                "tenant '{}' effective RAM ceiling {ceiling:.3} GiB (tenant {tenant_ceiling:.3} GiB, live {live_ceiling:.3} GiB) is below the executor's 1 GiB accounting quantum",
+                self.tenant,
             )));
         }
         Ok(Some(ceiling.floor() as u32))
@@ -237,6 +267,11 @@ mod tests {
 
         let sub_gib = TenantAdmission::from_snapshot(tenant.clone(), 0.25, snap(8.0, 8.0));
         assert!(sub_gib.executor_budget_gib(6.0).is_err());
+
+        let live_limited = TenantAdmission::from_snapshot(tenant.clone(), 1.0, snap(64.0, 10.0));
+        assert_eq!(live_limited.executor_budget_gib(6.0).unwrap(), Some(4));
+        let live_sub_gib = TenantAdmission::from_snapshot(tenant.clone(), 1.0, snap(64.0, 6.5));
+        assert!(live_sub_gib.executor_budget_gib(6.0).is_err());
 
         let probe_miss_full =
             TenantAdmission::from_snapshot(tenant.clone(), 1.0, ResourceSnapshot::default());

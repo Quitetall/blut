@@ -323,6 +323,10 @@ enum PlanCommand {
         /// Also consult the global cache (--shared-cache semantics).
         #[arg(long, default_value_t = false)]
         shared_cache: bool,
+        /// Force all declared async-I/O lanes onto the synchronous Inline
+        /// fallback for this resumed execution.
+        #[arg(long, default_value_t = false)]
+        sync_io: bool,
     },
     /// Compile a recipe + its args into a Plan and print the ASCII
     /// DAG render. Does NOT execute. Useful for previewing a
@@ -1047,8 +1051,8 @@ mod external_subcommand_tests {
 #[cfg(test)]
 mod registry_completion_cli_tests {
     use super::{
-        Cli, Command, DatasetCommand, ExperimentCommand, ModelCommand, RecipeCommand, RecipeMarker,
-        ensure_resume_registry_snapshot,
+        Cli, Command, DatasetCommand, ExperimentCommand, ModelCommand, PlanCommand, RecipeCommand,
+        RecipeMarker, ensure_resume_registry_snapshot,
     };
     use clap::Parser;
     use std::time::Duration;
@@ -1123,6 +1127,24 @@ mod registry_completion_cli_tests {
             Some(Command::Model {
                 cmd: ModelCommand::Promote { gate_timeout, tenant, .. }
             }) if gate_timeout == Duration::from_secs(300) && tenant == "default"
+        ));
+    }
+
+    #[test]
+    fn plan_resume_sync_io_is_explicit_and_defaults_false() {
+        let default = Cli::try_parse_from(["blut", "plan", "resume", "job-1"]).unwrap();
+        assert!(matches!(
+            default.command,
+            Some(Command::Plan {
+                cmd: PlanCommand::Resume { sync_io: false, .. }
+            })
+        ));
+        let forced = Cli::try_parse_from(["blut", "plan", "resume", "job-1", "--sync-io"]).unwrap();
+        assert!(matches!(
+            forced.command,
+            Some(Command::Plan {
+                cmd: PlanCommand::Resume { sync_io: true, .. }
+            })
         ));
     }
 
@@ -1274,7 +1296,11 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
     use crate::framework::{CacheHandle, ExecCtx};
     // Recipes resolve via the caller-supplied cookbook registry.
     match cmd {
-        PlanCommand::Resume { id, shared_cache } => {
+        PlanCommand::Resume {
+            id,
+            shared_cache,
+            sync_io,
+        } => {
             let job_id = crate::jobs::resolve_job_id(&id).with_context(|| {
                 format!("resolve job id '{id}' (ambiguous prefix or missing job)")
             })?;
@@ -1295,19 +1321,47 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                 .find(&marker.name)
                 .ok_or_else(|| anyhow!("recipe '{}' not in catalog", marker.name))?;
             let plan = (r.compile_fn)(args.clone()).map_err(|e| anyhow!("recipe compile: {e}"))?;
-            let footprint = recipe_footprint(&marker.name, &args);
             let tenant_admission =
                 crate::broker::tenant_quota::TenantAdmission::prepare(tenant.clone())
                     .map_err(|e| anyhow!("tenant admission: {e}"))?;
+            let snapshot = tenant_admission.snapshot();
+            let admitted_workers = admitted_workers_for(&marker.name, &args, snapshot);
+            let admitted_batch_size = admitted_workers.and_then(|workers| {
+                admitted_batch_size_for(&marker.name, &args, workers, snapshot)
+            });
+            let mut footprint = match admitted_workers {
+                Some(workers) => {
+                    recipe_footprint_tuned(&marker.name, &args, workers, admitted_batch_size)
+                }
+                None => recipe_footprint(&marker.name, &args),
+            };
 
             let mut ctx = ExecCtx::new(job_dir.clone());
-            ctx = ctx.with_tenant(tenant.clone());
+            ctx = ctx.with_tenant(tenant.clone()).with_sync_io(sync_io);
             if let Some(budget) = tenant_admission
                 .executor_budget_gib(crate::broker::admission::DEFAULT_FLOOR_GIB)
                 .map_err(|e| anyhow!("tenant admission: {e}"))?
             {
                 ctx = ctx.with_memory_budget(budget);
             }
+            if let Some(workers) = admitted_workers {
+                ctx = ctx.with_admitted_workers(workers);
+            }
+            if let Some(batch) = admitted_batch_size {
+                ctx = ctx.with_admitted_batch_size(batch);
+            }
+            let (plan, prepared_footprint) = configure_training_io_admission(
+                &format!("resume '{}'", marker.name),
+                plan,
+                &mut ctx,
+                &args,
+                admitted_workers,
+                admitted_batch_size,
+                footprint,
+                snapshot,
+                crate::config::launcher::LaunchTarget::Local,
+            )?;
+            footprint = prepared_footprint;
             if shared_cache {
                 match CacheHandle::default_global_path() {
                     Some(global) => {

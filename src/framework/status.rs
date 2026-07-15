@@ -41,7 +41,16 @@ pub const DEFAULT_BROADCAST_CAPACITY: usize = 4096;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum StageEvent {
+    /// The complete execution-only async-I/O profile admitted for this node.
+    /// Emitted on the lossless lifecycle lane before `StageBegin`. Stages with
+    /// no declared candidates emit no record and keep legacy behavior.
+    StageIoConfigured {
+        node_idx: u32,
+        stage_name: String,
+        profile: crate::framework::async_io::TrainingIoProfile,
+    },
     /// Stage entered its `run` body. `node_idx` is its position in
     /// the plan's topological order (0-indexed).
     StageBegin {
@@ -291,11 +300,58 @@ const STEP_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 /// The task ends once the lifecycle channel closes (the last
 /// `StatusHub` dropped) — it then drains any remaining broadcast Steps
 /// and returns.
+/// Back-compatible status writer API. Persistence failures are logged, matching
+/// the historical `JoinHandle<()>` contract. Executors that must fail a
+/// successful plan when authoritative lifecycle persistence fails use
+/// [`spawn_status_writer_checked`] instead.
 pub fn spawn_status_writer(
+    hub: &Arc<StatusHub>,
+    lifecycle_rx: mpsc::UnboundedReceiver<StageEvent>,
+    job_dir: &std::path::Path,
+) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    let checked = spawn_status_writer_checked(hub, lifecycle_rx, job_dir)?;
+    // The historical handle owned the writer task directly: aborting it stopped
+    // persistence. Keep that behavior even though the compatibility wrapper now
+    // translates the checked writer's result into a warning.
+    let mut checked_abort = AbortTaskOnDrop::new(checked.abort_handle());
+    Ok(tokio::spawn(async move {
+        let result = checked.await;
+        checked_abort.disarm();
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!("status lifecycle persistence failed: {error}"),
+            Err(error) => tracing::warn!("status lifecycle writer task failed: {error}"),
+        }
+    }))
+}
+
+struct AbortTaskOnDrop(Option<tokio::task::AbortHandle>);
+
+impl AbortTaskOnDrop {
+    fn new(handle: tokio::task::AbortHandle) -> Self {
+        Self(Some(handle))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Checked status writer used by the executor's authoritative lifecycle path.
+/// The nested `io::Result` carries serialization/write/flush/reopen failures.
+pub fn spawn_status_writer_checked(
     hub: &Arc<StatusHub>,
     mut lifecycle_rx: mpsc::UnboundedReceiver<StageEvent>,
     job_dir: &std::path::Path,
-) -> std::io::Result<tokio::task::JoinHandle<()>> {
+) -> std::io::Result<tokio::task::JoinHandle<std::io::Result<()>>> {
     use std::io::Write;
     std::fs::create_dir_all(job_dir)?;
     let path = job_dir.join("status.jsonl");
@@ -318,25 +374,17 @@ pub fn spawn_status_writer(
                 .open(p)
                 .map(|f| std::io::BufWriter::with_capacity(64 * 1024, f))
         };
-        // Write one event line; returns false on an unrecoverable I/O
-        // error (caller exits). `flush` forces the line to disk now.
+        // `flush = true` is the lifecycle durability boundary. Propagate every
+        // serialization/write/flush failure through the JoinHandle so a plan
+        // cannot report success after losing its authoritative profile record.
         macro_rules! write_event {
             ($ev:expr, $flush:expr) => {{
-                let mut ok = true;
-                match serde_json::to_string(&$ev) {
-                    Ok(line) => {
-                        if writeln!(writer, "{line}").is_err() {
-                            tracing::warn!("status writer: write failed, exiting");
-                            ok = false;
-                        }
-                    }
-                    Err(e) => tracing::error!("status writer: serialize event failed: {e}"),
+                let line = serde_json::to_string(&$ev)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                writeln!(writer, "{line}")?;
+                if $flush {
+                    writer.flush()?;
                 }
-                if ok && $flush && writer.flush().is_err() {
-                    tracing::warn!("status writer: flush failed, exiting");
-                    ok = false;
-                }
-                ok
             }};
         }
         loop {
@@ -347,43 +395,37 @@ pub fn spawn_status_writer(
                 // events are tagged with this node's host (D5).
                 got = lifecycle_rx.recv() => match got {
                     Some(event) => {
-                        if !write_event!(HostedEvent::wrap(&local_host, event), true) { return; }
+                        write_event!(HostedEvent::wrap(&local_host, event), true);
                     }
                     None => {
                         // Last StatusHub dropped → run is finishing. Drain any
                         // remaining REMOTE lifecycle events (D5) + broadcast
                         // Steps before exiting, so a worker event that arrived
                         // just before shutdown isn't lost.
-                        let _ = writer.flush();
+                        writer.flush()?;
                         if let Some(rx) = remote_rx.as_mut() {
                             while let Ok(hosted) = rx.try_recv() {
-                                let _ = write_event!(hosted, false);
+                                write_event!(hosted, false);
                             }
                         }
                         loop {
                             match brx.try_recv() {
                                 Ok(event) => {
-                                    if matches!(event, StageEvent::StageStep { .. })
-                                        && !write_event!(
-                                        HostedEvent::wrap(&local_host, event),
-                                        false
-                                    ) {
-                                        return;
+                                    if matches!(event, StageEvent::StageStep { .. }) {
+                                        write_event!(HostedEvent::wrap(&local_host, event), false);
                                     }
                                 }
                                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
                                     tracing::warn!(
                                         "status writer: broadcast lagged by {n} steps during shutdown"
                                     );
-                                    if !write_event!(
+                                    write_event!(
                                         HostedEvent::wrap(
                                             &local_host,
                                             StageEvent::StepGap { dropped: n },
                                         ),
                                         false
-                                    ) {
-                                        return;
-                                    }
+                                    );
                                 }
                                 Err(
                                     broadcast::error::TryRecvError::Empty
@@ -391,8 +433,8 @@ pub fn spawn_status_writer(
                                 ) => break,
                             }
                         }
-                        let _ = writer.flush();
-                        return;
+                        writer.flush()?;
+                        return Ok(());
                     }
                 },
                 // Lossless REMOTE lifecycle (D5): events forwarded from other
@@ -404,7 +446,7 @@ pub fn spawn_status_writer(
                         None => std::future::pending().await,
                     }
                 } => if let Some(hosted) = remote {
-                    if !write_event!(hosted, true) { return; }
+                    write_event!(hosted, true);
                 },
                 // Lossy Step spam — batched.
                 got = brx.recv() => match got {
@@ -413,10 +455,8 @@ pub fn spawn_status_writer(
                         // the lossless path already wrote them — skip to avoid
                         // duplicates. Explicit StepGap markers already used the
                         // lossless path; only Steps are writer-owned here.
-                        if matches!(event, StageEvent::StageStep { .. })
-                            && !write_event!(HostedEvent::wrap(&local_host, event), false)
-                        {
-                            return;
+                        if matches!(event, StageEvent::StageStep { .. }) {
+                            write_event!(HostedEvent::wrap(&local_host, event), false);
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => {
@@ -425,21 +465,18 @@ pub fn spawn_status_writer(
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("status writer: broadcast lagged by {n} steps");
-                        let _ = write_event!(
+                        write_event!(
                             HostedEvent::wrap(&local_host, StageEvent::StepGap { dropped: n }),
                             false
                         );
                     }
                 },
                 _ = &mut timeout => {
-                    let _ = writer.flush();
+                    writer.flush()?;
                     if crate::jobs::rotate_status_if_needed(&path) || !path.exists() {
                         match reopen(&path) {
                             Ok(w) => writer = w,
-                            Err(e) => {
-                                tracing::warn!("status writer: reopen after rotate failed: {e}");
-                                return;
-                            }
+                            Err(error) => return Err(error),
                         }
                     }
                 }
@@ -533,6 +570,44 @@ mod tests {
             body.contains("\"host\":\"workerC\"") && body.contains("\"stage_name\":\"remote\""),
             "worker event forwarded + host-tagged into the initiator's status.jsonl: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn aborting_legacy_writer_handle_stops_the_backing_writer() {
+        let (hub, lifecycle_rx) = StatusHub::new();
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("status.jsonl");
+        let writer = spawn_status_writer(&hub, lifecycle_rx, td.path()).unwrap();
+
+        hub.emit(StageEvent::StageBegin {
+            node_idx: 0,
+            stage_name: "before-abort".into(),
+            input_hash: ContentHash::of_bytes(b"in"),
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if std::fs::read_to_string(&path).is_ok_and(|body| body.contains("before-abort")) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("writer persisted the pre-abort event");
+
+        writer.abort();
+        assert!(writer.await.unwrap_err().is_cancelled());
+        hub.emit(StageEvent::StageEnd {
+            node_idx: 0,
+            stage_name: "after-abort".into(),
+            output_hash: ContentHash::of_bytes(b"out"),
+            elapsed: Duration::from_millis(1),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let body = std::fs::read_to_string(path).unwrap();
+        assert!(body.contains("before-abort"));
+        assert!(!body.contains("after-abort"));
     }
 
     #[test]

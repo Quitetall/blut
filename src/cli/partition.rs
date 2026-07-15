@@ -65,6 +65,9 @@ pub(super) enum PartitionCommand {
         launcher: String,
         #[arg(long, default_value = "default")]
         tenant: String,
+        /// Force the admitted inline I/O profile for reproducibility/debugging.
+        #[arg(long, default_value_t = false)]
+        sync_io: bool,
     },
 }
 
@@ -358,6 +361,7 @@ pub(super) async fn run_partition(
             args,
             launcher,
             tenant,
+            sync_io,
         } => {
             let set = PartitionSet::load(&recipe, &name).map_err(|e| anyhow!("{e}"))?;
             let base: serde_json::Value = serde_json::from_str(&args)
@@ -462,13 +466,19 @@ pub(super) async fn run_partition(
             for (i, cell) in targets.into_iter().enumerate() {
                 per_device[i % n_dev].push(cell);
             }
-            // Cross-cell RAM admission (never-OOM): size the box-fit budget ONCE
-            // (MemTotal − floor, same source the executor uses) and share one
-            // semaphore across all device-chains. Each cell acquires its
-            // (clamped) footprint in GiB permits for its whole run, so the SUM
-            // of concurrent cells can't exceed the box. `0` ⇒ probe failed ⇒
-            // ungated (per-cell broker gate alone), the pre-slice behaviour.
-            let budget_gib = scheduler_box_fit_budget_gib().unwrap_or(0);
+            // Prepare one immutable tenant admission snapshot for this
+            // backfill. Every cell selects workers, batch, and its exact
+            // async-I/O profile from this snapshot, and the shared semaphore
+            // uses the same tenant envelope. No cell probes again between its
+            // scheduler charge and execution.
+            let tenant_admission = std::sync::Arc::new(
+                crate::broker::tenant_quota::TenantAdmission::prepare(tenant.clone())
+                    .map_err(|error| anyhow!("tenant admission: {error}"))?,
+            );
+            let budget_gib = tenant_admission
+                .executor_budget_gib(crate::broker::admission::DEFAULT_FLOOR_GIB)
+                .map_err(|error| anyhow!("tenant admission: {error}"))?
+                .unwrap_or(0);
             let mem_sem =
                 std::sync::Arc::new(tokio::sync::Semaphore::new(budget_gib.max(1) as usize));
             let (set, recipe, base, evaluated_by_key) = (&set, &recipe, &base, &evaluated_by_key);
@@ -476,21 +486,15 @@ pub(super) async fn run_partition(
                 let dev = devices[d];
                 let mem_sem = mem_sem.clone();
                 let tenant = tenant.clone();
+                let tenant_admission = tenant_admission.clone();
                 async move {
                     let (mut ok, mut failed) = (0usize, 0usize);
                     for cell in cells {
                         let cell_args = apply_cell_overrides(base, &cell.overrides);
                         eprintln!("[gpu {dev}] cell {}", cell.key);
-                        // Per-cell footprint (RAM GiB) for the cross-cell gate:
-                        // the SAME `recipe_footprint` the per-cell broker
-                        // admission resolves on, rounded UP to whole GiB (never
-                        // under-bill). Clamp+acquire happens in `gated_cell_run`.
-                        let footprint = recipe_footprint(recipe, &cell_args);
-                        let footprint_gib =
-                            footprint.ram_bytes.div_ceil(crate::broker::footprint::GIB) as u32;
                         let partition = cell.partition_key().map_err(|e| anyhow!("{e}"));
-                        let cell_run = async {
-                            run_one_partitioned_recipe(
+                        let prepared = partition.and_then(|partition| {
+                            prepare_one_partitioned_recipe(
                                 reg,
                                 recipe,
                                 cell_args.clone(),
@@ -498,19 +502,26 @@ pub(super) async fn run_partition(
                                 launch_target,
                                 Some(dev),
                                 force || stale,
+                                sync_io,
                                 tenant.clone(),
-                                partition?,
+                                partition,
+                                tenant_admission.clone(),
                             )
-                            .await
+                        });
+                        let result = match prepared {
+                            Ok(prepared) => {
+                                let footprint_gib = prepared.footprint_gib();
+                                gated_cell_run(
+                                    mem_sem.clone(),
+                                    footprint_gib,
+                                    budget_gib,
+                                    prepared.execute(),
+                                )
+                                .await
+                            }
+                            Err(error) => Err(error),
                         };
-                        let (outcome, job_id, evaluation) = match gated_cell_run(
-                            mem_sem.clone(),
-                            footprint_gib,
-                            budget_gib,
-                            cell_run,
-                        )
-                        .await
-                        {
+                        let (outcome, job_id, evaluation) = match result {
                             Ok((jid, compiled_args, input_fingerprint)) => {
                                 ok += 1;
                                 (
@@ -605,7 +616,7 @@ pub(super) async fn run_partition(
 
 #[cfg(test)]
 mod cell_override_and_truncate_tests {
-    use super::{Cli, Parser, apply_cell_overrides, truncate_for_col};
+    use super::{Cli, Command, Parser, PartitionCommand, apply_cell_overrides, truncate_for_col};
     use serde_json::json;
 
     #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -707,6 +718,132 @@ mod cell_override_and_truncate_tests {
 
         fn recipes(&self) -> &'static [&'static crate::recipes::recipe::RecipeDef] {
             static RECIPES: &[&crate::recipes::recipe::RecipeDef] = &[&TOY_PARTITION_DEF];
+            RECIPES
+        }
+    }
+
+    static ASYNC_PARTITION_CANDIDATE_CALLS: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
+    static ASYNC_PARTITION_SAW_INLINE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    struct AsyncPartitionStage;
+
+    #[async_trait::async_trait]
+    impl crate::framework::Stage for AsyncPartitionStage {
+        const NAME: &'static str = "toy_async_partition_stage";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [crate::framework::Resource] = &[crate::framework::Resource::Cpu];
+        const MEMORY_GIB: u32 = 2;
+        type Input = ();
+        type Output = ToyPartitionArtifact;
+        type Args = ToyPartitionArgs;
+
+        fn training_io_sync_base_bytes(
+            &self,
+            _args: &Self::Args,
+            _hints: crate::framework::TrainingIoHints,
+        ) -> u64 {
+            2 * crate::broker::footprint::GIB
+        }
+
+        fn training_io_candidates(
+            &self,
+            _args: &Self::Args,
+            _hints: crate::framework::TrainingIoHints,
+        ) -> Vec<crate::framework::TrainingIoCandidate> {
+            ASYNC_PARTITION_CANDIDATE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let half_gib = crate::broker::footprint::GIB / 2;
+            vec![
+                crate::framework::TrainingIoCandidate {
+                    data_replicas: 1,
+                    decode_workers: 1,
+                    prefetch_per_worker: 1,
+                    cuda_staging_slots: 0,
+                    metrics: crate::framework::IoMode::Inline,
+                    checkpoints: crate::framework::IoMode::Inline,
+                    batch_bytes: Some(half_gib),
+                    checkpoint_snapshot_bytes: None,
+                    fixed_overhead_bytes: Some(half_gib),
+                },
+                crate::framework::TrainingIoCandidate {
+                    data_replicas: 1,
+                    decode_workers: 0,
+                    prefetch_per_worker: 0,
+                    cuda_staging_slots: 0,
+                    metrics: crate::framework::IoMode::Inline,
+                    checkpoints: crate::framework::IoMode::Inline,
+                    batch_bytes: None,
+                    checkpoint_snapshot_bytes: None,
+                    fixed_overhead_bytes: None,
+                },
+            ]
+        }
+
+        async fn run(
+            &self,
+            ctx: &crate::framework::StageContext,
+            _input: (),
+            args: &Self::Args,
+        ) -> std::result::Result<Self::Output, crate::framework::StageError> {
+            let profile = ctx
+                .training_io_profile
+                .as_ref()
+                .expect("declaring partition stage receives its prepared profile");
+            if profile.is_inline() {
+                ASYNC_PARTITION_SAW_INLINE.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(ToyPartitionArtifact {
+                corpus: args.corpus.clone(),
+            })
+        }
+    }
+
+    impl crate::framework::Compatible<crate::backends::LamuTrainerBackend> for AsyncPartitionStage {}
+
+    fn compile_async_partition(
+        raw: serde_json::Value,
+    ) -> std::result::Result<crate::framework::plan::CompiledPlan, crate::framework::RecipeError>
+    {
+        let args: ToyPartitionArgs = serde_json::from_value(raw).map_err(|error| {
+            crate::framework::RecipeError::InvalidArgs {
+                field: None,
+                message: error.to_string(),
+            }
+        })?;
+        Ok(
+            crate::framework::Plan::<(), crate::backends::LamuTrainerBackend>::new(
+                "toy_async_partition",
+                json!({}),
+            )
+            .start(AsyncPartitionStage, args)
+            .finish()
+            .into_compiled(),
+        )
+    }
+
+    static ASYNC_PARTITION_DEF: crate::recipes::recipe::RecipeDef =
+        crate::recipes::recipe::RecipeDef {
+            name: "toy_async_partition",
+            description: "partition async admission fixture",
+            backend_id: "lamu_trainer",
+            category: crate::recipes::recipe::RecipeCategory::User,
+            input_kinds: &[],
+            output_kind: "test.partition",
+            schedule: None,
+            args_schema_fn: || crate::recipes::recipe::schema_of::<ToyPartitionArgs>(),
+            compile_fn: compile_async_partition,
+        };
+
+    struct AsyncPartitionCookbook;
+
+    impl crate::framework::Cookbook for AsyncPartitionCookbook {
+        fn name(&self) -> &'static str {
+            "toy_async_partition"
+        }
+
+        fn recipes(&self) -> &'static [&'static crate::recipes::recipe::RecipeDef] {
+            static RECIPES: &[&crate::recipes::recipe::RecipeDef] = &[&ASYNC_PARTITION_DEF];
             RECIPES
         }
     }
@@ -847,6 +984,203 @@ mod cell_override_and_truncate_tests {
     }
 
     #[test]
+    fn partition_backfill_sync_io_is_explicit_and_defaults_false() {
+        fn sync_io_of(argv: &[&str]) -> bool {
+            match Cli::try_parse_from(argv).expect("parse").command {
+                Some(Command::Partition {
+                    cmd: PartitionCommand::Backfill { sync_io, .. },
+                }) => sync_io,
+                other => panic!("expected partition backfill, got {other:?}"),
+            }
+        }
+
+        assert!(!sync_io_of(&[
+            "blut",
+            "partition",
+            "backfill",
+            "recipe",
+            "set",
+        ]));
+        assert!(sync_io_of(&[
+            "blut",
+            "partition",
+            "backfill",
+            "recipe",
+            "set",
+            "--sync-io",
+        ]));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn prepared_async_footprints_charge_shared_gate_and_sync_io_selects_inline() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        async fn busy_cell(peak: Arc<AtomicU32>, live: Arc<AtomicU32>) {
+            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            live.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let _env = EnvRestore::set(&[
+            ("LAMU_TRAIN_JOBS_DIR", temp.path().join("jobs")),
+            ("LAMU_TRAIN_DATA_DIR", temp.path().join("data")),
+            ("XDG_DATA_HOME", temp.path().join("xdg-data")),
+            ("XDG_CACHE_HOME", temp.path().join("xdg-cache")),
+            ("CUDA_VISIBLE_DEVICES", std::path::PathBuf::new()),
+            ("BLUT_NO_CONTAIN", std::path::PathBuf::from("1")),
+        ]);
+        ASYNC_PARTITION_CANDIDATE_CALLS.store(0, Ordering::SeqCst);
+
+        let tenant = crate::tenant::Tenant::default();
+        let admission = Arc::new(
+            crate::broker::tenant_quota::TenantAdmission::from_snapshot_for_test(
+                tenant.clone(),
+                1.0,
+                crate::broker::ResourceSnapshot {
+                    mem_total_gb: 10.0,
+                    mem_avail_gb: 10.0,
+                    ..Default::default()
+                },
+            ),
+        );
+        assert_eq!(
+            admission
+                .executor_budget_gib(crate::broker::admission::DEFAULT_FLOOR_GIB)
+                .unwrap(),
+            Some(4)
+        );
+        let mut registry = crate::framework::Registry::new();
+        registry.register(Box::new(AsyncPartitionCookbook));
+        let prepare = |corpus: &str, sync_io: bool| {
+            super::prepare_one_partitioned_recipe(
+                &registry,
+                "toy_async_partition",
+                json!({"corpus": corpus, "restricted": false}),
+                false,
+                crate::config::launcher::LaunchTarget::Local,
+                Some(0),
+                true,
+                sync_io,
+                tenant.clone(),
+                crate::config::partition::PartitionKey::new(vec![
+                    crate::config::partition::PartitionValue::new("corpus", corpus),
+                ])
+                .unwrap(),
+                admission.clone(),
+            )
+            .unwrap()
+        };
+
+        let first = prepare("a", false);
+        let second = prepare("b", false);
+        assert_eq!(first.footprint_gib(), 3);
+        assert_eq!(second.footprint_gib(), 3);
+        for prepared in [&first, &second] {
+            let profile = prepared.selected_training_io_profile().unwrap();
+            assert!(!profile.is_inline());
+            assert_eq!(profile.billed_overhead_bytes, crate::broker::footprint::GIB);
+        }
+        assert_eq!(ASYNC_PARTITION_CANDIDATE_CALLS.load(Ordering::SeqCst), 2);
+        assert!(
+            !temp.path().join("jobs").exists(),
+            "admission preparation must not materialize orphan job state while waiting for the shared gate"
+        );
+
+        // The legacy 2-GiB recipe footprint would let these cells overlap in a
+        // 4-GiB envelope. The prepared 2+1 GiB charge must serialize them.
+        let sem = Arc::new(tokio::sync::Semaphore::new(4));
+        let peak = Arc::new(AtomicU32::new(0));
+        let live = Arc::new(AtomicU32::new(0));
+        tokio::join!(
+            super::gated_cell_run(
+                sem.clone(),
+                first.footprint_gib(),
+                4,
+                busy_cell(peak.clone(), live.clone())
+            ),
+            super::gated_cell_run(
+                sem,
+                second.footprint_gib(),
+                4,
+                busy_cell(peak.clone(), live.clone())
+            )
+        );
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+
+        let inline = prepare("inline", true);
+        let inline_profile = inline.selected_training_io_profile().unwrap();
+        assert!(inline_profile.is_inline());
+        assert_eq!(inline.footprint_gib(), 2);
+        assert_eq!(ASYNC_PARTITION_CANDIDATE_CALLS.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn partition_backfill_sync_io_reaches_inline_stage_profile() {
+        use crate::config::partition::{PartitionDim, PartitionSet};
+
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let _env = EnvRestore::set(&[
+            ("BLUT_PARTITIONS_DIR", temp.path().join("partitions")),
+            ("LAMU_TRAIN_JOBS_DIR", temp.path().join("jobs")),
+            ("LAMU_TRAIN_DATA_DIR", temp.path().join("data")),
+            ("XDG_DATA_HOME", temp.path().join("xdg-data")),
+            ("XDG_CACHE_HOME", temp.path().join("xdg-cache")),
+            ("BLUT_SCHED_DEVICES", std::path::PathBuf::from("0")),
+            ("CUDA_VISIBLE_DEVICES", std::path::PathBuf::new()),
+            ("BLUT_NO_CONTAIN", std::path::PathBuf::from("1")),
+        ]);
+        ASYNC_PARTITION_SAW_INLINE.store(false, std::sync::atomic::Ordering::SeqCst);
+        ASYNC_PARTITION_CANDIDATE_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let mut registry = crate::framework::Registry::new();
+        registry.register(Box::new(AsyncPartitionCookbook));
+        let set = PartitionSet {
+            name: "inline".into(),
+            recipe: "toy_async_partition".into(),
+            dims: vec![PartitionDim {
+                axis: "corpus".into(),
+                values: vec!["a".into()],
+            }],
+        };
+        set.save().unwrap();
+
+        super::run_partition(
+            &registry,
+            super::PartitionCommand::Backfill {
+                recipe: set.recipe,
+                name: set.name,
+                force: false,
+                missing: false,
+                stale: false,
+                partitions: None,
+                args: r#"{"restricted":false}"#.into(),
+                launcher: "local".into(),
+                tenant: "default".into(),
+                sync_io: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(ASYNC_PARTITION_SAW_INLINE.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            ASYNC_PARTITION_CANDIDATE_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "partition preparation selects once and execution consumes its witness"
+        );
+    }
+
+    #[test]
     fn restricted_classification_is_per_cell_and_tenant_dominates() {
         use crate::config::partition::partition_args_are_restricted;
         let research = crate::tenant::Tenant::parse("research/dev").unwrap();
@@ -914,6 +1248,7 @@ mod cell_override_and_truncate_tests {
                 args: "{}".into(),
                 launcher: "local".into(),
                 tenant: "default".into(),
+                sync_io: false,
             },
         )
         .await
@@ -957,6 +1292,7 @@ mod cell_override_and_truncate_tests {
                 args: "{}".into(),
                 launcher: "local".into(),
                 tenant: "default".into(),
+                sync_io: false,
             },
         )
         .await
@@ -1034,6 +1370,7 @@ mod cell_override_and_truncate_tests {
                 args: "{}".into(),
                 launcher: "local".into(),
                 tenant: "default".into(),
+                sync_io: false,
             },
         )
         .await
@@ -1092,6 +1429,7 @@ mod cell_override_and_truncate_tests {
                 args: "{}".into(),
                 launcher: "local".into(),
                 tenant: "default".into(),
+                sync_io: false,
             },
         )
         .await
@@ -1148,6 +1486,7 @@ mod cell_override_and_truncate_tests {
                 args: r#"{"corpus":"safe"}"#.into(),
                 launcher: "local".into(),
                 tenant: "default".into(),
+                sync_io: false,
             },
         )
         .await
@@ -1169,6 +1508,7 @@ mod cell_override_and_truncate_tests {
                 args: r#"{"corpus":"safe"}"#.into(),
                 launcher: "local".into(),
                 tenant: "default".into(),
+                sync_io: false,
             },
         )
         .await
@@ -1195,6 +1535,7 @@ mod cell_override_and_truncate_tests {
                 args: r#"{"classification":"restricted"}"#.into(),
                 launcher: "local".into(),
                 tenant: "default".into(),
+                sync_io: false,
             },
         )
         .await
