@@ -806,6 +806,31 @@ impl CompiledPlan {
     /// compatibility floor is doing the billing — reported loudly per the
     /// ADR 0133 floor policy (fail-loud now; an operator strict mode that
     /// refuses undeclared plans arrives with the launch-consumer flip).
+    /// The largest-RAM DECLARED envelope in the plan (nodes + map templates),
+    /// with its stage name — the seam's input to launch admission (ADR 0133
+    /// incr 2b). `None` when no node declares (the JSON fallback applies).
+    pub(crate) fn max_declared_envelope(
+        &self,
+    ) -> Option<(String, blut_types::envelope::ResourceEnvelope)> {
+        fn scan(
+            nodes: &[PlanNode],
+            best: &mut Option<(String, blut_types::envelope::ResourceEnvelope)>,
+        ) {
+            for n in nodes {
+                let e = n.stage.resource_envelope(&n.args);
+                if e.is_declared() && best.as_ref().is_none_or(|(_, b)| e.ram_bytes > b.ram_bytes) {
+                    *best = Some((n.stage.name().to_string(), e));
+                }
+            }
+        }
+        let mut best = None;
+        scan(&self.nodes, &mut best);
+        for x in &self.expansions {
+            scan(&x.template.nodes, &mut best);
+        }
+        best
+    }
+
     pub(crate) fn has_resource_declarations(&self) -> bool {
         fn any(nodes: &[PlanNode]) -> bool {
             nodes

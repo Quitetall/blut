@@ -8,6 +8,42 @@
 //! imports, the other submodules' items, and the mod.rs helpers)
 //! resolves exactly as it did inline.
 
+/// ADR 0133 increment 2b: the UNTUNED launch footprint through the TYPED seam.
+///
+/// Applies when a plan node declares an envelope with calibration dimensions.
+/// The envelope's args-only estimate is the hint; the ENGINE-composed key (the
+/// RECIPE name as identity, so the SAME store rows the JSON path calibrates)
+/// resolves against the measured-peak store. Returns `None` for undeclared
+/// plans, where the JSON fallback applies unchanged. STRANGLER SHADOW: the
+/// JSON path is still computed and any divergence is warned loudly (the parity
+/// gate keeps this green in CI; the double-compute dies at Phase D). The TUNED
+/// path, whose worker/batch overrides change the ESTIMATE itself, stays on the
+/// JSON formula until the envelope's structured cost terms land (increment 3).
+pub(super) fn plan_footprint_declared(
+    plan: &crate::framework::CompiledPlan,
+    recipe: &str,
+    raw: &serde_json::Value,
+) -> Option<crate::broker::Footprint> {
+    let (stage_name, env) = plan.max_declared_envelope()?;
+    let flat = crate::broker::footprint::envelope_calibration_key(recipe, &env)?;
+    let hint = crate::broker::Footprint {
+        ram_bytes: env.ram_bytes,
+        vram_mib: 0,
+    };
+    let resolved = crate::broker::FootprintStore::load().resolve_flat(&flat, hint);
+    // Shadow referee (runtime defense on top of the CI parity gate).
+    let incumbent = recipe_footprint(recipe, raw);
+    if incumbent.ram_bytes != resolved.ram_bytes {
+        tracing::warn!(
+            "ADR 0133 shadow divergence for {recipe} (stage {stage_name}, key {flat}): \
+             typed {}G vs JSON {}G — investigate before Phase D",
+            resolved.ram_bytes / (1024 * 1024 * 1024),
+            incumbent.ram_bytes / (1024 * 1024 * 1024),
+        );
+    }
+    Some(resolved)
+}
+
 /// Estimate a job's RAM footprint from the recipe's raw args JSON
 /// (ADR 0046 slice-1). Best-effort + recipe-agnostic: blut can't see
 /// the cookbook's typed Args, so it reads the well-known cost-driver

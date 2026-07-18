@@ -1039,7 +1039,8 @@ pub(super) fn prepare_compiled_plan_launch(
             workers,
             admitted_batch_size,
         ),
-        None => recipe_footprint(name, plan.exec_view().recipe_args),
+        None => plan_footprint_declared(&plan, name, plan.exec_view().recipe_args)
+            .unwrap_or_else(|| recipe_footprint(name, plan.exec_view().recipe_args)),
     };
 
     let job_id = crate::jobs::new_job_id();

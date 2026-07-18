@@ -865,6 +865,22 @@ impl FootprintStore {
         self.resolve_inner(key, hint, standard)
     }
 
+    /// ADR 0133 incr 2b: resolve by the ENVELOPE-composed flat key (the seam's
+    /// path into the same store rows — `envelope_calibration_key*` reproduces
+    /// `FootprintKey::flat` byte-exactly, so measured history is shared, not
+    /// forked). Honors BLUT_FOOTPRINT_STANDARD like [`resolve`](Self::resolve).
+    pub fn resolve_flat(&self, flat: &str, hint: Footprint) -> Footprint {
+        let standard = use_standard_footprint_estimate();
+        if standard {
+            tracing::info!(
+                "BLUT_FOOTPRINT_STANDARD active — ignoring learned calibration for \
+                 key {flat}, using the static estimate ({:.1}G)",
+                hint.ram_bytes as f64 / GIB as f64,
+            );
+        }
+        self.resolve_inner_flat(flat, hint, standard)
+    }
+
     /// Core resolver. `standard_estimate = true` IGNORES the learned calibration
     /// and returns the conservative STATIC `hint` verbatim — use when a recorded
     /// cgroup peak may be DIRTY (inflated by OTHER processes co-resident on the
@@ -877,10 +893,19 @@ impl FootprintStore {
         hint: Footprint,
         standard_estimate: bool,
     ) -> Footprint {
+        self.resolve_inner_flat(&key.flat(), hint, standard_estimate)
+    }
+
+    fn resolve_inner_flat(
+        &self,
+        flat: &str,
+        hint: Footprint,
+        standard_estimate: bool,
+    ) -> Footprint {
         if standard_estimate {
             return hint;
         }
-        match self.entries.get(&key.flat()) {
+        match self.entries.get(flat) {
             Some(e) if e.source == FootprintSource::OomCorrected => {
                 // Grow strictly above the OOMing lower bound; never below
                 // the conservative hint; clamped by OOM_RESOLVE_CEILING_BYTES
@@ -1911,5 +1936,32 @@ mod envelope_key_continuity {
             Some("train_joint|3|32|2|c"),
             "unknown context dimensions never mutate the key layout"
         );
+    }
+
+    #[test]
+    fn resolve_flat_reads_the_same_store_rows_as_the_json_path() {
+        // Incr 2b: a Measured peak recorded under the incumbent FootprintKey
+        // must be served to the seam's flat-key resolve — shared history, not a
+        // forked store.
+        let mut store = FootprintStore::default();
+        let key = footprint_key("train_joint", 2, 32, 3, false);
+        store.entries.insert(
+            key.flat(),
+            FootprintEntry {
+                ram_bytes: 20 * GIB,
+                vram_mib: 0,
+                n_samples: 1,
+                source: FootprintSource::Measured,
+                updated_unix: 0,
+            },
+        );
+        let hint = Footprint {
+            ram_bytes: 35 * GIB,
+            vram_mib: 0,
+        };
+        let via_key = store.resolve(&key, hint);
+        let via_flat = store.resolve_flat("train_joint|3|32|2|c", hint);
+        assert_eq!(via_key.ram_bytes, via_flat.ram_bytes);
+        assert_eq!(via_flat.ram_bytes, 20 * GIB, "measured peak served");
     }
 }
