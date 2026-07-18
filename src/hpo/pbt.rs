@@ -156,11 +156,11 @@ impl PbtPolicy {
         let mut st = self.state.lock();
 
         // 1. Emit a queued clone first (one per step), under the spawn cap.
-        if st.spawns_done < self.cfg.max_spawns {
-            if let Some((overlay, resume)) = st.queue.pop_front() {
-                st.spawns_done += 1;
-                return PbtDecision::Spawn { overlay, resume };
-            }
+        if st.spawns_done < self.cfg.max_spawns
+            && let Some((overlay, resume)) = st.queue.pop_front()
+        {
+            st.spawns_done += 1;
+            return PbtDecision::Spawn { overlay, resume };
         }
 
         if st.killed.contains(&trial) {

@@ -187,11 +187,11 @@ impl SearchSpace {
     /// bare map of name → dist (the `dims:` wrapper is optional).
     pub fn from_yaml(text: &str) -> Result<SearchSpace, String> {
         // Try the wrapped form first, then the bare map.
-        if let Ok(s) = serde_yaml::from_str::<SearchSpace>(text) {
-            if !s.dims.is_empty() {
-                s.validate()?;
-                return Ok(s);
-            }
+        if let Ok(s) = serde_yaml::from_str::<SearchSpace>(text)
+            && !s.dims.is_empty()
+        {
+            s.validate()?;
+            return Ok(s);
         }
         let space = serde_yaml::from_str::<BTreeMap<String, Dist>>(text)
             .map(|dims| SearchSpace { dims })

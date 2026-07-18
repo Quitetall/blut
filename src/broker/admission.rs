@@ -72,25 +72,25 @@ pub fn decide(snap: &ResourceSnapshot, fp: &Footprint, floor_gib: f64) -> AdmitD
 
     // (3) VRAM courtesy pre-check (best-effort, never a box guarantee).
     if fp.vram_mib > 0 {
-        if let Some(total) = snap.vram_total_mib {
-            if fp.vram_mib > total {
-                return AdmitDecision::Refuse {
-                    reason: format!(
-                        "VRAM footprint {}MiB exceeds card capacity ({}MiB)",
-                        fp.vram_mib, total
-                    ),
-                };
-            }
+        if let Some(total) = snap.vram_total_mib
+            && fp.vram_mib > total
+        {
+            return AdmitDecision::Refuse {
+                reason: format!(
+                    "VRAM footprint {}MiB exceeds card capacity ({}MiB)",
+                    fp.vram_mib, total
+                ),
+            };
         }
-        if let Some(free) = snap.vram_free_mib {
-            if fp.vram_mib > free {
-                return AdmitDecision::Refuse {
-                    reason: format!(
-                        "VRAM footprint {}MiB > {}MiB free — serialize big-VRAM jobs",
-                        fp.vram_mib, free
-                    ),
-                };
-            }
+        if let Some(free) = snap.vram_free_mib
+            && fp.vram_mib > free
+        {
+            return AdmitDecision::Refuse {
+                reason: format!(
+                    "VRAM footprint {}MiB > {}MiB free — serialize big-VRAM jobs",
+                    fp.vram_mib, free
+                ),
+            };
         }
     }
 

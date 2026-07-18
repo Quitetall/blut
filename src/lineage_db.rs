@@ -1202,14 +1202,13 @@ impl LineageDb {
                 Some(a) => self.get_run(&a.job_id)?,
                 None => None,
             };
-            if exclude_restricted {
-                if let Some(r) = &run {
-                    if crate::tenant::Tenant::parse(&r.tenant).is_some_and(|t| t.is_restricted()) {
-                        // Drop this node entirely — do NOT enqueue its inputs, so
-                        // its whole subtree stays out of the export.
-                        continue;
-                    }
-                }
+            if exclude_restricted
+                && let Some(r) = &run
+                && crate::tenant::Tenant::parse(&r.tenant).is_some_and(|t| t.is_restricted())
+            {
+                // Drop this node entirely — do NOT enqueue its inputs, so
+                // its whole subtree stays out of the export.
+                continue;
             }
             nodes.push(crate::lineage_report::GraphNode {
                 content_hash: cur.clone(),

@@ -216,16 +216,16 @@ pub fn record_from_jsonl(
 /// the user might want to register the same content twice
 /// deliberately).
 pub fn add(conn: &Connection, rec: &DatasetRecord) -> Result<()> {
-    if let Some(existing) = get_by_sha256(conn, &rec.sha256)? {
-        if existing.name != rec.name {
-            tracing::warn!(
-                "dataset sha256 {} already registered as '{}' \
+    if let Some(existing) = get_by_sha256(conn, &rec.sha256)?
+        && existing.name != rec.name
+    {
+        tracing::warn!(
+            "dataset sha256 {} already registered as '{}' \
                  (now also as '{}'); accepting both",
-                rec.sha256,
-                existing.name,
-                rec.name
-            );
-        }
+            rec.sha256,
+            existing.name,
+            rec.name
+        );
     }
     let path_str = rec.source_path.to_string_lossy().into_owned();
     let r = conn.execute(

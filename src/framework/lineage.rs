@@ -181,10 +181,10 @@ pub fn fold_metrics(job_id: &str) -> Result<Vec<crate::lineage_db::MetricRow>> {
         // are NOT training metrics — route them out so their numeric
         // fields (gpu_util, …) don't pollute the metrics table. They are
         // folded separately by `fold_gauges`.
-        if let Some(kind) = obj.get("kind").and_then(|k| k.as_str()) {
-            if kind == "gpu_gauge" || kind == "gpu_starved" {
-                continue;
-            }
+        if let Some(kind) = obj.get("kind").and_then(|k| k.as_str())
+            && (kind == "gpu_gauge" || kind == "gpu_starved")
+        {
+            continue;
         }
         let step = obj
             .get("step")
@@ -199,18 +199,18 @@ pub fn fold_metrics(job_id: &str) -> Result<Vec<crate::lineage_db::MetricRow>> {
             if k == "step" || k == "epoch" {
                 continue; // a coordinate, not a metric
             }
-            if let Some(x) = v.as_f64() {
-                if x.is_finite() {
-                    rows.push(MetricRow {
-                        job_id: id.clone(),
-                        node_idx: node_idx as i64,
-                        step,
-                        metric: k.clone(),
-                        value: x,
-                        wall_unix: None,
-                    });
-                    last.insert((node_idx, k.clone()), x);
-                }
+            if let Some(x) = v.as_f64()
+                && x.is_finite()
+            {
+                rows.push(MetricRow {
+                    job_id: id.clone(),
+                    node_idx: node_idx as i64,
+                    step,
+                    metric: k.clone(),
+                    value: x,
+                    wall_unix: None,
+                });
+                last.insert((node_idx, k.clone()), x);
             }
         }
     }

@@ -87,6 +87,16 @@ jobs:
           cargo test --locked -p blut --features cloud --lib cloud
           cargo test --locked -p blut --features cloud --test cloud_integration
 
+      # AUDIT 2026-07: every feature above is gated INDIVIDUALLY, but a real
+      # cookbook binary unifies them (at least tui+p2p). Cargo feature
+      # unification can break combinations that each pass alone (the
+      # `serde_json/arbitrary_precision` class the Cargo.toml warns about), so
+      # lint the FULL union once — `tui,cloud` is the complete set (`cloud`
+      # implies `p2p` + the object-store deps). Clippy implies a full
+      # type-check; the per-feature jobs above already run the tests.
+      - name: Clippy the combined feature union (tui+cloud ⊇ p2p)
+        run: cargo clippy --locked -p blut --features tui,cloud --all-targets -- -D warnings
+
       # crates/blut-dsl is a STANDALONE workspace (path-deps on the engine).
       # It links `starlark` — and its `serde_json/arbitrary_precision` feature
       # — which is exactly why it lives OUTSIDE the engine (ADR 0078). Gate it

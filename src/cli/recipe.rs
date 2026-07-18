@@ -1293,12 +1293,11 @@ pub(super) async fn run_recipe_sweep(
 /// as-is (it feeds the Args directly, but top-level overrides can't apply — a
 /// compose-grammar limitation; `warn_dotless_overrides` surfaces it).
 pub(super) fn project_args(mut config: serde_json::Value, key: &str) -> serde_json::Value {
-    if let serde_json::Value::Object(map) = &mut config {
-        if let Some(sub) = map.get_mut(key) {
-            if sub.is_object() {
-                return sub.take();
-            }
-        }
+    if let serde_json::Value::Object(map) = &mut config
+        && let Some(sub) = map.get_mut(key)
+        && sub.is_object()
+    {
+        return sub.take();
     }
     config
 }

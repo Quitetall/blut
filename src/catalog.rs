@@ -167,16 +167,15 @@ impl CatalogQuery {
 
     /// Whether an entry (with its resolved `tags`) satisfies EVERY term.
     pub fn matches(&self, e: &CatalogEntry, tags: &[String]) -> bool {
-        if let Some(m) = &self.modality {
-            if e.schema
+        if let Some(m) = &self.modality
+            && e.schema
                 .modality
                 .as_deref()
                 .map(str::to_lowercase)
                 .as_deref()
                 != Some(m.as_str())
-            {
-                return false;
-            }
+        {
+            return false;
         }
         if let Some(f) = self.fs {
             // bit-compare (no float-cmp lint); fs:256 matches a stored 256.0.
@@ -184,20 +183,20 @@ impl CatalogQuery {
                 return false;
             }
         }
-        if let Some(k) = &self.kind {
-            if &e.kind != k {
-                return false;
-            }
+        if let Some(k) = &self.kind
+            && &e.kind != k
+        {
+            return false;
         }
-        if let Some(h) = &self.hash {
-            if !e.hash.to_lowercase().starts_with(h) {
-                return false;
-            }
+        if let Some(h) = &self.hash
+            && !e.hash.to_lowercase().starts_with(h)
+        {
+            return false;
         }
-        if let Some(t) = &self.tag {
-            if !tags.iter().any(|x| x == t) {
-                return false;
-            }
+        if let Some(t) = &self.tag
+            && !tags.iter().any(|x| x == t)
+        {
+            return false;
         }
         true
     }

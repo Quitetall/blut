@@ -226,13 +226,44 @@ pub fn get_model(conn: &Connection, model_hash: &str) -> Result<Option<ModelReg>
     }
 }
 
-/// Promote `model_hash` onto the pointer `(tenant, name, alias)`, appending the
-/// move to the audit trail in one transaction. Fail-closed boundary: the model
-/// must be registered AND its own tenant must equal `tenant` — a Restricted
-/// checkpoint can never be promoted onto another tenant's pointer (ADR 0061).
-/// The name is also verified to match the registered model, so an alias can't be
-/// pointed at a hash that belongs to a different model line.
+/// Promote `model_hash` onto the pointer `(tenant, name, alias)` — the
+/// GOVERNANCE-AWARE default entry point. A governed alias (the
+/// [`DEFAULT_GOVERNED_ALIASES`] set) is refused outright here: promoting onto
+/// `@prod` requires [`promote_governed`] with a passing [`GateVerdict`], so the
+/// "@prod never points at an unvetted checkpoint" invariant holds at the
+/// LIBRARY boundary, not just in the CLI — a cookbook binary calling this crate
+/// directly cannot bypass it (AUDIT 2026-07: governance used to live only in
+/// the `blut model` handler).
 pub fn promote(
+    conn: &mut Connection,
+    model_hash: &str,
+    tenant: &str,
+    name: &str,
+    alias: &str,
+    now_unix: i64,
+) -> Result<()> {
+    promote_governed(
+        conn,
+        model_hash,
+        tenant,
+        name,
+        alias,
+        DEFAULT_GOVERNED_ALIASES,
+        None,
+        now_unix,
+    )
+}
+
+/// The ungoverned promote mechanism: registration/tenant/name checks + the
+/// pointer upsert + audit append in one IMMEDIATE transaction. Private — every
+/// public path goes through [`promote`] (refuses governed aliases) or
+/// [`promote_governed`] (requires a passing verdict for them). Fail-closed
+/// boundary: the model must be registered AND its own tenant must equal
+/// `tenant` — a Restricted checkpoint can never be promoted onto another
+/// tenant's pointer (ADR 0061). The name is also verified to match the
+/// registered model, so an alias can't be pointed at a hash that belongs to a
+/// different model line.
+fn promote_unchecked(
     conn: &mut Connection,
     model_hash: &str,
     tenant: &str,
@@ -454,7 +485,7 @@ pub fn promote_governed(
             }
         }
     }
-    promote(conn, model_hash, tenant, name, alias, now_unix)
+    promote_unchecked(conn, model_hash, tenant, name, alias, now_unix)
 }
 
 /// Roll an alias back to its previous target atomically (one `BEGIN IMMEDIATE`
@@ -593,6 +624,28 @@ mod tests {
         c
     }
 
+    /// Promote onto a GOVERNED alias with a passing verdict — the test-side
+    /// shorthand for the vetted path (`promote` itself refuses governed aliases).
+    fn promote_pass(
+        c: &mut Connection,
+        hash: &str,
+        tenant: &str,
+        name: &str,
+        alias: &str,
+        t: i64,
+    ) -> Result<()> {
+        promote_governed(
+            c,
+            hash,
+            tenant,
+            name,
+            alias,
+            DEFAULT_GOVERNED_ALIASES,
+            Some(&GateVerdict::Pass),
+            t,
+        )
+    }
+
     #[test]
     fn register_validates_hash_and_name() {
         let c = db();
@@ -622,7 +675,7 @@ mod tests {
         assert!(register(&c, HASH_A, "enc", "../evil", None, 1).is_err());
         // A well-formed project/domain tenant is accepted.
         assert!(register(&c, HASH_A, "enc", "research/prod", None, 1).is_ok());
-        assert!(promote(&mut c, HASH_A, "bad tenant", "enc", "prod", 2).is_err());
+        assert!(promote(&mut c, HASH_A, "bad tenant", "enc", "staging", 2).is_err());
     }
 
     #[test]
@@ -631,8 +684,8 @@ mod tests {
         register(&c, HASH_A, "enc", SHARED_TENANT, None, 1).unwrap();
         register(&c, HASH_B, "enc", SHARED_TENANT, None, 2).unwrap();
         // Promote A→@prod, then B→@prod.
-        promote(&mut c, HASH_A, SHARED_TENANT, "enc", "prod", 10).unwrap();
-        promote(&mut c, HASH_B, SHARED_TENANT, "enc", "prod", 20).unwrap();
+        promote_pass(&mut c, HASH_A, SHARED_TENANT, "enc", "prod", 10).unwrap();
+        promote_pass(&mut c, HASH_B, SHARED_TENANT, "enc", "prod", 20).unwrap();
         assert_eq!(
             resolve_pointer(&c, SHARED_TENANT, "enc", "prod")
                 .unwrap()
@@ -663,7 +716,7 @@ mod tests {
         register(&c, HASH_A, "enc", SHARED_TENANT, None, 1).unwrap();
         register(&c, HASH_B, "enc", SHARED_TENANT, None, 2).unwrap();
         promote(&mut c, HASH_A, SHARED_TENANT, "enc", "staging", 10).unwrap();
-        promote(&mut c, HASH_B, SHARED_TENANT, "enc", "prod", 11).unwrap();
+        promote_pass(&mut c, HASH_B, SHARED_TENANT, "enc", "prod", 11).unwrap();
         assert_eq!(
             resolve_pointer(&c, SHARED_TENANT, "enc", "staging")
                 .unwrap()
@@ -683,20 +736,43 @@ mod tests {
         let mut c = db();
         register(&c, HASH_A, "enc", RESTRICTED_TENANT, None, 1).unwrap();
         // A restricted checkpoint can't be promoted onto a shared-tenant pointer.
-        assert!(promote(&mut c, HASH_A, SHARED_TENANT, "enc", "prod", 10).is_err());
+        assert!(promote_pass(&mut c, HASH_A, SHARED_TENANT, "enc", "prod", 10).is_err());
         // Nor onto a pointer whose name doesn't match the registered model.
-        assert!(promote(&mut c, HASH_A, RESTRICTED_TENANT, "other", "prod", 11).is_err());
+        assert!(promote_pass(&mut c, HASH_A, RESTRICTED_TENANT, "other", "prod", 11).is_err());
         // The matching promote succeeds.
-        assert!(promote(&mut c, HASH_A, RESTRICTED_TENANT, "enc", "prod", 12).is_ok());
+        assert!(promote_pass(&mut c, HASH_A, RESTRICTED_TENANT, "enc", "prod", 12).is_ok());
     }
 
     #[test]
     fn rollback_without_prior_is_refused() {
         let mut c = db();
         register(&c, HASH_A, "enc", SHARED_TENANT, None, 1).unwrap();
-        promote(&mut c, HASH_A, SHARED_TENANT, "enc", "prod", 10).unwrap();
+        promote_pass(&mut c, HASH_A, SHARED_TENANT, "enc", "prod", 10).unwrap();
         // Only ONE entry in the trail → no prior to roll back to.
         assert!(rollback(&mut c, SHARED_TENANT, "enc", "prod", 20).is_err());
+    }
+
+    /// AUDIT REGRESSION (2026-07): governance is a LIBRARY invariant, not a CLI
+    /// courtesy. The bare `promote()` used to skip the governed-alias check —
+    /// any cookbook binary calling the crate directly could point `@prod` at an
+    /// unvetted hash. Now `promote()` itself refuses a governed alias.
+    #[test]
+    fn bare_promote_refuses_governed_alias_at_the_library_boundary() {
+        let mut c = db();
+        register(&c, HASH_A, "enc", SHARED_TENANT, None, 1).unwrap();
+        let err = promote(&mut c, HASH_A, SHARED_TENANT, "enc", "prod", 10).unwrap_err();
+        assert!(
+            err.to_string().contains("governed"),
+            "bare promote to @prod must cite governance: {err}"
+        );
+        assert!(
+            resolve_pointer(&c, SHARED_TENANT, "enc", "prod")
+                .unwrap()
+                .is_none(),
+            "the refused promote must not create the pointer"
+        );
+        // Ungoverned aliases are unaffected.
+        promote(&mut c, HASH_A, SHARED_TENANT, "enc", "staging", 11).unwrap();
     }
 
     #[test]

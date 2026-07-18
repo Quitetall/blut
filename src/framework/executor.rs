@@ -3476,10 +3476,10 @@ fn publish_speculative_inner(
                     rollback_failure,
                 ));
             }
-            if rollback_cache_on_stop {
-                if let Some(error) = plan_stop_error(deadline, plan_started, &env.cancel) {
-                    return Err(NodeFailure::Plan(error));
-                }
+            if rollback_cache_on_stop
+                && let Some(error) = plan_stop_error(deadline, plan_started, &env.cancel)
+            {
+                return Err(NodeFailure::Plan(error));
             }
             let proof = crate::framework::cache::CacheProof {
                 key: prepared.key,
@@ -4698,14 +4698,14 @@ impl SequentialExecutor {
         for (idx, node_id) in order.iter().enumerate() {
             // Plan-level deadline (D2): coarse between-stage check; a
             // stage mid-run is bounded by its own hard timeout instead.
-            if let Some(dl) = deadline {
-                if Instant::now() >= dl {
-                    env.cancel.cancel();
-                    let error = PlanError::DeadlineExceeded {
-                        elapsed: started.elapsed(),
-                    };
-                    return Err(finish_writer_after_error(env, writer_handle, error).await);
-                }
+            if let Some(dl) = deadline
+                && Instant::now() >= dl
+            {
+                env.cancel.cancel();
+                let error = PlanError::DeadlineExceeded {
+                    elapsed: started.elapsed(),
+                };
+                return Err(finish_writer_after_error(env, writer_handle, error).await);
             }
             if env.cancel.is_cancelled() {
                 env.status.emit(StageEvent::StageFailed {
@@ -4753,21 +4753,22 @@ impl SequentialExecutor {
                     // not a plan failure — record it and STOP (the remaining topo
                     // nodes are its descendants and can't run). `strict_advisory()`
                     // forces the old fail-hard behaviour for CI.
-                    if let NodeFailure::Stage { idx, stage, source } = &f {
-                        if node.stage.is_advisory() && !strict_advisory() {
-                            tracing::warn!("advisory stage '{stage}' failed (non-fatal): {source}");
-                            warnings.push(StageWarning {
-                                idx: *idx,
-                                stage: stage.clone(),
-                                reason: source.to_string(),
-                                // No StageFailure downcast happens on this path today
-                                // (source is only stringified above) — nothing to
-                                // thread through yet (ADR 0072 B-series wires real
-                                // origins into cookbook StageFailures).
-                                origin: None,
-                            });
-                            break;
-                        }
+                    if let NodeFailure::Stage { idx, stage, source } = &f
+                        && node.stage.is_advisory()
+                        && !strict_advisory()
+                    {
+                        tracing::warn!("advisory stage '{stage}' failed (non-fatal): {source}");
+                        warnings.push(StageWarning {
+                            idx: *idx,
+                            stage: stage.clone(),
+                            reason: source.to_string(),
+                            // No StageFailure downcast happens on this path today
+                            // (source is only stringified above) — nothing to
+                            // thread through yet (ADR 0072 B-series wires real
+                            // origins into cookbook StageFailures).
+                            origin: None,
+                        });
+                        break;
                     }
                     let error = plan_error_of(f);
                     return Err(finish_writer_after_error(env, writer_handle, error).await);
@@ -5377,15 +5378,14 @@ impl ParallelExecutor {
             // nodes, cancel + drain the in-flight ones, report
             // DeadlineExceeded (a stage mid-run is bounded by its own
             // hard timeout).
-            if first_error.is_none() {
-                if let Some(dl) = deadline {
-                    if Instant::now() >= dl {
-                        first_error = Some(PlanError::DeadlineExceeded {
-                            elapsed: started.elapsed(),
-                        });
-                        env.cancel.cancel();
-                    }
-                }
+            if first_error.is_none()
+                && let Some(dl) = deadline
+                && Instant::now() >= dl
+            {
+                first_error = Some(PlanError::DeadlineExceeded {
+                    elapsed: started.elapsed(),
+                });
+                env.cancel.cancel();
             }
             // #4 SPAWN: drain runtime-injected sub-plans on the coordinator seam
             // BEFORE the spawn-ready loop, so newly-ready roots are scheduled
@@ -6687,20 +6687,19 @@ impl ParallelExecutor {
                         }
 
                         // Decrement successors' in-degrees; newly-zero → ready.
-                        if first_error.is_none() {
-                            if let Some(ss) = succs.get(&outcome.node_id) {
-                                for &s in ss {
-                                    if let Some(d) = indeg.get_mut(&s) {
-                                        *d -= 1;
-                                        let condition_allows = !condition_by_target
-                                            .contains_key(&s)
-                                            || enabled_condition_targets.contains(&s);
-                                        if *d == 0
-                                            && condition_allows
-                                            && !fused_internal_nodes.contains(&s)
-                                        {
-                                            ready.insert(s);
-                                        }
+                        if first_error.is_none()
+                            && let Some(ss) = succs.get(&outcome.node_id)
+                        {
+                            for &s in ss {
+                                if let Some(d) = indeg.get_mut(&s) {
+                                    *d -= 1;
+                                    let condition_allows = !condition_by_target.contains_key(&s)
+                                        || enabled_condition_targets.contains(&s);
+                                    if *d == 0
+                                        && condition_allows
+                                        && !fused_internal_nodes.contains(&s)
+                                    {
+                                        ready.insert(s);
                                     }
                                 }
                             }
@@ -7055,20 +7054,20 @@ impl ParallelExecutor {
                     // latch. Capture whether the failing stage is ADVISORY (ADR
                     // 0071) BEFORE removing it from `node_stages`.
                     let mut advisory: Option<(u32, String, String, NodeId)> = None;
-                    if let NodeFailure::Stage { idx, stage, source } = &f {
-                        if let Some(&nid) = order.get(*idx as usize) {
-                            let is_adv = node_stages
-                                .get(&nid)
-                                .map(|s| s.is_advisory())
-                                .unwrap_or(false)
-                                && !strict_advisory();
-                            node_tokens.remove(&nid);
-                            node_stages.remove(&nid);
-                            ordinary_admission_demands.remove(&nid);
-                            kill_flagged.remove(&nid);
-                            if is_adv {
-                                advisory = Some((*idx, stage.clone(), source.to_string(), nid));
-                            }
+                    if let NodeFailure::Stage { idx, stage, source } = &f
+                        && let Some(&nid) = order.get(*idx as usize)
+                    {
+                        let is_adv = node_stages
+                            .get(&nid)
+                            .map(|s| s.is_advisory())
+                            .unwrap_or(false)
+                            && !strict_advisory();
+                        node_tokens.remove(&nid);
+                        node_stages.remove(&nid);
+                        ordinary_admission_demands.remove(&nid);
+                        kill_flagged.remove(&nid);
+                        if is_adv {
+                            advisory = Some((*idx, stage.clone(), source.to_string(), nid));
                         }
                     }
                     if let Some((idx, stage, reason, nid)) = advisory {

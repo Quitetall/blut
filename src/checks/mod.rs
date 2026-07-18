@@ -208,29 +208,29 @@ impl Stage for CheckJsonl {
             ))
         })?;
 
-        if let Some(min) = args.min_rows {
-            if rows < min {
-                handle_breach(
-                    ctx,
-                    CHECK_JSONL,
-                    "DATA_QUALITY_MIN_ROWS",
-                    args.on_breach,
-                    format!("row count {rows} below min_rows {min}"),
-                    &[("rows", rows.to_string()), ("min_rows", min.to_string())],
-                )?;
-            }
+        if let Some(min) = args.min_rows
+            && rows < min
+        {
+            handle_breach(
+                ctx,
+                CHECK_JSONL,
+                "DATA_QUALITY_MIN_ROWS",
+                args.on_breach,
+                format!("row count {rows} below min_rows {min}"),
+                &[("rows", rows.to_string()), ("min_rows", min.to_string())],
+            )?;
         }
-        if let Some(max) = args.max_rows {
-            if rows > max {
-                handle_breach(
-                    ctx,
-                    CHECK_JSONL,
-                    "DATA_QUALITY_MAX_ROWS",
-                    args.on_breach,
-                    format!("row count {rows} above max_rows {max}"),
-                    &[("rows", rows.to_string()), ("max_rows", max.to_string())],
-                )?;
-            }
+        if let Some(max) = args.max_rows
+            && rows > max
+        {
+            handle_breach(
+                ctx,
+                CHECK_JSONL,
+                "DATA_QUALITY_MAX_ROWS",
+                args.on_breach,
+                format!("row count {rows} above max_rows {max}"),
+                &[("rows", rows.to_string()), ("max_rows", max.to_string())],
+            )?;
         }
         // Passthrough: same path + hash → downstream sees byte-identical input.
         Ok(input)

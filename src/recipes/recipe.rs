@@ -185,13 +185,13 @@ pub(crate) fn validate_args_against_schema(
                 .get(k)
                 .and_then(|d| d.get("type"))
                 .and_then(|t| t.as_str())
+                && !v.is_null()
+                && !json_type_matches(v, expected)
             {
-                if !v.is_null() && !json_type_matches(v, expected) {
-                    return bad(format!(
-                        "arg '{k}' expected {expected}, got {}",
-                        json_kind(v)
-                    ));
-                }
+                return bad(format!(
+                    "arg '{k}' expected {expected}, got {}",
+                    json_kind(v)
+                ));
             }
         }
     }

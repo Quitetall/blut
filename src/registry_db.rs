@@ -225,8 +225,12 @@ pub fn promote(
             dep.tenant, tenant
         )));
     }
+    // IMMEDIATE (not DEFERRED), matching `rollback` and the model registry: both
+    // verbs MUTATE the same pointer, so take the write lock up front and
+    // serialize cleanly — a concurrent double-promote waits instead of surfacing
+    // a raw SQLITE_BUSY.
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| TrainError::other(format!("promote txn: {e}")))?;
     tx.execute(
         "INSERT INTO deployment_pointers (tenant, name, plan_fingerprint, updated_at) \

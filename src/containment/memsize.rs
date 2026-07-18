@@ -29,10 +29,10 @@ pub fn resolve_mem_bytes(typed: Option<u64>, env_key: &str, default: &str) -> Op
     if let Some(bytes) = typed.filter(|&b| b > 0) {
         return Some(bytes);
     }
-    if let Ok(s) = std::env::var(env_key) {
-        if let Some(b) = parse_memsize(&s) {
-            return Some(b);
-        }
+    if let Ok(s) = std::env::var(env_key)
+        && let Some(b) = parse_memsize(&s)
+    {
+        return Some(b);
     }
     parse_memsize(default)
 }
@@ -45,11 +45,11 @@ pub fn fmt_bytes_as_memsize(bytes: u64) -> String {
     const K: u64 = 1024;
     const M: u64 = 1024 * 1024;
     const G: u64 = 1024 * 1024 * 1024;
-    if bytes != 0 && bytes % G == 0 {
+    if bytes != 0 && bytes.is_multiple_of(G) {
         format!("{}G", bytes / G)
-    } else if bytes != 0 && bytes % M == 0 {
+    } else if bytes != 0 && bytes.is_multiple_of(M) {
         format!("{}M", bytes / M)
-    } else if bytes != 0 && bytes % K == 0 {
+    } else if bytes != 0 && bytes.is_multiple_of(K) {
         format!("{}K", bytes / K)
     } else {
         // Bare integer = bytes in systemd's MemoryMax= grammar.

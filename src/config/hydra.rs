@@ -374,13 +374,12 @@ impl ConfigDict {
                 (self.get(key), value),
                 (Some(ConfigValue::Dict(_)), ConfigValue::Dict(_))
             );
-            if deep {
-                if let (ConfigValue::Dict(other_dict), Some(ConfigValue::Dict(self_dict))) =
+            if deep
+                && let (ConfigValue::Dict(other_dict), Some(ConfigValue::Dict(self_dict))) =
                     (value, self.get_mut(key))
-                {
-                    self_dict.merge(other_dict);
-                    continue;
-                }
+            {
+                self_dict.merge(other_dict);
+                continue;
             }
             self.insert(key.to_string(), value.clone());
         }
@@ -473,10 +472,10 @@ impl ConfigLoader {
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for entry in rd.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("yaml") {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        items.push(stem.to_string());
-                    }
+                if path.extension().and_then(|e| e.to_str()) == Some("yaml")
+                    && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                {
+                    items.push(stem.to_string());
                 }
             }
         }
@@ -696,10 +695,10 @@ fn parse_override_value(value_str: &str) -> ConfigValue {
     // Require a digit before accepting a float, so bare `inf`/`nan`/`infinity`
     // (which `f64::from_str` DOES accept) stay strings — matching Hydra, and
     // keeping a `nan` from poisoning `ConfigValue`'s `PartialEq`.
-    if trimmed.bytes().any(|b| b.is_ascii_digit()) {
-        if let Ok(f) = trimmed.parse::<f64>() {
-            return ConfigValue::Float(f);
-        }
+    if trimmed.bytes().any(|b| b.is_ascii_digit())
+        && let Ok(f) = trimmed.parse::<f64>()
+    {
+        return ConfigValue::Float(f);
     }
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
         let inner = &trimmed[1..trimmed.len() - 1];

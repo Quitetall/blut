@@ -27,7 +27,7 @@ use crate::framework::{GraphSnapshot, graph_snapshot};
 use crate::jobs;
 use crate::lineage_db::LineageDb;
 
-/// The metric the leaderboard ranks by in 1.0. Every trainer records a
+/// The metric the leaderboard ranks by. Every trainer records a
 /// `loss`; lower is better (so the leaderboard minimizes). Bespoke metrics
 /// are surfaced per-run in Compare / Metrics and via the `hpo show` CLI.
 pub const DEFAULT_METRIC: &str = "loss";
@@ -47,10 +47,10 @@ fn fmt_unix(secs: u64) -> String {
 /// A run's wall-clock label: its recorded start time if the lineage DB has
 /// one, else the timestamp embedded in the job id (`YYYYMMDD-HHMMSS-…`).
 fn when_of(job_id: &str, started_unix: Option<i64>) -> String {
-    if let Some(s) = started_unix {
-        if s > 0 {
-            return fmt_unix(s as u64);
-        }
+    if let Some(s) = started_unix
+        && s > 0
+    {
+        return fmt_unix(s as u64);
     }
     fmt_job_id_date(job_id)
 }

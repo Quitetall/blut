@@ -205,18 +205,18 @@ pub fn check_unlocked() -> Result<()> {
 }
 
 pub fn check_unlocked_at(path: &Path) -> Result<()> {
-    if let Some(existing) = read_lock(path) {
-        if pid_alive(existing.pid) {
-            return Err(Error::Other(format!(
-                "GPU held by '{}' (pid {}, kind {:?}). \
+    if let Some(existing) = read_lock(path)
+        && pid_alive(existing.pid)
+    {
+        return Err(Error::Other(format!(
+            "GPU held by '{}' (pid {}, kind {:?}). \
                  Pass --allow-evict to wait.",
-                existing.holder, existing.pid, existing.kind
-            )));
-        }
-        // Stale lock; readers don't clean up to avoid racing the
-        // legitimate holder of a freshly-created file. Just report
-        // unlocked and leave cleanup to the next acquire.
+            existing.holder, existing.pid, existing.kind
+        )));
     }
+    // Stale lock; readers don't clean up to avoid racing the
+    // legitimate holder of a freshly-created file. Just report
+    // unlocked and leave cleanup to the next acquire.
     Ok(())
 }
 
@@ -261,13 +261,13 @@ fn write_lock(path: &Path, holder: &str, kind: LockKind) -> Result<ExclusiveLock
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // Someone raced us between the stale-cleanup and the
             // create. Re-read; if alive, surface the conflict.
-            if let Some(existing) = read_lock(path) {
-                if pid_alive(existing.pid) {
-                    return Err(Error::Other(format!(
-                        "GPU lock raced; now held by '{}' (pid {}, kind {:?})",
-                        existing.holder, existing.pid, existing.kind
-                    )));
-                }
+            if let Some(existing) = read_lock(path)
+                && pid_alive(existing.pid)
+            {
+                return Err(Error::Other(format!(
+                    "GPU lock raced; now held by '{}' (pid {}, kind {:?})",
+                    existing.holder, existing.pid, existing.kind
+                )));
             }
             return Err(Error::Other(format!(
                 "scheduler lock create_new race at {}: {e}",

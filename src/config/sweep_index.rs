@@ -52,11 +52,11 @@ pub fn default_index_path() -> Option<PathBuf> {
 /// Append one completion record. Atomic per line (a single `\n`-terminated
 /// `write_all`); concurrent appends are serialized by the scheduler lock.
 pub fn record_to(index_path: &Path, rec: &SweepRecord) -> Result<()> {
-    if let Some(parent) = index_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| TrainError::other(format!("mkdir sweep-index dir: {e}")))?;
-        }
+    if let Some(parent) = index_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| TrainError::other(format!("mkdir sweep-index dir: {e}")))?;
     }
     let mut line = serde_json::to_string(rec)
         .map_err(|e| TrainError::other(format!("encode sweep record: {e}")))?;

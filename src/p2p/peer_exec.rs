@@ -104,13 +104,13 @@ struct StageDirGuard(PathBuf);
 
 impl Drop for StageDirGuard {
     fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_dir_all(&self.0) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    "peer stage_dir cleanup failed for {}: {e}",
-                    self.0.display()
-                );
-            }
+        if let Err(e) = std::fs::remove_dir_all(&self.0)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                "peer stage_dir cleanup failed for {}: {e}",
+                self.0.display()
+            );
         }
     }
 }

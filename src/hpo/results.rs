@@ -118,16 +118,15 @@ pub fn reconstruct(manifest: &HpoManifest, status_lines: &[String]) -> Vec<Trial
         match kind {
             "stage_step" => {
                 began[t] = true;
-                if let Some(update) = ev.get("update") {
-                    if let Some(obj) = dotted_f64(update, &manifest.metric) {
-                        if obj.is_finite() {
-                            best[t] = Some(match best[t] {
-                                None => obj,
-                                Some(b) if maximize => b.max(obj),
-                                Some(b) => b.min(obj),
-                            });
-                        }
-                    }
+                if let Some(update) = ev.get("update")
+                    && let Some(obj) = dotted_f64(update, &manifest.metric)
+                    && obj.is_finite()
+                {
+                    best[t] = Some(match best[t] {
+                        None => obj,
+                        Some(b) if maximize => b.max(obj),
+                        Some(b) => b.min(obj),
+                    });
                 }
             }
             "stage_begin" => began[t] = true,

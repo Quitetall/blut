@@ -503,16 +503,14 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
         ctx = ctx.with_training_io_selection_budget_bytes(budget_bytes);
     }
     ctx = ctx.with_training_io_node_admission_resolver(node_admission);
-    if shared_cache {
-        if let Some(global) = crate::framework::CacheHandle::default_global_path() {
-            std::fs::create_dir_all(&global)
-                .with_context(|| format!("create global cache dir {}", global.display()))?;
-            let cache_handle = (*ctx.cache)
-                .clone()
-                .with_global(global)
-                .with_tenant(&tenant);
-            ctx.cache = std::sync::Arc::new(cache_handle);
-        }
+    if shared_cache && let Some(global) = crate::framework::CacheHandle::default_global_path() {
+        std::fs::create_dir_all(&global)
+            .with_context(|| format!("create global cache dir {}", global.display()))?;
+        let cache_handle = (*ctx.cache)
+            .clone()
+            .with_global(global)
+            .with_tenant(&tenant);
+        ctx.cache = std::sync::Arc::new(cache_handle);
     }
 
     // Force the HPO fan-out through the parallel optimizer, then select every

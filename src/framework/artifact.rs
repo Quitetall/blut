@@ -524,10 +524,10 @@ impl ArtifactMetadata {
     }
 
     pub fn write_to(&self, sidecar_path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = sidecar_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = sidecar_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         // Compact JSON (opt-5): ~2× smaller on disk than pretty,
         // faster to serialize, and sidecars are read by tools not

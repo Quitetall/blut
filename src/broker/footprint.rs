@@ -123,10 +123,10 @@ pub fn in_ch_from_args(extra_args: &[&str], extra_env: &[&str]) -> u32 {
                 return in_ch_from_detail_bands(m);
             }
             // Space form `--detail-bands <m>` / `--n <m>`.
-            if tok == flag {
-                if let Some(&m) = extra_args.get(i + 1) {
-                    return in_ch_from_detail_bands(m);
-                }
+            if tok == flag
+                && let Some(&m) = extra_args.get(i + 1)
+            {
+                return in_ch_from_detail_bands(m);
             }
         }
     }

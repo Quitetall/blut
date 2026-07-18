@@ -89,10 +89,10 @@ fn probe() -> Availability {
 /// (or we lack permission), proceed — the cap write will surface a real error.
 fn enable_memory_subtree(base: &Path) {
     let f = base.join("cgroup.subtree_control");
-    if let Ok(cur) = std::fs::read_to_string(&f) {
-        if cur.split_whitespace().any(|c| c == "memory") {
-            return;
-        }
+    if let Ok(cur) = std::fs::read_to_string(&f)
+        && cur.split_whitespace().any(|c| c == "memory")
+    {
+        return;
     }
     let _ = std::fs::write(&f, b"+memory");
 }

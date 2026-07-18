@@ -111,12 +111,11 @@ pub fn unregister_child(pid: u32) {
         m.remove(&pid);
         m.is_empty()
     });
-    if now_empty {
-        if let Some(job_id) = CURRENT_JOB.lock().expect("CURRENT_JOB poisoned").clone() {
-            if let Err(e) = crate::jobs::clear_pid(&job_id) {
-                tracing::debug!("clear pid file for {job_id} after last child exit: {e}");
-            }
-        }
+    if now_empty
+        && let Some(job_id) = CURRENT_JOB.lock().expect("CURRENT_JOB poisoned").clone()
+        && let Err(e) = crate::jobs::clear_pid(&job_id)
+    {
+        tracing::debug!("clear pid file for {job_id} after last child exit: {e}");
     }
 }
 

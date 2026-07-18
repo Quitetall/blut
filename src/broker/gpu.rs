@@ -262,6 +262,10 @@ pub struct GpuScheduler {
     devices: Vec<GpuDevice>,
     sems: Vec<Arc<Semaphore>>,
     avail: Arc<Semaphore>,
+    /// Signalled after a [`GpuGrant`] releases its devices. A floor-constrained
+    /// waiter (whose QUALIFYING devices are busy even though `avail` admitted it)
+    /// parks on this instead of hot-retrying; see [`GpuScheduler::acquire`].
+    released: Arc<tokio::sync::Notify>,
 }
 
 impl GpuScheduler {
@@ -288,6 +292,7 @@ impl GpuScheduler {
             devices,
             sems,
             avail,
+            released: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -325,10 +330,13 @@ impl GpuScheduler {
             .collect()
     }
 
-    /// Grab `need` FREE devices, VRAM-qualifying first (soft — under contention a
-    /// non-qualifying free device is a best-effort fallback; the ADR treats VRAM
-    /// as an estimate). Caller holds `need` `avail` permits, so `need` devices
-    /// ARE free ⇒ this never blocks and always fills.
+    /// Grab up to `need` FREE devices, QUALIFYING ONLY: a declared
+    /// `min_vram_mib` floor is a HARD constraint — a device below the floor is
+    /// never granted (it would CUDA-OOM the stage at runtime, later and worse).
+    /// With a `0` floor every device qualifies, so the floorless path is
+    /// unchanged. May under-fill when qualifying devices are busy even though
+    /// `avail` admitted the request (non-qualifying devices are free) — the
+    /// caller handles that (try_acquire ⇒ `None`; acquire ⇒ wait + retry).
     fn grab(&self, need: usize, min_vram_mib: u64) -> (Vec<OwnedSemaphorePermit>, Vec<usize>) {
         let mut permits = Vec::with_capacity(need);
         let mut got = Vec::with_capacity(need);
@@ -339,17 +347,6 @@ impl GpuScheduler {
             if let Ok(p) = self.sems[pos].clone().try_acquire_owned() {
                 permits.push(p);
                 got.push(pos);
-            }
-        }
-        for pos in 0..self.devices.len() {
-            if got.len() == need {
-                break;
-            }
-            if !got.contains(&pos) {
-                if let Ok(p) = self.sems[pos].clone().try_acquire_owned() {
-                    permits.push(p);
-                    got.push(pos);
-                }
             }
         }
         (permits, got)
@@ -366,7 +363,8 @@ impl GpuScheduler {
         GpuGrant {
             devices,
             _permits: permits,
-            _avail: avail,
+            _avail: Some(avail),
+            released: self.released.clone(),
         }
     }
 
@@ -390,10 +388,15 @@ impl GpuScheduler {
         Some(self.grant(avail, permits, got))
     }
 
-    /// Grant a device set, blocking until `need` devices free. Admission via the
-    /// `avail` counting semaphore is deadlock-free (no per-device ordering); the
-    /// device grabs afterward never block. Fails fast (never hangs) when no set
-    /// can EVER satisfy `min_vram_mib`.
+    /// Grant a device set, blocking until `need` QUALIFYING devices free.
+    /// Admission via the `avail` counting semaphore is deadlock-free (no
+    /// per-device ordering) and covers the floorless case exactly (`avail` free
+    /// ⇒ grab fills). With a `min_vram_mib` floor, `avail` may admit while the
+    /// qualifying subset is busy (only non-qualifying devices are free) — then
+    /// the loop releases everything (never waits while holding a device),
+    /// parks until a grant releases (bounded by a retry tick so a missed
+    /// wake-up can't strand it), and retries. Fails fast (never hangs) when no
+    /// device set can EVER satisfy the floor.
     pub async fn acquire(&self, req: GpuRequest) -> Result<GpuGrant, GpuError> {
         // effective_need warns once here on the slow (blocking) path; the fast
         // try_acquire path already warned if it ran first, but run_node calls one
@@ -407,17 +410,33 @@ impl GpuScheduler {
                 min_vram_mib: req.min_vram_mib,
             });
         }
-        let avail = match self.avail.clone().acquire_many_owned(need as u32).await {
-            Ok(a) => a,
-            Err(_) => return Err(GpuError::Closed),
-        };
-        let (permits, got) = self.grab(need, req.min_vram_mib);
-        debug_assert_eq!(
-            got.len(),
-            need,
-            "avail admission guarantees `need` free devices"
-        );
-        Ok(self.grant(avail, permits, got))
+        loop {
+            let avail = match self.avail.clone().acquire_many_owned(need as u32).await {
+                Ok(a) => a,
+                Err(_) => return Err(GpuError::Closed),
+            };
+            let (permits, got) = self.grab(need, req.min_vram_mib);
+            if got.len() == need {
+                return Ok(self.grant(avail, permits, got));
+            }
+            // Floor-constrained miss: free devices exist (avail admitted) but not
+            // enough QUALIFY. Release everything before waiting — never wait
+            // while holding a device (no circular wait) — then park until a
+            // grant releases (instant via GpuGrant::drop's notify) OR the retry
+            // tick fires. The tick bounds BOTH races: a grant releasing between
+            // our drop and the notified() registration, and another floor-waiter
+            // needing the partial we just released (deliberately NOT notified —
+            // partial-release notifies would let two floor-waiters ping-pong
+            // wake each other in a hot loop). A missed wake-up costs one tick,
+            // never a hang. This branch is unreachable with a 0 floor, so the
+            // floorless path is byte-identical to the pre-fix behavior.
+            drop(permits);
+            drop(avail);
+            tokio::select! {
+                _ = self.released.notified() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            }
+        }
     }
 }
 
@@ -428,7 +447,20 @@ impl GpuScheduler {
 pub struct GpuGrant {
     pub devices: Vec<usize>,
     _permits: Vec<OwnedSemaphorePermit>,
-    _avail: OwnedSemaphorePermit,
+    _avail: Option<OwnedSemaphorePermit>,
+    released: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for GpuGrant {
+    fn drop(&mut self) {
+        // Release the permits FIRST, then signal — a floor-waiter woken by the
+        // notify must observe the devices as already free, or it would retry
+        // against still-held semaphores and go back to sleep with no further
+        // wake coming (until the retry tick).
+        self._permits.clear();
+        self._avail.take();
+        self.released.notify_waiters();
+    }
 }
 
 impl GpuGrant {
@@ -514,6 +546,48 @@ mod gpu_sched {
         drop(g); // release device 0
         let g2 = waiter.await.unwrap().unwrap();
         assert_eq!(g2.devices, vec![0]);
+    }
+
+    /// AUDIT REGRESSION (2026-07): a declared `min_vram_mib` floor is HARD. The
+    /// old `grab()` had a "soft" fallback that, under contention, granted a FREE
+    /// device BELOW the floor (⇒ CUDA-OOM at runtime). Inventory: dev0=24G,
+    /// dev1=8G. With dev0 held, a floor-20G request must NOT be handed dev1 —
+    /// try_acquire refuses, acquire WAITS, and the wait resolves onto dev0 the
+    /// moment its grant drops (via the release notify, not just the retry tick).
+    #[tokio::test]
+    async fn vram_floor_is_hard_never_grants_a_below_floor_device() {
+        let s = Arc::new(GpuScheduler::new(GpuInventory::from_devices(vec![
+            dev(0, 24000),
+            dev(1, 8000),
+        ])));
+        let floor = GpuRequest {
+            count: 1,
+            min_vram_mib: 20000,
+            exclusive: true,
+        };
+        // Occupy the only qualifying device.
+        let g = s.acquire(floor).await.unwrap();
+        assert_eq!(g.devices, vec![0]);
+        // Fast path: must refuse (the old fallback returned dev1 here).
+        assert!(
+            s.try_acquire(floor).is_none(),
+            "8G device granted for a 20G floor — the floor must be hard"
+        );
+        // Floorless requests still use the below-floor device freely.
+        let floorless = s.try_acquire(GpuRequest::default()).unwrap();
+        assert_eq!(floorless.devices, vec![1]);
+        drop(floorless);
+        // Slow path: waits (does NOT take dev1), then lands on dev0 at release.
+        let s2 = s.clone();
+        let waiter = tokio::spawn(async move { s2.acquire(floor).await });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            !waiter.is_finished(),
+            "floor-constrained acquire must wait for a QUALIFYING device"
+        );
+        drop(g);
+        let g2 = waiter.await.unwrap().unwrap();
+        assert_eq!(g2.devices, vec![0], "resolves onto the qualifying device");
     }
 
     #[tokio::test]

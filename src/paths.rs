@@ -164,10 +164,10 @@ pub fn resolve_trainer_script_named(name: &str) -> Result<PathBuf> {
             .join("python")
             .join(name),
     );
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent().and_then(|p| p.parent()) {
-            candidates.push(dir.join("share/lamu/python").join(name));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent().and_then(|p| p.parent())
+    {
+        candidates.push(dir.join("share/lamu/python").join(name));
     }
     if let Some(home) = dirs::home_dir() {
         candidates.push(home.join(".local/share/lamu/python").join(name));
@@ -198,16 +198,16 @@ pub fn resolve_trainer_script() -> Result<PathBuf> {
             .join("python")
             .join("trainer.py"),
     );
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent().and_then(|p| p.parent()) {
-            // <prefix>/bin/lamu-train → <prefix>/share/lamu/python/trainer.py
-            candidates.push(
-                dir.join("share")
-                    .join("lamu")
-                    .join("python")
-                    .join("trainer.py"),
-            );
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent().and_then(|p| p.parent())
+    {
+        // <prefix>/bin/lamu-train → <prefix>/share/lamu/python/trainer.py
+        candidates.push(
+            dir.join("share")
+                .join("lamu")
+                .join("python")
+                .join("trainer.py"),
+        );
     }
     if let Some(home) = dirs::home_dir() {
         candidates.push(home.join(".local/share/lamu/python/trainer.py"));

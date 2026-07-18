@@ -374,11 +374,11 @@ impl TpePolicy {
             }
         }
         // 2. Emit ONE queued suggestion (one per step), under the cap.
-        if st.spawns_done < self.cfg.max_spawns {
-            if let Some(overlay) = st.queue.pop_front() {
-                st.spawns_done += 1;
-                return TpeDecision::Spawn(overlay);
-            }
+        if st.spawns_done < self.cfg.max_spawns
+            && let Some(overlay) = st.queue.pop_front()
+        {
+            st.spawns_done += 1;
+            return TpeDecision::Spawn(overlay);
         }
         TpeDecision::Continue
     }

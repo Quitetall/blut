@@ -609,10 +609,10 @@ impl App {
         // On the cockpit + the Jobs/Log views the live cursor is `self.selected`
         // over `self.jobs`; honour it so jumping straight to a detail view uses
         // the highlighted job, not just the newest.
-        if matches!(self.view, View::Cockpit | View::Jobs | View::Log) {
-            if let Some(j) = self.selected.selected().and_then(|i| self.jobs.get(i)) {
-                return Some(j.id.clone());
-            }
+        if matches!(self.view, View::Cockpit | View::Jobs | View::Log)
+            && let Some(j) = self.selected.selected().and_then(|i| self.jobs.get(i))
+        {
+            return Some(j.id.clone());
         }
         if let Some(r) = self.runs.get(self.list_cursor) {
             return Some(r.job_id.clone());
@@ -1580,10 +1580,10 @@ async fn run_app<B: ratatui::backend::Backend>(
 
     while !app.quit {
         // Stale status banner cleared after 3 s.
-        if let Some((_, when)) = &app.status_msg {
-            if when.elapsed() > Duration::from_secs(3) {
-                app.status_msg = None;
-            }
+        if let Some((_, when)) = &app.status_msg
+            && when.elapsed() > Duration::from_secs(3)
+        {
+            app.status_msg = None;
         }
         // Periodic auto-refresh (jobs + system) — log tail re-fetched
         // on Enter / selection change to avoid blocking the loop on
@@ -1602,10 +1602,9 @@ async fn run_app<B: ratatui::backend::Backend>(
         // cadence even when no key is pressed.
         if event::poll(Duration::from_millis(200))
             .map_err(|e| anyhow::anyhow!("event::poll: {e}"))?
+            && let Event::Key(k) = event::read().map_err(|e| anyhow::anyhow!("event::read: {e}"))?
         {
-            if let Event::Key(k) = event::read().map_err(|e| anyhow::anyhow!("event::read: {e}"))? {
-                handle_key(&mut app, k);
-            }
+            handle_key(&mut app, k);
         }
     }
     Ok(match app.launch_cookbook {

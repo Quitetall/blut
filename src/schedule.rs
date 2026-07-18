@@ -135,10 +135,10 @@ pub fn list() -> Result<Vec<String>> {
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if let Some(stem) = name.strip_suffix(".timer") {
-                if let Some(recipe) = stem.strip_prefix(UNIT_PREFIX) {
-                    out.push(recipe.to_string());
-                }
+            if let Some(stem) = name.strip_suffix(".timer")
+                && let Some(recipe) = stem.strip_prefix(UNIT_PREFIX)
+            {
+                out.push(recipe.to_string());
             }
         }
     }
