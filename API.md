@@ -272,7 +272,11 @@ not admitted-then-killed. The declarative surface is
 measured-peak store keys on (`broker::envelope_calibration_key` composes the
 key; a `shared_calibration_group` is the audited opt-in for stages that pool
 physics). A plan with no declarations is billed a small compatibility floor —
-loudly. The transitional recipe-JSON parser (`Drivers::from_args_json`) is
+loudly. Cost terms (`ResourceEnvelope::cost_terms`) make the estimate
+re-evaluable: the engine's fit-and-saturate auto-tune and the async-I/O sync
+base both derive from the declared affine model — the cookbook enumerates
+coefficients and ceilings, the engine owns the search. The transitional
+recipe-JSON parser (`Drivers::from_args_json`) is
 `doc(hidden)` and NOT part of the public surface; it is deleted when the
 ADR 0133 migration completes.
 

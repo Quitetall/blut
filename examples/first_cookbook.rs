@@ -109,6 +109,28 @@ impl Stage for Increment {
         println!("    · ingredient increment ran → {} → {}", input.n, out.n);
         Ok(out)
     }
+
+    // ── Declare your resources (ADR 0133) ────────────────────────────────
+    // ONE method gives your stage the whole admission stack: the launch gate
+    // sizes it, the measured-peak store CALIBRATES it run over run (with an
+    // OOM-aware self-heal), and the engine AUTO-TUNES any dimension you
+    // declare a cost term for — you enumerate the coefficients and ceilings,
+    // the engine owns the search. Skip this method and your stage still runs,
+    // billed a loud 2 GiB compatibility floor.
+    fn resource_envelope(&self, _args: &NoArgs) -> blut_types::envelope::ResourceEnvelope {
+        blut_types::envelope::ResourceEnvelope {
+            ram_bytes: 1 << 30, // 1 GiB conservative peak
+            calibration_dimensions: vec![("n".into(), "1".into())],
+            cost_terms: vec![blut_types::envelope::CostTerm {
+                dimension: "n".into(),
+                declared_units: 1,
+                ram_bytes_per_unit: 64 << 20, // 64 MiB per unit
+                max_units: 8,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
 }
 impl Compatible<DemoBackend> for Increment {}
 

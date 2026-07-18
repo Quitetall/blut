@@ -124,6 +124,36 @@ per capability is tracked in the
 
 ## Build your own cookbook
 
+### Declare your resources — one method, the whole stack
+
+Implement `Stage::resource_envelope` and your stage gets BLUT's entire
+resource machinery: the launch gate admits it against real memory, the
+measured-peak store calibrates the estimate run over run (with an OOM-aware
+self-heal), and the engine auto-tunes any dimension you declare a cost term
+for — you enumerate the coefficients and ceilings, the engine owns the
+search. Skip it and your stage still runs, billed a loud 2 GiB
+compatibility floor.
+
+```rust
+fn resource_envelope(&self, args: &Self::Args) -> ResourceEnvelope {
+    ResourceEnvelope {
+        ram_bytes: 30 << 30,                                    // 30 GiB peak
+        calibration_dimensions: vec![("batch".into(), args.batch.to_string())],
+        cost_terms: vec![CostTerm {                             // auto-tunable
+            dimension: "batch".into(),
+            declared_units: args.batch,
+            ram_bytes_per_unit: 64 << 20,                       // 64 MiB/unit
+            max_units: args.batch,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+```
+
+(The full working version lives in `examples/first_cookbook.rs` — CI runs it.)
+
+
 ```rust
 // 1. Define your backend
 struct MyBackend;

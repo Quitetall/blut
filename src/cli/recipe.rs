@@ -1022,26 +1022,33 @@ pub(super) fn prepare_compiled_plan_launch(
     use crate::framework::ExecCtx;
 
     let admission_snapshot = tenant_admission.snapshot();
-    let admitted_workers =
-        admitted_workers_for(name, plan.exec_view().recipe_args, admission_snapshot);
+    let admitted_workers = admitted_workers_for(
+        name,
+        plan.exec_view().recipe_args,
+        Some(&plan),
+        admission_snapshot,
+    );
     let admitted_batch_size = admitted_workers.and_then(|workers| {
         admitted_batch_size_for(
             name,
             plan.exec_view().recipe_args,
+            Some(&plan),
             workers,
             admission_snapshot,
         )
     });
-    let footprint = match admitted_workers {
-        Some(workers) => recipe_footprint_tuned(
-            name,
-            plan.exec_view().recipe_args,
-            workers,
-            admitted_batch_size,
-        ),
-        None => plan_footprint_declared(&plan, name, plan.exec_view().recipe_args)
-            .unwrap_or_else(|| recipe_footprint(name, plan.exec_view().recipe_args)),
-    };
+    let warm = warm_context(plan.exec_view().recipe_args);
+    let tuned = admitted_workers.map(|w| (w, admitted_batch_size));
+    let footprint = plan_footprint_declared(&plan, name, plan.exec_view().recipe_args, tuned, warm)
+        .unwrap_or_else(|| match admitted_workers {
+            Some(workers) => recipe_footprint_tuned(
+                name,
+                plan.exec_view().recipe_args,
+                workers,
+                admitted_batch_size,
+            ),
+            None => recipe_footprint(name, plan.exec_view().recipe_args),
+        });
 
     let job_id = crate::jobs::new_job_id();
     let job_dir = crate::paths::jobs_dir()?.join(&job_id);

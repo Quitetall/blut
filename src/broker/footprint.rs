@@ -273,6 +273,110 @@ pub fn envelope_calibration_key(
     Some(flat)
 }
 
+/// Increment-3 (ADR 0133): re-evaluate a declared envelope at other unit
+/// counts / warmth — the engine's window into the cookbook's affine cost model
+/// WITHOUT knowing the domain formula. Contract (see [`blut_types::envelope::CostTerm`]):
+/// `ram_bytes` includes `declared_units × ram_bytes_per_unit` (the COLD
+/// coefficient) per term; re-evaluation at `(units, warm)` subtracts the
+/// declared contribution and adds `units × per_unit(warm)`. A term with a warm
+/// variant re-prices its DECLARED units too when `warm` — warmth applies to the
+/// whole term, exactly as the incumbent formula applied it. All saturating;
+/// an override naming no term is ignored.
+pub fn envelope_footprint_at(
+    env: &blut_types::envelope::ResourceEnvelope,
+    overrides: &[(&str, u32)],
+    warm: bool,
+) -> u64 {
+    let mut ram = env.ram_bytes;
+    for t in &env.cost_terms {
+        let units = overrides
+            .iter()
+            .find(|(n, _)| *n == t.dimension)
+            .map(|(_, u)| *u)
+            .unwrap_or(t.declared_units);
+        let declared = u64::from(t.declared_units).saturating_mul(t.ram_bytes_per_unit);
+        let repriced = u64::from(units).saturating_mul(t.per_unit(warm));
+        ram = ram.saturating_sub(declared).saturating_add(repriced);
+    }
+    ram
+}
+
+/// Increment-3 (ADR 0133): the SYNC (async-retention-free) base of a declared
+/// envelope — every `sync_base_excluded` term at ZERO units, so the ADR-0103
+/// profile's separately-billed worker/queue bytes are never double-counted.
+/// Replaces `recipe_footprint_sync_base`'s estimate-delta trick for declared
+/// plans (the engine zeroes flagged terms; it never names "the workers").
+pub fn envelope_sync_base(env: &blut_types::envelope::ResourceEnvelope, warm: bool) -> u64 {
+    let zeroed: Vec<(&str, u32)> = env
+        .cost_terms
+        .iter()
+        .filter(|t| t.sync_base_excluded)
+        .map(|t| (t.dimension.as_str(), 0))
+        .collect();
+    envelope_footprint_at(env, &zeroed, warm)
+}
+
+/// Increment-3 (ADR 0133): fit-and-saturate over a DECLARED cost term — the
+/// engine's search mechanism (ADR 0071 semantics preserved: decrement from the
+/// target until the footprint fits `avail − floor`, always ≥ 1), the
+/// cookbook's enumeration (`max_units` can only be tightened by `target`).
+/// `avail_bytes == 0` (no probe) ⇒ the term's DECLARED units — a box we can't
+/// size to behaves exactly as declared, mirroring the incumbent's
+/// uncalibrated-box behavior. Returns `None` when the envelope has no such
+/// term (the caller falls back to the JSON path until Phase D).
+pub fn fit_and_saturate_env(
+    env: &blut_types::envelope::ResourceEnvelope,
+    dimension: &str,
+    target: u32,
+    avail_bytes: u64,
+    floor_bytes: u64,
+    warm: bool,
+) -> Option<u32> {
+    let term = env.cost_terms.iter().find(|t| t.dimension == dimension)?;
+    if avail_bytes == 0 {
+        return Some(term.declared_units.max(1));
+    }
+    let budget = avail_bytes.saturating_sub(floor_bytes);
+    let ceiling = target.min(term.max_units).max(1);
+    let mut u = ceiling;
+    while u > 1 && envelope_footprint_at(env, &[(dimension, u)], warm) > budget {
+        u -= 1;
+    }
+    Some(u)
+}
+
+/// Increment-3 (ADR 0133): shrink-only fit over a declared cost term with the
+/// already-resolved dimensions HELD (workers-then-batch residual-budget
+/// semantics — see `batch_size_to_fit`'s doc for why sequential reaches the
+/// joint boundary on an additive model). Never raises above `requested`
+/// (training-quality decisions are not the auto-tuner's to make). `None` when
+/// the envelope has no such term.
+pub fn shrink_to_fit_env(
+    env: &blut_types::envelope::ResourceEnvelope,
+    dimension: &str,
+    requested: u32,
+    resolved: &[(&str, u32)],
+    avail_bytes: u64,
+    floor_bytes: u64,
+    warm: bool,
+) -> Option<u32> {
+    env.cost_terms.iter().find(|t| t.dimension == dimension)?;
+    if avail_bytes == 0 {
+        return Some(requested.max(1));
+    }
+    let budget = avail_bytes.saturating_sub(floor_bytes);
+    let mut b = requested.max(1);
+    let est = |b: u32| {
+        let mut o: Vec<(&str, u32)> = resolved.to_vec();
+        o.push((dimension, b));
+        envelope_footprint_at(env, &o, warm)
+    };
+    while b > 1 && est(b) > budget {
+        b -= 1;
+    }
+    Some(b)
+}
+
 /// Increment-2 (ADR 0133): compose the store key with CONTEXT overrides — the
 /// runtime facts a stage's typed args cannot know (the warmed cache, the
 /// auto-tuned worker count). An override REPLACES the declared dimension's
@@ -1876,6 +1980,7 @@ mod envelope_key_continuity {
                 ("workers".into(), d.workers.to_string()),
                 ("warm".into(), if d.warm { "w" } else { "c" }.into()),
             ],
+            cost_terms: Vec::new(),
             shared_calibration_group: None,
         };
         assert_eq!(
@@ -1913,6 +2018,7 @@ mod envelope_key_continuity {
                 ("workers".into(), "2".into()),
                 ("warm".into(), "c".into()),
             ],
+            cost_terms: Vec::new(),
             shared_calibration_group: None,
         };
         let mut tuned = Drivers::new(2, 32, 3, 0, true, DEFAULT_IN_CH);
@@ -1936,6 +2042,125 @@ mod envelope_key_continuity {
             Some("train_joint|3|32|2|c"),
             "unknown context dimensions never mutate the key layout"
         );
+    }
+
+    /// Build the envelope a LamQuant-shaped train stage declares, from the SAME
+    /// constants the incumbent formula uses — the increment-3 equivalence
+    /// fixture (the cookbook's real terms mirror these; its parity suite pins
+    /// that side).
+    fn env_with_terms(tier: u32, batch: u32) -> ResourceEnvelope {
+        use blut_types::envelope::CostTerm;
+        ResourceEnvelope {
+            ram_bytes: estimate_ram_bytes(2, batch, tier, 0, false, DEFAULT_IN_CH),
+            gpu: Default::default(),
+            calibration_dimensions: vec![
+                ("tier".into(), tier.to_string()),
+                ("batch".into(), batch.to_string()),
+                ("workers".into(), "2".into()),
+                ("warm".into(), "c".into()),
+            ],
+            cost_terms: vec![
+                CostTerm {
+                    dimension: "workers".into(),
+                    declared_units: 2,
+                    ram_bytes_per_unit: PREFETCH_PER_WORKER_BYTES,
+                    ram_bytes_per_unit_warm: Some(PREFETCH_PER_WORKER_BYTES_WARM),
+                    max_units: MAX_AUTO_WORKERS,
+                    sync_base_excluded: true,
+                },
+                CostTerm {
+                    dimension: "batch".into(),
+                    declared_units: batch,
+                    ram_bytes_per_unit: PER_BATCH_BYTES,
+                    ram_bytes_per_unit_warm: None,
+                    max_units: batch,
+                    sync_base_excluded: false,
+                },
+            ],
+            shared_calibration_group: None,
+        }
+    }
+
+    #[test]
+    fn envelope_footprint_at_reproduces_the_formula_at_tuned_points() {
+        for tier in [1, 3, 7] {
+            for batch in [4, 32, 64] {
+                let env = env_with_terms(tier, batch);
+                for w in [0, 1, 2, 6, 16] {
+                    for warm in [false, true] {
+                        assert_eq!(
+                            envelope_footprint_at(&env, &[("workers", w)], warm),
+                            estimate_ram_bytes(w, batch, tier, 0, warm, DEFAULT_IN_CH),
+                            "diverged at tier={tier} batch={batch} w={w} warm={warm}"
+                        );
+                        // Batch shrink at held workers.
+                        for b in [1, batch / 2, batch] {
+                            let b = b.max(1);
+                            assert_eq!(
+                                envelope_footprint_at(&env, &[("workers", w), ("batch", b)], warm),
+                                estimate_ram_bytes(w, b, tier, 0, warm, DEFAULT_IN_CH),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn envelope_sync_base_matches_the_zero_worker_formula() {
+        let env = env_with_terms(3, 32);
+        for warm in [false, true] {
+            assert_eq!(
+                envelope_sync_base(&env, warm),
+                estimate_ram_bytes(0, 32, 3, 0, warm, DEFAULT_IN_CH),
+                "sync base must equal the incumbent estimate(0, …) (warm={warm})"
+            );
+        }
+    }
+
+    #[test]
+    fn env_searches_reproduce_the_legacy_tuned_decisions() {
+        let cpu = 8u32;
+        let target = cpu.saturating_sub(2).clamp(1, MAX_AUTO_WORKERS);
+        let floor = 6 * GIB; // DEFAULT_FLOOR_GIB as bytes
+        for tier in [1, 3, 7] {
+            for batch in [4, 32] {
+                for warm in [false, true] {
+                    let d = Drivers::new(2, batch, tier, 0, warm, DEFAULT_IN_CH);
+                    let env = env_with_terms(tier, batch);
+                    for avail_gib in [0u64, 12, 24, 40, 62] {
+                        let avail = avail_gib * GIB;
+                        let legacy_w = workers_to_fit_and_saturate(cpu, avail, floor, &d);
+                        let env_w =
+                            fit_and_saturate_env(&env, "workers", target, avail, floor, warm)
+                                .expect("workers term declared");
+                        // avail==0: legacy returns the uncalibrated cap, env
+                        // returns the DECLARED units — same value (2) by
+                        // construction of the declared envelope.
+                        assert_eq!(
+                            env_w, legacy_w,
+                            "workers diverged tier={tier} batch={batch} warm={warm} avail={avail_gib}G"
+                        );
+                        let legacy_b = batch_size_to_fit(legacy_w, avail, floor, &d);
+                        let env_b = shrink_to_fit_env(
+                            &env,
+                            "batch",
+                            batch,
+                            &[("workers", env_w)],
+                            avail,
+                            floor,
+                            warm,
+                        )
+                        .expect("batch term declared");
+                        assert_eq!(
+                            env_b, legacy_b,
+                            "batch diverged tier={tier} batch={batch} warm={warm} avail={avail_gib}G"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

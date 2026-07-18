@@ -121,9 +121,9 @@ fn hpo_trial_admission(
     recipe_args: &serde_json::Value,
     snapshot: &crate::broker::ResourceSnapshot,
 ) -> HpoTrialAdmission {
-    let admitted_workers = admitted_workers_for(recipe, recipe_args, snapshot);
+    let admitted_workers = admitted_workers_for(recipe, recipe_args, None, snapshot);
     let admitted_batch_size = admitted_workers
-        .and_then(|workers| admitted_batch_size_for(recipe, recipe_args, workers, snapshot));
+        .and_then(|workers| admitted_batch_size_for(recipe, recipe_args, None, workers, snapshot));
     let resolved_footprint = match admitted_workers {
         Some(workers) => recipe_footprint_tuned(recipe, recipe_args, workers, admitted_batch_size),
         None => recipe_footprint(recipe, recipe_args),
@@ -132,6 +132,7 @@ fn hpo_trial_admission(
         .unwrap_or_else(|| crate::broker::Drivers::from_args_json(recipe_args).workers);
     let sync_footprint = recipe_footprint_sync_base(
         recipe_args,
+        None,
         admitted_batch_size,
         resolved_workers,
         resolved_footprint,

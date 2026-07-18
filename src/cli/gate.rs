@@ -23,25 +23,61 @@ pub(super) fn plan_footprint_declared(
     plan: &crate::framework::CompiledPlan,
     recipe: &str,
     raw: &serde_json::Value,
+    tuned: Option<(u32, Option<u32>)>,
+    warm: bool,
 ) -> Option<crate::broker::Footprint> {
     let (stage_name, env) = plan.max_declared_envelope()?;
-    let flat = crate::broker::footprint::envelope_calibration_key(recipe, &env)?;
+    // Tuned units re-evaluate the affine cost model (increment 3); the same
+    // overrides + the warm context compose the store key, so the calibration
+    // row is exactly the one the JSON path reads/writes for this launch shape.
+    let mut unit_overrides: Vec<(&str, u32)> = Vec::new();
+    let mut key_ctx: Vec<(&str, String)> = Vec::new();
+    if let Some((workers, batch)) = tuned {
+        // A tuned launch needs the re-evaluable model — without cost terms the
+        // declared estimate can't reflect the override, so fall back to JSON.
+        if env.cost_terms.iter().all(|t| t.dimension != "workers") {
+            return None;
+        }
+        unit_overrides.push(("workers", workers));
+        key_ctx.push(("workers", workers.to_string()));
+        if let Some(b) = batch {
+            unit_overrides.push(("batch", b));
+            key_ctx.push(("batch", b.to_string()));
+        }
+    }
+    key_ctx.push(("warm", if warm { "w" } else { "c" }.to_string()));
+    let flat =
+        crate::broker::footprint::envelope_calibration_key_with_context(recipe, &env, &key_ctx)?;
     let hint = crate::broker::Footprint {
-        ram_bytes: env.ram_bytes,
+        ram_bytes: crate::broker::footprint::envelope_footprint_at(&env, &unit_overrides, warm),
         vram_mib: 0,
     };
     let resolved = crate::broker::FootprintStore::load().resolve_flat(&flat, hint);
     // Shadow referee (runtime defense on top of the CI parity gate).
-    let incumbent = recipe_footprint(recipe, raw);
+    let incumbent = match tuned {
+        Some((workers, batch)) => recipe_footprint_tuned(recipe, raw, workers, batch),
+        None => recipe_footprint(recipe, raw),
+    };
     if incumbent.ram_bytes != resolved.ram_bytes {
         tracing::warn!(
-            "ADR 0133 shadow divergence for {recipe} (stage {stage_name}, key {flat}): \
-             typed {}G vs JSON {}G — investigate before Phase D",
+            "ADR 0133 shadow divergence for {recipe} (stage {stage_name}, key {flat}, \
+             tuned {tuned:?}, warm {warm}): typed {}G vs JSON {}G — investigate before Phase D",
             resolved.ram_bytes / (1024 * 1024 * 1024),
             incumbent.ram_bytes / (1024 * 1024 * 1024),
         );
     }
     Some(resolved)
+}
+
+/// The warm-cache CONTEXT fact (`warm_fb_cache` recipe arg) — a runtime launch
+/// condition the CLI threads into `StageContext.fb_warm`, the warm coefficient
+/// selection, and the calibration key. This is NOT footprint interpretation of
+/// cookbook keys (the coefficients live in the cookbook's declared cost terms);
+/// it is the one blessed context read that survives Phase D (ADR 0133).
+pub(super) fn warm_context(raw: &serde_json::Value) -> bool {
+    raw.get("warm_fb_cache")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// Estimate a job's RAM footprint from the recipe's raw args JSON
@@ -138,10 +174,31 @@ pub(super) fn recipe_footprint_tuned(
 /// terms remain in the base because they exist on the inline path too.
 pub(super) fn recipe_footprint_sync_base(
     raw: &serde_json::Value,
+    plan: Option<&crate::framework::CompiledPlan>,
     batch: Option<u32>,
     resolved_workers: u32,
     resolved: crate::broker::Footprint,
 ) -> crate::broker::Footprint {
+    // ADR 0133 incr 3: declared plans compute the sync base from the envelope —
+    // sync_base_excluded terms at zero (the engine never names "the workers"),
+    // the calibrated `resolved` floor preserved via the same max() shape.
+    if let Some((_, env)) = plan.and_then(|p| p.max_declared_envelope())
+        && !env.cost_terms.is_empty()
+    {
+        let warm = warm_context(raw);
+        let mut overrides: Vec<(&str, u32)> = vec![("workers", resolved_workers)];
+        if let Some(b) = batch {
+            overrides.push(("batch", b));
+        }
+        let sync = crate::broker::footprint::envelope_sync_base(&env, warm);
+        let with_workers = crate::broker::footprint::envelope_footprint_at(&env, &overrides, warm);
+        let known_worker_term = with_workers.saturating_sub(sync);
+        let resolved_minus_worker = resolved.ram_bytes.saturating_sub(known_worker_term);
+        return crate::broker::Footprint {
+            ram_bytes: sync.max(resolved_minus_worker),
+            vram_mib: resolved.vram_mib,
+        };
+    }
     if raw.is_null() || raw.as_object().is_some_and(|object| object.is_empty()) {
         return crate::broker::Footprint {
             ram_bytes: resolved.ram_bytes.max(2 * 1024 * 1024 * 1024),
@@ -241,6 +298,7 @@ pub(super) fn configure_training_io_admission(
         admitted_workers.unwrap_or_else(|| crate::broker::Drivers::from_args_json(raw).workers);
     let sync_footprint = recipe_footprint_sync_base(
         raw,
+        Some(&plan),
         admitted_batch_size,
         resolved_workers,
         resolved_footprint,
@@ -286,6 +344,7 @@ pub(super) fn configure_training_io_admission(
 pub(super) fn admitted_workers_for(
     name: &str,
     raw: &serde_json::Value,
+    plan: Option<&crate::framework::CompiledPlan>,
     snap: &crate::broker::ResourceSnapshot,
 ) -> Option<u32> {
     if raw.is_null() || raw.as_object().is_some_and(|o| o.is_empty()) {
@@ -304,6 +363,43 @@ pub(super) fn admitted_workers_for(
     // conservative cap and let the existing gate refuse on the cap footprint.
     if avail <= floor {
         return None;
+    }
+    // ADR 0133 incr 3: env-first — a declared cost model searches through the
+    // typed seam (cookbook enumerates the term + ceiling, engine owns the
+    // search). Shadow-compares against the JSON search until Phase D.
+    if let Some((_, env)) = plan.and_then(|p| p.max_declared_envelope()) {
+        let target = cpu
+            .saturating_sub(2)
+            .clamp(1, crate::broker::footprint::MAX_AUTO_WORKERS);
+        if let Some(w) = crate::broker::footprint::fit_and_saturate_env(
+            &env,
+            "workers",
+            target,
+            avail,
+            floor,
+            warm_context(raw),
+        ) {
+            let legacy = crate::broker::footprint::workers_to_fit_and_saturate(
+                cpu,
+                avail,
+                floor,
+                &crate::broker::Drivers::from_args_json(raw),
+            );
+            if w != legacy {
+                tracing::warn!(
+                    "ADR 0133 shadow divergence for {name} workers auto-tune: \
+                     typed {w} vs JSON {legacy} — investigate before Phase D"
+                );
+            }
+            if w != crate::broker::footprint::UNCALIBRATED_WORKER_CAP {
+                eprintln!(
+                    "workers {}→{w} (auto-tuned to fit {:.1}G avail, {cpu} cpus)",
+                    crate::broker::footprint::UNCALIBRATED_WORKER_CAP,
+                    snap.mem_avail_gb
+                );
+            }
+            return Some(w);
+        }
     }
     // This snapshot is serialized BLUT-vs-BLUT by the scheduler lock and nets
     // out other processes via MemAvailable. It reduces over-admission risk but
@@ -333,6 +429,7 @@ pub(super) fn admitted_workers_for(
 pub(super) fn admitted_batch_size_for(
     name: &str,
     raw: &serde_json::Value,
+    plan: Option<&crate::framework::CompiledPlan>,
     resolved_workers: u32,
     snap: &crate::broker::ResourceSnapshot,
 ) -> Option<u32> {
@@ -347,6 +444,40 @@ pub(super) fn admitted_batch_size_for(
     let floor = (crate::broker::admission::DEFAULT_FLOOR_GIB * gib) as u64;
     if avail <= floor {
         return None;
+    }
+    // ADR 0133 incr 3: env-first batch shrink at the held workers (residual
+    // budget), the requested batch = the term's declared units. Shadowed.
+    if let Some((_, env)) = plan.and_then(|p| p.max_declared_envelope())
+        && let Some(term) = env.cost_terms.iter().find(|t| t.dimension == "batch")
+    {
+        let requested = term.declared_units.max(1);
+        if let Some(b) = crate::broker::footprint::shrink_to_fit_env(
+            &env,
+            "batch",
+            requested,
+            &[("workers", resolved_workers)],
+            avail,
+            floor,
+            warm_context(raw),
+        ) {
+            let base = crate::broker::Drivers::from_args_json(raw);
+            let legacy =
+                crate::broker::footprint::batch_size_to_fit(resolved_workers, avail, floor, &base);
+            if b != legacy {
+                tracing::warn!(
+                    "ADR 0133 shadow divergence for {name} batch auto-tune: \
+                         typed {b} vs JSON {legacy} — investigate before Phase D"
+                );
+            }
+            if b == requested {
+                return None; // already fits — no override needed
+            }
+            eprintln!(
+                "batch {requested}→{b} (auto-tuned to fit {:.1}G avail at workers={resolved_workers})",
+                snap.mem_avail_gb
+            );
+            return Some(b);
+        }
     }
     let base = crate::broker::Drivers::from_args_json(raw);
     let requested = base.batch;

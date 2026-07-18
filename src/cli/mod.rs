@@ -1335,16 +1335,19 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                 crate::broker::tenant_quota::TenantAdmission::prepare(tenant.clone())
                     .map_err(|e| anyhow!("tenant admission: {e}"))?;
             let snapshot = tenant_admission.snapshot();
-            let admitted_workers = admitted_workers_for(&marker.name, &args, snapshot);
+            let admitted_workers = admitted_workers_for(&marker.name, &args, Some(&plan), snapshot);
             let admitted_batch_size = admitted_workers.and_then(|workers| {
-                admitted_batch_size_for(&marker.name, &args, workers, snapshot)
+                admitted_batch_size_for(&marker.name, &args, Some(&plan), workers, snapshot)
             });
-            let mut footprint = match admitted_workers {
-                Some(workers) => {
-                    recipe_footprint_tuned(&marker.name, &args, workers, admitted_batch_size)
-                }
-                None => recipe_footprint(&marker.name, &args),
-            };
+            let warm = warm_context(&args);
+            let tuned = admitted_workers.map(|w| (w, admitted_batch_size));
+            let mut footprint = plan_footprint_declared(&plan, &marker.name, &args, tuned, warm)
+                .unwrap_or_else(|| match admitted_workers {
+                    Some(workers) => {
+                        recipe_footprint_tuned(&marker.name, &args, workers, admitted_batch_size)
+                    }
+                    None => recipe_footprint(&marker.name, &args),
+                });
 
             let mut ctx = ExecCtx::new(job_dir.clone());
             ctx = ctx.with_tenant(tenant.clone()).with_sync_io(sync_io);
