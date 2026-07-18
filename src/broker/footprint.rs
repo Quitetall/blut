@@ -273,6 +273,37 @@ pub fn envelope_calibration_key(
     Some(flat)
 }
 
+/// Increment-2 (ADR 0133): compose the store key with CONTEXT overrides — the
+/// runtime facts a stage's typed args cannot know (the warmed cache, the
+/// auto-tuned worker count). An override REPLACES the declared dimension's
+/// value by NAME (declaration order is preserved, so the flat layout — and
+/// store continuity — is unchanged); an override naming no declared dimension
+/// is ignored (a stage that doesn't calibrate on `warm` is not forced to).
+/// This is how `recipe_footprint_tuned`'s key semantics ride the typed seam:
+/// same layout, context-true values.
+pub fn envelope_calibration_key_with_context(
+    identity: &str,
+    env: &blut_types::envelope::ResourceEnvelope,
+    context: &[(&str, String)],
+) -> Option<String> {
+    if env.calibration_dimensions.is_empty() {
+        return None;
+    }
+    let ident = env.shared_calibration_group.as_deref().unwrap_or(identity);
+    debug_assert!(!ident.contains('|'), "key identity must not contain '|'");
+    let mut flat = String::from(ident);
+    for (name, declared) in &env.calibration_dimensions {
+        let value = context
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or(declared.as_str());
+        flat.push('|');
+        flat.push_str(value);
+    }
+    Some(flat)
+}
+
 /// Per-DataLoader-worker prefetch RAM (CoW fork + decode buffers +
 /// per-worker sample LRU).
 ///
@@ -1840,6 +1871,45 @@ mod envelope_key_continuity {
         assert_eq!(
             envelope_calibration_key("x", &ResourceEnvelope::default()),
             None
+        );
+    }
+
+    #[test]
+    fn context_overrides_reproduce_the_incumbent_tuned_key() {
+        // The incumbent TUNED path (recipe_footprint_tuned): auto-tuned workers
+        // + the runtime warm fact override the declared defaults, same layout.
+        let declared = Drivers::new(2, 32, 3, 0, false, DEFAULT_IN_CH);
+        let env = ResourceEnvelope {
+            ram_bytes: declared.estimate().ram_bytes,
+            gpu: Default::default(),
+            calibration_dimensions: vec![
+                ("tier".into(), "3".into()),
+                ("batch".into(), "32".into()),
+                ("workers".into(), "2".into()),
+                ("warm".into(), "c".into()),
+            ],
+            shared_calibration_group: None,
+        };
+        let mut tuned = Drivers::new(2, 32, 3, 0, true, DEFAULT_IN_CH);
+        tuned.workers = 6; // fit-and-saturate override (bypasses the cap)
+        let incumbent = tuned.key("train_joint").flat();
+        let composed = envelope_calibration_key_with_context(
+            "train_joint",
+            &env,
+            &[("workers", "6".into()), ("warm", "w".into())],
+        );
+        assert_eq!(composed.as_deref(), Some(incumbent.as_str()));
+        assert_eq!(incumbent, "train_joint|3|32|6|w");
+        // An override naming no declared dimension is ignored, not appended.
+        let noop = envelope_calibration_key_with_context(
+            "train_joint",
+            &env,
+            &[("nonexistent", "9".into())],
+        );
+        assert_eq!(
+            noop.as_deref(),
+            Some("train_joint|3|32|2|c"),
+            "unknown context dimensions never mutate the key layout"
         );
     }
 }
