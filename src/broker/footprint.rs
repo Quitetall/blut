@@ -54,6 +54,7 @@ pub const MAX_AUTO_WORKERS: u32 = 16;
 /// Compatibility footprint cost drivers for the LamQuant cookbook. This shape
 /// is not part of the generic engine launch contract and may move before 1.0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)] // de-publicized pre-0.2 (ADR 0133): transitional recipe-JSON parser
 pub struct Drivers {
     /// DataLoader workers (the dominant RAM term), clamped
     /// `1..=UNCALIBRATED_WORKER_CAP`.
@@ -166,6 +167,7 @@ impl Drivers {
     /// [`DEFAULT_BATCH`], `tier` to 3 (the train-recipe default), and
     /// `latent` is parsed from a `--encoder-width N` token in
     /// `extra_args` (0 = unspecified).
+    #[doc(hidden)] // de-publicized pre-0.2 (ADR 0133)
     pub fn from_args_json(raw: &serde_json::Value) -> Self {
         let u32_or = |key: &str, default: u32| -> u32 {
             raw.get(key)
@@ -242,6 +244,33 @@ impl Drivers {
     pub fn key(&self, recipe: &str) -> FootprintKey {
         footprint_key(recipe, self.workers, self.batch, self.tier, self.warm)
     }
+}
+
+/// Compose the measured-peak store key from a stage/recipe identity and a
+/// declared [`ResourceEnvelope`] (ADR 0133). ENGINE-composed: the identity
+/// namespaces the key (`shared_calibration_group` is the audited opt-out for
+/// stages that genuinely pool physics), and the ORDERED dimension values are
+/// joined in the same pipe-delimited flat form as [`FootprintKey::flat`] — so a
+/// cookbook that declares the incumbent driver dimensions
+/// (`tier`,`batch`,`workers`,`warm` as `"w"`/`"c"`) produces a BYTE-IDENTICAL
+/// key and the calibration store's measured history carries over (the ADR's
+/// store-continuity requirement). `None` when no dimensions are declared
+/// (estimate-only admission, nothing to calibrate).
+pub fn envelope_calibration_key(
+    identity: &str,
+    env: &blut_types::envelope::ResourceEnvelope,
+) -> Option<String> {
+    if env.calibration_dimensions.is_empty() {
+        return None;
+    }
+    let ident = env.shared_calibration_group.as_deref().unwrap_or(identity);
+    debug_assert!(!ident.contains('|'), "key identity must not contain '|'");
+    let mut flat = String::from(ident);
+    for (_, value) in &env.calibration_dimensions {
+        flat.push('|');
+        flat.push_str(value);
+    }
+    Some(flat)
 }
 
 /// Per-DataLoader-worker prefetch RAM (CoW fork + decode buffers +
@@ -1767,5 +1796,50 @@ mod tests {
                  w{w2} b{b2} t{t2} l{l2} i{i2})"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod envelope_key_continuity {
+    //! ADR 0133 store-continuity gate: a cookbook declaring the incumbent
+    //! driver dimensions must produce the EXACT flat key the JSON path built,
+    //! or the calibration store's measured history is silently orphaned.
+    use super::*;
+    use blut_types::envelope::ResourceEnvelope;
+
+    #[test]
+    fn declared_dimensions_reproduce_the_incumbent_flat_key() {
+        let d = Drivers::new(2, 32, 3, 0, true, DEFAULT_IN_CH);
+        let incumbent = d.key("train_joint").flat();
+        let env = ResourceEnvelope {
+            ram_bytes: d.estimate().ram_bytes,
+            gpu: Default::default(),
+            calibration_dimensions: vec![
+                ("tier".into(), d.tier.to_string()),
+                ("batch".into(), d.batch.to_string()),
+                ("workers".into(), d.workers.to_string()),
+                ("warm".into(), if d.warm { "w" } else { "c" }.into()),
+            ],
+            shared_calibration_group: None,
+        };
+        assert_eq!(
+            envelope_calibration_key("train_joint", &env).as_deref(),
+            Some(incumbent.as_str()),
+            "byte-identical key = calibration history carries over"
+        );
+        // Order matters — the incumbent is recipe|tier|batch|workers|warm.
+        assert_eq!(incumbent, "train_joint|3|32|2|w");
+        // shared group replaces the identity, dimensions unchanged.
+        let mut shared = env.clone();
+        shared.shared_calibration_group = Some("train".into());
+        assert_eq!(
+            envelope_calibration_key("train_joint", &shared).as_deref(),
+            Some("train|3|32|2|w")
+        );
+        // No dimensions -> nothing to calibrate.
+        assert_eq!(
+            envelope_calibration_key("x", &ResourceEnvelope::default()),
+            None
+        );
     }
 }

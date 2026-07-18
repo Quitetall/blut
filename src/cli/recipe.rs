@@ -366,6 +366,14 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                         .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
                     let plan = (def.compile_fn)(raw.clone()).map_err(|e| anyhow!("{e}"))?;
                     let fp = plan.declared_footprint();
+                    if !plan.has_resource_declarations() {
+                        eprintln!(
+                            "warning: no stage in this plan declares a resource \
+                             envelope — billing the 2G compatibility floor. \
+                             Implement Stage::resource_envelope (ADR 0133) for \
+                             real admission."
+                        );
+                    }
                     let gib = fp.ram_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
                     println!(
                         "[dry-run] recipe={name} resolved RAM footprint ≈ {gib:.1}G \

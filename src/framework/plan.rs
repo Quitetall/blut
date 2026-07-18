@@ -802,6 +802,19 @@ impl CompiledPlan {
     /// exceeds the whole-job RAM reservation is rejected, never silently
     /// clamped). Undeclared plans receive a small 2 GiB compatibility estimate;
     /// the engine never infers domain meaning from recipe JSON keys.
+    /// Did ANY node declare a real envelope? `false` ⇒ the 2 GiB
+    /// compatibility floor is doing the billing — reported loudly per the
+    /// ADR 0133 floor policy (fail-loud now; an operator strict mode that
+    /// refuses undeclared plans arrives with the launch-consumer flip).
+    pub(crate) fn has_resource_declarations(&self) -> bool {
+        fn any(nodes: &[PlanNode]) -> bool {
+            nodes
+                .iter()
+                .any(|n| n.stage.resource_envelope(&n.args).is_declared())
+        }
+        any(&self.nodes) || self.expansions.iter().any(|e| any(&e.template.nodes))
+    }
+
     pub(crate) fn declared_footprint(&self) -> crate::broker::Footprint {
         fn visit(nodes: &[PlanNode], ram_gib: &mut u32, vram_mib: &mut u64) {
             for node in nodes {

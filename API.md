@@ -262,14 +262,19 @@ fractions, mixed modes, and unknown launch tenants.
 
 ## Broker (`broker/`) — never-OOM admission
 
-`broker::{decide, Drivers, Footprint, FootprintStore}` size a per-stage RAM
-footprint, gate admission against the box-fit budget (`MemTotal − floor`), and
-calibrate the estimate from measured peaks (with an OOM-aware self-heal). This is
-the engine behind the containment guarantee: a job that wouldn't fit is refused,
-not admitted-then-killed. A recipe invoked with **no args** is billed a light
-base footprint (a heavy data-trainer always declares required args); everything
-else uses the conservative `Drivers` estimate. A first-class **per-recipe
-declared footprint** is a planned post-1.0 addition (see "Not yet stable").
+`broker::{decide, Footprint, FootprintStore}` size a per-stage RAM footprint,
+gate admission against the box-fit budget (`MemTotal − floor`), and calibrate
+the estimate from measured peaks (with an OOM-aware self-heal). This is the
+engine behind the containment guarantee: a job that wouldn't fit is refused,
+not admitted-then-killed. The declarative surface is
+`Stage::resource_envelope` → `blut_types::envelope::ResourceEnvelope`
+(ADR 0133): a byte-granular footprint + the ordered calibration dimensions the
+measured-peak store keys on (`broker::envelope_calibration_key` composes the
+key; a `shared_calibration_group` is the audited opt-in for stages that pool
+physics). A plan with no declarations is billed a small compatibility floor —
+loudly. The transitional recipe-JSON parser (`Drivers::from_args_json`) is
+`doc(hidden)` and NOT part of the public surface; it is deleted when the
+ADR 0133 migration completes.
 
 `broker::tenant_quota::TenantQuotaTracker` atomically reserves each admitted
 job's resolved footprint against its tenant sub-envelope. Its RAII reservation
@@ -379,7 +384,6 @@ version while the campaign is in progress.
 `tui` module surface (the cockpit is included in the preview, but it is driven
 entirely through the intended `cli::run` entry — the `View`/drawer internals are
 not a public contract); the `Slurm` / `Ray` launchers (deferred); the
-`broker::Drivers` footprint-driver shape (a planned post-1.0 refactor moves its
-domain-specific arg parsing into cookbooks — additive, but the `Drivers` fields
-may change); and the non-exhaustive async-I/O profile and status-event variants.
+hidden transitional `broker::Drivers` recipe-JSON path (being replaced by
+`Stage::resource_envelope` per ADR 0133 — do not build against it); and the non-exhaustive async-I/O profile and status-event variants.
 Treat anything not listed under "Preview surface" as subject to change.

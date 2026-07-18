@@ -726,6 +726,20 @@ pub trait Stage: Send + Sync + 'static {
         }
     }
 
+    /// The ONE declarative resource surface (ADR 0133). Every new resource
+    /// capability (calibration dimensions, tunables, io-profile terms) lands as
+    /// a FIELD on [`blut_types::envelope::ResourceEnvelope`] — never as another
+    /// trait method. The default composes from the legacy per-method
+    /// declarations, so every existing stage compiles and bills identically. A
+    /// cookbook overrides this to declare a byte-granular footprint and the
+    /// calibration dimensions the measured-peak store keys on.
+    fn resource_envelope(&self, args: &Self::Args) -> blut_types::envelope::ResourceEnvelope {
+        blut_types::envelope::ResourceEnvelope::from_parts(
+            self.memory_gib_for(args),
+            self.gpu_request(args),
+        )
+    }
+
     /// Args-aware RAM reservation (default = the const `MEMORY_GIB`). A DDP
     /// stage scales it ×nproc (each rank is a full process).
     fn memory_gib_for(&self, _args: &Self::Args) -> u32 {
@@ -934,6 +948,17 @@ pub trait StageDyn: Send + Sync + 'static {
             min_vram_mib: 0,
             exclusive: true,
         }
+    }
+    /// Erased mirror of [`Stage::resource_envelope`] (ADR 0133). Default
+    /// composes from the erased legacy declarations.
+    fn resource_envelope(
+        &self,
+        args: &serde_json::Value,
+    ) -> blut_types::envelope::ResourceEnvelope {
+        blut_types::envelope::ResourceEnvelope::from_parts(
+            self.memory_gib_for(args),
+            self.gpu_request(args),
+        )
     }
     fn input_kind(&self) -> &'static str;
     fn output_kind(&self) -> &'static str;
@@ -1259,6 +1284,21 @@ impl<S: Stage> StageDyn for S {
         match serde_json::from_value::<S::Args>(args.clone()) {
             Ok(typed) => Stage::gpu_request(self, &typed),
             Err(_) => crate::broker::gpu::GpuRequest::default(),
+        }
+    }
+    fn resource_envelope(
+        &self,
+        args: &serde_json::Value,
+    ) -> blut_types::envelope::ResourceEnvelope {
+        match serde_json::from_value::<S::Args>(args.clone()) {
+            Ok(typed) => Stage::resource_envelope(self, &typed),
+            // Mirror the components' own parse-error fallbacks (1 GiB + default
+            // whole-device ask) — conservative-small, and the typed path is the
+            // one the executor actually reaches for well-formed nodes.
+            Err(_) => blut_types::envelope::ResourceEnvelope::from_parts(
+                1,
+                crate::broker::gpu::GpuRequest::default(),
+            ),
         }
     }
     fn retry(&self) -> crate::framework::retry::RetryPolicy {
