@@ -8,6 +8,36 @@
 //! imports, the other submodules' items, and the mod.rs helpers)
 //! resolves exactly as it did inline.
 
+/// ADR 0133 floor policy (fail-LOUD): an entirely undeclared plan bills the
+/// 2 GiB compatibility floor and SAYS SO on every launch — implement
+/// `Stage::resource_envelope` for real admission. `BLUT_STRICT_DECLARATIONS=1`
+/// is the operator strict mode: refuse instead of floor.
+pub(super) fn footprint_or_floor(
+    declared_fp: Option<crate::broker::Footprint>,
+    name: &str,
+) -> anyhow::Result<crate::broker::Footprint> {
+    match declared_fp {
+        Some(fp) => Ok(fp),
+        None => {
+            if std::env::var("BLUT_STRICT_DECLARATIONS").is_ok_and(|v| v == "1") {
+                anyhow::bail!(
+                    "'{name}' declares no resource envelope and BLUT_STRICT_DECLARATIONS=1 \
+                     — implement Stage::resource_envelope (ADR 0133)"
+                );
+            }
+            eprintln!(
+                "warning: no stage in '{name}' declares a resource envelope — billing the \
+                 2G compatibility floor. Implement Stage::resource_envelope (ADR 0133) for \
+                 real admission."
+            );
+            Ok(crate::broker::Footprint {
+                ram_bytes: 2 * 1024 * 1024 * 1024,
+                vram_mib: 0,
+            })
+        }
+    }
+}
+
 /// ADR 0133 increment 2b: the UNTUNED launch footprint through the TYPED seam.
 ///
 /// Applies when a plan node declares an envelope with calibration dimensions.
@@ -22,7 +52,6 @@
 pub(super) fn plan_footprint_declared(
     declared: Option<&(String, blut_types::envelope::ResourceEnvelope)>,
     recipe: &str,
-    raw: &serde_json::Value,
     tuned: Option<(u32, Option<u32>)>,
     warm: bool,
 ) -> Option<crate::broker::Footprint> {
@@ -33,10 +62,14 @@ pub(super) fn plan_footprint_declared(
     let mut unit_overrides: Vec<(&str, u32)> = Vec::new();
     let mut key_ctx: Vec<(&str, String)> = Vec::new();
     if let Some((workers, batch)) = tuned {
-        // A tuned launch needs the re-evaluable model — without cost terms the
-        // declared estimate can't reflect the override, so fall back to JSON.
+        // A tuned launch needs the re-evaluable model — without a workers cost
+        // term the declared estimate can't reflect the override; bill the
+        // DECLARED (conservative-high) estimate instead of guessing.
         if env.cost_terms.iter().all(|t| t.dimension != "workers") {
-            return None;
+            return Some(crate::broker::Footprint {
+                ram_bytes: env.ram_bytes,
+                vram_mib: 0,
+            });
         }
         unit_overrides.push(("workers", workers));
         key_ctx.push(("workers", workers.to_string()));
@@ -46,26 +79,22 @@ pub(super) fn plan_footprint_declared(
         }
     }
     key_ctx.push(("warm", if warm { "w" } else { "c" }.to_string()));
-    let flat =
-        crate::broker::footprint::envelope_calibration_key_with_context(recipe, env, &key_ctx)?;
+    // No calibration dimensions ⇒ estimate-only admission (nothing to key the
+    // measured-peak store on) — the declared envelope IS the footprint.
+    let Some(flat) =
+        crate::broker::footprint::envelope_calibration_key_with_context(recipe, env, &key_ctx)
+    else {
+        return Some(crate::broker::Footprint {
+            ram_bytes: crate::broker::footprint::envelope_footprint_at(env, &unit_overrides, warm),
+            vram_mib: 0,
+        });
+    };
     let hint = crate::broker::Footprint {
         ram_bytes: crate::broker::footprint::envelope_footprint_at(env, &unit_overrides, warm),
         vram_mib: 0,
     };
     let resolved = crate::broker::FootprintStore::load().resolve_flat(&flat, hint);
-    // Shadow referee (runtime defense on top of the CI parity gate).
-    let incumbent = match tuned {
-        Some((workers, batch)) => recipe_footprint_tuned(recipe, raw, workers, batch),
-        None => recipe_footprint(recipe, raw),
-    };
-    if incumbent.ram_bytes != resolved.ram_bytes {
-        tracing::warn!(
-            "ADR 0133 shadow divergence for {recipe} (stage {stage_name}, key {flat}, \
-             tuned {tuned:?}, warm {warm}): typed {}G vs JSON {}G — investigate before Phase D",
-            resolved.ram_bytes / (1024 * 1024 * 1024),
-            incumbent.ram_bytes / (1024 * 1024 * 1024),
-        );
-    }
+    let _ = stage_name; // identity kept for future diagnostics
     Some(resolved)
 }
 
@@ -80,99 +109,12 @@ pub(super) fn warm_context(raw: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Estimate a job's RAM footprint from the recipe's raw args JSON
-/// (ADR 0046 slice-1). Best-effort + recipe-agnostic: blut can't see
-/// the cookbook's typed Args, so it reads the well-known cost-driver
-/// keys directly off the JSON, defaulting CONSERVATIVELY when absent so
-/// a recipe that omits them still gates oversubscription rather than
-/// admitting blind. The dominant term is `workers` (dataloader
-/// prefetch); since the train stage caps uncalibrated workers at 4 and
-/// blut can't read that cap here, we mirror the cap as the default.
-///
-/// The scaling formula itself lives in `broker::footprint` so the cli
-/// admission gate and the cookbook's train stage share ONE source of
-/// truth.
-/// Extract the footprint cost drivers `(workers, batch, tier, latent)`
-/// from a recipe's raw args JSON, applying the SAME conservative
-/// defaults the train stage's `train_containment` uses. PURE + testable:
-/// this is the RESOLVE-side half of the calibration key parity (the
-/// RECORD side is the cookbook's `train_containment`). If the two
-/// diverged the calibration would never be hit and the broker would
-/// over-refuse forever — `footprint_key_parity` pins them equal.
-///
-///   * `workers` — env-only in the cookbook (`LMA_NUM_WORKERS`), so the
-///     JSON rarely carries it; default to the 4-worker uncalibrated cap
-///     (matches `UNCALIBRATED_WORKER_CAP`). Clamped 1..=4.
-///   * `batch` — `batch_size` JSON field or broker `DEFAULT_BATCH`.
-///   * `tier` — `tier` JSON field or 3 (matches the joint recipe default).
-///   * `latent` — `--encoder-width N` in `extra_args` (folded into the
-///     estimate, NOT the key).
-pub(super) fn recipe_footprint(name: &str, raw: &serde_json::Value) -> crate::broker::Footprint {
-    // A recipe invoked with NO args (null or an empty object) is billed a LIGHT
-    // base footprint, not the conservative trainer estimate. A heavy data-trainer
-    // always declares required args (data roots, a manifest), so an arg-less
-    // recipe is a lightweight in-process workflow; without this a trivial zero-arg
-    // recipe is billed the full trainer ~30G and refused on a loaded box. Safe for
-    // the trainer recipes (they always carry args → the estimate path below). A
-    // general per-recipe DECLARED footprint is a tracked post-1.0 addition (API.md).
-    if raw.is_null() || raw.as_object().is_some_and(|o| o.is_empty()) {
-        return crate::broker::Footprint {
-            ram_bytes: 2 * 1024 * 1024 * 1024,
-            vram_mib: 0,
-        };
-    }
-    // THE single shared extraction (RESOLVE side). `Drivers::from_args_json`
-    // clamps workers to `UNCALIBRATED_WORKER_CAP` and resolves batch/tier the
-    // same way the train stage's `train_containment` does (RECORD side), so
-    // the calibration key built below is byte-identical to the one the stage
-    // records under — the prior copy here clamped `1..=4` while the stage
-    // capped at 2, so an explicit `workers:4` config never calibrated.
-    let drivers = crate::broker::Drivers::from_args_json(raw);
-    // The conservative-high estimate (over-refuses) — the fallback when
-    // no calibration exists for this key.
-    let hint = drivers.estimate();
-    // ADR 0046 slice-2: if a MEASURED peak exists for this exact
-    // (recipe,tier,batch,workers) key, resolve admits at the real
-    // footprint (~20G) instead of the conservative hint (~35G). A miss
-    // is benign: `resolve` returns the hint, so admission stays safe.
-    let key = drivers.key(name);
-    crate::broker::FootprintStore::load().resolve(&key, hint)
-}
-
-/// Like [`recipe_footprint`] but with the decode worker count OVERRIDDEN to the
-/// auto-tuned `workers` (ADR 0071 A2), and OPTIONALLY the batch size too (E2,
-/// extends the same auto-tune to a second knob) — so the gate's footprint +
-/// calibration key reflect what the stage will actually launch (threaded via
-/// `ExecCtx::with_admitted_workers`/`with_admitted_batch_size`). The light
-/// arg-less path is unchanged.
-pub(super) fn recipe_footprint_tuned(
-    name: &str,
-    raw: &serde_json::Value,
-    workers: u32,
-    batch: Option<u32>,
-) -> crate::broker::Footprint {
-    if raw.is_null() || raw.as_object().is_some_and(|o| o.is_empty()) {
-        return crate::broker::Footprint {
-            ram_bytes: 2 * 1024 * 1024 * 1024,
-            vram_mib: 0,
-        };
-    }
-    let mut drivers = crate::broker::Drivers::from_args_json(raw);
-    drivers.workers = workers; // the fit-and-saturate count (overrides the cap)
-    if let Some(b) = batch {
-        drivers.batch = b; // the fit-and-saturate batch (E2, overrides the request)
-    }
-    let hint = drivers.estimate();
-    let key = drivers.key(name);
-    crate::broker::FootprintStore::load().resolve(&key, hint)
-}
-
 /// Synchronous/base half of a train-shaped footprint for ADR 0103 profiles.
 /// The selected profile separately bills worker process RSS and every retained
 /// async queue payload, so this intentionally evaluates the existing model at
 /// zero workers to avoid counting those bytes twice. Batch/model/tier/input
 /// terms remain in the base because they exist on the inline path too.
-pub(super) fn recipe_footprint_sync_base(
+pub(super) fn sync_base_footprint(
     raw: &serde_json::Value,
     declared: Option<&(String, blut_types::envelope::ResourceEnvelope)>,
     batch: Option<u32>,
@@ -199,43 +141,17 @@ pub(super) fn recipe_footprint_sync_base(
             vram_mib: resolved.vram_mib,
         };
     }
-    if raw.is_null() || raw.as_object().is_some_and(|object| object.is_empty()) {
-        return crate::broker::Footprint {
-            ram_bytes: resolved.ram_bytes.max(2 * 1024 * 1024 * 1024),
-            vram_mib: resolved.vram_mib,
-        };
-    }
-    let mut drivers = crate::broker::Drivers::from_args_json(raw);
-    if let Some(batch) = batch {
-        drivers.batch = batch;
-    }
-    let formula_sync = crate::broker::footprint::estimate(
-        0,
-        drivers.batch,
-        drivers.tier,
-        drivers.latent,
-        drivers.warm,
-        drivers.in_ch,
-    );
-    let formula_with_workers = crate::broker::footprint::estimate(
-        resolved_workers,
-        drivers.batch,
-        drivers.tier,
-        drivers.latent,
-        drivers.warm,
-        drivers.in_ch,
-    );
-    let known_worker_term = formula_with_workers
-        .ram_bytes
-        .saturating_sub(formula_sync.ram_bytes);
-    // Preserve calibration/OOM-correction conservatively. Removing only the
-    // known formula worker term leaves every unexplained measured excess in
-    // the synchronous base; the profile then adds its explicit worker/queue
-    // terms without discarding a previously raised safety bound.
-    let resolved_minus_worker = resolved.ram_bytes.saturating_sub(known_worker_term);
+    // No declared cost terms: nothing separates the worker bytes from the
+    // whole-footprint estimate, so the sync base IS the resolved footprint
+    // (floored at the light base for an arg-less recipe). An async-I/O
+    // profile on such a stage would double-bill its worker term — but a
+    // profile-declaring stage necessarily declares cost terms (train_joint
+    // does), so this branch only serves profile-less stages, where the value
+    // is unused beyond containment sizing. (ADR 0133 Phase D: the recipe-JSON
+    // formula path is gone.)
     crate::broker::Footprint {
-        ram_bytes: formula_sync.ram_bytes.max(resolved_minus_worker),
-        vram_mib: formula_sync.vram_mib.max(resolved.vram_mib),
+        ram_bytes: resolved.ram_bytes.max(2 * 1024 * 1024 * 1024),
+        vram_mib: resolved.vram_mib,
     }
 }
 
@@ -280,7 +196,7 @@ pub(super) fn configure_training_io_admission(
     // recipe args before candidates/base bytes are evaluated. Keeping this in
     // their shared helper prevents resume from silently reverting to the cold
     // profile for an otherwise identical recipe.
-    ctx.fb_warm = crate::broker::Drivers::from_args_json(raw).warm;
+    ctx.fb_warm = warm_context(raw);
     let live_budget_bytes = training_io_live_budget_bytes(snapshot, launch_target);
     ctx.training_io_selection_budget_bytes = live_budget_bytes;
     let downgrade_reason = if ctx.sync_io {
@@ -294,10 +210,21 @@ pub(super) fn configure_training_io_admission(
     };
     ctx.set_training_io_downgrade_reason(downgrade_reason);
 
-    let resolved_workers =
-        admitted_workers.unwrap_or_else(|| crate::broker::Drivers::from_args_json(raw).workers);
+    // Untuned: the declared workers-term units (what the stage launches), else
+    // the conservative cap constant — the recipe JSON is never consulted.
     let declared = plan.max_declared_envelope();
-    let sync_footprint = recipe_footprint_sync_base(
+    let resolved_workers = admitted_workers.unwrap_or_else(|| {
+        declared
+            .as_ref()
+            .and_then(|(_, e)| {
+                e.cost_terms
+                    .iter()
+                    .find(|t| t.dimension == "workers")
+                    .map(|t| t.declared_units)
+            })
+            .unwrap_or(crate::broker::footprint::UNCALIBRATED_WORKER_CAP)
+    });
+    let sync_footprint = sync_base_footprint(
         raw,
         declared.as_ref(),
         admitted_batch_size,
@@ -368,45 +295,24 @@ pub(super) fn admitted_workers_for(
     // ADR 0133 incr 3: env-first — a declared cost model searches through the
     // typed seam (cookbook enumerates the term + ceiling, engine owns the
     // search). Shadow-compares against the JSON search until Phase D.
-    if let Some((_, env)) = declared {
-        let target = cpu
-            .saturating_sub(2)
-            .clamp(1, crate::broker::footprint::MAX_AUTO_WORKERS);
-        if let Some(w) = crate::broker::footprint::fit_and_saturate_env(
-            env,
-            "workers",
-            target,
-            avail,
-            floor,
-            warm_context(raw),
-        ) {
-            let legacy = crate::broker::footprint::workers_to_fit_and_saturate(
-                cpu,
-                avail,
-                floor,
-                &crate::broker::Drivers::from_args_json(raw),
-            );
-            if w != legacy {
-                tracing::warn!(
-                    "ADR 0133 shadow divergence for {name} workers auto-tune: \
-                     typed {w} vs JSON {legacy} — investigate before Phase D"
-                );
-            }
-            if w != crate::broker::footprint::UNCALIBRATED_WORKER_CAP {
-                eprintln!(
-                    "workers {}→{w} (auto-tuned to fit {:.1}G avail, {cpu} cpus)",
-                    crate::broker::footprint::UNCALIBRATED_WORKER_CAP,
-                    snap.mem_avail_gb
-                );
-            }
-            return Some(w);
-        }
-    }
     // This snapshot is serialized BLUT-vs-BLUT by the scheduler lock and nets
     // out other processes via MemAvailable. It reduces over-admission risk but
-    // cannot guarantee against drift or uncontained processes.
-    let base = crate::broker::Drivers::from_args_json(raw);
-    let w = crate::broker::footprint::workers_to_fit_and_saturate(cpu, avail, floor, &base);
+    // cannot guarantee against drift or uncontained processes. The search runs
+    // over the DECLARED workers cost term (ADR 0133 Phase D: the recipe-JSON
+    // formula is gone) — no term declared ⇒ nothing to tune, keep the launch
+    // count as declared (`None`, exactly the pre-auto-tune behavior).
+    let (_, env) = declared?;
+    let target = cpu
+        .saturating_sub(2)
+        .clamp(1, crate::broker::footprint::MAX_AUTO_WORKERS);
+    let w = crate::broker::footprint::fit_and_saturate_env(
+        env,
+        "workers",
+        target,
+        avail,
+        floor,
+        warm_context(raw),
+    )?;
     if w != crate::broker::footprint::UNCALIBRATED_WORKER_CAP {
         eprintln!(
             "admission: recipe '{name}' decode workers {} → {w} to fit {:.0}G available + {} cores (auto-tuned estimate)",
@@ -446,43 +352,21 @@ pub(super) fn admitted_batch_size_for(
     if avail <= floor {
         return None;
     }
-    // ADR 0133 incr 3: env-first batch shrink at the held workers (residual
-    // budget), the requested batch = the term's declared units. Shadowed.
-    if let Some((_, env)) = declared
-        && let Some(term) = env.cost_terms.iter().find(|t| t.dimension == "batch")
-    {
-        let requested = term.declared_units.max(1);
-        if let Some(b) = crate::broker::footprint::shrink_to_fit_env(
-            env,
-            "batch",
-            requested,
-            &[("workers", resolved_workers)],
-            avail,
-            floor,
-            warm_context(raw),
-        ) {
-            let base = crate::broker::Drivers::from_args_json(raw);
-            let legacy =
-                crate::broker::footprint::batch_size_to_fit(resolved_workers, avail, floor, &base);
-            if b != legacy {
-                tracing::warn!(
-                    "ADR 0133 shadow divergence for {name} batch auto-tune: \
-                         typed {b} vs JSON {legacy} — investigate before Phase D"
-                );
-            }
-            if b == requested {
-                return None; // already fits — no override needed
-            }
-            eprintln!(
-                "batch {requested}→{b} (auto-tuned to fit {:.1}G avail at workers={resolved_workers})",
-                snap.mem_avail_gb
-            );
-            return Some(b);
-        }
-    }
-    let base = crate::broker::Drivers::from_args_json(raw);
-    let requested = base.batch;
-    let b = crate::broker::footprint::batch_size_to_fit(resolved_workers, avail, floor, &base);
+    // Batch shrink over the DECLARED batch cost term at the held workers
+    // (residual budget; ADR 0133 Phase D — the recipe-JSON formula is gone).
+    // No term declared ⇒ nothing to tune (`None`, requested batch unchanged).
+    let (_, env) = declared?;
+    let term = env.cost_terms.iter().find(|t| t.dimension == "batch")?;
+    let requested = term.declared_units.max(1);
+    let b = crate::broker::footprint::shrink_to_fit_env(
+        env,
+        "batch",
+        requested,
+        &[("workers", resolved_workers)],
+        avail,
+        floor,
+        warm_context(raw),
+    )?;
     if b == requested {
         return None; // already fits — no override needed
     }
@@ -593,84 +477,6 @@ mod footprint_resolve_tests {
         assert!(
             training_io_live_budget_bytes(&unknown, crate::config::launcher::LaunchTarget::Local)
                 .is_none()
-        );
-    }
-
-    /// RESOLVE-side cost-driver extraction for `lamquant_joint_codec`
-    /// DEFAULTS (`tier`/`batch_size` absent) — the over-refuse target the
-    /// slice fixes. The tuple here MUST equal the RECORD-side
-    /// `train_containment(None, 3, 0)` tuple in the cookbook
-    /// (`footprint_key_parity` there anchors on the same literal) or the
-    /// calibration never gets hit.
-    #[test]
-    fn joint_codec_default_drivers() {
-        let raw = serde_json::json!({});
-        let d = crate::broker::Drivers::from_args_json(&raw);
-        assert_eq!(d.workers, 2, "uncalibrated worker cap (robustness default)");
-        assert_eq!(d.batch, crate::broker::footprint::DEFAULT_BATCH);
-        assert_eq!(d.tier, 3, "joint recipe default tier");
-        assert_eq!(d.latent, 0, "no --encoder-width ⇒ default latent");
-        assert!(
-            !d.warm,
-            "raw {{}} has no warm_fb_cache ⇒ cold (defaults applied via the plan, not here)"
-        );
-        // The exact key the cli RESOLVES under for a RAW (undefaulted) joint
-        // run. Production bills the plan's DEFAULTED args (warm_fb_cache=true ⇒
-        // `|w`); from_args_json on raw args is the conservative cold `|c`.
-        assert_eq!(
-            d.key("lamquant_joint_codec").flat(),
-            "lamquant_joint_codec|3|32|2|c"
-        );
-    }
-
-    /// Explicit tier/batch flow through to the key (so a tier-6 fullband
-    /// run keys separately from a tier-3 run).
-    #[test]
-    fn explicit_tier_batch_flow_to_key() {
-        let raw = serde_json::json!({ "tier": 6, "batch_size": 16 });
-        let d = crate::broker::Drivers::from_args_json(&raw);
-        assert_eq!((d.workers, d.batch, d.tier), (2, 16, 6));
-        assert_eq!(
-            d.key("lamquant_joint_codec").flat(),
-            "lamquant_joint_codec|6|16|2|c"
-        );
-    }
-
-    /// THE parity-bug regression: an explicit `workers:4` must clamp to the
-    /// cap (2) on the RESOLVE side, so it keys identically to the RECORD
-    /// side (which always launches `UNCALIBRATED_WORKER_CAP`). Before the
-    /// fix the cli clamped `1..=4` → keyed under workers=4, a permanent miss.
-    #[test]
-    fn explicit_workers_clamps_to_cap_for_key_parity() {
-        let raw = serde_json::json!({ "workers": 4, "tier": 3, "batch_size": 32 });
-        let d = crate::broker::Drivers::from_args_json(&raw);
-        assert_eq!(d.workers, crate::broker::UNCALIBRATED_WORKER_CAP);
-        assert_eq!(
-            d.key("lamquant_joint_codec").flat(),
-            "lamquant_joint_codec|3|32|2|c"
-        );
-    }
-
-    /// Phase 3: the warm flag (off the recipe's DEFAULTED args) flows into the
-    /// estimate AND the key — a warm run bills the tighter per-worker term and
-    /// keys `|w` so it can't share calibration with a cold `|c` run.
-    #[test]
-    fn warm_flag_flows_to_estimate_and_key() {
-        let warm = crate::broker::Drivers::from_args_json(
-            &serde_json::json!({ "warm_fb_cache": true, "tier": 3, "batch_size": 32 }),
-        );
-        let cold = crate::broker::Drivers::from_args_json(
-            &serde_json::json!({ "warm_fb_cache": false, "tier": 3, "batch_size": 32 }),
-        );
-        assert!(warm.warm && !cold.warm);
-        assert!(warm.estimate().ram_bytes < cold.estimate().ram_bytes);
-        assert_eq!(
-            warm.key("lamquant_joint_codec").flat(),
-            "lamquant_joint_codec|3|32|2|w"
-        );
-        assert_eq!(
-            cold.key("lamquant_joint_codec").flat(),
-            "lamquant_joint_codec|3|32|2|c"
         );
     }
 }

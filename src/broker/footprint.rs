@@ -28,12 +28,6 @@ use serde::{Deserialize, Serialize};
 /// One gibibyte in bytes.
 pub const GIB: u64 = 1024 * 1024 * 1024;
 
-/// Conservative default batch billed when a recipe leaves `batch_size`
-/// to the kernel default. Used by the LamQuant compatibility containment and
-/// calibration path. Conservative-high so its cap is never under-sized for an
-/// unspecified batch.
-pub const DEFAULT_BATCH: u32 = 32;
-
 /// Conservative DataLoader worker cap for a train-shaped stage (ADR 0046
 /// slice-1 item 5). Each fork-worker is a CoW copy of the ~6 GiB parent
 /// plus decode buffers + a per-worker sample LRU, so RAM scales ~linearly
@@ -50,201 +44,6 @@ pub const UNCALIBRATED_WORKER_CAP: u32 = 2;
 /// GPU feed well before the core count on a many-core box, and each worker holds a
 /// multi-GiB prefetch buffer, so raising past this just burns RAM for no throughput.
 pub const MAX_AUTO_WORKERS: u32 = 16;
-
-/// Compatibility footprint cost drivers for the LamQuant cookbook. This shape
-/// is not part of the generic engine launch contract and may move before 1.0.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[doc(hidden)] // de-publicized pre-0.2 (ADR 0133): transitional recipe-JSON parser
-pub struct Drivers {
-    /// DataLoader workers (the dominant RAM term), clamped
-    /// `1..=UNCALIBRATED_WORKER_CAP`.
-    pub workers: u32,
-    /// Live mini-batch size (resolved default applied).
-    pub batch: u32,
-    /// Model tier (1..=8); larger ⇒ more model/optimizer RAM.
-    pub tier: u32,
-    /// Model latent width (0 ⇒ billed as the 256-wide default).
-    /// Folded into the estimate, NOT the calibration key.
-    pub latent: u32,
-    /// Memory-admission Phase 3: the per-sample disk cache is warmed upstream
-    /// (`warm_fb_cache` recipe arg). Lowers the per-worker term (the warm worker
-    /// holds no whole-input decode) AND is part of the calibration key, so a
-    /// warm `Measured` peak can never resolve a cold run (and vice versa).
-    pub warm: bool,
-    /// Model INPUT channels (`detail_bands`): 21 = the narrow baseline, 168 =
-    /// the full input width (the wide default `--detail-bands all`). The 8×
-    /// wider full-width front-end (wider model layers + SOAP preconditioners +
-    /// the stacked dataloader input) costs materially more RAM than the narrow
-    /// baseline — without this term a full-width launch billed identically to the
-    /// baseline and was admitted then cgroup-killed. Folded into the ESTIMATE,
-    /// not the key: the store's MAX-merge keeps the largest (full-width) peak per
-    /// key, so a low baseline peak can never under-size a full-width run. SET VIA
-    /// [`in_ch_from_args`] (or [`L3_ONLY_IN_CH`]/[`DEFAULT_IN_CH`]); the estimate
-    /// rounds a non-multiple of 21 UP, so an arbitrary value is billed
-    /// conservatively, never under.
-    pub in_ch: u32,
-}
-
-/// Default model input channels when no `--detail-bands`/`--n` override is
-/// present: the kernel's own default is `detail_bands='all'` (the full input
-/// width → 168 ch), so a bare run IS full-width. Defaulting here to 168 (not 21)
-/// is the load-bearing fix — the implicit full-width default must not be
-/// under-billed.
-pub const DEFAULT_IN_CH: u32 = 168;
-/// Narrow-baseline model input (`--detail-bands none` / `--n none`).
-pub const L3_ONLY_IN_CH: u32 = 21;
-
-/// Map a `--detail-bands` / `--n` mode token to the conservative model in_ch.
-/// `none` → narrow baseline (21). ANY other mode (`all` / `l3_detail` / …) → the
-/// full input width (168), billed conservatively so a partial run is never
-/// UNDER-sized (over-billing a partial width only over-provisions; the store
-/// self-heals).
-pub fn in_ch_from_detail_bands(mode: &str) -> u32 {
-    if mode.trim().eq_ignore_ascii_case("none") {
-        L3_ONLY_IN_CH
-    } else {
-        DEFAULT_IN_CH
-    }
-}
-
-/// Resolve the model in_ch from a train invocation's passthrough args.
-///
-/// Precedence: `--detail-bands <m>` (or its `--n <m>` alias) in `extra_args`
-/// wins; else `SNN_DETAIL_BANDS=<bands>` in `extra_env` (empty ⇒ none ⇒ 21);
-/// else the kernel default `detail_bands='all'` ⇒ [`DEFAULT_IN_CH`] (168).
-///
-/// Shared derivation for LamQuant's compatibility resolve/record path so its
-/// billed input width and containment estimate match.
-pub fn in_ch_from_args(extra_args: &[&str], extra_env: &[&str]) -> u32 {
-    for (i, &tok) in extra_args.iter().enumerate() {
-        for flag in ["--detail-bands", "--n"] {
-            // Equals form `--detail-bands=<m>` / `--n=<m>`. (`--n` can't false-
-            // match `--no-gan`: stripping `--n` leaves `o-gan`, no leading `=`.)
-            if let Some(m) = tok.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) {
-                return in_ch_from_detail_bands(m);
-            }
-            // Space form `--detail-bands <m>` / `--n <m>`.
-            if tok == flag
-                && let Some(&m) = extra_args.get(i + 1)
-            {
-                return in_ch_from_detail_bands(m);
-            }
-        }
-    }
-    for kv in extra_env {
-        if let Some(val) = kv.strip_prefix("SNN_DETAIL_BANDS=") {
-            // The trainer sets this to `''` for `detail_bands='none'`, so
-            // empty ⇒ narrow baseline; tolerate a literal `none` too. Any band
-            // list ⇒ full width (conservative).
-            let v = val.trim();
-            return if v.is_empty() || v.eq_ignore_ascii_case("none") {
-                L3_ONLY_IN_CH
-            } else {
-                DEFAULT_IN_CH
-            };
-        }
-    }
-    DEFAULT_IN_CH
-}
-
-/// `in_ch` from LamQuant compatibility args JSON. Extracts the
-/// `extra_args`/`extra_env` string arrays and defers to [`in_ch_from_args`].
-fn in_ch_from_args_json(raw: &serde_json::Value) -> u32 {
-    let strs = |key: &str| -> Vec<&str> {
-        raw.get(key)
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|x| x.as_str()).collect())
-            .unwrap_or_default()
-    };
-    in_ch_from_args(&strs("extra_args"), &strs("extra_env"))
-}
-
-impl Drivers {
-    /// Extract LamQuant compatibility cost drivers from recipe args JSON.
-    /// The generic engine launch path does not call this parser. Workers
-    /// defaults to and is clamped by [`UNCALIBRATED_WORKER_CAP`] (the
-    /// value the train stage actually launches), `batch` to
-    /// [`DEFAULT_BATCH`], `tier` to 3 (the train-recipe default), and
-    /// `latent` is parsed from a `--encoder-width N` token in
-    /// `extra_args` (0 = unspecified).
-    #[doc(hidden)] // de-publicized pre-0.2 (ADR 0133)
-    pub fn from_args_json(raw: &serde_json::Value) -> Self {
-        let u32_or = |key: &str, default: u32| -> u32 {
-            raw.get(key)
-                .and_then(|v| v.as_u64())
-                // saturate, never wrap-to-0 (would under-bill)
-                .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
-                .unwrap_or(default)
-        };
-        let workers = u32_or("workers", UNCALIBRATED_WORKER_CAP).clamp(1, UNCALIBRATED_WORKER_CAP);
-        let batch = u32_or("batch_size", DEFAULT_BATCH);
-        let tier = u32_or("tier", 3);
-        let latent = raw
-            .get("extra_args")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| {
-                arr.iter()
-                    .position(|x| x.as_str() == Some("--encoder-width"))
-                    .and_then(|i| arr.get(i + 1))
-                    .and_then(|x| x.as_str())
-                    .and_then(|s| s.parse::<u32>().ok())
-            })
-            .unwrap_or(0);
-        // `warm_fb_cache` (Phase 2/3): present + true on the warm-by-default
-        // train recipe; ABSENT ⇒ false (the conservative cold term) so a recipe
-        // that doesn't warm is never under-billed. Downstream compatibility
-        // resolve and record paths must agree or their calibration key misses.
-        let warm = raw
-            .get("warm_fb_cache")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        // Model in_ch from the detail-band mode (default 168 = the kernel's
-        // implicit `detail_bands='all'`); the under-bill fix for full width.
-        let in_ch = in_ch_from_args_json(raw);
-        Self {
-            workers,
-            batch,
-            tier,
-            latent,
-            warm,
-            in_ch,
-        }
-    }
-
-    /// Build directly from the resolved drivers a compatibility train stage
-    /// launches. Clamps `workers` to the cap so its resolve and record keys
-    /// cannot diverge on an out-of-range raw count.
-    pub fn new(workers: u32, batch: u32, tier: u32, latent: u32, warm: bool, in_ch: u32) -> Self {
-        Self {
-            workers: workers.clamp(1, UNCALIBRATED_WORKER_CAP),
-            batch,
-            tier,
-            latent,
-            warm,
-            in_ch,
-        }
-    }
-
-    /// The conservative-high RAM/VRAM estimate for these drivers.
-    pub fn estimate(&self) -> Footprint {
-        estimate(
-            self.workers,
-            self.batch,
-            self.tier,
-            self.latent,
-            self.warm,
-            self.in_ch,
-        )
-    }
-
-    /// The calibration key for these drivers under `recipe`. Latent is
-    /// folded into the estimate, not the key (it rarely varies and would
-    /// fragment the calibration). `warm` IS part of the key (a warm peak
-    /// must never resolve a cold run).
-    pub fn key(&self, recipe: &str) -> FootprintKey {
-        footprint_key(recipe, self.workers, self.batch, self.tier, self.warm)
-    }
-}
 
 /// Compose the measured-peak store key from a stage/recipe identity and a
 /// declared [`ResourceEnvelope`] (ADR 0133). ENGINE-composed: the identity
@@ -304,7 +103,7 @@ pub fn envelope_footprint_at(
 /// Increment-3 (ADR 0133): the SYNC (async-retention-free) base of a declared
 /// envelope — every `sync_base_excluded` term at ZERO units, so the ADR-0103
 /// profile's separately-billed worker/queue bytes are never double-counted.
-/// Replaces `recipe_footprint_sync_base`'s estimate-delta trick for declared
+/// Replaces the deleted JSON-path estimate-delta trick for declared
 /// plans (the engine zeroes flagged terms; it never names "the workers").
 pub fn envelope_sync_base(env: &blut_types::envelope::ResourceEnvelope, warm: bool) -> u64 {
     let zeroed: Vec<(&str, u32)> = env
@@ -383,7 +182,7 @@ pub fn shrink_to_fit_env(
 /// value by NAME (declaration order is preserved, so the flat layout — and
 /// store continuity — is unchanged); an override naming no declared dimension
 /// is ignored (a stage that doesn't calibrate on `warm` is not forced to).
-/// This is how `recipe_footprint_tuned`'s key semantics ride the typed seam:
+/// This is how the incumbent tuned-key semantics ride the typed seam:
 /// same layout, context-true values.
 pub fn envelope_calibration_key_with_context(
     identity: &str,
@@ -407,72 +206,6 @@ pub fn envelope_calibration_key_with_context(
     }
     Some(flat)
 }
-
-/// Per-DataLoader-worker prefetch RAM (CoW fork + decode buffers +
-/// per-worker sample LRU).
-///
-/// MEASURED (2026-06-10): a tier-3 warm run at workers=4 peaks ~23 GiB
-/// RESIDENT *plus ~9 GiB swap* under a 25 GiB cgroup cap — i.e. its true
-/// working set is ~32 GiB, the cap forced the overflow to swap and it
-/// OOM-killed under any added pressure. So ~3.7-6 GiB/worker is the real
-/// envelope; the earlier 2.0 GiB UNDER-sized it (the cap then sat at the
-/// peak with no headroom → OOM-on-pressure). 4.0 GiB/worker is the honest
-/// upper-mid, so a workers=2 run (the new default cap) bills ~23 GiB /
-/// caps ~25 GiB over a ~20 GiB real demand — real headroom, no swap. The
-/// calibration store refines per key; a cgroup cap (estimate + headroom)
-/// hard-bounds any under-shoot to a unit kill, never a box OOM.
-const PREFETCH_PER_WORKER_BYTES: u64 = 4 * GIB;
-
-/// Per-DataLoader-worker RAM when the per-sample disk cache is WARM
-/// (memory-admission Phase 2: the warm-cache stage ran upstream). With every used
-/// sample already on disk, the adapter's disk tier hits FIRST and the in-proc
-/// whole-input LRU stays EMPTY, so the per-worker resident set collapses to
-/// CoW-fork + a reclaimable mmap page + the small per-sample LRU — NOT a whole
-/// large input. The cold [`PREFETCH_PER_WORKER_BYTES`] (4 GiB) was sized for the
-/// PRE-Phase-1/2 worker that held + re-decoded a whole input every epoch (the
-/// OOM driver); the warm worker's true set is ~1.5-2.5 GiB.
-///
-/// Set conservative-HIGH at 3 GiB (a 25% cut, not the full ~40%) because no
-/// post-warm clean run has been MEASURED yet — the store auto-tightens DOWN
-/// from the first warm `Measured` peak (resolve returns it verbatim), and the
-/// 90%-rode-cap → `OomCorrected` → escalate self-heal bounds any under-shoot to
-/// a unit kill (never a box OOM). So this is the cold-START hint only; the
-/// calibration store does the rest. A run that DIDN'T warm bills the higher
-/// cold term (the `warm` flag is part of the calibration key, so warm + cold
-/// runs of the same recipe never share — nor poison — an entry).
-const PREFETCH_PER_WORKER_BYTES_WARM: u64 = 3 * GIB;
-
-/// Base RSS floor: python + torch + CUDA context + framework overhead,
-/// independent of workers/batch. Conservative-high.
-const BASE_RSS_BYTES: u64 = 6 * GIB;
-
-/// Model + optimizer-state RAM per model tier (SOAP keeps
-/// preconditioners; bill generously). Multiplied by `tier`.
-const PER_TIER_BYTES: u64 = 2 * GIB;
-
-/// RAM per 256 units of model latent width (the latent-dim knob,
-/// tasks #270/#271). Conservative; mostly host-side staging buffers.
-const PER_LATENT256_BYTES: u64 = GIB;
-
-/// Host-side RAM that scales with the live mini-batch (pinned buffers,
-/// collation staging), per unit of batch. Small vs the worker term —
-/// the actual batch tensors live on the GPU; only the CPU collation /
-/// pinned-staging buffers for a handful of samples are host RAM, so
-/// 64 MiB/unit (batch 32 ⇒ 2 GiB) is realistic. The prior 256 MiB/unit
-/// double-counted the dataloader's own batch staging (already in the
-/// worker term) and inflated batch-32 to a spurious 8 GiB.
-const PER_BATCH_BYTES: u64 = GIB / 16; // 64 MiB / batch unit
-
-/// RAM per extra 21-channel group of model input beyond the narrow baseline
-/// (`in_ch` > 21). The full input width (`detail_bands='all'` → 168 ch = 8
-/// groups) drives an 8× wider model front-end (wider conv/linear layers + their
-/// SOAP preconditioners) plus the stacked `[in_ch, 313]` dataloader input — none
-/// of which the 21-ch baseline carries. So the full width bills `(8-1) × 1 GiB =
-/// +7 GiB` over the baseline. Conservative-high (a full-width tier-3 truly needs
-/// ~30 GiB vs the baseline-shaped ~23 GiB estimate that was admitted then
-/// cgroup-killed); the store self-heals DOWN from the first full-width
-/// `Measured` peak.
-const PER_INCH_GROUP_BYTES: u64 = GIB;
 
 // ── OOM-correction growth (R2 / ADR 0046 slice-3) ────────────────────────
 // An `OomCorrected` entry stores the cgroup cap that was HIT on an OOM — a
@@ -643,77 +376,6 @@ impl Footprint {
     }
 }
 
-/// Estimate peak RAM (bytes) for a train-shaped job. **Monotone
-/// non-decreasing** in every argument — the property the unit tests
-/// pin and the property that makes "conservative-high" meaningful.
-///
-/// - `workers`: DataLoader workers (the dominant term via prefetch).
-/// - `batch`: live mini-batch size.
-/// - `tier`: model tier (1..=4); larger tier ⇒ more model/opt RAM.
-/// - `latent_dim`: model latent width (0 ⇒ default, billed as 256).
-/// - `warm`: the per-sample disk cache was warmed upstream (Phase 2) ⇒ the
-///   per-worker term drops to `PREFETCH_PER_WORKER_BYTES_WARM` (no
-///   whole-input decode held).
-/// - `in_ch`: model input channels (21 = narrow baseline, 168 = full input
-///   width) ⇒ a `(in_ch/21 − 1) × PER_INCH_GROUP_BYTES` full-width term, so a
-///   168-ch run is no longer billed like a 21-ch run.
-pub fn estimate_ram_bytes(
-    workers: u32,
-    batch: u32,
-    tier: u32,
-    latent_dim: u32,
-    warm: bool,
-    in_ch: u32,
-) -> u64 {
-    let workers = workers as u64;
-    let batch = batch as u64;
-    let tier = tier.max(1) as u64; // tier 0 is nonsensical; floor at 1
-    // Treat an unspecified latent (0) as the default 256-wide model
-    // so the model term is never under-counted.
-    let latent = if latent_dim == 0 { 256 } else { latent_dim } as u64;
-
-    let per_worker = if warm {
-        PREFETCH_PER_WORKER_BYTES_WARM
-    } else {
-        PREFETCH_PER_WORKER_BYTES
-    };
-    let workers_term = workers.saturating_mul(per_worker);
-    let tier_term = tier.saturating_mul(PER_TIER_BYTES);
-    // ceil-div by 256 so any latent > 0 bills at least one unit.
-    let latent_units = latent.div_ceil(256);
-    let latent_term = latent_units.saturating_mul(PER_LATENT256_BYTES);
-    let batch_term = batch.saturating_mul(PER_BATCH_BYTES);
-    // Full-width front-end: extra 21-ch groups beyond the narrow baseline. 168
-    // ch ⇒ (168/21 − 1) = 7 groups ⇒ +7 GiB; 21 ch ⇒ 0. `div_ceil` rounds a
-    // non-multiple UP (a 30-ch model bills 1 group, never 0 — conservative,
-    // never under-bills); `max(21)` floors so a sub-baseline value can't wrap.
-    let in_ch_groups = (in_ch.max(L3_ONLY_IN_CH).div_ceil(L3_ONLY_IN_CH)).saturating_sub(1) as u64;
-    let inch_term = in_ch_groups.saturating_mul(PER_INCH_GROUP_BYTES);
-
-    BASE_RSS_BYTES
-        .saturating_add(workers_term)
-        .saturating_add(tier_term)
-        .saturating_add(latent_term)
-        .saturating_add(batch_term)
-        .saturating_add(inch_term)
-}
-
-/// Convenience: build a [`Footprint`] from the cost drivers (RAM
-/// scaled, VRAM left unknown for slice-1).
-pub fn estimate(
-    workers: u32,
-    batch: u32,
-    tier: u32,
-    latent_dim: u32,
-    warm: bool,
-    in_ch: u32,
-) -> Footprint {
-    Footprint {
-        ram_bytes: estimate_ram_bytes(workers, batch, tier, latent_dim, warm, in_ch),
-        vram_mib: 0,
-    }
-}
-
 // ── Warm-stage (parallel cache precompute) RAM model ──────────────────────
 //
 // DISTINCT from the train scaling formula above. The warm-cache stage forks N
@@ -725,137 +387,6 @@ pub fn estimate(
 // `MEMORY_GIB = 8` reservation under ~6 workers × ~6 GiB ≈ 36 GiB real, with NO
 // cgroup cap to catch the overshoot). The warm stage now bills + caps from this
 // model, exactly as the train stage does from `estimate`.
-
-/// Memory-admission cap on warm fork workers (the warm-side analogue of
-/// [`UNCALIBRATED_WORKER_CAP`]). The warm is a one-time precompute, so
-/// box-survival dominates throughput: 4 workers is near the validated ~5.5×
-/// speedup knee, and [`warm_workers_for_budget`] drops it further on a box that
-/// can't hold the cap's footprint.
-pub const WARM_WORKER_CAP: u32 = 4;
-
-/// Parent-process RSS floor of the warm driver: python + the sample index +
-/// the decode of the first input + framework overhead,
-/// independent of worker count. Conservative-high (mirrors [`BASE_RSS_BYTES`]).
-const WARM_BASE_RSS_BYTES: u64 = 6 * GIB;
-
-/// Per-fork-worker RSS: a CoW-defeated near-full copy of the inherited sample
-/// index plus the worker's own one-input decode + fp16 cast buffer. Raised
-/// 6→8 GiB to match the MEASURED warm peak: a 4-worker warm rode ~23 GiB RSS +
-/// ~9 GiB swap = ~32 GiB true working set (≈8 GiB/worker), so the prior 6 GiB
-/// under-sized it → the 32 GiB cgroup cap was ridden → OOM-kill → partial cache.
-/// 8 GiB makes `warm_estimate` bill the real peak so `warm_workers_for_budget`
-/// reduces workers BEFORE the OOM (raise-to-measured is always the safe
-/// direction; cf. the never-lower-an-unproven-cap rule).
-const PER_WARM_WORKER_BYTES: u64 = 8 * GIB;
-
-/// Conservative-high peak RSS (bytes) of the warm stage at `workers` fork
-/// workers: `base + workers × per_worker`. Monotone in `workers`; floors at 1
-/// worker (a serial warm still pays the base + one worker's set).
-pub fn warm_ram_bytes(workers: u32) -> u64 {
-    let w = workers.max(1) as u64;
-    WARM_BASE_RSS_BYTES.saturating_add(w.saturating_mul(PER_WARM_WORKER_BYTES))
-}
-
-/// A [`Footprint`] for the warm stage at `workers` (RAM scaled, VRAM 0 — the
-/// warm is CPU + disk only). `memmax_bytes()` adds the standard 2 GiB headroom.
-pub fn warm_estimate(workers: u32) -> Footprint {
-    Footprint {
-        ram_bytes: warm_ram_bytes(workers),
-        vram_mib: 0,
-    }
-}
-
-/// Pick the warm worker count that stays box-safe: the largest
-/// `w ∈ 1..=min(requested, WARM_WORKER_CAP)` whose cgroup cap
-/// (`warm_estimate(w).memmax_bytes()`) fits `budget_bytes` (the box-fit RAM
-/// ceiling, `MemTotal − floor`). `budget_bytes == 0` (probe unavailable) skips
-/// the box-fit reduction and returns `min(requested, WARM_WORKER_CAP)`. Always
-/// ≥ 1 — a single worker is the floor even on a box too small for its cap (the
-/// cgroup then kills the unit rather than the box; the warm fails closed and
-/// the contained trainer re-decodes + self-heals).
-pub fn warm_workers_for_budget(requested: u32, budget_bytes: u64) -> u32 {
-    let ceil = requested.clamp(1, WARM_WORKER_CAP);
-    if budget_bytes == 0 {
-        return ceil;
-    }
-    let mut w = ceil;
-    while w > 1 && warm_estimate(w).memmax_bytes() > budget_bytes {
-        w -= 1;
-    }
-    w
-}
-
-/// Auto-tune DataLoader workers to FIT-AND-SATURATE (ADR 0071): the largest
-/// `w ∈ 1..=target` whose train footprint `estimate_ram_bytes(w, …)` fits the RAM
-/// budget `avail_bytes − floor_bytes`, where `target` is the CPU-bound throughput
-/// goal (`cpu_count − 2`, clamped to [`MAX_AUTO_WORKERS`]). So it RAISES workers to
-/// saturate decode up to what RAM allows, and LOWERS them to fit — memory-admission.
-///
-/// Always ≥ 1. If even one worker doesn't fit, returns 1 (the admission gate then
-/// refuses on box-capacity — there is NO silent OOM-cap fallback). `avail_bytes == 0`
-/// (probe unavailable) ⇒ the conservative [`UNCALIBRATED_WORKER_CAP`], so a box we
-/// can't size to behaves exactly as before.
-///
-/// A downstream compatibility path that uses this helper must compute the
-/// count once and pass the same value to containment and calibration.
-pub fn workers_to_fit_and_saturate(
-    cpu_count: u32,
-    avail_bytes: u64,
-    floor_bytes: u64,
-    d: &Drivers,
-) -> u32 {
-    if avail_bytes == 0 {
-        return UNCALIBRATED_WORKER_CAP; // can't size to RAM → conservative
-    }
-    let budget = avail_bytes.saturating_sub(floor_bytes);
-    let target = cpu_count.saturating_sub(2).clamp(1, MAX_AUTO_WORKERS);
-    let est = |w: u32| estimate_ram_bytes(w, d.batch, d.tier, d.latent, d.warm, d.in_ch);
-    let mut w = target;
-    while w > 1 && est(w) > budget {
-        w -= 1;
-    }
-    w
-}
-
-/// Auto-tune batch size to FIT the RAM budget, extending ADR 0071's
-/// fit-and-saturate auto-tune to a second knob (E2). Unlike workers, batch has
-/// no "saturate up" direction — raising it beyond what the recipe requested
-/// changes gradient-noise scale / convergence, a training-quality decision
-/// this auto-tuner must never make silently. So this only ever LOWERS:
-/// the largest `b ∈ 1..=d.batch` (the recipe's REQUESTED batch, not a computed
-/// target) whose footprint `estimate_ram_bytes(resolved_workers, b, …)` fits
-/// `avail_bytes − floor_bytes`.
-///
-/// `resolved_workers` must be the value `workers_to_fit_and_saturate` already
-/// picked for this SAME admission snapshot — `estimate_ram_bytes`'s
-/// `batch_term` (`PER_BATCH_BYTES` per unit) has no cross-term with the
-/// workers/tier/latent/in_ch terms (they're a flat additive sum), so
-/// resolving workers first and batch second against the residual budget
-/// reaches the identical feasibility boundary a joint 2-D search would —
-/// see `estimate_ram_bytes`'s doc comment for the term breakdown.
-///
-/// Always ≥ 1. `avail_bytes == 0` (probe unavailable) ⇒ returns the
-/// recipe's requested batch unchanged (mirrors `workers_to_fit_and_saturate`'s
-/// uncalibrated-box behavior — a box we can't size to behaves as before, no
-/// silent shrink). As with workers, a downstream compatibility path must pass
-/// the same resolved value to containment and calibration.
-pub fn batch_size_to_fit(
-    resolved_workers: u32,
-    avail_bytes: u64,
-    floor_bytes: u64,
-    d: &Drivers,
-) -> u32 {
-    if avail_bytes == 0 {
-        return d.batch.max(1);
-    }
-    let budget = avail_bytes.saturating_sub(floor_bytes);
-    let est = |b: u32| estimate_ram_bytes(resolved_workers, b, d.tier, d.latent, d.warm, d.in_ch);
-    let mut b = d.batch.max(1);
-    while b > 1 && est(b) > budget {
-        b -= 1;
-    }
-    b
-}
 
 /// One persisted calibration entry. RAM is MAX-merged (monotone-up: a
 /// measured cgroup peak is the true need and, being cgroup-isolated,
@@ -1190,118 +721,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base_floor_with_zero_drivers() {
-        // Even all-zero drivers bill the base RSS + a tier-1 + default
-        // latent floor — never zero, so admission can't be fooled.
-        let r = estimate_ram_bytes(0, 0, 0, 0, false, 21);
-        assert!(r >= BASE_RSS_BYTES, "got {r}");
-        // floors: base + tier1 + latent256 = 6 + 2 + 1 = 9 GiB
-        assert_eq!(r, 9 * GIB);
-    }
-
-    #[test]
-    fn monotone_in_workers() {
-        let lo = estimate_ram_bytes(2, 16, 3, 256, false, 21);
-        let hi = estimate_ram_bytes(8, 16, 3, 256, false, 21);
-        assert!(hi > lo, "workers must increase RAM: {lo} !< {hi}");
-        // workers dominate: +6 workers × 4 GiB = +24 GiB
-        assert_eq!(hi - lo, 6 * PREFETCH_PER_WORKER_BYTES);
-    }
-
-    #[test]
-    fn monotone_in_batch() {
-        let lo = estimate_ram_bytes(4, 8, 3, 256, false, 21);
-        let hi = estimate_ram_bytes(4, 32, 3, 256, false, 21);
-        assert!(hi > lo, "batch must increase RAM: {lo} !< {hi}");
-    }
-
-    #[test]
-    fn monotone_in_tier() {
-        let lo = estimate_ram_bytes(4, 16, 1, 256, false, 21);
-        let hi = estimate_ram_bytes(4, 16, 4, 256, false, 21);
-        assert!(hi > lo, "tier must increase RAM: {lo} !< {hi}");
-    }
-
-    #[test]
-    fn monotone_in_latent() {
-        let lo = estimate_ram_bytes(4, 16, 3, 256, false, 21);
-        let hi = estimate_ram_bytes(4, 16, 3, 512, false, 21);
-        assert!(hi > lo, "latent_dim must increase RAM: {lo} !< {hi}");
-    }
-
-    #[test]
-    fn workers_term_dominates() {
-        // The whole point (hole #4): RAM is workers-driven, not
-        // batch-driven. Doubling workers must move RAM more than
-        // doubling batch from the same baseline.
-        let base = estimate_ram_bytes(4, 16, 3, 256, false, 21);
-        let more_workers = estimate_ram_bytes(8, 16, 3, 256, false, 21);
-        let more_batch = estimate_ram_bytes(4, 32, 3, 256, false, 21);
-        assert!(
-            more_workers - base > more_batch - base,
-            "workers must dominate batch: dW={} dB={}",
-            more_workers - base,
-            more_batch - base
-        );
-    }
-
-    #[test]
     fn memmax_adds_headroom() {
-        let fp = estimate(4, 16, 3, 256, false, 21);
+        let fp = Footprint {
+            ram_bytes: 30 * GIB,
+            vram_mib: 0,
+        };
         assert_eq!(fp.memmax_bytes(), fp.ram_bytes + 2 * GIB);
     }
 
-    #[test]
-    fn conservative_default_admits_one_train_on_62g_box() {
-        // The load-bearing slice-1 property: the uncalibrated default
-        // (capped workers ≤ 4) is conservative-high but still fits ONE
-        // train on the 62 GiB box with the 6 GiB floor.
-        let fp = estimate(4, 16, 3, 256, false, 21);
-        // 6 + 4×4 + 3×2 + 1 + 16×64MiB = 6+16+6+1+1 = 30 GiB
-        assert_eq!(fp.ram_bytes, 30 * GIB);
-        assert!(
-            fp.ram_bytes < (62 - 6) * GIB,
-            "must fit one train on 62G box"
-        );
-    }
-
-    #[test]
-    fn cold_tier3_cap_exceeds_measured_workers2_demand() {
-        // R3 regression pin: at the capped worker count (UNCALIBRATED_WORKER_CAP
-        // = 2 in blut-lamquant), the COLD tier-3 cap must exceed the MEASURED
-        // workers=2 true working set (~16-20 GiB, DEV_LOG 2026-06-10 db39698),
-        // so a cold run stays within the declared cap estimate. A future constant tweak that
-        // re-under-sizes the hint (the 51bcc43 bug) trips this test.
-        let cold_cap = estimate(2, 32, 3, 256, false, 21).memmax_bytes();
-        // 6 + 2×4 + 3×2 + 1 + 32×64MiB = 23 GiB estimate, +2 GiB headroom = 25 GiB.
-        // Pin the ACTUAL cap (24G threshold = the 25G cap with 1G slack), not
-        // a loose ">demand" floor — a constant tweak that drops the cold cap
-        // below the measured ~20G workers-2 demand (the 51bcc43 bug) trips this.
-        assert!(
-            cold_cap >= 24 * GIB,
-            "cold tier-3 workers-2 cap {cold_cap} must hold the ~25G right-sized value \
-             (>> the ~20G measured demand)"
-        );
-    }
-
     // ── Phase 3: warm-aware footprint ─────────────────────────────────
-
-    #[test]
-    fn warm_lowers_per_worker_term_only() {
-        // The warm flag drops ONLY the per-worker term (no whole-recording
-        // decode held); base/tier/latent/batch are unchanged.
-        let cold = estimate_ram_bytes(2, 32, 3, 256, false, 21);
-        let warm = estimate_ram_bytes(2, 32, 3, 256, true, 21);
-        assert!(
-            warm < cold,
-            "warm must be tighter than cold: {warm} !< {cold}"
-        );
-        // Δ = workers × (cold_per_worker − warm_per_worker) = 2 × (4−3) GiB.
-        assert_eq!(
-            cold - warm,
-            2 * (PREFETCH_PER_WORKER_BYTES - PREFETCH_PER_WORKER_BYTES_WARM)
-        );
-    }
 
     #[test]
     fn warm_key_differs_from_cold() {
@@ -1320,8 +748,10 @@ mod tests {
         // true working set. 6 + 2×3 + 3×2 + 1 + 32×64MiB = 21 GiB est, +2 = 23.
         // Pin it ABOVE the conservative warm demand (~20 GiB) yet BELOW the cold
         // 25 GiB cap — the tightening Phase 3 delivers, without re-OOMing.
-        let warm_cap = estimate(2, 32, 3, 256, true, 21).memmax_bytes();
-        let cold_cap = estimate(2, 32, 3, 256, false, 21).memmax_bytes();
+        // Golden literals (formula lives in the cookbook since Phase D):
+        // warm 6+2×3+3×2+1+2 = 21 GiB est → 23 cap; cold 6+2×4+… = 23 est → 25.
+        let warm_cap = 23 * GIB;
+        let cold_cap = 25 * GIB;
         assert!(
             warm_cap < cold_cap,
             "warm cap must be tighter: {warm_cap} !< {cold_cap}"
@@ -1339,307 +769,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn drivers_from_args_reads_warm_flag() {
-        // Compatibility resolve side: warm comes from recipe JSON. Absent ⇒
-        // cold (conservative). Present+true ⇒ warm.
-        let cold = Drivers::from_args_json(&serde_json::json!({"tier": 3}));
-        assert!(!cold.warm, "absent warm_fb_cache ⇒ cold");
-        let warm = Drivers::from_args_json(&serde_json::json!({"warm_fb_cache": true, "tier": 3}));
-        assert!(warm.warm, "warm_fb_cache=true ⇒ warm");
-        // And the warm estimate is tighter than the cold one for the same args.
-        assert!(warm.estimate().ram_bytes < cold.estimate().ram_bytes);
-    }
-
     // ── in_ch fullband term (the under-bill fix) ──────────────────────
 
-    #[test]
-    fn fullband_in_ch_adds_term_over_l3() {
-        // 168-ch fullband bills (168/21 − 1) = 7 GiB OVER the 21-ch L3 baseline —
-        // previously they were identical (the admit-then-cgroup-kill bug).
-        let l3 = estimate_ram_bytes(2, 32, 3, 256, false, 21);
-        let fb = estimate_ram_bytes(2, 32, 3, 256, false, 168);
-        assert!(fb > l3, "fullband must bill more than L3: {fb} !> {l3}");
-        assert_eq!(fb - l3, 7 * PER_INCH_GROUP_BYTES, "168ch ⇒ +7 groups");
-        // L3 baseline (21) adds nothing; a sub-baseline in_ch never wraps negative.
-        assert_eq!(
-            estimate_ram_bytes(2, 32, 3, 256, false, 0),
-            estimate_ram_bytes(2, 32, 3, 256, false, 21),
-            "in_ch < baseline floors at 21 (no wrap)"
-        );
-        // A non-multiple rounds UP (conservative): 30 ch ⇒ 1 group, not 0.
-        assert_eq!(
-            estimate_ram_bytes(2, 32, 3, 256, false, 30) - l3,
-            PER_INCH_GROUP_BYTES,
-            "30ch rounds up to 1 group (never under-bills)"
-        );
-    }
-
-    #[test]
-    fn in_ch_from_detail_bands_mapping() {
-        assert_eq!(in_ch_from_detail_bands("none"), L3_ONLY_IN_CH);
-        assert_eq!(in_ch_from_detail_bands("NONE"), L3_ONLY_IN_CH);
-        assert_eq!(in_ch_from_detail_bands("all"), DEFAULT_IN_CH);
-        assert_eq!(in_ch_from_detail_bands("l3_detail"), DEFAULT_IN_CH);
-    }
-
-    #[test]
-    fn in_ch_from_args_precedence() {
-        // --detail-bands wins.
-        assert_eq!(in_ch_from_args(&["--detail-bands", "none"], &[]), 21);
-        assert_eq!(in_ch_from_args(&["--detail-bands", "all"], &[]), 168);
-        // --n alias.
-        assert_eq!(in_ch_from_args(&["--n", "none"], &[]), 21);
-        // Equals form (shell convention) — must parse too.
-        assert_eq!(in_ch_from_args(&["--detail-bands=none"], &[]), 21);
-        assert_eq!(in_ch_from_args(&["--n=all"], &[]), 168);
-        // `--n` must NOT false-match `--no-gan` etc.
-        assert_eq!(in_ch_from_args(&["--no-gan"], &[]), 168);
-        // SNN_DETAIL_BANDS env: empty (the kernel's `none`) or literal `none`
-        // ⇒ L3; a band list ⇒ fullband.
-        assert_eq!(in_ch_from_args(&[], &["SNN_DETAIL_BANDS="]), 21);
-        assert_eq!(in_ch_from_args(&[], &["SNN_DETAIL_BANDS=none"]), 21);
-        assert_eq!(in_ch_from_args(&[], &["SNN_DETAIL_BANDS=l3_detail"]), 168);
-        // Nothing ⇒ the kernel default detail_bands='all' ⇒ fullband (the fix).
-        assert_eq!(in_ch_from_args(&[], &[]), 168);
-    }
-
-    #[test]
-    fn drivers_default_is_fullband_then_overridable() {
-        // RESOLVE side: a bare joint run defaults to fullband (168) — the implicit
-        // 'all' default that was being under-billed.
-        let bare = Drivers::from_args_json(&serde_json::json!({"tier": 3}));
-        assert_eq!(bare.in_ch, 168, "bare joint run is fullband by default");
-        // Explicit L3-only drops the fullband term.
-        let l3 = Drivers::from_args_json(
-            &serde_json::json!({"tier": 3, "extra_args": ["--detail-bands", "none"]}),
-        );
-        assert_eq!(l3.in_ch, 21);
-        assert!(
-            l3.estimate().ram_bytes < bare.estimate().ram_bytes,
-            "L3 bills less than fullband"
-        );
-    }
-
     // ── warm-stage footprint model (memory-admission hole: uncontained warm) ──
-
-    #[test]
-    fn warm_ram_is_base_plus_per_worker_monotone() {
-        // The warm bills base + workers × per-worker, monotone-up in workers —
-        // the replacement for the flat 8 GiB that under-billed the fork pool.
-        let w1 = warm_ram_bytes(1);
-        let w4 = warm_ram_bytes(4);
-        assert_eq!(w1, WARM_BASE_RSS_BYTES + PER_WARM_WORKER_BYTES);
-        assert_eq!(w4, WARM_BASE_RSS_BYTES + 4 * PER_WARM_WORKER_BYTES);
-        assert!(w4 > w1, "more workers ⇒ more RAM");
-        // Floors at 1 worker: 0 bills the same as 1 (a serial warm still pays).
-        assert_eq!(warm_ram_bytes(0), warm_ram_bytes(1));
-        // The 4-worker cap blows the prior flat 8 GiB reservation out of the
-        // water — that mismatch (30 GiB real vs 8 GiB billed) is the box-OOM.
-        assert!(w4 > 8 * GIB, "warm cap must dwarf the old flat 8 GiB lie");
-    }
-
-    #[test]
-    fn warm_estimate_adds_headroom() {
-        let fp = warm_estimate(2);
-        assert_eq!(fp.vram_mib, 0, "warm is CPU + disk only");
-        assert_eq!(fp.memmax_bytes(), warm_ram_bytes(2) + 2 * GIB);
-    }
-
-    #[test]
-    fn warm_workers_for_budget_reduces_to_fit_box() {
-        // The cap (4) costs base+4×per = 6+32 = 38 GiB est, +2 = 40 GiB cap
-        // (PER_WARM_WORKER_BYTES raised 6→8 GiB to match the measured ~8 GiB/
-        // worker warm peak — see the const's doc).
-        let cap4 = warm_estimate(4).memmax_bytes();
-        assert_eq!(cap4, 40 * GIB);
-        // A box that can hold the cap keeps all 4.
-        assert_eq!(warm_workers_for_budget(4, 56 * GIB), 4);
-        // A tighter box steps workers DOWN until the cap fits. memmax(w)=8+8w:
-        // w2=24G, w3=32G, w4=40G.
-        assert_eq!(warm_estimate(2).memmax_bytes(), 24 * GIB);
-        assert_eq!(
-            warm_workers_for_budget(4, 24 * GIB),
-            2,
-            "2-worker cap (24G) fits a 24G box"
-        );
-        assert_eq!(
-            warm_workers_for_budget(4, 23 * GIB),
-            1,
-            "only 1 worker (16G) fits 23G"
-        );
-        // Never below 1 even on an impossibly small box (the unit-kill floor).
-        assert_eq!(warm_workers_for_budget(4, GIB), 1);
-        // requested clamps to the cap; budget 0 (no probe) skips the reduction.
-        assert_eq!(warm_workers_for_budget(99, 0), WARM_WORKER_CAP);
-        assert_eq!(warm_workers_for_budget(2, 0), 2);
-        assert_eq!(warm_workers_for_budget(0, 0), 1, "requested 0 floors at 1");
-    }
-
-    #[test]
-    fn workers_auto_tune_fits_and_saturates() {
-        let d = Drivers {
-            workers: 0,
-            batch: 16,
-            tier: 3,
-            latent: 256,
-            warm: false,
-            in_ch: 21,
-        };
-        let est = |w: u32| estimate_ram_bytes(w, d.batch, d.tier, d.latent, d.warm, d.in_ch);
-
-        // Huge RAM + many cores → saturate up to MAX_AUTO_WORKERS (not all cores).
-        assert_eq!(
-            workers_to_fit_and_saturate(64, 10_000 * GIB, 6 * GIB, &d),
-            MAX_AUTO_WORKERS
-        );
-
-        // Tight RAM → the LARGEST w that fits `avail − floor`, and maximal.
-        let (avail, floor) = (40 * GIB, 6 * GIB);
-        let budget = avail - floor;
-        let target = (64u32 - 2).min(MAX_AUTO_WORKERS);
-        let w = workers_to_fit_and_saturate(64, avail, floor, &d);
-        assert!(w >= 1 && w <= target);
-        assert!(est(w) <= budget, "fits the RAM budget (memory-admission)");
-        if w < target {
-            assert!(
-                est(w + 1) > budget,
-                "maximal: one more worker would not fit"
-            );
-        }
-
-        // Probe unavailable → the conservative cap (unchanged behaviour).
-        assert_eq!(
-            workers_to_fit_and_saturate(64, 0, 6 * GIB, &d),
-            UNCALIBRATED_WORKER_CAP
-        );
-
-        // Even one worker doesn't fit a tiny box → 1 (the gate then refuses on box-cap).
-        let budget_lt_one = est(1) - GIB; // a budget smaller than a single worker needs
-        assert_eq!(
-            workers_to_fit_and_saturate(64, budget_lt_one + 6 * GIB, 6 * GIB, &d),
-            1
-        );
-
-        // Few cores caps the throughput target at cpu_count − 2.
-        assert_eq!(workers_to_fit_and_saturate(6, 10_000 * GIB, 6 * GIB, &d), 4);
-    }
-
-    #[test]
-    fn batch_auto_tune_only_ever_lowers_never_raises() {
-        let d = Drivers {
-            workers: 0,
-            batch: 64,
-            tier: 3,
-            latent: 256,
-            warm: false,
-            in_ch: 21,
-        };
-        let est = |b: u32| estimate_ram_bytes(4, b, d.tier, d.latent, d.warm, d.in_ch);
-
-        // Huge RAM → the requested batch is returned UNCHANGED (never raised
-        // beyond what the recipe asked, unlike workers' saturate-up behavior).
-        assert_eq!(batch_size_to_fit(4, 10_000 * GIB, 6 * GIB, &d), 64);
-
-        // Tight RAM → the LARGEST b ≤ requested that fits `avail − floor`.
-        // (base 6G + workers 4×4G=16G + tier 3×2G=6G + latent 1G = 29G before
-        // any batch term, so the budget must clear that floor to be meaningful.)
-        let (avail, floor) = (37 * GIB, 6 * GIB);
-        let budget = avail - floor;
-        let b = batch_size_to_fit(4, avail, floor, &d);
-        assert!((1..=64).contains(&b));
-        assert!(est(b) <= budget, "fits the RAM budget (memory-admission)");
-        if b < 64 {
-            assert!(
-                est(b + 1) > budget,
-                "maximal: one more batch unit would not fit"
-            );
-        }
-
-        // Probe unavailable → the requested batch, unchanged (no silent shrink
-        // on a box we can't size to — mirrors workers' uncalibrated fallback,
-        // but returns the REQUEST not a fixed cap, since batch has no cap).
-        assert_eq!(batch_size_to_fit(4, 0, 6 * GIB, &d), 64);
-
-        // Even batch=1 doesn't fit a tiny box → 1 (never below 1; the gate
-        // then refuses on box-capacity, same floor as workers).
-        let budget_lt_one = est(1) - GIB;
-        assert_eq!(
-            batch_size_to_fit(4, budget_lt_one + 6 * GIB, 6 * GIB, &d),
-            1
-        );
-
-        // requested batch 0 floors at 1 (defensive; DEFAULT_BATCH is never 0
-        // in practice, but the fn must not divide-by/loop-on a 0 target).
-        let d0 = Drivers { batch: 0, ..d };
-        assert_eq!(batch_size_to_fit(4, 10_000 * GIB, 6 * GIB, &d0), 1);
-    }
-
-    #[test]
-    fn batch_and_workers_sequential_resolution_matches_joint_search() {
-        // The additive (no-cross-term) claim in `batch_size_to_fit`'s doc
-        // comment, checked empirically: resolving workers first via
-        // `workers_to_fit_and_saturate`, then batch against the residual
-        // budget, must reach the SAME feasibility boundary a hypothetical
-        // joint 2-D search would — i.e. the pair (w, b) it returns is the
-        // pointwise-maximal pair that still fits, not a strictly-smaller one.
-        let d = Drivers {
-            workers: 0,
-            batch: 48,
-            tier: 3,
-            latent: 256,
-            warm: false,
-            in_ch: 21,
-        };
-        let (avail, floor) = (30 * GIB, 6 * GIB);
-        let budget = avail - floor;
-        let est = |w: u32, b: u32| estimate_ram_bytes(w, b, d.tier, d.latent, d.warm, d.in_ch);
-
-        let w = workers_to_fit_and_saturate(16, avail, floor, &d);
-        let b = batch_size_to_fit(w, avail, floor, &d);
-        assert!(
-            est(w, b) <= budget,
-            "the resolved (w,b) pair fits the budget"
-        );
-
-        // Maximality: bumping EITHER knob by one unit (holding the other
-        // fixed at its resolved value) must not fit — otherwise the
-        // sequential search left a cheaper joint solution on the table.
-        if w < MAX_AUTO_WORKERS {
-            assert!(
-                est(w + 1, b) > budget,
-                "one more worker (at the resolved batch) must not fit"
-            );
-        }
-        if b < d.batch {
-            assert!(
-                est(w, b + 1) > budget,
-                "one more batch unit (at the resolved workers) must not fit"
-            );
-        }
-
-        // MiMo review follow-up: pointwise maximality at (w,b) alone doesn't
-        // rule out a DIFFERENT pair (w', b') — e.g. fewer workers freeing
-        // enough budget for strictly more batch — that also fits. Brute-force
-        // every candidate pair in range and assert none dominates (w,b) on
-        // BOTH axes simultaneously; a workers-heavy target is the correct
-        // choice for the stated lexicographic objective (saturate throughput
-        // first, batch second), so a candidate with w' > w is allowed to have
-        // b' < b (that's expected, not a violation) — the real claim is that
-        // nothing fits with aHIGHER batch at the SAME OR HIGHER worker count.
-        for cand_w in 1..=16u32 {
-            for cand_b in 1..=d.batch {
-                if est(cand_w, cand_b) <= budget && cand_w >= w {
-                    assert!(
-                        cand_b <= b,
-                        "({cand_w},{cand_b}) fits at >= the resolved worker count \
-                         but has a HIGHER batch than the resolved ({w},{b}) — the \
-                         sequential search left a better solution on the table"
-                    );
-                }
-            }
-        }
-    }
 
     // ── calibration store (ADR 0046 slice-2) ──────────────────────────
 
@@ -1807,7 +939,10 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("footprints.json");
         let mut s = FootprintStore::load_from(path);
-        let hint = estimate(4, 16, 3, 256, false, 21); // 31 GiB conservative
+        let hint = Footprint {
+            ram_bytes: 31 * GIB, // frozen golden conservative hint
+            vram_mib: 0,
+        };
         // Absent → hint verbatim.
         assert_eq!(s.resolve(&key(), hint), hint);
         // Present (measured ~20G) → measured RAM, hint VRAM (deferred).
@@ -1832,7 +967,10 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("footprints.json");
         let mut s = FootprintStore::load_from(path);
-        let hint = estimate(2, 16, 3, 256, false, 21); // conservative cold hint
+        let hint = Footprint {
+            ram_bytes: 23 * GIB, // frozen golden conservative cold hint
+            vram_mib: 0,
+        };
         s.record(&key(), 24 * GIB, 0, FootprintSource::OomCorrected)
             .unwrap();
         let r = s.resolve(&key(), hint);
@@ -1850,7 +988,10 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("footprints.json");
         let mut s = FootprintStore::load_from(path);
-        let hint = estimate(2, 16, 3, 256, false, 21);
+        let hint = Footprint {
+            ram_bytes: 23 * GIB,
+            vram_mib: 0,
+        };
         s.record(&key(), 8 * GIB, 0, FootprintSource::OomCorrected)
             .unwrap();
         let r = s.resolve(&key(), hint);
@@ -1864,7 +1005,10 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("footprints.json");
         let mut s = FootprintStore::load_from(path);
-        let hint = estimate(2, 16, 3, 256, false, 21);
+        let hint = Footprint {
+            ram_bytes: 23 * GIB,
+            vram_mib: 0,
+        };
         s.record(&key(), 60 * GIB, 0, FootprintSource::OomCorrected)
             .unwrap();
         let r = s.resolve(&key(), hint);
@@ -1881,7 +1025,10 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let path = td.path().join("footprints.json");
         let mut s = FootprintStore::load_from(path);
-        let hint = estimate(2, 16, 3, 256, false, 21);
+        let hint = Footprint {
+            ram_bytes: 23 * GIB,
+            vram_mib: 0,
+        };
         s.record(&key(), 24 * GIB, 0, FootprintSource::OomCorrected)
             .unwrap();
         let r1 = s.resolve(&key(), hint).ram_bytes; // max(30, 32)=32G
@@ -1916,47 +1063,6 @@ mod tests {
             "corrupt store must degrade to empty, not panic"
         );
     }
-
-    // ── ADR 0072 A7: property-based monotonicity ───────────────────────
-    //
-    // The hand-written `monotone_in_*` tests above pin specific before/after
-    // values. This proptest generalizes the doc-commented invariant
-    // ("**Monotone non-decreasing** in every argument") over random driver
-    // combinations: bumping ANY single driver (workers/batch/tier/
-    // latent_dim/in_ch) by a random positive delta, holding every other
-    // driver (including `warm`) fixed, must never lower the estimate. A
-    // hand-picked pair of values can miss a term that regresses only in
-    // some region of the input space; random generation exercises the
-    // whole domain.
-    proptest::proptest! {
-        #[test]
-        fn estimate_ram_bytes_monotone_in_each_driver(
-            workers in 0u32..100_000,
-            batch in 0u32..100_000,
-            tier in 0u32..1_000,
-            latent_dim in 0u32..1_000_000,
-            in_ch in 0u32..1_000_000,
-            warm in proptest::bool::ANY,
-            driver in 0u8..5,
-            delta in 1u32..1_000_000,
-        ) {
-            let lo = estimate_ram_bytes(workers, batch, tier, latent_dim, warm, in_ch);
-            let (w2, b2, t2, l2, i2) = match driver {
-                0 => (workers.saturating_add(delta), batch, tier, latent_dim, in_ch),
-                1 => (workers, batch.saturating_add(delta), tier, latent_dim, in_ch),
-                2 => (workers, batch, tier.saturating_add(delta), latent_dim, in_ch),
-                3 => (workers, batch, tier, latent_dim.saturating_add(delta), in_ch),
-                _ => (workers, batch, tier, latent_dim, in_ch.saturating_add(delta)),
-            };
-            let hi = estimate_ram_bytes(w2, b2, t2, l2, warm, i2);
-            proptest::prop_assert!(
-                hi >= lo,
-                "driver {driver} increase must not decrease RAM: lo={lo} hi={hi} \
-                 (w{workers} b{batch} t{tier} l{latent_dim} i{in_ch} warm={warm} -> \
-                 w{w2} b{b2} t{t2} l{l2} i{i2})"
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1967,91 +1073,20 @@ mod envelope_key_continuity {
     use super::*;
     use blut_types::envelope::ResourceEnvelope;
 
-    #[test]
-    fn declared_dimensions_reproduce_the_incumbent_flat_key() {
-        let d = Drivers::new(2, 32, 3, 0, true, DEFAULT_IN_CH);
-        let incumbent = d.key("train_joint").flat();
-        let env = ResourceEnvelope {
-            ram_bytes: d.estimate().ram_bytes,
-            gpu: Default::default(),
-            calibration_dimensions: vec![
-                ("tier".into(), d.tier.to_string()),
-                ("batch".into(), d.batch.to_string()),
-                ("workers".into(), d.workers.to_string()),
-                ("warm".into(), if d.warm { "w" } else { "c" }.into()),
-            ],
-            cost_terms: Vec::new(),
-            shared_calibration_group: None,
-        };
-        assert_eq!(
-            envelope_calibration_key("train_joint", &env).as_deref(),
-            Some(incumbent.as_str()),
-            "byte-identical key = calibration history carries over"
-        );
-        // Order matters — the incumbent is recipe|tier|batch|workers|warm.
-        assert_eq!(incumbent, "train_joint|3|32|2|w");
-        // shared group replaces the identity, dimensions unchanged.
-        let mut shared = env.clone();
-        shared.shared_calibration_group = Some("train".into());
-        assert_eq!(
-            envelope_calibration_key("train_joint", &shared).as_deref(),
-            Some("train|3|32|2|w")
-        );
-        // No dimensions -> nothing to calibrate.
-        assert_eq!(
-            envelope_calibration_key("x", &ResourceEnvelope::default()),
-            None
-        );
-    }
+    // GOLDEN test model (frozen literals — the real formula lives in the
+    // cookbook since ADR 0133 Phase D; these pin the ENGINE's affine math and
+    // key composition, independent of any domain formula):
+    const PW_COLD: u64 = 4 * GIB; // per-worker, cold
+    const PW_WARM: u64 = 3 * GIB; // per-worker, warm
+    const PB: u64 = GIB / 16; // per-batch unit
 
-    #[test]
-    fn context_overrides_reproduce_the_incumbent_tuned_key() {
-        // The incumbent TUNED path (recipe_footprint_tuned): auto-tuned workers
-        // + the runtime warm fact override the declared defaults, same layout.
-        let declared = Drivers::new(2, 32, 3, 0, false, DEFAULT_IN_CH);
-        let env = ResourceEnvelope {
-            ram_bytes: declared.estimate().ram_bytes,
-            gpu: Default::default(),
-            calibration_dimensions: vec![
-                ("tier".into(), "3".into()),
-                ("batch".into(), "32".into()),
-                ("workers".into(), "2".into()),
-                ("warm".into(), "c".into()),
-            ],
-            cost_terms: Vec::new(),
-            shared_calibration_group: None,
-        };
-        let mut tuned = Drivers::new(2, 32, 3, 0, true, DEFAULT_IN_CH);
-        tuned.workers = 6; // fit-and-saturate override (bypasses the cap)
-        let incumbent = tuned.key("train_joint").flat();
-        let composed = envelope_calibration_key_with_context(
-            "train_joint",
-            &env,
-            &[("workers", "6".into()), ("warm", "w".into())],
-        );
-        assert_eq!(composed.as_deref(), Some(incumbent.as_str()));
-        assert_eq!(incumbent, "train_joint|3|32|6|w");
-        // An override naming no declared dimension is ignored, not appended.
-        let noop = envelope_calibration_key_with_context(
-            "train_joint",
-            &env,
-            &[("nonexistent", "9".into())],
-        );
-        assert_eq!(
-            noop.as_deref(),
-            Some("train_joint|3|32|2|c"),
-            "unknown context dimensions never mutate the key layout"
-        );
-    }
-
-    /// Build the envelope a LamQuant-shaped train stage declares, from the SAME
-    /// constants the incumbent formula uses — the increment-3 equivalence
-    /// fixture (the cookbook's real terms mirror these; its parity suite pins
-    /// that side).
+    /// A golden declared envelope: base + 2 workers (cold) + `batch` units,
+    /// with the incumbent-layout calibration dimensions.
     fn env_with_terms(tier: u32, batch: u32) -> ResourceEnvelope {
         use blut_types::envelope::CostTerm;
+        let base = (6 + 2 * u64::from(tier) + 1 + 7) * GIB; // frozen golden base
         ResourceEnvelope {
-            ram_bytes: estimate_ram_bytes(2, batch, tier, 0, false, DEFAULT_IN_CH),
+            ram_bytes: base + 2 * PW_COLD + u64::from(batch) * PB,
             gpu: Default::default(),
             calibration_dimensions: vec![
                 ("tier".into(), tier.to_string()),
@@ -2063,15 +1098,15 @@ mod envelope_key_continuity {
                 CostTerm {
                     dimension: "workers".into(),
                     declared_units: 2,
-                    ram_bytes_per_unit: PREFETCH_PER_WORKER_BYTES,
-                    ram_bytes_per_unit_warm: Some(PREFETCH_PER_WORKER_BYTES_WARM),
+                    ram_bytes_per_unit: PW_COLD,
+                    ram_bytes_per_unit_warm: Some(PW_WARM),
                     max_units: MAX_AUTO_WORKERS,
                     sync_base_excluded: true,
                 },
                 CostTerm {
                     dimension: "batch".into(),
                     declared_units: batch,
-                    ram_bytes_per_unit: PER_BATCH_BYTES,
+                    ram_bytes_per_unit: PB,
                     ram_bytes_per_unit_warm: None,
                     max_units: batch,
                     sync_base_excluded: false,
@@ -2081,86 +1116,106 @@ mod envelope_key_continuity {
         }
     }
 
-    #[test]
-    fn envelope_footprint_at_reproduces_the_formula_at_tuned_points() {
-        for tier in [1, 3, 7] {
-            for batch in [4, 32, 64] {
-                let env = env_with_terms(tier, batch);
-                for w in [0, 1, 2, 6, 16] {
-                    for warm in [false, true] {
-                        assert_eq!(
-                            envelope_footprint_at(&env, &[("workers", w)], warm),
-                            estimate_ram_bytes(w, batch, tier, 0, warm, DEFAULT_IN_CH),
-                            "diverged at tier={tier} batch={batch} w={w} warm={warm}"
-                        );
-                        // Batch shrink at held workers.
-                        for b in [1, batch / 2, batch] {
-                            let b = b.max(1);
-                            assert_eq!(
-                                envelope_footprint_at(&env, &[("workers", w), ("batch", b)], warm),
-                                estimate_ram_bytes(w, b, tier, 0, warm, DEFAULT_IN_CH),
-                            );
-                        }
-                    }
-                }
-            }
-        }
+    /// The golden model evaluated by hand — what `envelope_footprint_at` must
+    /// reproduce for any (workers, batch, warm).
+    fn golden(tier: u32, batch: u32, workers: u32, warm: bool) -> u64 {
+        let base = (6 + 2 * u64::from(tier) + 1 + 7) * GIB;
+        let pw = if warm { PW_WARM } else { PW_COLD };
+        base + u64::from(workers) * pw + u64::from(batch) * PB
     }
 
     #[test]
-    fn envelope_sync_base_matches_the_zero_worker_formula() {
-        let env = env_with_terms(3, 32);
-        for warm in [false, true] {
-            assert_eq!(
-                envelope_sync_base(&env, warm),
-                estimate_ram_bytes(0, 32, 3, 0, warm, DEFAULT_IN_CH),
-                "sync base must equal the incumbent estimate(0, …) (warm={warm})"
-            );
-        }
-    }
-
-    #[test]
-    fn env_searches_reproduce_the_legacy_tuned_decisions() {
-        let cpu = 8u32;
-        let target = cpu.saturating_sub(2).clamp(1, MAX_AUTO_WORKERS);
-        let floor = 6 * GIB; // DEFAULT_FLOOR_GIB as bytes
+    fn affine_evaluation_and_sync_base_match_the_golden_model() {
         for tier in [1, 3, 7] {
             for batch in [4, 32] {
+                let env = env_with_terms(tier, batch);
                 for warm in [false, true] {
-                    let d = Drivers::new(2, batch, tier, 0, warm, DEFAULT_IN_CH);
-                    let env = env_with_terms(tier, batch);
-                    for avail_gib in [0u64, 12, 24, 40, 62] {
-                        let avail = avail_gib * GIB;
-                        let legacy_w = workers_to_fit_and_saturate(cpu, avail, floor, &d);
-                        let env_w =
-                            fit_and_saturate_env(&env, "workers", target, avail, floor, warm)
-                                .expect("workers term declared");
-                        // avail==0: legacy returns the uncalibrated cap, env
-                        // returns the DECLARED units — same value (2) by
-                        // construction of the declared envelope.
+                    for w in [0, 1, 2, 6, 16] {
                         assert_eq!(
-                            env_w, legacy_w,
-                            "workers diverged tier={tier} batch={batch} warm={warm} avail={avail_gib}G"
-                        );
-                        let legacy_b = batch_size_to_fit(legacy_w, avail, floor, &d);
-                        let env_b = shrink_to_fit_env(
-                            &env,
-                            "batch",
-                            batch,
-                            &[("workers", env_w)],
-                            avail,
-                            floor,
-                            warm,
-                        )
-                        .expect("batch term declared");
-                        assert_eq!(
-                            env_b, legacy_b,
-                            "batch diverged tier={tier} batch={batch} warm={warm} avail={avail_gib}G"
+                            envelope_footprint_at(&env, &[("workers", w)], warm),
+                            golden(tier, batch, w, warm),
+                            "affine diverged tier={tier} batch={batch} w={w} warm={warm}"
                         );
                     }
+                    // Sync base = the sync_base_excluded (workers) term at zero.
+                    assert_eq!(envelope_sync_base(&env, warm), golden(tier, batch, 0, warm));
                 }
             }
         }
+    }
+
+    #[test]
+    fn key_composition_layout_and_context_overrides_are_stable() {
+        // The store-key layout is a PERMANENT wire format: identity|dims… in
+        // declaration order, warm as w/c. Changing it orphans measured history.
+        let env = env_with_terms(3, 32);
+        assert_eq!(
+            envelope_calibration_key("train_joint", &env).as_deref(),
+            Some("train_joint|3|32|2|c")
+        );
+        let ctx = [("workers", "6".to_string()), ("warm", "w".to_string())];
+        assert_eq!(
+            envelope_calibration_key_with_context("train_joint", &env, &ctx).as_deref(),
+            Some("train_joint|3|32|6|w")
+        );
+        // Unknown context names never mutate the layout.
+        let noop = [("nonexistent", "9".to_string())];
+        assert_eq!(
+            envelope_calibration_key_with_context("train_joint", &env, &noop).as_deref(),
+            Some("train_joint|3|32|2|c")
+        );
+        // A shared group replaces the identity; dimensions unchanged.
+        let mut shared = env.clone();
+        shared.shared_calibration_group = Some("train".into());
+        assert_eq!(
+            envelope_calibration_key("train_joint", &shared).as_deref(),
+            Some("train|3|32|2|c")
+        );
+        // No dimensions ⇒ nothing to calibrate.
+        assert_eq!(
+            envelope_calibration_key("x", &ResourceEnvelope::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn env_searches_fit_and_saturate_against_the_golden_model() {
+        let env = env_with_terms(3, 32);
+        let floor = 6 * GIB;
+        // Saturate: enough room for the full target.
+        assert_eq!(
+            fit_and_saturate_env(&env, "workers", 6, 62 * GIB, floor, false),
+            Some(6)
+        );
+        // Fit: tight budget decrements below the target but never below 1.
+        let w = fit_and_saturate_env(&env, "workers", 6, 24 * GIB, floor, false).unwrap();
+        assert!(
+            (1..6).contains(&w),
+            "tight budget must reduce the count: {w}"
+        );
+        assert_eq!(
+            fit_and_saturate_env(&env, "workers", 6, 7 * GIB, floor, false),
+            Some(1),
+            "always ≥ 1 — admission refuses, the search never deadlocks"
+        );
+        // No probe ⇒ the declared units (behave as declared).
+        assert_eq!(
+            fit_and_saturate_env(&env, "workers", 6, 0, floor, false),
+            Some(2)
+        );
+        // Batch shrink-only at held workers; requested already fits ⇒ requested.
+        assert_eq!(
+            shrink_to_fit_env(&env, "batch", 32, &[("workers", 2)], 62 * GIB, floor, false),
+            Some(32)
+        );
+        let b = shrink_to_fit_env(&env, "batch", 32, &[("workers", 2)], 23 * GIB, floor, false)
+            .unwrap();
+        assert!(b <= 32 && b >= 1);
+        // Missing term ⇒ None (caller keeps the requested value).
+        assert_eq!(
+            shrink_to_fit_env(&env, "nope", 32, &[], 62 * GIB, floor, false),
+            None
+        );
     }
 
     #[test]

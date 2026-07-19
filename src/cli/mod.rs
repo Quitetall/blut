@@ -1343,17 +1343,10 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             });
             let warm = warm_context(&args);
             let tuned = admitted_workers.map(|w| (w, admitted_batch_size));
-            let mut footprint =
-                plan_footprint_declared(declared.as_ref(), &marker.name, &args, tuned, warm)
-                    .unwrap_or_else(|| match admitted_workers {
-                        Some(workers) => recipe_footprint_tuned(
-                            &marker.name,
-                            &args,
-                            workers,
-                            admitted_batch_size,
-                        ),
-                        None => recipe_footprint(&marker.name, &args),
-                    });
+            let mut footprint = footprint_or_floor(
+                plan_footprint_declared(declared.as_ref(), &marker.name, tuned, warm),
+                &marker.name,
+            )?;
 
             let mut ctx = ExecCtx::new(job_dir.clone());
             ctx = ctx.with_tenant(tenant.clone()).with_sync_io(sync_io);

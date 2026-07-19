@@ -261,28 +261,28 @@ pub fn append_tuning(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::broker::footprint::{Drivers, batch_size_to_fit};
 
     #[test]
     fn auto_batch_equals_the_broker_admission_ceiling() {
-        // A big requested batch on a tight budget: the broker's ceiling is below
-        // the request. AutoBatch proposes EXACTLY that ceiling (never over-budget).
-        let d = Drivers::new(1, 64, 3, 64, false, 21);
-        let avail = 8u64 * 1024 * 1024 * 1024; // 8 GiB
-        let floor = 2u64 * 1024 * 1024 * 1024;
-        let ceiling = batch_size_to_fit(1, avail, floor, &d);
-        let p = auto_batch(d.batch, ceiling, 1);
-        if ceiling == d.batch {
-            assert!(p.is_none(), "already at ceiling ⇒ no proposal");
-        } else {
-            let p = p.expect("a below-request ceiling ⇒ a proposal");
-            assert_eq!(
-                p.new,
-                serde_json::json!(ceiling),
-                "proposes the broker ceiling exactly"
-            );
-            assert_eq!(p.field, "batch");
-        }
+        // A big requested batch on a tight budget: the broker's ceiling (as the
+        // caller resolves it via `shrink_to_fit_env` over the DECLARED batch
+        // cost term, ADR 0133) is below the request. AutoBatch proposes EXACTLY
+        // that ceiling (never over-budget). Ceiling pinned as a literal — the
+        // formula lives in the cookbook now.
+        let requested = 64u32;
+        let ceiling = 12u32;
+        let p = auto_batch(requested, ceiling, 1);
+        let p = p.expect("a below-request ceiling ⇒ a proposal");
+        assert_eq!(
+            p.new,
+            serde_json::json!(ceiling),
+            "proposes the broker ceiling exactly"
+        );
+        assert_eq!(p.field, "batch");
+        assert!(
+            auto_batch(64, 64, 1).is_none(),
+            "already at ceiling ⇒ no proposal"
+        );
         // Fail-closed: a ceiling below the operator floor ⇒ propose NOTHING.
         assert!(
             auto_batch(64, 4, 8).is_none(),

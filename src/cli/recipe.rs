@@ -1042,22 +1042,10 @@ pub(super) fn prepare_compiled_plan_launch(
     });
     let warm = warm_context(plan.exec_view().recipe_args);
     let tuned = admitted_workers.map(|w| (w, admitted_batch_size));
-    let footprint = plan_footprint_declared(
-        declared.as_ref(),
+    let footprint = footprint_or_floor(
+        plan_footprint_declared(declared.as_ref(), name, tuned, warm),
         name,
-        plan.exec_view().recipe_args,
-        tuned,
-        warm,
-    )
-    .unwrap_or_else(|| match admitted_workers {
-        Some(workers) => recipe_footprint_tuned(
-            name,
-            plan.exec_view().recipe_args,
-            workers,
-            admitted_batch_size,
-        ),
-        None => recipe_footprint(name, plan.exec_view().recipe_args),
-    });
+    )?;
 
     let job_id = crate::jobs::new_job_id();
     let job_dir = crate::paths::jobs_dir()?.join(&job_id);

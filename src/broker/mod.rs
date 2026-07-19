@@ -46,7 +46,7 @@ pub mod tenant_quota;
 
 pub use admission::{AdmitDecision, decide, gate};
 pub use footprint::{
-    Drivers, Footprint, FootprintEntry, FootprintKey, FootprintSource, FootprintStore, GIB,
-    UNCALIBRATED_WORKER_CAP, estimate_ram_bytes, footprint_key,
+    Footprint, FootprintEntry, FootprintKey, FootprintSource, FootprintStore, GIB,
+    UNCALIBRATED_WORKER_CAP, footprint_key,
 };
 pub use probe::ResourceSnapshot;

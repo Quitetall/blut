@@ -41,6 +41,10 @@ PATTERNS=(
   "log aggregation (reimpl)|\\b(slog|fern|flexi_logger)\\b"
   "process supervision|\\b(setsid|pre_exec|process_group|libc::kill)\\b|kill\\([^)]*,[[:space:]]*0[[:space:]]*\\)"
   "HTTP/web server|[0-9]+:[[:space:]]*use[[:space:]]+(axum|hyper|warp|tower_http|actix_web|rocket|tiny_http)\\b"
+  # ADR 0133 (frozen): admission derives from typed Stage declarations. Recipe-
+  # JSON footprint parsing must never return to the engine — the formula lives
+  # in the cookbook; the one blessed context read is cli/gate.rs warm_context.
+  "recipe-JSON admission parsing (ADR 0133)|\\bfrom_args_json\\b|\\bestimate_ram_bytes\\b|\"(tier|latent|in_ch|batch_size)\"[[:space:]]*\\)?[[:space:]]*\\.as_(u64|str)\\("
 )
 
 fail=0

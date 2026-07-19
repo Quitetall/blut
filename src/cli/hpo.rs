@@ -126,13 +126,33 @@ fn hpo_trial_admission(
     let admitted_batch_size = admitted_workers.and_then(|workers| {
         admitted_batch_size_for(recipe, recipe_args, declared, workers, snapshot)
     });
-    let resolved_footprint = match admitted_workers {
-        Some(workers) => recipe_footprint_tuned(recipe, recipe_args, workers, admitted_batch_size),
-        None => recipe_footprint(recipe, recipe_args),
-    };
-    let resolved_workers = admitted_workers
-        .unwrap_or_else(|| crate::broker::Drivers::from_args_json(recipe_args).workers);
-    let sync_footprint = recipe_footprint_sync_base(
+    // ADR 0133 Phase D: the trial footprint resolves through the typed seam;
+    // an undeclared trial bills the loud 2 GiB floor (strict-mode enforcement
+    // happens at the outer launch gate, not per HPO trial).
+    let tuned = admitted_workers.map(|w| (w, admitted_batch_size));
+    let warm = warm_context(recipe_args);
+    let resolved_footprint =
+        plan_footprint_declared(declared, recipe, tuned, warm).unwrap_or_else(|| {
+            eprintln!(
+                "warning: HPO trial recipe '{recipe}' declares no resource envelope — \
+                 billing the 2G compatibility floor (ADR 0133)."
+            );
+            crate::broker::Footprint {
+                ram_bytes: 2 * 1024 * 1024 * 1024,
+                vram_mib: 0,
+            }
+        });
+    let resolved_workers = admitted_workers.unwrap_or_else(|| {
+        declared
+            .and_then(|(_, e)| {
+                e.cost_terms
+                    .iter()
+                    .find(|t| t.dimension == "workers")
+                    .map(|t| t.declared_units)
+            })
+            .unwrap_or(crate::broker::footprint::UNCALIBRATED_WORKER_CAP)
+    });
+    let sync_footprint = sync_base_footprint(
         recipe_args,
         declared,
         admitted_batch_size,
@@ -145,7 +165,7 @@ fn hpo_trial_admission(
         node: crate::framework::executor::TrainingIoNodeAdmission {
             admitted_decode_workers: admitted_workers,
             admitted_batch_size,
-            cache_warm: crate::broker::Drivers::from_args_json(recipe_args).warm,
+            cache_warm: warm_context(recipe_args),
             calibrated_base_floor_bytes: Some(sync_footprint.ram_bytes),
             selection_budget_bytes: None,
         },
@@ -518,7 +538,7 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
         ctx = ctx.with_memory_budget(budget);
     }
     ctx = ctx.with_launch_target(launch_target);
-    ctx = ctx.with_fb_warm(crate::broker::Drivers::from_args_json(&base_args).warm);
+    ctx = ctx.with_fb_warm(warm_context(&base_args));
     if let Some(budget_bytes) =
         training_io_live_budget_bytes(tenant_admission.snapshot(), launch_target)
     {
