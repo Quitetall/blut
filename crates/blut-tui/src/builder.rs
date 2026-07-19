@@ -5,7 +5,7 @@
 //! The BLUT console lets you assemble your own DAG from the detected
 //! ingredients (registered stages) instead of running a pre-baked recipe: pick
 //! ingredients into a canvas, wire them, and validate. "Validate" is the real
-//! payoff — it builds a [`PlanSpec`](crate::framework::plan_spec::PlanSpec) and
+//! payoff — it builds a [`PlanSpec`](blut::framework::plan_spec::PlanSpec) and
 //! runs it through `compile`, so every wiring break is a typed kind-check error
 //! BEFORE anything executes (ADR 0078). A valid plan can be written out as a
 //! `.json` PlanSpec — the same IR the Python SDK / `blut recipe declare` consume.
@@ -17,9 +17,9 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::framework::Ingredient;
-use crate::framework::plan_spec::{PLAN_SPEC_VERSION, PlanSpec, SpecNode};
-use crate::tui::theme;
+use crate::theme;
+use blut::framework::Ingredient;
+use blut::framework::plan_spec::{PLAN_SPEC_VERSION, PlanSpec, SpecNode};
 
 /// Which pane the builder's cursor is in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -97,13 +97,13 @@ impl DagBuilder {
     /// its args prefilled from the stage's schema template (serde defaults +
     /// `<TODO>` placeholders for required fields) — the same start the recipe
     /// editor uses.
-    fn add_from_palette(&mut self, palette: &[Ingredient], reg: &crate::framework::Registry) {
+    fn add_from_palette(&mut self, palette: &[Ingredient], reg: &blut::framework::Registry) {
         let Some(ing) = palette.get(self.palette_cursor) else {
             return;
         };
         let args = reg
             .find_erased_stage(&ing.stage)
-            .map(|ctor| crate::recipes::recipe::args_template_from_schema(&ctor().args_schema()))
+            .map(|ctor| blut::recipes::recipe::args_template_from_schema(&ctor().args_schema()))
             .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
         self.nodes.push(BuilderNode {
             stage: ing.stage.clone(),
@@ -261,7 +261,7 @@ impl DagBuilder {
 
     /// `v`: the real kind-check — build the `PlanSpec` and `compile` it against
     /// the registry. Sets an Ok/Err status with the precise typed error.
-    fn validate(&mut self, reg: &crate::framework::Registry) {
+    fn validate(&mut self, reg: &blut::framework::Registry) {
         if self.nodes.is_empty() {
             self.set(
                 "nothing to validate — add ingredients first",
@@ -284,7 +284,7 @@ impl DagBuilder {
 
     /// `w`: write the plan as a `.json` PlanSpec under `<data_dir>/plans/` — the
     /// same IR `blut recipe declare <file>.json` consumes. Validates first.
-    fn write(&mut self, reg: &crate::framework::Registry) {
+    fn write(&mut self, reg: &blut::framework::Registry) {
         // Restrict the name to a safe filename charset — it's the only place the
         // (pub, editable) name touches the filesystem, so this fail-closed guard
         // closes any path-traversal vector (`../`, absolute paths, NUL).
@@ -308,7 +308,7 @@ impl DagBuilder {
             );
             return;
         }
-        let dir = match crate::paths::data_dir() {
+        let dir = match blut::paths::data_dir() {
             Ok(d) => d.join("plans"),
             Err(e) => {
                 self.set(format!("no data dir: {e}"), StatusKind::Err);
@@ -346,7 +346,7 @@ impl DagBuilder {
         &mut self,
         code: crossterm::event::KeyCode,
         palette: &[Ingredient],
-        reg: &crate::framework::Registry,
+        reg: &blut::framework::Registry,
     ) -> bool {
         use crossterm::event::KeyCode;
         // The args editor is a modal: while open it captures every key.
@@ -608,7 +608,7 @@ mod tests {
 
     #[test]
     fn add_wire_delete_reindexes_edges() {
-        let reg = crate::framework::Registry::new();
+        let reg = blut::framework::Registry::new();
         let p = palette();
         let mut b = DagBuilder::default();
         // add two nodes
@@ -632,7 +632,7 @@ mod tests {
 
     #[test]
     fn self_loop_is_refused() {
-        let reg = crate::framework::Registry::new();
+        let reg = blut::framework::Registry::new();
         let p = palette();
         let mut b = DagBuilder::default();
         b.handle_key(KeyCode::Enter, &p, &reg);
@@ -646,7 +646,7 @@ mod tests {
 
     #[test]
     fn write_refuses_unsafe_names() {
-        let reg = crate::framework::Registry::new();
+        let reg = blut::framework::Registry::new();
         let mut b = DagBuilder {
             name: "../evil".into(),
             ..DagBuilder::default()
@@ -662,7 +662,7 @@ mod tests {
 
     #[test]
     fn edit_args_saves_valid_json_and_rejects_invalid() {
-        let reg = crate::framework::Registry::new();
+        let reg = blut::framework::Registry::new();
         let p = palette();
         let mut b = DagBuilder::default();
         b.handle_key(KeyCode::Enter, &p, &reg); // add node 0
@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     fn validate_empty_is_an_error() {
-        let reg = crate::framework::Registry::new();
+        let reg = blut::framework::Registry::new();
         let mut b = DagBuilder::default();
         b.handle_key(KeyCode::Char('v'), &[], &reg);
         assert!(matches!(b.status, Some((_, StatusKind::Err))));
@@ -703,7 +703,7 @@ mod tests {
     #[test]
     fn to_plan_spec_is_dense_and_versioned() {
         let p = palette();
-        let reg = crate::framework::Registry::new();
+        let reg = blut::framework::Registry::new();
         let mut b = DagBuilder::default();
         b.handle_key(KeyCode::Enter, &p, &reg);
         let spec = b.to_plan_spec();

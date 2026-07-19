@@ -145,10 +145,10 @@ fn json_type_matches(v: &serde_json::Value, expected: &str) -> bool {
 /// the rest. A `null` value or a field schemars typed as a `["T","null"]` union
 /// (Option) is not type-checked here (it's nullable by construction).
 ///
-/// `pub(crate)` so the TUI Editor (F2/U3) runs the SAME preflight before it
-/// launches a recipe — a non-AI human gets the precise message in-TUI instead
-/// of a detached job that fails deep in the executor.
-pub(crate) fn validate_args_against_schema(
+/// `pub` so the `blut-tui` sidecar's Editor (F2/U3; ADR 0083 M2) runs the SAME
+/// preflight before it launches a recipe — a non-AI human gets the precise
+/// message in-TUI instead of a detached job that fails deep in the executor.
+pub fn validate_args_against_schema(
     recipe: &str,
     schema: &serde_json::Value,
     raw: &serde_json::Value,

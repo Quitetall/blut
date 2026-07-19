@@ -45,9 +45,9 @@ fn run_row(id: &str, recipe: &str, metric: Option<f64>) -> views::RunRow {
     }
 }
 
-fn graph(n: usize) -> crate::framework::GraphSnapshot {
-    use crate::framework::NodeStatus as N;
-    use crate::framework::graph::{GraphNode, PlanGraphEdge};
+fn graph(n: usize) -> blut::framework::GraphSnapshot {
+    use blut::framework::NodeStatus as N;
+    use blut::framework::graph::{GraphNode, PlanGraphEdge};
     let st = [
         N::Done,
         N::Running,
@@ -80,7 +80,7 @@ fn graph(n: usize) -> crate::framework::GraphSnapshot {
     let edges = (1..n)
         .map(|i| PlanGraphEdge { from: i - 1, to: i })
         .collect();
-    crate::framework::GraphSnapshot {
+    blut::framework::GraphSnapshot {
         job: "20260618-073012-000000001".into(),
         name: "demo_plan".into(),
         nodes,

@@ -78,7 +78,7 @@ fn disk_probe_path() -> String {
     if let Ok(p) = std::env::var("BLUT_HOME") {
         return p;
     }
-    if let Ok(p) = crate::paths::jobs_dir() {
+    if let Ok(p) = blut::paths::jobs_dir() {
         return p.to_string_lossy().into_owned();
     }
     ".".to_string()

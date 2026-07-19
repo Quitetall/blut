@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# blut-tui (ADR 0083 M2) — the interactive cockpit as a SIDECAR crate: the
+# ratatui console + training-cockpit views extracted from `blut/src/tui`, so
+# the engine ships as a lean CLI with zero terminal-UI deps. Two ways in:
+#   * a cookbook binary links this LIB and passes `blut_tui::hook()` to
+#     `blut::cli::run_with_tui` — in-process cockpit over the LIVE registry;
+#   * the bare engine `blut tui` execs the `blut-tui` BINARY via the ADR-0083
+#     external-subcommand dispatch (engine-only views: jobs / log / system /
+#     history — an empty registry, no cookbook recipes).
+# Standalone workspace: a sidecar is deliberately not a member of the engine
+# workspace (the engine never links it; it links the engine).
+[workspace]
+
+[package]
+name = "blut-tui"
+version = "0.2.0-alpha.1"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Brian Lam"]
+license = "AGPL-3.0-or-later"
+description = "BLUT interactive cockpit — ratatui console over the engine's jobs/lineage/cache/graph stores (ADR 0083)."
+publish = false
+
+[[bin]]
+name = "blut-tui"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Mesh panels (peers / trust / privacy ledger) — forwards to the engine's
+# off-by-default p2p feature.
+p2p = ["blut/p2p"]
+
+[dependencies]
+blut = { path = "../.." }
+anyhow = "1"
+ratatui = "0.30"
+crossterm = "0.28"
+fuzzy-matcher = "0.3"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+tempfile = "3"

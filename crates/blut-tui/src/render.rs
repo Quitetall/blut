@@ -211,10 +211,8 @@ pub(super) fn draw_cockpit_body(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     // Bucket recipes by category, preserving recipe_menu() order within
     // each bucket and first-seen category order across buckets.
     use std::collections::BTreeMap;
-    let mut by_cat: BTreeMap<
-        &'static str,
-        Vec<(Option<char>, &'static crate::recipes::RecipeDef)>,
-    > = BTreeMap::new();
+    let mut by_cat: BTreeMap<&'static str, Vec<(Option<char>, &'static blut::recipes::RecipeDef)>> =
+        BTreeMap::new();
     for (k, r) in &menu {
         by_cat.entry(r.category.label()).or_default().push((*k, *r));
     }
@@ -878,8 +876,8 @@ pub(super) fn draw_compare(f: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 /// Style a node-status tag by outcome category.
-pub(super) fn node_status_style(s: crate::framework::NodeStatus) -> ratatui::style::Style {
-    use crate::framework::NodeStatus as N;
+pub(super) fn node_status_style(s: blut::framework::NodeStatus) -> ratatui::style::Style {
+    use blut::framework::NodeStatus as N;
     match s {
         N::Done | N::Skipped => theme::success(),
         N::Running => theme::key_hint(),
@@ -1354,7 +1352,7 @@ mod render_tests {
 
     #[test]
     fn not_selected_uses_neutral_status_style() {
-        use crate::framework::NodeStatus;
+        use blut::framework::NodeStatus;
 
         assert_eq!(node_status_style(NodeStatus::NotSelected), theme::dim());
         assert_ne!(node_status_style(NodeStatus::NotSelected), theme::error());

@@ -22,10 +22,10 @@
 //!   * DAG         → [`dag_for`]       (`graph_snapshot`)
 //!   * Reset       → [`reset`]         (generic cache/job/footprint maintenance)
 
-use crate::framework::lineage;
-use crate::framework::{GraphSnapshot, graph_snapshot};
-use crate::jobs;
-use crate::lineage_db::LineageDb;
+use blut::framework::lineage;
+use blut::framework::{GraphSnapshot, graph_snapshot};
+use blut::jobs;
+use blut::lineage_db::LineageDb;
 
 /// The metric the leaderboard ranks by. Every trainer records a
 /// `loss`; lower is better (so the leaderboard minimizes). Bespoke metrics
@@ -365,8 +365,8 @@ fn cache_cap_bytes() -> u64 {
 /// selected (required for [`ResetAction::ClearJob`]). Returns a result line.
 pub fn reset(action: ResetAction, current_job: Option<&str>) -> String {
     match action {
-        ResetAction::PruneCache => match crate::framework::CacheHandle::default_global_path() {
-            Some(root) => match crate::framework::cache::lru_prune(&root, cache_cap_bytes()) {
+        ResetAction::PruneCache => match blut::framework::CacheHandle::default_global_path() {
+            Some(root) => match blut::framework::cache::lru_prune(&root, cache_cap_bytes()) {
                 Ok(freed) => format!(
                     "pruned cache to cap; freed {:.2} GiB",
                     freed as f64 / (1024.0 * 1024.0 * 1024.0)
@@ -389,7 +389,7 @@ pub fn reset(action: ResetAction, current_job: Option<&str>) -> String {
             }
         }
         ResetAction::ForgetFootprints => {
-            let mut store = crate::broker::FootprintStore::load();
+            let mut store = blut::broker::FootprintStore::load();
             let keys: Vec<String> = store
                 .entries_snapshot()
                 .into_iter()

@@ -1210,7 +1210,7 @@ mod envelope_key_continuity {
         );
         let b = shrink_to_fit_env(&env, "batch", 32, &[("workers", 2)], 23 * GIB, floor, false)
             .unwrap();
-        assert!(b <= 32 && b >= 1);
+        assert!((1..=32).contains(&b));
         // Missing term ⇒ None (caller keeps the requested value).
         assert_eq!(
             shrink_to_fit_env(&env, "nope", 32, &[], 62 * GIB, floor, false),

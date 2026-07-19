@@ -319,12 +319,16 @@ cannot cross an off-box boundary.
 
 ## CLI (`cli`)
 
-`blut::cli::run(registry: Registry).await` — the single public entry point. A
+`blut::cli::run(registry: Registry).await` — the public entry point. A
 cookbook binary supplies its `Registry` and delegates the whole CLI to it
 (`recipe`, `jobs`, `log`, `cancel`, `plan`, `cache`, `footprint`, `partition`,
-`schedule`, `sensor`, `policy`, …). The interactive `tui` subcommand + the
-bare-command cockpit ship in the default build (the default-on `tui` feature);
-`--no-default-features` yields a lean CLI-only binary (bare `blut` prints help).
+`schedule`, `sensor`, `policy`, …). The cockpit lives in the `crates/blut-tui`
+SIDECAR (ADR 0083 M2 — the engine carries no terminal-UI deps): a cookbook
+binary that wants the in-process cockpit calls
+`blut::cli::run_with_tui(reg, Some(blut_tui::hook())).await` instead (bare
+invocation opens the console over its live registry); with plain `run`, the
+`tui` subcommand execs the `blut-tui` binary from PATH via the external
+dispatch, and a bare invocation prints help.
 
 `blut dataset pin` binds an existing raw source to an immutable
 `dataset://name@version`; `blut exp compare` compares the two newest lineage

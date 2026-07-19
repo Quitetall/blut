@@ -25,7 +25,7 @@
 //!     fan-out/fan-in DAG shapes.
 //!   - Status: `StatusHub::emit` for 1000 lossy `StageStep`s and 1000
 //!     lossless lifecycle events (the per-step coordinator overhead).
-//!   - Broker admission: the PURE `decide` box-fit math, `Drivers::estimate`,
+//!   - Broker admission: the PURE `decide` box-fit math, the typed-envelope
 //!     and `FootprintStore::resolve` (calibration lookup). `ResourceSnapshot::
 //!     probe` is benched SEPARATELY and is syscall-bound (reads /proc/meminfo +
 //!     shells out to nvidia-smi) — not a fair micro-bench, recorded for context.
@@ -46,7 +46,7 @@ use std::sync::Arc;
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 
 use blut::backends::TrainingBackend;
-use blut::broker::{Drivers, FootprintSource, FootprintStore, ResourceSnapshot, decide};
+use blut::broker::{FootprintSource, FootprintStore, ResourceSnapshot, decide};
 
 /// Local backend fixture for the framework benches. The engine ships
 /// no concrete backend after the engine-carve milestone, and the in-crate test
@@ -498,11 +498,47 @@ fn bench_status_emit(c: &mut Criterion) {
 }
 
 fn bench_broker_admission(c: &mut Criterion) {
-    // Drivers::estimate — the conservative-high RAM footprint formula a launch
-    // computes once per run.
-    let drivers = Drivers::new(4, 32, 3, 256, false, 168);
-    c.bench_function("broker Drivers::estimate", |b| {
-        b.iter(|| black_box(black_box(&drivers).estimate()));
+    // envelope_footprint_at — the typed-seam affine re-evaluation a launch
+    // computes once per run (ADR 0133: the engine re-prices the cookbook's
+    // declared cost terms without knowing the domain formula).
+    let gib: u64 = blut::broker::GIB;
+    let env = blut_types::envelope::ResourceEnvelope {
+        ram_bytes: 30 * gib,
+        gpu: Default::default(),
+        calibration_dimensions: vec![
+            ("tier".into(), "3".into()),
+            ("batch".into(), "32".into()),
+            ("workers".into(), "4".into()),
+            ("warm".into(), "c".into()),
+        ],
+        cost_terms: vec![
+            blut_types::envelope::CostTerm {
+                dimension: "workers".into(),
+                declared_units: 4,
+                ram_bytes_per_unit: 4 * gib,
+                ram_bytes_per_unit_warm: Some(3 * gib),
+                max_units: 16,
+                sync_base_excluded: true,
+            },
+            blut_types::envelope::CostTerm {
+                dimension: "batch".into(),
+                declared_units: 32,
+                ram_bytes_per_unit: gib / 16,
+                ram_bytes_per_unit_warm: None,
+                max_units: 32,
+                sync_base_excluded: false,
+            },
+        ],
+        shared_calibration_group: None,
+    };
+    c.bench_function("broker envelope_footprint_at (typed seam)", |b| {
+        b.iter(|| {
+            black_box(blut::broker::footprint::envelope_footprint_at(
+                black_box(&env),
+                black_box(&[("workers", 8u32), ("batch", 16u32)]),
+                false,
+            ))
+        });
     });
 
     // decide — the PURE box-fit / oversubscription math (NO syscalls). The
@@ -515,7 +551,10 @@ fn bench_broker_admission(c: &mut Criterion) {
         vram_free_mib: Some(20000),
         gpus: Vec::new(),
     };
-    let fp = drivers.estimate();
+    let fp = blut::broker::Footprint {
+        ram_bytes: blut::broker::footprint::envelope_footprint_at(&env, &[], false),
+        vram_mib: 0,
+    };
     c.bench_function("broker decide (pure box-fit)", |b| {
         b.iter(|| black_box(decide(black_box(&snap), black_box(&fp), 6.0)));
     });
@@ -526,7 +565,10 @@ fn bench_broker_admission(c: &mut Criterion) {
     let store = {
         let td = tempfile::tempdir().unwrap();
         let mut s = FootprintStore::load_from(td.path().join("footprints.json"));
-        let key = drivers.key("bench_recipe");
+        // Record through the legacy FootprintKey path; resolve below through
+        // the envelope-composed flat key — the byte-equal continuity the ADR
+        // 0133 seam guarantees (same store rows, either door).
+        let key = blut::broker::footprint::footprint_key("bench_recipe", 4, 32, 3, false);
         s.record(&key, 20 * blut::broker::GIB, 0, FootprintSource::Measured)
             .unwrap();
         // Keep td alive for the bench duration by leaking it (the bench process
@@ -534,9 +576,10 @@ fn bench_broker_admission(c: &mut Criterion) {
         std::mem::forget(td);
         s
     };
-    let key = drivers.key("bench_recipe");
-    c.bench_function("broker FootprintStore::resolve (measured hit)", |b| {
-        b.iter(|| black_box(black_box(&store).resolve(black_box(&key), fp)));
+    let key = blut::broker::footprint::envelope_calibration_key("bench_recipe", &env)
+        .expect("dimensions declared");
+    c.bench_function("broker FootprintStore::resolve_flat (measured hit)", |b| {
+        b.iter(|| black_box(black_box(&store).resolve_flat(black_box(&key), fp)));
     });
 
     // probe — SYSCALL-BOUND (reads /proc/meminfo + may shell out to nvidia-smi).

@@ -21,17 +21,12 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 
-/// Top-level `about` line. The default build is TUI-on, so bare `blut` opens the
-/// cockpit; a `--no-default-features` build is CLI-only (so the banner reflects
-/// which build this is).
-#[cfg(feature = "tui")]
-const CLI_ABOUT: &str = "BLUT — typed-DAG orchestrator for local ML training. Bare `blut` opens the \
-     interactive cockpit; subcommands: recipe, jobs, log, cancel, plan, cache, \
-     footprint, partition, schedule, sensor, policy, tui.";
-#[cfg(not(feature = "tui"))]
-const CLI_ABOUT: &str = "BLUT — typed-DAG orchestrator for local ML training. Run a subcommand: \
-     recipe, jobs, log, cancel, plan, cache, footprint, partition, schedule, \
-     sensor, policy.";
+/// Top-level `about` line. The cockpit lives in the `blut-tui` sidecar crate
+/// (ADR 0083 M2): a cookbook binary that links it opens it on bare invocation;
+/// the bare engine reaches it via `blut tui` (external dispatch).
+const CLI_ABOUT: &str = "BLUT — typed-DAG orchestrator for local ML training. Subcommands: recipe, \
+     jobs, log, cancel, plan, cache, footprint, partition, schedule, sensor, \
+     policy, tui.";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -241,9 +236,10 @@ enum Command {
     /// presets / live-metrics / reset views. Keys: ↑↓ select, Enter log,
     /// c cancel, R recipe picker, J/L/Y/H/B/K/P/M/X switch views, q quit.
     ///
-    /// Behind the `tui` feature — DEFAULT-ON in the 0.2 preview (bare `blut`
-    /// opens the cockpit); `--no-default-features` builds a lean CLI-only binary.
-    #[cfg(feature = "tui")]
+    /// The cockpit lives in the `blut-tui` SIDECAR crate (ADR 0083 M2): a
+    /// cookbook binary that links it opens it in-process over the live
+    /// registry; the bare engine execs the `blut-tui` binary from PATH
+    /// (engine-generic views, no cookbook recipes).
     Tui {
         /// Headless self-check: build the cockpit + render every view to a test
         /// backend, exit 0 if all draw non-blank (no raw mode). For CI / smoke.
@@ -874,11 +870,36 @@ pub(super) fn emit_json<T: serde::Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
+/// The cockpit seam (ADR 0083 M2): the engine carries NO terminal-UI code, so
+/// a binary that wants the in-process cockpit (a cookbook binary linking the
+/// `blut-tui` sidecar crate) hands its entry points here —
+/// `blut::cli::run_with_tui(reg, Some(blut_tui::hook()))`. Plain `fn` pointers
+/// keep this a data seam, not a widget API: the trait-shaped cookbook-TUI
+/// contract stays [`crate::framework::CookbookTui`] (owner-locked 2026-07-12).
+pub struct TuiHook {
+    /// Run the interactive console to completion (owns the terminal).
+    pub console: ConsoleFn,
+    /// Headless self-check: render every view to a test backend (CI / smoke).
+    pub check: fn(crate::framework::Registry) -> Result<()>,
+}
+
+/// The console entry a [`TuiHook`] carries: registry in, boxed future out
+/// (a plain `fn` pointer — the sidecar's `run_console_loop` wrapped in a pin).
+pub type ConsoleFn = fn(
+    std::sync::Arc<crate::framework::Registry>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>>>>;
+
 /// BLUT CLI entrypoint. The recipe catalog is supplied by the caller as
 /// a composed [`crate::framework::cookbook::Registry`] (the binary — in a cookbook crate — registers
 /// the cookbooks it ships and passes them here). This is the library seam that
 /// keeps the engine domain-agnostic; the engine crate itself has no binary.
+/// No cockpit attached — `blut tui` execs the `blut-tui` sidecar from PATH.
 pub async fn run(reg: crate::framework::Registry) -> Result<()> {
+    run_with_tui(reg, None).await
+}
+
+/// [`run`] with an optional in-process cockpit (see [`TuiHook`]).
+pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>) -> Result<()> {
     init_tracing();
     warn_if_stale_binary();
     // The engine owns the built-in `checks` cookbook (ADR 0091): augment the
@@ -938,32 +959,40 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
         Some(Command::P2p { cmd }) => run_p2p_cmd(reg, cmd).await,
         #[cfg(feature = "cloud")]
         Some(Command::Cloud { cmd }) => run_cloud_cmd(reg, cmd).await,
-        #[cfg(feature = "tui")]
-        Some(Command::Tui { check }) => {
-            if check {
-                crate::tui::check(reg)
-            } else {
-                crate::tui::run_console_loop(std::sync::Arc::new(reg)).await
+        Some(Command::Tui { check }) => match &tui {
+            Some(hook) => {
+                if check {
+                    (hook.check)(reg)
+                } else {
+                    (hook.console)(std::sync::Arc::new(reg)).await
+                }
             }
-        }
+            // No in-process cockpit: exec the `blut-tui` sidecar from PATH
+            // (the ADR-0083 dispatch — same seam as any external subcommand).
+            None => {
+                let mut argv = vec!["tui".to_string()];
+                if check {
+                    argv.push("--check".to_string());
+                }
+                run_external(argv)
+            }
+        },
         Some(Command::External(argv)) => run_external(argv),
-        // Bare `blut`: the default (TUI-on) build opens the BLUT console; a
-        // cookbook's own TUI is reachable from its selector. A
-        // `--no-default-features` (CLI-only) build has no interactive mode —
-        // print help so the user sees the subcommands.
-        #[cfg(feature = "tui")]
-        None => crate::tui::run_console_loop(std::sync::Arc::new(reg)).await,
-        #[cfg(not(feature = "tui"))]
-        None => {
-            use clap::CommandFactory;
-            Cli::command().print_help().ok();
-            println!(
-                "\n(this is a CLI-only build — run a subcommand above. The interactive \
-                 cockpit ships in the default build; rebuild without \
-                 `--no-default-features` to get it.)"
-            );
-            Ok(())
-        }
+        // Bare invocation: a binary with an attached cockpit opens it (the
+        // cookbook binaries); the bare engine prints help — interactive mode
+        // is one `blut tui` away, not a silent exec of another binary.
+        None => match &tui {
+            Some(hook) => (hook.console)(std::sync::Arc::new(reg)).await,
+            None => {
+                use clap::CommandFactory;
+                Cli::command().print_help().ok();
+                println!(
+                    "\n(the interactive cockpit lives in the `blut-tui` sidecar — run \
+                     `blut tui`, or use a cookbook binary, which opens it directly.)"
+                );
+                Ok(())
+            }
+        },
     };
     // ADR 0072 A2: the command dispatch above is the CLI's single top-level
     // error boundary — every subcommand's Result funnels through here before

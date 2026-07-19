@@ -59,7 +59,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::jobs::{self, JobState, JobSummary};
+use blut::jobs::{self, JobState, JobSummary};
 // The TUI sources its recipe catalog from the injected Registry
 // (App.catalog) — blut-core ships NO recipes. The in-module tests bring
 // their own domain-free fixture catalog (`test_fixtures`) so the generic
@@ -75,8 +75,8 @@ use test_fixtures::{FIXTURE, test_registry};
 /// names) and avoid the reserved-hotkey first chars.
 #[cfg(test)]
 mod test_fixtures {
-    use crate::framework::{Cookbook, Registry};
-    use crate::recipes::recipe::{RecipeCategory, RecipeDef};
+    use blut::framework::{Cookbook, Registry};
+    use blut::recipes::recipe::{RecipeCategory, RecipeDef};
 
     fn empty_object_schema() -> serde_json::Value {
         serde_json::json!({"type": "object", "properties": {}})
@@ -110,7 +110,7 @@ mod test_fixtures {
         schedule: None,
         args_schema_fn: empty_object_schema,
         compile_fn: |_| {
-            Err(crate::framework::error::RecipeError::CompileFailed(
+            Err(blut::framework::error::RecipeError::CompileFailed(
                 "fixture".into(),
             ))
         },
@@ -125,7 +125,7 @@ mod test_fixtures {
         schedule: None,
         args_schema_fn: empty_object_schema,
         compile_fn: |_| {
-            Err(crate::framework::error::RecipeError::CompileFailed(
+            Err(blut::framework::error::RecipeError::CompileFailed(
                 "fixture".into(),
             ))
         },
@@ -140,7 +140,7 @@ mod test_fixtures {
         schedule: None,
         args_schema_fn: empty_object_schema,
         compile_fn: |_| {
-            Err(crate::framework::error::RecipeError::CompileFailed(
+            Err(blut::framework::error::RecipeError::CompileFailed(
                 "fixture".into(),
             ))
         },
@@ -174,7 +174,7 @@ mod test_fixtures {
         schedule: None,
         args_schema_fn: dataset_input_schema,
         compile_fn: |_| {
-            Err(crate::framework::error::RecipeError::CompileFailed(
+            Err(blut::framework::error::RecipeError::CompileFailed(
                 "fixture".into(),
             ))
         },
@@ -193,7 +193,7 @@ mod test_fixtures {
         schedule: None,
         args_schema_fn: typed_args_schema,
         compile_fn: |_| {
-            Err(crate::framework::error::RecipeError::CompileFailed(
+            Err(blut::framework::error::RecipeError::CompileFailed(
                 "fixture".into(),
             ))
         },
@@ -343,7 +343,7 @@ enum Overlay {
     /// source_path captured at open). Esc skips → editor with no
     /// dataset injected.
     DatasetPicker {
-        recipe: &'static crate::recipes::RecipeDef,
+        recipe: &'static blut::recipes::RecipeDef,
         datasets: Vec<DatasetChoice>,
         cursor: usize,
     },
@@ -409,7 +409,7 @@ struct App {
     builder: builder::DagBuilder,
     /// The ingredient palette — every registered stage with its kinds, built
     /// once from the registry for the Build tab.
-    ingredients: Vec<crate::framework::Ingredient>,
+    ingredients: Vec<blut::framework::Ingredient>,
     /// Set when the operator picks a cookbook's TUI to open from the console
     /// selector: index into `registry.cookbook_tuis()`. The run loop returns
     /// [`ConsoleOutcome::OpenCookbookTui`] and the CLI launches it, then
@@ -441,7 +441,7 @@ struct App {
     /// refresh: the selected run's artifacts, plan DAG, lineage/provenance,
     /// and final metrics.
     artifacts: Vec<views::ArtifactRow>,
-    dag: Option<crate::framework::GraphSnapshot>,
+    dag: Option<blut::framework::GraphSnapshot>,
     lineage: views::LineageView,
     metrics: Vec<(String, f64)>,
     compare: Vec<views::CompareCol>,
@@ -456,10 +456,10 @@ struct App {
     /// composes it). Source of the recipe catalog + per-recipe default
     /// args — the TUI indexes the composed catalog, not any static slice,
     /// so it is domain-agnostic. [[project_blut_cookbook_split]]
-    registry: std::sync::Arc<crate::framework::Registry>,
+    registry: std::sync::Arc<blut::framework::Registry>,
     /// Flat recipe catalog (union of the registry's cookbooks), collected
     /// once at startup. `filter_recipes` / `recipe_menu` index into this.
-    catalog: Vec<&'static crate::recipes::RecipeDef>,
+    catalog: Vec<&'static blut::recipes::RecipeDef>,
     /// F1: after a TUI-launched spawn, auto-focus the new job's Log on the
     /// first refresh that surfaces it. `focus_baseline_top` is the newest
     /// job id at spawn time; jobs are newest-first, so when index 0 differs
@@ -484,14 +484,14 @@ const RESET_ROWS: &[views::ResetAction] = &[
 ];
 
 impl App {
-    fn new(registry: impl Into<std::sync::Arc<crate::framework::Registry>>) -> Self {
+    fn new(registry: impl Into<std::sync::Arc<blut::framework::Registry>>) -> Self {
         let registry = registry.into();
         let mut selected = ListState::default();
         selected.select(Some(0));
         // Collect the catalog once: the union of the registered cookbooks'
         // recipes. Elements are `&'static`, so the Vec owns no borrow of
         // `registry` and `App` can hold both without a self-referential tie.
-        let catalog: Vec<&'static crate::recipes::RecipeDef> = registry.all().collect();
+        let catalog: Vec<&'static blut::recipes::RecipeDef> = registry.all().collect();
         let ingredients = registry.ingredient_palette();
         Self {
             console: console::ConsoleModel::demo(),
@@ -641,7 +641,7 @@ impl App {
     /// (rather than `&self`) so callers can pass `&self.catalog` as a
     /// disjoint-field borrow alongside a `&mut self.overlay` in the
     /// picker handler.
-    fn filter_recipes(catalog: &[&'static crate::recipes::RecipeDef], query: &str) -> Vec<usize> {
+    fn filter_recipes(catalog: &[&'static blut::recipes::RecipeDef], query: &str) -> Vec<usize> {
         use fuzzy_matcher::FuzzyMatcher;
         use fuzzy_matcher::skim::SkimMatcherV2;
         let matcher = SkimMatcherV2::default();
@@ -712,7 +712,7 @@ impl App {
             serde_json::from_str(buffer).map_err(|e| format!("args are not valid JSON: {e}"))?;
         if let Some(def) = self.catalog.iter().find(|r| r.name == recipe) {
             let schema = (def.args_schema_fn)();
-            crate::recipes::recipe::validate_args_against_schema(recipe, &schema, &raw)
+            blut::recipes::recipe::validate_args_against_schema(recipe, &schema, &raw)
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
@@ -788,7 +788,7 @@ impl App {
     /// single source; the overlay only adds domain paths + curated
     /// non-default starts on top. Keeps blut-core domain-agnostic — no
     /// hardcoded paths.
-    fn open_editor(&mut self, recipe: &'static crate::recipes::RecipeDef) {
+    fn open_editor(&mut self, recipe: &'static blut::recipes::RecipeDef) {
         // The prefill JSON is the source of the seed VALUES; the schema's
         // `properties` is the source of the field SET + per-field type hints.
         let prefill = self.registry.prefill_args(recipe.name);
@@ -813,13 +813,13 @@ impl App {
     /// args editor — unchanged from before this feature. If the db can't be
     /// opened (e.g. no datasets registered yet) we degrade to the editor with
     /// a status note rather than blocking the launch.
-    fn open_dataset_picker(&mut self, recipe: &'static crate::recipes::RecipeDef) {
+    fn open_dataset_picker(&mut self, recipe: &'static blut::recipes::RecipeDef) {
         if recipe.input_kinds.is_empty() {
             self.open_editor(recipe);
             return;
         }
-        let datasets = match crate::datasets_db::open()
-            .and_then(|conn| crate::datasets_db::list_by_kinds(&conn, recipe.input_kinds))
+        let datasets = match blut::datasets_db::open()
+            .and_then(|conn| blut::datasets_db::list_by_kinds(&conn, recipe.input_kinds))
         {
             Ok(rows) => rows
                 .into_iter()
@@ -867,7 +867,7 @@ impl App {
     /// still open the editor (the operator wires the input by hand) and note it
     /// in the status bar. The chosen value is layered onto the prefill so the
     /// editor opens with the dataset already filled in.
-    fn pick_dataset(&mut self, recipe: &'static crate::recipes::RecipeDef, choice: &DatasetChoice) {
+    fn pick_dataset(&mut self, recipe: &'static blut::recipes::RecipeDef, choice: &DatasetChoice) {
         let schema = (recipe.args_schema_fn)();
         let prop_names = schema_prop_names(&schema);
         // Prefer the registered-name convention; fall back to a path arg.
@@ -949,12 +949,12 @@ impl App {
     /// l reserved for U3 log toggle). Recipes beyond the available
     /// hotkeys still show in the menu but require `R` to launch.
     fn recipe_menu(
-        catalog: &[&'static crate::recipes::RecipeDef],
-    ) -> Vec<(Option<char>, &'static crate::recipes::RecipeDef)> {
+        catalog: &[&'static blut::recipes::RecipeDef],
+    ) -> Vec<(Option<char>, &'static blut::recipes::RecipeDef)> {
         // Menu order = each course's pipeline position (ADR 0051).
         // `Course::order()` is a compiler-forced exhaustive match, so a
         // newly-added course can't silently drop to the bottom here.
-        let mut sorted: Vec<&'static crate::recipes::RecipeDef> = catalog.to_vec();
+        let mut sorted: Vec<&'static blut::recipes::RecipeDef> = catalog.to_vec();
         sorted.sort_by(|a, b| {
             a.category
                 .order()
@@ -1361,14 +1361,14 @@ fn assemble_fields(fields: &[EditorField]) -> String {
 }
 
 /// Entrypoint registered as `blut tui`. The caller (the cookbook binary)
-/// supplies the composed cookbook [`crate::framework::cookbook::Registry`]; the cockpit's recipe
+/// supplies the composed cookbook [`blut::framework::cookbook::Registry`]; the cockpit's recipe
 /// catalog comes from it, not a static slice.
 /// Why the console/cockpit event loop returned.
 pub enum ConsoleOutcome {
     /// The operator quit BLUT.
     Quit,
     /// The operator chose to open a cookbook's TUI from the console selector —
-    /// the index into [`crate::framework::Registry::cookbook_tuis`]. The CLI
+    /// the index into [`blut::framework::Registry::cookbook_tuis`]. The CLI
     /// launches that TUI, then re-enters the console.
     OpenCookbookTui(usize),
 }
@@ -1376,14 +1376,14 @@ pub enum ConsoleOutcome {
 /// Open the BLUT engine console (the default surface). Returns whether the
 /// operator quit or asked to launch a cookbook's TUI; the CLI owns the
 /// console↔cookbook loop so the registry survives across launches.
-pub async fn run(registry: std::sync::Arc<crate::framework::Registry>) -> Result<ConsoleOutcome> {
+pub async fn run(registry: std::sync::Arc<blut::framework::Registry>) -> Result<ConsoleOutcome> {
     run_surface(registry, View::Console).await
 }
 
 /// Open a cookbook's built-in training cockpit (the retired surface, now a
-/// cookbook's TUI — see [`crate::framework::CookbookTui`]). Owns the terminal
+/// cookbook's TUI — see [`blut::framework::CookbookTui`]). Owns the terminal
 /// for its lifetime; returns when the operator leaves the cockpit.
-pub async fn run_cockpit(registry: std::sync::Arc<crate::framework::Registry>) -> Result<()> {
+pub async fn run_cockpit(registry: std::sync::Arc<blut::framework::Registry>) -> Result<()> {
     run_surface(registry, View::Cockpit).await.map(|_| ())
 }
 
@@ -1391,7 +1391,7 @@ pub async fn run_cockpit(registry: std::sync::Arc<crate::framework::Registry>) -
 /// picks a cookbook's TUI from the selector, launch it and return to the console
 /// on exit. The registry is shared (`Arc`) so it survives across launches. Loops
 /// until the operator quits BLUT from the console.
-pub async fn run_console_loop(registry: std::sync::Arc<crate::framework::Registry>) -> Result<()> {
+pub async fn run_console_loop(registry: std::sync::Arc<blut::framework::Registry>) -> Result<()> {
     loop {
         match run(registry.clone()).await? {
             ConsoleOutcome::Quit => return Ok(()),
@@ -1405,10 +1405,23 @@ pub async fn run_console_loop(registry: std::sync::Arc<crate::framework::Registr
     }
 }
 
+/// The one-liner a cookbook binary passes to `blut::cli::run_with_tui` to get
+/// the in-process cockpit over its live registry (ADR 0083 M2):
+///
+/// ```ignore
+/// blut::cli::run_with_tui(reg, Some(blut_tui::hook())).await
+/// ```
+pub fn hook() -> blut::cli::TuiHook {
+    blut::cli::TuiHook {
+        console: |reg| Box::pin(run_console_loop(reg)),
+        check,
+    }
+}
+
 /// Shared terminal setup/teardown around [`run_app`], parameterised by the
 /// surface it opens on.
 async fn run_surface(
-    registry: std::sync::Arc<crate::framework::Registry>,
+    registry: std::sync::Arc<blut::framework::Registry>,
     initial_view: View,
 ) -> Result<ConsoleOutcome> {
     // Detect NO_COLOR / TERM=dumb / locale once before the first draw so
@@ -1439,7 +1452,7 @@ async fn run_surface(
 /// every view headless to a `TestBackend`, asserting each produces a non-blank
 /// buffer; exits 0 on success. Lets CI / an operator verify the cockpit builds
 /// + every view draws without entering raw mode.
-pub fn check(registry: impl Into<std::sync::Arc<crate::framework::Registry>>) -> Result<()> {
+pub fn check(registry: impl Into<std::sync::Arc<blut::framework::Registry>>) -> Result<()> {
     use ratatui::backend::TestBackend;
     let views = [
         View::Console,
@@ -1568,7 +1581,7 @@ fn render_overlay_check(
 
 async fn run_app<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
-    registry: std::sync::Arc<crate::framework::Registry>,
+    registry: std::sync::Arc<blut::framework::Registry>,
     initial_view: View,
 ) -> Result<ConsoleOutcome> {
     let mut app = App::new(registry);

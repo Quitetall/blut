@@ -77,7 +77,7 @@ let result = ParallelExecutor::execute(plan.into_compiled(), ctx).await?;
 | **Containment** | systemd → cgroup2 → rlimit → bare fallback chain |
 | **Durable resume** | Crash-gated recovery, epoch-level resume |
 | **Observability** | status.jsonl, metric store, lineage index |
-| **TUI cockpit** | default-on `tui` feature; `--no-default-features` for a lean CLI |
+| **TUI cockpit** | the `crates/blut-tui` sidecar (ADR 0083): in-process via `blut_tui::hook()` in a cookbook binary, or `blut tui` execs the `blut-tui` binary |
 | **Multi-tenancy** | tenant-scoped cache/registry/lineage/privacy, RAM sub-envelopes, Restricted node-local custody |
 | **Registries** | governed `model://`, immutable `dataset://`, and lineage-backed `experiment://` handles resolved in recipe args |
 

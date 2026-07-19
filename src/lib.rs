@@ -73,11 +73,9 @@ pub mod sensor;
 pub mod spec;
 pub mod tenant;
 pub mod trust;
-/// The interactive ratatui cockpit. Part of the default-on `tui` feature, so
-/// it ships in the 0.2 preview. A `--no-default-features` build drops it from
-/// the library; downstream cookbook binaries still own their executable surface.
-#[cfg(feature = "tui")]
-pub mod tui;
+// The interactive ratatui cockpit moved to the `crates/blut-tui` SIDECAR
+// (ADR 0083 M2). The engine keeps only the seams: `cli::TuiHook` (attach an
+// in-process cockpit) and `framework::CookbookTui` (a cookbook's bespoke TUI).
 
 // ENGINE CARVE (v1.0): the generic-LLM cookbook — concrete `ingredients`,
 // the `backend` trait + concrete backends (`backends::{lamu,hf_trainer}`),

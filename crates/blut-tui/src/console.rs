@@ -22,8 +22,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::framework::status::{HostedEvent, StageEvent};
-use crate::tui::theme;
+use crate::theme;
+use blut::framework::status::{HostedEvent, StageEvent};
 
 /// Which console surface is shown: the at-a-glance home, or a full-screen
 /// drill-down for one instrument. Switched by the number keys.
@@ -299,7 +299,7 @@ impl ConsoleModel {
         let (mut hits, mut ran) = (0u32, 0u32);
         let mut any_fail = false;
 
-        let short = |h: crate::framework::artifact::ContentHash| {
+        let short = |h: blut::framework::artifact::ContentHash| {
             h.to_hex().chars().take(8).collect::<String>()
         };
         let set = |nodes: &mut HashMap<u32, DagNode>, idx, name: String, st, note: String| {
@@ -458,8 +458,8 @@ impl ConsoleModel {
     /// (`MemAvailable − floor`), and the held remainder. This is the memory-admission
     /// guarantee visualized. Names the top holder as the running stage, if any.
     pub fn apply_broker(&mut self) {
-        use crate::broker::admission::DEFAULT_FLOOR_GIB;
-        use crate::broker::probe::ResourceSnapshot;
+        use blut::broker::admission::DEFAULT_FLOOR_GIB;
+        use blut::broker::probe::ResourceSnapshot;
         let snap = ResourceSnapshot::probe();
         if snap.mem_total_gb <= 0.0 {
             return; // probe unavailable (non-Linux) — keep the representative panel
@@ -481,9 +481,9 @@ impl ConsoleModel {
     /// registry). No-op when the `p2p` feature is off.
     #[cfg(feature = "p2p")]
     pub fn apply_mesh(&mut self) {
-        use crate::p2p::registry::PeerRegistry;
-        use crate::p2p::trust::TrustLevel;
-        let Ok(dir) = crate::paths::data_dir() else {
+        use blut::p2p::registry::PeerRegistry;
+        use blut::p2p::trust::TrustLevel;
+        let Ok(dir) = blut::paths::data_dir() else {
             return;
         };
         let Ok(reg) = PeerRegistry::load(&dir.join("p2p").join("peers.json")) else {
@@ -519,8 +519,8 @@ impl ConsoleModel {
     /// No-op when the `p2p` feature is off or the ledger is empty.
     #[cfg(feature = "p2p")]
     pub fn apply_privacy(&mut self) {
-        use crate::p2p::privacy::PrivacyLedger;
-        let Ok(dir) = crate::paths::data_dir() else {
+        use blut::p2p::privacy::PrivacyLedger;
+        let Ok(dir) = blut::paths::data_dir() else {
             return;
         };
         let Ok(ledger) = PrivacyLedger::load_readonly(dir.join("p2p").join("privacy_ledger.json"))
@@ -607,8 +607,8 @@ pub fn draw_console(
     m: &ConsoleModel,
     tab: ConsoleTab,
     builder: &super::builder::DagBuilder,
-    palette: &[crate::framework::Ingredient],
-    catalog: &[&'static crate::recipes::RecipeDef],
+    palette: &[blut::framework::Ingredient],
+    catalog: &[&'static blut::recipes::RecipeDef],
 ) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -959,7 +959,7 @@ fn draw_cache(f: &mut Frame<'_>, area: Rect, m: &ConsoleModel) {
 /// DATA PREPARATION → PRETRAINING → TRAINING → … → USER), each recipe with its
 /// I/O kinds + description. Read-only browse; the Build tab is where you compose
 /// your own from ingredients.
-fn draw_recipes(f: &mut Frame<'_>, area: Rect, catalog: &[&'static crate::recipes::RecipeDef]) {
+fn draw_recipes(f: &mut Frame<'_>, area: Rect, catalog: &[&'static blut::recipes::RecipeDef]) {
     let arrow = if theme::ascii_only() { "->" } else { "→" };
     let mut lines: Vec<Line> = Vec::new();
     if catalog.is_empty() {
@@ -969,7 +969,7 @@ fn draw_recipes(f: &mut Frame<'_>, area: Rect, catalog: &[&'static crate::recipe
         )));
     }
     // Course order = the lifecycle phase order; stable + exhaustive.
-    let mut courses: Vec<crate::recipes::Course> = catalog.iter().map(|r| r.category).collect();
+    let mut courses: Vec<blut::recipes::Course> = catalog.iter().map(|r| r.category).collect();
     courses.sort_by_key(|c| c.order());
     courses.dedup();
     for &course in &courses {
@@ -977,7 +977,7 @@ fn draw_recipes(f: &mut Frame<'_>, area: Rect, catalog: &[&'static crate::recipe
             format!(" {} ", course.label()),
             theme::signal_bold(),
         )));
-        let mut recs: Vec<&&crate::recipes::RecipeDef> =
+        let mut recs: Vec<&&blut::recipes::RecipeDef> =
             catalog.iter().filter(|r| r.category == course).collect();
         recs.sort_by(|a, b| a.name.cmp(b.name));
         for r in recs {
@@ -1076,7 +1076,7 @@ mod tests {
 
     #[test]
     fn applies_a_real_status_jsonl() {
-        use crate::framework::artifact::ContentHash;
+        use blut::framework::artifact::ContentHash;
         use std::time::Duration;
         let h = |e| HostedEvent {
             host: None,
@@ -1129,7 +1129,7 @@ mod tests {
 
     #[test]
     fn control_prune_is_a_successful_accounted_stage() {
-        use crate::framework::artifact::ContentHash;
+        use blut::framework::artifact::ContentHash;
         use std::time::Duration;
 
         let events = [

@@ -61,14 +61,6 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
 
-      # The cockpit's `tui` feature is default-on in the preview, but pin it
-      # explicitly so a future change to the default feature set can't
-      # silently drop the cockpit from CI coverage.
-      - name: Clippy + test the tui feature
-        run: |
-          cargo clippy --locked -p blut --features tui --all-targets -- -D warnings
-          cargo test --locked -p blut --features tui
-
       # P2P distributed compute is off-by-default; without an explicit gate
       # the entire src/p2p tree (and the executor's #[cfg(feature = "p2p")]
       # dispatch path) never compiles in CI and rots silently.
@@ -88,14 +80,15 @@ jobs:
           cargo test --locked -p blut --features cloud --test cloud_integration
 
       # AUDIT 2026-07: every feature above is gated INDIVIDUALLY, but a real
-      # cookbook binary unifies them (at least tui+p2p). Cargo feature
-      # unification can break combinations that each pass alone (the
-      # `serde_json/arbitrary_precision` class the Cargo.toml warns about), so
-      # lint the FULL union once — `tui,cloud` is the complete set (`cloud`
-      # implies `p2p` + the object-store deps). Clippy implies a full
-      # type-check; the per-feature jobs above already run the tests.
-      - name: Clippy the combined feature union (tui+cloud ⊇ p2p)
-        run: cargo clippy --locked -p blut --features tui,cloud --all-targets -- -D warnings
+      # cookbook binary unifies them. Cargo feature unification can break
+      # combinations that each pass alone (the `serde_json/arbitrary_precision`
+      # class the Cargo.toml warns about), so lint the FULL union once —
+      # `cloud` is the complete set post-TUI-extraction (`cloud` implies `p2p`
+      # + the object-store deps; the cockpit lives in crates/blut-tui now).
+      # Clippy implies a full type-check; the per-feature jobs above already
+      # run the tests.
+      - name: Clippy the combined feature union (cloud ⊇ p2p)
+        run: cargo clippy --locked -p blut --features cloud --all-targets -- -D warnings
 
       # crates/blut-dsl is a STANDALONE workspace (path-deps on the engine).
       # It links `starlark` — and its `serde_json/arbitrary_precision` feature
@@ -143,6 +136,19 @@ jobs:
           cargo build --all-targets
           cargo clippy --all-targets -- -D warnings
           cargo test
+
+      # ADR 0083 M2: the cockpit is the blut-tui SIDECAR (standalone
+      # workspace) — the engine ships zero terminal-UI deps. Gate the build,
+      # the 76 state/harness tests, AND the headless `--check` (renders every
+      # view to a test backend) so the extraction can't rot.
+      - name: Build + lint + test blut-tui (standalone workspace)
+        working-directory: crates/blut-tui
+        run: |
+          cargo fmt --all -- --check
+          cargo build --all-targets
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+          ./target/debug/blut-tui --check
 
       - name: Rustdoc (deny broken public docs)
         env:

@@ -1,12 +1,12 @@
 # blut — the domain-agnostic BLUT engine, a lib-only crate. Ships ZERO
 # recipes, concrete stages, backends, or Python: only the framework
 # (Stage / Plan / Recipe / Registry / Cookbook trait), the content-
-# addressed cache, memory-admission broker, HPO, lineage, the optional
-# interactive TUI module, and shared CLI orchestration. Cookbooks that
-# supply recipes + the user-facing binaries are SEPARATE crates depending
-# on this one; the generic-LLM stages + backends live in `blut-backends`.
-# The TUI module ships in the 0.2 preview (default-on `tui` feature); downstream
-# cookbook binaries select whether to expose it. See README.md / API.md.
+# addressed cache, memory-admission broker, HPO, lineage, and shared CLI
+# orchestration. Cookbooks that supply recipes + the user-facing binaries
+# are SEPARATE crates depending on this one; the generic-LLM stages +
+# backends live in `blut-backends`; the interactive cockpit is the
+# `crates/blut-tui` SIDECAR (ADR 0083 M2 — the engine carries no
+# terminal-UI deps). See README.md / API.md.
 
 # Standalone crate: declare our own (empty) workspace so the engine builds
 # independently of whatever parent tree it's vendored or nested under (it lives
@@ -110,17 +110,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # DER parser over attacker-controlled certificate bytes.
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc"], optional = true }
 rcgen = { version = "0.13", optional = true }
-# TUI deps — optional, behind the default-on `tui` feature. Building with
-# `--no-default-features` drops these three from the library dependency tree.
-ratatui = { version = "0.30", optional = true }
-crossterm = { version = "0.28", optional = true }
-fuzzy-matcher = { version = "0.3", optional = true }
 [features]
-default = ["tui"]
-# The shared interactive ratatui cockpit used by downstream cookbook binaries.
-# On by default in the 0.2 preview; downstream crates can drop it with
-# `blut = { ..., default-features = false }`.
-tui = ["dep:ratatui", "dep:crossterm", "dep:fuzzy-matcher"]
+# The cockpit moved to the `crates/blut-tui` sidecar (ADR 0083 M2); the lean
+# CLI is now THE default build — no terminal-UI deps in the engine tree.
+default = []
 # P2P distributed compute — trust model, encryption, task dispatch.
 p2p = ["dep:ed25519-dalek", "dep:aes-gcm", "dep:x25519-dalek", "dep:blake3", "dep:hkdf", "dep:quinn", "dep:rustls", "dep:webpki", "dep:rcgen"]
 # Cloud compute queue (T3.1 / ADR 0082) — "submit a job, get the result back,

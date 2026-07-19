@@ -319,7 +319,7 @@ fn dataset_picker_filters_by_kind_and_injects_registered_name() {
     // picker for a `dataset.jsonl` recipe must show only the jsonl one, and
     // picking it must inject its NAME into the `registered_name` form field.
     let mut a = app();
-    let conn = crate::datasets_db::open().expect("isolated db opens");
+    let conn = blut::datasets_db::open().expect("isolated db opens");
     let td = std::env::temp_dir().join(format!("blut-tui-f3-{:?}", std::thread::current().id()));
     let _ = std::fs::create_dir_all(&td);
     let f = td.join("ds.jsonl");
@@ -329,10 +329,10 @@ fn dataset_picker_filters_by_kind_and_injects_registered_name() {
         format!("f3jsonl{:?}", std::thread::current().id()).replace(['(', ')', ' '], "");
     let split_name =
         format!("f3split{:?}", std::thread::current().id()).replace(['(', ')', ' '], "");
-    let r1 = crate::datasets_db::record_from_jsonl(&jsonl_name, &f, "dataset.jsonl", None).unwrap();
-    let r2 = crate::datasets_db::record_from_jsonl(&split_name, &f, "dataset.split", None).unwrap();
-    crate::datasets_db::add(&conn, &r1).unwrap();
-    crate::datasets_db::add(&conn, &r2).unwrap();
+    let r1 = blut::datasets_db::record_from_jsonl(&jsonl_name, &f, "dataset.jsonl", None).unwrap();
+    let r2 = blut::datasets_db::record_from_jsonl(&split_name, &f, "dataset.split", None).unwrap();
+    blut::datasets_db::add(&conn, &r1).unwrap();
+    blut::datasets_db::add(&conn, &r2).unwrap();
 
     a.open_dataset_picker(&test_fixtures::TRAIN_EPSILON);
     let names: Vec<String> = match &a.overlay {
@@ -381,14 +381,14 @@ fn dataset_picker_filters_by_kind_and_injects_registered_name() {
 fn dataset_picker_esc_skips_to_editor_without_injection() {
     // Esc in the dataset picker skips → editor opens, no dataset injected.
     let mut a = app();
-    let conn = crate::datasets_db::open().expect("isolated db opens");
+    let conn = blut::datasets_db::open().expect("isolated db opens");
     let td = std::env::temp_dir().join(format!("blut-tui-f3esc-{:?}", std::thread::current().id()));
     let _ = std::fs::create_dir_all(&td);
     let f = td.join("ds.jsonl");
     std::fs::write(&f, "{\"a\":1}\n").unwrap();
     let name = format!("f3esc{:?}", std::thread::current().id()).replace(['(', ')', ' '], "");
-    let r = crate::datasets_db::record_from_jsonl(&name, &f, "dataset.jsonl", None).unwrap();
-    crate::datasets_db::add(&conn, &r).unwrap();
+    let r = blut::datasets_db::record_from_jsonl(&name, &f, "dataset.jsonl", None).unwrap();
+    blut::datasets_db::add(&conn, &r).unwrap();
     a.open_dataset_picker(&test_fixtures::TRAIN_EPSILON);
     assert!(matches!(a.overlay, Overlay::DatasetPicker { .. }));
     handle_key(&mut a, code(KeyCode::Esc));
@@ -539,7 +539,7 @@ fn is_subsequence(needle: &str, hay: &str) -> bool {
 #[test]
 fn args_template_is_an_object_for_every_recipe() {
     for r in FIXTURE {
-        let tpl = crate::recipes::recipe::args_template(r);
+        let tpl = blut::recipes::recipe::args_template(r);
         // The top level must be a JSON object (the args dict) — never a
         // bare scalar / array, even for a schema-less fixture (→ `{}`).
         assert!(
