@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# blut-web-ui (ADR 0083 M2) — the Leptos+WASM dashboard, Rust end-to-end:
+# a CSR app compiled to wasm32-unknown-unknown by `trunk` (scripts/build_ui.sh)
+# and EMBEDDED into the blut-web binary (one binary, zero deploy steps). It
+# talks only to blut-web's own /api endpoints and deserializes the wasm-safe
+# `blut-types` wire types those endpoints serve — the keystone premise.
+# Standalone workspace: never built for the host; CI gates it with
+# `cargo check --target wasm32-unknown-unknown` (same pattern as blut-types).
+[workspace]
+
+[package]
+name = "blut-web-ui"
+version = "0.2.0-alpha.1"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Brian Lam"]
+license = "AGPL-3.0-or-later"
+description = "BLUT dashboard — Leptos CSR front-end embedded in the blut-web sidecar (ADR 0083)."
+publish = false
+
+[dependencies]
+blut-types = { path = "../../blut-types" }
+leptos = { version = "0.8", features = ["csr"] }
+gloo-net = "0.7"
+gloo-timers = { version = "0.3", features = ["futures"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen-futures = "0.4"
+# PINNED `=` to the wasm-bindgen-cli version scripts/build_ui.sh documents:
+# the CLI and the crate must match exactly or the emitted JS glue is rejected.
+wasm-bindgen = "=0.2.126"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1

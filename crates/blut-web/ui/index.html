@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later
+     The dashboard shell: loads the wasm-bindgen ES module emitted by
+     scripts/build_ui.sh into dist/. Styling is inline and utilitarian —
+     the app is operated, not read. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BLUT — dashboard</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: #101418; color: #cfd8dc;
+      font: 14px/1.5 ui-monospace, "JetBrains Mono", Menlo, monospace;
+    }
+    .bar {
+      display: flex; align-items: baseline; gap: 12px;
+      padding: 10px 16px; border-bottom: 1px solid #263238;
+    }
+    .bar h1 { margin: 0; font-size: 18px; letter-spacing: 2px; color: #80cbc4; }
+    .bar .sub { color: #607d8b; }
+    .bar .spacer { flex: 1; }
+    main {
+      display: grid; grid-template-columns: 2fr 1fr; gap: 16px;
+      padding: 16px; align-items: start;
+    }
+    main section:first-child { grid-row: span 2; }
+    section {
+      border: 1px solid #263238; border-radius: 4px; padding: 12px 16px;
+      background: #151b21;
+    }
+    h2 { margin: 0 0 8px; font-size: 14px; text-transform: uppercase;
+         letter-spacing: 1px; color: #80cbc4; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #1f2a33; }
+    th { color: #607d8b; font-weight: normal; }
+    tbody tr { cursor: pointer; }
+    tbody tr:hover { background: #1a2129; }
+    tr.sel { background: #1e2a35; }
+    input, textarea, button {
+      font: inherit; color: inherit; background: #0d1117;
+      border: 1px solid #263238; border-radius: 3px; padding: 5px 8px;
+      margin: 3px 0; width: 100%;
+    }
+    .bar input { width: 320px; }
+    button { cursor: pointer; width: auto; background: #163230; border-color: #2e5d58; }
+    button:hover { background: #1d4340; }
+    button:focus-visible, input:focus-visible, textarea:focus-visible {
+      outline: 2px solid #80cbc4; outline-offset: 1px;
+    }
+    pre.tail {
+      max-height: 320px; overflow: auto; background: #0d1117;
+      padding: 8px; border-radius: 3px; white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .flash { padding: 0 16px; color: #ffcc80; min-height: 1.5em; margin: 4px 0 0; }
+    .hint { color: #607d8b; margin: 0 0 6px; }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <script type="module">
+    import init from "./blut_web_ui.js";
+    init();
+  </script>
+</body>
+</html>

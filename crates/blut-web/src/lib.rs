@@ -42,6 +42,13 @@ pub const EXPORT_EXCLUDES_RESTRICTED: bool = true;
 /// Hard cap on `?tail=` for status streams (bounded responses, no file slurp).
 const STATUS_TAIL_CAP: usize = 1000;
 
+/// The embedded dashboard (ADR 0083: one binary, zero deploy steps) — the
+/// Leptos+WASM bundle staged by build.rs (`ui/dist` when built via
+/// `scripts/build_ui.sh`, else a self-describing stub page). Static assets
+/// carry no data, so they are served without auth; every data read/mutation
+/// still goes through the token-gated `/api`.
+static UI: include_dir::Dir<'_> = include_dir::include_dir!("$OUT_DIR/ui_dist");
+
 #[derive(Clone)]
 pub struct AppState {
     /// Parsed ADR-0095 token store; `None` = loopback-only dev mode.
@@ -403,6 +410,28 @@ async fn cancel_job(
     }
 }
 
+// ── the embedded dashboard ─────────────────────────────────────────
+
+async fn ui_index() -> Response {
+    ui_asset(AxPath(String::from("index.html"))).await
+}
+
+async fn ui_asset(AxPath(path): AxPath<String>) -> Response {
+    // The embedded dir is a closed set baked at compile time; include_dir's
+    // lookup is by exact relative path, so nothing traversal-ish resolves.
+    let Some(file) = UI.get_file(&path) else {
+        return err(StatusCode::NOT_FOUND, "no such asset");
+    };
+    let mime = match path.rsplit('.').next() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript",
+        Some("wasm") => "application/wasm",
+        Some("css") => "text/css",
+        _ => "application/octet-stream",
+    };
+    ([(axum::http::header::CONTENT_TYPE, mime)], file.contents()).into_response()
+}
+
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/jobs", get(jobs).post(run_recipe))
@@ -413,8 +442,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/lineage/diff/{a}/{b}", get(lineage_diff))
         .route("/api/models/{name}/{alias}", get(model_pointer))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
-        // healthz stays unauthenticated (liveness probes).
+        // Unauthenticated below: liveness + the embedded dashboard SHELL
+        // (static assets carry no data; every read/mutation is `/api`).
         .route("/healthz", get(healthz))
+        .route("/", get(ui_index))
+        .route("/{*path}", get(ui_asset))
         .with_state(state)
 }
 
@@ -626,6 +658,44 @@ tenant = "shared"
                 .unwrap();
             assert_eq!(res.status(), StatusCode::BAD_REQUEST, "name {bad:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn dashboard_shell_is_served_at_root_without_auth() {
+        // Even with tokens configured, "/" serves the embedded SHELL (static
+        // assets carry no data — every read/mutation is the token-gated /api).
+        let (store, _, _) = two_role_store();
+        let app = build_router(state(Some(store)));
+        let res = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(
+            res.headers()[axum::http::header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        let body = axum::body::to_bytes(res.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        // Real bundle and stub both title themselves BLUT.
+        assert!(String::from_utf8_lossy(&body).contains("BLUT"));
+    }
+
+    #[tokio::test]
+    async fn unknown_ui_asset_is_404() {
+        let app = build_router(state(None));
+        let res = app
+            .oneshot(
+                Request::get("/no-such-file.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
