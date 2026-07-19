@@ -1,7 +1,8 @@
 # BLUT Release Procedure
 
 Public preview train: `blut-types` → `blut` → `blut-dsl`, all at the same exact
-version. `blut-worker` and `blut-operator` are unpublished.
+version. `blut-operator` is unpublished. (`blut-worker` was deleted at ADR
+0083 M3 — superseded by `src/cloud` + the `blut-web` sidecar.)
 
 ## Candidate gate
 
@@ -17,7 +18,6 @@ RUSTDOCFLAGS="-D warnings" cargo +1.88 doc --locked --workspace --all-features -
 cargo +1.88 check --locked -p blut-types --target wasm32-unknown-unknown
 cargo deny --locked check
 cargo deny --locked --manifest-path crates/blut-dsl/Cargo.toml --config deny.toml check
-cargo deny --locked --manifest-path crates/blut-worker/Cargo.toml --config deny.toml check
 cargo deny --locked --manifest-path crates/blut-operator/Cargo.toml --config deny.toml check
 gitleaks git --log-opts="--all"
 cargo +1.88 run --locked --example first_cookbook
@@ -28,7 +28,6 @@ Also gate detached workspaces:
 
 ```bash
 (cd crates/blut-dsl && cargo +1.88 fmt --all -- --check && cargo +1.88 clippy --locked --all-targets -- -D warnings && cargo +1.88 test --locked && RUSTDOCFLAGS="-D warnings" cargo +1.88 doc --locked --no-deps)
-(cd crates/blut-worker && cargo +1.88 fmt --all -- --check && cargo +1.88 clippy --locked --all-targets -- -D warnings && cargo +1.88 test --locked)
 (cd crates/blut-operator && cargo +1.89 fmt --all -- --check && cargo +1.89 clippy --locked --all-targets -- -D warnings && cargo +1.89 test --locked)
 ```
 

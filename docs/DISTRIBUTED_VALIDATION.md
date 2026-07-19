@@ -21,7 +21,7 @@ Last updated: 2026-07-12.
 | Live multi-host P2P mesh | Deferred | Requires independent-host validation |
 | Cloud queue over local object storage | Component-tested | Local-filesystem loopback smoke |
 | Network object storage (S3/R2/GCS/MinIO) | Deferred | Removed from public preview pending dependency and infrastructure gates |
-| Deprecated `blut-worker` REST prototype | Unsupported | Unpublished; loopback-only hardening tests do not make it a release surface |
+| `blut-worker` REST prototype | Deleted (ADR 0083 M3) | Superseded by `src/cloud` + the `blut-web` sidecar |
 | Kubernetes operator | Unsupported | Unpublished prototype; separate Rust 1.89 compile/test lane |
 | Windows containment | Deferred | Bare fallback only; Job Object implementation absent |
 

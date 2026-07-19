@@ -38,7 +38,7 @@ pub struct CloudJob {
     pub timeout_secs: u64,
 }
 
-/// Terminal disposition of a job (mirrors p2p's verdict + blut-worker's JobStatus).
+/// Terminal disposition of a job (mirrors p2p's verdict + the retired blut-worker prototype's JobStatus).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobOutcome {

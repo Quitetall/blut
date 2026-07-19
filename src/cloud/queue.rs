@@ -1,7 +1,7 @@
 //! Cloud job queue (ADR 0067 · T3.1b) — a leased, priority queue.
 //!
 //! The lease (visibility timeout + requeue) is the durability property
-//! `blut-worker`'s file queue lacks: a worker that claims a job and crashes does
+//! the retired `blut-worker` prototype's file queue lacked: a worker that claims a job and crashes does
 //! not strand it — `reclaim_expired` returns the job to the pending set once its
 //! lease elapses, so another worker picks it up.
 //!

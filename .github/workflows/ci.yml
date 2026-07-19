@@ -103,18 +103,6 @@ jobs:
           cargo test --locked
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 
-      # crates/blut-worker is a STANDALONE workspace (it path-depends on the
-      # engine but is not a member of the root [workspace]), so none of the
-      # --workspace steps above touch it. Gate it explicitly or it rots
-      # silently — the framework bench already demonstrated that failure mode.
-      - name: Build + lint + test blut-worker (standalone workspace)
-        working-directory: crates/blut-worker
-        run: |
-          cargo fmt --all -- --check
-          cargo build --locked --all-targets
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo test --locked
-
       # ADR 0096: the notification boundary is a separate sidecar crate, and
       # its Restricted refusal is load-bearing enough to gate explicitly even
       # though the root workspace also discovers it through the acceptance test.
@@ -289,7 +277,6 @@ jobs:
         run: |
           cargo deny --locked check
           cargo deny --locked --manifest-path crates/blut-dsl/Cargo.toml --config deny.toml check
-          cargo deny --locked --manifest-path crates/blut-worker/Cargo.toml --config deny.toml check
           cargo deny --locked --manifest-path crates/blut-operator/Cargo.toml --config deny.toml check
       - name: Secret scan
         uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
