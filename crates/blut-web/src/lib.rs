@@ -17,8 +17,12 @@
 //!   sha256-hashed store), every request needs `Authorization: Bearer <token>`
 //!   resolving to a principal — else 401. Without a store the server refuses
 //!   to bind anything but loopback (dev mode, warned loudly).
-//! * **Mutations**: none in this increment. They arrive via the exec bridge
-//!   (`rbac::enforce` → the CLI), never by reaching into engine internals.
+//! * **Mutations (increment 2 — the exec bridge)**: `POST /api/jobs` (run a
+//!   recipe) and `POST /api/jobs/{id}/cancel` pass `rbac::enforce` (Operator
+//!   floor, allow AND deny audited to `audit.jsonl` BEFORE dispatch) and then
+//!   shell out to the CLI — one enforcement path for human and API, never a
+//!   reach into engine internals (ADR 0083 §4). Without a token store every
+//!   mutation is anonymous ⇒ denied (viewer-only), even on loopback.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,7 +31,7 @@ use axum::extract::{Path as AxPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 
 /// The web surface is an EXPORT: restricted/clinical rows are excluded from
@@ -44,7 +48,18 @@ pub struct AppState {
     pub tokens: Option<Arc<blut::rbac::TokenStore>>,
     /// Lineage DB override (tests); `None` = the default `~/.blut` path.
     pub lineage_path: Option<PathBuf>,
+    /// The CLI binary the exec bridge shells out to. Recipe launches need a
+    /// cookbook binary (only it knows the recipes), so operators point this at
+    /// theirs (`--cli lqt`); `cancel` works with the bare engine CLI too.
+    pub cli: PathBuf,
+    /// The ADR-0095 `audit.jsonl` every mutation is enforced against.
+    pub audit_path: PathBuf,
 }
+
+/// The principal the token middleware resolved for this request (`None` =
+/// anonymous — possible only in loopback dev mode, and viewer-scoped).
+#[derive(Clone)]
+struct MaybePrincipal(Option<blut::rbac::Principal>);
 
 fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
     (
@@ -57,20 +72,48 @@ fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
 async fn require_token(
     State(state): State<AppState>,
     headers: HeaderMap,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if let Some(store) = &state.tokens {
+    let principal = if let Some(store) = &state.tokens {
         let presented = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
         match presented.and_then(|secret| store.resolve(secret)) {
-            Some(_principal) => {} // any resolved principal may READ (Viewer floor)
+            Some(p) => Some(p), // any resolved principal may READ (Viewer floor)
             None => return err(StatusCode::UNAUTHORIZED, "missing or unknown bearer token"),
         }
-    }
+    } else {
+        None // loopback dev mode: anonymous = viewer scope (mutations denied)
+    };
+    request.extensions_mut().insert(MaybePrincipal(principal));
     next.run(request).await
+}
+
+/// Authorise + audit a bridge mutation (`rbac::enforce`): the audit row is
+/// written for allow AND deny BEFORE anything is dispatched, and an audit
+/// write failure is itself a deny. Every bridge mutation targets the SHARED
+/// tenant — the web surface structurally cannot act on a restricted tenant
+/// (same posture as the read side, ADR 0061/0096).
+#[allow(clippy::result_large_err)] // an axum Response IS the error surface here
+fn enforce_bridge(
+    state: &AppState,
+    principal: Option<&blut::rbac::Principal>,
+    action: blut::rbac::Action,
+) -> Result<(), Response> {
+    let shared = blut::tenant::Tenant::parse(blut::model_registry::SHARED_TENANT)
+        .expect("the shared tenant name parses");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let decision = blut::rbac::enforce(principal, action, &shared, &state.audit_path, now);
+    if decision.allowed {
+        Ok(())
+    } else {
+        Err(err(StatusCode::FORBIDDEN, decision.reason))
+    }
 }
 
 #[allow(clippy::result_large_err)] // an axum Response IS the error surface here
@@ -212,10 +255,159 @@ async fn model_pointer(AxPath((name, alias)): AxPath<(String, String)>) -> Respo
     .into_response()
 }
 
+// ── the exec bridge (ADR 0083 §4) ──────────────────────────────────
+
+/// A launched job is a generated identifier; a recipe name comes from a
+/// cookbook catalog. Both share one conservative charset — refuse anything
+/// path-ish or flag-ish before it can reach an argv.
+fn valid_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+#[derive(serde::Deserialize)]
+struct RunRequest {
+    recipe: String,
+    /// Recipe args, forwarded verbatim as `--args <json>`. Must be an object.
+    #[serde(default)]
+    args: Option<serde_json::Value>,
+}
+
+async fn run_recipe(
+    State(state): State<AppState>,
+    axum::Extension(MaybePrincipal(principal)): axum::Extension<MaybePrincipal>,
+    Json(req): Json<RunRequest>,
+) -> Response {
+    if let Err(deny) = enforce_bridge(&state, principal.as_ref(), blut::rbac::Action::Run) {
+        return deny;
+    }
+    if !valid_name(&req.recipe) {
+        return err(StatusCode::BAD_REQUEST, "invalid recipe name");
+    }
+    let args = req.args.unwrap_or_else(|| serde_json::json!({}));
+    if !args.is_object() {
+        return err(StatusCode::BAD_REQUEST, "args must be a JSON object");
+    }
+    // Launch DETACHED through the CLI — the run must outlive this server, and
+    // args travel as one argv element (never a shell), so there is nothing to
+    // inject into. Output goes to a per-launch log beside the audit trail.
+    let launch_dir = state
+        .audit_path
+        .parent()
+        .map(|d| d.join("web-launches"))
+        .unwrap_or_else(|| PathBuf::from("web-launches"));
+    if let Err(e) = std::fs::create_dir_all(&launch_dir) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let log_path = launch_dir.join(format!("{stamp}-{}.log", req.recipe));
+    let log = match std::fs::File::create(&log_path) {
+        Ok(f) => f,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let log_err = match log.try_clone() {
+        Ok(f) => f,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let mut cmd = std::process::Command::new(&state.cli);
+    cmd.arg("recipe")
+        .arg("run")
+        .arg(&req.recipe)
+        .arg("--args")
+        .arg(args.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(log)
+        .stderr(log_err);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0); // survive this server's exit / signals
+    }
+    match cmd.spawn() {
+        Ok(child) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "spawned": true,
+                "recipe": req.recipe,
+                "pid": child.id(),
+                "log": log_path,
+            })),
+        )
+            .into_response(),
+        Err(e) => err(
+            StatusCode::BAD_GATEWAY,
+            format!("exec {} failed: {e}", state.cli.display()),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CancelRequest {
+    /// Grace period before SIGKILL, e.g. `"10s"` (the CLI's default).
+    grace: Option<String>,
+}
+
+async fn cancel_job(
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+    axum::Extension(MaybePrincipal(principal)): axum::Extension<MaybePrincipal>,
+    body: Option<Json<CancelRequest>>,
+) -> Response {
+    if let Err(deny) = enforce_bridge(&state, principal.as_ref(), blut::rbac::Action::Cancel) {
+        return deny;
+    }
+    if !valid_name(&id) {
+        return err(StatusCode::BAD_REQUEST, "invalid job id");
+    }
+    let grace = body.and_then(|Json(b)| b.grace);
+    if let Some(g) = &grace
+        && (g.is_empty() || !g.chars().all(|c| c.is_ascii_alphanumeric()))
+    {
+        return err(StatusCode::BAD_REQUEST, "invalid grace duration");
+    }
+    // Cancel is quick (SIGTERM + bookkeeping) — run it synchronously and
+    // return the CLI's own words, one enforcement path for human and API.
+    let mut cmd = tokio::process::Command::new(&state.cli);
+    cmd.arg("cancel").arg(&id);
+    if let Some(g) = grace {
+        cmd.arg("--grace").arg(g);
+    }
+    match cmd.output().await {
+        Ok(out) => {
+            let ok = out.status.success();
+            let status = if ok {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "ok": ok,
+                    "job": id,
+                    "stdout": String::from_utf8_lossy(&out.stdout),
+                    "stderr": String::from_utf8_lossy(&out.stderr),
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => err(
+            StatusCode::BAD_GATEWAY,
+            format!("exec {} failed: {e}", state.cli.display()),
+        ),
+    }
+}
+
 pub fn build_router(state: AppState) -> Router {
     Router::new()
-        .route("/api/jobs", get(jobs))
+        .route("/api/jobs", get(jobs).post(run_recipe))
         .route("/api/jobs/{id}/status", get(job_status))
+        .route("/api/jobs/{id}/cancel", post(cancel_job))
         .route("/api/lineage/graph/{hash}", get(lineage_graph))
         .route("/api/lineage/card/{hash}", get(lineage_card))
         .route("/api/lineage/diff/{a}/{b}", get(lineage_diff))
@@ -237,7 +429,27 @@ mod tests {
         AppState {
             tokens: tokens.map(Arc::new),
             lineage_path: None,
+            cli: PathBuf::from("blut"),
+            audit_path: std::env::temp_dir().join("blut-web-test-audit.jsonl"),
         }
+    }
+
+    /// A store with one operator and one viewer token whose SECRETS are the
+    /// strings below (hashes precomputed via `rbac::hash_token`).
+    fn two_role_store() -> (blut::rbac::TokenStore, &'static str, &'static str) {
+        let op_secret = "op-secret-token";
+        let view_secret = "view-secret-token";
+        let toml = format!(
+            "[[token]]\nid=\"op\"\nhash=\"{}\"\nrole=\"operator\"\ntenant=\"shared\"\n\
+             [[token]]\nid=\"view\"\nhash=\"{}\"\nrole=\"viewer\"\ntenant=\"shared\"\n",
+            blut::rbac::hash_token(op_secret),
+            blut::rbac::hash_token(view_secret),
+        );
+        (
+            blut::rbac::TokenStore::parse(&toml).expect("valid store"),
+            op_secret,
+            view_secret,
+        )
     }
 
     #[test]
@@ -304,10 +516,9 @@ tenant = "shared"
     #[tokio::test]
     async fn unknown_artifact_is_404_not_500() {
         let td = tempfile::tempdir().unwrap();
-        let app = build_router(AppState {
-            tokens: None,
-            lineage_path: Some(td.path().join("lineage.db")),
-        });
+        let mut st = state(None);
+        st.lineage_path = Some(td.path().join("lineage.db"));
+        let app = build_router(st);
         let res = app
             .oneshot(
                 Request::get("/api/lineage/graph/deadbeef")
@@ -317,6 +528,104 @@ tenant = "shared"
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn anonymous_mutation_is_denied_and_audited() {
+        // Loopback dev mode (no token store): reads are open, mutations are
+        // NOT — rbac treats anonymous as viewer, and the deny is on the record.
+        let td = tempfile::tempdir().unwrap();
+        let audit = td.path().join("audit.jsonl");
+        let mut st = state(None);
+        st.audit_path = audit.clone();
+        let app = build_router(st);
+        let res = app
+            .oneshot(
+                Request::post("/api/jobs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"recipe":"anything"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let log = std::fs::read_to_string(&audit).expect("deny was audited");
+        assert!(log.contains(r#""allowed":false"#) && log.contains(r#""action":"run""#));
+    }
+
+    #[tokio::test]
+    async fn viewer_token_cannot_mutate_operator_can() {
+        let (store, op, view) = two_role_store();
+        let td = tempfile::tempdir().unwrap();
+        let mut st = state(Some(store));
+        st.audit_path = td.path().join("audit.jsonl");
+        // Point the bridge CLI at /bin/echo: the cancel path runs it
+        // synchronously and returns its words, proving the argv it built.
+        st.cli = PathBuf::from("/bin/echo");
+        let app = build_router(st);
+
+        // Viewer: authenticated, but under the Operator floor → 403.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/api/jobs/j123/cancel")
+                    .header("authorization", format!("Bearer {view}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Operator: allowed; the CLI (echo) reflects `cancel j123 --grace 30s`.
+        let res = app
+            .oneshot(
+                Request::post("/api/jobs/j123/cancel")
+                    .header("authorization", format!("Bearer {op}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"grace":"30s"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        assert!(
+            v["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("cancel j123 --grace 30s")
+        );
+        // Both decisions are on the audit record.
+        let log = std::fs::read_to_string(td.path().join("audit.jsonl")).unwrap();
+        assert!(log.contains(r#""allowed":false"#) && log.contains(r#""allowed":true"#));
+    }
+
+    #[tokio::test]
+    async fn bridge_refuses_flaggy_or_pathish_names() {
+        let (store, op, _) = two_role_store();
+        let td = tempfile::tempdir().unwrap();
+        let mut st = state(Some(store));
+        st.audit_path = td.path().join("audit.jsonl");
+        let app = build_router(st);
+        for bad in ["--force", "a/b", "", "x;y"] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/jobs")
+                        .header("authorization", format!("Bearer {op}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::json!({ "recipe": bad }).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "name {bad:?}");
+        }
     }
 
     #[tokio::test]

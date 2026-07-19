@@ -18,6 +18,15 @@ struct Args {
     /// `~/.blut/web-tokens.toml` when present.
     #[arg(long)]
     tokens: Option<std::path::PathBuf>,
+    /// CLI binary the exec bridge shells out to for mutations. Recipe
+    /// launches need a cookbook binary (only it knows the recipes) — point
+    /// this at yours (e.g. `--cli lqt`).
+    #[arg(long, default_value = "blut")]
+    cli: std::path::PathBuf,
+    /// The rbac audit log every mutation is enforced against (allow AND deny
+    /// rows, written before dispatch). Default: `~/.blut/audit.jsonl`.
+    #[arg(long)]
+    audit: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -59,9 +68,16 @@ async fn main() -> Result<()> {
         }
     };
 
+    let audit_path = args.audit.unwrap_or_else(|| {
+        dirs_path()
+            .map(|d| d.join("audit.jsonl"))
+            .unwrap_or_else(|| std::path::PathBuf::from("audit.jsonl"))
+    });
     let app = blut_web::build_router(blut_web::AppState {
         tokens,
         lineage_path: None,
+        cli: args.cli,
+        audit_path,
     });
     let listener = tokio::net::TcpListener::bind(args.bind)
         .await
