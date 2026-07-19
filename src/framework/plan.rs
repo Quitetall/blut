@@ -806,6 +806,33 @@ impl CompiledPlan {
     /// compatibility floor is doing the billing — reported loudly per the
     /// ADR 0133 floor policy (fail-loud now; an operator strict mode that
     /// refuses undeclared plans arrives with the launch-consumer flip).
+    /// Range-scoped variant of [`Self::max_declared_envelope`] — the largest
+    /// declared envelope among TOP-LEVEL nodes whose id falls in `range`, plus
+    /// any map template whose parent does (ADR 0133: per-TRIAL admission for a
+    /// merged HPO plan, so a small trial is never billed the biggest trial's
+    /// envelope).
+    pub(crate) fn max_declared_envelope_in(
+        &self,
+        range: std::ops::Range<NodeId>,
+    ) -> Option<(String, blut_types::envelope::ResourceEnvelope)> {
+        let mut best: Option<(String, blut_types::envelope::ResourceEnvelope)> = None;
+        let mut consider = |n: &PlanNode| {
+            let e = n.stage.resource_envelope(&n.args);
+            if e.is_declared() && best.as_ref().is_none_or(|(_, b)| e.ram_bytes > b.ram_bytes) {
+                best = Some((n.stage.name().to_string(), e));
+            }
+        };
+        for n in self.nodes.iter().filter(|n| range.contains(&n.id)) {
+            consider(n);
+        }
+        for x in self.expansions.iter().filter(|x| range.contains(&x.parent)) {
+            for n in &x.template.nodes {
+                consider(n);
+            }
+        }
+        best
+    }
+
     /// The largest-RAM DECLARED envelope in the plan (nodes + map templates),
     /// with its stage name — the seam's input to launch admission (ADR 0133
     /// incr 2b). `None` when no node declares (the JSON fallback applies).

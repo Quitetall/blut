@@ -119,11 +119,13 @@ struct HpoTrialAdmission {
 fn hpo_trial_admission(
     recipe: &str,
     recipe_args: &serde_json::Value,
+    declared: Option<&(String, blut_types::envelope::ResourceEnvelope)>,
     snapshot: &crate::broker::ResourceSnapshot,
 ) -> HpoTrialAdmission {
-    let admitted_workers = admitted_workers_for(recipe, recipe_args, None, snapshot);
-    let admitted_batch_size = admitted_workers
-        .and_then(|workers| admitted_batch_size_for(recipe, recipe_args, None, workers, snapshot));
+    let admitted_workers = admitted_workers_for(recipe, recipe_args, declared, snapshot);
+    let admitted_batch_size = admitted_workers.and_then(|workers| {
+        admitted_batch_size_for(recipe, recipe_args, declared, workers, snapshot)
+    });
     let resolved_footprint = match admitted_workers {
         Some(workers) => recipe_footprint_tuned(recipe, recipe_args, workers, admitted_batch_size),
         None => recipe_footprint(recipe, recipe_args),
@@ -132,7 +134,7 @@ fn hpo_trial_admission(
         .unwrap_or_else(|| crate::broker::Drivers::from_args_json(recipe_args).workers);
     let sync_footprint = recipe_footprint_sync_base(
         recipe_args,
-        None,
+        declared,
         admitted_batch_size,
         resolved_workers,
         resolved_footprint,
@@ -301,7 +303,10 @@ fn hpo_node_admission_resolver(
             {
                 admission
             } else {
-                let admission = hpo_trial_admission(&recipe, recipe_args, &snapshot);
+                // Runtime-injected trial: no compiled sub-plan is threaded here; the
+                // JSON path bills it (the declared-envelope spawn guard already bounds
+                // any oversized suggestion). Per-trial envelopes cover initial trials.
+                let admission = hpo_trial_admission(&recipe, recipe_args, None, &snapshot);
                 let mut cached = cache
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -467,9 +472,25 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
     // admission-only Arc. The Arc identity survives optimization/DCE and remains
     // distinct even when a sampler repeats an identical overlay.
     let trial_recipe_args = hpo_trial_recipe_args(&plan, &trials)?;
+    // ADR 0133: bill each trial its OWN declared envelope (node-range scoped) —
+    // a small trial is never billed the biggest trial's footprint.
+    let trial_envelopes: Vec<_> = trials
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let end = trials
+                .get(i + 1)
+                .map(|n| n.node_offset)
+                .unwrap_or(plan.n_nodes() as u32);
+            plan.max_declared_envelope_in(t.node_offset..end)
+        })
+        .collect();
     let trial_admissions: Vec<_> = trial_recipe_args
         .iter()
-        .map(|args| hpo_trial_admission(&name, args, tenant_admission.snapshot()))
+        .zip(&trial_envelopes)
+        .map(|(args, env)| {
+            hpo_trial_admission(&name, args, env.as_ref(), tenant_admission.snapshot())
+        })
         .collect();
     let dynamic_admission_limit = std::sync::Arc::new(std::sync::OnceLock::new());
     let node_admission = hpo_node_admission_resolver(

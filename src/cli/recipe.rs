@@ -1022,33 +1022,42 @@ pub(super) fn prepare_compiled_plan_launch(
     use crate::framework::ExecCtx;
 
     let admission_snapshot = tenant_admission.snapshot();
+    // One scan: the plan's largest declared envelope feeds auto-tune, the
+    // launch footprint, and the sync base below (ADR 0133).
+    let declared = plan.max_declared_envelope();
     let admitted_workers = admitted_workers_for(
         name,
         plan.exec_view().recipe_args,
-        Some(&plan),
+        declared.as_ref(),
         admission_snapshot,
     );
     let admitted_batch_size = admitted_workers.and_then(|workers| {
         admitted_batch_size_for(
             name,
             plan.exec_view().recipe_args,
-            Some(&plan),
+            declared.as_ref(),
             workers,
             admission_snapshot,
         )
     });
     let warm = warm_context(plan.exec_view().recipe_args);
     let tuned = admitted_workers.map(|w| (w, admitted_batch_size));
-    let footprint = plan_footprint_declared(&plan, name, plan.exec_view().recipe_args, tuned, warm)
-        .unwrap_or_else(|| match admitted_workers {
-            Some(workers) => recipe_footprint_tuned(
-                name,
-                plan.exec_view().recipe_args,
-                workers,
-                admitted_batch_size,
-            ),
-            None => recipe_footprint(name, plan.exec_view().recipe_args),
-        });
+    let footprint = plan_footprint_declared(
+        declared.as_ref(),
+        name,
+        plan.exec_view().recipe_args,
+        tuned,
+        warm,
+    )
+    .unwrap_or_else(|| match admitted_workers {
+        Some(workers) => recipe_footprint_tuned(
+            name,
+            plan.exec_view().recipe_args,
+            workers,
+            admitted_batch_size,
+        ),
+        None => recipe_footprint(name, plan.exec_view().recipe_args),
+    });
 
     let job_id = crate::jobs::new_job_id();
     let job_dir = crate::paths::jobs_dir()?.join(&job_id);

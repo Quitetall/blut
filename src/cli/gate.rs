@@ -20,13 +20,13 @@
 /// path, whose worker/batch overrides change the ESTIMATE itself, stays on the
 /// JSON formula until the envelope's structured cost terms land (increment 3).
 pub(super) fn plan_footprint_declared(
-    plan: &crate::framework::CompiledPlan,
+    declared: Option<&(String, blut_types::envelope::ResourceEnvelope)>,
     recipe: &str,
     raw: &serde_json::Value,
     tuned: Option<(u32, Option<u32>)>,
     warm: bool,
 ) -> Option<crate::broker::Footprint> {
-    let (stage_name, env) = plan.max_declared_envelope()?;
+    let (stage_name, env) = declared?;
     // Tuned units re-evaluate the affine cost model (increment 3); the same
     // overrides + the warm context compose the store key, so the calibration
     // row is exactly the one the JSON path reads/writes for this launch shape.
@@ -49,7 +49,7 @@ pub(super) fn plan_footprint_declared(
     let flat =
         crate::broker::footprint::envelope_calibration_key_with_context(recipe, &env, &key_ctx)?;
     let hint = crate::broker::Footprint {
-        ram_bytes: crate::broker::footprint::envelope_footprint_at(&env, &unit_overrides, warm),
+        ram_bytes: crate::broker::footprint::envelope_footprint_at(env, &unit_overrides, warm),
         vram_mib: 0,
     };
     let resolved = crate::broker::FootprintStore::load().resolve_flat(&flat, hint);
@@ -174,7 +174,7 @@ pub(super) fn recipe_footprint_tuned(
 /// terms remain in the base because they exist on the inline path too.
 pub(super) fn recipe_footprint_sync_base(
     raw: &serde_json::Value,
-    plan: Option<&crate::framework::CompiledPlan>,
+    declared: Option<&(String, blut_types::envelope::ResourceEnvelope)>,
     batch: Option<u32>,
     resolved_workers: u32,
     resolved: crate::broker::Footprint,
@@ -182,7 +182,7 @@ pub(super) fn recipe_footprint_sync_base(
     // ADR 0133 incr 3: declared plans compute the sync base from the envelope —
     // sync_base_excluded terms at zero (the engine never names "the workers"),
     // the calibrated `resolved` floor preserved via the same max() shape.
-    if let Some((_, env)) = plan.and_then(|p| p.max_declared_envelope())
+    if let Some((_, env)) = declared
         && !env.cost_terms.is_empty()
     {
         let warm = warm_context(raw);
@@ -190,8 +190,8 @@ pub(super) fn recipe_footprint_sync_base(
         if let Some(b) = batch {
             overrides.push(("batch", b));
         }
-        let sync = crate::broker::footprint::envelope_sync_base(&env, warm);
-        let with_workers = crate::broker::footprint::envelope_footprint_at(&env, &overrides, warm);
+        let sync = crate::broker::footprint::envelope_sync_base(env, warm);
+        let with_workers = crate::broker::footprint::envelope_footprint_at(env, &overrides, warm);
         let known_worker_term = with_workers.saturating_sub(sync);
         let resolved_minus_worker = resolved.ram_bytes.saturating_sub(known_worker_term);
         return crate::broker::Footprint {
@@ -296,9 +296,10 @@ pub(super) fn configure_training_io_admission(
 
     let resolved_workers =
         admitted_workers.unwrap_or_else(|| crate::broker::Drivers::from_args_json(raw).workers);
+    let declared = plan.max_declared_envelope();
     let sync_footprint = recipe_footprint_sync_base(
         raw,
-        Some(&plan),
+        declared.as_ref(),
         admitted_batch_size,
         resolved_workers,
         resolved_footprint,
@@ -344,7 +345,7 @@ pub(super) fn configure_training_io_admission(
 pub(super) fn admitted_workers_for(
     name: &str,
     raw: &serde_json::Value,
-    plan: Option<&crate::framework::CompiledPlan>,
+    declared: Option<&(String, blut_types::envelope::ResourceEnvelope)>,
     snap: &crate::broker::ResourceSnapshot,
 ) -> Option<u32> {
     if raw.is_null() || raw.as_object().is_some_and(|o| o.is_empty()) {
@@ -367,12 +368,12 @@ pub(super) fn admitted_workers_for(
     // ADR 0133 incr 3: env-first — a declared cost model searches through the
     // typed seam (cookbook enumerates the term + ceiling, engine owns the
     // search). Shadow-compares against the JSON search until Phase D.
-    if let Some((_, env)) = plan.and_then(|p| p.max_declared_envelope()) {
+    if let Some((_, env)) = declared {
         let target = cpu
             .saturating_sub(2)
             .clamp(1, crate::broker::footprint::MAX_AUTO_WORKERS);
         if let Some(w) = crate::broker::footprint::fit_and_saturate_env(
-            &env,
+            env,
             "workers",
             target,
             avail,
@@ -429,7 +430,7 @@ pub(super) fn admitted_workers_for(
 pub(super) fn admitted_batch_size_for(
     name: &str,
     raw: &serde_json::Value,
-    plan: Option<&crate::framework::CompiledPlan>,
+    declared: Option<&(String, blut_types::envelope::ResourceEnvelope)>,
     resolved_workers: u32,
     snap: &crate::broker::ResourceSnapshot,
 ) -> Option<u32> {
@@ -447,12 +448,12 @@ pub(super) fn admitted_batch_size_for(
     }
     // ADR 0133 incr 3: env-first batch shrink at the held workers (residual
     // budget), the requested batch = the term's declared units. Shadowed.
-    if let Some((_, env)) = plan.and_then(|p| p.max_declared_envelope())
+    if let Some((_, env)) = declared
         && let Some(term) = env.cost_terms.iter().find(|t| t.dimension == "batch")
     {
         let requested = term.declared_units.max(1);
         if let Some(b) = crate::broker::footprint::shrink_to_fit_env(
-            &env,
+            env,
             "batch",
             requested,
             &[("workers", resolved_workers)],
