@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# blut-web (ADR 0083 M2) — the web SIDECAR: an axum host serving read-only
+# JSON views over exactly the stores the TUI reads (jobs, status.jsonl, the
+# lineage SQLite, the model registry, the catalog). A separate binary the
+# engine `exec`s via the external-subcommand dispatch (`blut web`) and NEVER
+# links (ADR 0034 charter: no in-engine HTTP server). Mutations arrive in a
+# later increment through the exec bridge (rbac::enforce → the CLI); the
+# embedded Leptos UI bundle is the increment after that.
+# Standalone workspace: a SIDECAR is deliberately not a member of the engine
+# workspace (the engine never links it; it links the engine).
+[workspace]
+
+[package]
+name = "blut-web"
+version = "0.2.0-alpha.1"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Brian Lam"]
+license = "AGPL-3.0-or-later"
+description = "BLUT web sidecar — read-only HTTP views over jobs, lineage, models, and the catalog (ADR 0083)."
+publish = false
+
+[[bin]]
+name = "blut-web"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+blut = { path = "../.." }
+blut-types = { path = "../blut-types" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"

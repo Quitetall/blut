@@ -132,6 +132,18 @@ jobs:
           cargo clippy -p blut-notify --all-targets -- -D warnings
           cargo test -p blut-notify
 
+      # ADR 0083 M2: the web sidecar is a STANDALONE workspace (path-deps on
+      # the engine; the engine never links it). Gate it or the read-API +
+      # fail-closed custody tests (401, loopback-only, restricted-export
+      # tripwire) rot silently.
+      - name: Build + lint + test blut-web (standalone workspace)
+        working-directory: crates/blut-web
+        run: |
+          cargo fmt --all -- --check
+          cargo build --all-targets
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
       - name: Rustdoc (deny broken public docs)
         env:
           RUSTDOCFLAGS: -D warnings
