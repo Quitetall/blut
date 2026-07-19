@@ -47,7 +47,7 @@ pub(super) fn plan_footprint_declared(
     }
     key_ctx.push(("warm", if warm { "w" } else { "c" }.to_string()));
     let flat =
-        crate::broker::footprint::envelope_calibration_key_with_context(recipe, &env, &key_ctx)?;
+        crate::broker::footprint::envelope_calibration_key_with_context(recipe, env, &key_ctx)?;
     let hint = crate::broker::Footprint {
         ram_bytes: crate::broker::footprint::envelope_footprint_at(env, &unit_overrides, warm),
         vram_mib: 0,
