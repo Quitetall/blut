@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Brian Lam
 //! Plan executor.
 //!
-//! Two executors share one per-stage core, [`run_node`]:
+//! Two executors share one private per-stage core, `run_node`:
 //!
 //!   1. Build the input artifact (initial map for graph-input
 //!      nodes; the predecessor's output for a linear edge; a

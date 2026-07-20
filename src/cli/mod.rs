@@ -1982,7 +1982,10 @@ async fn run_sensord(
     let parsed: TriggersFile =
         toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     if parsed.trigger.is_empty() {
-        println!("sensord: no triggers configured in {} — nothing to watch", path.display());
+        println!(
+            "sensord: no triggers configured in {} — nothing to watch",
+            path.display()
+        );
         return Ok(());
     }
 

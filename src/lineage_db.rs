@@ -1313,7 +1313,7 @@ impl LineageDb {
     /// config-fingerprint / input-hash / argument / gate-outcome / metric fields
     /// that DIFFER. Errors if either run is unknown or persisted args are
     /// malformed. This generic export refuses cross-tenant and Restricted runs;
-    /// tenant-scoped engine views use [`Self::run_diff_for_tenant`].
+    /// tenant-scoped engine views use the private `run_diff_for_tenant` seam.
     pub fn run_diff(&self, a: &str, b: &str) -> Result<crate::lineage_report::RunDiff> {
         self.run_diff_scoped(a, b, None)
     }

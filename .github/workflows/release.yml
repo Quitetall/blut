@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # BLUT release train (ADR 0083 M6 / ADR 0137). Two deliberately separate paths:
 #
-#   * on a `v*` tag  → GATE (the full CI suite) + BUILD the sidecar binaries
-#     (blut-tui, blut-web, blut-notify) and attach them to the GitHub Release.
+#   * on a `v*` tag  → GATE (the release-critical CI suite) + BUILD the
+#     sidecar binaries (blut-tui, blut-web, blut-operator, blut-notify) and
+#     attach them to the GitHub Release.
 #     This is automatic and reversible (a Release can be deleted / re-cut).
 #
 #   * workflow_dispatch with publish_crates=true → PUBLISH the crate chain to
@@ -32,9 +33,9 @@ concurrency:
   cancel-in-progress: false # never interrupt a publish mid-chain
 
 jobs:
-  # ── gate: the release candidate must pass the full CI suite ──────────
+  # ── gate: the release candidate must pass release-critical CI ────────
   gate:
-    name: release gate (full CI)
+    name: release gate (release-critical CI)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -47,31 +48,103 @@ jobs:
           targets: wasm32-unknown-unknown
       - name: Scope guard (ADR 0034 charter)
         run: bash scripts/scope_guard.sh
-      - name: Format + clippy + test (workspace)
+      - name: Format + check + clippy + test (workspace)
         run: |
           cargo fmt --all -- --check
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo test --locked --workspace
+          cargo check --locked --workspace --all-targets --all-features
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+          cargo test --locked --workspace --all-targets --all-features
+      - name: Public rustdoc (deny broken links and warnings)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --all-features --no-deps
       - name: wasm32 keystone (blut-types)
         run: cargo check --locked -p blut-types --target wasm32-unknown-unknown
+      - name: Compare framework benchmarks with the committed release baseline
+        run: bash scripts/run_benchmarks.sh compare
+      - name: Gate blut-dsl (standalone workspace)
+        working-directory: crates/blut-dsl
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+      - name: Gate blut-web (standalone workspace)
+        working-directory: crates/blut-web
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+      - name: Gate blut-tui (standalone workspace)
+        working-directory: crates/blut-tui
+        run: |
+          cargo fmt --all -- --check
+          cargo build --locked --all-targets
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          ./target/debug/blut-tui --check
 
-  # ── binaries: build the sidecars + attach to the Release (tag only) ──
-  binaries:
-    name: sidecar binaries (${{ matrix.crate }})
-    needs: gate
-    if: startsWith(github.ref, 'refs/tags/v')
+  # The operator intentionally has a newer MSRV than the public crate chain.
+  # Gate it separately, then exercise its CRDs against a real API server.
+  operator-gate:
+    name: operator gate (Rust 1.89)
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        crate: [blut-tui, blut-web, blut-notify]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
-          toolchain: 1.88.0
-      # blut-tui / blut-web are standalone workspaces; blut-notify is a member.
+          toolchain: 1.89.0
+          components: clippy, rustfmt
+      - name: Format + clippy + test blut-operator
+        working-directory: crates/blut-operator
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+
+  kind-smoke:
+    name: kind CRD admission smoke
+    needs: [gate, operator-gate]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.89.0
+      - name: Install pinned kind + kubectl
+        run: |
+          curl -fsSLo /tmp/kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64
+          echo "a6875aaea358acf0ac07786b1a6755d08fd640f4c79b7a2e46681cc13f49a04b  /tmp/kind" | sha256sum -c -
+          curl -fsSLo /tmp/kubectl https://dl.k8s.io/release/v1.32.2/bin/linux/amd64/kubectl
+          echo "4f6a959dcc5b702135f8354cc7109b542a2933c46b808b248a214c1f69f817ea  /tmp/kubectl" | sha256sum -c -
+          sudo install /tmp/kind /usr/local/bin/kind
+          sudo install /tmp/kubectl /usr/local/bin/kubectl
+      - name: CRD install + BlutPlan admission
+        run: bash scripts/k8s_kind_smoke.sh
+
+  # ── binaries: build the sidecars + attach to the Release (tag only) ──
+  binaries:
+    name: sidecar binaries (${{ matrix.crate }})
+    needs: kind-smoke
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        crate: [blut-tui, blut-web, blut-operator, blut-notify]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          # The matrix includes blut-operator, whose deliberate MSRV is 1.89.
+          # Rust 1.89 also builds the 1.88 public crates and sidecars.
+          toolchain: 1.89.0
+      # blut-tui / blut-web / blut-operator are standalone workspaces;
+      # blut-notify is a member.
       - name: Build release binary
         run: |
           if [ -f "crates/${{ matrix.crate }}/Cargo.toml" ] && grep -q '^\[workspace\]' "crates/${{ matrix.crate }}/Cargo.toml"; then
@@ -94,7 +167,7 @@ jobs:
   # publish=false — they ship as the binaries above, not as crates.
   publish-crates:
     name: publish crate chain (IRREVERSIBLE)
-    needs: gate
+    needs: kind-smoke
     if: github.event_name == 'workflow_dispatch' && inputs.publish_crates
     runs-on: ubuntu-latest
     environment: crates-io # a protected environment = a second human approval

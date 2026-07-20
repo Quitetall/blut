@@ -1161,7 +1161,8 @@ impl CompiledPlan {
     ///   * the FIRST stage must be graph-input (`input_kind() == "()"`), and
     ///   * each stage's `output_kind()` must equal the next's `input_kind()`.
     ///
-    /// A break is a clear [`PlanError::Other`]. Edges form the linear chain
+    /// A break is a clear [`crate::framework::error::PlanError::Other`]. Edges
+    /// form the linear chain
     /// `0→1→…→n-1`; node 0 receives the unit graph-input artifact, exactly as
     /// [`Plan::start`] does. The produced [`CompiledPlan`] runs through the
     /// SAME executor as a compiled recipe (the executor only ever sees erased
@@ -1288,8 +1289,9 @@ impl CompiledPlan {
     ///     are re-verified at `decode_erased`, exactly as the typed `merge`
     ///     path relies on — this checks arity here).
     ///
-    /// A break is a precise [`PlanError`] naming the offending stage(s)/kinds;
-    /// a cycle or empty plan is rejected too (reusing [`topo_order`]). Never
+    /// A break is a precise [`crate::framework::error::PlanError`] naming the
+    /// offending stage(s)/kinds; a cycle or empty plan is rejected too (reusing
+    /// [`Self::topo_order`]). Never
     /// panics on bad input — every malformed graph is a typed `Err`.
     /// `from_erased_chain` is left untouched (the declarative TOML path keeps
     /// its own byte-equal test surface).

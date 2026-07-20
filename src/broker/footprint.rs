@@ -46,7 +46,8 @@ pub const UNCALIBRATED_WORKER_CAP: u32 = 2;
 pub const MAX_AUTO_WORKERS: u32 = 16;
 
 /// Compose the measured-peak store key from a stage/recipe identity and a
-/// declared [`ResourceEnvelope`] (ADR 0133). ENGINE-composed: the identity
+/// declared [`blut_types::envelope::ResourceEnvelope`] (ADR 0133).
+/// ENGINE-composed: the identity
 /// namespaces the key (`shared_calibration_group` is the audited opt-out for
 /// stages that genuinely pool physics), and the ORDERED dimension values are
 /// joined in the same pipe-delimited flat form as [`FootprintKey::flat`] — so a
@@ -348,7 +349,8 @@ impl FootprintKey {
 
 /// Build a compatibility calibration key from a recipe name and its cost
 /// drivers. A cookbook's resolve and record paths must supply the same values;
-/// `workers`/`batch`/`tier`/`warm` must also match those fed to [`estimate`].
+/// `workers`/`batch`/`tier`/`warm` must also match those fed to the cookbook's
+/// `estimate` function.
 pub fn footprint_key(
     recipe: &str,
     workers: u32,

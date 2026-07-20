@@ -158,7 +158,10 @@ pub fn load_rules(path: &std::path::Path) -> std::io::Result<Vec<SlaRule>> {
         Err(e) => return Err(e),
     };
     let parsed: RulesFile = toml::from_str(&text).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse {path:?}: {e}"))
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("parse {path:?}: {e}"),
+        )
     })?;
     Ok(parsed.rule)
 }
