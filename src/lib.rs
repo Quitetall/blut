@@ -72,6 +72,7 @@ pub mod secrets;
 pub mod sensor;
 pub mod spec;
 pub mod tenant;
+pub mod trigger;
 pub mod trust;
 // The interactive ratatui cockpit moved to the `crates/blut-tui` SIDECAR
 // (ADR 0083 M2). The engine keeps only the seams: `cli::TuiHook` (attach an
