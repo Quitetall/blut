@@ -17,6 +17,266 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use blut_types::trust::DataClass;
+
+/// One declarative trigger binding shared by `blut sensord` and the web
+/// sidecar. Keeping ingress authentication and dispatch custody in one file
+/// prevents the listener and daemon from silently disagreeing about tenant or
+/// classification.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TriggerBinding {
+    pub name: String,
+    /// Trigger implementation. Omitted for backwards-compatible file-drop.
+    #[serde(default)]
+    pub kind: TriggerKind,
+    /// Watched directory. Default: the trigger's content-addressed spool.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// Extension filter (no dot), e.g. `json`.
+    #[serde(default)]
+    pub ext: Option<String>,
+    /// Registered recipe or `registry://plan@<name>` dispatched on fire.
+    pub plan: String,
+    /// Owning tenant. The daemon always forwards this exact identity to the
+    /// launched plan; restricted tenants therefore remain same-tenant/local.
+    #[serde(default = "default_trigger_tenant")]
+    pub tenant: String,
+    /// Explicit payload classification. A restricted tenant dominates this
+    /// value at custody checks.
+    #[serde(default = "default_data_class")]
+    pub data_class: DataClass,
+    /// HMAC credential reference for webhook ingress. No entry means this
+    /// trigger has no web ingress route, even if it watches a local spool.
+    #[serde(default)]
+    pub webhook_secret: Option<crate::secrets::SecretRef>,
+    /// Spool threshold metric/direction/value (`kind = "spool"`).
+    #[serde(default)]
+    pub spool_metric: Option<SpoolMetric>,
+    #[serde(default)]
+    pub spool_direction: Option<SpoolDirection>,
+    #[serde(default)]
+    pub threshold: Option<u64>,
+    /// Seven-field cron expression (`sec min hour day month weekday year`).
+    #[serde(default)]
+    pub schedule: Option<String>,
+    /// How long after a scheduled instant a daemon poll may still fire it.
+    #[serde(default)]
+    pub grace_secs: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TriggerKind {
+    #[default]
+    FileDrop,
+    Spool,
+    Cron,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpoolMetric {
+    Files,
+    Bytes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpoolDirection {
+    AtLeast,
+    AtMost,
+}
+
+fn default_trigger_tenant() -> String {
+    "default".to_string()
+}
+
+fn default_data_class() -> DataClass {
+    DataClass::Internal
+}
+
+/// Shared trigger configuration (`[[trigger]]` tables).
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TriggerConfig {
+    #[serde(default)]
+    pub trigger: Vec<TriggerBinding>,
+    /// Maximum accepted webhook clock skew in seconds.
+    #[serde(default = "default_webhook_max_skew_secs")]
+    pub webhook_max_skew_secs: u64,
+    /// How long sensord waits for the child recipe's exact broker-admission
+    /// acknowledgement before terminating it and leaving the event retryable.
+    #[serde(default = "default_admission_timeout_secs")]
+    pub admission_timeout_secs: u64,
+}
+
+impl Default for TriggerConfig {
+    fn default() -> Self {
+        Self {
+            trigger: Vec::new(),
+            webhook_max_skew_secs: default_webhook_max_skew_secs(),
+            admission_timeout_secs: default_admission_timeout_secs(),
+        }
+    }
+}
+
+const fn default_webhook_max_skew_secs() -> u64 {
+    300
+}
+
+const fn default_admission_timeout_secs() -> u64 {
+    60
+}
+
+impl TriggerConfig {
+    pub fn parse(text: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(text)
+    }
+
+    pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
+        let text = std::fs::read_to_string(path)?;
+        let config = Self::parse(&text).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("parse {}: {error}", path.display()),
+            )
+        })?;
+        config.validate().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("validate {}: {error}", path.display()),
+            )
+        })?;
+        Ok(config)
+    }
+
+    pub fn binding(&self, name: &str) -> Option<&TriggerBinding> {
+        self.trigger.iter().find(|binding| binding.name == name)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        use std::str::FromStr as _;
+
+        if self.webhook_max_skew_secs == 0 || self.webhook_max_skew_secs > 3600 {
+            return Err("webhook_max_skew_secs must be in 1..=3600".to_string());
+        }
+        if self.admission_timeout_secs == 0 || self.admission_timeout_secs > 3600 {
+            return Err("admission_timeout_secs must be in 1..=3600".to_string());
+        }
+        let mut names = HashSet::new();
+        for binding in &self.trigger {
+            if !safe_component(&binding.name) || !names.insert(binding.name.clone()) {
+                return Err(format!(
+                    "invalid or duplicate trigger name {:?}",
+                    binding.name
+                ));
+            }
+            if binding
+                .ext
+                .as_ref()
+                .is_some_and(|extension| !safe_component(extension))
+            {
+                return Err(format!("invalid extension for trigger {:?}", binding.name));
+            }
+            let tenant = crate::tenant::Tenant::parse(&binding.tenant).ok_or_else(|| {
+                format!(
+                    "invalid tenant {:?} for trigger {:?}",
+                    binding.tenant, binding.name
+                )
+            })?;
+            if tenant.is_restricted() && binding.data_class != DataClass::Restricted {
+                return Err(format!(
+                    "restricted trigger {:?} must declare data_class = \"Restricted\"",
+                    binding.name
+                ));
+            }
+            if let Some(secret) = &binding.webhook_secret {
+                secret.validate().map_err(|error| {
+                    format!("invalid webhook credential for {:?}: {error}", binding.name)
+                })?;
+            }
+            if crate::registry_db::parse_pointer_uri(&binding.plan).is_none()
+                && !safe_component(&binding.plan)
+            {
+                return Err(format!("invalid recipe/plan target {:?}", binding.plan));
+            }
+            if binding.webhook_secret.is_some()
+                && (binding.kind != TriggerKind::FileDrop
+                    || binding.ext.as_deref().is_some_and(|ext| ext != "json"))
+            {
+                return Err(format!(
+                    "webhook trigger {:?} must be file-drop with ext omitted or \"json\"",
+                    binding.name
+                ));
+            }
+            match binding.kind {
+                TriggerKind::FileDrop => {
+                    if binding.spool_metric.is_some()
+                        || binding.spool_direction.is_some()
+                        || binding.threshold.is_some()
+                        || binding.schedule.is_some()
+                        || binding.grace_secs.is_some()
+                    {
+                        return Err(format!(
+                            "file-drop trigger {:?} has fields for another kind",
+                            binding.name
+                        ));
+                    }
+                }
+                TriggerKind::Spool => {
+                    if binding.spool_metric.is_none()
+                        || binding.spool_direction.is_none()
+                        || binding.threshold.is_none()
+                        || binding.schedule.is_some()
+                        || binding.grace_secs.is_some()
+                    {
+                        return Err(format!(
+                            "spool trigger {:?} requires metric/direction/threshold only",
+                            binding.name
+                        ));
+                    }
+                }
+                TriggerKind::Cron => {
+                    if binding.dir.is_some()
+                        || binding.ext.is_some()
+                        || binding.spool_metric.is_some()
+                        || binding.spool_direction.is_some()
+                        || binding.threshold.is_some()
+                    {
+                        return Err(format!(
+                            "cron trigger {:?} has non-cron fields",
+                            binding.name
+                        ));
+                    }
+                    let expression = binding.schedule.as_ref().ok_or_else(|| {
+                        format!("cron trigger {:?} requires schedule", binding.name)
+                    })?;
+                    cron::Schedule::from_str(expression)
+                        .map_err(|error| format!("invalid cron for {:?}: {error}", binding.name))?;
+                    if !(1..=3600).contains(&binding.grace_secs.unwrap_or(1)) {
+                        return Err(format!(
+                            "cron trigger {:?} grace_secs must be in 1..=3600",
+                            binding.name
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn safe_component(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.starts_with('-')
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
 /// The launch callback an [`AdmissionDispatcher`] invokes only after the broker
 /// admits — spawns `blut recipe run <plan>` in production, records in a test.
 pub type LaunchFn = Box<dyn Fn(&str, &TriggerEvent) -> std::io::Result<()> + Send + Sync>;
@@ -56,10 +316,10 @@ fn event_id(parts: &[&str]) -> String {
 }
 
 /// Fire once per file present in a watched directory (optionally filtered by
-/// extension) — the file-drop / spool sensor. The event id folds path + size +
-/// mtime, so re-creating a file with new content (new mtime) re-fires while an
-/// unchanged file stays deduped. A missing directory is not an error — it is an
-/// empty observation (the spool simply has not been created yet).
+/// extension) — the file-drop sensor. The event id folds path + CONTENT hash,
+/// so rewriting the same bytes is a replay while genuinely new content fires.
+/// A missing directory is not an error — it is an empty observation (the spool
+/// simply has not been created yet).
 pub struct FileDropTrigger {
     name: String,
     dir: PathBuf,
@@ -95,6 +355,12 @@ impl Trigger for FileDropTrigger {
             if !p.is_file() {
                 continue;
             }
+            if p.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with('.'))
+            {
+                continue; // daemon control files are never user events
+            }
             if let Some(want) = &self.ext
                 && p.extension().and_then(|x| x.to_str()) != Some(want.as_str())
             {
@@ -104,21 +370,194 @@ impl Trigger for FileDropTrigger {
         }
         entries.sort(); // deterministic event order regardless of readdir order
         for p in entries {
-            let md = std::fs::metadata(&p)?;
-            let mtime = md
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
+            use sha2::{Digest as _, Sha256};
+            use std::io::Read as _;
+            let mut file = std::fs::File::open(&p)?;
+            let mut digest = Sha256::new();
+            let mut buf = [0_u8; 64 * 1024];
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                digest.update(&buf[..n]);
+            }
+            let content = faster_hex::hex_string(&digest.finalize());
             let path_s = p.to_string_lossy();
-            let id = event_id(&[&path_s, &md.len().to_string(), &mtime.to_string()]);
+            let id = event_id(&[&path_s, &content]);
             out.push(TriggerEvent {
                 id,
                 source: path_s.into_owned(),
             });
         }
         Ok(out)
+    }
+}
+
+/// Fire when a direct-child spool snapshot crosses a declared file-count or
+/// byte-size threshold. The event id includes the deterministic snapshot, so a
+/// stable over/under-threshold state fires once while a materially changed
+/// spool can fire again.
+pub struct SpoolThresholdTrigger {
+    name: String,
+    dir: PathBuf,
+    metric: SpoolMetric,
+    direction: SpoolDirection,
+    threshold: u64,
+}
+
+impl SpoolThresholdTrigger {
+    pub fn new(
+        name: impl Into<String>,
+        dir: impl Into<PathBuf>,
+        metric: SpoolMetric,
+        direction: SpoolDirection,
+        threshold: u64,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            dir: dir.into(),
+            metric,
+            direction,
+            threshold,
+        }
+    }
+}
+
+impl Trigger for SpoolThresholdTrigger {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn poll(&self) -> std::io::Result<Vec<TriggerEvent>> {
+        let entries = directory_snapshot(&self.dir)?;
+        let observed = match self.metric {
+            SpoolMetric::Files => entries.len() as u64,
+            SpoolMetric::Bytes => entries.iter().map(|(_, bytes, _)| *bytes).sum(),
+        };
+        let fired = match self.direction {
+            SpoolDirection::AtLeast => observed >= self.threshold,
+            SpoolDirection::AtMost => observed <= self.threshold,
+        };
+        if !fired {
+            return Ok(Vec::new());
+        }
+        let snapshot = serde_json::to_string(&entries).map_err(std::io::Error::other)?;
+        let id = event_id(&[
+            &self.dir.to_string_lossy(),
+            &format!("{:?}", self.metric),
+            &format!("{:?}", self.direction),
+            &self.threshold.to_string(),
+            &snapshot,
+        ]);
+        Ok(vec![TriggerEvent {
+            id,
+            source: format!(
+                "{} ({:?}={observed}, {:?} {})",
+                self.dir.display(),
+                self.metric,
+                self.direction,
+                self.threshold
+            ),
+        }])
+    }
+}
+
+fn directory_snapshot(dir: &std::path::Path) -> std::io::Result<Vec<(String, u64, u128)>> {
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut snapshot = Vec::new();
+    for entry in read_dir {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with('.'))
+        {
+            continue;
+        }
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|instant| instant.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        snapshot.push((
+            entry.file_name().to_string_lossy().into_owned(),
+            metadata.len(),
+            modified,
+        ));
+    }
+    snapshot.sort();
+    Ok(snapshot)
+}
+
+/// Fire on the most recent cron instant while it remains inside a bounded
+/// grace window. Re-polls produce the same scheduled-instant id and therefore
+/// dedupe; the next scheduled instant produces a new id.
+pub struct CronTrigger {
+    name: String,
+    expression: String,
+    schedule: cron::Schedule,
+    grace: chrono::Duration,
+}
+
+impl CronTrigger {
+    pub fn new(
+        name: impl Into<String>,
+        expression: impl Into<String>,
+        grace: std::time::Duration,
+    ) -> Result<Self, String> {
+        use std::str::FromStr as _;
+        let expression = expression.into();
+        let schedule = cron::Schedule::from_str(&expression).map_err(|error| error.to_string())?;
+        if grace > std::time::Duration::from_secs(3600) {
+            return Err("cron grace must be <= 3600 seconds".to_string());
+        }
+        let grace = chrono::Duration::from_std(grace).map_err(|error| error.to_string())?;
+        Ok(Self {
+            name: name.into(),
+            expression,
+            schedule,
+            grace,
+        })
+    }
+
+    fn poll_at(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<TriggerEvent> {
+        let start = now - self.grace - chrono::Duration::seconds(1);
+        let Some(scheduled) = self
+            .schedule
+            .after(&start)
+            .take_while(|instant| *instant <= now)
+            .last()
+        else {
+            return Vec::new();
+        };
+        if now.signed_duration_since(scheduled) > self.grace {
+            return Vec::new();
+        }
+        let scheduled_unix = scheduled.timestamp().to_string();
+        vec![TriggerEvent {
+            id: event_id(&[&self.expression, &scheduled_unix]),
+            source: format!("cron:{}@{}", self.name, scheduled.to_rfc3339()),
+        }]
+    }
+}
+
+impl Trigger for CronTrigger {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn poll(&self) -> std::io::Result<Vec<TriggerEvent>> {
+        Ok(self.poll_at(chrono::Utc::now()))
     }
 }
 
@@ -135,11 +574,28 @@ impl SeenStore {
     /// Load the seen-id set from `path` (absent ⇒ empty).
     pub fn load(path: impl Into<PathBuf>) -> std::io::Result<Self> {
         let path = path.into();
-        let seen = match std::fs::read_to_string(&path) {
+        let mut seen: HashSet<String> = match std::fs::read_to_string(&path) {
             Ok(text) => text.lines().map(str::to_string).collect(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
             Err(e) => return Err(e),
         };
+        // The launched CLI writes one durable marker only after exact plan
+        // admission succeeds. Recover those markers before polling so a daemon
+        // crash between child acknowledgement and `.seen` append cannot launch
+        // the same event twice.
+        let admitted_dir = admitted_dir_for(&path);
+        match std::fs::read_dir(&admitted_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let id = entry.file_name().to_string_lossy().into_owned();
+                    if is_event_id(&id) && entry.path().is_file() {
+                        seen.insert(id);
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         Ok(Self { path, seen })
     }
 
@@ -162,6 +618,95 @@ impl SeenStore {
             .append(true)
             .open(&self.path)?;
         writeln!(f, "{id}")
+    }
+
+    /// Durable child-admission marker for `id`. The path is deterministic so
+    /// restart recovery can reconcile it without any in-memory daemon state.
+    pub fn admission_ack_path(&self, id: &str) -> std::io::Result<PathBuf> {
+        if !is_event_id(id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid trigger event id",
+            ));
+        }
+        let dir = admitted_dir_for(&self.path);
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir.join(id))
+    }
+}
+
+fn admitted_dir_for(seen_path: &std::path::Path) -> PathBuf {
+    seen_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(".admitted")
+}
+
+fn is_event_id(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Private sensord↔recipe admission acknowledgement protocol. Sensord sets
+/// both variables in the dedicated child process; the recipe writes the marker
+/// only after its exact tenant reservation and scheduler lock are held.
+pub const ADMISSION_ACK_PATH_ENV: &str = "BLUT_TRIGGER_ADMISSION_ACK";
+pub const ADMISSION_EVENT_ID_ENV: &str = "BLUT_TRIGGER_EVENT_ID";
+
+/// Write the durable admission marker requested by sensord, if any. Returns
+/// `Ok(false)` for ordinary human/CLI launches where the protocol is absent.
+/// Both variables are required together and the path must be exactly
+/// `.admitted/<event-id>`; this is not a general arbitrary-file write hook.
+pub fn acknowledge_admission_from_env(job_id: &str) -> std::io::Result<bool> {
+    let path = std::env::var_os(ADMISSION_ACK_PATH_ENV).map(PathBuf::from);
+    let event_id = std::env::var(ADMISSION_EVENT_ID_ENV).ok();
+    match (path, event_id) {
+        (None, None) => Ok(false),
+        (Some(path), Some(event_id)) => {
+            let file_name_matches =
+                path.file_name().and_then(|name| name.to_str()) == Some(event_id.as_str());
+            let parent_matches = path.parent().and_then(|parent| parent.file_name())
+                == Some(std::ffi::OsStr::new(".admitted"));
+            let trigger_name = path
+                .parent()
+                .and_then(std::path::Path::parent)
+                .and_then(std::path::Path::file_name)
+                .and_then(std::ffi::OsStr::to_str);
+            let expected_path = trigger_name
+                .filter(|name| safe_component(name))
+                .map(|name| spool_dir(name).join(".admitted").join(&event_id));
+            if !is_event_id(&event_id)
+                || !file_name_matches
+                || !parent_matches
+                || expected_path.as_deref() != Some(path.as_path())
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid sensord admission acknowledgement path",
+                ));
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            use std::io::Write as _;
+            let mut file = options.open(path)?;
+            writeln!(file, "{job_id}")?;
+            file.sync_all()?;
+            Ok(true)
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "incomplete sensord admission acknowledgement environment",
+        )),
     }
 }
 
@@ -220,6 +765,26 @@ pub struct AdmissionDispatcher {
     /// Called ONLY after admission returns `Admit`. Real impl spawns the CLI;
     /// returns Ok on a successful launch.
     pub launch: LaunchFn,
+}
+
+/// Production sensord dispatcher. Its launch callback does not return until
+/// the child recipe has acquired its exact tenant reservation and scheduler
+/// lock and written the durable admission marker. Consequently `Admitted`
+/// means the normal recipe broker path admitted the real compiled plan, not a
+/// guessed daemon-side footprint.
+pub struct ChildAdmissionDispatcher {
+    pub launch: LaunchFn,
+}
+
+impl Dispatcher for ChildAdmissionDispatcher {
+    fn dispatch(&self, plan: &str, event: &TriggerEvent) -> DispatchOutcome {
+        match (self.launch)(plan, event) {
+            Ok(()) => DispatchOutcome::Admitted,
+            Err(error) => {
+                DispatchOutcome::Refused(format!("child admission/launch failed: {error}"))
+            }
+        }
+    }
 }
 
 impl Dispatcher for AdmissionDispatcher {
@@ -299,6 +864,13 @@ mod tests {
         let r2 = drive_once(&trig, "plan", &mut seen, &disp).unwrap();
         assert!(r2.is_empty());
         assert_eq!(*disp.calls.borrow(), 1);
+
+        // A webhook replay may rewrite/touch its spool path. Dedupe is based
+        // on content, not mutable mtime, so identical bytes remain one event.
+        touch(&watch.join("a.json"), "{}");
+        let r3 = drive_once(&trig, "plan", &mut seen, &disp).unwrap();
+        assert!(r3.is_empty());
+        assert_eq!(*disp.calls.borrow(), 1);
     }
 
     #[test]
@@ -334,6 +906,85 @@ mod tests {
     }
 
     #[test]
+    fn admission_ack_recovers_crash_window() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("spool").join(".seen");
+        let s = SeenStore::load(&p).unwrap();
+        let id = "a".repeat(64);
+        let ack = s.admission_ack_path(&id).unwrap();
+        std::fs::write(ack, "job-1\n").unwrap();
+
+        let recovered = SeenStore::load(&p).unwrap();
+        assert!(recovered.contains(&id));
+    }
+
+    #[test]
+    fn admission_ack_path_is_not_an_arbitrary_write_primitive() {
+        let td = tempfile::tempdir().unwrap();
+        let id = "b".repeat(64);
+        // SAFETY (unit test): cargo runs this module's environment-mutating
+        // test without any production sensord child in the same process.
+        unsafe {
+            std::env::set_var(ADMISSION_EVENT_ID_ENV, &id);
+            std::env::set_var(ADMISSION_ACK_PATH_ENV, td.path().join("outside"));
+        }
+        assert!(acknowledge_admission_from_env("job-1").is_err());
+        assert!(!td.path().join("outside").exists());
+        let outside = td.path().join("outside").join(".admitted").join(&id);
+        unsafe {
+            std::env::set_var("BLUT_EVENTS_DIR", td.path().join("events"));
+            std::env::set_var(ADMISSION_ACK_PATH_ENV, &outside);
+        }
+        assert!(acknowledge_admission_from_env("job-1").is_err());
+        assert!(!outside.exists());
+        unsafe {
+            std::env::remove_var("BLUT_EVENTS_DIR");
+            std::env::remove_var(ADMISSION_EVENT_ID_ENV);
+            std::env::remove_var(ADMISSION_ACK_PATH_ENV);
+        }
+    }
+
+    #[test]
+    fn shared_config_carries_webhook_custody() {
+        let cfg = TriggerConfig::parse(
+            r#"
+webhook_max_skew_secs = 45
+
+[[trigger]]
+name = "clinical-hook"
+plan = "registry://plan@prod"
+tenant = "clinical/prod"
+data_class = "Restricted"
+webhook_secret = { name = "BLUT_HOOK_KEY" }
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let binding = cfg.binding("clinical-hook").unwrap();
+        assert_eq!(binding.tenant, "clinical/prod");
+        assert_eq!(binding.data_class, DataClass::Restricted);
+        assert_eq!(
+            binding.webhook_secret.as_ref().unwrap().name,
+            "BLUT_HOOK_KEY"
+        );
+        assert_eq!(cfg.webhook_max_skew_secs, 45);
+        assert_eq!(cfg.admission_timeout_secs, 60);
+    }
+
+    #[test]
+    fn trigger_names_cannot_escape_the_event_root() {
+        let cfg = TriggerConfig::parse(
+            r#"
+[[trigger]]
+name = ".."
+plan = "demo"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn extension_filter_excludes_nonmatching() {
         let td = tempfile::tempdir().unwrap();
         touch(&td.path().join("keep.json"), "{}");
@@ -349,5 +1000,49 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let trig = FileDropTrigger::new("t", td.path().join("nope"), None);
         assert!(trig.poll().unwrap().is_empty());
+    }
+
+    #[test]
+    fn spool_threshold_refires_only_after_snapshot_changes() {
+        let td = tempfile::tempdir().unwrap();
+        let trigger = SpoolThresholdTrigger::new(
+            "queue-full",
+            td.path(),
+            SpoolMetric::Files,
+            SpoolDirection::AtLeast,
+            2,
+        );
+        touch(&td.path().join("a"), "1");
+        assert!(trigger.poll().unwrap().is_empty());
+        touch(&td.path().join("b"), "2");
+        let first = trigger.poll().unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(trigger.poll().unwrap()[0].id, first[0].id);
+        touch(&td.path().join("c"), "3");
+        assert_ne!(trigger.poll().unwrap()[0].id, first[0].id);
+    }
+
+    #[test]
+    fn cron_uses_scheduled_instant_as_stable_event_identity() {
+        use chrono::TimeZone as _;
+        let trigger = CronTrigger::new(
+            "minute",
+            "0 * * * * * *",
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 7, 20, 12, 34, 5)
+            .unwrap();
+        let first = trigger.poll_at(now);
+        assert_eq!(first.len(), 1);
+        assert_eq!(trigger.poll_at(now)[0].id, first[0].id);
+        let next = trigger.poll_at(now + chrono::Duration::minutes(1));
+        assert_ne!(next[0].id, first[0].id);
+        assert!(
+            trigger
+                .poll_at(now + chrono::Duration::seconds(11))
+                .is_empty()
+        );
     }
 }

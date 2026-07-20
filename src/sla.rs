@@ -54,6 +54,15 @@ pub struct RunObservation {
     pub data_age_secs: Option<i64>,
 }
 
+/// One complete SLA evaluation pass, shared by `blut sla check` and sensord.
+#[derive(Clone, Debug)]
+pub struct SlaCheckReport {
+    pub rule_count: usize,
+    pub run_count: usize,
+    pub breaches: Vec<SlaBreach>,
+    pub new_rows: usize,
+}
+
 fn breach(
     rule: &SlaRule,
     kind: SlaKind,
@@ -122,10 +131,70 @@ pub fn evaluate(rules: &[SlaRule], runs: &[RunObservation], now: i64) -> Vec<Sla
     out
 }
 
+/// Freshness rules are fail-closed: every matching run must carry a measured
+/// artifact timestamp. Returning an error is preferable to a false-clean SLA
+/// report when provenance is incomplete.
+pub fn require_freshness_measurements(
+    rules: &[SlaRule],
+    runs: &[RunObservation],
+) -> Result<(), String> {
+    for observation in runs {
+        for rule in rules {
+            if rule.freshness_secs.is_none()
+                || rule
+                    .recipe
+                    .as_ref()
+                    .is_some_and(|recipe| recipe != &observation.recipe)
+            {
+                continue;
+            }
+            if observation.data_age_secs.is_none() {
+                return Err(format!(
+                    "freshness rule '{}' is unmeasured for job '{}' (lineage has no produced_unix artifact)",
+                    rule.name, observation.job_id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Append breaches to `sla.jsonl` (one JSON line each, `O_APPEND`). Returns the
 /// number of rows written. Creates the parent dir on demand.
 pub fn append_breaches(path: &std::path::Path, breaches: &[SlaBreach]) -> std::io::Result<usize> {
     if breaches.is_empty() {
+        return Ok(0);
+    }
+    let mut existing = std::collections::HashSet::new();
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            for breach in text
+                .lines()
+                .filter_map(|line| SlaBreach::from_line(line).ok())
+            {
+                existing.insert((
+                    breach.rule,
+                    breach.kind.as_str().to_string(),
+                    breach.job_id,
+                    breach.limit_secs,
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let new: Vec<&SlaBreach> = breaches
+        .iter()
+        .filter(|breach| {
+            existing.insert((
+                breach.rule.clone(),
+                breach.kind.as_str().to_string(),
+                breach.job_id.clone(),
+                breach.limit_secs,
+            ))
+        })
+        .collect();
+    if new.is_empty() {
         return Ok(0);
     }
     if let Some(dir) = path.parent() {
@@ -136,10 +205,10 @@ pub fn append_breaches(path: &std::path::Path, breaches: &[SlaBreach]) -> std::i
         .create(true)
         .append(true)
         .open(path)?;
-    for b in breaches {
+    for b in &new {
         writeln!(f, "{}", b.to_line())?;
     }
-    Ok(breaches.len())
+    Ok(new.len())
 }
 
 /// A `sla.toml` rule file: `[[rule]]` tables → [`SlaRule`]s.
@@ -163,14 +232,95 @@ pub fn load_rules(path: &std::path::Path) -> std::io::Result<Vec<SlaRule>> {
             format!("parse {path:?}: {e}"),
         )
     })?;
+    validate_rules(&parsed.rule).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("validate {path:?}: {error}"),
+        )
+    })?;
     Ok(parsed.rule)
+}
+
+fn validate_rules(rules: &[SlaRule]) -> Result<(), String> {
+    let mut names = std::collections::HashSet::new();
+    for rule in rules {
+        let safe_name = !rule.name.is_empty()
+            && rule
+                .name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'));
+        if !safe_name || !names.insert(rule.name.clone()) {
+            return Err(format!(
+                "invalid or duplicate SLA rule name {:?}",
+                rule.name
+            ));
+        }
+        if rule.recipe.as_ref().is_some_and(|recipe| {
+            recipe.is_empty()
+                || recipe.starts_with('-')
+                || !recipe
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        }) {
+            return Err(format!("invalid recipe scope in SLA rule {:?}", rule.name));
+        }
+        if rule.max_runtime_secs.is_none()
+            && rule.deadline_unix.is_none()
+            && rule.freshness_secs.is_none()
+        {
+            return Err(format!("SLA rule {:?} declares no bounds", rule.name));
+        }
+        if rule.max_runtime_secs.is_some_and(|value| value <= 0)
+            || rule.deadline_unix.is_some_and(|value| value <= 0)
+            || rule.freshness_secs.is_some_and(|value| value <= 0)
+        {
+            return Err(format!("SLA rule {:?} bounds must be positive", rule.name));
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate the configured rules over live lineage and append new breach rows.
+/// This is the single implementation used by the CLI and long-running daemon.
+pub fn check_paths(
+    rules_path: &std::path::Path,
+    out_path: &std::path::Path,
+) -> crate::error::Result<SlaCheckReport> {
+    let rules = load_rules(rules_path)?;
+    if rules.is_empty() {
+        return Ok(SlaCheckReport {
+            rule_count: 0,
+            run_count: 0,
+            breaches: Vec::new(),
+            new_rows: 0,
+        });
+    }
+    let db = crate::lineage_db::LineageDb::open()?;
+    let now = now_unix();
+    let source_runs = db.all_runs()?;
+    let mut observations = Vec::new();
+    for run in &source_runs {
+        if let Some(observation) = observation_from_run_with_db(&db, run, now)? {
+            observations.push(observation);
+        }
+    }
+    require_freshness_measurements(&rules, &observations)
+        .map_err(crate::error::TrainError::other)?;
+    let breaches = evaluate(&rules, &observations, now);
+    let new_rows = append_breaches(out_path, &breaches)?;
+    Ok(SlaCheckReport {
+        rule_count: rules.len(),
+        run_count: observations.len(),
+        breaches,
+        new_rows,
+    })
 }
 
 /// Build a [`RunObservation`] from a lineage run row (`None` if the run has no
 /// start time — SLA timing is undefined without it, never a false breach). The
 /// data class is derived from the tenant: a `restricted` tenant ⇒ `Restricted`,
-/// else `Internal`. Freshness input is left `None` (deferred — it needs
-/// per-artifact timestamps).
+/// else `Internal`. The DB-aware wrapper below supplies the measured artifact
+/// freshness; this pure base leaves it unmeasured.
 pub fn observation_from_run(run: &crate::lineage_db::RunRow) -> Option<RunObservation> {
     let started = run.started_unix?;
     let tenant = if run.tenant.is_empty() {
@@ -192,6 +342,21 @@ pub fn observation_from_run(run: &crate::lineage_db::RunRow) -> Option<RunObserv
         ended_unix: run.ended_unix,
         data_age_secs: None,
     })
+}
+
+/// Build a run observation with a measured lineage freshness age.
+pub fn observation_from_run_with_db(
+    db: &crate::lineage_db::LineageDb,
+    run: &crate::lineage_db::RunRow,
+    now: i64,
+) -> crate::error::Result<Option<RunObservation>> {
+    let Some(mut observation) = observation_from_run(run) else {
+        return Ok(None);
+    };
+    observation.data_age_secs = db
+        .freshest_artifact_unix(&run.job_id)?
+        .map(|produced| now.saturating_sub(produced).max(0));
+    Ok(Some(observation))
 }
 
 /// Current wall-clock unix seconds (SLA evaluation's `now`).
@@ -315,5 +480,60 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 1);
         assert!(SlaBreach::from_line(text.lines().next().unwrap()).is_ok());
+        assert_eq!(append_breaches(&path, &breaches).unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 1);
+
+        let duplicate_batch = vec![breaches[0].clone(), breaches[0].clone()];
+        let second_path = td.path().join("duplicate.jsonl");
+        assert_eq!(append_breaches(&second_path, &duplicate_batch).unwrap(), 1);
+        assert_eq!(
+            std::fs::read_to_string(second_path)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn configured_freshness_is_fail_closed_when_unmeasured() {
+        let rules = vec![SlaRule {
+            name: "fresh".into(),
+            recipe: None,
+            max_runtime_secs: None,
+            deadline_unix: None,
+            freshness_secs: Some(60),
+        }];
+        let runs = vec![obs("train", "shared", DataClass::Internal, 0, Some(10))];
+        assert!(require_freshness_measurements(&rules, &runs).is_err());
+
+        let mut measured = runs[0].clone();
+        measured.data_age_secs = Some(30);
+        require_freshness_measurements(&rules, &[measured]).unwrap();
+    }
+
+    #[test]
+    fn rule_validation_rejects_ambiguous_or_nonpositive_contracts() {
+        let invalid = SlaRule {
+            name: "duplicate".into(),
+            recipe: None,
+            max_runtime_secs: Some(0),
+            deadline_unix: None,
+            freshness_secs: None,
+        };
+        assert!(validate_rules(std::slice::from_ref(&invalid)).is_err());
+        let mut valid = invalid;
+        valid.max_runtime_secs = Some(1);
+        assert!(validate_rules(&[valid.clone(), valid]).is_err());
+    }
+
+    #[test]
+    fn absent_rule_file_is_a_side_effect_free_noop() {
+        let td = tempfile::tempdir().unwrap();
+        let output = td.path().join("sla.jsonl");
+        let report = check_paths(&td.path().join("missing.toml"), &output).unwrap();
+        assert_eq!(report.rule_count, 0);
+        assert_eq!(report.run_count, 0);
+        assert!(!output.exists());
     }
 }

@@ -7,6 +7,10 @@
 //! Restricted tenants or payload classifications may be handled locally, never
 //! emitted off the owning box.
 
+pub mod config;
+pub mod sinks;
+pub mod tailer;
+
 use blut_types::sla::SlaBreach;
 use blut_types::tenant::Tenant;
 use blut_types::trust::{DataClass, custody_allows_off_box};
@@ -72,7 +76,7 @@ pub trait NotifySink {
 /// sees the envelope, so a refused payload cannot leak through sink logging,
 /// retries, or serialization.
 pub fn deliver(
-    sink: &mut impl NotifySink,
+    sink: &mut dyn NotifySink,
     envelope: &NotificationEnvelope,
 ) -> Result<(), NotifyError> {
     if sink.boundary() == SinkBoundary::OffBox
@@ -121,7 +125,7 @@ pub fn read_breaches(path: &std::path::Path) -> std::io::Result<Vec<SlaBreach>> 
 /// breach to an off-box sink is dropped, fail-closed, and counted as 0). Errors
 /// other than a custody refusal (a sink failure) propagate.
 pub fn notify_breaches(
-    sink: &mut impl NotifySink,
+    sink: &mut dyn NotifySink,
     breaches: &[SlaBreach],
 ) -> Result<usize, NotifyError> {
     let mut delivered = 0;

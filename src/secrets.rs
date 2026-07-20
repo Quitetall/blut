@@ -23,36 +23,7 @@
 //! `~/.blut/secrets.age` vault + `blut secret {set,ls,rm}` are the deliverable
 //! upgrade behind a `secrets` crypto feature.
 
-use serde::{Deserialize, Serialize};
-
-/// A reference to a secret by NAME. Carries NO value — that is the whole point:
-/// it serialises to `{name, restricted}` into every provenance surface, so the
-/// plaintext can never leak through the spec/cache/lineage. A `restricted` ref
-/// (ADR 0061) resolves only inside a local engine process.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct SecretRef {
-    /// The credential name (the env var / vault key). Visible in provenance.
-    pub name: String,
-    /// Clinical/PHI-locked: never resolves across a dispatch/mesh/sidecar
-    /// boundary (ADR 0061/0096).
-    #[serde(default)]
-    pub restricted: bool,
-}
-
-impl SecretRef {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            restricted: false,
-        }
-    }
-    pub fn restricted(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            restricted: true,
-        }
-    }
-}
+pub use blut_types::secrets::SecretRef;
 
 /// A resolved plaintext secret — held ONLY in-process (as raw bytes so it can be
 /// zeroised without `unsafe`), zeroised on drop, and redacting in `Debug` so it

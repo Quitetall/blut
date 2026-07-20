@@ -12,6 +12,7 @@ on:
       - "book_src/**"
       - "README.md"
       - "API.md"
+      - "EVENTING.md"
       - "RELEASING.md"
       - "CONTRIBUTING.md"
       - "SECURITY.md"

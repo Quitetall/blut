@@ -70,6 +70,7 @@ pub mod schedule;
 pub mod scheduler_lock;
 pub mod secrets;
 pub mod sensor;
+pub mod sensord;
 pub mod sla;
 pub mod spec;
 pub mod tenant;

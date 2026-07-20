@@ -101,7 +101,12 @@ per capability is tracked in the
 | **DDP multi-node** | `MASTER_ADDR`/`MASTER_PORT`/`NODE_RANK` → torchrun rendezvous (multi-node NCCL run still pending hardware) |
 | **Multi-GPU discovery** | Per-GPU VRAM via nvidia-smi + rocm-smi |
 | **DAG optimizer** | Dead code elimination, critical path scheduling, cache/memory-aware ordering |
-| **Notify sidecar** | `crates/blut-notify`: stdin envelope → custody gate → sink; Restricted is node-local |
+| **Event daemon** | `blut sensord`: file-drop, spool-threshold, and cron triggers → durable dedupe → exact recipe admission acknowledgement |
+| **Webhook ingress** | `blut-web`: HMAC-SHA256 signed, timestamp-bounded, content-addressed replay-safe events; Restricted stays local |
+| **Notify sidecar** | `crates/blut-notify`: durable status/SLA tail → declarative rules → Slack, Discord, ntfy, SMTP, or exec; Restricted is node-local |
+
+See [Eventing, SLA, and notifications](EVENTING.md) for the shared trigger file,
+webhook signing contract, SLA rules, notification sinks, and restart semantics.
 
 ## Scaling ladder
 

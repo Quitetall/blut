@@ -84,3 +84,55 @@ fn sla_breach_writes_a_row_and_notifies_once_redacted() {
     assert_eq!(delivered_off, 0, "a restricted breach never leaves the box");
     assert!(offbox.seen.is_empty(), "off-box sink saw no payload");
 }
+
+#[test]
+fn notifier_daemon_tails_sla_rule_once_into_exec_sink() {
+    let td = tempfile::tempdir().unwrap();
+    let sla_path = td.path().join("sla.jsonl");
+    let output = td.path().join("delivered.jsonl");
+    let breach = SlaBreach {
+        rule: "cap".into(),
+        kind: SlaKind::MaxRuntime,
+        job_id: "job-1".into(),
+        tenant: "shared".into(),
+        data_class: DataClass::Internal,
+        observed_secs: 20,
+        limit_secs: 10,
+        summary: "max_runtime breach on job job-1: 20s vs limit 10s".into(),
+        detected_unix: 100,
+    };
+    std::fs::write(&sla_path, format!("{}\n", breach.to_line())).unwrap();
+    let config = blut_notify::config::NotifyConfig::parse(&format!(
+        r#"
+[[sink]]
+name = "local"
+kind = "exec"
+program = "/bin/sh"
+args = ["-c", "cat >> {}"]
+
+[[rule]]
+name = "sla-cap"
+source = "sla"
+field = "rule"
+equals = "cap"
+sinks = ["local"]
+"#,
+        output.display()
+    ))
+    .unwrap();
+    let mut notifier =
+        blut_notify::tailer::Notifier::open(config, td.path().join("cursor.json")).unwrap();
+    let first = notifier
+        .run_once(&td.path().join("jobs"), &sla_path)
+        .unwrap();
+    assert_eq!(first.delivered, 1);
+    let delivered = std::fs::read_to_string(&output).unwrap();
+    assert_eq!(delivered.lines().count(), 1);
+    assert!(delivered.contains("sla-cap"));
+
+    let second = notifier
+        .run_once(&td.path().join("jobs"), &sla_path)
+        .unwrap();
+    assert_eq!(second.delivered, 0, "durable cursor prevents a duplicate");
+    assert_eq!(std::fs::read_to_string(output).unwrap().lines().count(), 1);
+}

@@ -13,7 +13,8 @@ use blut::broker::Footprint;
 use blut::broker::GIB;
 use blut::broker::probe::{GpuInfo, ResourceSnapshot};
 use blut::trigger::{
-    AdmissionDispatcher, DispatchOutcome, FileDropTrigger, SeenStore, TriggerEvent, drive_once,
+    AdmissionDispatcher, DispatchOutcome, FileDropTrigger, SeenStore, SpoolDirection, SpoolMetric,
+    SpoolThresholdTrigger, Trigger, TriggerEvent, drive_once,
 };
 
 fn snapshot(mem_total_gb: f64, mem_avail_gb: f64) -> ResourceSnapshot {
@@ -24,6 +25,24 @@ fn snapshot(mem_total_gb: f64, mem_avail_gb: f64) -> ResourceSnapshot {
         vram_free_mib: None,
         gpus: Vec::<GpuInfo>::new(),
     }
+}
+
+#[test]
+fn spool_threshold_has_stable_snapshot_events() {
+    let td = tempfile::tempdir().unwrap();
+    let trigger = SpoolThresholdTrigger::new(
+        "full",
+        td.path(),
+        SpoolMetric::Files,
+        SpoolDirection::AtLeast,
+        2,
+    );
+    std::fs::write(td.path().join("one"), "1").unwrap();
+    assert!(trigger.poll().unwrap().is_empty());
+    std::fs::write(td.path().join("two"), "2").unwrap();
+    let first = trigger.poll().unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(trigger.poll().unwrap()[0].id, first[0].id);
 }
 
 fn dispatcher(snap: ResourceSnapshot, counter: Arc<AtomicUsize>) -> AdmissionDispatcher {

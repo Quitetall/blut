@@ -123,7 +123,10 @@ pub fn write_tenant(job_id: &str, tenant: &Tenant) -> Result<()> {
 /// belong to the flat `default` namespace. A present but invalid marker is
 /// refused fail-closed; it is never silently coerced to default.
 pub fn read_tenant(job_id: &str) -> Result<Tenant> {
-    let path = paths::job_dir(job_id)?.join("tenant");
+    // Read paths must never materialize job state. In particular, the web
+    // export sidecar calls this before serving status; using `job_dir()` here
+    // used to turn a GET for an unknown id into an empty on-disk job.
+    let path = paths::jobs_dir()?.join(job_id).join("tenant");
     let body = match std::fs::read_to_string(&path) {
         Ok(body) => body,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Tenant::default()),

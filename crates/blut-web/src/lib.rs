@@ -67,6 +67,9 @@ pub struct AppState {
     pub cli: PathBuf,
     /// The ADR-0095 `audit.jsonl` every mutation is enforced against.
     pub audit_path: PathBuf,
+    /// Shared ADR-0094 trigger configuration. A webhook route is closed unless
+    /// its trigger has an explicit `webhook_secret` reference here.
+    pub triggers: Arc<blut::trigger::TriggerConfig>,
 }
 
 /// The principal the token middleware resolved for this request (`None` =
@@ -142,9 +145,35 @@ async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true, "service": "blut-web" }))
 }
 
+fn exportable_job_dir(id: &str) -> Result<PathBuf, Box<Response>> {
+    if !valid_name(id) {
+        return Err(Box::new(err(StatusCode::BAD_REQUEST, "invalid job id")));
+    }
+    let dir = blut::paths::jobs_dir()
+        .map_err(|error| Box::new(err(StatusCode::INTERNAL_SERVER_ERROR, error)))?
+        .join(id);
+    if !dir.is_dir() {
+        return Err(Box::new(err(StatusCode::NOT_FOUND, "no such job")));
+    }
+    let tenant = blut::jobs::read_tenant(id)
+        .map_err(|_| Box::new(err(StatusCode::NOT_FOUND, "job is not exportable")))?;
+    if tenant.is_restricted() {
+        return Err(Box::new(err(
+            StatusCode::NOT_FOUND,
+            "job is not exportable",
+        )));
+    }
+    Ok(dir)
+}
+
 async fn jobs() -> Response {
     match blut::jobs::list_jobs() {
-        Ok(list) => Json(list).into_response(),
+        Ok(mut list) => {
+            // Fail closed: malformed custody metadata and restricted tenants
+            // are absent from the export rather than partially disclosed.
+            list.retain(|job| exportable_job_dir(&job.id).is_ok());
+            Json(list).into_response()
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
@@ -155,16 +184,9 @@ struct TailQuery {
 }
 
 async fn job_status(AxPath(id): AxPath<String>, Query(q): Query<TailQuery>) -> Response {
-    // The job id is a generated identifier — refuse anything path-ish.
-    if !id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return err(StatusCode::BAD_REQUEST, "invalid job id");
-    }
-    let dir = match blut::paths::job_dir(&id) {
+    let dir = match exportable_job_dir(&id) {
         Ok(d) => d,
-        Err(e) => return err(StatusCode::NOT_FOUND, e),
+        Err(response) => return *response,
     };
     let path = dir.join("status.jsonl");
     let text = match std::fs::read_to_string(&path) {
@@ -187,14 +209,14 @@ async fn job_status(AxPath(id): AxPath<String>, Query(q): Query<TailQuery>) -> R
 /// `text/event-stream` `data:` frames. Purely a reader — it opens no write path
 /// into the engine; the client dropping the connection drops the stream.
 async fn job_events(AxPath(id): AxPath<String>) -> Response {
-    if !valid_name(&id) {
-        return err(StatusCode::BAD_REQUEST, "invalid job id");
-    }
-    let dir = match blut::paths::job_dir(&id) {
+    let dir = match exportable_job_dir(&id) {
         Ok(d) => d,
-        Err(e) => return err(StatusCode::NOT_FOUND, e),
+        Err(response) => return *response,
     };
     let path = dir.join("status.jsonl");
+    if !path.is_file() {
+        return err(StatusCode::NOT_FOUND, "no status stream for job");
+    }
     let stream = async_stream::stream! {
         // Track by line COUNT (not byte offset): the writer appends whole JSON
         // lines, so `lines()` on a re-read never yields a partial record, and a
@@ -311,42 +333,181 @@ async fn model_pointer(AxPath((name, alias)): AxPath<(String, String)>) -> Respo
 
 // ── webhook ingress (ADR 0094) ─────────────────────────────────────
 
-/// `POST /api/events/{trigger}` — the webhook ingress. Writes the posted JSON
-/// body as one event file into the trigger's spool (`~/.blut/events/<trigger>`),
-/// which `blut sensord` watches. HTTP→filesystem keeps push triggers out of the
-/// engine (ADR 0034): this sidecar is the only listener; the daemon stays a pure
-/// file reader. Auth is the token middleware (a mutation-adjacent write); the
-/// daemon still routes the eventual launch through broker admission + rbac.
-async fn webhook_event(AxPath(trigger): AxPath<String>, body: axum::body::Bytes) -> Response {
-    if !valid_name(&trigger) {
+/// `POST /api/events/{trigger}` — signed, replay-safe webhook ingress. The HMAC
+/// covers `<unix-seconds>.<raw-body>` and arrives as
+/// `X-Blut-Signature: sha256=<hex>` plus `X-Blut-Timestamp`. The trigger's key
+/// is a `SecretRef` in the same configuration sensord consumes.
+async fn webhook_event(
+    State(state): State<AppState>,
+    AxPath(trigger): AxPath<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if !blut::trigger::safe_component(&trigger) {
         return err(StatusCode::BAD_REQUEST, "invalid trigger name");
     }
     // The body must be a JSON object (a well-formed event), bounded in size by
     // axum's default request-body limit.
     let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&body);
-    match parsed {
-        Ok(v) if v.is_object() => {}
+    let payload = match parsed {
+        Ok(v) if v.is_object() => v,
         _ => return err(StatusCode::BAD_REQUEST, "event body must be a JSON object"),
+    };
+    let Some(binding) = state.triggers.binding(&trigger) else {
+        return err(StatusCode::NOT_FOUND, "webhook trigger is not configured");
+    };
+    let Some(secret_ref) = binding.webhook_secret.as_ref() else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "webhook ingress is disabled for trigger",
+        );
+    };
+    let Some(tenant) = blut::tenant::Tenant::parse(&binding.tenant) else {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid trigger custody configuration",
+        );
+    };
+    if tenant.is_restricted() && binding.data_class != blut_types::trust::DataClass::Restricted {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "restricted trigger must be classified Restricted",
+        );
     }
-    let dir = blut::trigger::spool_dir(&trigger);
+
+    let timestamp = match headers
+        .get("x-blut-timestamp")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+    {
+        Some(value) => value,
+        None => {
+            return err(
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid webhook timestamp",
+            );
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    if now.abs_diff(timestamp) > state.triggers.webhook_max_skew_secs {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "webhook timestamp is outside the replay window",
+        );
+    }
+    let presented_hex = match headers
+        .get("x-blut-signature")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("sha256="))
+    {
+        Some(value) if value.len() == 64 => value,
+        _ => {
+            return err(
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid webhook signature",
+            );
+        }
+    };
+    let mut presented = [0_u8; 32];
+    if faster_hex::hex_decode(presented_hex.as_bytes(), &mut presented).is_err() {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid webhook signature",
+        );
+    }
+    use blut::secrets::{EnvResolver, ResolveCtx, SecretResolver as _};
+    let secret = match EnvResolver.resolve(secret_ref, ResolveCtx::remote()) {
+        Ok(secret) => secret,
+        Err(_) => return err(StatusCode::UNAUTHORIZED, "webhook credential unavailable"),
+    };
+    use hmac::{Hmac, Mac as _};
+    let mut mac = match Hmac::<sha2::Sha256>::new_from_slice(secret.expose().as_bytes()) {
+        Ok(mac) => mac,
+        Err(_) => return err(StatusCode::UNAUTHORIZED, "webhook credential unavailable"),
+    };
+    mac.update(timestamp.to_string().as_bytes());
+    mac.update(b".");
+    mac.update(&body);
+    if mac.verify_slice(&presented).is_err() {
+        return err(StatusCode::UNAUTHORIZED, "webhook signature mismatch");
+    }
+
+    let dir = binding
+        .dir
+        .clone()
+        .unwrap_or_else(|| blut::trigger::spool_dir(&trigger));
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
-    // Content-address the event file so an identical replay lands on the same
-    // name (the daemon's dedupe also folds mtime, so a true replay is a no-op).
+    #[cfg(unix)]
+    if let Err(error) = std::fs::set_permissions(
+        &dir,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    ) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error);
+    }
+    // Content-address the accepted event identity so an identical replay for
+    // this exact custody binding lands on the same name. Domain separation
+    // prevents two triggers sharing a custom spool directory from colliding.
     let digest = {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
-        h.update(&body);
+        h.update(b"blut.webhook.event.v1");
+        let data_class = format!("{:?}", binding.data_class);
+        for part in [
+            trigger.as_bytes(),
+            binding.tenant.as_bytes(),
+            data_class.as_bytes(),
+            body.as_ref(),
+        ] {
+            h.update((part.len() as u64).to_le_bytes());
+            h.update(part);
+        }
         faster_hex::hex_string(&h.finalize())
     };
-    let file = dir.join(format!("{}.json", &digest[..32.min(digest.len())]));
-    if let Err(e) = std::fs::write(&file, &body) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e);
+    let file = dir.join(format!("{digest}.json"));
+    let event = serde_json::json!({
+        "trigger": trigger,
+        "tenant": tenant,
+        "data_class": binding.data_class,
+        "signed_unix": timestamp,
+        "received_unix": now,
+        "payload": payload,
+    });
+    let encoded = match serde_json::to_vec(&event) {
+        Ok(encoded) => encoded,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
     }
+    let replayed = match options.open(&file) {
+        Ok(mut output) => {
+            use std::io::Write as _;
+            if let Err(error) = output.write_all(&encoded).and_then(|()| output.sync_all()) {
+                let _ = std::fs::remove_file(&file);
+                return err(StatusCode::INTERNAL_SERVER_ERROR, error);
+            }
+            false
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => true,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
     (
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "spooled": true, "trigger": trigger, "event": file })),
+        Json(serde_json::json!({
+            "spooled": !replayed,
+            "replayed": replayed,
+            "trigger": trigger,
+            "event": digest,
+        })),
     )
         .into_response()
 }
@@ -528,6 +689,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/jobs/{id}/events", get(job_events))
         .route("/api/jobs/{id}/cancel", post(cancel_job))
         .route("/api/events/{trigger}", post(webhook_event))
+        .route("/events/{trigger}", post(webhook_event))
         .route("/api/lineage/graph/{hash}", get(lineage_graph))
         .route("/api/lineage/card/{hash}", get(lineage_card))
         .route("/api/lineage/diff/{a}/{b}", get(lineage_diff))
@@ -554,6 +716,7 @@ mod tests {
             lineage_path: None,
             cli: PathBuf::from("blut"),
             audit_path: std::env::temp_dir().join("blut-web-test-audit.jsonl"),
+            triggers: Arc::new(blut::trigger::TriggerConfig::default()),
         }
     }
 

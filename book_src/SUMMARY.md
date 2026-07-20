@@ -4,6 +4,7 @@
 [Introduction](introduction.md)
 
 - [API reference](api.md)
+- [Eventing, SLA, and notifications](eventing.md)
 - [Distributed validation](distributed.md)
 - [Releasing](releasing.md)
 - [Contributing](contributing.md)

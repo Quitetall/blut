@@ -14,7 +14,7 @@
 name = "blut-web"
 version = "0.2.0-alpha.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
 description = "BLUT web sidecar — read-only HTTP views over jobs, lineage, models, and the catalog (ADR 0083)."
@@ -33,6 +33,7 @@ blut-types = { path = "../blut-types" }
 axum = "0.8"
 async-stream = "0.3"
 sha2 = "0.10"
+hmac = "0.12"
 faster-hex = "0.10"
 include_dir = "0.7"
 tokio = { version = "1", features = ["full"] }

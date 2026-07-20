@@ -10,7 +10,17 @@ depend on this crate.
 
 ## [Unreleased]
 
-No changes yet.
+### Added
+- ADR 0094 eventing is complete: file-drop, threshold-spool, and cron triggers;
+  signed/replay-safe webhooks; durable exact-admission acknowledgement; measured
+  SLA freshness; and a rule-driven notification daemon with Slack, Discord,
+  ntfy, SMTP, and exec sinks.
+
+### Fixed
+- Web job/status/SSE exports now fail closed for restricted tenants and unknown
+  GETs no longer create job directories.
+- SLA breach rows and webhook events deduplicate durably across repeated checks
+  and daemon restarts.
 
 ## 0.2.0-alpha.1
 

@@ -949,6 +949,20 @@ impl PreparedRecipeLaunch {
             }
         };
 
+        // Sensord marks an event dispatched only after this exact recipe owns
+        // both its tenant reservation and scheduler lock. The durable marker
+        // closes the daemon-crash window: restart recovery treats an admitted
+        // child as seen even if the parent died before appending `.seen`.
+        if let Err(error) = crate::trigger::acknowledge_admission_from_env(&job_id) {
+            crate::python_kill::unbind_current_job();
+            if let Err(state_error) = crate::jobs::write_state(&job_id, JobState::Failed) {
+                tracing::warn!("write Failed state for {job_id}: {state_error}");
+            }
+            return Err(anyhow!(
+                "recipe '{name}' could not acknowledge trigger admission: {error}"
+            ));
+        }
+
         eprintln!("recipe {name}");
         eprintln!("job    {job_id}");
         eprintln!("dir    {}", job_dir.display());

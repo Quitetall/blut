@@ -15,9 +15,10 @@ Two workflows carry the release; both are reviewable in `.github/workflows/`:
   the real kind CRD-admission smoke, and builds all four sidecar/member binaries;
   the crate publish is a SEPARATE, MANUAL `workflow_dispatch`
   (`publish_crates=true`) behind the protected `crates-io` environment and the
-  `CARGO_REGISTRY_TOKEN` secret, so the irreversible publish needs a deliberate
-  human trigger + approval. Without the token the publish job refuses
-  (fail-closed).
+  `CARGO_REGISTRY_TOKEN` secret. The operator must also enter this exact
+  candidate SHA as `quiet_benchmark_sha`, proving the designated-host benchmark
+  gate was run for the bytes being published. A missing/mismatched SHA or token
+  refuses before publication (fail-closed).
 - **`docs.yml`** — builds the mdBook site (`book.toml` / `book_src`, which
   `{{#include}}`s the top-level docs so there is no drift) and deploys it to
   GitHub Pages on every `main` push that touches a doc.
@@ -67,6 +68,9 @@ Every commit in the candidate range must also have a recorded `PASS` or
 unavailable reviewer is a release blocker, not a waiver. The benchmark command
 above requires the committed `release-0.2` quiet-host baseline; establish it
 with `bash scripts/run_benchmarks.sh --save` only on the designated quiet host.
+GitHub's heterogeneous hosted runners compile the benchmark harness but do not
+claim comparable timings; the manual publish job requires the exact-SHA quiet
+host attestation instead.
 
 ## Public source gate
 

@@ -1,7 +1,7 @@
 # blut-notify
 
-`blut-notify` is BLUT's out-of-process notification boundary. This first slice
-owns the load-bearing custody rule: a `clinical`/`restricted` tenant or a
+`blut-notify` is BLUT's out-of-process notification boundary. It owns the
+load-bearing custody rule: a `clinical`/`restricted` tenant or a
 `Restricted` envelope may be handled by a local sink, but it cannot reach an
 off-box sink. The policy runs before the sink receives the envelope.
 
@@ -12,9 +12,32 @@ printf '%s' '{"tenant":"research/dev","data_class":"Internal","summary":"run com
   | blut-notify --boundary off-box
 ```
 
-The current executable sink is stdout, which is sufficient for process piping
-and the custody acceptance gate. With `--boundary local`, the caller assumes
-custody of stdout and must not pipe it to an off-box or uncontrolled log sink.
-Webhook/SMTP/SLA sinks remain additive work under ADR 0094; each must implement
-`NotifySink` and therefore pass through the same `deliver` chokepoint. This
-sidecar does not constrain cookbook TUIs or their Ratatui architecture.
+With `--config`, the sidecar durably tails every job's `status.jsonl` (including
+the rotated `.1` generation) plus `sla.jsonl`, matches declarative rules, and
+routes them to Slack, Discord, ntfy, SMTP, or `exec`. Cursors are crash-safe and
+single-writer locked; delivery is at-least-once. Network credentials are
+`SecretRef` names resolved only at send time, never plaintext config fields.
+
+```toml
+[[sink]]
+name = "ops"
+kind = "slack"
+webhook = { name = "BLUT_SLACK_WEBHOOK" }
+
+[[rule]]
+name = "run-failed"
+source = "status"
+field = "kind"
+equals = "failed"
+sinks = ["ops"]
+```
+
+```bash
+blut-notify --config ~/.blut/notify.toml
+blut-notify --config ~/.blut/notify.toml --once   # smoke/CI
+```
+
+Every sink implements `NotifySink` and therefore passes through the same
+`deliver` chokepoint. Restricted summaries may reach local sinks; they are
+structurally refused before any off-box sink sees them. The legacy one-envelope
+stdin mode remains available for process composition.

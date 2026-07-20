@@ -16,6 +16,21 @@ use axum::http::{Request, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::util::ServiceExt;
 
+fn signed_request(path: &str, body: &'static str, timestamp: i64) -> Request<Body> {
+    use hmac::{Hmac, Mac as _};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(b"test-webhook-key").unwrap();
+    mac.update(timestamp.to_string().as_bytes());
+    mac.update(b".");
+    mac.update(body.as_bytes());
+    let signature = faster_hex::hex_string(&mac.finalize().into_bytes());
+    Request::post(path)
+        .header("content-type", "application/json")
+        .header("x-blut-timestamp", timestamp.to_string())
+        .header("x-blut-signature", format!("sha256={signature}"))
+        .body(Body::from(body))
+        .unwrap()
+}
+
 fn state(jobs_dir: &std::path::Path, lineage: PathBuf) -> blut_web::AppState {
     // Point the engine's per-job path resolver at our fixture tree.
     unsafe { std::env::set_var("LAMU_TRAIN_JOBS_DIR", jobs_dir) };
@@ -24,6 +39,7 @@ fn state(jobs_dir: &std::path::Path, lineage: PathBuf) -> blut_web::AppState {
         lineage_path: Some(lineage),
         cli: PathBuf::from("/bin/false"), // no mutation is exercised here
         audit_path: jobs_dir.join("audit.jsonl"),
+        triggers: std::sync::Arc::new(blut::trigger::TriggerConfig::default()),
     }
 }
 
@@ -73,6 +89,18 @@ async fn dashboard_readonly_gate() {
     let status = job_dir.join("status.jsonl");
     // Line 1: the run starts.
     std::fs::write(&status, "{\"event\":\"start\",\"state\":\"running\"}\n").unwrap();
+    std::fs::write(job_dir.join("tenant"), "shared").unwrap();
+
+    // A restricted job must be absent from all job export surfaces, not only
+    // from lineage graph/card queries.
+    let restricted_job = jobs_dir.join("clinical-job");
+    std::fs::create_dir_all(&restricted_job).unwrap();
+    std::fs::write(restricted_job.join("tenant"), "clinical/prod").unwrap();
+    std::fs::write(
+        restricted_job.join("status.jsonl"),
+        "{\"event\":\"patient-sensitive\"}\n",
+    )
+    .unwrap();
 
     // Seed the lineage DB: one SHARED artifact (served) and one RESTRICTED
     // artifact (excluded) — the non-vacuous control for property (3).
@@ -105,7 +133,23 @@ async fn dashboard_readonly_gate() {
         }
     }
 
-    let app = blut_web::build_router(state(&jobs_dir, lineage_path));
+    let mut app_state = state(&jobs_dir, lineage_path);
+    let trigger_cfg = blut::trigger::TriggerConfig::parse(
+        r#"
+[[trigger]]
+name = "nightly.v1"
+plan = "registry://plan@prod"
+tenant = "shared"
+data_class = "Internal"
+webhook_secret = { name = "BLUT_TEST_WEBHOOK_KEY" }
+"#,
+    )
+    .unwrap();
+    app_state.triggers = std::sync::Arc::new(trigger_cfg);
+    // SAFETY (serial integration test): no other test in this process reads
+    // this test-only credential.
+    unsafe { std::env::set_var("BLUT_TEST_WEBHOOK_KEY", "test-webhook-key") };
+    let app = blut_web::build_router(app_state);
 
     // ── property (1): SSE reflects a live transition ───────────────────
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -159,6 +203,41 @@ async fn dashboard_readonly_gate() {
     let after = (dir_snapshot(&job_dir), std::fs::read(&status).unwrap());
     assert_eq!(before, after, "a GET mutated on-disk job state");
 
+    // Unknown reads are also side-effect free: asking for a ghost job must not
+    // create the directory via `paths::job_dir`.
+    let ghost = app
+        .clone()
+        .oneshot(
+            Request::get("/api/jobs/ghost/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ghost.status(), StatusCode::NOT_FOUND);
+    assert!(!jobs_dir.join("ghost").exists());
+
+    for path in [
+        "/api/jobs/clinical-job/status",
+        "/api/jobs/clinical-job/events",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "GET {path}");
+    }
+    let listed = app
+        .clone()
+        .oneshot(Request::get("/api/jobs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let listed_body = axum::body::to_bytes(listed.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&listed_body).contains("clinical-job"));
+
     // ── property (3): restricted excluded, shared control served ───────
     let served = app
         .clone()
@@ -192,14 +271,26 @@ async fn dashboard_readonly_gate() {
     // ── webhook ingress (ADR 0094): POST an event → spooled for sensord ─
     let events_dir = td.path().join("events");
     unsafe { std::env::set_var("BLUT_EVENTS_DIR", &events_dir) };
-    let posted = app
+    let body = r#"{"kind":"webhook","payload":1}"#;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let unsigned = app
         .clone()
         .oneshot(
-            Request::post("/api/events/nightly")
+            Request::post("/api/events/nightly.v1")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"kind":"webhook","payload":1}"#))
+                .body(Body::from(body))
                 .unwrap(),
         )
+        .await
+        .unwrap();
+    assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+
+    let posted = app
+        .clone()
+        .oneshot(signed_request("/events/nightly.v1", body, timestamp))
         .await
         .unwrap();
     assert_eq!(
@@ -207,19 +298,32 @@ async fn dashboard_readonly_gate() {
         StatusCode::ACCEPTED,
         "webhook event spooled"
     );
-    let spooled: Vec<_> = std::fs::read_dir(events_dir.join("nightly"))
+    let spooled: Vec<_> = std::fs::read_dir(events_dir.join("nightly.v1"))
         .unwrap()
         .filter_map(|e| e.ok())
         .collect();
     assert_eq!(spooled.len(), 1, "one event file written to the spool");
+    let first_modified = spooled[0].metadata().unwrap().modified().unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+    let replay = app
+        .clone()
+        .oneshot(signed_request("/api/events/nightly.v1", body, timestamp))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    let after_replay: Vec<_> = std::fs::read_dir(events_dir.join("nightly.v1"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .collect();
+    assert_eq!(after_replay.len(), 1, "replay must not add a spool file");
+    assert_eq!(
+        after_replay[0].metadata().unwrap().modified().unwrap(),
+        first_modified,
+        "replay must not rewrite the content-addressed event"
+    );
     // A non-object body is refused.
     let bad = app
-        .oneshot(
-            Request::post("/api/events/nightly")
-                .header("content-type", "application/json")
-                .body(Body::from("42"))
-                .unwrap(),
-        )
+        .oneshot(signed_request("/api/events/nightly.v1", "42", timestamp))
         .await
         .unwrap();
     assert_eq!(

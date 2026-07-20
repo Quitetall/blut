@@ -308,14 +308,18 @@ refuses to wire a stage tagged for a different backend.
 | `model_registry` | governed `model://name@alias` checkpoint pointers with append-only history |
 | `experiment_registry` | tenant-scoped `experiment://recipe/run` lineage views and latest-run comparison |
 | `registry_args` | recursive registry-URI resolution before recipe args are typed/deserialized |
-| `sensor`, `schedule`, `policy` | named freshness sensors, systemd-timer schedules, the auto-retrain policy |
+| `sensor`, `sensord`, `trigger`, `schedule`, `policy` | readiness sensors; file/spool/cron event dispatch with durable dedupe + exact admission acknowledgement; systemd schedules; auto-retrain policy |
+| `sla` | max-runtime, deadline, and fail-closed measured artifact-freshness rules; deduplicated `sla.jsonl` breaches |
 | `config::launcher::Launcher` | placement abstraction (local / cluster) |
 | `error::TrainError` | top-level error type |
 
 The separate `crates/blut-notify` sidecar consumes the same keystone-owned
-`Tenant` and `DataClass` wire types. Its `deliver` function checks custody
-before a sink receives an envelope; Restricted payloads may stay local but
-cannot cross an off-box boundary.
+`Tenant`, `DataClass`, `SlaBreach`, and `SecretRef` wire types. It durably tails
+`status.jsonl` (including rotation) and `sla.jsonl`, applies declarative field
+rules, and routes to Slack, Discord, ntfy, SMTP, or exec. Its `deliver` function
+checks custody before a sink receives an envelope; Restricted payloads may stay
+local but cannot cross an off-box boundary. Network credentials are reference
+names resolved only at send time.
 
 ## CLI (`cli`)
 

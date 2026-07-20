@@ -12,6 +12,7 @@ pub mod envelope;
 pub mod gpu;
 pub mod partition;
 pub mod report;
+pub mod secrets;
 pub mod sla;
 pub mod tenant;
 pub mod trust;

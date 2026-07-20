@@ -915,6 +915,19 @@ impl LineageDb {
             })
     }
 
+    /// Newest measured artifact timestamp for a run. SLA freshness uses this
+    /// explicit lineage measurement; `None` remains unmeasured and therefore
+    /// fails a configured freshness gate instead of being guessed from mtime.
+    pub fn freshest_artifact_unix(&self, job_id: &str) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT MAX(produced_unix) FROM artifacts WHERE job_id=?1",
+                params![job_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| TrainError::other(format!("freshest_artifact_unix: {error}")))
+    }
+
     /// Top runs by their FINAL `metric` value (HPO ranking / leaderboard) — the
     /// `step = -1` row per (job, node), so an overfit run that peaked then
     /// collapsed ranks by where it ENDED, not its best-ever intermediate.

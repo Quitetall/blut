@@ -27,6 +27,10 @@ struct Args {
     /// rows, written before dispatch). Default: `~/.blut/audit.jsonl`.
     #[arg(long)]
     audit: Option<std::path::PathBuf>,
+    /// Shared ADR-0094 trigger bindings. Defaults to `$BLUT_TRIGGERS` or
+    /// `~/.blut/triggers.toml`; an absent default disables webhook routes.
+    #[arg(long)]
+    triggers: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -73,11 +77,27 @@ async fn main() -> Result<()> {
             .map(|d| d.join("audit.jsonl"))
             .unwrap_or_else(|| std::path::PathBuf::from("audit.jsonl"))
     });
+    let trigger_from_env = std::env::var_os("BLUT_TRIGGERS").map(std::path::PathBuf::from);
+    let trigger_explicit = args.triggers.is_some() || trigger_from_env.is_some();
+    let trigger_path = args
+        .triggers
+        .clone()
+        .or(trigger_from_env)
+        .or_else(|| dirs_path().map(|dir| dir.join("triggers.toml")));
+    let triggers = match trigger_path {
+        Some(path) if path.exists() => blut::trigger::TriggerConfig::load(&path)
+            .with_context(|| format!("load trigger bindings {}", path.display()))?,
+        Some(path) if trigger_explicit => {
+            bail!("trigger bindings {} do not exist", path.display())
+        }
+        _ => blut::trigger::TriggerConfig::default(),
+    };
     let app = blut_web::build_router(blut_web::AppState {
         tokens,
         lineage_path: None,
         cli: args.cli,
         audit_path,
+        triggers: std::sync::Arc::new(triggers),
     });
     let listener = tokio::net::TcpListener::bind(args.bind)
         .await

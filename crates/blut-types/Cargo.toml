@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # blut-types (ADR 0083) — the wasm32-safe KEYSTONE crate: pure-serde wire types
-# shared by the engine and the (Rust-end-to-end) web/notify sidecars. serde +
-# serde_json are the only structural deps; sha2/faster_hex are pure-Rust
+# shared by the engine and the (Rust-end-to-end) web/notify sidecars. serde and
+# schemars own the wire/schema derives; sha2/faster_hex are pure-Rust
 # content-addressing helpers. NO tokio, rusqlite, filesystem, or engine dep — a
 # required `cargo check --target wasm32-unknown-unknown -p blut-types` CI job
 # keeps this invariant green (the Leptos+WASM UI depends on it).
@@ -33,3 +33,4 @@ sha2 = "0.10"
 # 0.10's SIMD is std/target-gated with a pure fallback, so it wasm32-checks clean
 # (the `wasm32-keystone` CI job is the guard).
 faster-hex = "0.10"
+schemars = "0.8"

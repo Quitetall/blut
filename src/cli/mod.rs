@@ -221,9 +221,9 @@ enum Command {
         #[command(subcommand)]
         cmd: SlaCommand,
     },
-    /// Trigger daemon (ADR 0094): poll file-drop/spool triggers and dispatch
-    /// their bound plan through broker admission (never bypassed). `--once`
-    /// runs a single poll and exits (for smoke/CI); default loops.
+    /// Trigger daemon (ADR 0094): poll file/spool/cron events, evaluate SLA
+    /// rules, and dispatch bound plans through broker admission (never
+    /// bypassed). `--once` runs a single poll and exits (for smoke/CI).
     Sensord {
         /// Trigger bindings file (TOML `[[trigger]]` entries). Default:
         /// `$BLUT_TRIGGERS or ~/.blut/triggers.toml`.
@@ -501,8 +501,8 @@ enum SensorCommand {
 #[derive(Subcommand, Debug)]
 enum SlaCommand {
     /// Evaluate the rule file against recorded runs and append any breaches to
-    /// `sla.jsonl`. Exit 0 with no breaches; exit 1 if any breach was written
-    /// (usable as a CI/cron alert gate).
+    /// `sla.jsonl`. Exit 0 with no active breaches; exit 1 while any breach is
+    /// active, including a breach whose durable row already exists.
     Check {
         /// Rule file (TOML `[[rule]]`). Default: `$BLUT_SLA_RULES` or
         /// `~/.blut/sla.toml`.
@@ -1006,7 +1006,7 @@ pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>)
             once,
             interval,
             cli,
-        }) => run_sensord(triggers, once, interval, cli).await,
+        }) => crate::sensord::run(triggers, once, interval, cli).await,
         #[cfg(feature = "p2p")]
         Some(Command::P2p { cmd }) => run_p2p_cmd(reg, cmd).await,
         #[cfg(feature = "cloud")]
@@ -1901,9 +1901,9 @@ fn run_sensor_cmd(cmd: SensorCommand) -> Result<()> {
     }
 }
 
-/// `blut sla check` (ADR 0094) — a PURE lineage read: evaluate the rule file
-/// over every recorded run and append breaches to `sla.jsonl`. Exit 1 when any
-/// breach was written (a cron/CI alert gate), 0 when clean.
+/// `blut sla check` (ADR 0094) — evaluate the rule file over every recorded run
+/// and append new breaches to `sla.jsonl`. Exit 1 while any breach is active (a
+/// cron/CI alert gate), even when its durable row already exists.
 fn run_sla_cmd(cmd: SlaCommand) -> Result<()> {
     match cmd {
         SlaCommand::Check { rules, out, json } => {
@@ -1913,157 +1913,25 @@ fn run_sla_cmd(cmd: SlaCommand) -> Result<()> {
                     .unwrap_or_else(|| dot_blut().join("sla.toml"))
             });
             let out_path = out.unwrap_or_else(crate::sla::default_sla_path);
-            let rules = crate::sla::load_rules(&rules_path)
-                .with_context(|| format!("load SLA rules {}", rules_path.display()))?;
-            let db = crate::lineage_db::LineageDb::open().context("open lineage DB")?;
-            let now = crate::sla::now_unix();
-            let runs = db.all_runs().context("read runs")?;
-            let obs: Vec<crate::sla::RunObservation> = runs
-                .iter()
-                .filter_map(crate::sla::observation_from_run)
-                .collect();
-            let breaches = crate::sla::evaluate(&rules, &obs, now);
-            let n = crate::sla::append_breaches(&out_path, &breaches)
-                .with_context(|| format!("append breaches to {}", out_path.display()))?;
+            let report = crate::sla::check_paths(&rules_path, &out_path)
+                .with_context(|| format!("check SLA rules {}", rules_path.display()))?;
             if json {
-                emit_json(&breaches)?;
+                emit_json(&report.breaches)?;
             } else {
                 println!(
-                    "sla check: {} rule(s) × {} run(s) → {n} breach(es) written to {}",
-                    rules.len(),
-                    obs.len(),
+                    "sla check: {} rule(s) × {} run(s) → {} active breach(es), {} new row(s) in {}",
+                    report.rule_count,
+                    report.run_count,
+                    report.breaches.len(),
+                    report.new_rows,
                     out_path.display()
                 );
             }
-            if n > 0 {
+            if !report.breaches.is_empty() {
                 std::process::exit(1);
             }
             Ok(())
         }
-    }
-}
-
-/// A single `[[trigger]]` binding from `triggers.toml`.
-#[derive(serde::Deserialize)]
-struct TriggerBinding {
-    name: String,
-    /// Watched directory. Default: the trigger's spool (`~/.blut/events/<name>`).
-    #[serde(default)]
-    dir: Option<std::path::PathBuf>,
-    /// Extension filter (no dot), e.g. `json`.
-    #[serde(default)]
-    ext: Option<String>,
-    /// The registered plan a fired event launches.
-    plan: String,
-}
-
-#[derive(serde::Deserialize, Default)]
-struct TriggersFile {
-    #[serde(default)]
-    trigger: Vec<TriggerBinding>,
-}
-
-/// `blut sensord` (ADR 0094) — poll file-drop/spool triggers and dispatch their
-/// bound plan through broker admission (never bypassed). `--once` drives a
-/// single poll (smoke/CI); otherwise it loops every `interval` seconds.
-async fn run_sensord(
-    triggers: Option<std::path::PathBuf>,
-    once: bool,
-    interval: u64,
-    cli: std::path::PathBuf,
-) -> Result<()> {
-    let path = triggers.unwrap_or_else(|| {
-        std::env::var_os("BLUT_TRIGGERS")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| dot_blut().join("triggers.toml"))
-    });
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("read triggers file {}", path.display()))?;
-    let parsed: TriggersFile =
-        toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-    if parsed.trigger.is_empty() {
-        println!(
-            "sensord: no triggers configured in {} — nothing to watch",
-            path.display()
-        );
-        return Ok(());
-    }
-
-    // Build each binding's trigger + persistent dedupe store once.
-    struct Bound {
-        trigger: crate::trigger::FileDropTrigger,
-        plan: String,
-        seen: crate::trigger::SeenStore,
-    }
-    let mut bound: Vec<Bound> = Vec::new();
-    for b in &parsed.trigger {
-        let dir = b
-            .dir
-            .clone()
-            .unwrap_or_else(|| crate::trigger::spool_dir(&b.name));
-        let seen = crate::trigger::SeenStore::load(crate::trigger::seen_path(&b.name))
-            .with_context(|| format!("load dedupe store for trigger '{}'", b.name))?;
-        bound.push(Bound {
-            trigger: crate::trigger::FileDropTrigger::new(b.name.clone(), dir, b.ext.clone()),
-            plan: b.plan.clone(),
-            seen,
-        });
-    }
-
-    loop {
-        for b in &mut bound {
-            // Probe the box fresh each poll so admission reflects live capacity.
-            // Footprint is the loud 2 GiB compatibility floor: sensord does not
-            // know the triggered plan's declared envelope (that resolves inside
-            // the launched `recipe run`); this gate only stops a flood from
-            // stampeding an already-full box — the real per-plan admission runs
-            // again at launch.
-            let snapshot = crate::broker::probe::ResourceSnapshot::probe();
-            let dispatcher = crate::trigger::AdmissionDispatcher {
-                snapshot,
-                footprint: crate::broker::Footprint {
-                    ram_bytes: 2 * crate::broker::GIB,
-                    vram_mib: 0,
-                },
-                floor_gib: crate::broker::admission::DEFAULT_FLOOR_GIB,
-                launch: {
-                    let cli = cli.clone();
-                    Box::new(move |plan: &str, ev: &crate::trigger::TriggerEvent| {
-                        // Launch detached; the run outlives the daemon poll.
-                        std::process::Command::new(&cli)
-                            .arg("recipe")
-                            .arg("run")
-                            .arg(plan)
-                            .stdin(std::process::Stdio::null())
-                            .spawn()
-                            .map(|_| ())
-                            .inspect(|_| {
-                                eprintln!("sensord: launched '{plan}' for event {}", ev.source)
-                            })
-                    })
-                },
-            };
-            match crate::trigger::drive_once(&b.trigger, &b.plan, &mut b.seen, &dispatcher) {
-                Ok(results) => {
-                    for (ev, outcome) in results {
-                        match outcome {
-                            crate::trigger::DispatchOutcome::Admitted => {}
-                            crate::trigger::DispatchOutcome::Refused(why) => {
-                                eprintln!(
-                                    "sensord: '{}' refused for event {} ({why}) — will retry",
-                                    b.plan, ev.source
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(e) => eprintln!("sensord: poll failed for plan '{}': {e}", b.plan),
-            }
-        }
-        if once {
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(interval.max(1))).await;
     }
 }
 
