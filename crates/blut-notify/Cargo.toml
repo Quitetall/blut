@@ -5,13 +5,13 @@ edition = "2024"
 rust-version = "1.88"
 publish = ["crates-io"]
 authors = ["Brian Lam"]
-license = "AGPL-3.0-or-later"
+license-file = "../../LICENSE"
 description = "BLUT notification sidecar — durable rule routing with fail-closed custody boundaries."
 repository = "https://github.com/Quitetall/blut"
 homepage = "https://github.com/Quitetall/blut"
 documentation = "https://docs.rs/blut-notify"
 readme = "README.md"
-include = ["/src/**", "/tests/**", "/Cargo.toml", "/README.md", "/LICENSE"]
+include = ["/src/**", "/tests/**", "/Cargo.toml", "/README.md"]
 
 [lib]
 name = "blut_notify"
