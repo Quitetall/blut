@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# mdBook config for the BLUT engine docs site (ADR 0083 M6 / ADR 0137).
+# The book SOURCES the existing top-level docs via `{{#include}}` (see
+# book_src/*.md) so there is ONE copy of each doc — the site never drifts from
+# README.md / API.md / RELEASING.md. Build: `mdbook build` → `book/` (a
+# git-ignored artifact); the docs workflow deploys it to GitHub Pages.
+[book]
+title = "BLUT — typed-DAG ML orchestrator"
+authors = ["Brian Lam"]
+description = "The BLUT engine: compile-time-typed DAGs, a never-OOM broker, content-addressed caching, and a lean CLI."
+src = "book_src"
+language = "en"
+
+[output.html]
+default-theme = "navy"
+git-repository-url = "https://github.com/Quitetall/blut"
+edit-url-template = "https://github.com/Quitetall/blut/edit/main/{path}"
+
+[output.html.fold]
+enable = true
+level = 1

@@ -12,3 +12,6 @@
 .DS_Store
 *.swp
 *~
+
+# mdBook build artifact (ADR 0083 M6)
+/book

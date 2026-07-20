@@ -1,8 +1,32 @@
 # BLUT Release Procedure
 
-Public preview train: `blut-types` → `blut` → `blut-dsl`, all at the same exact
-version. `blut-operator` is unpublished. (`blut-worker` was deleted at ADR
-0083 M3 — superseded by `src/cloud` + the `blut-web` sidecar.)
+Public preview train: `blut-types` → `blut` → `blut-dsl` → `blut-notify`, all at
+the same exact version. The standalone-workspace sidecars `blut-tui`, `blut-web`,
+and `blut-operator` are `publish = false` — they ship as **release binaries**
+(the `release.yml` `binaries` job attaches them to the GitHub Release), not as
+crates, because the engine ships as the CLI + its sidecars. (`blut-worker` was
+deleted at ADR 0083 M3 — superseded by `src/cloud` + the `blut-web` sidecar.)
+
+## Automation (ADR 0083 M6)
+
+Two workflows carry the release; both are reviewable in `.github/workflows/`:
+
+- **`release.yml`** — on a `v*` tag it runs the full gate and builds the sidecar
+  binaries; the crate publish is a SEPARATE, MANUAL `workflow_dispatch`
+  (`publish_crates=true`) behind the protected `crates-io` environment and the
+  `CARGO_REGISTRY_TOKEN` secret, so the irreversible publish needs a deliberate
+  human trigger + approval. Without the token the publish job refuses
+  (fail-closed).
+- **`docs.yml`** — builds the mdBook site (`book.toml` / `book_src`, which
+  `{{#include}}`s the top-level docs so there is no drift) and deploys it to
+  GitHub Pages on every `main` push that touches a doc.
+- **`scripts/k8s_kind_smoke.sh`** — the operator gate: installs the
+  `blut-operator` CRDs on an ephemeral `kind` cluster and asserts a `BlutPlan`
+  CR is accepted by the API server (schema valid); reconcile-to-Job is a
+  best-effort extra when the operator image is loaded.
+
+The step-by-step below is the AUTHORITATIVE manual procedure the automation
+mirrors — run it (or the `release.yml` publish job) at the reviewed tag SHA.
 
 ## Candidate gate
 
@@ -69,6 +93,17 @@ cargo publish --locked
 
 (cd crates/blut-dsl && cargo publish --dry-run --locked)
 (cd crates/blut-dsl && cargo publish --locked)
+# Wait until crates.io resolves blut-dsl, then the last member of the chain:
+
+cargo publish --dry-run --locked -p blut-notify
+cargo publish --locked -p blut-notify
+```
+
+Run the kind smoke before tagging (the operator's CRD schemas are part of the
+public contract):
+
+```bash
+bash scripts/k8s_kind_smoke.sh   # needs kind + kubectl
 ```
 
 Then verify from an empty directory and clean Cargo home:
