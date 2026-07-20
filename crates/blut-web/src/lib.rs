@@ -42,6 +42,12 @@ pub const EXPORT_EXCLUDES_RESTRICTED: bool = true;
 /// Hard cap on `?tail=` for status streams (bounded responses, no file slurp).
 const STATUS_TAIL_CAP: usize = 1000;
 
+/// Poll cadence for the SSE live-tail of `status.jsonl` (ADR 0093). The file
+/// IS the bus: we re-read it and emit only newly-appended complete lines, so a
+/// writer that appends whole JSON lines can never hand a subscriber a partial
+/// record. Kept modest — a dashboard tail, not a low-latency data path.
+const SSE_POLL: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// The embedded dashboard (ADR 0083: one binary, zero deploy steps) — the
 /// Leptos+WASM bundle staged by build.rs (`ui/dist` when built via
 /// `scripts/build_ui.sh`, else a self-describing stub page). Static assets
@@ -174,6 +180,47 @@ async fn job_status(AxPath(id): AxPath<String>, Query(q): Query<TailQuery>) -> R
         .collect();
     let lines: Vec<_> = lines.into_iter().rev().collect();
     Json(serde_json::json!({ "job": id, "events": lines })).into_response()
+}
+
+/// SSE live-tail of a job's `status.jsonl` (ADR 0093 read-only v1). Emits every
+/// complete line already present, then each newly-appended line as it lands, as
+/// `text/event-stream` `data:` frames. Purely a reader — it opens no write path
+/// into the engine; the client dropping the connection drops the stream.
+async fn job_events(AxPath(id): AxPath<String>) -> Response {
+    if !valid_name(&id) {
+        return err(StatusCode::BAD_REQUEST, "invalid job id");
+    }
+    let dir = match blut::paths::job_dir(&id) {
+        Ok(d) => d,
+        Err(e) => return err(StatusCode::NOT_FOUND, e),
+    };
+    let path = dir.join("status.jsonl");
+    let stream = async_stream::stream! {
+        // Track by line COUNT (not byte offset): the writer appends whole JSON
+        // lines, so `lines()` on a re-read never yields a partial record, and a
+        // truncation/rotation (fewer lines than emitted) resets cleanly.
+        let mut emitted = 0usize;
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let lines: Vec<&str> = text.lines().collect();
+                if lines.len() < emitted {
+                    emitted = 0; // file shrank (rotated) — re-emit from the top
+                }
+                for line in lines.iter().skip(emitted) {
+                    if !line.is_empty() {
+                        yield Ok::<_, std::convert::Infallible>(
+                            axum::response::sse::Event::default().data(*line),
+                        );
+                    }
+                }
+                emitted = lines.len();
+            }
+            tokio::time::sleep(SSE_POLL).await;
+        }
+    };
+    axum::response::sse::Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -436,6 +483,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/jobs", get(jobs).post(run_recipe))
         .route("/api/jobs/{id}/status", get(job_status))
+        .route("/api/jobs/{id}/events", get(job_events))
         .route("/api/jobs/{id}/cancel", post(cancel_job))
         .route("/api/lineage/graph/{hash}", get(lineage_graph))
         .route("/api/lineage/card/{hash}", get(lineage_card))

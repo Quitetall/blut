@@ -31,6 +31,7 @@ path = "src/lib.rs"
 blut = { path = "../.." }
 blut-types = { path = "../blut-types" }
 axum = "0.8"
+async-stream = "0.3"
 include_dir = "0.7"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
