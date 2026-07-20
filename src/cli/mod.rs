@@ -214,6 +214,31 @@ enum Command {
         #[command(subcommand)]
         cmd: SensorCommand,
     },
+    /// SLA rules (ADR 0094): evaluate `max_runtime` / `deadline` / `freshness`
+    /// over recorded runs and append breaches to `sla.jsonl`. A pure lineage
+    /// read — never mutates a run.
+    Sla {
+        #[command(subcommand)]
+        cmd: SlaCommand,
+    },
+    /// Trigger daemon (ADR 0094): poll file-drop/spool triggers and dispatch
+    /// their bound plan through broker admission (never bypassed). `--once`
+    /// runs a single poll and exits (for smoke/CI); default loops.
+    Sensord {
+        /// Trigger bindings file (TOML `[[trigger]]` entries). Default:
+        /// `$BLUT_TRIGGERS or ~/.blut/triggers.toml`.
+        #[arg(long)]
+        triggers: Option<std::path::PathBuf>,
+        /// Poll once and exit instead of looping.
+        #[arg(long, default_value_t = false)]
+        once: bool,
+        /// Seconds between polls in loop mode.
+        #[arg(long, default_value_t = 15)]
+        interval: u64,
+        /// The CLI binary a fired trigger launches (`<cli> recipe run <plan>`).
+        #[arg(long, default_value = "blut")]
+        cli: std::path::PathBuf,
+    },
     /// P2P distributed compute: manage identity keys + peers, run as a
     /// coordinator or a worker peer, and dispatch a dispatchable stage to a
     /// peer over QUIC (behind the off-by-default `p2p` feature).
@@ -468,6 +493,26 @@ enum SensorCommand {
         /// Sensor name (see `blut sensor list`).
         name: String,
         /// Emit as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SlaCommand {
+    /// Evaluate the rule file against recorded runs and append any breaches to
+    /// `sla.jsonl`. Exit 0 with no breaches; exit 1 if any breach was written
+    /// (usable as a CI/cron alert gate).
+    Check {
+        /// Rule file (TOML `[[rule]]`). Default: `$BLUT_SLA_RULES` or
+        /// `~/.blut/sla.toml`.
+        #[arg(long)]
+        rules: Option<std::path::PathBuf>,
+        /// Where to append breaches. Default: `$BLUT_SLA_PATH` or
+        /// `~/.blut/sla.jsonl`.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Emit the breaches as JSON to stdout too.
         #[arg(long)]
         json: bool,
     },
@@ -955,6 +1000,13 @@ pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>)
         Some(Command::Cache { cmd }) => run_cache_cmd(cmd),
         Some(Command::Footprint { cmd }) => run_footprint_cmd(cmd),
         Some(Command::Sensor { cmd }) => run_sensor_cmd(cmd),
+        Some(Command::Sla { cmd }) => run_sla_cmd(cmd),
+        Some(Command::Sensord {
+            triggers,
+            once,
+            interval,
+            cli,
+        }) => run_sensord(triggers, once, interval, cli).await,
         #[cfg(feature = "p2p")]
         Some(Command::P2p { cmd }) => run_p2p_cmd(reg, cmd).await,
         #[cfg(feature = "cloud")]
@@ -1847,6 +1899,177 @@ fn run_sensor_cmd(cmd: SensorCommand) -> Result<()> {
             }
         }
     }
+}
+
+/// `blut sla check` (ADR 0094) — a PURE lineage read: evaluate the rule file
+/// over every recorded run and append breaches to `sla.jsonl`. Exit 1 when any
+/// breach was written (a cron/CI alert gate), 0 when clean.
+fn run_sla_cmd(cmd: SlaCommand) -> Result<()> {
+    match cmd {
+        SlaCommand::Check { rules, out, json } => {
+            let rules_path = rules.unwrap_or_else(|| {
+                std::env::var_os("BLUT_SLA_RULES")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| dot_blut().join("sla.toml"))
+            });
+            let out_path = out.unwrap_or_else(crate::sla::default_sla_path);
+            let rules = crate::sla::load_rules(&rules_path)
+                .with_context(|| format!("load SLA rules {}", rules_path.display()))?;
+            let db = crate::lineage_db::LineageDb::open().context("open lineage DB")?;
+            let now = crate::sla::now_unix();
+            let runs = db.all_runs().context("read runs")?;
+            let obs: Vec<crate::sla::RunObservation> = runs
+                .iter()
+                .filter_map(crate::sla::observation_from_run)
+                .collect();
+            let breaches = crate::sla::evaluate(&rules, &obs, now);
+            let n = crate::sla::append_breaches(&out_path, &breaches)
+                .with_context(|| format!("append breaches to {}", out_path.display()))?;
+            if json {
+                emit_json(&breaches)?;
+            } else {
+                println!(
+                    "sla check: {} rule(s) × {} run(s) → {n} breach(es) written to {}",
+                    rules.len(),
+                    obs.len(),
+                    out_path.display()
+                );
+            }
+            if n > 0 {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// A single `[[trigger]]` binding from `triggers.toml`.
+#[derive(serde::Deserialize)]
+struct TriggerBinding {
+    name: String,
+    /// Watched directory. Default: the trigger's spool (`~/.blut/events/<name>`).
+    #[serde(default)]
+    dir: Option<std::path::PathBuf>,
+    /// Extension filter (no dot), e.g. `json`.
+    #[serde(default)]
+    ext: Option<String>,
+    /// The registered plan a fired event launches.
+    plan: String,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct TriggersFile {
+    #[serde(default)]
+    trigger: Vec<TriggerBinding>,
+}
+
+/// `blut sensord` (ADR 0094) — poll file-drop/spool triggers and dispatch their
+/// bound plan through broker admission (never bypassed). `--once` drives a
+/// single poll (smoke/CI); otherwise it loops every `interval` seconds.
+async fn run_sensord(
+    triggers: Option<std::path::PathBuf>,
+    once: bool,
+    interval: u64,
+    cli: std::path::PathBuf,
+) -> Result<()> {
+    let path = triggers.unwrap_or_else(|| {
+        std::env::var_os("BLUT_TRIGGERS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| dot_blut().join("triggers.toml"))
+    });
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("read triggers file {}", path.display()))?;
+    let parsed: TriggersFile =
+        toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    if parsed.trigger.is_empty() {
+        println!("sensord: no triggers configured in {} — nothing to watch", path.display());
+        return Ok(());
+    }
+
+    // Build each binding's trigger + persistent dedupe store once.
+    struct Bound {
+        trigger: crate::trigger::FileDropTrigger,
+        plan: String,
+        seen: crate::trigger::SeenStore,
+    }
+    let mut bound: Vec<Bound> = Vec::new();
+    for b in &parsed.trigger {
+        let dir = b
+            .dir
+            .clone()
+            .unwrap_or_else(|| crate::trigger::spool_dir(&b.name));
+        let seen = crate::trigger::SeenStore::load(crate::trigger::seen_path(&b.name))
+            .with_context(|| format!("load dedupe store for trigger '{}'", b.name))?;
+        bound.push(Bound {
+            trigger: crate::trigger::FileDropTrigger::new(b.name.clone(), dir, b.ext.clone()),
+            plan: b.plan.clone(),
+            seen,
+        });
+    }
+
+    loop {
+        for b in &mut bound {
+            // Probe the box fresh each poll so admission reflects live capacity.
+            // Footprint is the loud 2 GiB compatibility floor: sensord does not
+            // know the triggered plan's declared envelope (that resolves inside
+            // the launched `recipe run`); this gate only stops a flood from
+            // stampeding an already-full box — the real per-plan admission runs
+            // again at launch.
+            let snapshot = crate::broker::probe::ResourceSnapshot::probe();
+            let dispatcher = crate::trigger::AdmissionDispatcher {
+                snapshot,
+                footprint: crate::broker::Footprint {
+                    ram_bytes: 2 * crate::broker::GIB,
+                    vram_mib: 0,
+                },
+                floor_gib: crate::broker::admission::DEFAULT_FLOOR_GIB,
+                launch: {
+                    let cli = cli.clone();
+                    Box::new(move |plan: &str, ev: &crate::trigger::TriggerEvent| {
+                        // Launch detached; the run outlives the daemon poll.
+                        std::process::Command::new(&cli)
+                            .arg("recipe")
+                            .arg("run")
+                            .arg(plan)
+                            .stdin(std::process::Stdio::null())
+                            .spawn()
+                            .map(|_| ())
+                            .inspect(|_| {
+                                eprintln!("sensord: launched '{plan}' for event {}", ev.source)
+                            })
+                    })
+                },
+            };
+            match crate::trigger::drive_once(&b.trigger, &b.plan, &mut b.seen, &dispatcher) {
+                Ok(results) => {
+                    for (ev, outcome) in results {
+                        match outcome {
+                            crate::trigger::DispatchOutcome::Admitted => {}
+                            crate::trigger::DispatchOutcome::Refused(why) => {
+                                eprintln!(
+                                    "sensord: '{}' refused for event {} ({why}) — will retry",
+                                    b.plan, ev.source
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => eprintln!("sensord: poll failed for plan '{}': {e}", b.plan),
+            }
+        }
+        if once {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(interval.max(1))).await;
+    }
+}
+
+/// `~/.blut` — the operator state root shared by triggers/sla/secrets configs.
+fn dot_blut() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join(".blut")
 }
 
 fn run_footprint_cmd(cmd: FootprintCommand) -> Result<()> {

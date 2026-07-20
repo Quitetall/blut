@@ -309,6 +309,48 @@ async fn model_pointer(AxPath((name, alias)): AxPath<(String, String)>) -> Respo
     .into_response()
 }
 
+// ── webhook ingress (ADR 0094) ─────────────────────────────────────
+
+/// `POST /api/events/{trigger}` — the webhook ingress. Writes the posted JSON
+/// body as one event file into the trigger's spool (`~/.blut/events/<trigger>`),
+/// which `blut sensord` watches. HTTP→filesystem keeps push triggers out of the
+/// engine (ADR 0034): this sidecar is the only listener; the daemon stays a pure
+/// file reader. Auth is the token middleware (a mutation-adjacent write); the
+/// daemon still routes the eventual launch through broker admission + rbac.
+async fn webhook_event(AxPath(trigger): AxPath<String>, body: axum::body::Bytes) -> Response {
+    if !valid_name(&trigger) {
+        return err(StatusCode::BAD_REQUEST, "invalid trigger name");
+    }
+    // The body must be a JSON object (a well-formed event), bounded in size by
+    // axum's default request-body limit.
+    let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&body);
+    match parsed {
+        Ok(v) if v.is_object() => {}
+        _ => return err(StatusCode::BAD_REQUEST, "event body must be a JSON object"),
+    }
+    let dir = blut::trigger::spool_dir(&trigger);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    // Content-address the event file so an identical replay lands on the same
+    // name (the daemon's dedupe also folds mtime, so a true replay is a no-op).
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&body);
+        faster_hex::hex_string(&h.finalize())
+    };
+    let file = dir.join(format!("{}.json", &digest[..32.min(digest.len())]));
+    if let Err(e) = std::fs::write(&file, &body) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "spooled": true, "trigger": trigger, "event": file })),
+    )
+        .into_response()
+}
+
 // ── the exec bridge (ADR 0083 §4) ──────────────────────────────────
 
 /// A launched job is a generated identifier; a recipe name comes from a
@@ -485,6 +527,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/jobs/{id}/status", get(job_status))
         .route("/api/jobs/{id}/events", get(job_events))
         .route("/api/jobs/{id}/cancel", post(cancel_job))
+        .route("/api/events/{trigger}", post(webhook_event))
         .route("/api/lineage/graph/{hash}", get(lineage_graph))
         .route("/api/lineage/card/{hash}", get(lineage_card))
         .route("/api/lineage/diff/{a}/{b}", get(lineage_diff))

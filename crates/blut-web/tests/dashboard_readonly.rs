@@ -188,4 +188,43 @@ async fn dashboard_readonly_gate() {
         StatusCode::NOT_FOUND,
         "a restricted artifact must never be served (ADR 0061)"
     );
+
+    // ── webhook ingress (ADR 0094): POST an event → spooled for sensord ─
+    let events_dir = td.path().join("events");
+    unsafe { std::env::set_var("BLUT_EVENTS_DIR", &events_dir) };
+    let posted = app
+        .clone()
+        .oneshot(
+            Request::post("/api/events/nightly")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"kind":"webhook","payload":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        posted.status(),
+        StatusCode::ACCEPTED,
+        "webhook event spooled"
+    );
+    let spooled: Vec<_> = std::fs::read_dir(events_dir.join("nightly"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(spooled.len(), 1, "one event file written to the spool");
+    // A non-object body is refused.
+    let bad = app
+        .oneshot(
+            Request::post("/api/events/nightly")
+                .header("content-type", "application/json")
+                .body(Body::from("42"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        bad.status(),
+        StatusCode::BAD_REQUEST,
+        "non-object event refused"
+    );
 }

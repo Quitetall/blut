@@ -142,6 +142,63 @@ pub fn append_breaches(path: &std::path::Path, breaches: &[SlaBreach]) -> std::i
     Ok(breaches.len())
 }
 
+/// A `sla.toml` rule file: `[[rule]]` tables → [`SlaRule`]s.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct RulesFile {
+    #[serde(default)]
+    pub rule: Vec<SlaRule>,
+}
+
+/// Load SLA rules from a TOML file (`[[rule]]` entries). Absent file ⇒ no rules
+/// (SLA checking is opt-in, not a hard error).
+pub fn load_rules(path: &std::path::Path) -> std::io::Result<Vec<SlaRule>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let parsed: RulesFile = toml::from_str(&text).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse {path:?}: {e}"))
+    })?;
+    Ok(parsed.rule)
+}
+
+/// Build a [`RunObservation`] from a lineage run row (`None` if the run has no
+/// start time — SLA timing is undefined without it, never a false breach). The
+/// data class is derived from the tenant: a `restricted` tenant ⇒ `Restricted`,
+/// else `Internal`. Freshness input is left `None` (deferred — it needs
+/// per-artifact timestamps).
+pub fn observation_from_run(run: &crate::lineage_db::RunRow) -> Option<RunObservation> {
+    let started = run.started_unix?;
+    let tenant = if run.tenant.is_empty() {
+        "default"
+    } else {
+        run.tenant.as_str()
+    };
+    let data_class = if crate::tenant::Tenant::parse(tenant).is_some_and(|t| t.is_restricted()) {
+        DataClass::Restricted
+    } else {
+        DataClass::Internal
+    };
+    Some(RunObservation {
+        job_id: run.job_id.clone(),
+        recipe: run.recipe.clone(),
+        tenant: tenant.to_string(),
+        data_class,
+        started_unix: started,
+        ended_unix: run.ended_unix,
+        data_age_secs: None,
+    })
+}
+
+/// Current wall-clock unix seconds (SLA evaluation's `now`).
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Default sla.jsonl location (`$BLUT_SLA_PATH` or `~/.blut/sla.jsonl`).
 pub fn default_sla_path() -> std::path::PathBuf {
     if let Some(p) = std::env::var_os("BLUT_SLA_PATH") {

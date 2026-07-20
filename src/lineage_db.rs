@@ -1025,6 +1025,24 @@ impl LineageDb {
             .map_err(|e| TrainError::other(format!("get_run {job_id}: {e}")))
     }
 
+    /// All recorded runs (newest started first). Used by `blut sla check` (ADR
+    /// 0094) to evaluate SLA rules over every run's timing — a pure read.
+    pub fn all_runs(&self) -> Result<Vec<RunRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT job_id, recipe, config_fingerprint, git_sha, started_unix, ended_unix,
+                        outcome, host, gpu_name, ram_gib, vram_mib, tenant, experiment, args_json
+                 FROM runs ORDER BY started_unix DESC",
+            )
+            .map_err(|e| TrainError::other(format!("all_runs prepare: {e}")))?;
+        let rows = stmt
+            .query_map([], row_to_run)
+            .map_err(|e| TrainError::other(format!("all_runs query: {e}")))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| TrainError::other(format!("all_runs collect: {e}")))
+    }
+
     /// Newest runs for one explicit experiment in exactly one tenant. Legacy
     /// rows with no marker use their recipe name as the experiment key.
     /// The tenant predicate is part of the SQL, not a caller-side filter, so a
