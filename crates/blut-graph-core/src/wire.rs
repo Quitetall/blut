@@ -57,7 +57,9 @@ impl CompiledPlan {
     }
 
     /// Decode untrusted AOT bytes under structural limits and re-derive the
-    /// physical plan identity before returning an executable plan.
+    /// physical plan identity before returning an executable plan. `max_bytes`
+    /// is the allocation bound during postcard decode; the count limits are
+    /// post-decode semantic bounds within that already-bounded envelope.
     pub fn from_aot_bytes(bytes: &[u8], limits: PlanLimits) -> Result<Self, PlanDecodeError> {
         if bytes.len() > limits.max_bytes {
             return Err(PlanDecodeError::TooLarge);
@@ -80,6 +82,8 @@ impl CompiledPlan {
             return Err(PlanDecodeError::LimitExceeded);
         }
         for (index, buffer) in plan.buffers.iter().enumerate() {
+            // Compiler output uses dense, ID-ordered buffers so executor lookup
+            // remains O(1); hand-built sparse plans are not valid AOT inputs.
             if buffer.id.0 as usize != index
                 || buffer.capacity_bytes == 0
                 || buffer.consumers.is_empty()

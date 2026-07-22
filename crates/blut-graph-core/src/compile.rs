@@ -502,7 +502,7 @@ pub(crate) fn hash_plan(plan: &CompiledPlan) -> [u8; 32] {
         }
         put_u32(&mut hasher, node.effect as u32);
         put_u32(&mut hasher, u32::from(node.retry_limit));
-        hasher.update(&[u8::from(node.checkpointable)]);
+        put_u32(&mut hasher, u32::from(node.checkpointable));
     }
     put_u32(&mut hasher, plan.buffers.len() as u32);
     for buffer in &plan.buffers {
@@ -799,13 +799,15 @@ mod tests {
         assert_eq!(host.order, durable.order);
         assert_ne!(host.plan_id, mcu.plan_id);
         assert_ne!(host.plan_id, durable.plan_id);
-        assert_eq!(
-            crate::CompiledPlan::from_aot_bytes(
-                &mcu.to_aot_bytes().unwrap(),
-                crate::PlanLimits::default()
-            )
-            .unwrap(),
-            mcu
-        );
+        for plan in [&host, &mcu, &durable] {
+            assert_eq!(
+                crate::CompiledPlan::from_aot_bytes(
+                    &plan.to_aot_bytes().unwrap(),
+                    crate::PlanLimits::default()
+                )
+                .unwrap(),
+                *plan
+            );
+        }
     }
 }
