@@ -213,6 +213,7 @@ pub struct BufferPlan {
     pub capacity_bytes: u64,
     pub producer: NodeId,
     pub consumers: Vec<NodeId>,
+    /// Cached final consumer in topological order for constant-time liveness release.
     pub last_consumer: NodeId,
     pub aliases: Option<BufferId>,
 }

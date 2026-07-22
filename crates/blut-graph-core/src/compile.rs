@@ -18,6 +18,7 @@ pub enum CompileError {
     UnknownDescriptor(String, u32),
     DuplicateKernel(KernelId),
     UnknownPort(NodeId, String),
+    InvalidPortSize(NodeId, String),
     TypeMismatch(String, String),
     MissingInput(NodeId, String),
     DuplicateInput(NodeId, String),
@@ -353,6 +354,9 @@ fn allocate_buffers(
             .expect("edge group is non-empty");
         let producer = descriptors[&source.node];
         let output = find_port(&producer.outputs, source.node, &source.port)?;
+        if output.max_bytes == 0 {
+            return Err(CompileError::InvalidPortSize(source.node, source.port));
+        }
         let kernel = kernels[&source.node];
         let layout = kernel
             .output_layouts
@@ -419,7 +423,7 @@ fn build_compiled_nodes(
                     buffers
                         .iter()
                         .find(|buffer| buffer.id == *buffer_id)
-                        .is_some_and(|buffer| buffer.consumers == alloc::vec![*id])
+                        .is_some_and(|buffer| buffer.consumers.as_slice() == [*id])
                 })
             {
                 previous.semantic_nodes.push(*id);
@@ -483,6 +487,7 @@ fn hash_plan(plan: &CompiledPlan) -> [u8; 32] {
         put_u32(&mut hasher, buffer.layout as u32);
         hasher.update(&buffer.capacity_bytes.to_le_bytes());
         put_u32(&mut hasher, buffer.producer.0);
+        put_u32(&mut hasher, buffer.consumers.len() as u32);
         for consumer in &buffer.consumers {
             put_u32(&mut hasher, consumer.0);
         }
@@ -719,5 +724,20 @@ mod tests {
         assert_eq!(plan.buffers[0].capacity_bytes, 64);
         assert_eq!(plan.buffers[0].consumers, vec![NodeId(1), NodeId(2)]);
         assert_eq!(plan.peak_bytes, 64);
+    }
+
+    #[test]
+    fn connected_zero_sized_output_is_rejected() {
+        let (mut registry, graph) = fixture(false);
+        registry
+            .descriptors
+            .get_mut(&("source".to_string(), 1))
+            .unwrap()
+            .outputs[0]
+            .max_bytes = 0;
+        assert!(matches!(
+            Compiler::new(&registry, ExecutionRealm::HostStream).compile(&graph),
+            Err(CompileError::InvalidPortSize(NodeId(0), _))
+        ));
     }
 }

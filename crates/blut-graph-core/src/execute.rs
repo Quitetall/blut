@@ -34,10 +34,12 @@ pub struct ExecutionReceipt {
 pub trait KernelExecutor {
     type Value;
 
+    /// Execute one attempt from immutable input and return a newly owned output.
+    /// A failed attempt cannot mutate the input observed by a later retry.
     fn execute(
         &mut self,
         node: &CompiledNode,
-        value: Option<Self::Value>,
+        value: Option<&Self::Value>,
     ) -> Result<Option<Self::Value>, ExecutionError>;
 }
 
@@ -55,7 +57,6 @@ pub struct PlanExecutor<'a, K, S> {
 impl<'a, K, S> PlanExecutor<'a, K, S>
 where
     K: KernelExecutor,
-    K::Value: Clone,
     S: TransactionalSink,
 {
     pub fn new(kernels: &'a mut K, sink: &'a mut S) -> Self {
@@ -79,7 +80,7 @@ where
             }
             let mut attempts = 0u16;
             loop {
-                match self.kernels.execute(node, value.clone()) {
+                match self.kernels.execute(node, value.as_ref()) {
                     Ok(next) => {
                         value = next;
                         receipt.completed_kernels.push(node.kernel);
@@ -138,10 +139,10 @@ mod tests {
         fn execute(
             &mut self,
             _node: &CompiledNode,
-            value: Option<Self::Value>,
+            value: Option<&Self::Value>,
         ) -> Result<Option<Self::Value>, ExecutionError> {
             self.calls += 1;
-            Ok(Some(value.unwrap_or_default() + 1))
+            Ok(Some(value.copied().unwrap_or_default() + 1))
         }
     }
 
