@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
@@ -14,6 +14,7 @@ use crate::model::{
 pub enum CompileError {
     UnsupportedGraphVersion(u32),
     DuplicateNode(NodeId),
+    UnknownNode(NodeId),
     UnknownDescriptor(String, u32),
     DuplicateKernel(KernelId),
     UnknownPort(NodeId, String),
@@ -248,7 +249,13 @@ fn topological_order(graph: &Graph) -> Result<Vec<NodeId>, CompileError> {
     let mut outgoing: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
     for Edge { from, to } in &graph.edges {
         if !indegree.contains_key(&from.node) || !indegree.contains_key(&to.node) {
-            return Err(CompileError::UnknownPort(to.node, to.port.clone()));
+            return Err(CompileError::UnknownNode(
+                if !indegree.contains_key(&from.node) {
+                    from.node
+                } else {
+                    to.node
+                },
+            ));
         }
         *indegree.get_mut(&to.node).expect("checked") += 1;
         outgoing.entry(from.node).or_default().push(to.node);
@@ -256,23 +263,19 @@ fn topological_order(graph: &Graph) -> Result<Vec<NodeId>, CompileError> {
     for values in outgoing.values_mut() {
         values.sort();
     }
-    let mut ready: VecDeque<NodeId> = indegree
+    let mut ready: BTreeSet<NodeId> = indegree
         .iter()
         .filter_map(|(id, count)| (*count == 0).then_some(*id))
         .collect();
     let mut result = Vec::with_capacity(indegree.len());
-    while let Some(id) = ready.pop_front() {
+    while let Some(id) = ready.pop_first() {
         result.push(id);
         if let Some(next) = outgoing.get(&id) {
             for target in next {
                 let degree = indegree.get_mut(target).expect("edge target checked");
                 *degree -= 1;
                 if *degree == 0 {
-                    let position = ready
-                        .iter()
-                        .position(|queued| queued > target)
-                        .unwrap_or(ready.len());
-                    ready.insert(position, *target);
+                    ready.insert(*target);
                 }
             }
         }
@@ -333,11 +336,24 @@ fn allocate_buffers(
         .enumerate()
         .map(|(index, id)| (*id, index))
         .collect();
-    let mut buffers = Vec::new();
+    let mut grouped: BTreeMap<crate::model::PortRef, Vec<NodeId>> = BTreeMap::new();
     for edge in &graph.edges {
-        let producer = descriptors[&edge.from.node];
-        let output = find_port(&producer.outputs, edge.from.node, &edge.from.port)?;
-        let kernel = kernels[&edge.from.node];
+        grouped
+            .entry(edge.from.clone())
+            .or_default()
+            .push(edge.to.node);
+    }
+    let mut buffers = Vec::new();
+    for (source, mut consumers) in grouped {
+        consumers.sort();
+        consumers.dedup();
+        let last_consumer = *consumers
+            .iter()
+            .max_by_key(|consumer| position[consumer])
+            .expect("edge group is non-empty");
+        let producer = descriptors[&source.node];
+        let output = find_port(&producer.outputs, source.node, &source.port)?;
+        let kernel = kernels[&source.node];
         let layout = kernel
             .output_layouts
             .iter()
@@ -347,9 +363,10 @@ fn allocate_buffers(
         buffers.push(BufferPlan {
             id: BufferId(buffers.len() as u32),
             layout,
-            capacity_bytes: kernel.resources.peak_bytes.max(1),
-            producer: edge.from.node,
-            last_consumer: edge.to.node,
+            capacity_bytes: output.max_bytes,
+            producer: source.node,
+            consumers,
+            last_consumer,
             aliases: None,
         });
     }
@@ -380,7 +397,7 @@ fn build_compiled_nodes(
         let kernel = kernels[id];
         let input_buffers = buffers
             .iter()
-            .filter(|buffer| buffer.last_consumer == *id)
+            .filter(|buffer| buffer.consumers.contains(id))
             .map(|buffer| buffer.id)
             .collect();
         let output_buffers = buffers
@@ -398,6 +415,12 @@ fn build_compiled_nodes(
                 && descriptors[&previous_last].effect == crate::model::Effect::Pure
                 && previous.output_buffers.len() == 1
                 && input_buffers == previous.output_buffers
+                && previous.output_buffers.iter().all(|buffer_id| {
+                    buffers
+                        .iter()
+                        .find(|buffer| buffer.id == *buffer_id)
+                        .is_some_and(|buffer| buffer.consumers == alloc::vec![*id])
+                })
             {
                 previous.semantic_nodes.push(*id);
                 previous.kernel = kernel.id;
@@ -460,6 +483,9 @@ fn hash_plan(plan: &CompiledPlan) -> [u8; 32] {
         put_u32(&mut hasher, buffer.layout as u32);
         hasher.update(&buffer.capacity_bytes.to_le_bytes());
         put_u32(&mut hasher, buffer.producer.0);
+        for consumer in &buffer.consumers {
+            put_u32(&mut hasher, consumer.0);
+        }
         put_u32(&mut hasher, buffer.last_consumer.0);
     }
     for proof in &plan.propagated_proofs {
@@ -503,6 +529,7 @@ mod tests {
                     semantic_type: "abir.block".to_string(),
                     optional: false,
                     layouts: vec![Layout::Canonical],
+                    max_bytes: 64,
                 }]
             } else {
                 vec![]
@@ -512,6 +539,7 @@ mod tests {
                 semantic_type: "abir.block".to_string(),
                 optional: false,
                 layouts: vec![Layout::Canonical],
+                max_bytes: 64,
             }],
             capabilities: vec![Capability("abir".to_string())],
             targets: vec![Target::Host, Target::McuAot, Target::BlutDurable],
@@ -666,5 +694,30 @@ mod tests {
         assert_eq!(fused.graph_id, plain.graph_id);
         assert_ne!(fused.plan_id, plain.plan_id);
         assert_eq!(fused.order, plain.order);
+    }
+
+    #[test]
+    fn fanout_shares_one_sized_buffer_and_tracks_every_consumer() {
+        let (registry, mut graph) = fixture(false);
+        graph.edges.push(Edge {
+            from: PortRef {
+                node: NodeId(0),
+                port: "out".to_string(),
+            },
+            to: PortRef {
+                node: NodeId(2),
+                port: "in".to_string(),
+            },
+        });
+        graph
+            .edges
+            .retain(|edge| !(edge.from.node == NodeId(1) && edge.to.node == NodeId(2)));
+        let plan = Compiler::new(&registry, ExecutionRealm::HostStream)
+            .compile(&graph)
+            .unwrap();
+        assert_eq!(plan.buffers.len(), 1);
+        assert_eq!(plan.buffers[0].capacity_bytes, 64);
+        assert_eq!(plan.buffers[0].consumers, vec![NodeId(1), NodeId(2)]);
+        assert_eq!(plan.peak_bytes, 64);
     }
 }

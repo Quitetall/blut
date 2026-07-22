@@ -37,8 +37,8 @@ pub trait KernelExecutor {
     fn execute(
         &mut self,
         node: &CompiledNode,
-        value: &mut Option<Self::Value>,
-    ) -> Result<(), ExecutionError>;
+        value: Option<Self::Value>,
+    ) -> Result<Option<Self::Value>, ExecutionError>;
 }
 
 pub trait TransactionalSink {
@@ -55,6 +55,7 @@ pub struct PlanExecutor<'a, K, S> {
 impl<'a, K, S> PlanExecutor<'a, K, S>
 where
     K: KernelExecutor,
+    K::Value: Clone,
     S: TransactionalSink,
 {
     pub fn new(kernels: &'a mut K, sink: &'a mut S) -> Self {
@@ -78,8 +79,9 @@ where
             }
             let mut attempts = 0u16;
             loop {
-                match self.kernels.execute(node, &mut value) {
-                    Ok(()) => {
+                match self.kernels.execute(node, value.clone()) {
+                    Ok(next) => {
+                        value = next;
                         receipt.completed_kernels.push(node.kernel);
                         break;
                     }
@@ -136,11 +138,10 @@ mod tests {
         fn execute(
             &mut self,
             _node: &CompiledNode,
-            value: &mut Option<Self::Value>,
-        ) -> Result<(), ExecutionError> {
+            value: Option<Self::Value>,
+        ) -> Result<Option<Self::Value>, ExecutionError> {
             self.calls += 1;
-            *value = Some(value.unwrap_or_default() + 1);
-            Ok(())
+            Ok(Some(value.unwrap_or_default() + 1))
         }
     }
 

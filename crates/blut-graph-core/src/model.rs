@@ -110,6 +110,7 @@ pub struct PortDescriptor {
     pub semantic_type: String,
     pub optional: bool,
     pub layouts: Vec<Layout>,
+    pub max_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +212,7 @@ pub struct BufferPlan {
     pub layout: Layout,
     pub capacity_bytes: u64,
     pub producer: NodeId,
+    pub consumers: Vec<NodeId>,
     pub last_consumer: NodeId,
     pub aliases: Option<BufferId>,
 }
