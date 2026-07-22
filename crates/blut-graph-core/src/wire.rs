@@ -743,6 +743,17 @@ mod tests {
             ),
             Err(PlanDecodeError::InvalidPlan)
         );
+
+        let mut propagated_policy = minimal_plan();
+        propagated_policy.propagated_policy.push(String::new());
+        propagated_policy.plan_id = PlanId(hash_plan(&propagated_policy));
+        assert_eq!(
+            CompiledPlan::from_aot_bytes(
+                &propagated_policy.to_aot_bytes().unwrap(),
+                PlanLimits::default(),
+            ),
+            Err(PlanDecodeError::InvalidPlan)
+        );
     }
 
     #[test]

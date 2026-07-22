@@ -1041,6 +1041,10 @@ impl<'a> Compiler<'a> {
             .iter()
             .chain(&graph.policy)
             .any(|name| name.is_empty())
+            || graph
+                .required_capabilities
+                .iter()
+                .any(|capability| capability.0.is_empty())
         {
             return Err(CompileError::InvalidGraphContract);
         }
@@ -3635,6 +3639,13 @@ mod tests {
 
         graph.required_proofs.clear();
         graph.policy.push(String::new());
+        assert_eq!(
+            Compiler::new(&registry, ExecutionRealm::HostStream).compile(&graph),
+            Err(CompileError::InvalidGraphContract)
+        );
+
+        graph.policy.clear();
+        graph.required_capabilities.push(Capability(String::new()));
         assert_eq!(
             Compiler::new(&registry, ExecutionRealm::HostStream).compile(&graph),
             Err(CompileError::InvalidGraphContract)
