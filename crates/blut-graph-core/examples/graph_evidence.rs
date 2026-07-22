@@ -7,12 +7,48 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use blut_graph_core::{
-    Capability, Compiler, Determinism, Edge, Effect, ExecutionRealm, FidelityContract, Graph,
-    KernelDescriptor, KernelId, KernelRegistry, Layout, NodeDescriptor, NodeId, NodeInstance,
+    Capability, CompiledNode, Compiler, Determinism, Edge, Effect, ExecutionError, ExecutionRealm,
+    FidelityContract, Graph, ImplementationId, KernelDescriptor, KernelExecutor, KernelId,
+    KernelRegistry, Layout, NodeDescriptor, NodeId, NodeInstance, NodeTypeRef, PlanExecutor,
     PlanLimits, PolicyContract, PortDescriptor, PortRef, ProofContract, ResourceEnvelope, Target,
+    TransactionalSink,
 };
 
 const ITERATIONS: usize = 10_000;
+
+struct SyntheticKernels;
+
+impl KernelExecutor for SyntheticKernels {
+    type Value = u32;
+
+    fn execute(
+        &mut self,
+        node: &CompiledNode,
+        inputs: &[Option<&Self::Value>],
+    ) -> Result<Vec<Self::Value>, ExecutionError> {
+        let value = inputs
+            .first()
+            .and_then(|value| *value)
+            .copied()
+            .unwrap_or_default()
+            + 1;
+        Ok(vec![value; node.output_bindings.len()])
+    }
+}
+
+struct NoTransactions;
+
+impl TransactionalSink for NoTransactions {
+    fn prepare(&mut self, _idempotency_key: &str) -> Result<(), ExecutionError> {
+        Ok(())
+    }
+
+    fn commit(&mut self, _idempotency_key: &str) -> Result<String, ExecutionError> {
+        unreachable!("the evidence graph contains no transactional nodes")
+    }
+
+    fn abort(&mut self, _idempotency_key: &str) {}
+}
 
 fn descriptor(name: &str, input: bool) -> NodeDescriptor {
     NodeDescriptor {
@@ -44,6 +80,7 @@ fn descriptor(name: &str, input: bool) -> NodeDescriptor {
         proof: ProofContract {
             requires: vec![],
             provides: vec![format!("{name}.verified")],
+            invalidates: vec![],
         },
         policy: PolicyContract {
             requires: vec!["research".to_owned()],
@@ -53,6 +90,8 @@ fn descriptor(name: &str, input: bool) -> NodeDescriptor {
             minimum_input: 65_000,
             maximum_loss: 0,
         },
+        partiality: blut_graph_core::Partiality::Atomic,
+        failure: blut_graph_core::FailureContract { domains: vec![] },
         effect: Effect::Pure,
         retry_limit: 0,
         checkpointable: false,
@@ -62,7 +101,9 @@ fn descriptor(name: &str, input: bool) -> NodeDescriptor {
 fn fixture() -> (KernelRegistry, Graph) {
     let mut registry = KernelRegistry::default();
     for (node_index, name) in ["source", "process", "sink"].into_iter().enumerate() {
-        registry.register_descriptor(descriptor(name, node_index != 0));
+        registry
+            .register_descriptor(descriptor(name, node_index != 0))
+            .expect("unique descriptor identity");
         for (target_index, target) in [Target::Host, Target::McuAot, Target::BlutDurable]
             .into_iter()
             .enumerate()
@@ -70,15 +111,20 @@ fn fixture() -> (KernelRegistry, Graph) {
             registry
                 .register_kernel(KernelDescriptor {
                     id: KernelId((node_index * 3 + target_index) as u32),
-                    node_type: name.to_owned(),
-                    node_version: 1,
+                    implements: vec![NodeTypeRef {
+                        type_name: name.to_owned(),
+                        version: 1,
+                    }],
+                    implementation_id: ImplementationId(
+                        [(node_index * 3 + target_index + 1) as u8; 32],
+                    ),
+                    conversion: None,
                     target,
                     input_layouts: vec![Layout::Canonical],
                     output_layouts: vec![Layout::Canonical],
                     resources: ResourceEnvelope::bounded(4096, 1024, 1),
                     determinism: Determinism::BitExact,
                     lowering: format!("{target:?}"),
-                    fuses_with_next: vec![],
                 })
                 .expect("unique kernel ID");
         }
@@ -109,9 +155,10 @@ fn fixture() -> (KernelRegistry, Graph) {
     (
         registry,
         Graph {
-            version: 1,
+            version: 2,
             nodes,
             edges,
+            invocation_inputs: vec![],
             required_capabilities: vec![Capability("abir".to_owned())],
             required_proofs: vec![],
             policy: vec!["research".to_owned()],
@@ -176,6 +223,29 @@ fn main() {
         .expect("durable fixture compiles");
     assert_eq!(plan.graph_id, mcu_plan.graph_id);
     assert_eq!(plan.graph_id, durable_plan.graph_id);
+    let mcu_arena = mcu_plan
+        .mcu_arena_requirements()
+        .expect("MCU plan exposes a fixed-arena contract");
+    for realm_plan in [&mcu_plan, &plan, &durable_plan] {
+        let mut kernels = SyntheticKernels;
+        let mut transactions = NoTransactions;
+        let roots = BTreeMap::new();
+        let result = PlanExecutor::new(&mut kernels, &mut transactions)
+            .execute(realm_plan, [1; 32], roots)
+            .expect("synthetic realm execution succeeds");
+        assert_eq!(result.terminal_values[&NodeId(2)], vec![3]);
+        assert_eq!(result.receipt.graph_id, plan.graph_id);
+        assert_eq!(result.receipt.plan_id, realm_plan.plan_id);
+        assert_eq!(result.receipt.realm, realm_plan.realm);
+        assert_eq!(result.receipt.completed_nodes, realm_plan.order);
+        assert!(
+            result
+                .receipt
+                .attempts
+                .iter()
+                .all(|attempt| attempt.attempts == 1)
+        );
+    }
 
     let started = Instant::now();
     let mut bytes = Vec::new();
@@ -195,7 +265,8 @@ fn main() {
     let evidence = serde_json::json!({
         "schema": "blut.graph-runtime-evidence/v1",
         "stage": "graph-runtime",
-        "status": "PASS",
+        "status": "FAIL",
+        "completion_eligible": false,
         "revision": revision,
         "iterations": ITERATIONS,
         "compiled_plan_bytes": bytes.len(),
@@ -206,7 +277,17 @@ fn main() {
         "encode_ops_s": encode_ops_s,
         "decode_ops_s": decode_ops_s,
         "compile_benchmark_realm": "host-stream",
-        "identity_checked_realms": ["mcu-aot", "host-stream", "blut-durable"]
+        "identity_checked_realms": ["mcu-aot", "host-stream", "blut-durable"],
+        "synthetic_executor_checked_realms": ["mcu-aot", "host-stream", "blut-durable"],
+        "mcu_fixed_arena_bytes": mcu_arena.byte_arena,
+        "realm_implementation_blockers": [
+            "MCU has an authorized fixed-arena sizing contract but no distinct static executor evidence",
+            "host-stream execution evidence still uses the synthetic generic executor",
+            "BLUT has a fail-closed adapter contract but no end-to-end durable execution receipt in this artifact",
+            "supervised process-plugin lifecycle evidence is absent"
+        ],
+        "durable_adapter_validation": "cargo test -p blut semantic_plan::tests --lib",
+        "synthetic_output": 3
     });
     fs::write(
         output,

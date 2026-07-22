@@ -13,19 +13,24 @@ extern crate alloc;
 
 mod compile;
 mod execute;
+mod mcu;
 mod model;
 mod plugin;
 mod wire;
 
-pub use compile::{CompileError, Compiler, KernelRegistry};
+pub use compile::{CompileError, CompileLimits, Compiler, KernelRegistry};
 pub use execute::{
-    ExecutionError, ExecutionReceipt, KernelExecutor, PlanExecutor, TransactionalSink,
+    ExecutionAttempt, ExecutionError, ExecutionFailure, ExecutionReceipt, ExecutionResult,
+    GapReceipt, KernelExecution, KernelExecutor, KernelGap, PlanExecutor, StructuredFailure,
+    TransactionalSink,
 };
+pub use mcu::{McuArenaRequirements, McuPlanError};
 pub use model::{
-    BufferId, BufferPlan, Capability, CompiledNode, CompiledPlan, Determinism, Edge, Effect,
-    ExecutionRealm, FidelityContract, Graph, GraphId, KernelDescriptor, KernelId, Layout,
-    NodeDescriptor, NodeId, NodeInstance, PlanId, PolicyContract, PortDescriptor, PortRef,
-    ProofContract, ResourceEnvelope, Target,
+    AuthorizedPlan, BufferId, BufferPlan, Capability, CompiledNode, CompiledPlan, Determinism,
+    Edge, Effect, ExecutionRealm, FailureContract, FidelityContract, Graph, GraphId,
+    ImplementationId, InputBinding, KernelDescriptor, KernelId, Layout, LayoutConversion,
+    NodeDescriptor, NodeId, NodeInstance, NodeTypeRef, OutputBinding, Partiality, PlanId,
+    PolicyContract, PortDescriptor, PortRef, ProofContract, ResourceEnvelope, StepId, Target,
 };
 pub use plugin::{PluginError, PluginHost, PluginManifest, PluginRequest, PluginResponse};
-pub use wire::{PlanDecodeError, PlanLimits};
+pub use wire::{PlanAuthorization, PlanDecodeError, PlanLimits};
