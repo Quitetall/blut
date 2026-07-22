@@ -29,6 +29,7 @@ pub enum CompileError {
     ProofMissing(NodeId, String),
     PolicyMissing(NodeId, String),
     FidelityInsufficient(NodeId),
+    UnsafeRetry(NodeId),
     ResourceOverflow,
     EmptyGraph,
 }
@@ -119,6 +120,11 @@ impl<'a> Compiler<'a> {
                 .ok_or_else(|| CompileError::UnknownDescriptor(key.0.clone(), key.1))?;
             if !descriptor.targets.contains(&target) {
                 return Err(CompileError::TargetUnsupported(node.id, target));
+            }
+            if descriptor.retry_limit > 0
+                && matches!(descriptor.effect, crate::model::Effect::AtMostOnce)
+            {
+                return Err(CompileError::UnsafeRetry(node.id));
             }
             for capability in &descriptor.capabilities {
                 if !required_caps.contains(capability) {
@@ -470,18 +476,35 @@ fn hash_graph(graph: &Graph) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-fn hash_plan(plan: &CompiledPlan) -> [u8; 32] {
+pub(crate) fn hash_plan(plan: &CompiledPlan) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key("blut.compiled-plan.v1");
+    put_u32(&mut hasher, plan.schema_version);
     hasher.update(&plan.graph_id.0);
     put_u32(&mut hasher, plan.realm as u32);
+    put_u32(&mut hasher, plan.order.len() as u32);
+    for node in &plan.order {
+        put_u32(&mut hasher, node.0);
+    }
+    put_u32(&mut hasher, plan.nodes.len() as u32);
     for node in &plan.nodes {
+        put_u32(&mut hasher, node.semantic_nodes.len() as u32);
         for semantic in &node.semantic_nodes {
             put_u32(&mut hasher, semantic.0);
         }
         put_u32(&mut hasher, node.kernel.0);
+        put_u32(&mut hasher, node.input_buffers.len() as u32);
+        for buffer in &node.input_buffers {
+            put_u32(&mut hasher, buffer.0);
+        }
+        put_u32(&mut hasher, node.output_buffers.len() as u32);
+        for buffer in &node.output_buffers {
+            put_u32(&mut hasher, buffer.0);
+        }
         put_u32(&mut hasher, node.effect as u32);
         put_u32(&mut hasher, u32::from(node.retry_limit));
+        hasher.update(&[u8::from(node.checkpointable)]);
     }
+    put_u32(&mut hasher, plan.buffers.len() as u32);
     for buffer in &plan.buffers {
         put_u32(&mut hasher, buffer.id.0);
         put_u32(&mut hasher, buffer.layout as u32);
@@ -492,14 +515,26 @@ fn hash_plan(plan: &CompiledPlan) -> [u8; 32] {
             put_u32(&mut hasher, consumer.0);
         }
         put_u32(&mut hasher, buffer.last_consumer.0);
+        match buffer.aliases {
+            Some(alias) => {
+                hasher.update(&[1]);
+                put_u32(&mut hasher, alias.0);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        };
     }
+    put_u32(&mut hasher, plan.propagated_proofs.len() as u32);
     for proof in &plan.propagated_proofs {
         put_str(&mut hasher, proof);
     }
+    put_u32(&mut hasher, plan.propagated_policy.len() as u32);
     for policy in &plan.propagated_policy {
         put_str(&mut hasher, policy);
     }
     put_u32(&mut hasher, u32::from(plan.resulting_fidelity));
+    hasher.update(&plan.peak_bytes.to_le_bytes());
     *hasher.finalize().as_bytes()
 }
 
@@ -573,24 +608,29 @@ mod tests {
         let mut registry = KernelRegistry::default();
         for (index, name) in ["source", "process", "sink"].into_iter().enumerate() {
             registry.register_descriptor(descriptor(name, index != 0));
-            registry
-                .register_kernel(KernelDescriptor {
-                    id: KernelId(index as u32),
-                    node_type: name.to_string(),
-                    node_version: 1,
-                    target: Target::Host,
-                    input_layouts: vec![Layout::Canonical],
-                    output_layouts: vec![Layout::Canonical],
-                    resources: ResourceEnvelope::bounded(64, 0, 1),
-                    determinism: Determinism::BitExact,
-                    lowering: "test".to_string(),
-                    fuses_with_next: if name == "source" {
-                        vec!["process".to_string()]
-                    } else {
-                        vec![]
-                    },
-                })
-                .unwrap();
+            for (target_index, target) in [Target::Host, Target::McuAot, Target::BlutDurable]
+                .into_iter()
+                .enumerate()
+            {
+                registry
+                    .register_kernel(KernelDescriptor {
+                        id: KernelId((index * 3 + target_index) as u32),
+                        node_type: name.to_string(),
+                        node_version: 1,
+                        target,
+                        input_layouts: vec![Layout::Canonical],
+                        output_layouts: vec![Layout::Canonical],
+                        resources: ResourceEnvelope::bounded(64, 0, 1),
+                        determinism: Determinism::BitExact,
+                        lowering: "test".to_string(),
+                        fuses_with_next: if name == "source" {
+                            vec!["process".to_string()]
+                        } else {
+                            vec![]
+                        },
+                    })
+                    .unwrap();
+            }
         }
         let mut nodes = vec![
             NodeInstance {
@@ -739,5 +779,33 @@ mod tests {
             Compiler::new(&registry, ExecutionRealm::HostStream).compile(&graph),
             Err(CompileError::InvalidPortSize(NodeId(0), _))
         ));
+    }
+
+    #[test]
+    fn all_realms_compile_the_same_semantic_graph() {
+        let (registry, graph) = fixture(false);
+        let host = Compiler::new(&registry, ExecutionRealm::HostStream)
+            .compile(&graph)
+            .unwrap();
+        let mcu = Compiler::new(&registry, ExecutionRealm::McuAot)
+            .compile(&graph)
+            .unwrap();
+        let durable = Compiler::new(&registry, ExecutionRealm::BlutDurable)
+            .compile(&graph)
+            .unwrap();
+        assert_eq!(host.graph_id, mcu.graph_id);
+        assert_eq!(host.graph_id, durable.graph_id);
+        assert_eq!(host.order, mcu.order);
+        assert_eq!(host.order, durable.order);
+        assert_ne!(host.plan_id, mcu.plan_id);
+        assert_ne!(host.plan_id, durable.plan_id);
+        assert_eq!(
+            crate::CompiledPlan::from_aot_bytes(
+                &mcu.to_aot_bytes().unwrap(),
+                crate::PlanLimits::default()
+            )
+            .unwrap(),
+            mcu
+        );
     }
 }

@@ -15,6 +15,7 @@ mod compile;
 mod execute;
 mod model;
 mod plugin;
+mod wire;
 
 pub use compile::{CompileError, Compiler, KernelRegistry};
 pub use execute::{
@@ -27,3 +28,4 @@ pub use model::{
     ProofContract, ResourceEnvelope, Target,
 };
 pub use plugin::{PluginError, PluginHost, PluginManifest, PluginRequest, PluginResponse};
+pub use wire::{PlanDecodeError, PlanLimits};
