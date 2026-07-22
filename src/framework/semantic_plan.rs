@@ -48,10 +48,20 @@ pub enum DurablePlanError {
     UnsupportedEffect { step: StepId, effect: Effect },
     #[error("BLUT adapter cannot represent explicit gaps from step {step:?}")]
     PartialOutput { step: StepId },
+    #[error("BLUT's legacy stage seam cannot provide {scope:?} state for step {step:?}")]
+    UnsupportedState {
+        step: StepId,
+        scope: blut_graph_core::StateScope,
+    },
     #[error("durable implementation identity differs for step {step:?}")]
     Implementation { step: StepId },
     #[error("durable checkpoint contract differs for step {step:?}")]
     Checkpoint { step: StepId },
+    #[error("BLUT's tuple seam cannot bind feedback state {feedback:?} at step {step:?}")]
+    FeedbackInput {
+        step: StepId,
+        feedback: blut_graph_core::FeedbackId,
+    },
     #[error("durable policy recheck differs for step {step:?}")]
     Policy { step: StepId },
     #[error(transparent)]
@@ -71,7 +81,7 @@ pub struct ResolvedDurableStep {
 pub struct DurableStepContract {
     pub implementation_id: ImplementationId,
     pub effect: Effect,
-    pub checkpointable: bool,
+    pub state: blut_graph_core::StateContract,
     pub rechecked_policy: Vec<String>,
 }
 
@@ -139,6 +149,19 @@ pub fn adapt_durable_plan(
                 input,
             });
         }
+        if let Some(feedback) = step
+            .input_bindings
+            .iter()
+            .find_map(|binding| match binding {
+                blut_graph_core::InputBinding::Feedback(feedback) => Some(*feedback),
+                _ => None,
+            })
+        {
+            return Err(DurablePlanError::FeedbackInput {
+                step: step.id,
+                feedback,
+            });
+        }
         if step.effect != Effect::Pure {
             return Err(DurablePlanError::UnsupportedEffect {
                 step: step.id,
@@ -147,6 +170,12 @@ pub fn adapt_durable_plan(
         }
         if step.partiality != Partiality::Atomic {
             return Err(DurablePlanError::PartialOutput { step: step.id });
+        }
+        if step.state.scope != blut_graph_core::StateScope::Stateless {
+            return Err(DurablePlanError::UnsupportedState {
+                step: step.id,
+                scope: step.state.scope,
+            });
         }
         let resolved = resolver
             .resolve(step)
@@ -159,7 +188,7 @@ pub fn adapt_durable_plan(
         {
             return Err(DurablePlanError::Implementation { step: step.id });
         }
-        if resolved.contract.checkpointable != step.checkpointable {
+        if resolved.contract.state != step.state {
             return Err(DurablePlanError::Checkpoint { step: step.id });
         }
         let mut expected_policy = semantic.propagated_policy.clone();
@@ -227,12 +256,14 @@ pub fn adapt_durable_plan(
             "steps": semantic.nodes.iter().map(|step| serde_json::json!({
                 "step": step.id.0,
                 "semantic_nodes": step.semantic_nodes.iter().map(|node| node.0).collect::<Vec<_>>(),
+                "semantic_configs": step.semantic_configs,
                 "implementation_id": hex(&step.implementation_id.0),
                 "ordered_inputs": step.input_ports.iter().zip(&step.input_bindings).map(|(port, binding)| serde_json::json!({
                     "port": port,
                     "binding": match binding {
                         blut_graph_core::InputBinding::Buffer(buffer) => format!("buffer:{}", buffer.0),
                         blut_graph_core::InputBinding::Invocation(input) => format!("invocation:{input}"),
+                        blut_graph_core::InputBinding::Feedback(feedback) => format!("feedback:{}", feedback.0),
                         blut_graph_core::InputBinding::Absent => "absent".to_string(),
                     },
                 })).collect::<Vec<_>>(),
@@ -243,7 +274,13 @@ pub fn adapt_durable_plan(
                         blut_graph_core::OutputBinding::Terminal => "terminal".to_string(),
                     },
                 })).collect::<Vec<_>>(),
+                "input_contracts": step.input_contracts,
+                "output_contracts": step.output_contracts,
+                "state": step.state,
+                "subgraph_path": step.subgraph_path,
             })).collect::<Vec<_>>(),
+            "persistent_state_bytes": semantic.persistent_state_bytes,
+            "session": semantic.session,
         }
     });
     let durable = CompiledPlan::from_erased_graph(name, recipe_args, nodes, edges)?;
@@ -309,7 +346,7 @@ mod tests {
                 contract: DurableStepContract {
                     implementation_id: _step.implementation_id,
                     effect: _step.effect,
-                    checkpointable: _step.checkpointable,
+                    state: _step.state.clone(),
                     rechecked_policy: vec![],
                 },
             })
@@ -329,8 +366,36 @@ mod tests {
                 contract: DurableStepContract {
                     implementation_id: step.implementation_id,
                     effect: step.effect,
-                    checkpointable: step.checkpointable,
+                    state: step.state.clone(),
                     rechecked_policy: vec!["untrusted-extra-policy".into()],
+                },
+            })
+        }
+    }
+
+    struct WrongStateResolver;
+
+    impl DurableStepResolver for WrongStateResolver {
+        fn resolve(
+            &self,
+            step: &blut_graph_core::CompiledNode,
+        ) -> Result<ResolvedDurableStep, String> {
+            Ok(ResolvedDurableStep {
+                stage: Arc::new(UnitStage),
+                args: serde_json::json!(null),
+                contract: DurableStepContract {
+                    implementation_id: step.implementation_id,
+                    effect: step.effect,
+                    state: blut_graph_core::StateContract {
+                        scope: blut_graph_core::StateScope::Session,
+                        max_bytes: 1,
+                        checkpoint: blut_graph_core::CheckpointContract {
+                            mode: blut_graph_core::CheckpointMode::Disabled,
+                            max_snapshot_bytes: 0,
+                            max_interval_invocations: 0,
+                        },
+                    },
+                    rechecked_policy: vec![],
                 },
             })
         }
@@ -343,6 +408,7 @@ mod tests {
             optional: false,
             layouts: vec![Layout::Canonical],
             max_bytes: 64,
+            ..PortDescriptor::opaque(if input { "in" } else { "out" }, "abir.block", 64)
         };
         NodeDescriptor {
             type_name: name.into(),
@@ -354,12 +420,15 @@ mod tests {
                 optional: false,
                 layouts: vec![Layout::Canonical],
                 max_bytes: 64,
+                ..PortDescriptor::opaque("out", "abir.block", 64)
             }],
             capabilities: vec![Capability("abir".into())],
             targets: vec![Target::BlutDurable, Target::Host],
             resources: ResourceEnvelope::bounded(0, 0, 1),
             determinism: Determinism::BitExact,
-            stateful: false,
+            config: blut_graph_core::ConfigSchema::default(),
+            state: blut_graph_core::StateContract::stateless(),
+            subgraph: None,
             proof: ProofContract {
                 requires: vec![],
                 provides: vec![],
@@ -377,16 +446,19 @@ mod tests {
             failure: blut_graph_core::FailureContract { domains: vec![] },
             effect: Effect::Pure,
             retry_limit: 0,
-            checkpointable: false,
         }
     }
 
-    fn plan(realm: ExecutionRealm) -> AuthorizedPlan {
+    fn plan_with_feedback(realm: ExecutionRealm, feedback: bool) -> AuthorizedPlan {
         let mut registry = KernelRegistry::default();
         for (index, name) in ["source", "sink"].into_iter().enumerate() {
-            registry
-                .register_descriptor(descriptor(name, index != 0))
-                .unwrap();
+            let mut descriptor = descriptor(name, index != 0);
+            if feedback && index == 0 {
+                let mut history = PortDescriptor::opaque("history", "abir.block", 64);
+                history.optional = true;
+                descriptor.inputs.push(history);
+            }
+            registry.register_descriptor(descriptor).unwrap();
             let target = realm.target();
             registry
                 .register_kernel(KernelDescriptor {
@@ -408,7 +480,7 @@ mod tests {
         }
         Compiler::new(&registry, realm)
             .compile(&Graph {
-                version: 2,
+                version: 3,
                 nodes: vec![
                     NodeInstance {
                         id: NodeId(0),
@@ -433,13 +505,41 @@ mod tests {
                         port: "in".into(),
                     },
                 }],
+                feedback: if feedback {
+                    vec![blut_graph_core::FeedbackEdge {
+                        from: PortRef {
+                            node: NodeId(1),
+                            port: "out".into(),
+                        },
+                        to: PortRef {
+                            node: NodeId(0),
+                            port: "history".into(),
+                        },
+                        delay: blut_graph_core::DelayContract {
+                            invocations: 1,
+                            initial: blut_graph_core::DelayInitial::Absent,
+                        },
+                    }]
+                } else {
+                    vec![]
+                },
                 invocation_inputs: vec![],
                 required_capabilities: vec![Capability("abir".into())],
                 required_proofs: vec![],
                 policy: vec![],
                 minimum_fidelity: 0,
+                session: feedback.then(|| blut_graph_core::SessionContract {
+                    namespace: "durable-test".into(),
+                    max_concurrent_sessions: 2,
+                    max_idle_millis: 1_000,
+                    reset_on_plan_change: true,
+                }),
             })
             .unwrap()
+    }
+
+    fn plan(realm: ExecutionRealm) -> AuthorizedPlan {
+        plan_with_feedback(realm, false)
     }
 
     #[test]
@@ -458,6 +558,11 @@ mod tests {
             adapted.durable_plan().recipe_args()["semantic_graph"]["steps"][1]["ordered_inputs"][0]
                 ["port"],
             "in"
+        );
+        assert_eq!(
+            adapted.durable_plan().recipe_args()["semantic_graph"]["steps"][1]["input_contracts"]
+                [0]["semantic_type"],
+            "abir.block"
         );
     }
 
@@ -484,6 +589,28 @@ mod tests {
                 &WrongPolicyResolver,
             ),
             Err(DurablePlanError::Policy { .. })
+        ));
+    }
+
+    #[test]
+    fn durable_adapter_requires_exact_state_and_rejects_feedback_until_supported() {
+        assert!(matches!(
+            adapt_durable_plan(
+                "semantic",
+                serde_json::json!({}),
+                plan(ExecutionRealm::BlutDurable),
+                &WrongStateResolver,
+            ),
+            Err(DurablePlanError::Checkpoint { .. })
+        ));
+        assert!(matches!(
+            adapt_durable_plan(
+                "semantic",
+                serde_json::json!({}),
+                plan_with_feedback(ExecutionRealm::BlutDurable, true),
+                &Resolver,
+            ),
+            Err(DurablePlanError::FeedbackInput { .. })
         ));
     }
 }

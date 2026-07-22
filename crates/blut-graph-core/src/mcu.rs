@@ -27,6 +27,8 @@ pub enum McuPlanError {
     UnsupportedEffect(crate::StepId, Effect),
     UnboundedPartialOutput(crate::StepId),
     HostResource(crate::StepId),
+    StatefulPlan,
+    HierarchicalPlan(crate::StepId),
     SizeOverflow,
 }
 
@@ -46,6 +48,9 @@ impl AuthorizedPlan {
         if self.realm != ExecutionRealm::McuAot {
             return Err(McuPlanError::WrongRealm(self.realm));
         }
+        if self.persistent_state_bytes != 0 || !self.feedback.is_empty() || self.session.is_some() {
+            return Err(McuPlanError::StatefulPlan);
+        }
         let mut max_step_inputs = 0usize;
         let mut max_step_outputs = 0usize;
         let mut terminal_slots = 0usize;
@@ -58,6 +63,12 @@ impl AuthorizedPlan {
             }
             if step.resources.threads != 1 || step.resources.device.is_some() {
                 return Err(McuPlanError::HostResource(step.id));
+            }
+            if step.state.scope != crate::StateScope::Stateless {
+                return Err(McuPlanError::StatefulPlan);
+            }
+            if !step.subgraph_path.is_empty() {
+                return Err(McuPlanError::HierarchicalPlan(step.id));
             }
             max_step_inputs = max_step_inputs.max(step.input_bindings.len());
             max_step_outputs = max_step_outputs.max(step.output_bindings.len());
@@ -98,7 +109,7 @@ mod tests {
     #[test]
     fn authorized_mcu_plan_exposes_exact_fixed_arena_shape() {
         let mut plan = CompiledPlan {
-            schema_version: 2,
+            schema_version: 3,
             graph_id: GraphId([1; 32]),
             plan_id: PlanId([0; 32]),
             realm: ExecutionRealm::McuAot,
@@ -119,20 +130,31 @@ mod tests {
                 conversion: None,
                 input_ports: vec![],
                 output_ports: vec!["out".into()],
+                input_contracts: vec![],
+                output_contracts: vec![crate::CompiledPortContract::opaque(
+                    "out",
+                    "test",
+                    crate::Layout::Canonical,
+                    1,
+                )],
                 input_bindings: vec![],
                 output_bindings: vec![OutputBinding::Terminal],
                 partiality: Partiality::Atomic,
                 failure: FailureContract { domains: vec![] },
                 effect: Effect::Pure,
                 retry_limit: 0,
-                checkpointable: false,
+                state: crate::StateContract::stateless(),
+                subgraph_path: vec![],
             }],
             buffers: vec![],
+            feedback: vec![],
             invocation_ports: vec![],
             propagated_proofs: vec![],
             propagated_policy: vec![],
             resulting_fidelity: u16::MAX,
             peak_bytes: 128,
+            persistent_state_bytes: 0,
+            session: None,
         };
         plan.plan_id = PlanId(crate::compile::hash_plan(&plan));
         let requirements = AuthorizedPlan::new(plan).mcu_arena_requirements().unwrap();

@@ -31,6 +31,7 @@ pub enum ExecutionError {
     TransactionPrepare(String),
     TransactionCommit(String),
     InvalidGap(KernelId),
+    StatefulPlanUnsupported,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,6 +190,18 @@ where
         let mut buffers: BTreeMap<BufferId, K::Value> = BTreeMap::new();
         let mut terminal_values = BTreeMap::new();
 
+        if !plan.feedback.is_empty()
+            || plan
+                .nodes
+                .iter()
+                .any(|node| node.state.scope != crate::StateScope::Stateless)
+        {
+            return Err(Box::new(ExecutionFailure {
+                error: ExecutionError::StatefulPlanUnsupported,
+                receipt,
+            }));
+        }
+
         if let Some(unexpected) = invocation_inputs
             .keys()
             .find(|port| plan.invocation_ports.binary_search(port).is_err())
@@ -258,6 +271,9 @@ where
                             }));
                         }
                     },
+                    InputBinding::Feedback(_) => {
+                        unreachable!("stateful plans fail before execution")
+                    }
                 }
             }
 
@@ -369,7 +385,9 @@ where
                 .iter()
                 .filter_map(|binding| match binding {
                     InputBinding::Buffer(buffer) => Some(buffer),
-                    InputBinding::Invocation(_) | InputBinding::Absent => None,
+                    InputBinding::Invocation(_)
+                    | InputBinding::Feedback(_)
+                    | InputBinding::Absent => None,
                 })
             {
                 if plan
@@ -473,6 +491,8 @@ mod tests {
         outputs: Vec<BufferId>,
         effect: Effect,
     ) -> CompiledNode {
+        let input_count = inputs.len();
+        let output_count = outputs.len().max(1);
         CompiledNode {
             id: StepId(id),
             semantic_nodes: vec![NodeId(id)],
@@ -497,6 +517,30 @@ mod tests {
                     .map(|index| format!("out-{index}"))
                     .collect()
             },
+            input_contracts: (0..input_count)
+                .map(|index| {
+                    crate::CompiledPortContract::opaque(
+                        format!("in-{index}"),
+                        "test",
+                        crate::Layout::Canonical,
+                        4,
+                    )
+                })
+                .collect(),
+            output_contracts: (0..output_count)
+                .map(|index| {
+                    crate::CompiledPortContract::opaque(
+                        if output_count == 1 {
+                            "out".into()
+                        } else {
+                            format!("out-{index}")
+                        },
+                        "test",
+                        crate::Layout::Canonical,
+                        4,
+                    )
+                })
+                .collect(),
             input_bindings: inputs.into_iter().map(InputBinding::Buffer).collect(),
             output_bindings: if outputs.is_empty() {
                 vec![OutputBinding::Terminal]
@@ -509,14 +553,15 @@ mod tests {
             },
             effect,
             retry_limit: 0,
-            checkpointable: effect == Effect::Transactional,
+            state: crate::StateContract::stateless(),
+            subgraph_path: vec![],
         }
     }
 
     #[test]
     fn fanout_and_join_follow_buffers_not_node_iteration() {
         let mut plan = CompiledPlan {
-            schema_version: 2,
+            schema_version: 3,
             graph_id: GraphId([1; 32]),
             plan_id: PlanId([2; 32]),
             realm: ExecutionRealm::HostStream,
@@ -556,11 +601,14 @@ mod tests {
                     aliases: None,
                 },
             ],
+            feedback: vec![],
             invocation_ports: vec![],
             propagated_proofs: vec![],
             propagated_policy: vec![],
             resulting_fidelity: u16::MAX,
             peak_bytes: 12,
+            persistent_state_bytes: 0,
+            session: None,
         };
         plan.plan_id = PlanId(crate::compile::hash_plan(&plan));
         let plan = AuthorizedPlan::new(plan);
@@ -579,18 +627,21 @@ mod tests {
     #[test]
     fn failure_returns_attempt_receipt_and_invocations_have_distinct_keys() {
         let mut plan = CompiledPlan {
-            schema_version: 2,
+            schema_version: 3,
             graph_id: GraphId([1; 32]),
             plan_id: PlanId([2; 32]),
             realm: ExecutionRealm::BlutDurable,
             order: vec![NodeId(0)],
             nodes: vec![node(0, vec![], vec![], Effect::Transactional)],
             buffers: vec![],
+            feedback: vec![],
             invocation_ports: vec![],
             propagated_proofs: vec![],
             propagated_policy: vec![],
             resulting_fidelity: u16::MAX,
             peak_bytes: 0,
+            persistent_state_bytes: 0,
+            session: None,
         };
         plan.nodes[0].retry_limit = 1;
         plan.plan_id = PlanId(crate::compile::hash_plan(&plan));
@@ -614,18 +665,21 @@ mod tests {
     #[test]
     fn commit_failure_returns_the_completed_attempt_without_a_commit_receipt() {
         let mut plan = CompiledPlan {
-            schema_version: 2,
+            schema_version: 3,
             graph_id: GraphId([1; 32]),
             plan_id: PlanId([2; 32]),
             realm: ExecutionRealm::BlutDurable,
             order: vec![NodeId(0)],
             nodes: vec![node(0, vec![], vec![], Effect::Transactional)],
             buffers: vec![],
+            feedback: vec![],
             invocation_ports: vec![],
             propagated_proofs: vec![],
             propagated_policy: vec![],
             resulting_fidelity: u16::MAX,
             peak_bytes: 0,
+            persistent_state_bytes: 0,
+            session: None,
         };
         plan.plan_id = PlanId(crate::compile::hash_plan(&plan));
         let plan = AuthorizedPlan::new(plan);
@@ -686,18 +740,21 @@ mod tests {
         partial.partiality = crate::Partiality::ExplicitGaps;
         partial.failure.domains = vec!["biosignal.missing".into()];
         let mut plan = CompiledPlan {
-            schema_version: 2,
+            schema_version: 3,
             graph_id: GraphId([1; 32]),
             plan_id: PlanId([0; 32]),
             realm: ExecutionRealm::HostStream,
             order: vec![NodeId(0)],
             nodes: vec![partial],
             buffers: vec![],
+            feedback: vec![],
             invocation_ports: vec![],
             propagated_proofs: vec![],
             propagated_policy: vec![],
             resulting_fidelity: u16::MAX,
             peak_bytes: 0,
+            persistent_state_bytes: 0,
+            session: None,
         };
         plan.plan_id = PlanId(crate::compile::hash_plan(&plan));
         let plan = AuthorizedPlan::new(plan);

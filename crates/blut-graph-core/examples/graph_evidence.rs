@@ -61,6 +61,7 @@ fn descriptor(name: &str, input: bool) -> NodeDescriptor {
                 optional: false,
                 layouts: vec![Layout::Canonical],
                 max_bytes: 4096,
+                ..PortDescriptor::opaque("in", "abir.block", 4096)
             }]
         } else {
             vec![]
@@ -71,12 +72,15 @@ fn descriptor(name: &str, input: bool) -> NodeDescriptor {
             optional: false,
             layouts: vec![Layout::Canonical],
             max_bytes: 4096,
+            ..PortDescriptor::opaque("out", "abir.block", 4096)
         }],
         capabilities: vec![Capability("abir".to_owned())],
         targets: vec![Target::Host, Target::McuAot, Target::BlutDurable],
         resources: ResourceEnvelope::bounded(4096, 1024, 1),
         determinism: Determinism::BitExact,
-        stateful: false,
+        config: blut_graph_core::ConfigSchema::default(),
+        state: blut_graph_core::StateContract::stateless(),
+        subgraph: None,
         proof: ProofContract {
             requires: vec![],
             provides: vec![format!("{name}.verified")],
@@ -94,7 +98,6 @@ fn descriptor(name: &str, input: bool) -> NodeDescriptor {
         failure: blut_graph_core::FailureContract { domains: vec![] },
         effect: Effect::Pure,
         retry_limit: 0,
-        checkpointable: false,
     }
 }
 
@@ -155,14 +158,16 @@ fn fixture() -> (KernelRegistry, Graph) {
     (
         registry,
         Graph {
-            version: 2,
+            version: 3,
             nodes,
             edges,
+            feedback: vec![],
             invocation_inputs: vec![],
             required_capabilities: vec![Capability("abir".to_owned())],
             required_proofs: vec![],
             policy: vec!["research".to_owned()],
             minimum_fidelity: 65_000,
+            session: None,
         },
     )
 }
@@ -270,9 +275,12 @@ fn main() {
         "revision": revision,
         "iterations": ITERATIONS,
         "compiled_plan_bytes": bytes.len(),
+        "wire_magic": "BGP3",
+        "schema_version": plan.schema_version,
         "graph_id": hex(&plan.graph_id.0),
         "plan_id": hex(&plan.plan_id.0),
         "peak_bytes": plan.peak_bytes,
+        "persistent_state_bytes": plan.persistent_state_bytes,
         "compile_ops_s": compile_ops_s,
         "encode_ops_s": encode_ops_s,
         "decode_ops_s": decode_ops_s,
@@ -284,7 +292,10 @@ fn main() {
             "MCU has an authorized fixed-arena sizing contract but no distinct static executor evidence",
             "host-stream execution evidence still uses the synthetic generic executor",
             "BLUT has a fail-closed adapter contract but no end-to-end durable execution receipt in this artifact",
-            "supervised process-plugin lifecycle evidence is absent"
+            "stateful session and feedback realm-store execution evidence is absent",
+            "hierarchical schemas are identity-bound but inner DAGs are not yet inline-expanded",
+            "checkpoint bounds are declarative; explicit runtime barrier evidence is absent",
+            "BPC2 supervised process-plugin lifecycle implementation evidence is absent"
         ],
         "durable_adapter_validation": "cargo test -p blut semantic_plan::tests --lib",
         "synthetic_output": 3

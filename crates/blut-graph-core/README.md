@@ -6,6 +6,17 @@ proof, policy, fidelity, resource, effect, and target contracts before producing
 a deterministic `CompiledPlan` shared by MCU AOT, host/stream, and BLUT durable
 execution realms.
 
+Node configuration is a sealed exact-value algebra (`bool`, signed/unsigned
+integers, bounded text/choice/bytes) validated against a normalized descriptor
+schema. Defaults are materialized before semantic identity is calculated, so
+implicit and explicit defaults compile to the same `GraphId` and `PlanId`.
+Unknown, missing, mistyped, and out-of-range values fail before kernel search.
+
+Every physical port carries its ABIR root/view semantic type plus proof, policy,
+fidelity, extent, layout, and lease contract. These contracts survive fusion,
+layout conversion, AOT serialization, and durable-plan adaptation; an edge is
+admitted only when the producer contract satisfies the consumer contract.
+
 The crate owns no biosignal semantics, filesystem, network, async runtime, or
 plugin process. Those remain implementation concerns behind the kernel,
 transaction, and process-host traits.
@@ -47,10 +58,35 @@ static subset and returns exact caller-owned arena dimensions without
 allocating. The firmware execution loop remains a realm implementation rather
 than a disguised use of the generic allocating host executor.
 
-Semantic graphs use schema version 2 and the physical-step/ordered-port contract
-is encoded as `BGP2`. The earlier
-alpha `BGP1` postcard layout is intentionally not reinterpreted because it had
-no physical conversion identity or registry-bound execution contract.
+State is explicit and bounded. `StateContract` distinguishes invocation,
+session, and durable state and binds checkpoint mode, snapshot size, and maximum
+checkpoint interval. Cross-invocation feedback uses a positive-delay
+`FeedbackEdge`, a dense `FeedbackPlan`, and a session contract; the plan records
+the exact persistent-state arena size. The generic one-shot executor and MCU
+subset fail closed on these constructs until their realm supplies a state
+store. Hierarchical decompositions are content-identified `SubgraphSchema`s;
+their identity covers repeated local instances, typed config, internal edges,
+interface bindings, and nested child identities. Registered lowerings require
+descriptor-compatible child interfaces and exact port maps; compilation
+enforces search/depth ceilings while preserving the root subgraph identity in
+the physical step. BGP3 does not yet inline-expand the inner DAG: a physical
+kernel still implements the outer node, with the subgraph serving as an
+identity-bound decomposition contract.
+
+Semantic graphs use schema version 3 and the physical-step/ordered-port contract
+is encoded as `BGP3`. Earlier alpha `BGP1` and `BGP2` postcard layouts are
+intentionally not reinterpreted. `BGP3` adds typed canonical configuration,
+per-port semantic contracts, explicit bounded state/feedback/session records,
+and identity-bound hierarchical lowering.
+
+The process-plugin control plane is `BPC2`, a bounded canonical postcard wire.
+It binds a domain-separated BLAKE3 executable digest, declared capabilities,
+a canonical unsigned Ed25519 manifest digest and verifier key identifier,
+request and invocation identity, startup/request/heartbeat
+deadlines, maximum inflight/frame sizes, and graceful-then-kill or immediate
+teardown policy. Its lifecycle only advances from spawn through handshake,
+ready, draining, and termination; it cannot re-enter readiness after teardown.
+The crate defines the supervisory contract but never spawns a process itself.
 
 The BLUT engine exposes `adapt_durable_plan`, which maps an authorized
 `BlutDurable` physical plan into the existing kind-checked durable DAG. The

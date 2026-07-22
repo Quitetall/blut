@@ -12,13 +12,15 @@
 extern crate alloc;
 
 mod compile;
+mod config;
 mod execute;
 mod mcu;
 mod model;
 mod plugin;
 mod wire;
 
-pub use compile::{CompileError, CompileLimits, Compiler, KernelRegistry};
+pub use compile::{CompileError, CompileLimits, Compiler, KernelRegistry, subgraph_identity};
+pub use config::{ConfigError, ConfigField, ConfigSchema, ConfigType, ConfigValue};
 pub use execute::{
     ExecutionAttempt, ExecutionError, ExecutionFailure, ExecutionReceipt, ExecutionResult,
     GapReceipt, KernelExecution, KernelExecutor, KernelGap, PlanExecutor, StructuredFailure,
@@ -26,11 +28,19 @@ pub use execute::{
 };
 pub use mcu::{McuArenaRequirements, McuPlanError};
 pub use model::{
-    AuthorizedPlan, BufferId, BufferPlan, Capability, CompiledNode, CompiledPlan, Determinism,
-    Edge, Effect, ExecutionRealm, FailureContract, FidelityContract, Graph, GraphId,
+    AbirRootType, AbirSemanticType, AbirViewType, AuthorizedPlan, BufferId, BufferPlan, Capability,
+    CheckpointContract, CheckpointMode, CompiledNode, CompiledPlan, CompiledPortContract,
+    DelayContract, DelayInitial, Determinism, Edge, Effect, ExecutionRealm, ExtentContract,
+    FailureContract, FeedbackEdge, FeedbackId, FeedbackPlan, FidelityContract, Graph, GraphId,
     ImplementationId, InputBinding, KernelDescriptor, KernelId, Layout, LayoutConversion,
-    NodeDescriptor, NodeId, NodeInstance, NodeTypeRef, OutputBinding, Partiality, PlanId,
-    PolicyContract, PortDescriptor, PortRef, ProofContract, ResourceEnvelope, StepId, Target,
+    LeaseAccess, LeaseContract, LeaseLifetime, NodeDescriptor, NodeId, NodeInstance, NodeTypeRef,
+    OutputBinding, Partiality, PlanId, PolicyContract, PortDescriptor, PortMap, PortRef,
+    ProofContract, ResourceEnvelope, SessionContract, StateContract, StateScope, StepId,
+    SubgraphId, SubgraphInterfacePort, SubgraphLowering, SubgraphNode, SubgraphSchema, Target,
 };
-pub use plugin::{PluginError, PluginHost, PluginManifest, PluginRequest, PluginResponse};
+pub use plugin::{
+    ExecutableDigestAlgorithm, PLUGIN_PROTOCOL_VERSION, PluginControlFrame, PluginControlLimits,
+    PluginError, PluginFailure, PluginHost, PluginLifecycle, PluginManifest, PluginRequest,
+    PluginResponse, ProcessContract, TeardownPolicy, executable_digest,
+};
 pub use wire::{PlanAuthorization, PlanDecodeError, PlanLimits};

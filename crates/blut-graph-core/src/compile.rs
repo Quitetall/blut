@@ -6,9 +6,9 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::model::{
-    AuthorizedPlan, BufferId, BufferPlan, CompiledNode, CompiledPlan, Edge, ExecutionRealm, Graph,
-    GraphId, KernelDescriptor, KernelId, Layout, NodeDescriptor, NodeId, NodeTypeRef,
-    OutputBinding, PlanId, PortDescriptor, StepId, Target,
+    AuthorizedPlan, BufferId, BufferPlan, CompiledNode, CompiledPlan, CompiledPortContract, Edge,
+    ExecutionRealm, Graph, GraphId, KernelDescriptor, KernelId, Layout, NodeDescriptor, NodeId,
+    NodeTypeRef, OutputBinding, PlanId, PortDescriptor, StateContract, StateScope, StepId, Target,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,6 +19,7 @@ pub enum CompileError {
     UnknownDescriptor(String, u32),
     DuplicateDescriptor(String, u32),
     InvalidDescriptor(String, u32),
+    InvalidConfig(NodeId, crate::ConfigError),
     DuplicateKernel(KernelId),
     InvalidKernelContract(KernelId),
     UnknownPort(NodeId, String),
@@ -42,6 +43,13 @@ pub enum CompileError {
     CompileLimitExceeded,
     ResourceOverflow,
     EmptyGraph,
+    InvalidState(NodeId),
+    InvalidSession,
+    InvalidFeedback(NodeId, String),
+    PortContractMismatch(NodeId, String, NodeId, String),
+    UnknownSubgraph(crate::SubgraphId),
+    InvalidSubgraph(crate::SubgraphId),
+    SubgraphDepthExceeded,
 }
 
 impl fmt::Display for CompileError {
@@ -57,6 +65,7 @@ impl std::error::Error for CompileError {}
 pub struct KernelRegistry {
     descriptors: BTreeMap<(String, u32), NodeDescriptor>,
     kernels: BTreeMap<KernelId, KernelDescriptor>,
+    subgraphs: BTreeMap<crate::SubgraphId, crate::SubgraphSchema>,
 }
 
 impl KernelRegistry {
@@ -71,6 +80,7 @@ impl KernelRegistry {
         {
             port.layouts.sort_unstable();
             port.layouts.dedup();
+            normalize_contract(&mut port.proof, &mut port.policy);
         }
         descriptor.capabilities.sort_unstable();
         descriptor.capabilities.dedup();
@@ -88,6 +98,15 @@ impl KernelRegistry {
         descriptor.policy.adds.dedup();
         descriptor.failure.domains.sort_unstable();
         descriptor.failure.domains.dedup();
+        if let Some(lowering) = &mut descriptor.subgraph {
+            lowering.input_map.sort_unstable();
+            lowering.input_map.dedup();
+            lowering.output_map.sort_unstable();
+            lowering.output_map.dedup();
+        }
+        descriptor.config.normalize().map_err(|_| {
+            CompileError::InvalidDescriptor(descriptor.type_name.clone(), descriptor.version)
+        })?;
         let key = (descriptor.type_name.clone(), descriptor.version);
         if self.descriptors.contains_key(&key) {
             return Err(CompileError::DuplicateDescriptor(key.0, key.1));
@@ -99,6 +118,7 @@ impl KernelRegistry {
                     || port.semantic_type.is_empty()
                     || port.max_bytes == 0
                     || port.layouts.is_empty()
+                    || !valid_port_contract(port)
                     || !names.insert(port.name.as_str())
             })
         }
@@ -115,10 +135,130 @@ impl KernelRegistry {
                 .any(|domain| domain.is_empty())
             || (descriptor.partiality == crate::model::Partiality::ExplicitGaps
                 && descriptor.failure.domains.is_empty())
+            || !valid_state_contract(&descriptor.state)
         {
             return Err(CompileError::InvalidDescriptor(key.0, key.1));
         }
         self.descriptors.insert(key, descriptor);
+        Ok(())
+    }
+
+    pub fn register_subgraph(
+        &mut self,
+        mut schema: crate::SubgraphSchema,
+    ) -> Result<(), CompileError> {
+        schema.nodes.sort_by_key(|node| node.id);
+        schema
+            .edges
+            .sort_by_key(|edge| (edge.from.clone(), edge.to.clone()));
+        schema.inputs.sort_unstable();
+        schema.outputs.sort_unstable();
+        let duplicate_nodes = schema.nodes.windows(2).any(|pair| pair[0].id == pair[1].id);
+        let duplicate_edges = schema.edges.windows(2).any(|pair| pair[0] == pair[1]);
+        let duplicate_interface = |ports: &[crate::SubgraphInterfacePort]| {
+            ports.windows(2).any(|pair| pair[0].name == pair[1].name)
+                || ports
+                    .iter()
+                    .map(|port| &port.inner)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != ports.len()
+        };
+        if schema.version == 0
+            || schema.nodes.is_empty()
+            || duplicate_nodes
+            || duplicate_edges
+            || duplicate_interface(&schema.inputs)
+            || duplicate_interface(&schema.outputs)
+            || schema.id != subgraph_identity(&schema)
+            || self.subgraphs.contains_key(&schema.id)
+        {
+            return Err(CompileError::InvalidSubgraph(schema.id));
+        }
+        let mut descriptors = BTreeMap::new();
+        for node in &schema.nodes {
+            let descriptor = self
+                .descriptors
+                .get(&(node.node_type.type_name.clone(), node.node_type.version))
+                .ok_or(CompileError::InvalidSubgraph(schema.id))?;
+            let invalid_config = match descriptor.config.canonicalize(&node.config) {
+                Ok(canonical) => canonical != node.config,
+                Err(_) => true,
+            };
+            let invalid_child = match node.child {
+                Some(child) if child == schema.id => true,
+                Some(child) => self.subgraphs.get(&child).is_none_or(|child| {
+                    !subgraph_implements_descriptor(child, descriptor, &self.descriptors)
+                }),
+                None => false,
+            };
+            if invalid_config || invalid_child {
+                return Err(CompileError::InvalidSubgraph(schema.id));
+            }
+            descriptors.insert(node.id, descriptor);
+        }
+        let mut bound_inputs = BTreeSet::new();
+        for edge in &schema.edges {
+            let from = descriptors
+                .get(&edge.from.node)
+                .ok_or(CompileError::InvalidSubgraph(schema.id))?;
+            let to = descriptors
+                .get(&edge.to.node)
+                .ok_or(CompileError::InvalidSubgraph(schema.id))?;
+            let output = from
+                .outputs
+                .iter()
+                .find(|port| port.name == edge.from.port)
+                .ok_or(CompileError::InvalidSubgraph(schema.id))?;
+            let input = to
+                .inputs
+                .iter()
+                .find(|port| port.name == edge.to.port)
+                .ok_or(CompileError::InvalidSubgraph(schema.id))?;
+            if !port_contract_satisfies(output, input) || !bound_inputs.insert(edge.to.clone()) {
+                return Err(CompileError::InvalidSubgraph(schema.id));
+            }
+        }
+        for port in &schema.inputs {
+            let descriptor = descriptors
+                .get(&port.inner.node)
+                .ok_or(CompileError::InvalidSubgraph(schema.id))?;
+            if port.name.is_empty()
+                || !descriptor
+                    .inputs
+                    .iter()
+                    .any(|input| input.name == port.inner.port)
+                || !bound_inputs.insert(port.inner.clone())
+            {
+                return Err(CompileError::InvalidSubgraph(schema.id));
+            }
+        }
+        for port in &schema.outputs {
+            let descriptor = descriptors
+                .get(&port.inner.node)
+                .ok_or(CompileError::InvalidSubgraph(schema.id))?;
+            if port.name.is_empty()
+                || !descriptor
+                    .outputs
+                    .iter()
+                    .any(|output| output.name == port.inner.port)
+            {
+                return Err(CompileError::InvalidSubgraph(schema.id));
+            }
+        }
+        if descriptors.iter().any(|(node, descriptor)| {
+            descriptor.inputs.iter().any(|input| {
+                !input.optional
+                    && !bound_inputs.contains(&crate::PortRef {
+                        node: *node,
+                        port: input.name.clone(),
+                    })
+            })
+        }) || !subgraph_is_acyclic(&schema)
+        {
+            return Err(CompileError::InvalidSubgraph(schema.id));
+        }
+        self.subgraphs.insert(schema.id, schema);
         Ok(())
     }
 
@@ -175,12 +315,21 @@ impl KernelRegistry {
             {
                 return Err(crate::PlanDecodeError::UnauthorizedPlan);
             }
-            if node.conversion.is_some() {
+            if let Some(conversion) = &node.conversion {
                 if !kernel.implements.is_empty()
                     || node.input_ports.as_slice() != ["input"]
                     || node.output_ports.as_slice() != ["output"]
+                    || node.input_contracts.len() != 1
+                    || node.output_contracts.len() != 1
+                    || !conversion_contracts_match(
+                        &node.input_contracts[0],
+                        &node.output_contracts[0],
+                        conversion,
+                    )
                     || node.partiality != crate::model::Partiality::Atomic
                     || !node.failure.domains.is_empty()
+                    || node.state != StateContract::stateless()
+                    || !node.subgraph_path.is_empty()
                 {
                     return Err(crate::PlanDecodeError::UnauthorizedPlan);
                 }
@@ -200,6 +349,14 @@ impl KernelRegistry {
             let last = semantic_descriptors
                 .last()
                 .ok_or(crate::PlanDecodeError::UnauthorizedPlan)?;
+            if semantic_descriptors.iter().zip(&node.semantic_configs).any(
+                |(descriptor, config)| match descriptor.config.canonicalize(config) {
+                    Ok(canonical) => canonical != *config,
+                    Err(_) => true,
+                },
+            ) {
+                return Err(crate::PlanDecodeError::UnauthorizedPlan);
+            }
             if semantic_descriptors
                 .iter()
                 .any(|descriptor| kernel.determinism > descriptor.determinism)
@@ -212,6 +369,26 @@ impl KernelRegistry {
                         .iter()
                         .map(|port| port.name.clone())
                         .collect::<Vec<_>>()
+                || node.input_contracts.len() != first.inputs.len()
+                || node.output_contracts.len() != last.outputs.len()
+                || node
+                    .input_contracts
+                    .iter()
+                    .any(|contract| !kernel.input_layouts.contains(&contract.layout))
+                || node
+                    .output_contracts
+                    .iter()
+                    .any(|contract| !kernel.output_layouts.contains(&contract.layout))
+                || node
+                    .input_contracts
+                    .iter()
+                    .zip(&first.inputs)
+                    .any(|(compiled, port)| !compiled_port_matches(compiled, port))
+                || node
+                    .output_contracts
+                    .iter()
+                    .zip(&last.outputs)
+                    .any(|(compiled, port)| !compiled_port_matches(compiled, port))
                 || node.output_ports
                     != last
                         .outputs
@@ -243,22 +420,40 @@ impl KernelRegistry {
             if semantic_descriptors.len() == 1 {
                 if node.effect != first.effect
                     || node.retry_limit != first.retry_limit
-                    || node.checkpointable != first.checkpointable
+                    || node.state != first.state
+                    || node.subgraph_path
+                        != first
+                            .subgraph
+                            .iter()
+                            .map(|lowering| lowering.subgraph)
+                            .collect::<Vec<_>>()
                     || node.partiality != first.partiality
                     || node.failure != first.failure
                 {
                     return Err(crate::PlanDecodeError::UnauthorizedPlan);
                 }
+                if let Some(lowering) = &first.subgraph {
+                    validate_subgraph_path(
+                        &self.subgraphs,
+                        lowering.subgraph,
+                        limits.max_subgraph_depth,
+                        limits.max_contract_entries,
+                    )
+                    .map_err(|_| crate::PlanDecodeError::UnauthorizedPlan)?;
+                    validate_port_map(first, lowering, &self.subgraphs)
+                        .map_err(|_| crate::PlanDecodeError::UnauthorizedPlan)?;
+                }
             } else if node.effect != crate::model::Effect::Pure
                 || node.retry_limit != 0
-                || node.checkpointable
+                || node.state != StateContract::stateless()
+                || !node.subgraph_path.is_empty()
                 || node.partiality != crate::model::Partiality::Atomic
                 || !node.failure.domains.is_empty()
                 || semantic_descriptors.iter().any(|descriptor| {
                     descriptor.effect != crate::model::Effect::Pure
-                        || descriptor.stateful
+                        || descriptor.state.scope != StateScope::Stateless
                         || descriptor.retry_limit != 0
-                        || descriptor.checkpointable
+                        || descriptor.state.checkpointable()
                         || descriptor.partiality != crate::model::Partiality::Atomic
                         || !descriptor.failure.domains.is_empty()
                 })
@@ -268,6 +463,474 @@ impl KernelRegistry {
         }
         Ok(AuthorizedPlan::new(plan))
     }
+}
+
+fn normalize_contract(proof: &mut crate::ProofContract, policy: &mut crate::PolicyContract) {
+    proof.requires.sort_unstable();
+    proof.requires.dedup();
+    proof.provides.sort_unstable();
+    proof.provides.dedup();
+    proof.invalidates.sort_unstable();
+    proof.invalidates.dedup();
+    policy.requires.sort_unstable();
+    policy.requires.dedup();
+    policy.adds.sort_unstable();
+    policy.adds.dedup();
+}
+
+fn subgraph_implements_descriptor(
+    schema: &crate::SubgraphSchema,
+    descriptor: &NodeDescriptor,
+    descriptors: &BTreeMap<(String, u32), NodeDescriptor>,
+) -> bool {
+    fn interface_matches(
+        schema: &crate::SubgraphSchema,
+        interface: &crate::SubgraphInterfacePort,
+        expected: &PortDescriptor,
+        descriptors: &BTreeMap<(String, u32), NodeDescriptor>,
+        input: bool,
+    ) -> bool {
+        let Some(node) = schema
+            .nodes
+            .iter()
+            .find(|node| node.id == interface.inner.node)
+        else {
+            return false;
+        };
+        let Some(descriptor) =
+            descriptors.get(&(node.node_type.type_name.clone(), node.node_type.version))
+        else {
+            return false;
+        };
+        let ports = if input {
+            &descriptor.inputs
+        } else {
+            &descriptor.outputs
+        };
+        let Some(inner) = ports.iter().find(|port| port.name == interface.inner.port) else {
+            return false;
+        };
+        let mut inner = inner.clone();
+        inner.name = interface.name.clone();
+        &inner == expected
+    }
+
+    schema.inputs.len() == descriptor.inputs.len()
+        && schema.outputs.len() == descriptor.outputs.len()
+        && descriptor.inputs.iter().all(|expected| {
+            schema
+                .inputs
+                .iter()
+                .find(|interface| interface.name == expected.name)
+                .is_some_and(|interface| {
+                    interface_matches(schema, interface, expected, descriptors, true)
+                })
+        })
+        && descriptor.outputs.iter().all(|expected| {
+            schema
+                .outputs
+                .iter()
+                .find(|interface| interface.name == expected.name)
+                .is_some_and(|interface| {
+                    interface_matches(schema, interface, expected, descriptors, false)
+                })
+        })
+}
+
+pub(crate) fn valid_port_contract(port: &PortDescriptor) -> bool {
+    let extent = &port.extent;
+    if extent.maximum_shape.len() != usize::from(extent.rank)
+        || extent.max_elements == 0
+        || extent.maximum_shape.contains(&0)
+    {
+        return false;
+    }
+    let shape_product = extent
+        .maximum_shape
+        .iter()
+        .try_fold(1u64, |product, size| product.checked_mul(*size));
+    if shape_product.is_none_or(|product| product > extent.max_elements) {
+        return false;
+    }
+    if port.lease.access == crate::LeaseAccess::ExclusiveWrite
+        && port.lease.lifetime == crate::LeaseLifetime::Session
+    {
+        return false;
+    }
+    !matches!(&port.abir.root, crate::AbirRootType::Unknown(name) if name.is_empty())
+        && !matches!(&port.abir.view, crate::AbirViewType::Unknown(name) if name.is_empty())
+}
+
+pub(crate) fn valid_state_contract(state: &StateContract) -> bool {
+    match state.scope {
+        StateScope::Stateless => {
+            state.max_bytes == 0
+                && state.checkpoint.mode == crate::CheckpointMode::Disabled
+                && state.checkpoint.max_snapshot_bytes == 0
+                && state.checkpoint.max_interval_invocations == 0
+        }
+        StateScope::Invocation => {
+            state.max_bytes > 0
+                && state.checkpoint.mode == crate::CheckpointMode::Disabled
+                && state.checkpoint.max_snapshot_bytes == 0
+                && state.checkpoint.max_interval_invocations == 0
+        }
+        StateScope::Session => {
+            state.max_bytes > 0
+                && match state.checkpoint.mode {
+                    crate::CheckpointMode::Disabled => {
+                        state.checkpoint.max_snapshot_bytes == 0
+                            && state.checkpoint.max_interval_invocations == 0
+                    }
+                    crate::CheckpointMode::Optional | crate::CheckpointMode::Required => {
+                        state.checkpoint.max_snapshot_bytes > 0
+                            && state.checkpoint.max_snapshot_bytes <= state.max_bytes
+                            && state.checkpoint.max_interval_invocations > 0
+                    }
+                }
+        }
+        StateScope::Durable => {
+            state.max_bytes > 0
+                && state.checkpoint.mode == crate::CheckpointMode::Required
+                && state.checkpoint.max_snapshot_bytes > 0
+                && state.checkpoint.max_snapshot_bytes <= state.max_bytes
+                && state.checkpoint.max_interval_invocations > 0
+        }
+    }
+}
+
+fn port_contract_satisfies(output: &PortDescriptor, input: &PortDescriptor) -> bool {
+    output.semantic_type == input.semantic_type
+        && output.abir == input.abir
+        && (!output.optional || input.optional)
+        && output.max_bytes <= input.max_bytes
+        && output.extent.rank == input.extent.rank
+        && output.extent.max_elements <= input.extent.max_elements
+        && output
+            .extent
+            .maximum_shape
+            .iter()
+            .zip(&input.extent.maximum_shape)
+            .all(|(actual, maximum)| actual <= maximum)
+        && (!output.extent.ragged || input.extent.ragged)
+        && (!output.extent.sparse || input.extent.sparse)
+        && input
+            .proof
+            .requires
+            .iter()
+            .all(|required| output.proof.provides.contains(required))
+        && input
+            .policy
+            .requires
+            .iter()
+            .all(|required| output.policy.adds.contains(required))
+        && output.fidelity.maximum_loss <= input.fidelity.maximum_loss
+        && output.fidelity.minimum_input >= input.fidelity.minimum_input
+        && output.lease == input.lease
+}
+
+pub(crate) fn compiled_port_contract_satisfies(
+    output: &CompiledPortContract,
+    input: &CompiledPortContract,
+) -> bool {
+    output.layout == input.layout
+        && output.semantic_type == input.semantic_type
+        && output.abir == input.abir
+        && (!output.optional || input.optional)
+        && output.max_bytes <= input.max_bytes
+        && output.extent.rank == input.extent.rank
+        && output.extent.max_elements <= input.extent.max_elements
+        && output
+            .extent
+            .maximum_shape
+            .iter()
+            .zip(&input.extent.maximum_shape)
+            .all(|(actual, maximum)| actual <= maximum)
+        && (!output.extent.ragged || input.extent.ragged)
+        && (!output.extent.sparse || input.extent.sparse)
+        && input
+            .proof
+            .requires
+            .iter()
+            .all(|required| output.proof.provides.contains(required))
+        && input
+            .policy
+            .requires
+            .iter()
+            .all(|required| output.policy.adds.contains(required))
+        && output.fidelity.maximum_loss <= input.fidelity.maximum_loss
+        && output.fidelity.minimum_input >= input.fidelity.minimum_input
+        && output.lease == input.lease
+}
+
+fn select_layout(port: &PortDescriptor, kernel_layouts: &[Layout]) -> Layout {
+    port.layouts
+        .iter()
+        .filter(|layout| kernel_layouts.contains(layout))
+        .copied()
+        .min()
+        .expect("kernel compatibility was checked")
+}
+
+fn compiled_port_contract(port: &PortDescriptor, layout: Layout) -> CompiledPortContract {
+    CompiledPortContract {
+        name: port.name.clone(),
+        semantic_type: port.semantic_type.clone(),
+        optional: port.optional,
+        layout,
+        max_bytes: port.max_bytes,
+        abir: port.abir.clone(),
+        proof: port.proof.clone(),
+        policy: port.policy.clone(),
+        fidelity: port.fidelity.clone(),
+        extent: port.extent.clone(),
+        lease: port.lease.clone(),
+    }
+}
+
+fn conversion_port_contract(
+    port: &PortDescriptor,
+    layout: Layout,
+    name: &str,
+    max_bytes: u64,
+) -> CompiledPortContract {
+    let mut contract = compiled_port_contract(port, layout);
+    contract.name = name.to_string();
+    contract.optional = false;
+    contract.max_bytes = max_bytes;
+    contract
+}
+
+fn compiled_port_matches(compiled: &CompiledPortContract, descriptor: &PortDescriptor) -> bool {
+    compiled.name == descriptor.name
+        && compiled.semantic_type == descriptor.semantic_type
+        && compiled.optional == descriptor.optional
+        && descriptor.layouts.contains(&compiled.layout)
+        && compiled.max_bytes == descriptor.max_bytes
+        && compiled.abir == descriptor.abir
+        && compiled.proof == descriptor.proof
+        && compiled.policy == descriptor.policy
+        && compiled.fidelity == descriptor.fidelity
+        && compiled.extent == descriptor.extent
+        && compiled.lease == descriptor.lease
+}
+
+fn conversion_contracts_match(
+    input: &CompiledPortContract,
+    output: &CompiledPortContract,
+    conversion: &crate::LayoutConversion,
+) -> bool {
+    input.name == "input"
+        && output.name == "output"
+        && !input.optional
+        && !output.optional
+        && input.semantic_type == conversion.semantic_type
+        && output.semantic_type == conversion.semantic_type
+        && input.layout == conversion.from
+        && output.layout == conversion.to
+        && input.max_bytes <= conversion.max_input_bytes
+        && output.max_bytes == conversion.max_output_bytes
+        && input.abir == output.abir
+        && input.proof == output.proof
+        && input.policy == output.policy
+        && input.fidelity == output.fidelity
+        && input.extent == output.extent
+        && input.lease == output.lease
+}
+
+fn synchronize_port_layouts(nodes: &mut [CompiledNode], buffers: &[BufferPlan]) {
+    for node in nodes {
+        for (contract, binding) in node.input_contracts.iter_mut().zip(&node.input_bindings) {
+            if let crate::InputBinding::Buffer(buffer) = binding {
+                contract.layout = buffers[buffer.0 as usize].layout;
+            }
+        }
+        for (contract, binding) in node.output_contracts.iter_mut().zip(&node.output_bindings) {
+            if let OutputBinding::Buffer(buffer) = binding {
+                contract.layout = buffers[buffer.0 as usize].layout;
+            }
+        }
+    }
+}
+
+/// Domain-separated semantic identity for a normalized hierarchical schema.
+pub fn subgraph_identity(schema: &crate::SubgraphSchema) -> crate::SubgraphId {
+    let mut hasher = blake3::Hasher::new_derive_key("blut.subgraph.v1");
+    put_u32(&mut hasher, schema.version);
+    let mut nodes = schema.nodes.clone();
+    nodes.sort_by_key(|node| node.id);
+    put_u32(&mut hasher, nodes.len() as u32);
+    for node in &nodes {
+        put_u32(&mut hasher, node.id.0);
+        put_str(&mut hasher, &node.node_type.type_name);
+        put_u32(&mut hasher, node.node_type.version);
+        put_u32(&mut hasher, node.config.len() as u32);
+        for (key, value) in &node.config {
+            put_str(&mut hasher, key);
+            hash_config_value(&mut hasher, value);
+        }
+        match node.child {
+            Some(child) => {
+                hasher.update(&[1]);
+                hasher.update(&child.0);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+    }
+    let mut edges = schema.edges.clone();
+    edges.sort_by_key(|edge| (edge.from.clone(), edge.to.clone()));
+    put_u32(&mut hasher, edges.len() as u32);
+    for edge in &edges {
+        put_port_ref(&mut hasher, &edge.from);
+        put_port_ref(&mut hasher, &edge.to);
+    }
+    for ports in [&schema.inputs, &schema.outputs] {
+        let mut ports = ports.clone();
+        ports.sort_unstable();
+        put_u32(&mut hasher, ports.len() as u32);
+        for port in &ports {
+            put_str(&mut hasher, &port.name);
+            put_port_ref(&mut hasher, &port.inner);
+        }
+    }
+    crate::SubgraphId(*hasher.finalize().as_bytes())
+}
+
+fn subgraph_is_acyclic(schema: &crate::SubgraphSchema) -> bool {
+    let mut indegree: BTreeMap<_, usize> = schema.nodes.iter().map(|node| (node.id, 0)).collect();
+    let mut outgoing: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for edge in &schema.edges {
+        let Some(degree) = indegree.get_mut(&edge.to.node) else {
+            return false;
+        };
+        *degree += 1;
+        outgoing
+            .entry(edge.from.node)
+            .or_default()
+            .push(edge.to.node);
+    }
+    let mut ready: Vec<_> = indegree
+        .iter()
+        .filter_map(|(node, degree)| (*degree == 0).then_some(*node))
+        .collect();
+    let mut visited = 0usize;
+    while let Some(node) = ready.pop() {
+        visited += 1;
+        for target in outgoing.get(&node).into_iter().flatten() {
+            let Some(degree) = indegree.get_mut(target) else {
+                return false;
+            };
+            *degree -= 1;
+            if *degree == 0 {
+                ready.push(*target);
+            }
+        }
+    }
+    visited == schema.nodes.len()
+}
+
+fn validate_subgraph_path(
+    schemas: &BTreeMap<crate::SubgraphId, crate::SubgraphSchema>,
+    root: crate::SubgraphId,
+    max_depth: usize,
+    max_states: usize,
+) -> Result<(), CompileError> {
+    let mut pending = alloc::vec![(root, 1usize, BTreeSet::new())];
+    let mut searched = 0usize;
+    while let Some((id, depth, mut ancestors)) = pending.pop() {
+        let schema = schemas.get(&id).ok_or(CompileError::UnknownSubgraph(id))?;
+        searched = searched
+            .checked_add(schema.nodes.len())
+            .and_then(|count| count.checked_add(schema.edges.len()))
+            .and_then(|count| count.checked_add(schema.inputs.len()))
+            .and_then(|count| count.checked_add(schema.outputs.len()))
+            .ok_or(CompileError::SearchLimitExceeded)?;
+        if searched > max_states {
+            return Err(CompileError::SearchLimitExceeded);
+        }
+        if depth > max_depth {
+            return Err(CompileError::SubgraphDepthExceeded);
+        }
+        if !ancestors.insert(id) {
+            return Err(CompileError::InvalidSubgraph(id));
+        }
+        for child in schema.nodes.iter().filter_map(|node| node.child) {
+            pending.push((child, depth + 1, ancestors.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_port_map(
+    descriptor: &NodeDescriptor,
+    lowering: &crate::SubgraphLowering,
+    schemas: &BTreeMap<crate::SubgraphId, crate::SubgraphSchema>,
+) -> Result<(), CompileError> {
+    let schema = schemas
+        .get(&lowering.subgraph)
+        .ok_or(CompileError::UnknownSubgraph(lowering.subgraph))?;
+    let input_names: BTreeSet<_> = descriptor
+        .inputs
+        .iter()
+        .map(|port| port.name.as_str())
+        .collect();
+    let output_names: BTreeSet<_> = descriptor
+        .outputs
+        .iter()
+        .map(|port| port.name.as_str())
+        .collect();
+    let mapped_inputs: BTreeSet<_> = lowering
+        .input_map
+        .iter()
+        .map(|map| map.outer.as_str())
+        .collect();
+    let mapped_outputs: BTreeSet<_> = lowering
+        .output_map
+        .iter()
+        .map(|map| map.outer.as_str())
+        .collect();
+    let inner_inputs: BTreeSet<_> = schema
+        .inputs
+        .iter()
+        .map(|port| port.name.as_str())
+        .collect();
+    let inner_outputs: BTreeSet<_> = schema
+        .outputs
+        .iter()
+        .map(|port| port.name.as_str())
+        .collect();
+    if input_names != mapped_inputs
+        || output_names != mapped_outputs
+        || lowering.input_map.len() != input_names.len()
+        || lowering.output_map.len() != output_names.len()
+        || lowering
+            .input_map
+            .iter()
+            .any(|map| !inner_inputs.contains(map.inner.as_str()))
+        || lowering
+            .output_map
+            .iter()
+            .any(|map| !inner_outputs.contains(map.inner.as_str()))
+        || lowering
+            .input_map
+            .iter()
+            .map(|map| map.inner.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+            != lowering.input_map.len()
+        || lowering
+            .output_map
+            .iter()
+            .map(|map| map.inner.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+            != lowering.output_map.len()
+    {
+        return Err(CompileError::InvalidSubgraph(lowering.subgraph));
+    }
+    Ok(())
 }
 
 pub struct Compiler<'a> {
@@ -285,6 +948,9 @@ pub struct CompileLimits {
     pub max_semantic_nodes: usize,
     pub max_steps: usize,
     pub max_buffers: usize,
+    pub max_subgraph_depth: usize,
+    pub max_feedback_edges: usize,
+    pub max_persistent_state_bytes: u64,
 }
 
 type LoweredCandidate = (
@@ -303,6 +969,9 @@ impl Default for CompileLimits {
             max_semantic_nodes: 65_536,
             max_steps: 65_536,
             max_buffers: 262_144,
+            max_subgraph_depth: 16,
+            max_feedback_edges: 65_536,
+            max_persistent_state_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -320,6 +989,9 @@ impl<'a> Compiler<'a> {
                 max_semantic_nodes: 65_536,
                 max_steps: 65_536,
                 max_buffers: 262_144,
+                max_subgraph_depth: 16,
+                max_feedback_edges: 65_536,
+                max_persistent_state_bytes: 64 * 1024 * 1024,
             },
         }
     }
@@ -340,7 +1012,7 @@ impl<'a> Compiler<'a> {
     }
 
     pub fn compile(&self, graph: &Graph) -> Result<AuthorizedPlan, CompileError> {
-        if graph.version != 2 {
+        if graph.version != 3 {
             return Err(CompileError::UnsupportedGraphVersion(graph.version));
         }
         if graph.nodes.is_empty() {
@@ -350,9 +1022,10 @@ impl<'a> Compiler<'a> {
             return Err(CompileError::CompileLimitExceeded);
         }
 
-        let mut nodes = BTreeMap::new();
-        for node in &graph.nodes {
-            if nodes.insert(node.id, node).is_some() {
+        let mut normalized_graph = graph.clone();
+        let mut seen_nodes = BTreeSet::new();
+        for node in &normalized_graph.nodes {
+            if !seen_nodes.insert(node.id) {
                 return Err(CompileError::DuplicateNode(node.id));
             }
         }
@@ -360,7 +1033,7 @@ impl<'a> Compiler<'a> {
         let mut descriptors = BTreeMap::new();
         let target = self.realm.target();
         let required_caps: BTreeSet<_> = graph.required_capabilities.iter().collect();
-        for node in &graph.nodes {
+        for node in &normalized_graph.nodes {
             let key = (node.descriptor.clone(), node.descriptor_version);
             let descriptor = self
                 .registry
@@ -375,12 +1048,48 @@ impl<'a> Compiler<'a> {
             {
                 return Err(CompileError::UnsafeRetry(node.id));
             }
+            if matches!(
+                descriptor.state.scope,
+                StateScope::Session | StateScope::Durable
+            ) && normalized_graph.session.is_none()
+            {
+                return Err(CompileError::InvalidState(node.id));
+            }
+            if let Some(lowering) = &descriptor.subgraph {
+                validate_subgraph_path(
+                    &self.registry.subgraphs,
+                    lowering.subgraph,
+                    self.limits.max_subgraph_depth,
+                    self.limits.max_search_states,
+                )?;
+                validate_port_map(descriptor, lowering, &self.registry.subgraphs)?;
+            }
             for capability in &descriptor.capabilities {
                 if !required_caps.contains(capability) {
                     return Err(CompileError::CapabilityMissing(capability.0.clone()));
                 }
             }
             descriptors.insert(node.id, descriptor);
+        }
+        for node in &mut normalized_graph.nodes {
+            node.config = descriptors[&node.id]
+                .config
+                .canonicalize(&node.config)
+                .map_err(|error| CompileError::InvalidConfig(node.id, error))?;
+        }
+        if normalized_graph.session.as_ref().is_some_and(|session| {
+            session.namespace.is_empty()
+                || session.max_concurrent_sessions == 0
+                || session.max_idle_millis == 0
+        }) {
+            return Err(CompileError::InvalidSession);
+        }
+        if !normalized_graph.feedback.is_empty() && normalized_graph.session.is_none() {
+            return Err(CompileError::InvalidSession);
+        }
+        let mut nodes = BTreeMap::new();
+        for node in &normalized_graph.nodes {
+            nodes.insert(node.id, node);
         }
         let supplied_caps: BTreeSet<_> = descriptors
             .values()
@@ -390,25 +1099,48 @@ impl<'a> Compiler<'a> {
             return Err(CompileError::CapabilityUnsupported(extra.0.clone()));
         }
 
-        let invocation_ports = self.verify_edges(graph, &descriptors)?;
-        let order = topological_order(graph)?;
-        let (proofs, policy, fidelity) = propagate_contracts(graph, &order, &descriptors)?;
-        let (compiled_nodes, buffers, peak_bytes) =
-            self.select_and_lower(graph, &order, &nodes, &descriptors, target)?;
-        let graph_id = GraphId(hash_graph(graph, &descriptors));
+        let invocation_ports = self.verify_edges(&normalized_graph, &descriptors)?;
+        let order = topological_order(&normalized_graph)?;
+        let (proofs, policy, fidelity) =
+            propagate_contracts(&normalized_graph, &order, &descriptors)?;
+        let (mut compiled_nodes, buffers, peak_bytes) =
+            self.select_and_lower(&normalized_graph, &order, &nodes, &descriptors, target)?;
+        let (feedback, feedback_bytes) = lower_feedback(
+            &normalized_graph,
+            &mut compiled_nodes,
+            self.limits.max_feedback_edges,
+        )?;
+        let node_state_bytes = compiled_nodes
+            .iter()
+            .filter(|node| matches!(node.state.scope, StateScope::Session | StateScope::Durable))
+            .try_fold(0u64, |total, node| {
+                total
+                    .checked_add(node.state.max_bytes)
+                    .ok_or(CompileError::ResourceOverflow)
+            })?;
+        let persistent_state_bytes = node_state_bytes
+            .checked_add(feedback_bytes)
+            .ok_or(CompileError::ResourceOverflow)?;
+        if persistent_state_bytes > self.limits.max_persistent_state_bytes {
+            return Err(CompileError::ResourceOverflow);
+        }
+        let graph_id = GraphId(hash_graph(&normalized_graph, &descriptors));
         let mut plan = CompiledPlan {
-            schema_version: 2,
+            schema_version: 3,
             graph_id,
             plan_id: PlanId([0; 32]),
             realm: self.realm,
             order,
             nodes: compiled_nodes,
             buffers,
+            feedback,
             invocation_ports,
             propagated_proofs: proofs,
             propagated_policy: policy,
             resulting_fidelity: fidelity,
             peak_bytes,
+            persistent_state_bytes,
+            session: normalized_graph.session.clone(),
         };
         plan.plan_id = PlanId(hash_plan(&plan));
         Ok(AuthorizedPlan::new(plan))
@@ -441,10 +1173,40 @@ impl<'a> Compiler<'a> {
                     input.semantic_type.clone(),
                 ));
             }
+            if !port_contract_satisfies(output, input) {
+                return Err(CompileError::PortContractMismatch(
+                    edge.from.node,
+                    edge.from.port.clone(),
+                    edge.to.node,
+                    edge.to.port.clone(),
+                ));
+            }
             if !bound.insert(edge.to.clone()) {
                 return Err(CompileError::DuplicateInput(
                     edge.to.node,
                     edge.to.port.clone(),
+                ));
+            }
+        }
+        for feedback in &graph.feedback {
+            let from = descriptors.get(&feedback.from.node).ok_or_else(|| {
+                CompileError::UnknownPort(feedback.from.node, feedback.from.port.clone())
+            })?;
+            let to = descriptors.get(&feedback.to.node).ok_or_else(|| {
+                CompileError::UnknownPort(feedback.to.node, feedback.to.port.clone())
+            })?;
+            let output = find_port(&from.outputs, feedback.from.node, &feedback.from.port)?;
+            let input = find_port(&to.inputs, feedback.to.node, &feedback.to.port)?;
+            if feedback.delay.invocations == 0
+                || (matches!(&feedback.delay.initial, crate::DelayInitial::Absent)
+                    && !input.optional)
+                || !port_contract_satisfies(output, input)
+                || output.max_bytes > input.max_bytes
+                || !bound.insert(feedback.to.clone())
+            {
+                return Err(CompileError::InvalidFeedback(
+                    feedback.to.node,
+                    feedback.to.port.clone(),
                 ));
             }
         }
@@ -561,6 +1323,7 @@ impl<'a> Compiler<'a> {
 
         let mut best: Option<LoweredCandidate> = None;
         let mut saw_layout_failure = false;
+        let mut saw_feedback_failure = false;
         let mut saw_resource_failure = false;
         for ordinal in 0..assignment_count {
             let mut remainder = ordinal;
@@ -592,11 +1355,19 @@ impl<'a> Compiler<'a> {
                     max_buffers: self.limits.max_buffers,
                 },
             ) {
-                Ok((nodes, buffers, peak))
+                Ok((mut nodes, buffers, peak))
                     if peak <= self.max_peak_bytes
                         && nodes.len() <= self.limits.max_steps
                         && buffers.len() <= self.limits.max_buffers =>
                 {
+                    if !align_feedback_layouts(graph, descriptors, self.registry, &mut nodes)? {
+                        saw_feedback_failure = true;
+                        continue;
+                    }
+                    if !feedback_physical_compatible(graph, &nodes)? {
+                        saw_feedback_failure = true;
+                        continue;
+                    }
                     let implementation_order = nodes.iter().map(|node| node.kernel).collect();
                     let score = (peak, nodes.len(), implementation_order);
                     if best
@@ -619,6 +1390,13 @@ impl<'a> Compiler<'a> {
         }
         match best {
             Some((peak, _, _, nodes, buffers)) => Ok((nodes, buffers, peak)),
+            None if saw_feedback_failure => {
+                let feedback = graph.feedback.first().expect("failure requires feedback");
+                Err(CompileError::InvalidFeedback(
+                    feedback.to.node,
+                    feedback.to.port.clone(),
+                ))
+            }
             None if saw_resource_failure => Err(CompileError::ResourceOverflow),
             None if saw_layout_failure => Err(CompileError::LayoutUnavailable(
                 *order.first().expect("non-empty graph"),
@@ -642,6 +1420,122 @@ fn descriptor_layouts_compatible(descriptor: &NodeDescriptor, kernel: &KernelDes
             .iter()
             .any(|layout| kernel.output_layouts.contains(layout))
     })
+}
+
+fn align_feedback_layouts(
+    graph: &Graph,
+    descriptors: &BTreeMap<NodeId, &NodeDescriptor>,
+    registry: &KernelRegistry,
+    nodes: &mut [CompiledNode],
+) -> Result<bool, CompileError> {
+    let mut groups: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for edge in &graph.feedback {
+        groups.entry(edge.from.clone()).or_default().push(edge);
+    }
+    for (source, edges) in groups {
+        let from_index = nodes
+            .iter()
+            .position(|node| node.semantic_nodes.contains(&source.node))
+            .ok_or(CompileError::UnknownNode(source.node))?;
+        let from_port = nodes[from_index]
+            .output_ports
+            .iter()
+            .position(|port| port == &source.port)
+            .ok_or_else(|| CompileError::UnknownPort(source.node, source.port.clone()))?;
+        let from_descriptor = descriptors[&source.node]
+            .outputs
+            .iter()
+            .find(|port| port.name == source.port)
+            .ok_or_else(|| CompileError::UnknownPort(source.node, source.port.clone()))?;
+        let from_kernel = registry
+            .kernels
+            .get(&nodes[from_index].kernel)
+            .ok_or_else(|| CompileError::InvalidFeedback(source.node, source.port.clone()))?;
+        let producer_fixed = matches!(
+            nodes[from_index].output_bindings[from_port],
+            OutputBinding::Buffer(_)
+        );
+        let mut layouts: Vec<_> = from_descriptor
+            .layouts
+            .iter()
+            .filter(|layout| from_kernel.output_layouts.contains(layout))
+            .copied()
+            .collect();
+        let mut consumers = Vec::with_capacity(edges.len());
+        for edge in edges {
+            let to_index = nodes
+                .iter()
+                .position(|node| node.semantic_nodes.contains(&edge.to.node))
+                .ok_or(CompileError::UnknownNode(edge.to.node))?;
+            let to_port = nodes[to_index]
+                .input_ports
+                .iter()
+                .position(|port| port == &edge.to.port)
+                .ok_or_else(|| CompileError::UnknownPort(edge.to.node, edge.to.port.clone()))?;
+            let to_descriptor = descriptors[&edge.to.node]
+                .inputs
+                .iter()
+                .find(|port| port.name == edge.to.port)
+                .ok_or_else(|| CompileError::UnknownPort(edge.to.node, edge.to.port.clone()))?;
+            let to_kernel = registry
+                .kernels
+                .get(&nodes[to_index].kernel)
+                .ok_or_else(|| CompileError::InvalidFeedback(edge.to.node, edge.to.port.clone()))?;
+            layouts.retain(|layout| {
+                to_descriptor.layouts.contains(layout) && to_kernel.input_layouts.contains(layout)
+            });
+            consumers.push((to_index, to_port));
+        }
+        layouts.sort_unstable();
+        layouts.dedup();
+        let selected = if producer_fixed {
+            let current = nodes[from_index].output_contracts[from_port].layout;
+            layouts.contains(&current).then_some(current)
+        } else {
+            layouts.first().copied()
+        };
+        let Some(selected) = selected else {
+            return Ok(false);
+        };
+        nodes[from_index].output_contracts[from_port].layout = selected;
+        for (to_index, to_port) in consumers {
+            nodes[to_index].input_contracts[to_port].layout = selected;
+        }
+    }
+    Ok(true)
+}
+
+fn feedback_physical_compatible(
+    graph: &Graph,
+    nodes: &[CompiledNode],
+) -> Result<bool, CompileError> {
+    for edge in &graph.feedback {
+        let from = nodes
+            .iter()
+            .find(|node| node.semantic_nodes.contains(&edge.from.node))
+            .ok_or(CompileError::UnknownNode(edge.from.node))?;
+        let from_port = from
+            .output_ports
+            .iter()
+            .position(|port| port == &edge.from.port)
+            .ok_or_else(|| CompileError::UnknownPort(edge.from.node, edge.from.port.clone()))?;
+        let to = nodes
+            .iter()
+            .find(|node| node.semantic_nodes.contains(&edge.to.node))
+            .ok_or(CompileError::UnknownNode(edge.to.node))?;
+        let to_port = to
+            .input_ports
+            .iter()
+            .position(|port| port == &edge.to.port)
+            .ok_or_else(|| CompileError::UnknownPort(edge.to.node, edge.to.port.clone()))?;
+        if !compiled_port_contract_satisfies(
+            &from.output_contracts[from_port],
+            &to.input_contracts[to_port],
+        ) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn find_port<'a>(
@@ -953,6 +1847,16 @@ fn semantic_region(
         conversion: None,
         input_ports: first.inputs.iter().map(|port| port.name.clone()).collect(),
         output_ports: last.outputs.iter().map(|port| port.name.clone()).collect(),
+        input_contracts: first
+            .inputs
+            .iter()
+            .map(|port| compiled_port_contract(port, select_layout(port, &kernel.input_layouts)))
+            .collect(),
+        output_contracts: last
+            .outputs
+            .iter()
+            .map(|port| compiled_port_contract(port, select_layout(port, &kernel.output_layouts)))
+            .collect(),
         input_bindings: alloc::vec![crate::model::InputBinding::Absent; first.inputs.len()],
         output_bindings: alloc::vec![OutputBinding::Terminal; last.outputs.len()],
         partiality: if fused {
@@ -973,7 +1877,15 @@ fn semantic_region(
             first.effect
         },
         retry_limit: if fused { 0 } else { first.retry_limit },
-        checkpointable: if fused { false } else { first.checkpointable },
+        state: if fused {
+            StateContract::stateless()
+        } else {
+            first.state.clone()
+        },
+        subgraph_path: ids
+            .iter()
+            .filter_map(|id| descriptors[id].subgraph.as_ref().map(|item| item.subgraph))
+            .collect(),
     }
 }
 
@@ -982,14 +1894,22 @@ fn linear_fusion_is_safe(
     ids: &[NodeId],
     descriptors: &BTreeMap<NodeId, &NodeDescriptor>,
 ) -> bool {
+    if graph
+        .feedback
+        .iter()
+        .any(|edge| ids.contains(&edge.from.node) || ids.contains(&edge.to.node))
+    {
+        return false;
+    }
     if ids.iter().any(|id| {
         let descriptor = descriptors[id];
         descriptor.effect != crate::model::Effect::Pure
             || descriptor.partiality != crate::model::Partiality::Atomic
-            || descriptor.stateful
+            || descriptor.state.scope != StateScope::Stateless
             || descriptor.retry_limit != 0
-            || descriptor.checkpointable
+            || descriptor.state.checkpointable()
             || !descriptor.failure.domains.is_empty()
+            || descriptor.subgraph.is_some()
     }) {
         return false;
     }
@@ -1044,6 +1964,7 @@ struct PortGroup<'a> {
     output_index: usize,
     layout: Layout,
     capacity_bytes: u64,
+    contract: PortDescriptor,
     routes: Vec<Route<'a>>,
 }
 
@@ -1230,6 +2151,7 @@ fn lower_semantic_regions(
             output_index,
             layout,
             capacity_bytes: output.max_bytes,
+            contract: output.clone(),
             routes,
         });
     }
@@ -1244,7 +2166,7 @@ fn lower_semantic_regions(
                     continue;
                 }
                 let mut steps = Vec::new();
-                for kernel in &route.path {
+                for (path_index, kernel) in route.path.iter().enumerate() {
                     let conversion = kernel
                         .conversion
                         .clone()
@@ -1261,9 +2183,29 @@ fn lower_semantic_regions(
                         resources: kernel.resources.clone(),
                         determinism: kernel.determinism,
                         lowering: kernel.lowering.clone(),
-                        conversion: Some(conversion),
+                        conversion: Some(conversion.clone()),
                         input_ports: alloc::vec!["input".to_string()],
                         output_ports: alloc::vec!["output".to_string()],
+                        input_contracts: alloc::vec![conversion_port_contract(
+                            &group.contract,
+                            conversion.from,
+                            "input",
+                            if path_index == 0 {
+                                group.capacity_bytes
+                            } else {
+                                route.path[path_index - 1]
+                                    .conversion
+                                    .as_ref()
+                                    .expect("conversion path")
+                                    .max_output_bytes
+                            },
+                        )],
+                        output_contracts: alloc::vec![conversion_port_contract(
+                            &group.contract,
+                            conversion.to,
+                            "output",
+                            conversion.max_output_bytes,
+                        )],
                         input_bindings: alloc::vec![crate::model::InputBinding::Absent],
                         output_bindings: alloc::vec![OutputBinding::Terminal],
                         partiality: crate::model::Partiality::Atomic,
@@ -1272,7 +2214,8 @@ fn lower_semantic_regions(
                         },
                         effect: crate::model::Effect::Pure,
                         retry_limit: 0,
-                        checkpointable: false,
+                        state: StateContract::stateless(),
+                        subgraph_path: Vec::new(),
                     });
                 }
                 conversion_steps.insert((group_index, route_index), steps);
@@ -1369,6 +2312,7 @@ fn lower_semantic_regions(
         }
     }
     canonicalize_buffers(&mut nodes, &mut buffers);
+    synchronize_port_layouts(&mut nodes, &buffers);
     assign_aliases(&mut buffers);
     let arena_bytes = buffers
         .iter()
@@ -1378,17 +2322,92 @@ fn lower_semantic_regions(
                 .ok_or(CompileError::ResourceOverflow)
         })?;
     let workspace = nodes.iter().try_fold(0u64, |peak, node| {
-        let bytes = node
+        let mut bytes = node
             .resources
             .peak_bytes
             .checked_add(node.resources.scratch_bytes)
             .ok_or(CompileError::ResourceOverflow)?;
+        if node.state.scope == StateScope::Invocation {
+            bytes = bytes
+                .checked_add(node.state.max_bytes)
+                .ok_or(CompileError::ResourceOverflow)?;
+        }
         Ok::<_, CompileError>(peak.max(bytes))
     })?;
     let peak = arena_bytes
         .checked_add(workspace)
         .ok_or(CompileError::ResourceOverflow)?;
     Ok((nodes, buffers, peak))
+}
+
+fn lower_feedback(
+    graph: &Graph,
+    nodes: &mut [CompiledNode],
+    max_feedback_edges: usize,
+) -> Result<(Vec<crate::FeedbackPlan>, u64), CompileError> {
+    if graph.feedback.len() > max_feedback_edges {
+        return Err(CompileError::CompileLimitExceeded);
+    }
+    let mut feedback_edges = graph.feedback.clone();
+    feedback_edges.sort_by_key(|edge| (edge.from.clone(), edge.to.clone()));
+    if feedback_edges
+        .windows(2)
+        .any(|pair| pair[0].from == pair[1].from && pair[0].to == pair[1].to)
+    {
+        return Err(CompileError::InvalidFeedback(
+            feedback_edges[0].to.node,
+            feedback_edges[0].to.port.clone(),
+        ));
+    }
+    let mut plans = Vec::with_capacity(feedback_edges.len());
+    let mut state_bytes = 0u64;
+    for edge in feedback_edges {
+        let from_step_index = nodes
+            .iter()
+            .position(|node| node.semantic_nodes.contains(&edge.from.node))
+            .ok_or(CompileError::UnknownNode(edge.from.node))?;
+        let from_port = nodes[from_step_index]
+            .output_ports
+            .iter()
+            .position(|port| port == &edge.from.port)
+            .ok_or_else(|| CompileError::UnknownPort(edge.from.node, edge.from.port.clone()))?;
+        let to_step_index = nodes
+            .iter()
+            .position(|node| node.semantic_nodes.contains(&edge.to.node))
+            .ok_or(CompileError::UnknownNode(edge.to.node))?;
+        let to_port = nodes[to_step_index]
+            .input_ports
+            .iter()
+            .position(|port| port == &edge.to.port)
+            .ok_or_else(|| CompileError::UnknownPort(edge.to.node, edge.to.port.clone()))?;
+        let output_contract = &nodes[from_step_index].output_contracts[from_port];
+        let input_contract = &nodes[to_step_index].input_contracts[to_port];
+        if !compiled_port_contract_satisfies(output_contract, input_contract) {
+            return Err(CompileError::InvalidFeedback(
+                edge.to.node,
+                edge.to.port.clone(),
+            ));
+        }
+        let value_bytes = output_contract.max_bytes;
+        let bytes = value_bytes
+            .checked_mul(u64::from(edge.delay.invocations))
+            .ok_or(CompileError::ResourceOverflow)?;
+        let id = crate::FeedbackId(plans.len() as u32);
+        nodes[to_step_index].input_bindings[to_port] = crate::InputBinding::Feedback(id);
+        plans.push(crate::FeedbackPlan {
+            id,
+            from_step: nodes[from_step_index].id,
+            from_port: from_port as u32,
+            to_step: nodes[to_step_index].id,
+            to_port: to_port as u32,
+            delay: edge.delay,
+            state_bytes: bytes,
+        });
+        state_bytes = state_bytes
+            .checked_add(bytes)
+            .ok_or(CompileError::ResourceOverflow)?;
+    }
+    Ok((plans, state_bytes))
 }
 
 struct ConversionRequest<'a> {
@@ -1617,7 +2636,7 @@ fn assign_aliases(buffers: &mut [BufferPlan]) {
 }
 
 fn hash_graph(graph: &Graph, descriptors: &BTreeMap<NodeId, &NodeDescriptor>) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key("blut.graph.v2");
+    let mut hasher = blake3::Hasher::new_derive_key("blut.graph.v3");
     put_u32(&mut hasher, graph.version);
     let mut nodes = graph.nodes.clone();
     nodes.sort_by_key(|node| node.id);
@@ -1630,7 +2649,7 @@ fn hash_graph(graph: &Graph, descriptors: &BTreeMap<NodeId, &NodeDescriptor>) ->
         put_u32(&mut hasher, node.config.len() as u32);
         for (key, value) in node.config {
             put_str(&mut hasher, &key);
-            put_str(&mut hasher, &value);
+            hash_config_value(&mut hasher, &value);
         }
     }
     let mut edges = graph.edges.clone();
@@ -1641,6 +2660,15 @@ fn hash_graph(graph: &Graph, descriptors: &BTreeMap<NodeId, &NodeDescriptor>) ->
         put_str(&mut hasher, &edge.from.port);
         put_u32(&mut hasher, edge.to.node.0);
         put_str(&mut hasher, &edge.to.port);
+    }
+    let mut feedback = graph.feedback.clone();
+    feedback.sort_by_key(|edge| (edge.from.clone(), edge.to.clone()));
+    put_u32(&mut hasher, feedback.len() as u32);
+    for edge in feedback {
+        put_port_ref(&mut hasher, &edge.from);
+        put_port_ref(&mut hasher, &edge.to);
+        put_u32(&mut hasher, edge.delay.invocations);
+        hash_delay_initial(&mut hasher, &edge.delay.initial);
     }
     let mut invocation_ports = graph.invocation_inputs.clone();
     invocation_ports.sort_unstable();
@@ -1667,6 +2695,7 @@ fn hash_graph(graph: &Graph, descriptors: &BTreeMap<NodeId, &NodeDescriptor>) ->
     policy.dedup();
     put_str_set(&mut hasher, &policy);
     put_u32(&mut hasher, u32::from(graph.minimum_fidelity));
+    hash_session(&mut hasher, graph.session.as_ref());
     *hasher.finalize().as_bytes()
 }
 
@@ -1687,6 +2716,12 @@ fn hash_descriptor(hasher: &mut blake3::Hasher, descriptor: &NodeDescriptor) {
                 put_u32(hasher, layout as u32);
             }
             hasher.update(&port.max_bytes.to_le_bytes());
+            hash_abir_type(hasher, &port.abir);
+            hash_proof(hasher, &port.proof);
+            hash_policy(hasher, &port.policy);
+            hash_fidelity(hasher, &port.fidelity);
+            hash_extent(hasher, &port.extent);
+            hash_lease(hasher, &port.lease);
         }
     }
     hash_ports(hasher, &descriptor.inputs);
@@ -1719,7 +2754,19 @@ fn hash_descriptor(hasher: &mut blake3::Hasher, descriptor: &NodeDescriptor) {
         }
     }
     put_u32(hasher, descriptor.determinism as u32);
-    put_u32(hasher, u32::from(descriptor.stateful));
+    hash_config_schema(hasher, &descriptor.config);
+    hash_state(hasher, &descriptor.state);
+    match &descriptor.subgraph {
+        Some(lowering) => {
+            hasher.update(&[1]);
+            hasher.update(&lowering.subgraph.0);
+            hash_port_maps(hasher, &lowering.input_map);
+            hash_port_maps(hasher, &lowering.output_map);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
     let mut proof_requires: Vec<_> = descriptor
         .proof
         .requires
@@ -1774,7 +2821,6 @@ fn hash_descriptor(hasher: &mut blake3::Hasher, descriptor: &NodeDescriptor) {
     put_str_set(hasher, &failure_domains);
     put_u32(hasher, descriptor.effect as u32);
     put_u32(hasher, u32::from(descriptor.retry_limit));
-    put_u32(hasher, u32::from(descriptor.checkpointable));
 }
 
 fn put_str_set(hasher: &mut blake3::Hasher, values: &[&str]) {
@@ -1784,8 +2830,270 @@ fn put_str_set(hasher: &mut blake3::Hasher, values: &[&str]) {
     }
 }
 
+fn hash_config_value(hasher: &mut blake3::Hasher, value: &crate::ConfigValue) {
+    match value {
+        crate::ConfigValue::Bool(value) => {
+            hasher.update(&[0, u8::from(*value)]);
+        }
+        crate::ConfigValue::I64(value) => {
+            hasher.update(&[1]);
+            hasher.update(&value.to_le_bytes());
+        }
+        crate::ConfigValue::U64(value) => {
+            hasher.update(&[2]);
+            hasher.update(&value.to_le_bytes());
+        }
+        crate::ConfigValue::Text(value) => {
+            hasher.update(&[3]);
+            put_str(hasher, value);
+        }
+        crate::ConfigValue::Bytes(value) => {
+            hasher.update(&[4]);
+            put_u32(hasher, value.len() as u32);
+            hasher.update(value);
+        }
+    }
+}
+
+fn hash_config_schema(hasher: &mut blake3::Hasher, schema: &crate::ConfigSchema) {
+    put_u32(hasher, schema.fields.len() as u32);
+    for field in &schema.fields {
+        put_str(hasher, &field.name);
+        match &field.value_type {
+            crate::ConfigType::Bool => {
+                hasher.update(&[0]);
+            }
+            crate::ConfigType::I64 { minimum, maximum } => {
+                hasher.update(&[1]);
+                hasher.update(&minimum.to_le_bytes());
+                hasher.update(&maximum.to_le_bytes());
+            }
+            crate::ConfigType::U64 { minimum, maximum } => {
+                hasher.update(&[2]);
+                hasher.update(&minimum.to_le_bytes());
+                hasher.update(&maximum.to_le_bytes());
+            }
+            crate::ConfigType::Text { max_bytes } => {
+                hasher.update(&[3]);
+                put_u32(hasher, *max_bytes);
+            }
+            crate::ConfigType::Choice { values } => {
+                hasher.update(&[4]);
+                put_u32(hasher, values.len() as u32);
+                for value in values {
+                    put_str(hasher, value);
+                }
+            }
+            crate::ConfigType::Bytes { max_bytes } => {
+                hasher.update(&[5]);
+                put_u32(hasher, *max_bytes);
+            }
+        };
+        hasher.update(&[u8::from(field.required)]);
+        match &field.default {
+            Some(value) => {
+                hasher.update(&[1]);
+                hash_config_value(hasher, value);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+    }
+}
+
+fn hash_abir_type(hasher: &mut blake3::Hasher, abir: &crate::AbirSemanticType) {
+    fn hash_root(hasher: &mut blake3::Hasher, root: &crate::AbirRootType) {
+        match root {
+            crate::AbirRootType::Dataset => {
+                hasher.update(&[0]);
+            }
+            crate::AbirRootType::Recording => {
+                hasher.update(&[1]);
+            }
+            crate::AbirRootType::Stream => {
+                hasher.update(&[2]);
+            }
+            crate::AbirRootType::SignalBlock => {
+                hasher.update(&[3]);
+            }
+            crate::AbirRootType::TemporalTable => {
+                hasher.update(&[4]);
+            }
+            crate::AbirRootType::Table => {
+                hasher.update(&[5]);
+            }
+            crate::AbirRootType::Tensor => {
+                hasher.update(&[6]);
+            }
+            crate::AbirRootType::EncodedBlock => {
+                hasher.update(&[7]);
+            }
+            crate::AbirRootType::BlobRef => {
+                hasher.update(&[8]);
+            }
+            crate::AbirRootType::Unknown(value) => {
+                hasher.update(&[9]);
+                put_str(hasher, value);
+            }
+        };
+    }
+    fn hash_view(hasher: &mut blake3::Hasher, view: &crate::AbirViewType) {
+        match view {
+            crate::AbirViewType::Root => {
+                hasher.update(&[0]);
+            }
+            crate::AbirViewType::Recording => {
+                hasher.update(&[1]);
+            }
+            crate::AbirViewType::Stream => {
+                hasher.update(&[2]);
+            }
+            crate::AbirViewType::Block => {
+                hasher.update(&[3]);
+            }
+            crate::AbirViewType::Tensor => {
+                hasher.update(&[4]);
+            }
+            crate::AbirViewType::Atom => {
+                hasher.update(&[5]);
+            }
+            crate::AbirViewType::Unknown(value) => {
+                hasher.update(&[6]);
+                put_str(hasher, value);
+            }
+        };
+    }
+    hash_root(hasher, &abir.root);
+    hash_view(hasher, &abir.view);
+}
+
+fn hash_proof(hasher: &mut blake3::Hasher, proof: &crate::ProofContract) {
+    let requires = proof
+        .requires
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let provides = proof
+        .provides
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let invalidates = proof
+        .invalidates
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    put_str_set(hasher, &requires);
+    put_str_set(hasher, &provides);
+    put_str_set(hasher, &invalidates);
+}
+
+fn hash_policy(hasher: &mut blake3::Hasher, policy: &crate::PolicyContract) {
+    let requires = policy
+        .requires
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let adds = policy.adds.iter().map(String::as_str).collect::<Vec<_>>();
+    put_str_set(hasher, &requires);
+    put_str_set(hasher, &adds);
+}
+
+fn hash_fidelity(hasher: &mut blake3::Hasher, fidelity: &crate::FidelityContract) {
+    put_u32(hasher, u32::from(fidelity.minimum_input));
+    put_u32(hasher, u32::from(fidelity.maximum_loss));
+}
+
+fn hash_extent(hasher: &mut blake3::Hasher, extent: &crate::ExtentContract) {
+    hasher.update(&[extent.rank]);
+    put_u32(hasher, extent.maximum_shape.len() as u32);
+    for size in &extent.maximum_shape {
+        hasher.update(&size.to_le_bytes());
+    }
+    hasher.update(&extent.max_elements.to_le_bytes());
+    hasher.update(&[u8::from(extent.ragged), u8::from(extent.sparse)]);
+}
+
+fn hash_lease(hasher: &mut blake3::Hasher, lease: &crate::LeaseContract) {
+    put_u32(hasher, lease.access as u32);
+    put_u32(hasher, lease.lifetime as u32);
+    hasher.update(&[
+        u8::from(lease.zero_copy_permitted),
+        u8::from(lease.contiguous_required),
+    ]);
+}
+
+fn hash_state(hasher: &mut blake3::Hasher, state: &StateContract) {
+    put_u32(hasher, state.scope as u32);
+    hasher.update(&state.max_bytes.to_le_bytes());
+    put_u32(hasher, state.checkpoint.mode as u32);
+    hasher.update(&state.checkpoint.max_snapshot_bytes.to_le_bytes());
+    put_u32(hasher, state.checkpoint.max_interval_invocations);
+}
+
+fn hash_port_maps(hasher: &mut blake3::Hasher, maps: &[crate::PortMap]) {
+    put_u32(hasher, maps.len() as u32);
+    for map in maps {
+        put_str(hasher, &map.outer);
+        put_str(hasher, &map.inner);
+    }
+}
+
+fn hash_delay_initial(hasher: &mut blake3::Hasher, initial: &crate::DelayInitial) {
+    match initial {
+        crate::DelayInitial::Absent => {
+            hasher.update(&[0]);
+        }
+        crate::DelayInitial::Zeroed => {
+            hasher.update(&[1]);
+        }
+        crate::DelayInitial::ContentId(id) => {
+            hasher.update(&[2]);
+            hasher.update(id);
+        }
+    };
+}
+
+fn hash_session(hasher: &mut blake3::Hasher, session: Option<&crate::SessionContract>) {
+    match session {
+        Some(session) => {
+            hasher.update(&[1]);
+            put_str(hasher, &session.namespace);
+            put_u32(hasher, session.max_concurrent_sessions);
+            hasher.update(&session.max_idle_millis.to_le_bytes());
+            hasher.update(&[u8::from(session.reset_on_plan_change)]);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+}
+
+fn hash_compiled_ports(hasher: &mut blake3::Hasher, ports: &[CompiledPortContract]) {
+    put_u32(hasher, ports.len() as u32);
+    for port in ports {
+        put_str(hasher, &port.name);
+        put_str(hasher, &port.semantic_type);
+        hasher.update(&[u8::from(port.optional)]);
+        put_u32(hasher, port.layout as u32);
+        hasher.update(&port.max_bytes.to_le_bytes());
+        hash_abir_type(hasher, &port.abir);
+        hash_proof(hasher, &port.proof);
+        hash_policy(hasher, &port.policy);
+        hash_fidelity(hasher, &port.fidelity);
+        hash_extent(hasher, &port.extent);
+        hash_lease(hasher, &port.lease);
+    }
+}
+
+fn put_port_ref(hasher: &mut blake3::Hasher, port: &crate::PortRef) {
+    put_u32(hasher, port.node.0);
+    put_str(hasher, &port.port);
+}
+
 pub(crate) fn hash_plan(plan: &CompiledPlan) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key("blut.compiled-plan.v2");
+    let mut hasher = blake3::Hasher::new_derive_key("blut.compiled-plan.v3");
     put_u32(&mut hasher, plan.schema_version);
     hasher.update(&plan.graph_id.0);
     put_u32(&mut hasher, plan.realm as u32);
@@ -1810,7 +3118,7 @@ pub(crate) fn hash_plan(plan: &CompiledPlan) -> [u8; 32] {
             put_u32(&mut hasher, config.len() as u32);
             for (key, value) in config {
                 put_str(&mut hasher, key);
-                put_str(&mut hasher, value);
+                hash_config_value(&mut hasher, value);
             }
         }
         put_u32(&mut hasher, node.kernel.0);
@@ -1850,6 +3158,8 @@ pub(crate) fn hash_plan(plan: &CompiledPlan) -> [u8; 32] {
         for port in &node.output_ports {
             put_str(&mut hasher, port);
         }
+        hash_compiled_ports(&mut hasher, &node.input_contracts);
+        hash_compiled_ports(&mut hasher, &node.output_contracts);
         put_u32(&mut hasher, node.input_bindings.len() as u32);
         for binding in &node.input_bindings {
             match binding {
@@ -1860,6 +3170,10 @@ pub(crate) fn hash_plan(plan: &CompiledPlan) -> [u8; 32] {
                 crate::model::InputBinding::Invocation(invocation) => {
                     hasher.update(&[2]);
                     put_u32(&mut hasher, *invocation);
+                }
+                crate::model::InputBinding::Feedback(feedback) => {
+                    hasher.update(&[3]);
+                    put_u32(&mut hasher, feedback.0);
                 }
                 crate::model::InputBinding::Absent => {
                     hasher.update(&[0]);
@@ -1888,7 +3202,11 @@ pub(crate) fn hash_plan(plan: &CompiledPlan) -> [u8; 32] {
         }
         put_u32(&mut hasher, node.effect as u32);
         put_u32(&mut hasher, u32::from(node.retry_limit));
-        put_u32(&mut hasher, u32::from(node.checkpointable));
+        hash_state(&mut hasher, &node.state);
+        put_u32(&mut hasher, node.subgraph_path.len() as u32);
+        for subgraph in &node.subgraph_path {
+            hasher.update(&subgraph.0);
+        }
     }
     put_u32(&mut hasher, plan.invocation_ports.len() as u32);
     for port in &plan.invocation_ports {
@@ -1916,6 +3234,17 @@ pub(crate) fn hash_plan(plan: &CompiledPlan) -> [u8; 32] {
             }
         };
     }
+    put_u32(&mut hasher, plan.feedback.len() as u32);
+    for feedback in &plan.feedback {
+        put_u32(&mut hasher, feedback.id.0);
+        put_u32(&mut hasher, feedback.from_step.0);
+        put_u32(&mut hasher, feedback.from_port);
+        put_u32(&mut hasher, feedback.to_step.0);
+        put_u32(&mut hasher, feedback.to_port);
+        put_u32(&mut hasher, feedback.delay.invocations);
+        hash_delay_initial(&mut hasher, &feedback.delay.initial);
+        hasher.update(&feedback.state_bytes.to_le_bytes());
+    }
     put_u32(&mut hasher, plan.propagated_proofs.len() as u32);
     for proof in &plan.propagated_proofs {
         put_str(&mut hasher, proof);
@@ -1926,6 +3255,8 @@ pub(crate) fn hash_plan(plan: &CompiledPlan) -> [u8; 32] {
     }
     put_u32(&mut hasher, u32::from(plan.resulting_fidelity));
     hasher.update(&plan.peak_bytes.to_le_bytes());
+    hasher.update(&plan.persistent_state_bytes.to_le_bytes());
+    hash_session(&mut hasher, plan.session.as_ref());
     *hasher.finalize().as_bytes()
 }
 
@@ -2002,6 +3333,7 @@ mod tests {
                     optional: false,
                     layouts: vec![Layout::Canonical],
                     max_bytes: 64,
+                    ..PortDescriptor::opaque("in", "abir.block", 64)
                 }]
             } else {
                 vec![]
@@ -2012,12 +3344,22 @@ mod tests {
                 optional: false,
                 layouts: vec![Layout::Canonical],
                 max_bytes: 64,
+                ..PortDescriptor::opaque("out", "abir.block", 64)
             }],
             capabilities: vec![Capability("abir".to_string())],
             targets: vec![Target::Host, Target::McuAot, Target::BlutDurable],
             resources: ResourceEnvelope::bounded(64, 0, 1),
             determinism: Determinism::BitExact,
-            stateful: false,
+            config: crate::ConfigSchema {
+                fields: vec![crate::ConfigField {
+                    name: "gain".into(),
+                    value_type: crate::ConfigType::Text { max_bytes: 16 },
+                    required: false,
+                    default: None,
+                }],
+            },
+            state: StateContract::stateless(),
+            subgraph: None,
             proof: ProofContract {
                 requires: vec![],
                 provides: vec![format!("{name}.verified")],
@@ -2035,7 +3377,6 @@ mod tests {
             failure: crate::FailureContract { domains: vec![] },
             effect: Effect::Pure,
             retry_limit: 0,
-            checkpointable: false,
         }
     }
 
@@ -2122,7 +3463,7 @@ mod tests {
             nodes.reverse();
         }
         let graph = Graph {
-            version: 2,
+            version: 3,
             nodes,
             edges: vec![
                 Edge {
@@ -2146,11 +3487,13 @@ mod tests {
                     },
                 },
             ],
+            feedback: vec![],
             invocation_inputs: vec![],
             required_capabilities: vec![Capability("abir".to_string())],
             required_proofs: vec![],
             policy: vec![],
             minimum_fidelity: u16::MAX,
+            session: None,
         };
         (registry, graph)
     }
@@ -2252,14 +3595,18 @@ mod tests {
     #[test]
     fn instance_configuration_reaches_the_selected_physical_step() {
         let (registry, mut graph) = fixture(false);
-        graph.nodes[1]
-            .config
-            .insert("gain".to_string(), "2".to_string());
+        graph.nodes[1].config.insert(
+            "gain".to_string(),
+            crate::ConfigValue::Text("2".to_string()),
+        );
         let plan = Compiler::new(&registry, ExecutionRealm::HostStream)
             .compile(&graph)
             .unwrap();
         assert_eq!(plan.nodes[0].semantic_nodes, vec![NodeId(0), NodeId(1)]);
-        assert_eq!(plan.nodes[0].semantic_configs[1]["gain"], "2");
+        assert_eq!(
+            plan.nodes[0].semantic_configs[1]["gain"],
+            crate::ConfigValue::Text("2".into())
+        );
     }
 
     #[test]
@@ -2512,6 +3859,7 @@ mod tests {
             optional: false,
             layouts: vec![Layout::Canonical],
             max_bytes: 64,
+            ..PortDescriptor::opaque("seed", "abir.block", 64)
         }];
         let seed = PortRef {
             node: NodeId(0),
@@ -2582,6 +3930,7 @@ mod tests {
                 optional: false,
                 layouts: vec![Layout::Canonical],
                 max_bytes: 64,
+                ..PortDescriptor::opaque("audit", "abir.block", 64)
             });
         let plan = Compiler::new(&registry, ExecutionRealm::HostStream)
             .compile(&graph)
@@ -3064,6 +4413,384 @@ mod tests {
                 forged_authorization,
             ),
             Err(crate::PlanDecodeError::UnauthorizedPlan)
+        );
+    }
+
+    #[test]
+    fn typed_configuration_defaults_are_identity_canonical_and_invalid_values_fail() {
+        let (mut registry, graph) = fixture(false);
+        registry
+            .descriptors
+            .get_mut(&("process".into(), 1))
+            .unwrap()
+            .config
+            .fields[0]
+            .default = Some(crate::ConfigValue::Text("1".into()));
+
+        let implicit = Compiler::new(&registry, ExecutionRealm::HostStream)
+            .compile(&graph)
+            .unwrap();
+        let mut explicit_graph = graph.clone();
+        explicit_graph.nodes[1]
+            .config
+            .insert("gain".into(), crate::ConfigValue::Text("1".into()));
+        let explicit = Compiler::new(&registry, ExecutionRealm::HostStream)
+            .compile(&explicit_graph)
+            .unwrap();
+        assert_eq!(implicit.graph_id, explicit.graph_id);
+        assert_eq!(implicit.plan_id, explicit.plan_id);
+
+        explicit_graph.nodes[1]
+            .config
+            .insert("gain".into(), crate::ConfigValue::Text("x".repeat(17)));
+        assert!(matches!(
+            Compiler::new(&registry, ExecutionRealm::HostStream).compile(&explicit_graph),
+            Err(CompileError::InvalidConfig(NodeId(1), _))
+        ));
+    }
+
+    #[test]
+    fn per_port_abir_contract_mismatch_fails_before_kernel_selection() {
+        let (mut registry, graph) = fixture(false);
+        registry
+            .descriptors
+            .get_mut(&("process".into(), 1))
+            .unwrap()
+            .inputs[0]
+            .abir
+            .root = crate::AbirRootType::Recording;
+        assert!(matches!(
+            Compiler::new(&registry, ExecutionRealm::HostStream).compile(&graph),
+            Err(CompileError::PortContractMismatch(
+                NodeId(0),
+                _,
+                NodeId(1),
+                _
+            ))
+        ));
+    }
+
+    #[test]
+    fn session_feedback_has_explicit_binding_and_exact_bounded_state() {
+        let (mut registry, mut graph) = fixture(false);
+        let source = registry.descriptors.get_mut(&("source".into(), 1)).unwrap();
+        let mut history = PortDescriptor::opaque("history", "abir.block", 64);
+        history.optional = true;
+        source.inputs.push(history);
+        registry
+            .descriptors
+            .get_mut(&("process".into(), 1))
+            .unwrap()
+            .state = StateContract {
+            scope: StateScope::Session,
+            max_bytes: 128,
+            checkpoint: crate::CheckpointContract {
+                mode: crate::CheckpointMode::Required,
+                max_snapshot_bytes: 64,
+                max_interval_invocations: 8,
+            },
+        };
+        graph.feedback.push(crate::FeedbackEdge {
+            from: PortRef {
+                node: NodeId(1),
+                port: "out".into(),
+            },
+            to: PortRef {
+                node: NodeId(0),
+                port: "history".into(),
+            },
+            delay: crate::DelayContract {
+                invocations: 1,
+                initial: crate::DelayInitial::Absent,
+            },
+        });
+        graph.session = Some(crate::SessionContract {
+            namespace: "patient-session".into(),
+            max_concurrent_sessions: 16,
+            max_idle_millis: 60_000,
+            reset_on_plan_change: true,
+        });
+
+        let plan = Compiler::new(&registry, ExecutionRealm::HostStream)
+            .compile(&graph)
+            .unwrap();
+        assert_eq!(plan.feedback.len(), 1);
+        assert_eq!(plan.persistent_state_bytes, 192);
+        assert!(plan.nodes.iter().any(|step| {
+            step.input_bindings
+                .contains(&crate::InputBinding::Feedback(crate::FeedbackId(0)))
+        }));
+        let bytes = plan.to_aot_bytes().unwrap();
+        assert!(CompiledPlan::from_aot_bytes(&bytes, crate::PlanLimits::default()).is_ok());
+
+        graph.feedback[0].delay.invocations = 3;
+        let longer_delay = Compiler::new(&registry, ExecutionRealm::HostStream)
+            .compile(&graph)
+            .unwrap();
+        assert_eq!(longer_delay.feedback[0].state_bytes, 192);
+        assert_eq!(longer_delay.persistent_state_bytes, 320);
+
+        let mut overlapping_layouts = registry.clone();
+        let mut overlapping_graph = graph.clone();
+        overlapping_graph.feedback[0].from.node = NodeId(2);
+        overlapping_graph.feedback.push(crate::FeedbackEdge {
+            from: PortRef {
+                node: NodeId(2),
+                port: "out".into(),
+            },
+            to: PortRef {
+                node: NodeId(1),
+                port: "history-2".into(),
+            },
+            delay: crate::DelayContract {
+                invocations: 3,
+                initial: crate::DelayInitial::Absent,
+            },
+        });
+        overlapping_layouts
+            .descriptors
+            .get_mut(&("source".into(), 1))
+            .unwrap()
+            .inputs[0]
+            .layouts = vec![Layout::ChannelMajor, Layout::TimeMajor];
+        overlapping_layouts
+            .descriptors
+            .get_mut(&("sink".into(), 1))
+            .unwrap()
+            .outputs[0]
+            .layouts = vec![Layout::Canonical, Layout::TimeMajor];
+        let mut history_2 = PortDescriptor::opaque("history-2", "abir.block", 64);
+        history_2.optional = true;
+        history_2.layouts = vec![Layout::ChannelMajor, Layout::TimeMajor];
+        overlapping_layouts
+            .descriptors
+            .get_mut(&("process".into(), 1))
+            .unwrap()
+            .inputs
+            .push(history_2);
+        for kernel in overlapping_layouts.kernels.values_mut() {
+            if kernel.implements.as_slice()
+                == [NodeTypeRef {
+                    type_name: "source".into(),
+                    version: 1,
+                }]
+            {
+                kernel.input_layouts = vec![Layout::ChannelMajor, Layout::TimeMajor];
+            }
+            if kernel.implements.as_slice()
+                == [NodeTypeRef {
+                    type_name: "sink".into(),
+                    version: 1,
+                }]
+            {
+                kernel.output_layouts = vec![Layout::Canonical, Layout::TimeMajor];
+            }
+            if kernel.implements.as_slice()
+                == [NodeTypeRef {
+                    type_name: "process".into(),
+                    version: 1,
+                }]
+            {
+                kernel.input_layouts =
+                    vec![Layout::Canonical, Layout::ChannelMajor, Layout::TimeMajor];
+            }
+        }
+        let overlapping = Compiler::new(&overlapping_layouts, ExecutionRealm::HostStream)
+            .compile(&overlapping_graph)
+            .unwrap();
+        for feedback in &overlapping.feedback {
+            assert_eq!(
+                overlapping.nodes[feedback.from_step.0 as usize].output_contracts
+                    [feedback.from_port as usize]
+                    .layout,
+                Layout::TimeMajor
+            );
+            assert_eq!(
+                overlapping.nodes[feedback.to_step.0 as usize].input_contracts
+                    [feedback.to_port as usize]
+                    .layout,
+                Layout::TimeMajor
+            );
+        }
+
+        let mut incompatible_layouts = registry.clone();
+        incompatible_layouts
+            .descriptors
+            .get_mut(&("source".into(), 1))
+            .unwrap()
+            .inputs[0]
+            .layouts = vec![Layout::TimeMajor];
+        incompatible_layouts
+            .descriptors
+            .get_mut(&("process".into(), 1))
+            .unwrap()
+            .outputs[0]
+            .layouts = vec![Layout::ChannelMajor];
+        incompatible_layouts
+            .descriptors
+            .get_mut(&("sink".into(), 1))
+            .unwrap()
+            .inputs[0]
+            .layouts = vec![Layout::ChannelMajor];
+        for kernel in incompatible_layouts.kernels.values_mut() {
+            if kernel.implements.as_slice()
+                == [NodeTypeRef {
+                    type_name: "source".into(),
+                    version: 1,
+                }]
+            {
+                kernel.input_layouts = vec![Layout::TimeMajor];
+            }
+            if kernel.implements.as_slice()
+                == [NodeTypeRef {
+                    type_name: "process".into(),
+                    version: 1,
+                }]
+            {
+                kernel.output_layouts = vec![Layout::ChannelMajor];
+            }
+            if kernel.implements.as_slice()
+                == [NodeTypeRef {
+                    type_name: "sink".into(),
+                    version: 1,
+                }]
+            {
+                kernel.input_layouts = vec![Layout::ChannelMajor];
+            }
+        }
+        assert_eq!(
+            Compiler::new(&incompatible_layouts, ExecutionRealm::HostStream)
+                .compile(&graph)
+                .unwrap_err(),
+            CompileError::InvalidFeedback(NodeId(0), "history".into())
+        );
+
+        registry
+            .descriptors
+            .get_mut(&("source".into(), 1))
+            .unwrap()
+            .inputs[0]
+            .optional = false;
+        assert!(matches!(
+            Compiler::new(&registry, ExecutionRealm::HostStream).compile(&graph),
+            Err(CompileError::InvalidFeedback(NodeId(0), _))
+        ));
+    }
+
+    #[test]
+    fn hierarchical_lowering_identity_and_depth_are_bounded() {
+        let (mut registry, graph) = fixture(false);
+        let mut leaf = crate::SubgraphSchema {
+            id: crate::SubgraphId([0; 32]),
+            version: 1,
+            nodes: vec![crate::SubgraphNode {
+                id: NodeId(0),
+                node_type: NodeTypeRef {
+                    type_name: "process".into(),
+                    version: 1,
+                },
+                config: BTreeMap::from([("gain".into(), crate::ConfigValue::Text("1".into()))]),
+                child: None,
+            }],
+            edges: vec![],
+            inputs: vec![crate::SubgraphInterfacePort {
+                name: "in".into(),
+                inner: PortRef {
+                    node: NodeId(0),
+                    port: "in".into(),
+                },
+            }],
+            outputs: vec![crate::SubgraphInterfacePort {
+                name: "out".into(),
+                inner: PortRef {
+                    node: NodeId(0),
+                    port: "out".into(),
+                },
+            }],
+        };
+        leaf.id = subgraph_identity(&leaf);
+        registry.register_subgraph(leaf.clone()).unwrap();
+        let mut repeated = leaf.clone();
+        repeated.nodes.push(crate::SubgraphNode {
+            id: NodeId(1),
+            node_type: NodeTypeRef {
+                type_name: "process".into(),
+                version: 1,
+            },
+            config: BTreeMap::from([("gain".into(), crate::ConfigValue::Text("1".into()))]),
+            child: None,
+        });
+        repeated.id = subgraph_identity(&repeated);
+        assert_ne!(
+            leaf.id, repeated.id,
+            "repeated instances are identity-bearing"
+        );
+        let mut parent = crate::SubgraphSchema {
+            id: crate::SubgraphId([0; 32]),
+            version: 1,
+            nodes: vec![crate::SubgraphNode {
+                id: NodeId(0),
+                node_type: NodeTypeRef {
+                    type_name: "process".into(),
+                    version: 1,
+                },
+                config: BTreeMap::from([("gain".into(), crate::ConfigValue::Text("1".into()))]),
+                child: Some(leaf.id),
+            }],
+            edges: vec![],
+            inputs: vec![crate::SubgraphInterfacePort {
+                name: "in".into(),
+                inner: PortRef {
+                    node: NodeId(0),
+                    port: "in".into(),
+                },
+            }],
+            outputs: vec![crate::SubgraphInterfacePort {
+                name: "out".into(),
+                inner: PortRef {
+                    node: NodeId(0),
+                    port: "out".into(),
+                },
+            }],
+        };
+        parent.id = subgraph_identity(&parent);
+        registry.register_subgraph(parent.clone()).unwrap();
+        registry
+            .descriptors
+            .get_mut(&("process".into(), 1))
+            .unwrap()
+            .subgraph = Some(crate::SubgraphLowering {
+            subgraph: parent.id,
+            input_map: vec![crate::PortMap {
+                outer: "in".into(),
+                inner: "in".into(),
+            }],
+            output_map: vec![crate::PortMap {
+                outer: "out".into(),
+                inner: "out".into(),
+            }],
+        });
+
+        assert!(matches!(
+            Compiler::new(&registry, ExecutionRealm::HostStream)
+                .with_limits(CompileLimits {
+                    max_subgraph_depth: 1,
+                    ..CompileLimits::default()
+                })
+                .compile(&graph),
+            Err(CompileError::SubgraphDepthExceeded)
+        ));
+        let plan = Compiler::new(&registry, ExecutionRealm::HostStream)
+            .with_limits(CompileLimits {
+                max_subgraph_depth: 2,
+                ..CompileLimits::default()
+            })
+            .compile(&graph)
+            .unwrap();
+        assert!(
+            plan.nodes
+                .iter()
+                .any(|step| step.subgraph_path == [parent.id])
         );
     }
 }
