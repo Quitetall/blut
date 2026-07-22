@@ -1,0 +1,20 @@
+{
+  "compile_benchmark_realm": "host-stream",
+  "compile_ops_s": 467833.63087552256,
+  "compiled_plan_bytes": 185,
+  "decode_ops_s": 922684.8246119164,
+  "encode_ops_s": 2377414.56166419,
+  "graph_id": "4b5452b3eba5c18a882ac5d03f5d37b74a44bb916fffa5269800f531b66d394b",
+  "identity_checked_realms": [
+    "mcu-aot",
+    "host-stream",
+    "blut-durable"
+  ],
+  "iterations": 10000,
+  "peak_bytes": 8192,
+  "plan_id": "b11fe83237bac8b0ca57ac8a4a36f07994106a2bd110c40a7e94af6ccfa45798",
+  "revision": "050b1c6f1b0900ddd1c6c5682cff2ab0da12194a",
+  "schema": "blut.graph-runtime-evidence/v1",
+  "stage": "graph-runtime",
+  "status": "PASS"
+}
