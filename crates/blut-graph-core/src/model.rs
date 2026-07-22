@@ -629,7 +629,11 @@ pub struct CompiledPlan {
     pub propagated_proofs: Vec<String>,
     pub propagated_policy: Vec<String>,
     pub resulting_fidelity: u16,
+    /// Peak invocation memory: live buffers, kernel workspaces/scratch, and
+    /// invocation-scoped state. Session/durable state and feedback history are
+    /// excluded and accounted by `persistent_state_bytes`.
     pub peak_bytes: u64,
+    /// Session/durable state plus feedback history retained across invocations.
     pub persistent_state_bytes: u64,
     pub session: Option<SessionContract>,
 }

@@ -242,8 +242,9 @@ pub fn adapt_durable_plan(
                     to: consumer.id,
                 });
             }
-            // Insertion order is the consumer's declared input-binding order;
-            // BLUT preserves this order when assembling tuple<N> merge inputs.
+            // Edge order follows physical-step order, then each step's compiled
+            // input-binding order. BLUT preserves that sequence when assembling
+            // tuple<N> merge inputs.
             edges.push((producer.0, consumer.id.0));
         }
     }

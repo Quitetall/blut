@@ -154,6 +154,8 @@ impl CompiledPlan {
                 .propagated_policy
                 .windows(2)
                 .any(|pair| pair[0] >= pair[1])
+            || plan.propagated_proofs.iter().any(|entry| entry.is_empty())
+            || plan.propagated_policy.iter().any(|entry| entry.is_empty())
         {
             return Err(PlanDecodeError::InvalidPlan);
         }
@@ -710,6 +712,55 @@ mod tests {
             CompiledPlan::from_aot_bytes(
                 &rewire_forgery.to_aot_bytes().unwrap(),
                 PlanLimits::default(),
+            ),
+            Err(PlanDecodeError::InvalidPlan)
+        );
+    }
+
+    #[test]
+    fn empty_compiled_contract_names_are_rejected() {
+        let mut port_contract = minimal_plan();
+        port_contract.nodes[0].output_contracts[0]
+            .policy
+            .adds
+            .push(String::new());
+        port_contract.plan_id = PlanId(hash_plan(&port_contract));
+        assert_eq!(
+            CompiledPlan::from_aot_bytes(
+                &port_contract.to_aot_bytes().unwrap(),
+                PlanLimits::default(),
+            ),
+            Err(PlanDecodeError::InvalidPlan)
+        );
+
+        let mut propagated_contract = minimal_plan();
+        propagated_contract.propagated_proofs.push(String::new());
+        propagated_contract.plan_id = PlanId(hash_plan(&propagated_contract));
+        assert_eq!(
+            CompiledPlan::from_aot_bytes(
+                &propagated_contract.to_aot_bytes().unwrap(),
+                PlanLimits::default(),
+            ),
+            Err(PlanDecodeError::InvalidPlan)
+        );
+    }
+
+    #[test]
+    fn subgraph_depth_limit_is_enforced_during_structural_decode() {
+        let mut plan = minimal_plan();
+        plan.nodes[0].subgraph_path = vec![crate::SubgraphId([1; 32]), crate::SubgraphId([2; 32])];
+        plan.plan_id = PlanId(hash_plan(&plan));
+        assert_eq!(
+            CompiledPlan::from_authorized_aot_bytes(
+                &plan.to_aot_bytes().unwrap(),
+                PlanLimits {
+                    max_subgraph_depth: 1,
+                    ..PlanLimits::default()
+                },
+                PlanAuthorization {
+                    expected_realm: plan.realm,
+                    expected_plan_id: plan.plan_id,
+                },
             ),
             Err(PlanDecodeError::InvalidPlan)
         );

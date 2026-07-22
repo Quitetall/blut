@@ -43,6 +43,7 @@ pub enum CompileError {
     CompileLimitExceeded,
     ResourceOverflow,
     EmptyGraph,
+    InvalidGraphContract,
     InvalidState(NodeId),
     InvalidSession,
     InvalidFeedback(NodeId, String),
@@ -50,6 +51,7 @@ pub enum CompileError {
     UnknownSubgraph(crate::SubgraphId),
     InvalidSubgraph(crate::SubgraphId),
     SubgraphDepthExceeded,
+    SubgraphEntryLimitExceeded,
 }
 
 impl fmt::Display for CompileError {
@@ -125,6 +127,7 @@ impl KernelRegistry {
         if descriptor.type_name.is_empty()
             || descriptor.version == 0
             || descriptor.resources.threads == 0
+            || !valid_contract_names(&descriptor.proof, &descriptor.policy)
             || invalid_ports(&descriptor.inputs)
             || invalid_ports(&descriptor.outputs)
             || (descriptor.effect == crate::model::Effect::AtMostOnce && descriptor.retry_limit > 0)
@@ -478,6 +481,17 @@ fn normalize_contract(proof: &mut crate::ProofContract, policy: &mut crate::Poli
     policy.adds.dedup();
 }
 
+fn valid_contract_names(proof: &crate::ProofContract, policy: &crate::PolicyContract) -> bool {
+    proof
+        .requires
+        .iter()
+        .chain(&proof.provides)
+        .chain(&proof.invalidates)
+        .chain(&policy.requires)
+        .chain(&policy.adds)
+        .all(|name| !name.is_empty())
+}
+
 fn subgraph_implements_descriptor(
     schema: &crate::SubgraphSchema,
     descriptor: &NodeDescriptor,
@@ -557,7 +571,8 @@ pub(crate) fn valid_port_contract(port: &PortDescriptor) -> bool {
     {
         return false;
     }
-    !matches!(&port.abir.root, crate::AbirRootType::Unknown(name) if name.is_empty())
+    valid_contract_names(&port.proof, &port.policy)
+        && !matches!(&port.abir.root, crate::AbirRootType::Unknown(name) if name.is_empty())
         && !matches!(&port.abir.view, crate::AbirViewType::Unknown(name) if name.is_empty())
 }
 
@@ -835,7 +850,7 @@ fn validate_subgraph_path(
     schemas: &BTreeMap<crate::SubgraphId, crate::SubgraphSchema>,
     root: crate::SubgraphId,
     max_depth: usize,
-    max_states: usize,
+    max_entries: usize,
 ) -> Result<(), CompileError> {
     let mut pending = alloc::vec![(root, 1usize, BTreeSet::new())];
     let mut searched = 0usize;
@@ -846,9 +861,9 @@ fn validate_subgraph_path(
             .and_then(|count| count.checked_add(schema.edges.len()))
             .and_then(|count| count.checked_add(schema.inputs.len()))
             .and_then(|count| count.checked_add(schema.outputs.len()))
-            .ok_or(CompileError::SearchLimitExceeded)?;
-        if searched > max_states {
-            return Err(CompileError::SearchLimitExceeded);
+            .ok_or(CompileError::SubgraphEntryLimitExceeded)?;
+        if searched > max_entries {
+            return Err(CompileError::SubgraphEntryLimitExceeded);
         }
         if depth > max_depth {
             return Err(CompileError::SubgraphDepthExceeded);
@@ -949,6 +964,7 @@ pub struct CompileLimits {
     pub max_steps: usize,
     pub max_buffers: usize,
     pub max_subgraph_depth: usize,
+    pub max_subgraph_entries: usize,
     pub max_feedback_edges: usize,
     pub max_persistent_state_bytes: u64,
 }
@@ -970,6 +986,7 @@ impl Default for CompileLimits {
             max_steps: 65_536,
             max_buffers: 262_144,
             max_subgraph_depth: 16,
+            max_subgraph_entries: 65_536,
             max_feedback_edges: 65_536,
             max_persistent_state_bytes: 64 * 1024 * 1024,
         }
@@ -990,6 +1007,7 @@ impl<'a> Compiler<'a> {
                 max_steps: 65_536,
                 max_buffers: 262_144,
                 max_subgraph_depth: 16,
+                max_subgraph_entries: 65_536,
                 max_feedback_edges: 65_536,
                 max_persistent_state_bytes: 64 * 1024 * 1024,
             },
@@ -1017,6 +1035,14 @@ impl<'a> Compiler<'a> {
         }
         if graph.nodes.is_empty() {
             return Err(CompileError::EmptyGraph);
+        }
+        if graph
+            .required_proofs
+            .iter()
+            .chain(&graph.policy)
+            .any(|name| name.is_empty())
+        {
+            return Err(CompileError::InvalidGraphContract);
         }
         if graph.nodes.len() > self.limits.max_semantic_nodes {
             return Err(CompileError::CompileLimitExceeded);
@@ -1060,7 +1086,7 @@ impl<'a> Compiler<'a> {
                     &self.registry.subgraphs,
                     lowering.subgraph,
                     self.limits.max_subgraph_depth,
-                    self.limits.max_search_states,
+                    self.limits.max_subgraph_entries,
                 )?;
                 validate_port_map(descriptor, lowering, &self.registry.subgraphs)?;
             }
@@ -2392,7 +2418,7 @@ fn lower_feedback(
         let bytes = value_bytes
             .checked_mul(u64::from(edge.delay.invocations))
             .ok_or(CompileError::ResourceOverflow)?;
-        let id = crate::FeedbackId(plans.len() as u32);
+        let id = feedback_id(plans.len())?;
         nodes[to_step_index].input_bindings[to_port] = crate::InputBinding::Feedback(id);
         plans.push(crate::FeedbackPlan {
             id,
@@ -2408,6 +2434,12 @@ fn lower_feedback(
             .ok_or(CompileError::ResourceOverflow)?;
     }
     Ok((plans, state_bytes))
+}
+
+fn feedback_id(index: usize) -> Result<crate::FeedbackId, CompileError> {
+    u32::try_from(index)
+        .map(crate::FeedbackId)
+        .map_err(|_| CompileError::CompileLimitExceeded)
 }
 
 struct ConversionRequest<'a> {
@@ -3593,6 +3625,23 @@ mod tests {
     }
 
     #[test]
+    fn semantic_graph_rejects_empty_proof_and_policy_names() {
+        let (registry, mut graph) = fixture(false);
+        graph.required_proofs.push(String::new());
+        assert_eq!(
+            Compiler::new(&registry, ExecutionRealm::HostStream).compile(&graph),
+            Err(CompileError::InvalidGraphContract)
+        );
+
+        graph.required_proofs.clear();
+        graph.policy.push(String::new());
+        assert_eq!(
+            Compiler::new(&registry, ExecutionRealm::HostStream).compile(&graph),
+            Err(CompileError::InvalidGraphContract)
+        );
+    }
+
+    #[test]
     fn instance_configuration_reaches_the_selected_physical_step() {
         let (registry, mut graph) = fixture(false);
         graph.nodes[1].config.insert(
@@ -3709,6 +3758,30 @@ mod tests {
         Compiler::new(&registry, ExecutionRealm::HostStream)
             .compile(&graph)
             .unwrap();
+    }
+
+    #[test]
+    fn descriptor_registration_rejects_empty_contract_names() {
+        let mut descriptor_contract = descriptor("empty-descriptor-contract", false);
+        descriptor_contract.policy.adds.push(String::new());
+        let mut registry = KernelRegistry::default();
+        assert_eq!(
+            registry.register_descriptor(descriptor_contract),
+            Err(CompileError::InvalidDescriptor(
+                "empty-descriptor-contract".to_string(),
+                1
+            ))
+        );
+
+        let mut port_contract = descriptor("empty-port-contract", false);
+        port_contract.outputs[0].proof.provides.push(String::new());
+        assert_eq!(
+            registry.register_descriptor(port_contract),
+            Err(CompileError::InvalidDescriptor(
+                "empty-port-contract".to_string(),
+                1
+            ))
+        );
     }
 
     #[test]
@@ -4181,6 +4254,19 @@ mod tests {
                 })
                 .compile(&graph),
             Err(CompileError::SearchLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn feedback_identity_conversion_is_checked() {
+        assert_eq!(
+            feedback_id(u32::MAX as usize),
+            Ok(crate::FeedbackId(u32::MAX))
+        );
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(
+            feedback_id(u32::MAX as usize + 1),
+            Err(CompileError::CompileLimitExceeded)
         );
     }
 
@@ -4771,6 +4857,15 @@ mod tests {
             }],
         });
 
+        assert_eq!(
+            Compiler::new(&registry, ExecutionRealm::HostStream)
+                .with_limits(CompileLimits {
+                    max_subgraph_entries: 5,
+                    ..CompileLimits::default()
+                })
+                .compile(&graph),
+            Err(CompileError::SubgraphEntryLimitExceeded)
+        );
         assert!(matches!(
             Compiler::new(&registry, ExecutionRealm::HostStream)
                 .with_limits(CompileLimits {
