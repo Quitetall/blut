@@ -53,6 +53,7 @@ pub use async_io::{
     IoMode, TrainingIoAdmissionError, TrainingIoCandidate, TrainingIoDowngradeReason,
     TrainingIoHints, TrainingIoProfile, profile_is_declared, select_training_io_profile,
 };
+pub use blut_graph_core as semantic_graph;
 pub use cache::{CacheHandle, CacheHit, lru_prune};
 pub use compat::Compatible;
 pub use cookbook::{

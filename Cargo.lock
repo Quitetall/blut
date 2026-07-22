@@ -237,6 +237,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "blake3",
+ "blut-graph-core",
  "blut-notify",
  "blut-types",
  "bytes",
@@ -277,6 +278,15 @@ dependencies = [
  "uuid",
  "which",
  "x25519-dalek",
+]
+
+[[package]]
+name = "blut-graph-core"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
