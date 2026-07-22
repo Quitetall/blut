@@ -139,8 +139,14 @@ fn main() {
     let mut revision = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--output" => output = args.next().map(PathBuf::from),
-            "--revision" => revision = args.next(),
+            "--output" => {
+                output = Some(PathBuf::from(
+                    args.next().expect("--output requires a path"),
+                ));
+            }
+            "--revision" => {
+                revision = Some(args.next().expect("--revision requires a value"));
+            }
             _ => panic!("unknown argument: {arg}"),
         }
     }
@@ -160,6 +166,16 @@ fn main() {
     }
     let compile_ops_s = rate(ITERATIONS, started.elapsed());
     let plan = plan.expect("iterations are non-zero");
+    let mcu_plan = Compiler::new(&registry, ExecutionRealm::McuAot)
+        .with_memory_limit(16 * 1024)
+        .compile(&graph)
+        .expect("MCU fixture compiles");
+    let durable_plan = Compiler::new(&registry, ExecutionRealm::BlutDurable)
+        .with_memory_limit(16 * 1024)
+        .compile(&graph)
+        .expect("durable fixture compiles");
+    assert_eq!(plan.graph_id, mcu_plan.graph_id);
+    assert_eq!(plan.graph_id, durable_plan.graph_id);
 
     let started = Instant::now();
     let mut bytes = Vec::new();
@@ -189,11 +205,8 @@ fn main() {
         "compile_ops_s": compile_ops_s,
         "encode_ops_s": encode_ops_s,
         "decode_ops_s": decode_ops_s,
-        "realms": ["mcu-aot", "host-stream", "blut-durable"],
-        "fused_unfused_semantic_identity": true,
-        "bounded_decode": true,
-        "transaction_receipts": true,
-        "plugin_capability_isolation": true
+        "compile_benchmark_realm": "host-stream",
+        "identity_checked_realms": ["mcu-aot", "host-stream", "blut-durable"]
     });
     fs::write(
         output,
