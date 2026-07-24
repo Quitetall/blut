@@ -26,7 +26,10 @@ pub use execute::{
     GapReceipt, KernelExecution, KernelExecutor, KernelGap, PlanExecutor, StructuredFailure,
     TransactionalSink,
 };
-pub use mcu::{McuArenaRequirements, McuPlanError};
+pub use mcu::{
+    MAX_STATIC_STEP_INPUTS, McuArenaRequirements, McuPlanError, StaticArenas, StaticExecutionError,
+    StaticExecutor, StaticKernel, StaticReceipt,
+};
 pub use model::{
     AbirRootType, AbirSemanticType, AbirViewType, AuthorizedPlan, BufferId, BufferPlan, Capability,
     CheckpointContract, CheckpointMode, CompiledNode, CompiledPlan, CompiledPortContract,
