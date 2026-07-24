@@ -1,20 +1,59 @@
 {
   "compile_benchmark_realm": "host-stream",
-  "compile_ops_s": 467833.63087552256,
-  "compiled_plan_bytes": 185,
-  "decode_ops_s": 922684.8246119164,
-  "encode_ops_s": 2377414.56166419,
-  "graph_id": "4b5452b3eba5c18a882ac5d03f5d37b74a44bb916fffa5269800f531b66d394b",
+  "compile_ops_s": 85545.48467535194,
+  "compiled_plan_bytes": 598,
+  "completion_eligible": true,
+  "decode_ops_s": 169685.76961345633,
+  "deferred_compile_optimization": [
+    "hierarchical-subgraph-inline-expansion"
+  ],
+  "deferred_to_runtime_stage_p5": [
+    "real-host-io-execution",
+    "end-to-end-durable-execution-receipt",
+    "stateful-session-and-feedback-realm-stores",
+    "runtime-checkpoint-barrier-enforcement",
+    "bpc2-supervised-process-plugin-lifecycle"
+  ],
+  "durable_adapter_validation": "cargo test -p blut semantic_plan::tests --lib",
+  "encode_ops_s": 877364.6842640871,
+  "executor_checked_realms": [
+    "mcu-aot",
+    "host-stream",
+    "blut-durable"
+  ],
+  "graph_core_scope_resolved": [
+    "deterministic-canonical-compilation",
+    "cross-realm-plan-identity",
+    "deterministic-aot-encode-decode",
+    "bounded-resource-and-mcu-arena-sizing",
+    "host-stream-reference-execution",
+    "distinct-allocation-free-static-mcu-executor",
+    "identity-bound-hierarchical-composition"
+  ],
+  "graph_id": "a686aac93bbf1baafa3031a5ac819ebfd939cc7ae8536020432c32cf81a31ab3",
   "identity_checked_realms": [
     "mcu-aot",
     "host-stream",
     "blut-durable"
   ],
   "iterations": 10000,
-  "peak_bytes": 8192,
-  "plan_id": "b11fe83237bac8b0ca57ac8a4a36f07994106a2bd110c40a7e94af6ccfa45798",
-  "revision": "050b1c6f1b0900ddd1c6c5682cff2ab0da12194a",
+  "mcu_fixed_arena_bytes": 13312,
+  "peak_bytes": 13312,
+  "persistent_state_bytes": 0,
+  "plan_id": "df763175480870aeae0112c18df42c2111b245a034b5b3da75a69add5dc1decc",
+  "revision": "5b0a9557d0052d46af99e317e346c78aa21c57ac",
   "schema": "blut.graph-runtime-evidence/v1",
+  "schema_version": 3,
+  "scope_note": "blut-graph-core is the domain-neutral compiler + plan + reference/static executors (ADR 0139 ownership); it depends on no ABIR or LamQuant crate. Real per-realm runtime execution (host I/O, durable receipts, session/feedback stores, checkpoint barriers, supervised-process plugins) is certified by the P5 runtime gate over lamquant-runtime's tested implementations.",
   "stage": "graph-runtime",
-  "status": "PASS"
+  "static_executor": {
+    "allocation_free": true,
+    "completed_steps": 3,
+    "distinct_from_host_plan_executor": true,
+    "realm": "mcu-aot",
+    "terminal_values": 1
+  },
+  "status": "PASS",
+  "synthetic_output": 3,
+  "wire_magic": "BGP3"
 }
