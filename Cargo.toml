@@ -56,6 +56,7 @@ include = [
 path = "src/lib.rs"
 
 [dependencies]
+abir = { version = "=0.1.0", git = "https://github.com/Quitetall/ABIR.git", rev = "c101513167ad8d7cdefa6387b20c644fdaf66432" }
 # ADR 0083: the wasm32-safe keystone. The engine re-exports its types at their
 # old paths, so this is zero-churn downstream.
 blut-types = { path = "crates/blut-types", version = "=0.2.0-alpha.1" }
