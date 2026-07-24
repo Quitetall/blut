@@ -1,7 +1,11 @@
 # BLUT Release Procedure
 
-Public preview train: `blut-types` → `blut` → `blut-dsl` → `blut-notify`, all at
-the same exact version. The standalone-workspace sidecars `blut-tui`, `blut-web`,
+Public preview train: (`blut-types`, `blut-graph-core`) → `blut` → `blut-dsl` →
+`blut-notify`. `blut-types` and `blut-graph-core` are the two chain ROOTS (no
+in-repo path deps); `blut` depends on BOTH, so both must be indexed on crates.io
+before it will package — omitting either fails with `no matching package named
+'<crate>' found`. Members share the exact preview version except
+`blut-graph-core`, which carries its own (`0.1.0-alpha.1`). The standalone-workspace sidecars `blut-tui`, `blut-web`,
 and `blut-operator` are `publish = false`. The `release.yml` `binaries` job
 attaches those three plus the runnable `blut-notify` member binary to the GitHub
 Release. (`blut-worker` was deleted at ADR 0083 M3 — superseded by `src/cloud`
@@ -94,6 +98,13 @@ Each publish is irreversible. Confirm package contents before removing
 # Wait until crates.io resolves blut-types at the exact preview version.
 # Re-run exact-SHA CI now; root and DSL tarball verification cannot resolve
 # their exact owner dependencies until the preceding package is indexed.
+
+# The SECOND chain root. `blut` depends on it as well as on blut-types, so
+# publishing `blut` before this one fails ("no matching package named
+# `blut-graph-core` found"). Its version is independent (0.1.0-alpha.1).
+(cd crates/blut-graph-core && cargo publish --dry-run --locked)
+(cd crates/blut-graph-core && cargo publish --locked)
+# Wait until crates.io resolves blut-graph-core.
 
 cargo publish --dry-run --locked
 cargo publish --locked

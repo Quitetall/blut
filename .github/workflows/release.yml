@@ -168,7 +168,8 @@ jobs:
           files: dist/*
 
   # ── publish: the crate chain to crates.io, in dependency order ──────
-  # MANUAL + owner-gated. blut-types → blut → blut-dsl → blut-notify. The
+  # MANUAL + owner-gated. (blut-types, blut-graph-core) → blut → blut-dsl →
+  # blut-notify. The
   # standalone-workspace sidecars (blut-tui/blut-web/blut-operator) are
   # publish=false — they ship as the binaries above, not as crates.
   publish-crates:
@@ -220,7 +221,12 @@ jobs:
             done
             echo "::error::failed to publish $pkg"; return 1
           }
+          # Two chain ROOTS (no in-repo path deps), then their dependents.
+          # blut depends on BOTH blut-types and blut-graph-core, so both must
+          # be indexed before it packages — omitting either fails with
+          # "no matching package named `<crate>` found".
           publish blut-types
+          publish blut-graph-core
           publish blut
           publish blut-dsl --manifest-path crates/blut-dsl/Cargo.toml
           publish blut-notify
