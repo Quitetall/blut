@@ -3,15 +3,6 @@
 version = 4
 
 [[package]]
-name = "abir"
-version = "0.1.0"
-source = "git+https://github.com/Quitetall/ABIR.git?rev=c101513167ad8d7cdefa6387b20c644fdaf66432#c101513167ad8d7cdefa6387b20c644fdaf66432"
-dependencies = [
- "blake3",
- "serde_json",
-]
-
-[[package]]
 name = "aead"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -241,7 +232,6 @@ dependencies = [
 name = "blut"
 version = "0.2.0-alpha.1"
 dependencies = [
- "abir",
  "aes-gcm",
  "anyhow",
  "async-trait",
