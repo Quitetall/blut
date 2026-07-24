@@ -1,0 +1,11 @@
+{
+  "case_id": "mcu-aot",
+  "clock_and_gap_evidence_preserved": true,
+  "completed_steps": 3,
+  "policy_bypass_count": 0,
+  "realm": "mcu-aot",
+  "resource_bound_violations": 0,
+  "schema": "lamquant.adr0139.runtime-graph-receipt/v1",
+  "status": "pass",
+  "transactional_receipt_failures": 0
+}

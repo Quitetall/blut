@@ -1,0 +1,9 @@
+{
+  "case_id": "mcu-aot-fault",
+  "completed_steps": 0,
+  "contained": true,
+  "realm": "mcu-aot",
+  "schema": "lamquant.adr0139.runtime-fault-receipt/v1",
+  "status": "pass",
+  "terminal_values": 0
+}

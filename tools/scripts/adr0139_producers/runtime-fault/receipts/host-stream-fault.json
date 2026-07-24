@@ -1,0 +1,9 @@
+{
+  "case_id": "host-stream-fault",
+  "completed_steps": 0,
+  "contained": true,
+  "realm": "host-stream",
+  "schema": "lamquant.adr0139.runtime-fault-receipt/v1",
+  "status": "pass",
+  "terminal_values": 0
+}
