@@ -67,11 +67,12 @@ subset fail closed on these constructs until their realm supplies a state
 store. Hierarchical decompositions are content-identified `SubgraphSchema`s;
 their identity covers repeated local instances, typed config, internal edges,
 interface bindings, and nested child identities. Registered lowerings require
-descriptor-compatible child interfaces and exact port maps; compilation
-enforces search/depth ceilings while preserving the root subgraph identity in
-the physical step. BGP3 does not yet inline-expand the inner DAG: a physical
-kernel still implements the outer node, with the subgraph serving as an
-identity-bound decomposition contract.
+descriptor-compatible child interfaces, exact port maps, and type-compatible
+outer-to-inner configuration bindings. `KernelRegistry::materialize_subgraph`
+applies one canonical outer instance to a concrete reference graph that callers
+can compile with fusion enabled or disabled. Ordinary compilation still keeps
+the outer node physical and preserves root subgraph identity in its step; BGP3
+does not implicitly inline-expand inner DAGs.
 
 Semantic graphs use schema version 3 and the physical-step/ordered-port contract
 is encoded as `BGP3`. Earlier alpha `BGP1` and `BGP2` postcard layouts are

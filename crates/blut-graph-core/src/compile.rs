@@ -105,6 +105,8 @@ impl KernelRegistry {
             lowering.input_map.dedup();
             lowering.output_map.sort_unstable();
             lowering.output_map.dedup();
+            lowering.config_map.sort_unstable();
+            lowering.config_map.dedup();
         }
         descriptor.config.normalize().map_err(|_| {
             CompileError::InvalidDescriptor(descriptor.type_name.clone(), descriptor.version)
@@ -140,6 +142,12 @@ impl KernelRegistry {
                 && descriptor.failure.domains.is_empty())
             || !valid_state_contract(&descriptor.state)
         {
+            return Err(CompileError::InvalidDescriptor(key.0, key.1));
+        }
+        if descriptor.subgraph.as_ref().is_some_and(|lowering| {
+            validate_subgraph_lowering(&descriptor, lowering, &self.subgraphs, &self.descriptors)
+                .is_err()
+        }) {
             return Err(CompileError::InvalidDescriptor(key.0, key.1));
         }
         self.descriptors.insert(key, descriptor);
@@ -293,6 +301,121 @@ impl KernelRegistry {
         Ok(())
     }
 
+    /// Apply one outer node instance's canonical configuration to its declared
+    /// inner DAG. This is an explicit reference graph, not physical inlining:
+    /// callers compile it normally with fusion enabled or disabled.
+    pub fn materialize_subgraph(
+        &self,
+        instance: &crate::NodeInstance,
+    ) -> Result<crate::MaterializedSubgraph, CompileError> {
+        let descriptor = self
+            .descriptors
+            .get(&(instance.descriptor.clone(), instance.descriptor_version))
+            .ok_or_else(|| {
+                CompileError::UnknownDescriptor(
+                    instance.descriptor.clone(),
+                    instance.descriptor_version,
+                )
+            })?;
+        let lowering = descriptor
+            .subgraph
+            .as_ref()
+            .ok_or(CompileError::InvalidSubgraph(crate::SubgraphId([0; 32])))?;
+        validate_subgraph_lowering(descriptor, lowering, &self.subgraphs, &self.descriptors)?;
+        let schema = self
+            .subgraphs
+            .get(&lowering.subgraph)
+            .ok_or(CompileError::UnknownSubgraph(lowering.subgraph))?;
+        if schema.nodes.iter().any(|node| node.child.is_some()) {
+            return Err(CompileError::InvalidSubgraph(schema.id));
+        }
+        let outer_config = descriptor
+            .config
+            .canonicalize(&instance.config)
+            .map_err(|error| CompileError::InvalidConfig(instance.id, error))?;
+        let mut nodes = schema
+            .nodes
+            .iter()
+            .map(|node| crate::NodeInstance {
+                id: node.id,
+                descriptor: node.node_type.type_name.clone(),
+                descriptor_version: node.node_type.version,
+                config: node.config.clone(),
+            })
+            .collect::<Vec<_>>();
+        for binding in &lowering.config_map {
+            let value = outer_config
+                .get(&binding.outer)
+                .ok_or(CompileError::InvalidSubgraph(schema.id))?
+                .clone();
+            let node = nodes
+                .iter_mut()
+                .find(|node| node.id == binding.node)
+                .ok_or(CompileError::InvalidSubgraph(schema.id))?;
+            node.config.insert(binding.inner.clone(), value);
+        }
+        for node in &mut nodes {
+            let inner = self
+                .descriptors
+                .get(&(node.descriptor.clone(), node.descriptor_version))
+                .ok_or(CompileError::InvalidSubgraph(schema.id))?;
+            node.config = inner
+                .config
+                .canonicalize(&node.config)
+                .map_err(|_| CompileError::InvalidSubgraph(schema.id))?;
+        }
+
+        let map_interfaces =
+            |maps: &[crate::PortMap], interfaces: &[crate::SubgraphInterfacePort]| {
+                maps.iter()
+                    .map(|map| {
+                        interfaces
+                            .iter()
+                            .find(|interface| interface.name == map.inner)
+                            .map(|interface| crate::SubgraphInterfacePort {
+                                name: map.outer.clone(),
+                                inner: interface.inner.clone(),
+                            })
+                            .ok_or(CompileError::InvalidSubgraph(schema.id))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            };
+        let mut inputs = map_interfaces(&lowering.input_map, &schema.inputs)?;
+        let mut outputs = map_interfaces(&lowering.output_map, &schema.outputs)?;
+        inputs.sort_unstable();
+        outputs.sort_unstable();
+        let mut required_capabilities = schema
+            .nodes
+            .iter()
+            .flat_map(|node| {
+                self.descriptors[&(node.node_type.type_name.clone(), node.node_type.version)]
+                    .capabilities
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        required_capabilities.sort_unstable();
+        required_capabilities.dedup();
+        Ok(crate::MaterializedSubgraph {
+            graph: crate::Graph {
+                version: 3,
+                nodes,
+                edges: schema.edges.clone(),
+                feedback: Vec::new(),
+                invocation_inputs: inputs
+                    .iter()
+                    .map(|interface| interface.inner.clone())
+                    .collect(),
+                required_capabilities,
+                required_proofs: descriptor.proof.requires.clone(),
+                policy: descriptor.policy.requires.clone(),
+                minimum_fidelity: descriptor.fidelity.minimum_input,
+                session: None,
+            },
+            inputs,
+            outputs,
+        })
+    }
+
     /// Decode an untrusted physical plan, bind it to a trusted realm/PlanId,
     /// and verify every executable step against this registry before use.
     pub fn decode_authorized_plan(
@@ -443,25 +566,28 @@ impl KernelRegistry {
                         limits.max_contract_entries,
                     )
                     .map_err(|_| crate::PlanDecodeError::UnauthorizedPlan)?;
-                    validate_port_map(first, lowering, &self.subgraphs)
+                    validate_subgraph_lowering(first, lowering, &self.subgraphs, &self.descriptors)
                         .map_err(|_| crate::PlanDecodeError::UnauthorizedPlan)?;
                 }
-            } else if node.effect != crate::model::Effect::Pure
-                || node.retry_limit != 0
-                || node.state != StateContract::stateless()
-                || !node.subgraph_path.is_empty()
-                || node.partiality != crate::model::Partiality::Atomic
-                || !node.failure.domains.is_empty()
-                || semantic_descriptors.iter().any(|descriptor| {
-                    descriptor.effect != crate::model::Effect::Pure
-                        || descriptor.state.scope != StateScope::Stateless
-                        || descriptor.retry_limit != 0
-                        || descriptor.state.checkpointable()
-                        || descriptor.partiality != crate::model::Partiality::Atomic
-                        || !descriptor.failure.domains.is_empty()
-                })
-            {
-                return Err(crate::PlanDecodeError::UnauthorizedPlan);
+            } else {
+                let expected_failures = failure_domain_union(semantic_descriptors.iter().copied());
+                if node.effect != crate::model::Effect::Pure
+                    || node.retry_limit != 0
+                    || node.state != StateContract::stateless()
+                    || !node.subgraph_path.is_empty()
+                    || node.partiality != crate::model::Partiality::Atomic
+                    || node.failure.domains != expected_failures
+                    || semantic_descriptors.iter().any(|descriptor| {
+                        descriptor.effect != crate::model::Effect::Pure
+                            || descriptor.state.scope != StateScope::Stateless
+                            || descriptor.retry_limit != 0
+                            || descriptor.state.checkpointable()
+                            || descriptor.partiality != crate::model::Partiality::Atomic
+                            || descriptor.subgraph.is_some()
+                    })
+                {
+                    return Err(crate::PlanDecodeError::UnauthorizedPlan);
+                }
             }
         }
         Ok(AuthorizedPlan::new(plan))
@@ -878,10 +1004,72 @@ fn validate_subgraph_path(
     Ok(())
 }
 
-fn validate_port_map(
+fn config_type_satisfies(outer: &crate::ConfigType, inner: &crate::ConfigType) -> bool {
+    match (outer, inner) {
+        (crate::ConfigType::Bool, crate::ConfigType::Bool) => true,
+        (
+            crate::ConfigType::I64 {
+                minimum: outer_min,
+                maximum: outer_max,
+            },
+            crate::ConfigType::I64 {
+                minimum: inner_min,
+                maximum: inner_max,
+            },
+        ) => outer_min >= inner_min && outer_max <= inner_max,
+        (
+            crate::ConfigType::U64 {
+                minimum: outer_min,
+                maximum: outer_max,
+            },
+            crate::ConfigType::U64 {
+                minimum: inner_min,
+                maximum: inner_max,
+            },
+        ) => outer_min >= inner_min && outer_max <= inner_max,
+        (
+            crate::ConfigType::Text {
+                max_bytes: outer_max,
+            },
+            crate::ConfigType::Text {
+                max_bytes: inner_max,
+            },
+        )
+        | (
+            crate::ConfigType::Bytes {
+                max_bytes: outer_max,
+            },
+            crate::ConfigType::Bytes {
+                max_bytes: inner_max,
+            },
+        ) => outer_max <= inner_max,
+        (
+            crate::ConfigType::Choice {
+                values: outer_values,
+            },
+            crate::ConfigType::Choice {
+                values: inner_values,
+            },
+        ) => outer_values
+            .iter()
+            .all(|value| inner_values.contains(value)),
+        (
+            crate::ConfigType::Choice {
+                values: outer_values,
+            },
+            crate::ConfigType::Text { max_bytes },
+        ) => outer_values
+            .iter()
+            .all(|value| value.len() <= *max_bytes as usize),
+        _ => false,
+    }
+}
+
+fn validate_subgraph_lowering(
     descriptor: &NodeDescriptor,
     lowering: &crate::SubgraphLowering,
     schemas: &BTreeMap<crate::SubgraphId, crate::SubgraphSchema>,
+    descriptors: &BTreeMap<(String, u32), NodeDescriptor>,
 ) -> Result<(), CompileError> {
     let schema = schemas
         .get(&lowering.subgraph)
@@ -916,6 +1104,42 @@ fn validate_port_map(
         .iter()
         .map(|port| port.name.as_str())
         .collect();
+    let outer_fields: BTreeMap<_, _> = descriptor
+        .config
+        .fields
+        .iter()
+        .map(|field| (field.name.as_str(), field))
+        .collect();
+    let mapped_outer_fields: BTreeSet<_> = lowering
+        .config_map
+        .iter()
+        .map(|map| map.outer.as_str())
+        .collect();
+    let inner_nodes: BTreeMap<_, _> = schema.nodes.iter().map(|node| (node.id, node)).collect();
+    let mut config_targets = BTreeSet::new();
+    let invalid_config_map = lowering.config_map.iter().any(|map| {
+        let Some(outer) = outer_fields.get(map.outer.as_str()) else {
+            return true;
+        };
+        let Some(node) = inner_nodes.get(&map.node) else {
+            return true;
+        };
+        let Some(inner_descriptor) =
+            descriptors.get(&(node.node_type.type_name.clone(), node.node_type.version))
+        else {
+            return true;
+        };
+        let Some(inner) = inner_descriptor
+            .config
+            .fields
+            .iter()
+            .find(|field| field.name == map.inner)
+        else {
+            return true;
+        };
+        !config_targets.insert((map.node, map.inner.as_str()))
+            || !config_type_satisfies(&outer.value_type, &inner.value_type)
+    });
     if input_names != mapped_inputs
         || output_names != mapped_outputs
         || lowering.input_map.len() != input_names.len()
@@ -942,6 +1166,8 @@ fn validate_port_map(
             .collect::<BTreeSet<_>>()
             .len()
             != lowering.output_map.len()
+        || invalid_config_map
+        || mapped_outer_fields != outer_fields.keys().copied().collect()
     {
         return Err(CompileError::InvalidSubgraph(lowering.subgraph));
     }
@@ -1092,7 +1318,12 @@ impl<'a> Compiler<'a> {
                     self.limits.max_subgraph_depth,
                     self.limits.max_subgraph_entries,
                 )?;
-                validate_port_map(descriptor, lowering, &self.registry.subgraphs)?;
+                validate_subgraph_lowering(
+                    descriptor,
+                    lowering,
+                    &self.registry.subgraphs,
+                    &self.registry.descriptors,
+                )?;
             }
             for capability in &descriptor.capabilities {
                 if !required_caps.contains(capability) {
@@ -1896,7 +2127,7 @@ fn semantic_region(
         },
         failure: if fused {
             crate::model::FailureContract {
-                domains: Vec::new(),
+                domains: failure_domain_union(ids.iter().map(|id| descriptors[id])),
             }
         } else {
             first.failure.clone()
@@ -1938,7 +2169,6 @@ fn linear_fusion_is_safe(
             || descriptor.state.scope != StateScope::Stateless
             || descriptor.retry_limit != 0
             || descriptor.state.checkpointable()
-            || !descriptor.failure.domains.is_empty()
             || descriptor.subgraph.is_some()
     }) {
         return false;
@@ -1964,6 +2194,18 @@ fn linear_fusion_is_safe(
             && outgoing[0].from.port == descriptors[&from].outputs[0].name
             && incoming[0].to.port == descriptors[&to].inputs[0].name
     })
+}
+
+fn failure_domain_union<'a>(
+    descriptors: impl IntoIterator<Item = &'a NodeDescriptor>,
+) -> Vec<String> {
+    let mut domains = descriptors
+        .into_iter()
+        .flat_map(|descriptor| descriptor.failure.domains.iter().cloned())
+        .collect::<Vec<_>>();
+    domains.sort_unstable();
+    domains.dedup();
+    domains
 }
 
 fn fused_layouts_compatible(
@@ -2798,6 +3040,12 @@ fn hash_descriptor(hasher: &mut blake3::Hasher, descriptor: &NodeDescriptor) {
             hasher.update(&lowering.subgraph.0);
             hash_port_maps(hasher, &lowering.input_map);
             hash_port_maps(hasher, &lowering.output_map);
+            put_u32(hasher, lowering.config_map.len() as u32);
+            for map in &lowering.config_map {
+                put_str(hasher, &map.outer);
+                put_u32(hasher, map.node.0);
+                put_str(hasher, &map.inner);
+            }
         }
         None => {
             hasher.update(&[0]);
@@ -4865,6 +5113,11 @@ mod tests {
             output_map: vec![crate::PortMap {
                 outer: "out".into(),
                 inner: "out".into(),
+            }],
+            config_map: vec![crate::SubgraphConfigMap {
+                outer: "gain".into(),
+                node: NodeId(0),
+                inner: "gain".into(),
             }],
         });
 

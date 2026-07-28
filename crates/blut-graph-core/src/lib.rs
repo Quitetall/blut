@@ -36,10 +36,11 @@ pub use model::{
     DelayContract, DelayInitial, Determinism, Edge, Effect, ExecutionRealm, ExtentContract,
     FailureContract, FeedbackEdge, FeedbackId, FeedbackPlan, FidelityContract, Graph, GraphId,
     ImplementationId, InputBinding, KernelDescriptor, KernelId, Layout, LayoutConversion,
-    LeaseAccess, LeaseContract, LeaseLifetime, NodeDescriptor, NodeId, NodeInstance, NodeTypeRef,
-    OutputBinding, Partiality, PlanId, PolicyContract, PortDescriptor, PortMap, PortRef,
-    ProofContract, ResourceEnvelope, SessionContract, StateContract, StateScope, StepId,
-    SubgraphId, SubgraphInterfacePort, SubgraphLowering, SubgraphNode, SubgraphSchema, Target,
+    LeaseAccess, LeaseContract, LeaseLifetime, MaterializedSubgraph, NodeDescriptor, NodeId,
+    NodeInstance, NodeTypeRef, OutputBinding, Partiality, PlanId, PolicyContract, PortDescriptor,
+    PortMap, PortRef, ProofContract, ResourceEnvelope, SessionContract, StateContract, StateScope,
+    StepId, SubgraphConfigMap, SubgraphId, SubgraphInterfacePort, SubgraphLowering, SubgraphNode,
+    SubgraphSchema, Target,
 };
 pub use plugin::{
     ExecutableDigestAlgorithm, PLUGIN_PROTOCOL_VERSION, PluginControlFrame, PluginControlLimits,

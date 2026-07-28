@@ -371,11 +371,23 @@ pub struct PortMap {
     pub inner: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SubgraphConfigMap {
+    /// Field on the outer descriptor.
+    pub outer: String,
+    /// Local node receiving the bound value.
+    pub node: NodeId,
+    /// Field on the inner node descriptor.
+    pub inner: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubgraphLowering {
     pub subgraph: SubgraphId,
     pub input_map: Vec<PortMap>,
     pub output_map: Vec<PortMap>,
+    /// Exact outer-instance configuration bindings into the inner DAG.
+    pub config_map: Vec<SubgraphConfigMap>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -401,6 +413,15 @@ pub struct SubgraphSchema {
     pub nodes: Vec<SubgraphNode>,
     pub edges: Vec<Edge>,
     pub inputs: Vec<SubgraphInterfacePort>,
+    pub outputs: Vec<SubgraphInterfacePort>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterializedSubgraph {
+    pub graph: Graph,
+    /// Outer input names bound to concrete inner ports.
+    pub inputs: Vec<SubgraphInterfacePort>,
+    /// Outer output names bound to concrete inner ports.
     pub outputs: Vec<SubgraphInterfacePort>,
 }
 
