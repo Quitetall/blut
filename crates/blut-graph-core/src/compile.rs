@@ -71,6 +71,15 @@ pub struct KernelRegistry {
 }
 
 impl KernelRegistry {
+    /// Return exact normalized semantic contract trusted by this registry.
+    ///
+    /// Product runtimes use this after compilation to ensure live policy grants
+    /// are required by the semantic node they authorize.
+    pub fn descriptor(&self, node_type: &NodeTypeRef) -> Option<&NodeDescriptor> {
+        self.descriptors
+            .get(&(node_type.type_name.clone(), node_type.version))
+    }
+
     pub fn register_descriptor(
         &mut self,
         mut descriptor: NodeDescriptor,
@@ -3980,6 +3989,31 @@ mod tests {
             .unwrap();
         assert_eq!(baseline.graph_id, physical_change.graph_id);
         assert_ne!(baseline.plan_id, physical_change.plan_id);
+    }
+
+    #[test]
+    fn descriptor_lookup_returns_normalized_registered_contract_only() {
+        let mut registry = KernelRegistry::default();
+        let mut contract = descriptor("lookup", false);
+        contract.policy.requires = vec!["z".into(), "a".into(), "z".into()];
+        let node_type = NodeTypeRef {
+            type_name: contract.type_name.clone(),
+            version: contract.version,
+        };
+        registry.register_descriptor(contract).unwrap();
+
+        assert_eq!(
+            registry.descriptor(&node_type).unwrap().policy.requires,
+            ["a", "z"]
+        );
+        assert!(
+            registry
+                .descriptor(&NodeTypeRef {
+                    type_name: "missing".into(),
+                    version: 1,
+                })
+                .is_none()
+        );
     }
 
     #[test]
