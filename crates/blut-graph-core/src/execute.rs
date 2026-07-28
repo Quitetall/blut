@@ -35,11 +35,18 @@ pub enum ExecutionError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailureEvidence {
+    pub semantic_type: String,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StructuredFailure {
     pub domain: String,
     pub code: String,
     pub message: String,
     pub retryable: bool,
+    pub evidence: Vec<FailureEvidence>,
 }
 
 impl ExecutionError {
@@ -93,7 +100,8 @@ pub struct ExecutionReceipt {
 pub struct KernelGap {
     pub output_index: u32,
     pub offset: u64,
-    pub length: u64,
+    /// Known missing extent. `None` preserves unknown cardinality.
+    pub length: Option<u64>,
     pub domain: String,
     pub code: String,
 }
@@ -335,7 +343,7 @@ where
             if outputs.gaps.iter().any(|gap| {
                 node.partiality != crate::Partiality::ExplicitGaps
                     || gap.output_index as usize >= outputs.outputs.len()
-                    || gap.length == 0
+                    || gap.length == Some(0)
                     || !node.failure.domains.contains(&gap.domain)
             }) {
                 if node.effect == Effect::Transactional {
@@ -453,6 +461,7 @@ mod tests {
                         code: "retry".into(),
                         message: "retry".into(),
                         retryable: true,
+                        evidence: Vec::new(),
                     },
                 });
             }
@@ -728,7 +737,7 @@ mod tests {
                     gaps: vec![KernelGap {
                         output_index: 0,
                         offset: 12,
-                        length: 4,
+                        length: Some(4),
                         domain: "biosignal.missing".into(),
                         code: "packet-loss".into(),
                     }],

@@ -23,8 +23,8 @@ pub use compile::{CompileError, CompileLimits, Compiler, KernelRegistry, subgrap
 pub use config::{ConfigError, ConfigField, ConfigSchema, ConfigType, ConfigValue};
 pub use execute::{
     ExecutionAttempt, ExecutionError, ExecutionFailure, ExecutionReceipt, ExecutionResult,
-    GapReceipt, KernelExecution, KernelExecutor, KernelGap, PlanExecutor, StructuredFailure,
-    TransactionalSink,
+    FailureEvidence, GapReceipt, KernelExecution, KernelExecutor, KernelGap, PlanExecutor,
+    StructuredFailure, TransactionalSink,
 };
 pub use mcu::{
     MAX_STATIC_STEP_INPUTS, McuArenaRequirements, McuPlanError, StaticArenas, StaticExecutionError,
