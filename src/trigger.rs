@@ -109,6 +109,14 @@ pub struct TriggerConfig {
     /// acknowledgement before terminating it and leaving the event retryable.
     #[serde(default = "default_admission_timeout_secs")]
     pub admission_timeout_secs: u64,
+    /// How long a dispatched file-drop event is kept in `<spool>/.processed/`
+    /// before deletion. This bounds all three otherwise-unbounded stores: the
+    /// spool itself, the `.seen` dedupe log, and the `.admitted` markers (the
+    /// latter two are reclaimed once an event stops being observable). `0`
+    /// disables archival — events then stay in the watched directory forever
+    /// and their dedupe records can never be reclaimed.
+    #[serde(default = "default_spool_retention_secs")]
+    pub spool_retention_secs: u64,
 }
 
 impl Default for TriggerConfig {
@@ -117,6 +125,7 @@ impl Default for TriggerConfig {
             trigger: Vec::new(),
             webhook_max_skew_secs: default_webhook_max_skew_secs(),
             admission_timeout_secs: default_admission_timeout_secs(),
+            spool_retention_secs: default_spool_retention_secs(),
         }
     }
 }
@@ -127,6 +136,12 @@ const fn default_webhook_max_skew_secs() -> u64 {
 
 const fn default_admission_timeout_secs() -> u64 {
     60
+}
+
+/// Seven days: long enough to inspect what a trigger acted on, short enough
+/// that a busy webhook spool cannot grow without bound.
+const fn default_spool_retention_secs() -> u64 {
+    7 * 24 * 60 * 60
 }
 
 impl TriggerConfig {
@@ -620,6 +635,69 @@ impl SeenStore {
         writeln!(f, "{id}")
     }
 
+    /// Reclaim dedupe records for events that can no longer fire.
+    ///
+    /// The ONLY safe reclamation rule: an id a fresh poll still observes MUST
+    /// be retained — forgetting it would re-dispatch its event — while an id
+    /// that is no longer observable cannot fire again, so its log line and its
+    /// `.admitted` marker are both droppable. Deriving liveness from a poll
+    /// (rather than an id→source map) keeps this correct for every trigger
+    /// kind, including spool-threshold and cron events that own no file.
+    ///
+    /// Without this, `.seen` and `.admitted` grow for the life of the daemon:
+    /// every id ever dispatched stays in memory, on disk, and in the linear
+    /// startup scan. Pair it with [`archive_dispatched`], which is what makes
+    /// ids stop being observable in the first place.
+    ///
+    /// The log is rewritten atomically (temp file + rename), so a crash leaves
+    /// either the old log or the new one — never a truncated one.
+    pub fn retain_observable(&mut self, observable: &HashSet<String>) -> std::io::Result<usize> {
+        let dropped: Vec<String> = self
+            .seen
+            .iter()
+            .filter(|id| !observable.contains(*id))
+            .cloned()
+            .collect();
+        if dropped.is_empty() {
+            return Ok(0);
+        }
+        self.seen.retain(|id| observable.contains(id));
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(".seen");
+        let tmp = self.path.with_file_name(format!("{file_name}.compact.tmp"));
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::File::create(&tmp)?;
+            for id in &self.seen {
+                writeln!(file, "{id}")?;
+            }
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp, &self.path)?;
+        // The durable admission markers exist only to recover a crash window
+        // for events that could still fire; a reclaimed id has none.
+        let admitted = admitted_dir_for(&self.path);
+        for id in &dropped {
+            let _ = std::fs::remove_file(admitted.join(id));
+        }
+        Ok(dropped.len())
+    }
+
+    /// Number of dedupe records currently held (operational visibility).
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+
     /// Durable child-admission marker for `id`. The path is deterministic so
     /// restart recovery can reconcile it without any in-memory daemon state.
     pub fn admission_ack_path(&self, id: &str) -> std::io::Result<PathBuf> {
@@ -633,6 +711,80 @@ impl SeenStore {
         std::fs::create_dir_all(&dir)?;
         Ok(dir.join(id))
     }
+}
+
+/// Where a dispatched file-drop event is moved so it can never fire again.
+/// Both this and `.admitted` are DIRECTORIES inside the watched spool, and
+/// every trigger's `read_dir` is non-recursive and skips non-files, so an
+/// archived event is invisible to a later poll.
+fn processed_dir_for(spool: &std::path::Path) -> PathBuf {
+    spool.join(".processed")
+}
+
+/// Move a dispatched file-drop event out of the watched directory into
+/// `.processed/`.
+///
+/// This is the half of retention that bounds the SPOOL, and it is what lets
+/// [`SeenStore::retain_observable`] reclaim anything: while a dispatched file
+/// stays in place it remains observable, so its dedupe record must be kept
+/// forever. Returns `false` for events that own no single file (spool-
+/// threshold and cron fire on a condition, not a document) — those are left
+/// untouched.
+pub fn archive_dispatched(event: &TriggerEvent) -> std::io::Result<bool> {
+    let source = std::path::Path::new(&event.source);
+    if !source.is_file() {
+        return Ok(false);
+    }
+    let Some(parent) = source.parent() else {
+        return Ok(false);
+    };
+    let Some(name) = source.file_name() else {
+        return Ok(false);
+    };
+    let dir = processed_dir_for(parent);
+    std::fs::create_dir_all(&dir)?;
+    // Same-filesystem rename: atomic, and a repeated content-addressed name
+    // simply replaces its identical predecessor.
+    std::fs::rename(source, dir.join(name))?;
+    Ok(true)
+}
+
+/// Delete archived events older than `max_age_secs`, bounding `.processed/`.
+/// `0` keeps them forever (opt-out). Returns how many were removed.
+pub fn prune_processed(spool: &std::path::Path, max_age_secs: u64) -> std::io::Result<usize> {
+    if max_age_secs == 0 {
+        return Ok(0);
+    }
+    let dir = processed_dir_for(spool);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let aged = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age.as_secs() > max_age_secs);
+        if aged && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// The id set a fresh poll would observe — the input to
+/// [`SeenStore::retain_observable`].
+pub fn observable_ids(trigger: &dyn Trigger) -> std::io::Result<HashSet<String>> {
+    Ok(trigger.poll()?.into_iter().map(|event| event.id).collect())
 }
 
 fn admitted_dir_for(seen_path: &std::path::Path) -> PathBuf {

@@ -190,6 +190,35 @@ webhook_secret = { name = "BLUT_TEST_WEBHOOK_KEY" }
         "SSE live-tail did not deliver the appended state transition"
     );
 
+    // The incremental tail must never hand a subscriber HALF a JSON record:
+    // write a line with no terminating newline, prove it is withheld, then
+    // complete it and prove it arrives whole.
+    let partial_marker = "PARTIAL_RECORD_QX41";
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&status)
+            .unwrap();
+        write!(f, "{{\"event\":\"mid\",\"m\":\"{partial_marker}\"").unwrap();
+    }
+    assert!(
+        !read_until(&mut sock, partial_marker, Duration::from_millis(1200)).await,
+        "an unterminated line must NOT be emitted as an SSE event"
+    );
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&status)
+            .unwrap();
+        writeln!(f, "}}").unwrap();
+    }
+    assert!(
+        read_until(&mut sock, partial_marker, Duration::from_secs(8)).await,
+        "the completed line must arrive once its newline lands"
+    );
+
     // ── property (2): GETs are side-effect-free on engine state ────────
     let before = (dir_snapshot(&job_dir), std::fs::read(&status).unwrap());
     for path in ["/api/jobs", &format!("/api/jobs/{job}/status")] {

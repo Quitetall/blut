@@ -48,6 +48,11 @@ const STATUS_TAIL_CAP: usize = 1000;
 /// record. Kept modest — a dashboard tail, not a low-latency data path.
 const SSE_POLL: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// Cap on an unterminated trailing line held by the SSE tail. A status writer
+/// emits whole JSON lines, so this only trips on a pathological producer; the
+/// cap keeps one bad stream from growing a subscriber's buffer without bound.
+const MAX_SSE_PENDING_LINE: usize = 1024 * 1024;
+
 /// The embedded dashboard (ADR 0083: one binary, zero deploy steps) — the
 /// Leptos+WASM bundle staged by build.rs (`ui/dist` when built via
 /// `scripts/build_ui.sh`, else a self-describing stub page). Static assets
@@ -218,24 +223,52 @@ async fn job_events(AxPath(id): AxPath<String>) -> Response {
         return err(StatusCode::NOT_FOUND, "no status stream for job");
     }
     let stream = async_stream::stream! {
-        // Track by line COUNT (not byte offset): the writer appends whole JSON
-        // lines, so `lines()` on a re-read never yields a partial record, and a
-        // truncation/rotation (fewer lines than emitted) resets cleanly.
-        let mut emitted = 0usize;
+        // INCREMENTAL byte-offset tail. The previous line-count approach
+        // re-read the WHOLE file every poll: a long run's status.jsonl reaches
+        // several MB, so a single subscriber cost tens of MB/s of pure re-read
+        // forever (measured ~19 MB/s against a 5.8 MB file at this cadence),
+        // and it never stopped once the job finished. Now we seek to the last
+        // position and read only what was appended.
+        //
+        // `carry` holds bytes AFTER the last newline — a writer caught
+        // mid-append never hands a subscriber half a JSON record. Bytes are
+        // only decoded once a line is complete, so a multi-byte character
+        // split across two reads is reassembled rather than mangled. A file
+        // that SHRANK (rotated/truncated) resets to the top, as before.
+        let mut offset: u64 = 0;
+        let mut carry: Vec<u8> = Vec::new();
         loop {
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                let lines: Vec<&str> = text.lines().collect();
-                if lines.len() < emitted {
-                    emitted = 0; // file shrank (rotated) — re-emit from the top
+            if let Ok(mut f) = std::fs::File::open(&path) {
+                let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                if len < offset {
+                    offset = 0; // rotated/truncated — re-emit from the top
+                    carry.clear();
                 }
-                for line in lines.iter().skip(emitted) {
-                    if !line.is_empty() {
-                        yield Ok::<_, std::convert::Infallible>(
-                            axum::response::sse::Event::default().data(*line),
-                        );
+                if len > offset {
+                    use std::io::{Read as _, Seek as _, SeekFrom};
+                    if f.seek(SeekFrom::Start(offset)).is_ok() {
+                        let mut buf = Vec::new();
+                        if let Ok(n) = f.take(len - offset).read_to_end(&mut buf) {
+                            offset += n as u64;
+                            carry.extend_from_slice(&buf);
+                            while let Some(nl) = carry.iter().position(|&b| b == b'\n') {
+                                let raw: Vec<u8> = carry.drain(..=nl).collect();
+                                let line = String::from_utf8_lossy(&raw);
+                                let line = line.trim_end_matches(['\n', '\r']);
+                                if !line.is_empty() {
+                                    yield Ok::<_, std::convert::Infallible>(
+                                        axum::response::sse::Event::default().data(line),
+                                    );
+                                }
+                            }
+                            // A writer that never terminates a line must not
+                            // grow this buffer without bound.
+                            if carry.len() > MAX_SSE_PENDING_LINE {
+                                carry.clear();
+                            }
+                        }
                     }
                 }
-                emitted = lines.len();
             }
             tokio::time::sleep(SSE_POLL).await;
         }

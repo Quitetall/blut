@@ -15,6 +15,55 @@ struct Bound {
     plan: String,
     tenant: String,
     seen: crate::trigger::SeenStore,
+    /// Watched spool — where `.processed/` archival and pruning happen.
+    dir: std::path::PathBuf,
+}
+
+/// Bound the daemon's three otherwise-unbounded stores, in the only order that
+/// is safe.
+///
+/// 1. Delete archived events past their retention window (bounds the spool).
+/// 2. Reclaim dedupe records for events a fresh poll no longer observes — an
+///    archived or pruned event cannot fire again, so its `.seen` line and
+///    `.admitted` marker are droppable, while anything still observable is
+///    retained so it can never re-dispatch.
+///
+/// Without this a long-lived daemon accumulates every event it ever saw: the
+/// spool keeps every delivered file, `.seen` keeps every id in memory and on
+/// disk, and startup re-scans all of it. Failures here are logged, never fatal
+/// — a sweep that cannot run must not stop the daemon from dispatching.
+fn retention_sweep(binding: &mut Bound, retention_secs: u64) {
+    match crate::trigger::prune_processed(&binding.dir, retention_secs) {
+        Ok(pruned) if pruned > 0 => {
+            eprintln!(
+                "sensord: pruned {pruned} archived event(s) for trigger '{}'",
+                binding.name
+            );
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!(
+            "sensord: could not prune archived events for '{}': {error}",
+            binding.name
+        ),
+    }
+    match crate::trigger::observable_ids(binding.trigger.as_ref()) {
+        Ok(observable) => match binding.seen.retain_observable(&observable) {
+            Ok(dropped) if dropped > 0 => eprintln!(
+                "sensord: reclaimed {dropped} dedupe record(s) for trigger '{}' ({} retained)",
+                binding.name,
+                binding.seen.len()
+            ),
+            Ok(_) => {}
+            Err(error) => eprintln!(
+                "sensord: could not compact the dedupe store for '{}': {error}",
+                binding.name
+            ),
+        },
+        Err(error) => eprintln!(
+            "sensord: could not re-poll '{}' for dedupe compaction: {error}",
+            binding.name
+        ),
+    }
 }
 
 /// Run `blut sensord`. `once` drives one deterministic poll for smoke/CI;
@@ -63,6 +112,10 @@ pub async fn run(
             plan: binding.plan.clone(),
             tenant: binding.tenant.clone(),
             seen,
+            dir: binding
+                .dir
+                .clone()
+                .unwrap_or_else(|| crate::trigger::spool_dir(&binding.name)),
         });
     }
 
@@ -90,10 +143,21 @@ pub async fn run(
                 Ok(results) => {
                     for (event, outcome) in results {
                         match outcome {
-                            crate::trigger::DispatchOutcome::Admitted => eprintln!(
-                                "sensord: admitted '{}' for event {}",
-                                binding.plan, event.source
-                            ),
+                            crate::trigger::DispatchOutcome::Admitted => {
+                                eprintln!(
+                                    "sensord: admitted '{}' for event {}",
+                                    binding.plan, event.source
+                                );
+                                // Move the dispatched event out of the watched
+                                // directory so it can never fire again — this
+                                // is what lets its dedupe record be reclaimed.
+                                if let Err(error) = crate::trigger::archive_dispatched(&event) {
+                                    eprintln!(
+                                        "sensord: could not archive event {}: {error}",
+                                        event.source
+                                    );
+                                }
+                            }
                             crate::trigger::DispatchOutcome::Refused(reason) => eprintln!(
                                 "sensord: '{}' refused for event {} ({reason}) — will retry",
                                 binding.plan, event.source
@@ -105,6 +169,7 @@ pub async fn run(
                     eprintln!("sensord: poll failed for plan '{}': {error}", binding.plan)
                 }
             }
+            retention_sweep(binding, parsed.spool_retention_secs);
         }
         let sla_report = crate::sla::check_paths(&sla_rules, &sla_out)
             .with_context(|| format!("evaluate SLA rules {}", sla_rules.display()))?;
