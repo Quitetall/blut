@@ -237,6 +237,9 @@ async fn job_events(AxPath(id): AxPath<String>) -> Response {
         // that SHRANK (rotated/truncated) resets to the top, as before.
         let mut offset: u64 = 0;
         let mut carry: Vec<u8> = Vec::new();
+        // Set when a record exceeded the cap: its remaining bytes, up to and
+        // including the next newline, belong to a record already abandoned.
+        let mut oversized = false;
         loop {
             if let Ok(mut f) = std::fs::File::open(&path) {
                 let len = f.metadata().map(|m| m.len()).unwrap_or(0);
@@ -253,6 +256,14 @@ async fn job_events(AxPath(id): AxPath<String>) -> Response {
                             carry.extend_from_slice(&buf);
                             while let Some(nl) = carry.iter().position(|&b| b == b'\n') {
                                 let raw: Vec<u8> = carry.drain(..=nl).collect();
+                                // The tail of a record we already abandoned for
+                                // exceeding the cap: drop it WHOLE. Emitting it
+                                // would hand the subscriber a fragment — exactly
+                                // what carrying bytes exists to prevent.
+                                if oversized {
+                                    oversized = false;
+                                    continue;
+                                }
                                 let line = String::from_utf8_lossy(&raw);
                                 let line = line.trim_end_matches(['\n', '\r']);
                                 if !line.is_empty() {
@@ -262,8 +273,10 @@ async fn job_events(AxPath(id): AxPath<String>) -> Response {
                                 }
                             }
                             // A writer that never terminates a line must not
-                            // grow this buffer without bound.
+                            // grow this buffer without bound. Abandon the record
+                            // and skip through its terminator.
                             if carry.len() > MAX_SSE_PENDING_LINE {
+                                oversized = true;
                                 carry.clear();
                             }
                         }

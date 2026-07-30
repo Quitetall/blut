@@ -219,6 +219,51 @@ webhook_secret = { name = "BLUT_TEST_WEBHOOK_KEY" }
         "the completed line must arrive once its newline lands"
     );
 
+    // An OVERSIZED record must be abandoned WHOLE. Before the cap logic
+    // skipped through the terminator, clearing the buffer left the record's
+    // tail to be emitted at the next newline as if it were a complete line —
+    // a malformed fragment, the exact failure carrying bytes prevents.
+    let tail_marker = "OVERSIZE_TAIL_MUST_NOT_APPEAR";
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&status)
+            .unwrap();
+        // > MAX_SSE_PENDING_LINE (1 MiB) with NO newline yet.
+        f.write_all(&vec![b'A'; 1_200_000]).unwrap();
+    }
+    // Yield to the runtime (an OS-thread sleep would starve the single-threaded
+    // tokio executor and the tail would never poll) so the stream observes the
+    // oversized, unterminated buffer and abandons the record.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&status)
+            .unwrap();
+        writeln!(f, "{tail_marker}").unwrap();
+    }
+    assert!(
+        !read_until(&mut sock, tail_marker, Duration::from_millis(1500)).await,
+        "the tail of an abandoned oversized record must never be emitted"
+    );
+    // The stream stays healthy: a normal line after the abandoned record arrives.
+    let recovery_marker = "RECOVERED_AFTER_OVERSIZE";
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&status)
+            .unwrap();
+        writeln!(f, "{{\"event\":\"ok\",\"m\":\"{recovery_marker}\"}}").unwrap();
+    }
+    assert!(
+        read_until(&mut sock, recovery_marker, Duration::from_secs(8)).await,
+        "the tail must resume cleanly after abandoning an oversized record"
+    );
+
     // ── property (2): GETs are side-effect-free on engine state ────────
     let before = (dir_snapshot(&job_dir), std::fs::read(&status).unwrap());
     for path in ["/api/jobs", &format!("/api/jobs/{job}/status")] {
