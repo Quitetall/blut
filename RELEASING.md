@@ -3,7 +3,11 @@
 Public preview train: (`blut-types`, `blut-graph-core`) → `blut` → `blut-dsl` →
 `blut-notify`. `blut-types` and `blut-graph-core` are the two chain ROOTS (no
 in-repo path deps); `blut` depends on BOTH, so both must be indexed on crates.io
-before it will package — omitting either fails with `no matching package named
+before it will package. NOTE: `blut-graph-core` is an OPTIONAL dependency (the
+off-by-default `semantic-graph` feature, ADR 0034 — it carries ABIR domain
+vocabulary and the engine stays domain-agnostic), but an optional dependency
+still appears in the registry index, so it remains publish-ORDERED ahead of
+`blut` even though a default `cargo add blut` pulls none of it — omitting either fails with `no matching package named
 '<crate>' found`. Members share the exact preview version except
 `blut-graph-core`, which carries its own (`0.1.0-alpha.1`). The standalone-workspace sidecars `blut-tui`, `blut-web`,
 and `blut-operator` are `publish = false`. The `release.yml` `binaries` job

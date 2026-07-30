@@ -45,6 +45,12 @@ pub mod plan_spec;
 pub mod resource;
 pub mod resume;
 pub mod retry;
+/// ADR 0139 semantic-graph adapter. Behind the OFF-BY-DEFAULT `semantic-graph`
+/// feature: `blut-graph-core`'s node/port model carries ABIR's semantic type
+/// taxonomy (`AbirRootType`/`AbirViewType`), which is DOMAIN vocabulary. The
+/// engine stays domain-agnostic (ADR 0034), so a cookbook that wants ABIR
+/// graphs opts in; the default engine never links it.
+#[cfg(feature = "semantic-graph")]
 pub mod semantic_plan;
 pub mod stage;
 pub mod status;
@@ -54,6 +60,7 @@ pub use async_io::{
     IoMode, TrainingIoAdmissionError, TrainingIoCandidate, TrainingIoDowngradeReason,
     TrainingIoHints, TrainingIoProfile, profile_is_declared, select_training_io_profile,
 };
+#[cfg(feature = "semantic-graph")]
 pub use blut_graph_core as semantic_graph;
 pub use cache::{CacheHandle, CacheHit, lru_prune};
 pub use compat::Compatible;
@@ -73,6 +80,7 @@ pub use plan::{CompiledPlan, NodeId, Plan};
 pub use plan_spec::{ConditionGateSpec, PLAN_SPEC_VERSION, PlanSpec, PlanSpecError, SpecNode};
 pub use resource::Resource;
 pub use retry::{Backoff, RetryEvent, RetryHook, RetryOn, RetryPolicy, StageTimeout};
+#[cfg(feature = "semantic-graph")]
 pub use semantic_plan::{
     DurableAdaptedPlan, DurablePlanError, DurableStepContract, DurableStepResolver,
     ResolvedDurableStep, adapt_durable_plan,

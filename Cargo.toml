@@ -59,7 +59,11 @@ path = "src/lib.rs"
 # ADR 0083: the wasm32-safe keystone. The engine re-exports its types at their
 # old paths, so this is zero-churn downstream.
 blut-types = { path = "crates/blut-types", version = "=0.2.0-alpha.1" }
-blut-graph-core = { path = "crates/blut-graph-core", version = "=0.1.0-alpha.1" }
+# ADR 0139 semantic graphs. OPTIONAL and off by default: its node/port model
+# embeds ABIR's semantic type taxonomy, which is DOMAIN vocabulary — the engine
+# is domain-agnostic (ADR 0034), so this rides the `semantic-graph` feature and
+# a cookbook opts in.
+blut-graph-core = { path = "crates/blut-graph-core", version = "=0.1.0-alpha.1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -117,6 +121,10 @@ rcgen = { version = "0.13", optional = true }
 # The cockpit moved to the `crates/blut-tui` sidecar (ADR 0083 M2); the lean
 # CLI is now THE default build — no terminal-UI deps in the engine tree.
 default = []
+# ADR 0139 semantic-graph compilation (`framework::semantic_plan`). OFF by
+# default: `blut-graph-core` carries ABIR domain vocabulary, and the engine
+# stays domain-agnostic (ADR 0034). Cookbooks that want it opt in.
+semantic-graph = ["dep:blut-graph-core"]
 # P2P distributed compute — trust model, encryption, task dispatch.
 p2p = ["dep:ed25519-dalek", "dep:aes-gcm", "dep:x25519-dalek", "dep:blake3", "dep:hkdf", "dep:quinn", "dep:rustls", "dep:webpki", "dep:rcgen"]
 # Cloud compute queue (T3.1 / ADR 0082) — "submit a job, get the result back,
