@@ -807,7 +807,7 @@ fn run_catalog_cmd(cmd: CatalogCommand) -> Result<()> {
                             .as_ref()
                             .map(|v| format!("{}@{v}", e.name))
                             .unwrap_or_else(|| e.name.clone()),
-                        &e.hash.get(..8).unwrap_or(&e.hash),
+                        e.hash.get(..8).unwrap_or(&e.hash),
                         e.schema.modality.as_deref().unwrap_or("-"),
                         fs,
                         e.kind,
