@@ -80,6 +80,11 @@ enum Command {
         #[command(subcommand)]
         cmd: LineageCommand,
     },
+    /// The append-only run ledger (ADR 0152): list, promote, collect, verify.
+    Ledger {
+        #[command(subcommand)]
+        cmd: LedgerCommand,
+    },
     /// Hyperparameter optimization: adaptive search over a recipe (v0.20).
     Hpo {
         #[command(subcommand)]
@@ -962,6 +967,7 @@ pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>)
         Some(Command::Log { id, tail, json }) => run_log(&id, tail, json),
         Some(Command::Runs { cmd }) => run_runs_cmd(cmd),
         Some(Command::Lineage { cmd }) => run_lineage_cmd(cmd),
+        Some(Command::Ledger { cmd }) => run_ledger_cmd(cmd),
         Some(Command::Hpo { cmd }) => run_hpo(&reg, cmd).await,
         Some(Command::Dag { job, json }) => run_dag(job, json),
         Some(Command::Compare { a, b }) => run_compare(&a, &b),
@@ -2407,7 +2413,9 @@ use gate::*;
 mod hpo;
 use hpo::*;
 
+mod ledger;
 mod lineage;
+use ledger::*;
 use lineage::*;
 
 #[cfg(feature = "p2p")]

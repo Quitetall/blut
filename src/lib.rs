@@ -65,6 +65,7 @@ pub mod recipes;
 pub mod registry;
 pub mod registry_args;
 pub mod registry_db;
+pub mod run_ledger;
 pub mod runs;
 pub mod schedule;
 pub mod scheduler_lock;
