@@ -436,6 +436,55 @@ mod tests {
         assert_eq!(r.malformed, 0);
     }
 
+    /// Frozen bytes emitted by `tools/import_experiment_log.py` (ADR 0152 §C).
+    ///
+    /// This is a CROSS-LANGUAGE contract: the migration writes
+    /// `blut.run-ledger/v1` from Python and this reader must accept it. Pinning
+    /// real emitted bytes rather than a hand-written approximation is the point
+    /// — a hand-written fixture drifts silently from what the tool actually
+    /// produces, and the failure then shows up as unreadable history.
+    ///
+    /// Note both records omit `checkpoint_sha256`: the legacy rows carry
+    /// checkpoint PATHS, not digests, and omitting the field says "unknown"
+    /// where an empty list would claim "we checked and found none".
+    #[test]
+    fn reads_the_bytes_the_python_migration_actually_emits() {
+        const STARTED: &str = r#"{"kind":"run_started","schema":"blut.run-ledger/v1","run_uid":"legacy:e2e_ship_1776390243","recipe":"fast","intent":"probe","started_unix":0,"identity":{"blut_job_id":"","trainer_run_id":"e2e_ship_1776390243"}}"#;
+        const ENDED: &str = r#"{"kind":"run_ended","schema":"blut.run-ledger/v1","run_uid":"legacy:e2e_ship_1776390243","ended_unix":0,"duration_secs":0,"outcome":"completed","tier":"recorded","identity":{"blut_job_id":"","trainer_run_id":"e2e_ship_1776390243"},"metrics":{"best_val_r":0.32290266334120965,"best_val_prd":116.21831108624536,"final_val_r":0.0,"final_val_prd":0.0,"best_epoch":0.0}}"#;
+
+        let started: Record = serde_json::from_str(STARTED).expect("run_started must parse");
+        let ended: Record = serde_json::from_str(ENDED).expect("run_ended must parse");
+
+        match &started {
+            Record::RunStarted {
+                intent, identity, ..
+            } => {
+                assert_eq!(*intent, Intent::Probe);
+                assert_eq!(
+                    identity.trainer_run_id.as_deref(),
+                    Some("e2e_ship_1776390243")
+                );
+                assert!(identity.checkpoint_sha256.is_empty());
+            }
+            other => panic!("expected RunStarted, got {other:?}"),
+        }
+        match &ended {
+            Record::RunEnded {
+                tier,
+                outcome,
+                metrics,
+                ..
+            } => {
+                assert_eq!(*tier, Tier::Recorded);
+                assert_eq!(*outcome, Outcome::Completed);
+                assert_eq!(metrics.get("best_val_r"), Some(&0.322_902_663_341_209_65));
+            }
+            other => panic!("expected RunEnded, got {other:?}"),
+        }
+        // And the pair groups under one run, which is what `tiers()` relies on.
+        assert_eq!(started.run_uid(), ended.run_uid());
+    }
+
     #[test]
     fn append_then_read_round_trips() {
         let l = tmp_ledger("roundtrip");
