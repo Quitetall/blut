@@ -144,6 +144,15 @@ pub enum Record {
         recipe: String,
         intent: Intent,
         started_unix: i64,
+        /// ADR 0096 owning tenant, `project[/domain]` — e.g. `lamquant`,
+        /// `lamquant/codec`, `tritium`. THE LEDGER IS GLOBAL: BLUT records runs
+        /// for every project that uses it, and this is the field a project
+        /// filters on to find its own. BLUT stays domain-neutral by treating the
+        /// label as opaque — it never interprets "lamquant".
+        ///
+        /// Empty means the flat `default` namespace, matching `lineage_db`.
+        #[serde(default)]
+        tenant: String,
         identity: RunIdentity,
     },
     RunEnded {
@@ -174,6 +183,37 @@ pub enum Record {
         /// Kept so a citation to a collected run still resolves.
         recipe: String,
     },
+}
+
+/// Whether a run may appear in an EXPORT — a rendered doc, a published report,
+/// anything leaving the machine.
+///
+/// Delegates to [`crate::tenant::Tenant::is_restricted`] rather than re-deriving
+/// the rule, because that check is deliberately case-insensitive "so spelling
+/// cannot bypass custody policy" and a second implementation is a second place
+/// for that to rot. A `clinical`/`restricted` tenant is fail-closed excluded
+/// from any export (ADR 0061/0099), and a generated doc tree is an export.
+///
+/// FAIL-CLOSED on an unparseable tenant: a label we cannot classify is treated
+/// as restricted. The alternative — defaulting an unrecognised namespace to
+/// exportable — is how PHI leaves by typo.
+pub fn exportable(tenant: &str) -> bool {
+    if tenant.is_empty() {
+        return true; // the flat `default` namespace
+    }
+    match crate::tenant::Tenant::parse(tenant) {
+        Some(t) => !t.is_restricted(),
+        None => false,
+    }
+}
+
+/// The project segment of a `project[/domain]` tenant, for "is this mine?".
+/// Empty tenant reads as the `default` project.
+pub fn tenant_project(tenant: &str) -> &str {
+    if tenant.is_empty() {
+        return crate::tenant::DEFAULT_PROJECT;
+    }
+    tenant.split('/').next().unwrap_or(tenant)
 }
 
 impl Record {
@@ -403,6 +443,7 @@ mod tests {
             recipe: "lamquant_joint_codec".into(),
             intent: Intent::Campaign,
             started_unix: 1_785_000_000,
+            tenant: "lamquant".into(),
             identity: RunIdentity {
                 blut_job_id: uid.into(),
                 ..Default::default()
@@ -582,6 +623,91 @@ mod tests {
         assert_eq!(tiers.get("a"), Some(&Tier::Canonical));
         // History is intact: promotion appended, it did not rewrite.
         assert_eq!(l.read().unwrap().records.len(), 3);
+        let _ = std::fs::remove_file(l.path());
+    }
+
+    #[test]
+    fn a_restricted_tenant_is_never_exportable() {
+        // The doc tree is an export (ADR 0061/0099). Case-insensitive, because
+        // the upstream check is — spelling must not bypass custody policy.
+        for t in [
+            "clinical",
+            "Clinical",
+            "CLINICAL",
+            "restricted",
+            "ReStRiCtEd",
+        ] {
+            assert!(!exportable(t), "{t} must not be exportable");
+        }
+        for t in ["clinical/eeg", "restricted/phi"] {
+            assert!(!exportable(t), "{t} must not be exportable");
+        }
+    }
+
+    #[test]
+    fn an_unparseable_tenant_fails_closed() {
+        // A label we cannot classify is treated as restricted. Defaulting an
+        // unrecognised namespace to exportable is how PHI leaves by typo.
+        // `..` traversal, too many segments, and non-`[A-Za-z0-9_.-]` bytes are
+        // all refused by Tenant::parse.
+        for t in ["../escape", "a/b/c/d", "\u{0}", ".hidden", "trailing."] {
+            assert!(!exportable(t), "{t:?} must fail closed");
+        }
+    }
+
+    #[test]
+    fn whitespace_only_tenant_is_the_default_namespace_not_a_failure() {
+        // Tenant::parse TRIMS before the empty check, so "   " is the flat
+        // `default` namespace and exports. Asserted explicitly because it is
+        // the one input that looks like it should fail closed and does not —
+        // worth pinning so a future trim change is caught here rather than by
+        // a doc quietly gaining or losing rows.
+        assert!(exportable("   "));
+        assert_eq!(tenant_project("   "), "   ".split('/').next().unwrap());
+    }
+
+    #[test]
+    fn ordinary_projects_export_and_keep_their_project_segment() {
+        assert!(exportable("lamquant"));
+        assert!(exportable("lamquant/codec"));
+        assert!(exportable("tritium"));
+        assert!(exportable("")); // flat default namespace
+        assert_eq!(tenant_project("lamquant/codec"), "lamquant");
+        assert_eq!(tenant_project("tritium"), "tritium");
+        assert_eq!(tenant_project(""), crate::tenant::DEFAULT_PROJECT);
+    }
+
+    #[test]
+    fn the_ledger_is_global_so_projects_are_distinguishable() {
+        // The whole point of carrying a tenant: one ledger holds every
+        // project's runs, and a consumer filters to its own.
+        let l = tmp_ledger("multiproject");
+        for (uid, tenant) in [("a", "lamquant"), ("b", "tritium"), ("c", "lamquant/codec")] {
+            l.append(&Record::RunStarted {
+                schema: SCHEMA.into(),
+                run_uid: uid.into(),
+                recipe: "r".into(),
+                intent: Intent::Campaign,
+                started_unix: 0,
+                tenant: tenant.into(),
+                identity: RunIdentity::default(),
+            })
+            .unwrap();
+        }
+        let mine: Vec<&str> = l
+            .read()
+            .unwrap()
+            .records
+            .iter()
+            .filter_map(|r| match r {
+                Record::RunStarted {
+                    run_uid, tenant, ..
+                } if tenant_project(tenant) == "lamquant" => Some(run_uid.as_str()),
+                _ => None,
+            })
+            .map(|s| Box::leak(s.to_string().into_boxed_str()) as &str)
+            .collect();
+        assert_eq!(mine, vec!["a", "c"], "tritium's run must not be mine");
         let _ = std::fs::remove_file(l.path());
     }
 
