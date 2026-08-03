@@ -1262,7 +1262,10 @@ mod cross_language_tests {
         let read = RunLedger::at(fixture)
             .read()
             .expect("a trainer-written ledger must parse");
-        assert_eq!(read.malformed, 0, "no trainer-written line may be unparseable");
+        assert_eq!(
+            read.malformed, 0,
+            "no trainer-written line may be unparseable"
+        );
         assert_eq!(read.records.len(), 2, "one run: start + end");
 
         match &read.records[0] {
@@ -1297,7 +1300,11 @@ mod cross_language_tests {
             Record::RunEnded { outcome, tier, .. } => {
                 // A setup crash is an outcome, not an absence.
                 assert_eq!(*outcome, Outcome::Failed);
-                assert_eq!(*tier, Tier::Scratch, "a trainer may never mint a tier above scratch");
+                assert_eq!(
+                    *tier,
+                    Tier::Scratch,
+                    "a trainer may never mint a tier above scratch"
+                );
             }
             other => panic!("expected run_ended, got {other:?}"),
         }
