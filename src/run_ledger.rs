@@ -1231,6 +1231,77 @@ mod cross_language_tests {
         }
         assert_eq!(starts, 2);
     }
+
+    /// THE CALL SITE, not just the shim.
+    ///
+    /// The test above proves `blut_core/run_ledger.py` and this file agree.
+    /// It does NOT prove any trainer calls it correctly — and a shim nobody
+    /// invokes is exactly the state ADR 0154 was written to end.
+    ///
+    /// This fixture was produced by the real launcher, not by hand and not by
+    /// the shim's self-check:
+    ///
+    /// ```text
+    /// python -m lamquant.student.train_joint --config production --tier 3 \
+    ///     --seed 424242 --experiment LEDGER-E2E --intent smoke \
+    ///     --ckpt-dir <dir>/run-PCCP-CHG-2026-999 --encoder-init <missing>
+    /// ```
+    ///
+    /// It captures the case that used to vanish entirely: the run died during
+    /// setup, before a single metric existed, so nothing downstream — no
+    /// checkpoint, no wandb run, no metric row — would ever have shown it
+    /// happened. The `failed` record below is the whole point.
+    ///
+    /// Unlike the fixture above this one is COMMITTED and the test cannot
+    /// skip. A regenerable fixture under /var/tmp is absent on every fresh
+    /// checkout, which makes a skip-if-absent test green by default.
+    #[test]
+    fn rust_reads_what_the_trainer_writes() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/trainer-run-ledger.jsonl");
+        let read = RunLedger::at(fixture)
+            .read()
+            .expect("a trainer-written ledger must parse");
+        assert_eq!(read.malformed, 0, "no trainer-written line may be unparseable");
+        assert_eq!(read.records.len(), 2, "one run: start + end");
+
+        match &read.records[0] {
+            Record::RunStarted {
+                experiment,
+                seed,
+                tenant,
+                intent,
+                recipe,
+                identity,
+                ..
+            } => {
+                // The two fields only the launcher knows. Both were populated
+                // 0 times in lineage.db's 167 rows before this wiring.
+                assert_eq!(experiment.as_deref(), Some("LEDGER-E2E"));
+                assert_eq!(*intent, Intent::Smoke);
+                assert_eq!(*seed, Some(424242));
+                assert_eq!(tenant, "lamquant");
+                assert_eq!(recipe, "lamquant_joint_codec");
+                // Derived from the checkpoint directory name, which is where
+                // PCCP change ids actually appear at launch today.
+                assert_eq!(
+                    identity.pccp_change_id.as_deref(),
+                    Some("CHG-2026-999"),
+                    "the PCCP join key must survive the trainer boundary"
+                );
+            }
+            other => panic!("expected run_started, got {other:?}"),
+        }
+
+        match &read.records[1] {
+            Record::RunEnded { outcome, tier, .. } => {
+                // A setup crash is an outcome, not an absence.
+                assert_eq!(*outcome, Outcome::Failed);
+                assert_eq!(*tier, Tier::Scratch, "a trainer may never mint a tier above scratch");
+            }
+            other => panic!("expected run_ended, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
