@@ -114,6 +114,15 @@ pub enum StageEvent {
     /// explicit marker through [`StatusHub::emit`] when their own receiver
     /// lagged before selection.
     StepGap { dropped: u64 },
+    /// An ADR 0097 telemetry record (counter / gauge / duration / span). The
+    /// record is FLATTENED, so the emitted line carries both `kind:
+    /// "telemetry"` for stage-event readers and the record's own `telemetry`
+    /// tag for `blut_types::telemetry::TelemetryRecord::from_line` — one line,
+    /// two readers, no second stream to keep in sync.
+    Telemetry {
+        #[serde(flatten)]
+        record: blut_types::telemetry::TelemetryRecord,
+    },
     /// A stage attempt failed with a retryable error and will be retried
     /// (D1). `attempt` is the one that just failed (1-based).
     StageRetrying {
@@ -137,6 +146,14 @@ impl StageEvent {
             StageEvent::StageStep { .. } | StageEvent::StepGap { .. }
         )
     }
+
+    /// The telemetry record this event carries, if any (ADR 0097).
+    pub fn telemetry(&self) -> Option<&blut_types::telemetry::TelemetryRecord> {
+        match self {
+            StageEvent::Telemetry { record } => Some(record),
+            _ => None,
+        }
+    }
 }
 
 /// A [`StageEvent`] tagged with the host that produced it (D5, cross-host
@@ -148,6 +165,13 @@ impl StageEvent {
 pub struct HostedEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// ADR 0097 trace context. Threading these across a mesh hop is what keeps
+    /// a host-hopping stage ONE trace instead of N fragments; both are omitted
+    /// when absent, so a pre-0097 reader sees a byte-identical line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<blut_types::telemetry::TraceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_span_id: Option<blut_types::telemetry::SpanId>,
     #[serde(flatten)]
     pub event: StageEvent,
 }
@@ -158,6 +182,24 @@ impl HostedEvent {
     pub fn wrap(host: &Option<String>, event: StageEvent) -> Self {
         Self {
             host: host.clone(),
+            trace_id: None,
+            parent_span_id: None,
+            event,
+        }
+    }
+
+    /// Tag with host AND the ADR 0097 trace context. `ctx` supplies the trace
+    /// this line belongs to and the span that is its parent, so a consumer can
+    /// stitch events across hosts into one waterfall.
+    pub fn wrap_traced(
+        host: &Option<String>,
+        event: StageEvent,
+        ctx: Option<&blut_types::telemetry::SpanContext>,
+    ) -> Self {
+        Self {
+            host: host.clone(),
+            trace_id: ctx.map(|c| c.trace_id.clone()),
+            parent_span_id: ctx.map(|c| c.span_id.clone()),
             event,
         }
     }
@@ -240,12 +282,21 @@ impl StatusHub {
             .remote_tx
             .try_send(HostedEvent {
                 host: Some(host.into()),
+                trace_id: None,
+                parent_span_id: None,
                 event,
             })
             .is_err()
         {
             tracing::warn!("status: remote event channel full/closed; dropped a forwarded event");
         }
+    }
+
+    /// Emit one ADR 0097 telemetry record. It rides the LOSSLESS lane: a
+    /// dropped metric is a silent hole in a time series, which is worse than
+    /// back-pressure on what is otherwise a display channel.
+    pub fn emit_telemetry(&self, record: blut_types::telemetry::TelemetryRecord) {
+        self.emit(StageEvent::Telemetry { record });
     }
 
     /// Emit one event. Lifecycle events go to the lossless writer
@@ -778,5 +829,113 @@ mod tests {
     #[allow(dead_code)]
     fn _path_marker() -> PathBuf {
         PathBuf::new()
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+    use blut_types::telemetry::{Label, MetricName, SpanContext, SpanId, TelemetryRecord, TraceId};
+
+    fn ctx() -> SpanContext {
+        SpanContext::root(
+            TraceId::parse("4bf92f3577b34da6a3ce929d0e0e4736").unwrap(),
+            SpanId::parse("00f067aa0ba902b7").unwrap(),
+        )
+    }
+
+    /// The load-bearing claim of the design: ONE status.jsonl line is readable
+    /// both as a stage event (engine/TUI) and as a telemetry record (the
+    /// blut-metrics sidecar). If this breaks, the two would need separate
+    /// streams that could silently disagree.
+    #[test]
+    fn one_line_parses_as_both_a_stage_event_and_a_telemetry_record() {
+        let record = TelemetryRecord::Gauge {
+            name: MetricName::parse("blut_privacy_epsilon").unwrap(),
+            value: 0.25,
+            labels: vec![Label::new("tenant", "shared").unwrap()],
+        };
+        let line = serde_json::to_string(&HostedEvent::wrap(
+            &Some("ab12cd".into()),
+            StageEvent::Telemetry {
+                record: record.clone(),
+            },
+        ))
+        .unwrap();
+
+        // Reader A — the engine's own line format.
+        let back: HostedEvent = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.host.as_deref(), Some("ab12cd"));
+        assert_eq!(back.event.telemetry(), Some(&record));
+        // Reader B — the sidecar, which knows nothing of StageEvent.
+        assert_eq!(TelemetryRecord::from_line(&line), Some(record));
+    }
+
+    /// Telemetry must ride the LOSSLESS lane; a dropped sample is a silent gap
+    /// in a time series.
+    #[test]
+    fn telemetry_is_lifecycle_so_it_is_never_dropped() {
+        let ev = StageEvent::Telemetry {
+            record: TelemetryRecord::Counter {
+                name: MetricName::parse("blut_cache_hits_total").unwrap(),
+                value: 1,
+                labels: vec![],
+            },
+        };
+        assert!(ev.is_lifecycle(), "telemetry must not ride the lossy lane");
+    }
+
+    /// The trace fields are ADDITIVE: an untraced line is byte-identical to
+    /// what a pre-0097 engine wrote, so old readers are unaffected.
+    #[test]
+    fn untraced_lines_stay_byte_identical_for_old_readers() {
+        let ev = StageEvent::StepGap { dropped: 3 };
+        let line = serde_json::to_string(&HostedEvent::wrap(&None, ev)).unwrap();
+        assert!(
+            !line.contains("trace_id"),
+            "absent trace must not serialize"
+        );
+        assert!(!line.contains("parent_span_id"));
+        assert!(!line.contains("host"), "absent host still omitted: {line}");
+    }
+
+    /// A hop carries the trace: the forwarded line names the same trace and
+    /// parents onto the originating span, which is what stitches N per-host
+    /// fragments into one waterfall.
+    #[test]
+    fn a_hop_keeps_one_trace_and_parents_onto_the_origin_span() {
+        let origin = ctx();
+        let hosted = HostedEvent::wrap_traced(
+            &Some("peer99".into()),
+            StageEvent::StepGap { dropped: 0 },
+            Some(&origin),
+        );
+        let line = serde_json::to_string(&hosted).unwrap();
+        let back: HostedEvent = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.trace_id.as_ref(), Some(&origin.trace_id));
+        assert_eq!(
+            back.parent_span_id.as_ref(),
+            Some(&origin.span_id),
+            "the remote span must parent onto the span that dispatched it"
+        );
+        // A child minted from that context stays in the same trace.
+        let child = origin.child(SpanId::parse("1122334455667788").unwrap());
+        assert_eq!(child.trace_id, origin.trace_id);
+    }
+
+    /// The hub's emit_telemetry reaches the lossless writer lane.
+    #[tokio::test]
+    async fn emit_telemetry_reaches_the_writer_lane() {
+        let (hub, mut rx) = StatusHub::new();
+        hub.emit_telemetry(TelemetryRecord::Duration {
+            name: MetricName::parse("blut_stage_duration_seconds").unwrap(),
+            seconds: 2.5,
+            labels: vec![],
+        });
+        let got = rx.recv().await.expect("telemetry reached the writer");
+        assert!(matches!(
+            got.telemetry(),
+            Some(TelemetryRecord::Duration { .. })
+        ));
     }
 }
