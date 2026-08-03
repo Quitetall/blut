@@ -50,6 +50,7 @@ impl KernelExecutor for Kernels {
                     code: "injected".into(),
                     message: "injected runtime fault".into(),
                     retryable: false,
+                    evidence: Vec::new(),
                 },
             });
         }

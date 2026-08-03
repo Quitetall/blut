@@ -69,7 +69,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 async-trait = "0.1"
-nix = { version = "0.29", features = ["signal", "process", "resource"] }
+# "fs" is required by run_ledger.rs, which uses nix::fcntl::{Flock, FlockArg} to
+# hold an advisory lock while appending. There is no "fcntl" feature in nix 0.29
+# — the module is ungated but its CONTENTS sit behind "fs" (fcntl.rs:32,43) — so
+# naming the module was the wrong guess and this is the right one.
+#
+# It was missing and nothing caught it, because the sibling crate blut-notify
+# enables nix/fs and Cargo unifies features across a workspace build. `cargo
+# test` here passed while `cargo check -p blut --lib` failed, and every
+# DOWNSTREAM consumer (the cookbooks, codec-lossless, firmware) failed too. A
+# feature a crate needs must be declared by that crate; borrowing it from a
+# sibling only works until someone depends on you.
+nix = { version = "0.29", features = ["signal", "process", "resource", "fs"] }
 dirs = "5"
 parking_lot = "0.12"
 clap = { version = "4", features = ["derive"] }
