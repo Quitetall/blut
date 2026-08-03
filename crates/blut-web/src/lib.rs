@@ -377,6 +377,47 @@ async fn model_pointer(AxPath((name, alias)): AxPath<(String, String)>) -> Respo
     .into_response()
 }
 
+// ── cost dashboards (ADR 0098) ─────────────────────────────────────
+
+/// `GET /api/cost` — spend rolled up per run, per tenant, and per provider,
+/// plus a linear burn forecast when `?progress=` is supplied.
+///
+/// Custody: this is an EXPORT surface, so restricted-tenant rows are filtered
+/// out via the shared `exportable_rows` before anything is summed — the same
+/// fail-closed posture as every other view here (ADR 0061/0096). The rollup
+/// ARITHMETIC comes from `blut_types::cost`, the identical implementation the
+/// engine's budget guard uses, so the dashboard can never disagree with the
+/// number a job was refused over.
+async fn cost_report(Query(q): Query<CostQuery>) -> Response {
+    let ledger = blut::cost::default_ledger_path();
+    let rows = blut::cost::read_ledger(&ledger);
+    let exportable: Vec<blut::cost::CostRow> = blut::cost::exportable_rows(&rows)
+        .into_iter()
+        .cloned()
+        .collect();
+    let summary = blut::cost::rollup(&exportable);
+    let cap = match q.cap_cents {
+        Some(cents) if cents > 0 => blut::cost::BudgetCap(blut::cost::Micros::from_cents(cents)),
+        // Absent cap reads as REFUSE_ALL, matching the guard (ADR 0098).
+        _ => blut::cost::BudgetCap::REFUSE_ALL,
+    };
+    let forecast = q
+        .progress
+        .map(|p| blut::cost::forecast(summary.total, p, cap));
+    Json(serde_json::json!({
+        "rollup": summary,
+        "forecast": forecast,
+        "withheld_restricted_rows": rows.len() - exportable.len(),
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct CostQuery {
+    progress: Option<f64>,
+    cap_cents: Option<i64>,
+}
+
 // ── webhook ingress (ADR 0094) ─────────────────────────────────────
 
 /// `POST /api/events/{trigger}` — signed, replay-safe webhook ingress. The HMAC
@@ -735,6 +776,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/jobs/{id}/events", get(job_events))
         .route("/api/jobs/{id}/cancel", post(cancel_job))
         .route("/api/events/{trigger}", post(webhook_event))
+        .route("/api/cost", get(cost_report))
         .route("/events/{trigger}", post(webhook_event))
         .route("/api/lineage/graph/{hash}", get(lineage_graph))
         .route("/api/lineage/card/{hash}", get(lineage_card))

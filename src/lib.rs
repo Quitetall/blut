@@ -42,6 +42,7 @@ pub mod cloud;
 pub mod config;
 pub mod connectors;
 pub mod containment;
+pub mod cost;
 pub mod dataset_registry;
 pub mod datasets_db;
 pub mod error;
