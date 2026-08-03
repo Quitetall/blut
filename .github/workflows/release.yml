@@ -80,6 +80,16 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked
+      # ADR 0097: the telemetry sidecar owns ALL network I/O for metrics —
+      # the engine only writes records. Gate it or the OpenMetrics exposition
+      # and the mesh trace-propagation proof rot.
+      - name: Gate blut-metrics (standalone workspace)
+        working-directory: crates/blut-metrics
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+
       - name: Gate blut-semantic (standalone workspace)
         working-directory: crates/blut-semantic
         run: |
