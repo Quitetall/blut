@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Brian Lam
-//! RunLedger — BLUT's append-only record of what actually ran (ADR 0152).
+//! RunLedger — BLUT's append-only record of what actually ran (ADR 0154).
 //!
 //! ARCHITECTURE. This file is the **source of truth**, which is the opposite of
 //! [`crate::lineage_db`]'s contract and the reason it is a separate artifact
@@ -12,7 +12,7 @@
 //! `lineage_db` may index it like anything else.
 //!
 //! WHY BLUT OWNS THIS. ADR 0034 delegated the experiment record away from BLUT
-//! to `outputs/experiment_log.jsonl`. ADR 0152 amends that single row: a run is
+//! to `outputs/experiment_log.jsonl`. ADR 0154 amends that single row: a run is
 //! a BLUT noun — BLUT already assigns `job_id` and records
 //! `runs`/`artifacts`/`lineage_edges`/`git_sha` — whereas a run *dashboard* is a
 //! verb and stays wandb's. The delegate target had also stopped working: 1894 of
@@ -153,6 +153,27 @@ pub enum Record {
         /// Empty means the flat `default` namespace, matching `lineage_db`.
         #[serde(default)]
         tenant: String,
+        /// The HYPOTHESIS this run tests, e.g. `E1`, `L1`, `PCCP-CHG-2026-007`.
+        ///
+        /// Without it the ledger records THAT something ran, not WHAT it was
+        /// testing, and "has E1 been run?" stays an archaeology question. That
+        /// is not hypothetical: `lineage_db` has 167 runs, three distinct recipe
+        /// names, and its `experiment` column populated zero times, so the only
+        /// way to answer it was to read prose in a stage card — which said
+        /// "never-run" while the card's own caveat field recorded an earlier
+        /// invalid attempt at R≈0.17.
+        ///
+        /// Free text and opaque to BLUT, like `tenant`: the engine never
+        /// interprets `E1`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        experiment: Option<String>,
+        /// The REPLICATE axis. Two runs sharing (experiment, config_fingerprint)
+        /// and differing only here are repeats, and repeats are the only source
+        /// of a run-to-run variance estimate. Without that estimate no
+        /// difference between two runs can be separated from training
+        /// stochasticity — see [`compare`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed: Option<i64>,
         identity: RunIdentity,
     },
     RunEnded {
@@ -233,7 +254,7 @@ impl Record {
 pub struct Classification {
     pub tier: Tier,
     /// Set when the recipe declared no bar of its own. Advisory — the run is
-    /// recorded either way (ADR 0152: absence must not block recording).
+    /// recorded either way (ADR 0154: absence must not block recording).
     pub recommendation: Option<String>,
 }
 
@@ -443,6 +464,8 @@ mod tests {
             recipe: "lamquant_joint_codec".into(),
             intent: Intent::Campaign,
             started_unix: 1_785_000_000,
+            experiment: None,
+            seed: None,
             tenant: "lamquant".into(),
             identity: RunIdentity {
                 blut_job_id: uid.into(),
@@ -477,7 +500,7 @@ mod tests {
         assert_eq!(r.malformed, 0);
     }
 
-    /// Frozen bytes emitted by `tools/import_experiment_log.py` (ADR 0152 §C).
+    /// Frozen bytes emitted by `tools/import_experiment_log.py` (ADR 0154 §C).
     ///
     /// This is a CROSS-LANGUAGE contract: the migration writes
     /// `blut.run-ledger/v1` from Python and this reader must accept it. Pinning
@@ -587,7 +610,7 @@ mod tests {
 
     #[test]
     fn missing_recipe_bar_records_anyway_and_recommends() {
-        // ADR 0152: absence of a declared bar must not block recording.
+        // ADR 0154: absence of a declared bar must not block recording.
         let c = classify(Intent::Campaign, 10, None);
         assert_eq!(c.tier, Tier::Recorded);
         let rec = c.recommendation.expect("should nudge the author");
@@ -689,6 +712,8 @@ mod tests {
                 recipe: "r".into(),
                 intent: Intent::Campaign,
                 started_unix: 0,
+                experiment: None,
+                seed: None,
                 tenant: tenant.into(),
                 identity: RunIdentity::default(),
             })
@@ -753,5 +778,539 @@ mod tests {
         let tiers = l.tiers().unwrap();
         assert_eq!(tiers.get("d"), Some(&Tier::Recorded));
         let _ = std::fs::remove_file(l.path());
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Separating a result from run-to-run noise.
+//
+// The ledger's whole point is to stop a number being believed because it is
+// large. A codec run reporting val_r 0.850 against a previous 0.813 looks like a
+// clear win, and it may be — but training is stochastic, and without repeats
+// there is NOTHING in the record that distinguishes a real 0.037 from the spread
+// you would get by rerunning the SAME configuration with a different seed.
+//
+// So the unit of comparison is an ARM: runs sharing (experiment,
+// config_fingerprint). Within an arm, runs differ only by `seed`, and their
+// spread IS the noise floor. Between arms, the question is whether the observed
+// difference is large relative to that floor.
+//
+// The test is an exact permutation test rather than a t-test, chosen for a
+// property that matters more here than power: IT CANNOT LIE AT SMALL n. With one
+// run per arm there are exactly two labellings, so the smallest reachable
+// two-sided p is 1.0 and the answer is `Indeterminate` by construction — not by
+// a threshold someone picked. No distributional assumption is made, which is
+// right for n in the single digits where normality is untestable anyway.
+// ─────────────────────────────────────────────────────────────────
+
+/// One side of a comparison: every run of a single configuration.
+#[derive(Debug, Clone)]
+pub struct Arm {
+    pub label: String,
+    /// One metric value per run. Length is the replicate count.
+    pub values: Vec<f64>,
+}
+
+impl Arm {
+    pub fn mean(&self) -> f64 {
+        if self.values.is_empty() {
+            return f64::NAN;
+        }
+        self.values.iter().sum::<f64>() / self.values.len() as f64
+    }
+
+    /// Sample standard deviation (n-1). `None` below two runs, because one run
+    /// has no spread to report and returning 0.0 would read as "perfectly
+    /// reproducible".
+    pub fn sd(&self) -> Option<f64> {
+        if self.values.len() < 2 {
+            return None;
+        }
+        let mean = self.mean();
+        let var = self.values.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+            / (self.values.len() - 1) as f64;
+        Some(var.sqrt())
+    }
+}
+
+/// What the record can and cannot support.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Verdict {
+    /// The design cannot reach the threshold no matter what the numbers are.
+    /// Carries the replicate count that could, so the answer is actionable
+    /// rather than a shrug.
+    Indeterminate {
+        reason: String,
+        seeds_per_arm_needed: usize,
+    },
+    /// An exact p-value was computed.
+    Decided { p_value: f64, significant: bool },
+}
+
+/// Result of comparing two arms on one metric.
+#[derive(Debug, Clone)]
+pub struct Comparison {
+    pub metric: String,
+    pub baseline: String,
+    pub candidate: String,
+    pub baseline_n: usize,
+    pub candidate_n: usize,
+    pub delta: f64,
+    /// Pooled within-arm SD — the noise floor. `None` when neither arm repeats.
+    pub within_sd: Option<f64>,
+    /// `delta` in units of that floor. `None` when the floor is unknown.
+    pub effect_size: Option<f64>,
+    /// Smallest two-sided p this DESIGN could produce, whatever the data. The
+    /// honest headline for an underpowered comparison.
+    pub min_achievable_p: f64,
+    pub verdict: Verdict,
+}
+
+fn binomial(n: usize, k: usize) -> f64 {
+    if k > n {
+        return 0.0;
+    }
+    let k = k.min(n - k);
+    let mut acc = 1.0f64;
+    for i in 0..k {
+        acc = acc * (n - i) as f64 / (i + 1) as f64;
+    }
+    acc
+}
+
+/// Enumeration ceiling. C(24,12) is 2.7M; beyond that an exact test stops being
+/// cheap, and a comparison with two dozen runs per arm is not the regime this
+/// guard exists for.
+const MAX_PERMUTATIONS: f64 = 3_000_000.0;
+
+/// Compare two arms on one metric. `alpha` is the two-sided threshold.
+///
+/// Returns `Indeterminate` whenever the arms are too small for ANY arrangement
+/// of the data to clear `alpha`. That is the case this exists for: it is the
+/// difference between "we measured no effect" and "we could not have measured
+/// one", and conflating those is how an underpowered result gets written into a
+/// roadmap as fact.
+pub fn compare(metric: &str, baseline: &Arm, candidate: &Arm, alpha: f64) -> Comparison {
+    let (n, m) = (baseline.values.len(), candidate.values.len());
+    let delta = candidate.mean() - baseline.mean();
+
+    // Pool the within-arm variances that exist. An arm of one contributes no
+    // spread and is simply absent from the pool.
+    let mut ss = 0.0f64;
+    let mut df = 0usize;
+    for arm in [baseline, candidate] {
+        if arm.values.len() >= 2 {
+            let mean = arm.mean();
+            ss += arm.values.iter().map(|v| (v - mean).powi(2)).sum::<f64>();
+            df += arm.values.len() - 1;
+        }
+    }
+    let within_sd = if df > 0 {
+        Some((ss / df as f64).sqrt())
+    } else {
+        None
+    };
+    let effect_size = within_sd.and_then(|sd| (sd > 0.0).then(|| delta / sd));
+
+    let total = binomial(n + m, n);
+    let min_achievable_p = if total > 0.0 {
+        (2.0 / total).min(1.0)
+    } else {
+        1.0
+    };
+
+    // Smallest arm size k (per arm) with 2 / C(2k, k) <= alpha.
+    let seeds_needed = (1..=32)
+        .find(|k| 2.0 / binomial(2 * k, *k) <= alpha)
+        .unwrap_or(32);
+
+    if n == 0 || m == 0 {
+        return Comparison {
+            metric: metric.into(),
+            baseline: baseline.label.clone(),
+            candidate: candidate.label.clone(),
+            baseline_n: n,
+            candidate_n: m,
+            delta,
+            within_sd,
+            effect_size,
+            min_achievable_p: 1.0,
+            verdict: Verdict::Indeterminate {
+                reason: "an arm has no runs".into(),
+                seeds_per_arm_needed: seeds_needed,
+            },
+        };
+    }
+
+    if min_achievable_p > alpha {
+        return Comparison {
+            metric: metric.into(),
+            baseline: baseline.label.clone(),
+            candidate: candidate.label.clone(),
+            baseline_n: n,
+            candidate_n: m,
+            delta,
+            within_sd,
+            effect_size,
+            min_achievable_p,
+            verdict: Verdict::Indeterminate {
+                reason: format!(
+                    "{n} vs {m} runs: the smallest two-sided p this design can \
+                     produce is {min_achievable_p:.3}, above alpha {alpha:.3}. \
+                     No arrangement of these numbers could be significant."
+                ),
+                seeds_per_arm_needed: seeds_needed,
+            },
+        };
+    }
+
+    if total > MAX_PERMUTATIONS {
+        return Comparison {
+            metric: metric.into(),
+            baseline: baseline.label.clone(),
+            candidate: candidate.label.clone(),
+            baseline_n: n,
+            candidate_n: m,
+            delta,
+            within_sd,
+            effect_size,
+            min_achievable_p,
+            verdict: Verdict::Indeterminate {
+                reason: format!("{total:.0} permutations exceeds the exact-enumeration ceiling"),
+                seeds_per_arm_needed: seeds_needed,
+            },
+        };
+    }
+
+    // Exact two-sided permutation test over every way to split the pooled
+    // values into arms of the original sizes.
+    let pooled: Vec<f64> = baseline
+        .values
+        .iter()
+        .chain(candidate.values.iter())
+        .copied()
+        .collect();
+    let observed = delta.abs();
+    let mut at_least_as_extreme = 0u64;
+    let mut seen = 0u64;
+    let mut index = vec![0usize; n];
+    for (slot, value) in index.iter_mut().enumerate() {
+        *value = slot;
+    }
+    loop {
+        let base_sum: f64 = index.iter().map(|&i| pooled[i]).sum();
+        let total_sum: f64 = pooled.iter().sum();
+        let cand_mean = (total_sum - base_sum) / m as f64;
+        let base_mean = base_sum / n as f64;
+        if (cand_mean - base_mean).abs() >= observed - 1e-12 {
+            at_least_as_extreme += 1;
+        }
+        seen += 1;
+
+        // Next combination in lexicographic order.
+        let mut i = n;
+        loop {
+            if i == 0 {
+                break;
+            }
+            i -= 1;
+            if index[i] != i + pooled.len() - n {
+                index[i] += 1;
+                for j in i + 1..n {
+                    index[j] = index[j - 1] + 1;
+                }
+                break;
+            }
+            if i == 0 {
+                break;
+            }
+        }
+        if index[0] > pooled.len() - n {
+            break;
+        }
+        if seen >= total as u64 {
+            break;
+        }
+    }
+
+    let p_value = at_least_as_extreme as f64 / seen.max(1) as f64;
+    Comparison {
+        metric: metric.into(),
+        baseline: baseline.label.clone(),
+        candidate: candidate.label.clone(),
+        baseline_n: n,
+        candidate_n: m,
+        delta,
+        within_sd,
+        effect_size,
+        min_achievable_p,
+        verdict: Verdict::Decided {
+            p_value,
+            significant: p_value <= alpha,
+        },
+    }
+}
+
+#[cfg(test)]
+mod significance_tests {
+    use super::*;
+
+    fn arm(label: &str, values: &[f64]) -> Arm {
+        Arm {
+            label: label.into(),
+            values: values.to_vec(),
+        }
+    }
+
+    #[test]
+    fn one_run_per_arm_is_indeterminate_however_large_the_gap() {
+        // THE CASE FROM 2026-08-03. CHG-006 reported held-out R 0.813 and
+        // CHG-007 reported 0.842 on a byte-identical validation set with one
+        // variable changed. That is a well-built ablation and the delta may well
+        // be real — but it is one run against one run, so nothing in the record
+        // separates it from seed-to-seed spread.
+        //
+        // The gap is deliberately made absurd here to show the verdict does not
+        // depend on effect size at all.
+        let c = compare(
+            "val_r",
+            &arm("chg-006", &[0.813]),
+            &arm("chg-007", &[0.999]),
+            0.05,
+        );
+        assert!(
+            matches!(c.verdict, Verdict::Indeterminate { .. }),
+            "n=1 vs n=1 must never be reported as significant, got {:?}",
+            c.verdict
+        );
+        assert_eq!(c.min_achievable_p, 1.0);
+        assert!(c.within_sd.is_none(), "no replicates means no noise floor");
+    }
+
+    #[test]
+    fn indeterminate_says_how_many_seeds_would_settle_it() {
+        // A verdict the reader cannot act on is only marginally better than
+        // silence. Four per arm is what an exact two-sided test needs at
+        // alpha=0.05: C(8,4)=70, so 2/70 = 0.029 <= 0.05, while three per arm
+        // gives C(6,3)=20 and a floor of 0.100.
+        let c = compare("val_r", &arm("a", &[0.80]), &arm("b", &[0.85]), 0.05);
+        match c.verdict {
+            Verdict::Indeterminate {
+                seeds_per_arm_needed,
+                ..
+            } => {
+                assert_eq!(seeds_per_arm_needed, 4);
+            }
+            other => panic!("expected Indeterminate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn three_per_arm_still_cannot_reach_alpha_05() {
+        // The boundary worth pinning: 3v3 feels like "we replicated it" and is
+        // still underpowered for a two-sided exact test.
+        let c = compare(
+            "val_r",
+            &arm("a", &[0.80, 0.81, 0.79]),
+            &arm("b", &[0.90, 0.91, 0.89]),
+            0.05,
+        );
+        assert!(matches!(c.verdict, Verdict::Indeterminate { .. }));
+        assert!((c.min_achievable_p - 0.1).abs() < 1e-9, "2/C(6,3) = 0.1");
+        // The noise floor IS estimable here even though the test cannot fire.
+        assert!(c.within_sd.is_some());
+    }
+
+    #[test]
+    fn a_clean_separation_at_four_per_arm_is_significant() {
+        let c = compare(
+            "val_r",
+            &arm("a", &[0.80, 0.81, 0.79, 0.80]),
+            &arm("b", &[0.90, 0.91, 0.89, 0.90]),
+            0.05,
+        );
+        match c.verdict {
+            Verdict::Decided {
+                p_value,
+                significant,
+            } => {
+                assert!(significant, "clean separation should decide, p={p_value}");
+                assert!(p_value <= 0.05);
+            }
+            other => panic!("expected Decided, got {other:?}"),
+        }
+        assert!(
+            c.effect_size.unwrap() > 5.0,
+            "delta should dwarf the noise floor"
+        );
+    }
+
+    #[test]
+    fn overlapping_arms_are_decided_but_not_significant() {
+        // The other half of honesty: with enough runs, a small delta must be
+        // reported as NOT significant rather than quietly dropped.
+        let c = compare(
+            "val_r",
+            &arm("a", &[0.80, 0.84, 0.79, 0.83]),
+            &arm("b", &[0.82, 0.81, 0.85, 0.80]),
+            0.05,
+        );
+        match c.verdict {
+            Verdict::Decided { significant, .. } => assert!(!significant),
+            other => panic!("expected Decided, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_arm_is_indeterminate_not_a_crash() {
+        let c = compare("val_r", &arm("a", &[]), &arm("b", &[0.9]), 0.05);
+        assert!(matches!(c.verdict, Verdict::Indeterminate { .. }));
+    }
+
+    #[test]
+    fn sd_is_none_for_a_single_run_rather_than_zero() {
+        // Returning 0.0 would read as "perfectly reproducible", which is the
+        // opposite of what one run tells you.
+        assert!(arm("a", &[0.5]).sd().is_none());
+        assert!(arm("a", &[0.5, 0.7]).sd().is_some());
+    }
+}
+
+#[cfg(test)]
+mod cross_language_tests {
+    use super::*;
+
+    /// THE INTERFACE THAT FAILS SILENTLY.
+    ///
+    /// `blut_core/run_ledger.py` hand-writes this wire format so a Python
+    /// trainer can record a run without shelling out to the CLI. A drifted
+    /// field name or enum spelling there would not raise: reads are lenient by
+    /// design, so the records would be skipped as malformed and the ledger
+    /// would look empty while every trainer believed it was logging. That is
+    /// precisely the failure this whole ADR exists to end, so it gets a test
+    /// that crosses the language boundary rather than two schemas maintained
+    /// by eye.
+    ///
+    /// The fixture is written BY THE SHIM, never typed out here — a
+    /// hand-written fixture would only prove this file agrees with itself.
+    /// `tools/tests/test_run_ledger_shim.py` regenerates it.
+    #[test]
+    fn rust_reads_what_the_python_shim_writes() {
+        let fixture = std::path::Path::new("/var/tmp/lamquant-gates/xlang/run-ledger.jsonl");
+        if !fixture.is_file() {
+            eprintln!("skipping: fixture absent (regenerate via the python shim test)");
+            return;
+        }
+        let ledger = RunLedger::at(fixture.to_path_buf());
+        let read = ledger.read().expect("a python-written ledger must parse");
+        assert_eq!(
+            read.malformed, 0,
+            "no line written by the shim may be unparseable"
+        );
+        assert_eq!(read.records.len(), 4, "two runs, start + end each");
+
+        let mut starts = 0;
+        for record in &read.records {
+            if let Record::RunStarted {
+                experiment,
+                seed,
+                tenant,
+                intent,
+                ..
+            } = record
+            {
+                assert_eq!(experiment.as_deref(), Some("E1"), "experiment must survive");
+                assert!(
+                    seed.is_some(),
+                    "seed is the replicate axis; it must survive"
+                );
+                assert_eq!(tenant, "lamquant");
+                assert_eq!(*intent, Intent::Campaign);
+                starts += 1;
+            }
+        }
+        assert_eq!(starts, 2);
+    }
+}
+
+#[cfg(test)]
+mod dogfood_tests {
+    use super::*;
+
+    /// The end-to-end chain on the case that prompted all of this.
+    ///
+    /// On 2026-08-03 a Package 16 run reported held-out R 0.842 against a prior
+    /// 0.813, on a byte-identical validation set with exactly one input changed
+    /// — a genuinely well-built ablation. The delta may well be real. The point
+    /// is that the RECORD cannot say so, because each arm has one run, and this
+    /// test pins that the tooling refuses to pretend otherwise.
+    ///
+    /// The fixture is written by `blut_core/run_ledger.py`, so a pass here
+    /// exercises Python write -> Rust read -> verdict, not just the last step.
+    #[test]
+    fn the_package16_comparison_is_indeterminate_not_a_win() {
+        let fixture = std::path::Path::new("/var/tmp/lamquant-gates/dogfood/run-ledger.jsonl");
+        if !fixture.is_file() {
+            eprintln!("skipping: dogfood fixture absent");
+            return;
+        }
+        let read = RunLedger::at(fixture.to_path_buf()).read().expect("parse");
+        assert_eq!(read.malformed, 0);
+
+        let arm_for = |fingerprint: &str| -> Arm {
+            let uids: Vec<&str> = read
+                .records
+                .iter()
+                .filter_map(|r| match r {
+                    Record::RunStarted {
+                        run_uid, identity, ..
+                    } if identity.config_fingerprint.as_deref() == Some(fingerprint) => {
+                        Some(run_uid.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            let values = read
+                .records
+                .iter()
+                .filter_map(|r| match r {
+                    Record::RunEnded {
+                        run_uid, metrics, ..
+                    } if uids.contains(&run_uid.as_str()) => metrics.get("best_val_r").copied(),
+                    _ => None,
+                })
+                .collect();
+            Arm {
+                label: fingerprint.into(),
+                values,
+            }
+        };
+
+        let result = compare(
+            "best_val_r",
+            &arm_for("cohort-train9"),
+            &arm_for("cohort-train56"),
+            0.05,
+        );
+        assert_eq!(result.baseline_n, 1);
+        assert_eq!(result.candidate_n, 1);
+        assert!(
+            (result.delta - 0.029).abs() < 1e-6,
+            "delta {}",
+            result.delta
+        );
+        assert!(
+            result.within_sd.is_none(),
+            "one run per arm has no noise floor"
+        );
+        match &result.verdict {
+            Verdict::Indeterminate {
+                seeds_per_arm_needed,
+                ..
+            } => {
+                assert_eq!(*seeds_per_arm_needed, 4);
+            }
+            other => panic!("a 1-vs-1 comparison must not be Decided, got {other:?}"),
+        }
     }
 }

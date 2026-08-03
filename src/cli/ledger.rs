@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Brian Lam
-//! `blut ledger` — read and curate the append-only run ledger (ADR 0152).
+//! `blut ledger` — read and curate the append-only run ledger (ADR 0154).
 //!
 //! Every mutating subcommand here APPENDS. Nothing rewrites or deletes a line,
 //! because the ledger is the record of what happened, not a view of what is
@@ -10,7 +10,7 @@
 use anyhow::{Result, anyhow};
 use clap::Subcommand;
 
-use crate::run_ledger::{Record, RunLedger, Tier};
+use crate::run_ledger::{Arm, Record, RunLedger, Tier, Verdict, compare};
 
 #[derive(Subcommand, Debug)]
 pub(super) enum LedgerCommand {
@@ -51,6 +51,30 @@ pub(super) enum LedgerCommand {
         commit: bool,
     },
     /// Structural checks over the ledger.
+    /// Compare two configurations on a metric, and refuse to overclaim.
+    ///
+    /// Groups runs into ARMS by (experiment, config_fingerprint) and asks
+    /// whether a difference between two arms is larger than the spread you get
+    /// from rerunning the SAME arm with a different seed. With one run per arm
+    /// there is no such spread, and the answer is INDETERMINATE regardless of
+    /// how large the gap looks — which is the case this exists for.
+    Compare {
+        /// Experiment id both arms belong to, e.g. `E1`.
+        experiment: String,
+        /// Baseline arm: a config_fingerprint (or unique prefix).
+        baseline: String,
+        /// Candidate arm: a config_fingerprint (or unique prefix).
+        candidate: String,
+        /// Metric to compare, as recorded in `run_ended.metrics`.
+        #[arg(long, default_value = "best_val_r")]
+        metric: String,
+        /// Two-sided significance threshold.
+        #[arg(long, default_value_t = 0.05)]
+        alpha: f64,
+        /// Emit as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     Verify {
         /// Also require every TRUTH_LEDGER §2 citation to resolve to a run.
         #[arg(long)]
@@ -207,6 +231,137 @@ pub(super) fn run_ledger_cmd(cmd: LedgerCommand) -> Result<()> {
                 println!("collected {uid}");
             }
         }
+        LedgerCommand::Compare {
+            experiment,
+            baseline,
+            candidate,
+            metric,
+            alpha,
+            json,
+        } => {
+            let read = ledger.read().map_err(|e| anyhow!("{e}"))?;
+            let arm = |fingerprint: &str| -> Arm {
+                // Collect the metric from every ended run whose start declared
+                // this experiment and whose config fingerprint matches.
+                let uids: Vec<&str> = read
+                    .records
+                    .iter()
+                    .filter_map(|r| match r {
+                        Record::RunStarted {
+                            run_uid,
+                            experiment: e,
+                            identity,
+                            ..
+                        } if e.as_deref() == Some(experiment.as_str())
+                            && identity
+                                .config_fingerprint
+                                .as_deref()
+                                .is_some_and(|c| c.starts_with(fingerprint)) =>
+                        {
+                            Some(run_uid.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let values = read
+                    .records
+                    .iter()
+                    .filter_map(|r| match r {
+                        Record::RunEnded {
+                            run_uid, metrics, ..
+                        } if uids.contains(&run_uid.as_str()) => metrics.get(&metric).copied(),
+                        _ => None,
+                    })
+                    .collect();
+                Arm {
+                    label: fingerprint.to_string(),
+                    values,
+                }
+            };
+
+            let result = compare(&metric, &arm(&baseline), &arm(&candidate), alpha);
+            if json {
+                // Hand-rolled: the report is small and adding a Serialize impl
+                // to the comparison types would put a presentation concern in
+                // the analysis module.
+                let verdict = match &result.verdict {
+                    Verdict::Indeterminate {
+                        reason,
+                        seeds_per_arm_needed,
+                    } => format!(
+                        "{{\"kind\":\"indeterminate\",\"reason\":{},\"seeds_per_arm_needed\":{}}}",
+                        serde_json::to_string(reason)?,
+                        seeds_per_arm_needed
+                    ),
+                    Verdict::Decided {
+                        p_value,
+                        significant,
+                    } => format!(
+                        "{{\"kind\":\"decided\",\"p_value\":{p_value},\"significant\":{significant}}}"
+                    ),
+                };
+                println!(
+                    "{{\"metric\":{},\"baseline_n\":{},\"candidate_n\":{},\"delta\":{},\"within_sd\":{},\"min_achievable_p\":{},\"verdict\":{}}}",
+                    serde_json::to_string(&result.metric)?,
+                    result.baseline_n,
+                    result.candidate_n,
+                    result.delta,
+                    result
+                        .within_sd
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "null".into()),
+                    result.min_achievable_p,
+                    verdict
+                );
+            } else {
+                println!("experiment {experiment}  metric {}", result.metric);
+                println!(
+                    "  {:<24} n={}  mean {:.6}",
+                    result.baseline,
+                    result.baseline_n,
+                    arm(&baseline).mean()
+                );
+                println!(
+                    "  {:<24} n={}  mean {:.6}",
+                    result.candidate,
+                    result.candidate_n,
+                    arm(&candidate).mean()
+                );
+                println!("  delta            {:+.6}", result.delta);
+                match result.within_sd {
+                    Some(sd) => println!("  within-arm sd    {sd:.6}  (the noise floor)"),
+                    None => println!("  within-arm sd    unknown — no arm has a repeat"),
+                }
+                if let Some(effect) = result.effect_size {
+                    println!("  effect size      {effect:.2} sd");
+                }
+                match &result.verdict {
+                    Verdict::Indeterminate {
+                        reason,
+                        seeds_per_arm_needed,
+                    } => {
+                        println!("  VERDICT          INDETERMINATE");
+                        println!("    {reason}");
+                        println!(
+                            "    {seeds_per_arm_needed} seeds per arm would make this decidable."
+                        );
+                    }
+                    Verdict::Decided {
+                        p_value,
+                        significant,
+                    } => {
+                        println!(
+                            "  VERDICT          {} (exact permutation p = {p_value:.4})",
+                            if *significant {
+                                "SIGNIFICANT"
+                            } else {
+                                "not significant"
+                            }
+                        );
+                    }
+                }
+            }
+        }
         LedgerCommand::Verify {
             require_ledger_rows_resolve,
         } => {
@@ -250,7 +405,7 @@ pub(super) fn run_ledger_cmd(cmd: LedgerCommand) -> Result<()> {
 /// knows. Reported rather than enforced silently: rows `2.4` and `2.7` are
 /// expected to fail today because they cite `/tmp/eval_april.py` and a
 /// scratchpad script — provenance that cannot be recovered. Surfacing that is
-/// the point (ADR 0152 Consequences).
+/// the point (ADR 0154 Consequences).
 fn unresolved_ledger_rows(records: &[Record]) -> Vec<String> {
     let mut claimed = std::collections::BTreeSet::new();
     for r in records {

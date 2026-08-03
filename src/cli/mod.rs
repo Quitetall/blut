@@ -80,7 +80,7 @@ enum Command {
         #[command(subcommand)]
         cmd: LineageCommand,
     },
-    /// The append-only run ledger (ADR 0152): list, promote, collect, verify.
+    /// The append-only run ledger (ADR 0154): list, promote, collect, verify.
     Ledger {
         #[command(subcommand)]
         cmd: LedgerCommand,
