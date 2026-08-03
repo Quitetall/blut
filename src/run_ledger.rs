@@ -29,8 +29,9 @@
 //! unstated `O_APPEND` atomicity, which POSIX only guarantees for writes up to
 //! `PIPE_BUF` (4096 bytes). A run record with a long argv exceeds that. So every
 //! append here takes an advisory `flock(LOCK_EX)` for the duration of the write.
-//! On non-unix the lock is a no-op and the guarantee degrades to O_APPEND —
-//! stated rather than assumed.
+//! On non-unix ordinary appends degrade to O_APPEND, but checked curation
+//! fails closed because its read-validate-append transaction requires a real
+//! cross-process lock.
 //!
 //! READS ARE LENIENT, AND SAY SO. A malformed line is skipped, but the count is
 //! returned in [`LedgerRead::malformed`] rather than swallowed. Silently
@@ -38,7 +39,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -330,6 +331,32 @@ impl RunLedger {
     /// appenders cannot interleave a partial line. See the module docs for why
     /// `O_APPEND` alone is not enough.
     pub fn append(&self, record: &Record) -> Result<()> {
+        self.append_inner(record, |_| Ok(()), false)
+    }
+
+    /// Atomically validate current ledger contents and append one record under
+    /// the same exclusive lock. Curation commands use this to prevent a stale
+    /// read from racing another promotion or collection.
+    pub fn append_checked<F>(&self, record: &Record, validate: F) -> Result<()>
+    where
+        F: FnOnce(&LedgerRead) -> Result<()>,
+    {
+        #[cfg(not(unix))]
+        {
+            let _ = (record, validate);
+            return Err(TrainError::other(
+                "checked ledger append requires cross-process locking unavailable on this platform",
+            ));
+        }
+
+        #[cfg(unix)]
+        self.append_inner(record, validate, true)
+    }
+
+    fn append_inner<F>(&self, record: &Record, validate: F, read_before_append: bool) -> Result<()>
+    where
+        F: FnOnce(&LedgerRead) -> Result<()>,
+    {
         let mut line = serde_json::to_string(record)
             .map_err(|e| TrainError::other(format!("serialize ledger record: {e}")))?;
         line.push('\n');
@@ -341,11 +368,19 @@ impl RunLedger {
         }
         let file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&self.path)
             .map_err(|e| TrainError::other(format!("open ledger {}: {e}", self.path.display())))?;
 
         let mut file = lock_exclusive(file)?;
+        reject_unterminated_tail(&mut *file)?;
+        if read_before_append {
+            file.seek(SeekFrom::Start(0))
+                .map_err(|e| TrainError::other(format!("seek ledger: {e}")))?;
+            let read = read_records(BufReader::new(&mut *file))?;
+            validate(&read)?;
+        }
         file.write_all(line.as_bytes())
             .map_err(|e| TrainError::other(format!("append to ledger: {e}")))?;
         file.flush()
@@ -366,18 +401,7 @@ impl RunLedger {
                 )));
             }
         };
-        let mut out = LedgerRead::default();
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(|e| TrainError::other(format!("read ledger line: {e}")))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<Record>(&line) {
-                Ok(rec) => out.records.push(rec),
-                Err(_) => out.malformed += 1,
-            }
-        }
-        Ok(out)
+        read_records(BufReader::new(file))
     }
 
     /// Effective tier per run: the highest ever reached, since promotion
@@ -402,6 +426,42 @@ impl RunLedger {
         }
         Ok(out)
     }
+}
+
+fn reject_unterminated_tail(file: &mut (impl Read + Seek)) -> Result<()> {
+    let len = file
+        .seek(SeekFrom::End(0))
+        .map_err(|e| TrainError::other(format!("seek ledger end: {e}")))?;
+    if len == 0 {
+        return Ok(());
+    }
+
+    file.seek(SeekFrom::End(-1))
+        .map_err(|e| TrainError::other(format!("seek ledger tail: {e}")))?;
+    let mut tail = [0_u8; 1];
+    file.read_exact(&mut tail)
+        .map_err(|e| TrainError::other(format!("read ledger tail: {e}")))?;
+    if tail[0] != b'\n' {
+        return Err(TrainError::other(
+            "ledger has an unterminated final line; refusing append",
+        ));
+    }
+    Ok(())
+}
+
+fn read_records(reader: impl BufRead) -> Result<LedgerRead> {
+    let mut out = LedgerRead::default();
+    for line in reader.lines() {
+        let line = line.map_err(|e| TrainError::other(format!("read ledger line: {e}")))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Record>(&line) {
+            Ok(record) => out.records.push(record),
+            Err(_) => out.malformed += 1,
+        }
+    }
+    Ok(out)
 }
 
 fn rank(t: Tier) -> u8 {
@@ -435,9 +495,8 @@ fn lock_exclusive(file: std::fs::File) -> Result<nix::fcntl::Flock<std::fs::File
         .map_err(|(_file, errno)| TrainError::other(format!("lock ledger: {errno}")))
 }
 
-/// Off unix there is no advisory lock and the guarantee degrades to `O_APPEND`
-/// atomicity, which POSIX bounds at `PIPE_BUF`. Stated rather than assumed —
-/// the Python logger this replaces made exactly this assumption silently.
+/// Off unix ordinary append safety degrades to `O_APPEND`. Checked curation is
+/// rejected by [`RunLedger::append_checked`] before reaching this fallback.
 #[cfg(not(unix))]
 fn lock_exclusive(file: std::fs::File) -> Result<std::fs::File> {
     Ok(file)
