@@ -136,6 +136,27 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --target wasm32-unknown-unknown -- -D warnings
 
+      # ADR 0097: the telemetry sidecar owns ALL network I/O for metrics —
+      # the engine only writes records. Gate it or the OpenMetrics exposition
+      # and the mesh trace-propagation proof rot.
+      - name: Build + lint + test blut-metrics (standalone workspace)
+        working-directory: crates/blut-metrics
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+      # ADR 0139 / ADR 0034: the semantic-graph adapter is a SIDECAR (standalone
+      # workspace) so the domain-agnostic engine carries no ABIR vocabulary and
+      # no blut-graph-core code. Gate it or the adapter rots.
+      - name: Build + lint + test blut-semantic (standalone workspace)
+        working-directory: crates/blut-semantic
+        run: |
+          cargo fmt --all -- --check
+          cargo build --all-targets
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
       # ADR 0083 M2: the cockpit is the blut-tui SIDECAR (standalone
       # workspace) — the engine ships zero terminal-UI deps. Gate the build,
       # the 76 state/harness tests, AND the headless `--check` (renders every

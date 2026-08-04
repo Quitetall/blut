@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# gitleaks configuration for the BLUT release secret-scan gate
+# (`gitleaks git --log-opts="--all"`, RELEASING.md candidate gate).
+#
+# Start from the upstream default ruleset — this file NARROWS it with reviewed
+# exceptions only. Never add a broad path or rule exemption here: a scan that
+# is taught to ignore whole directories stops being a gate.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = """
+Vendored upstream PROTOCOL PROVENANCE: `crates/blut-reapi/vendor/UPSTREAM.md`
+records the exact upstream git commits the REAPI protobuf closure was vendored
+from (remote-apis, googleapis, and the binding source). A 40-character hex
+commit SHA is indistinguishable from a token by shape and entropy alone, so the
+`generic-api-key` heuristic flags them.
+
+Verified 2026-07-30: the flagged values are git commit pins in a documentation
+file — they identify public upstream revisions, grant no access, and carry no
+credential material. Recording them is the POINT of the file (reproducible
+vendoring). Scoped to that one path and that one rule so any real credential
+elsewhere, or any other rule firing on this path, still fails the gate.
+"""
+paths = ['''crates/blut-reapi/vendor/UPSTREAM\.md''']
+regexes = ['''\b[0-9a-f]{40}\b''']
+regexTarget = "match"

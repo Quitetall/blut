@@ -45,7 +45,6 @@ pub mod plan_spec;
 pub mod resource;
 pub mod resume;
 pub mod retry;
-pub mod semantic_plan;
 pub mod stage;
 pub mod status;
 
@@ -54,7 +53,6 @@ pub use async_io::{
     IoMode, TrainingIoAdmissionError, TrainingIoCandidate, TrainingIoDowngradeReason,
     TrainingIoHints, TrainingIoProfile, profile_is_declared, select_training_io_profile,
 };
-pub use blut_graph_core as semantic_graph;
 pub use cache::{CacheHandle, CacheHit, lru_prune};
 pub use compat::Compatible;
 pub use cookbook::{
@@ -73,10 +71,6 @@ pub use plan::{CompiledPlan, NodeId, Plan};
 pub use plan_spec::{ConditionGateSpec, PLAN_SPEC_VERSION, PlanSpec, PlanSpecError, SpecNode};
 pub use resource::Resource;
 pub use retry::{Backoff, RetryEvent, RetryHook, RetryOn, RetryPolicy, StageTimeout};
-pub use semantic_plan::{
-    DurableAdaptedPlan, DurablePlanError, DurableStepContract, DurableStepResolver,
-    ResolvedDurableStep, adapt_durable_plan,
-};
 pub use stage::{
     ErasedArtifact, ErasedDecodeError, PipelineManifest, Stage, StageContext, StageDyn,
     StageExecutionBoundary,

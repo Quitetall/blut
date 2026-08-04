@@ -9,8 +9,8 @@ use blut_graph_core::{
     AuthorizedPlan, Determinism, Effect, ExecutionRealm, ImplementationId, Partiality, StepId,
 };
 
-use crate::framework::plan::CompiledPlan;
-use crate::framework::stage::StageDyn;
+use blut::framework::plan::CompiledPlan;
+use blut::framework::stage::StageDyn;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DurablePlanError {
@@ -65,7 +65,7 @@ pub enum DurablePlanError {
     #[error("durable policy recheck differs for step {step:?}")]
     Policy { step: StepId },
     #[error(transparent)]
-    Plan(#[from] crate::framework::error::PlanError),
+    Plan(#[from] blut::framework::error::PlanError),
 }
 
 pub struct ResolvedDurableStep {
@@ -217,7 +217,7 @@ pub fn adapt_durable_plan(
             .peak_bytes
             .saturating_add(step.resources.scratch_bytes);
         let reserved = u64::from(resolved.stage.memory_gib_for(&resolved.args))
-            .saturating_mul(crate::broker::footprint::GIB);
+            .saturating_mul(blut::broker::footprint::GIB);
         if reserved < required {
             return Err(DurablePlanError::Memory {
                 step: step.id,
@@ -310,7 +310,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::framework::{Resource, Stage, StageContext, StageError};
+    use blut::framework::{Resource, Stage, StageContext, StageError};
 
     struct UnitStage;
 
