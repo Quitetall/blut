@@ -213,7 +213,11 @@ impl TrainingIoCandidate {
                 .ok_or(CandidateFailure::ArithmeticOverflow)
         })?;
 
-        Ok(TrainingIoProfile {
+        // Built with a placeholder depth, then set from the ONE definition —
+        // so the serialized value cannot encode a different rule than
+        // `derived_async_depth`.
+        let mut profile = TrainingIoProfile {
+            async_depth: 0,
             sync_base_bytes: 0,
             data_replicas: self.data_replicas,
             decode_workers: self.decode_workers,
@@ -227,7 +231,9 @@ impl TrainingIoCandidate {
             fixed_overhead_bytes: fixed_overhead_bytes_per_replica,
             billed_overhead_bytes,
             downgrade_reason: None,
-        })
+        };
+        profile.async_depth = profile.derived_async_depth();
+        Ok(profile)
     }
 }
 
@@ -301,11 +307,33 @@ pub struct TrainingIoProfile {
     /// `billed_overhead_bytes`.
     pub fixed_overhead_bytes: u64,
     pub billed_overhead_bytes: u64,
+    /// In-flight batch depth (ADR 0103). Surfaced on `status.jsonl` so an
+    /// operator can see that a memory-pressured stage was admitted at reduced
+    /// depth rather than refused — `1` means it ran the synchronous path.
+    /// Set ONLY by the resolver, and pinned to [`Self::derived_async_depth`]
+    /// by test so the reported number cannot drift from the profile.
+    #[serde(default)]
+    pub async_depth: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub downgrade_reason: Option<TrainingIoDowngradeReason>,
 }
 
 impl TrainingIoProfile {
+    /// Effective async DEPTH (ADR 0103): how many batches may be in flight.
+    /// `1` IS the synchronous path, which is what makes "degrade to depth 1"
+    /// and "fall back to inline" the same statement — the ADR's graceful
+    /// degradation has no separate mechanism to keep in sync.
+    ///
+    /// Derived, never stored twice: [`Self::async_depth`] is the one definition
+    /// and the serialized `async_depth` field is pinned to it by test.
+    pub fn derived_async_depth(&self) -> u32 {
+        if self.is_inline() {
+            1
+        } else {
+            self.prefetch_per_worker.max(1)
+        }
+    }
+
     pub fn is_inline(&self) -> bool {
         self.decode_workers == 0
             && self.prefetch_per_worker == 0
@@ -325,6 +353,10 @@ impl TrainingIoProfile {
         let (metrics_capacity, metrics_max_item) = self.metrics.capacity_and_max_item();
         let (checkpoint_capacity, checkpoint_max_item) = self.checkpoints.capacity_and_max_item();
         BTreeMap::from([
+            (
+                "BLUT_IO_ASYNC_DEPTH",
+                self.derived_async_depth().to_string(),
+            ),
             (
                 "BLUT_IO_PIPELINE_MODE",
                 if self.pipeline.is_inline() {
