@@ -809,3 +809,57 @@ async fn p2p_never_dispatches_a_locally_selected_bounded_profile() {
     assert!(status.contains("\"billed_overhead_bytes\":104857600"));
     assert!(!status.contains("\"downgrade_reason\""));
 }
+
+/// ADR 0103: the reported `async_depth` must never encode a different rule
+/// than the profile it describes, and depth 1 must mean the synchronous path.
+#[test]
+fn async_depth_is_pinned_to_the_profile_and_reaches_the_trainer() {
+    // A bounded candidate selected with room to spare keeps its real depth.
+    let bounded = select_training_io_profile(
+        0,
+        u64::MAX / 2,
+        // The selector REQUIRES an inline tail — the guarantee that there is
+        // always a depth-1 target to degrade onto instead of an OOM.
+        &[bounded_candidate(Some(MIB)), inline_candidate()],
+        false,
+    )
+    .expect("bounded candidate fits");
+    assert_eq!(
+        bounded.async_depth,
+        bounded.derived_async_depth(),
+        "the serialized depth must equal the single derived definition"
+    );
+    assert!(bounded.async_depth >= 1, "depth is never 0");
+
+    // Inline IS depth 1 — "degrade to depth 1" and "fall back to inline" are
+    // the same statement, so there is no second mechanism to keep in sync.
+    // force_inline is the same lever memory pressure pulls: degrade to depth 1.
+    let inline = select_training_io_profile(0, u64::MAX / 2, &[inline_candidate()], true)
+        .expect("inline always fits");
+    assert!(inline.is_inline());
+    assert_eq!(inline.async_depth, 1, "inline is exactly depth 1");
+    assert_eq!(inline.async_depth, inline.derived_async_depth());
+
+    // The depth reaches the trainer subprocess, and rides status.jsonl.
+    assert_eq!(
+        bounded.env_pairs().get("BLUT_IO_ASYNC_DEPTH"),
+        Some(&bounded.async_depth.to_string())
+    );
+    let line = serde_json::to_string(&bounded).unwrap();
+    assert!(
+        line.contains("\"async_depth\""),
+        "status must carry it: {line}"
+    );
+
+    // A pre-0103 profile without the field still parses (additive).
+    let legacy = serde_json::json!({
+        "sync_base_bytes": 0, "data_replicas": 1, "decode_workers": 0,
+        "prefetch_per_worker": 0, "cuda_staging_slots": 0,
+        "metrics": inline.metrics, "checkpoints": inline.checkpoints,
+        "batch_bytes": 0, "checkpoint_snapshot_bytes": 0,
+        "fixed_overhead_bytes": 0, "billed_overhead_bytes": 0
+    });
+    let parsed: blut::framework::async_io::TrainingIoProfile =
+        serde_json::from_value(legacy).expect("a pre-0103 profile still parses");
+    assert_eq!(parsed.async_depth, 0, "absent field defaults, never errors");
+}
