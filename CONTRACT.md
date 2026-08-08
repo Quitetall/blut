@@ -2,7 +2,8 @@
 
 Frozen 2026-08-08 (ADR 0037 Stage 0). This is the wire contract between the orchestrator
 (the Rust engine) and every trainer subprocess, across all cookbooks (LLM, LamQuant/EEG).
-The reference implementation ships publicly as `tritium.torch.contract`; this document is
+The reference implementation will ship publicly as `tritium.torch.contract` (ADR 0037
+Stage 1); this document is
 the authority, and the golden fixtures under `tests/contract/` are its executable form.
 Both this repo's CI and consumers' CIs validate against those fixtures.
 
@@ -36,8 +37,9 @@ Rules:
 
 ### Contract announcement (RECOMMENDED in v1)
 
-First stdout line: `BLUT_CONTRACT 1`. Non-JSON prefixed lines are ignored by control-channel
-readers, so this is backward-compatible. Absence ⇒ v0-legacy stream.
+First stdout line: `BLUT_CONTRACT 1`. Current readers treat non-JSON lines as malformed —
+warn-log-and-continue, never stall — so this is backward-compatible today; contract-aware
+readers (from Stage 2) recognize the prefix explicitly. Absence ⇒ v0-legacy stream.
 
 ## 2. Metric channel — `BLUT_METRIC <json>` lines (stdout, multiplexed)
 

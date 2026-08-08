@@ -30,9 +30,13 @@ KINDS: dict[str, dict[str, tuple]] = {
     "saved": {"path": (str,)},
     "done": {"final_loss": _NUM, "checkpoint_dir": (str,)},
     "failed": {"error": (str,)},
-    "heartbeat": {},  # phase/vram_mb optional
+    "heartbeat": {},  # no required fields; optional ones typed below
 }
 TERMINAL = {"done", "failed"}
+# Optional per-kind fields, type-checked when present.
+OPTIONAL_FIELDS: dict[str, dict[str, tuple]] = {
+    "heartbeat": {"phase": (str,), "vram_mb": (int,)},
+}
 
 ENVELOPE_REQUIRED = ["model", "opt", "config", "step", "rng"]
 ENVELOPE_OPTIONAL = ["ema", "sched", "manifest_ref"]
@@ -41,7 +45,7 @@ ENVELOPE_ALIASES = {
     "model": ["state_dict"],
     "opt": ["optimizer"],
     "config": ["training_config_hash"],
-    "rng": ["rng_state", "get_rng_state", "getstate()"],
+    "rng": ["rng_state"],
 }
 
 
@@ -125,6 +129,11 @@ def lint_stream(path: Path) -> int:
             v = obj.get(field)
             if isinstance(v, bool) or not isinstance(v, types):
                 r.fail(f"line {i}: kind={kind} field {field!r} missing or mistyped ({v!r})")
+        for field, types in OPTIONAL_FIELDS.get(kind, {}).items():
+            if field in obj:
+                v = obj[field]
+                if isinstance(v, bool) or not isinstance(v, types):
+                    r.fail(f"line {i}: kind={kind} optional field {field!r} mistyped ({v!r})")
         if kind in TERMINAL:
             terminal_at = i
 
@@ -168,10 +177,7 @@ def lint_source(paths: list[Path]) -> int:
         if has(rf"[\"']{key}[\"']"):
             return True, False
         for alias in ENVELOPE_ALIASES.get(key, []):
-            if re.escape(alias) != alias:
-                if alias in src:
-                    return True, True
-            elif has(rf"[\"']{alias}[\"']|{alias}"):
+            if has(rf"[\"']{re.escape(alias)}[\"']"):
                 return True, True
         return False, False
 
