@@ -1,0 +1,12 @@
+BLUT_CONTRACT 1
+{"kind":"heartbeat","phase":"model-load"}
+BLUT_METRIC {"kind":"epoch","phase":"warmup","val_r":0.8412,"prd":6.02}
+{"kind":"step","step":1,"total":100,"loss":2.3401,"lr":0.0002,"vram_mb":8123}
+{"kind":"step","step":2,"total":100,"loss":2.2917,"lr":0.0002,"vram_mb":8123}
+{"kind":"heartbeat","phase":"checkpoint-save","vram_mb":8123}
+{"kind":"saved","path":"ckpt/step_2.pt"}
+{"kind":"eval","step":2,"eval_loss":2.3105}
+BLUT_METRIC {"kind":"epoch","phase":"quant","val_r":0.9120,"prd":4.31}
+{"kind":"step","step":3,"total":100,"loss":2.2409,"lr":0.00019,"vram_mb":8125}
+{"kind":"saved","path":"ckpt/step_3.pt"}
+{"kind":"done","final_loss":2.2409,"checkpoint_dir":"ckpt"}
