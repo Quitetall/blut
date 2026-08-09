@@ -430,13 +430,15 @@ pub(super) async fn run_one_recipe(
     experiment: Option<String>,
 ) -> Result<String> {
     let source_args = args.clone();
-    let args = crate::registry_args::resolve_recipe_args(args, &tenant, launch_target)
-        .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
+    let (args, resolved_handles) =
+        crate::registry_args::resolve_recipe_args_reported(args, &tenant, launch_target)
+            .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
     run_one_recipe_resolved(
         reg,
         name,
         source_args,
         args,
+        resolved_handles,
         sweep_fp,
         shared_cache,
         launch_target,
@@ -537,9 +539,12 @@ pub(super) fn prepare_one_partitioned_recipe(
     partition: blut_types::partition::PartitionKey,
     tenant_admission: std::sync::Arc<crate::broker::tenant_quota::TenantAdmission>,
 ) -> Result<PreparedPartitionedRecipeLaunch> {
-    let resolved_args =
-        crate::registry_args::resolve_recipe_args(source_args.clone(), &tenant, launch_target)
-            .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
+    let (resolved_args, resolved_handles) = crate::registry_args::resolve_recipe_args_reported(
+        source_args.clone(),
+        &tenant,
+        launch_target,
+    )
+    .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
     let recipe = reg
         .find(name)
         .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
@@ -559,6 +564,7 @@ pub(super) fn prepare_one_partitioned_recipe(
             name: name.to_string(),
             args: resolved_args,
             source_args: Some(source_args),
+            resolved_handles,
         }),
         None,
         shared_cache,
@@ -583,6 +589,7 @@ async fn run_one_recipe_resolved(
     name: &str,
     source_args: serde_json::Value,
     args: serde_json::Value,
+    resolved_handles: crate::registry_args::ResolvedHandles,
     sweep_fp: Option<crate::framework::ContentHash>,
     shared_cache: bool,
     launch_target: crate::config::launcher::LaunchTarget,
@@ -617,6 +624,7 @@ async fn run_one_recipe_resolved(
             name: name.to_string(),
             args,
             source_args: Some(source_args),
+            resolved_handles,
         }),
         sweep_fp,
         shared_cache,

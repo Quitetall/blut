@@ -1251,9 +1251,30 @@ mod registry_completion_cli_tests {
             name: "train".into(),
             args: serde_json::json!({"data":"/verified/data.jsonl"}),
             source_args: Some(serde_json::json!({"data":"dataset://train@v1"})),
+            resolved_handles: crate::registry_args::ResolvedHandles {
+                datasets: vec![crate::dataset_registry::DatasetResolution {
+                    tenant: "research/dev".into(),
+                    name: "train".into(),
+                    version: "v1".into(),
+                    dataset_id: "ds-1".into(),
+                    source_name: "train-source".into(),
+                    source_path: std::path::PathBuf::from("/verified/data.jsonl"),
+                    manifest_sha256: "c".repeat(64),
+                    kind: "dataset.jsonl".into(),
+                    clinical: false,
+                    pinned_at: 1,
+                }],
+            },
         };
         let encoded = serde_json::to_value(&marker).unwrap();
         assert_eq!(encoded["source_args"]["data"], "dataset://train@v1");
+        // The digest the path cannot carry must survive a round-trip.
+        assert_eq!(
+            encoded["resolved_handles"]["datasets"][0]["manifest_sha256"],
+            "c".repeat(64)
+        );
+        let round_tripped: RecipeMarker = serde_json::from_value(encoded).unwrap();
+        assert_eq!(round_tripped.resolved_handles, marker.resolved_handles);
         assert!(ensure_resume_registry_snapshot(&marker, &marker.args).is_ok());
         assert!(
             ensure_resume_registry_snapshot(
@@ -1270,6 +1291,20 @@ mod registry_completion_cli_tests {
         }))
         .unwrap();
         assert!(legacy.source_args.is_none());
+        assert!(
+            legacy.resolved_handles.is_empty(),
+            "a marker written before resolved_handles existed must still load"
+        );
+
+        // A URI-free run serialises no empty scaffolding.
+        let plain = RecipeMarker {
+            name: "train".into(),
+            args: serde_json::json!({"epochs": 3}),
+            source_args: Some(serde_json::json!({"epochs": 3})),
+            resolved_handles: crate::registry_args::ResolvedHandles::default(),
+        };
+        let encoded_plain = serde_json::to_value(&plain).unwrap();
+        assert!(encoded_plain.get("resolved_handles").is_none());
     }
 }
 
@@ -1371,6 +1406,19 @@ struct RecipeMarker {
     /// before recompiling. Older markers deserialize with `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_args: Option<serde_json::Value>,
+    /// What each `dataset://` handle resolved to, captured at resolution time.
+    ///
+    /// `source_args` records which handle was asked for and `args` records the
+    /// path that came back; only this records **at which bytes**, which is the
+    /// part an audit actually needs — a path is not evidence. Resolution had
+    /// already re-hashed those bytes and refused on drift; without this the
+    /// proof was discarded at the moment of substitution. Empty for URI-free
+    /// runs and for markers written before this field existed.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::registry_args::ResolvedHandles::is_empty"
+    )]
+    resolved_handles: crate::registry_args::ResolvedHandles,
 }
 
 impl RecipeMarker {

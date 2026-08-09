@@ -6,13 +6,61 @@
 //! ordinary strings are byte-for-byte unchanged. Dataset handles become a
 //! hash-verified local path, model handles become their immutable checkpoint
 //! hash, and experiment handles become the tenant-scoped run id.
+//!
+//! # Why resolution is also REPORTED, not just applied
+//!
+//! Substituting `dataset://tusz@v2.0.6` with its path is what the typed arg
+//! needs, but the path is the least durable part of what was proved. To return
+//! it, [`crate::dataset_registry::resolve_uri`] first re-hashed the live bytes
+//! and refused on drift, checked tenancy, and enforced the clinical node-local
+//! rule. All of that evidence used to be dropped on the floor at the moment of
+//! substitution, so a persisted run recorded a bare path and nothing could
+//! later answer "which pinned dataset was that, and at what digest?".
+//!
+//! [`ResolvedHandles`] carries that evidence out alongside the rewritten args.
+//! The substitution itself is unchanged — a dataset handle still becomes a
+//! plain path string, so every existing typed arg keeps deserializing — which
+//! is why this is additive and [`resolve_recipe_args`] still exists with its
+//! original signature.
 
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 
 use crate::config::launcher::LaunchTarget;
+use crate::dataset_registry::DatasetResolution;
 use crate::error::{Result, TrainError};
 use crate::lineage_db::LineageDb;
 use crate::tenant::Tenant;
+
+/// Every registry handle the args resolved to, captured at resolution time.
+///
+/// Order is first-appearance in the recursive walk and duplicates are collapsed,
+/// so the same handle used twice in one arg set is recorded once and the record
+/// is deterministic for a given `raw` — it can be hashed or diffed across runs.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedHandles {
+    /// Dataset bindings, each carrying the digest that was re-verified.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub datasets: Vec<DatasetResolution>,
+}
+
+impl ResolvedHandles {
+    /// True when no registry handle appeared in the args at all.
+    pub fn is_empty(&self) -> bool {
+        self.datasets.is_empty()
+    }
+
+    /// Record a dataset binding, ignoring an exact repeat of one already held.
+    fn push_dataset(&mut self, resolved: DatasetResolution) {
+        if !self.datasets.iter().any(|held| {
+            held.tenant == resolved.tenant
+                && held.name == resolved.name
+                && held.version == resolved.version
+        }) {
+            self.datasets.push(resolved);
+        }
+    }
+}
 
 /// Production resolver. It opens only stores required by schemes actually
 /// present in `raw`; URI-free args remain a no-I/O identity operation.
@@ -21,21 +69,37 @@ pub fn resolve_recipe_args(
     tenant: &Tenant,
     launch_target: LaunchTarget,
 ) -> Result<serde_json::Value> {
+    resolve_recipe_args_reported(raw, tenant, launch_target).map(|(args, _)| args)
+}
+
+/// As [`resolve_recipe_args`], and also return what the handles resolved to.
+///
+/// Prefer this at any call site that persists a run: the args alone cannot say
+/// which pinned dataset produced a path, and the digest proved during
+/// resolution is exactly what makes the record auditable later.
+pub fn resolve_recipe_args_reported(
+    raw: serde_json::Value,
+    tenant: &Tenant,
+    launch_target: LaunchTarget,
+) -> Result<(serde_json::Value, ResolvedHandles)> {
     let needs = Needed::scan(&raw);
     if !needs.any() {
-        return Ok(raw);
+        return Ok((raw, ResolvedHandles::default()));
     }
     let datasets = needs.dataset.then(crate::datasets_db::open).transpose()?;
     let models = needs.model.then(crate::model_registry::open).transpose()?;
     let lineage = needs.experiment.then(LineageDb::open).transpose()?;
-    resolve_inner(
+    let mut handles = ResolvedHandles::default();
+    let args = resolve_inner(
         raw,
         tenant,
         launch_target,
         datasets.as_ref(),
         models.as_ref(),
         lineage.as_ref(),
-    )
+        &mut handles,
+    )?;
+    Ok((args, handles))
 }
 
 /// Injectable resolver for tests/embedders that already own their DB handles.
@@ -47,14 +111,30 @@ pub fn resolve_with(
     models: &Connection,
     lineage: &LineageDb,
 ) -> Result<serde_json::Value> {
-    resolve_inner(
+    resolve_with_reported(raw, tenant, launch_target, datasets, models, lineage)
+        .map(|(args, _)| args)
+}
+
+/// As [`resolve_with`], and also return what the handles resolved to.
+pub fn resolve_with_reported(
+    raw: serde_json::Value,
+    tenant: &Tenant,
+    launch_target: LaunchTarget,
+    datasets: &Connection,
+    models: &Connection,
+    lineage: &LineageDb,
+) -> Result<(serde_json::Value, ResolvedHandles)> {
+    let mut handles = ResolvedHandles::default();
+    let args = resolve_inner(
         raw,
         tenant,
         launch_target,
         Some(datasets),
         Some(models),
         Some(lineage),
-    )
+        &mut handles,
+    )?;
+    Ok((args, handles))
 }
 
 fn resolve_inner(
@@ -64,21 +144,46 @@ fn resolve_inner(
     datasets: Option<&Connection>,
     models: Option<&Connection>,
     lineage: Option<&LineageDb>,
+    handles: &mut ResolvedHandles,
 ) -> Result<serde_json::Value> {
     match raw {
-        serde_json::Value::String(value) => {
-            resolve_string(value, tenant, launch_target, datasets, models, lineage)
-        }
+        serde_json::Value::String(value) => resolve_string(
+            value,
+            tenant,
+            launch_target,
+            datasets,
+            models,
+            lineage,
+            handles,
+        ),
         serde_json::Value::Array(values) => values
             .into_iter()
-            .map(|value| resolve_inner(value, tenant, launch_target, datasets, models, lineage))
+            .map(|value| {
+                resolve_inner(
+                    value,
+                    tenant,
+                    launch_target,
+                    datasets,
+                    models,
+                    lineage,
+                    handles,
+                )
+            })
             .collect::<Result<Vec<_>>>()
             .map(serde_json::Value::Array),
         serde_json::Value::Object(values) => values
             .into_iter()
             .map(|(key, value)| {
-                resolve_inner(value, tenant, launch_target, datasets, models, lineage)
-                    .map(|resolved| (key, resolved))
+                resolve_inner(
+                    value,
+                    tenant,
+                    launch_target,
+                    datasets,
+                    models,
+                    lineage,
+                    handles,
+                )
+                .map(|resolved| (key, resolved))
             })
             .collect::<Result<serde_json::Map<_, _>>>()
             .map(serde_json::Value::Object),
@@ -86,6 +191,7 @@ fn resolve_inner(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_string(
     value: String,
     tenant: &Tenant,
@@ -93,6 +199,7 @@ fn resolve_string(
     datasets: Option<&Connection>,
     models: Option<&Connection>,
     lineage: Option<&LineageDb>,
+    handles: &mut ResolvedHandles,
 ) -> Result<serde_json::Value> {
     if value.starts_with("dataset://") {
         let conn = datasets.ok_or_else(|| TrainError::other("dataset registry unavailable"))?;
@@ -102,7 +209,9 @@ fn resolve_string(
                 "dataset path for {value} is not valid UTF-8 and cannot enter JSON recipe args"
             ))
         })?;
-        return Ok(serde_json::Value::String(path.to_string()));
+        let path = path.to_string();
+        handles.push_dataset(resolved);
+        return Ok(serde_json::Value::String(path));
     }
     if value.starts_with("model://") {
         let conn = models.ok_or_else(|| TrainError::other("model registry unavailable"))?;

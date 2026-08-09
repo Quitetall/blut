@@ -349,6 +349,101 @@ mod registry {
         );
     }
 
+    /// Resolution proves a digest; the substituted path cannot carry that proof.
+    ///
+    /// Before the reported form existed, a persisted run held only the path, so
+    /// nothing downstream could say which pinned dataset it came from or at what
+    /// bytes. These assertions are the contract that the evidence survives.
+    #[test]
+    fn resolution_reports_the_pinned_digest_the_substituted_path_cannot_carry() {
+        let td = tempfile::tempdir().unwrap();
+        let datasets = datasets_db::open_at(&td.path().join("datasets.db")).unwrap();
+        let source = add_dataset(
+            &datasets,
+            td.path(),
+            "corpus-source",
+            "{\"sample\":1}\n",
+            json!({"tenant":"research/dev"}),
+        );
+        let tenant = Tenant::parse("research/dev").unwrap();
+        let pinned = blut::dataset_registry::pin(
+            &datasets,
+            &source.name,
+            "dataset://corpus@v2.0.6",
+            &tenant,
+            1,
+        )
+        .unwrap();
+
+        let models = blut::model_registry::open_at(&td.path().join("models.db")).unwrap();
+        let lineage = LineageDb::open_at(td.path().join("lineage.db")).unwrap();
+
+        // The same handle twice, one of them nested, plus an ordinary string.
+        let (args, handles) = blut::registry_args::resolve_with_reported(
+            json!({
+                "train":"dataset://corpus@v2.0.6",
+                "plain":"not-a-uri",
+                "nested":{"val":"dataset://corpus@v2.0.6"}
+            }),
+            &tenant,
+            LaunchTarget::Local,
+            &datasets,
+            &models,
+            &lineage,
+        )
+        .unwrap();
+
+        // Substitution is unchanged, so every existing typed arg still parses.
+        assert_eq!(args["train"], json!(source.source_path));
+        assert_eq!(args["nested"]["val"], json!(source.source_path));
+        assert_eq!(args["plain"], "not-a-uri");
+
+        // ...and the evidence now escapes alongside it, collapsed to one entry.
+        assert_eq!(
+            handles.datasets.len(),
+            1,
+            "one handle used twice is one row"
+        );
+        let bound = &handles.datasets[0];
+        assert_eq!(bound.name, "corpus");
+        assert_eq!(bound.version, "v2.0.6");
+        assert_eq!(bound.tenant, "research/dev");
+        assert!(!bound.clinical);
+        assert_eq!(
+            bound.manifest_sha256, pinned.manifest_sha256,
+            "the reported digest must be the pinned one that was just re-verified"
+        );
+        assert_eq!(bound.manifest_sha256, source.sha256);
+
+        // URI-free args stay a no-op and report nothing.
+        let (untouched, none) = blut::registry_args::resolve_with_reported(
+            json!({"epochs": 3, "name": "plain"}),
+            &tenant,
+            LaunchTarget::Local,
+            &datasets,
+            &models,
+            &lineage,
+        )
+        .unwrap();
+        assert_eq!(untouched, json!({"epochs": 3, "name": "plain"}));
+        assert!(none.is_empty());
+
+        // Fail-closed: drifted source bytes refuse rather than follow the path.
+        std::fs::write(&source.source_path, "{\"sample\":2}\n").unwrap();
+        let drifted = blut::registry_args::resolve_with_reported(
+            json!({"train":"dataset://corpus@v2.0.6"}),
+            &tenant,
+            LaunchTarget::Local,
+            &datasets,
+            &models,
+            &lineage,
+        );
+        assert!(
+            drifted.is_err(),
+            "a pinned name must never silently follow changed bytes"
+        );
+    }
+
     #[tokio::test]
     async fn governance_gate_is_async_bounded_and_fail_closed() {
         use blut::model_registry::{GateCmd, GateVerdict};

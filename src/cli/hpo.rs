@@ -453,8 +453,12 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
         launcher.parse().map_err(|e| anyhow!("{e}"))?;
     let tenant = crate::tenant::Tenant::parse(&tenant)
         .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
-    let base_args = crate::registry_args::resolve_recipe_args(base_args, &tenant, launch_target)
-        .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
+    // Only the BASE args' handles are recorded on the marker. Per-dimension
+    // `Choice` values resolve below and vary per trial, so they belong to the
+    // trial rather than to the sweep-wide launch record.
+    let (base_args, resolved_handles) =
+        crate::registry_args::resolve_recipe_args_reported(base_args, &tenant, launch_target)
+            .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
     for (dimension, distribution) in &mut sp.dims {
         if let crate::hpo::Dist::Choice { choices } = distribution {
             for choice in choices {
@@ -788,6 +792,7 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
         name: name.to_string(),
         args: base_args.clone(),
         source_args: Some(source_args),
+        resolved_handles,
     }
     .write_to(&job_dir)?;
     crate::jobs::write_state(&job_id, JobState::Running)
