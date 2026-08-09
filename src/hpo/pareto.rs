@@ -185,6 +185,10 @@ impl ParetoReport {
 ///
 /// Points not dominating the reference contribute nothing (never a negative
 /// box). Returns `0.0` for an empty or non-2-D front.
+///
+/// The caller does NOT need to pre-filter to the Pareto front: `best_y` only
+/// ever decreases, so a dominated point's slab is already covered by the point
+/// dominating it and adds exactly zero. Passing the raw trial set is fine.
 pub fn hypervolume_2d(front: &[ParetoPoint], reference: [f64; 2], dirs: &[Direction]) -> f64 {
     if dirs.len() != 2 {
         return 0.0;
