@@ -104,11 +104,22 @@ Known v1 deviations (documented per Stage-0 acceptance; to be closed in Stage 3/
 
 ## 5. Resume key
 
-`resume_key = BLAKE3(canonical_config_hash ‖ data_digest ‖ contract_version)` where
-`data_digest` is the ABIR snapshot digest (LamQuant) or the dataset content hash (LLM
-cookbook), and `canonical_config_hash` is the config serialized with sorted keys and
-normalized numbers. The engine derives cache keys and resume admission from it; a trainer
-handed a checkpoint whose stored resume key mismatches MUST refuse to resume.
+Pinned composition (every implementation, the Rust engine included, must byte-match):
+
+```
+config_hash = blake3_hex( canonical_json(config) )
+resume_key  = blake3_hex( config_hash + 0x1F + data_digest + 0x1F + contract_version )
+```
+
+where `canonical_json` is EXACTLY Python's
+`json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)`
+(sorted keys, no whitespace, `\uXXXX`-escaped non-ASCII, shortest-round-trip float repr,
+NaN/Inf rejected; `1` and `1.0` canonicalize differently — configs are single-sourced and
+type-stable), 0x1F is the unit-separator byte, all pieces UTF-8, and `data_digest` is the
+ABIR snapshot digest (LamQuant) or the dataset content hash (LLM cookbook). The engine
+derives cache keys and resume admission from it; a trainer handed a checkpoint whose
+stored resume key mismatches MUST refuse to resume. Reference:
+`tritium.torch.contract.resume_key`.
 
 ## 6. RUN_MANIFEST
 
