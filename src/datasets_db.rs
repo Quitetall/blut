@@ -184,6 +184,40 @@ pub fn record_from_jsonl(
     kind: impl Into<String>,
     metadata: Option<String>,
 ) -> Result<DatasetRecord> {
+    let n_examples = if path.exists() {
+        count_jsonl_examples(path)?
+    } else {
+        // Let `record_from_file` produce the canonical not-found error rather
+        // than failing here with a different one for the same cause.
+        0
+    };
+    record_from_file(name, path, kind, n_examples, metadata)
+}
+
+/// Register a source that is NOT line-delimited JSON.
+///
+/// Two things separate this from [`record_from_jsonl`], and both matter for a
+/// source like a corpus manifest:
+///
+/// * **The count comes from the caller.** `count_jsonl_examples` parses every
+///   line, which for a manifest describing 70,841 archive entries would report
+///   `1` — technically the line count, and a meaningless answer. Only the caller
+///   knows what an "example" is for a given `kind`.
+/// * **Metadata is first-class.** `dataset_registry::classify_source` reads
+///   `metadata.clinical` and `metadata.tenant` to decide whether a source may
+///   enter a tenant at all. A registration path that cannot carry metadata
+///   cannot register a clinical source — which is most of a biosignal corpus
+///   library.
+///
+/// `metadata` is parsed here rather than at pin time so a malformed blob is
+/// refused by the command that wrote it, not by a later one that only read it.
+pub fn record_from_file(
+    name: impl Into<String>,
+    path: &Path,
+    kind: impl Into<String>,
+    n_examples: i64,
+    metadata: Option<String>,
+) -> Result<DatasetRecord> {
     let name = name.into();
     if !is_safe_dataset_name(&name) {
         return Err(TrainError::other(format!(
@@ -197,13 +231,33 @@ pub fn record_from_jsonl(
             path.display()
         )));
     }
+    if n_examples < 0 {
+        return Err(TrainError::other(format!(
+            "dataset '{name}' cannot have {n_examples} examples"
+        )));
+    }
+    if let Some(raw) = metadata.as_deref() {
+        match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(serde_json::Value::Object(_)) => {}
+            Ok(other) => {
+                return Err(TrainError::other(format!(
+                    "dataset '{name}' metadata must be a JSON object, got {other}"
+                )));
+            }
+            Err(e) => {
+                return Err(TrainError::other(format!(
+                    "dataset '{name}' metadata is not valid JSON: {e}"
+                )));
+            }
+        }
+    }
     Ok(DatasetRecord {
         id: uuid::Uuid::new_v4().to_string(),
         name,
         kind: kind.into(),
         source_path: path.to_path_buf(),
         sha256: compute_file_sha256(path)?,
-        n_examples: count_jsonl_examples(path)?,
+        n_examples,
         n_tokens: None,
         created_at: now_unix(),
         metadata,

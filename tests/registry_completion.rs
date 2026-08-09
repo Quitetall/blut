@@ -349,6 +349,102 @@ mod registry {
         );
     }
 
+    /// A biosignal corpus is clinical and is not line-delimited JSON.
+    ///
+    /// Both facts were unrepresentable through the registration path: the
+    /// example count came from parsing JSONL lines, and metadata was hardcoded
+    /// `None` — so `classify_source`, which reads `clinical`/`tenant` from
+    /// metadata, could never see a classification at all.
+    #[test]
+    fn a_clinical_non_jsonl_corpus_registers_pins_and_stays_node_local() {
+        let td = tempfile::tempdir().unwrap();
+        let conn = datasets_db::open_at(&td.path().join("datasets.db")).unwrap();
+        let clinical = Tenant::parse("clinical/corpora").unwrap();
+        let research = Tenant::parse("research/dev").unwrap();
+
+        // A corpus manifest: one canonical JSON line describing 70841 entries.
+        // Counting lines would report 1 — technically true, and meaningless.
+        let manifest = td.path().join("tueg.json");
+        std::fs::write(&manifest, "{\"corpus\":\"tueg\",\"entries\":70841}\n").unwrap();
+
+        let record = datasets_db::record_from_file(
+            "tueg-manifest",
+            &manifest,
+            "lamquant.corpus-manifest",
+            70841,
+            Some(json!({"clinical": true, "tenant": "clinical/corpora"}).to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            record.n_examples, 70841,
+            "the caller's count, not a line count"
+        );
+        datasets_db::add(&conn, &record).unwrap();
+
+        let pinned =
+            blut::dataset_registry::pin(&conn, &record.name, "dataset://tueg@v2.0.2", &clinical, 1)
+                .unwrap();
+        assert!(pinned.clinical, "a clinical source must pin as clinical");
+
+        // Restricted data resolves node-local only, and never off-tenant.
+        assert!(
+            blut::dataset_registry::resolve_uri(
+                &conn,
+                "dataset://tueg@v2.0.2",
+                &clinical,
+                LaunchTarget::Local,
+            )
+            .is_ok()
+        );
+        assert!(
+            blut::dataset_registry::resolve_uri(
+                &conn,
+                "dataset://tueg@v2.0.2",
+                &clinical,
+                LaunchTarget::Cloud,
+            )
+            .is_err(),
+            "clinical corpora must not resolve onto a remote launcher"
+        );
+
+        // A clinical source cannot be pinned into a non-Restricted tenant.
+        let leak = td.path().join("tusz.json");
+        std::fs::write(&leak, "{\"corpus\":\"tusz\"}\n").unwrap();
+        let leaky = datasets_db::record_from_file(
+            "tusz-manifest",
+            &leak,
+            "lamquant.corpus-manifest",
+            24429,
+            Some(json!({"clinical": true, "tenant": "clinical/corpora"}).to_string()),
+        )
+        .unwrap();
+        datasets_db::add(&conn, &leaky).unwrap();
+        assert!(
+            blut::dataset_registry::pin(&conn, &leaky.name, "dataset://tusz@v2", &research, 2)
+                .is_err(),
+            "a clinical corpus must not enter a non-Restricted tenant"
+        );
+
+        // Malformed metadata is refused by the command that writes it.
+        for bad in ["not json", "[1,2,3]", "\"a string\""] {
+            assert!(
+                datasets_db::record_from_file(
+                    "bad-meta",
+                    &manifest,
+                    "lamquant.corpus-manifest",
+                    1,
+                    Some(bad.to_string()),
+                )
+                .is_err(),
+                "metadata {bad:?} must be refused at registration, not at pin time"
+            );
+        }
+        assert!(
+            datasets_db::record_from_file("neg", &manifest, "k", -1, None).is_err(),
+            "a negative example count is not a count"
+        );
+    }
+
     /// Resolution proves a digest; the substituted path cannot carry that proof.
     ///
     /// Before the reported form existed, a persisted run held only the path, so

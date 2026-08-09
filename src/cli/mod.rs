@@ -596,15 +596,23 @@ enum ArtifactCommand {
 enum DataCommand {
     /// List registered datasets, newest first.
     List,
-    /// Register a JSONL file under a name.
+    /// Register a source file under a name.
     Add {
         /// Registry name (must match [A-Za-z0-9_.-]+).
         name: String,
-        /// Path to a JSONL file.
+        /// Path to the source file.
         path: PathBuf,
         /// Free-form kind tag stored in the record.
         #[arg(long, default_value = "jsonl")]
         kind: String,
+        /// Example count for a non-JSONL source. Omit to count JSONL lines.
+        #[arg(long)]
+        n_examples: Option<i64>,
+        /// JSON object stored on the record. `dataset_registry` reads
+        /// `clinical` and `tenant` from it to classify the source, so a
+        /// clinical corpus CANNOT be pinned without this.
+        #[arg(long)]
+        metadata: Option<String>,
     },
     /// Remove a registered dataset (deletes the registry row only,
     /// not the JSONL file on disk).
@@ -2354,8 +2362,17 @@ fn run_data(cmd: DataCommand) -> Result<()> {
                 );
             }
         }
-        DataCommand::Add { name, path, kind } => {
-            let rec = datasets_db::record_from_jsonl(&name, &path, &kind, None)?;
+        DataCommand::Add {
+            name,
+            path,
+            kind,
+            n_examples,
+            metadata,
+        } => {
+            let rec = match n_examples {
+                Some(count) => datasets_db::record_from_file(&name, &path, &kind, count, metadata)?,
+                None => datasets_db::record_from_jsonl(&name, &path, &kind, metadata)?,
+            };
             datasets_db::add(&conn, &rec)?;
             println!(
                 "registered '{name}' ({} examples, sha256={})",
