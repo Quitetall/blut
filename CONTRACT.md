@@ -137,6 +137,7 @@ repo, torch/numpy/CUDA versions, GPU + driver, seed, final checkpoint SHA-256.
 - `scripts/contract_lint.py` — validates a stream (`--stream`) or statically checks a
   trainer source (`--source`) for REQUIRED/RECOMMENDED conformance.
 
-The Rust engine's golden test parses the fixture stream with its `protocol.rs` reader
-(lands with the rehomed engine, ADR 0037 Stage 2 — the current in-tree parser predates the
-`heartbeat` kind and is superseded).
+The Rust engine's golden test (`tests/contract_golden.rs`) parses the fixture stream with
+the engine's own `protocol.rs` reader — all six kinds including `heartbeat`, prefix
+recognition for both `BLUT_*` channels, one-terminal-event ordering, and unknown-kind
+rejection.
