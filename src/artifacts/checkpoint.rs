@@ -48,7 +48,13 @@ pub struct GgufModel {
     pub content_hash: ContentHash,
     /// Registry entry name once `register_model` has run; `None`
     /// when the GGUF is in-flight.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// NO `skip_serializing_if` here: stage outputs cross the bincode
+    /// stage-cache sidecar, where a skipped field truncates the record and
+    /// the NEXT stage's input read fails with UnexpectedEof. Found by the
+    /// blut-lamu drafter DAG smoke (ADR 0037 Stage 3); the cookbook's
+    /// Some("") workaround is retired with this fix.
+    #[serde(default)]
     pub registered_as: Option<String>,
 }
 
@@ -68,6 +74,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gguf_model_none_field_survives_bincode() {
+        // Regression: the stage cache is bincode, and serde `skip_serializing_if`
+        // fields truncate bincode records (read back as UnexpectedEof).
+        let g = GgufModel {
+            path: PathBuf::from("/tmp/m.gguf"),
+            quant: "I2_S".into(),
+            content_hash: ContentHash::of_bytes(b"gguf"),
+            registered_as: None,
+        };
+        let bytes = bincode::serialize(&g).unwrap();
+        let back: GgufModel = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.registered_as, None);
+        assert_eq!(back.quant, g.quant);
+    }
+
+    #[test]
     fn hf_checkpoint_round_trips() {
         let h = HfCheckpoint {
             path: PathBuf::from("/tmp/ckpt"),
@@ -83,7 +105,10 @@ mod tests {
     }
 
     #[test]
-    fn gguf_model_skips_registered_as_when_none() {
+    fn gguf_model_serializes_registered_as_even_when_none() {
+        // Inverted from the original skip-asserting test: the field must
+        // ALWAYS serialize (as null in JSON) so the bincode stage-cache
+        // record stays fixed-shape — see the field's doc comment.
         let g = GgufModel {
             path: PathBuf::from("/tmp/m.gguf"),
             quant: "Q4_K_M".into(),
@@ -91,7 +116,7 @@ mod tests {
             registered_as: None,
         };
         let json = serde_json::to_string(&g).unwrap();
-        assert!(!json.contains("registered_as"));
+        assert!(json.contains("\"registered_as\":null"));
     }
 
     #[test]
