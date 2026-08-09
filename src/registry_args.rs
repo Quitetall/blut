@@ -50,7 +50,24 @@ impl ResolvedHandles {
         self.datasets.is_empty()
     }
 
-    /// Record a dataset binding, ignoring an exact repeat of one already held.
+    /// Fold another resolution's handles in, collapsing repeats.
+    ///
+    /// Used where one launch record must cover several independent resolution
+    /// passes — an HPO sweep resolves its base args and then each `Choice`
+    /// value separately, and every dataset any trial can reach belongs on the
+    /// sweep's record.
+    pub fn absorb(&mut self, other: Self) {
+        for resolved in other.datasets {
+            self.push_dataset(resolved);
+        }
+    }
+
+    /// Record a dataset binding, ignoring a repeat of one already held.
+    ///
+    /// The key is `(tenant, name, version)` — a `dataset://` URI resolves
+    /// identically every time within one walk, so a differing digest under the
+    /// same key cannot arise here; the narrower key just keeps the record one
+    /// row per distinct handle.
     fn push_dataset(&mut self, resolved: DatasetResolution) {
         if !self.datasets.iter().any(|held| {
             held.tenant == resolved.tenant
@@ -277,5 +294,56 @@ impl Needed {
 
     fn any(self) -> bool {
         self.dataset || self.model || self.experiment
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resolution(name: &str, version: &str) -> DatasetResolution {
+        DatasetResolution {
+            tenant: "research/dev".into(),
+            name: name.into(),
+            version: version.into(),
+            dataset_id: format!("id-{name}-{version}"),
+            source_name: format!("{name}-source"),
+            source_path: std::path::PathBuf::from(format!("/data/{name}.lma")),
+            manifest_sha256: "a".repeat(64),
+            kind: "dataset.lma".into(),
+            clinical: false,
+            pinned_at: 1,
+        }
+    }
+
+    /// An HPO sweep resolves base args and each `Choice` in separate passes;
+    /// the marker must end up with every distinct handle exactly once.
+    #[test]
+    fn absorb_unions_across_passes_and_collapses_repeats() {
+        let mut base = ResolvedHandles::default();
+        base.push_dataset(resolution("tusz", "v2.0.6"));
+
+        let mut choice_a = ResolvedHandles::default();
+        choice_a.push_dataset(resolution("tuev", "v2.0.1"));
+        // A second dimension reusing the base handle must not duplicate it.
+        choice_a.push_dataset(resolution("tusz", "v2.0.6"));
+
+        base.absorb(choice_a);
+
+        let named: Vec<_> = base.datasets.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(named, vec!["tusz", "tuev"], "union, first-appearance order");
+
+        // Absorbing nothing changes nothing; absorbing a repeat is idempotent.
+        let before = base.clone();
+        base.absorb(ResolvedHandles::default());
+        let mut repeat = ResolvedHandles::default();
+        repeat.push_dataset(resolution("tuev", "v2.0.1"));
+        base.absorb(repeat);
+        assert_eq!(base, before);
+    }
+
+    #[test]
+    fn default_handles_are_empty() {
+        assert!(ResolvedHandles::default().is_empty());
     }
 }

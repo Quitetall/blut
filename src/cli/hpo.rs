@@ -453,16 +453,18 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
         launcher.parse().map_err(|e| anyhow!("{e}"))?;
     let tenant = crate::tenant::Tenant::parse(&tenant)
         .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
-    // Only the BASE args' handles are recorded on the marker. Per-dimension
-    // `Choice` values resolve below and vary per trial, so they belong to the
-    // trial rather than to the sweep-wide launch record.
-    let (base_args, resolved_handles) =
+    // The marker records the UNION of every dataset any trial can reach: the
+    // base args, plus each per-dimension `Choice`. A `Choice` may itself be a
+    // `dataset://` handle, and it is substituted into the args a trial actually
+    // runs — so recording only the base would leave those trials' data
+    // unattributable, which is the exact hole this reporting exists to close.
+    let (base_args, mut resolved_handles) =
         crate::registry_args::resolve_recipe_args_reported(base_args, &tenant, launch_target)
             .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
     for (dimension, distribution) in &mut sp.dims {
         if let crate::hpo::Dist::Choice { choices } = distribution {
             for choice in choices {
-                *choice = crate::registry_args::resolve_recipe_args(
+                let (resolved, handles) = crate::registry_args::resolve_recipe_args_reported(
                     std::mem::take(choice),
                     &tenant,
                     launch_target,
@@ -470,6 +472,8 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
                 .map_err(|e| {
                     anyhow!("registry arg resolution for HPO dimension '{dimension}': {e}")
                 })?;
+                *choice = resolved;
+                resolved_handles.absorb(handles);
             }
         }
     }
