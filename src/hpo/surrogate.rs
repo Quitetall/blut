@@ -215,14 +215,29 @@ impl MvTpeSampler {
         }
         let mut total = acc;
 
+        // A dim absent from either overlay falls back to that dim's PRIOR
+        // factor. Skipping it instead (multiplying by 1.0) would score the
+        // missing dimension as a perfect match, so an incomplete overlay would
+        // look more like every observation than a complete one does.
+        let prior_factor = |dist: &Dist| -> f64 {
+            match dist {
+                Dist::Choice { choices } => 1.0 / choices.len().max(1) as f64,
+                _ => {
+                    let (lo, hi) = support_t(dist).unwrap_or((0.0, 1.0));
+                    1.0 / (hi - lo).abs().max(1e-12)
+                }
+            }
+        };
+
         for o in obs {
             let mut k = 1.0_f64;
             for (name, dist) in &space.dims {
                 let (Some(cv), Some(ov)) = (value_of(cand, name), value_of(&o.overlay, name))
                 else {
+                    k *= prior_factor(dist);
                     continue;
                 };
-                k *= match dist {
+                let factor = match dist {
                     Dist::Choice { choices } => {
                         // Laplace-smoothed match/mismatch, so an unobserved
                         // category keeps non-zero mass.
@@ -236,12 +251,15 @@ impl MvTpeSampler {
                     _ => {
                         let (lo, hi) = support_t(dist).unwrap_or((0.0, 1.0));
                         let bw = ((hi - lo) * self.cfg.bw_factor).abs().max(1e-9);
-                        let (Some(c), Some(m)) = (cv.as_f64(), ov.as_f64()) else {
-                            continue;
-                        };
-                        gaussian(to_t(dist, c), to_t(dist, m), bw)
+                        match (cv.as_f64(), ov.as_f64()) {
+                            (Some(c), Some(m)) => gaussian(to_t(dist, c), to_t(dist, m), bw),
+                            // A non-numeric value where a number was declared
+                            // is as uninformative as an absent one.
+                            _ => prior_factor(dist),
+                        }
                     }
                 };
+                k *= factor;
             }
             total += k;
         }
@@ -358,7 +376,13 @@ impl CostModel {
             let mut d2 = 0.0;
             for (name, dist) in &space.dims {
                 let get = |ov: &Overlay| ov.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+                // A dim present in one overlay and absent from the other is a
+                // full unit of distance, NOT a skip. Skipping let a candidate
+                // that simply omits a dimension read as distance 0 from an
+                // observation, hitting the exact-match fast path and returning
+                // that observation's cost verbatim.
                 let (Some(a), Some(b)) = (get(cand), get(&o.overlay)) else {
+                    d2 += 1.0;
                     continue;
                 };
                 match dist {
@@ -801,6 +825,90 @@ mod tests {
             let p = m.predict(&sp, &vec![("a".into(), json!(v)), ("c".into(), json!("q"))]);
             assert!(p.is_finite() && p > 0.0, "bad prediction {p} at {v}");
         }
+    }
+
+    #[test]
+    fn a_dim_missing_from_the_candidate_is_distance_not_a_free_match() {
+        // Regression: skipping an absent dim made it read as distance 0, so a
+        // candidate that merely OMITTED a dimension hit the exact-match fast
+        // path and was handed that observation's cost verbatim.
+        let sp = space_of(vec![
+            (
+                "a",
+                Dist::Uniform {
+                    low: 0.0,
+                    high: 1.0,
+                },
+            ),
+            (
+                "b",
+                Dist::Uniform {
+                    low: 0.0,
+                    high: 1.0,
+                },
+            ),
+        ]);
+        let m = CostModel::fit(vec![
+            CostObservation {
+                overlay: vec![("a".into(), json!(0.0)), ("b".into(), json!(0.0))],
+                cost: 10.0,
+            },
+            CostObservation {
+                overlay: vec![("a".into(), json!(1.0)), ("b".into(), json!(1.0))],
+                cost: 90.0,
+            },
+        ]);
+        let exact = m.predict(
+            &sp,
+            &vec![("a".into(), json!(0.0)), ("b".into(), json!(0.0))],
+        );
+        assert_eq!(exact, 10.0, "a true exact match still returns its cost");
+        let partial = m.predict(&sp, &vec![("a".into(), json!(0.0))]); // 'b' absent
+        assert_ne!(
+            partial, exact,
+            "an incomplete overlay must not read as exact"
+        );
+        assert!(
+            partial > 10.0 && partial < 90.0,
+            "should interpolate, got {partial}"
+        );
+    }
+
+    #[test]
+    fn a_missing_dim_does_not_make_a_candidate_look_universally_good() {
+        // Same class on the density side: an absent dim used to multiply the
+        // kernel by 1.0 — a perfect match — so an incomplete overlay scored
+        // higher against EVERY observation than a complete one could.
+        let sp = space_of(vec![
+            (
+                "x",
+                Dist::Uniform {
+                    low: 0.0,
+                    high: 1.0,
+                },
+            ),
+            (
+                "y",
+                Dist::Uniform {
+                    low: 0.0,
+                    high: 1.0,
+                },
+            ),
+        ]);
+        let s = MvTpeSampler::new(MvTpeConfig::default(), 5);
+        let obs = [tr(vec![("x", json!(0.5)), ("y", json!(0.5))], 1.0)];
+        let refs: Vec<&TrialResult> = obs.iter().collect();
+        let complete = s.joint_density(
+            &sp,
+            &vec![("x".into(), json!(0.5)), ("y".into(), json!(0.5))],
+            &refs,
+        );
+        let partial = s.joint_density(&sp, &vec![("x".into(), json!(0.5))], &refs);
+        assert!(
+            complete > partial,
+            "an exact complete match must outscore an incomplete overlay: {complete} !> {partial}"
+        );
+        assert!(partial.is_finite() && partial > 0.0);
     }
 
     #[test]
