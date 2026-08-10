@@ -116,7 +116,7 @@ only). No TNN training recipe. No full-pipeline recipe.
 > `LamQuant-Neural/ai_models/dataset_sim/precompute_fullband.py`. The script
 > *path-resolution* break (wrong `lamquant_home` root) is real; the
 > scripts-deleted claim is not. `pccp_gate.py` and the `lml` binary and the
-> `/mnt/4tb/data/Training/lma` corpus all verified present.
+> `/mnt/4tb/data/derived/lma` corpus all verified present.
 
 ### 2.3 TUI cockpit (`src/tui/mod.rs` 967 lines + `system.rs`)
 **State: launches single recipes; monitoring & queue & custom-data UI INCOMPLETE.**
@@ -193,7 +193,7 @@ which themselves didn't run (cli_smoke abort).
 | TUI-03 | high | tui | No custom-training-data UI (no dataset picker — U3/U5) | `tui/mod.rs:553-560`; `datasets_db.rs:291` unused | Implement U3 dataset picker fed by `datasets_db::list()`; U5 validate kind vs `input_kinds`. |
 | RCP-4 | high | recipes | SNN-label generation un-recipe'd (script exists but no stage chained) | `lamquant_generate_snn_labels.rs:73`; not in `RECIPES` | Chain `lamquant_generate_snn_labels` into a data-prep pipeline recipe; fix path root (RCP-1). |
 | RCP-5 | high | recipes | `lamquant_data_prep` is a 1-node stub (convert only; no labels/split) | `lamquant_data_prep.rs:7-12` | Add build_manifest + generate_labels + split bridges (needs fork/tuple wiring); rename so it isn't advertised as "full setup". |
-| RCP-6 | high | recipes | `convert_lma` labels-dir default points at dead monorepo path (3 inconsistent label paths) | `lamquant_convert_lma.rs:142-143`; `bulk_lml_to_lma.py:66` | Default to `/mnt/4tb/data/Training/labels`; unify across stage + script. |
+| RCP-6 | high | recipes | `convert_lma` labels-dir default points at dead monorepo path (3 inconsistent label paths) | `lamquant_convert_lma.rs:142-143`; `bulk_lml_to_lma.py:66` | Default to `/mnt/4tb/data/derived/labels`; unify across stage + script. |
 | MONITOR-2 | medium | orchestration | Liveness inferred from on-disk state only; crashed job shows Running forever | `jobs.rs:77-88,199-201` | Reconcile JobState vs `pid_alive` on `jobs`/refresh; mark dead-pid Running jobs as Failed. |
 | QUEUE-2 | medium | orchestration | `await_unlock`→`acquire_exclusive` TOCTOU race; thundering-herd `--allow-evict` waiters | `scheduler_lock.rs:199-214,235-250`; `main.rs:1145-1155` | Single atomic acquire-or-wait; add jitter/backoff or replace with the FIFO queue. |
 | FW-6 | medium | framework | GPU-holding stages do multi-GB `hash_dir` while holding the GPU permit | `executor.rs:357,400-415`; `sft_train.rs:147` | Drop permits before hashing/insert; or use stat-fingerprint for large GPU outputs. |
@@ -338,7 +338,7 @@ covered in isolation but not at the integration seam that actually breaks.
 | Multi-root resolution (scripts/ + ai_models/ under one home) | assert both resolve | **[ZERO]** (RCP-7) |
 | Split-manifest generation | no stage exists | **[ZERO]** (RCP-3) |
 | Labels generation wrapping | no recipe; script exists | **[ZERO]** (RCP-4) |
-| `convert_lma` idempotent-skip on live corpus | point at `/mnt/4tb/data/Training/lma`, assert LmaCorpus emitted | **[ZERO]** (RCP-2) |
+| `convert_lma` idempotent-skip on live corpus | point at `/mnt/4tb/data/derived/lma`, assert LmaCorpus emitted | **[ZERO]** (RCP-2) |
 | PCCP gate vs real registry location | run gate w/ real `pccp/registry.yaml` vs script in submodule | **[ZERO]** (RCP-9) |
 | Fork→merge E2E through executor | run a forked plan, assert tuple payload order + input_hash | **[ZERO]** (FW-10; plan test only checks counts) |
 | Recipe failure (non-zero subprocess exit) | assert StageError + JobState::Failed | **[unit-only]** |
@@ -422,7 +422,7 @@ covered in isolation but not at the integration seam that actually breaks.
 **Phase 2 — make the LamQuant pipeline runnable:**
 8. **RCP-1 + RCP-7** — multi-root path resolution (`scripts_root` +
    `ai_models_root`, env-overridable). *Prereq for every other recipe fix.*
-9. **RCP-6** — unify the labels-dir default to `/mnt/4tb/data/Training/labels`.
+9. **RCP-6** — unify the labels-dir default to `/mnt/4tb/data/derived/labels`.
 10. **RCP-2** — add `lamquant_encode_lma` stage (`lml encode` EDF→.lma).
 11. **RCP-4** — chain `generate_snn_labels` stage.
 12. **RCP-3** — add `build_split_manifest` stage.
