@@ -36,7 +36,10 @@ fn golden_stream_parses_end_to_end() {
     }
 
     assert_eq!(announce_lines, 1, "exactly one announcement line");
-    assert!(metric_lines >= 1, "the golden stream exercises the metric channel");
+    assert!(
+        metric_lines >= 1,
+        "the golden stream exercises the metric channel"
+    );
 
     // Exactly one terminal event, and it is the last control line.
     let terminal_positions: Vec<usize> = control
@@ -54,7 +57,10 @@ fn golden_stream_parses_end_to_end() {
     for u in &control {
         match u {
             StatusUpdate::Step { step, total, .. } => {
-                assert!(*step >= 1 && *step <= *total, "step is 1-indexed and bounded");
+                assert!(
+                    *step >= 1 && *step <= *total,
+                    "step is 1-indexed and bounded"
+                );
                 saw[0] = true;
             }
             StatusUpdate::Eval { .. } => saw[1] = true,
@@ -64,11 +70,17 @@ fn golden_stream_parses_end_to_end() {
             StatusUpdate::Failed { .. } => {}
         }
     }
-    assert!(saw.iter().all(|s| *s), "golden stream covers step/eval/saved/done/heartbeat");
+    assert!(
+        saw.iter().all(|s| *s),
+        "golden stream covers step/eval/saved/done/heartbeat"
+    );
 }
 
 #[test]
 fn unknown_kind_is_rejected() {
     let err = serde_json::from_str::<StatusUpdate>("{\"kind\":\"telemetry\",\"x\":1}");
-    assert!(err.is_err(), "unknown kinds must be protocol errors (CONTRACT.md §1)");
+    assert!(
+        err.is_err(),
+        "unknown kinds must be protocol errors (CONTRACT.md §1)"
+    );
 }
