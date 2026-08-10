@@ -272,6 +272,41 @@ mod tests {
         assert_eq!(non_dominated(&pts, &d), vec![1]);
     }
 
+    /// The `pareto.json` wire shape is consumed OUTSIDE this crate — the meta
+    /// repo's `tools/check_pareto.py` (ADR 0109's gate) parses it, and
+    /// `tests/fixtures/pareto_multiobj.json` there is verbatim output of this
+    /// type. Python cannot fail this crate's build, so a field rename here
+    /// would silently break that validator at gate time instead of at compile
+    /// time. This pins the exact serialization; if it fails, regenerate the
+    /// meta fixture from this output rather than loosening the assert.
+    #[test]
+    fn pareto_json_wire_shape_is_pinned_for_the_external_validator() {
+        let dirs = vec![Minimize, Maximize];
+        let pts = vec![
+            ParetoPoint {
+                trial_id: 2,
+                objectives: vec![0.27, 9.8],
+                cost: Some(1450.0),
+            },
+            ParetoPoint {
+                trial_id: 5,
+                objectives: vec![f64::NAN, 20.0],
+                cost: None,
+            },
+        ];
+        let r = ParetoReport::build(vec!["prd".into(), "compression_ratio".into()], dirs, &pts);
+        let json = serde_json::to_string(&r).unwrap();
+        assert_eq!(
+            json,
+            r#"{"objectives":["prd","compression_ratio"],"directions":["minimize","maximize"],"front":[{"trial_id":2,"objectives":[0.27,9.8],"cost":1450.0}],"unmeasured_trials":[5]}"#,
+            "pareto.json wire shape changed — update tools/check_pareto.py and \
+             tests/fixtures/pareto_multiobj.json in the meta repo together"
+        );
+        // `cost` is omitted entirely when absent, not emitted as null: the
+        // validator treats a present-but-null cost as a malformed point.
+        assert!(!json.contains("null"));
+    }
+
     #[test]
     fn front_keeps_every_trade_off_and_drops_the_dominated() {
         let d = [Minimize, Minimize];
