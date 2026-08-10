@@ -83,7 +83,7 @@ impl TpeSampler {
 }
 
 /// Standard normal pdf at `z = (x-μ)/σ`, scaled by `1/σ`.
-fn gaussian(x: f64, mu: f64, sigma: f64) -> f64 {
+pub(super) fn gaussian(x: f64, mu: f64, sigma: f64) -> f64 {
     let s = sigma.max(1e-12);
     let z = (x - mu) / s;
     (-0.5 * z * z).exp() / (s * (2.0 * std::f64::consts::PI).sqrt())
@@ -91,7 +91,7 @@ fn gaussian(x: f64, mu: f64, sigma: f64) -> f64 {
 
 /// A continuous dim's support in t-space (log for `log_uniform`), straight from
 /// the `Dist` — independent of any data point. `None` for categoricals.
-fn support_t(dist: &Dist) -> Option<(f64, f64)> {
+pub(super) fn support_t(dist: &Dist) -> Option<(f64, f64)> {
     match dist {
         Dist::Uniform { low, high } | Dist::QUniform { low, high, .. } => Some((*low, *high)),
         Dist::LogUniform { low, high } => Some((low.ln(), high.ln())),
@@ -102,7 +102,7 @@ fn support_t(dist: &Dist) -> Option<(f64, f64)> {
 
 /// Forward transform of a value into t-space (log for `log_uniform`, else
 /// identity).
-fn to_t(dist: &Dist, v: f64) -> f64 {
+pub(super) fn to_t(dist: &Dist, v: f64) -> f64 {
     match dist {
         Dist::LogUniform { .. } => v.max(f64::MIN_POSITIVE).ln(),
         _ => v,
@@ -110,7 +110,7 @@ fn to_t(dist: &Dist, v: f64) -> f64 {
 }
 
 /// Inverse transform: t-space value → a JSON value honoring the dim's type.
-fn from_t(dist: &Dist, t: f64) -> Value {
+pub(super) fn from_t(dist: &Dist, t: f64) -> Value {
     let num = |x: f64| {
         serde_json::Number::from_f64(x)
             .map(Value::Number)

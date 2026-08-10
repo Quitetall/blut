@@ -24,6 +24,7 @@ pub mod results;
 pub mod sampler;
 pub mod scheduler;
 pub mod space;
+pub mod surrogate;
 pub mod tpe;
 
 pub use asha::AshaStop;
@@ -37,4 +38,7 @@ pub use results::{HpoManifest, TrialOutcome, TrialRec, leaderboard};
 pub use sampler::{RandomSampler, Sampler};
 pub use scheduler::{EarlyStop, HpoScheduler, build_trial_of_topo};
 pub use space::{Dist, Overlay, SearchSpace, TrialResult, apply_overlay};
+pub use surrogate::{
+    CostModel, CostObservation, GridSampler, MvTpeConfig, MvTpeSampler, acq_per_cost,
+};
 pub use tpe::{FreshFactory, TpeConfig, TpePolicy, TpePolicyConfig, TpeSampler};
