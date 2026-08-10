@@ -1,0 +1,27 @@
+# Test obligations this repository satisfies, and how.
+#
+# The meta-repository declares WHAT must be true (tests/contracts/test-taxonomy.toml,
+# `obligations` per owner). This file declares HOW this repository proves it. The
+# validator (`tools/owner_contracts.py`) runs these commands here and observes the
+# result; it never learns this repository's test layout, so reorganising tests is
+# a local change that breaks nothing upstream.
+#
+# ADR 0092 invariant 5: owner-local tests exercise implementation; the meta
+# exercises public interfaces. This file is the seam between those two.
+
+schema_version = 1
+owner = "blut-engine"
+
+[obligation.owner-tests]
+description = """
+The BLUT engine workspace: DAG orchestration, scheduler, broker, samplers,
+cache, governance and the P2P mesh.
+"""
+argv = ["cargo", "test", "--workspace", "--no-fail-fast"]
+timeout_seconds = 1800
+
+# RATCHET, not a waiver. Measured 2026-08-10: 1046 passed, 0 failed.
+#
+# Declared at 0 because 0 is what was measured. A ceiling above a green suite is
+# permission to regress, and the ratchet only means something when it is tight.
+max_failures = 0
