@@ -148,7 +148,6 @@ dependencies = [
  "axum",
  "blut-types",
  "clap",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",
