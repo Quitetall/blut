@@ -4254,6 +4254,130 @@ async fn composite_spawns_when_finite() {
     );
 }
 
+// ── A08 local lifecycle and wall-clock deadline ─────────────────────
+
+struct DeadlineHang;
+
+#[async_trait]
+impl Stage for DeadlineHang {
+    const NAME: &'static str = "deadline_hang";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    type Input = ();
+    type Output = Counter;
+    type Args = EmptyArgs;
+
+    async fn run(
+        &self,
+        _ctx: &StageContext,
+        _input: (),
+        _args: &EmptyArgs,
+    ) -> Result<Counter, StageError> {
+        std::future::pending().await
+    }
+}
+
+impl Compatible<LamuTrainerBackend> for DeadlineHang {}
+
+static DEADLINE_QUEUED_RUNS: AtomicU32 = AtomicU32::new(0);
+
+struct DeadlineQueued;
+
+#[async_trait]
+impl Stage for DeadlineQueued {
+    const NAME: &'static str = "deadline_queued";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    type Input = ();
+    type Output = Counter;
+    type Args = EmptyArgs;
+
+    async fn run(
+        &self,
+        _ctx: &StageContext,
+        _input: (),
+        _args: &EmptyArgs,
+    ) -> Result<Counter, StageError> {
+        DEADLINE_QUEUED_RUNS.fetch_add(1, Ordering::SeqCst);
+        Ok(Counter { n: 1 })
+    }
+}
+
+impl Compatible<LamuTrainerBackend> for DeadlineQueued {}
+
+#[tokio::test]
+async fn plan_deadline_interrupts_in_flight_local_stage_in_both_executors() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    for parallel in [false, true] {
+        let (_td, base) = fresh_ctx();
+        let ctx = base.with_deadline(std::time::Duration::from_millis(20));
+        let plan = Plan::<(), LamuTrainerBackend>::new("deadline", serde_json::json!({}))
+            .start(DeadlineHang, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            if parallel {
+                ParallelExecutor::execute(plan, ctx).await
+            } else {
+                SequentialExecutor::execute(plan, ctx).await
+            }
+        })
+        .await
+        .expect("plan deadline must bound a non-cooperative local stage");
+        assert!(
+            matches!(result, Err(PlanError::DeadlineExceeded { .. })),
+            "parallel={parallel}: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn plan_deadline_interrupts_local_resource_queue_before_stage_runs() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    DEADLINE_QUEUED_RUNS.store(0, Ordering::SeqCst);
+    let (_td, base) = fresh_ctx();
+    let base = base.with_resource_limit(Resource::Cpu, 1);
+    let cpu = base.resources.get(&Resource::Cpu).unwrap().clone();
+    let held = cpu.acquire_owned().await.unwrap();
+    let ctx = base.with_deadline(std::time::Duration::from_millis(20));
+    let plan = Plan::<(), LamuTrainerBackend>::new("deadline_queue", serde_json::json!({}))
+        .start(DeadlineQueued, EmptyArgs)
+        .finish()
+        .into_compiled();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        ParallelExecutor::execute(plan, ctx),
+    )
+    .await
+    .expect("resource queue must observe the plan deadline");
+    drop(held);
+    assert!(matches!(result, Err(PlanError::DeadlineExceeded { .. })));
+    assert_eq!(DEADLINE_QUEUED_RUNS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn local_attempt_drop_latches_one_fail_closed_terminal() {
+    let attempt = LocalExecutionAttempt::queued(1);
+    attempt.start();
+    let lifecycle = attempt.lifecycle.clone();
+    drop(attempt);
+    let snapshot = lifecycle.snapshot();
+    assert!(matches!(
+        snapshot.terminal,
+        Some(ExecutionTerminal::Failed { .. })
+    ));
+    assert!(matches!(
+        lifecycle.finish(
+            snapshot.assignment.as_ref(),
+            ExecutionTerminal::Cancelled {
+                reason: "late".into()
+            }
+        ),
+        Err(crate::framework::execution::LifecycleError::AlreadyTerminal)
+    ));
+}
+
 // ── P2P dispatch (audit findings 1 & 2) ─────────────────────────────
 //
 // Pre-fix, a P2P-dispatched node's completion poll loop was a detached

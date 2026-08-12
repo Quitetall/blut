@@ -54,11 +54,14 @@ use crate::framework::artifact_store::{
 use crate::framework::cache::{CacheHandle, CacheHit};
 use crate::framework::control::{Control, ControlPolicy, StepMetrics};
 use crate::framework::error::{PlanError, StageError};
+use crate::framework::execution::{
+    Assignment, ExecutionArtifact, ExecutionFailure, ExecutionFailureKind, ExecutionLifecycle,
+    ExecutionMode, ExecutionPhase, ExecutionTerminal,
+};
 #[cfg(feature = "p2p")]
 use crate::framework::execution::{
     DEFAULT_REMOTE_TIMEOUT, DataClassification, EXECUTION_PROTOCOL_VERSION, ExecutionAdapter,
-    ExecutionDeadline, ExecutionFailureKind, ExecutionRequest, ExecutionResources, ExecutionResult,
-    drive_execution,
+    ExecutionDeadline, ExecutionRequest, ExecutionResources, ExecutionResult, drive_execution,
 };
 use crate::framework::plan::{CompiledPlan, NodeId};
 use crate::framework::resource::Resource;
@@ -1293,6 +1296,8 @@ enum NodeFailure {
     /// The plan token fired (before or during the stage). Output, if
     /// any, was discarded; nothing was cached.
     Cancelled,
+    /// Plan-wide wall-clock budget elapsed while node queued or running.
+    DeadlineExceeded,
     /// This node's OWN token fired while the plan token did NOT (#4): a
     /// targeted KILL-on-NaN, not a plan-wide cancel. The coordinator prunes
     /// this node's descendants and continues other branches — it is NOT a
@@ -1325,6 +1330,96 @@ enum NodeFailure {
         source: std::io::Error,
         cause: String,
     },
+}
+
+/// Local work records assignment and exactly one terminal result through the
+/// same A08 lifecycle used by remote adapters.
+struct LocalExecutionAttempt {
+    lifecycle: ExecutionLifecycle,
+    assignment: Assignment,
+}
+
+impl LocalExecutionAttempt {
+    fn queued(attempt: u32) -> Self {
+        let lifecycle = ExecutionLifecycle::new(ExecutionMode::Local);
+        let assignment = Assignment::new("local", u64::from(attempt));
+        lifecycle
+            .transition(ExecutionPhase::Queued, None)
+            .expect("fresh local lifecycle can queue");
+        Self {
+            lifecycle,
+            assignment,
+        }
+    }
+
+    fn start(&self) {
+        self.lifecycle
+            .transition(ExecutionPhase::Assigned, Some(self.assignment.clone()))
+            .expect("queued local lifecycle accepts assignment");
+        self.lifecycle
+            .transition(ExecutionPhase::Running, None)
+            .expect("assigned local lifecycle can run");
+    }
+
+    fn succeed(&self, content_id: ContentId, elapsed: std::time::Duration) {
+        let _ = self.lifecycle.finish(
+            Some(&self.assignment),
+            ExecutionTerminal::Succeeded {
+                artifact: ExecutionArtifact {
+                    content_id,
+                    stored: None,
+                },
+                wall_time_ms: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+            },
+        );
+    }
+
+    fn fail(&self, stage_name: &str, error: &StageError) {
+        let terminal = if matches!(error, StageError::Cancelled) {
+            ExecutionTerminal::Cancelled {
+                reason: "local stage cancelled".into(),
+            }
+        } else {
+            ExecutionTerminal::Failed {
+                failure: ExecutionFailure::from_stage_error(stage_name, error),
+            }
+        };
+        let _ = self.lifecycle.finish(Some(&self.assignment), terminal);
+    }
+
+    fn timeout(&self) {
+        let phase = self.lifecycle.snapshot().phase;
+        let deadline_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let _ = self.lifecycle.finish(
+            None,
+            ExecutionTerminal::TimedOut {
+                phase,
+                deadline_unix_ms,
+            },
+        );
+    }
+}
+
+impl Drop for LocalExecutionAttempt {
+    fn drop(&mut self) {
+        if self.lifecycle.snapshot().terminal.is_none() {
+            let _ = self.lifecycle.finish(
+                Some(&self.assignment),
+                ExecutionTerminal::Failed {
+                    failure: ExecutionFailure::new(
+                        ExecutionFailureKind::Unknown,
+                        "EXECUTION_ABANDONED",
+                        "local attempt exited before recording a terminal outcome",
+                    ),
+                },
+            );
+        }
+    }
 }
 
 /// Classify a cancel observed inside `run_node`: a targeted KILL (this
@@ -2057,9 +2152,13 @@ async fn acquire_admission(
                     stage_name: stage_name.to_string(),
                     resource,
                 });
-                sem.clone().acquire_owned().await.map_err(|_| {
-                    NodeFailure::Other(format!("resource '{resource}' semaphore closed"))
-                })?
+                tokio::select! {
+                    permit = sem.clone().acquire_owned() => permit.map_err(|_| {
+                        NodeFailure::Other(format!("resource '{resource}' semaphore closed"))
+                    })?,
+                    _ = env.cancel.cancelled() => return Err(NodeFailure::Cancelled),
+                    _ = sleep_until_opt(env.deadline) => return Err(NodeFailure::DeadlineExceeded),
+                }
             }
         };
         permits.push(permit);
@@ -2074,10 +2173,12 @@ async fn acquire_admission(
                     stage_name: stage_name.to_string(),
                     resource: Resource::Gpu,
                 });
-                env.gpu
-                    .acquire(request)
-                    .await
-                    .map_err(|error| NodeFailure::Other(format!("GPU admission: {error}")))?
+                tokio::select! {
+                    grant = env.gpu.acquire(request) => grant
+                        .map_err(|error| NodeFailure::Other(format!("GPU admission: {error}")))?,
+                    _ = env.cancel.cancelled() => return Err(NodeFailure::Cancelled),
+                    _ = sleep_until_opt(env.deadline) => return Err(NodeFailure::DeadlineExceeded),
+                }
             }
         };
         Some(grant)
@@ -2086,13 +2187,12 @@ async fn acquire_admission(
     };
 
     let memory = if request.memory_gib > 0 {
-        Some(
-            env.memory
-                .clone()
-                .acquire_many_owned(request.memory_gib)
-                .await
+        Some(tokio::select! {
+            permit = env.memory.clone().acquire_many_owned(request.memory_gib) => permit
                 .map_err(|_| NodeFailure::Other("memory semaphore closed".into()))?,
-        )
+            _ = env.cancel.cancelled() => return Err(NodeFailure::Cancelled),
+            _ = sleep_until_opt(env.deadline) => return Err(NodeFailure::DeadlineExceeded),
+        })
     } else {
         None
     };
@@ -2302,8 +2402,20 @@ async fn run_node_with_admission(
     let mut attempt = 0u32;
     #[cfg(feature = "p2p")]
     let mut remote_enabled = true;
-    let (stage_output, run_elapsed, returned_content_id) = loop {
+    let (stage_output, run_elapsed, returned_content_id, local_attempt) = loop {
         attempt += 1;
+        if env
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            env.status.emit(StageEvent::StageFailed {
+                node_idx: idx,
+                stage_name: stage_name.clone(),
+                error: "plan deadline exceeded before stage attempt".into(),
+                failure: None,
+            });
+            return Err(NodeFailure::DeadlineExceeded);
+        }
         // Backoff before a re-attempt — cancellable (a backing-off stage
         // must drop the GPU/permits, which it already has by here).
         if attempt > 1 {
@@ -2323,6 +2435,9 @@ async fn run_node_with_admission(
                             failure: None,
                         });
                         return Err(cancel_failure(task.node_id, &task.node_cancel, &env.cancel));
+                    }
+                    _ = sleep_until_opt(env.deadline) => {
+                        return Err(NodeFailure::DeadlineExceeded);
                     }
                 }
             }
@@ -2370,6 +2485,7 @@ async fn run_node_with_admission(
         let is_remote = remote_request.is_some();
         #[cfg(not(feature = "p2p"))]
         let is_remote = false;
+        let local_attempt = (!is_remote).then(|| LocalExecutionAttempt::queued(attempt));
         let mut stage_ctx = StageContext {
             job_dir: env.job_dir.clone(),
             stage_dir: tmp_stage_dir.clone(),
@@ -2521,6 +2637,9 @@ async fn run_node_with_admission(
                 .or(stage_ctx.device_index);
         }
 
+        if let Some(local) = &local_attempt {
+            local.start();
+        }
         let stage_started = Instant::now();
 
         // ── GPU-saturation sampler (E2) ─────────────────────────────
@@ -2592,6 +2711,13 @@ async fn run_node_with_admission(
                     ExecutionResult::TimedOut {
                         deadline_unix_ms, ..
                     } => {
+                        if env
+                            .deadline
+                            .is_some_and(|deadline| Instant::now() >= deadline)
+                        {
+                            let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+                            return Err(NodeFailure::DeadlineExceeded);
+                        }
                         let limit = if request_deadline.soft_unix_ms == Some(deadline_unix_ms) {
                             soft_limit.unwrap_or(hard_limit)
                         } else {
@@ -2607,11 +2733,34 @@ async fn run_node_with_admission(
                 None
             };
         #[cfg(not(feature = "p2p"))]
-        let remote_result: Option<Result<(StageRunOutput, Option<ContentId>), StageError>> = None;
+        let remote_result: Option<
+            Result<
+                (
+                    StageRunOutput,
+                    Option<ContentId>,
+                    Option<LocalExecutionAttempt>,
+                ),
+                StageError,
+            >,
+        > = None;
+
+        #[cfg(feature = "p2p")]
+        let remote_result = remote_result
+            .map(|result| result.map(|(output, content_id)| (output, content_id, None)));
 
         let run_result = match remote_result {
             Some(result) => result,
             None => {
+                let local_attempt = local_attempt.expect("local branch owns local lifecycle");
+                let plan_remaining = env
+                    .deadline
+                    .map(|deadline| deadline.saturating_duration_since(stage_started));
+                let hard_timeout = match (task.timeout.hard, plan_remaining) {
+                    (Some(stage), Some(plan)) => Some(stage.min(plan)),
+                    (Some(stage), None) => Some(stage),
+                    (None, Some(plan)) => Some(plan),
+                    (None, None) => None,
+                };
                 let run_fut = async {
                     if fused_handoff {
                         // Typed handoff is local-only. A retry decodes canonical
@@ -2642,11 +2791,27 @@ async fn run_node_with_admission(
                     run_fut,
                     &stage_cancel,
                     task.timeout.soft,
-                    task.timeout.hard,
+                    hard_timeout,
                     stage_started,
                 );
                 match std::panic::AssertUnwindSafe(timed_fut).catch_unwind().await {
-                    Ok(result) => result.map(|output| (output, None)),
+                    Ok(Ok(output)) => Ok((output, None, Some(local_attempt))),
+                    Ok(Err(error)) => {
+                        if matches!(error, StageError::Timeout { .. })
+                            && env
+                                .deadline
+                                .is_some_and(|deadline| Instant::now() >= deadline)
+                        {
+                            local_attempt.timeout();
+                            if let Some(handle) = gpu_sampler {
+                                handle.stop().await;
+                            }
+                            let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+                            return Err(NodeFailure::DeadlineExceeded);
+                        }
+                        local_attempt.fail(&stage_name, &error);
+                        Err(error)
+                    }
                     Err(panic_payload) => {
                         if let Some(h) = gpu_sampler {
                             h.stop().await;
@@ -2701,7 +2866,7 @@ async fn run_node_with_admission(
         // the retryable + auto-resume path below; otherwise the prior behaviour
         // is byte-identical (Ok-cancel → cancel_failure, Err → classify `e`).
         let err: StageError = match run_result {
-            Ok((o, returned_content_id)) => {
+            Ok((o, returned_content_id, local_attempt)) => {
                 debug_assert_eq!(
                     o.erased.kind,
                     task.stage.output_kind(),
@@ -2714,6 +2879,9 @@ async fn run_node_with_admission(
                 // plan cancel (child inherits the parent) AND on a stage's own
                 // cooperative cancel.
                 if stage_cancel.is_cancelled() {
+                    if let Some(local) = &local_attempt {
+                        local.fail(&stage_name, &StageError::Cancelled);
+                    }
                     let _ = std::fs::remove_dir_all(&tmp_stage_dir);
                     match diverged_detail {
                         // A DIVERGENCE cancel: synthesize a retryable `Diverged`
@@ -2739,7 +2907,12 @@ async fn run_node_with_admission(
                     // StageEnd reports the SUCCESSFUL attempt's wall time;
                     // failed attempts + backoff are visible as StageRetrying
                     // events, not folded into this duration.
-                    break (o, stage_started.elapsed(), returned_content_id);
+                    break (
+                        o,
+                        stage_started.elapsed(),
+                        returned_content_id,
+                        local_attempt,
+                    );
                 }
             }
             Err(e) => {
@@ -2967,6 +3140,9 @@ async fn run_node_with_admission(
     }
     if let Some(stored) = &stored {
         debug_assert_eq!(stored.manifest.logical_hash, logical_hash);
+    }
+    if let Some(local_attempt) = &local_attempt {
+        local_attempt.succeed(content_id, run_elapsed);
     }
     let persisted = stored.is_some();
     let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, content_id)
@@ -4799,6 +4975,9 @@ fn inject_spawn(
 fn plan_error_of(f: NodeFailure) -> PlanError {
     match f {
         NodeFailure::Cancelled => PlanError::Cancelled,
+        NodeFailure::DeadlineExceeded => PlanError::DeadlineExceeded {
+            elapsed: std::time::Duration::ZERO,
+        },
         // A `Killed` reaching here means a control policy fired on a path
         // that doesn't special-case it (the sequential executor, which wires
         // no policy, so this is unreachable there). Map to Cancelled — a
