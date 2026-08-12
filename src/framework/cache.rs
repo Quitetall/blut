@@ -45,7 +45,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
 use crate::framework::artifact_store::{ArtifactRole, StoredArtifact, capture, restore};
-use crate::framework::object_store::{BlockingObjectStore, MAX_OBJECT_SIZE, ObjectKey};
+use crate::framework::object_store::{
+    BlockingObjectStore, MAX_OBJECT_SIZE, ObjectKey, ObjectNamespace,
+};
 use crate::framework::stage::{ErasedArtifact, StageDyn};
 
 const CACHE_RECORD_VERSION: u16 = 1;
@@ -283,10 +285,14 @@ impl CacheHandle {
         into_stage_dir: &Path,
     ) -> Option<CacheHit> {
         for base in self.search_order() {
-            let record_path = record_path(base, key);
-            let record_bytes = match read_file_capped(&record_path, MAX_CACHE_RECORD_BYTES) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            let store = BlockingObjectStore::filesystem(base);
+            let record_key = ObjectKey::CacheInvocation(key);
+            let record_path = store
+                .filesystem_path(record_key)
+                .expect("filesystem store exposes paths");
+            let record_bytes = match store.get(record_key) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => continue,
                 Err(error) => {
                     tracing::warn!(
                         "cache: read {}: {error}; treating as miss",
@@ -298,10 +304,13 @@ impl CacheHandle {
             let Some(record) = decode_record(&record_bytes, key, stage, &record_path) else {
                 continue;
             };
-            let object_path = object_path(base, record.content_id);
-            let object_bytes = match read_file_capped(&object_path, MAX_OBJECT_SIZE) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            let object_key = ObjectKey::Artifact(record.content_id);
+            let object_path = store
+                .filesystem_path(object_key)
+                .expect("filesystem store exposes paths");
+            let object_bytes = match store.get(object_key) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => continue,
                 Err(error) => {
                     tracing::warn!(
                         "cache: read {}: {error}; treating as miss",
@@ -351,23 +360,38 @@ impl CacheHandle {
                 return None;
             }
         };
+        // Publish an object orphan before consuming its allocation. Invocation
+        // record remains the visibility marker and lands only after typed restore
+        // validates the remote object.
+        let local = self.write_store();
+        let local_object_ready = match put_local_repairing_corrupt(
+            &local,
+            ObjectKey::Artifact(record.content_id),
+            &object_bytes,
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    "cache: remote object verified by storage envelope but local write-through failed: {error}"
+                );
+                false
+            }
+        };
         let hit = materialize_hit(
             &record,
-            object_bytes.clone(),
+            object_bytes,
             stage,
             into_stage_dir,
             &PathBuf::from(format!("remote:objects/{}", record.content_id)),
         )?;
 
-        // Object first, invocation record last: the record is the visibility
-        // marker, so a failed write-through cannot expose a partial local hit.
-        let target = self.write_target();
-        let local_object = object_path(target, record.content_id);
-        let local_record = record_path(target, key);
-        if let Err(error) = write_atomic(&local_object, &object_bytes)
-            .and_then(|()| write_atomic(&local_record, &record_bytes))
+        if local_object_ready
+            && let Err(error) =
+                put_local_repairing_corrupt(&local, ObjectKey::CacheInvocation(key), &record_bytes)
         {
-            tracing::warn!("cache: remote hit verified but local write-through failed: {error}");
+            tracing::warn!(
+                "cache: remote hit verified but invocation write-through failed: {error}"
+            );
         }
         Some(hit)
     }
@@ -406,10 +430,9 @@ impl CacheHandle {
         let record_bytes = bincode::serialize(&record).map_err(cache_encode_io)?;
         ensure_cache_bytes_bound(&object_bytes, MAX_OBJECT_SIZE, "content object")?;
         ensure_cache_bytes_bound(&record_bytes, MAX_CACHE_RECORD_BYTES, "invocation record")?;
-        let target = self.write_target();
-
-        write_atomic(&object_path(target, content_id), &object_bytes)?;
-        write_atomic(&record_path(target, key), &record_bytes)?;
+        let target = self.write_store();
+        put_local_repairing_corrupt(&target, ObjectKey::Artifact(content_id), &object_bytes)?;
+        put_local_repairing_corrupt(&target, ObjectKey::CacheInvocation(key), &record_bytes)?;
 
         if let Some(remote) = &self.remote {
             match remote.put(ObjectKey::Artifact(content_id), &object_bytes) {
@@ -439,15 +462,12 @@ impl CacheHandle {
     /// [`lookup`](Self::lookup). Shared tiers are treated as "possibly present"
     /// because even a metadata/HEAD request may block the single coordinator.
     pub(crate) fn probe_presence(&self, key: InvocationKey) -> std::io::Result<bool> {
-        let path = record_path(&self.job_local, key);
-        match std::fs::metadata(path) {
-            Ok(metadata) => {
-                if metadata.is_file() {
-                    return Ok(true);
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+        match BlockingObjectStore::filesystem(&self.job_local)
+            .contains(ObjectKey::CacheInvocation(key))
+        {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(error) => return Err(store_io(error)),
         }
         if self.global.is_some() || self.remote.is_some() {
             return Ok(true);
@@ -476,9 +496,9 @@ impl CacheHandle {
         let record_bytes = bincode::serialize(&record).map_err(cache_encode_io)?;
         ensure_cache_bytes_bound(&object_bytes, MAX_OBJECT_SIZE, "content object")?;
         ensure_cache_bytes_bound(&record_bytes, MAX_CACHE_RECORD_BYTES, "invocation record")?;
-        let target = self.write_target();
-        write_atomic(&object_path(target, content_id), &object_bytes)?;
-        write_atomic(&record_path(target, key), &record_bytes)?;
+        let target = self.write_store();
+        put_local_repairing_corrupt(&target, ObjectKey::Artifact(content_id), &object_bytes)?;
+        put_local_repairing_corrupt(&target, ObjectKey::CacheInvocation(key), &record_bytes)?;
         #[cfg(test)]
         run_optional_local_insert_hook(&self.entry_path_for_write(key));
         Ok(OptionalCacheWrite {
@@ -517,7 +537,15 @@ impl CacheHandle {
 
     /// Exact local entry path an insert writes for this handle/key.
     pub(crate) fn entry_path_for_write(&self, key: InvocationKey) -> PathBuf {
-        record_path(self.write_target(), key)
+        self.write_store()
+            .filesystem_path(ObjectKey::CacheInvocation(key))
+            .expect("local/global cache targets are filesystem stores")
+    }
+
+    pub(crate) fn remove_invocation(&self, key: InvocationKey) -> std::io::Result<bool> {
+        self.write_store()
+            .remove(ObjectKey::CacheInvocation(key))
+            .map_err(store_io)
     }
 
     /// Search order for lookups: global first when `--shared-cache`
@@ -543,18 +571,20 @@ impl CacheHandle {
             None => &self.job_local,
         }
     }
+
+    fn write_store(&self) -> BlockingObjectStore {
+        BlockingObjectStore::filesystem(self.write_target())
+    }
 }
 
+#[cfg(test)]
 fn record_path(base: &Path, key: InvocationKey) -> PathBuf {
-    base.join("invocations")
-        .join(key.to_hex())
-        .join("record.bin")
+    base.join(ObjectKey::CacheInvocation(key).relative_path())
 }
 
+#[cfg(test)]
 fn object_path(base: &Path, content_id: ContentId) -> PathBuf {
-    base.join("objects")
-        .join(content_id.to_hex())
-        .join("artifact.bin")
+    base.join(ObjectKey::Artifact(content_id).relative_path())
 }
 
 fn ensure_cache_bytes_bound(bytes: &[u8], max_bytes: u64, label: &str) -> std::io::Result<()> {
@@ -794,6 +824,25 @@ fn cache_encode_io(error: bincode::Error) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, error)
 }
 
+fn store_io(error: crate::framework::object_store::StoreError) -> std::io::Error {
+    std::io::Error::other(error)
+}
+
+fn put_local_repairing_corrupt(
+    store: &BlockingObjectStore,
+    key: ObjectKey,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    match store.put(key, bytes) {
+        Ok(_) => Ok(()),
+        Err(crate::framework::object_store::StoreError::Corrupt { .. }) => {
+            store.remove(key).map_err(store_io)?;
+            store.put(key, bytes).map(|_| ()).map_err(store_io)
+        }
+        Err(error) => Err(store_io(error)),
+    }
+}
+
 fn artifact_store_io(
     error: crate::framework::artifact_store::ArtifactStoreError,
 ) -> std::io::Error {
@@ -806,47 +855,35 @@ fn artifact_store_io(
 /// eligible first. Best-effort I/O failures are logged and skipped.
 ///
 /// Callers must not run pruning concurrently with writers targeting the same
-/// root. A10 replaces this boundary with the canonical object-store concurrency
-/// policy; until then the CLI/TUI prune operation is a quiescent maintenance
-/// command.
+/// root. Addressing, listing, validation, and deletion all flow through the
+/// canonical typed object store; cache owns only reference/LRU decisions.
 ///
 /// `max_bytes`: cap, e.g. 50 GiB. Default driven by
 /// `$LAMU_CACHE_MAX_GB` (commit 8 wires the CLI knob).
 pub fn lru_prune(cache_root: &Path, max_bytes: u64) -> std::io::Result<u64> {
-    let mut total = match dir_size(cache_root) {
-        Ok(size) => size,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error),
-    };
+    let store = BlockingObjectStore::filesystem(cache_root);
+    let invocation_objects = store
+        .list_namespace(ObjectNamespace::CacheInvocation)
+        .map_err(store_io)?;
+    let artifact_objects = store
+        .list_namespace(ObjectNamespace::Artifact)
+        .map_err(store_io)?;
+    let mut total = invocation_objects
+        .iter()
+        .chain(&artifact_objects)
+        .fold(0_u64, |sum, object| sum.saturating_add(object.stored_size));
     if total <= max_bytes {
         return Ok(0);
     }
 
-    let invocations_root = cache_root.join("invocations");
     let mut entries = Vec::new();
     let mut references: std::collections::HashMap<ContentId, usize> =
         std::collections::HashMap::new();
-    let dir = match std::fs::read_dir(&invocations_root) {
-        Ok(dir) => Some(dir),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e),
-    };
-    for entry in dir.into_iter().flatten().flatten() {
-        let path = entry.path();
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if !meta.is_dir() {
-            continue;
-        }
-        let size = dir_size(&path).unwrap_or(0);
-        let atime = meta
-            .accessed()
-            .or_else(|_| meta.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let content_id = read_file_capped(&path.join("record.bin"), MAX_CACHE_RECORD_BYTES)
+    for entry in invocation_objects {
+        let content_id = store
+            .get(entry.key)
             .ok()
+            .flatten()
             .and_then(|bytes| {
                 deserialize_capped::<CacheRecord>(&bytes, MAX_CACHE_RECORD_BYTES).ok()
             })
@@ -855,77 +892,80 @@ pub fn lru_prune(cache_root: &Path, max_bytes: u64) -> std::io::Result<u64> {
         if let Some(content_id) = content_id {
             *references.entry(content_id).or_default() += 1;
         }
-        entries.push((path, atime, size, content_id));
+        entries.push((entry, content_id));
     }
 
     let mut freed = 0u64;
-    let objects_root = cache_root.join("objects");
-    if let Ok(objects) = std::fs::read_dir(&objects_root) {
-        let referenced_hex: std::collections::HashSet<String> = references
-            .keys()
-            .map(|content_id| content_id.to_hex())
-            .collect();
-        let mut orphans: Vec<_> = objects
-            .flatten()
-            .filter_map(|entry| {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if referenced_hex.contains(&name) {
-                    return None;
-                }
-                let metadata = entry.metadata().ok()?;
-                let atime = metadata
-                    .accessed()
-                    .or_else(|_| metadata.modified())
-                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                Some((path.clone(), atime, dir_size(&path).unwrap_or(0)))
-            })
-            .collect();
-        orphans.sort_by_key(|(_, atime, _)| *atime);
-        for (path, _, size) in orphans {
-            if total <= max_bytes {
-                break;
-            }
-            if let Err(error) = std::fs::remove_dir_all(&path) {
-                tracing::warn!("lru_prune: failed to remove {}: {error}", path.display());
-                continue;
-            }
-            total = total.saturating_sub(size);
-            freed += size;
-        }
-    }
-
-    entries.sort_by_key(|(_, atime, _, _)| *atime);
-    for (path, _, size, content_id) in entries {
+    let mut artifact_by_id: std::collections::HashMap<ContentId, _> = artifact_objects
+        .into_iter()
+        .filter_map(|object| match object.key {
+            ObjectKey::Artifact(content_id) => Some((content_id, object)),
+            _ => None,
+        })
+        .collect();
+    let mut orphans: Vec<_> = artifact_by_id
+        .iter()
+        .filter(|(content_id, _)| !references.contains_key(content_id))
+        .map(|(content_id, object)| (*content_id, *object))
+        .collect();
+    orphans.sort_by_key(|(_, object)| object.accessed);
+    for (content_id, object) in orphans {
         if total <= max_bytes {
             break;
         }
-        match std::fs::remove_dir_all(&path) {
-            Ok(()) => {
-                total = total.saturating_sub(size);
-                freed += size;
+        match store.remove(object.key) {
+            Ok(true) => {
+                total = total.saturating_sub(object.stored_size);
+                freed += object.stored_size;
+                artifact_by_id.remove(&content_id);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!("lru_prune: failed to remove {}: {error}", object.key);
+            }
+        }
+    }
+
+    entries.sort_by_key(|(object, _)| object.accessed);
+    for (object, content_id) in entries {
+        if total <= max_bytes {
+            break;
+        }
+        match store.remove(object.key) {
+            Ok(true) => {
+                total = total.saturating_sub(object.stored_size);
+                freed += object.stored_size;
                 if let Some(content_id) = content_id
                     && let Some(count) = references.get_mut(&content_id)
                 {
                     *count -= 1;
-                    if *count == 0 {
-                        let object_dir = objects_root.join(content_id.to_hex());
-                        let object_size = dir_size(&object_dir).unwrap_or(0);
-                        if std::fs::remove_dir_all(&object_dir).is_ok() {
-                            total = total.saturating_sub(object_size);
-                            freed += object_size;
+                    if *count == 0
+                        && let Some(artifact) = artifact_by_id.remove(&content_id)
+                    {
+                        match store.remove(artifact.key) {
+                            Ok(true) => {
+                                total = total.saturating_sub(artifact.stored_size);
+                                freed += artifact.stored_size;
+                            }
+                            Ok(false) => {}
+                            Err(error) => tracing::warn!(
+                                "lru_prune: failed to remove {}: {error}",
+                                artifact.key
+                            ),
                         }
                     }
                 }
             }
-            Err(e) => {
-                tracing::warn!("lru_prune: failed to remove {}: {}", path.display(), e);
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!("lru_prune: failed to remove {}: {error}", object.key);
             }
         }
     }
     Ok(freed)
 }
 
+#[cfg(test)]
 fn dir_size(path: &Path) -> std::io::Result<u64> {
     let mut total = 0u64;
     for entry in std::fs::read_dir(path)? {
@@ -977,22 +1017,18 @@ impl CacheProof {
     }
 
     pub fn is_live(&self) -> bool {
-        let key_hex = self.key.to_hex();
-        if self.entry_path.file_name().and_then(|name| name.to_str()) != Some("record.bin")
-            || self
-                .entry_path
-                .parent()
-                .and_then(|parent| parent.file_name())
-                .and_then(|name| name.to_str())
-                != Some(key_hex.as_str())
-        {
-            return false;
-        }
         let Some(base) = self.entry_path.ancestors().nth(3) else {
             return false;
         };
-        let Some(record) = read_file_capped(&self.entry_path, MAX_CACHE_RECORD_BYTES)
+        let store = BlockingObjectStore::filesystem(base);
+        let record_key = ObjectKey::CacheInvocation(self.key);
+        if store.filesystem_path(record_key).as_deref() != Some(self.entry_path.as_path()) {
+            return false;
+        }
+        let Some(record) = store
+            .get(record_key)
             .ok()
+            .flatten()
             .and_then(|body| deserialize_capped::<CacheRecord>(&body, MAX_CACHE_RECORD_BYTES).ok())
             .filter(|record| {
                 record.version == CACHE_RECORD_VERSION && record.invocation_key == self.key
@@ -1000,8 +1036,10 @@ impl CacheProof {
         else {
             return false;
         };
-        read_file_capped(&object_path(base, record.content_id), MAX_OBJECT_SIZE)
+        store
+            .get(ObjectKey::Artifact(record.content_id))
             .ok()
+            .flatten()
             .and_then(|body| decode_stored(body).ok())
             .is_some_and(|stored| stored.manifest.content_id == record.content_id)
     }

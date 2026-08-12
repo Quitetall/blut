@@ -315,6 +315,13 @@ impl ExecCtx {
     /// Construct an `ExecCtx` rooted at `job_dir`. The caller is
     /// responsible for creating `job_dir` if it doesn't exist.
     pub fn new(job_dir: PathBuf) -> Self {
+        let job_dir = if job_dir.is_absolute() {
+            job_dir
+        } else {
+            std::env::current_dir()
+                .map(|current| current.join(&job_dir))
+                .unwrap_or(job_dir)
+        };
         let cache = Arc::new(CacheHandle::job_local(job_dir.join("_cache")));
         let (status, lifecycle_rx) = StatusHub::new();
         let cancel = CancellationToken::new();
@@ -1103,18 +1110,21 @@ struct SpeculativePublishGuard {
 /// launch is disabled for force-recompute and shared cache tiers, and its exact
 /// key was probed cold, so this guard never removes a pre-existing entry.
 struct PipelineCachePublishGuard {
-    entry_path: PathBuf,
+    cache: Arc<CacheHandle>,
+    key: InvocationKey,
     committed: bool,
     rollback_failure: Arc<std::sync::Mutex<Option<std::io::Error>>>,
 }
 
 impl PipelineCachePublishGuard {
     fn new(
-        entry_path: PathBuf,
+        cache: Arc<CacheHandle>,
+        key: InvocationKey,
         rollback_failure: Arc<std::sync::Mutex<Option<std::io::Error>>>,
     ) -> Self {
         Self {
-            entry_path,
+            cache,
+            key,
             committed: false,
             rollback_failure,
         }
@@ -1130,28 +1140,7 @@ impl Drop for PipelineCachePublishGuard {
         if self.committed {
             return;
         }
-        let removal = match std::fs::remove_file(&self.entry_path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
-        .and_then(|()| {
-            let Some(parent) = self.entry_path.parent() else {
-                return Ok(());
-            };
-            match std::fs::remove_dir(parent) {
-                Ok(()) => Ok(()),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-                    ) =>
-                {
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            }
-        });
+        let removal = self.cache.remove_invocation(self.key).map(|_| ());
         if let Err(error) = removal {
             *self
                 .rollback_failure
@@ -3614,7 +3603,8 @@ fn publish_speculative_inner(
                 optional_cache_body = Some(body);
                 if rollback_cache_on_stop {
                     pipeline_cache_guard = Some(PipelineCachePublishGuard::new(
-                        env.cache.entry_path_for_write(prepared.key),
+                        env.cache.clone(),
+                        prepared.key,
                         rollback_failure,
                     ));
                 }

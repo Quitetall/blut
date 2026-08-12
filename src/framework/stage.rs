@@ -1175,6 +1175,18 @@ pub trait StageDyn: Send + Sync + 'static {
         None
     }
 
+    /// Primary locator declared by the typed input artifact. Artifact storage
+    /// uses this only to distinguish pathless inline-style sentinels from an
+    /// unresolved relative backing.
+    fn input_primary_path(&self, _art: &ErasedArtifact) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// Output-role counterpart of [`StageDyn::input_primary_path`].
+    fn output_primary_path(&self, _art: &ErasedArtifact) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// Mirror of `rebase_output_paths` but decodes as `S::Input`, and returns
     /// `None` on ANY decode/encode failure. The P2P import path treats a
     /// failed rebase as a HARD error (never run a stage whose input paths
@@ -1616,6 +1628,14 @@ impl<S: Stage> StageDyn for S {
         contains_absolute_paths_typed::<S::Output>(art)
     }
 
+    fn input_primary_path(&self, art: &ErasedArtifact) -> Option<std::path::PathBuf> {
+        primary_path_typed::<S::Input>(art)
+    }
+
+    fn output_primary_path(&self, art: &ErasedArtifact) -> Option<std::path::PathBuf> {
+        primary_path_typed::<S::Output>(art)
+    }
+
     fn rebase_input_paths(
         &self,
         art: ErasedArtifact,
@@ -1665,6 +1685,11 @@ fn contains_absolute_paths_typed<A: Artifact>(art: &ErasedArtifact) -> Option<bo
     Some(contains_absolute_path_strings(&value))
 }
 
+fn primary_path_typed<A: Artifact>(art: &ErasedArtifact) -> Option<std::path::PathBuf> {
+    let typed: A = art.clone().into_typed::<A>().ok()?;
+    Some(typed.primary_path().to_path_buf())
+}
+
 fn contains_absolute_path_strings(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::String(value) => crate::framework::artifact::looks_absolute_path(value),
@@ -1701,10 +1726,8 @@ fn rebase_typed<A: Artifact>(
     ErasedArtifact::from_typed(&rebased).ok()
 }
 
-/// Recurse a JSON value collecting every `String` that is an absolute path
-/// equal to `root` or a descendant (`root` + separator prefix), and that
-/// currently `exists()` on disk. Mirrors `rebase_path_strings`' prefix rule so
-/// the discovered set is exactly the set that a `from→to` rebase would move.
+/// Recurse a JSON value collecting every existing path under `root`. Relative
+/// paths resolve against `root`; absolute paths must already be descendants.
 fn collect_paths_under(
     value: &serde_json::Value,
     root: &std::path::Path,
@@ -1718,9 +1741,14 @@ fn collect_paths_under(
             // `/a/b`). NOTE (TOCTOU): `exists()` here is advisory — the bundle
             // layer (C1b) re-hashes every file at ship time, so a file that
             // vanishes between discovery and packing fails there, not silently.
-            let p = std::path::Path::new(s);
-            if p.is_absolute() && p.starts_with(root) && p.exists() {
-                out.push(p.to_path_buf());
+            let declared = std::path::Path::new(s);
+            let candidate = if declared.is_absolute() {
+                declared.to_path_buf()
+            } else {
+                root.join(declared)
+            };
+            if candidate.starts_with(root) && candidate.exists() {
+                out.push(candidate);
             }
         }
         Value::Array(items) => {

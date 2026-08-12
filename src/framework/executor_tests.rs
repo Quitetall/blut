@@ -401,7 +401,10 @@ fn dag_opt_advanced_gate_pipeline_cancel_after_cache_rename_rolls_back_before_li
 
     assert!(matches!(error, NodeFailure::Plan(PlanError::Cancelled)));
     assert!(!child_cache_path.exists());
-    assert!(!child_cache_path.parent().unwrap().exists());
+    assert!(
+        child_cache_path.parent().unwrap().is_dir(),
+        "typed cache namespace is shared with retained invocation objects"
+    );
     assert!(parent_cache_path.is_file());
     assert_eq!(
         std::fs::read(parent_stage_dir.join("kept")).unwrap(),
@@ -4719,4 +4722,13 @@ async fn args_setup_failure_precedes_and_never_detaches_the_status_writer() {
             .contains("injected lifecycle persistence failure"),
         "an unstarted writer cannot contribute a synthetic secondary error"
     );
+}
+
+#[test]
+fn exec_ctx_normalizes_relative_job_root_before_deriving_paths() {
+    let ctx = ExecCtx::new(PathBuf::from("relative-job-root"));
+
+    assert!(ctx.job_dir.is_absolute());
+    assert!(ctx.cache.job_local.is_absolute());
+    assert_eq!(ctx.cache.job_local, ctx.job_dir.join("_cache"));
 }

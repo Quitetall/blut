@@ -12,7 +12,7 @@ use blut::framework::artifact::{Artifact, ContentHash, ContentId};
 use blut::framework::artifact_store::StoredArtifact;
 use blut::framework::compat::Compatible;
 use blut::framework::executor::{ExecCtx, SequentialExecutor};
-use blut::framework::object_store::BlockingObjectStore;
+use blut::framework::object_store::{BlockingObjectStore, ObjectKey, ObjectNamespace};
 use blut::framework::plan::Plan;
 use blut::framework::resource::Resource;
 use blut::framework::stage::{Stage, StageContext};
@@ -239,15 +239,13 @@ async fn shared_cache_rehydrates_file_and_directory_after_producer_deletion() {
     let warm_id = stage_skipped_content_id(&lifecycle_events(&host_b));
     assert_eq!(warm_id, cold_id, "cold and warm lineage identities match");
 
-    let invocation_hex = std::fs::read_dir(cache_b_root.join("invocations"))
+    let invocation = BlockingObjectStore::filesystem(&cache_b_root)
+        .list_namespace(ObjectNamespace::CacheInvocation)
         .unwrap()
+        .into_iter()
         .next()
-        .unwrap()
-        .unwrap()
-        .file_name()
-        .to_string_lossy()
-        .into_owned();
-    assert_ne!(invocation_hex, cold_id.to_hex());
+        .unwrap();
+    assert_ne!(invocation.key.digest().to_hex(), cold_id.to_hex());
 
     // Build a known invocation entry for direct missing/corruption assertions.
     let fault_root = workspace.path().join("fault-cache");
@@ -271,11 +269,9 @@ async fn shared_cache_rehydrates_file_and_directory_after_producer_deletion() {
         .unwrap();
     assert_eq!(inserted_id, cold_id);
 
-    let object_path = fault_root
-        .join("objects")
-        .join(cold_id.to_hex())
-        .join("artifact.bin");
-    let object_bytes = std::fs::read(&object_path).unwrap();
+    let fault_store = BlockingObjectStore::filesystem(&fault_root);
+    let object_key = ObjectKey::Artifact(cold_id);
+    let object_bytes = fault_store.get(object_key).unwrap().unwrap();
     let stored: StoredArtifact = bincode::deserialize(&object_bytes).unwrap();
     let portable: FileAndDirectory = stored.manifest.erased.clone().into_typed().unwrap();
     assert!(!stored.manifest.handle_root.is_absolute());
@@ -283,7 +279,7 @@ async fn shared_cache_rehydrates_file_and_directory_after_producer_deletion() {
     assert!(!portable.directory_path.is_absolute());
     assert!(!portable.file_path.to_string_lossy().contains("host-b-job"));
 
-    std::fs::remove_file(&object_path).unwrap();
+    assert!(fault_store.remove(object_key).unwrap());
     assert!(
         fault_cache
             .lookup(
@@ -295,14 +291,15 @@ async fn shared_cache_rehydrates_file_and_directory_after_producer_deletion() {
         "missing content object is a miss"
     );
 
-    std::fs::write(&object_path, &object_bytes).unwrap();
     let mut modified: StoredArtifact = bincode::deserialize(&object_bytes).unwrap();
     let last = modified
         .pack
         .last_mut()
         .expect("file+dir pack is non-empty");
     *last ^= 0x80;
-    std::fs::write(&object_path, bincode::serialize(&modified).unwrap()).unwrap();
+    fault_store
+        .put(object_key, &bincode::serialize(&modified).unwrap())
+        .unwrap();
     let modified_consumer = workspace.path().join("modified-consumer");
     assert!(
         fault_cache

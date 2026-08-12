@@ -166,6 +166,8 @@ pub enum StoreError {
     },
     #[error("object-store blocking adapter failed: {0}")]
     Runtime(String),
+    #[error("object-store operation {operation} is unsupported by this adapter")]
+    Unsupported { operation: &'static str },
 }
 
 impl StoreError {
@@ -213,6 +215,11 @@ pub trait ObjectStoreAdapter: Send + Sync + std::fmt::Debug {
     async fn read_raw(&self, key: ObjectKey) -> Result<Option<Vec<u8>>, StoreError>;
     async fn create_raw(&self, key: ObjectKey, stored: Vec<u8>) -> Result<bool, StoreError>;
     async fn contains_raw(&self, key: ObjectKey) -> Result<bool, StoreError>;
+    async fn delete_raw(&self, _key: ObjectKey) -> Result<bool, StoreError> {
+        Err(StoreError::Unsupported {
+            operation: "delete",
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -331,6 +338,28 @@ impl ObjectStore {
         self.contains_raw(key).await
     }
 
+    /// Remove one typed object. Cache maintenance uses this only after proving
+    /// no retained invocation references the object.
+    pub async fn remove(&self, key: ObjectKey) -> Result<bool, StoreError> {
+        match &self.backend {
+            Backend::Filesystem { root } => {
+                let path = root.join(key.relative_path());
+                tokio::task::spawn_blocking(move || remove_file(&path, key))
+                    .await
+                    .map_err(|error| StoreError::Runtime(error.to_string()))?
+            }
+            #[cfg(feature = "cloud")]
+            Backend::Provider { inner, prefix } => {
+                match inner.delete(&provider_path(prefix, key)).await {
+                    Ok(()) => Ok(true),
+                    Err(object_store::Error::NotFound { .. }) => Ok(false),
+                    Err(error) => Err(StoreError::backend("delete", key, error)),
+                }
+            }
+            Backend::Adapter { inner } => inner.delete_raw(key).await,
+        }
+    }
+
     /// Cross into synchronous code through the one explicit blocking adapter.
     pub fn blocking(&self) -> BlockingObjectStore {
         BlockingObjectStore::new(self.clone())
@@ -438,6 +467,14 @@ pub struct BlockingObjectStore {
     inner: ObjectStore,
 }
 
+/// Physical usage metadata exposed only for typed cache maintenance.
+#[derive(Clone, Copy, Debug)]
+pub struct StoredObjectInfo {
+    pub key: ObjectKey,
+    pub stored_size: u64,
+    pub accessed: std::time::SystemTime,
+}
+
 impl BlockingObjectStore {
     pub fn new(inner: ObjectStore) -> Self {
         Self { inner }
@@ -502,6 +539,85 @@ impl BlockingObjectStore {
                 let store = self.inner.clone();
                 block_on_isolated(async move { store.contains(key).await })
             }
+        }
+    }
+
+    pub fn remove(&self, key: ObjectKey) -> Result<bool, StoreError> {
+        match &self.inner.backend {
+            Backend::Filesystem { root } => remove_file(&root.join(key.relative_path()), key),
+            #[cfg(feature = "cloud")]
+            Backend::Provider { .. } => {
+                let store = self.inner.clone();
+                block_on_isolated(async move { store.remove(key).await })
+            }
+            Backend::Adapter { .. } => {
+                let store = self.inner.clone();
+                block_on_isolated(async move { store.remove(key).await })
+            }
+        }
+    }
+
+    /// List canonical files in one namespace. Provider listing is deliberately
+    /// outside synchronous cache-prune scope.
+    pub fn list_namespace(
+        &self,
+        namespace: ObjectNamespace,
+    ) -> Result<Vec<StoredObjectInfo>, StoreError> {
+        let Backend::Filesystem { root } = &self.inner.backend else {
+            return Err(StoreError::Unsupported { operation: "list" });
+        };
+        let dir = root
+            .join(format!("v{OBJECT_FORMAT_VERSION}"))
+            .join(namespace.path_segment());
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                let placeholder = ObjectKey::from_parts(namespace, ContentHash([0; 32]));
+                return Err(StoreError::backend("list", placeholder, error));
+            }
+        };
+        let mut objects = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                let placeholder = ObjectKey::from_parts(namespace, ContentHash([0; 32]));
+                StoreError::backend("list", placeholder, error)
+            })?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".object-") {
+                continue;
+            }
+            let digest = ContentHash::from_hex(&name)
+                .map_err(|_| StoreError::InvalidAddress(entry.path().display().to_string()))?;
+            let metadata = entry.metadata().map_err(|error| {
+                StoreError::backend("head", ObjectKey::from_parts(namespace, digest), error)
+            })?;
+            if !metadata.is_file() {
+                return Err(StoreError::Corrupt {
+                    key: ObjectKey::from_parts(namespace, digest),
+                    reason: "canonical address is not a regular file".into(),
+                });
+            }
+            objects.push(StoredObjectInfo {
+                key: ObjectKey::from_parts(namespace, digest),
+                stored_size: metadata.len(),
+                accessed: metadata
+                    .accessed()
+                    .or_else(|_| metadata.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            });
+        }
+        Ok(objects)
+    }
+
+    /// Exact physical address for proofs and diagnostics. Non-filesystem stores
+    /// intentionally expose no host path.
+    pub fn filesystem_path(&self, key: ObjectKey) -> Option<PathBuf> {
+        match &self.inner.backend {
+            Backend::Filesystem { root } => Some(root.join(key.relative_path())),
+            #[cfg(feature = "cloud")]
+            Backend::Provider { .. } => None,
+            Backend::Adapter { .. } => None,
         }
     }
 
@@ -687,6 +803,14 @@ fn contains_file(path: &Path, key: ObjectKey) -> Result<bool, StoreError> {
         }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(StoreError::backend("head", key, error)),
+    }
+}
+
+fn remove_file(path: &Path, key: ObjectKey) -> Result<bool, StoreError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(StoreError::backend("delete", key, error)),
     }
 }
 

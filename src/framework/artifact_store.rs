@@ -344,6 +344,7 @@ pub fn bundle(
         logical_hash,
         backings,
         contains_absolute_paths,
+        primary_path,
         inline,
         allow_external_paths,
     ) = match role {
@@ -353,6 +354,7 @@ pub fn bundle(
             stage.input_content_hash(&erased),
             stage.input_backing_under(&erased, src_root),
             stage.input_contains_absolute_paths(&erased),
+            stage.input_primary_path(&erased),
             stage.input_inline(),
             stage.input_allows_external_paths(),
         ),
@@ -362,6 +364,7 @@ pub fn bundle(
             stage.output_content_hash(&erased),
             stage.output_backing_under(&erased, src_root),
             stage.output_contains_absolute_paths(&erased),
+            stage.output_primary_path(&erased),
             stage.output_inline(),
             stage.output_allows_external_paths(),
         ),
@@ -378,8 +381,10 @@ pub fn bundle(
 
     let backings = backings.ok_or(ArtifactStoreError::Undecodable)?;
     let contains_absolute_paths = contains_absolute_paths.ok_or(ArtifactStoreError::Undecodable)?;
-    if backings.is_empty() && contains_absolute_paths && !inline {
-        return if allow_external_paths {
+    let primary_path = primary_path.ok_or(ArtifactStoreError::Undecodable)?;
+    let unresolved_relative_primary = primary_path.is_relative() && primary_path != Path::new(".");
+    if backings.is_empty() && !inline && (contains_absolute_paths || unresolved_relative_primary) {
+        return if contains_absolute_paths && allow_external_paths {
             Err(ArtifactStoreError::NonPortable(format!(
                 "absolute locator is outside owned root {}",
                 src_root.display()
@@ -1382,6 +1387,20 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn rejects_relative_non_inline_backing_that_resolves_to_no_owned_file() {
+        let src = tempfile::tempdir().unwrap();
+        let erased = ErasedArtifact::from_typed(&DirArt {
+            path: PathBuf::from("relative-artifact"),
+            content_hash: ContentHash::of_bytes(b"unresolved relative fixture"),
+        })
+        .unwrap();
+
+        let error = bundle(&DirStage, erased, src.path(), ArtifactRole::Output, None).unwrap_err();
+
+        assert!(matches!(error, ArtifactStoreError::Empty(_)));
     }
 
     #[test]

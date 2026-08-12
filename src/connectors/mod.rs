@@ -46,6 +46,13 @@ macro_rules! connector_kind {
             const HASH_CONTENTS: bool = false;
             fn content_hash(&self) -> ContentHash { self.content_hash }
             fn primary_path(&self) -> &Path { &self.path }
+            fn portable_identity(&self) -> Result<serde_json::Value, serde_json::Error> {
+                let mut value = serde_json::to_value(self)?;
+                if let serde_json::Value::Object(fields) = &mut value {
+                    fields.remove("path");
+                }
+                Ok(value)
+            }
         }
     };
 }
@@ -326,6 +333,8 @@ pub fn register(reg: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framework::artifact_store::{ArtifactRole, bundle};
+    use crate::framework::stage::ErasedArtifact;
 
     #[test]
     fn connector_kinds_are_distinct_and_closed() {
@@ -334,6 +343,40 @@ mod tests {
         k.dedup();
         assert_eq!(k.len(), 4, "four distinct connector kinds");
         assert!(CONNECTOR_KINDS.contains(&ObjectRef::KIND));
+    }
+
+    #[test]
+    fn connector_digest_changes_portable_content_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let descriptor = root.path().join("object.ref.json");
+        std::fs::write(&descriptor, r#"{"uri":"s3://bucket/key"}"#).unwrap();
+        let object = |digest: &[u8]| {
+            ErasedArtifact::from_typed(&ObjectRef {
+                uri: "s3://bucket/key".into(),
+                content_hash: ContentHash::of_bytes(digest),
+                path: descriptor.clone(),
+            })
+            .unwrap()
+        };
+
+        let (first, _) = bundle(
+            &DeclareObject,
+            object(b"first external object"),
+            root.path(),
+            ArtifactRole::Output,
+            None,
+        )
+        .unwrap();
+        let (second, _) = bundle(
+            &DeclareObject,
+            object(b"changed external object"),
+            root.path(),
+            ArtifactRole::Output,
+            None,
+        )
+        .unwrap();
+
+        assert_ne!(first.content_id, second.content_id);
     }
 
     #[test]
