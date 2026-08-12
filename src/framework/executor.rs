@@ -609,6 +609,7 @@ fn strict_advisory() -> bool {
 /// Immutable per-run environment shared by every node task. Cheaply
 /// cloneable handles only — a worker task borrows nothing from the plan.
 struct NodeEnv {
+    started_at: Instant,
     job_dir: PathBuf,
     cache: Arc<CacheHandle>,
     tenant: crate::tenant::Tenant,
@@ -1297,7 +1298,7 @@ enum NodeFailure {
     /// any, was discarded; nothing was cached.
     Cancelled,
     /// Plan-wide wall-clock budget elapsed while node queued or running.
-    DeadlineExceeded,
+    DeadlineExceeded { elapsed: std::time::Duration },
     /// This node's OWN token fired while the plan token did NOT (#4): a
     /// targeted KILL-on-NaN, not a plan-wide cancel. The coordinator prunes
     /// this node's descendants and continues other branches — it is NOT a
@@ -1387,21 +1388,38 @@ impl LocalExecutionAttempt {
         let _ = self.lifecycle.finish(Some(&self.assignment), terminal);
     }
 
-    fn timeout(&self) {
+    fn timeout(&self, deadline: Option<Instant>) {
         let phase = self.lifecycle.snapshot().phase;
-        let deadline_unix_ms = std::time::SystemTime::now()
+        let now_instant = Instant::now();
+        let now_system = std::time::SystemTime::now();
+        let deadline_system = match deadline {
+            Some(deadline) if deadline >= now_instant => now_system
+                .checked_add(deadline.duration_since(now_instant))
+                .unwrap_or(now_system),
+            Some(deadline) => now_system
+                .checked_sub(now_instant.duration_since(deadline))
+                .unwrap_or(std::time::UNIX_EPOCH),
+            None => now_system,
+        };
+        let deadline_unix_ms = deadline_system
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
         let _ = self.lifecycle.finish(
-            None,
+            Some(&self.assignment),
             ExecutionTerminal::TimedOut {
                 phase,
                 deadline_unix_ms,
             },
         );
+    }
+}
+
+fn deadline_failure(env: &NodeEnv) -> NodeFailure {
+    NodeFailure::DeadlineExceeded {
+        elapsed: env.started_at.elapsed(),
     }
 }
 
@@ -2157,7 +2175,7 @@ async fn acquire_admission(
                         NodeFailure::Other(format!("resource '{resource}' semaphore closed"))
                     })?,
                     _ = env.cancel.cancelled() => return Err(NodeFailure::Cancelled),
-                    _ = sleep_until_opt(env.deadline) => return Err(NodeFailure::DeadlineExceeded),
+                    _ = sleep_until_opt(env.deadline) => return Err(deadline_failure(env)),
                 }
             }
         };
@@ -2177,7 +2195,7 @@ async fn acquire_admission(
                     grant = env.gpu.acquire(request) => grant
                         .map_err(|error| NodeFailure::Other(format!("GPU admission: {error}")))?,
                     _ = env.cancel.cancelled() => return Err(NodeFailure::Cancelled),
-                    _ = sleep_until_opt(env.deadline) => return Err(NodeFailure::DeadlineExceeded),
+                    _ = sleep_until_opt(env.deadline) => return Err(deadline_failure(env)),
                 }
             }
         };
@@ -2191,7 +2209,7 @@ async fn acquire_admission(
             permit = env.memory.clone().acquire_many_owned(request.memory_gib) => permit
                 .map_err(|_| NodeFailure::Other("memory semaphore closed".into()))?,
             _ = env.cancel.cancelled() => return Err(NodeFailure::Cancelled),
-            _ = sleep_until_opt(env.deadline) => return Err(NodeFailure::DeadlineExceeded),
+            _ = sleep_until_opt(env.deadline) => return Err(deadline_failure(env)),
         })
     } else {
         None
@@ -2414,7 +2432,7 @@ async fn run_node_with_admission(
                 error: "plan deadline exceeded before stage attempt".into(),
                 failure: None,
             });
-            return Err(NodeFailure::DeadlineExceeded);
+            return Err(deadline_failure(&env));
         }
         // Backoff before a re-attempt — cancellable (a backing-off stage
         // must drop the GPU/permits, which it already has by here).
@@ -2437,7 +2455,7 @@ async fn run_node_with_admission(
                         return Err(cancel_failure(task.node_id, &task.node_cancel, &env.cancel));
                     }
                     _ = sleep_until_opt(env.deadline) => {
-                        return Err(NodeFailure::DeadlineExceeded);
+                        return Err(deadline_failure(&env));
                     }
                 }
             }
@@ -2716,7 +2734,7 @@ async fn run_node_with_admission(
                             .is_some_and(|deadline| Instant::now() >= deadline)
                         {
                             let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-                            return Err(NodeFailure::DeadlineExceeded);
+                            return Err(deadline_failure(&env));
                         }
                         let limit = if request_deadline.soft_unix_ms == Some(deadline_unix_ms) {
                             soft_limit.unwrap_or(hard_limit)
@@ -2802,12 +2820,12 @@ async fn run_node_with_admission(
                                 .deadline
                                 .is_some_and(|deadline| Instant::now() >= deadline)
                         {
-                            local_attempt.timeout();
+                            local_attempt.timeout(env.deadline);
                             if let Some(handle) = gpu_sampler {
                                 handle.stop().await;
                             }
                             let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-                            return Err(NodeFailure::DeadlineExceeded);
+                            return Err(deadline_failure(&env));
                         }
                         local_attempt.fail(&stage_name, &error);
                         Err(error)
@@ -3288,6 +3306,7 @@ async fn prepare_private(
         training_io_profiles.insert(node_id, selected);
     }
     let private_env = Arc::new(NodeEnv {
+        started_at: canonical_env.started_at,
         job_dir: scratch_root.clone(),
         cache: Arc::new(CacheHandle::job_local(scratch_root.join("_cache"))),
         tenant: canonical_env.tenant.clone(),
@@ -4975,9 +4994,7 @@ fn inject_spawn(
 fn plan_error_of(f: NodeFailure) -> PlanError {
     match f {
         NodeFailure::Cancelled => PlanError::Cancelled,
-        NodeFailure::DeadlineExceeded => PlanError::DeadlineExceeded {
-            elapsed: std::time::Duration::ZERO,
-        },
+        NodeFailure::DeadlineExceeded { elapsed } => PlanError::DeadlineExceeded { elapsed },
         // A `Killed` reaching here means a control policy fired on a path
         // that doesn't special-case it (the sequential executor, which wires
         // no policy, so this is unreachable there). Map to Cancelled — a
@@ -5083,6 +5100,7 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
 
     // MOVE ctx's fields into env — the hub Arc lives only here now.
     let env = Arc::new(NodeEnv {
+        started_at: Instant::now(),
         job_dir: ctx.job_dir,
         cache: ctx.cache,
         tenant: ctx.tenant,

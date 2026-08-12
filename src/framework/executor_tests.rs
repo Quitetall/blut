@@ -325,6 +325,7 @@ fn dag_opt_advanced_gate_pipeline_cancel_after_cache_rename_rolls_back_before_li
     let training_io_resolver = TrainingIoResolver::from_ctx(&ctx).unwrap();
     let mut events = ctx.status.subscribe();
     let env = NodeEnv {
+        started_at: Instant::now(),
         job_dir: ctx.job_dir,
         cache: ctx.cache,
         tenant: ctx.tenant,
@@ -444,6 +445,7 @@ fn ordinary_speculation_cache_insert_is_the_cancellation_linearization_point() {
     let training_io_resolver = TrainingIoResolver::from_ctx(&ctx).unwrap();
     let mut events = ctx.status.subscribe();
     let env = NodeEnv {
+        started_at: Instant::now(),
         job_dir: ctx.job_dir,
         cache: ctx.cache,
         tenant: ctx.tenant,
@@ -557,6 +559,7 @@ fn speculative_external_reference_succeeds_without_portable_cache() {
     let training_io_resolver = TrainingIoResolver::from_ctx(&ctx).unwrap();
     let mut events = ctx.status.subscribe();
     let env = NodeEnv {
+        started_at: Instant::now(),
         job_dir: ctx.job_dir,
         cache: ctx.cache,
         tenant: ctx.tenant,
