@@ -13,3 +13,13 @@ impl From<crate::framework::execution::DataClassification> for DataClass {
         }
     }
 }
+
+impl From<DataClass> for crate::framework::execution::DataClassification {
+    fn from(value: DataClass) -> Self {
+        match value {
+            DataClass::Public => Self::Public,
+            DataClass::Internal => Self::Internal,
+            DataClass::Restricted => Self::Restricted,
+        }
+    }
+}

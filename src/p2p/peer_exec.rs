@@ -32,8 +32,8 @@ use crate::framework::artifact_store::StoredArtifact;
 use crate::framework::cache::CacheHandle;
 use crate::framework::cookbook::Registry;
 use crate::framework::execution::{
-    Assignment, DataClassification, ExecutionDeadline, ExecutionFailure, ExecutionFailureKind,
-    ExecutionLifecycle, ExecutionPhase, ExecutionRequest,
+    Assignment, ExecutionDeadline, ExecutionFailure, ExecutionFailureKind, ExecutionLifecycle,
+    ExecutionPhase, ExecutionRequest,
 };
 use crate::framework::stage::{ErasedArtifact, StageContext};
 use crate::p2p::PeerId;
@@ -663,11 +663,6 @@ pub async fn dispatch_to_peer(
     let stage = ctor();
     let (manifest, pack) = bundle::bundle(&*stage, input, src_root, BlobDir::Input, None)
         .map_err(|e| TrainError::other(format!("bundle input: {e}")))?;
-    let data_class = match data_class {
-        crate::p2p::DataClass::Public => DataClassification::Public,
-        crate::p2p::DataClass::Internal => DataClassification::Internal,
-        crate::p2p::DataClass::Restricted => DataClassification::Restricted,
-    };
     let request = ExecutionRequest {
         protocol_version: crate::framework::execution::EXECUTION_PROTOCOL_VERSION,
         execution_id: task_id.to_string(),
@@ -682,7 +677,7 @@ pub async fn dispatch_to_peer(
         input: StoredArtifact { manifest, pack },
         expected_content_id,
         resources: crate::framework::execution::ExecutionResources::default(),
-        data_class,
+        data_class: data_class.into(),
         deadline: ExecutionDeadline::from_now(
             None,
             std::time::Duration::from_secs(timeout_secs.max(1)),
