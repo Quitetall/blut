@@ -617,11 +617,14 @@ fn speculative_external_reference_succeeds_without_portable_cache() {
     assert_eq!(outcome.node_id, 1);
     assert_eq!(outcome.logical, logical_hash);
     assert!(!cache.entry_path_for_write(key).exists());
-    assert!(
-        !job_dir
-            .join("stages/1-make_external_ref/cache-proof.json")
-            .exists()
-    );
+    let final_stage_dir = job_dir.join("stages/1-make_external_ref");
+    assert!(final_stage_dir.is_dir());
+    assert!(!final_stage_dir.join("cache-proof.json").exists());
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(final_stage_dir.join("output.metadata.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(metadata["extra"]["persisted"], false);
     assert!(external_path.is_file());
     assert!(!scratch_root.exists());
     assert!(matches!(

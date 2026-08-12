@@ -75,17 +75,13 @@ pub fn job_lineage(job_id: &str) -> Result<Vec<LineageNode>> {
             StageEvent::StageSkipped {
                 node_idx,
                 stage_name,
-                invocation_key,
+                invocation_key: _,
                 content_id,
             } => {
                 let n = ensure_node(&mut by_idx, node_idx, &stage_name);
                 n.cached = true;
                 if let Some(content_id) = content_id {
                     n.output_hash = Some(content_id.to_hex());
-                } else {
-                    // 7.8 compatibility only: old records had no content
-                    // identity and displayed the invocation key here.
-                    n.output_hash.get_or_insert_with(|| invocation_key.to_hex());
                 }
             }
             _ => {}
@@ -407,6 +403,47 @@ mod tests {
         s.per_stage.insert("a".into(), (2, 1));
         s.per_stage.insert("b".into(), (0, 3));
         assert_eq!(s.totals(), (2, 4));
+    }
+
+    #[test]
+    fn legacy_status_hashes_do_not_become_content_lineage() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let prev = std::env::var("LAMU_TRAIN_JOBS_DIR").ok();
+        unsafe {
+            std::env::set_var("LAMU_TRAIN_JOBS_DIR", td.path());
+        }
+
+        let job = "20260812-000000-legacy-lineage";
+        let jdir = td.path().join(job);
+        std::fs::create_dir_all(&jdir).unwrap();
+        let logical_input = "1".repeat(64);
+        let invocation_key = "2".repeat(64);
+        let lines = [
+            format!(
+                r#"{{"kind":"stage_begin","node_idx":1,"stage_name":"legacy","input_hash":"{logical_input}"}}"#
+            ),
+            format!(
+                r#"{{"kind":"stage_skipped","node_idx":1,"stage_name":"legacy","cache_key":"{invocation_key}"}}"#
+            ),
+        ];
+        std::fs::write(jdir.join("status.jsonl"), lines.join("\n") + "\n").unwrap();
+
+        let nodes = job_lineage(job).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].input_hash.as_deref(), Some(logical_input.as_str()));
+        assert!(nodes[0].input_content_ids.is_empty());
+        assert!(nodes[0].output_hash.is_none());
+        assert!(nodes[0].cached);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("LAMU_TRAIN_JOBS_DIR", v),
+                None => std::env::remove_var("LAMU_TRAIN_JOBS_DIR"),
+            }
+        }
     }
 
     /// E2 round-trip: a `status.jsonl` mixing a real training metric, two

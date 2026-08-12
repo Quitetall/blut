@@ -1569,12 +1569,10 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
         let Some(output) = node.output_hash else {
             continue;
         };
-        let inputs = if node.input_content_ids.is_empty() {
-            node.input_hash.into_iter().collect()
-        } else {
-            node.input_content_ids
-        };
-        for input in inputs {
+        // Legacy `input_hash` values belong to the logical invocation domain,
+        // not the portable content domain. Missing content identities remain
+        // unknown: manufacturing an edge would defeat A09 type separation.
+        for input in node.input_content_ids {
             db.record_edge(&EdgeRow {
                 job_id: job_id.to_string(),
                 to_idx: node.node_idx as i64,
