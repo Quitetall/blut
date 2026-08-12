@@ -236,6 +236,24 @@ pub struct ObjectStore {
     backend: Backend,
 }
 
+/// Shared ownership lets asynchronous adapters retain incoming bytes through a
+/// conflict read-back without cloning the full payload. Provider uploads wrap
+/// this owner in `Bytes`; filesystem writes borrow it inside `spawn_blocking`.
+#[derive(Clone, Debug)]
+struct SharedPayload(Arc<Vec<u8>>);
+
+impl SharedPayload {
+    fn new(payload: Vec<u8>) -> Self {
+        Self(Arc::new(payload))
+    }
+}
+
+impl AsRef<[u8]> for SharedPayload {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
 impl ObjectStore {
     /// Open a store rooted on a filesystem. Directories are created lazily.
     pub fn filesystem(root: impl Into<PathBuf>) -> Self {
@@ -288,7 +306,7 @@ impl ObjectStore {
         let Some(stored) = self.read_raw(key).await? else {
             return Ok(None);
         };
-        decode_object(key, &stored).map(Some)
+        decode_object(key, stored).map(Some)
     }
 
     /// Atomically publish immutable bytes. Repeating the same write is
@@ -298,11 +316,13 @@ impl ObjectStore {
         key: ObjectKey,
         payload: impl Into<Vec<u8>>,
     ) -> Result<PutOutcome, StoreError> {
-        let payload = payload.into();
-        let stored = encode_object(key, &payload)?;
-        match self.create_raw(key, stored).await? {
+        let payload = SharedPayload::new(payload.into());
+        let header = encode_header(key, payload.as_ref())?;
+        match self.create_raw(key, header, payload.clone()).await? {
             RawCreate::Created => Ok(PutOutcome::Stored),
-            RawCreate::AlreadyExists => resolve_existing(key, &payload, self.get(key).await?),
+            RawCreate::AlreadyExists => {
+                resolve_existing(key, payload.as_ref(), self.get(key).await?)
+            }
         }
     }
 
@@ -348,18 +368,28 @@ impl ObjectStore {
         }
     }
 
-    async fn create_raw(&self, key: ObjectKey, stored: Vec<u8>) -> Result<RawCreate, StoreError> {
+    async fn create_raw(
+        &self,
+        key: ObjectKey,
+        header: [u8; OBJECT_HEADER_LEN],
+        payload: SharedPayload,
+    ) -> Result<RawCreate, StoreError> {
         match &self.backend {
             Backend::Filesystem { root } => {
                 let path = root.join(key.relative_path());
-                tokio::task::spawn_blocking(move || create_file_atomic(&path, key, &stored))
-                    .await
-                    .map_err(|error| StoreError::Runtime(error.to_string()))?
+                tokio::task::spawn_blocking(move || {
+                    create_file_atomic(&path, key, &header, payload.as_ref())
+                })
+                .await
+                .map_err(|error| StoreError::Runtime(error.to_string()))?
             }
             #[cfg(feature = "cloud")]
             Backend::Provider { inner, prefix } => {
                 let path = provider_path(prefix, key);
-                let payload = object_store::PutPayload::from_bytes(bytes::Bytes::from(stored));
+                let payload = object_store::PutPayload::from_iter([
+                    bytes::Bytes::copy_from_slice(&header),
+                    bytes::Bytes::from_owner(payload),
+                ]);
                 let options = object_store::PutOptions::from(object_store::PutMode::Create);
                 match inner.put_opts(&path, payload, options).await {
                     Ok(_) => Ok(RawCreate::Created),
@@ -367,13 +397,16 @@ impl ObjectStore {
                     Err(error) => Err(StoreError::backend("put", key, error)),
                 }
             }
-            Backend::Adapter { inner } => inner.create_raw(key, stored).await.map(|created| {
-                if created {
-                    RawCreate::Created
-                } else {
-                    RawCreate::AlreadyExists
-                }
-            }),
+            Backend::Adapter { inner } => inner
+                .create_raw(key, join_envelope(header, payload.as_ref().to_vec()))
+                .await
+                .map(|created| {
+                    if created {
+                        RawCreate::Created
+                    } else {
+                        RawCreate::AlreadyExists
+                    }
+                }),
         }
     }
 
@@ -420,7 +453,7 @@ impl BlockingObjectStore {
                 let Some(stored) = read_file_capped(&root.join(key.relative_path()), key)? else {
                     return Ok(None);
                 };
-                decode_object(key, &stored).map(Some)
+                decode_object(key, stored).map(Some)
             }
             #[cfg(feature = "cloud")]
             Backend::Provider { .. } => {
@@ -437,8 +470,8 @@ impl BlockingObjectStore {
     pub fn put(&self, key: ObjectKey, payload: &[u8]) -> Result<PutOutcome, StoreError> {
         match &self.inner.backend {
             Backend::Filesystem { root } => {
-                let stored = encode_object(key, payload)?;
-                match create_file_atomic(&root.join(key.relative_path()), key, &stored)? {
+                let header = encode_header(key, payload)?;
+                match create_file_atomic(&root.join(key.relative_path()), key, &header, payload)? {
                     RawCreate::Created => Ok(PutOutcome::Stored),
                     RawCreate::AlreadyExists => resolve_existing(key, payload, self.get(key)?),
                 }
@@ -498,12 +531,20 @@ fn resolve_existing(
     }
 }
 
-fn encode_object(key: ObjectKey, payload: &[u8]) -> Result<Vec<u8>, StoreError> {
-    if payload.len() as u64 > MAX_OBJECT_SIZE {
+fn encode_header(key: ObjectKey, payload: &[u8]) -> Result<[u8; OBJECT_HEADER_LEN], StoreError> {
+    encode_header_with_limit(key, payload, MAX_OBJECT_SIZE)
+}
+
+fn encode_header_with_limit(
+    key: ObjectKey,
+    payload: &[u8],
+    max_size: u64,
+) -> Result<[u8; OBJECT_HEADER_LEN], StoreError> {
+    if payload.len() as u64 > max_size {
         return Err(StoreError::TooLarge {
             key,
             size: payload.len() as u64,
-            max: MAX_OBJECT_SIZE,
+            max: max_size,
         });
     }
     let payload_hash = ContentHash::of_bytes(payload);
@@ -515,18 +556,26 @@ fn encode_object(key: ObjectKey, payload: &[u8]) -> Result<Vec<u8>, StoreError> 
         });
     }
 
-    let mut stored = Vec::with_capacity(OBJECT_HEADER_LEN + payload.len());
-    stored.extend_from_slice(OBJECT_MAGIC);
-    stored.extend_from_slice(&OBJECT_FORMAT_VERSION.to_le_bytes());
-    stored.push(key.namespace().tag());
-    stored.extend_from_slice(&key.digest().0);
-    stored.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-    stored.extend_from_slice(&payload_hash.0);
-    stored.extend_from_slice(payload);
-    Ok(stored)
+    let mut header = [0_u8; OBJECT_HEADER_LEN];
+    header[..8].copy_from_slice(OBJECT_MAGIC);
+    header[8..10].copy_from_slice(&OBJECT_FORMAT_VERSION.to_le_bytes());
+    header[10] = key.namespace().tag();
+    header[11..43].copy_from_slice(&key.digest().0);
+    header[43..51].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+    header[51..83].copy_from_slice(&payload_hash.0);
+    Ok(header)
 }
 
-fn decode_object(key: ObjectKey, stored: &[u8]) -> Result<Vec<u8>, StoreError> {
+fn join_envelope(header: [u8; OBJECT_HEADER_LEN], mut payload: Vec<u8>) -> Vec<u8> {
+    payload.reserve_exact(OBJECT_HEADER_LEN);
+    let payload_len = payload.len();
+    payload.resize(payload_len + OBJECT_HEADER_LEN, 0);
+    payload.copy_within(..payload_len, OBJECT_HEADER_LEN);
+    payload[..OBJECT_HEADER_LEN].copy_from_slice(&header);
+    payload
+}
+
+fn decode_object(key: ObjectKey, mut stored: Vec<u8>) -> Result<Vec<u8>, StoreError> {
     if stored.len() < OBJECT_HEADER_LEN {
         return Err(StoreError::Corrupt {
             key,
@@ -591,7 +640,9 @@ fn decode_object(key: ObjectKey, stored: &[u8]) -> Result<Vec<u8>, StoreError> {
             actual: actual_hash,
         });
     }
-    Ok(payload.to_vec())
+    stored.copy_within(OBJECT_HEADER_LEN.., 0);
+    stored.truncate(declared_len as usize);
+    Ok(stored)
 }
 
 fn read_file_capped(path: &Path, key: ObjectKey) -> Result<Option<Vec<u8>>, StoreError> {
@@ -639,7 +690,12 @@ fn contains_file(path: &Path, key: ObjectKey) -> Result<bool, StoreError> {
     }
 }
 
-fn create_file_atomic(path: &Path, key: ObjectKey, stored: &[u8]) -> Result<RawCreate, StoreError> {
+fn create_file_atomic(
+    path: &Path,
+    key: ObjectKey,
+    header: &[u8; OBJECT_HEADER_LEN],
+    payload: &[u8],
+) -> Result<RawCreate, StoreError> {
     use std::io::Write;
 
     let parent = path
@@ -653,7 +709,8 @@ fn create_file_atomic(path: &Path, key: ObjectKey, stored: &[u8]) -> Result<RawC
             .write(true)
             .open(&tmp)
             .map_err(|error| StoreError::backend("create-temp", key, error))?;
-        file.write_all(stored)
+        file.write_all(header)
+            .and_then(|()| file.write_all(payload))
             .map_err(|error| StoreError::backend("write", key, error))?;
         file.sync_all()
             .map_err(|error| StoreError::backend("sync", key, error))?;
@@ -665,7 +722,15 @@ fn create_file_atomic(path: &Path, key: ObjectKey, stored: &[u8]) -> Result<RawC
             Err(error) => Err(StoreError::backend("publish", key, error)),
         }
     })();
-    let _ = std::fs::remove_file(&tmp);
+    if let Err(error) = std::fs::remove_file(&tmp)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %tmp.display(),
+            object = %key,
+            "object-store temporary-file cleanup failed: {error}"
+        );
+    }
     write_result
 }
 
@@ -740,4 +805,39 @@ fn block_on_isolated<T: Send + 'static>(
     })
     .join()
     .map_err(|_| StoreError::Runtime("blocking worker thread panicked".into()))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payload_limit_is_inclusive_and_reports_exact_oversize_fields() {
+        let key = ObjectKey::CacheInvocation(InvocationKey::from_digest(ContentHash::of_bytes(
+            b"bounded-write",
+        )));
+        assert!(encode_header_with_limit(key, b"four", 4).is_ok());
+
+        let error = encode_header_with_limit(key, b"five!", 4).unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::TooLarge {
+                key: actual_key,
+                size: 5,
+                max: 4,
+            } if actual_key == key
+        ));
+    }
+
+    #[test]
+    fn decoding_reuses_envelope_allocation() {
+        let payload = b"decode-without-full-payload-copy".to_vec();
+        let key = ObjectKey::DispatchBundle(ContentHash::of_bytes(&payload));
+        let stored = join_envelope(encode_header(key, &payload).unwrap(), payload.clone());
+        let allocation = stored.as_ptr();
+
+        let decoded = decode_object(key, stored).unwrap();
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.as_ptr(), allocation);
+    }
 }
