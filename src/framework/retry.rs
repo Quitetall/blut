@@ -126,6 +126,11 @@ pub enum RetryOn {
 /// retried; deterministic input/contract errors are never retried even
 /// under `AllErrors` (they reproduce on every attempt).
 pub fn is_retryable(err: &StageError, policy: RetryOn) -> bool {
+    // A remote adapter has already classified the failure at the source. Do not
+    // flatten protocol/artifact errors into the generic Backend=transient rule.
+    if let StageError::Execution(failure) = err {
+        return failure.as_ref().retryable;
+    }
     // Deterministic / contract errors re-fail identically — never retry.
     let deterministic = matches!(
         err,

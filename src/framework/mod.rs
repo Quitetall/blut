@@ -36,6 +36,7 @@ pub mod cookbook;
 pub mod dag_opt;
 pub mod error;
 pub mod error_domain;
+pub mod execution;
 pub mod executor;
 pub mod gpu_sampler;
 pub mod graph;
@@ -70,6 +71,13 @@ pub use error::{PlanError, RecipeError, StageError};
 pub use error_domain::{
     ErrorDomain, ErrorDomainDef, FailureSummary, FaultOrigin, Severity, StageFailure,
     extract_failure_summary,
+};
+pub use execution::{
+    Assignment, DEFAULT_REMOTE_TIMEOUT, DataClassification, EXECUTION_PROTOCOL_VERSION,
+    ExecutionAdapter, ExecutionArtifact, ExecutionDeadline, ExecutionFailure, ExecutionFailureKind,
+    ExecutionHandle, ExecutionLifecycle, ExecutionMode, ExecutionPhase, ExecutionRequest,
+    ExecutionResources, ExecutionResult, ExecutionSnapshot, ExecutionTerminal, LifecycleError,
+    drive_execution,
 };
 pub use executor::{ExecCtx, ParallelExecutor, PlanResult, SequentialExecutor, execute_plan};
 pub use graph::{GraphSnapshot, NodeStatus, PlanGraph, graph_snapshot};

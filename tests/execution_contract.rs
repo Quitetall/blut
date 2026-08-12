@@ -1,237 +1,433 @@
-//! ADR 0092 A08 — one execution lifecycle, three adapters.
-//!
-//! A08 is "training execution modes have incompatible lifecycles": local
-//! `run_node` owns typed failures, retries, cancellation and soft/hard timeouts,
-//! while the executor-integrated P2P path cannot even carry the work. Its gate
-//! asks that "the same lifecycle contract suite passes for local, P2P, and cloud
-//! adapters".
-//!
-//! The suite therefore takes an ADAPTER and asserts the rules every adapter owes,
-//! rather than testing one implementation. That shape is the point: a contract
-//! written against a single adapter proves that adapter, and A08 exists because
-//! three implementations disagreed while each passed its own tests.
-//!
-//! WHAT THIS FILE DELIBERATELY DOES NOT DO. It does not run P2P or cloud. Both
-//! are unable to satisfy the contract today, and A08 says why. Those facts are
-//! pinned below as executable statements about the SEAM rather than left as
-//! prose, so that fixing the seam breaks these tests — which is the signal the
-//! work landed, and is the opposite of a skip that quietly reports success.
-//!
-//! A08 also depends on A09 (artifact identity) and A10 (storage policy), so the
-//! full merge is not this file's job.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! ADR 0092 A08 execution-lifecycle contract.
 
-use blut::config::launcher::JobState;
-use blut::framework::artifact::ContentHash;
-use blut::framework::executor::{DispatchHandle, DispatchRequest, DispatchSubmitter};
+use std::future::pending;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
-/// A minimal adapter that honours the lifecycle, so the contract below is known
-/// to be satisfiable. A contract no implementation can pass is indistinguishable
-/// from a contract that is simply wrong.
-struct MockHandle {
-    polls: Arc<AtomicUsize>,
-    cancels: Arc<AtomicUsize>,
-    settle_after: usize,
-    terminal: JobState,
+use async_trait::async_trait;
+use blut::framework::artifact::{ContentHash, ContentId, InvocationKey};
+use blut::framework::artifact_store::{ARTIFACT_FORMAT_VERSION, ArtifactManifest, StoredArtifact};
+use blut::framework::error::StageError;
+use blut::framework::error_domain::StageFailure;
+use blut::framework::execution::{
+    Assignment, DataClassification, EXECUTION_PROTOCOL_VERSION, ExecutionAdapter,
+    ExecutionArtifact, ExecutionDeadline, ExecutionFailure, ExecutionHandle, ExecutionLifecycle,
+    ExecutionMode, ExecutionPhase, ExecutionRequest, ExecutionResources, ExecutionResult,
+    ExecutionSnapshot, ExecutionTerminal, LifecycleError, drive_execution,
+};
+use blut::framework::stage::ErasedArtifact;
+use blut::p2p::smoke::{SmokeEcho, SmokeText};
+
+fn content_id(label: &[u8]) -> ContentId {
+    ContentId::from_digest(ContentHash::of_bytes(label))
 }
 
-impl DispatchHandle for MockHandle {
-    fn poll(&self) -> Result<Option<JobState>, blut::error::TrainError> {
-        let seen = self.polls.fetch_add(1, Ordering::SeqCst) + 1;
-        if self.cancels.load(Ordering::SeqCst) > 0 {
-            return Ok(Some(JobState::Cancelled));
-        }
-        Ok((seen >= self.settle_after).then(|| self.terminal.clone()))
+fn stored(label: &[u8]) -> StoredArtifact {
+    let id = content_id(label);
+    StoredArtifact {
+        manifest: ArtifactManifest {
+            format_version: ARTIFACT_FORMAT_VERSION,
+            erased: ErasedArtifact {
+                kind: "contract".into(),
+                schema: 1,
+                payload: Vec::new(),
+            },
+            kind: "contract".into(),
+            schema: 1,
+            content_id: id,
+            logical_hash: ContentHash::of_bytes(label),
+            handle_root: "__blut_artifact_root_v2__".into(),
+            files: Vec::new(),
+            blob_len: 0,
+            blob_sha256: ContentHash::of_bytes(&[]),
+        },
+        pack: Vec::new(),
+    }
+}
+
+fn request(deadline: ExecutionDeadline) -> ExecutionRequest {
+    let input = stored(b"input");
+    ExecutionRequest {
+        protocol_version: EXECUTION_PROTOCOL_VERSION,
+        execution_id: "contract-execution".into(),
+        stage_name: "contract".into(),
+        stage_schema: 1,
+        invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"invocation")),
+        args_hash: ContentHash::of_bytes(b"{}"),
+        args: serde_json::json!({}),
+        input,
+        expected_content_id: None,
+        resources: ExecutionResources::default(),
+        data_class: DataClassification::Public,
+        deadline,
+    }
+}
+
+fn success(label: &[u8]) -> ExecutionTerminal {
+    let stored = stored(label);
+    ExecutionTerminal::Succeeded {
+        artifact: ExecutionArtifact {
+            content_id: stored.manifest.content_id,
+            stored: Some(stored),
+        },
+        wall_time_ms: 7,
+    }
+}
+
+#[test]
+fn every_mode_obeys_the_same_transition_and_terminal_contract() {
+    for mode in [
+        ExecutionMode::Local,
+        ExecutionMode::P2p,
+        ExecutionMode::Cloud,
+    ] {
+        let lifecycle = ExecutionLifecycle::new(mode);
+        let assignment = Assignment::new(format!("{mode:?}-worker"), 1);
+        lifecycle
+            .transition(ExecutionPhase::Assigned, Some(assignment.clone()))
+            .unwrap();
+        lifecycle.transition(ExecutionPhase::Running, None).unwrap();
+        let terminal = lifecycle
+            .finish(Some(&assignment), success(b"output"))
+            .unwrap();
+        assert!(matches!(
+            terminal.terminal,
+            Some(ExecutionTerminal::Succeeded { .. })
+        ));
+        assert!(
+            matches!(
+                lifecycle.finish(
+                    Some(&assignment),
+                    ExecutionTerminal::Cancelled {
+                        reason: "late cancel".into()
+                    }
+                ),
+                Err(LifecycleError::AlreadyTerminal)
+            ),
+            "{mode:?} must keep exactly one terminal outcome"
+        );
+    }
+}
+
+#[test]
+fn assignment_generation_fences_late_completion_even_for_same_owner() {
+    let lifecycle = ExecutionLifecycle::new(ExecutionMode::Cloud);
+    let first = Assignment::new("worker", 1);
+    let second = Assignment::new("worker", 2);
+    lifecycle.transition(ExecutionPhase::Queued, None).unwrap();
+    lifecycle
+        .transition(ExecutionPhase::Assigned, Some(first.clone()))
+        .unwrap();
+    lifecycle.transition(ExecutionPhase::Running, None).unwrap();
+    lifecycle.transition(ExecutionPhase::Queued, None).unwrap();
+    assert!(matches!(
+        lifecycle.transition(ExecutionPhase::Assigned, Some(first.clone())),
+        Err(LifecycleError::StaleAssignment)
+    ));
+    lifecycle
+        .transition(ExecutionPhase::Assigned, Some(second.clone()))
+        .unwrap();
+    lifecycle.transition(ExecutionPhase::Running, None).unwrap();
+
+    assert!(matches!(
+        lifecycle.finish(Some(&first), success(b"stale")),
+        Err(LifecycleError::StaleAssignment)
+    ));
+    assert!(lifecycle.finish(Some(&second), success(b"fresh")).is_ok());
+}
+
+#[test]
+fn typed_stage_failure_survives_serialization() {
+    let typed = StageFailure::new("E_CONTRACT", "contract")
+        .stage("contract")
+        .message("typed failure");
+    let failure = ExecutionFailure {
+        kind: blut::framework::execution::ExecutionFailureKind::Stage,
+        code: typed.code.clone(),
+        message: typed.message.clone(),
+        retryable: false,
+        stage_failure: Some(typed),
+    };
+
+    let bytes = serde_json::to_vec(&failure).unwrap();
+    let decoded: ExecutionFailure = serde_json::from_slice(&bytes).unwrap();
+    let stage_failure = decoded.stage_failure.expect("typed identity preserved");
+    assert_eq!(stage_failure.code, "E_CONTRACT");
+    assert_eq!(stage_failure.domain, "contract");
+    assert_eq!(stage_failure.stage.as_deref(), Some("contract"));
+}
+
+#[test]
+fn execution_failure_retryability_survives_stage_error_conversion() {
+    for retryable in [false, true] {
+        let mut failure = ExecutionFailure::transport("contract transport");
+        failure.retryable = retryable;
+        let error = failure.into_stage_error();
+        assert!(matches!(error, StageError::Execution(_)));
+        assert_eq!(
+            blut::framework::retry::is_retryable(
+                &error,
+                blut::framework::retry::RetryOn::Transient
+            ),
+            retryable
+        );
+    }
+}
+
+enum AdapterBehavior {
+    HangSubmit,
+    Handle(Arc<ScriptHandle>),
+}
+
+struct ScriptAdapter {
+    mode: ExecutionMode,
+    behavior: AdapterBehavior,
+}
+
+#[async_trait]
+impl ExecutionAdapter for ScriptAdapter {
+    fn mode(&self) -> ExecutionMode {
+        self.mode
     }
 
-    fn cancel(&self) -> Result<(), blut::error::TrainError> {
-        self.cancels.fetch_add(1, Ordering::SeqCst);
+    async fn submit(
+        &self,
+        _request: ExecutionRequest,
+    ) -> Result<Box<dyn ExecutionHandle>, ExecutionFailure> {
+        match &self.behavior {
+            AdapterBehavior::HangSubmit => pending().await,
+            AdapterBehavior::Handle(handle) => Ok(Box::new(ScriptHandleRef(handle.clone()))),
+        }
+    }
+}
+
+struct ScriptHandle {
+    lifecycle: ExecutionLifecycle,
+    hang_poll: bool,
+    cancel_calls: AtomicUsize,
+}
+
+impl ScriptHandle {
+    fn hanging(mode: ExecutionMode) -> Arc<Self> {
+        Arc::new(Self {
+            lifecycle: ExecutionLifecycle::new(mode),
+            hang_poll: true,
+            cancel_calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn completed(mode: ExecutionMode, terminal: ExecutionTerminal) -> Arc<Self> {
+        let lifecycle = ExecutionLifecycle::new(mode);
+        let assignment = Assignment::new(format!("{mode:?}-worker"), 1);
+        lifecycle
+            .transition(ExecutionPhase::Assigned, Some(assignment.clone()))
+            .unwrap();
+        lifecycle.transition(ExecutionPhase::Running, None).unwrap();
+        lifecycle.finish(Some(&assignment), terminal).unwrap();
+        Arc::new(Self {
+            lifecycle,
+            hang_poll: false,
+            cancel_calls: AtomicUsize::new(0),
+        })
+    }
+}
+
+struct ScriptHandleRef(Arc<ScriptHandle>);
+
+#[async_trait]
+impl ExecutionHandle for ScriptHandleRef {
+    async fn snapshot(&self) -> Result<ExecutionSnapshot, ExecutionFailure> {
+        if self.0.hang_poll {
+            pending().await
+        } else {
+            Ok(self.0.lifecycle.snapshot())
+        }
+    }
+
+    async fn cancel(&self) -> Result<(), ExecutionFailure> {
+        self.0.cancel_calls.fetch_add(1, Ordering::SeqCst);
+        let _ = self.0.lifecycle.finish(
+            None,
+            ExecutionTerminal::Cancelled {
+                reason: "contract cancel".into(),
+            },
+        );
         Ok(())
     }
 }
 
-struct MockSubmitter {
-    polls: Arc<AtomicUsize>,
-    cancels: Arc<AtomicUsize>,
-    settle_after: usize,
-    terminal: JobState,
-}
-
-impl DispatchSubmitter for MockSubmitter {
-    fn submit(
-        &self,
-        _request: DispatchRequest<'_>,
-    ) -> Result<Box<dyn DispatchHandle>, blut::error::TrainError> {
-        Ok(Box::new(MockHandle {
-            polls: Arc::clone(&self.polls),
-            cancels: Arc::clone(&self.cancels),
-            settle_after: self.settle_after,
-            terminal: self.terminal.clone(),
-        }))
-    }
-}
-
-fn request<'a>(
-    args: &'a serde_json::Value,
-    tenant: &'a blut::tenant::Tenant,
-) -> DispatchRequest<'a> {
-    DispatchRequest {
-        stage_name: "contract_stage",
-        stage_schema: 1,
-        invocation_key: blut::framework::InvocationKey::from_digest(ContentHash::of_bytes(
-            b"invocation",
-        )),
-        input_content_id: blut::framework::ContentId::from_digest(ContentHash::of_bytes(b"input")),
-        args_hash: ContentHash::of_bytes(b"args"),
-        args,
-        expected_content_id: Some(blut::framework::ContentId::from_digest(
-            ContentHash::of_bytes(b"output"),
-        )),
-        resource_request: Default::default(),
-        data_class: 0,
-        tenant,
-    }
-}
-
-/// THE CONTRACT. Every adapter owes exactly these, whatever transport it uses.
-fn assert_lifecycle_contract(submitter: &dyn DispatchSubmitter, label: &str) {
-    let args = serde_json::json!({});
-    let tenant = blut::tenant::Tenant::default();
-
-    // 1. A handle settles into exactly ONE terminal state, and stays there.
-    let handle = submitter.submit(request(&args, &tenant)).expect("submit");
-    let mut terminal = None;
-    for _ in 0..16 {
-        if let Some(state) = handle.poll().expect("poll") {
-            terminal = Some(state);
-            break;
-        }
-    }
-    let settled = terminal.unwrap_or_else(|| panic!("{label}: never reached a terminal state"));
-    for _ in 0..3 {
-        assert_eq!(
-            handle.poll().expect("poll after terminal"),
-            Some(settled.clone()),
-            "{label}: terminal state changed after settling. Exactly one terminal \
-             outcome is what lets a caller stop polling and trust the answer."
-        );
-    }
-
-    // 2. Cancellation is observable, and cancelling twice is not an error.
-    //    An adapter whose second cancel fails forces every caller to track
-    //    whether it already cancelled, which is state the caller should not own.
-    let handle = submitter.submit(request(&args, &tenant)).expect("submit");
-    handle.cancel().expect("first cancel");
-    handle.cancel().expect("second cancel must be idempotent");
-    assert_eq!(
-        handle.poll().expect("poll after cancel"),
-        Some(JobState::Cancelled),
-        "{label}: cancellation was not observable through poll"
-    );
-}
-
-#[test]
-fn a_conforming_adapter_satisfies_the_lifecycle_contract() {
-    for terminal in [JobState::Succeeded, JobState::Failed("boom".into())] {
-        let submitter = MockSubmitter {
-            polls: Arc::new(AtomicUsize::new(0)),
-            cancels: Arc::new(AtomicUsize::new(0)),
-            settle_after: 3,
-            terminal: terminal.clone(),
-        };
-        assert_lifecycle_contract(&submitter, &format!("mock({terminal:?})"));
-    }
-}
-
-/// A08's evidence, as executable statements rather than prose.
-///
-/// "successful output cannot return through `DispatchHandle`". `poll` yields
-/// `Option<JobState>`, and `JobState::Succeeded` is a UNIT variant — so a remote
-/// success reports the word "Succeeded" and nothing else. There is no channel for
-/// the artifact the stage produced, which is why the gate says "no adapter
-/// reports success without validated artifact identity and rehydrated output":
-/// today no adapter *could*, whatever it wanted to do.
-///
-/// These pins pass while the gap exists and FAIL once the seam can carry an
-/// outcome. That failure is the signal A08's work landed, not a regression.
-#[test]
-fn a_remote_success_carries_no_output() {
-    let submitter = MockSubmitter {
-        polls: Arc::new(AtomicUsize::new(0)),
-        cancels: Arc::new(AtomicUsize::new(0)),
-        settle_after: 1,
-        terminal: JobState::Succeeded,
+#[tokio::test]
+async fn cancellation_interrupts_a_hanging_submit() {
+    let adapter = ScriptAdapter {
+        mode: ExecutionMode::Cloud,
+        behavior: AdapterBehavior::HangSubmit,
     };
-    let args = serde_json::json!({});
-    let tenant = blut::tenant::Tenant::default();
-    let handle = submitter.submit(request(&args, &tenant)).expect("submit");
-    let settled = handle.poll().expect("poll").expect("terminal");
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    cancellation.cancel();
 
-    // Everything a caller learns from a remote success. If `Succeeded` ever gains
-    // a payload this stops compiling, which is exactly the intended alarm.
-    match settled {
-        JobState::Succeeded => {}
-        other => panic!("expected Succeeded, got {other:?}"),
+    let submit = adapter.submit(request(ExecutionDeadline::from_now(
+        None,
+        Duration::from_secs(30),
+    )));
+    tokio::pin!(submit);
+    tokio::select! {
+        _ = cancellation.cancelled() => {}
+        _ = &mut submit => panic!("hanging submit unexpectedly completed"),
     }
 }
 
-/// Remote failure identity is an unstructured string. A08 says so, and it is right.
-///
-/// I first wrote this test asserting failures carried NO identity at all, having
-/// read `blut::jobs::JobState` — a DIFFERENT enum from the one this seam uses.
-/// The dispatch trait speaks `blut::config::launcher::JobState`, whose
-/// `Failed(String)` and `Unknown(String)` do carry a scheduler-reported reason.
-/// The ADR's wording was accurate; my reading was not.
-///
-/// That two same-named enums describe job state in one crate is itself worth
-/// noticing while consolidating lifecycles, since "which JobState?" is precisely
-/// the ambiguity A08 is about.
-///
-/// What the gate wants is TYPED failure identity. A string means every consumer
-/// re-parses vendor text — `"OutOfMemory"` from one scheduler, `"TIMEOUT"` from
-/// another — and no two consumers classify identically.
-#[test]
-fn remote_failure_identity_is_an_unstructured_string() {
-    let oom = JobState::Failed("OutOfMemory".to_string());
-    let timeout = JobState::Failed("TIMEOUT".to_string());
-    assert_ne!(
-        oom, timeout,
-        "sanity: the payload is the only discriminator"
-    );
+#[tokio::test]
+async fn adapter_returns_the_shared_lifecycle_handle() {
+    let scripted = ScriptHandle::hanging(ExecutionMode::Local);
+    let adapter = ScriptAdapter {
+        mode: ExecutionMode::Local,
+        behavior: AdapterBehavior::Handle(scripted.clone()),
+    };
+    let handle = adapter
+        .submit(request(ExecutionDeadline::from_now(
+            None,
+            Duration::from_secs(30),
+        )))
+        .await
+        .unwrap();
 
-    // Distinguishable ONLY by string comparison — there is no code, no kind, no
-    // retryability flag. Delete this test when a typed failure lands.
-    match (&oom, &timeout) {
-        (JobState::Failed(a), JobState::Failed(b)) => {
-            assert!(
-                a.parse::<u32>().is_err() && b.parse::<u32>().is_err(),
-                "failure payloads became structured; assert the typed identity instead"
-            );
+    handle.cancel().await.unwrap();
+    assert_eq!(scripted.cancel_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_a_hanging_poll_and_signals_the_handle() {
+    let handle = ScriptHandle::hanging(ExecutionMode::P2p);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    cancellation.cancel();
+    let handle_ref = ScriptHandleRef(handle.clone());
+
+    tokio::select! {
+        _ = cancellation.cancelled() => handle_ref.cancel().await.unwrap(),
+        result = handle_ref.snapshot() => panic!("hanging poll completed: {result:?}"),
+    }
+    assert_eq!(handle.cancel_calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        handle.lifecycle.snapshot().terminal,
+        Some(ExecutionTerminal::Cancelled { .. })
+    ));
+}
+
+#[tokio::test]
+async fn driver_restores_a_validated_success_artifact() {
+    use blut::framework::artifact::Artifact;
+    use blut::framework::artifact_store::{ArtifactRole, capture};
+
+    let source = tempfile::tempdir().unwrap();
+    let source_path = source.path().join("output.txt");
+    std::fs::write(&source_path, b"RESTORED").unwrap();
+    let typed = SmokeText {
+        path: source_path.clone(),
+        content_hash: ContentHash::hash_file(&source_path).unwrap(),
+    };
+    let stage: Arc<dyn blut::framework::stage::StageDyn> = Arc::new(SmokeEcho);
+    let stored = capture(
+        stage.as_ref(),
+        ErasedArtifact::from_typed(&typed).unwrap(),
+        source.path(),
+        ArtifactRole::Output,
+        None,
+    )
+    .unwrap();
+    let content_id = stored.manifest.content_id;
+    let handle = ScriptHandle::completed(
+        ExecutionMode::Local,
+        ExecutionTerminal::Succeeded {
+            artifact: ExecutionArtifact {
+                content_id,
+                stored: Some(stored),
+            },
+            wall_time_ms: 9,
+        },
+    );
+    let adapter = ScriptAdapter {
+        mode: ExecutionMode::Local,
+        behavior: AdapterBehavior::Handle(handle),
+    };
+    let mut execution_request = request(ExecutionDeadline::from_now(None, Duration::from_secs(5)));
+    execution_request.expected_content_id = Some(content_id);
+    let destination = tempfile::tempdir().unwrap();
+
+    let result = drive_execution(
+        &adapter,
+        execution_request,
+        &tokio_util::sync::CancellationToken::new(),
+        stage,
+        destination.path(),
+        Duration::from_millis(1),
+    )
+    .await;
+    match result {
+        ExecutionResult::Succeeded {
+            artifact,
+            content_id: actual,
+            wall_time_ms,
+        } => {
+            let restored = artifact.into_typed::<SmokeText>().unwrap();
+            assert_eq!(actual, content_id);
+            assert_eq!(wall_time_ms, 9);
+            assert_eq!(std::fs::read(restored.primary_path()).unwrap(), b"RESTORED");
+            assert!(restored.primary_path().starts_with(destination.path()));
         }
-        _ => panic!("Failed is no longer the string-carrying variant"),
+        _ => panic!("validated success did not complete"),
     }
 }
 
-/// The request seam carries no input bytes and no source root.
-///
-/// A08: "`DispatchRequest` carries neither artifact nor source root, the
-/// coordinator sends `encrypted_input: None`, the peer rejects it". The struct
-/// carries portable identities — `input_content_id`, `expected_content_id` — which describe work
-/// without transporting it. A peer can therefore verify what it was asked for
-/// and still be unable to do it.
+#[tokio::test]
+async fn driver_hard_deadline_interrupts_hanging_poll_and_cancels_handle() {
+    let handle = ScriptHandle::hanging(ExecutionMode::Cloud);
+    let adapter = ScriptAdapter {
+        mode: ExecutionMode::Cloud,
+        behavior: AdapterBehavior::Handle(handle.clone()),
+    };
+    let destination = tempfile::tempdir().unwrap();
+    let result = drive_execution(
+        &adapter,
+        request(ExecutionDeadline::from_now(None, Duration::from_millis(20))),
+        &tokio_util::sync::CancellationToken::new(),
+        Arc::new(SmokeEcho),
+        destination.path(),
+        Duration::from_millis(1),
+    )
+    .await;
+
+    assert!(matches!(result, ExecutionResult::TimedOut { .. }));
+    assert_eq!(handle.cancel_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn driver_pre_cancel_interrupts_hanging_submit() {
+    let adapter = ScriptAdapter {
+        mode: ExecutionMode::P2p,
+        behavior: AdapterBehavior::HangSubmit,
+    };
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    cancellation.cancel();
+    let destination = tempfile::tempdir().unwrap();
+
+    let result = drive_execution(
+        &adapter,
+        request(ExecutionDeadline::from_now(None, Duration::from_secs(5))),
+        &cancellation,
+        Arc::new(SmokeEcho),
+        destination.path(),
+        Duration::from_millis(1),
+    )
+    .await;
+    assert!(matches!(result, ExecutionResult::Cancelled));
+}
+
 #[test]
-fn the_request_seam_describes_work_without_transporting_it() {
-    let args = serde_json::json!({});
-    let tenant = blut::tenant::Tenant::default();
-    let req = request(&args, &tenant);
-    // Present: identity of the work.
-    let _ = req.input_content_id;
-    let _ = req.expected_content_id;
-    // Absent: the work itself. This test exists to be DELETED when a payload or
-    // source-root field is added, because that addition is A08's actual fix.
-    assert_eq!(
-        req.stage_name, "contract_stage",
-        "sanity: the request under test is the one constructed above"
-    );
+fn deadline_is_absolute_and_fail_closed() {
+    let deadline =
+        ExecutionDeadline::from_now(Some(Duration::from_millis(10)), Duration::from_millis(20));
+    assert!(deadline.soft_unix_ms.unwrap() <= deadline.hard_unix_ms);
+    assert!(ExecutionDeadline::absolute(Some(20), 10).is_err());
 }

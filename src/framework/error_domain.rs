@@ -354,8 +354,7 @@ impl From<&StageFailure> for FailureSummary {
 /// Try to extract a `FailureSummary` from a `StageError`.
 ///
 /// Walks the error chain looking for a `StageFailure` in `Backend(anyhow)`
-/// variants. Returns `None` for non-Backend variants or if the anyhow
-/// chain doesn't contain a `StageFailure`.
+/// variants and reads the serialized identity carried by `Execution` failures.
 pub fn extract_failure_summary(
     err: &crate::framework::error::StageError,
 ) -> Option<FailureSummary> {
@@ -363,6 +362,11 @@ pub fn extract_failure_summary(
         crate::framework::error::StageError::Backend(anyhow_err) => {
             StageFailure::try_extract(anyhow_err).map(FailureSummary::from)
         }
+        crate::framework::error::StageError::Execution(failure) => failure
+            .as_ref()
+            .stage_failure
+            .as_ref()
+            .map(FailureSummary::from),
         _ => None,
     }
 }

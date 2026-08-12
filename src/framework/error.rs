@@ -26,6 +26,14 @@ pub enum StageError {
     #[error("backend: {0}")]
     Backend(#[source] anyhow::Error),
 
+    /// Failure returned by a local/P2P/cloud execution adapter. Unlike the
+    /// generic backend variant, this preserves the adapter's typed retryability
+    /// and any serialized cookbook [`StageFailure`] identity.
+    ///
+    /// [`StageFailure`]: crate::framework::error_domain::StageFailure
+    #[error("execution: {0}")]
+    Execution(#[source] Box<crate::framework::execution::ExecutionFailure>),
+
     /// I/O failure with the offending path. Stage callers usually
     /// have the path already; carrying it in the error type spares
     /// log readers from grepping for it.
