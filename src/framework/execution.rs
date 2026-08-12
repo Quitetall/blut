@@ -414,12 +414,11 @@ impl ExecutionLifecycle {
         if phase_requires_assignment(next) && next_assignment.is_none() {
             return Err(LifecycleError::AssignmentRequired(next));
         }
-        if let (Some(current), Some(candidate)) = (&state.snapshot.assignment, &next_assignment) {
-            if candidate.generation < current.generation
-                || (candidate.generation == current.generation && candidate != current)
-            {
-                return Err(LifecycleError::StaleAssignment);
-            }
+        if let (Some(current), Some(candidate)) = (&state.snapshot.assignment, &next_assignment)
+            && (candidate.generation < current.generation
+                || (candidate.generation == current.generation && candidate != current))
+        {
+            return Err(LifecycleError::StaleAssignment);
         }
         if let Some(candidate) = &next_assignment {
             if candidate.generation < state.max_generation
@@ -450,10 +449,10 @@ impl ExecutionLifecycle {
         if state.snapshot.terminal.is_some() {
             return Err(LifecycleError::AlreadyTerminal);
         }
-        if let Some(expected) = assignment {
-            if state.snapshot.assignment.as_ref() != Some(expected) {
-                return Err(LifecycleError::StaleAssignment);
-            }
+        if let Some(expected) = assignment
+            && state.snapshot.assignment.as_ref() != Some(expected)
+        {
+            return Err(LifecycleError::StaleAssignment);
         }
         if let ExecutionTerminal::Succeeded { artifact, .. } = &terminal {
             // Defense in depth: lifecycle producers are checked here, and the
