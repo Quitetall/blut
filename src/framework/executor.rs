@@ -3544,23 +3544,42 @@ fn publish_speculative_inner(
         prepared.input_hash,
         &prepared.canon_args,
     );
-    let stored = capture(
+    let (content_id, stored) = match capture(
         prepared.stage.as_ref(),
         output.clone(),
         &final_stage_dir,
         ArtifactRole::Output,
         None,
-    )
-    .map_err(|error| NodeFailure::Stage {
-        idx,
-        stage: stage_name.clone(),
-        source: StageError::Io {
-            path: final_stage_dir.clone(),
-            source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-        },
-    })?;
-    let content_id = stored.manifest.content_id;
-    debug_assert_eq!(stored.manifest.logical_hash, output_hash);
+    ) {
+        Ok(stored) => (stored.manifest.content_id, Some(stored)),
+        Err(error @ ArtifactStoreError::NonPortable(_)) => {
+            tracing::warn!(
+                "executor: speculative output for stage '{stage_name}' is not portable and will not be cached: {error}"
+            );
+            (
+                unpersisted_content_id(
+                    prepared.stage.as_ref(),
+                    &output,
+                    ArtifactRole::Output,
+                    output_hash,
+                ),
+                None,
+            )
+        }
+        Err(error) => {
+            return Err(NodeFailure::Stage {
+                idx,
+                stage: stage_name.clone(),
+                source: StageError::Io {
+                    path: final_stage_dir.clone(),
+                    source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                },
+            });
+        }
+    };
+    if let Some(stored) = &stored {
+        debug_assert_eq!(stored.manifest.logical_hash, output_hash);
+    }
     if let Err(source) = prepared._scratch.cleanup() {
         return Err(NodeFailure::SpeculationCleanup {
             path: prepared._scratch.0.clone(),
@@ -3576,6 +3595,7 @@ fn publish_speculative_inner(
     }
     let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, content_id.digest())
         .with_logical_hash(output_hash)
+        .with_extra("persisted", serde_json::Value::Bool(stored.is_some()))
         .with_stage(prepared.stage_name.clone());
     if let Err(error) = metadata.write_to(&final_stage_dir.join("output.metadata.json")) {
         tracing::warn!(
@@ -3591,35 +3611,37 @@ fn publish_speculative_inner(
     }
     let mut pipeline_cache_guard = None;
     let mut optional_cache_body = None;
-    match env.cache.insert_optional_local(prepared.key, &stored) {
-        Ok(body) => {
-            optional_cache_body = Some(body);
-            if rollback_cache_on_stop {
-                pipeline_cache_guard = Some(PipelineCachePublishGuard::new(
-                    env.cache.entry_path_for_write(prepared.key),
-                    rollback_failure,
-                ));
+    if let Some(stored) = &stored {
+        match env.cache.insert_optional_local(prepared.key, stored) {
+            Ok(body) => {
+                optional_cache_body = Some(body);
+                if rollback_cache_on_stop {
+                    pipeline_cache_guard = Some(PipelineCachePublishGuard::new(
+                        env.cache.entry_path_for_write(prepared.key),
+                        rollback_failure,
+                    ));
+                }
+                if rollback_cache_on_stop
+                    && let Some(error) = plan_stop_error(deadline, plan_started, &env.cancel)
+                {
+                    return Err(NodeFailure::Plan(error));
+                }
+                let proof = crate::framework::cache::CacheProof {
+                    key: prepared.key,
+                    entry_path: env.cache.entry_path_for_write(prepared.key),
+                };
+                if let Err(error) = proof.write_to(&final_stage_dir.join("cache-proof.json")) {
+                    tracing::warn!(
+                        "executor: speculative cache proof for stage '{}' failed: {error}",
+                        prepared.stage_name
+                    );
+                }
             }
-            if rollback_cache_on_stop
-                && let Some(error) = plan_stop_error(deadline, plan_started, &env.cancel)
-            {
-                return Err(NodeFailure::Plan(error));
-            }
-            let proof = crate::framework::cache::CacheProof {
-                key: prepared.key,
-                entry_path: env.cache.entry_path_for_write(prepared.key),
-            };
-            if let Err(error) = proof.write_to(&final_stage_dir.join("cache-proof.json")) {
-                tracing::warn!(
-                    "executor: speculative cache proof for stage '{}' failed: {error}",
-                    prepared.stage_name
-                );
-            }
+            Err(error) => tracing::warn!(
+                "executor: speculative cache insert for stage '{}' failed: {error}; continuing",
+                prepared.stage_name
+            ),
         }
-        Err(error) => tracing::warn!(
-            "executor: speculative cache insert for stage '{}' failed: {error}; continuing",
-            prepared.stage_name
-        ),
     }
     // Pipeline keys are cold, private reservations, so their cache write stays
     // rollback-capable until lifecycle publication. Ordinary speculation can

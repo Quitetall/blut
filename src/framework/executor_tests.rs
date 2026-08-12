@@ -544,6 +544,97 @@ fn ordinary_speculation_cache_insert_is_the_cancellation_linearization_point() {
 }
 
 #[test]
+fn speculative_external_reference_succeeds_without_portable_cache() {
+    let _lock = TEST_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let job_dir = temp.path().join("job");
+    let external = tempfile::tempdir().unwrap();
+    let external_path = external.path().join("corpus.bin");
+    std::fs::write(&external_path, b"externally managed corpus").unwrap();
+    let cache = Arc::new(CacheHandle::job_local(job_dir.join("_cache")));
+    let mut ctx = ExecCtx::new(job_dir.clone());
+    ctx.cache = cache.clone();
+    let training_io_resolver = TrainingIoResolver::from_ctx(&ctx).unwrap();
+    let mut events = ctx.status.subscribe();
+    let env = NodeEnv {
+        job_dir: ctx.job_dir,
+        cache: ctx.cache,
+        tenant: ctx.tenant,
+        status: ctx.status,
+        cancel: ctx.cancel,
+        resources: ctx.resources,
+        gpu: ctx.gpu,
+        memory: ctx.memory,
+        memory_budget_gib: ctx.memory_budget_gib,
+        launch_target: ctx.launch_target,
+        device_index: ctx.device_index,
+        fb_warm: ctx.fb_warm,
+        admitted_workers: ctx.admitted_workers,
+        admitted_batch_size: ctx.admitted_batch_size,
+        training_io_profiles: std::sync::RwLock::new(HashMap::new()),
+        training_io_resolver,
+        bypass_cache: false,
+        recipe_name: "speculative-external-reference-test".into(),
+        on_retry: None,
+        diverged: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        #[cfg(feature = "p2p")]
+        dispatch_policy: None,
+        #[cfg(feature = "p2p")]
+        dispatcher: None,
+    };
+
+    let key = InvocationKey::from_digest(ContentHash::of_bytes(b"external-speculative-key"));
+    let scratch_root = job_dir.join(".speculative/private-external");
+    let scratch_stage_dir = scratch_root.join("stages/1-make_external_ref");
+    std::fs::create_dir_all(&scratch_stage_dir).unwrap();
+    let logical_hash = ContentHash::hash_file(&external_path).unwrap();
+    let prepared = SpeculativePrepared {
+        _scratch: SpeculationScratch(scratch_root.clone()),
+        scratch_stage_dir,
+        node_id: 1,
+        node_idx: 1,
+        stage: Arc::new(MakeExternalRef),
+        stage_name: MakeExternalRef::NAME.into(),
+        input_hash: ContentHash::of_bytes(b"external-speculative-input"),
+        input_content_ids: Vec::new(),
+        canon_args: b"{}".to_vec(),
+        key,
+        output: ErasedArtifact::from_typed(&ExternalRef {
+            path: external_path.clone(),
+            content_hash: logical_hash,
+        })
+        .unwrap(),
+        elapsed: std::time::Duration::from_millis(1),
+        training_io_profile: None,
+        buffered_steps: Vec::new(),
+    };
+
+    let outcome = match publish_speculative(prepared, &env, None, Instant::now(), false) {
+        Ok(outcome) => outcome,
+        Err(_) => panic!("non-portable speculative output must degrade to an uncached result"),
+    };
+
+    assert_eq!(outcome.node_id, 1);
+    assert_eq!(outcome.logical, logical_hash);
+    assert!(!cache.entry_path_for_write(key).exists());
+    assert!(
+        !job_dir
+            .join("stages/1-make_external_ref/cache-proof.json")
+            .exists()
+    );
+    assert!(external_path.is_file());
+    assert!(!scratch_root.exists());
+    assert!(matches!(
+        events.try_recv(),
+        Ok(StageEvent::StageBegin { node_idx: 1, .. })
+    ));
+    assert!(matches!(
+        events.try_recv(),
+        Ok(StageEvent::StageEnd { node_idx: 1, .. })
+    ));
+}
+
+#[test]
 fn dag_opt_advanced_gate_pipeline_corrupt_spill_cleanup_failure_is_fatal() {
     let temp = tempfile::tempdir().unwrap();
     let scratch_root = temp.path().join(".blut-test-pipeline-cleanup-failure");
