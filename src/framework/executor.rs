@@ -54,6 +54,12 @@ use crate::framework::artifact_store::{
 use crate::framework::cache::{CacheHandle, CacheHit};
 use crate::framework::control::{Control, ControlPolicy, StepMetrics};
 use crate::framework::error::{PlanError, StageError};
+#[cfg(feature = "p2p")]
+use crate::framework::execution::{
+    DEFAULT_REMOTE_TIMEOUT, DataClassification, EXECUTION_PROTOCOL_VERSION, ExecutionAdapter,
+    ExecutionDeadline, ExecutionFailureKind, ExecutionRequest, ExecutionResources, ExecutionResult,
+    drive_execution,
+};
 use crate::framework::plan::{CompiledPlan, NodeId};
 use crate::framework::resource::Resource;
 use crate::framework::stage::{ErasedArtifact, InProcessArtifact, StageContext, StageDyn};
@@ -305,6 +311,10 @@ pub struct ExecCtx {
     /// P2P dispatch: submits tasks to the remote compute network.
     #[cfg(feature = "p2p")]
     pub dispatcher: Option<Arc<dyn DispatchSubmitter>>,
+    /// Canonical A08 adapter. New callers use this lifecycle; legacy dispatcher
+    /// remains only until all external callers migrate.
+    #[cfg(feature = "p2p")]
+    pub execution_adapter: Option<Arc<dyn ExecutionAdapter>>,
     /// DAG optimizer. When set, the executor runs its enabled passes before
     /// execution. The established DCE/critical-path/memory passes default on;
     /// advanced cache-aware and user-priority ordering default off.
@@ -376,6 +386,8 @@ impl ExecCtx {
             dispatch_policy: None,
             #[cfg(feature = "p2p")]
             dispatcher: None,
+            #[cfg(feature = "p2p")]
+            execution_adapter: None,
             dag_optimizer: Some(crate::framework::dag_opt::DagOptimizer::new()),
         }
     }
@@ -464,6 +476,18 @@ impl ExecCtx {
     ) -> Self {
         self.dispatch_policy = Some(policy);
         self.dispatcher = Some(submitter);
+        self
+    }
+
+    /// Place dispatchable stages through the canonical A08 lifecycle adapter.
+    #[cfg(feature = "p2p")]
+    pub fn with_execution_adapter(
+        mut self,
+        policy: Arc<dyn crate::p2p::dispatch::DispatchPolicy>,
+        adapter: Arc<dyn ExecutionAdapter>,
+    ) -> Self {
+        self.dispatch_policy = Some(policy);
+        self.execution_adapter = Some(adapter);
         self
     }
 
@@ -609,6 +633,7 @@ struct NodeEnv {
     bypass_cache: bool,
     recipe_name: String,
     on_retry: Option<crate::framework::retry::RetryHook>,
+    deadline: Option<Instant>,
     /// Divergence registry (S1 / ADR 0044 P7). Node id → the offending step's
     /// divergence detail, populated by the coordinator at the KILL site (a
     /// `Control::KillBranch` or a `Stage::divergence_check` true) BEFORE it
@@ -626,6 +651,8 @@ struct NodeEnv {
     dispatch_policy: Option<Arc<dyn crate::p2p::dispatch::DispatchPolicy>>,
     #[cfg(feature = "p2p")]
     dispatcher: Option<Arc<dyn DispatchSubmitter>>,
+    #[cfg(feature = "p2p")]
+    execution_adapter: Option<Arc<dyn ExecutionAdapter>>,
 }
 
 impl NodeEnv {
@@ -2077,6 +2104,79 @@ async fn acquire_admission(
     })
 }
 
+#[cfg(feature = "p2p")]
+fn remote_deadline(task: &NodeTask, env: &NodeEnv) -> ExecutionDeadline {
+    let plan_remaining = env
+        .deadline
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+    let mut hard = task.timeout.hard.unwrap_or(DEFAULT_REMOTE_TIMEOUT);
+    if let Some(remaining) = plan_remaining {
+        hard = hard.min(remaining);
+    }
+    ExecutionDeadline::from_now(task.timeout.soft, hard)
+}
+
+#[cfg(feature = "p2p")]
+fn build_remote_request(task: &NodeTask, env: &NodeEnv, attempt: u32) -> Option<ExecutionRequest> {
+    let (policy, _adapter) = (
+        env.dispatch_policy.as_ref()?,
+        env.execution_adapter.as_ref()?,
+    );
+    if env.tenant.is_restricted()
+        || env.training_io_node(task.node_id).is_some()
+        || !policy.is_dispatchable(task.stage.name())
+    {
+        return None;
+    }
+    let input = match capture(
+        task.stage.as_ref(),
+        task.input.clone(),
+        &env.job_dir,
+        ArtifactRole::Input,
+        None,
+    ) {
+        Ok(input) => input,
+        Err(error) => {
+            tracing::warn!(
+                "portable input capture failed for node {} ({}), running locally: {error}",
+                task.node_idx,
+                task.stage.name()
+            );
+            return None;
+        }
+    };
+    let data_class = match policy.classify_stage(task.stage.name(), &task.args) {
+        crate::p2p::trust::DataClass::Public => DataClassification::Public,
+        crate::p2p::trust::DataClass::Internal => DataClassification::Internal,
+        crate::p2p::trust::DataClass::Restricted => DataClassification::Restricted,
+    };
+    let resources = task.stage.resources();
+    Some(ExecutionRequest {
+        protocol_version: EXECUTION_PROTOCOL_VERSION,
+        execution_id: format!(
+            "exec-{}-{}-{}",
+            task.node_idx,
+            attempt,
+            uuid::Uuid::new_v4()
+        ),
+        stage_name: task.stage.name().to_string(),
+        stage_schema: task.stage.schema(),
+        invocation_key: task.key,
+        args_hash: ContentHash::of_bytes(&task.canon_args),
+        args: task.args.clone(),
+        input,
+        expected_content_id: None,
+        resources: ExecutionResources {
+            cpu_cores: task.stage.cpu_cores(),
+            memory_gib: task.stage.memory_gib(),
+            gpu: resources.contains(&Resource::Gpu),
+            gpu_vram_gib: None,
+        },
+        data_class,
+        deadline: remote_deadline(task, env),
+    })
+}
+
 async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, NodeFailure> {
     run_node_with_admission(task, env, None, None, false, None).await
 }
@@ -2200,7 +2300,9 @@ async fn run_node_with_admission(
     // post-promote (below the loop, on success).
     let fused_handoff = allow_in_process_handoff && task.stage.supports_in_process_handoff();
     let mut attempt = 0u32;
-    let (stage_output, run_elapsed) = loop {
+    #[cfg(feature = "p2p")]
+    let mut remote_enabled = true;
+    let (stage_output, run_elapsed, returned_content_id) = loop {
         attempt += 1;
         // Backoff before a re-attempt — cancellable (a backing-off stage
         // must drop the GPU/permits, which it already has by here).
@@ -2257,6 +2359,17 @@ async fn run_node_with_admission(
         // divergence retry the slot holds a FRESH (un-poisoned) token, so this
         // attempt starts clean yet stays killable by the coordinator.
         let stage_cancel = task.node_cancel.current().child_token();
+        #[cfg(feature = "p2p")]
+        let remote_request = (remote_enabled
+            && shared_admission.is_none()
+            && pre_acquired_admission.is_none()
+            && !fused_handoff)
+            .then(|| build_remote_request(&task, &env, attempt))
+            .flatten();
+        #[cfg(feature = "p2p")]
+        let is_remote = remote_request.is_some();
+        #[cfg(not(feature = "p2p"))]
+        let is_remote = false;
         let mut stage_ctx = StageContext {
             job_dir: env.job_dir.clone(),
             stage_dir: tmp_stage_dir.clone(),
@@ -2302,7 +2415,7 @@ async fn run_node_with_admission(
         // `RefuseConcurrent`s (we must not race two trainers on one dir). The
         // Executor owns the resume axis: it sets `resume_from`, the stage reads
         // it and appends `--resume`. Non-resumable stages re-run unchanged.
-        if attempt > 1 {
+        if attempt > 1 && !is_remote {
             // A job dir with no basename (e.g. a filesystem root) can't yield a
             // run identity — never auto-resume in that case (re-run fresh rather
             // than risk matching a foreign empty run_id). job_dir is always
@@ -2419,78 +2532,133 @@ async fn run_node_with_admission(
         // into the gauges table at run-end; a sustained sub-floor streak
         // raises a `gpu_starved` sentinel. Best-effort: no nvidia-smi ⇒
         // no samples, run unaffected.
-        let gpu_sampler = task.stage.resources().contains(&Resource::Gpu).then(|| {
-            crate::framework::gpu_sampler::spawn_gpu_sampler(
-                env.status.clone(),
-                idx,
-                stage_name.clone(),
-            )
-        });
+        let gpu_sampler =
+            (!is_remote && task.stage.resources().contains(&Resource::Gpu)).then(|| {
+                crate::framework::gpu_sampler::spawn_gpu_sampler(
+                    env.status.clone(),
+                    idx,
+                    stage_name.clone(),
+                )
+            });
 
-        let run_fut = async {
-            if fused_handoff {
-                // The typed predecessor value is single-owner and is consumed
-                // by the first attempt. A retry intentionally decodes the
-                // canonical erased input: the prior attempt may have consumed
-                // or mutated its typed value before failing.
-                task.stage
-                    .run_in_process(
-                        &stage_ctx,
-                        task.input.clone(),
-                        in_process_input.take(),
-                        task.args.clone(),
-                    )
-                    .await
-                    .map(|(erased, in_process)| StageRunOutput {
-                        erased,
-                        in_process: Some(in_process),
-                    })
+        #[cfg(feature = "p2p")]
+        let remote_result: Option<Result<(StageRunOutput, Option<ContentId>), StageError>> =
+            if let Some(request) = remote_request {
+                let request_deadline = request.deadline;
+                let hard_limit = request_deadline.hard_remaining();
+                let soft_limit = request_deadline.soft_remaining();
+                let adapter = env
+                    .execution_adapter
+                    .as_ref()
+                    .expect("remote request requires execution adapter");
+                let result = drive_execution(
+                    adapter.as_ref(),
+                    request,
+                    &stage_cancel,
+                    task.stage.clone(),
+                    &tmp_stage_dir,
+                    std::time::Duration::from_millis(100),
+                )
+                .await;
+                Some(match result {
+                    ExecutionResult::Succeeded {
+                        artifact,
+                        content_id,
+                        ..
+                    } => Ok((
+                        StageRunOutput {
+                            erased: artifact,
+                            in_process: None,
+                        },
+                        Some(content_id),
+                    )),
+                    ExecutionResult::Failed(failure)
+                        if failure.kind == ExecutionFailureKind::Unavailable =>
+                    {
+                        tracing::warn!(
+                            "remote execution unavailable for node {idx} ({stage_name}); running locally"
+                        );
+                        remote_enabled = false;
+                        attempt = attempt.saturating_sub(1);
+                        if let Some(owned) = owned_admission.as_mut() {
+                            owned.release_non_gpu_resources();
+                        }
+                        let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+                        drop(stage_ctx);
+                        continue;
+                    }
+                    ExecutionResult::Failed(failure) => Err(failure.into_stage_error()),
+                    ExecutionResult::Cancelled => Err(StageError::Cancelled),
+                    ExecutionResult::TimedOut {
+                        deadline_unix_ms, ..
+                    } => {
+                        let limit = if request_deadline.soft_unix_ms == Some(deadline_unix_ms) {
+                            soft_limit.unwrap_or(hard_limit)
+                        } else {
+                            hard_limit
+                        };
+                        Err(StageError::Timeout {
+                            limit,
+                            elapsed: stage_started.elapsed(),
+                        })
+                    }
+                })
             } else {
-                task.stage
-                    .run_erased(&stage_ctx, task.input.clone(), task.args.clone())
-                    .await
-                    .map(|erased| StageRunOutput {
-                        erased,
-                        in_process: None,
-                    })
-            }
-        };
-        let timed_fut = run_with_timeout(
-            run_fut,
-            &stage_cancel,
-            task.timeout.soft,
-            task.timeout.hard,
-            stage_started,
-        );
-        // Panic-safe stage run. `GpuSamplerHandle` has no `Drop` impl (a bare
-        // drop only DETACHES its background nvidia-smi poller — see the NOTE
-        // on `GpuSamplerHandle` in gpu_sampler.rs — it keeps sampling until
-        // process exit), so a panic unwinding straight through this scope
-        // used to skip the `h.stop().await` below entirely and leak the
-        // sampler task forever. `catch_unwind` runs the SAME teardown on a
-        // caught panic, then `resume_unwind`s unchanged — the coordinator's
-        // panic handling (`JoinError` → `PlanError::Other("node task
-        // panicked...")`, see the `join.join_next()` match) is untouched;
-        // only the sampler cleanup is now unwind-safe. `AssertUnwindSafe` is
-        // sound here: `timed_fut` is dropped either way immediately after
-        // this point, so no unwind-unsafe state is ever observed again.
-        let run_result = match std::panic::AssertUnwindSafe(timed_fut).catch_unwind().await {
-            Ok(r) => r,
-            Err(panic_payload) => {
-                if let Some(h) = gpu_sampler {
-                    h.stop().await;
+                None
+            };
+        #[cfg(not(feature = "p2p"))]
+        let remote_result: Option<Result<(StageRunOutput, Option<ContentId>), StageError>> = None;
+
+        let run_result = match remote_result {
+            Some(result) => result,
+            None => {
+                let run_fut = async {
+                    if fused_handoff {
+                        // Typed handoff is local-only. A retry decodes canonical
+                        // erased input after any failed consuming attempt.
+                        task.stage
+                            .run_in_process(
+                                &stage_ctx,
+                                task.input.clone(),
+                                in_process_input.take(),
+                                task.args.clone(),
+                            )
+                            .await
+                            .map(|(erased, in_process)| StageRunOutput {
+                                erased,
+                                in_process: Some(in_process),
+                            })
+                    } else {
+                        task.stage
+                            .run_erased(&stage_ctx, task.input.clone(), task.args.clone())
+                            .await
+                            .map(|erased| StageRunOutput {
+                                erased,
+                                in_process: None,
+                            })
+                    }
+                };
+                let timed_fut = run_with_timeout(
+                    run_fut,
+                    &stage_cancel,
+                    task.timeout.soft,
+                    task.timeout.hard,
+                    stage_started,
+                );
+                match std::panic::AssertUnwindSafe(timed_fut).catch_unwind().await {
+                    Ok(result) => result.map(|output| (output, None)),
+                    Err(panic_payload) => {
+                        if let Some(h) = gpu_sampler {
+                            h.stop().await;
+                        }
+                        if let Some(owned) = owned_admission.as_mut() {
+                            owned.release_non_gpu_resources();
+                        }
+                        let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+                        drop(stage_ctx);
+                        std::panic::resume_unwind(panic_payload);
+                    }
                 }
-                if let Some(owned) = owned_admission.as_mut() {
-                    owned.release_non_gpu_resources();
-                }
-                // Match every other error exit from this attempt (see the
-                // sibling `let _ = std::fs::remove_dir_all(&tmp_stage_dir)`
-                // calls above/below): a caught panic must not skip cleanup
-                // of this attempt's tmp dir either, or it lingers on disk
-                // until process exit.
-                let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-                drop(stage_ctx);
-                std::panic::resume_unwind(panic_payload);
             }
         };
 
@@ -2533,7 +2701,7 @@ async fn run_node_with_admission(
         // the retryable + auto-resume path below; otherwise the prior behaviour
         // is byte-identical (Ok-cancel → cancel_failure, Err → classify `e`).
         let err: StageError = match run_result {
-            Ok(o) => {
+            Ok((o, returned_content_id)) => {
                 debug_assert_eq!(
                     o.erased.kind,
                     task.stage.output_kind(),
@@ -2571,7 +2739,7 @@ async fn run_node_with_admission(
                     // StageEnd reports the SUCCESSFUL attempt's wall time;
                     // failed attempts + backoff are visible as StageRetrying
                     // events, not folded into this duration.
-                    break (o, stage_started.elapsed());
+                    break (o, stage_started.elapsed(), returned_content_id);
                 }
             }
             Err(e) => {
@@ -2778,6 +2946,25 @@ async fn run_node_with_admission(
             });
         }
     };
+    if let Some(returned) = returned_content_id
+        && returned != content_id
+    {
+        let failure = crate::framework::execution::ExecutionFailure::artifact(format!(
+            "restored remote identity {returned} != canonical promoted identity {content_id}"
+        ));
+        let _ = std::fs::remove_dir_all(&final_stage_dir);
+        env.status.emit(StageEvent::StageFailed {
+            node_idx: idx,
+            stage_name: stage_name.clone(),
+            error: failure.to_string(),
+            failure: None,
+        });
+        return Err(NodeFailure::Stage {
+            idx,
+            stage: stage_name,
+            source: failure.into_stage_error(),
+        });
+    }
     if let Some(stored) = &stored {
         debug_assert_eq!(stored.manifest.logical_hash, logical_hash);
     }
@@ -2944,11 +3131,14 @@ async fn prepare_private(
         bypass_cache: true,
         recipe_name: canonical_env.recipe_name.clone(),
         on_retry: None,
+        deadline: canonical_env.deadline,
         diverged: Arc::new(std::sync::Mutex::new(HashMap::new())),
         #[cfg(feature = "p2p")]
         dispatch_policy: None,
         #[cfg(feature = "p2p")]
         dispatcher: None,
+        #[cfg(feature = "p2p")]
+        execution_adapter: None,
     });
     let started = Instant::now();
     // Keep the explicit scratch owner outside the unwind boundary. If plugin
@@ -4733,11 +4923,14 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
         bypass_cache: ctx.bypass_cache,
         recipe_name: plan.name().to_string(),
         on_retry: ctx.on_retry,
+        deadline: ctx.deadline,
         diverged: Arc::new(std::sync::Mutex::new(HashMap::new())),
         #[cfg(feature = "p2p")]
         dispatch_policy: ctx.dispatch_policy,
         #[cfg(feature = "p2p")]
         dispatcher: ctx.dispatcher,
+        #[cfg(feature = "p2p")]
+        execution_adapter: ctx.execution_adapter,
     });
 
     Ok(Prelude {
@@ -5880,7 +6073,8 @@ impl ParallelExecutor {
                     // selected bounded policy and its exact retained-byte bill.
                     // The local path emits the profile losslessly before Begin.
                     #[cfg(feature = "p2p")]
-                    if task.prepared_cache_hit.is_none()
+                    if env.execution_adapter.is_none()
+                        && task.prepared_cache_hit.is_none()
                         && env.training_io_node(task.node_id).is_none()
                         && let (Some(policy), Some(dispatcher)) =
                             (env.dispatch_policy.as_ref(), env.dispatcher.as_ref())

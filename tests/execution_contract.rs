@@ -2,12 +2,13 @@
 //! ADR 0092 A08 execution-lifecycle contract.
 
 use std::future::pending;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use blut::framework::artifact::{ContentHash, ContentId, InvocationKey};
+use blut::framework::artifact::{Artifact, ContentHash, ContentId, InvocationKey};
 use blut::framework::artifact_store::{ARTIFACT_FORMAT_VERSION, ArtifactManifest, StoredArtifact};
 use blut::framework::error::StageError;
 use blut::framework::error_domain::StageFailure;
@@ -18,7 +19,51 @@ use blut::framework::execution::{
     ExecutionSnapshot, ExecutionTerminal, LifecycleError, drive_execution,
 };
 use blut::framework::stage::ErasedArtifact;
-use blut::p2p::smoke::{SmokeEcho, SmokeText};
+use blut::framework::{Resource, Stage, StageContext};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ContractFile {
+    path: PathBuf,
+    content_hash: ContentHash,
+}
+
+impl Artifact for ContractFile {
+    const KIND: &'static str = "contract";
+    const SCHEMA: u32 = 1;
+
+    fn content_hash(&self) -> ContentHash {
+        self.content_hash
+    }
+
+    fn primary_path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+struct ContractArgs {}
+
+struct ContractStage;
+
+#[async_trait]
+impl Stage for ContractStage {
+    const NAME: &'static str = "contract";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    type Input = ContractFile;
+    type Output = ContractFile;
+    type Args = ContractArgs;
+
+    async fn run(
+        &self,
+        _ctx: &StageContext,
+        input: Self::Input,
+        _args: &Self::Args,
+    ) -> Result<Self::Output, StageError> {
+        Ok(input)
+    }
+}
 
 fn content_id(label: &[u8]) -> ContentId {
     ContentId::from_digest(ContentHash::of_bytes(label))
@@ -121,6 +166,10 @@ fn assignment_generation_fences_late_completion_even_for_same_owner() {
         .transition(ExecutionPhase::Assigned, Some(first.clone()))
         .unwrap();
     lifecycle.transition(ExecutionPhase::Running, None).unwrap();
+    assert!(matches!(
+        lifecycle.transition(ExecutionPhase::Queued, Some(first.clone())),
+        Err(LifecycleError::UnexpectedAssignment(ExecutionPhase::Queued))
+    ));
     lifecycle.transition(ExecutionPhase::Queued, None).unwrap();
     assert!(matches!(
         lifecycle.transition(ExecutionPhase::Assigned, Some(first.clone())),
@@ -317,17 +366,16 @@ async fn cancellation_interrupts_a_hanging_poll_and_signals_the_handle() {
 
 #[tokio::test]
 async fn driver_restores_a_validated_success_artifact() {
-    use blut::framework::artifact::Artifact;
     use blut::framework::artifact_store::{ArtifactRole, capture};
 
     let source = tempfile::tempdir().unwrap();
     let source_path = source.path().join("output.txt");
     std::fs::write(&source_path, b"RESTORED").unwrap();
-    let typed = SmokeText {
+    let typed = ContractFile {
         path: source_path.clone(),
         content_hash: ContentHash::hash_file(&source_path).unwrap(),
     };
-    let stage: Arc<dyn blut::framework::stage::StageDyn> = Arc::new(SmokeEcho);
+    let stage: Arc<dyn blut::framework::stage::StageDyn> = Arc::new(ContractStage);
     let stored = capture(
         stage.as_ref(),
         ErasedArtifact::from_typed(&typed).unwrap(),
@@ -370,7 +418,7 @@ async fn driver_restores_a_validated_success_artifact() {
             content_id: actual,
             wall_time_ms,
         } => {
-            let restored = artifact.into_typed::<SmokeText>().unwrap();
+            let restored = artifact.into_typed::<ContractFile>().unwrap();
             assert_eq!(actual, content_id);
             assert_eq!(wall_time_ms, 9);
             assert_eq!(std::fs::read(restored.primary_path()).unwrap(), b"RESTORED");
@@ -392,7 +440,7 @@ async fn driver_hard_deadline_interrupts_hanging_poll_and_cancels_handle() {
         &adapter,
         request(ExecutionDeadline::from_now(None, Duration::from_millis(20))),
         &tokio_util::sync::CancellationToken::new(),
-        Arc::new(SmokeEcho),
+        Arc::new(ContractStage),
         destination.path(),
         Duration::from_millis(1),
     )
@@ -416,7 +464,7 @@ async fn driver_pre_cancel_interrupts_hanging_submit() {
         &adapter,
         request(ExecutionDeadline::from_now(None, Duration::from_secs(5))),
         &cancellation,
-        Arc::new(SmokeEcho),
+        Arc::new(ContractStage),
         destination.path(),
         Duration::from_millis(1),
     )

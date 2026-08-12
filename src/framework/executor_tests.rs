@@ -344,11 +344,14 @@ fn dag_opt_advanced_gate_pipeline_cancel_after_cache_rename_rolls_back_before_li
         bypass_cache: false,
         recipe_name: "pipeline-publication-test".into(),
         on_retry: None,
+        deadline: ctx.deadline,
         diverged: Arc::new(std::sync::Mutex::new(HashMap::new())),
         #[cfg(feature = "p2p")]
         dispatch_policy: None,
         #[cfg(feature = "p2p")]
         dispatcher: None,
+        #[cfg(feature = "p2p")]
+        execution_adapter: None,
     };
 
     let parent_key = InvocationKey::from_digest(ContentHash::of_bytes(b"pipeline-parent-key"));
@@ -460,11 +463,14 @@ fn ordinary_speculation_cache_insert_is_the_cancellation_linearization_point() {
         bypass_cache: false,
         recipe_name: "ordinary-publication-test".into(),
         on_retry: None,
+        deadline: ctx.deadline,
         diverged: Arc::new(std::sync::Mutex::new(HashMap::new())),
         #[cfg(feature = "p2p")]
         dispatch_policy: None,
         #[cfg(feature = "p2p")]
         dispatcher: None,
+        #[cfg(feature = "p2p")]
+        execution_adapter: None,
     };
 
     let child_key =
@@ -570,11 +576,14 @@ fn speculative_external_reference_succeeds_without_portable_cache() {
         bypass_cache: false,
         recipe_name: "speculative-external-reference-test".into(),
         on_retry: None,
+        deadline: ctx.deadline,
         diverged: Arc::new(std::sync::Mutex::new(HashMap::new())),
         #[cfg(feature = "p2p")]
         dispatch_policy: None,
         #[cfg(feature = "p2p")]
         dispatcher: None,
+        #[cfg(feature = "p2p")]
+        execution_adapter: None,
     };
 
     let key = InvocationKey::from_digest(ContentHash::of_bytes(b"external-speculative-key"));
@@ -4404,6 +4413,153 @@ impl Stage for DispatchableStage {
 }
 #[cfg(feature = "p2p")]
 impl Compatible<LamuTrainerBackend> for DispatchableStage {}
+
+#[cfg(feature = "p2p")]
+enum CanonicalAdapterOutcome {
+    Succeeded(Counter),
+    Unavailable,
+}
+
+#[cfg(feature = "p2p")]
+struct MockExecutionAdapter {
+    outcome: CanonicalAdapterOutcome,
+    submit_count: Arc<AtomicU32>,
+}
+
+#[cfg(feature = "p2p")]
+struct MockExecutionHandle {
+    snapshot: crate::framework::execution::ExecutionSnapshot,
+}
+
+#[cfg(feature = "p2p")]
+#[async_trait]
+impl crate::framework::execution::ExecutionHandle for MockExecutionHandle {
+    async fn snapshot(
+        &self,
+    ) -> Result<
+        crate::framework::execution::ExecutionSnapshot,
+        crate::framework::execution::ExecutionFailure,
+    > {
+        Ok(self.snapshot.clone())
+    }
+
+    async fn cancel(&self) -> Result<(), crate::framework::execution::ExecutionFailure> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "p2p")]
+#[async_trait]
+impl crate::framework::execution::ExecutionAdapter for MockExecutionAdapter {
+    fn mode(&self) -> crate::framework::execution::ExecutionMode {
+        crate::framework::execution::ExecutionMode::P2p
+    }
+
+    async fn submit(
+        &self,
+        request: crate::framework::execution::ExecutionRequest,
+    ) -> Result<
+        Box<dyn crate::framework::execution::ExecutionHandle>,
+        crate::framework::execution::ExecutionFailure,
+    > {
+        self.submit_count.fetch_add(1, Ordering::SeqCst);
+        let CanonicalAdapterOutcome::Succeeded(counter) = &self.outcome else {
+            return Err(crate::framework::execution::ExecutionFailure::unavailable(
+                "no mock peer",
+            ));
+        };
+        let output = ErasedArtifact::from_typed(counter).unwrap();
+        let stored = capture(
+            &DispatchableStage,
+            output,
+            std::path::Path::new("."),
+            ArtifactRole::Output,
+            request.expected_content_id,
+        )
+        .unwrap();
+        let lifecycle = crate::framework::execution::ExecutionLifecycle::new(
+            crate::framework::execution::ExecutionMode::P2p,
+        );
+        let assignment = crate::framework::execution::Assignment::new("mock-peer", 1);
+        lifecycle
+            .transition(
+                crate::framework::execution::ExecutionPhase::Assigned,
+                Some(assignment.clone()),
+            )
+            .unwrap();
+        lifecycle
+            .transition(crate::framework::execution::ExecutionPhase::Running, None)
+            .unwrap();
+        lifecycle
+            .finish(
+                Some(&assignment),
+                crate::framework::execution::ExecutionTerminal::Succeeded {
+                    artifact: crate::framework::execution::ExecutionArtifact {
+                        content_id: stored.manifest.content_id,
+                        stored: Some(stored),
+                    },
+                    wall_time_ms: 1,
+                },
+            )
+            .unwrap();
+        Ok(Box::new(MockExecutionHandle {
+            snapshot: lifecycle.snapshot(),
+        }))
+    }
+}
+
+#[cfg(feature = "p2p")]
+#[tokio::test]
+async fn canonical_execution_adapter_returns_validated_artifact_through_run_node() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (_td, base) = fresh_ctx();
+    let submit_count = Arc::new(AtomicU32::new(0));
+    let adapter = Arc::new(MockExecutionAdapter {
+        outcome: CanonicalAdapterOutcome::Succeeded(Counter { n: 42 }),
+        submit_count: submit_count.clone(),
+    });
+    let policy = Arc::new(MockDispatchPolicy {
+        dispatchable: "dispatchable_thing",
+    });
+    let ctx = base.with_execution_adapter(policy, adapter);
+    let plan = Plan::<(), LamuTrainerBackend>::new("a08_success", serde_json::json!({}))
+        .start(DispatchableStage, EmptyArgs)
+        .finish()
+        .into_compiled();
+
+    let result = ParallelExecutor::execute(plan, ctx).await.unwrap();
+    let output: Counter = result.final_output.unwrap().into_typed().unwrap();
+    assert_eq!(
+        output.n, 42,
+        "remote artifact must survive common promotion"
+    );
+    assert_eq!(submit_count.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "p2p")]
+#[tokio::test]
+async fn unavailable_canonical_adapter_falls_back_before_local_work_starts() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (_td, base) = fresh_ctx();
+    let submit_count = Arc::new(AtomicU32::new(0));
+    let adapter = Arc::new(MockExecutionAdapter {
+        outcome: CanonicalAdapterOutcome::Unavailable,
+        submit_count: submit_count.clone(),
+    });
+    let policy = Arc::new(MockDispatchPolicy {
+        dispatchable: "dispatchable_thing",
+    });
+    let ctx = base.with_execution_adapter(policy, adapter);
+    let plan = Plan::<(), LamuTrainerBackend>::new("a08_fallback", serde_json::json!({}))
+        .start(DispatchableStage, EmptyArgs)
+        .finish()
+        .into_compiled();
+
+    let result = ParallelExecutor::execute(plan, ctx).await.unwrap();
+    let output: Counter = result.final_output.unwrap().into_typed().unwrap();
+    assert_eq!(output.n, 999, "unassigned work must retain local fallback");
+    assert_eq!(submit_count.load(Ordering::SeqCst), 1);
+}
 
 #[cfg(feature = "p2p")]
 #[tokio::test]

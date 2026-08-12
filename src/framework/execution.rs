@@ -79,6 +79,8 @@ pub struct ExecutionDeadline {
 impl ExecutionDeadline {
     /// Build a deadline from relative budgets. The optional soft bound is
     /// clamped to the hard bound so no adapter observes an impossible ordering.
+    /// A zero hard budget becomes one millisecond: callers get an immediately
+    /// expiring, but still well-formed, absolute deadline.
     pub fn from_now(soft: Option<Duration>, hard: Duration) -> Self {
         let now = unix_ms();
         let hard_ms = duration_ms(hard.max(Duration::from_millis(1)));
@@ -400,6 +402,9 @@ impl ExecutionLifecycle {
         }
 
         let next_assignment = if next == ExecutionPhase::Queued {
+            if assignment.is_some() {
+                return Err(LifecycleError::UnexpectedAssignment(next));
+            }
             None
         } else {
             assignment.or_else(|| state.snapshot.assignment.clone())
@@ -507,6 +512,8 @@ pub enum LifecycleError {
     },
     #[error("phase {0:?} requires assignment ownership")]
     AssignmentRequired(ExecutionPhase),
+    #[error("phase {0:?} must not carry assignment ownership")]
+    UnexpectedAssignment(ExecutionPhase),
     #[error("completion or transition used a stale assignment")]
     StaleAssignment,
     #[error("success content identity does not match the stored artifact")]
@@ -524,6 +531,10 @@ pub trait ExecutionHandle: Send + Sync {
 }
 
 /// The only executor-facing seam for local/mesh/cloud placement variation.
+///
+/// `submit` is cancellation-safe: dropping its future before a handle is
+/// returned MUST leave no queued, assigned, or durable work behind. Adapters
+/// that perform I/O return a handle first and run submission behind that handle.
 #[async_trait]
 pub trait ExecutionAdapter: Send + Sync {
     fn mode(&self) -> ExecutionMode;
@@ -619,6 +630,7 @@ pub async fn drive_execution(
                 expected_content_id,
                 stage,
                 output_dir.to_path_buf(),
+                deadline,
             )
             .await;
         }
@@ -663,6 +675,7 @@ async fn validate_terminal(
     expected_content_id: Option<ContentId>,
     stage: Arc<dyn StageDyn>,
     output_dir: std::path::PathBuf,
+    deadline: ExecutionDeadline,
 ) -> ExecutionResult {
     match terminal {
         ExecutionTerminal::Succeeded {
@@ -689,32 +702,86 @@ async fn validate_terminal(
                 )));
             }
             let content_id = artifact.content_id;
-            let restored = tokio::task::spawn_blocking(move || {
-                restore(
+            let quarantine_root = output_dir
+                .parent()
+                .unwrap_or(&output_dir)
+                .join(format!(".execution-restore-{}", uuid::Uuid::new_v4()));
+            let quarantine_import = quarantine_root
+                .join(".artifact-import")
+                .join(content_id.to_hex());
+            let restore_root = quarantine_root.clone();
+            let mut restore_task = tokio::task::spawn_blocking(move || {
+                let quarantine = RestoreQuarantine::new(restore_root, quarantine_import);
+                let output = restore(
                     stage.as_ref(),
                     &stored,
-                    &output_dir,
+                    &quarantine.root,
                     ArtifactRole::Output,
                     Some(content_id),
-                )
-            })
-            .await;
-            match restored {
-                Ok(output) => ExecutionResult::Succeeded {
-                    artifact: match output {
-                        Ok(output) => output,
-                        Err(error) => {
-                            return ExecutionResult::Failed(ExecutionFailure::artifact(format!(
-                                "restore remote output: {error}"
-                            )));
-                        }
-                    },
-                    content_id,
-                    wall_time_ms,
-                },
-                Err(error) => ExecutionResult::Failed(ExecutionFailure::artifact(format!(
-                    "restore task failed: {error}"
-                ))),
+                )?;
+                Ok::<_, crate::framework::artifact_store::ArtifactStoreError>((
+                    stage, quarantine, output,
+                ))
+            });
+            let (restore_budget, restore_deadline) = match deadline.soft_remaining() {
+                Some(soft) => (soft, deadline.soft_unix_ms.expect("matched Some")),
+                None => (deadline.hard_remaining(), deadline.hard_unix_ms),
+            };
+            let (stage, quarantine, restored) =
+                match tokio::time::timeout(restore_budget, &mut restore_task).await {
+                    Ok(Ok(Ok(restored))) => restored,
+                    Ok(Ok(Err(error))) => {
+                        return ExecutionResult::Failed(ExecutionFailure::artifact(format!(
+                            "restore remote output: {error}"
+                        )));
+                    }
+                    Ok(Err(error)) => {
+                        return ExecutionResult::Failed(ExecutionFailure::artifact(format!(
+                            "restore task failed: {error}"
+                        )));
+                    }
+                    Err(_) => {
+                        // `spawn_blocking` cannot interrupt a syscall already in
+                        // progress, but the task writes only to its quarantine. If it
+                        // eventually returns, its detached result is dropped and the
+                        // quarantine guard cleans up without racing attempt cleanup.
+                        restore_task.abort();
+                        return ExecutionResult::TimedOut {
+                            phase: ExecutionPhase::DownloadingOutput,
+                            deadline_unix_ms: restore_deadline,
+                        };
+                    }
+                };
+            let target_import = output_dir
+                .join(".artifact-import")
+                .join(content_id.to_hex());
+            if let Some(parent) = target_import.parent()
+                && let Err(error) = std::fs::create_dir_all(parent)
+            {
+                return ExecutionResult::Failed(ExecutionFailure::artifact(format!(
+                    "create restored output parent: {error}"
+                )));
+            }
+            let _ = std::fs::remove_dir_all(&target_import);
+            if let Err(error) = std::fs::rename(&quarantine.import_root, &target_import) {
+                return ExecutionResult::Failed(ExecutionFailure::artifact(format!(
+                    "publish restored output: {error}"
+                )));
+            }
+            let Some(restored) = stage.rebase_output_paths_checked(
+                restored,
+                &quarantine.import_root,
+                &target_import,
+            ) else {
+                let _ = std::fs::remove_dir_all(&target_import);
+                return ExecutionResult::Failed(ExecutionFailure::artifact(
+                    "rebase published remote output",
+                ));
+            };
+            ExecutionResult::Succeeded {
+                artifact: restored,
+                content_id,
+                wall_time_ms,
             }
         }
         ExecutionTerminal::Failed { failure } => ExecutionResult::Failed(failure),
@@ -726,5 +793,25 @@ async fn validate_terminal(
             phase,
             deadline_unix_ms,
         },
+    }
+}
+
+/// Restore output is quarantined beside (not inside) the caller's attempt
+/// directory. If a timed-out blocking task eventually returns, dropping its
+/// detached result removes this directory without racing attempt cleanup.
+struct RestoreQuarantine {
+    root: std::path::PathBuf,
+    import_root: std::path::PathBuf,
+}
+
+impl RestoreQuarantine {
+    fn new(root: std::path::PathBuf, import_root: std::path::PathBuf) -> Self {
+        Self { root, import_root }
+    }
+}
+
+impl Drop for RestoreQuarantine {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
