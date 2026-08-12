@@ -45,6 +45,7 @@ static FUSION_RELEASE_WAITER: tokio::sync::Notify = tokio::sync::Notify::const_n
 static FUSION_WAITER_ACQUIRED: AtomicBool = AtomicBool::new(false);
 static DIRECT_ARTIFACT_BINARY_DESERIALIZES: AtomicUsize = AtomicUsize::new(0);
 static FUSION_DUPLICATE_RUNS: AtomicUsize = AtomicUsize::new(0);
+static FUSION_BOUNDARY_STAGE_STARTED: AtomicBool = AtomicBool::new(false);
 static FUSION_BOUNDARY_DEADLINE: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
 static SPEC_GATE_DECISION_STARTED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
@@ -506,6 +507,7 @@ impl Stage for RecordSlowAfter {
         input: OrderArtifact,
         args: &OrderArgs,
     ) -> Result<OrderArtifact, StageError> {
+        FUSION_BOUNDARY_STAGE_STARTED.store(true, Ordering::SeqCst);
         let deadline = *FUSION_BOUNDARY_DEADLINE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2445,6 +2447,7 @@ async fn dag_opt_advanced_gate_dce_dense_renumbers_middle_hole_before_fusion() {
 #[tokio::test]
 async fn dag_opt_advanced_gate_stops_at_internal_fusion_deadline_boundary() {
     let _guard = TEST_LOCK.lock().await;
+    FUSION_BOUNDARY_STAGE_STARTED.store(false, Ordering::SeqCst);
     EXECUTION_ORDER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2481,7 +2484,7 @@ async fn dag_opt_advanced_gate_stops_at_internal_fusion_deadline_boundary() {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     assert!(
-        order.iter().any(|label| label == "fuse-deadline-slow"),
+        FUSION_BOUNDARY_STAGE_STARTED.load(Ordering::SeqCst),
         "the deadline fixture must expire while the first internal fused stage is running: {order:?}"
     );
     assert!(
