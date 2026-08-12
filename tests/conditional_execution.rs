@@ -774,10 +774,10 @@ fn is_pruned_stage(event: &StageEvent, expected: &str) -> bool {
 }
 
 fn cache_entry_count(job_dir: &Path) -> usize {
-    std::fs::read_dir(job_dir.join("_cache"))
-        .expect("job-local cache exists")
+    std::fs::read_dir(job_dir.join("_cache/invocations"))
+        .expect("job-local invocation cache exists")
         .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter(|entry| entry.path().join("record.bin").is_file())
         .count()
 }
 

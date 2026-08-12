@@ -59,7 +59,12 @@ pub enum StageEvent {
     StageBegin {
         node_idx: u32,
         stage_name: String,
+        /// Legacy logical-input digest retained for invocation/cache diagnostics.
         input_hash: ContentHash,
+        /// Portable identities of predecessor artifacts, in dependency order.
+        /// Empty for graph roots and legacy status records.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        input_content_ids: Vec<ContentId>,
     },
     /// Stage successfully produced output.
     StageEnd {
@@ -557,6 +562,7 @@ mod tests {
             node_idx: 0,
             stage_name: "materialize_conversations".into(),
             input_hash: ContentHash::of_bytes(b""),
+            input_content_ids: Vec::new(),
         };
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains("\"kind\":\"stage_begin\""));
@@ -667,6 +673,7 @@ mod tests {
             node_idx: 0,
             stage_name: "local".into(),
             input_hash: ContentHash::of_bytes(b"i"),
+            input_content_ids: Vec::new(),
         });
         // A lifecycle event forwarded FROM a worker, tagged with the worker id.
         hub.ingest_remote(
@@ -705,6 +712,7 @@ mod tests {
             node_idx: 0,
             stage_name: "before-abort".into(),
             input_hash: ContentHash::of_bytes(b"in"),
+            input_content_ids: Vec::new(),
         });
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
@@ -823,6 +831,7 @@ mod tests {
                 node_idx: 0,
                 stage_name: "s".into(),
                 input_hash: ContentHash::of_bytes(b""),
+                input_content_ids: Vec::new(),
             }
             .is_lifecycle()
         );
@@ -859,6 +868,7 @@ mod tests {
             node_idx: 0,
             stage_name: "flooded".into(),
             input_hash: ContentHash::of_bytes(b"in"),
+            input_content_ids: Vec::new(),
         });
         // Flood far more Steps than the broadcast can hold (4096).
         for i in 0..20_000u32 {

@@ -11,10 +11,28 @@ use blut::config::partition::{
     BackfillSelector, CellStatus, PartitionDim, PartitionKey, PartitionSet, PartitionSpec,
     PartitionStatus, PartitionValue, select_backfill_targets, status_matrix,
 };
+use blut::framework::stage::{Stage, StageContext};
 use blut::framework::{CacheHandle, ContentHash, InvocationKey};
+use blut::framework::{Resource, StageError};
 use blut::lineage_db::{ArtifactRow, LineageDb, PartitionStatusRow, RunRow};
 
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct UnitStage;
+
+#[async_trait::async_trait]
+impl Stage for UnitStage {
+    const NAME: &'static str = "partition_backfill_unit";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    type Input = ();
+    type Output = ();
+    type Args = ();
+
+    async fn run(&self, _ctx: &StageContext, _input: (), _args: &()) -> Result<(), StageError> {
+        Ok(())
+    }
+}
 
 #[test]
 fn partition_key_is_a_wire_type_and_extends_cache_identity_without_moving_none() {
@@ -146,15 +164,16 @@ fn partition_backfill_matrix_is_lineage_derived_and_selector_exact() {
             InvocationKey::from_digest(ContentHash::of_bytes(format!("cache-{key}").as_bytes()));
         let cache_root = temp.path().join("cache");
         let cache = CacheHandle::job_local(cache_root.clone());
+        let erased = blut::framework::stage::ErasedArtifact::from_typed(&()).unwrap();
         cache
-            .insert(
-                cache_key,
-                &blut::framework::stage::ErasedArtifact::from_typed(&()).unwrap(),
-            )
+            .insert(cache_key, &UnitStage, &erased, &stage_dir)
             .unwrap();
         blut::framework::cache::CacheProof {
             key: cache_key,
-            entry_path: cache_root.join(cache_key.to_hex()).join("output.bin"),
+            entry_path: cache_root
+                .join("invocations")
+                .join(cache_key.to_hex())
+                .join("record.bin"),
         }
         .write_to(&stage_dir.join("cache-proof.json"))
         .unwrap();
@@ -316,8 +335,9 @@ fn partition_backfill_matrix_is_lineage_derived_and_selector_exact() {
     std::fs::remove_file(
         temp.path()
             .join("cache")
+            .join("invocations")
             .join(fresh_cache_key.to_hex())
-            .join("output.bin"),
+            .join("record.bin"),
     )
     .unwrap();
     assert_eq!(

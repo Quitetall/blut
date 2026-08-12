@@ -32,6 +32,7 @@ pub struct HfCheckpoint {
 impl Artifact for HfCheckpoint {
     const KIND: &'static str = "checkpoint.hf";
     const SCHEMA: u32 = 1;
+    const ALLOW_EXTERNAL_PATHS: bool = true;
     fn content_hash(&self) -> ContentHash {
         self.content_hash
     }
@@ -61,6 +62,7 @@ pub struct GgufModel {
 impl Artifact for GgufModel {
     const KIND: &'static str = "model.gguf";
     const SCHEMA: u32 = 1;
+    const ALLOW_EXTERNAL_PATHS: bool = true;
     fn content_hash(&self) -> ContentHash {
         self.content_hash
     }

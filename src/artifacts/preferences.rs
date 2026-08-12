@@ -23,6 +23,7 @@ pub struct PreferenceJsonl {
 impl Artifact for PreferenceJsonl {
     const KIND: &'static str = "dataset.preferences";
     const SCHEMA: u32 = 1;
+    const ALLOW_EXTERNAL_PATHS: bool = true;
     fn content_hash(&self) -> ContentHash {
         self.content_hash
     }

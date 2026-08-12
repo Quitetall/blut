@@ -25,6 +25,8 @@ pub struct LineageNode {
     pub node_idx: u32,
     pub stage: String,
     pub input_hash: Option<String>,
+    /// Portable predecessor identities. Multi-input stages retain every edge.
+    pub input_content_ids: Vec<String>,
     pub output_hash: Option<String>,
     /// `true` if the stage was served from cache (a `StageSkipped`).
     pub cached: bool,
@@ -49,9 +51,16 @@ pub fn job_lineage(job_id: &str) -> Result<Vec<LineageNode>> {
                 node_idx,
                 stage_name,
                 input_hash,
+                input_content_ids,
             } => {
-                ensure_node(&mut by_idx, node_idx, &stage_name).input_hash =
-                    Some(input_hash.to_hex());
+                let identities: Vec<String> = input_content_ids
+                    .into_iter()
+                    .map(|content_id| content_id.to_hex())
+                    .collect();
+                let logical = input_hash.to_hex();
+                let node = ensure_node(&mut by_idx, node_idx, &stage_name);
+                node.input_hash = Some(logical);
+                node.input_content_ids = identities;
             }
             StageEvent::StageEnd {
                 node_idx,
@@ -292,6 +301,7 @@ fn ensure_node<'a>(
         node_idx: idx,
         stage: name.to_string(),
         input_hash: None,
+        input_content_ids: Vec::new(),
         output_hash: None,
         cached: false,
         elapsed: None,

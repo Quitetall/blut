@@ -27,6 +27,7 @@
 //! kill-switch; commit 8 deletes the legacy path.
 
 pub mod artifact;
+pub mod artifact_store;
 pub mod async_io;
 pub mod cache;
 pub mod compat;
@@ -50,6 +51,10 @@ pub mod status;
 
 pub use artifact::{
     Artifact, ArtifactMetadata, BranchDecision, ContentHash, ContentId, InvocationKey, ListOf,
+};
+pub use artifact_store::{
+    ARTIFACT_FORMAT_VERSION, ArtifactManifest, ArtifactRole, ArtifactStoreError, StoredArtifact,
+    capture, restore,
 };
 pub use async_io::{
     IoMode, TrainingIoAdmissionError, TrainingIoCandidate, TrainingIoDowngradeReason,

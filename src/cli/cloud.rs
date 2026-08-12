@@ -35,7 +35,7 @@ pub(super) async fn run_cloud_cmd(
     use crate::cloud::store::ObjStore;
     use crate::cloud::submitter::{CloudPoll, CloudSubmitSpec, CloudSubmitter};
     use crate::cloud::worker::run_one;
-    use crate::framework::artifact::{Artifact, ContentHash};
+    use crate::framework::artifact::ContentHash;
     use crate::framework::stage::ErasedArtifact;
     use crate::p2p::dispatch::DefaultDispatchPolicy;
     use crate::p2p::smoke::{self, SMOKE_STAGE, SmokeText};
@@ -62,9 +62,7 @@ pub(super) async fn run_cloud_cmd(
                 content_hash: ContentHash::hash_file(&in_path).context("hash input")?,
                 path: in_path,
             };
-            let input_hash = art.content_hash();
             let erased = ErasedArtifact::from_typed(&art).context("erase input")?;
-            let expected = smoke::expected_echo_hash(&input);
 
             let submitter = CloudSubmitter::new(blob_store.clone(), queue.clone(), reg.clone());
             eprintln!(
@@ -77,11 +75,13 @@ pub(super) async fn run_cloud_cmd(
                     // (blobs are content-addressed; the MemQueue is fresh each run).
                     job_id: "cloud-smoke-1".into(),
                     stage_name: SMOKE_STAGE.into(),
+                    invocation_key: crate::framework::InvocationKey::from_digest(
+                        ContentHash::of_bytes(b"cloud-smoke-1"),
+                    ),
                     input: erased,
                     src_root: src_root.path().to_path_buf(),
                     args: serde_json::json!({}),
-                    input_hash,
-                    expected_output_hash: expected,
+                    expected_content_id: None,
                     data_class: DataClass::Public,
                     resources: ResourceRequest::default(),
                     priority: 0,

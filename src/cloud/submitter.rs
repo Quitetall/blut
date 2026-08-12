@@ -24,7 +24,7 @@ use super::job::{CloudJob, JobOutcome};
 use super::queue::{CloudQueue, JobStatus};
 use super::store::BlobStore;
 use crate::framework::Registry;
-use crate::framework::artifact::ContentHash;
+use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
 use crate::framework::stage::ErasedArtifact;
 use crate::p2p::bundle::{BlobDir, bundle, unbundle};
 use crate::p2p::task::ResourceRequest;
@@ -36,11 +36,11 @@ use crate::p2p::trust::DataClass;
 pub struct CloudSubmitSpec {
     pub job_id: String,
     pub stage_name: String,
+    pub invocation_key: InvocationKey,
     pub input: ErasedArtifact,
     pub src_root: PathBuf,
     pub args: Value,
-    pub input_hash: ContentHash,
-    pub expected_output_hash: ContentHash,
+    pub expected_content_id: Option<ContentId>,
     pub data_class: DataClass,
     pub resources: ResourceRequest,
     pub priority: i32,
@@ -92,27 +92,23 @@ impl CloudSubmitter {
         let stage = factory();
 
         // Bundle the input rooted at its producing dir (reuses the p2p data plane).
-        let (manifest, pack) = bundle(
-            &*stage,
-            spec.input,
-            &spec.src_root,
-            BlobDir::Input,
-            &spec.input_hash,
-        )
-        .map_err(|e| CloudError::Store(format!("bundle input: {e}")))?;
+        let (manifest, pack) = bundle(&*stage, spec.input, &spec.src_root, BlobDir::Input, None)
+            .map_err(|e| CloudError::Store(format!("bundle input: {e}")))?;
 
         // Upload the pack keyed by its own hash; the small manifest rides the job.
         let blob_key = ContentHash::of_bytes(&pack);
         self.store.put_blob(&blob_key, Bytes::from(pack)).await?;
 
         let job = CloudJob {
+            protocol_version: super::job::CLOUD_JOB_PROTOCOL_VERSION,
             id: spec.job_id.clone(),
             stage_name: spec.stage_name.clone(),
             stage_schema: stage.schema(),
+            invocation_key: spec.invocation_key,
             args: spec.args,
             input_blob_key: blob_key,
             input_manifest: manifest,
-            expected_output_hash: spec.expected_output_hash,
+            expected_content_id: spec.expected_content_id,
             resources: spec.resources,
             data_class: spec.data_class,
             priority: spec.priority,
@@ -126,7 +122,7 @@ impl CloudSubmitter {
             registry: self.registry.clone(),
             job_id: spec.job_id,
             stage_name: spec.stage_name,
-            expected_output_hash: spec.expected_output_hash,
+            expected_content_id: spec.expected_content_id,
         })
     }
 }
@@ -140,7 +136,7 @@ pub struct CloudJobHandle {
     registry: Arc<Registry>,
     job_id: String,
     stage_name: String,
-    expected_output_hash: ContentHash,
+    expected_content_id: Option<ContentId>,
 }
 
 impl CloudJobHandle {
@@ -155,38 +151,57 @@ impl CloudJobHandle {
         match self.queue.status(&self.job_id).await? {
             JobStatus::Queued | JobStatus::Running => Ok(CloudPoll::Pending),
             JobStatus::Unknown => Ok(CloudPoll::Unknown),
-            JobStatus::Done(result) => match result.outcome {
-                JobOutcome::Failed => Ok(CloudPoll::Failed(
-                    result.error.unwrap_or_else(|| "unknown error".into()),
-                )),
-                JobOutcome::Cancelled => Ok(CloudPoll::Cancelled),
-                JobOutcome::Succeeded => {
-                    let blob_key = result.output_blob_key.ok_or_else(|| {
-                        CloudError::Store("succeeded result missing output_blob_key".into())
-                    })?;
-                    let manifest = result.output_manifest.ok_or_else(|| {
-                        CloudError::Store("succeeded result missing output_manifest".into())
-                    })?;
-                    let pack = self.store.get_blob(&blob_key).await?;
-                    let factory = self
-                        .registry
-                        .find_erased_stage(&self.stage_name)
-                        .ok_or_else(|| {
-                            CloudError::Dispatch(format!("unknown stage '{}'", self.stage_name))
-                        })?;
-                    let stage = factory();
-                    let output = unbundle(
-                        &*stage,
-                        &manifest,
-                        &pack,
-                        out_dir,
-                        &self.expected_output_hash,
-                        BlobDir::Output,
-                    )
-                    .map_err(|e| CloudError::Store(format!("unbundle output: {e}")))?;
-                    Ok(CloudPoll::Succeeded(output))
+            JobStatus::Done(result) => {
+                if result.protocol_version != super::job::CLOUD_JOB_PROTOCOL_VERSION {
+                    return Err(CloudError::Store(format!(
+                        "cloud result protocol v{} unsupported (want v{})",
+                        result.protocol_version,
+                        super::job::CLOUD_JOB_PROTOCOL_VERSION
+                    )));
                 }
-            },
+                match result.outcome {
+                    JobOutcome::Failed => Ok(CloudPoll::Failed(
+                        result.error.unwrap_or_else(|| "unknown error".into()),
+                    )),
+                    JobOutcome::Cancelled => Ok(CloudPoll::Cancelled),
+                    JobOutcome::Succeeded => {
+                        let blob_key = result.output_blob_key.ok_or_else(|| {
+                            CloudError::Store("succeeded result missing output_blob_key".into())
+                        })?;
+                        let manifest = result.output_manifest.ok_or_else(|| {
+                            CloudError::Store("succeeded result missing output_manifest".into())
+                        })?;
+                        let content_id = result.content_id.ok_or_else(|| {
+                            CloudError::Store("succeeded result missing content_id".into())
+                        })?;
+                        if let Some(expected) = self.expected_content_id
+                            && content_id != expected
+                        {
+                            return Err(CloudError::Store(format!(
+                                "output identity {content_id} != analytically expected {expected}"
+                            )));
+                        }
+                        let pack = self.store.get_blob(&blob_key).await?;
+                        let factory = self
+                            .registry
+                            .find_erased_stage(&self.stage_name)
+                            .ok_or_else(|| {
+                                CloudError::Dispatch(format!("unknown stage '{}'", self.stage_name))
+                            })?;
+                        let stage = factory();
+                        let output = unbundle(
+                            &*stage,
+                            &manifest,
+                            &pack,
+                            out_dir,
+                            Some(content_id),
+                            BlobDir::Output,
+                        )
+                        .map_err(|e| CloudError::Store(format!("unbundle output: {e}")))?;
+                        Ok(CloudPoll::Succeeded(output))
+                    }
+                }
+            }
         }
     }
 }

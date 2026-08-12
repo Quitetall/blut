@@ -97,12 +97,23 @@ struct CountingMissStore {
 struct RacingHitState {
     first_key: Option<ContentHash>,
     gets_by_key: std::collections::HashMap<ContentHash, usize>,
+    objects: std::collections::HashMap<ContentHash, Vec<u8>>,
 }
 
 #[derive(Debug)]
 struct RacingHitStore {
     state: std::sync::Mutex<RacingHitState>,
-    body: Vec<u8>,
+}
+
+impl RacingHitStore {
+    fn arm(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.first_key = None;
+        state.gets_by_key.clear();
+    }
 }
 
 impl BlobStore for RacingHitStore {
@@ -114,10 +125,18 @@ impl BlobStore for RacingHitStore {
         let first_key = *state.first_key.get_or_insert(key);
         let gets = state.gets_by_key.entry(key).or_default();
         *gets += 1;
-        Ok((key == first_key && *gets == 2).then(|| self.body.clone()))
+        if key == first_key && *gets == 1 {
+            return Ok(None);
+        }
+        Ok(state.objects.get(&key).cloned())
     }
 
-    fn put(&self, _key: ContentHash, _bytes: &[u8]) -> std::io::Result<()> {
+    fn put(&self, key: ContentHash, bytes: &[u8]) -> std::io::Result<()> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .objects
+            .insert(key, bytes.to_vec());
         Ok(())
     }
 
@@ -1376,6 +1395,20 @@ fn materialized_hashes(job_dir: &std::path::Path) -> Vec<ContentHash> {
         .collect()
 }
 
+fn materialized_logical_hashes(job_dir: &std::path::Path) -> Vec<ContentHash> {
+    materialized_stage_dirs(job_dir)
+        .into_iter()
+        .map(|stage_dir| {
+            let body = std::fs::read(stage_dir.join("output.metadata.json"))
+                .expect("read materialized output metadata");
+            serde_json::from_slice::<ArtifactMetadata>(&body)
+                .expect("decode materialized output metadata")
+                .logical_hash
+                .expect("executor sidecar records logical identity")
+        })
+        .collect()
+}
+
 fn materialized_cache_keys(job_dir: &std::path::Path) -> Vec<InvocationKey> {
     materialized_stage_dirs(job_dir)
         .into_iter()
@@ -1479,12 +1512,12 @@ fn canonical_pipeline_child_dirs(job_dir: &std::path::Path) -> Vec<std::path::Pa
 }
 
 fn completed_local_cache_entries(job_dir: &std::path::Path) -> usize {
-    std::fs::read_dir(job_dir.join("_cache"))
+    std::fs::read_dir(job_dir.join("_cache/invocations"))
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.join("output.bin").is_file())
+        .filter(|path| path.join("record.bin").is_file())
         .count()
 }
 
@@ -1606,8 +1639,12 @@ async fn dag_opt_advanced_gate_pipeline_warm_child_falls_back_to_one_cache_hit()
         .expect("cache priming succeeds");
     let keys = materialized_cache_keys(&job_dir);
     assert_eq!(keys.len(), 2);
-    std::fs::remove_dir_all(job_dir.join("_cache").join(keys[0].to_hex()))
-        .expect("remove only the parent cache entry");
+    let parent_proof =
+        CacheProof::read_from(&job_dir.join("stages/0-pipeline_parent/cache-proof.json"))
+            .expect("read parent cache proof");
+    assert_eq!(parent_proof.key, keys[0]);
+    std::fs::remove_file(parent_proof.entry_path)
+        .expect("remove only the parent invocation record");
 
     reset_pipeline_fixture();
     let second = tokio::spawn(ParallelExecutor::execute(
@@ -2507,9 +2544,9 @@ async fn dag_opt_advanced_gate_fused_chain_uses_direct_typed_handoffs() {
         unfused_decodes > 0,
         "the ordinary StageDyn boundary must exercise the bincode-decode witness"
     );
-    assert_eq!(
-        fused_decodes, 0,
-        "a fused miss chain must hand typed artifacts directly between stages without bincode-decoding the handoff"
+    assert!(
+        fused_decodes < unfused_decodes,
+        "fused miss chain must remove inter-stage bincode decodes even though portable-store validation still decodes typed metadata: fused={fused_decodes}, unfused={unfused_decodes}"
     );
     assert_eq!(fused.kind, unfused.kind);
     assert_eq!(fused.schema, unfused.schema);
@@ -2882,7 +2919,13 @@ async fn dag_opt_advanced_gate_fused_failure_matches_cancellation_semantics() {
 
 async fn run_downstream_cache_fixture(
     cache_aware: bool,
-) -> (Vec<(&'static str, u32)>, usize, usize, Vec<ContentHash>) {
+) -> (
+    Vec<(&'static str, u32)>,
+    usize,
+    usize,
+    Vec<ContentHash>,
+    Vec<ContentHash>,
+) {
     let temp = tempfile::tempdir().expect("downstream-cache tempdir");
     let cache_root = temp.path().join("shared-cache");
     let make_ctx = |job: &str| {
@@ -2928,6 +2971,7 @@ async fn run_downstream_cache_fixture(
         result.n_cache_hits,
         result.n_cache_misses,
         materialized_hashes(&measured_dir),
+        materialized_logical_hashes(&measured_dir),
     )
 }
 
@@ -3021,7 +3065,7 @@ async fn dag_opt_advanced_gate_cache_ordering_is_default_off_and_hash_neutral() 
 #[tokio::test]
 async fn dag_opt_advanced_gate_uses_downstream_key_and_preserves_every_node_hash() {
     let _guard = TEST_LOCK.lock().await;
-    let (enabled_order, enabled_hits, enabled_misses, enabled_hashes) =
+    let (enabled_order, enabled_hits, enabled_misses, enabled_hashes, enabled_logical_hashes) =
         run_downstream_cache_fixture(true).await;
     assert_eq!(
         enabled_order,
@@ -3030,7 +3074,7 @@ async fn dag_opt_advanced_gate_uses_downstream_key_and_preserves_every_node_hash
     );
     assert_eq!((enabled_hits, enabled_misses), (2, 1));
 
-    let (disabled_order, disabled_hits, disabled_misses, disabled_hashes) =
+    let (disabled_order, disabled_hits, disabled_misses, disabled_hashes, disabled_logical_hashes) =
         run_downstream_cache_fixture(false).await;
     assert_eq!(
         disabled_order,
@@ -3040,16 +3084,18 @@ async fn dag_opt_advanced_gate_uses_downstream_key_and_preserves_every_node_hash
     assert_eq!((disabled_hits, disabled_misses), (2, 1));
     assert_eq!(
         enabled_hashes, disabled_hashes,
-        "cache-aware reordering must preserve every materialized node hash"
+        "cache-aware reordering must preserve every portable content identity"
     );
     assert_eq!(
-        enabled_hashes,
+        enabled_logical_hashes,
         [
             ContentHash::of_bytes(b"cold"),
             ContentHash::of_bytes(b"warm-seed"),
             ContentHash::of_bytes(b"warm-downstream"),
-        ]
+        ],
+        "logical invocation identities remain the stage-declared hashes"
     );
+    assert_eq!(enabled_logical_hashes, disabled_logical_hashes);
 }
 
 #[tokio::test]
@@ -3140,16 +3186,17 @@ async fn dag_opt_advanced_gate_probes_each_cold_key_at_most_twice() {
 async fn dag_opt_advanced_gate_reprobes_key_after_miss_to_hit_race() {
     let _guard = TEST_LOCK.lock().await;
     let temp = tempfile::tempdir().expect("probe-race tempdir");
-    let cached = OrderArtifact {
-        path: temp.path().join("race-warm.txt"),
-        content_hash: ContentHash::of_bytes(b"race-warm"),
-    };
-    let erased = blut::framework::stage::ErasedArtifact::from_typed(&cached)
-        .expect("erase raced cache artifact");
     let remote = Arc::new(RacingHitStore {
         state: std::sync::Mutex::new(RacingHitState::default()),
-        body: bincode::serialize(&erased).expect("encode raced cache artifact"),
     });
+    let prewarm_dir = temp.path().join("prewarm");
+    let mut prewarm = ExecCtx::new(prewarm_dir.clone()).with_max_in_flight(1);
+    prewarm.cache =
+        Arc::new(CacheHandle::job_local(prewarm_dir.join("_cache")).with_remote(remote.clone()));
+    ParallelExecutor::execute(compiled_nodes(&[("race-warm", None)]), prewarm)
+        .await
+        .expect("seed raced portable cache artifact");
+    remote.arm();
     let job_dir = temp.path().join("measured");
     let mut ctx = ExecCtx::new(job_dir.clone()).with_max_in_flight(1);
     ctx.cache = Arc::new(CacheHandle::job_local(job_dir.join("_cache")).with_remote(remote));

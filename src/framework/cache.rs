@@ -4,7 +4,7 @@
 //!
 //! Skips re-execution of a stage when the inputs + args + stage
 //! identity match a previous run's cached output. Per-job by
-//! default (lives at `<job_dir>/_cache/<key:hex>/output.json`); the
+//! default; the
 //! `--shared-cache` flag (commit 5) flips lookup to the global
 //! cache at `~/.local/share/lamu/train-cache/` first, then job-local.
 //!
@@ -12,10 +12,11 @@
 //!
 //! ```text
 //! sha256(
-//!   b"blut.cache.v1" ‖
-//!   stage_name (as bytes) ‖
+//!   b"blut.cache.v2" ‖ 0x00 ‖
+//!   stage_name (as bytes) ‖ 0x00 ‖
 //!   stage_schema (LE u32) ‖
 //!   input_content_hash (32 bytes) ‖
+//!   code_sha_len (LE u64) ‖ code_sha ‖
 //!   canonical(args_json)
 //! )
 //! ```
@@ -24,22 +25,46 @@
 //! lexicographically. Field reorder doesn't invalidate; rename
 //! does (semantic change). Test-covered.
 //!
-//! What lives in `<key:hex>/`:
+//! Cache roots contain two disjoint namespaces:
 //!
-//! - `output.json` — the `ErasedArtifact` JSON. Cheap to read.
-//! - The artifact's payload files DO NOT live here. They live
-//!   wherever the producing stage put them (typically
-//!   `<job_dir>/stages/<idx>-<name>/`). Cache hit means "I know
-//!   the output of this stage; here's the metadata"; the on-disk
-//!   payload is content-addressed via the artifact's primary path
-//!   so it's findable even across jobs.
+//! - `invocations/<InvocationKey>/record.bin` maps one invocation to a
+//!   [`ContentId`] plus the expected artifact kind/schema.
+//! - `objects/<ContentId>/artifact.bin` owns the canonical payload, portable
+//!   handle, integrity metadata, and validation material.
+//!
+//! A lookup is not a metadata read. It restores and independently validates the
+//! object beneath the consumer's stage directory before returning a handle.
+//! Pre-A09 `<key>/output.bin` entries intentionally cold-miss: cache data is
+//! non-authoritative and cannot be migrated safely because it owns no payload.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::framework::artifact::{ContentHash, InvocationKey};
-use crate::framework::stage::ErasedArtifact;
+use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
+use crate::framework::artifact_store::{ArtifactRole, StoredArtifact, capture, restore};
+use crate::framework::stage::{ErasedArtifact, StageDyn};
+
+const CACHE_RECORD_VERSION: u16 = 1;
+const INVOCATION_NAMESPACE: &[u8] = b"blut.cache.remote.invocation.v1";
+const OBJECT_NAMESPACE: &[u8] = b"blut.cache.remote.object.v1";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CacheRecord {
+    pub version: u16,
+    pub invocation_key: InvocationKey,
+    pub content_id: ContentId,
+    pub kind: String,
+    pub schema: u32,
+}
+
+/// Canonical object and invocation bytes held until optional execution commits.
+pub(crate) struct OptionalCacheWrite {
+    key: InvocationKey,
+    pub(crate) content_id: ContentId,
+    object_bytes: Vec<u8>,
+    record_bytes: Vec<u8>,
+}
 
 #[cfg(test)]
 type OptionalLocalInsertHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
@@ -76,8 +101,9 @@ pub struct CacheHandle {
     pub global: Option<PathBuf>,
     /// Optional content-addressed REMOTE tier (ADR 0067 T4.2): checked LAST on
     /// lookup (after the local dirs), and — on a remote hit — written through
-    /// to `job_local` so the entry is a real local `CacheHit`. `insert` writes
-    /// through to it too (best-effort). A shared cache across machines / pods.
+    /// to the active local write target so the entry is a real local `CacheHit`.
+    /// `insert` writes through to it too (best-effort). A shared cache across
+    /// machines / pods.
     pub remote: Option<std::sync::Arc<dyn crate::framework::object_store::BlobStore>>,
 }
 
@@ -243,96 +269,162 @@ impl CacheHandle {
         canonical_json(args).into_bytes()
     }
 
-    /// Look up a cached output. Returns the parsed
-    /// `ErasedArtifact` if present, `None` if absent.
-    ///
-    /// Cache entries are bincode-encoded (opt-4). The original opt-2
-    /// bincode attempt failed because `ErasedArtifact.payload` was
-    /// `serde_json::Value` and bincode rejects `deserialize_any`;
-    /// after refactoring payload to `Vec<u8>` (bincode bytes of the
-    /// typed inner artifact), the wrapper itself is now safely
-    /// bincode-able too. Result: smaller on-disk size + ~2-3×
-    /// faster parse on cache hits.
-    ///
-    /// File extension is `.bin` (was `.json`) — old caches need a
-    /// one-shot purge; BLUT is pre-v1 so we don't carry a migration.
-    ///
-    /// I/O errors other than NotFound are downgraded to None with
-    /// a `tracing::warn` — a corrupt cache entry shouldn't break
-    /// the run, just trigger a re-execution.
-    pub fn lookup(&self, key: InvocationKey) -> Option<CacheHit> {
+    /// Resolve an invocation to a content object, restore that object beneath
+    /// `into_stage_dir`, and validate it as this stage's output. Any missing,
+    /// corrupt, mismatched, or unrehydratable value is a cache miss. Restore
+    /// removes its private `.artifact-import/<ContentId>` subtree on failure;
+    /// the executor's cold path removes the enclosing final stage directory
+    /// before atomic promotion, so a failed lookup cannot poison a rerun.
+    pub fn lookup(
+        &self,
+        key: InvocationKey,
+        stage: &dyn StageDyn,
+        into_stage_dir: &Path,
+    ) -> Option<CacheHit> {
         for base in self.search_order() {
-            let path = base.join(key.to_hex()).join("output.bin");
-            match std::fs::read(&path) {
-                Ok(body) => match bincode::deserialize::<ErasedArtifact>(&body) {
-                    Ok(art) => {
-                        return Some(CacheHit {
-                            artifact: art,
-                            from_path: path,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "cache: corrupt entry at {}: {e}; treating as miss",
-                            path.display()
-                        );
-                    }
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    tracing::warn!("cache: read {}: {e}; treating as miss", path.display());
+            let record_path = record_path(base, key);
+            let record_bytes = match std::fs::read(&record_path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        "cache: read {}: {error}; treating as miss",
+                        record_path.display()
+                    );
+                    continue;
                 }
+            };
+            let Some(record) = decode_record(&record_bytes, key, stage, &record_path) else {
+                continue;
+            };
+            let object_path = object_path(base, record.content_id);
+            let object_bytes = match std::fs::read(&object_path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        "cache: read {}: {error}; treating as miss",
+                        object_path.display()
+                    );
+                    continue;
+                }
+            };
+            if let Some(hit) =
+                materialize_hit(&record, &object_bytes, stage, into_stage_dir, &object_path)
+            {
+                return Some(hit);
             }
         }
-        // Remote tier (T4.2): local dirs missed — try the shared object store.
-        // On a hit, write the bytes through to `job_local` so this becomes a
-        // real local CacheHit (with a `from_path` a stage can read), and later
-        // lookups in this job skip the network. A remote error degrades to a
-        // miss (never a wrong answer).
+
+        self.lookup_remote(key, stage, into_stage_dir)
+    }
+
+    fn lookup_remote(
+        &self,
+        key: InvocationKey,
+        stage: &dyn StageDyn,
+        into_stage_dir: &Path,
+    ) -> Option<CacheHit> {
+        let remote = self.remote.as_ref()?;
+        let record_bytes = match remote.get(remote_invocation_key(key)) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(
+                    "cache: remote invocation lookup for {}: {error}; treating as miss",
+                    key.to_hex()
+                );
+                return None;
+            }
+        };
+        let diagnostic_path = PathBuf::from(format!("remote:invocations/{}", key.to_hex()));
+        let record = decode_record(&record_bytes, key, stage, &diagnostic_path)?;
+        let object_bytes = match remote.get(remote_object_key(record.content_id)) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(
+                    "cache: remote object lookup for {}: {error}; treating as miss",
+                    record.content_id
+                );
+                return None;
+            }
+        };
+        let hit = materialize_hit(
+            &record,
+            &object_bytes,
+            stage,
+            into_stage_dir,
+            &PathBuf::from(format!("remote:objects/{}", record.content_id)),
+        )?;
+
+        // Object first, invocation record last: the record is the visibility
+        // marker, so a failed write-through cannot expose a partial local hit.
+        let target = self.write_target();
+        let local_object = object_path(target, record.content_id);
+        let local_record = record_path(target, key);
+        if let Err(error) = write_atomic(&local_object, &object_bytes)
+            .and_then(|()| write_atomic(&local_record, &record_bytes))
+        {
+            tracing::warn!("cache: remote hit verified but local write-through failed: {error}");
+        }
+        Some(hit)
+    }
+
+    /// Capture `output` into the canonical object representation, write the
+    /// content object first, then publish the invocation record atomically.
+    pub fn insert(
+        &self,
+        key: InvocationKey,
+        stage: &dyn StageDyn,
+        output: &ErasedArtifact,
+        src_root: &Path,
+    ) -> std::io::Result<ContentId> {
+        let stored = capture(stage, output.clone(), src_root, ArtifactRole::Output, None)
+            .map_err(artifact_store_io)?;
+        self.insert_stored(key, &stored)
+    }
+
+    /// Persist an artifact already captured by the canonical store. The executor
+    /// uses this path so lineage identity and cache identity come from the exact
+    /// same captured bytes without reading large artifacts twice.
+    pub fn insert_stored(
+        &self,
+        key: InvocationKey,
+        stored: &StoredArtifact,
+    ) -> std::io::Result<ContentId> {
+        let content_id = stored.manifest.content_id;
+        let record = CacheRecord {
+            version: CACHE_RECORD_VERSION,
+            invocation_key: key,
+            content_id,
+            kind: stored.manifest.kind.clone(),
+            schema: stored.manifest.schema,
+        };
+        let object_bytes = bincode::serialize(stored).map_err(cache_encode_io)?;
+        let record_bytes = bincode::serialize(&record).map_err(cache_encode_io)?;
+        let target = self.write_target();
+
+        write_atomic(&object_path(target, content_id), &object_bytes)?;
+        write_atomic(&record_path(target, key), &record_bytes)?;
+
         if let Some(remote) = &self.remote {
-            match remote.get(key.digest()) {
-                Ok(Some(body)) => match bincode::deserialize::<ErasedArtifact>(&body) {
-                    Ok(art) => {
-                        // Write through so `from_path` names a file that
-                        // EXISTS. If that write fails, fall through to a miss
-                        // rather than return a hit whose `from_path` points at
-                        // nothing — every returned CacheHit has a readable
-                        // path, and the entry is still on the remote for a
-                        // later attempt.
-                        let dest = self.job_local.join(key.to_hex()).join("output.bin");
-                        match write_atomic(&dest, &body) {
-                            Ok(()) => {
-                                return Some(CacheHit {
-                                    artifact: art,
-                                    from_path: dest,
-                                });
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "cache: remote hit but local write-through failed at {}: \
-                                     {e}; treating as miss",
-                                    dest.display()
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
+            match remote.put(remote_object_key(content_id), &object_bytes) {
+                Ok(()) => {
+                    if let Err(error) = remote.put(remote_invocation_key(key), &record_bytes) {
                         tracing::warn!(
-                            "cache: corrupt remote entry for {}: {e}; miss",
+                            "cache: remote invocation write-through for {}: {error}",
                             key.to_hex()
                         );
                     }
-                },
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        "cache: remote lookup for {}: {e}; treating as miss",
-                        key.to_hex()
-                    );
                 }
+                Err(error) => tracing::warn!(
+                    "cache: remote object write-through for {}: {error}",
+                    content_id
+                ),
             }
         }
-        None
+        Ok(content_id)
     }
 
     /// Side-effect-free presence probe used by optional scheduler work.
@@ -344,7 +436,7 @@ impl CacheHandle {
     /// [`lookup`](Self::lookup). Shared tiers are treated as "possibly present"
     /// because even a metadata/HEAD request may block the single coordinator.
     pub(crate) fn probe_presence(&self, key: InvocationKey) -> std::io::Result<bool> {
-        let path = self.job_local.join(key.to_hex()).join("output.bin");
+        let path = record_path(&self.job_local, key);
         match std::fs::metadata(path) {
             Ok(metadata) => {
                 if metadata.is_file() {
@@ -360,13 +452,6 @@ impl CacheHandle {
         Ok(false)
     }
 
-    /// Insert an output for the given key. Atomic: writes to a
-    /// sibling `.tmp.<pid>.<nanos>` and renames into place. Encoded
-    /// as bincode — see `lookup` for rationale.
-    pub fn insert(&self, key: InvocationKey, output: &ErasedArtifact) -> std::io::Result<()> {
-        self.insert_with_policy(key, output, false)
-    }
-
     /// Commit only the local/global filesystem tier for selected optional work.
     /// The executor keeps this write behind its publication rollback guard and
     /// calls [`replicate_optional`](Self::replicate_optional) only after the
@@ -374,76 +459,60 @@ impl CacheHandle {
     pub(crate) fn insert_optional_local(
         &self,
         key: InvocationKey,
-        output: &ErasedArtifact,
-    ) -> std::io::Result<Vec<u8>> {
-        let body = self.insert_local(key, output)?;
+        stored: &StoredArtifact,
+    ) -> std::io::Result<OptionalCacheWrite> {
+        let content_id = stored.manifest.content_id;
+        let record = CacheRecord {
+            version: CACHE_RECORD_VERSION,
+            invocation_key: key,
+            content_id,
+            kind: stored.manifest.kind.clone(),
+            schema: stored.manifest.schema,
+        };
+        let object_bytes = bincode::serialize(stored).map_err(cache_encode_io)?;
+        let record_bytes = bincode::serialize(&record).map_err(cache_encode_io)?;
+        let target = self.write_target();
+        write_atomic(&object_path(target, content_id), &object_bytes)?;
+        write_atomic(&record_path(target, key), &record_bytes)?;
         #[cfg(test)]
         run_optional_local_insert_hook(&self.entry_path_for_write(key));
-        Ok(body)
+        Ok(OptionalCacheWrite {
+            key,
+            content_id,
+            object_bytes,
+            record_bytes,
+        })
     }
 
     /// Best-effort remote replication after an optional result is canonical.
     /// Plugin panics and remote errors remain contained; the committed local
     /// entry is already sufficient for correctness.
-    pub(crate) fn replicate_optional(&self, key: InvocationKey, body: &[u8]) {
-        self.replicate(key, body, true);
-    }
-
-    fn insert_with_policy(
-        &self,
-        key: InvocationKey,
-        output: &ErasedArtifact,
-        contain_remote_panic: bool,
-    ) -> std::io::Result<()> {
-        let body = self.insert_local(key, output)?;
-        self.replicate(key, &body, contain_remote_panic);
-        Ok(())
-    }
-
-    fn insert_local(
-        &self,
-        key: InvocationKey,
-        output: &ErasedArtifact,
-    ) -> std::io::Result<Vec<u8>> {
-        let dir = self.write_target().join(key.to_hex());
-        std::fs::create_dir_all(&dir)?;
-        let dest = dir.join("output.bin");
-        let body = encode_entry(output)?;
-        write_atomic(&dest, &body)?;
-        Ok(body)
-    }
-
-    fn replicate(&self, key: InvocationKey, body: &[u8], contain_remote_panic: bool) {
-        // Write through to the remote tier (T4.2) so other machines/pods share
-        // this result. Best-effort: a remote failure is logged, not fatal — the
-        // local write already succeeded, so the run is unaffected.
-        if let Some(remote) = &self.remote
-            && contain_remote_panic
-        {
+    pub(crate) fn replicate_optional(&self, write: &OptionalCacheWrite) {
+        if let Some(remote) = &self.remote {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                remote.put(key.digest(), body)
+                remote.put(remote_object_key(write.content_id), &write.object_bytes)?;
+                remote.put(remote_invocation_key(write.key), &write.record_bytes)
             })) {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    tracing::warn!("cache: remote write-through for {}: {error}", key.to_hex());
+                    tracing::warn!(
+                        "cache: optional remote write-through for {}: {error}",
+                        write.key.to_hex()
+                    );
                 }
                 Err(_) => {
                     tracing::warn!(
-                        "cache: remote write-through for {} panicked; local entry retained",
-                        key.to_hex()
+                        "cache: optional remote write-through for {} panicked; local entry retained",
+                        write.key.to_hex()
                     );
                 }
             }
-        } else if let Some(remote) = &self.remote
-            && let Err(error) = remote.put(key.digest(), body)
-        {
-            tracing::warn!("cache: remote write-through for {}: {error}", key.to_hex());
         }
     }
 
     /// Exact local entry path an insert writes for this handle/key.
     pub(crate) fn entry_path_for_write(&self, key: InvocationKey) -> PathBuf {
-        self.write_target().join(key.to_hex()).join("output.bin")
+        record_path(self.write_target(), key)
     }
 
     /// Search order for lookups: global first when `--shared-cache`
@@ -471,32 +540,156 @@ impl CacheHandle {
     }
 }
 
-fn encode_entry(output: &ErasedArtifact) -> std::io::Result<Vec<u8>> {
-    bincode::serialize(output).map_err(|error| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("serialize cache entry: {error}"),
-        )
-    })
+fn record_path(base: &Path, key: InvocationKey) -> PathBuf {
+    base.join("invocations")
+        .join(key.to_hex())
+        .join("record.bin")
 }
 
-/// LRU prune: scan the cache root, sort entries by atime, delete
-/// oldest until total size ≤ `max_bytes`. Best-effort: I/O errors
-/// are logged + skipped. Intended to run periodically (e.g. before
-/// a fresh `recipe run` that's about to fill the cache further).
+fn object_path(base: &Path, content_id: ContentId) -> PathBuf {
+    base.join("objects")
+        .join(content_id.to_hex())
+        .join("artifact.bin")
+}
+
+fn namespaced_remote_key(namespace: &[u8], digest: ContentHash) -> ContentHash {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(namespace);
+    hasher.update([0]);
+    hasher.update(digest.0);
+    ContentHash(hasher.finalize().into())
+}
+
+fn remote_invocation_key(key: InvocationKey) -> ContentHash {
+    namespaced_remote_key(INVOCATION_NAMESPACE, key.digest())
+}
+
+fn remote_object_key(content_id: ContentId) -> ContentHash {
+    namespaced_remote_key(OBJECT_NAMESPACE, content_id.digest())
+}
+
+fn decode_record(
+    bytes: &[u8],
+    key: InvocationKey,
+    stage: &dyn StageDyn,
+    source: &Path,
+) -> Option<CacheRecord> {
+    let record = match bincode::deserialize::<CacheRecord>(bytes) {
+        Ok(record) => record,
+        Err(error) => {
+            tracing::warn!(
+                "cache: corrupt invocation record at {}: {error}; treating as miss",
+                source.display()
+            );
+            return None;
+        }
+    };
+    if record.version != CACHE_RECORD_VERSION
+        || record.invocation_key != key
+        || record.kind != stage.output_kind()
+        || record.schema != stage.output_schema()
+    {
+        tracing::warn!(
+            "cache: invocation record contract mismatch at {}; treating as miss",
+            source.display()
+        );
+        return None;
+    }
+    Some(record)
+}
+
+fn materialize_hit(
+    record: &CacheRecord,
+    object_bytes: &[u8],
+    stage: &dyn StageDyn,
+    into_stage_dir: &Path,
+    source: &Path,
+) -> Option<CacheHit> {
+    let stored = match bincode::deserialize::<StoredArtifact>(object_bytes) {
+        Ok(stored) => stored,
+        Err(error) => {
+            tracing::warn!(
+                "cache: corrupt content object at {}: {error}; treating as miss",
+                source.display()
+            );
+            return None;
+        }
+    };
+    if stored.manifest.content_id != record.content_id
+        || stored.manifest.kind != record.kind
+        || stored.manifest.schema != record.schema
+    {
+        tracing::warn!(
+            "cache: content object contract mismatch at {}; treating as miss",
+            source.display()
+        );
+        return None;
+    }
+    match restore(
+        stage,
+        &stored,
+        into_stage_dir,
+        ArtifactRole::Output,
+        Some(record.content_id),
+    ) {
+        Ok(artifact) => Some(CacheHit {
+            artifact,
+            content_id: record.content_id,
+        }),
+        Err(error) => {
+            tracing::warn!(
+                "cache: failed to validate content object at {}: {error}; treating as miss",
+                source.display()
+            );
+            None
+        }
+    }
+}
+
+fn cache_encode_io(error: bincode::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+}
+
+fn artifact_store_io(
+    error: crate::framework::artifact_store::ArtifactStoreError,
+) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+}
+
+/// LRU prune invocation records until the complete cache root is within the
+/// limit. A content object is removed only after its final local invocation
+/// reference disappears; unreferenced objects from interrupted writes are
+/// eligible first. Best-effort I/O failures are logged and skipped.
+///
+/// Callers must not run pruning concurrently with writers targeting the same
+/// root. A10 replaces this boundary with the canonical object-store concurrency
+/// policy; until then the CLI/TUI prune operation is a quiescent maintenance
+/// command.
 ///
 /// `max_bytes`: cap, e.g. 50 GiB. Default driven by
 /// `$LAMU_CACHE_MAX_GB` (commit 8 wires the CLI knob).
 pub fn lru_prune(cache_root: &Path, max_bytes: u64) -> std::io::Result<u64> {
-    let mut entries: Vec<(PathBuf, std::time::SystemTime, u64)> = Vec::new();
-    let mut total: u64 = 0;
-    let dir = match std::fs::read_dir(cache_root) {
-        Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+    let mut total = match dir_size(cache_root) {
+        Ok(size) => size,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    if total <= max_bytes {
+        return Ok(0);
+    }
+
+    let invocations_root = cache_root.join("invocations");
+    let mut entries = Vec::new();
+    let mut references: std::collections::HashMap<ContentId, usize> =
+        std::collections::HashMap::new();
+    let dir = match std::fs::read_dir(&invocations_root) {
+        Ok(dir) => Some(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e),
     };
-    for entry in dir.flatten() {
-        let p = entry.path();
+    for entry in dir.into_iter().flatten().flatten() {
+        let path = entry.path();
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(_) => continue,
@@ -504,20 +697,61 @@ pub fn lru_prune(cache_root: &Path, max_bytes: u64) -> std::io::Result<u64> {
         if !meta.is_dir() {
             continue;
         }
-        let size = dir_size(&p).unwrap_or(0);
+        let size = dir_size(&path).unwrap_or(0);
         let atime = meta
             .accessed()
             .or_else(|_| meta.modified())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        total += size;
-        entries.push((p, atime, size));
+        let content_id = std::fs::read(path.join("record.bin"))
+            .ok()
+            .and_then(|bytes| bincode::deserialize::<CacheRecord>(&bytes).ok())
+            .filter(|record| record.version == CACHE_RECORD_VERSION)
+            .map(|record| record.content_id);
+        if let Some(content_id) = content_id {
+            *references.entry(content_id).or_default() += 1;
+        }
+        entries.push((path, atime, size, content_id));
     }
-    if total <= max_bytes {
-        return Ok(0);
+
+    let mut freed = 0u64;
+    let objects_root = cache_root.join("objects");
+    if let Ok(objects) = std::fs::read_dir(&objects_root) {
+        let referenced_hex: std::collections::HashSet<String> = references
+            .keys()
+            .map(|content_id| content_id.to_hex())
+            .collect();
+        let mut orphans: Vec<_> = objects
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if referenced_hex.contains(&name) {
+                    return None;
+                }
+                let metadata = entry.metadata().ok()?;
+                let atime = metadata
+                    .accessed()
+                    .or_else(|_| metadata.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                Some((path.clone(), atime, dir_size(&path).unwrap_or(0)))
+            })
+            .collect();
+        orphans.sort_by_key(|(_, atime, _)| *atime);
+        for (path, _, size) in orphans {
+            if total <= max_bytes {
+                break;
+            }
+            if let Err(error) = std::fs::remove_dir_all(&path) {
+                tracing::warn!("lru_prune: failed to remove {}: {error}", path.display());
+                continue;
+            }
+            total = total.saturating_sub(size);
+            freed += size;
+        }
     }
-    entries.sort_by_key(|(_, atime, _)| *atime);
-    let mut freed: u64 = 0;
-    for (path, _, size) in entries {
+
+    entries.sort_by_key(|(_, atime, _, _)| *atime);
+    for (path, _, size, content_id) in entries {
         if total <= max_bytes {
             break;
         }
@@ -525,6 +759,19 @@ pub fn lru_prune(cache_root: &Path, max_bytes: u64) -> std::io::Result<u64> {
             Ok(()) => {
                 total = total.saturating_sub(size);
                 freed += size;
+                if let Some(content_id) = content_id
+                    && let Some(count) = references.get_mut(&content_id)
+                {
+                    *count -= 1;
+                    if *count == 0 {
+                        let object_dir = objects_root.join(content_id.to_hex());
+                        let object_size = dir_size(&object_dir).unwrap_or(0);
+                        if std::fs::remove_dir_all(&object_dir).is_ok() {
+                            total = total.saturating_sub(object_size);
+                            freed += object_size;
+                        }
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!("lru_prune: failed to remove {}: {}", path.display(), e);
@@ -551,7 +798,7 @@ fn dir_size(path: &Path) -> std::io::Result<u64> {
 #[derive(Clone, Debug)]
 pub struct CacheHit {
     pub artifact: ErasedArtifact,
-    pub from_path: PathBuf,
+    pub content_id: ContentId,
 }
 
 /// Durable proof tying a completed stage to the cache entry that made it
@@ -586,7 +833,7 @@ impl CacheProof {
 
     pub fn is_live(&self) -> bool {
         let key_hex = self.key.to_hex();
-        if self.entry_path.file_name().and_then(|name| name.to_str()) != Some("output.bin")
+        if self.entry_path.file_name().and_then(|name| name.to_str()) != Some("record.bin")
             || self
                 .entry_path
                 .parent()
@@ -596,10 +843,22 @@ impl CacheProof {
         {
             return false;
         }
-        std::fs::read(&self.entry_path)
+        let Some(base) = self.entry_path.ancestors().nth(3) else {
+            return false;
+        };
+        let Some(record) = std::fs::read(&self.entry_path)
             .ok()
-            .and_then(|body| bincode::deserialize::<ErasedArtifact>(&body).ok())
-            .is_some()
+            .and_then(|body| bincode::deserialize::<CacheRecord>(&body).ok())
+            .filter(|record| {
+                record.version == CACHE_RECORD_VERSION && record.invocation_key == self.key
+            })
+        else {
+            return false;
+        };
+        std::fs::read(object_path(base, record.content_id))
+            .ok()
+            .and_then(|body| bincode::deserialize::<StoredArtifact>(&body).ok())
+            .is_some_and(|stored| stored.manifest.content_id == record.content_id)
     }
 }
 
@@ -673,15 +932,6 @@ fn write_canonical(value: &serde_json::Value, out: &mut String) {
     }
 }
 
-/// Serializable record used by the executor when writing the
-/// cache. Currently identical to `ErasedArtifact`, but kept as a
-/// distinct alias so commit 5's lru-prune metadata can extend
-/// without touching every call site.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CacheRecord {
-    pub artifact: ErasedArtifact,
-}
-
 pub(crate) fn write_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(parent) = dest.parent() {
@@ -691,11 +941,7 @@ pub(crate) fn write_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "tmp".into());
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp = dest.with_file_name(format!(".{stem}.tmp.{}.{nanos}", std::process::id()));
+    let tmp = dest.with_file_name(format!(".{stem}.tmp.{}", uuid::Uuid::new_v4()));
     // Write+sync+rename in one fallible step; clean up the tmp on ANY
     // failure (mirrors `broker/footprint.rs::save`) — a sync error must
     // not leave an orphaned tmp file behind, same as a rename error. A
@@ -723,6 +969,13 @@ pub(crate) fn write_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use serde::{Deserialize, Serialize};
+
+    use crate::framework::artifact::Artifact;
+    use crate::framework::error::StageError;
+    use crate::framework::resource::Resource;
+    use crate::framework::stage::{Stage, StageContext};
 
     #[derive(Debug)]
     struct PanicHeadStore;
@@ -741,22 +994,64 @@ mod tests {
         }
     }
 
-    fn fake_erased(payload: serde_json::Value) -> ErasedArtifact {
-        // Payload bytes are bincode of the JSON STRING form of the
-        // value. `serde_json::Value` itself requires `deserialize_any`
-        // which bincode rejects; encoding the string side-steps it
-        // and keeps test fixtures ergonomic with `json!(...)`.
-        let s = payload.to_string();
-        ErasedArtifact {
-            kind: "test.kind".into(),
-            schema: 1,
-            payload: bincode::serialize(&s).unwrap(),
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct FileArtifact {
+        path: PathBuf,
+        content_hash: ContentHash,
+    }
+
+    impl Artifact for FileArtifact {
+        const KIND: &'static str = "test.cache-file";
+        const SCHEMA: u32 = 1;
+
+        fn content_hash(&self) -> ContentHash {
+            self.content_hash
+        }
+
+        fn primary_path(&self) -> &Path {
+            &self.path
         }
     }
 
-    fn decode_payload(art: &ErasedArtifact) -> serde_json::Value {
-        let s: String = bincode::deserialize(&art.payload).unwrap();
-        serde_json::from_str(&s).unwrap()
+    #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+    struct NoArgs;
+
+    struct FileStage;
+
+    #[async_trait]
+    impl Stage for FileStage {
+        const NAME: &'static str = "cache_file_stage";
+        const SCHEMA: u32 = 7;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = FileArtifact;
+        type Output = FileArtifact;
+        type Args = NoArgs;
+
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            input: Self::Input,
+            _args: &Self::Args,
+        ) -> Result<Self::Output, StageError> {
+            Ok(input)
+        }
+    }
+
+    fn file_artifact(root: &Path, body: &[u8]) -> (ErasedArtifact, ContentHash) {
+        std::fs::create_dir_all(root).unwrap();
+        let path = root.join("payload.bin");
+        std::fs::write(&path, body).unwrap();
+        let hash = ContentHash::hash_file(&path).unwrap();
+        let erased = ErasedArtifact::from_typed(&FileArtifact {
+            path,
+            content_hash: hash,
+        })
+        .unwrap();
+        (erased, hash)
+    }
+
+    fn restored_file(hit: &CacheHit) -> FileArtifact {
+        hit.artifact.clone().into_typed().unwrap()
     }
 
     const CS: &[u8] = b"code-sha-fixture";
@@ -841,19 +1136,32 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let h = CacheHandle::job_local(td.path().to_path_buf());
         let key = invocation(b"missing");
-        assert!(h.lookup(key).is_none());
+        assert!(
+            h.lookup(key, &FileStage, &td.path().join("consumer"))
+                .is_none()
+        );
     }
 
     #[test]
     fn insert_then_lookup_round_trip() {
         let td = tempfile::tempdir().unwrap();
-        let h = CacheHandle::job_local(td.path().to_path_buf());
+        let cache = td.path().join("cache");
+        let producer = td.path().join("producer");
+        let consumer = td.path().join("consumer");
+        let h = CacheHandle::job_local(cache);
         let key = invocation(b"k");
-        let art = fake_erased(serde_json::json!({"n": 7}));
-        h.insert(key, &art).unwrap();
-        let hit = h.lookup(key).expect("should hit");
-        assert_eq!(hit.artifact.kind, "test.kind");
-        assert_eq!(decode_payload(&hit.artifact), serde_json::json!({"n": 7}));
+        let (artifact, logical_hash) = file_artifact(&producer, b"portable bytes");
+        let content_id = h.insert(key, &FileStage, &artifact, &producer).unwrap();
+        assert_ne!(content_id.digest(), logical_hash);
+        std::fs::remove_dir_all(&producer).unwrap();
+
+        let hit = h
+            .lookup(key, &FileStage, &consumer)
+            .expect("should rehydrate after producer deletion");
+        let restored = restored_file(&hit);
+        assert_eq!(hit.content_id, content_id);
+        assert!(restored.path.starts_with(&consumer));
+        assert_eq!(std::fs::read(restored.path).unwrap(), b"portable bytes");
     }
 
     #[test]
@@ -861,15 +1169,15 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let h = CacheHandle::job_local(td.path().to_path_buf());
         let key = invocation(b"k");
-        let dir = td.path().join(key.to_hex());
-        std::fs::create_dir_all(&dir).unwrap();
-        // Truncated bincode header → deserialize fails.
-        std::fs::write(dir.join("output.bin"), [0xFFu8; 3]).unwrap();
-        assert!(h.lookup(key).is_none());
+        let path = record_path(td.path(), key);
+        write_atomic(&path, &[0xFFu8; 3]).unwrap();
+        assert!(
+            h.lookup(key, &FileStage, &td.path().join("consumer"))
+                .is_none()
+        );
     }
 
-    /// §5.1 "Cache CORRUPT `.bin`": a `output.bin` that is a *truncated*
-    /// copy of a once-valid bincode `ErasedArtifact` must DOWNGRADE to a
+    /// A truncated once-valid invocation record must downgrade to a
     /// miss (return `None`, triggering a re-run) — never panic and never
     /// hand back a garbage / partially-decoded artifact.
     #[test]
@@ -877,19 +1185,21 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let h = CacheHandle::job_local(td.path().to_path_buf());
         let key = invocation(b"truncated");
-        let dir = td.path().join(key.to_hex());
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // Serialize a real, well-formed cache entry first…
-        let good = bincode::serialize(&fake_erased(serde_json::json!({"n": 42}))).unwrap();
+        let record = CacheRecord {
+            version: CACHE_RECORD_VERSION,
+            invocation_key: key,
+            content_id: ContentId::from_digest(ContentHash::of_bytes(b"content")),
+            kind: FileArtifact::KIND.into(),
+            schema: FileArtifact::SCHEMA,
+        };
+        let good = bincode::serialize(&record).unwrap();
         assert!(good.len() > 4, "fixture must be long enough to truncate");
-        // …then write only its first few bytes (the length prefix +
-        // partial payload) so the on-disk record is a torn write.
-        std::fs::write(dir.join("output.bin"), &good[..good.len() / 2]).unwrap();
+        write_atomic(&record_path(td.path(), key), &good[..good.len() / 2]).unwrap();
 
         // No panic, and the lookup reports a clean miss.
         assert!(
-            h.lookup(key).is_none(),
+            h.lookup(key, &FileStage, &td.path().join("consumer"))
+                .is_none(),
             "truncated bincode must downgrade to a cache miss"
         );
     }
@@ -901,8 +1211,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let h = CacheHandle::job_local(td.path().to_path_buf());
         let key = invocation(b"garbage");
-        let dir = td.path().join(key.to_hex());
-        std::fs::create_dir_all(&dir).unwrap();
+        let path = record_path(td.path(), key);
         // A bincode length prefix claiming a huge string, followed by no
         // data — the classic "allocator bomb" corrupt-frame shape. The
         // deserializer must error (not OOM / panic), and lookup returns
@@ -910,16 +1219,18 @@ mod tests {
         let mut garbage = Vec::new();
         garbage.extend_from_slice(&u64::MAX.to_le_bytes()); // bogus length
         garbage.extend_from_slice(b"\x00not-a-valid-record\xff\xfe");
-        std::fs::write(dir.join("output.bin"), &garbage).unwrap();
+        write_atomic(&path, &garbage).unwrap();
         assert!(
-            h.lookup(key).is_none(),
+            h.lookup(key, &FileStage, &td.path().join("consumer"))
+                .is_none(),
             "garbage bytes must downgrade to a cache miss, not panic"
         );
 
         // Empty file is also corrupt-shaped (truncated to zero) → miss.
-        std::fs::write(dir.join("output.bin"), b"").unwrap();
+        write_atomic(&path, b"").unwrap();
         assert!(
-            h.lookup(key).is_none(),
+            h.lookup(key, &FileStage, &td.path().join("consumer"))
+                .is_none(),
             "empty output.bin must downgrade to a cache miss"
         );
     }
@@ -931,19 +1242,24 @@ mod tests {
     #[test]
     fn corrupt_then_valid_entry_hits() {
         let td = tempfile::tempdir().unwrap();
-        let h = CacheHandle::job_local(td.path().to_path_buf());
+        let cache = td.path().join("cache");
+        let producer = td.path().join("producer");
+        let h = CacheHandle::job_local(cache.clone());
         let key = invocation(b"recover");
-        let dir = td.path().join(key.to_hex());
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("output.bin"), [0x01u8, 0x02, 0x03]).unwrap();
-        assert!(h.lookup(key).is_none(), "corrupt first read → miss");
+        write_atomic(&record_path(&cache, key), &[0x01u8, 0x02, 0x03]).unwrap();
+        assert!(
+            h.lookup(key, &FileStage, &td.path().join("miss")).is_none(),
+            "corrupt first read -> miss"
+        );
         // Overwrite with a valid record (insert uses atomic rename).
-        h.insert(key, &fake_erased(serde_json::json!({"ok": true})))
-            .unwrap();
-        let hit = h.lookup(key).expect("valid entry must now hit");
+        let (artifact, _) = file_artifact(&producer, b"recovered");
+        h.insert(key, &FileStage, &artifact, &producer).unwrap();
+        let hit = h
+            .lookup(key, &FileStage, &td.path().join("consumer"))
+            .expect("valid entry must now hit");
         assert_eq!(
-            decode_payload(&hit.artifact),
-            serde_json::json!({"ok": true})
+            std::fs::read(restored_file(&hit).path).unwrap(),
+            b"recovered"
         );
     }
 
@@ -952,14 +1268,15 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let job = td.path().join("job");
         let global = td.path().join("global");
+        let producer = td.path().join("producer");
         std::fs::create_dir_all(&job).unwrap();
         std::fs::create_dir_all(&global).unwrap();
         let h = CacheHandle::job_local(job).with_global(global.clone());
         let key = invocation(b"k");
-        h.insert(key, &fake_erased(serde_json::json!({"x": 1})))
-            .unwrap();
-        // Entry must exist under the global path.
-        assert!(global.join(key.to_hex()).join("output.bin").exists());
+        let (artifact, _) = file_artifact(&producer, b"global");
+        let content_id = h.insert(key, &FileStage, &artifact, &producer).unwrap();
+        assert!(record_path(&global, key).exists());
+        assert!(object_path(&global, content_id).exists());
     }
 
     #[test]
@@ -971,24 +1288,60 @@ mod tests {
 
         // Machine A: insert → writes local AND through to the remote store.
         let a_job = td.path().join("a");
+        let a_producer = td.path().join("a-producer");
         let h_a = CacheHandle::job_local(a_job).with_remote(remote.clone());
-        h_a.insert(key, &fake_erased(serde_json::json!({ "v": 1 })))
-            .unwrap();
+        let (artifact, _) = file_artifact(&a_producer, b"remote payload");
+        let content_id = h_a.insert(key, &FileStage, &artifact, &a_producer).unwrap();
         assert!(
-            remote.head(key.digest()).unwrap(),
-            "insert wrote through to remote"
+            remote.head(remote_invocation_key(key)).unwrap(),
+            "invocation record wrote through to remote"
         );
+        assert!(
+            remote.head(remote_object_key(content_id)).unwrap(),
+            "content object wrote through to remote"
+        );
+        std::fs::remove_dir_all(&a_producer).unwrap();
 
-        // Machine B: cold local, same remote → lookup hits the remote and
-        // writes it through to B's job dir (a real CacheHit with a path).
+        // Machine B: cold local, same remote -> verified B-local materialization.
         let b_job = td.path().join("b");
+        let b_consumer = td.path().join("b-consumer");
         let h_b = CacheHandle::job_local(b_job.clone()).with_remote(remote.clone());
-        let hit = h_b.lookup(key).expect("remote tier serves the entry");
-        assert_eq!(hit.artifact.kind, fake_erased(serde_json::json!({})).kind);
-        assert!(
-            b_job.join(key.to_hex()).join("output.bin").exists(),
-            "remote hit was written through to the local job dir"
-        );
+        let hit = h_b
+            .lookup(key, &FileStage, &b_consumer)
+            .expect("remote tier serves the entry");
+        let restored = restored_file(&hit);
+        assert!(restored.path.starts_with(&b_consumer));
+        assert_eq!(std::fs::read(restored.path).unwrap(), b"remote payload");
+        assert!(record_path(&b_job, key).exists());
+        assert!(object_path(&b_job, content_id).exists());
+    }
+
+    #[test]
+    fn remote_hit_writes_through_to_global_when_shared_cache_is_enabled() {
+        use crate::framework::object_store::FsBlobStore;
+        let td = tempfile::tempdir().unwrap();
+        let remote = std::sync::Arc::new(FsBlobStore::new(td.path().join("remote")));
+        let key = invocation(b"remote-global");
+        let producer = td.path().join("producer");
+        let (artifact, _) = file_artifact(&producer, b"shared remote payload");
+        let content_id = CacheHandle::job_local(td.path().join("seed"))
+            .with_remote(remote.clone())
+            .insert(key, &FileStage, &artifact, &producer)
+            .unwrap();
+
+        let job = td.path().join("job");
+        let global = td.path().join("global");
+        let handle = CacheHandle::job_local(job.clone())
+            .with_global(global.clone())
+            .with_remote(remote);
+        handle
+            .lookup(key, &FileStage, &td.path().join("consumer"))
+            .expect("remote hit must materialize");
+
+        assert!(record_path(&global, key).exists());
+        assert!(object_path(&global, content_id).exists());
+        assert!(!record_path(&job, key).exists());
+        assert!(!object_path(&job, content_id).exists());
     }
 
     #[test]
@@ -997,20 +1350,24 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let remote = std::sync::Arc::new(FsBlobStore::new(td.path().join("remote")));
         let key = invocation(b"probe-remote");
-        CacheHandle::job_local(td.path().join("producer"))
+        let producer = td.path().join("producer");
+        let (artifact, _) = file_artifact(&producer, b"presence probe payload");
+        let content_id = CacheHandle::job_local(td.path().join("seed"))
             .with_remote(remote.clone())
-            .insert(key, &fake_erased(serde_json::json!({ "v": 1 })))
+            .insert(key, &FileStage, &artifact, &producer)
             .unwrap();
 
         let consumer = td.path().join("consumer");
-        let handle = CacheHandle::job_local(consumer.clone()).with_remote(remote);
+        let job_cache = td.path().join("consumer-cache");
+        let handle = CacheHandle::job_local(job_cache.clone()).with_remote(remote);
         assert!(handle.probe_presence(key).unwrap());
         assert!(
-            !consumer.join(key.to_hex()).join("output.bin").exists(),
+            !record_path(&job_cache, key).exists() && !object_path(&job_cache, content_id).exists(),
             "an optional presence check must not hydrate canonical job state"
         );
-        assert!(handle.lookup(key).is_some());
-        assert!(consumer.join(key.to_hex()).join("output.bin").is_file());
+        assert!(handle.lookup(key, &FileStage, &consumer).is_some());
+        assert!(record_path(&job_cache, key).is_file());
+        assert!(object_path(&job_cache, content_id).is_file());
     }
 
     #[test]
@@ -1024,14 +1381,18 @@ mod tests {
             handle.probe_presence(key).unwrap(),
             "unknown shared state must conservatively suppress optional work"
         );
-        assert!(handle.lookup(key).is_none());
+        assert!(
+            handle
+                .lookup(key, &FileStage, &td.path().join("restore"))
+                .is_none()
+        );
     }
 
     #[test]
     fn presence_probe_suppresses_optional_work_without_parsing_corrupt_bytes() {
         let td = tempfile::tempdir().unwrap();
         let key = invocation(b"probe-corrupt");
-        let path = td.path().join(key.to_hex()).join("output.bin");
+        let path = record_path(td.path(), key);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let bytes = [0xFF, 0x01, 0x02];
         std::fs::write(&path, bytes).unwrap();
@@ -1040,7 +1401,9 @@ mod tests {
         assert!(handle.probe_presence(key).unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert!(
-            handle.lookup(key).is_none(),
+            handle
+                .lookup(key, &FileStage, &td.path().join("restore"))
+                .is_none(),
             "ordinary lookup remains the authoritative validity check"
         );
     }
@@ -1054,7 +1417,14 @@ mod tests {
         // get; the handle must simply report no hit.
         let remote = std::sync::Arc::new(FsBlobStore::new(PathBuf::from("/no-such-remote-xyz")));
         let h = CacheHandle::job_local(td.path().join("job")).with_remote(remote);
-        assert!(h.lookup(invocation(b"absent")).is_none());
+        assert!(
+            h.lookup(
+                invocation(b"absent"),
+                &FileStage,
+                &td.path().join("consumer")
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1063,54 +1433,57 @@ mod tests {
         let job = td.path().join("job");
         let global = td.path().join("global");
         let key = invocation(b"k");
-        std::fs::create_dir_all(job.join(key.to_hex())).unwrap();
-        std::fs::create_dir_all(global.join(key.to_hex())).unwrap();
-        // Different payloads under the two roots.
-        std::fs::write(
-            job.join(key.to_hex()).join("output.bin"),
-            bincode::serialize(&fake_erased(serde_json::json!({"src": "job"}))).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            global.join(key.to_hex()).join("output.bin"),
-            bincode::serialize(&fake_erased(serde_json::json!({"src": "global"}))).unwrap(),
-        )
-        .unwrap();
+        let job_producer = td.path().join("job-producer");
+        let global_producer = td.path().join("global-producer");
+        let (job_artifact, _) = file_artifact(&job_producer, b"job");
+        CacheHandle::job_local(job.clone())
+            .insert(key, &FileStage, &job_artifact, &job_producer)
+            .unwrap();
+        let (global_artifact, _) = file_artifact(&global_producer, b"global");
+        CacheHandle::job_local(global.clone())
+            .insert(key, &FileStage, &global_artifact, &global_producer)
+            .unwrap();
         let h = CacheHandle::job_local(job).with_global(global);
-        let hit = h.lookup(key).expect("must hit");
-        assert_eq!(
-            decode_payload(&hit.artifact),
-            serde_json::json!({"src": "global"})
-        );
+        let hit = h
+            .lookup(key, &FileStage, &td.path().join("consumer"))
+            .expect("must hit");
+        assert_eq!(std::fs::read(restored_file(&hit).path).unwrap(), b"global");
     }
 
     #[test]
     fn lru_prune_removes_oldest_until_under_cap() {
         let td = tempfile::tempdir().unwrap();
-        // Three "cache entries" each 1 KiB. Cap at 2 KiB → one
-        // must go.
-        for name in ["e1", "e2", "e3"] {
-            let dir = td.path().join(name);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("output.bin"), vec![0u8; 1024]).unwrap();
+        let cache = CacheHandle::job_local(td.path().join("cache"));
+        for (index, byte) in [1u8, 2, 3].into_iter().enumerate() {
+            let producer = td.path().join(format!("producer-{index}"));
+            let (artifact, _) = file_artifact(&producer, &vec![byte; 1024]);
+            cache
+                .insert(
+                    invocation(format!("entry-{index}").as_bytes()),
+                    &FileStage,
+                    &artifact,
+                    &producer,
+                )
+                .unwrap();
         }
-        // Bump atime ordering by sleeping briefly between touches.
-        // tempdirs default to creation time; force atime spread:
-        for name in ["e1", "e2", "e3"] {
-            let p = td.path().join(name);
-            let _ = std::fs::File::open(&p);
-        }
-        let freed = lru_prune(td.path(), 2 * 1024).unwrap();
-        // At least one entry was freed.
-        assert!(freed >= 1024);
+        let root = td.path().join("cache");
+        let before = dir_size(&root).unwrap();
+        let freed = lru_prune(&root, before - 1).unwrap();
+        assert!(freed > 0);
+        assert!(dir_size(&root).unwrap() < before);
     }
 
     #[test]
     fn lru_prune_noop_when_under_cap() {
         let td = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(td.path().join("e1")).unwrap();
-        std::fs::write(td.path().join("e1/output.bin"), vec![0u8; 100]).unwrap();
-        let freed = lru_prune(td.path(), 1024).unwrap();
+        let cache_root = td.path().join("cache");
+        let producer = td.path().join("producer");
+        let cache = CacheHandle::job_local(cache_root.clone());
+        let (artifact, _) = file_artifact(&producer, b"small");
+        cache
+            .insert(invocation(b"entry"), &FileStage, &artifact, &producer)
+            .unwrap();
+        let freed = lru_prune(&cache_root, dir_size(&cache_root).unwrap() + 1).unwrap();
         assert_eq!(freed, 0);
     }
 
@@ -1176,13 +1549,21 @@ mod tests {
     #[test]
     fn insert_creates_dir_atomically_no_tmp_remnants() {
         let td = tempfile::tempdir().unwrap();
-        let h = CacheHandle::job_local(td.path().to_path_buf());
+        let cache = td.path().join("cache");
+        let producer = td.path().join("producer");
+        let h = CacheHandle::job_local(cache.clone());
         let key = invocation(b"k");
-        h.insert(key, &fake_erased(serde_json::json!({}))).unwrap();
-        let entries: Vec<_> = std::fs::read_dir(td.path().join(key.to_hex()))
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+        let (artifact, _) = file_artifact(&producer, b"atomic");
+        let content_id = h.insert(key, &FileStage, &artifact, &producer).unwrap();
+        let entries: Vec<_> = [record_path(&cache, key), object_path(&cache, content_id)]
+            .into_iter()
+            .flat_map(|path| {
+                std::fs::read_dir(path.parent().unwrap())
+                    .unwrap()
+                    .filter_map(|entry| entry.ok())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
             .collect();
         assert!(
             entries.is_empty(),

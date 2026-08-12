@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 
-use crate::framework::artifact::ContentHash;
+use crate::framework::artifact::ContentId;
 use crate::p2p::peer::{PeerId, PeerInfo};
 use crate::p2p::task::{ResourceRequest, TaskResult};
 #[cfg(test)]
@@ -41,7 +41,7 @@ pub trait DispatchPolicy: Send + Sync {
     fn verify_result(
         &self,
         result: &TaskResult,
-        expected: &ContentHash,
+        expected: Option<ContentId>,
         peer_pubkey: &ed25519_dalek::VerifyingKey,
     ) -> DispatchVerdict;
 }
@@ -180,23 +180,30 @@ impl DispatchPolicy for DefaultDispatchPolicy {
     fn verify_result(
         &self,
         result: &TaskResult,
-        expected: &ContentHash,
+        expected: Option<ContentId>,
         peer_pubkey: &ed25519_dalek::VerifyingKey,
     ) -> DispatchVerdict {
+        if result.protocol_version != crate::p2p::task::TASK_PROTOCOL_VERSION {
+            return DispatchVerdict::Reject(format!(
+                "result protocol v{} unsupported (want v{})",
+                result.protocol_version,
+                crate::p2p::task::TASK_PROTOCOL_VERSION
+            ));
+        }
         // Verify Ed25519 signature first.
         let payload = result.sign_payload();
         if !crate::p2p::crypto::verify(peer_pubkey, &payload, &result.signature) {
             return DispatchVerdict::Reject("invalid Ed25519 signature".into());
         }
-        // Then verify output hash.
-        if result.output_hash == *expected {
-            DispatchVerdict::Accept
-        } else {
-            DispatchVerdict::Reject(format!(
-                "output hash mismatch: got {}, expected {}",
-                result.output_hash.to_hex(),
-                expected.to_hex()
-            ))
+        // Compare only an analytically known identity. Otherwise the receiver
+        // binds the signed result identity to the downloaded artifact and the
+        // artifact store independently recomputes it from consumer-local bytes.
+        match expected {
+            Some(expected) if result.content_id != expected => DispatchVerdict::Reject(format!(
+                "output identity mismatch: got {}, expected {}",
+                result.content_id, expected
+            )),
+            _ => DispatchVerdict::Accept,
         }
     }
 }
@@ -204,6 +211,7 @@ impl DispatchPolicy for DefaultDispatchPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framework::ContentHash;
     use crate::p2p::crypto::KeyPair;
     use crate::p2p::peer::PeerCapabilities;
 
@@ -362,16 +370,37 @@ mod tests {
         let kp = KeyPair::generate();
         let hash = ContentHash::of_bytes(&[42u8; 32]);
         let mut result = TaskResult {
+            protocol_version: crate::p2p::task::TASK_PROTOCOL_VERSION,
             task_id: "test".into(),
             peer_id: crate::p2p::peer::PeerId::from_pubkey(&kp.verifying),
-            output_hash: hash,
+            content_id: ContentId::from_digest(hash),
             encrypted_output: None,
             wall_time_ms: 1000,
             signature: kp.sign(b"placeholder"),
         };
         result.signature = kp.sign(&result.sign_payload());
         assert!(matches!(
-            policy.verify_result(&result, &hash, &kp.verifying),
+            policy.verify_result(&result, Some(ContentId::from_digest(hash)), &kp.verifying,),
+            DispatchVerdict::Accept
+        ));
+    }
+
+    #[test]
+    fn verify_result_without_analytic_expectation_accepts_signed_identity() {
+        let policy = DefaultDispatchPolicy::new(DispatchMatrix::default());
+        let kp = KeyPair::generate();
+        let mut result = TaskResult {
+            protocol_version: crate::p2p::task::TASK_PROTOCOL_VERSION,
+            task_id: "test".into(),
+            peer_id: crate::p2p::peer::PeerId::from_pubkey(&kp.verifying),
+            content_id: ContentId::from_digest(ContentHash::of_bytes(b"worker-output")),
+            encrypted_output: None,
+            wall_time_ms: 1000,
+            signature: kp.sign(b"placeholder"),
+        };
+        result.signature = kp.sign(&result.sign_payload());
+        assert!(matches!(
+            policy.verify_result(&result, None, &kp.verifying),
             DispatchVerdict::Accept
         ));
     }
@@ -383,16 +412,21 @@ mod tests {
         let expected = ContentHash::of_bytes(&[42u8; 32]);
         let actual = ContentHash::of_bytes(&[99u8; 32]);
         let mut result = TaskResult {
+            protocol_version: crate::p2p::task::TASK_PROTOCOL_VERSION,
             task_id: "test".into(),
             peer_id: crate::p2p::peer::PeerId::from_pubkey(&kp.verifying),
-            output_hash: actual,
+            content_id: ContentId::from_digest(actual),
             encrypted_output: None,
             wall_time_ms: 1000,
             signature: kp.sign(b"placeholder"),
         };
         result.signature = kp.sign(&result.sign_payload());
         assert!(matches!(
-            policy.verify_result(&result, &expected, &kp.verifying),
+            policy.verify_result(
+                &result,
+                Some(ContentId::from_digest(expected)),
+                &kp.verifying,
+            ),
             DispatchVerdict::Reject(_)
         ));
     }
@@ -403,16 +437,17 @@ mod tests {
         let kp = KeyPair::generate();
         let hash = ContentHash::of_bytes(&[42u8; 32]);
         let result = TaskResult {
+            protocol_version: crate::p2p::task::TASK_PROTOCOL_VERSION,
             task_id: "test".into(),
             peer_id: crate::p2p::peer::PeerId::from_pubkey(&kp.verifying),
-            output_hash: hash,
+            content_id: ContentId::from_digest(hash),
             encrypted_output: None,
             wall_time_ms: 1000,
             signature: kp.sign(b"wrong payload"),
         };
         // Signature was over "wrong payload", not sign_payload() → rejects.
         assert!(matches!(
-            policy.verify_result(&result, &hash, &kp.verifying),
+            policy.verify_result(&result, Some(ContentId::from_digest(hash)), &kp.verifying,),
             DispatchVerdict::Reject(_)
         ));
     }
@@ -428,16 +463,17 @@ mod tests {
         let kp_other = KeyPair::generate();
         let hash = ContentHash::of_bytes(&[42u8; 32]);
         let mut result = TaskResult {
+            protocol_version: crate::p2p::task::TASK_PROTOCOL_VERSION,
             task_id: "test".into(),
             peer_id: crate::p2p::peer::PeerId::from_pubkey(&kp.verifying),
-            output_hash: hash,
+            content_id: ContentId::from_digest(hash),
             encrypted_output: None,
             wall_time_ms: 1000,
             signature: kp_other.sign(b"placeholder"),
         };
         result.signature = kp_other.sign(&result.sign_payload());
         assert!(matches!(
-            policy.verify_result(&result, &hash, &kp.verifying),
+            policy.verify_result(&result, Some(ContentId::from_digest(hash)), &kp.verifying,),
             DispatchVerdict::Reject(_)
         ));
     }

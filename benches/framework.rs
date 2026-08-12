@@ -224,8 +224,29 @@ fn bench_cache_write_then_read(c: &mut Criterion) {
             &self.path
         }
     }
+    #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+    struct ToyArgs;
+    struct ToyStage;
+    #[async_trait::async_trait]
+    impl Stage for ToyStage {
+        const NAME: &'static str = "bench_cache_toy";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = Toy;
+        type Output = Toy;
+        type Args = ToyArgs;
+
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            input: Self::Input,
+            _args: &Self::Args,
+        ) -> Result<Self::Output, StageError> {
+            Ok(input)
+        }
+    }
     let toy = Toy {
-        path: "/tmp/x".into(),
+        path: "inline".into(),
         n: 12345,
         meta: "lorem ipsum dolor sit amet".repeat(20),
     };
@@ -240,8 +261,11 @@ fn bench_cache_write_then_read(c: &mut Criterion) {
                 (td, h, key)
             },
             |(_td, h, key)| {
-                h.insert(key, black_box(&art)).unwrap();
-                let hit = h.lookup(key).expect("must hit");
+                h.insert(key, &ToyStage, black_box(&art), Path::new("."))
+                    .unwrap();
+                let hit = h
+                    .lookup(key, &ToyStage, Path::new("bench-consumer"))
+                    .expect("must hit");
                 black_box(hit);
             },
             BatchSize::SmallInput,
@@ -488,6 +512,7 @@ fn bench_status_emit(c: &mut Criterion) {
                         node_idx: i % 8,
                         stage_name: "train".into(),
                         input_hash: ContentHash::of_bytes(b"x"),
+                        input_content_ids: Vec::new(),
                     });
                 }
                 black_box(&hub);

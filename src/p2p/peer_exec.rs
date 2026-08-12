@@ -27,7 +27,7 @@ use std::sync::Arc;
 use quinn::Connection as QuinnConnection;
 
 use crate::error::TrainError;
-use crate::framework::artifact::ContentHash;
+use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
 use crate::framework::cache::CacheHandle;
 use crate::framework::cookbook::Registry;
 use crate::framework::stage::{ErasedArtifact, StageContext};
@@ -154,6 +154,13 @@ async fn execute_one(
     work_root: &std::path::Path,
     task: TaskManifest,
 ) -> Result<(), TrainError> {
+    if task.protocol_version != crate::p2p::task::TASK_PROTOCOL_VERSION {
+        return Err(TrainError::other(format!(
+            "task protocol v{} unsupported (want v{})",
+            task.protocol_version,
+            crate::p2p::task::TASK_PROTOCOL_VERSION
+        )));
+    }
     // 1. Verify the coordinator's Ed25519 signature over the manifest.
     if !crypto::verify(
         &coordinator.verifying,
@@ -227,11 +234,11 @@ async fn execute_one(
     //     exact comparison later (defense in depth, on the rebased path); doing
     //     it here too means a mismatched/malicious blob from a low-trust peer
     //     is never fully received into memory in the first place.
-    if input_manifest.content_hash != task.input_hash {
+    if input_manifest.content_id != task.input_content_id {
         return Err(TrainError::other(format!(
-            "hash binding: bundle.content_hash {} != signed input_hash {} — rejecting before blob receive",
-            input_manifest.content_hash.to_hex(),
-            task.input_hash.to_hex(),
+            "identity binding: artifact {} != signed input identity {} — rejecting before blob receive",
+            input_manifest.content_id.to_hex(),
+            task.input_content_id.to_hex(),
         )));
     }
 
@@ -255,7 +262,7 @@ async fn execute_one(
         stage_dir.clone(),
         stage_dir.clone(),
         cache,
-        crate::framework::InvocationKey::from_digest(task.input_hash),
+        task.invocation_key,
     );
 
     // 6. Receive the input blob side-stream (sealed to this peer's X25519 key —
@@ -270,7 +277,7 @@ async fn execute_one(
         &input_manifest,
         &pack,
         &stage_dir,
-        &task.input_hash,
+        Some(task.input_content_id),
         BlobDir::Input,
     )
     .map_err(|e| TrainError::other(format!("unbundle input: {e}")))?;
@@ -291,14 +298,15 @@ async fn execute_one(
         .map_err(|e| TrainError::other(format!("stage run failed: {e}")))?;
     let wall_time_ms = started.elapsed().as_millis() as u64;
 
-    // 8. Bundle the output (rooted at the peer's stage_dir) + ship it back. The
-    //    coordinator re-verifies against task.expected_output_hash.
+    // 8. Bundle the output (rooted at the peer's stage_dir) + ship it back. An
+    //    analytical expectation is checked when present; otherwise capture
+    //    derives the identity from the typed output.
     let (out_manifest, out_pack) = bundle::bundle(
         &*stage,
         output,
         &stage_dir,
         BlobDir::Output,
-        &task.expected_output_hash,
+        task.expected_content_id,
     )
     .map_err(|e| TrainError::other(format!("bundle output: {e}")))?;
 
@@ -308,9 +316,10 @@ async fn execute_one(
     let encrypted_output = crypto::encrypt(&manifest_bytes, &coordinator.x25519_pub);
 
     let mut result = TaskResult {
+        protocol_version: crate::p2p::task::TASK_PROTOCOL_VERSION,
         task_id: task.task_id.clone(),
         peer_id: PeerId::from_pubkey(&keypair.verifying),
-        output_hash: out_manifest.content_hash,
+        content_id: out_manifest.content_id,
         encrypted_output: Some(encrypted_output),
         wall_time_ms,
         signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
@@ -344,6 +353,7 @@ pub(crate) fn is_safe_task_id(id: &str) -> bool {
 /// plus the peer that produced it.
 pub struct DispatchedOutput {
     pub output: ErasedArtifact,
+    pub content_id: ContentId,
     pub peer_id: PeerId,
 }
 
@@ -367,8 +377,8 @@ pub async fn dispatch_to_peer(
     input: ErasedArtifact,
     src_root: &std::path::Path,
     args: serde_json::Value,
-    input_hash: ContentHash,
-    expected_output_hash: ContentHash,
+    invocation_key: InvocationKey,
+    expected_content_id: Option<ContentId>,
     data_class: crate::p2p::DataClass,
     timeout_secs: u64,
     out_stage_dir: &std::path::Path,
@@ -382,9 +392,9 @@ pub async fn dispatch_to_peer(
     );
 
     // 1. Bundle the input rooted at its producing stage_dir.
-    let (in_manifest, in_pack) =
-        bundle::bundle(&*stage, input, src_root, BlobDir::Input, &input_hash)
-            .map_err(|e| TrainError::other(format!("bundle input: {e}")))?;
+    let (in_manifest, in_pack) = bundle::bundle(&*stage, input, src_root, BlobDir::Input, None)
+        .map_err(|e| TrainError::other(format!("bundle input: {e}")))?;
+    let input_content_id = in_manifest.content_id;
 
     // 2. Seal the bundle manifest to the PEER's X25519 key + build the task.
     let manifest_bytes = bincode::serialize(&in_manifest)
@@ -398,13 +408,15 @@ pub async fn dispatch_to_peer(
         &serde_json::to_vec(&args).map_err(|e| TrainError::other(format!("args hash: {e}")))?,
     );
     let mut task = TaskManifest {
+        protocol_version: crate::p2p::task::TASK_PROTOCOL_VERSION,
         task_id: task_id.to_string(),
         coordinator_id: PeerId::from_pubkey(&coordinator_kp.verifying),
         stage_name: stage_name.to_string(),
         stage_schema: stage.schema(),
-        input_hash,
+        input_content_id,
+        invocation_key,
         args_hash,
-        expected_output_hash,
+        expected_content_id,
         args,
         resources: crate::p2p::task::ResourceRequest::default(),
         data_class,
@@ -428,6 +440,13 @@ pub async fn dispatch_to_peer(
     if result.task_id != task_id {
         return Err(TrainError::other("result task_id mismatch"));
     }
+    if result.protocol_version != crate::p2p::task::TASK_PROTOCOL_VERSION {
+        return Err(TrainError::other(format!(
+            "result protocol v{} unsupported (want v{})",
+            result.protocol_version,
+            crate::p2p::task::TASK_PROTOCOL_VERSION
+        )));
+    }
     if !crypto::verify(&peer.pubkey, &result.sign_payload(), &result.signature) {
         return Err(TrainError::other("result signature invalid"));
     }
@@ -446,11 +465,19 @@ pub async fn dispatch_to_peer(
     // it, not just after. `bundle::unbundle` re-checks this exact comparison
     // later (defense in depth) — mirrors the identical pre-check on the peer
     // side in `execute_one`, step 4b.
-    if out_manifest.content_hash != expected_output_hash {
+    if out_manifest.content_id != result.content_id {
         return Err(TrainError::other(format!(
-            "hash binding: bundle.content_hash {} != expected_output_hash {} — rejecting before blob receive",
-            out_manifest.content_hash.to_hex(),
-            expected_output_hash.to_hex(),
+            "identity binding: artifact {} != signed result identity {} — rejecting before blob receive",
+            out_manifest.content_id.to_hex(),
+            result.content_id.to_hex(),
+        )));
+    }
+    if let Some(expected) = expected_content_id
+        && result.content_id != expected
+    {
+        return Err(TrainError::other(format!(
+            "output identity {} != analytically expected {}",
+            result.content_id, expected
         )));
     }
 
@@ -462,13 +489,14 @@ pub async fn dispatch_to_peer(
         &out_manifest,
         &out_pack,
         out_stage_dir,
-        &expected_output_hash,
+        Some(result.content_id),
         BlobDir::Output,
     )
     .map_err(|e| TrainError::other(format!("unbundle output: {e}")))?;
 
     Ok(DispatchedOutput {
         output,
+        content_id: result.content_id,
         peer_id: result.peer_id,
     })
 }

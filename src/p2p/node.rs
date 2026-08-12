@@ -449,10 +449,14 @@ mod tests {
     #[async_trait]
     impl MeshTaskRunner for EchoRunner {
         async fn run(&self, task: TaskManifest) -> Result<TaskResult, TrainError> {
+            let content_id = task.expected_content_id.ok_or_else(|| {
+                TrainError::other("echo runner requires expected content identity")
+            })?;
             let mut result = TaskResult {
+                protocol_version: crate::p2p::task::TASK_PROTOCOL_VERSION,
                 task_id: task.task_id,
                 peer_id: PeerId::from_pubkey(&self.keypair.verifying),
-                output_hash: task.expected_output_hash,
+                content_id,
                 encrypted_output: None,
                 wall_time_ms: 1,
                 signature: self.keypair.sign(b"placeholder"),
@@ -479,13 +483,21 @@ mod tests {
 
     fn echo_task(from: &PeerId, signer: &KeyPair) -> TaskManifest {
         let mut task = TaskManifest {
+            protocol_version: crate::p2p::task::TASK_PROTOCOL_VERSION,
             task_id: "echo-1".into(),
             coordinator_id: from.clone(),
             stage_name: "p2p-echo".into(),
             stage_schema: 1,
-            input_hash: ContentHash::of_bytes(b"in"),
+            input_content_id: crate::framework::ContentId::from_digest(ContentHash::of_bytes(
+                b"in",
+            )),
+            invocation_key: crate::framework::InvocationKey::from_digest(ContentHash::of_bytes(
+                b"echo-invocation",
+            )),
             args_hash: ContentHash::of_bytes(b"args"),
-            expected_output_hash: ContentHash::of_bytes(b"out"),
+            expected_content_id: Some(crate::framework::ContentId::from_digest(
+                ContentHash::of_bytes(b"out"),
+            )),
             args: serde_json::json!({}),
             resources: ResourceRequest::default(),
             data_class: DataClass::Public,
@@ -546,14 +558,14 @@ mod tests {
             .await
             .expect("A connects to C");
         let task = echo_task(a.node_id(), &_a_kp);
-        let expected_out = task.expected_output_hash;
+        let expected_out = task.expected_content_id.unwrap();
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(10), a.dispatch(&conn, task))
                 .await
                 .expect("dispatch must not hang")
                 .expect("worker executes the dispatched task");
 
-        assert_eq!(result.output_hash, expected_out, "worker echoed the output");
+        assert_eq!(result.content_id, expected_out, "worker echoed the output");
         assert_eq!(result.peer_id, c_id, "result came from worker C");
         // The result is signed by C — verify it.
         assert!(

@@ -964,11 +964,55 @@ pub trait StageDyn: Send + Sync + 'static {
     }
     fn input_kind(&self) -> &'static str;
     fn output_kind(&self) -> &'static str;
+    /// Schema of the typed input artifact. Kept separate from the stage schema:
+    /// artifact persistence validates the handle contract, not the stage code
+    /// version used by invocation caching.
+    fn input_schema(&self) -> u32 {
+        self.schema()
+    }
+    /// Schema of the typed output artifact. See [`StageDyn::input_schema`].
+    fn output_schema(&self) -> u32 {
+        self.schema()
+    }
     /// If this stage's output is a `list` (`ListOf<E>`), the element `KIND`;
     /// `None` otherwise. Used by a typed runtime `map_output` fan-out to
     /// kind-check the template's root against the element type (ADR 0078).
     /// Defaulted `None` so manual `StageDyn` impls need not opt in.
     fn output_element_kind(&self) -> Option<&'static str> {
+        None
+    }
+    /// Whether the selected input/output type is fully carried in its erased
+    /// payload rather than producer-owned files.
+    fn input_inline(&self) -> bool {
+        false
+    }
+    fn output_inline(&self) -> bool {
+        false
+    }
+    /// Whether the selected input/output artifact type explicitly permits
+    /// externally owned absolute locators.
+    fn input_allows_external_paths(&self) -> bool {
+        false
+    }
+    fn output_allows_external_paths(&self) -> bool {
+        false
+    }
+    /// Whether the artifact's logical hash is portable and can be independently
+    /// re-derived from restored bytes. `false` preserves large-artifact stat
+    /// fingerprints while the store validates those bytes through `ContentId`.
+    fn input_hashes_contents(&self) -> bool {
+        true
+    }
+    fn output_hashes_contents(&self) -> bool {
+        true
+    }
+    /// Canonical typed payload used only when an artifact has no persisted
+    /// backing files. Absolute path hints are normalized so in-memory identity
+    /// is host-independent.
+    fn input_portable_identity(&self, _art: &ErasedArtifact) -> Option<Vec<u8>> {
+        None
+    }
+    fn output_portable_identity(&self, _art: &ErasedArtifact) -> Option<Vec<u8>> {
         None
     }
     fn args_schema(&self) -> serde_json::Value;
@@ -988,6 +1032,13 @@ pub trait StageDyn: Send + Sync + 'static {
     /// this stage's `Output` (a contract violation the executor
     /// falls back from gracefully, see executor seam).
     fn output_content_hash(&self, art: &ErasedArtifact) -> Option<ContentHash>;
+
+    /// Stable content address recorded by this stage's typed input artifact.
+    /// The artifact store uses this value as the manifest identity, then
+    /// independently recomputes it from consumer-local bytes during restore.
+    fn input_content_hash(&self, _art: &ErasedArtifact) -> Option<ContentHash> {
+        None
+    }
 
     /// Re-root any absolute paths the typed `Output` embedded under
     /// `from` so they instead live under `to`, returning the rebased
@@ -1112,6 +1163,18 @@ pub trait StageDyn: Send + Sync + 'static {
         None
     }
 
+    /// Whether the typed input handle still contains any absolute path strings.
+    /// The artifact store uses this to distinguish genuinely inline values from
+    /// path-bearing artifacts whose backing bytes escaped the declared root.
+    fn input_contains_absolute_paths(&self, _art: &ErasedArtifact) -> Option<bool> {
+        None
+    }
+
+    /// Output-role counterpart of [`StageDyn::input_contains_absolute_paths`].
+    fn output_contains_absolute_paths(&self, _art: &ErasedArtifact) -> Option<bool> {
+        None
+    }
+
     /// Mirror of `rebase_output_paths` but decodes as `S::Input`, and returns
     /// `None` on ANY decode/encode failure. The P2P import path treats a
     /// failed rebase as a HARD error (never run a stage whose input paths
@@ -1119,6 +1182,18 @@ pub trait StageDyn: Send + Sync + 'static {
     /// local-promote `rebase_output_paths`, which swallows failure because the
     /// promote already happened.
     fn rebase_input_paths(
+        &self,
+        _art: ErasedArtifact,
+        _from: &std::path::Path,
+        _to: &std::path::Path,
+    ) -> Option<ErasedArtifact> {
+        None
+    }
+
+    /// Hard-error counterpart of [`StageDyn::rebase_output_paths`] for artifact
+    /// restore. Local promotion keeps the historical tolerant method; importing
+    /// untrusted or cached bytes must prove every output path was rewritten.
+    fn rebase_output_paths_checked(
         &self,
         _art: ErasedArtifact,
         _from: &std::path::Path,
@@ -1315,8 +1390,38 @@ impl<S: Stage> StageDyn for S {
     fn output_kind(&self) -> &'static str {
         <S::Output as Artifact>::KIND
     }
+    fn input_schema(&self) -> u32 {
+        <S::Input as Artifact>::SCHEMA
+    }
+    fn output_schema(&self) -> u32 {
+        <S::Output as Artifact>::SCHEMA
+    }
     fn output_element_kind(&self) -> Option<&'static str> {
         <S::Output as Artifact>::ELEMENT_KIND
+    }
+    fn input_inline(&self) -> bool {
+        <S::Input as Artifact>::INLINE
+    }
+    fn output_inline(&self) -> bool {
+        <S::Output as Artifact>::INLINE
+    }
+    fn input_allows_external_paths(&self) -> bool {
+        <S::Input as Artifact>::ALLOW_EXTERNAL_PATHS
+    }
+    fn output_allows_external_paths(&self) -> bool {
+        <S::Output as Artifact>::ALLOW_EXTERNAL_PATHS
+    }
+    fn input_hashes_contents(&self) -> bool {
+        <S::Input as Artifact>::HASH_CONTENTS
+    }
+    fn output_hashes_contents(&self) -> bool {
+        <S::Output as Artifact>::HASH_CONTENTS
+    }
+    fn input_portable_identity(&self, art: &ErasedArtifact) -> Option<Vec<u8>> {
+        portable_identity_typed::<S::Input>(art)
+    }
+    fn output_portable_identity(&self, art: &ErasedArtifact) -> Option<Vec<u8>> {
+        portable_identity_typed::<S::Output>(art)
     }
     fn args_schema(&self) -> serde_json::Value {
         // schemars 0.8: schema_for! is a proc macro requiring a
@@ -1342,6 +1447,13 @@ impl<S: Stage> StageDyn for S {
         // the executor synthesizes the tuple hash itself.
         art.clone()
             .into_typed::<S::Output>()
+            .ok()
+            .map(|typed| typed.content_hash())
+    }
+
+    fn input_content_hash(&self, art: &ErasedArtifact) -> Option<ContentHash> {
+        art.clone()
+            .into_typed::<S::Input>()
             .ok()
             .map(|typed| typed.content_hash())
     }
@@ -1496,6 +1608,14 @@ impl<S: Stage> StageDyn for S {
         backing_under_typed::<S::Output>(art, root)
     }
 
+    fn input_contains_absolute_paths(&self, art: &ErasedArtifact) -> Option<bool> {
+        contains_absolute_paths_typed::<S::Input>(art)
+    }
+
+    fn output_contains_absolute_paths(&self, art: &ErasedArtifact) -> Option<bool> {
+        contains_absolute_paths_typed::<S::Output>(art)
+    }
+
     fn rebase_input_paths(
         &self,
         art: ErasedArtifact,
@@ -1503,6 +1623,15 @@ impl<S: Stage> StageDyn for S {
         to: &std::path::Path,
     ) -> Option<ErasedArtifact> {
         rebase_typed::<S::Input>(art, from, to)
+    }
+
+    fn rebase_output_paths_checked(
+        &self,
+        art: ErasedArtifact,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> Option<ErasedArtifact> {
+        rebase_typed::<S::Output>(art, from, to)
     }
 
     fn recompute_input_hash(&self, art: &ErasedArtifact) -> Option<std::io::Result<ContentHash>> {
@@ -1528,6 +1657,27 @@ fn backing_under_typed<A: Artifact>(
     let mut out = Vec::new();
     collect_paths_under(&v, root, &mut out);
     Some(out)
+}
+
+fn contains_absolute_paths_typed<A: Artifact>(art: &ErasedArtifact) -> Option<bool> {
+    let typed: A = art.clone().into_typed::<A>().ok()?;
+    let value = serde_json::to_value(&typed).ok()?;
+    Some(contains_absolute_path_strings(&value))
+}
+
+fn contains_absolute_path_strings(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(value) => crate::framework::artifact::looks_absolute_path(value),
+        serde_json::Value::Array(values) => values.iter().any(contains_absolute_path_strings),
+        serde_json::Value::Object(values) => values.values().any(contains_absolute_path_strings),
+        _ => false,
+    }
+}
+
+fn portable_identity_typed<A: Artifact>(art: &ErasedArtifact) -> Option<Vec<u8>> {
+    let typed: A = art.clone().into_typed::<A>().ok()?;
+    let value = typed.portable_identity().ok()?;
+    serde_json::to_vec(&value).ok()
 }
 
 /// Decode `art` as `A`, re-walk its on-disk bytes, return the content address.
@@ -2306,6 +2456,7 @@ mod tests {
                 node_idx: 0,
                 stage_name: "x".into(),
                 input_hash: ContentHash::of_bytes(b""),
+                input_content_ids: Vec::new(),
             })
             .unwrap();
         let _evt = rx.recv().await.unwrap();

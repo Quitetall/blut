@@ -375,11 +375,13 @@ fn dag_opt_advanced_gate_pipeline_cancel_after_cache_rename_rolls_back_before_li
     let parent_key = InvocationKey::from_digest(ContentHash::of_bytes(b"pipeline-parent-key"));
     let child_key = InvocationKey::from_digest(ContentHash::of_bytes(b"pipeline-child-key"));
     let parent_output = ErasedArtifact::from_typed(&Counter { n: 0 }).unwrap();
-    cache.insert(parent_key, &parent_output).unwrap();
+    let parent_stage_dir = job_dir.join("stages/0-parent");
+    cache
+        .insert(parent_key, &MakeOne, &parent_output, &parent_stage_dir)
+        .unwrap();
     remote_puts.store(0, Ordering::SeqCst);
     let parent_cache_path = cache.entry_path_for_write(parent_key);
     let child_cache_path = cache.entry_path_for_write(child_key);
-    let parent_stage_dir = job_dir.join("stages/0-parent");
     std::fs::create_dir_all(&parent_stage_dir).unwrap();
     std::fs::write(parent_stage_dir.join("kept"), b"parent").unwrap();
 
@@ -395,6 +397,7 @@ fn dag_opt_advanced_gate_pipeline_cancel_after_cache_rename_rolls_back_before_li
         stage: Arc::new(MakeOne),
         stage_name: MakeOne::NAME.into(),
         input_hash: ContentHash::of_bytes(b"pipeline-child-input"),
+        input_content_ids: Vec::new(),
         canon_args: b"{}".to_vec(),
         key: child_key,
         output: ErasedArtifact::from_typed(&Counter { n: 1 }).unwrap(),
@@ -492,6 +495,7 @@ fn ordinary_speculation_cache_insert_is_the_cancellation_linearization_point() {
         stage: Arc::new(MakeOne),
         stage_name: MakeOne::NAME.into(),
         input_hash: ContentHash::of_bytes(b"ordinary-speculative-child-input"),
+        input_content_ids: Vec::new(),
         canon_args: b"{}".to_vec(),
         key: child_key,
         output: ErasedArtifact::from_typed(&Counter { n: 1 }).unwrap(),
@@ -520,7 +524,11 @@ fn ordinary_speculation_cache_insert_is_the_cancellation_linearization_point() {
     assert!(child_cache_path.is_file());
     assert!(job_dir.join("stages/1-make_one/private").is_file());
     assert!(!scratch_root.exists());
-    assert_eq!(remote_puts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        remote_puts.load(Ordering::SeqCst),
+        2,
+        "portable cache publication writes content object then invocation record"
+    );
     assert!(matches!(
         events.try_recv(),
         Ok(StageEvent::StageBegin { node_idx: 1, .. })
@@ -550,6 +558,7 @@ fn dag_opt_advanced_gate_pipeline_corrupt_spill_cleanup_failure_is_fatal() {
         stage: Arc::new(MakeOne),
         stage_name: MakeOne::NAME.into(),
         input_hash: ContentHash::of_bytes(b"input"),
+        input_content_ids: Vec::new(),
         canon_args: Vec::new(),
         key: InvocationKey::from_digest(ContentHash::of_bytes(b"key")),
         elapsed: std::time::Duration::ZERO,
@@ -654,6 +663,7 @@ async fn cache_warm_probe_skips_control_pruned_ready_nodes() {
     let mut hints = HashMap::new();
     let mut probes = HashMap::new();
     let mut prepared_hits = HashMap::new();
+    let node_idx_of = HashMap::from([(0, 0)]);
     let cancel = CancellationToken::new();
     let started = Instant::now();
 
@@ -665,6 +675,8 @@ async fn cache_warm_probe_skips_control_pruned_ready_nodes() {
         view.nodes.len(),
         view.edges,
         &logical_outputs,
+        &node_idx_of,
+        temp.path(),
         cache,
         false,
         &cancel,
@@ -1161,6 +1173,7 @@ struct PathArt {
 impl Artifact for PathArt {
     const KIND: &'static str = "test.path_art";
     const SCHEMA: u32 = 1;
+    const INLINE: bool = true;
     fn content_hash(&self) -> CH {
         CH::of_bytes(&[self.content])
     }
@@ -1219,6 +1232,173 @@ impl Stage for ConsumePathArt {
     }
 }
 impl Compatible<LamuTrainerBackend> for ConsumePathArt {}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ExternalRef {
+    path: PathBuf,
+    content_hash: ContentHash,
+}
+impl Artifact for ExternalRef {
+    const KIND: &'static str = "test.external-ref";
+    const SCHEMA: u32 = 1;
+    const ALLOW_EXTERNAL_PATHS: bool = true;
+    fn content_hash(&self) -> ContentHash {
+        self.content_hash
+    }
+    fn primary_path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct ExternalArgs {
+    path: PathBuf,
+}
+
+struct MakeExternalRef;
+#[async_trait]
+impl Stage for MakeExternalRef {
+    const NAME: &'static str = "make_external_ref";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    type Input = ();
+    type Output = ExternalRef;
+    type Args = ExternalArgs;
+    async fn run(
+        &self,
+        _ctx: &StageContext,
+        _input: (),
+        args: &ExternalArgs,
+    ) -> Result<ExternalRef, StageError> {
+        Ok(ExternalRef {
+            path: args.path.clone(),
+            content_hash: ContentHash::hash_file(&args.path).map_err(|source| StageError::Io {
+                path: args.path.clone(),
+                source,
+            })?,
+        })
+    }
+}
+impl Compatible<LamuTrainerBackend> for MakeExternalRef {}
+
+static EXTERNAL_CONSUME_RUN_COUNT: AtomicU32 = AtomicU32::new(0);
+
+struct ConsumeExternalRef;
+#[async_trait]
+impl Stage for ConsumeExternalRef {
+    const NAME: &'static str = "consume_external_ref";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    type Input = ExternalRef;
+    type Output = Counter;
+    type Args = EmptyArgs;
+    async fn run(
+        &self,
+        _ctx: &StageContext,
+        input: ExternalRef,
+        _args: &EmptyArgs,
+    ) -> Result<Counter, StageError> {
+        EXTERNAL_CONSUME_RUN_COUNT.fetch_add(1, Ordering::SeqCst);
+        let len = std::fs::metadata(&input.path)
+            .map_err(|source| StageError::Io {
+                path: input.path,
+                source,
+            })?
+            .len();
+        Ok(Counter { n: len as u32 })
+    }
+}
+impl Compatible<LamuTrainerBackend> for ConsumeExternalRef {}
+
+#[tokio::test]
+async fn external_reference_succeeds_without_entering_portable_cache() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let external = tempfile::tempdir().unwrap();
+    let external_path = external.path().join("corpus.bin");
+    std::fs::write(&external_path, b"externally managed corpus").unwrap();
+    let (job, ctx) = fresh_ctx();
+    let plan = Plan::<(), LamuTrainerBackend>::new("external", serde_json::json!({}))
+        .start(
+            MakeExternalRef,
+            ExternalArgs {
+                path: external_path.clone(),
+            },
+        )
+        .finish()
+        .into_compiled();
+    let result = SequentialExecutor::execute(plan, ctx).await.unwrap();
+    assert_eq!(result.n_cache_hits, 0);
+    assert_eq!(result.n_cache_misses, 1);
+    assert!(external_path.exists());
+
+    let sidecar = job
+        .path()
+        .join("stages/0-make_external_ref/output.metadata.json");
+    let metadata = ArtifactMetadata::read_from(&sidecar).unwrap();
+    assert_eq!(
+        metadata.extra.get("persisted"),
+        Some(&serde_json::json!(false))
+    );
+    assert!(!job.path().join("_cache/invocations").exists());
+
+    let rerun = Plan::<(), LamuTrainerBackend>::new("external", serde_json::json!({}))
+        .start(
+            MakeExternalRef,
+            ExternalArgs {
+                path: external_path,
+            },
+        )
+        .finish()
+        .into_compiled();
+    let rerun = SequentialExecutor::execute(rerun, ExecCtx::new(job.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert_eq!(rerun.n_cache_hits, 0);
+    assert_eq!(rerun.n_cache_misses, 1);
+}
+
+#[tokio::test]
+async fn external_reference_identity_safely_keys_downstream_cache() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    EXTERNAL_CONSUME_RUN_COUNT.store(0, Ordering::SeqCst);
+    let external = tempfile::tempdir().unwrap();
+    let external_path = external.path().join("corpus.bin");
+    std::fs::write(&external_path, b"first").unwrap();
+    let (job, ctx) = fresh_ctx();
+
+    let make_plan = || {
+        Plan::<(), LamuTrainerBackend>::new("external-chain", serde_json::json!({}))
+            .start(
+                MakeExternalRef,
+                ExternalArgs {
+                    path: external_path.clone(),
+                },
+            )
+            .then(ConsumeExternalRef, EmptyArgs)
+            .finish()
+            .into_compiled()
+    };
+
+    let cold = SequentialExecutor::execute(make_plan(), ctx).await.unwrap();
+    assert_eq!(cold.n_cache_hits, 0);
+    assert_eq!(cold.n_cache_misses, 2);
+    assert_eq!(EXTERNAL_CONSUME_RUN_COUNT.load(Ordering::SeqCst), 1);
+
+    let warm = SequentialExecutor::execute(make_plan(), ExecCtx::new(job.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert_eq!(warm.n_cache_hits, 1);
+    assert_eq!(warm.n_cache_misses, 1);
+    assert_eq!(EXTERNAL_CONSUME_RUN_COUNT.load(Ordering::SeqCst), 1);
+
+    std::fs::write(&external_path, b"second payload").unwrap();
+    let changed = SequentialExecutor::execute(make_plan(), ExecCtx::new(job.path().to_path_buf()))
+        .await
+        .unwrap();
+    assert_eq!(changed.n_cache_hits, 0);
+    assert_eq!(changed.n_cache_misses, 2);
+    assert_eq!(EXTERNAL_CONSUME_RUN_COUNT.load(Ordering::SeqCst), 2);
+}
 
 async fn downstream_input_hash(abs_path: &str, content: u8) -> CH {
     let td = tempfile::tempdir().unwrap();
@@ -1280,6 +1460,45 @@ async fn content_hash_invoked_for_deterministic_stage() {
     );
 }
 
+#[tokio::test]
+async fn downstream_lineage_uses_predecessor_content_id() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let td = tempfile::tempdir().unwrap();
+    let ctx = ExecCtx::new(td.path().to_path_buf());
+    let mut rx = ctx.status.subscribe();
+    let plan = Plan::<(), LamuTrainerBackend>::new("a09-lineage", serde_json::json!({}))
+        .start(
+            MakePathArt,
+            PathArtArgs {
+                abs_path: "/machine-local/hint".into(),
+                content: 9,
+            },
+        )
+        .then(ConsumePathArt, EmptyArgs)
+        .finish()
+        .into_compiled();
+    SequentialExecutor::execute(plan, ctx).await.unwrap();
+
+    let mut producer = None;
+    let mut consumer_inputs = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            StageEvent::StageEnd {
+                node_idx: 0,
+                content_id,
+                ..
+            } => producer = Some(content_id),
+            StageEvent::StageBegin {
+                node_idx: 1,
+                input_content_ids,
+                ..
+            } => consumer_inputs = input_content_ids,
+            _ => {}
+        }
+    }
+    assert_eq!(consumer_inputs, vec![producer.expect("producer ContentId")]);
+}
+
 /// Capture the EMITTED `StageEnd.output_hash` for node 0 of a single-stage
 /// plan (the recorded provenance hash my B.1(a) fix changed).
 async fn recorded_output_hash(abs_path: &str, content: u8) -> CH {
@@ -1313,10 +1532,9 @@ async fn recorded_output_hash(abs_path: &str, content: u8) -> CH {
 
 #[tokio::test]
 async fn recorded_output_hash_is_content_based_and_path_stable() {
-    // B.1(a): the EMITTED StageEnd.output_hash (→ output.metadata.json sidecar
-    // + lineage_db) must be the artifact CONTENT hash, not the bincode-handle
-    // hash (which embeds absolute paths) — so recorded provenance is
-    // cross-machine stable + consistent with the downstream cache key.
+    // A09: the EMITTED StageEnd.output_hash (legacy wire name) is the portable
+    // ContentId. It is path-stable but intentionally lives in a different domain
+    // from the logical artifact hash used by downstream invocation keys.
     let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let h1 = recorded_output_hash("/machine-a/jobs/r1/stages/0-make/out", 7).await;
     let h2 = recorded_output_hash("/machine-b/elsewhere/out", 7).await;
@@ -1328,12 +1546,16 @@ async fn recorded_output_hash_is_content_based_and_path_stable() {
         content: 7,
         path: PathBuf::from("/machine-a/jobs/r1/stages/0-make/out"),
     };
-    assert_eq!(h1, art.content_hash(), "recorded hash = content_hash()");
+    assert_ne!(
+        h1,
+        art.content_hash(),
+        "ContentId and logical content_hash use distinct domains"
+    );
     let erased = ErasedArtifact::from_typed(&art).unwrap();
     assert_ne!(
         h1,
         content_hash_from_erased(&erased),
-        "must be the content hash, not the path-embedding handle hash"
+        "must not be the path-embedding handle hash"
     );
     let h3 = recorded_output_hash("/machine-a/jobs/r1/stages/0-make/out", 8).await;
     assert_ne!(h1, h3, "different content must change the recorded hash");
@@ -1396,11 +1618,11 @@ fn leftover_tmp_dirs(job_dir: &Path) -> Vec<PathBuf> {
 }
 
 fn cache_entry_count(job_dir: &Path) -> usize {
-    let cache_root = job_dir.join("_cache");
+    let cache_root = job_dir.join("_cache/invocations");
     let mut n = 0;
     if let Ok(rd) = std::fs::read_dir(&cache_root) {
         for e in rd.flatten() {
-            if e.path().join("output.bin").exists() {
+            if e.path().join("record.bin").exists() {
                 n += 1;
             }
         }
@@ -3988,7 +4210,7 @@ impl crate::p2p::dispatch::DispatchPolicy for MockDispatchPolicy {
     fn verify_result(
         &self,
         _result: &crate::p2p::task::TaskResult,
-        _expected: &ContentHash,
+        _expected: Option<crate::framework::ContentId>,
         _peer_pubkey: &ed25519_dalek::VerifyingKey,
     ) -> crate::p2p::dispatch::DispatchVerdict {
         unimplemented!("not exercised by the executor dispatch path")
@@ -4059,8 +4281,10 @@ impl DispatchSubmitter for MockDispatchSubmitter {
             let art = ErasedArtifact::from_typed(&self.succeed_with).unwrap();
             self.cache
                 .insert(
-                    crate::framework::InvocationKey::from_digest(request.expected_output_hash),
+                    request.invocation_key,
+                    &DispatchableStage,
                     &art,
+                    std::path::Path::new("."),
                 )
                 .expect("mock cache insert");
         }

@@ -1566,12 +1566,20 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
         })?;
     }
     for node in crate::framework::lineage::job_lineage(job_id)?.into_iter() {
-        if let (Some(input), Some(output)) = (node.input_hash, node.output_hash) {
+        let Some(output) = node.output_hash else {
+            continue;
+        };
+        let inputs = if node.input_content_ids.is_empty() {
+            node.input_hash.into_iter().collect()
+        } else {
+            node.input_content_ids
+        };
+        for input in inputs {
             db.record_edge(&EdgeRow {
                 job_id: job_id.to_string(),
                 to_idx: node.node_idx as i64,
                 input_hash: input,
-                output_hash: output,
+                output_hash: output.clone(),
             })?;
         }
     }

@@ -170,7 +170,6 @@ pub async fn smoke_dispatch_once(
     };
     let input_erased = ErasedArtifact::from_typed(&input)
         .map_err(|e| TrainError::other(format!("erase smoke input: {e}")))?;
-    let expected = expected_echo_hash(input_text);
 
     let out_dir =
         tempfile::tempdir().map_err(|e| TrainError::other(format!("smoke out_dir: {e}")))?;
@@ -184,8 +183,14 @@ pub async fn smoke_dispatch_once(
         input_erased,
         src_root.path(),
         serde_json::json!({}),
-        input_hash,
-        expected,
+        crate::framework::CacheHandle::key_for(
+            stage_name,
+            1,
+            input_hash,
+            &serde_json::json!({}),
+            b"p2p-smoke-v1",
+        ),
+        None,
         crate::p2p::trust::DataClass::Public,
         timeout_secs,
         out_dir.path(),

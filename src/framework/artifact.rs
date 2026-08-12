@@ -370,6 +370,47 @@ impl std::fmt::Debug for ContentId {
     }
 }
 
+/// Stable marker used in portable metadata whenever a typed artifact contains an
+/// absolute path hint. NUL cannot occur in an operating-system path, preventing
+/// a real path from colliding with the marker.
+const PORTABLE_ABSOLUTE_PATH_SENTINEL: &str = "\0blut:absolute-path:v1";
+
+/// Host-independent path classification for serialized metadata. Native
+/// `Path::is_absolute()` deliberately follows the current OS and would therefore
+/// disagree about Windows paths on Unix (or Unix paths on Windows). A leading
+/// backslash is conservatively treated as Windows current-drive-rooted.
+pub(crate) fn looks_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    value.starts_with('/')
+        || value.starts_with('\\')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+}
+
+fn normalize_portable_metadata(value: &mut serde_json::Value, artifact_root: bool) {
+    match value {
+        serde_json::Value::String(text) if looks_absolute_path(text) => {
+            *text = PORTABLE_ABSOLUTE_PATH_SENTINEL.to_string();
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                normalize_portable_metadata(value, false);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            if artifact_root {
+                values.remove("content_hash");
+            }
+            for value in values.values_mut() {
+                normalize_portable_metadata(value, false);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The framework's typed-artifact contract.
 ///
 /// Implementors are concrete data types like `DatasetJsonl`,
@@ -398,6 +439,19 @@ pub trait Artifact: Send + Sync + serde::Serialize + serde::de::DeserializeOwned
     /// `map_output` fan-out (ADR 0078) can kind-check the template's root
     /// against the element type before it runs.
     const ELEMENT_KIND: Option<&'static str> = None;
+
+    /// The complete artifact value lives in the erased payload and has no
+    /// producer-owned backing file to persist. Inline artifacts may still use a
+    /// sentinel `primary_path()` (for example `/dev/null`); the artifact store
+    /// must not mistake that sentinel for transferable content.
+    const INLINE: bool = false;
+
+    /// Whether this artifact may intentionally retain absolute locators outside
+    /// the producer-owned stage root. Such an output remains usable locally but
+    /// is not portable: the executor records identity without publishing a
+    /// direct producer invocation-to-object mapping. Keep this false unless
+    /// external ownership is part of the artifact's declared contract.
+    const ALLOW_EXTERNAL_PATHS: bool = false;
 
     /// Whether the artifact's `content_hash()` should walk on-disk
     /// bytes (true) or use a cheap fingerprint of path + size +
@@ -440,16 +494,28 @@ pub trait Artifact: Send + Sync + serde::Serialize + serde::de::DeserializeOwned
         false
     }
 
-    /// Stable content hash. For file-backed artifacts this is the
-    /// SHA-256 of the canonical bytes; for composite artifacts a
-    /// merkle of children. Idempotent — same content ⇒ same hash
-    /// ⇒ same cache key downstream.
+    /// Logical artifact hash used by deterministic invocation keys. Most
+    /// artifacts hash canonical bytes; large artifacts may retain the documented
+    /// `HASH_CONTENTS = false` path/stat fingerprint. Portable persistence uses
+    /// [`ContentId`], derived independently by the artifact store.
     fn content_hash(&self) -> ContentHash;
 
     /// Read-only path the user can `ls`. Always inside a stable
     /// location (job dir or content-addressed cache); never a
     /// tmpfile that might disappear.
     fn primary_path(&self) -> &Path;
+
+    /// Canonical semantic metadata for portable [`ContentId`] derivation.
+    /// Absolute path hints are normalized and the conventional top-level
+    /// `content_hash` field is omitted because it may be a producer-local stat
+    /// fingerprint. Composite Artifact implementations must call this method on
+    /// each child so child logical hashes are omitted at actual Artifact
+    /// boundaries without stripping unrelated nested fields of the same name.
+    fn portable_identity(&self) -> Result<serde_json::Value, serde_json::Error> {
+        let mut value = serde_json::to_value(self)?;
+        normalize_portable_metadata(&mut value, true);
+        Ok(value)
+    }
 
     /// Re-derive the content address from ON-DISK bytes — NOT the cached
     /// `content_hash()` field. The P2P import path (`p2p::bundle::unbundle`)
@@ -519,7 +585,7 @@ pub trait Artifact: Send + Sync + serde::Serialize + serde::de::DeserializeOwned
 
 /// Sidecar metadata.json next to every materialized artifact.
 /// Captures the full audit lineage: which stage produced this, when,
-/// what kind it is, what its content hash was at that moment.
+/// what kind it is, and its portable content identity at that moment.
 ///
 /// Lives at `<artifact_primary_path>.metadata.json` for files, and
 /// at `<artifact_primary_path>/.lamu-meta.json` for directory
@@ -530,7 +596,14 @@ pub trait Artifact: Send + Sync + serde::Serialize + serde::de::DeserializeOwned
 pub struct ArtifactMetadata {
     pub kind: String,
     pub schema: u32,
+    /// Legacy wire name retained for readers predating A09. The digest is the
+    /// portable [`ContentId`], not an invocation key or producer-local logical
+    /// fingerprint.
     pub content_hash: ContentHash,
+    /// Existing artifact-level hash used for invocation-key derivation. Omitted
+    /// on legacy sidecars and on callers that only know the portable identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_hash: Option<ContentHash>,
     /// The stage that produced this artifact, e.g.
     /// `"materialize_conversations"`. None for graph inputs.
     pub produced_by_stage: Option<String>,
@@ -550,6 +623,7 @@ impl ArtifactMetadata {
             kind: kind.into(),
             schema,
             content_hash,
+            logical_hash: None,
             produced_by_stage: None,
             produced_at_unix_secs: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -562,6 +636,16 @@ impl ArtifactMetadata {
     pub fn with_stage(mut self, stage: impl Into<String>) -> Self {
         self.produced_by_stage = Some(stage.into());
         self
+    }
+
+    pub fn with_logical_hash(mut self, logical_hash: ContentHash) -> Self {
+        self.logical_hash = Some(logical_hash);
+        self
+    }
+
+    /// Typed view of the legacy `content_hash` wire field.
+    pub fn content_id(&self) -> ContentId {
+        ContentId::from_digest(self.content_hash)
     }
 
     pub fn with_extra(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
@@ -664,6 +748,7 @@ impl ArtifactMetadata {
 impl Artifact for () {
     const KIND: &'static str = "()";
     const SCHEMA: u32 = 1;
+    const INLINE: bool = true;
     fn content_hash(&self) -> ContentHash {
         ContentHash::of_bytes(&[])
     }
@@ -710,6 +795,11 @@ const TUPLE_DOMAIN: &[u8] = b"tuple";
 impl<A: Artifact, B: Artifact> Artifact for (A, B) {
     const KIND: &'static str = "tuple<2>";
     const SCHEMA: u32 = crate::framework::stage::TUPLE_ENVELOPE_SCHEMA;
+    const INLINE: bool = A::INLINE && B::INLINE;
+    // One external member makes the composite non-portable; unlike INLINE,
+    // external ownership therefore propagates with OR rather than AND.
+    const ALLOW_EXTERNAL_PATHS: bool = A::ALLOW_EXTERNAL_PATHS || B::ALLOW_EXTERNAL_PATHS;
+    const HASH_CONTENTS: bool = A::HASH_CONTENTS && B::HASH_CONTENTS;
 
     fn content_hash(&self) -> ContentHash {
         let mut hasher = Sha256::new();
@@ -725,6 +815,13 @@ impl<A: Artifact, B: Artifact> Artifact for (A, B) {
         // Convention: first child's path. Tuple consumers know to
         // address members individually via destructuring.
         self.0.primary_path()
+    }
+
+    fn portable_identity(&self) -> Result<serde_json::Value, serde_json::Error> {
+        Ok(serde_json::Value::Array(vec![
+            self.0.portable_identity()?,
+            self.1.portable_identity()?,
+        ]))
     }
 
     fn encode_erased(
@@ -755,6 +852,10 @@ impl<A: Artifact, B: Artifact> Artifact for (A, B) {
 impl<A: Artifact, B: Artifact, C: Artifact> Artifact for (A, B, C) {
     const KIND: &'static str = "tuple<3>";
     const SCHEMA: u32 = crate::framework::stage::TUPLE_ENVELOPE_SCHEMA;
+    const INLINE: bool = A::INLINE && B::INLINE && C::INLINE;
+    const ALLOW_EXTERNAL_PATHS: bool =
+        A::ALLOW_EXTERNAL_PATHS || B::ALLOW_EXTERNAL_PATHS || C::ALLOW_EXTERNAL_PATHS;
+    const HASH_CONTENTS: bool = A::HASH_CONTENTS && B::HASH_CONTENTS && C::HASH_CONTENTS;
 
     fn content_hash(&self) -> ContentHash {
         let mut hasher = Sha256::new();
@@ -769,6 +870,14 @@ impl<A: Artifact, B: Artifact, C: Artifact> Artifact for (A, B, C) {
 
     fn primary_path(&self) -> &Path {
         self.0.primary_path()
+    }
+
+    fn portable_identity(&self) -> Result<serde_json::Value, serde_json::Error> {
+        Ok(serde_json::Value::Array(vec![
+            self.0.portable_identity()?,
+            self.1.portable_identity()?,
+            self.2.portable_identity()?,
+        ]))
     }
 
     fn encode_erased(
@@ -890,6 +999,9 @@ impl<E: Artifact> Artifact for ListOf<E> {
     const KIND: &'static str = "list";
     const SCHEMA: u32 = crate::framework::stage::LIST_ENVELOPE_SCHEMA;
     const ELEMENT_KIND: Option<&'static str> = Some(E::KIND);
+    const INLINE: bool = E::INLINE;
+    const ALLOW_EXTERNAL_PATHS: bool = E::ALLOW_EXTERNAL_PATHS;
+    const HASH_CONTENTS: bool = E::HASH_CONTENTS;
 
     fn content_hash(&self) -> ContentHash {
         list_content_hash_from_element_hashes(self.0.iter().map(Artifact::content_hash))
@@ -902,6 +1014,14 @@ impl<E: Artifact> Artifact for ListOf<E> {
             .first()
             .map(|e| e.primary_path())
             .unwrap_or(Path::new(""))
+    }
+
+    fn portable_identity(&self) -> Result<serde_json::Value, serde_json::Error> {
+        self.0
+            .iter()
+            .map(Artifact::portable_identity)
+            .collect::<Result<Vec<_>, _>>()
+            .map(serde_json::Value::Array)
     }
 
     fn recompute_content_hash(&self) -> std::io::Result<ContentHash> {
@@ -1190,6 +1310,56 @@ mod tests {
         }
         fn primary_path(&self) -> &Path {
             Path::new("/other")
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct NestedSemantic {
+        content_hash: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct IdentityArt {
+        path: PathBuf,
+        content_hash: ContentHash,
+        nested: NestedSemantic,
+    }
+
+    impl Artifact for IdentityArt {
+        const KIND: &'static str = "test.identity";
+        const SCHEMA: u32 = 1;
+        fn content_hash(&self) -> ContentHash {
+            self.content_hash
+        }
+        fn primary_path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    #[test]
+    fn portable_identity_is_cross_platform_and_scoped_to_artifact_boundary() {
+        assert!(looks_absolute_path("/unix/path"));
+        assert!(looks_absolute_path(r"C:\windows\path"));
+        assert!(looks_absolute_path(r"\\server\share"));
+        assert!(!looks_absolute_path("relative/path"));
+
+        let artifact = IdentityArt {
+            path: PathBuf::from("/producer/path"),
+            content_hash: ContentHash::of_bytes(b"producer-local"),
+            nested: NestedSemantic {
+                content_hash: "semantic checksum".into(),
+            },
+        };
+        let identity = artifact.portable_identity().unwrap();
+        assert!(identity.get("content_hash").is_none());
+        assert_eq!(identity["path"], PORTABLE_ABSOLUTE_PATH_SENTINEL);
+        assert_eq!(identity["nested"]["content_hash"], "semantic checksum");
+
+        let composite = (artifact.clone(), artifact);
+        let composite_identity = composite.portable_identity().unwrap();
+        for child in composite_identity.as_array().unwrap() {
+            assert!(child.get("content_hash").is_none());
+            assert_eq!(child["nested"]["content_hash"], "semantic checksum");
         }
     }
 

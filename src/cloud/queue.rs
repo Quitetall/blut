@@ -204,7 +204,7 @@ impl CloudQueue for MemQueue {
 mod tests {
     use super::*;
     use crate::cloud::job::JobOutcome;
-    use crate::framework::artifact::ContentHash;
+    use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
     use crate::framework::stage::ErasedArtifact;
     use crate::p2p::bundle::BundleManifest;
     use crate::p2p::task::ResourceRequest;
@@ -213,7 +213,7 @@ mod tests {
     // The queue never inspects the manifest, so a minimal one suffices here.
     fn dummy_manifest() -> BundleManifest {
         BundleManifest {
-            bundle_version: 1,
+            format_version: crate::framework::artifact_store::ARTIFACT_FORMAT_VERSION,
             erased: ErasedArtifact {
                 kind: "test".into(),
                 schema: 1,
@@ -221,8 +221,9 @@ mod tests {
             },
             kind: "test".into(),
             schema: 1,
-            content_hash: ContentHash::of_bytes(b""),
-            src_root: std::path::PathBuf::from("/tmp"),
+            content_id: ContentId::from_digest(ContentHash::of_bytes(b"")),
+            logical_hash: ContentHash::of_bytes(b""),
+            handle_root: std::path::PathBuf::from("__test_artifact_root__"),
             files: vec![],
             blob_len: 0,
             blob_sha256: ContentHash::of_bytes(b""),
@@ -231,13 +232,15 @@ mod tests {
 
     fn job(id: &str, priority: i32) -> CloudJob {
         CloudJob {
+            protocol_version: crate::cloud::job::CLOUD_JOB_PROTOCOL_VERSION,
             id: id.to_string(),
             stage_name: "p2p-echo".to_string(),
             stage_schema: 1,
+            invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(id.as_bytes())),
             args: serde_json::json!({}),
             input_blob_key: ContentHash::of_bytes(id.as_bytes()),
             input_manifest: dummy_manifest(),
-            expected_output_hash: ContentHash::of_bytes(b"out"),
+            expected_content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"out"))),
             resources: ResourceRequest::default(),
             data_class: DataClass::Public,
             priority,
@@ -247,11 +250,12 @@ mod tests {
 
     fn done(id: &str) -> CloudResult {
         CloudResult {
+            protocol_version: crate::cloud::job::CLOUD_JOB_PROTOCOL_VERSION,
             job_id: id.to_string(),
             outcome: JobOutcome::Succeeded,
             output_blob_key: Some(ContentHash::of_bytes(b"ok")),
             output_manifest: None,
-            output_hash: Some(ContentHash::of_bytes(b"ok")),
+            content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"ok"))),
             wall_time_ms: 5,
             error: None,
         }

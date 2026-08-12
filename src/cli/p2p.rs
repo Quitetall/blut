@@ -591,10 +591,14 @@ impl crate::p2p::node::MeshTaskRunner for SmokeRunner {
     ) -> std::result::Result<crate::p2p::task::TaskResult, crate::error::TrainError> {
         // Build with a zero signature, then sign (sign_payload never reads the
         // signature field — no wasted signing pass).
+        let content_id = task.expected_content_id.ok_or_else(|| {
+            crate::error::TrainError::other("smoke runner requires an expected content identity")
+        })?;
         let mut result = crate::p2p::task::TaskResult {
+            protocol_version: crate::p2p::task::TASK_PROTOCOL_VERSION,
             task_id: task.task_id,
             peer_id: crate::p2p::peer::PeerId::from_pubkey(&self.keypair.verifying),
-            output_hash: task.expected_output_hash,
+            content_id,
             encrypted_output: None,
             wall_time_ms: 0,
             signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),

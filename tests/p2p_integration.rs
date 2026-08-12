@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use blut::framework::artifact::ContentHash;
+use blut::framework::artifact::{ContentHash, ContentId, InvocationKey};
 use blut::p2p::Coordinator;
 use blut::p2p::crypto::KeyPair;
 use blut::p2p::dispatch::{DefaultDispatchPolicy, DispatchPolicy};
@@ -69,13 +69,15 @@ async fn task_manifest_sign_verify_roundtrip() {
     let expected_output_hash = ContentHash::of_bytes(&[3u8; 32]);
 
     let mut manifest = TaskManifest {
+        protocol_version: blut::p2p::task::TASK_PROTOCOL_VERSION,
         task_id: "test-task-1".into(),
         coordinator_id: PeerId::from_pubkey(&kp.verifying),
         stage_name: "warm_fb_cache".into(),
         stage_schema: 1,
-        input_hash,
+        input_content_id: ContentId::from_digest(input_hash),
+        invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"test-task-1")),
         args_hash,
-        expected_output_hash,
+        expected_content_id: Some(ContentId::from_digest(expected_output_hash)),
         args: serde_json::json!({"lma_root": "/data"}),
         resources: ResourceRequest::default(),
         data_class: DataClass::Public,
@@ -110,9 +112,10 @@ async fn task_result_sign_verify_roundtrip() {
     let output_hash = ContentHash::of_bytes(&[42u8; 32]);
 
     let mut result = TaskResult {
+        protocol_version: blut::p2p::task::TASK_PROTOCOL_VERSION,
         task_id: "test-task-1".into(),
         peer_id: PeerId::from_pubkey(&kp.verifying),
-        output_hash,
+        content_id: ContentId::from_digest(output_hash),
         encrypted_output: None,
         wall_time_ms: 1500,
         signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
@@ -312,7 +315,7 @@ mod e2e {
         fn verify_result(
             &self,
             _r: &TaskResult,
-            _e: &ContentHash,
+            _e: Option<ContentId>,
             _k: &ed25519_dalek::VerifyingKey,
         ) -> DispatchVerdict {
             DispatchVerdict::Accept
@@ -346,9 +349,6 @@ mod e2e {
         };
         let input_hash = input.content_hash;
         let input_erased = blut::framework::stage::ErasedArtifact::from_typed(&input).unwrap();
-
-        // Expected output hash = what a LOCAL run of `upper` would produce.
-        let expected_out_hash = ContentHash::of_bytes(b"HELLO P2P WORLD");
 
         // ── Peer side: accept the connection, run the loop for one task. ──
         let server_c = server.clone();
@@ -407,8 +407,14 @@ mod e2e {
             input_erased,
             src_root.path(),
             serde_json::json!({}),
-            input_hash,
-            expected_out_hash,
+            blut::framework::CacheHandle::key_for(
+                "upper",
+                1,
+                input_hash,
+                &serde_json::json!({}),
+                b"p2p-integration-v1",
+            ),
+            None,
             DataClass::Public,
             60, // timeout_secs
             out_dir.path(),

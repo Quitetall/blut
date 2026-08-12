@@ -10,14 +10,24 @@
 use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 
-use crate::framework::artifact::ContentHash;
+use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
 use crate::p2p::crypto::EncryptedPayload;
 use crate::p2p::peer::PeerId;
 use crate::p2p::trust::DataClass;
 
+pub const TASK_PROTOCOL_VERSION: u16 = 2;
+
+fn legacy_protocol_version() -> u16 {
+    1
+}
+
 /// A task to be executed by a remote peer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskManifest {
+    /// Signed wire-contract version. Missing on pre-A09 records and therefore
+    /// deserializes as v1, which current workers reject before execution.
+    #[serde(default = "legacy_protocol_version")]
+    pub protocol_version: u16,
     /// Unique task identifier: `blut-<job>-<node_idx>`.
     pub task_id: String,
     /// Coordinator's peer ID (so the peer knows who sent this).
@@ -26,14 +36,18 @@ pub struct TaskManifest {
     pub stage_name: String,
     /// Stage schema version.
     pub stage_schema: u32,
-    /// Content hash of the input artifact.
-    pub input_hash: ContentHash,
+    /// Content identity of the input artifact.
+    #[serde(rename = "input_hash")]
+    pub input_content_id: ContentId,
+    /// Invocation identity used only to correlate the returned content object
+    /// with the coordinator cache. It is never an expected content hash.
+    pub invocation_key: InvocationKey,
     /// Content hash of the serialized args.
     pub args_hash: ContentHash,
-    /// Expected content hash of the output artifact. The coordinator
-    /// pre-computes this from the cache key so it can verify the peer's
-    /// result without re-executing the stage.
-    pub expected_output_hash: ContentHash,
+    /// Expected output identity only when the stage contract can derive it
+    /// analytically before execution. Generic dispatch leaves this `None`.
+    #[serde(rename = "expected_output_hash")]
+    pub expected_content_id: Option<ContentId>,
     /// JSON-encoded stage args.
     pub args: serde_json::Value,
     /// Resource requirements for this task.
@@ -107,9 +121,11 @@ impl TaskManifest {
     /// reconcile received args against `args_hash` specifically.
     pub fn sign_payload(&self) -> Vec<u8> {
         let mut buf = Vec::new();
+        buf.extend_from_slice(&self.protocol_version.to_le_bytes());
         write_lp_string(&mut buf, &self.task_id);
         write_lp_string(&mut buf, &self.stage_name);
-        buf.extend_from_slice(&self.input_hash.0);
+        buf.extend_from_slice(&self.input_content_id.digest().0);
+        buf.extend_from_slice(&self.invocation_key.digest().0);
         buf.extend_from_slice(&self.args_hash.0);
         // `args` is recipe-arg JSON (small), not the artifact payload, so
         // signing it directly is cheap. serde_json's `Value` serialization
@@ -120,7 +136,13 @@ impl TaskManifest {
         let args_bytes =
             serde_json::to_vec(&self.args).expect("serde_json::Value serialization is infallible");
         write_lp_bytes(&mut buf, &args_bytes);
-        buf.extend_from_slice(&self.expected_output_hash.0);
+        match self.expected_content_id {
+            Some(content_id) => {
+                buf.push(1);
+                buf.extend_from_slice(&content_id.digest().0);
+            }
+            None => buf.push(0),
+        }
         buf.extend_from_slice(&self.coordinator_id.0);
         buf.extend_from_slice(&self.resources.cpu_cores.to_le_bytes());
         buf.extend_from_slice(&self.resources.memory_gib.to_le_bytes());
@@ -165,12 +187,17 @@ impl TaskManifest {
 /// Result returned by a peer after executing a task.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskResult {
+    /// Signed wire-contract version; see [`TaskManifest::protocol_version`].
+    #[serde(default = "legacy_protocol_version")]
+    pub protocol_version: u16,
     /// The task this result is for.
     pub task_id: String,
     /// The peer that computed this result.
     pub peer_id: PeerId,
-    /// Content hash of the output artifact.
-    pub output_hash: ContentHash,
+    /// Content identity of the output artifact, independently verified by the
+    /// receiving artifact store before the result is accepted.
+    #[serde(rename = "output_hash")]
+    pub content_id: ContentId,
     /// Encrypted output data (None if output is on shared filesystem).
     pub encrypted_output: Option<EncryptedPayload>,
     /// Wall-clock time for the task (milliseconds, integer for deterministic signing).
@@ -185,9 +212,10 @@ impl TaskResult {
     /// fields to prevent MITM tampering.
     pub fn sign_payload(&self) -> Vec<u8> {
         let mut buf = Vec::new();
+        buf.extend_from_slice(&self.protocol_version.to_le_bytes());
         write_lp_string(&mut buf, &self.task_id);
         buf.extend_from_slice(&self.peer_id.0);
-        buf.extend_from_slice(&self.output_hash.0);
+        buf.extend_from_slice(&self.content_id.digest().0);
         buf.extend_from_slice(&self.wall_time_ms.to_le_bytes());
         buf
     }
@@ -220,13 +248,15 @@ mod tests {
         let input_hash = ContentHash::of_bytes(&[1u8; 32]);
         let args_hash = ContentHash::of_bytes(&[2u8; 32]);
         let mut manifest = TaskManifest {
+            protocol_version: TASK_PROTOCOL_VERSION,
             task_id: "test-task-1".into(),
             coordinator_id: crate::p2p::peer::PeerId::from_pubkey(&kp.verifying),
             stage_name: "warm_fb_cache".into(),
             stage_schema: 1,
-            input_hash,
+            input_content_id: ContentId::from_digest(input_hash),
+            invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"invocation")),
             args_hash,
-            expected_output_hash: ContentHash::of_bytes(&[3u8; 32]),
+            expected_content_id: Some(ContentId::from_digest(ContentHash::of_bytes(&[3u8; 32]))),
             args: serde_json::json!({"lma_root": "/data"}),
             resources: ResourceRequest::default(),
             data_class: DataClass::Public,
@@ -247,6 +277,22 @@ mod tests {
     }
 
     #[test]
+    fn manifest_without_expected_identity_is_signed_and_round_trips() {
+        let kp = KeyPair::generate();
+        let mut manifest = make_manifest(&kp);
+        manifest.expected_content_id = None;
+        manifest.signature = kp.sign(&manifest.sign_payload());
+        assert!(verify(
+            &kp.verifying,
+            &manifest.sign_payload(),
+            &manifest.signature
+        ));
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let decoded: TaskManifest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.expected_content_id, None);
+    }
+
+    #[test]
     fn manifest_serialization_roundtrip() {
         let kp = KeyPair::generate();
         let manifest = make_manifest(&kp);
@@ -254,17 +300,40 @@ mod tests {
         let manifest2: TaskManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(manifest.task_id, manifest2.task_id);
         assert_eq!(manifest.stage_name, manifest2.stage_name);
-        assert_eq!(manifest.input_hash, manifest2.input_hash);
+        assert_eq!(manifest.input_content_id, manifest2.input_content_id);
+        assert_eq!(manifest.invocation_key, manifest2.invocation_key);
+    }
+
+    #[test]
+    fn content_identity_keeps_the_legacy_hash_json_shape() {
+        let kp = KeyPair::generate();
+        let manifest = make_manifest(&kp);
+        let mut value = serde_json::to_value(&manifest).unwrap();
+
+        let legacy_input: ContentHash =
+            serde_json::from_value(value["input_hash"].clone()).unwrap();
+        let legacy_expected: ContentHash =
+            serde_json::from_value(value["expected_output_hash"].clone()).unwrap();
+        assert_eq!(legacy_input, manifest.input_content_id.digest());
+        assert_eq!(
+            legacy_expected,
+            manifest.expected_content_id.unwrap().digest()
+        );
+
+        value.as_object_mut().unwrap().remove("protocol_version");
+        let legacy: TaskManifest = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.protocol_version, 1);
     }
 
     #[test]
     fn result_sign_verify() {
         let kp = KeyPair::generate();
-        let output_hash = ContentHash::of_bytes(&[3u8; 32]);
+        let content_id = ContentId::from_digest(ContentHash::of_bytes(&[3u8; 32]));
         let mut result = TaskResult {
+            protocol_version: TASK_PROTOCOL_VERSION,
             task_id: "test-task-1".into(),
             peer_id: crate::p2p::peer::PeerId::from_pubkey(&kp.verifying),
-            output_hash,
+            content_id,
             encrypted_output: None,
             wall_time_ms: 42500,
             signature: Signature::from_bytes(&[0u8; 64]), // placeholder
@@ -278,9 +347,10 @@ mod tests {
     fn result_serialization_roundtrip() {
         let kp = KeyPair::generate();
         let result = TaskResult {
+            protocol_version: TASK_PROTOCOL_VERSION,
             task_id: "test-task-1".into(),
             peer_id: crate::p2p::peer::PeerId::from_pubkey(&kp.verifying),
-            output_hash: ContentHash::of_bytes(&[3u8; 32]),
+            content_id: ContentId::from_digest(ContentHash::of_bytes(&[3u8; 32])),
             encrypted_output: None,
             wall_time_ms: 42500,
             signature: kp.sign(b"test"),
@@ -288,7 +358,7 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         let result2: TaskResult = serde_json::from_str(&json).unwrap();
         assert_eq!(result.task_id, result2.task_id);
-        assert_eq!(result.output_hash, result2.output_hash);
+        assert_eq!(result.content_id, result2.content_id);
     }
 
     #[test]
@@ -308,13 +378,15 @@ mod tests {
         let input_hash = ContentHash::of_bytes(&[1u8; 32]);
         let args_hash = ContentHash::of_bytes(&serde_json::to_vec(&args).unwrap());
         let mut manifest = TaskManifest {
+            protocol_version: TASK_PROTOCOL_VERSION,
             task_id: "test-task-1".into(),
             coordinator_id: crate::p2p::peer::PeerId::from_pubkey(&kp.verifying),
             stage_name: "warm_fb_cache".into(),
             stage_schema: 1,
-            input_hash,
+            input_content_id: ContentId::from_digest(input_hash),
+            invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"invocation")),
             args_hash,
-            expected_output_hash: ContentHash::of_bytes(&[3u8; 32]),
+            expected_content_id: Some(ContentId::from_digest(ContentHash::of_bytes(&[3u8; 32]))),
             args,
             resources: ResourceRequest::default(),
             data_class: DataClass::Public,

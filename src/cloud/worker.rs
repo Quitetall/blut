@@ -66,9 +66,10 @@ pub async fn run_one(
     .await
     {
         Ok((out_blob_key, out_manifest, compute_ms)) => CloudResult {
+            protocol_version: super::job::CLOUD_JOB_PROTOCOL_VERSION,
             job_id: job_id.clone(),
             outcome: JobOutcome::Succeeded,
-            output_hash: Some(out_manifest.content_hash),
+            content_id: Some(out_manifest.content_id),
             output_blob_key: Some(out_blob_key),
             output_manifest: Some(out_manifest),
             // Billing signal: COMPUTE wall-clock only (the stage run), not the I/O
@@ -109,6 +110,13 @@ async fn execute_claimed(
     work_root: &Path,
     job: &CloudJob,
 ) -> Result<(ContentHash, BundleManifest, u64), CloudError> {
+    if job.protocol_version != super::job::CLOUD_JOB_PROTOCOL_VERSION {
+        return Err(CloudError::Dispatch(format!(
+            "cloud job protocol v{} unsupported (want v{})",
+            job.protocol_version,
+            super::job::CLOUD_JOB_PROTOCOL_VERSION
+        )));
+    }
     // Defense in depth: the worker re-validates the id before joining it into a
     // path, rather than trust the queue's enqueue-time check.
     if !is_safe_job_id(&job.id) {
@@ -154,12 +162,12 @@ async fn run_in_dir(
     job: &CloudJob,
 ) -> Result<(ContentHash, BundleManifest, u64), CloudError> {
     let cache = Arc::new(CacheHandle::job_local(stage_dir.join(".cache")));
-    let input_hash = job.input_manifest.content_hash;
+    let input_content_id = job.input_manifest.content_id;
     let ctx = StageContext::for_peer(
         stage_dir.to_path_buf(),
         stage_dir.to_path_buf(),
         cache,
-        crate::framework::InvocationKey::from_digest(input_hash),
+        job.invocation_key,
     );
 
     // Download the input pack + unbundle (the four fail-closed gates run here).
@@ -169,7 +177,7 @@ async fn run_in_dir(
         &job.input_manifest,
         &pack,
         stage_dir,
-        &input_hash,
+        Some(input_content_id),
         BlobDir::Input,
     )
     .map_err(|e| CloudError::Dispatch(format!("unbundle input: {e}")))?;
@@ -194,7 +202,7 @@ async fn run_in_dir(
         output,
         stage_dir,
         BlobDir::Output,
-        &job.expected_output_hash,
+        job.expected_content_id,
     )
     .map_err(|e| CloudError::Dispatch(format!("bundle output: {e}")))?;
     let out_blob_key = ContentHash::of_bytes(&out_pack);

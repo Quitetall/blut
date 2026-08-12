@@ -8,26 +8,37 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::framework::artifact::ContentHash;
+use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
 use crate::p2p::bundle::BundleManifest;
 use crate::p2p::task::ResourceRequest;
 use crate::p2p::trust::DataClass;
+
+pub const CLOUD_JOB_PROTOCOL_VERSION: u16 = 2;
+
+fn legacy_protocol_version() -> u16 {
+    1
+}
 
 /// One unit of dispatchable work: a stage + its bundled input + the expected output
 /// address (content-addressed, verified fail-closed on the worker).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CloudJob {
+    #[serde(default = "legacy_protocol_version")]
+    pub protocol_version: u16,
     /// Unique, traversal-safe id (the queue key).
     pub id: String,
     pub stage_name: String,
     pub stage_schema: u32,
+    pub invocation_key: InvocationKey,
     pub args: serde_json::Value,
     /// Object-store key of the input bundle pack (the pack bytes' ContentHash).
     pub input_blob_key: ContentHash,
     /// The small bundle manifest (file table + erased handle) — rides the record.
     pub input_manifest: BundleManifest,
-    /// The address the worker's output MUST reproduce (the 4 bundle gates enforce).
-    pub expected_output_hash: ContentHash,
+    /// Analytically known output identity, when the stage can provide one before
+    /// execution. Otherwise the worker derives and returns the actual identity.
+    #[serde(rename = "expected_output_hash")]
+    pub expected_content_id: Option<ContentId>,
     pub resources: ResourceRequest,
     /// Data sensitivity — the reused `DispatchMatrix` refuses `Restricted` to a
     /// cloud worker below `Trusted` (clinical EEG hard-block in v1).
@@ -50,14 +61,17 @@ pub enum JobOutcome {
 /// The worker's reply: where the output bundle landed + how long it took.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CloudResult {
+    #[serde(default = "legacy_protocol_version")]
+    pub protocol_version: u16,
     pub job_id: String,
     pub outcome: JobOutcome,
     /// Object-store key of the output bundle pack (None on failure).
     pub output_blob_key: Option<ContentHash>,
     /// The output bundle manifest (None on failure).
     pub output_manifest: Option<BundleManifest>,
-    /// The output artifact's content address (None on failure).
-    pub output_hash: Option<ContentHash>,
+    /// The output artifact's content identity (None on failure).
+    #[serde(rename = "output_hash")]
+    pub content_id: Option<ContentId>,
     /// Wall-clock the stage ran on the worker — the billing signal (T3.1e).
     pub wall_time_ms: u64,
     /// Failure detail, if `outcome != Succeeded`.
@@ -68,11 +82,12 @@ impl CloudResult {
     /// Construct a failure result for `job_id` with `wall_time_ms` already spent.
     pub fn failed(job_id: impl Into<String>, wall_time_ms: u64, error: impl Into<String>) -> Self {
         Self {
+            protocol_version: CLOUD_JOB_PROTOCOL_VERSION,
             job_id: job_id.into(),
             outcome: JobOutcome::Failed,
             output_blob_key: None,
             output_manifest: None,
-            output_hash: None,
+            content_id: None,
             wall_time_ms,
             error: Some(error.into()),
         }

@@ -13,7 +13,7 @@ use blut::cloud::queue::MemQueue;
 use blut::cloud::store::ObjStore;
 use blut::cloud::submitter::{CloudPoll, CloudSubmitSpec, CloudSubmitter};
 use blut::cloud::worker::run_one;
-use blut::framework::artifact::{Artifact, ContentHash};
+use blut::framework::artifact::{ContentHash, InvocationKey};
 use blut::framework::cookbook::Registry;
 use blut::framework::stage::ErasedArtifact;
 use blut::p2p::dispatch::DefaultDispatchPolicy;
@@ -29,7 +29,7 @@ fn smoke_registry() -> Arc<Registry> {
 }
 
 /// Produce a `SmokeText` input artifact on disk and return (erased, src_root, input_hash).
-fn make_input(text: &str) -> (ErasedArtifact, tempfile::TempDir, ContentHash) {
+fn make_input(text: &str) -> (ErasedArtifact, tempfile::TempDir) {
     let src_root = tempfile::tempdir().unwrap();
     let in_path = src_root.path().join("in.txt");
     std::fs::write(&in_path, text.as_bytes()).unwrap();
@@ -37,9 +37,8 @@ fn make_input(text: &str) -> (ErasedArtifact, tempfile::TempDir, ContentHash) {
         content_hash: ContentHash::hash_file(&in_path).unwrap(),
         path: in_path,
     };
-    let input_hash = input.content_hash();
     let erased = ErasedArtifact::from_typed(&input).unwrap();
-    (erased, src_root, input_hash)
+    (erased, src_root)
 }
 
 #[tokio::test]
@@ -48,19 +47,18 @@ async fn cloud_dispatch_round_trips_over_local_object_store() {
     let queue = Arc::new(MemQueue::new());
     let reg = smoke_registry();
 
-    let (erased, _src, input_hash) = make_input("hello cloud");
-    let expected = smoke::expected_echo_hash("hello cloud"); // "HELLO CLOUD"
+    let (erased, _src) = make_input("hello cloud");
 
     let submitter = CloudSubmitter::new(store.clone(), queue.clone(), reg.clone());
     let handle = submitter
         .submit(CloudSubmitSpec {
             job_id: "job-1".into(),
             stage_name: SMOKE_STAGE.into(),
+            invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"job-1")),
             input: erased,
             src_root: _src.path().to_path_buf(),
             args: serde_json::json!({}),
-            input_hash,
-            expected_output_hash: expected,
+            expected_content_id: None,
             data_class: DataClass::Public,
             resources: ResourceRequest::default(),
             priority: 0,
@@ -135,19 +133,18 @@ async fn restricted_job_is_refused_by_a_registered_cloud_worker() {
     let queue = Arc::new(MemQueue::new());
     let reg = smoke_registry();
 
-    let (erased, _src, input_hash) = make_input("phi data");
-    let expected = smoke::expected_echo_hash("phi data");
+    let (erased, _src) = make_input("phi data");
 
     let submitter = CloudSubmitter::new(store.clone(), queue.clone(), reg.clone());
     let handle = submitter
         .submit(CloudSubmitSpec {
             job_id: "job-phi".into(),
             stage_name: SMOKE_STAGE.into(),
+            invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"job-phi")),
             input: erased,
             src_root: _src.path().to_path_buf(),
             args: serde_json::json!({}),
-            input_hash,
-            expected_output_hash: expected,
+            expected_content_id: None,
             data_class: DataClass::Restricted, // clinical
             resources: ResourceRequest::default(),
             priority: 0,

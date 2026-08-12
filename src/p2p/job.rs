@@ -212,9 +212,12 @@ mod tests {
         let job = P2pJob::new("test-1".into(), PeerId([0u8; 32]), rx);
 
         let result = TaskResult {
+            protocol_version: crate::p2p::task::TASK_PROTOCOL_VERSION,
             task_id: "test-1".into(),
             peer_id: PeerId([0u8; 32]),
-            output_hash: crate::framework::artifact::ContentHash::of_bytes(&[42u8; 32]),
+            content_id: crate::framework::ContentId::from_digest(
+                crate::framework::artifact::ContentHash::of_bytes(&[42u8; 32]),
+            ),
             encrypted_output: None,
             wall_time_ms: 1000,
             signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),

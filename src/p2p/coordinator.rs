@@ -15,7 +15,7 @@ use tokio::sync::{RwLock, oneshot};
 
 use crate::config::launcher::JobState;
 use crate::error::TrainError;
-use crate::framework::artifact::ContentHash;
+use crate::framework::artifact::ContentId;
 use crate::p2p::crypto::KeyPair;
 use crate::p2p::dispatch::{DispatchPolicy, DispatchVerdict};
 use crate::p2p::job::P2pJob;
@@ -28,7 +28,7 @@ use crate::p2p::transport::P2pServer;
 /// lifecycle and deliver the result.
 pub(crate) struct PendingTask {
     result_tx: oneshot::Sender<Result<TaskResult, String>>,
-    expected_output_hash: ContentHash,
+    expected_content_id: Option<ContentId>,
 }
 
 /// The P2P coordinator. Manages peers, dispatches tasks, verifies results.
@@ -91,8 +91,15 @@ impl Coordinator {
     /// Submit a task to the coordinator. The coordinator will dispatch it
     /// to the best available peer. Returns a `P2pJob` handle for tracking.
     pub async fn submit_task(&self, manifest: TaskManifest) -> Result<P2pJob, TrainError> {
+        if manifest.protocol_version != crate::p2p::task::TASK_PROTOCOL_VERSION {
+            return Err(TrainError::other(format!(
+                "task protocol v{} unsupported (want v{})",
+                manifest.protocol_version,
+                crate::p2p::task::TASK_PROTOCOL_VERSION
+            )));
+        }
         let task_id = manifest.task_id.clone();
-        let expected_output_hash = manifest.expected_output_hash;
+        let expected_content_id = manifest.expected_content_id;
 
         let (result_tx, result_rx) = oneshot::channel();
 
@@ -121,7 +128,7 @@ impl Coordinator {
                 task_id.clone(),
                 PendingTask {
                     result_tx,
-                    expected_output_hash,
+                    expected_content_id,
                 },
             );
         }
@@ -152,7 +159,7 @@ impl Coordinator {
     pub async fn verify_result(
         &self,
         result: &TaskResult,
-        expected: &ContentHash,
+        expected: Option<ContentId>,
     ) -> DispatchVerdict {
         let peers = self.server.peers.read().await;
         if let Some(peer) = peers.get(&result.peer_id) {
@@ -221,7 +228,7 @@ impl Coordinator {
                             if let Some(pt) = pending_map.get(&task_id) {
                                 dispatch.verify_result(
                                     &result,
-                                    &pt.expected_output_hash,
+                                    pt.expected_content_id,
                                     &peer_info.pubkey,
                                 )
                             } else {
@@ -401,15 +408,17 @@ impl crate::framework::executor::DispatchSubmitter for Coordinator {
         let select_resources = resources; // ResourceRequest is Copy
         let select_data_class = data_class;
 
-        let expected_output_hash = req.expected_output_hash;
+        let expected_content_id = req.expected_content_id;
         let mut manifest = TaskManifest {
+            protocol_version: crate::p2p::task::TASK_PROTOCOL_VERSION,
             task_id: task_id.clone(),
             coordinator_id: self.coordinator_id.clone(),
             stage_name: req.stage_name.to_string(),
             stage_schema: req.stage_schema,
-            input_hash: req.input_hash,
+            input_content_id: req.input_content_id,
+            invocation_key: req.invocation_key,
             args_hash: req.args_hash,
-            expected_output_hash,
+            expected_content_id,
             args: req.args.clone(),
             resources,
             data_class,
@@ -428,7 +437,7 @@ impl crate::framework::executor::DispatchSubmitter for Coordinator {
                 task_id.clone(),
                 PendingTask {
                     result_tx,
-                    expected_output_hash,
+                    expected_content_id,
                 },
             );
         }

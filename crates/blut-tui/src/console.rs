@@ -320,6 +320,7 @@ impl ConsoleModel {
                     node_idx,
                     stage_name,
                     input_hash,
+                    ..
                 } => set(
                     &mut nodes,
                     node_idx,
@@ -1095,6 +1096,7 @@ mod tests {
                 node_idx: 1,
                 stage_name: "train_joint".into(),
                 input_hash: ContentHash::of_bytes(b"b"),
+                input_content_ids: Vec::new(),
             }),
             h(StageEvent::StageEnd {
                 node_idx: 1,
@@ -1106,6 +1108,7 @@ mod tests {
                 node_idx: 2,
                 stage_name: "eval".into(),
                 input_hash: ContentHash::of_bytes(b"d"),
+                input_content_ids: Vec::new(),
             }),
         ];
         let td = tempfile::tempdir().unwrap();

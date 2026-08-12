@@ -24,6 +24,7 @@ pub struct DatasetJsonl {
 impl Artifact for DatasetJsonl {
     const KIND: &'static str = "dataset.jsonl";
     const SCHEMA: u32 = 1;
+    const ALLOW_EXTERNAL_PATHS: bool = true;
     fn content_hash(&self) -> ContentHash {
         self.content_hash
     }
@@ -52,6 +53,7 @@ const DATASET_SPLIT_DOMAIN: &[u8] = b"dataset.split";
 impl Artifact for DatasetSplit {
     const KIND: &'static str = "dataset.split";
     const SCHEMA: u32 = 1;
+    const ALLOW_EXTERNAL_PATHS: bool = true;
     fn content_hash(&self) -> ContentHash {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
@@ -63,6 +65,12 @@ impl Artifact for DatasetSplit {
     }
     fn primary_path(&self) -> &Path {
         &self.train.path
+    }
+    fn portable_identity(&self) -> Result<serde_json::Value, serde_json::Error> {
+        Ok(serde_json::Value::Array(vec![
+            self.train.portable_identity()?,
+            self.eval.portable_identity()?,
+        ]))
     }
     /// Composite: the address is a merkle over BOTH members, and
     /// `primary_path()` is only `train.path`. The default `recompute` would

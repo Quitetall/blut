@@ -79,10 +79,15 @@ fn request<'a>(
     DispatchRequest {
         stage_name: "contract_stage",
         stage_schema: 1,
-        input_hash: ContentHash::of_bytes(b"input"),
+        invocation_key: blut::framework::InvocationKey::from_digest(ContentHash::of_bytes(
+            b"invocation",
+        )),
+        input_content_id: blut::framework::ContentId::from_digest(ContentHash::of_bytes(b"input")),
         args_hash: ContentHash::of_bytes(b"args"),
         args,
-        expected_output_hash: ContentHash::of_bytes(b"output"),
+        expected_content_id: Some(blut::framework::ContentId::from_digest(
+            ContentHash::of_bytes(b"output"),
+        )),
         resource_request: Default::default(),
         data_class: 0,
         tenant,
@@ -212,7 +217,7 @@ fn remote_failure_identity_is_an_unstructured_string() {
 ///
 /// A08: "`DispatchRequest` carries neither artifact nor source root, the
 /// coordinator sends `encrypted_input: None`, the peer rejects it". The struct
-/// carries hashes — `input_hash`, `expected_output_hash` — which describe work
+/// carries portable identities — `input_content_id`, `expected_content_id` — which describe work
 /// without transporting it. A peer can therefore verify what it was asked for
 /// and still be unable to do it.
 #[test]
@@ -221,8 +226,8 @@ fn the_request_seam_describes_work_without_transporting_it() {
     let tenant = blut::tenant::Tenant::default();
     let req = request(&args, &tenant);
     // Present: identity of the work.
-    let _ = req.input_hash;
-    let _ = req.expected_output_hash;
+    let _ = req.input_content_id;
+    let _ = req.expected_content_id;
     // Absent: the work itself. This test exists to be DELETED when a payload or
     // source-root field is added, because that addition is A08's actual fix.
     assert_eq!(

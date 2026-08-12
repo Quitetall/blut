@@ -37,6 +37,7 @@ pub struct EvalReport {
 impl Artifact for EvalReport {
     const KIND: &'static str = "eval.report";
     const SCHEMA: u32 = 1;
+    const ALLOW_EXTERNAL_PATHS: bool = true;
     fn content_hash(&self) -> ContentHash {
         self.content_hash
     }

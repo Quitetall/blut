@@ -137,6 +137,10 @@ pub struct JsonlArtifact {
 impl Artifact for JsonlArtifact {
     const KIND: &'static str = "checks.jsonl";
     const SCHEMA: u32 = 1;
+    // Check stages intentionally pass through source files owned by upstream
+    // stages or datasets. Such handles remain usable but are not published as
+    // portable cache objects unless their bytes live beneath producer root.
+    const ALLOW_EXTERNAL_PATHS: bool = true;
     fn content_hash(&self) -> ContentHash {
         self.content_hash
     }

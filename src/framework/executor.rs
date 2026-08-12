@@ -48,6 +48,9 @@ use crate::config::launcher::JobState;
 use crate::framework::artifact::{
     ArtifactMetadata, BranchDecision, ContentHash, ContentId, InvocationKey,
 };
+use crate::framework::artifact_store::{
+    ArtifactRole, ArtifactStoreError, capture, unpersisted_content_id,
+};
 use crate::framework::cache::{CacheHandle, CacheHit};
 use crate::framework::control::{Control, ControlPolicy, StepMetrics};
 use crate::framework::error::{PlanError, StageError};
@@ -149,10 +152,14 @@ pub trait DispatchHandle: Send + Sync {
 pub struct DispatchRequest<'a> {
     pub stage_name: &'a str,
     pub stage_schema: u32,
-    pub input_hash: ContentHash,
+    pub invocation_key: InvocationKey,
+    pub input_content_id: ContentId,
     pub args_hash: ContentHash,
     pub args: &'a serde_json::Value,
-    pub expected_output_hash: ContentHash,
+    /// Present only when the stage can derive its output identity without
+    /// executing. `None` delegates identity production to the worker; success is
+    /// accepted only after the receiver restores and recomputes the artifact.
+    pub expected_content_id: Option<ContentId>,
     pub resource_request: ResourceRequest,
     pub data_class: u8, // 0=Public, 1=Internal, 2=Restricted
     /// Owning tenant. Dispatchers must refuse restricted tenants even if a
@@ -708,6 +715,10 @@ struct NodeTask {
     args: serde_json::Value,
     canon_args: Vec<u8>,
     input: ErasedArtifact,
+    /// Portable identities of predecessor outputs. Kept distinct from
+    /// `input_hash`, which is the folded logical digest used by invocation keys.
+    input_content_ids: Vec<ContentId>,
+    /// Logical predecessor identity used only for deterministic invocation keys.
     input_hash: ContentHash,
     key: InvocationKey,
     /// Cache artifact already decoded by cache-aware ready-queue probing. The
@@ -737,6 +748,7 @@ struct NodeOutcome {
     /// Present only on the fused fast path. The next stage consumes this box
     /// directly instead of decoding `output` through bincode again.
     in_process_output: Option<InProcessArtifact>,
+    content_id: ContentId,
     logical: ContentHash,
     cache_hit: bool,
 }
@@ -757,6 +769,7 @@ struct SpeculativePrepared {
     stage: Arc<dyn StageDyn>,
     stage_name: String,
     input_hash: ContentHash,
+    input_content_ids: Vec<ContentId>,
     canon_args: Vec<u8>,
     key: InvocationKey,
     output: ErasedArtifact,
@@ -855,6 +868,7 @@ struct SpilledPipelinePrepared {
     stage: Arc<dyn StageDyn>,
     stage_name: String,
     input_hash: ContentHash,
+    input_content_ids: Vec<ContentId>,
     canon_args: Vec<u8>,
     key: InvocationKey,
     elapsed: std::time::Duration,
@@ -876,6 +890,7 @@ impl SpilledPipelinePrepared {
             stage,
             stage_name,
             input_hash,
+            input_content_ids,
             canon_args,
             key,
             output,
@@ -919,6 +934,7 @@ impl SpilledPipelinePrepared {
             stage,
             stage_name,
             input_hash,
+            input_content_ids,
             canon_args,
             key,
             elapsed,
@@ -973,6 +989,7 @@ impl SpilledPipelinePrepared {
             stage: self.stage,
             stage_name: self.stage_name,
             input_hash: self.input_hash,
+            input_content_ids: self.input_content_ids,
             canon_args: self.canon_args,
             key: self.key,
             output: payload.output,
@@ -1398,8 +1415,30 @@ fn record_divergence_and_kill(
 async fn cache_lookup_off_thread(
     cache: Arc<CacheHandle>,
     key: InvocationKey,
+    stage: Arc<dyn StageDyn>,
+    into_stage_dir: PathBuf,
 ) -> Result<Option<CacheHit>, tokio::task::JoinError> {
-    tokio::task::spawn_blocking(move || cache.lookup(key)).await
+    tokio::task::spawn_blocking(move || cache.lookup(key, stage.as_ref(), &into_stage_dir)).await
+}
+
+fn tagged_cache_lookup_off_thread(
+    cache: Arc<CacheHandle>,
+    key: InvocationKey,
+    stage: Arc<dyn StageDyn>,
+    into_stage_dir: PathBuf,
+) -> impl std::future::Future<
+    Output = (
+        InvocationKey,
+        Result<Option<CacheHit>, tokio::task::JoinError>,
+    ),
+> + Send
++ 'static {
+    async move {
+        (
+            key,
+            cache_lookup_off_thread(cache, key, stage, into_stage_dir).await,
+        )
+    }
 }
 
 async fn cache_presence_probe_off_thread(
@@ -2068,6 +2107,9 @@ async fn run_node_with_admission(
 ) -> Result<NodeOutcome, NodeFailure> {
     let idx = task.node_idx;
     let stage_name = task.stage.name().to_string();
+    let stages_root = env.job_dir.join("stages");
+    let final_stage_dir = stages_root.join(format!("{idx}-{stage_name}"));
+    let tmp_stage_dir = stages_root.join(format!(".tmp-{idx}-{stage_name}-{}", task.key.to_hex()));
 
     // ── Cache lookup ────────────────────────────────────────────────
     // INC D (S4): `bypass_cache` forces a recompute — skip the READ so the
@@ -2078,27 +2120,27 @@ async fn run_node_with_admission(
     } else if let Some(hit) = task.prepared_cache_hit.take() {
         Some(hit)
     } else {
-        cache_lookup_off_thread(env.cache.clone(), task.key)
-            .await
-            .map_err(|error| {
-                NodeFailure::Other(format!(
-                    "cache lookup worker failed for {stage_name}: {error}"
-                ))
-            })?
-            .map(Arc::new)
+        cache_lookup_off_thread(
+            env.cache.clone(),
+            task.key,
+            task.stage.clone(),
+            final_stage_dir.clone(),
+        )
+        .await
+        .map_err(|error| {
+            NodeFailure::Other(format!(
+                "cache lookup worker failed for {stage_name}: {error}"
+            ))
+        })?
+        .map(Arc::new)
     };
     if let Some(hit) = cache_hit {
         let hit = Arc::try_unwrap(hit).unwrap_or_else(|shared| (*shared).clone());
-        let content_id = ContentId::from_digest(
-            task.stage
-                .output_content_hash(&hit.artifact)
-                .unwrap_or_else(|| content_hash_from_erased(&hit.artifact)),
-        );
         env.status.emit(StageEvent::StageSkipped {
             node_idx: idx,
             stage_name: stage_name.clone(),
             invocation_key: task.key,
-            content_id: Some(content_id),
+            content_id: Some(hit.content_id),
         });
         let logical = compute_logical_output_hash(
             task.stage.as_ref(),
@@ -2119,19 +2161,20 @@ async fn run_node_with_admission(
         if let Err(e) = std::fs::create_dir_all(&stage_dir) {
             tracing::warn!("cache-hit stage dir {}: {e}", stage_dir.display());
         } else {
-            let output_hash = task
-                .stage
-                .output_content_hash(&hit.artifact)
-                .unwrap_or_else(|| content_hash_from_erased(&hit.artifact));
-            let metadata =
-                ArtifactMetadata::new(hit.artifact.kind.clone(), hit.artifact.schema, output_hash)
-                    .with_stage(stage_name.clone());
+            let metadata = ArtifactMetadata::new(
+                hit.artifact.kind.clone(),
+                hit.artifact.schema,
+                hit.content_id.digest(),
+            )
+            .with_logical_hash(logical)
+            .with_extra("persisted", serde_json::Value::Bool(true))
+            .with_stage(stage_name.clone());
             if let Err(e) = metadata.write_to(&stage_dir.join("output.metadata.json")) {
                 tracing::warn!("cache-hit sidecar {}: {e}", stage_dir.display());
             }
             let proof = crate::framework::cache::CacheProof {
                 key: task.key,
-                entry_path: hit.from_path,
+                entry_path: env.cache.entry_path_for_write(task.key),
             };
             if let Err(e) = proof.write_to(&stage_dir.join("cache-proof.json")) {
                 tracing::warn!("cache-hit proof {}: {e}", stage_dir.display());
@@ -2141,6 +2184,7 @@ async fn run_node_with_admission(
             node_id: task.node_id,
             output: hit.artifact,
             in_process_output: None,
+            content_id: hit.content_id,
             logical,
             cache_hit: true,
         });
@@ -2159,6 +2203,7 @@ async fn run_node_with_admission(
         node_idx: idx,
         stage_name: stage_name.clone(),
         input_hash: task.input_hash,
+        input_content_ids: task.input_content_ids.clone(),
     });
 
     // FW-2: the stage runs against a private `.tmp-<key>` dir; on Ok we
@@ -2169,10 +2214,6 @@ async fn run_node_with_admission(
     // (D1) recreates the tmp dir + reacquires permits per attempt, so
     // FW-2 holds for EACH attempt; the cache insert is still strictly
     // post-promote (below the loop, on success).
-    let stages_root = env.job_dir.join("stages");
-    let final_stage_dir = stages_root.join(format!("{idx}-{stage_name}"));
-    let tmp_stage_dir = stages_root.join(format!(".tmp-{idx}-{stage_name}-{}", task.key.to_hex()));
-
     let fused_handoff = allow_in_process_handoff && task.stage.supports_in_process_handoff();
     let mut attempt = 0u32;
     let (stage_output, run_elapsed) = loop {
@@ -2702,20 +2743,63 @@ async fn run_node_with_admission(
         ),
     };
 
-    // Sidecar metadata next to the promoted payload. Record the CONTENT hash
-    // (the FW-1 fix path, same as the downstream logical hash uses) so the
-    // StageEnd event + the output.metadata.json sidecar + lineage are
-    // cross-machine-stable — `content_hash_from_erased` hashes the bincode
-    // handle, which embeds the producer's absolute paths. Falls back to the
-    // handle hash for non-deterministic / tuple outputs (the same well-tested
-    // fallback `compute_logical_output_hash` uses).
-    let output_hash = known_output_hash.unwrap_or_else(|| {
+    // Preserve the existing logical hash for downstream invocation keys, but
+    // derive lineage/cache identity from the canonical persisted bytes. Capture
+    // happens before the sidecar write so metadata cannot hash itself.
+    let logical_hash = known_output_hash.unwrap_or_else(|| {
         task.stage
             .output_content_hash(&output)
             .unwrap_or_else(|| content_hash_from_erased(&output))
     });
-    let content_id = ContentId::from_digest(output_hash);
-    let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, output_hash)
+    let (content_id, stored) = match capture(
+        task.stage.as_ref(),
+        output.clone(),
+        &final_stage_dir,
+        ArtifactRole::Output,
+        None,
+    ) {
+        Ok(stored) => (stored.manifest.content_id, Some(stored)),
+        // A declared external reference is an expected ownership policy outcome,
+        // not a failed store write. `capture` has only read the promoted output.
+        Err(error @ ArtifactStoreError::NonPortable(_)) => {
+            tracing::warn!(
+                "executor: output for stage '{stage_name}' is not portable and will not be cached: {error}"
+            );
+            (
+                unpersisted_content_id(
+                    task.stage.as_ref(),
+                    &output,
+                    ArtifactRole::Output,
+                    logical_hash,
+                ),
+                None,
+            )
+        }
+        Err(error) => {
+            let source = std::io::Error::new(std::io::ErrorKind::InvalidData, error);
+            let _ = std::fs::remove_dir_all(&final_stage_dir);
+            env.status.emit(StageEvent::StageFailed {
+                node_idx: idx,
+                stage_name: stage_name.clone(),
+                error: format!("capture canonical output: {source}"),
+                failure: None,
+            });
+            return Err(NodeFailure::Stage {
+                idx,
+                stage: stage_name,
+                source: StageError::Io {
+                    path: final_stage_dir,
+                    source,
+                },
+            });
+        }
+    };
+    if let Some(stored) = &stored {
+        debug_assert_eq!(stored.manifest.logical_hash, logical_hash);
+    }
+    let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, content_id.digest())
+        .with_logical_hash(logical_hash)
+        .with_extra("persisted", serde_json::Value::Bool(stored.is_some()))
         .with_stage(stage_name.clone());
     if let Err(e) = metadata.write_to(&final_stage_dir.join("output.metadata.json")) {
         tracing::warn!(
@@ -2726,20 +2810,23 @@ async fn run_node_with_admission(
     // Cache insert — STRICTLY after the atomic promote (the load-bearing
     // FW-2 ordering: the resume oracle appears only once the output is
     // fully in place).
-    match env.cache.insert(task.key, &output) {
-        Ok(()) => {
-            let proof = crate::framework::cache::CacheProof {
-                key: task.key,
-                entry_path: env.cache.entry_path_for_write(task.key),
-            };
-            if let Err(e) = proof.write_to(&final_stage_dir.join("cache-proof.json")) {
-                tracing::warn!("executor: cache proof for stage '{stage_name}' failed: {e}");
+    if let Some(stored) = &stored {
+        match env.cache.insert_stored(task.key, stored) {
+            Ok(stored_id) => {
+                debug_assert_eq!(stored_id, content_id);
+                let proof = crate::framework::cache::CacheProof {
+                    key: task.key,
+                    entry_path: env.cache.entry_path_for_write(task.key),
+                };
+                if let Err(e) = proof.write_to(&final_stage_dir.join("cache-proof.json")) {
+                    tracing::warn!("executor: cache proof for stage '{stage_name}' failed: {e}");
+                }
             }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "executor: cache insert for stage '{stage_name}' failed: {e}; continuing"
-            );
+            Err(e) => {
+                tracing::warn!(
+                    "executor: cache insert for stage '{stage_name}' failed: {e}; continuing"
+                );
+            }
         }
     }
 
@@ -2750,8 +2837,8 @@ async fn run_node_with_admission(
         elapsed: run_elapsed,
     });
 
-    let logical = if known_output_hash.is_some() && task.stage.deterministic() {
-        output_hash
+    let logical = if task.stage.deterministic() {
+        logical_hash
     } else {
         compute_logical_output_hash(
             task.stage.as_ref(),
@@ -2767,6 +2854,7 @@ async fn run_node_with_admission(
         node_id: task.node_id,
         output,
         in_process_output,
+        content_id,
         logical,
         cache_hit: false,
     })
@@ -2808,6 +2896,7 @@ async fn prepare_private(
     let stage = task.stage.clone();
     let stage_name = stage.name().to_string();
     let input_hash = task.input_hash;
+    let input_content_ids = task.input_content_ids.clone();
     let canon_args = task.canon_args.clone();
     let key = task.key;
     let training_io = training_io_override.or_else(|| canonical_env.training_io_node(node_id));
@@ -2935,6 +3024,7 @@ async fn prepare_private(
         stage,
         stage_name,
         input_hash,
+        input_content_ids,
         canon_args,
         key,
         output: outcome.output,
@@ -3064,6 +3154,12 @@ async fn run_pipeline_parent(
             .node
             .timeout
             .unwrap_or_else(|| child.node.stage.timeout());
+        let input_content_id = unpersisted_content_id(
+            child.node.stage.as_ref(),
+            &emission.artifact,
+            ArtifactRole::Input,
+            child.input_logical,
+        );
         let child_task = NodeTask {
             node_id: child.node.id,
             node_idx: child.node_idx,
@@ -3071,6 +3167,7 @@ async fn run_pipeline_parent(
             args: child.node.args.clone(),
             canon_args: child.node.canon_args.clone(),
             input: emission.artifact.clone(),
+            input_content_ids: vec![input_content_id],
             input_hash: child.input_logical,
             key: child.key,
             prepared_cache_hit: None,
@@ -3447,6 +3544,23 @@ fn publish_speculative_inner(
         prepared.input_hash,
         &prepared.canon_args,
     );
+    let stored = capture(
+        prepared.stage.as_ref(),
+        output.clone(),
+        &final_stage_dir,
+        ArtifactRole::Output,
+        None,
+    )
+    .map_err(|error| NodeFailure::Stage {
+        idx,
+        stage: stage_name.clone(),
+        source: StageError::Io {
+            path: final_stage_dir.clone(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+        },
+    })?;
+    let content_id = stored.manifest.content_id;
+    debug_assert_eq!(stored.manifest.logical_hash, output_hash);
     if let Err(source) = prepared._scratch.cleanup() {
         return Err(NodeFailure::SpeculationCleanup {
             path: prepared._scratch.0.clone(),
@@ -3460,7 +3574,8 @@ fn publish_speculative_inner(
     if let Some(error) = plan_stop_error(deadline, plan_started, &env.cancel) {
         return Err(NodeFailure::Plan(error));
     }
-    let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, output_hash)
+    let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, content_id.digest())
+        .with_logical_hash(output_hash)
         .with_stage(prepared.stage_name.clone());
     if let Err(error) = metadata.write_to(&final_stage_dir.join("output.metadata.json")) {
         tracing::warn!(
@@ -3476,7 +3591,7 @@ fn publish_speculative_inner(
     }
     let mut pipeline_cache_guard = None;
     let mut optional_cache_body = None;
-    match env.cache.insert_optional_local(prepared.key, &output) {
+    match env.cache.insert_optional_local(prepared.key, &stored) {
         Ok(body) => {
             optional_cache_body = Some(body);
             if rollback_cache_on_stop {
@@ -3533,6 +3648,7 @@ fn publish_speculative_inner(
         node_idx: idx,
         stage_name: stage_name.clone(),
         input_hash: prepared.input_hash,
+        input_content_ids: prepared.input_content_ids.clone(),
     });
     for event in prepared.buffered_steps.iter().cloned() {
         env.status.emit(event);
@@ -3540,7 +3656,7 @@ fn publish_speculative_inner(
     env.status.emit(StageEvent::StageEnd {
         node_idx: idx,
         stage_name: prepared.stage_name.clone(),
-        content_id: ContentId::from_digest(output_hash),
+        content_id,
         elapsed: prepared.elapsed,
     });
     if let Some(cache_guard) = pipeline_cache_guard {
@@ -3550,13 +3666,14 @@ fn publish_speculative_inner(
     // Remote object-store replication is optional acceleration, not part of
     // the local canonical commit. Run it only after the stage directory, cache
     // entry, and lifecycle batch are committed; plugin panics stay contained.
-    if let Some(body) = optional_cache_body {
-        env.cache.replicate_optional(prepared.key, &body);
+    if let Some(write) = optional_cache_body {
+        env.cache.replicate_optional(&write);
     }
     Ok(NodeOutcome {
         node_id: prepared.node_id,
         output,
         in_process_output: None,
+        content_id,
         logical,
         cache_hit: false,
     })
@@ -3754,11 +3871,16 @@ fn build_task(
     edges: &[crate::framework::plan::PlanEdge],
     outputs: &HashMap<NodeId, ErasedArtifact>,
     logical_outputs: &HashMap<NodeId, ContentHash>,
+    content_outputs: &HashMap<NodeId, ContentId>,
     node_cancel: KillSlot,
 ) -> Result<NodeTask, PlanError> {
     let preds = predecessors(edges, node.id);
     let input = gather_input(node.id, &preds, outputs)?;
     let input_hash = gather_input_hash(node.id, &preds, logical_outputs)?;
+    let input_content_ids = preds
+        .iter()
+        .filter_map(|predecessor| content_outputs.get(predecessor).copied())
+        .collect();
     let key = node_cache_key(node, input_hash);
     // Resolve retry/timeout: a per-node override wins over the stage const.
     let retry = node.retry.unwrap_or_else(|| node.stage.retry());
@@ -3770,6 +3892,7 @@ fn build_task(
         args: node.args.clone(),
         canon_args: node.canon_args.clone(),
         input,
+        input_content_ids,
         input_hash,
         key,
         prepared_cache_hit: None,
@@ -3839,6 +3962,8 @@ async fn refresh_cache_warm_hints(
     orig_n: usize,
     edges: &[crate::framework::plan::PlanEdge],
     logical_outputs: &HashMap<NodeId, ContentHash>,
+    node_idx_of: &HashMap<NodeId, u32>,
+    job_dir: &std::path::Path,
     cache: Arc<CacheHandle>,
     bypass_cache: bool,
     cancel: &CancellationToken,
@@ -3874,16 +3999,26 @@ async fn refresh_cache_warm_hints(
         let key = node_cache_key(node, input_hash);
         node_keys.push((node_id, key));
         if !probes.contains_key(&key) && unseen.insert(key) {
-            unseen_keys.push(key);
+            let node_idx = node_idx_of[&node_id];
+            let into_stage_dir = job_dir
+                .join("stages")
+                .join(format!("{node_idx}-{}", node.stage.name()));
+            unseen_keys.push((key, node.stage.clone(), into_stage_dir));
         }
     }
 
-    let completed = futures::stream::iter(unseen_keys.into_iter().map(|key| {
-        let cache = cache.clone();
-        async move { (key, cache_lookup_off_thread(cache, key).await) }
-    }))
-    .buffer_unordered(MAX_CACHE_PROBE_CONCURRENCY)
-    .collect::<Vec<_>>();
+    let mut pending = Vec::with_capacity(unseen_keys.len());
+    for (key, stage, path) in unseen_keys {
+        pending.push(tagged_cache_lookup_off_thread(
+            cache.clone(),
+            key,
+            stage,
+            path,
+        ));
+    }
+    let completed = futures::stream::iter(pending)
+        .buffer_unordered(MAX_CACHE_PROBE_CONCURRENCY)
+        .collect::<Vec<_>>();
     tokio::pin!(completed);
     let completed = tokio::select! {
         // If deadline and cancellation become ready together, preserve the
@@ -4497,6 +4632,7 @@ struct Prelude {
     env: Arc<NodeEnv>,
     outputs: HashMap<NodeId, ErasedArtifact>,
     logical_outputs: HashMap<NodeId, ContentHash>,
+    content_outputs: HashMap<NodeId, ContentId>,
 }
 
 fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> {
@@ -4513,6 +4649,7 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
 
     let mut outputs: HashMap<NodeId, ErasedArtifact> = HashMap::new();
     let mut logical_outputs: HashMap<NodeId, ContentHash> = HashMap::new();
+    let content_outputs: HashMap<NodeId, ContentId> = HashMap::new();
     for (id, art) in view.initial {
         let lh = content_hash_from_erased(art);
         outputs.insert(*id, art.clone());
@@ -4597,6 +4734,7 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
         env,
         outputs,
         logical_outputs,
+        content_outputs,
     })
 }
 
@@ -4701,6 +4839,7 @@ impl SequentialExecutor {
             env,
             mut outputs,
             mut logical_outputs,
+            mut content_outputs,
         } = prelude(ctx, &plan)?;
 
         let mut n_hits = 0usize;
@@ -4742,6 +4881,7 @@ impl SequentialExecutor {
                 view.edges,
                 &outputs,
                 &logical_outputs,
+                &content_outputs,
                 node_cancel,
             ) {
                 Ok(t) => t,
@@ -4759,6 +4899,7 @@ impl SequentialExecutor {
                     }
                     outputs.insert(outcome.node_id, outcome.output);
                     logical_outputs.insert(outcome.node_id, outcome.logical);
+                    content_outputs.insert(outcome.node_id, outcome.content_id);
                 }
                 Err(f) => {
                     // ADR 0071: an advisory stage's failure is a non-fatal warning,
@@ -4921,6 +5062,7 @@ async fn execute_fused_linear_plan(
         env,
         mut outputs,
         mut logical_outputs,
+        mut content_outputs,
     } = prelude(ctx, &plan)?;
     let mut n_hits = 0usize;
     let mut n_misses = 0usize;
@@ -4950,6 +5092,7 @@ async fn execute_fused_linear_plan(
             view.edges,
             &outputs,
             &logical_outputs,
+            &content_outputs,
             KillSlot::new(env.cancel.child_token()),
         ) {
             Ok(task) => task,
@@ -4980,6 +5123,7 @@ async fn execute_fused_linear_plan(
                 in_process_input = outcome.in_process_output.take();
                 outputs.insert(outcome.node_id, outcome.output);
                 logical_outputs.insert(outcome.node_id, outcome.logical);
+                content_outputs.insert(outcome.node_id, outcome.content_id);
             }
             Ok(Err(failure)) => {
                 env.cancel.cancel();
@@ -5026,6 +5170,7 @@ async fn run_fused_group(
     let mut admission = FusionAdmission::new(admission_request);
     let mut outputs = HashMap::new();
     let mut logical_outputs = HashMap::new();
+    let mut content_outputs = HashMap::new();
     let mut outcomes = Vec::with_capacity(remaining.len() + 1);
     let mut in_process_input = None;
     let mut next_task = Some(first_task);
@@ -5069,6 +5214,7 @@ async fn run_fused_group(
         let predecessor = outcome.node_id;
         outputs.insert(predecessor, outcome.output.clone());
         logical_outputs.insert(predecessor, outcome.logical);
+        content_outputs.insert(predecessor, outcome.content_id);
         let edge = [crate::framework::plan::PlanEdge {
             from: predecessor,
             to: node.id,
@@ -5080,12 +5226,14 @@ async fn run_fused_group(
                 &edge,
                 &outputs,
                 &logical_outputs,
+                &content_outputs,
                 KillSlot::new(env.cancel.child_token()),
             )
             .map_err(NodeFailure::Plan)?,
         );
         outputs.clear();
         logical_outputs.clear();
+        content_outputs.clear();
         outcomes.push(outcome);
     }
 
@@ -5287,6 +5435,7 @@ impl ParallelExecutor {
             env,
             mut outputs,
             mut logical_outputs,
+            mut content_outputs,
         } = prelude(ctx, &plan)?;
 
         // #4 runtime control state. `control_rx` is the live step stream the
@@ -5497,6 +5646,8 @@ impl ParallelExecutor {
                         orig_n,
                         &all_edges,
                         &logical_outputs,
+                        &node_idx_of,
+                        &env.job_dir,
                         env.cache.clone(),
                         env.bypass_cache,
                         &env.cancel,
@@ -5549,6 +5700,7 @@ impl ParallelExecutor {
                         &all_edges,
                         &outputs,
                         &logical_outputs,
+                        &content_outputs,
                         node_cancel.clone(),
                     ) {
                         Ok(t) => t,
@@ -5738,57 +5890,81 @@ impl ParallelExecutor {
                             };
                             let data_class =
                                 policy.classify_stage(task.stage.name(), &task.args) as u8;
-                            let request = DispatchRequest {
-                                stage_name: task.stage.name(),
-                                stage_schema: task.stage.schema(),
-                                input_hash: task.input_hash,
-                                args_hash,
-                                args: &task.args,
-                                expected_output_hash: task.key.digest(),
-                                resource_request,
-                                data_class,
-                                tenant: &env.tenant,
-                            };
-                            if let Some(error) = plan_stop_error(deadline, started, &env.cancel) {
-                                first_error = Some(error);
-                                env.cancel.cancel();
-                                break;
-                            }
-                            match dispatcher.submit(request) {
-                                Ok(handle) => {
-                                    tracing::info!(
-                                        "Dispatched node {} ({}) to P2P peer",
+                            let input_content_id = match capture(
+                                task.stage.as_ref(),
+                                task.input.clone(),
+                                &env.job_dir,
+                                ArtifactRole::Input,
+                                None,
+                            ) {
+                                Ok(stored) => Some(stored.manifest.content_id),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "P2P input capture failed for node {} ({}), running locally: {error}",
                                         node_idx,
                                         task.stage.name()
                                     );
-                                    let status = env.status.clone();
-                                    let cache = env.cache.clone();
-                                    let stage_name = task.stage.name().to_string();
-                                    let stage = task.stage.clone();
-                                    let deterministic = task.stage.deterministic();
-                                    let schema = task.stage.schema();
-                                    let key = task.key;
-                                    let node_id = task.node_id;
-                                    let input_hash = task.input_hash;
-                                    let canon_args = task.canon_args.clone();
-                                    // Route this dispatch's completion through the SAME
-                                    // JoinSet the coordinator awaits below (`join.join_next()`)
-                                    // instead of a detached `tokio::spawn` side-channel. A
-                                    // detached task bumps `in_flight` but is invisible to
-                                    // `join_next()`, so once every ready node is P2P-dispatched
-                                    // the JoinSet goes empty and `join_next()` returns `None`
-                                    // immediately — ending the coordinator loop while the
-                                    // remote work is still running, and tripping the
-                                    // `completed + pruned == order.len()` accounting check
-                                    // below. Being a JoinSet member also means a
-                                    // `JobState::Failed` now produces a real
-                                    // `NodeFailure::Stage` that flows through the SAME
-                                    // `first_error` / `env.cancel.cancel()` handling as a local
-                                    // stage failure (the `Err(f)` arm a few hundred lines down) —
-                                    // previously it only emitted a status event on a detached
-                                    // side-channel and the plan could return `Ok` past an
-                                    // explicitly failed remote stage.
-                                    join.spawn(async move {
+                                    None
+                                }
+                            };
+                            if let Some(input_content_id) = input_content_id {
+                                let request = DispatchRequest {
+                                    stage_name: task.stage.name(),
+                                    stage_schema: task.stage.schema(),
+                                    invocation_key: task.key,
+                                    input_content_id,
+                                    args_hash,
+                                    args: &task.args,
+                                    expected_content_id: None,
+                                    resource_request,
+                                    data_class,
+                                    tenant: &env.tenant,
+                                };
+                                if let Some(error) = plan_stop_error(deadline, started, &env.cancel)
+                                {
+                                    first_error = Some(error);
+                                    env.cancel.cancel();
+                                    break;
+                                }
+                                match dispatcher.submit(request) {
+                                    Ok(handle) => {
+                                        tracing::info!(
+                                            "Dispatched node {} ({}) to P2P peer",
+                                            node_idx,
+                                            task.stage.name()
+                                        );
+                                        let status = env.status.clone();
+                                        let cache = env.cache.clone();
+                                        let stage_name = task.stage.name().to_string();
+                                        let stage = task.stage.clone();
+                                        let deterministic = task.stage.deterministic();
+                                        let schema = task.stage.schema();
+                                        let key = task.key;
+                                        let node_id = task.node_id;
+                                        let input_hash = task.input_hash;
+                                        let canon_args = task.canon_args.clone();
+                                        let into_stage_dir = env
+                                            .job_dir
+                                            .join("stages")
+                                            .join(format!("{node_idx}-{stage_name}"));
+                                        // Route this dispatch's completion through the SAME
+                                        // JoinSet the coordinator awaits below (`join.join_next()`)
+                                        // instead of a detached `tokio::spawn` side-channel. A
+                                        // detached task bumps `in_flight` but is invisible to
+                                        // `join_next()`, so once every ready node is P2P-dispatched
+                                        // the JoinSet goes empty and `join_next()` returns `None`
+                                        // immediately — ending the coordinator loop while the
+                                        // remote work is still running, and tripping the
+                                        // `completed + pruned == order.len()` accounting check
+                                        // below. Being a JoinSet member also means a
+                                        // `JobState::Failed` now produces a real
+                                        // `NodeFailure::Stage` that flows through the SAME
+                                        // `first_error` / `env.cancel.cancel()` handling as a local
+                                        // stage failure (the `Err(f)` arm a few hundred lines down) —
+                                        // previously it only emitted a status event on a detached
+                                        // side-channel and the plan could return `Ok` past an
+                                        // explicitly failed remote stage.
+                                        join.spawn(async move {
                                         let start = std::time::Instant::now();
                                         loop {
                                             match handle.poll() {
@@ -5808,6 +5984,8 @@ impl ParallelExecutor {
                                                     return match cache_lookup_off_thread(
                                                         cache.clone(),
                                                         key,
+                                                        stage.clone(),
+                                                        into_stage_dir.clone(),
                                                     )
                                                     .await
                                                     {
@@ -5827,23 +6005,17 @@ impl ParallelExecutor {
                                                             // tooling reads this field expecting content
                                                             // addressability regardless of whether the node
                                                             // ran locally or was P2P-dispatched.
-                                                            let output_hash = stage
-                                                                .output_content_hash(&hit.artifact)
-                                                                .unwrap_or_else(|| {
-                                                                    content_hash_from_erased(&hit.artifact)
-                                                                });
                                                             status.emit(StageEvent::StageEnd {
                                                                 node_idx,
                                                                 stage_name: stage_name.clone(),
-                                                                content_id: ContentId::from_digest(
-                                                                    output_hash,
-                                                                ),
+                                                                content_id: hit.content_id,
                                                                 elapsed: start.elapsed(),
                                                             });
                                                             Ok(vec![NodeOutcome {
                                                                 node_id,
                                                                 output: hit.artifact,
                                                                 in_process_output: None,
+                                                                content_id: hit.content_id,
                                                                 logical,
                                                                 cache_hit: false,
                                                             }])
@@ -5944,16 +6116,18 @@ impl ParallelExecutor {
                                         }
                                     }
                                     .map(SchedulerTaskResult::Ordinary));
-                                    in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    continue; // skip local spawn
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "P2P dispatch failed for node {} ({}), running locally: {e}",
-                                        node_idx,
-                                        task.stage.name()
-                                    );
-                                    // Fall through to local spawn.
+                                        in_flight
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        continue; // skip local spawn
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "P2P dispatch failed for node {} ({}), running locally: {e}",
+                                            node_idx,
+                                            task.stage.name()
+                                        );
+                                        // Fall through to local spawn.
+                                    }
                                 }
                             }
                         }
@@ -6037,6 +6211,7 @@ impl ParallelExecutor {
                         &all_edges,
                         &outputs,
                         &logical_outputs,
+                        &content_outputs,
                         KillSlot::new(cancel.clone()),
                     );
                     match task {
@@ -6682,6 +6857,7 @@ impl ParallelExecutor {
                         let key = node_key_of.remove(&outcome.node_id);
                         outputs.insert(outcome.node_id, outcome.output);
                         logical_outputs.insert(outcome.node_id, outcome.logical);
+                        content_outputs.insert(outcome.node_id, outcome.content_id);
 
                         // Release any nodes deferred behind this key — they
                         // can now cache-hit. Re-add them to the ready set.
