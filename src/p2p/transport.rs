@@ -24,6 +24,7 @@ use tokio::sync::RwLock;
 
 use crate::error::TrainError;
 use crate::framework::artifact::ContentHash;
+use crate::framework::execution::ExecutionFailure;
 use crate::p2p::bundle::BlobDir;
 use crate::p2p::crypto::KeyPair;
 use crate::p2p::peer::{PeerCapabilities, PeerId, PeerInfo};
@@ -46,6 +47,14 @@ pub enum WireMessage {
     Task(TaskManifest),
     /// Peer → Coordinator: task result.
     Result(TaskResult),
+    /// Peer → Coordinator: typed terminal failure. This preserves cookbook
+    /// failure identity instead of flattening it into `Error { message }`.
+    ExecutionFailed {
+        task_id: String,
+        failure: ExecutionFailure,
+    },
+    /// Peer → Coordinator: peer observed cancellation before producing output.
+    ExecutionCancelled { task_id: String, reason: String },
     /// Coordinator → Peer: cancel a running task.
     Cancel { task_id: String },
     /// Either direction: error message.
@@ -72,6 +81,21 @@ pub enum WireMessage {
     BundleBlobEnd {
         task_id: String,
         dir: crate::p2p::bundle::BlobDir,
+    },
+}
+
+/// Terminal reply for one dispatched P2P task. The coordinator adapter maps
+/// this directly into the canonical execution lifecycle.
+#[derive(Clone, Debug)]
+pub enum TaskReply {
+    Succeeded(TaskResult),
+    Failed {
+        task_id: String,
+        failure: ExecutionFailure,
+    },
+    Cancelled {
+        task_id: String,
+        reason: String,
     },
 }
 
@@ -644,18 +668,37 @@ impl P2pServer {
         send_message(&mut stream, &WireMessage::Task(task.clone())).await
     }
 
-    /// Wait for a result from a peer on an accepted stream.
-    pub async fn recv_result(conn: &QuinnConnection) -> Result<TaskResult, TrainError> {
+    /// Wait for one terminal task reply from a peer on an accepted stream.
+    pub async fn recv_task_reply(conn: &QuinnConnection) -> Result<TaskReply, TrainError> {
         let mut stream = conn
             .accept_uni()
             .await
             .map_err(|e| TrainError::other(format!("accept result stream: {e}")))?;
         match recv_message(&mut stream).await? {
-            WireMessage::Result(result) => Ok(result),
+            WireMessage::Result(result) => Ok(TaskReply::Succeeded(result)),
+            WireMessage::ExecutionFailed { task_id, failure } => {
+                Ok(TaskReply::Failed { task_id, failure })
+            }
+            WireMessage::ExecutionCancelled { task_id, reason } => {
+                Ok(TaskReply::Cancelled { task_id, reason })
+            }
             WireMessage::Error { message } => {
                 Err(TrainError::other(format!("peer error: {message}")))
             }
             other => Err(TrainError::other(format!("unexpected message: {other:?}"))),
+        }
+    }
+
+    /// Compatibility helper for standalone callers that only accept success.
+    pub async fn recv_result(conn: &QuinnConnection) -> Result<TaskResult, TrainError> {
+        match Self::recv_task_reply(conn).await? {
+            TaskReply::Succeeded(result) => Ok(result),
+            TaskReply::Failed { task_id, failure } => Err(TrainError::other(format!(
+                "peer task {task_id} failed: {failure}"
+            ))),
+            TaskReply::Cancelled { task_id, reason } => Err(TrainError::other(format!(
+                "peer task {task_id} cancelled: {reason}"
+            ))),
         }
     }
 
@@ -937,6 +980,46 @@ impl P2pClient {
             .await
             .map_err(|e| TrainError::other(format!("open result stream: {e}")))?;
         send_message(&mut stream, &WireMessage::Result(result.clone())).await
+    }
+
+    /// Send a structured task failure back to the coordinator.
+    pub async fn send_execution_failure(
+        conn: &QuinnConnection,
+        task_id: &str,
+        failure: &ExecutionFailure,
+    ) -> Result<(), TrainError> {
+        let mut stream = conn
+            .open_uni()
+            .await
+            .map_err(|e| TrainError::other(format!("open execution-failure stream: {e}")))?;
+        send_message(
+            &mut stream,
+            &WireMessage::ExecutionFailed {
+                task_id: task_id.to_string(),
+                failure: failure.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Send a cancellation acknowledgement back to the coordinator.
+    pub async fn send_execution_cancelled(
+        conn: &QuinnConnection,
+        task_id: &str,
+        reason: &str,
+    ) -> Result<(), TrainError> {
+        let mut stream = conn
+            .open_uni()
+            .await
+            .map_err(|e| TrainError::other(format!("open execution-cancel stream: {e}")))?;
+        send_message(
+            &mut stream,
+            &WireMessage::ExecutionCancelled {
+                task_id: task_id.to_string(),
+                reason: reason.to_string(),
+            },
+        )
+        .await
     }
 
     /// Send an error to the coordinator.

@@ -82,6 +82,10 @@ async fn task_manifest_sign_verify_roundtrip() {
         resources: ResourceRequest::default(),
         data_class: DataClass::Public,
         timeout_secs: 3600,
+        deadline: blut::framework::execution::ExecutionDeadline::from_now(
+            None,
+            Duration::from_secs(3600),
+        ),
         encrypted_input: None,
         signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
     };
@@ -212,8 +216,13 @@ mod e2e {
     use super::*;
     use async_trait::async_trait;
     use blut::framework::artifact::Artifact;
+    use blut::framework::artifact_store::{ArtifactRole, capture};
     use blut::framework::cookbook::{Cookbook, Registry};
     use blut::framework::error::StageError;
+    use blut::framework::execution::{
+        DataClassification, EXECUTION_PROTOCOL_VERSION, ExecutionDeadline, ExecutionRequest,
+        ExecutionResources, ExecutionResult, drive_execution,
+    };
     use blut::framework::resource::Resource;
     use blut::framework::stage::{ErasedStageCtor, Stage, StageContext};
     use blut::p2p::PeerInfo;
@@ -223,6 +232,7 @@ mod e2e {
     use blut::p2p::transport::P2pServer;
     use serde::{Deserialize, Serialize};
     use std::path::{Path, PathBuf};
+    use tokio_util::sync::CancellationToken;
 
     // A file-backed artifact: one text file on disk.
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -435,6 +445,130 @@ mod e2e {
         drop(coord_conn);
         let _ = tokio::time::timeout(Duration::from_secs(2), peer).await;
         server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn coordinator_adapter_restores_portable_output() {
+        let coord_kp = Arc::new(KeyPair::generate());
+        let peer_kp = Arc::new(KeyPair::generate());
+        let policy: Arc<dyn DispatchPolicy> = Arc::new(AllowUpper);
+        let (registry_store, _dir) = temp_registry();
+        let coordinator = Coordinator::start(
+            "127.0.0.1:0".parse().unwrap(),
+            coord_kp.clone(),
+            policy,
+            registry_store,
+        )
+        .await
+        .unwrap();
+        let addr = coordinator.local_addr().unwrap();
+
+        let peer_kp_c = peer_kp.clone();
+        let coord_verifying = coord_kp.verifying;
+        let coord_x = coord_kp.x25519_public;
+        let peer_work = tempfile::tempdir().unwrap();
+        let peer_work_path = peer_work.path().to_path_buf();
+        let peer_stop = CancellationToken::new();
+        let peer_stop_c = peer_stop.clone();
+        let peer = tokio::spawn(async move {
+            let client = P2pClient::new(peer_kp_c.clone());
+            let (conn, _peer_id) = client.connect(addr).await.unwrap();
+            let keys = CoordinatorKeys {
+                verifying: coord_verifying,
+                x25519_pub: coord_x,
+            };
+            let peer_registry = registry();
+            let peer_policy = AllowUpper;
+            tokio::select! {
+                _ = peer_stop_c.cancelled() => {}
+                _ = run_peer_loop(
+                    &conn,
+                    &peer_kp_c,
+                    &keys,
+                    &peer_registry,
+                    &peer_policy,
+                    &peer_work_path,
+                ) => {}
+            }
+        });
+
+        let peer_id = PeerId::from_pubkey(&peer_kp.verifying);
+        for _ in 0..40 {
+            if coordinator.peers().read().await.get(&peer_id).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(coordinator.peers().read().await.get(&peer_id).is_some());
+
+        let src_root = tempfile::tempdir().unwrap();
+        let input_path = src_root.path().join("in.txt");
+        std::fs::write(&input_path, b"adapter roundtrip").unwrap();
+        let input = TextFile {
+            content_hash: ContentHash::hash_file(&input_path).unwrap(),
+            path: input_path,
+        };
+        let stage: Arc<dyn blut::framework::stage::StageDyn> = Arc::new(Upper);
+        let stored = capture(
+            stage.as_ref(),
+            blut::framework::stage::ErasedArtifact::from_typed(&input).unwrap(),
+            src_root.path(),
+            ArtifactRole::Input,
+            None,
+        )
+        .unwrap();
+        let request = ExecutionRequest {
+            protocol_version: EXECUTION_PROTOCOL_VERSION,
+            execution_id: "adapter-roundtrip-1".into(),
+            stage_name: "upper".into(),
+            stage_schema: 1,
+            invocation_key: blut::framework::CacheHandle::key_for(
+                "upper",
+                1,
+                input.content_hash,
+                &serde_json::json!({}),
+                b"p2p-adapter-v1",
+            ),
+            args_hash: ContentHash::of_bytes(b"{}"),
+            args: serde_json::json!({}),
+            input: stored,
+            expected_content_id: None,
+            resources: ExecutionResources::default(),
+            data_class: DataClassification::Public,
+            deadline: ExecutionDeadline::from_now(None, Duration::from_secs(5)),
+        };
+        let output_root = tempfile::tempdir().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            drive_execution(
+                &coordinator,
+                request,
+                &CancellationToken::new(),
+                stage,
+                output_root.path(),
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("canonical driver must respect P2P deadline");
+        let artifact = match result {
+            ExecutionResult::Succeeded { artifact, .. } => artifact,
+            ExecutionResult::Failed(failure) => {
+                panic!("expected restored P2P output, failed: {failure}")
+            }
+            ExecutionResult::Cancelled => panic!("expected restored P2P output, got cancellation"),
+            ExecutionResult::TimedOut { .. } => panic!("expected restored P2P output, timed out"),
+        };
+        let output: TextFile = artifact.into_typed().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&output.path).unwrap(),
+            "ADAPTER ROUNDTRIP"
+        );
+        assert!(output.path.starts_with(output_root.path()));
+
+        coordinator.shutdown();
+        peer_stop.cancel();
+        peer.abort();
     }
 }
 

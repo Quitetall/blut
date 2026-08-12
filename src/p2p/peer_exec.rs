@@ -28,13 +28,18 @@ use quinn::Connection as QuinnConnection;
 
 use crate::error::TrainError;
 use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
+use crate::framework::artifact_store::StoredArtifact;
 use crate::framework::cache::CacheHandle;
 use crate::framework::cookbook::Registry;
+use crate::framework::execution::{
+    Assignment, DataClassification, ExecutionDeadline, ExecutionFailure, ExecutionFailureKind,
+    ExecutionLifecycle, ExecutionPhase, ExecutionRequest,
+};
 use crate::framework::stage::{ErasedArtifact, StageContext};
 use crate::p2p::PeerId;
 use crate::p2p::bundle::{self, BlobDir};
 use crate::p2p::crypto::{self, KeyPair};
-use crate::p2p::dispatch::DispatchPolicy;
+use crate::p2p::dispatch::{DispatchPolicy, DispatchVerdict};
 use crate::p2p::task::{TaskManifest, TaskResult};
 use crate::p2p::transport::{self, MAX_BLOB_SIZE, P2pClient};
 use crate::p2p::trust::DataClass;
@@ -84,10 +89,14 @@ pub async fn run_peer_loop(
         .await
         {
             Ok(()) => {}
-            Err(e) => {
-                tracing::warn!("peer task {task_id} failed: {e}");
+            Err(failure) if failure.code == "EXECUTION_CANCELLED" => {
+                tracing::info!("peer task {task_id} cancelled: {failure}");
+                let _ = P2pClient::send_execution_cancelled(conn, &task_id, &failure.message).await;
+            }
+            Err(failure) => {
+                tracing::warn!("peer task {task_id} failed: {failure}");
                 // Best-effort: tell the coordinator so it can re-dispatch.
-                let _ = P2pClient::send_error(conn, &format!("{e}")).await;
+                let _ = P2pClient::send_execution_failure(conn, &task_id, &failure).await;
             }
         }
     }
@@ -145,6 +154,9 @@ fn open_blob(bytes: &[u8], kp: &KeyPair) -> Result<Vec<u8>, TrainError> {
 }
 
 /// Handle a single dispatched task end-to-end.
+// The peer emits this rich, serializable failure over the wire; boxing here
+// would add an allocation without reducing any caller-facing interface cost.
+#[allow(clippy::result_large_err)]
 async fn execute_one(
     conn: &QuinnConnection,
     keypair: &KeyPair,
@@ -153,9 +165,9 @@ async fn execute_one(
     policy: &dyn DispatchPolicy,
     work_root: &std::path::Path,
     task: TaskManifest,
-) -> Result<(), TrainError> {
+) -> Result<(), ExecutionFailure> {
     if task.protocol_version != crate::p2p::task::TASK_PROTOCOL_VERSION {
-        return Err(TrainError::other(format!(
+        return Err(ExecutionFailure::protocol(format!(
             "task protocol v{} unsupported (want v{})",
             task.protocol_version,
             crate::p2p::task::TASK_PROTOCOL_VERSION
@@ -167,11 +179,13 @@ async fn execute_one(
         &task.sign_payload(),
         &task.signature,
     ) {
-        return Err(TrainError::other("task manifest signature invalid"));
+        return Err(ExecutionFailure::protocol(
+            "task manifest signature invalid",
+        ));
     }
     // The signer must be the coordinator we connected to.
     if task.coordinator_id != PeerId::from_pubkey(&coordinator.verifying) {
-        return Err(TrainError::other(
+        return Err(ExecutionFailure::protocol(
             "task coordinator_id != connected coordinator",
         ));
     }
@@ -180,20 +194,21 @@ async fn execute_one(
     // coordinator could send a correctly signed manifest directly. Through M5,
     // Restricted data is node-local regardless of peer trust or encryption.
     if task.data_class == DataClass::Restricted {
-        return Err(TrainError::other(
+        return Err(ExecutionFailure::protocol(
             "remote task DENIED: Restricted data is node-local through M5 (ADR 0096)",
         ));
     }
     // Belt-and-suspenders: sign_payload() now covers `args` directly (a prior
     // version only signed args_hash and never checked it against the received
     // args), but reconcile args_hash explicitly too in case that ever regresses.
-    task.verify_args(&task.args)?;
+    task.verify_args(&task.args)
+        .map_err(|e| ExecutionFailure::protocol(e.to_string()))?;
 
     // task_id is network-controlled and becomes a path component below — reject
     // anything that isn't a flat, safe slug so a malicious coordinator can't
     // escape `work_root` via `../` or an absolute path.
     if !is_safe_task_id(&task.task_id) {
-        return Err(TrainError::other(format!(
+        return Err(ExecutionFailure::protocol(format!(
             "unsafe task_id '{}': expected [A-Za-z0-9._-]+ (no '..')",
             task.task_id
         )));
@@ -201,7 +216,7 @@ async fn execute_one(
 
     // 2. Policy gate: refuse a non-dispatchable stage (training never leaves home).
     if !policy.is_dispatchable(&task.stage_name) {
-        return Err(TrainError::other(format!(
+        return Err(ExecutionFailure::protocol(format!(
             "stage '{}' is not dispatchable",
             task.stage_name
         )));
@@ -210,7 +225,9 @@ async fn execute_one(
     // 3. Resolve the stage constructor (the peer hosts the cookbook).
     let ctor = registry
         .find_erased_stage(&task.stage_name)
-        .ok_or_else(|| TrainError::other(format!("unknown stage '{}'", task.stage_name)))?;
+        .ok_or_else(|| {
+            ExecutionFailure::protocol(format!("unknown stage '{}'", task.stage_name))
+        })?;
     let stage = ctor();
 
     // 4. Decode the input BundleManifest from the encrypted_input slot. Public
@@ -218,12 +235,15 @@ async fn execute_one(
     //    empty seal); non-Public is sealed to this peer's X25519 key.
     let input_manifest = match &task.encrypted_input {
         Some(payload) => {
-            let bytes = keypair.decrypt(payload)?;
-            bincode::deserialize::<bundle::BundleManifest>(&bytes)
-                .map_err(|e| TrainError::other(format!("decode input BundleManifest: {e}")))?
+            let bytes = keypair
+                .decrypt(payload)
+                .map_err(|e| ExecutionFailure::artifact(format!("decrypt input manifest: {e}")))?;
+            bincode::deserialize::<bundle::BundleManifest>(&bytes).map_err(|e| {
+                ExecutionFailure::artifact(format!("decode input BundleManifest: {e}"))
+            })?
         }
         None => {
-            return Err(TrainError::other(
+            return Err(ExecutionFailure::protocol(
                 "task has no encrypted_input — shared-FS dispatch not supported on this peer",
             ));
         }
@@ -235,7 +255,7 @@ async fn execute_one(
     //     it here too means a mismatched/malicious blob from a low-trust peer
     //     is never fully received into memory in the first place.
     if input_manifest.content_id != task.input_content_id {
-        return Err(TrainError::other(format!(
+        return Err(ExecutionFailure::artifact(format!(
             "identity binding: artifact {} != signed input identity {} — rejecting before blob receive",
             input_manifest.content_id.to_hex(),
             task.input_content_id.to_hex(),
@@ -244,8 +264,13 @@ async fn execute_one(
 
     // 5. Per-task work dir + a job-local cache. (task_id validated safe above.)
     let stage_dir = work_root.join(&task.task_id);
-    std::fs::create_dir_all(&stage_dir)
-        .map_err(|e| TrainError::other(format!("create peer stage_dir: {e}")))?;
+    std::fs::create_dir_all(&stage_dir).map_err(|e| {
+        ExecutionFailure::new(
+            ExecutionFailureKind::Storage,
+            "EXECUTION_STAGE_DIR",
+            format!("create peer stage_dir: {e}"),
+        )
+    })?;
     // RAII cleanup: `stage_dir` holds the imported input, the job-local cache,
     // and the stage's own outputs. Nothing past this function needs any of it
     // on disk — `run_peer_loop` only reads `task_id` (a String it already
@@ -269,9 +294,11 @@ async fn execute_one(
     //    see `seal_blob`) and unbundle into stage_dir. The bundle layer runs
     //    the four fail-closed gates against task.input_hash (content_hash was
     //    already pre-checked in 4b, before this buffered the blob).
-    let sealed_pack =
-        transport::recv_blob(conn, &task.task_id, BlobDir::Input, MAX_BLOB_SIZE).await?;
-    let pack = open_blob(&sealed_pack, keypair)?;
+    let sealed_pack = transport::recv_blob(conn, &task.task_id, BlobDir::Input, MAX_BLOB_SIZE)
+        .await
+        .map_err(|e| ExecutionFailure::transport(format!("receive input blob: {e}")))?;
+    let pack = open_blob(&sealed_pack, keypair)
+        .map_err(|e| ExecutionFailure::artifact(format!("open input blob: {e}")))?;
     let input: ErasedArtifact = bundle::unbundle(
         &*stage,
         &input_manifest,
@@ -280,22 +307,47 @@ async fn execute_one(
         Some(task.input_content_id),
         BlobDir::Input,
     )
-    .map_err(|e| TrainError::other(format!("unbundle input: {e}")))?;
+    .map_err(|e| ExecutionFailure::artifact(format!("unbundle input: {e}")))?;
 
-    // 7. Run the stage under the coordinator's wall-clock deadline. Its run()
-    //    opens primary_path(), which now exists locally. A runaway stage can't
-    //    block the peer loop forever — timeout_secs caps it.
+    // 7. Run under the coordinator's absolute deadline. It includes queueing
+    //    and transfer time, so a late peer never rebuilds a fresh hour-long
+    //    relative timeout after receiving an already-expired task.
     let started = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(task.timeout_secs.max(1));
-    let output = tokio::time::timeout(timeout, stage.run_erased(&ctx, input, task.args.clone()))
-        .await
-        .map_err(|_| {
-            TrainError::other(format!(
-                "stage '{}' exceeded timeout_secs {}",
-                task.stage_name, task.timeout_secs
-            ))
-        })?
-        .map_err(|e| TrainError::other(format!("stage run failed: {e}")))?;
+    let ctx = ctx;
+    let stage_cancel = ctx.cancel.clone();
+    let run = stage.run_erased(&ctx, input, task.args.clone());
+    tokio::pin!(run);
+    let output = tokio::select! {
+        result = &mut run => result
+            .map_err(|e| ExecutionFailure::from_stage_error(&task.stage_name, &e))?,
+        _ = ctx.cancel.cancelled() => {
+            return Err(ExecutionFailure::new(
+                ExecutionFailureKind::Stage,
+                "EXECUTION_CANCELLED",
+                "peer stage cancelled",
+            ));
+        }
+        _ = conn.closed() => {
+            stage_cancel.cancel();
+            return Err(ExecutionFailure::disconnected("coordinator connection closed while stage ran"));
+        }
+        _ = sleep_until_deadline(task.deadline.soft_remaining()) => {
+            stage_cancel.cancel();
+            return Err(ExecutionFailure::new(
+                ExecutionFailureKind::Stage,
+                "EXECUTION_SOFT_DEADLINE",
+                format!("stage '{}' exceeded soft execution deadline", task.stage_name),
+            ));
+        }
+        _ = tokio::time::sleep(task.deadline.hard_remaining()) => {
+            stage_cancel.cancel();
+            return Err(ExecutionFailure::new(
+                ExecutionFailureKind::Stage,
+                "EXECUTION_HARD_DEADLINE",
+                format!("stage '{}' exceeded hard execution deadline", task.stage_name),
+            ));
+        }
+    };
     let wall_time_ms = started.elapsed().as_millis() as u64;
 
     // 8. Bundle the output (rooted at the peer's stage_dir) + ship it back. An
@@ -308,11 +360,11 @@ async fn execute_one(
         BlobDir::Output,
         task.expected_content_id,
     )
-    .map_err(|e| TrainError::other(format!("bundle output: {e}")))?;
+    .map_err(|e| ExecutionFailure::artifact(format!("bundle output: {e}")))?;
 
     // Seal the output manifest to the coordinator's X25519 key.
     let manifest_bytes = bincode::serialize(&out_manifest)
-        .map_err(|e| TrainError::other(format!("serialize output manifest: {e}")))?;
+        .map_err(|e| ExecutionFailure::artifact(format!("serialize output manifest: {e}")))?;
     let encrypted_output = crypto::encrypt(&manifest_bytes, &coordinator.x25519_pub);
 
     let mut result = TaskResult {
@@ -329,11 +381,23 @@ async fn execute_one(
     // Seal the bulk output blob to the coordinator too (same reasoning as the
     // input leg in step 6 — see `seal_blob`); previously this shipped the
     // plaintext `out_pack` straight to `send_blob`.
-    let sealed_out_pack = seal_blob(&out_pack, &coordinator.x25519_pub)?;
+    let sealed_out_pack = seal_blob(&out_pack, &coordinator.x25519_pub)
+        .map_err(|e| ExecutionFailure::artifact(format!("seal output blob: {e}")))?;
 
-    P2pClient::send_result(conn, &result).await?;
-    transport::send_blob(conn, &task.task_id, BlobDir::Output, &sealed_out_pack).await?;
+    P2pClient::send_result(conn, &result)
+        .await
+        .map_err(|e| ExecutionFailure::transport(format!("send task result: {e}")))?;
+    transport::send_blob(conn, &task.task_id, BlobDir::Output, &sealed_out_pack)
+        .await
+        .map_err(|e| ExecutionFailure::transport(format!("send output blob: {e}")))?;
     Ok(())
+}
+
+async fn sleep_until_deadline(duration: Option<std::time::Duration>) {
+    match duration {
+        Some(duration) => tokio::time::sleep(duration).await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// A `task_id` is safe to use as a single path component: non-empty, only
@@ -355,6 +419,215 @@ pub struct DispatchedOutput {
     pub output: ErasedArtifact,
     pub content_id: ContentId,
     pub peer_id: PeerId,
+}
+
+/// Portable output returned by the P2P data plane before the executor restores
+/// it into its own attempt directory.
+pub struct DispatchedStoredOutput {
+    pub stored: StoredArtifact,
+    pub content_id: ContentId,
+    pub peer_id: PeerId,
+    pub wall_time_ms: u64,
+}
+
+/// Cancellation is a terminal disposition, not a stringly transport error.
+pub enum StoredDispatchOutcome {
+    Succeeded(Box<DispatchedStoredOutput>),
+    Cancelled { reason: String },
+}
+
+fn p2p_data_class(data_class: DataClassification) -> crate::p2p::trust::DataClass {
+    match data_class {
+        DataClassification::Public => crate::p2p::trust::DataClass::Public,
+        DataClassification::Internal => crate::p2p::trust::DataClass::Internal,
+        DataClassification::Restricted => crate::p2p::trust::DataClass::Restricted,
+    }
+}
+
+fn lifecycle_phase(
+    lifecycle: Option<(&ExecutionLifecycle, &Assignment)>,
+    phase: ExecutionPhase,
+) -> Result<(), crate::framework::execution::LifecycleError> {
+    if let Some((lifecycle, _assignment)) = lifecycle {
+        lifecycle.transition(phase, None)?;
+    }
+    Ok(())
+}
+
+/// Coordinator side of the portable P2P data plane. This module owns task
+/// signing, encrypted transport, peer-result verification, and conversion back
+/// to A09's [`StoredArtifact`]. The executor sees only `ExecutionAdapter`.
+pub async fn dispatch_stored_to_peer(
+    conn: &QuinnConnection,
+    coordinator_kp: &KeyPair,
+    peer: &crate::p2p::PeerInfo,
+    request: &ExecutionRequest,
+    verification: Option<&dyn DispatchPolicy>,
+    lifecycle: Option<(&ExecutionLifecycle, &Assignment)>,
+) -> Result<StoredDispatchOutcome, ExecutionFailure> {
+    if request.protocol_version != crate::framework::execution::EXECUTION_PROTOCOL_VERSION {
+        return Err(ExecutionFailure::protocol(format!(
+            "execution protocol v{} unsupported (want v{})",
+            request.protocol_version,
+            crate::framework::execution::EXECUTION_PROTOCOL_VERSION,
+        )));
+    }
+    if !is_safe_task_id(&request.execution_id) {
+        return Err(ExecutionFailure::protocol(format!(
+            "unsafe execution_id '{}'",
+            request.execution_id
+        )));
+    }
+    let manifest_bytes = bincode::serialize(&request.input.manifest)
+        .map_err(|e| ExecutionFailure::artifact(format!("serialize input manifest: {e}")))?;
+    let encrypted_input = crypto::encrypt(&manifest_bytes, &peer.x25519_pub);
+    let sealed_input = seal_blob(&request.input.pack, &peer.x25519_pub)
+        .map_err(|e| ExecutionFailure::artifact(format!("seal input blob: {e}")))?;
+    let mut task = TaskManifest {
+        protocol_version: crate::p2p::task::TASK_PROTOCOL_VERSION,
+        task_id: request.execution_id.clone(),
+        coordinator_id: PeerId::from_pubkey(&coordinator_kp.verifying),
+        stage_name: request.stage_name.clone(),
+        stage_schema: request.stage_schema,
+        input_content_id: request.input.manifest.content_id,
+        invocation_key: request.invocation_key,
+        args_hash: request.args_hash,
+        expected_content_id: request.expected_content_id,
+        args: request.args.clone(),
+        resources: crate::p2p::task::ResourceRequest {
+            cpu_cores: request.resources.cpu_cores,
+            memory_gib: request.resources.memory_gib,
+            gpu: request.resources.gpu,
+            gpu_vram_gib: request.resources.gpu_vram_gib,
+        },
+        data_class: p2p_data_class(request.data_class),
+        timeout_secs: request.deadline.hard_remaining().as_secs().max(1),
+        deadline: request.deadline,
+        encrypted_input: Some(encrypted_input),
+        signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
+    };
+    task.signature = coordinator_kp.sign(&task.sign_payload());
+
+    lifecycle_phase(lifecycle, ExecutionPhase::UploadingInput)
+        .map_err(|error| ExecutionFailure::protocol(format!("P2P upload transition: {error}")))?;
+    transport::P2pServer::send_task(conn, &task)
+        .await
+        .map_err(|e| ExecutionFailure::transport(format!("send task: {e}")))?;
+    transport::send_blob(conn, &task.task_id, BlobDir::Input, &sealed_input)
+        .await
+        .map_err(|e| ExecutionFailure::transport(format!("send input blob: {e}")))?;
+    lifecycle_phase(lifecycle, ExecutionPhase::Running)
+        .map_err(|error| ExecutionFailure::protocol(format!("P2P running transition: {error}")))?;
+
+    let reply = transport::P2pServer::recv_task_reply(conn)
+        .await
+        .map_err(|e| ExecutionFailure::disconnected(format!("receive task reply: {e}")))?;
+    let result = match reply {
+        transport::TaskReply::Succeeded(result) => result,
+        transport::TaskReply::Failed { task_id, failure } => {
+            if task_id != task.task_id {
+                return Err(ExecutionFailure::protocol(format!(
+                    "failure task_id {task_id} != dispatched task {}",
+                    task.task_id
+                )));
+            }
+            return Err(failure);
+        }
+        transport::TaskReply::Cancelled { task_id, reason } => {
+            if task_id != task.task_id {
+                return Err(ExecutionFailure::protocol(format!(
+                    "cancel task_id {task_id} != dispatched task {}",
+                    task.task_id
+                )));
+            }
+            return Ok(StoredDispatchOutcome::Cancelled { reason });
+        }
+    };
+    if result.task_id != task.task_id {
+        return Err(ExecutionFailure::protocol("result task_id mismatch"));
+    }
+    if result.protocol_version != crate::p2p::task::TASK_PROTOCOL_VERSION {
+        return Err(ExecutionFailure::protocol(format!(
+            "result protocol v{} unsupported (want v{})",
+            result.protocol_version,
+            crate::p2p::task::TASK_PROTOCOL_VERSION,
+        )));
+    }
+    if result.peer_id != peer.id {
+        return Err(ExecutionFailure::protocol(format!(
+            "result peer {} != selected peer {}",
+            result.peer_id, peer.id
+        )));
+    }
+    if !crypto::verify(&peer.pubkey, &result.sign_payload(), &result.signature) {
+        return Err(ExecutionFailure::protocol("result signature invalid"));
+    }
+    if let Some(policy) = verification {
+        match policy.verify_result(&result, request.expected_content_id, &peer.pubkey) {
+            DispatchVerdict::Accept => {}
+            DispatchVerdict::Reject(reason) => {
+                return Err(ExecutionFailure::protocol(format!(
+                    "dispatch policy rejected peer result: {reason}"
+                )));
+            }
+            DispatchVerdict::RetryOnDifferentPeer => {
+                return Err(ExecutionFailure::unavailable(
+                    "dispatch policy requires retry on a different peer",
+                ));
+            }
+        }
+    }
+    let encrypted_output = result
+        .encrypted_output
+        .as_ref()
+        .ok_or_else(|| ExecutionFailure::artifact("result has no encrypted_output"))?;
+    let output_manifest_bytes = coordinator_kp
+        .decrypt(encrypted_output)
+        .map_err(|e| ExecutionFailure::artifact(format!("decrypt output manifest: {e}")))?;
+    let manifest = bincode::deserialize::<bundle::BundleManifest>(&output_manifest_bytes)
+        .map_err(|e| ExecutionFailure::artifact(format!("decode output manifest: {e}")))?;
+    if manifest.content_id != result.content_id {
+        return Err(ExecutionFailure::artifact(format!(
+            "identity binding: artifact {} != signed result identity {}",
+            manifest.content_id, result.content_id
+        )));
+    }
+    if let Some(expected) = request.expected_content_id
+        && expected != result.content_id
+    {
+        return Err(ExecutionFailure::artifact(format!(
+            "output identity {} != analytically expected {}",
+            result.content_id, expected
+        )));
+    }
+
+    lifecycle_phase(lifecycle, ExecutionPhase::UploadingOutput).map_err(|error| {
+        ExecutionFailure::protocol(format!("P2P output-upload transition: {error}"))
+    })?;
+    lifecycle_phase(lifecycle, ExecutionPhase::DownloadingOutput).map_err(|error| {
+        ExecutionFailure::protocol(format!("P2P output-download transition: {error}"))
+    })?;
+    let sealed_output = transport::recv_blob(conn, &task.task_id, BlobDir::Output, MAX_BLOB_SIZE)
+        .await
+        .map_err(|e| ExecutionFailure::disconnected(format!("receive output blob: {e}")))?;
+    let pack = open_blob(&sealed_output, coordinator_kp)
+        .map_err(|e| ExecutionFailure::artifact(format!("open output blob: {e}")))?;
+    if manifest.blob_len != u64::try_from(pack.len()).unwrap_or(u64::MAX)
+        || manifest.blob_sha256 != ContentHash::of_bytes(&pack)
+    {
+        return Err(ExecutionFailure::artifact(
+            "output pack does not match its signed manifest",
+        ));
+    }
+
+    Ok(StoredDispatchOutcome::Succeeded(Box::new(
+        DispatchedStoredOutput {
+            stored: StoredArtifact { manifest, pack },
+            content_id: result.content_id,
+            peer_id: result.peer_id,
+            wall_time_ms: result.wall_time_ms,
+        },
+    )))
 }
 
 /// Coordinator side of one dispatch: bundle `input` (rooted at its producing
@@ -421,6 +694,10 @@ pub async fn dispatch_to_peer(
         resources: crate::p2p::task::ResourceRequest::default(),
         data_class,
         timeout_secs,
+        deadline: ExecutionDeadline::from_now(
+            None,
+            std::time::Duration::from_secs(timeout_secs.max(1)),
+        ),
         encrypted_input: Some(encrypted_input),
         signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
     };

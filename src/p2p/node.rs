@@ -502,6 +502,10 @@ mod tests {
             resources: ResourceRequest::default(),
             data_class: DataClass::Public,
             timeout_secs: 30,
+            deadline: crate::framework::execution::ExecutionDeadline::from_now(
+                None,
+                std::time::Duration::from_secs(30),
+            ),
             encrypted_input: None,
             signature: signer.sign(b"placeholder"),
         };

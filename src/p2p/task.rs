@@ -11,11 +11,12 @@ use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 
 use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
+use crate::framework::execution::ExecutionDeadline;
 use crate::p2p::crypto::EncryptedPayload;
 use crate::p2p::peer::PeerId;
 use crate::p2p::trust::DataClass;
 
-pub const TASK_PROTOCOL_VERSION: u16 = 2;
+pub const TASK_PROTOCOL_VERSION: u16 = 3;
 
 fn legacy_protocol_version() -> u16 {
     1
@@ -54,14 +55,19 @@ pub struct TaskManifest {
     pub resources: ResourceRequest,
     /// Data sensitivity classification.
     pub data_class: DataClass,
-    /// Maximum wall-clock time (seconds) for the task.
+    /// Compatibility budget used by older cloud queue callers. P2P execution
+    /// obeys [`deadline`](Self::deadline), never this relative value.
     pub timeout_secs: u64,
+    /// Absolute deadline retained across queueing, transfer, and peer runtime.
+    /// Protocol v3 rejects manifests without this field rather than rebuilding a
+    /// fresh relative timeout on the peer.
+    pub deadline: ExecutionDeadline,
     /// Encrypted input data (None for Public data on a shared filesystem).
     pub encrypted_input: Option<EncryptedPayload>,
     /// Ed25519 signature over (task_id + stage_name + input_hash + args_hash +
     /// args + expected_output_hash + coordinator_id + resources + data_class +
-    /// timeout_secs). The peer verifies this to confirm the task came from the
-    /// coordinator. Note the signature covers `args` directly (not just
+    /// timeout_secs + deadline). The peer verifies this to confirm the task came
+    /// from the coordinator. Note the signature covers `args` directly (not just
     /// `args_hash`) — see `sign_payload` and `verify_args`.
     #[serde(with = "sig_serde")]
     pub signature: Signature,
@@ -153,6 +159,14 @@ impl TaskManifest {
             DataClass::Restricted => 2,
         });
         buf.extend_from_slice(&self.timeout_secs.to_le_bytes());
+        match self.deadline.soft_unix_ms {
+            Some(soft) => {
+                buf.push(1);
+                buf.extend_from_slice(&soft.to_le_bytes());
+            }
+            None => buf.push(0),
+        }
+        buf.extend_from_slice(&self.deadline.hard_unix_ms.to_le_bytes());
         buf
     }
 
@@ -261,6 +275,7 @@ mod tests {
             resources: ResourceRequest::default(),
             data_class: DataClass::Public,
             timeout_secs: 3600,
+            deadline: ExecutionDeadline::from_now(None, std::time::Duration::from_secs(3600)),
             encrypted_input: None,
             signature: kp.sign(b"placeholder"),
         };
@@ -391,6 +406,7 @@ mod tests {
             resources: ResourceRequest::default(),
             data_class: DataClass::Public,
             timeout_secs: 3600,
+            deadline: ExecutionDeadline::from_now(None, std::time::Duration::from_secs(3600)),
             encrypted_input: None,
             signature: kp.sign(b"placeholder"),
         };

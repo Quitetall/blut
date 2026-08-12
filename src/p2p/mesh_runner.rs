@@ -324,6 +324,10 @@ mod tests {
             resources: crate::p2p::task::ResourceRequest::default(),
             data_class: crate::p2p::trust::DataClass::Public,
             timeout_secs: 30,
+            deadline: crate::framework::execution::ExecutionDeadline::from_now(
+                None,
+                std::time::Duration::from_secs(30),
+            ),
             encrypted_input: None,
             signature: coordinator.sign(b"placeholder"),
         };
@@ -393,6 +397,10 @@ mod tests {
             resources: crate::p2p::task::ResourceRequest::default(),
             data_class: crate::p2p::trust::DataClass::Public,
             timeout_secs: 30,
+            deadline: crate::framework::execution::ExecutionDeadline::from_now(
+                None,
+                std::time::Duration::from_secs(30),
+            ),
             encrypted_input: None,
             signature: impostor.sign(b"placeholder"),
         };

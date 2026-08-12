@@ -10,25 +10,33 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::{RwLock, oneshot};
+use async_trait::async_trait;
+use tokio::sync::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 
-use crate::config::launcher::JobState;
 use crate::error::TrainError;
 use crate::framework::artifact::ContentId;
+use crate::framework::execution::{
+    Assignment, DataClassification, ExecutionAdapter, ExecutionArtifact, ExecutionDeadline,
+    ExecutionFailure, ExecutionFailureKind, ExecutionHandle, ExecutionLifecycle, ExecutionMode,
+    ExecutionPhase, ExecutionRequest, ExecutionSnapshot, ExecutionTerminal,
+};
 use crate::p2p::crypto::KeyPair;
 use crate::p2p::dispatch::{DispatchPolicy, DispatchVerdict};
-use crate::p2p::job::P2pJob;
 use crate::p2p::peer::PeerId;
+use crate::p2p::peer_exec::{StoredDispatchOutcome, dispatch_stored_to_peer};
 use crate::p2p::registry::PeerRegistry;
-use crate::p2p::task::{TaskManifest, TaskResult};
+use crate::p2p::task::TaskResult;
 use crate::p2p::transport::P2pServer;
 
-/// Handle to a task submitted to the coordinator, used to track its
-/// lifecycle and deliver the result.
-pub(crate) struct PendingTask {
-    result_tx: oneshot::Sender<Result<TaskResult, String>>,
-    expected_content_id: Option<ContentId>,
+/// One live QUIC peer. Blob receive consumes every uni stream, so this gate is
+/// load-bearing: one task owns a connection until its terminal reply arrives.
+#[derive(Clone)]
+pub(crate) struct PeerSession {
+    conn: quinn::Connection,
+    gate: Arc<Mutex<()>>,
 }
 
 /// The P2P coordinator. Manages peers, dispatches tasks, verifies results.
@@ -37,13 +45,11 @@ pub struct Coordinator {
     dispatch: Arc<dyn DispatchPolicy>,
     /// The coordinator's keypair for signing task manifests.
     keypair: Arc<KeyPair>,
-    /// The coordinator's peer ID (derived from keypair).
-    coordinator_id: PeerId,
-    /// Pending tasks. Uses parking_lot so the sync DispatchSubmitter::submit
-    /// can lock without async.
-    pub(crate) pending: Arc<parking_lot::RwLock<HashMap<String, PendingTask>>>,
     /// Active peer connections, keyed by PeerId.
-    pub(crate) connections: Arc<RwLock<HashMap<PeerId, quinn::Connection>>>,
+    pub(crate) connections: Arc<RwLock<HashMap<PeerId, PeerSession>>>,
+    /// Strictly increasing fence for every assignment, including re-use of one
+    /// peer after a prior lease or connection is abandoned.
+    generation: Arc<AtomicU64>,
 }
 
 impl Coordinator {
@@ -54,27 +60,22 @@ impl Coordinator {
         dispatch: Arc<dyn DispatchPolicy>,
         peers: PeerRegistry,
     ) -> Result<Self, TrainError> {
-        let coordinator_id = PeerId::from_pubkey(&keypair.verifying);
         let server = Arc::new(P2pServer::bind(addr, keypair.clone(), peers).await?);
-        let pending = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let connections = Arc::new(RwLock::new(HashMap::new()));
 
         // Spawn the accept loop.
         let server_c = server.clone();
-        let pending_c = pending.clone();
-        let dispatch_c = dispatch.clone();
         let connections_c = connections.clone();
         tokio::spawn(async move {
-            Self::accept_loop(server_c, pending_c, dispatch_c, connections_c).await;
+            Self::accept_loop(server_c, connections_c).await;
         });
 
         Ok(Self {
             server,
             dispatch,
             keypair,
-            coordinator_id,
-            pending,
             connections,
+            generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -86,73 +87,6 @@ impl Coordinator {
     /// Get the peer registry.
     pub fn peers(&self) -> Arc<RwLock<PeerRegistry>> {
         self.server.peers.clone()
-    }
-
-    /// Submit a task to the coordinator. The coordinator will dispatch it
-    /// to the best available peer. Returns a `P2pJob` handle for tracking.
-    pub async fn submit_task(&self, manifest: TaskManifest) -> Result<P2pJob, TrainError> {
-        if manifest.protocol_version != crate::p2p::task::TASK_PROTOCOL_VERSION {
-            return Err(TrainError::other(format!(
-                "task protocol v{} unsupported (want v{})",
-                manifest.protocol_version,
-                crate::p2p::task::TASK_PROTOCOL_VERSION
-            )));
-        }
-        let task_id = manifest.task_id.clone();
-        let expected_content_id = manifest.expected_content_id;
-
-        let (result_tx, result_rx) = oneshot::channel();
-
-        // Select a peer.
-        let peers = self.server.peers.read().await;
-        let peer_list: Vec<_> = peers.list().into_iter().cloned().collect();
-        drop(peers);
-
-        let data_class = self
-            .dispatch
-            .classify_stage(&manifest.stage_name, &manifest.args);
-        let peer_id = self
-            .dispatch
-            .select_peer(
-                &manifest.stage_name,
-                &manifest.resources,
-                data_class,
-                &peer_list,
-            )
-            .ok_or_else(|| TrainError::other("no suitable peer available"))?;
-
-        // Register as pending.
-        {
-            let mut pending = self.pending.write();
-            pending.insert(
-                task_id.clone(),
-                PendingTask {
-                    result_tx,
-                    expected_content_id,
-                },
-            );
-        }
-
-        // Send the task to the peer. Clone the connection out, drop the
-        // lock, then send — avoids holding the read lock during I/O.
-        let conn = {
-            let connections = self.connections.read().await;
-            connections.get(&peer_id).cloned()
-        };
-        if let Some(conn) = conn {
-            P2pServer::send_task(&conn, &manifest).await?;
-            tracing::info!("Dispatched task {} to peer {}", task_id, peer_id);
-        } else {
-            // Peer not connected — remove from pending and fail.
-            let mut pending = self.pending.write();
-            pending.remove(&task_id);
-            return Err(TrainError::other(format!(
-                "peer {peer_id} not connected (task {task_id})"
-            )));
-        }
-
-        let job = P2pJob::new(task_id, peer_id, result_rx);
-        Ok(job)
     }
 
     /// Verify a task result. Returns the dispatch verdict.
@@ -169,32 +103,37 @@ impl Coordinator {
         }
     }
 
-    /// The accept loop: processes incoming peer connections and dispatches
-    /// results to pending tasks.
+    /// The accept loop only owns live connection registration. Per-attempt
+    /// adapters own task replies and blob streams; a background result reader
+    /// would race `recv_blob`, which consumes all incoming uni streams.
     async fn accept_loop(
         server: Arc<P2pServer>,
-        pending: Arc<parking_lot::RwLock<HashMap<String, PendingTask>>>,
-        dispatch: Arc<dyn DispatchPolicy>,
-        connections: Arc<RwLock<HashMap<PeerId, quinn::Connection>>>,
+        connections: Arc<RwLock<HashMap<PeerId, PeerSession>>>,
     ) {
         loop {
             match server.accept_peer().await {
                 Ok((peer_id, conn)) => {
-                    // Store the connection.
+                    let stable_id = conn.stable_id();
                     {
                         let mut conns = connections.write().await;
-                        conns.insert(peer_id.clone(), conn.clone());
+                        conns.insert(
+                            peer_id.clone(),
+                            PeerSession {
+                                conn: conn.clone(),
+                                gate: Arc::new(Mutex::new(())),
+                            },
+                        );
                     }
-
-                    let server_c = server.clone();
-                    let pending_c = pending.clone();
-                    let dispatch_c = dispatch.clone();
                     let connections_c = connections.clone();
                     tokio::spawn(async move {
-                        Self::handle_peer(peer_id.clone(), conn, server_c, pending_c, dispatch_c)
-                            .await;
-                        // Remove connection when peer disconnects.
-                        connections_c.write().await.remove(&peer_id);
+                        let _ = conn.closed().await;
+                        let mut conns = connections_c.write().await;
+                        if conns
+                            .get(&peer_id)
+                            .is_some_and(|session| session.conn.stable_id() == stable_id)
+                        {
+                            conns.remove(&peer_id);
+                        }
                     });
                 }
                 Err(e) => {
@@ -204,89 +143,13 @@ impl Coordinator {
         }
     }
 
-    /// Handle a single peer connection: receive results and deliver them
-    /// to pending tasks.
-    async fn handle_peer(
-        peer_id: PeerId,
-        conn: quinn::Connection,
-        server: Arc<P2pServer>,
-        pending: Arc<parking_lot::RwLock<HashMap<String, PendingTask>>>,
-        dispatch: Arc<dyn DispatchPolicy>,
-    ) {
-        tracing::debug!("Handling peer {}", peer_id);
-
-        loop {
-            match P2pServer::recv_result(&conn).await {
-                Ok(result) => {
-                    let task_id = result.task_id.clone();
-
-                    // Verify the result.
-                    let verdict = {
-                        let peers = server.peers.read().await;
-                        if let Some(peer_info) = peers.get(&result.peer_id) {
-                            let pending_map = pending.read();
-                            if let Some(pt) = pending_map.get(&task_id) {
-                                dispatch.verify_result(
-                                    &result,
-                                    pt.expected_content_id,
-                                    &peer_info.pubkey,
-                                )
-                            } else {
-                                DispatchVerdict::Reject(format!("no pending task: {task_id}"))
-                            }
-                        } else {
-                            DispatchVerdict::Reject(format!("unknown peer: {}", result.peer_id))
-                        }
-                    };
-
-                    match verdict {
-                        DispatchVerdict::Accept => {
-                            tracing::info!("Task {} completed by peer {}", task_id, peer_id);
-                            Self::persist_reputation_update(
-                                &server.peers,
-                                &result.peer_id,
-                                true,
-                                &format!("task {task_id} accepted"),
-                            )
-                            .await;
-                            let mut pending_map = pending.write();
-                            if let Some(pt) = pending_map.remove(&task_id) {
-                                let _ = pt.result_tx.send(Ok(result));
-                            }
-                        }
-                        DispatchVerdict::Reject(reason) => {
-                            tracing::warn!("Task {} rejected: {reason}", task_id);
-                            Self::persist_reputation_update(
-                                &server.peers,
-                                &result.peer_id,
-                                false,
-                                &format!("task {task_id} rejected: {reason}"),
-                            )
-                            .await;
-                            let mut pending_map = pending.write();
-                            if let Some(pt) = pending_map.remove(&task_id) {
-                                let _ = pt.result_tx.send(Err(reason));
-                            }
-                        }
-                        DispatchVerdict::RetryOnDifferentPeer => {
-                            tracing::info!("Task {} needs retry on different peer", task_id);
-                            let mut pending_map = pending.write();
-                            if let Some(pt) = pending_map.remove(&task_id) {
-                                let _ = pt.result_tx.send(Err("retry on different peer".into()));
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("Peer {} disconnected: {e}", peer_id);
-                    break;
-                }
-            }
-        }
-    }
-
     /// Shut down the coordinator.
     pub fn shutdown(&self) {
+        if let Ok(connections) = self.connections.try_read() {
+            for session in connections.values() {
+                session.conn.close(0u32.into(), b"coordinator shutdown");
+            }
+        }
         self.server.shutdown();
     }
 
@@ -328,170 +191,380 @@ impl Coordinator {
     }
 }
 
-/// A handle to a dispatched P2P task, polling via the oneshot receiver.
-struct CoordinatorDispatchHandle {
-    task_id: String,
-    result_rx:
-        parking_lot::Mutex<Option<tokio::sync::oneshot::Receiver<Result<TaskResult, String>>>>,
-    pending: Arc<parking_lot::RwLock<HashMap<String, PendingTask>>>,
+struct CoordinatorExecutionHandle {
+    lifecycle: ExecutionLifecycle,
+    cancel: CancellationToken,
+    connection: Arc<Mutex<Option<quinn::Connection>>>,
 }
 
-impl crate::framework::executor::DispatchHandle for CoordinatorDispatchHandle {
-    fn poll(&self) -> Result<Option<crate::config::launcher::JobState>, crate::error::TrainError> {
-        let mut rx_guard = self.result_rx.lock();
-        if let Some(rx) = rx_guard.as_mut() {
-            match rx.try_recv() {
-                Ok(Ok(_result)) => {
-                    *rx_guard = None;
-                    // Clean up pending entry.
-                    self.pending.write().remove(&self.task_id);
-                    Ok(Some(JobState::Succeeded))
-                }
-                Ok(Err(reason)) => {
-                    *rx_guard = None;
-                    self.pending.write().remove(&self.task_id);
-                    Ok(Some(JobState::Failed(reason)))
-                }
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => Ok(None),
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                    *rx_guard = None;
-                    self.pending.write().remove(&self.task_id);
-                    Ok(Some(JobState::Failed("channel closed".into())))
-                }
-            }
-        } else {
-            Ok(Some(JobState::Cancelled))
-        }
+#[async_trait]
+impl ExecutionHandle for CoordinatorExecutionHandle {
+    async fn snapshot(&self) -> Result<ExecutionSnapshot, ExecutionFailure> {
+        Ok(self.lifecycle.snapshot())
     }
 
-    fn cancel(&self) -> Result<(), crate::error::TrainError> {
-        // Drop the receiver so poll() returns Cancelled.
-        *self.result_rx.lock() = None;
-        // Remove from pending map.
-        self.pending.write().remove(&self.task_id);
-        tracing::info!("P2P dispatch task {} cancelled", self.task_id);
+    async fn cancel(&self) -> Result<(), ExecutionFailure> {
+        self.cancel.cancel();
+        if let Some(conn) = self.connection.lock().await.take() {
+            // `recv_blob` owns every incoming uni stream, so a per-task Cancel
+            // frame would corrupt an in-flight transfer. The session gate gives
+            // this attempt exclusive connection ownership; close is safe and
+            // peer execution observes it through `conn.closed()`.
+            conn.close(0u32.into(), b"execution cancelled");
+        }
         Ok(())
     }
 }
 
-impl crate::framework::executor::DispatchSubmitter for Coordinator {
-    fn submit(
-        &self,
-        req: crate::framework::executor::DispatchRequest<'_>,
-    ) -> Result<Box<dyn crate::framework::executor::DispatchHandle>, crate::error::TrainError> {
-        let task_id = format!("p2p-{}", uuid::Uuid::new_v4());
-        let data_class = match req.data_class {
-            0 => crate::p2p::trust::DataClass::Public,
-            1 => crate::p2p::trust::DataClass::Internal,
-            2 => crate::p2p::trust::DataClass::Restricted,
-            other => {
-                return Err(TrainError::other(format!(
-                    "unknown data_class: {other} (expected 0=Public, 1=Internal, 2=Restricted)"
-                )));
-            }
-        };
-        if !crate::trust::custody_allows_off_box(req.tenant, data_class) {
-            return Err(TrainError::other(format!(
-                "P2P dispatch DENIED: tenant '{}' / {data_class:?} data is node-local through M5",
-                req.tenant
-            )));
-        }
-        let resources = crate::p2p::task::ResourceRequest {
-            cpu_cores: req.resource_request.cpu_cores,
-            memory_gib: req.resource_request.memory_gib,
-            gpu: req.resource_request.gpu,
-            gpu_vram_gib: req.resource_request.gpu_vram_gib,
-        };
-        // Captured for peer selection inside the async dispatch (the manifest
-        // moves `resources`/`data_class`, so clone what `select_peer` needs).
-        let select_stage = req.stage_name.to_string();
-        let select_resources = resources; // ResourceRequest is Copy
-        let select_data_class = data_class;
+/// Last-resort lifecycle latch for a panic or newly added early return in the
+/// detached adapter task. First-terminal-wins keeps explicit outcomes intact.
+struct P2pAttemptGuard(ExecutionLifecycle);
 
-        let expected_content_id = req.expected_content_id;
-        let mut manifest = TaskManifest {
-            protocol_version: crate::p2p::task::TASK_PROTOCOL_VERSION,
-            task_id: task_id.clone(),
-            coordinator_id: self.coordinator_id.clone(),
-            stage_name: req.stage_name.to_string(),
-            stage_schema: req.stage_schema,
-            input_content_id: req.input_content_id,
-            invocation_key: req.invocation_key,
-            args_hash: req.args_hash,
-            expected_content_id,
-            args: req.args.clone(),
-            resources,
-            data_class,
-            timeout_secs: 3600,
-            encrypted_input: None,
-            signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
-        };
-        manifest.signature = self.keypair.sign(&manifest.sign_payload());
-
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-
-        // Register as pending.
-        {
-            let mut pending = self.pending.write();
-            pending.insert(
-                task_id.clone(),
-                PendingTask {
-                    result_tx,
-                    expected_content_id,
+impl Drop for P2pAttemptGuard {
+    fn drop(&mut self) {
+        if self.0.snapshot().terminal.is_none() {
+            let _ = self.0.finish(
+                None,
+                ExecutionTerminal::Failed {
+                    failure: ExecutionFailure::new(
+                        ExecutionFailureKind::Unknown,
+                        "EXECUTION_ABANDONED",
+                        "P2P adapter exited before recording a terminal outcome",
+                    ),
                 },
             );
         }
+    }
+}
 
-        // Spawn the async dispatch.
-        let connections = self.connections.clone();
-        let pending_c = self.pending.clone();
-        let task_id_c = task_id.clone();
-        let dispatch = self.dispatch.clone();
-        let registry = self.server.peers.clone();
-        tokio::spawn(async move {
-            let conn = {
-                let conns = connections.read().await;
-                // Route through the dispatch policy: gather the PeerInfo for the
-                // peers we actually hold a live connection to, ask the policy to
-                // pick one (trust matrix + capability + reputation), and dispatch
-                // to THAT peer. `None` ⇒ no suitable peer (we fail the task back
-                // rather than silently sending to an arbitrary connection).
-                let selected = {
-                    let reg = registry.read().await;
-                    let candidates: Vec<crate::p2p::peer::PeerInfo> =
-                        conns.keys().filter_map(|id| reg.get(id).cloned()).collect();
-                    dispatch.select_peer(
-                        &select_stage,
-                        &select_resources,
-                        select_data_class,
-                        &candidates,
-                    )
-                };
-                selected.and_then(|peer_id| conns.get(&peer_id).cloned())
-            };
-            if let Some(conn) = conn {
-                if let Err(e) = P2pServer::send_task(&conn, &manifest).await {
-                    tracing::warn!("P2P dispatch failed for {}: {e}", task_id_c);
-                    let mut pending = pending_c.write();
-                    if let Some(pt) = pending.remove(&task_id_c) {
-                        let _ = pt.result_tx.send(Err(format!("dispatch failed: {e}")));
+fn p2p_data_class(value: DataClassification) -> crate::p2p::trust::DataClass {
+    match value {
+        DataClassification::Public => crate::p2p::trust::DataClass::Public,
+        DataClassification::Internal => crate::p2p::trust::DataClass::Internal,
+        DataClassification::Restricted => crate::p2p::trust::DataClass::Restricted,
+    }
+}
+
+async fn sleep_optional(duration: Option<std::time::Duration>) {
+    match duration {
+        Some(duration) => tokio::time::sleep(duration).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn finish_cancel(
+    lifecycle: &ExecutionLifecycle,
+    assignment: Option<&Assignment>,
+    reason: impl Into<String>,
+) {
+    let _ = lifecycle.finish(
+        assignment,
+        ExecutionTerminal::Cancelled {
+            reason: reason.into(),
+        },
+    );
+}
+
+fn finish_timeout(
+    lifecycle: &ExecutionLifecycle,
+    assignment: Option<&Assignment>,
+    deadline_unix_ms: u64,
+) {
+    let _ = lifecycle.finish(
+        assignment,
+        ExecutionTerminal::TimedOut {
+            phase: lifecycle.snapshot().phase,
+            deadline_unix_ms,
+        },
+    );
+}
+
+fn finish_cancel_or_timeout(
+    lifecycle: &ExecutionLifecycle,
+    assignment: Option<&Assignment>,
+    deadline: ExecutionDeadline,
+    reason: &str,
+) {
+    if let Some(soft) = deadline.soft_remaining()
+        && soft.is_zero()
+    {
+        finish_timeout(
+            lifecycle,
+            assignment,
+            deadline.soft_unix_ms.expect("soft duration exists"),
+        );
+    } else if deadline.hard_remaining().is_zero() {
+        finish_timeout(lifecycle, assignment, deadline.hard_unix_ms);
+    } else {
+        finish_cancel(lifecycle, assignment, reason);
+    }
+}
+
+async fn select_peer_session(
+    dispatch: &dyn DispatchPolicy,
+    peers: &RwLock<PeerRegistry>,
+    connections: &RwLock<HashMap<PeerId, PeerSession>>,
+    request: &ExecutionRequest,
+) -> Option<(crate::p2p::peer::PeerInfo, PeerSession)> {
+    let connected_ids: Vec<PeerId> = connections.read().await.keys().cloned().collect();
+    let peer = {
+        let registry = peers.read().await;
+        let candidates: Vec<crate::p2p::peer::PeerInfo> = connected_ids
+            .iter()
+            .filter_map(|id| registry.get(id).cloned())
+            .collect();
+        let resources = crate::p2p::task::ResourceRequest {
+            cpu_cores: request.resources.cpu_cores,
+            memory_gib: request.resources.memory_gib,
+            gpu: request.resources.gpu,
+            gpu_vram_gib: request.resources.gpu_vram_gib,
+        };
+        dispatch
+            .select_peer(
+                &request.stage_name,
+                &resources,
+                p2p_data_class(request.data_class),
+                &candidates,
+            )
+            .and_then(|id| registry.get(&id).cloned())
+    }?;
+    let session = connections.read().await.get(&peer.id).cloned()?;
+    Some((peer, session))
+}
+
+struct P2pAttempt {
+    dispatch: Arc<dyn DispatchPolicy>,
+    keypair: Arc<KeyPair>,
+    peers: Arc<RwLock<PeerRegistry>>,
+    connections: Arc<RwLock<HashMap<PeerId, PeerSession>>>,
+    generation: Arc<AtomicU64>,
+    lifecycle: ExecutionLifecycle,
+    cancel: CancellationToken,
+    active_connection: Arc<Mutex<Option<quinn::Connection>>>,
+    request: ExecutionRequest,
+}
+
+impl P2pAttempt {
+    async fn run(self) {
+        let Self {
+            dispatch,
+            keypair,
+            peers,
+            connections,
+            generation,
+            lifecycle,
+            cancel,
+            active_connection,
+            request,
+        } = self;
+        let _guard = P2pAttemptGuard(lifecycle.clone());
+        if cancel.is_cancelled() {
+            finish_cancel_or_timeout(
+                &lifecycle,
+                None,
+                request.deadline,
+                "cancelled before queueing",
+            );
+            return;
+        }
+        if lifecycle.transition(ExecutionPhase::Queued, None).is_err() {
+            return;
+        }
+
+        let Some((peer, session)) = select_peer_session(
+            dispatch.as_ref(),
+            peers.as_ref(),
+            connections.as_ref(),
+            &request,
+        )
+        .await
+        else {
+            let _ = lifecycle.finish(
+                None,
+                ExecutionTerminal::Failed {
+                    failure: ExecutionFailure::unavailable(
+                        "no connected peer cleared the P2P dispatch policy",
+                    ),
+                },
+            );
+            return;
+        };
+
+        let gate = tokio::select! {
+            guard = session.gate.lock() => guard,
+            _ = cancel.cancelled() => {
+                finish_cancel_or_timeout(&lifecycle, None, request.deadline, "cancelled while queued for peer");
+                return;
+            }
+            _ = sleep_optional(request.deadline.soft_remaining()) => {
+                finish_timeout(&lifecycle, None, request.deadline.soft_unix_ms.unwrap_or(request.deadline.hard_unix_ms));
+                return;
+            }
+            _ = tokio::time::sleep(request.deadline.hard_remaining()) => {
+                finish_timeout(&lifecycle, None, request.deadline.hard_unix_ms);
+                return;
+            }
+        };
+        if session.conn.close_reason().is_some() {
+            let _ = lifecycle.finish(
+                None,
+                ExecutionTerminal::Failed {
+                    failure: ExecutionFailure::disconnected(
+                        "selected peer disconnected before assignment",
+                    ),
+                },
+            );
+            return;
+        }
+
+        let assignment = Assignment::new(
+            peer.id.to_string(),
+            generation.fetch_add(1, Ordering::Relaxed).saturating_add(1),
+        );
+        if lifecycle
+            .transition(ExecutionPhase::Assigned, Some(assignment.clone()))
+            .is_err()
+        {
+            return;
+        }
+        *active_connection.lock().await = Some(session.conn.clone());
+        if cancel.is_cancelled() {
+            session.conn.close(0u32.into(), b"execution cancelled");
+            let _ = active_connection.lock().await.take();
+            finish_cancel_or_timeout(
+                &lifecycle,
+                Some(&assignment),
+                request.deadline,
+                "cancelled before P2P transfer",
+            );
+            return;
+        }
+
+        let transfer = dispatch_stored_to_peer(
+            &session.conn,
+            keypair.as_ref(),
+            &peer,
+            &request,
+            Some(dispatch.as_ref()),
+            Some((&lifecycle, &assignment)),
+        );
+        tokio::pin!(transfer);
+        let outcome = tokio::select! {
+            outcome = &mut transfer => outcome,
+            _ = cancel.cancelled() => {
+                session.conn.close(0u32.into(), b"execution cancelled");
+                let _ = active_connection.lock().await.take();
+                finish_cancel_or_timeout(&lifecycle, Some(&assignment), request.deadline, "cancelled during P2P transfer");
+                return;
+            }
+            _ = sleep_optional(request.deadline.soft_remaining()) => {
+                session.conn.close(0u32.into(), b"execution soft deadline");
+                let _ = active_connection.lock().await.take();
+                finish_timeout(&lifecycle, Some(&assignment), request.deadline.soft_unix_ms.unwrap_or(request.deadline.hard_unix_ms));
+                return;
+            }
+            _ = tokio::time::sleep(request.deadline.hard_remaining()) => {
+                session.conn.close(0u32.into(), b"execution hard deadline");
+                let _ = active_connection.lock().await.take();
+                finish_timeout(&lifecycle, Some(&assignment), request.deadline.hard_unix_ms);
+                return;
+            }
+        };
+        drop(gate);
+        let _ = active_connection.lock().await.take();
+
+        match outcome {
+            Ok(StoredDispatchOutcome::Succeeded(output)) => {
+                let output = *output;
+                Coordinator::persist_reputation_update(
+                    peers.as_ref(),
+                    &peer.id,
+                    true,
+                    &format!("task {} accepted", request.execution_id),
+                )
+                .await;
+                let _ = lifecycle.finish(
+                    Some(&assignment),
+                    ExecutionTerminal::Succeeded {
+                        artifact: ExecutionArtifact {
+                            content_id: output.content_id,
+                            stored: Some(output.stored),
+                        },
+                        wall_time_ms: output.wall_time_ms,
+                    },
+                );
+            }
+            Ok(StoredDispatchOutcome::Cancelled { reason }) => {
+                finish_cancel(&lifecycle, Some(&assignment), reason);
+            }
+            Err(failure) => {
+                Coordinator::persist_reputation_update(
+                    peers.as_ref(),
+                    &peer.id,
+                    false,
+                    &format!("task {} failed: {}", request.execution_id, failure.code),
+                )
+                .await;
+                match failure.code.as_str() {
+                    "EXECUTION_SOFT_DEADLINE" => finish_timeout(
+                        &lifecycle,
+                        Some(&assignment),
+                        request
+                            .deadline
+                            .soft_unix_ms
+                            .unwrap_or(request.deadline.hard_unix_ms),
+                    ),
+                    "EXECUTION_HARD_DEADLINE" => {
+                        finish_timeout(&lifecycle, Some(&assignment), request.deadline.hard_unix_ms)
+                    }
+                    _ => {
+                        let _ = lifecycle
+                            .finish(Some(&assignment), ExecutionTerminal::Failed { failure });
                     }
                 }
-            } else {
-                let mut pending = pending_c.write();
-                if let Some(pt) = pending.remove(&task_id_c) {
-                    let _ = pt.result_tx.send(Err(
-                        "no suitable peer (none connected, or none cleared the dispatch policy)"
-                            .into(),
-                    ));
-                }
             }
-        });
+        }
+    }
+}
 
-        Ok(Box::new(CoordinatorDispatchHandle {
-            task_id,
-            result_rx: parking_lot::Mutex::new(Some(result_rx)),
-            pending: self.pending.clone(),
+#[async_trait]
+impl ExecutionAdapter for Coordinator {
+    fn mode(&self) -> ExecutionMode {
+        ExecutionMode::P2p
+    }
+
+    async fn submit(
+        &self,
+        request: ExecutionRequest,
+    ) -> Result<Box<dyn ExecutionHandle>, ExecutionFailure> {
+        if request.protocol_version != crate::framework::execution::EXECUTION_PROTOCOL_VERSION {
+            return Err(ExecutionFailure::protocol(format!(
+                "execution protocol v{} unsupported (want v{})",
+                request.protocol_version,
+                crate::framework::execution::EXECUTION_PROTOCOL_VERSION,
+            )));
+        }
+        let lifecycle = ExecutionLifecycle::new(ExecutionMode::P2p);
+        let cancel = CancellationToken::new();
+        let connection = Arc::new(Mutex::new(None));
+        tokio::spawn(
+            P2pAttempt {
+                dispatch: self.dispatch.clone(),
+                keypair: self.keypair.clone(),
+                peers: self.server.peers.clone(),
+                connections: self.connections.clone(),
+                generation: self.generation.clone(),
+                lifecycle: lifecycle.clone(),
+                cancel: cancel.clone(),
+                active_connection: connection.clone(),
+                request,
+            }
+            .run(),
+        );
+        Ok(Box::new(CoordinatorExecutionHandle {
+            lifecycle,
+            cancel,
+            connection,
         }))
     }
 }
