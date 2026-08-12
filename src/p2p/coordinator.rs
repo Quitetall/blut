@@ -19,9 +19,9 @@ use tokio_util::sync::CancellationToken;
 use crate::error::TrainError;
 use crate::framework::artifact::ContentId;
 use crate::framework::execution::{
-    Assignment, DataClassification, ExecutionAdapter, ExecutionArtifact, ExecutionDeadline,
-    ExecutionFailure, ExecutionFailureKind, ExecutionHandle, ExecutionLifecycle, ExecutionMode,
-    ExecutionPhase, ExecutionRequest, ExecutionSnapshot, ExecutionTerminal,
+    Assignment, ExecutionAdapter, ExecutionArtifact, ExecutionDeadline, ExecutionFailure,
+    ExecutionFailureKind, ExecutionHandle, ExecutionLifecycle, ExecutionMode, ExecutionPhase,
+    ExecutionRequest, ExecutionSnapshot, ExecutionTerminal,
 };
 use crate::p2p::crypto::KeyPair;
 use crate::p2p::dispatch::{DispatchPolicy, DispatchVerdict};
@@ -114,7 +114,7 @@ impl Coordinator {
             match server.accept_peer().await {
                 Ok((peer_id, conn)) => {
                     let stable_id = conn.stable_id();
-                    {
+                    let replaced = {
                         let mut conns = connections.write().await;
                         conns.insert(
                             peer_id.clone(),
@@ -122,7 +122,12 @@ impl Coordinator {
                                 conn: conn.clone(),
                                 gate: Arc::new(Mutex::new(())),
                             },
-                        );
+                        )
+                    };
+                    if let Some(previous) = replaced {
+                        previous
+                            .conn
+                            .close(0u32.into(), b"peer reconnected with a new session");
                     }
                     let connections_c = connections.clone();
                     tokio::spawn(async move {
@@ -149,6 +154,8 @@ impl Coordinator {
             for session in connections.values() {
                 session.conn.close(0u32.into(), b"coordinator shutdown");
             }
+        } else {
+            tracing::warn!("P2P coordinator shutdown could not immediately lock peer sessions");
         }
         self.server.shutdown();
     }
@@ -237,14 +244,6 @@ impl Drop for P2pAttemptGuard {
     }
 }
 
-fn p2p_data_class(value: DataClassification) -> crate::p2p::trust::DataClass {
-    match value {
-        DataClassification::Public => crate::p2p::trust::DataClass::Public,
-        DataClassification::Internal => crate::p2p::trust::DataClass::Internal,
-        DataClassification::Restricted => crate::p2p::trust::DataClass::Restricted,
-    }
-}
-
 async fn sleep_optional(duration: Option<std::time::Duration>) {
     match duration {
         Some(duration) => tokio::time::sleep(duration).await,
@@ -323,7 +322,7 @@ async fn select_peer_session(
             .select_peer(
                 &request.stage_name,
                 &resources,
-                p2p_data_class(request.data_class),
+                request.data_class.into(),
                 &candidates,
             )
             .and_then(|id| registry.get(&id).cloned())
@@ -542,6 +541,12 @@ impl ExecutionAdapter for Coordinator {
                 "execution protocol v{} unsupported (want v{})",
                 request.protocol_version,
                 crate::framework::execution::EXECUTION_PROTOCOL_VERSION,
+            )));
+        }
+        if !crate::p2p::trust::custody_allows_off_box(&request.tenant, request.data_class.into()) {
+            return Err(ExecutionFailure::protocol(format!(
+                "P2P execution denied by custody policy for tenant '{}' and {:?} data",
+                request.tenant, request.data_class
             )));
         }
         let lifecycle = ExecutionLifecycle::new(ExecutionMode::P2p);

@@ -62,6 +62,33 @@ async fn coordinator_accepts_peer_connection() {
 }
 
 #[tokio::test]
+async fn coordinator_reconnect_closes_replaced_peer_session() {
+    let coord_kp = Arc::new(KeyPair::generate());
+    let peer_kp = Arc::new(KeyPair::generate());
+    let dispatch: Arc<dyn DispatchPolicy> =
+        Arc::new(DefaultDispatchPolicy::new(DispatchMatrix::default()));
+    let (registry, _dir) = temp_registry();
+    let coordinator =
+        Coordinator::start("127.0.0.1:0".parse().unwrap(), coord_kp, dispatch, registry)
+            .await
+            .unwrap();
+    let client = P2pClient::new(peer_kp);
+    let (first, _peer_id) = client
+        .connect(coordinator.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (_second, _peer_id) = client
+        .connect(coordinator.local_addr().unwrap())
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), first.closed())
+        .await
+        .expect("replaced peer session must close its prior connection");
+    coordinator.shutdown();
+}
+
+#[tokio::test]
 async fn task_manifest_sign_verify_roundtrip() {
     let kp = KeyPair::generate();
     let input_hash = ContentHash::of_bytes(&[1u8; 32]);
@@ -520,6 +547,7 @@ mod e2e {
         let request = ExecutionRequest {
             protocol_version: EXECUTION_PROTOCOL_VERSION,
             execution_id: "adapter-roundtrip-1".into(),
+            tenant: blut::tenant::Tenant::default(),
             stage_name: "upper".into(),
             stage_schema: 1,
             invocation_key: blut::framework::CacheHandle::key_for(

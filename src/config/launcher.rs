@@ -985,7 +985,7 @@ pub fn launcher_for(target: LaunchTarget) -> Box<dyn Launcher> {
             num_gpus: env_u32("BLUT_RAY_NUM_GPUS"),
             extra: Vec::new(),
         }),
-        // P2P dispatch is handled by DispatchSubmitter, not Launcher.
+        // P2P dispatch is handled by the canonical ExecutionAdapter, not Launcher.
         // Fall through to LocalSystemd for local process management.
         LaunchTarget::P2P => Box::new(LocalSystemd::default()),
         // K8s submits a whole BlutPlan manifest (see `k8s::submit_plan`), not a

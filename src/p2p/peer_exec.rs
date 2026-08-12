@@ -436,14 +436,6 @@ pub enum StoredDispatchOutcome {
     Cancelled { reason: String },
 }
 
-fn p2p_data_class(data_class: DataClassification) -> crate::p2p::trust::DataClass {
-    match data_class {
-        DataClassification::Public => crate::p2p::trust::DataClass::Public,
-        DataClassification::Internal => crate::p2p::trust::DataClass::Internal,
-        DataClassification::Restricted => crate::p2p::trust::DataClass::Restricted,
-    }
-}
-
 fn lifecycle_phase(
     lifecycle: Option<(&ExecutionLifecycle, &Assignment)>,
     phase: ExecutionPhase,
@@ -500,7 +492,7 @@ pub async fn dispatch_stored_to_peer(
             gpu: request.resources.gpu,
             gpu_vram_gib: request.resources.gpu_vram_gib,
         },
-        data_class: p2p_data_class(request.data_class),
+        data_class: request.data_class.into(),
         timeout_secs: request.deadline.hard_remaining().as_secs().max(1),
         deadline: request.deadline,
         encrypted_input: Some(encrypted_input),
@@ -635,10 +627,9 @@ pub async fn dispatch_stored_to_peer(
 /// peer over `conn`, then receive the result + output blob, unbundle it into
 /// `out_stage_dir`, and verify it against `expected_output_hash`.
 ///
-/// This is the symmetric coordinator half of [`run_peer_loop`]; the CLI
-/// `blut p2p dispatch` drives it. (The executor's `DispatchSubmitter` seam can
-/// adopt this once it threads each node's producing stage_dir; until then the
-/// CLI path is the live-validation route.)
+/// This is the standalone CLI wrapper over [`dispatch_stored_to_peer`]'s
+/// portable transport contract. The executor uses that canonical path through
+/// `ExecutionAdapter` and restores its output independently.
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_to_peer(
     conn: &QuinnConnection,
@@ -659,122 +650,63 @@ pub async fn dispatch_to_peer(
     if !is_safe_task_id(task_id) {
         return Err(TrainError::other(format!("unsafe task_id '{task_id}'")));
     }
-    let stage = registry
+    let ctor = registry
         .find_erased_stage(stage_name)
-        .ok_or_else(|| TrainError::other(format!("unknown stage '{stage_name}'")))?(
-    );
-
-    // 1. Bundle the input rooted at its producing stage_dir.
-    let (in_manifest, in_pack) = bundle::bundle(&*stage, input, src_root, BlobDir::Input, None)
+        .ok_or_else(|| TrainError::other(format!("unknown stage '{stage_name}'")))?;
+    let stage = ctor();
+    let (manifest, pack) = bundle::bundle(&*stage, input, src_root, BlobDir::Input, None)
         .map_err(|e| TrainError::other(format!("bundle input: {e}")))?;
-    let input_content_id = in_manifest.content_id;
-
-    // 2. Seal the bundle manifest to the PEER's X25519 key + build the task.
-    let manifest_bytes = bincode::serialize(&in_manifest)
-        .map_err(|e| TrainError::other(format!("serialize input manifest: {e}")))?;
-    let encrypted_input = crypto::encrypt(&manifest_bytes, &peer.x25519_pub);
-    // Seal the bulk input blob to the PEER's X25519 key too — see `seal_blob`;
-    // previously the plaintext `in_pack` (the actual file bytes, which may be
-    // DataClass::Internal/Restricted corpora) rode `send_blob` unencrypted.
-    let sealed_in_pack = seal_blob(&in_pack, &peer.x25519_pub)?;
-    let args_hash = ContentHash::of_bytes(
-        &serde_json::to_vec(&args).map_err(|e| TrainError::other(format!("args hash: {e}")))?,
-    );
-    let mut task = TaskManifest {
-        protocol_version: crate::p2p::task::TASK_PROTOCOL_VERSION,
-        task_id: task_id.to_string(),
-        coordinator_id: PeerId::from_pubkey(&coordinator_kp.verifying),
+    let data_class = match data_class {
+        crate::p2p::DataClass::Public => DataClassification::Public,
+        crate::p2p::DataClass::Internal => DataClassification::Internal,
+        crate::p2p::DataClass::Restricted => DataClassification::Restricted,
+    };
+    let request = ExecutionRequest {
+        protocol_version: crate::framework::execution::EXECUTION_PROTOCOL_VERSION,
+        execution_id: task_id.to_string(),
+        tenant: crate::tenant::Tenant::default(),
         stage_name: stage_name.to_string(),
         stage_schema: stage.schema(),
-        input_content_id,
         invocation_key,
-        args_hash,
-        expected_content_id,
+        args_hash: ContentHash::of_bytes(
+            &serde_json::to_vec(&args).map_err(|e| TrainError::other(format!("args hash: {e}")))?,
+        ),
         args,
-        resources: crate::p2p::task::ResourceRequest::default(),
+        input: StoredArtifact { manifest, pack },
+        expected_content_id,
+        resources: crate::framework::execution::ExecutionResources::default(),
         data_class,
-        timeout_secs,
         deadline: ExecutionDeadline::from_now(
             None,
             std::time::Duration::from_secs(timeout_secs.max(1)),
         ),
-        encrypted_input: Some(encrypted_input),
-        signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
     };
-    task.signature = coordinator_kp.sign(&task.sign_payload());
-
-    // 3. Send task + input blob (encrypted — see 2).
-    transport::P2pServer::send_task(conn, &task).await?;
-    transport::send_blob(conn, task_id, BlobDir::Input, &sealed_in_pack).await?;
-
-    // 4. Receive the result, then the output blob, and verify. Bound by the
-    //    peer's deadline + slack so a hung/stalled peer can't block the
-    //    coordinator forever (symmetric with the peer-side timeout enforcement).
-    let deadline = std::time::Duration::from_secs(timeout_secs.max(1) + 30);
-    let result = tokio::time::timeout(deadline, transport::P2pServer::recv_result(conn))
-        .await
-        .map_err(|_| TrainError::other("timed out waiting for peer result"))??;
-    if result.task_id != task_id {
-        return Err(TrainError::other("result task_id mismatch"));
-    }
-    if result.protocol_version != crate::p2p::task::TASK_PROTOCOL_VERSION {
-        return Err(TrainError::other(format!(
-            "result protocol v{} unsupported (want v{})",
-            result.protocol_version,
-            crate::p2p::task::TASK_PROTOCOL_VERSION
-        )));
-    }
-    if !crypto::verify(&peer.pubkey, &result.sign_payload(), &result.signature) {
-        return Err(TrainError::other("result signature invalid"));
-    }
-    let out_payload = result
-        .encrypted_output
-        .as_ref()
-        .ok_or_else(|| TrainError::other("result has no encrypted_output"))?;
-    let out_bytes = coordinator_kp.decrypt(out_payload)?;
-    let out_manifest = bincode::deserialize::<bundle::BundleManifest>(&out_bytes)
-        .map_err(|e| TrainError::other(format!("decode output manifest: {e}")))?;
-
-    // Fail-fast hash-binding check, BEFORE `recv_blob` buffers the (up to
-    // MAX_BLOB_SIZE = 16 GiB) output blob. A rogue/compromised peer that
-    // passed signature verification above could still return a blob that
-    // doesn't match what we dispatched; reject it before spending memory on
-    // it, not just after. `bundle::unbundle` re-checks this exact comparison
-    // later (defense in depth) — mirrors the identical pre-check on the peer
-    // side in `execute_one`, step 4b.
-    if out_manifest.content_id != result.content_id {
-        return Err(TrainError::other(format!(
-            "identity binding: artifact {} != signed result identity {} — rejecting before blob receive",
-            out_manifest.content_id.to_hex(),
-            result.content_id.to_hex(),
-        )));
-    }
-    if let Some(expected) = expected_content_id
-        && result.content_id != expected
-    {
-        return Err(TrainError::other(format!(
-            "output identity {} != analytically expected {}",
-            result.content_id, expected
-        )));
-    }
-
-    let sealed_out_pack =
-        transport::recv_blob(conn, task_id, BlobDir::Output, MAX_BLOB_SIZE).await?;
-    let out_pack = open_blob(&sealed_out_pack, coordinator_kp)?;
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs.max(1).saturating_add(30)),
+        dispatch_stored_to_peer(conn, coordinator_kp, peer, &request, None, None),
+    )
+    .await
+    .map_err(|_| TrainError::other("timed out waiting for peer result"))?
+    .map_err(|failure| TrainError::other(failure.to_string()))?;
+    let remote = match outcome {
+        StoredDispatchOutcome::Succeeded(output) => *output,
+        StoredDispatchOutcome::Cancelled { reason } => {
+            return Err(TrainError::other(format!("peer task cancelled: {reason}")));
+        }
+    };
     let output = bundle::unbundle(
         &*stage,
-        &out_manifest,
-        &out_pack,
+        &remote.stored.manifest,
+        &remote.stored.pack,
         out_stage_dir,
-        Some(result.content_id),
+        Some(remote.content_id),
         BlobDir::Output,
     )
     .map_err(|e| TrainError::other(format!("unbundle output: {e}")))?;
-
     Ok(DispatchedOutput {
         output,
-        content_id: result.content_id,
-        peer_id: result.peer_id,
+        content_id: remote.content_id,
+        peer_id: remote.peer_id,
     })
 }
 

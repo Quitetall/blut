@@ -18,7 +18,9 @@ use blut::framework::control::{Control, ControlPolicy, SpawnDelta, StepMetrics};
 use blut::framework::cookbook::{Cookbook, Registry};
 use blut::framework::error::StageError;
 #[cfg(feature = "p2p")]
-use blut::framework::executor::{DispatchRequest, DispatchSubmitter};
+use blut::framework::execution::{
+    ExecutionAdapter, ExecutionFailure, ExecutionHandle, ExecutionMode, ExecutionRequest,
+};
 use blut::framework::executor::{ExecCtx, ParallelExecutor, execute_plan};
 use blut::framework::plan_spec::{PLAN_SPEC_VERSION, PlanSpec, SpecNode};
 use blut::framework::resource::Resource;
@@ -469,18 +471,23 @@ impl DispatchPolicy for ProfileDispatchPolicy {
 }
 
 #[cfg(feature = "p2p")]
-struct RefuseProfileSubmitter {
+struct RefuseProfileAdapter {
     submit_calls: Arc<AtomicUsize>,
 }
 
 #[cfg(feature = "p2p")]
-impl DispatchSubmitter for RefuseProfileSubmitter {
-    fn submit(
+#[async_trait]
+impl ExecutionAdapter for RefuseProfileAdapter {
+    fn mode(&self) -> ExecutionMode {
+        ExecutionMode::P2p
+    }
+
+    async fn submit(
         &self,
-        _request: DispatchRequest<'_>,
-    ) -> Result<Box<dyn blut::framework::executor::DispatchHandle>, blut::error::TrainError> {
+        _request: ExecutionRequest,
+    ) -> Result<Box<dyn ExecutionHandle>, ExecutionFailure> {
         self.submit_calls.fetch_add(1, Ordering::SeqCst);
-        Err(blut::error::TrainError::other(
+        Err(ExecutionFailure::unavailable(
             "profile-declaring stages must stay local until the remote profile wire exists",
         ))
     }
@@ -788,9 +795,9 @@ async fn p2p_never_dispatches_a_locally_selected_bounded_profile() {
             .with_memory_budget(2)
             .with_admitted_workers(3)
             .with_training_io_selection_budget_bytes(2 * 1024 * MIB)
-            .with_dispatch(
+            .with_execution_adapter(
                 Arc::new(ProfileDispatchPolicy),
-                Arc::new(RefuseProfileSubmitter {
+                Arc::new(RefuseProfileAdapter {
                     submit_calls: submit_calls.clone(),
                 }),
             ),

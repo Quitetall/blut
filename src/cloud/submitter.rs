@@ -125,8 +125,8 @@ impl CloudSubmitter {
 }
 
 /// Handle to a submitted cloud job: poll status, and on success download + verify
-/// the output bundle. (The `DispatchHandle`/executor-offload integration is T3.2;
-/// v1 drives this from the `blut cloud submit` CLI path.)
+/// the output bundle. The CLI wrapper keeps this explicit while the A08 cloud
+/// adapter consumes the same queue state through `ExecutionHandle`.
 pub struct CloudJobHandle {
     store: ObjectStore,
     queue: Arc<dyn CloudQueue>,

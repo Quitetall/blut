@@ -3,3 +3,13 @@
 //! Back-compatible P2P path for the keystone-owned trust policy.
 
 pub use crate::trust::{DataClass, DispatchMatrix, TrustLevel, custody_allows_off_box};
+
+impl From<crate::framework::execution::DataClassification> for DataClass {
+    fn from(value: crate::framework::execution::DataClassification) -> Self {
+        match value {
+            crate::framework::execution::DataClassification::Public => Self::Public,
+            crate::framework::execution::DataClassification::Internal => Self::Internal,
+            crate::framework::execution::DataClassification::Restricted => Self::Restricted,
+        }
+    }
+}

@@ -52,7 +52,7 @@ pub trait CloudQueue: Send + Sync {
     /// re-leased) is rejected (`LeaseLost`) — it cannot clobber the new worker's
     /// lease or write a stale result.
     async fn complete(&self, worker_id: &str, result: CloudResult) -> Result<(), CloudError>;
-    /// The job's current status (for the submitter's `DispatchHandle::poll`).
+    /// The job's current status (for the cloud execution handle snapshot).
     async fn status(&self, job_id: &str) -> Result<JobStatus, CloudError>;
     /// Return every job whose lease has expired to the pending set; returns how
     /// many were requeued.

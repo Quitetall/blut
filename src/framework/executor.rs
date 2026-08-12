@@ -44,7 +44,6 @@ use futures::{FutureExt, StreamExt};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::launcher::JobState;
 use crate::framework::artifact::{
     ArtifactMetadata, BranchDecision, ContentHash, ContentId, InvocationKey,
 };
@@ -142,57 +141,6 @@ struct TrainingIoResolver {
 struct ResolvedTrainingIoNode {
     profile: crate::framework::async_io::TrainingIoProfile,
     hints: crate::framework::async_io::TrainingIoHints,
-}
-
-/// Handle to a dispatched remote task. The executor polls this to
-/// determine when the task completes.
-pub trait DispatchHandle: Send + Sync {
-    /// Poll the remote task. Returns `Some(JobState)` when terminal,
-    /// `None` if still running.
-    fn poll(&self) -> Result<Option<JobState>, crate::error::TrainError>;
-    /// Cancel the remote task.
-    fn cancel(&self) -> Result<(), crate::error::TrainError>;
-}
-
-/// Trait for submitting tasks to a remote compute network. The P2P
-/// coordinator implements this; the executor calls it when a stage
-/// is dispatchable.
-/// Parameters for dispatching a stage to a remote peer.
-pub struct DispatchRequest<'a> {
-    pub stage_name: &'a str,
-    pub stage_schema: u32,
-    pub invocation_key: InvocationKey,
-    pub input_content_id: ContentId,
-    pub args_hash: ContentHash,
-    pub args: &'a serde_json::Value,
-    /// Present only when the stage can derive its output identity without
-    /// executing. `None` delegates identity production to the worker; success is
-    /// accepted only after the receiver restores and recomputes the artifact.
-    pub expected_content_id: Option<ContentId>,
-    pub resource_request: ResourceRequest,
-    pub data_class: u8, // 0=Public, 1=Internal, 2=Restricted
-    /// Owning tenant. Dispatchers must refuse restricted tenants even if a
-    /// cookbook accidentally classifies the individual stage as Public.
-    pub tenant: &'a crate::tenant::Tenant,
-}
-
-pub trait DispatchSubmitter: Send + Sync {
-    /// Submit a stage for remote execution. Returns a handle for
-    /// tracking the task's lifecycle.
-    fn submit(
-        &self,
-        request: DispatchRequest<'_>,
-    ) -> Result<Box<dyn DispatchHandle>, crate::error::TrainError>;
-}
-
-/// Resource requirements for a dispatched task. Mirrors
-/// `p2p::task::ResourceRequest` without the p2p dependency.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ResourceRequest {
-    pub cpu_cores: u32,
-    pub memory_gib: u32,
-    pub gpu: bool,
-    pub gpu_vram_gib: Option<u32>,
 }
 
 /// Caller-supplied execution context. Threaded through every
@@ -306,16 +254,11 @@ pub struct ExecCtx {
     /// is the A/B "force recompute" semantic — set by the CLI `--no-cache` /
     /// `--force` flag. Default false ⇒ byte-identical to the pre-INC-D path.
     pub bypass_cache: bool,
-    /// P2P dispatch: policy that decides which stages are dispatchable.
-    /// When set alongside `dispatcher`, the parallel executor offloads
-    /// dispatchable DAG nodes to remote peers.
+    /// P2P dispatch policy decides whether a node enters the canonical remote
+    /// execution adapter; it owns no transport lifecycle itself.
     #[cfg(feature = "p2p")]
     pub dispatch_policy: Option<Arc<dyn crate::p2p::dispatch::DispatchPolicy>>,
-    /// P2P dispatch: submits tasks to the remote compute network.
-    #[cfg(feature = "p2p")]
-    pub dispatcher: Option<Arc<dyn DispatchSubmitter>>,
-    /// Canonical A08 adapter. New callers use this lifecycle; legacy dispatcher
-    /// remains only until all external callers migrate.
+    /// Canonical A08 execution adapter for P2P or cloud placement.
     #[cfg(feature = "p2p")]
     pub execution_adapter: Option<Arc<dyn ExecutionAdapter>>,
     /// DAG optimizer. When set, the executor runs its enabled passes before
@@ -387,8 +330,6 @@ impl ExecCtx {
             bypass_cache: false,
             #[cfg(feature = "p2p")]
             dispatch_policy: None,
-            #[cfg(feature = "p2p")]
-            dispatcher: None,
             #[cfg(feature = "p2p")]
             execution_adapter: None,
             dag_optimizer: Some(crate::framework::dag_opt::DagOptimizer::new()),
@@ -467,19 +408,6 @@ impl ExecCtx {
         reason: Option<crate::framework::async_io::TrainingIoDowngradeReason>,
     ) {
         self.training_io_downgrade_reason = reason;
-    }
-
-    /// Set the P2P dispatch policy and submitter. When both are set,
-    /// the parallel executor offloads dispatchable stages to peers.
-    #[cfg(feature = "p2p")]
-    pub fn with_dispatch(
-        mut self,
-        policy: Arc<dyn crate::p2p::dispatch::DispatchPolicy>,
-        submitter: Arc<dyn DispatchSubmitter>,
-    ) -> Self {
-        self.dispatch_policy = Some(policy);
-        self.dispatcher = Some(submitter);
-        self
     }
 
     /// Place dispatchable stages through the canonical A08 lifecycle adapter.
@@ -649,12 +577,9 @@ struct NodeEnv {
     /// across an `.await` — so it can't deadlock the coordinator seam. Empty when
     /// no control policy is set, so the non-control path never touches it.
     diverged: Arc<std::sync::Mutex<HashMap<NodeId, String>>>,
-    /// P2P dispatch policy + submitter. When set, dispatchable stages
-    /// are offloaded to peers instead of running locally.
+    /// P2P placement policy and canonical adapter.
     #[cfg(feature = "p2p")]
     dispatch_policy: Option<Arc<dyn crate::p2p::dispatch::DispatchPolicy>>,
-    #[cfg(feature = "p2p")]
-    dispatcher: Option<Arc<dyn DispatchSubmitter>>,
     #[cfg(feature = "p2p")]
     execution_adapter: Option<Arc<dyn ExecutionAdapter>>,
 }
@@ -2016,6 +1941,14 @@ struct AdmissionLease {
 }
 
 impl AdmissionLease {
+    fn empty() -> Self {
+        Self {
+            resources: Vec::new(),
+            gpu: None,
+            _memory: None,
+        }
+    }
+
     fn release_non_gpu_resources(&mut self) {
         self.resources.clear();
     }
@@ -2277,6 +2210,7 @@ fn build_remote_request(task: &NodeTask, env: &NodeEnv, attempt: u32) -> Option<
             attempt,
             uuid::Uuid::new_v4()
         ),
+        tenant: env.tenant.clone(),
         stage_name: task.stage.name().to_string(),
         stage_schema: task.stage.schema(),
         invocation_key: task.key,
@@ -2613,8 +2547,11 @@ async fn run_node_with_admission(
         // so its stages cannot release/reacquire between boundaries. Both paths
         // use this same helper: fusion changes lease lifetime, never admission
         // policy or the StageContext device assignment.
+        let remote_admission = is_remote.then(AdmissionLease::empty);
         let mut owned_admission = None;
-        let admission = if let Some(pre_acquired) = pre_acquired_admission.as_deref() {
+        let admission = if let Some(remote) = remote_admission.as_ref() {
+            remote
+        } else if let Some(pre_acquired) = pre_acquired_admission.as_deref() {
             pre_acquired
         } else if let Some(shared) = shared_admission.as_deref_mut() {
             shared
@@ -3330,8 +3267,6 @@ async fn prepare_private(
         diverged: Arc::new(std::sync::Mutex::new(HashMap::new())),
         #[cfg(feature = "p2p")]
         dispatch_policy: None,
-        #[cfg(feature = "p2p")]
-        dispatcher: None,
         #[cfg(feature = "p2p")]
         execution_adapter: None,
     });
@@ -5125,8 +5060,6 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
         #[cfg(feature = "p2p")]
         dispatch_policy: ctx.dispatch_policy,
         #[cfg(feature = "p2p")]
-        dispatcher: ctx.dispatcher,
-        #[cfg(feature = "p2p")]
         execution_adapter: ctx.execution_adapter,
     });
 
@@ -5435,7 +5368,7 @@ fn internal_linear_fusion_groups(
 
 #[cfg(feature = "p2p")]
 fn fusion_runtime_is_local(ctx: &ExecCtx) -> bool {
-    ctx.dispatch_policy.is_none() && ctx.dispatcher.is_none()
+    ctx.execution_adapter.is_none()
 }
 
 #[cfg(not(feature = "p2p"))]
@@ -6261,276 +6194,6 @@ impl ParallelExecutor {
                     // preserve advisory-stage semantics even when conditional
                     // control forced the parallel executor without a policy.
                     node_stages.insert(node_id, task.stage.clone());
-
-                    // P2P dispatch: a prepared cache hit is already complete
-                    // locally and must reach `run_node`'s skip path. Only a
-                    // genuine miss may be offloaded to a peer. A declaring
-                    // stage also stays local: DispatchRequest has no checked
-                    // TrainingIoProfile wire, so sending it would lose both the
-                    // selected bounded policy and its exact retained-byte bill.
-                    // The local path emits the profile losslessly before Begin.
-                    #[cfg(feature = "p2p")]
-                    if env.execution_adapter.is_none()
-                        && task.prepared_cache_hit.is_none()
-                        && env.training_io_node(task.node_id).is_none()
-                        && let (Some(policy), Some(dispatcher)) =
-                            (env.dispatch_policy.as_ref(), env.dispatcher.as_ref())
-                    {
-                        // Restricted tenant custody dominates a cookbook's data
-                        // classification. Even a buggy/custom policy that labels
-                        // a clinical stage Public cannot move it off-node.
-                        if !env.tenant.is_restricted() && policy.is_dispatchable(task.stage.name())
-                        {
-                            let args_hash = ContentHash::of_bytes(&task.canon_args);
-                            let stage_resources = task.stage.resources();
-                            let has_gpu = stage_resources.contains(&Resource::Gpu);
-                            let resource_request = ResourceRequest {
-                                cpu_cores: task.stage.cpu_cores(),
-                                memory_gib: task.stage.memory_gib(),
-                                gpu: has_gpu,
-                                gpu_vram_gib: None,
-                            };
-                            let data_class =
-                                policy.classify_stage(task.stage.name(), &task.args) as u8;
-                            let input_content_id = match capture(
-                                task.stage.as_ref(),
-                                task.input.clone(),
-                                &env.job_dir,
-                                ArtifactRole::Input,
-                                None,
-                            ) {
-                                Ok(stored) => Some(stored.manifest.content_id),
-                                Err(error) => {
-                                    tracing::warn!(
-                                        "P2P input capture failed for node {} ({}), running locally: {error}",
-                                        node_idx,
-                                        task.stage.name()
-                                    );
-                                    None
-                                }
-                            };
-                            if let Some(input_content_id) = input_content_id {
-                                let request = DispatchRequest {
-                                    stage_name: task.stage.name(),
-                                    stage_schema: task.stage.schema(),
-                                    invocation_key: task.key,
-                                    input_content_id,
-                                    args_hash,
-                                    args: &task.args,
-                                    expected_content_id: None,
-                                    resource_request,
-                                    data_class,
-                                    tenant: &env.tenant,
-                                };
-                                if let Some(error) = plan_stop_error(deadline, started, &env.cancel)
-                                {
-                                    first_error = Some(error);
-                                    env.cancel.cancel();
-                                    break;
-                                }
-                                match dispatcher.submit(request) {
-                                    Ok(handle) => {
-                                        tracing::info!(
-                                            "Dispatched node {} ({}) to P2P peer",
-                                            node_idx,
-                                            task.stage.name()
-                                        );
-                                        let status = env.status.clone();
-                                        let cache = env.cache.clone();
-                                        let stage_name = task.stage.name().to_string();
-                                        let stage = task.stage.clone();
-                                        let deterministic = task.stage.deterministic();
-                                        let schema = task.stage.schema();
-                                        let key = task.key;
-                                        let node_id = task.node_id;
-                                        let input_hash = task.input_hash;
-                                        let canon_args = task.canon_args.clone();
-                                        let into_stage_dir = env
-                                            .job_dir
-                                            .join("stages")
-                                            .join(format!("{node_idx}-{stage_name}"));
-                                        // Route this dispatch's completion through the SAME
-                                        // JoinSet the coordinator awaits below (`join.join_next()`)
-                                        // instead of a detached `tokio::spawn` side-channel. A
-                                        // detached task bumps `in_flight` but is invisible to
-                                        // `join_next()`, so once every ready node is P2P-dispatched
-                                        // the JoinSet goes empty and `join_next()` returns `None`
-                                        // immediately — ending the coordinator loop while the
-                                        // remote work is still running, and tripping the
-                                        // `completed + pruned == order.len()` accounting check
-                                        // below. Being a JoinSet member also means a
-                                        // `JobState::Failed` now produces a real
-                                        // `NodeFailure::Stage` that flows through the SAME
-                                        // `first_error` / `env.cancel.cancel()` handling as a local
-                                        // stage failure (the `Err(f)` arm a few hundred lines down) —
-                                        // previously it only emitted a status event on a detached
-                                        // side-channel and the plan could return `Ok` past an
-                                        // explicitly failed remote stage.
-                                        join.spawn(async move {
-                                        let start = std::time::Instant::now();
-                                        loop {
-                                            match handle.poll() {
-                                                Ok(Some(JobState::Succeeded)) => {
-                                                    // `DispatchHandle::poll` carries no artifact
-                                                    // payload (`JobState::Succeeded` is a unit
-                                                    // variant), so the only route back to a real
-                                                    // `ErasedArtifact` without widening that trait
-                                                    // is the content-addressed cache: the P2P data
-                                                    // plane is expected to have landed the peer's
-                                                    // output bytes there under
-                                                    // `expected_output_hash` (== `key`) by the time
-                                                    // the job goes terminal. A miss here means the
-                                                    // peer claimed success but never delivered the
-                                                    // artifact — fail closed instead of returning a
-                                                    // phantom `Ok` with no real output.
-                                                    return match cache_lookup_off_thread(
-                                                        cache.clone(),
-                                                        key,
-                                                        stage.clone(),
-                                                        into_stage_dir.clone(),
-                                                    )
-                                                    .await
-                                                    {
-                                                        Ok(Some(hit)) => {
-                                                            let logical = compute_logical_output_hash(
-                                                                stage.as_ref(),
-                                                                &hit.artifact,
-                                                                deterministic,
-                                                                &stage_name,
-                                                                schema,
-                                                                input_hash,
-                                                                &canon_args,
-                                                            );
-                                                            // Match local execution: record portable content
-                                                            // identity, never invocation or logical hash.
-                                                            status.emit(StageEvent::StageEnd {
-                                                                node_idx,
-                                                                stage_name: stage_name.clone(),
-                                                                content_id: Some(hit.content_id),
-                                                                legacy_output_hash: None,
-                                                                elapsed: start.elapsed(),
-                                                            });
-                                                            Ok(vec![NodeOutcome {
-                                                                node_id,
-                                                                output: hit.artifact,
-                                                                in_process_output: None,
-                                                                content_id: hit.content_id,
-                                                                logical,
-                                                                cache_hit: false,
-                                                            }])
-                                                        }
-                                                        Ok(None) => {
-                                                            let msg = format!(
-                                                                "P2P dispatch reported success for node {node_idx} ({stage_name}) but no artifact was found in the cache for key {}",
-                                                                key.to_hex()
-                                                            );
-                                                            status.emit(StageEvent::StageFailed {
-                                                                node_idx,
-                                                                stage_name: stage_name.clone(),
-                                                                error: msg.clone(),
-                                                                failure: None,
-                                                            });
-                                                            Err(NodeFailure::Stage {
-                                                                idx: node_idx,
-                                                                stage: stage_name,
-                                                                source: StageError::Backend(anyhow::anyhow!(msg)),
-                                                            })
-                                                        }
-                                                        Err(error) => {
-                                                            let msg = format!(
-                                                                "P2P cache lookup worker failed for node {node_idx} ({stage_name}): {error}"
-                                                            );
-                                                            status.emit(StageEvent::StageFailed {
-                                                                node_idx,
-                                                                stage_name: stage_name.clone(),
-                                                                error: msg.clone(),
-                                                                failure: None,
-                                                            });
-                                                            Err(NodeFailure::Stage {
-                                                                idx: node_idx,
-                                                                stage: stage_name,
-                                                                source: StageError::Backend(anyhow::anyhow!(msg)),
-                                                            })
-                                                        }
-                                                    };
-                                                }
-                                                Ok(Some(JobState::Failed(reason))) => {
-                                                    status.emit(StageEvent::StageFailed {
-                                                        node_idx,
-                                                        stage_name: stage_name.clone(),
-                                                        error: reason.clone(),
-                                                        failure: None,
-                                                    });
-                                                    // Was: "Don't cancel the whole plan — just
-                                                    // report the failure", with first_error/cancel
-                                                    // never touched. Now: return a real Err so the
-                                                    // coordinator's normal Err(f) handling (which
-                                                    // sets first_error + cancels siblings) applies —
-                                                    // an explicit remote-stage failure fails the plan.
-                                                    return Err(NodeFailure::Stage {
-                                                        idx: node_idx,
-                                                        stage: stage_name,
-                                                        source: StageError::Backend(anyhow::anyhow!(reason)),
-                                                    });
-                                                }
-                                                Ok(Some(JobState::Cancelled)) => {
-                                                    return Err(NodeFailure::Cancelled);
-                                                }
-                                                Ok(Some(JobState::Unknown(reason))) => {
-                                                    let msg = format!(
-                                                        "P2P dispatch for node {node_idx} ({stage_name}) ended in an unknown state: {reason}"
-                                                    );
-                                                    status.emit(StageEvent::StageFailed {
-                                                        node_idx,
-                                                        stage_name: stage_name.clone(),
-                                                        error: msg.clone(),
-                                                        failure: None,
-                                                    });
-                                                    return Err(NodeFailure::Stage {
-                                                        idx: node_idx,
-                                                        stage: stage_name,
-                                                        source: StageError::Backend(anyhow::anyhow!(msg)),
-                                                    });
-                                                }
-                                                Ok(Some(JobState::Running)) | Ok(None) => {
-                                                    tokio::time::sleep(
-                                                        std::time::Duration::from_millis(500),
-                                                    ).await;
-                                                }
-                                                Err(e) => {
-                                                    let msg = format!("{e}");
-                                                    status.emit(StageEvent::StageFailed {
-                                                        node_idx,
-                                                        stage_name: stage_name.clone(),
-                                                        error: msg.clone(),
-                                                        failure: None,
-                                                    });
-                                                    return Err(NodeFailure::Stage {
-                                                        idx: node_idx,
-                                                        stage: stage_name,
-                                                        source: StageError::Backend(anyhow::anyhow!(msg)),
-                                                    });
-                                                }
-                                            }
-                                        }
-                                    }
-                                    .map(SchedulerTaskResult::Ordinary));
-                                        in_flight
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        continue; // skip local spawn
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "P2P dispatch failed for node {} ({}), running locally: {e}",
-                                            node_idx,
-                                            task.stage.name()
-                                        );
-                                        // Fall through to local spawn.
-                                    }
-                                }
-                            }
-                        }
-                    }
 
                     let env_c = env.clone();
                     if let Some(error) = plan_stop_error(deadline, started, &env.cancel) {

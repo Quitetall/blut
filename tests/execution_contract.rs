@@ -97,6 +97,7 @@ fn request(deadline: ExecutionDeadline) -> ExecutionRequest {
     ExecutionRequest {
         protocol_version: EXECUTION_PROTOCOL_VERSION,
         execution_id: "contract-execution".into(),
+        tenant: blut::tenant::Tenant::default(),
         stage_name: "contract".into(),
         stage_schema: 1,
         invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"invocation")),

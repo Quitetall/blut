@@ -363,7 +363,14 @@ async fn same_graph_executes_in_disjoint_tenant_cache_namespaces() {
 #[cfg(feature = "p2p")]
 #[tokio::test]
 async fn restricted_tenant_is_refused_by_real_coordinator_submit() {
-    use blut::framework::executor::{DispatchRequest, DispatchSubmitter, ResourceRequest};
+    use blut::framework::artifact_store::{
+        ARTIFACT_FORMAT_VERSION, ArtifactManifest, StoredArtifact,
+    };
+    use blut::framework::execution::{
+        DataClassification, EXECUTION_PROTOCOL_VERSION, ExecutionAdapter, ExecutionDeadline,
+        ExecutionRequest, ExecutionResources,
+    };
+    use blut::framework::stage::ErasedArtifact;
     use blut::p2p::Coordinator;
     use blut::p2p::crypto::KeyPair;
     use blut::p2p::dispatch::DefaultDispatchPolicy;
@@ -381,47 +388,68 @@ async fn restricted_tenant_is_refused_by_real_coordinator_submit() {
     .await
     .unwrap();
 
-    let tenant = Tenant::parse("clinical/prod").unwrap();
     let args = serde_json::json!({"payload": "patient-name-must-not-leak"});
-    let request = DispatchRequest {
-        stage_name: "warm_fb_cache",
+    let input_id = ContentId::from_digest(ContentHash::of_bytes(b"input"));
+    let erased = ErasedArtifact::from_typed(&()).unwrap();
+    let input = StoredArtifact {
+        manifest: ArtifactManifest {
+            format_version: ARTIFACT_FORMAT_VERSION,
+            kind: erased.kind.clone(),
+            schema: erased.schema,
+            erased,
+            content_id: input_id,
+            logical_hash: ContentHash::of_bytes(b"input"),
+            handle_root: "__blut_artifact_root_v2__".into(),
+            files: Vec::new(),
+            blob_len: 0,
+            blob_sha256: ContentHash::of_bytes(&[]),
+        },
+        pack: Vec::new(),
+    };
+    let request = ExecutionRequest {
+        protocol_version: EXECUTION_PROTOCOL_VERSION,
+        execution_id: "clinical-custody".into(),
+        tenant: Tenant::parse("clinical/prod").unwrap(),
+        stage_name: "warm_fb_cache".into(),
         stage_schema: 1,
         invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"invocation")),
-        input_content_id: ContentId::from_digest(ContentHash::of_bytes(b"input")),
         args_hash: ContentHash::of_bytes(b"args"),
-        args: &args,
+        args: args.clone(),
+        input: input.clone(),
         expected_content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"output"))),
-        resource_request: ResourceRequest::default(),
-        data_class: 0,
-        tenant: &tenant,
+        resources: ExecutionResources::default(),
+        data_class: DataClassification::Public,
+        deadline: ExecutionDeadline::from_now(None, std::time::Duration::from_secs(1)),
     };
-    let refusal = match DispatchSubmitter::submit(&coordinator, request) {
+    let refusal = match ExecutionAdapter::submit(&coordinator, request).await {
         Ok(_) => panic!("clinical work reached the real coordinator dispatch path"),
         Err(error) => error,
     };
     let visible = refusal.to_string();
-    assert!(visible.contains("P2P dispatch DENIED"));
+    assert!(visible.contains("P2P execution denied by custody policy"));
     assert!(!visible.contains("patient-name-must-not-leak"));
 
-    let research = Tenant::parse("research/dev").unwrap();
-    let restricted_request = DispatchRequest {
-        stage_name: "warm_fb_cache",
+    let restricted_request = ExecutionRequest {
+        protocol_version: EXECUTION_PROTOCOL_VERSION,
+        execution_id: "restricted-data-custody".into(),
+        tenant: Tenant::parse("research/dev").unwrap(),
+        stage_name: "warm_fb_cache".into(),
         stage_schema: 1,
         invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"invocation")),
-        input_content_id: ContentId::from_digest(ContentHash::of_bytes(b"input")),
         args_hash: ContentHash::of_bytes(b"args"),
-        args: &args,
+        args,
+        input,
         expected_content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"output"))),
-        resource_request: ResourceRequest::default(),
-        data_class: 2,
-        tenant: &research,
+        resources: ExecutionResources::default(),
+        data_class: DataClassification::Restricted,
+        deadline: ExecutionDeadline::from_now(None, std::time::Duration::from_secs(1)),
     };
-    let refusal = match DispatchSubmitter::submit(&coordinator, restricted_request) {
+    let refusal = match ExecutionAdapter::submit(&coordinator, restricted_request).await {
         Ok(_) => panic!("Restricted data reached the real coordinator dispatch path"),
         Err(error) => error,
     };
     let visible = refusal.to_string();
-    assert!(visible.contains("P2P dispatch DENIED"));
+    assert!(visible.contains("P2P execution denied by custody policy"));
     assert!(!visible.contains("patient-name-must-not-leak"));
     coordinator.shutdown();
 }

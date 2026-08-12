@@ -350,8 +350,6 @@ fn dag_opt_advanced_gate_pipeline_cancel_after_cache_rename_rolls_back_before_li
         #[cfg(feature = "p2p")]
         dispatch_policy: None,
         #[cfg(feature = "p2p")]
-        dispatcher: None,
-        #[cfg(feature = "p2p")]
         execution_adapter: None,
     };
 
@@ -470,8 +468,6 @@ fn ordinary_speculation_cache_insert_is_the_cancellation_linearization_point() {
         #[cfg(feature = "p2p")]
         dispatch_policy: None,
         #[cfg(feature = "p2p")]
-        dispatcher: None,
-        #[cfg(feature = "p2p")]
         execution_adapter: None,
     };
 
@@ -583,8 +579,6 @@ fn speculative_external_reference_succeeds_without_portable_cache() {
         diverged: Arc::new(std::sync::Mutex::new(HashMap::new())),
         #[cfg(feature = "p2p")]
         dispatch_policy: None,
-        #[cfg(feature = "p2p")]
-        dispatcher: None,
         #[cfg(feature = "p2p")]
         execution_adapter: None,
     };
@@ -4381,23 +4375,6 @@ fn local_attempt_drop_latches_one_fail_closed_terminal() {
     ));
 }
 
-// ── P2P dispatch (audit findings 1 & 2) ─────────────────────────────
-//
-// Pre-fix, a P2P-dispatched node's completion poll loop was a detached
-// `tokio::spawn` that bumped `in_flight` but was never a member of the
-// `JoinSet` the coordinator actually awaits via `join.join_next()`. Once
-// every ready node was dispatched, the JoinSet went empty and
-// `join_next()` returned `None` immediately — ending the coordinator
-// loop while the remote work was still running (finding 1), and a
-// remote `JobState::Failed` never touched `first_error`/`env.cancel`, so
-// an explicit remote failure could not fail the plan (finding 2). The
-// fix makes the poll loop itself a `join.spawn`-ed task that produces a
-// real `Result<NodeOutcome, NodeFailure>`, so both properties are
-// enforced by the SAME machinery a local node uses.
-//
-// These mocks stand in for `p2p::coordinator::Coordinator` (the real
-// `DispatchSubmitter`/`DispatchHandle` impls, in `src/p2p/coordinator.rs`,
-// outside this file's scope) without needing a live peer connection.
 #[cfg(feature = "p2p")]
 struct MockDispatchPolicy {
     dispatchable: &'static str,
@@ -4433,85 +4410,6 @@ impl crate::p2p::dispatch::DispatchPolicy for MockDispatchPolicy {
         _peer_pubkey: &ed25519_dalek::VerifyingKey,
     ) -> crate::p2p::dispatch::DispatchVerdict {
         unimplemented!("not exercised by the executor dispatch path")
-    }
-}
-
-/// Terminal state a [`MockDispatchHandle`] settles into after
-/// `polls_before_terminal` `Ok(None)` ("still running") answers.
-#[cfg(feature = "p2p")]
-#[derive(Clone)]
-enum MockTerminal {
-    Succeeded,
-    Failed(String),
-}
-
-#[cfg(feature = "p2p")]
-struct MockDispatchHandle {
-    polls_remaining: std::sync::atomic::AtomicU32,
-    terminal: MockTerminal,
-    poll_count: Arc<AtomicU32>,
-}
-#[cfg(feature = "p2p")]
-impl DispatchHandle for MockDispatchHandle {
-    fn poll(&self) -> Result<Option<JobState>, crate::error::TrainError> {
-        self.poll_count.fetch_add(1, Ordering::SeqCst);
-        let still_running = self
-            .polls_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                if n == 0 { None } else { Some(n - 1) }
-            })
-            .is_ok();
-        if still_running {
-            return Ok(None);
-        }
-        Ok(Some(match &self.terminal {
-            MockTerminal::Succeeded => JobState::Succeeded,
-            MockTerminal::Failed(reason) => JobState::Failed(reason.clone()),
-        }))
-    }
-    fn cancel(&self) -> Result<(), crate::error::TrainError> {
-        Ok(())
-    }
-}
-
-/// Submits every dispatchable node to a [`MockDispatchHandle`]. On a
-/// `Succeeded` terminal it ALSO pre-populates `cache` under the
-/// request's `expected_output_hash` — standing in for the P2P data
-/// plane having already landed the peer's output bytes by the time the
-/// job goes terminal, which is what the fixed dispatch-success arm now
-/// relies on (`cache.lookup(key)` in the executor's P2P dispatch block).
-#[cfg(feature = "p2p")]
-struct MockDispatchSubmitter {
-    cache: Arc<CacheHandle>,
-    polls_before_terminal: u32,
-    terminal: MockTerminal,
-    succeed_with: Counter,
-    poll_count: Arc<AtomicU32>,
-    submit_count: Arc<AtomicU32>,
-}
-#[cfg(feature = "p2p")]
-impl DispatchSubmitter for MockDispatchSubmitter {
-    fn submit(
-        &self,
-        request: DispatchRequest<'_>,
-    ) -> Result<Box<dyn DispatchHandle>, crate::error::TrainError> {
-        self.submit_count.fetch_add(1, Ordering::SeqCst);
-        if matches!(self.terminal, MockTerminal::Succeeded) {
-            let art = ErasedArtifact::from_typed(&self.succeed_with).unwrap();
-            self.cache
-                .insert(
-                    request.invocation_key,
-                    &DispatchableStage,
-                    &art,
-                    std::path::Path::new("."),
-                )
-                .expect("mock cache insert");
-        }
-        Ok(Box::new(MockDispatchHandle {
-            polls_remaining: std::sync::atomic::AtomicU32::new(self.polls_before_terminal),
-            terminal: self.terminal.clone(),
-            poll_count: self.poll_count.clone(),
-        }))
     }
 }
 
@@ -4640,6 +4538,15 @@ impl crate::framework::execution::ExecutionAdapter for MockExecutionAdapter {
 async fn canonical_execution_adapter_returns_validated_artifact_through_run_node() {
     let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (_td, base) = fresh_ctx();
+    let base = base.with_resource_limit(Resource::Cpu, 1);
+    let held_local_cpu = base
+        .resources
+        .get(&Resource::Cpu)
+        .expect("CPU admission semaphore")
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
     let submit_count = Arc::new(AtomicU32::new(0));
     let adapter = Arc::new(MockExecutionAdapter {
         outcome: CanonicalAdapterOutcome::Succeeded(Counter { n: 42 }),
@@ -4654,7 +4561,14 @@ async fn canonical_execution_adapter_returns_validated_artifact_through_run_node
         .finish()
         .into_compiled();
 
-    let result = ParallelExecutor::execute(plan, ctx).await.unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        ParallelExecutor::execute(plan, ctx),
+    )
+    .await
+    .expect("remote execution must not wait for local CPU admission")
+    .unwrap();
+    drop(held_local_cpu);
     let output: Counter = result.final_output.unwrap().into_typed().unwrap();
     assert_eq!(
         output.n, 42,
@@ -4687,182 +4601,6 @@ async fn unavailable_canonical_adapter_falls_back_before_local_work_starts() {
     assert_eq!(output.n, 999, "unassigned work must retain local fallback");
     assert_eq!(submit_count.load(Ordering::SeqCst), 1);
 }
-
-#[cfg(feature = "p2p")]
-#[tokio::test]
-async fn cache_aware_warm_node_skips_p2p_dispatch() {
-    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let td = tempfile::tempdir().unwrap();
-    let cache = Arc::new(CacheHandle::job_local(td.path().join("shared-cache")));
-    let make_plan = || {
-        Plan::<(), LamuTrainerBackend>::new("p2p_cache_hit", serde_json::json!({}))
-            .start(DispatchableStage, EmptyArgs)
-            .finish()
-            .into_compiled()
-    };
-
-    let mut prewarm = ExecCtx::new(td.path().join("prewarm"));
-    prewarm.cache = cache.clone();
-    let first = ParallelExecutor::execute(make_plan(), prewarm)
-        .await
-        .expect("prewarm dispatchable stage locally");
-    assert_eq!((first.n_cache_hits, first.n_cache_misses), (0, 1));
-
-    let submit_count = Arc::new(AtomicU32::new(0));
-    let submitter = Arc::new(MockDispatchSubmitter {
-        cache: cache.clone(),
-        polls_before_terminal: 0,
-        terminal: MockTerminal::Succeeded,
-        succeed_with: Counter { n: 42 },
-        poll_count: Arc::new(AtomicU32::new(0)),
-        submit_count: submit_count.clone(),
-    });
-    let policy = Arc::new(MockDispatchPolicy {
-        dispatchable: "dispatchable_thing",
-    });
-    let mut ctx = ExecCtx::new(td.path().join("measured"));
-    ctx.cache = cache;
-    ctx.dag_optimizer
-        .as_mut()
-        .expect("default optimizer")
-        .cache_aware = true;
-    let result = ParallelExecutor::execute(make_plan(), ctx.with_dispatch(policy, submitter))
-        .await
-        .expect("warm dispatchable stage must finish from cache");
-
-    assert_eq!((result.n_cache_hits, result.n_cache_misses), (1, 0));
-    assert_eq!(
-        submit_count.load(Ordering::SeqCst),
-        0,
-        "a prepared local cache hit must short-circuit before remote dispatch"
-    );
-}
-
-#[cfg(feature = "p2p")]
-#[tokio::test]
-async fn p2p_dispatch_success_is_awaited_before_plan_completes() {
-    // Finding 1 repro shape: a dispatch policy that dispatches the
-    // SINGLE (and therefore last/only ready) node in the plan. Pre-fix,
-    // the coordinator's very next `join.join_next().await` hit an EMPTY
-    // JoinSet (the detached poll task was never added to it) and
-    // returned `None` immediately, so the loop broke — either tripping
-    // the `completed + pruned == order.len()` debug assertion or (in a
-    // release build) returning an incomplete `PlanResult` — well before
-    // the mock had gone terminal. The fix makes the poll loop a real
-    // JoinSet member, so the coordinator must actually wait through the
-    // mock's `Ok(None)` backoff cycles.
-    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let (_td, base) = fresh_ctx();
-    let cache = base.cache.clone();
-    let poll_count = Arc::new(AtomicU32::new(0));
-    let submitter = Arc::new(MockDispatchSubmitter {
-        cache,
-        polls_before_terminal: 2,
-        terminal: MockTerminal::Succeeded,
-        succeed_with: Counter { n: 42 },
-        poll_count: poll_count.clone(),
-        submit_count: Arc::new(AtomicU32::new(0)),
-    });
-    let policy = Arc::new(MockDispatchPolicy {
-        dispatchable: "dispatchable_thing",
-    });
-    let ctx = base.with_dispatch(policy, submitter);
-
-    let plan = Plan::<(), LamuTrainerBackend>::new("p2p_success", serde_json::json!({}))
-        .start(DispatchableStage, EmptyArgs)
-        .finish()
-        .into_compiled();
-
-    let start = std::time::Instant::now();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        ParallelExecutor::execute(plan, ctx),
-    )
-    .await
-    .expect("dispatched plan must terminate")
-    .expect("a Succeeded remote node must not fail the plan");
-    let elapsed = start.elapsed();
-
-    // The mock forces 2 "still running" poll cycles (500ms backoff each,
-    // per the executor's poll loop) before going terminal. A coordinator
-    // that raced ahead of the real completion (the pre-fix bug) would
-    // return in a few milliseconds instead.
-    assert!(
-        elapsed >= std::time::Duration::from_millis(900),
-        "coordinator returned in {elapsed:?}, before the dispatched node's \
-         mock backoff cycles could have completed — it did not genuinely \
-         await the dispatched node's result"
-    );
-    assert!(
-        poll_count.load(Ordering::SeqCst) >= 3,
-        "expected at least 3 polls (2×still-running + 1 terminal), got {}",
-        poll_count.load(Ordering::SeqCst)
-    );
-    let out: Counter = result
-        .final_output
-        .expect("the dispatched node's real output must be in the plan result")
-        .into_typed()
-        .unwrap();
-    assert_eq!(
-        out.n, 42,
-        "final output must be the artifact delivered by the mock P2P peer \
-         (via cache), not a local re-run (999) or a missing/stale output"
-    );
-}
-
-#[cfg(feature = "p2p")]
-#[tokio::test]
-async fn p2p_dispatch_failure_fails_the_plan() {
-    // Finding 2 repro: pre-fix, a remote `JobState::Failed` only emitted
-    // a `StageFailed` status event on the detached side-channel —
-    // `first_error`/`env.cancel` were never touched, so `execute()`
-    // could still return `Ok` past an explicitly failed dispatched node.
-    // The fix routes the Failed outcome through the SAME
-    // `Err(NodeFailure::Stage)` path a local stage failure uses.
-    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let (_td, base) = fresh_ctx();
-    let cache = base.cache.clone();
-    let submitter = Arc::new(MockDispatchSubmitter {
-        cache,
-        polls_before_terminal: 1,
-        terminal: MockTerminal::Failed("remote OOM".to_string()),
-        succeed_with: Counter { n: 0 },
-        poll_count: Arc::new(AtomicU32::new(0)),
-        submit_count: Arc::new(AtomicU32::new(0)),
-    });
-    let policy = Arc::new(MockDispatchPolicy {
-        dispatchable: "dispatchable_thing",
-    });
-    let ctx = base.with_dispatch(policy, submitter);
-
-    let plan = Plan::<(), LamuTrainerBackend>::new("p2p_failure", serde_json::json!({}))
-        .start(DispatchableStage, EmptyArgs)
-        .finish()
-        .into_compiled();
-
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        ParallelExecutor::execute(plan, ctx),
-    )
-    .await
-    .expect("dispatched plan must terminate");
-
-    match result {
-        Err(PlanError::StageFailed { stage, source, .. }) => {
-            assert_eq!(stage, "dispatchable_thing");
-            let msg = source.to_string();
-            assert!(
-                msg.contains("remote OOM"),
-                "expected the remote failure reason surfaced in the error, got: {msg}"
-            );
-        }
-        other => panic!(
-            "an explicit remote-stage failure must fail the plan \
-             (StageFailed), got: {other:?}"
-        ),
-    }
-}
-
 // ── GPU sampler leaked on panic (audit finding 4) ───────────────────
 //
 // `GpuSamplerHandle` (gpu_sampler.rs) has no `Drop` impl — a bare drop

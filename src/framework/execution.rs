@@ -181,6 +181,8 @@ impl From<DataClassification> for u8 {
 pub struct ExecutionRequest {
     pub protocol_version: u16,
     pub execution_id: String,
+    /// Custody namespace. Adapters must enforce it together with data class.
+    pub tenant: crate::tenant::Tenant,
     pub stage_name: String,
     pub stage_schema: u32,
     pub invocation_key: InvocationKey,

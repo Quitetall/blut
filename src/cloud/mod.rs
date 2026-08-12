@@ -3,7 +3,7 @@
 //!
 //! Architecture: this is **the P2P data plane with an object store in place of
 //! QUIC**. The artifact bundle (`crate::p2p::bundle`), the four fail-closed verify
-//! gates, the dispatch seam (`DispatchSubmitter`/`DispatchHandle`), and the trust
+//! gates, the canonical execution seam (`ExecutionAdapter`/`ExecutionHandle`), and the trust
 //! matrix (`crate::p2p::trust`) are all transport-agnostic and reused verbatim;
 //! only the blob transport changes — `crate::p2p::transport::{send_blob,recv_blob}`
 //! over QUIC becomes the canonical [`crate::framework::object_store::ObjectStore`].
