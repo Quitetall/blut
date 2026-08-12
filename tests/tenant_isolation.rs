@@ -17,7 +17,7 @@ use blut::config::tenants::TenantQuotaPolicy;
 use blut::framework::CacheHandle;
 use blut::framework::ExecCtx;
 use blut::framework::Registry;
-use blut::framework::artifact::ContentHash;
+use blut::framework::artifact::{ContentHash, ContentId, InvocationKey};
 use blut::framework::cookbook::Cookbook;
 use blut::framework::error::StageError;
 use blut::framework::executor::SequentialExecutor;
@@ -382,10 +382,11 @@ async fn restricted_tenant_is_refused_by_real_coordinator_submit() {
     let request = DispatchRequest {
         stage_name: "warm_fb_cache",
         stage_schema: 1,
-        input_hash: ContentHash::of_bytes(b"input"),
+        invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"invocation")),
+        input_content_id: ContentId::from_digest(ContentHash::of_bytes(b"input")),
         args_hash: ContentHash::of_bytes(b"args"),
         args: &args,
-        expected_output_hash: ContentHash::of_bytes(b"output"),
+        expected_content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"output"))),
         resource_request: ResourceRequest::default(),
         data_class: 0,
         tenant: &tenant,
@@ -402,10 +403,11 @@ async fn restricted_tenant_is_refused_by_real_coordinator_submit() {
     let restricted_request = DispatchRequest {
         stage_name: "warm_fb_cache",
         stage_schema: 1,
-        input_hash: ContentHash::of_bytes(b"input"),
+        invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"invocation")),
+        input_content_id: ContentId::from_digest(ContentHash::of_bytes(b"input")),
         args_hash: ContentHash::of_bytes(b"args"),
         args: &args,
-        expected_output_hash: ContentHash::of_bytes(b"output"),
+        expected_content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"output"))),
         resource_request: ResourceRequest::default(),
         data_class: 2,
         tenant: &research,
