@@ -17,7 +17,9 @@ use blut::config::tenants::TenantQuotaPolicy;
 use blut::framework::CacheHandle;
 use blut::framework::ExecCtx;
 use blut::framework::Registry;
-use blut::framework::artifact::{ContentHash, ContentId, InvocationKey};
+use blut::framework::artifact::ContentHash;
+#[cfg(feature = "p2p")]
+use blut::framework::artifact::{ContentId, InvocationKey};
 use blut::framework::cookbook::Cookbook;
 use blut::framework::error::StageError;
 use blut::framework::executor::SequentialExecutor;

@@ -635,7 +635,7 @@ pub(super) async fn run_p2p_node(
         match &coordinator_pubkey {
             // Real stage execution via the shared content-addressed cache.
             Some(hex) => {
-                use crate::framework::object_store::FsBlobStore;
+                use crate::framework::object_store::ObjectStore;
                 use crate::p2p::dispatch::{DefaultDispatchPolicy, DispatchPolicy};
                 use crate::p2p::mesh_runner::SharedCacheRunner;
                 use crate::p2p::trust::DispatchMatrix;
@@ -647,8 +647,7 @@ pub(super) async fn run_p2p_node(
                     .map_err(|e| anyhow!("--coordinator-pubkey: invalid Ed25519 key: {e}"))?;
                 let cache_dir = paths::data_dir()?.join("p2p").join("shared-cache");
                 let work_root = paths::data_dir()?.join("p2p").join("work");
-                let store: std::sync::Arc<dyn crate::framework::object_store::BlobStore> =
-                    std::sync::Arc::new(FsBlobStore::new(cache_dir));
+                let store = ObjectStore::filesystem(cache_dir);
                 let policy: std::sync::Arc<dyn DispatchPolicy> =
                     std::sync::Arc::new(DefaultDispatchPolicy::new(DispatchMatrix::default()));
                 Some(std::sync::Arc::new(SharedCacheRunner::new(

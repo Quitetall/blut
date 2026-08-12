@@ -2,8 +2,6 @@
 // Copyright (C) 2026 Brian Lam
 //! ADR 0092 A10: one storage contract across adapters and caller modes.
 
-#![cfg(feature = "cloud")]
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -30,6 +28,7 @@ impl Fixture {
         }
     }
 
+    #[cfg(feature = "cloud")]
     fn provider() -> Self {
         let root = tempfile::tempdir().unwrap();
         let prefix = "provider-contract";
@@ -205,6 +204,21 @@ fn assert_blocking_contract(fixture: Fixture) {
         Some(&b"first"[..])
     );
 
+    let digest = ContentHash::of_bytes(b"blocking-typed-namespace-digest");
+    let cache_key = ObjectKey::CacheInvocation(InvocationKey::from_digest(digest));
+    let artifact_key = ObjectKey::Artifact(ContentId::from_digest(digest));
+    store.put(cache_key, b"invocation").unwrap();
+    store.put(artifact_key, b"artifact").unwrap();
+    assert_ne!(cache_key.relative_path(), artifact_key.relative_path());
+    assert_eq!(
+        store.get(cache_key).unwrap().as_deref(),
+        Some(&b"invocation"[..])
+    );
+    assert_eq!(
+        store.get(artifact_key).unwrap().as_deref(),
+        Some(&b"artifact"[..])
+    );
+
     let concurrent_payload = b"blocking-concurrent-put".to_vec();
     let concurrent_key = content_key(&concurrent_payload);
     let outcomes = std::thread::scope(|scope| {
@@ -263,6 +277,7 @@ async fn filesystem_async_conformance() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "cloud")]
 async fn provider_async_conformance() {
     assert_async_contract(Fixture::provider()).await;
 }
@@ -273,6 +288,7 @@ fn filesystem_blocking_conformance() {
 }
 
 #[test]
+#[cfg(feature = "cloud")]
 fn provider_blocking_conformance() {
     assert_blocking_contract(Fixture::provider());
 }

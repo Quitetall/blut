@@ -6,7 +6,7 @@
 //! gates, the dispatch seam (`DispatchSubmitter`/`DispatchHandle`), and the trust
 //! matrix (`crate::p2p::trust`) are all transport-agnostic and reused verbatim;
 //! only the blob transport changes — `crate::p2p::transport::{send_blob,recv_blob}`
-//! over QUIC becomes `BlobStore::put_blob`/`BlobStore::get_blob` over an object store.
+//! over QUIC becomes the canonical [`crate::framework::object_store::ObjectStore`].
 //!
 //! The public preview builds on `object_store`'s local-filesystem backend only.
 //! Network providers are deferred until their dependency, TLS, secret-handling,
@@ -17,7 +17,6 @@
 pub mod cost;
 pub mod job;
 pub mod queue;
-pub mod store;
 pub mod submitter;
 pub mod worker;
 
@@ -26,7 +25,9 @@ pub mod worker;
 #[derive(Debug)]
 pub enum CloudError {
     /// Object-store transport failure (put/get/head).
-    Store(String),
+    Store(crate::framework::object_store::StoreError),
+    /// Artifact packaging, identity, or rehydration failure.
+    Artifact(String),
     /// Dispatch/execution failure (unknown stage, policy refusal, data-class
     /// hard-block, timeout, stage run error) — distinct from a storage fault.
     Dispatch(String),
@@ -43,6 +44,7 @@ impl std::fmt::Display for CloudError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CloudError::Store(m) => write!(f, "cloud object store: {m}"),
+            CloudError::Artifact(m) => write!(f, "cloud artifact: {m}"),
             CloudError::Dispatch(m) => write!(f, "cloud dispatch: {m}"),
             CloudError::BadJobId(id) => write!(f, "unsafe cloud job id '{id}'"),
             CloudError::DuplicateJob(id) => write!(f, "duplicate cloud job id '{id}'"),
@@ -51,4 +53,17 @@ impl std::fmt::Display for CloudError {
     }
 }
 
-impl std::error::Error for CloudError {}
+impl std::error::Error for CloudError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Store(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<crate::framework::object_store::StoreError> for CloudError {
+    fn from(error: crate::framework::object_store::StoreError) -> Self {
+        Self::Store(error)
+    }
+}

@@ -73,7 +73,10 @@ pub use error_domain::{
 };
 pub use executor::{ExecCtx, ParallelExecutor, PlanResult, SequentialExecutor, execute_plan};
 pub use graph::{GraphSnapshot, NodeStatus, PlanGraph, graph_snapshot};
-pub use object_store::{BlobStore, FsBlobStore};
+pub use object_store::{
+    BlockingObjectStore, MAX_OBJECT_SIZE, ObjectKey, ObjectNamespace, ObjectStore,
+    ObjectStoreAdapter, PutOutcome, StoreError,
+};
 pub use plan::{CompiledPlan, NodeId, Plan};
 pub use plan_spec::{ConditionGateSpec, PLAN_SPEC_VERSION, PlanSpec, PlanSpecError, SpecNode};
 pub use resource::Resource;

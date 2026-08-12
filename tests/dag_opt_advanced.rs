@@ -18,7 +18,7 @@ use blut::framework::cache::{CacheHandle, CacheProof};
 use blut::framework::cookbook::{Cookbook, Registry};
 use blut::framework::dag_opt::DagOptimizer;
 use blut::framework::executor::{ExecCtx, ParallelExecutor};
-use blut::framework::object_store::BlobStore;
+use blut::framework::object_store::{ObjectKey, ObjectStore, ObjectStoreAdapter, StoreError};
 use blut::framework::plan::CompiledPlan;
 use blut::framework::plan_spec::{
     ConditionGateSpec, MapSpec, PLAN_SPEC_VERSION, PlanSpec, SpecNode,
@@ -95,9 +95,9 @@ struct CountingMissStore {
 
 #[derive(Debug, Default)]
 struct RacingHitState {
-    first_key: Option<ContentHash>,
-    gets_by_key: std::collections::HashMap<ContentHash, usize>,
-    objects: std::collections::HashMap<ContentHash, Vec<u8>>,
+    first_key: Option<ObjectKey>,
+    gets_by_key: std::collections::HashMap<ObjectKey, usize>,
+    objects: std::collections::HashMap<ObjectKey, Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -116,8 +116,9 @@ impl RacingHitStore {
     }
 }
 
-impl BlobStore for RacingHitStore {
-    fn get(&self, key: ContentHash) -> std::io::Result<Option<Vec<u8>>> {
+#[async_trait]
+impl ObjectStoreAdapter for RacingHitStore {
+    async fn read_raw(&self, key: ObjectKey) -> Result<Option<Vec<u8>>, StoreError> {
         let mut state = self
             .state
             .lock()
@@ -131,32 +132,43 @@ impl BlobStore for RacingHitStore {
         Ok(state.objects.get(&key).cloned())
     }
 
-    fn put(&self, key: ContentHash, bytes: &[u8]) -> std::io::Result<()> {
-        self.state
+    async fn create_raw(&self, key: ObjectKey, stored: Vec<u8>) -> Result<bool, StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match state.objects.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(stored);
+                Ok(true)
+            }
+            std::collections::hash_map::Entry::Occupied(_) => Ok(false),
+        }
+    }
+
+    async fn contains_raw(&self, key: ObjectKey) -> Result<bool, StoreError> {
+        Ok(self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .objects
-            .insert(key, bytes.to_vec());
-        Ok(())
-    }
-
-    fn head(&self, _key: ContentHash) -> std::io::Result<bool> {
-        Ok(false)
+            .contains_key(&key))
     }
 }
 
-impl BlobStore for CountingMissStore {
-    fn get(&self, _key: ContentHash) -> std::io::Result<Option<Vec<u8>>> {
+#[async_trait]
+impl ObjectStoreAdapter for CountingMissStore {
+    async fn read_raw(&self, _key: ObjectKey) -> Result<Option<Vec<u8>>, StoreError> {
         self.gets.fetch_add(1, Ordering::SeqCst);
         std::thread::sleep(self.delay);
         Ok(None)
     }
 
-    fn put(&self, _key: ContentHash, _bytes: &[u8]) -> std::io::Result<()> {
-        Ok(())
+    async fn create_raw(&self, _key: ObjectKey, _stored: Vec<u8>) -> Result<bool, StoreError> {
+        Ok(true)
     }
 
-    fn head(&self, _key: ContentHash) -> std::io::Result<bool> {
+    async fn contains_raw(&self, _key: ObjectKey) -> Result<bool, StoreError> {
         Ok(false)
     }
 }
@@ -3164,6 +3176,7 @@ async fn dag_opt_advanced_gate_probes_each_cold_key_at_most_twice() {
         gets: gets.clone(),
         delay: std::time::Duration::ZERO,
     });
+    let remote = ObjectStore::adapter(remote).blocking();
     let job_dir = temp.path().join("measured");
     let mut ctx = ExecCtx::new(job_dir.clone()).with_max_in_flight(1);
     ctx.cache = Arc::new(CacheHandle::job_local(job_dir.join("_cache")).with_remote(remote));
@@ -3186,9 +3199,10 @@ async fn dag_opt_advanced_gate_probes_each_cold_key_at_most_twice() {
 async fn dag_opt_advanced_gate_reprobes_key_after_miss_to_hit_race() {
     let _guard = TEST_LOCK.lock().await;
     let temp = tempfile::tempdir().expect("probe-race tempdir");
-    let remote = Arc::new(RacingHitStore {
+    let remote_adapter = Arc::new(RacingHitStore {
         state: std::sync::Mutex::new(RacingHitState::default()),
     });
+    let remote = ObjectStore::adapter(remote_adapter.clone()).blocking();
     let prewarm_dir = temp.path().join("prewarm");
     let mut prewarm = ExecCtx::new(prewarm_dir.clone()).with_max_in_flight(1);
     prewarm.cache =
@@ -3196,7 +3210,7 @@ async fn dag_opt_advanced_gate_reprobes_key_after_miss_to_hit_race() {
     ParallelExecutor::execute(compiled_nodes(&[("race-warm", None)]), prewarm)
         .await
         .expect("seed raced portable cache artifact");
-    remote.arm();
+    remote_adapter.arm();
     let job_dir = temp.path().join("measured");
     let mut ctx = ExecCtx::new(job_dir.clone()).with_max_in_flight(1);
     ctx.cache = Arc::new(CacheHandle::job_local(job_dir.join("_cache")).with_remote(remote));
@@ -3232,6 +3246,7 @@ async fn dag_opt_advanced_gate_slow_remote_probe_does_not_block_runtime() {
         gets: gets.clone(),
         delay: std::time::Duration::from_millis(250),
     });
+    let remote = ObjectStore::adapter(remote).blocking();
     let job_dir = temp.path().join("measured");
     let mut ctx = ExecCtx::new(job_dir.clone()).with_max_in_flight(1);
     ctx.cache = Arc::new(CacheHandle::job_local(job_dir.join("_cache")).with_remote(remote));
@@ -3263,6 +3278,7 @@ async fn dag_opt_advanced_gate_slow_probe_honors_plan_deadline_before_stage_begi
         gets: gets.clone(),
         delay: std::time::Duration::from_millis(250),
     });
+    let remote = ObjectStore::adapter(remote).blocking();
     let job_dir = temp.path().join("measured");
     let mut ctx = ExecCtx::new(job_dir.clone())
         .with_max_in_flight(1)

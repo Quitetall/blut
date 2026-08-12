@@ -60,7 +60,7 @@ fn default_plan_key() -> String {
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum CacheConfig {
-    /// A ReadWriteMany PVC mounted at the global-cache path (FsBlobStore).
+    /// A ReadWriteMany PVC mounted at the canonical filesystem-store path.
     Pvc { claim_name: String },
     /// No shared cache — job-local only (default).
     None {},

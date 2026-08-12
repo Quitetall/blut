@@ -32,10 +32,10 @@ pub(super) async fn run_cloud_cmd(
     cmd: CloudCommand,
 ) -> Result<()> {
     use crate::cloud::queue::MemQueue;
-    use crate::cloud::store::ObjStore;
     use crate::cloud::submitter::{CloudPoll, CloudSubmitSpec, CloudSubmitter};
     use crate::cloud::worker::run_one;
     use crate::framework::artifact::ContentHash;
+    use crate::framework::object_store::ObjectStore;
     use crate::framework::stage::ErasedArtifact;
     use crate::p2p::dispatch::DefaultDispatchPolicy;
     use crate::p2p::smoke::{self, SMOKE_STAGE, SmokeText};
@@ -51,7 +51,8 @@ pub(super) async fn run_cloud_cmd(
         CloudCommand::Smoke { store, input } => {
             std::fs::create_dir_all(&store)
                 .with_context(|| format!("create object-store dir {}", store.display()))?;
-            let blob_store = Arc::new(ObjStore::local(&store).context("open object store")?);
+            let blob_store =
+                ObjectStore::local_provider(&store, "cloud").context("open object store")?;
             let queue = Arc::new(MemQueue::new());
 
             // Produce the input artifact on disk (the submitter's src_root).
@@ -98,7 +99,7 @@ pub(super) async fn run_cloud_cmd(
             let work_root = tempfile::tempdir()?;
             eprintln!("running a cloud worker…");
             run_one(
-                blob_store.as_ref(),
+                &blob_store,
                 queue.as_ref(),
                 reg.as_ref(),
                 &policy,

@@ -19,7 +19,7 @@ use blut::framework::cookbook::{Cookbook, Registry};
 use blut::framework::dag_opt::DagOptimizer;
 use blut::framework::error::{PlanError, StageError};
 use blut::framework::executor::{ExecCtx, execute_plan};
-use blut::framework::object_store::BlobStore;
+use blut::framework::object_store::{ObjectKey, ObjectStore, ObjectStoreAdapter, StoreError};
 use blut::framework::plan::CompiledPlan;
 use blut::framework::plan_spec::{ConditionGateSpec, PLAN_SPEC_VERSION, PlanSpec, SpecNode};
 use blut::framework::resource::Resource;
@@ -503,22 +503,23 @@ impl Stage for PanicPublishStage {
 
 #[derive(Debug)]
 struct PanicOnTargetPutStore {
-    target: ContentHash,
+    target: ObjectKey,
 }
 
-impl BlobStore for PanicOnTargetPutStore {
-    fn get(&self, _key: ContentHash) -> std::io::Result<Option<Vec<u8>>> {
+#[async_trait]
+impl ObjectStoreAdapter for PanicOnTargetPutStore {
+    async fn read_raw(&self, _key: ObjectKey) -> Result<Option<Vec<u8>>, StoreError> {
         Ok(None)
     }
 
-    fn put(&self, key: ContentHash, _bytes: &[u8]) -> std::io::Result<()> {
+    async fn create_raw(&self, key: ObjectKey, _stored: Vec<u8>) -> Result<bool, StoreError> {
         if key == self.target {
             panic!("remote target put panic fixture");
         }
-        Ok(())
+        Ok(true)
     }
 
-    fn head(&self, _key: ContentHash) -> std::io::Result<bool> {
+    async fn contains_raw(&self, _key: ObjectKey) -> Result<bool, StoreError> {
         Ok(false)
     }
 }
@@ -1764,13 +1765,11 @@ async fn selected_publication_contains_remote_cache_plugin_panic() {
     let temp = tempfile::tempdir().expect("panic target publication tempdir");
     let job_dir = temp.path().join("job");
     let mut ctx = speculation_ctx(job_dir.clone(), true).with_bypass_cache(true);
-    ctx.cache = Arc::new(
-        CacheHandle::job_local(job_dir.join("_cache")).with_remote(Arc::new(
-            PanicOnTargetPutStore {
-                target: target_key.digest(),
-            },
-        )),
-    );
+    let remote = ObjectStore::adapter(Arc::new(PanicOnTargetPutStore {
+        target: ObjectKey::CacheInvocation(target_key),
+    }))
+    .blocking();
+    ctx.cache = Arc::new(CacheHandle::job_local(job_dir.join("_cache")).with_remote(remote));
     let handle = tokio::spawn(execute_plan(
         speculation_spec(true)
             .compile(&registry)

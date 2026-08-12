@@ -10,11 +10,11 @@
 use std::sync::Arc;
 
 use blut::cloud::queue::MemQueue;
-use blut::cloud::store::ObjStore;
 use blut::cloud::submitter::{CloudPoll, CloudSubmitSpec, CloudSubmitter};
 use blut::cloud::worker::run_one;
 use blut::framework::artifact::{ContentHash, InvocationKey};
 use blut::framework::cookbook::Registry;
+use blut::framework::object_store::ObjectStore;
 use blut::framework::stage::ErasedArtifact;
 use blut::p2p::dispatch::DefaultDispatchPolicy;
 use blut::p2p::smoke::{self, SMOKE_STAGE, SmokeText};
@@ -43,7 +43,8 @@ fn make_input(text: &str) -> (ErasedArtifact, tempfile::TempDir) {
 
 #[tokio::test]
 async fn cloud_dispatch_round_trips_over_local_object_store() {
-    let store = Arc::new(ObjStore::local(tempfile::tempdir().unwrap().path()).unwrap());
+    let store_root = tempfile::tempdir().unwrap();
+    let store = ObjectStore::local_provider(store_root.path(), "cloud-test").unwrap();
     let queue = Arc::new(MemQueue::new());
     let reg = smoke_registry();
 
@@ -80,7 +81,7 @@ async fn cloud_dispatch_round_trips_over_local_object_store() {
     let work_root = tempfile::tempdir().unwrap();
     let ledger = blut::cloud::cost::CostLedger::new(Default::default());
     let ran = run_one(
-        store.as_ref(),
+        &store,
         queue.as_ref(),
         reg.as_ref(),
         &policy,
@@ -129,7 +130,8 @@ async fn cloud_dispatch_round_trips_over_local_object_store() {
 async fn restricted_job_is_refused_by_a_registered_cloud_worker() {
     // The clinical hard-block: PHI EEG (DataClass::Restricted) must never run on a
     // cloud worker capped at Registered trust.
-    let store = Arc::new(ObjStore::local(tempfile::tempdir().unwrap().path()).unwrap());
+    let store_root = tempfile::tempdir().unwrap();
+    let store = ObjectStore::local_provider(store_root.path(), "cloud-test").unwrap();
     let queue = Arc::new(MemQueue::new());
     let reg = smoke_registry();
 
@@ -157,7 +159,7 @@ async fn restricted_job_is_refused_by_a_registered_cloud_worker() {
     let matrix = DispatchMatrix::default();
     let work_root = tempfile::tempdir().unwrap();
     run_one(
-        store.as_ref(),
+        &store,
         queue.as_ref(),
         reg.as_ref(),
         &policy,

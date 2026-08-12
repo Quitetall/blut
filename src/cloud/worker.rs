@@ -18,15 +18,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use bytes::Bytes;
-
 use super::CloudError;
 use super::job::{CloudJob, CloudResult, JobOutcome};
 use super::queue::{CloudQueue, is_safe_job_id};
-use super::store::BlobStore;
 use crate::framework::Registry;
 use crate::framework::artifact::ContentHash;
 use crate::framework::cache::CacheHandle;
+use crate::framework::object_store::{ObjectKey, ObjectStore};
 use crate::framework::stage::StageContext;
 use crate::p2p::bundle::{BlobDir, BundleManifest, bundle, unbundle};
 use crate::p2p::dispatch::DispatchPolicy;
@@ -37,7 +35,7 @@ use crate::p2p::trust::{DispatchMatrix, TrustLevel};
 /// `Ok(None)` if the queue was idle.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_one(
-    store: &dyn BlobStore,
+    store: &ObjectStore,
     queue: &dyn CloudQueue,
     registry: &Registry,
     policy: &dyn DispatchPolicy,
@@ -102,7 +100,7 @@ pub async fn run_one(
 /// Gate the job, create its work dir, run it, then clean the dir up. Returns the
 /// output blob key + manifest + the COMPUTE-only wall time (ms).
 async fn execute_claimed(
-    store: &dyn BlobStore,
+    store: &ObjectStore,
     registry: &Registry,
     policy: &dyn DispatchPolicy,
     matrix: &DispatchMatrix,
@@ -144,7 +142,7 @@ async fn execute_claimed(
 
     let stage_dir = work_root.join(&job.id);
     std::fs::create_dir_all(&stage_dir)
-        .map_err(|e| CloudError::Store(format!("create worker stage_dir: {e}")))?;
+        .map_err(|e| CloudError::Dispatch(format!("create worker stage_dir: {e}")))?;
 
     // Do the fs-touching work, then clean the dir up regardless of outcome — the
     // output bytes now live in the object store, so the local dir is disposable.
@@ -156,7 +154,7 @@ async fn execute_claimed(
 /// The fs choreography inside an already-created `stage_dir`: download → unbundle →
 /// run (timed) → bundle → upload.
 async fn run_in_dir(
-    store: &dyn BlobStore,
+    store: &ObjectStore,
     stage: &dyn crate::framework::stage::StageDyn,
     stage_dir: &Path,
     job: &CloudJob,
@@ -171,7 +169,15 @@ async fn run_in_dir(
     );
 
     // Download the input pack + unbundle (the four fail-closed gates run here).
-    let pack = store.get_blob(&job.input_blob_key).await?;
+    let pack = store
+        .get(ObjectKey::DispatchBundle(job.input_blob_key))
+        .await?
+        .ok_or_else(|| {
+            CloudError::Artifact(format!(
+                "input bundle {} is missing",
+                job.input_blob_key.to_hex()
+            ))
+        })?;
     let input = unbundle(
         stage,
         &job.input_manifest,
@@ -206,7 +212,9 @@ async fn run_in_dir(
     )
     .map_err(|e| CloudError::Dispatch(format!("bundle output: {e}")))?;
     let out_blob_key = ContentHash::of_bytes(&out_pack);
-    store.put_blob(&out_blob_key, Bytes::from(out_pack)).await?;
+    store
+        .put(ObjectKey::DispatchBundle(out_blob_key), out_pack)
+        .await?;
 
     Ok((out_blob_key, out_manifest, compute_ms))
 }

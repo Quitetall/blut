@@ -16,15 +16,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use bytes::Bytes;
 use serde_json::Value;
 
 use super::CloudError;
 use super::job::{CloudJob, JobOutcome};
 use super::queue::{CloudQueue, JobStatus};
-use super::store::BlobStore;
 use crate::framework::Registry;
 use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
+use crate::framework::object_store::{ObjectKey, ObjectStore};
 use crate::framework::stage::ErasedArtifact;
 use crate::p2p::bundle::{BlobDir, bundle, unbundle};
 use crate::p2p::task::ResourceRequest;
@@ -47,11 +46,11 @@ pub struct CloudSubmitSpec {
     pub timeout_secs: u64,
 }
 
-/// Submits cloud jobs over a [`BlobStore`] + [`CloudQueue`], resolving stages from
+/// Submits cloud jobs over an [`ObjectStore`] + [`CloudQueue`], resolving stages from
 /// a `Registry` (needed to bundle/unbundle the typed artifact).
 #[derive(Clone)]
 pub struct CloudSubmitter {
-    store: Arc<dyn BlobStore>,
+    store: ObjectStore,
     queue: Arc<dyn CloudQueue>,
     registry: Arc<Registry>,
 }
@@ -71,11 +70,7 @@ pub enum CloudPoll {
 }
 
 impl CloudSubmitter {
-    pub fn new(
-        store: Arc<dyn BlobStore>,
-        queue: Arc<dyn CloudQueue>,
-        registry: Arc<Registry>,
-    ) -> Self {
+    pub fn new(store: ObjectStore, queue: Arc<dyn CloudQueue>, registry: Arc<Registry>) -> Self {
         Self {
             store,
             queue,
@@ -93,11 +88,13 @@ impl CloudSubmitter {
 
         // Bundle the input rooted at its producing dir (reuses the p2p data plane).
         let (manifest, pack) = bundle(&*stage, spec.input, &spec.src_root, BlobDir::Input, None)
-            .map_err(|e| CloudError::Store(format!("bundle input: {e}")))?;
+            .map_err(|e| CloudError::Artifact(format!("bundle input: {e}")))?;
 
         // Upload the pack keyed by its own hash; the small manifest rides the job.
         let blob_key = ContentHash::of_bytes(&pack);
-        self.store.put_blob(&blob_key, Bytes::from(pack)).await?;
+        self.store
+            .put(ObjectKey::DispatchBundle(blob_key), pack)
+            .await?;
 
         let job = CloudJob {
             protocol_version: super::job::CLOUD_JOB_PROTOCOL_VERSION,
@@ -131,7 +128,7 @@ impl CloudSubmitter {
 /// the output bundle. (The `DispatchHandle`/executor-offload integration is T3.2;
 /// v1 drives this from the `blut cloud submit` CLI path.)
 pub struct CloudJobHandle {
-    store: Arc<dyn BlobStore>,
+    store: ObjectStore,
     queue: Arc<dyn CloudQueue>,
     registry: Arc<Registry>,
     job_id: String,
@@ -153,7 +150,7 @@ impl CloudJobHandle {
             JobStatus::Unknown => Ok(CloudPoll::Unknown),
             JobStatus::Done(result) => {
                 if result.protocol_version != super::job::CLOUD_JOB_PROTOCOL_VERSION {
-                    return Err(CloudError::Store(format!(
+                    return Err(CloudError::Artifact(format!(
                         "cloud result protocol v{} unsupported (want v{})",
                         result.protocol_version,
                         super::job::CLOUD_JOB_PROTOCOL_VERSION
@@ -166,22 +163,31 @@ impl CloudJobHandle {
                     JobOutcome::Cancelled => Ok(CloudPoll::Cancelled),
                     JobOutcome::Succeeded => {
                         let blob_key = result.output_blob_key.ok_or_else(|| {
-                            CloudError::Store("succeeded result missing output_blob_key".into())
+                            CloudError::Artifact("succeeded result missing output_blob_key".into())
                         })?;
                         let manifest = result.output_manifest.ok_or_else(|| {
-                            CloudError::Store("succeeded result missing output_manifest".into())
+                            CloudError::Artifact("succeeded result missing output_manifest".into())
                         })?;
                         let content_id = result.content_id.ok_or_else(|| {
-                            CloudError::Store("succeeded result missing content_id".into())
+                            CloudError::Artifact("succeeded result missing content_id".into())
                         })?;
                         if let Some(expected) = self.expected_content_id
                             && content_id != expected
                         {
-                            return Err(CloudError::Store(format!(
+                            return Err(CloudError::Artifact(format!(
                                 "output identity {content_id} != analytically expected {expected}"
                             )));
                         }
-                        let pack = self.store.get_blob(&blob_key).await?;
+                        let pack = self
+                            .store
+                            .get(ObjectKey::DispatchBundle(blob_key))
+                            .await?
+                            .ok_or_else(|| {
+                                CloudError::Artifact(format!(
+                                    "output bundle {} is missing",
+                                    blob_key.to_hex()
+                                ))
+                            })?;
                         let factory = self
                             .registry
                             .find_erased_stage(&self.stage_name)
@@ -197,7 +203,7 @@ impl CloudJobHandle {
                             Some(content_id),
                             BlobDir::Output,
                         )
-                        .map_err(|e| CloudError::Store(format!("unbundle output: {e}")))?;
+                        .map_err(|e| CloudError::Artifact(format!("unbundle output: {e}")))?;
                         Ok(CloudPoll::Succeeded(output))
                     }
                 }

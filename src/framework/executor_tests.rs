@@ -16,6 +16,7 @@ use super::*;
 use crate::backends::LamuTrainerBackend;
 use crate::framework::artifact::Artifact;
 use crate::framework::compat::Compatible;
+use crate::framework::object_store::{BlockingObjectStore, ObjectKey};
 use crate::framework::plan::{CompiledConditionGate, ExecutionOverrides, Plan};
 use crate::framework::stage::Stage;
 use async_trait::async_trait;
@@ -300,26 +301,6 @@ fn dag_opt_advanced_gate_pipeline_abandoned_predicted_key_requeues_deferred_wait
     assert_eq!(ready, BTreeSet::from([21]));
 }
 
-#[derive(Debug)]
-struct PipelinePublicationRemoteProbe {
-    puts: Arc<AtomicU32>,
-}
-
-impl crate::framework::object_store::BlobStore for PipelinePublicationRemoteProbe {
-    fn get(&self, _key: ContentHash) -> std::io::Result<Option<Vec<u8>>> {
-        Ok(None)
-    }
-
-    fn put(&self, _key: ContentHash, _bytes: &[u8]) -> std::io::Result<()> {
-        self.puts.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn head(&self, _key: ContentHash) -> std::io::Result<bool> {
-        Ok(false)
-    }
-}
-
 struct OptionalLocalInsertHookReset;
 
 impl Drop for OptionalLocalInsertHookReset {
@@ -333,13 +314,10 @@ fn dag_opt_advanced_gate_pipeline_cancel_after_cache_rename_rolls_back_before_li
     let _lock = TEST_LOCK.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let job_dir = temp.path().join("job");
-    let remote_puts = Arc::new(AtomicU32::new(0));
+    let remote_root = temp.path().join("remote");
     let cache = Arc::new(
-        CacheHandle::job_local(job_dir.join("_cache")).with_remote(Arc::new(
-            PipelinePublicationRemoteProbe {
-                puts: remote_puts.clone(),
-            },
-        )),
+        CacheHandle::job_local(job_dir.join("_cache"))
+            .with_remote(BlockingObjectStore::filesystem(remote_root.clone())),
     );
     let mut ctx = ExecCtx::new(job_dir.clone());
     ctx.cache = cache.clone();
@@ -379,7 +357,6 @@ fn dag_opt_advanced_gate_pipeline_cancel_after_cache_rename_rolls_back_before_li
     cache
         .insert(parent_key, &MakeOne, &parent_output, &parent_stage_dir)
         .unwrap();
-    remote_puts.store(0, Ordering::SeqCst);
     let parent_cache_path = cache.entry_path_for_write(parent_key);
     let child_cache_path = cache.entry_path_for_write(child_key);
     std::fs::create_dir_all(&parent_stage_dir).unwrap();
@@ -432,7 +409,16 @@ fn dag_opt_advanced_gate_pipeline_cancel_after_cache_rename_rolls_back_before_li
     );
     assert!(!job_dir.join("stages/1-make_one").exists());
     assert!(!scratch_root.exists());
-    assert_eq!(remote_puts.load(Ordering::SeqCst), 0);
+    assert!(
+        remote_root
+            .join(ObjectKey::CacheInvocation(parent_key).relative_path())
+            .is_file()
+    );
+    assert!(
+        !remote_root
+            .join(ObjectKey::CacheInvocation(child_key).relative_path())
+            .exists()
+    );
     assert!(events.try_recv().is_err());
 }
 
@@ -441,13 +427,10 @@ fn ordinary_speculation_cache_insert_is_the_cancellation_linearization_point() {
     let _lock = TEST_LOCK.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let job_dir = temp.path().join("job");
-    let remote_puts = Arc::new(AtomicU32::new(0));
+    let remote_root = temp.path().join("remote");
     let cache = Arc::new(
-        CacheHandle::job_local(job_dir.join("_cache")).with_remote(Arc::new(
-            PipelinePublicationRemoteProbe {
-                puts: remote_puts.clone(),
-            },
-        )),
+        CacheHandle::job_local(job_dir.join("_cache"))
+            .with_remote(BlockingObjectStore::filesystem(remote_root.clone())),
     );
     let mut ctx = ExecCtx::new(job_dir.clone());
     ctx.cache = cache.clone();
@@ -524,10 +507,17 @@ fn ordinary_speculation_cache_insert_is_the_cancellation_linearization_point() {
     assert!(child_cache_path.is_file());
     assert!(job_dir.join("stages/1-make_one/private").is_file());
     assert!(!scratch_root.exists());
-    assert_eq!(
-        remote_puts.load(Ordering::SeqCst),
-        2,
-        "portable cache publication writes content object then invocation record"
+    assert!(
+        remote_root
+            .join(ObjectKey::CacheInvocation(child_key).relative_path())
+            .is_file(),
+        "portable cache publication writes invocation record"
+    );
+    assert!(
+        remote_root
+            .join(ObjectKey::Artifact(outcome.content_id).relative_path())
+            .is_file(),
+        "portable cache publication writes content object"
     );
     assert!(matches!(
         events.try_recv(),

@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 #[cfg(feature = "cloud")]
 use object_store::ObjectStoreExt;
 
@@ -150,6 +151,12 @@ pub enum StoreError {
     Conflict { key: ObjectKey },
     #[error("invalid object-store address: {0}")]
     InvalidAddress(String),
+    #[error("object-store {adapter} adapter initialization failed: {source}")]
+    Initialization {
+        adapter: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("object-store {operation} failed for {key}: {source}")]
     Backend {
         operation: &'static str,
@@ -162,6 +169,17 @@ pub enum StoreError {
 }
 
 impl StoreError {
+    #[cfg(feature = "cloud")]
+    fn initialization(
+        adapter: &'static str,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Initialization {
+            adapter,
+            source: Box::new(source),
+        }
+    }
+
     fn backend(
         operation: &'static str,
         key: ObjectKey,
@@ -182,6 +200,21 @@ pub enum PutOutcome {
     AlreadyPresent,
 }
 
+/// Physical adapter seam beneath canonical addressing and validation policy.
+///
+/// Implementations only move already-enveloped bytes. [`ObjectStore`] remains
+/// responsible for namespaces, size limits, hashes, immutable-conflict checks,
+/// and error semantics. `create_raw` returns `true` only when this call created
+/// the key; `false` means an object already existed and must be verified by the
+/// facade. Production callers normally use the filesystem or provider
+/// constructors; this seam also permits deterministic fault-injection tests.
+#[async_trait]
+pub trait ObjectStoreAdapter: Send + Sync + std::fmt::Debug {
+    async fn read_raw(&self, key: ObjectKey) -> Result<Option<Vec<u8>>, StoreError>;
+    async fn create_raw(&self, key: ObjectKey, stored: Vec<u8>) -> Result<bool, StoreError>;
+    async fn contains_raw(&self, key: ObjectKey) -> Result<bool, StoreError>;
+}
+
 #[derive(Clone, Debug)]
 enum Backend {
     Filesystem {
@@ -191,6 +224,9 @@ enum Backend {
     Provider {
         inner: Arc<dyn object_store::ObjectStore>,
         prefix: String,
+    },
+    Adapter {
+        inner: Arc<dyn ObjectStoreAdapter>,
     },
 }
 
@@ -205,6 +241,13 @@ impl ObjectStore {
     pub fn filesystem(root: impl Into<PathBuf>) -> Self {
         Self {
             backend: Backend::Filesystem { root: root.into() },
+        }
+    }
+
+    /// Wrap a physical adapter while retaining every canonical policy gate.
+    pub fn adapter(inner: Arc<dyn ObjectStoreAdapter>) -> Self {
+        Self {
+            backend: Backend::Adapter { inner },
         }
     }
 
@@ -236,7 +279,7 @@ impl ObjectStore {
         prefix: impl AsRef<str>,
     ) -> Result<Self, StoreError> {
         let inner = object_store::local::LocalFileSystem::new_with_prefix(root)
-            .map_err(|error| StoreError::InvalidAddress(error.to_string()))?;
+            .map_err(|error| StoreError::initialization("local-provider", error))?;
         Self::provider(Arc::new(inner), prefix)
     }
 
@@ -292,6 +335,23 @@ impl ObjectStore {
             Backend::Provider { inner, prefix } => {
                 read_provider_capped(inner, provider_path(prefix, key), key).await
             }
+            Backend::Adapter { inner } => {
+                let stored = inner.read_raw(key).await?;
+                if stored
+                    .as_ref()
+                    .is_some_and(|bytes| bytes.len() as u64 > MAX_STORED_SIZE)
+                {
+                    return Err(StoreError::TooLarge {
+                        key,
+                        size: stored
+                            .as_ref()
+                            .map_or(0, |bytes| bytes.len() as u64)
+                            .saturating_sub(OBJECT_HEADER_LEN as u64),
+                        max: MAX_OBJECT_SIZE,
+                    });
+                }
+                Ok(stored)
+            }
         }
     }
 
@@ -314,6 +374,13 @@ impl ObjectStore {
                     Err(error) => Err(StoreError::backend("put", key, error)),
                 }
             }
+            Backend::Adapter { inner } => inner.create_raw(key, stored).await.map(|created| {
+                if created {
+                    RawCreate::Created
+                } else {
+                    RawCreate::AlreadyExists
+                }
+            }),
         }
     }
 
@@ -341,6 +408,7 @@ impl ObjectStore {
                     Err(error) => Err(StoreError::backend("head", key, error)),
                 }
             }
+            Backend::Adapter { inner } => inner.contains_raw(key).await,
         }
     }
 }
@@ -618,104 +686,4 @@ fn block_on_isolated<T: Send + 'static>(
     })
     .join()
     .map_err(|_| StoreError::Runtime("blocking worker thread panicked".into()))?
-}
-
-/// A content-addressed blob backend. Implementations must be cheap to share
-/// (`Arc`ed) across the executor's tasks.
-pub trait BlobStore: Send + Sync + std::fmt::Debug {
-    /// Fetch the bytes stored under `key`, or `None` if absent. An I/O error
-    /// (network blip, permission) is surfaced — the caller treats it as a miss
-    /// but logs it, so a broken remote degrades to "no shared cache" rather
-    /// than a wrong answer.
-    fn get(&self, key: ContentHash) -> std::io::Result<Option<Vec<u8>>>;
-
-    /// Store `bytes` under `key`. Idempotent — content-addressed, so a
-    /// re-`put` of the same key is a no-op-equivalent overwrite of identical
-    /// bytes.
-    fn put(&self, key: ContentHash, bytes: &[u8]) -> std::io::Result<()>;
-
-    /// Presence check without transferring the bytes.
-    fn head(&self, key: ContentHash) -> std::io::Result<bool>;
-}
-
-/// A shared-filesystem blob store: one file per key at
-/// `<root>/<hex-key>`. This is the plain NFS/Lustre backend AND the
-/// Kubernetes RWX-PVC backend for a pod-shared cache. Writes are atomic
-/// (write-temp + rename), so concurrent writers never observe a torn blob.
-#[derive(Debug, Clone)]
-pub struct FsBlobStore {
-    root: PathBuf,
-}
-
-impl FsBlobStore {
-    pub fn new(root: PathBuf) -> Self {
-        Self { root }
-    }
-
-    fn path_for(&self, key: ContentHash) -> PathBuf {
-        self.root.join(key.to_hex())
-    }
-}
-
-impl BlobStore for FsBlobStore {
-    fn get(&self, key: ContentHash) -> std::io::Result<Option<Vec<u8>>> {
-        match std::fs::read(self.path_for(key)) {
-            Ok(b) => Ok(Some(b)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn put(&self, key: ContentHash, bytes: &[u8]) -> std::io::Result<()> {
-        crate::framework::cache::write_atomic(&self.path_for(key), bytes)
-    }
-
-    fn head(&self, key: ContentHash) -> std::io::Result<bool> {
-        // `is_file` (not `exists`): a key resolves to a regular file, never a
-        // directory. Presence is advisory — a concurrent delete can race a
-        // following `get`, which then simply misses (never a wrong answer).
-        Ok(self.path_for(key).is_file())
-    }
-}
-
-/// Convenience: `Arc` a store for the cache's remote tier.
-pub fn shared(store: impl BlobStore + 'static) -> Arc<dyn BlobStore> {
-    Arc::new(store)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fs_blob_store_round_trips_and_head() {
-        let td = tempfile::tempdir().unwrap();
-        let store = FsBlobStore::new(td.path().to_path_buf());
-        let key = ContentHash::of_bytes(b"payload");
-        assert!(!store.head(key).unwrap());
-        assert_eq!(store.get(key).unwrap(), None);
-        store.put(key, b"payload-bytes").unwrap();
-        assert!(store.head(key).unwrap());
-        assert_eq!(
-            store.get(key).unwrap().as_deref(),
-            Some(&b"payload-bytes"[..])
-        );
-    }
-
-    #[test]
-    fn fs_blob_store_put_is_idempotent() {
-        let td = tempfile::tempdir().unwrap();
-        let store = FsBlobStore::new(td.path().to_path_buf());
-        let key = ContentHash::of_bytes(b"k");
-        store.put(key, b"v").unwrap();
-        store.put(key, b"v").unwrap(); // no torn write, no error
-        assert_eq!(store.get(key).unwrap().as_deref(), Some(&b"v"[..]));
-    }
-
-    #[test]
-    fn missing_root_get_is_a_miss_not_an_error() {
-        let store = FsBlobStore::new(PathBuf::from("/nonexistent-blob-root-xyz"));
-        assert_eq!(store.get(ContentHash::of_bytes(b"x")).unwrap(), None);
-        assert!(!store.head(ContentHash::of_bytes(b"x")).unwrap());
-    }
 }

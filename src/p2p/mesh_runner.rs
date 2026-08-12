@@ -6,8 +6,8 @@
 //! The A3 node core made task execution pluggable ([`MeshTaskRunner`]); the CLI
 //! ships a smoke runner. This is the REAL one: it executes a dispatched cookbook
 //! stage, sourcing its input and sinking its output through a shared
-//! [`BlobStore`] (the cache's remote tier — a shared filesystem/RWX PVC in the
-//! public preview), keyed by
+//! [`ObjectStore`] (the cache's remote tier — a shared filesystem or qualified
+//! provider adapter), keyed by
 //! content hash. No per-task blob transfer is needed: the scheduler
 //! [`publish_input`]s the bundle under `input_hash`, the worker reads it, runs
 //! the stage, writes the output bundle under `output_hash`, and returns a
@@ -32,7 +32,7 @@ use crate::framework::artifact::ContentId;
 use crate::framework::artifact_store::StoredArtifact;
 use crate::framework::cache::CacheHandle;
 use crate::framework::cookbook::Registry;
-use crate::framework::object_store::BlobStore;
+use crate::framework::object_store::{ObjectKey, ObjectStore};
 use crate::framework::stage::{ErasedArtifact, StageContext};
 use crate::p2p::bundle::{self, BlobDir};
 use crate::p2p::crypto::{KeyPair, verify};
@@ -44,10 +44,10 @@ use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
 
 /// Executes dispatched cookbook stages, sourcing/sinking artifacts through a
-/// shared content-addressed [`BlobStore`].
+/// shared content-addressed [`ObjectStore`].
 pub struct SharedCacheRunner {
     registry: Arc<Registry>,
-    store: Arc<dyn BlobStore>,
+    store: ObjectStore,
     work_root: PathBuf,
     keypair: Arc<KeyPair>,
     policy: Arc<dyn DispatchPolicy>,
@@ -59,7 +59,7 @@ pub struct SharedCacheRunner {
 impl SharedCacheRunner {
     pub fn new(
         registry: Arc<Registry>,
-        store: Arc<dyn BlobStore>,
+        store: ObjectStore,
         work_root: PathBuf,
         keypair: Arc<KeyPair>,
         policy: Arc<dyn DispatchPolicy>,
@@ -79,8 +79,8 @@ impl SharedCacheRunner {
     /// the shared store under its store-derived [`ContentId`], so a worker's
     /// [`run`](Self::run) can source it. The stage resolves the artifact's
     /// backing paths.
-    pub fn publish_input(
-        store: &dyn BlobStore,
+    pub async fn publish_input(
+        store: &ObjectStore,
         registry: &Registry,
         stage_name: &str,
         input: ErasedArtifact,
@@ -96,14 +96,15 @@ impl SharedCacheRunner {
         let bytes = bincode::serialize(&StoredArtifact { manifest, pack })
             .map_err(|e| TrainError::other(format!("serialize input bundle: {e}")))?;
         store
-            .put(input_content_id.digest(), &bytes)
+            .put(ObjectKey::Artifact(input_content_id), bytes)
+            .await
             .map_err(|e| TrainError::other(format!("publish input bundle: {e}")))?;
         Ok(input_content_id)
     }
 
     /// Initiator-side: read the output bundle a completed task wrote to the
     /// shared store, rebase it into `into_dir`, and return the verified handle.
-    pub fn fetch_output(
+    pub async fn fetch_output(
         &self,
         stage_name: &str,
         content_id: ContentId,
@@ -113,7 +114,7 @@ impl SharedCacheRunner {
             TrainError::other(format!("fetch_output: unknown stage '{stage_name}'"))
         })?;
         let stage = ctor();
-        let shared = self.read_bundle(content_id)?;
+        let shared = self.read_bundle(content_id).await?;
         bundle::unbundle(
             &*stage,
             &shared.manifest,
@@ -125,10 +126,11 @@ impl SharedCacheRunner {
         .map_err(|e| TrainError::other(format!("unbundle output: {e}")))
     }
 
-    fn read_bundle(&self, content_id: ContentId) -> Result<StoredArtifact, TrainError> {
+    async fn read_bundle(&self, content_id: ContentId) -> Result<StoredArtifact, TrainError> {
         let bytes = self
             .store
-            .get(content_id.digest())
+            .get(ObjectKey::Artifact(content_id))
+            .await
             .map_err(|e| TrainError::other(format!("read shared bundle: {e}")))?
             .ok_or_else(|| {
                 TrainError::other(format!("shared store has no artifact for {content_id}"))
@@ -187,7 +189,7 @@ impl MeshTaskRunner for SharedCacheRunner {
 
         // 5. Source the input bundle from the shared store + unbundle (the four
         //    fail-closed gates run against task.input_hash inside unbundle).
-        let shared_in = self.read_bundle(task.input_content_id)?;
+        let shared_in = self.read_bundle(task.input_content_id).await?;
         let input = bundle::unbundle(
             &*stage,
             &shared_in.manifest,
@@ -237,7 +239,8 @@ impl MeshTaskRunner for SharedCacheRunner {
         })
         .map_err(|e| TrainError::other(format!("serialize output bundle: {e}")))?;
         self.store
-            .put(output_content_id.digest(), &out_bytes)
+            .put(ObjectKey::Artifact(output_content_id), out_bytes)
+            .await
             .map_err(|e| TrainError::other(format!("publish output bundle: {e}")))?;
 
         // Best-effort cleanup of the work dir (the output is on the store now).
@@ -261,7 +264,7 @@ impl MeshTaskRunner for SharedCacheRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::framework::object_store::FsBlobStore;
+    use crate::framework::object_store::ObjectStore;
     use crate::framework::{ContentHash, InvocationKey};
     use crate::p2p::dispatch::DefaultDispatchPolicy;
     use crate::p2p::smoke::{SMOKE_STAGE, SmokeText, expected_echo_hash};
@@ -274,7 +277,7 @@ mod tests {
     #[tokio::test]
     async fn shared_cache_runner_executes_a_real_stage() {
         let store_dir = tempfile::tempdir().unwrap();
-        let store: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(store_dir.path().to_path_buf()));
+        let store = ObjectStore::filesystem(store_dir.path());
 
         let mut registry = Registry::new();
         crate::p2p::smoke::register(&mut registry);
@@ -296,12 +299,13 @@ mod tests {
         };
         let input_erased = ErasedArtifact::from_typed(&input).unwrap();
         let input_content_id = SharedCacheRunner::publish_input(
-            &*store,
+            &store,
             &registry,
             SMOKE_STAGE,
             input_erased,
             src_root.path(),
         )
+        .await
         .unwrap();
 
         // The scheduler's signed manifest.
@@ -352,6 +356,7 @@ mod tests {
         let out_dir = tempfile::tempdir().unwrap();
         let out = runner
             .fetch_output(SMOKE_STAGE, result.content_id, out_dir.path())
+            .await
             .expect("fetch output from shared store");
         let out: SmokeText = out.into_typed().unwrap();
         assert_eq!(out.content_hash, expected_logical);
@@ -364,9 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn forged_manifest_signature_is_rejected() {
-        let store: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(
-            tempfile::tempdir().unwrap().path().to_path_buf(),
-        ));
+        let store = ObjectStore::filesystem(tempfile::tempdir().unwrap().path());
         let mut registry = Registry::new();
         crate::p2p::smoke::register(&mut registry);
         let policy: Arc<dyn DispatchPolicy> =

@@ -43,11 +43,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
 use crate::framework::artifact_store::{ArtifactRole, StoredArtifact, capture, restore};
+use crate::framework::object_store::{BlockingObjectStore, ObjectKey};
 use crate::framework::stage::{ErasedArtifact, StageDyn};
 
 const CACHE_RECORD_VERSION: u16 = 1;
-const INVOCATION_NAMESPACE: &[u8] = b"blut.cache.remote.invocation.v1";
-const OBJECT_NAMESPACE: &[u8] = b"blut.cache.remote.object.v1";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CacheRecord {
@@ -104,7 +103,7 @@ pub struct CacheHandle {
     /// to the active local write target so the entry is a real local `CacheHit`.
     /// `insert` writes through to it too (best-effort). A shared cache across
     /// machines / pods.
-    pub remote: Option<std::sync::Arc<dyn crate::framework::object_store::BlobStore>>,
+    pub remote: Option<BlockingObjectStore>,
 }
 
 impl CacheHandle {
@@ -143,10 +142,7 @@ impl CacheHandle {
 
     /// Attach a content-addressed remote tier (a shared object store / RWX
     /// PVC). Checked after the local dirs on lookup; written through on insert.
-    pub fn with_remote(
-        self,
-        remote: std::sync::Arc<dyn crate::framework::object_store::BlobStore>,
-    ) -> Self {
+    pub fn with_remote(self, remote: BlockingObjectStore) -> Self {
         Self {
             remote: Some(remote),
             ..self
@@ -326,7 +322,7 @@ impl CacheHandle {
         into_stage_dir: &Path,
     ) -> Option<CacheHit> {
         let remote = self.remote.as_ref()?;
-        let record_bytes = match remote.get(remote_invocation_key(key)) {
+        let record_bytes = match remote.get(ObjectKey::CacheInvocation(key)) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return None,
             Err(error) => {
@@ -339,7 +335,7 @@ impl CacheHandle {
         };
         let diagnostic_path = PathBuf::from(format!("remote:invocations/{}", key.to_hex()));
         let record = decode_record(&record_bytes, key, stage, &diagnostic_path)?;
-        let object_bytes = match remote.get(remote_object_key(record.content_id)) {
+        let object_bytes = match remote.get(ObjectKey::Artifact(record.content_id)) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return None,
             Err(error) => {
@@ -409,9 +405,9 @@ impl CacheHandle {
         write_atomic(&record_path(target, key), &record_bytes)?;
 
         if let Some(remote) = &self.remote {
-            match remote.put(remote_object_key(content_id), &object_bytes) {
-                Ok(()) => {
-                    if let Err(error) = remote.put(remote_invocation_key(key), &record_bytes) {
+            match remote.put(ObjectKey::Artifact(content_id), &object_bytes) {
+                Ok(_) => {
+                    if let Err(error) = remote.put(ObjectKey::CacheInvocation(key), &record_bytes) {
                         tracing::warn!(
                             "cache: remote invocation write-through for {}: {error}",
                             key.to_hex()
@@ -490,10 +486,10 @@ impl CacheHandle {
     pub(crate) fn replicate_optional(&self, write: &OptionalCacheWrite) {
         if let Some(remote) = &self.remote {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                remote.put(remote_object_key(write.content_id), &write.object_bytes)?;
-                remote.put(remote_invocation_key(write.key), &write.record_bytes)
+                remote.put(ObjectKey::Artifact(write.content_id), &write.object_bytes)?;
+                remote.put(ObjectKey::CacheInvocation(write.key), &write.record_bytes)
             })) {
-                Ok(Ok(())) => {}
+                Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
                     tracing::warn!(
                         "cache: optional remote write-through for {}: {error}",
@@ -550,23 +546,6 @@ fn object_path(base: &Path, content_id: ContentId) -> PathBuf {
     base.join("objects")
         .join(content_id.to_hex())
         .join("artifact.bin")
-}
-
-fn namespaced_remote_key(namespace: &[u8], digest: ContentHash) -> ContentHash {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(namespace);
-    hasher.update([0]);
-    hasher.update(digest.0);
-    ContentHash(hasher.finalize().into())
-}
-
-fn remote_invocation_key(key: InvocationKey) -> ContentHash {
-    namespaced_remote_key(INVOCATION_NAMESPACE, key.digest())
-}
-
-fn remote_object_key(content_id: ContentId) -> ContentHash {
-    namespaced_remote_key(OBJECT_NAMESPACE, content_id.digest())
 }
 
 fn decode_record(
@@ -977,23 +956,6 @@ mod tests {
     use crate::framework::resource::Resource;
     use crate::framework::stage::{Stage, StageContext};
 
-    #[derive(Debug)]
-    struct PanicHeadStore;
-
-    impl crate::framework::object_store::BlobStore for PanicHeadStore {
-        fn get(&self, _key: ContentHash) -> std::io::Result<Option<Vec<u8>>> {
-            Ok(None)
-        }
-
-        fn put(&self, _key: ContentHash, _bytes: &[u8]) -> std::io::Result<()> {
-            Ok(())
-        }
-
-        fn head(&self, _key: ContentHash) -> std::io::Result<bool> {
-            panic!("optional presence probe called remote head");
-        }
-    }
-
     #[derive(Clone, Debug, Serialize, Deserialize)]
     struct FileArtifact {
         path: PathBuf,
@@ -1281,9 +1243,9 @@ mod tests {
 
     #[test]
     fn remote_tier_write_through_and_hit() {
-        use crate::framework::object_store::{BlobStore, FsBlobStore};
+        use crate::framework::object_store::{BlockingObjectStore, ObjectKey};
         let td = tempfile::tempdir().unwrap();
-        let remote = std::sync::Arc::new(FsBlobStore::new(td.path().join("remote")));
+        let remote = BlockingObjectStore::filesystem(td.path().join("remote"));
         let key = invocation(b"k");
 
         // Machine A: insert → writes local AND through to the remote store.
@@ -1293,11 +1255,11 @@ mod tests {
         let (artifact, _) = file_artifact(&a_producer, b"remote payload");
         let content_id = h_a.insert(key, &FileStage, &artifact, &a_producer).unwrap();
         assert!(
-            remote.head(remote_invocation_key(key)).unwrap(),
+            remote.contains(ObjectKey::CacheInvocation(key)).unwrap(),
             "invocation record wrote through to remote"
         );
         assert!(
-            remote.head(remote_object_key(content_id)).unwrap(),
+            remote.contains(ObjectKey::Artifact(content_id)).unwrap(),
             "content object wrote through to remote"
         );
         std::fs::remove_dir_all(&a_producer).unwrap();
@@ -1318,9 +1280,9 @@ mod tests {
 
     #[test]
     fn remote_hit_writes_through_to_global_when_shared_cache_is_enabled() {
-        use crate::framework::object_store::FsBlobStore;
+        use crate::framework::object_store::BlockingObjectStore;
         let td = tempfile::tempdir().unwrap();
-        let remote = std::sync::Arc::new(FsBlobStore::new(td.path().join("remote")));
+        let remote = BlockingObjectStore::filesystem(td.path().join("remote"));
         let key = invocation(b"remote-global");
         let producer = td.path().join("producer");
         let (artifact, _) = file_artifact(&producer, b"shared remote payload");
@@ -1346,9 +1308,9 @@ mod tests {
 
     #[test]
     fn presence_probe_sees_remote_without_hydrating_job_cache() {
-        use crate::framework::object_store::FsBlobStore;
+        use crate::framework::object_store::BlockingObjectStore;
         let td = tempfile::tempdir().unwrap();
-        let remote = std::sync::Arc::new(FsBlobStore::new(td.path().join("remote")));
+        let remote = BlockingObjectStore::filesystem(td.path().join("remote"));
         let key = invocation(b"probe-remote");
         let producer = td.path().join("producer");
         let (artifact, _) = file_artifact(&producer, b"presence probe payload");
@@ -1374,13 +1336,16 @@ mod tests {
     fn presence_probe_treats_shared_tier_as_unknown_without_provider_io() {
         let td = tempfile::tempdir().unwrap();
         let key = invocation(b"probe-remote-provider");
+        let remote_root = td.path().join("remote-is-a-file");
+        std::fs::write(&remote_root, b"not a store root").unwrap();
         let handle = CacheHandle::job_local(td.path().join("consumer"))
-            .with_remote(std::sync::Arc::new(PanicHeadStore));
+            .with_remote(BlockingObjectStore::filesystem(remote_root.clone()));
 
         assert!(
             handle.probe_presence(key).unwrap(),
             "unknown shared state must conservatively suppress optional work"
         );
+        assert_eq!(std::fs::read(&remote_root).unwrap(), b"not a store root");
         assert!(
             handle
                 .lookup(key, &FileStage, &td.path().join("restore"))
@@ -1411,11 +1376,11 @@ mod tests {
     #[test]
     fn remote_error_degrades_to_a_miss() {
         // A remote whose root can't be read → lookup is a miss, not a panic.
-        use crate::framework::object_store::FsBlobStore;
+        use crate::framework::object_store::BlockingObjectStore;
         let td = tempfile::tempdir().unwrap();
-        // FsBlobStore over a missing dir returns None (a miss), never errors on
+        // A filesystem store over a missing dir returns None, never errors on
         // get; the handle must simply report no hit.
-        let remote = std::sync::Arc::new(FsBlobStore::new(PathBuf::from("/no-such-remote-xyz")));
+        let remote = BlockingObjectStore::filesystem(PathBuf::from("/no-such-remote-xyz"));
         let h = CacheHandle::job_local(td.path().join("job")).with_remote(remote);
         assert!(
             h.lookup(

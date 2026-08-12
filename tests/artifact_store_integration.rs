@@ -12,7 +12,7 @@ use blut::framework::artifact::{Artifact, ContentHash, ContentId};
 use blut::framework::artifact_store::StoredArtifact;
 use blut::framework::compat::Compatible;
 use blut::framework::executor::{ExecCtx, SequentialExecutor};
-use blut::framework::object_store::FsBlobStore;
+use blut::framework::object_store::BlockingObjectStore;
 use blut::framework::plan::Plan;
 use blut::framework::resource::Resource;
 use blut::framework::stage::{Stage, StageContext};
@@ -175,7 +175,7 @@ async fn shared_cache_rehydrates_file_and_directory_after_producer_deletion() {
     RUNS.store(0, Ordering::SeqCst);
     let workspace = tempfile::tempdir().unwrap();
     let remote_root = workspace.path().join("shared-object-store");
-    let remote = Arc::new(FsBlobStore::new(remote_root));
+    let remote = BlockingObjectStore::filesystem(remote_root);
 
     let host_a = workspace.path().join("host-a-job");
     let cache_a =

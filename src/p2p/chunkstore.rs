@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::framework::artifact::ContentHash;
-use crate::framework::object_store::{BlobStore, FsBlobStore};
+use crate::framework::object_store::{BlockingObjectStore, ObjectKey, StoreError};
 use crate::p2p::transport::{CHUNK_MAX, MAX_BLOB_SIZE};
 
 /// An ordered manifest of a blob's content-addressed chunks. Serialized and
@@ -95,18 +95,18 @@ impl ChunkIndex {
 }
 
 /// A content-addressed store of blob chunks on the local filesystem. Backed by
-/// [`FsBlobStore`], so chunks survive across transfers and jobs — that is what
+/// [`BlockingObjectStore`], so chunks survive across transfers and jobs — that is what
 /// makes dedup work: a chunk seen in any earlier bundle is already present.
 #[derive(Debug, Clone)]
 pub struct ChunkStore {
-    inner: FsBlobStore,
+    inner: BlockingObjectStore,
 }
 
 impl ChunkStore {
     /// Open (or lazily create) a chunk store rooted at `dir`.
     pub fn new(dir: PathBuf) -> Self {
         Self {
-            inner: FsBlobStore::new(dir),
+            inner: BlockingObjectStore::filesystem(dir),
         }
     }
 
@@ -120,7 +120,9 @@ impl ChunkStore {
         // conforming receiver would accept.
         index.validate()?;
         for (hash, chunk) in index.chunk_hashes.iter().zip(blob.chunks(CHUNK_MAX)) {
-            self.inner.put(*hash, chunk).map_err(ChunkError::Io)?;
+            self.inner
+                .put(ObjectKey::Chunk(*hash), chunk)
+                .map_err(ChunkError::Store)?;
         }
         Ok(index)
     }
@@ -131,7 +133,11 @@ impl ChunkStore {
     pub fn missing(&self, index: &ChunkIndex) -> Result<Vec<usize>, ChunkError> {
         let mut out = Vec::new();
         for (i, hash) in index.chunk_hashes.iter().enumerate() {
-            if !self.inner.head(*hash).map_err(ChunkError::Io)? {
+            if !self
+                .inner
+                .contains(ObjectKey::Chunk(*hash))
+                .map_err(ChunkError::Store)?
+            {
                 out.push(i);
             }
         }
@@ -149,18 +155,25 @@ impl ChunkStore {
         if actual != claimed {
             return Err(ChunkError::HashMismatch { claimed, actual });
         }
-        self.inner.put(claimed, bytes).map_err(ChunkError::Io)
+        self.inner
+            .put(ObjectKey::Chunk(claimed), bytes)
+            .map(|_| ())
+            .map_err(ChunkError::Store)
     }
 
     /// Whether a chunk is present.
     pub fn has(&self, hash: ContentHash) -> Result<bool, ChunkError> {
-        self.inner.head(hash).map_err(ChunkError::Io)
+        self.inner
+            .contains(ObjectKey::Chunk(hash))
+            .map_err(ChunkError::Store)
     }
 
     /// Fetch a locally-stored chunk's bytes (for the SENDER to transmit a chunk
     /// the receiver requested). `None` if absent.
     pub fn get_chunk(&self, hash: ContentHash) -> Result<Option<Vec<u8>>, ChunkError> {
-        self.inner.get(hash).map_err(ChunkError::Io)
+        self.inner
+            .get(ObjectKey::Chunk(hash))
+            .map_err(ChunkError::Store)
     }
 
     /// Reassemble the full blob from locally-stored chunks. Fails if any chunk
@@ -180,8 +193,8 @@ impl ChunkStore {
         for hash in &index.chunk_hashes {
             let chunk = self
                 .inner
-                .get(*hash)
-                .map_err(ChunkError::Io)?
+                .get(ObjectKey::Chunk(*hash))
+                .map_err(ChunkError::Store)?
                 .ok_or(ChunkError::MissingChunk { hash: *hash })?;
             out.reserve(chunk.len());
             out.extend_from_slice(&chunk);
@@ -199,8 +212,8 @@ impl ChunkStore {
 /// Errors from chunk-store operations.
 #[derive(Debug)]
 pub enum ChunkError {
-    /// Underlying blob-store I/O failed.
-    Io(std::io::Error),
+    /// Canonical object-store operation failed.
+    Store(StoreError),
     /// Received bytes did not hash to the claimed key (integrity violation).
     HashMismatch {
         claimed: ContentHash,
@@ -225,7 +238,7 @@ pub enum ChunkError {
 impl std::fmt::Display for ChunkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ChunkError::Io(e) => write!(f, "chunk store I/O: {e}"),
+            ChunkError::Store(e) => write!(f, "chunk store: {e}"),
             ChunkError::HashMismatch { claimed, actual } => write!(
                 f,
                 "chunk hash mismatch: claimed {}, got {}",
@@ -256,7 +269,14 @@ impl std::fmt::Display for ChunkError {
     }
 }
 
-impl std::error::Error for ChunkError {}
+impl std::error::Error for ChunkError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Store(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -404,7 +424,10 @@ mod tests {
     // Test helper: pull one chunk's bytes back out of a sender store.
     impl ChunkStore {
         fn reassemble_one(&self, index: &ChunkIndex, i: usize) -> Vec<u8> {
-            self.inner.get(index.chunk_hashes[i]).unwrap().unwrap()
+            self.inner
+                .get(ObjectKey::Chunk(index.chunk_hashes[i]))
+                .unwrap()
+                .unwrap()
         }
     }
 }
