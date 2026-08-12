@@ -75,6 +75,7 @@ pub(super) async fn run_cloud_cmd(
                     // Fixed id: re-running against the same --store is idempotent
                     // (blobs are content-addressed; the MemQueue is fresh each run).
                     job_id: "cloud-smoke-1".into(),
+                    tenant: crate::tenant::Tenant::default(),
                     stage_name: SMOKE_STAGE.into(),
                     invocation_key: crate::framework::InvocationKey::from_digest(
                         ContentHash::of_bytes(b"cloud-smoke-1"),
@@ -132,6 +133,7 @@ pub(super) async fn run_cloud_cmd(
                 CloudPoll::Failed(m) => Err(anyhow!("cloud job failed: {m}")),
                 CloudPoll::Pending => Err(anyhow!("job still pending after the worker ran")),
                 CloudPoll::Cancelled => Err(anyhow!("job cancelled")),
+                CloudPoll::TimedOut => Err(anyhow!("job timed out")),
                 CloudPoll::Unknown => Err(anyhow!("job unknown")),
             }
         }
