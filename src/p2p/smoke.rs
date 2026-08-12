@@ -191,6 +191,7 @@ pub async fn smoke_dispatch_once(
             b"p2p-smoke-v1",
         ),
         None,
+        crate::tenant::Tenant::default(),
         crate::p2p::trust::DataClass::Public,
         timeout_secs,
         out_dir.path(),

@@ -4443,6 +4443,7 @@ impl Compatible<LamuTrainerBackend> for DispatchableStage {}
 enum CanonicalAdapterOutcome {
     Succeeded(Counter),
     Unavailable,
+    Failed,
 }
 
 #[cfg(feature = "p2p")]
@@ -4488,10 +4489,20 @@ impl crate::framework::execution::ExecutionAdapter for MockExecutionAdapter {
         crate::framework::execution::ExecutionFailure,
     > {
         self.submit_count.fetch_add(1, Ordering::SeqCst);
-        let CanonicalAdapterOutcome::Succeeded(counter) = &self.outcome else {
-            return Err(crate::framework::execution::ExecutionFailure::unavailable(
-                "no mock peer",
-            ));
+        let counter = match &self.outcome {
+            CanonicalAdapterOutcome::Succeeded(counter) => counter,
+            CanonicalAdapterOutcome::Unavailable => {
+                return Err(crate::framework::execution::ExecutionFailure::unavailable(
+                    "no mock peer",
+                ));
+            }
+            CanonicalAdapterOutcome::Failed => {
+                return Err(crate::framework::execution::ExecutionFailure::new(
+                    crate::framework::execution::ExecutionFailureKind::Stage,
+                    "REMOTE_TEST_FAILURE",
+                    "remote execution adapter failed",
+                ));
+            }
         };
         let output = ErasedArtifact::from_typed(counter).unwrap();
         let stored = capture(
@@ -4599,6 +4610,40 @@ async fn unavailable_canonical_adapter_falls_back_before_local_work_starts() {
     let result = ParallelExecutor::execute(plan, ctx).await.unwrap();
     let output: Counter = result.final_output.unwrap().into_typed().unwrap();
     assert_eq!(output.n, 999, "unassigned work must retain local fallback");
+    assert_eq!(submit_count.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "p2p")]
+#[tokio::test]
+async fn canonical_adapter_failure_fails_the_plan() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (_td, base) = fresh_ctx();
+    let submit_count = Arc::new(AtomicU32::new(0));
+    let adapter = Arc::new(MockExecutionAdapter {
+        outcome: CanonicalAdapterOutcome::Failed,
+        submit_count: submit_count.clone(),
+    });
+    let policy = Arc::new(MockDispatchPolicy {
+        dispatchable: "dispatchable_thing",
+    });
+    let ctx = base.with_execution_adapter(policy, adapter);
+    let plan = Plan::<(), LamuTrainerBackend>::new("a08_failure", serde_json::json!({}))
+        .start(DispatchableStage, EmptyArgs)
+        .finish()
+        .into_compiled();
+
+    let result = ParallelExecutor::execute(plan, ctx).await;
+    match result {
+        Err(PlanError::StageFailed { stage, source, .. }) => {
+            assert_eq!(stage, "dispatchable_thing");
+            assert!(
+                source
+                    .to_string()
+                    .contains("remote execution adapter failed")
+            );
+        }
+        other => panic!("remote adapter failure must fail the plan: {other:?}"),
+    }
     assert_eq!(submit_count.load(Ordering::SeqCst), 1);
 }
 // ── GPU sampler leaked on panic (audit finding 4) ───────────────────

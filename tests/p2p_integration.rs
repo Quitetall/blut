@@ -452,6 +452,7 @@ mod e2e {
                 b"p2p-integration-v1",
             ),
             None,
+            blut::tenant::Tenant::default(),
             DataClass::Public,
             60, // timeout_secs
             out_dir.path(),

@@ -464,6 +464,12 @@ pub async fn dispatch_stored_to_peer(
             crate::framework::execution::EXECUTION_PROTOCOL_VERSION,
         )));
     }
+    if !crate::p2p::trust::custody_allows_off_box(&request.tenant, request.data_class.into()) {
+        return Err(ExecutionFailure::protocol(format!(
+            "P2P execution denied by custody policy for tenant '{}' and {:?} data",
+            request.tenant, request.data_class
+        )));
+    }
     if !is_safe_task_id(&request.execution_id) {
         return Err(ExecutionFailure::protocol(format!(
             "unsafe execution_id '{}'",
@@ -643,6 +649,7 @@ pub async fn dispatch_to_peer(
     args: serde_json::Value,
     invocation_key: InvocationKey,
     expected_content_id: Option<ContentId>,
+    tenant: crate::tenant::Tenant,
     data_class: crate::p2p::DataClass,
     timeout_secs: u64,
     out_stage_dir: &std::path::Path,
@@ -664,7 +671,7 @@ pub async fn dispatch_to_peer(
     let request = ExecutionRequest {
         protocol_version: crate::framework::execution::EXECUTION_PROTOCOL_VERSION,
         execution_id: task_id.to_string(),
-        tenant: crate::tenant::Tenant::default(),
+        tenant,
         stage_name: stage_name.to_string(),
         stage_schema: stage.schema(),
         invocation_key,
