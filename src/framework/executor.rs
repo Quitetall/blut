@@ -1421,24 +1421,19 @@ async fn cache_lookup_off_thread(
     tokio::task::spawn_blocking(move || cache.lookup(key, stage.as_ref(), &into_stage_dir)).await
 }
 
-fn tagged_cache_lookup_off_thread(
+async fn tagged_cache_lookup_off_thread(
     cache: Arc<CacheHandle>,
     key: InvocationKey,
     stage: Arc<dyn StageDyn>,
     into_stage_dir: PathBuf,
-) -> impl std::future::Future<
-    Output = (
-        InvocationKey,
-        Result<Option<CacheHit>, tokio::task::JoinError>,
-    ),
-> + Send
-+ 'static {
-    async move {
-        (
-            key,
-            cache_lookup_off_thread(cache, key, stage, into_stage_dir).await,
-        )
-    }
+) -> (
+    InvocationKey,
+    Result<Option<CacheHit>, tokio::task::JoinError>,
+) {
+    (
+        key,
+        cache_lookup_off_thread(cache, key, stage, into_stage_dir).await,
+    )
 }
 
 async fn cache_presence_probe_off_thread(
