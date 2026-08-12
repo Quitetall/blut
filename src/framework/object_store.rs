@@ -302,14 +302,7 @@ impl ObjectStore {
         let stored = encode_object(key, &payload)?;
         match self.create_raw(key, stored).await? {
             RawCreate::Created => Ok(PutOutcome::Stored),
-            RawCreate::AlreadyExists => match self.get(key).await? {
-                Some(existing) if existing == payload => Ok(PutOutcome::AlreadyPresent),
-                Some(_) => Err(StoreError::Conflict { key }),
-                None => Err(StoreError::Corrupt {
-                    key,
-                    reason: "object disappeared after create conflict".into(),
-                }),
-            },
+            RawCreate::AlreadyExists => resolve_existing(key, &payload, self.get(key).await?),
         }
     }
 
@@ -388,17 +381,9 @@ impl ObjectStore {
         match &self.backend {
             Backend::Filesystem { root } => {
                 let path = root.join(key.relative_path());
-                tokio::task::spawn_blocking(move || match std::fs::metadata(&path) {
-                    Ok(metadata) if metadata.is_file() => Ok(true),
-                    Ok(_) => Err(StoreError::Corrupt {
-                        key,
-                        reason: "address is not a regular file".into(),
-                    }),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                    Err(error) => Err(StoreError::backend("head", key, error)),
-                })
-                .await
-                .map_err(|error| StoreError::Runtime(error.to_string()))?
+                tokio::task::spawn_blocking(move || contains_file(&path, key))
+                    .await
+                    .map_err(|error| StoreError::Runtime(error.to_string()))?
             }
             #[cfg(feature = "cloud")]
             Backend::Provider { inner, prefix } => {
@@ -430,19 +415,61 @@ impl BlockingObjectStore {
     }
 
     pub fn get(&self, key: ObjectKey) -> Result<Option<Vec<u8>>, StoreError> {
-        let store = self.inner.clone();
-        block_on_isolated(async move { store.get(key).await })
+        match &self.inner.backend {
+            Backend::Filesystem { root } => {
+                let Some(stored) = read_file_capped(&root.join(key.relative_path()), key)? else {
+                    return Ok(None);
+                };
+                decode_object(key, &stored).map(Some)
+            }
+            #[cfg(feature = "cloud")]
+            Backend::Provider { .. } => {
+                let store = self.inner.clone();
+                block_on_isolated(async move { store.get(key).await })
+            }
+            Backend::Adapter { .. } => {
+                let store = self.inner.clone();
+                block_on_isolated(async move { store.get(key).await })
+            }
+        }
     }
 
     pub fn put(&self, key: ObjectKey, payload: &[u8]) -> Result<PutOutcome, StoreError> {
-        let store = self.inner.clone();
-        let payload = payload.to_vec();
-        block_on_isolated(async move { store.put(key, payload).await })
+        match &self.inner.backend {
+            Backend::Filesystem { root } => {
+                let stored = encode_object(key, payload)?;
+                match create_file_atomic(&root.join(key.relative_path()), key, &stored)? {
+                    RawCreate::Created => Ok(PutOutcome::Stored),
+                    RawCreate::AlreadyExists => resolve_existing(key, payload, self.get(key)?),
+                }
+            }
+            #[cfg(feature = "cloud")]
+            Backend::Provider { .. } => {
+                let store = self.inner.clone();
+                let payload = payload.to_vec();
+                block_on_isolated(async move { store.put(key, payload).await })
+            }
+            Backend::Adapter { .. } => {
+                let store = self.inner.clone();
+                let payload = payload.to_vec();
+                block_on_isolated(async move { store.put(key, payload).await })
+            }
+        }
     }
 
     pub fn contains(&self, key: ObjectKey) -> Result<bool, StoreError> {
-        let store = self.inner.clone();
-        block_on_isolated(async move { store.contains(key).await })
+        match &self.inner.backend {
+            Backend::Filesystem { root } => contains_file(&root.join(key.relative_path()), key),
+            #[cfg(feature = "cloud")]
+            Backend::Provider { .. } => {
+                let store = self.inner.clone();
+                block_on_isolated(async move { store.contains(key).await })
+            }
+            Backend::Adapter { .. } => {
+                let store = self.inner.clone();
+                block_on_isolated(async move { store.contains(key).await })
+            }
+        }
     }
 
     pub fn asynchronous(&self) -> &ObjectStore {
@@ -454,6 +481,21 @@ impl BlockingObjectStore {
 enum RawCreate {
     Created,
     AlreadyExists,
+}
+
+fn resolve_existing(
+    key: ObjectKey,
+    payload: &[u8],
+    existing: Option<Vec<u8>>,
+) -> Result<PutOutcome, StoreError> {
+    match existing {
+        Some(existing) if existing == payload => Ok(PutOutcome::AlreadyPresent),
+        Some(_) => Err(StoreError::Conflict { key }),
+        None => Err(StoreError::Corrupt {
+            key,
+            reason: "object disappeared after create conflict".into(),
+        }),
+    }
 }
 
 fn encode_object(key: ObjectKey, payload: &[u8]) -> Result<Vec<u8>, StoreError> {
@@ -583,6 +625,18 @@ fn read_file_capped(path: &Path, key: ObjectKey) -> Result<Option<Vec<u8>>, Stor
         });
     }
     Ok(Some(stored))
+}
+
+fn contains_file(path: &Path, key: ObjectKey) -> Result<bool, StoreError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(StoreError::Corrupt {
+            key,
+            reason: "address is not a regular file".into(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(StoreError::backend("head", key, error)),
+    }
 }
 
 fn create_file_atomic(path: &Path, key: ObjectKey, stored: &[u8]) -> Result<RawCreate, StoreError> {
