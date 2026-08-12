@@ -213,12 +213,15 @@ impl CloudQueue for MemQueue {
             return Ok(false);
         }
         let pending = g.pending.iter().position(|job| job.id == job_id);
-        let existed = pending
+        let removed_pending = pending
             .map(|index| {
                 g.pending.remove(index);
             })
-            .is_some()
-            || g.leased.remove(job_id).is_some();
+            .is_some();
+        // Remove both representations even if an invariant breach placed the
+        // same job in both sets. Cancellation must leave no live assignment.
+        let removed_lease = g.leased.remove(job_id).is_some();
+        let existed = removed_pending || removed_lease;
         if existed {
             g.done
                 .insert(job_id.to_string(), CloudResult::cancelled(job_id, reason));
