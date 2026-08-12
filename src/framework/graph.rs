@@ -489,6 +489,20 @@ mod tests {
     }
 
     #[test]
+    fn legacy_skipped_invocation_is_not_reported_as_content_identity() {
+        let l = lines(&[json!({
+            "kind":"stage_skipped",
+            "node_idx":0,
+            "stage_name":"legacy_cached",
+            "cache_key":"invocation-only"
+        })]);
+        let o = fold_status(&l, 1);
+        assert_eq!(o[0].status, Some(NodeStatus::Skipped));
+        assert!(o[0].cache_hit);
+        assert!(o[0].output_hash.is_none());
+    }
+
+    #[test]
     fn summarize_args_compacts_scalars_only() {
         let s = summarize_args(&json!({"lr":0.1,"epochs":10,"nested":{"x":1},"tag":"run"}));
         assert!(s.contains("lr=0.1"));

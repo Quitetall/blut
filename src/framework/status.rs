@@ -39,9 +39,11 @@ use crate::framework::resource::Resource;
 /// audit trail. The broadcast is for the live UI only.
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 4096;
 
-/// Legacy invocation keys remain aliases of the same typed domain. Legacy
-/// `StageEnd.output_hash` values do not: they deserialize into a separate field
-/// and never manufacture a portable [`ContentId`].
+/// A09 is a deliberate writer-side clean break: current records name
+/// `content_id` and `invocation_key` explicitly. Current readers retain aliases
+/// for pre-A09 fields. Legacy invocation keys remain in the same typed domain;
+/// legacy `StageEnd.output_hash` values do not and therefore deserialize into a
+/// separate field instead of manufacturing a portable [`ContentId`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
