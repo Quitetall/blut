@@ -201,8 +201,12 @@ impl MeshTaskRunner for SharedCacheRunner {
 
         // 6. Run the stage under the coordinator's deadline.
         let cache = Arc::new(CacheHandle::job_local(stage_dir.join(".cache")));
-        let ctx =
-            StageContext::for_peer(stage_dir.clone(), stage_dir.clone(), cache, task.input_hash);
+        let ctx = StageContext::for_peer(
+            stage_dir.clone(),
+            stage_dir.clone(),
+            cache,
+            crate::framework::InvocationKey::from_digest(task.input_hash),
+        );
         let started = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(task.timeout_secs.max(1));
         let output =

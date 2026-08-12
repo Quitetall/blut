@@ -11,7 +11,7 @@ use blut::config::partition::{
     BackfillSelector, CellStatus, PartitionDim, PartitionKey, PartitionSet, PartitionSpec,
     PartitionStatus, PartitionValue, select_backfill_targets, status_matrix,
 };
-use blut::framework::{CacheHandle, ContentHash};
+use blut::framework::{CacheHandle, ContentHash, InvocationKey};
 use blut::lineage_db::{ArtifactRow, LineageDb, PartitionStatusRow, RunRow};
 
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -142,7 +142,8 @@ fn partition_backfill_matrix_is_lineage_derived_and_selector_exact() {
             .with_stage("evaluate")
             .write_to(&sidecar)
             .unwrap();
-        let cache_key = ContentHash::of_bytes(format!("cache-{key}").as_bytes());
+        let cache_key =
+            InvocationKey::from_digest(ContentHash::of_bytes(format!("cache-{key}").as_bytes()));
         let cache_root = temp.path().join("cache");
         let cache = CacheHandle::job_local(cache_root.clone());
         cache

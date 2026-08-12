@@ -21,7 +21,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
-use crate::framework::artifact::ContentHash;
+use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
 use crate::framework::error_domain::FailureSummary;
 use crate::framework::resource::Resource;
 
@@ -39,6 +39,9 @@ use crate::framework::resource::Resource;
 /// audit trail. The broadcast is for the live UI only.
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 4096;
 
+/// During the 7.8 bridge, `StageSkipped.invocation_key` serializes as
+/// `cache_key` and `StageEnd.content_id` serializes as `output_hash`. Those
+/// fields now belong to different hash domains and must not be compared.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -62,7 +65,9 @@ pub enum StageEvent {
     StageEnd {
         node_idx: u32,
         stage_name: String,
-        output_hash: ContentHash,
+        /// Serialized as the legacy `output_hash` field during the 7.8 bridge.
+        #[serde(rename = "output_hash")]
+        content_id: ContentId,
         elapsed: Duration,
     },
     /// Stage was skipped because the cache hit on
@@ -70,7 +75,12 @@ pub enum StageEvent {
     StageSkipped {
         node_idx: u32,
         stage_name: String,
-        cache_key: ContentHash,
+        /// Serialized as the legacy `cache_key` field during the 7.8 bridge.
+        #[serde(rename = "cache_key")]
+        invocation_key: InvocationKey,
+        /// Absent only when replaying a pre-A09 status record.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_id: Option<ContentId>,
     },
     /// Stage failed. `error` is the `Display` form of the
     /// `StageError`. When the error chain contains a [`crate::framework::error_domain::StageFailure`],
@@ -554,11 +564,72 @@ mod tests {
     }
 
     #[test]
+    fn stage_end_retains_legacy_output_hash_wire_key() {
+        let content = ContentId::from_digest(ContentHash::of_bytes(b"content"));
+        let event = StageEvent::StageEnd {
+            node_idx: 1,
+            stage_name: "producer".into(),
+            content_id: content,
+            elapsed: Duration::from_millis(12),
+        };
+
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["output_hash"], content.to_hex());
+        assert!(value.get("content_id").is_none());
+        let round_trip: StageEvent = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            round_trip,
+            StageEvent::StageEnd { content_id, .. } if content_id == content
+        ));
+    }
+
+    #[test]
+    fn skipped_event_serializes_invocation_and_content_identity() {
+        let invocation = InvocationKey::from_digest(ContentHash::of_bytes(b"invocation"));
+        let content = ContentId::from_digest(ContentHash::of_bytes(b"content"));
+        let event = StageEvent::StageSkipped {
+            node_idx: 3,
+            stage_name: "cached".into(),
+            invocation_key: invocation,
+            content_id: Some(content),
+        };
+
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["cache_key"], invocation.to_hex());
+        assert_eq!(value["content_id"], content.to_hex());
+        let round_trip: StageEvent = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            round_trip,
+            StageEvent::StageSkipped {
+                invocation_key,
+                content_id: Some(content_id),
+                ..
+            } if invocation_key == invocation && content_id == content
+        ));
+
+        let legacy = serde_json::json!({
+            "kind": "stage_skipped",
+            "node_idx": 3,
+            "stage_name": "cached",
+            "cache_key": invocation.to_hex(),
+        });
+        let legacy: StageEvent = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            legacy,
+            StageEvent::StageSkipped {
+                invocation_key,
+                content_id: None,
+                ..
+            } if invocation_key == invocation
+        ));
+    }
+
+    #[test]
     fn hosted_event_flattens_host_and_omits_when_none() {
         let event = StageEvent::StageEnd {
             node_idx: 2,
             stage_name: "train".into(),
-            output_hash: ContentHash::of_bytes(b"out"),
+            content_id: ContentId::from_digest(ContentHash::of_bytes(b"out")),
             elapsed: Duration::from_secs(1),
         };
         // No host → the field is omitted (old single-host readers unaffected).
@@ -603,7 +674,7 @@ mod tests {
             StageEvent::StageEnd {
                 node_idx: 5,
                 stage_name: "remote".into(),
-                output_hash: ContentHash::of_bytes(b"o"),
+                content_id: ContentId::from_digest(ContentHash::of_bytes(b"o")),
                 elapsed: Duration::from_millis(3),
             },
         );
@@ -651,7 +722,7 @@ mod tests {
         hub.emit(StageEvent::StageEnd {
             node_idx: 0,
             stage_name: "after-abort".into(),
-            output_hash: ContentHash::of_bytes(b"out"),
+            content_id: ContentId::from_digest(ContentHash::of_bytes(b"out")),
             elapsed: Duration::from_millis(1),
         });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -727,7 +798,7 @@ mod tests {
         tx.send(StageEvent::StageEnd {
             node_idx: 1,
             stage_name: "filter_dataset".into(),
-            output_hash: h,
+            content_id: ContentId::from_digest(h),
             elapsed: Duration::from_millis(42),
         })
         .unwrap();
@@ -800,7 +871,7 @@ mod tests {
         hub.emit(StageEvent::StageEnd {
             node_idx: 0,
             stage_name: "flooded".into(),
-            output_hash: ContentHash::of_bytes(b"out"),
+            content_id: ContentId::from_digest(ContentHash::of_bytes(b"out")),
             elapsed: Duration::from_millis(1),
         });
 

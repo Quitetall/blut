@@ -272,7 +272,7 @@ fn next_ready_empty_set_is_none() {
 
 #[test]
 fn dag_opt_advanced_gate_pipeline_abandoned_predicted_key_requeues_deferred_waiter() {
-    let key = ContentHash::of_bytes(b"abandoned-pipeline-key");
+    let key = InvocationKey::from_digest(ContentHash::of_bytes(b"abandoned-pipeline-key"));
     let mut inflight_keys = HashSet::from([key]);
     let mut node_key_of = HashMap::from([(11, key)]);
     let mut deferred = HashMap::from([(key, vec![21, 22])]);
@@ -372,8 +372,8 @@ fn dag_opt_advanced_gate_pipeline_cancel_after_cache_rename_rolls_back_before_li
         dispatcher: None,
     };
 
-    let parent_key = ContentHash::of_bytes(b"pipeline-parent-key");
-    let child_key = ContentHash::of_bytes(b"pipeline-child-key");
+    let parent_key = InvocationKey::from_digest(ContentHash::of_bytes(b"pipeline-parent-key"));
+    let child_key = InvocationKey::from_digest(ContentHash::of_bytes(b"pipeline-child-key"));
     let parent_output = ErasedArtifact::from_typed(&Counter { n: 0 }).unwrap();
     cache.insert(parent_key, &parent_output).unwrap();
     remote_puts.store(0, Ordering::SeqCst);
@@ -477,7 +477,8 @@ fn ordinary_speculation_cache_insert_is_the_cancellation_linearization_point() {
         dispatcher: None,
     };
 
-    let child_key = ContentHash::of_bytes(b"ordinary-speculative-child-key");
+    let child_key =
+        InvocationKey::from_digest(ContentHash::of_bytes(b"ordinary-speculative-child-key"));
     let child_cache_path = cache.entry_path_for_write(child_key);
     let scratch_root = job_dir.join(".speculative/private-child");
     let scratch_stage_dir = scratch_root.join("stages/1-make_one");
@@ -550,7 +551,7 @@ fn dag_opt_advanced_gate_pipeline_corrupt_spill_cleanup_failure_is_fatal() {
         stage_name: MakeOne::NAME.into(),
         input_hash: ContentHash::of_bytes(b"input"),
         canon_args: Vec::new(),
-        key: ContentHash::of_bytes(b"key"),
+        key: InvocationKey::from_digest(ContentHash::of_bytes(b"key")),
         elapsed: std::time::Duration::ZERO,
         training_io_profile: None,
         max_spill_bytes: 4096,
@@ -1300,11 +1301,11 @@ async fn recorded_output_hash(abs_path: &str, content: u8) -> CH {
     while let Ok(evt) = rx.try_recv() {
         if let StageEvent::StageEnd {
             node_idx: 0,
-            output_hash,
+            content_id,
             ..
         } = evt
         {
-            found = Some(output_hash);
+            found = Some(content_id.digest());
         }
     }
     found.expect("StageEnd must carry an output_hash")
@@ -4057,7 +4058,10 @@ impl DispatchSubmitter for MockDispatchSubmitter {
         if matches!(self.terminal, MockTerminal::Succeeded) {
             let art = ErasedArtifact::from_typed(&self.succeed_with).unwrap();
             self.cache
-                .insert(request.expected_output_hash, &art)
+                .insert(
+                    crate::framework::InvocationKey::from_digest(request.expected_output_hash),
+                    &art,
+                )
                 .expect("mock cache insert");
         }
         Ok(Box::new(MockDispatchHandle {

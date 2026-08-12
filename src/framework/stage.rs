@@ -342,7 +342,7 @@ pub struct StageContext {
     /// with identical args resolves to the same path — finding the prior run's
     /// recovery checkpoint. A different training arg ⇒ a different key ⇒ a fresh
     /// dir ⇒ a fresh run (conservative: never resume onto a foreign checkpoint).
-    pub cache_key: crate::framework::artifact::ContentHash,
+    pub cache_key: crate::framework::artifact::InvocationKey,
     /// 1-based retry attempt number (S3 / P7). `1` on the first try; the executor
     /// increments it per attempt. A resumable stage reads this together with
     /// [`resume_from`](Self::resume_from): attempt ≥ 2 with `resume_from = Some`
@@ -378,7 +378,9 @@ impl StageContext {
             admitted_batch_size: None,
             training_io_profile: None,
             pipeline_emitter: None,
-            cache_key: crate::framework::artifact::ContentHash([0u8; 32]),
+            cache_key: crate::framework::artifact::InvocationKey::from_digest(
+                crate::framework::artifact::ContentHash([0u8; 32]),
+            ),
             attempt: 1,
             resume_from: None,
         }
@@ -396,7 +398,7 @@ impl StageContext {
         job_dir: PathBuf,
         stage_dir: PathBuf,
         cache: Arc<CacheHandle>,
-        cache_key: crate::framework::artifact::ContentHash,
+        cache_key: crate::framework::artifact::InvocationKey,
     ) -> Self {
         Self {
             job_dir,

@@ -159,7 +159,7 @@ async fn run_in_dir(
         stage_dir.to_path_buf(),
         stage_dir.to_path_buf(),
         cache,
-        input_hash,
+        crate::framework::InvocationKey::from_digest(input_hash),
     );
 
     // Download the input pack + unbundle (the four fail-closed gates run here).

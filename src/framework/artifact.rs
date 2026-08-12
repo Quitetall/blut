@@ -298,6 +298,78 @@ impl<'de> Deserialize<'de> for ContentHash {
     }
 }
 
+/// Identity of one stage invocation: stage implementation, schema, input
+/// content, and canonical arguments. This addresses cache records, never
+/// artifact payload bytes.
+///
+/// ```compile_fail
+/// use blut::framework::{ContentHash, ContentId, InvocationKey};
+/// fn lookup(_: InvocationKey) {}
+/// let content = ContentId::from_digest(ContentHash::of_bytes(b"payload"));
+/// lookup(content);
+/// ```
+#[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct InvocationKey(ContentHash);
+
+impl InvocationKey {
+    pub fn from_digest(digest: ContentHash) -> Self {
+        Self(digest)
+    }
+
+    pub fn digest(self) -> ContentHash {
+        self.0
+    }
+
+    pub fn to_hex(self) -> String {
+        self.0.to_hex()
+    }
+}
+
+impl std::fmt::Display for InvocationKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::fmt::Debug for InvocationKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InvocationKey({})", self.to_hex())
+    }
+}
+
+/// Identity of canonical artifact payload bytes. This addresses stored
+/// artifacts and lineage, never stage invocations.
+#[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ContentId(ContentHash);
+
+impl ContentId {
+    pub fn from_digest(digest: ContentHash) -> Self {
+        Self(digest)
+    }
+
+    pub fn digest(self) -> ContentHash {
+        self.0
+    }
+
+    pub fn to_hex(self) -> String {
+        self.0.to_hex()
+    }
+}
+
+impl std::fmt::Display for ContentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::fmt::Debug for ContentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ContentId({})", self.to_hex())
+    }
+}
+
 /// The framework's typed-artifact contract.
 ///
 /// Implementors are concrete data types like `DatasetJsonl`,
@@ -921,6 +993,22 @@ mod tests {
         let hex = h.to_hex();
         let back = ContentHash::from_hex(&hex).unwrap();
         assert_eq!(h, back);
+    }
+
+    #[test]
+    fn invocation_and_content_id_are_distinct_transparent_types() {
+        use std::any::TypeId;
+
+        let digest = ContentHash::of_bytes(b"same digest, different meaning");
+        let invocation = InvocationKey::from_digest(digest);
+        let content = ContentId::from_digest(digest);
+
+        assert_ne!(TypeId::of::<InvocationKey>(), TypeId::of::<ContentId>());
+        assert_eq!(invocation.digest(), digest);
+        assert_eq!(content.digest(), digest);
+        let encoded = format!("\"{}\"", digest.to_hex());
+        assert_eq!(serde_json::to_string(&invocation).unwrap(), encoded);
+        assert_eq!(serde_json::to_string(&content).unwrap(), encoded);
     }
 
     #[test]

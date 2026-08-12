@@ -20,11 +20,11 @@
 //! A08 also depends on A09 (artifact identity) and A10 (storage policy), so the
 //! full merge is not this file's job.
 
+use blut::config::launcher::JobState;
 use blut::framework::artifact::ContentHash;
 use blut::framework::executor::{DispatchHandle, DispatchRequest, DispatchSubmitter};
-use blut::config::launcher::JobState;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A minimal adapter that honours the lifecycle, so the contract below is known
 /// to be satisfiable. A contract no implementation can pass is indistinguishable
@@ -190,7 +190,10 @@ fn a_remote_success_carries_no_output() {
 fn remote_failure_identity_is_an_unstructured_string() {
     let oom = JobState::Failed("OutOfMemory".to_string());
     let timeout = JobState::Failed("TIMEOUT".to_string());
-    assert_ne!(oom, timeout, "sanity: the payload is the only discriminator");
+    assert_ne!(
+        oom, timeout,
+        "sanity: the payload is the only discriminator"
+    );
 
     // Distinguishable ONLY by string comparison — there is no code, no kind, no
     // retryability flag. Delete this test when a typed failure lands.

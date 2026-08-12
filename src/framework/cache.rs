@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::framework::artifact::ContentHash;
+use crate::framework::artifact::{ContentHash, InvocationKey};
 use crate::framework::stage::ErasedArtifact;
 
 #[cfg(test)]
@@ -150,7 +150,7 @@ impl CacheHandle {
         input_hash: ContentHash,
         args: &serde_json::Value,
         code_sha: &[u8],
-    ) -> ContentHash {
+    ) -> InvocationKey {
         Self::key_for_partitioned(stage_name, stage_schema, input_hash, args, code_sha, None)
     }
 
@@ -164,7 +164,7 @@ impl CacheHandle {
         args: &serde_json::Value,
         code_sha: &[u8],
         partition: Option<&blut_types::partition::PartitionKey>,
-    ) -> ContentHash {
+    ) -> InvocationKey {
         let canon = canonical_json(args);
         Self::key_for_canon_bytes_partitioned(
             stage_name,
@@ -186,7 +186,7 @@ impl CacheHandle {
         input_hash: ContentHash,
         canon_args: &[u8],
         code_sha: &[u8],
-    ) -> ContentHash {
+    ) -> InvocationKey {
         Self::key_for_canon_bytes_partitioned(
             stage_name,
             stage_schema,
@@ -204,7 +204,7 @@ impl CacheHandle {
         canon_args: &[u8],
         code_sha: &[u8],
         partition: Option<&blut_types::partition::PartitionKey>,
-    ) -> ContentHash {
+    ) -> InvocationKey {
         // v1→v2 (S4): `code_sha` (build git hash + the stage's script content
         // hash) now keys the cache, so editing a kernel with identical args
         // re-runs instead of reusing the stale checkpoint (closes G9). This is a
@@ -233,7 +233,7 @@ impl CacheHandle {
             hasher.update(canonical.as_bytes());
         }
         let arr: [u8; 32] = hasher.finalize().into();
-        ContentHash(arr)
+        InvocationKey::from_digest(ContentHash(arr))
     }
 
     /// Expose `canonical_json` for the executor / plan compiler so
@@ -260,7 +260,7 @@ impl CacheHandle {
     /// I/O errors other than NotFound are downgraded to None with
     /// a `tracing::warn` — a corrupt cache entry shouldn't break
     /// the run, just trigger a re-execution.
-    pub fn lookup(&self, key: ContentHash) -> Option<CacheHit> {
+    pub fn lookup(&self, key: InvocationKey) -> Option<CacheHit> {
         for base in self.search_order() {
             let path = base.join(key.to_hex()).join("output.bin");
             match std::fs::read(&path) {
@@ -290,7 +290,7 @@ impl CacheHandle {
         // lookups in this job skip the network. A remote error degrades to a
         // miss (never a wrong answer).
         if let Some(remote) = &self.remote {
-            match remote.get(key) {
+            match remote.get(key.digest()) {
                 Ok(Some(body)) => match bincode::deserialize::<ErasedArtifact>(&body) {
                     Ok(art) => {
                         // Write through so `from_path` names a file that
@@ -343,7 +343,7 @@ impl CacheHandle {
     /// speculation; the ordinary path still performs the authoritative
     /// [`lookup`](Self::lookup). Shared tiers are treated as "possibly present"
     /// because even a metadata/HEAD request may block the single coordinator.
-    pub(crate) fn probe_presence(&self, key: ContentHash) -> std::io::Result<bool> {
+    pub(crate) fn probe_presence(&self, key: InvocationKey) -> std::io::Result<bool> {
         let path = self.job_local.join(key.to_hex()).join("output.bin");
         match std::fs::metadata(path) {
             Ok(metadata) => {
@@ -363,7 +363,7 @@ impl CacheHandle {
     /// Insert an output for the given key. Atomic: writes to a
     /// sibling `.tmp.<pid>.<nanos>` and renames into place. Encoded
     /// as bincode — see `lookup` for rationale.
-    pub fn insert(&self, key: ContentHash, output: &ErasedArtifact) -> std::io::Result<()> {
+    pub fn insert(&self, key: InvocationKey, output: &ErasedArtifact) -> std::io::Result<()> {
         self.insert_with_policy(key, output, false)
     }
 
@@ -373,7 +373,7 @@ impl CacheHandle {
     /// canonical stage/lifecycle commit.
     pub(crate) fn insert_optional_local(
         &self,
-        key: ContentHash,
+        key: InvocationKey,
         output: &ErasedArtifact,
     ) -> std::io::Result<Vec<u8>> {
         let body = self.insert_local(key, output)?;
@@ -385,13 +385,13 @@ impl CacheHandle {
     /// Best-effort remote replication after an optional result is canonical.
     /// Plugin panics and remote errors remain contained; the committed local
     /// entry is already sufficient for correctness.
-    pub(crate) fn replicate_optional(&self, key: ContentHash, body: &[u8]) {
+    pub(crate) fn replicate_optional(&self, key: InvocationKey, body: &[u8]) {
         self.replicate(key, body, true);
     }
 
     fn insert_with_policy(
         &self,
-        key: ContentHash,
+        key: InvocationKey,
         output: &ErasedArtifact,
         contain_remote_panic: bool,
     ) -> std::io::Result<()> {
@@ -400,7 +400,11 @@ impl CacheHandle {
         Ok(())
     }
 
-    fn insert_local(&self, key: ContentHash, output: &ErasedArtifact) -> std::io::Result<Vec<u8>> {
+    fn insert_local(
+        &self,
+        key: InvocationKey,
+        output: &ErasedArtifact,
+    ) -> std::io::Result<Vec<u8>> {
         let dir = self.write_target().join(key.to_hex());
         std::fs::create_dir_all(&dir)?;
         let dest = dir.join("output.bin");
@@ -409,14 +413,16 @@ impl CacheHandle {
         Ok(body)
     }
 
-    fn replicate(&self, key: ContentHash, body: &[u8], contain_remote_panic: bool) {
+    fn replicate(&self, key: InvocationKey, body: &[u8], contain_remote_panic: bool) {
         // Write through to the remote tier (T4.2) so other machines/pods share
         // this result. Best-effort: a remote failure is logged, not fatal — the
         // local write already succeeded, so the run is unaffected.
         if let Some(remote) = &self.remote
             && contain_remote_panic
         {
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| remote.put(key, body))) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                remote.put(key.digest(), body)
+            })) {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     tracing::warn!("cache: remote write-through for {}: {error}", key.to_hex());
@@ -429,14 +435,14 @@ impl CacheHandle {
                 }
             }
         } else if let Some(remote) = &self.remote
-            && let Err(error) = remote.put(key, body)
+            && let Err(error) = remote.put(key.digest(), body)
         {
             tracing::warn!("cache: remote write-through for {}: {error}", key.to_hex());
         }
     }
 
     /// Exact local entry path an insert writes for this handle/key.
-    pub(crate) fn entry_path_for_write(&self, key: ContentHash) -> PathBuf {
+    pub(crate) fn entry_path_for_write(&self, key: InvocationKey) -> PathBuf {
         self.write_target().join(key.to_hex()).join("output.bin")
     }
 
@@ -553,7 +559,7 @@ pub struct CacheHit {
 /// misses so lineage remains complete for all-cache-hit jobs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CacheProof {
-    pub key: ContentHash,
+    pub key: InvocationKey,
     pub entry_path: PathBuf,
 }
 
@@ -755,6 +761,10 @@ mod tests {
 
     const CS: &[u8] = b"code-sha-fixture";
 
+    fn invocation(bytes: &[u8]) -> InvocationKey {
+        InvocationKey::from_digest(ContentHash::of_bytes(bytes))
+    }
+
     #[test]
     fn key_changes_on_stage_name_change() {
         let h = ContentHash::of_bytes(b"x");
@@ -830,7 +840,7 @@ mod tests {
     fn lookup_returns_none_when_empty() {
         let td = tempfile::tempdir().unwrap();
         let h = CacheHandle::job_local(td.path().to_path_buf());
-        let key = ContentHash::of_bytes(b"missing");
+        let key = invocation(b"missing");
         assert!(h.lookup(key).is_none());
     }
 
@@ -838,7 +848,7 @@ mod tests {
     fn insert_then_lookup_round_trip() {
         let td = tempfile::tempdir().unwrap();
         let h = CacheHandle::job_local(td.path().to_path_buf());
-        let key = ContentHash::of_bytes(b"k");
+        let key = invocation(b"k");
         let art = fake_erased(serde_json::json!({"n": 7}));
         h.insert(key, &art).unwrap();
         let hit = h.lookup(key).expect("should hit");
@@ -850,7 +860,7 @@ mod tests {
     fn lookup_returns_none_on_corrupt_entry() {
         let td = tempfile::tempdir().unwrap();
         let h = CacheHandle::job_local(td.path().to_path_buf());
-        let key = ContentHash::of_bytes(b"k");
+        let key = invocation(b"k");
         let dir = td.path().join(key.to_hex());
         std::fs::create_dir_all(&dir).unwrap();
         // Truncated bincode header → deserialize fails.
@@ -866,7 +876,7 @@ mod tests {
     fn lookup_downgrades_truncated_valid_entry_to_miss() {
         let td = tempfile::tempdir().unwrap();
         let h = CacheHandle::job_local(td.path().to_path_buf());
-        let key = ContentHash::of_bytes(b"truncated");
+        let key = invocation(b"truncated");
         let dir = td.path().join(key.to_hex());
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -890,7 +900,7 @@ mod tests {
     fn lookup_downgrades_garbage_entry_to_miss() {
         let td = tempfile::tempdir().unwrap();
         let h = CacheHandle::job_local(td.path().to_path_buf());
-        let key = ContentHash::of_bytes(b"garbage");
+        let key = invocation(b"garbage");
         let dir = td.path().join(key.to_hex());
         std::fs::create_dir_all(&dir).unwrap();
         // A bincode length prefix claiming a huge string, followed by no
@@ -922,7 +932,7 @@ mod tests {
     fn corrupt_then_valid_entry_hits() {
         let td = tempfile::tempdir().unwrap();
         let h = CacheHandle::job_local(td.path().to_path_buf());
-        let key = ContentHash::of_bytes(b"recover");
+        let key = invocation(b"recover");
         let dir = td.path().join(key.to_hex());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("output.bin"), [0x01u8, 0x02, 0x03]).unwrap();
@@ -945,7 +955,7 @@ mod tests {
         std::fs::create_dir_all(&job).unwrap();
         std::fs::create_dir_all(&global).unwrap();
         let h = CacheHandle::job_local(job).with_global(global.clone());
-        let key = ContentHash::of_bytes(b"k");
+        let key = invocation(b"k");
         h.insert(key, &fake_erased(serde_json::json!({"x": 1})))
             .unwrap();
         // Entry must exist under the global path.
@@ -957,14 +967,17 @@ mod tests {
         use crate::framework::object_store::{BlobStore, FsBlobStore};
         let td = tempfile::tempdir().unwrap();
         let remote = std::sync::Arc::new(FsBlobStore::new(td.path().join("remote")));
-        let key = ContentHash::of_bytes(b"k");
+        let key = invocation(b"k");
 
         // Machine A: insert → writes local AND through to the remote store.
         let a_job = td.path().join("a");
         let h_a = CacheHandle::job_local(a_job).with_remote(remote.clone());
         h_a.insert(key, &fake_erased(serde_json::json!({ "v": 1 })))
             .unwrap();
-        assert!(remote.head(key).unwrap(), "insert wrote through to remote");
+        assert!(
+            remote.head(key.digest()).unwrap(),
+            "insert wrote through to remote"
+        );
 
         // Machine B: cold local, same remote → lookup hits the remote and
         // writes it through to B's job dir (a real CacheHit with a path).
@@ -983,7 +996,7 @@ mod tests {
         use crate::framework::object_store::FsBlobStore;
         let td = tempfile::tempdir().unwrap();
         let remote = std::sync::Arc::new(FsBlobStore::new(td.path().join("remote")));
-        let key = ContentHash::of_bytes(b"probe-remote");
+        let key = invocation(b"probe-remote");
         CacheHandle::job_local(td.path().join("producer"))
             .with_remote(remote.clone())
             .insert(key, &fake_erased(serde_json::json!({ "v": 1 })))
@@ -1003,7 +1016,7 @@ mod tests {
     #[test]
     fn presence_probe_treats_shared_tier_as_unknown_without_provider_io() {
         let td = tempfile::tempdir().unwrap();
-        let key = ContentHash::of_bytes(b"probe-remote-provider");
+        let key = invocation(b"probe-remote-provider");
         let handle = CacheHandle::job_local(td.path().join("consumer"))
             .with_remote(std::sync::Arc::new(PanicHeadStore));
 
@@ -1017,7 +1030,7 @@ mod tests {
     #[test]
     fn presence_probe_suppresses_optional_work_without_parsing_corrupt_bytes() {
         let td = tempfile::tempdir().unwrap();
-        let key = ContentHash::of_bytes(b"probe-corrupt");
+        let key = invocation(b"probe-corrupt");
         let path = td.path().join(key.to_hex()).join("output.bin");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let bytes = [0xFF, 0x01, 0x02];
@@ -1041,7 +1054,7 @@ mod tests {
         // get; the handle must simply report no hit.
         let remote = std::sync::Arc::new(FsBlobStore::new(PathBuf::from("/no-such-remote-xyz")));
         let h = CacheHandle::job_local(td.path().join("job")).with_remote(remote);
-        assert!(h.lookup(ContentHash::of_bytes(b"absent")).is_none());
+        assert!(h.lookup(invocation(b"absent")).is_none());
     }
 
     #[test]
@@ -1049,7 +1062,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let job = td.path().join("job");
         let global = td.path().join("global");
-        let key = ContentHash::of_bytes(b"k");
+        let key = invocation(b"k");
         std::fs::create_dir_all(job.join(key.to_hex())).unwrap();
         std::fs::create_dir_all(global.join(key.to_hex())).unwrap();
         // Different payloads under the two roots.
@@ -1164,7 +1177,7 @@ mod tests {
     fn insert_creates_dir_atomically_no_tmp_remnants() {
         let td = tempfile::tempdir().unwrap();
         let h = CacheHandle::job_local(td.path().to_path_buf());
-        let key = ContentHash::of_bytes(b"k");
+        let key = invocation(b"k");
         h.insert(key, &fake_erased(serde_json::json!({}))).unwrap();
         let entries: Vec<_> = std::fs::read_dir(td.path().join(key.to_hex()))
             .unwrap()

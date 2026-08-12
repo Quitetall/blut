@@ -48,7 +48,9 @@ pub mod retry;
 pub mod stage;
 pub mod status;
 
-pub use artifact::{Artifact, ArtifactMetadata, BranchDecision, ContentHash, ListOf};
+pub use artifact::{
+    Artifact, ArtifactMetadata, BranchDecision, ContentHash, ContentId, InvocationKey, ListOf,
+};
 pub use async_io::{
     IoMode, TrainingIoAdmissionError, TrainingIoCandidate, TrainingIoDowngradeReason,
     TrainingIoHints, TrainingIoProfile, profile_is_declared, select_training_io_profile,

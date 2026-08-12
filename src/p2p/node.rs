@@ -778,7 +778,9 @@ mod tests {
                 StageEvent::StageEnd {
                     node_idx: 3,
                     stage_name: "worker-stage".into(),
-                    output_hash: ContentHash::of_bytes(b"o"),
+                    content_id: crate::framework::ContentId::from_digest(ContentHash::of_bytes(
+                        b"o",
+                    )),
                     elapsed: std::time::Duration::from_millis(2),
                 },
             )

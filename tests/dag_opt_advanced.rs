@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use blut::framework::artifact::{Artifact, ArtifactMetadata, BranchDecision, ContentHash, ListOf};
+use blut::framework::artifact::{
+    Artifact, ArtifactMetadata, BranchDecision, ContentHash, InvocationKey, ListOf,
+};
 use blut::framework::async_io::{IoMode, TrainingIoCandidate, TrainingIoHints};
 use blut::framework::cache::{CacheHandle, CacheProof};
 use blut::framework::cookbook::{Cookbook, Registry};
@@ -1374,7 +1376,7 @@ fn materialized_hashes(job_dir: &std::path::Path) -> Vec<ContentHash> {
         .collect()
 }
 
-fn materialized_cache_keys(job_dir: &std::path::Path) -> Vec<ContentHash> {
+fn materialized_cache_keys(job_dir: &std::path::Path) -> Vec<InvocationKey> {
     materialized_stage_dirs(job_dir)
         .into_iter()
         .map(|stage_dir| {

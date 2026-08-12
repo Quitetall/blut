@@ -1765,8 +1765,11 @@ async fn selected_publication_contains_remote_cache_plugin_panic() {
     let job_dir = temp.path().join("job");
     let mut ctx = speculation_ctx(job_dir.clone(), true).with_bypass_cache(true);
     ctx.cache = Arc::new(
-        CacheHandle::job_local(job_dir.join("_cache"))
-            .with_remote(Arc::new(PanicOnTargetPutStore { target: target_key })),
+        CacheHandle::job_local(job_dir.join("_cache")).with_remote(Arc::new(
+            PanicOnTargetPutStore {
+                target: target_key.digest(),
+            },
+        )),
     );
     let handle = tokio::spawn(execute_plan(
         speculation_spec(true)

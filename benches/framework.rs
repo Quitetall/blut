@@ -60,8 +60,8 @@ impl TrainingBackend for LamuTrainerBackend {
     const DESCRIPTION: &'static str = "Bench fixture backend (engine framework benches only).";
 }
 use blut::framework::{
-    Artifact, CacheHandle, Compatible, CompiledPlan, ContentHash, ErasedArtifact, Plan, Registry,
-    Resource, Stage, StageContext, StageDyn, StageError, StageEvent, StatusHub,
+    Artifact, CacheHandle, Compatible, CompiledPlan, ContentHash, ErasedArtifact, InvocationKey,
+    Plan, Registry, Resource, Stage, StageContext, StageDyn, StageError, StageEvent, StatusHub,
 };
 use blut::lineage_db::{LineageDb, MetricRow};
 use blut::recipes::{Course, RecipeDef};
@@ -236,7 +236,7 @@ fn bench_cache_write_then_read(c: &mut Criterion) {
             || {
                 let td = tempfile::tempdir().unwrap();
                 let h = CacheHandle::job_local(td.path().to_path_buf());
-                let key = ContentHash::of_bytes(b"bench");
+                let key = InvocationKey::from_digest(ContentHash::of_bytes(b"bench"));
                 (td, h, key)
             },
             |(_td, h, key)| {

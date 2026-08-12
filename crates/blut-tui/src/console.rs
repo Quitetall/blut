@@ -299,9 +299,7 @@ impl ConsoleModel {
         let (mut hits, mut ran) = (0u32, 0u32);
         let mut any_fail = false;
 
-        let short = |h: blut::framework::artifact::ContentHash| {
-            h.to_hex().chars().take(8).collect::<String>()
-        };
+        let short = |hex: String| hex.chars().take(8).collect::<String>();
         let set = |nodes: &mut HashMap<u32, DagNode>, idx, name: String, st, note: String| {
             nodes.insert(
                 idx,
@@ -327,19 +325,19 @@ impl ConsoleModel {
                     node_idx,
                     stage_name,
                     NodeState::Running,
-                    format!("{} · running", short(input_hash)),
+                    format!("{} · running", short(input_hash.to_hex())),
                 ),
                 StageEvent::StageEnd {
                     node_idx,
                     stage_name,
-                    output_hash,
+                    content_id,
                     elapsed,
                 } => {
                     ran += 1;
                     cache.push(CacheEvent {
                         hit: false,
                         stage: stage_name.clone(),
-                        hash: short(output_hash),
+                        hash: short(content_id.to_hex()),
                         note: format!("ran {:.1}s", elapsed.as_secs_f64()),
                     });
                     set(
@@ -347,19 +345,23 @@ impl ConsoleModel {
                         node_idx,
                         stage_name,
                         NodeState::Done,
-                        short(output_hash),
+                        short(content_id.to_hex()),
                     );
                 }
                 StageEvent::StageSkipped {
                     node_idx,
                     stage_name,
-                    cache_key,
+                    invocation_key,
+                    content_id,
                 } => {
+                    let observed = content_id
+                        .map(|id| id.to_hex())
+                        .unwrap_or_else(|| invocation_key.to_hex());
                     hits += 1;
                     cache.push(CacheEvent {
                         hit: true,
                         stage: stage_name.clone(),
-                        hash: short(cache_key),
+                        hash: short(observed.clone()),
                         note: "reused".into(),
                     });
                     set(
@@ -367,7 +369,7 @@ impl ConsoleModel {
                         node_idx,
                         stage_name,
                         NodeState::Cached,
-                        format!("{} · reused", short(cache_key)),
+                        format!("{} · reused", short(observed)),
                     );
                 }
                 StageEvent::StageFailed {
@@ -1076,7 +1078,7 @@ mod tests {
 
     #[test]
     fn applies_a_real_status_jsonl() {
-        use blut::framework::artifact::ContentHash;
+        use blut::framework::artifact::{ContentHash, ContentId, InvocationKey};
         use std::time::Duration;
         let h = |e| HostedEvent {
             host: None,
@@ -1086,7 +1088,8 @@ mod tests {
             h(StageEvent::StageSkipped {
                 node_idx: 0,
                 stage_name: "codec_ready".into(),
-                cache_key: ContentHash::of_bytes(b"a"),
+                invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"a")),
+                content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"cached"))),
             }),
             h(StageEvent::StageBegin {
                 node_idx: 1,
@@ -1096,7 +1099,7 @@ mod tests {
             h(StageEvent::StageEnd {
                 node_idx: 1,
                 stage_name: "train_joint".into(),
-                output_hash: ContentHash::of_bytes(b"c"),
+                content_id: ContentId::from_digest(ContentHash::of_bytes(b"c")),
                 elapsed: Duration::from_secs(4),
             }),
             h(StageEvent::StageBegin {

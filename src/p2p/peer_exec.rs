@@ -251,7 +251,12 @@ async fn execute_one(
     // Isolated: job_dir == stage_dir for a single dispatched stage. cache_key =
     // the input hash (unique per task) so concurrent peer tasks don't collide if
     // a stage does a content-addressed cache lookup.
-    let ctx = StageContext::for_peer(stage_dir.clone(), stage_dir.clone(), cache, task.input_hash);
+    let ctx = StageContext::for_peer(
+        stage_dir.clone(),
+        stage_dir.clone(),
+        cache,
+        crate::framework::InvocationKey::from_digest(task.input_hash),
+    );
 
     // 6. Receive the input blob side-stream (sealed to this peer's X25519 key —
     //    see `seal_blob`) and unbundle into stage_dir. The bundle layer runs

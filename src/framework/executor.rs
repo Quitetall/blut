@@ -45,7 +45,9 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::launcher::JobState;
-use crate::framework::artifact::{ArtifactMetadata, BranchDecision, ContentHash};
+use crate::framework::artifact::{
+    ArtifactMetadata, BranchDecision, ContentHash, ContentId, InvocationKey,
+};
 use crate::framework::cache::{CacheHandle, CacheHit};
 use crate::framework::control::{Control, ControlPolicy, StepMetrics};
 use crate::framework::error::{PlanError, StageError};
@@ -707,7 +709,7 @@ struct NodeTask {
     canon_args: Vec<u8>,
     input: ErasedArtifact,
     input_hash: ContentHash,
-    key: ContentHash,
+    key: InvocationKey,
     /// Cache artifact already decoded by cache-aware ready-queue probing. The
     /// parallel executor carries it into `run_node` so a warm node is read once
     /// and can short-circuit before optional remote dispatch.
@@ -756,7 +758,7 @@ struct SpeculativePrepared {
     stage_name: String,
     input_hash: ContentHash,
     canon_args: Vec<u8>,
-    key: ContentHash,
+    key: InvocationKey,
     output: ErasedArtifact,
     elapsed: std::time::Duration,
     training_io_profile: Option<crate::framework::async_io::TrainingIoProfile>,
@@ -854,7 +856,7 @@ struct SpilledPipelinePrepared {
     stage_name: String,
     input_hash: ContentHash,
     canon_args: Vec<u8>,
-    key: ContentHash,
+    key: InvocationKey,
     elapsed: std::time::Duration,
     training_io_profile: Option<crate::framework::async_io::TrainingIoProfile>,
     max_spill_bytes: u64,
@@ -1193,7 +1195,7 @@ enum SchedulerTaskResult {
     Pipeline(Result<PipelineRunResult, NodeFailure>),
     Speculative {
         target: NodeId,
-        key: ContentHash,
+        key: InvocationKey,
         result: Result<Box<SpeculativePrepared>, NodeFailure>,
     },
 }
@@ -1222,7 +1224,7 @@ struct PipelineChildSpec {
     node: crate::framework::plan::PlanNode,
     node_idx: u32,
     input_logical: ContentHash,
-    key: ContentHash,
+    key: InvocationKey,
 }
 
 struct PipelineRunResult {
@@ -1395,14 +1397,14 @@ fn record_divergence_and_kill(
 /// writer's lifecycle (the coordinator owns that).
 async fn cache_lookup_off_thread(
     cache: Arc<CacheHandle>,
-    key: ContentHash,
+    key: InvocationKey,
 ) -> Result<Option<CacheHit>, tokio::task::JoinError> {
     tokio::task::spawn_blocking(move || cache.lookup(key)).await
 }
 
 async fn cache_presence_probe_off_thread(
     cache: Arc<CacheHandle>,
-    key: ContentHash,
+    key: InvocationKey,
 ) -> Result<std::io::Result<bool>, tokio::task::JoinError> {
     tokio::task::spawn_blocking(move || cache.probe_presence(key)).await
 }
@@ -2087,10 +2089,16 @@ async fn run_node_with_admission(
     };
     if let Some(hit) = cache_hit {
         let hit = Arc::try_unwrap(hit).unwrap_or_else(|shared| (*shared).clone());
+        let content_id = ContentId::from_digest(
+            task.stage
+                .output_content_hash(&hit.artifact)
+                .unwrap_or_else(|| content_hash_from_erased(&hit.artifact)),
+        );
         env.status.emit(StageEvent::StageSkipped {
             node_idx: idx,
             stage_name: stage_name.clone(),
-            cache_key: task.key,
+            invocation_key: task.key,
+            content_id: Some(content_id),
         });
         let logical = compute_logical_output_hash(
             task.stage.as_ref(),
@@ -2706,6 +2714,7 @@ async fn run_node_with_admission(
             .output_content_hash(&output)
             .unwrap_or_else(|| content_hash_from_erased(&output))
     });
+    let content_id = ContentId::from_digest(output_hash);
     let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, output_hash)
         .with_stage(stage_name.clone());
     if let Err(e) = metadata.write_to(&final_stage_dir.join("output.metadata.json")) {
@@ -2737,7 +2746,7 @@ async fn run_node_with_admission(
     env.status.emit(StageEvent::StageEnd {
         node_idx: idx,
         stage_name: stage_name.clone(),
-        output_hash,
+        content_id,
         elapsed: run_elapsed,
     });
 
@@ -3298,7 +3307,7 @@ fn discard_speculation_result(
 /// undeletable speculative residue behind best-effort destruction.
 fn discard_retained_speculation(
     speculation: &mut HashMap<NodeId, SpeculationState>,
-    speculative_keys: &mut HashMap<ContentHash, NodeId>,
+    speculative_keys: &mut HashMap<InvocationKey, NodeId>,
 ) -> Result<(), NodeFailure> {
     let mut first_failure = None;
     for (_, state) in std::mem::take(speculation) {
@@ -3531,7 +3540,7 @@ fn publish_speculative_inner(
     env.status.emit(StageEvent::StageEnd {
         node_idx: idx,
         stage_name: prepared.stage_name.clone(),
-        output_hash,
+        content_id: ContentId::from_digest(output_hash),
         elapsed: prepared.elapsed,
     });
     if let Some(cache_guard) = pipeline_cache_guard {
@@ -3774,7 +3783,10 @@ fn build_task(
 /// Exact ADR-0078/0101 cache key for one node after predecessor hashes resolve.
 /// Scheduling probes and `build_task` share this function, so cache-aware order
 /// cannot drift from the key `run_node` later reads and writes.
-fn node_cache_key(node: &crate::framework::plan::PlanNode, input_hash: ContentHash) -> ContentHash {
+fn node_cache_key(
+    node: &crate::framework::plan::PlanNode,
+    input_hash: ContentHash,
+) -> InvocationKey {
     let code_sha = node_code_sha(node.stage.as_ref());
     CacheHandle::key_for_canon_bytes_partitioned(
         node.stage.name(),
@@ -3833,7 +3845,7 @@ async fn refresh_cache_warm_hints(
     deadline: Option<Instant>,
     started: Instant,
     hints: &mut HashMap<NodeId, crate::framework::dag_opt::ScheduleHint>,
-    probes: &mut HashMap<ContentHash, Option<Arc<CacheHit>>>,
+    probes: &mut HashMap<InvocationKey, Option<Arc<CacheHit>>>,
     prepared_hits: &mut HashMap<NodeId, Arc<CacheHit>>,
 ) -> Result<(), PlanError> {
     prepared_hits.clear();
@@ -3954,11 +3966,11 @@ fn next_ready(
 #[allow(clippy::too_many_arguments)]
 fn abandon_inflight_key(
     node_id: NodeId,
-    key: ContentHash,
-    inflight_keys: &mut HashSet<ContentHash>,
-    node_key_of: &mut HashMap<NodeId, ContentHash>,
-    deferred: &mut HashMap<ContentHash, Vec<NodeId>>,
-    cache_probes: &mut HashMap<ContentHash, Option<Arc<CacheHit>>>,
+    key: InvocationKey,
+    inflight_keys: &mut HashSet<InvocationKey>,
+    node_key_of: &mut HashMap<NodeId, InvocationKey>,
+    deferred: &mut HashMap<InvocationKey, Vec<NodeId>>,
+    cache_probes: &mut HashMap<InvocationKey, Option<Arc<CacheHit>>>,
     prepared_cache_hits: &mut HashMap<NodeId, Arc<CacheHit>>,
     ready: &mut BTreeSet<NodeId>,
     pruned: &HashSet<NodeId>,
@@ -4036,7 +4048,7 @@ struct PipelineLaunchContext<'a> {
     orig_n: usize,
     appended_len: usize,
     order_len: usize,
-    inflight_keys: &'a HashSet<ContentHash>,
+    inflight_keys: &'a HashSet<InvocationKey>,
     spawn_capacity: usize,
 }
 
@@ -4832,12 +4844,12 @@ fn internal_linear_fusion_groups(
         let node = &plan.nodes[id as usize];
         AdmissionRequest::for_stage(node.stage.as_ref(), &node.args, memory_budget_gib, None).ok()
     };
-    let static_ids: Vec<ContentHash> = plan
+    let static_ids: Vec<InvocationKey> = plan
         .nodes
         .iter()
         .map(|node| node_cache_key(node, ContentHash([0; 32])))
         .collect();
-    let mut global_counts = HashMap::<ContentHash, usize>::new();
+    let mut global_counts = HashMap::<InvocationKey, usize>::new();
     for identity in &static_ids {
         *global_counts.entry(*identity).or_default() += 1;
     }
@@ -4853,7 +4865,7 @@ fn internal_linear_fusion_groups(
             }
             let node_ids = candidate[start..end].to_vec();
             if node_ids.len() >= 2 {
-                let mut local_counts = HashMap::<ContentHash, usize>::new();
+                let mut local_counts = HashMap::<InvocationKey, usize>::new();
                 for node_id in &node_ids {
                     *local_counts
                         .entry(static_ids[*node_id as usize])
@@ -5257,7 +5269,7 @@ impl ParallelExecutor {
         } else {
             HashMap::new()
         };
-        let mut speculative_keys: HashMap<ContentHash, NodeId> = HashMap::new();
+        let mut speculative_keys: HashMap<InvocationKey, NodeId> = HashMap::new();
         // Shadow every ordinary in-flight envelope even before its task reaches
         // post-cache admission. Optional speculation must leave this demand
         // untouched; entries disappear only when ordinary work completes or is
@@ -5345,13 +5357,13 @@ impl ParallelExecutor {
         // `inflight_keys` is the set of keys currently running (one node
         // each, by construction); `node_key_of` is the O(1) reverse lookup
         // for "which key did this finished node run under".
-        let mut inflight_keys: HashSet<ContentHash> = HashSet::new();
-        let mut node_key_of: HashMap<NodeId, ContentHash> = HashMap::new();
-        let mut deferred: HashMap<ContentHash, Vec<NodeId>> = HashMap::new();
+        let mut inflight_keys: HashSet<InvocationKey> = HashSet::new();
+        let mut node_key_of: HashMap<NodeId, InvocationKey> = HashMap::new();
+        let mut deferred: HashMap<InvocationKey, Vec<NodeId>> = HashMap::new();
         // ADR 0102 cache-aware scheduling state. `None` means a probed miss;
         // absence means unprobed. Prepared hits are cheap Arc clones rebuilt
         // for the current ready set and consumed by selected tasks.
-        let mut cache_probes: HashMap<ContentHash, Option<Arc<CacheHit>>> = HashMap::new();
+        let mut cache_probes: HashMap<InvocationKey, Option<Arc<CacheHit>>> = HashMap::new();
         let mut prepared_cache_hits: HashMap<NodeId, Arc<CacheHit>> = HashMap::new();
 
         let mut join: tokio::task::JoinSet<SchedulerTaskResult> = tokio::task::JoinSet::new();
@@ -5732,7 +5744,7 @@ impl ParallelExecutor {
                                 input_hash: task.input_hash,
                                 args_hash,
                                 args: &task.args,
-                                expected_output_hash: task.key,
+                                expected_output_hash: task.key.digest(),
                                 resource_request,
                                 data_class,
                                 tenant: &env.tenant,
@@ -5823,7 +5835,9 @@ impl ParallelExecutor {
                                                             status.emit(StageEvent::StageEnd {
                                                                 node_idx,
                                                                 stage_name: stage_name.clone(),
-                                                                output_hash,
+                                                                content_id: ContentId::from_digest(
+                                                                    output_hash,
+                                                                ),
                                                                 elapsed: start.elapsed(),
                                                             });
                                                             Ok(vec![NodeOutcome {

@@ -274,6 +274,13 @@ fn fold_status(lines: &[String], n_nodes: usize) -> Vec<Obs> {
             "stage_skipped" if !terminal => {
                 o.status = Some(NodeStatus::Skipped);
                 o.cache_hit = true;
+                if let Some(h) = ev
+                    .get("content_id")
+                    .or_else(|| ev.get("cache_key"))
+                    .and_then(|v| v.as_str())
+                {
+                    o.output_hash = Some(h.to_string());
+                }
             }
             "stage_failed" if !terminal => {
                 // Same split as the HPO leaderboard: a control-kill / plan-cancel

@@ -56,21 +56,28 @@ pub fn job_lineage(job_id: &str) -> Result<Vec<LineageNode>> {
             StageEvent::StageEnd {
                 node_idx,
                 stage_name,
-                output_hash,
+                content_id,
                 elapsed,
             } => {
                 let n = ensure_node(&mut by_idx, node_idx, &stage_name);
-                n.output_hash = Some(output_hash.to_hex());
+                n.output_hash = Some(content_id.to_hex());
                 n.elapsed = Some(elapsed);
             }
             StageEvent::StageSkipped {
                 node_idx,
                 stage_name,
-                cache_key,
+                invocation_key,
+                content_id,
             } => {
                 let n = ensure_node(&mut by_idx, node_idx, &stage_name);
                 n.cached = true;
-                n.output_hash.get_or_insert_with(|| cache_key.to_hex());
+                if let Some(content_id) = content_id {
+                    n.output_hash = Some(content_id.to_hex());
+                } else {
+                    // 7.8 compatibility only: old records had no content
+                    // identity and displayed the invocation key here.
+                    n.output_hash.get_or_insert_with(|| invocation_key.to_hex());
+                }
             }
             _ => {}
         }
