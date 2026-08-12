@@ -264,7 +264,7 @@ fn fold_status(lines: &[String], n_nodes: usize) -> Vec<Obs> {
             // downgrade a node (e.g. a stray stage_skipped flipping Done→Skipped).
             "stage_end" if !terminal => {
                 o.status = Some(NodeStatus::Done);
-                if let Some(h) = ev.get("output_hash").and_then(|v| v.as_str()) {
+                if let Some(h) = ev.get("content_id").and_then(|v| v.as_str()) {
                     o.output_hash = Some(h.to_string());
                 }
                 if let Some(d) = ev.get("elapsed").and_then(dur_secs) {
@@ -274,11 +274,7 @@ fn fold_status(lines: &[String], n_nodes: usize) -> Vec<Obs> {
             "stage_skipped" if !terminal => {
                 o.status = Some(NodeStatus::Skipped);
                 o.cache_hit = true;
-                if let Some(h) = ev
-                    .get("content_id")
-                    .or_else(|| ev.get("cache_key"))
-                    .and_then(|v| v.as_str())
-                {
+                if let Some(h) = ev.get("content_id").and_then(|v| v.as_str()) {
                     o.output_hash = Some(h.to_string());
                 }
             }
@@ -415,8 +411,8 @@ mod tests {
     fn fold_assigns_terminal_states() {
         let l = lines(&[
             json!({"kind":"stage_begin","node_idx":0,"stage_name":"a","input_hash":"aa"}),
-            json!({"kind":"stage_end","node_idx":0,"stage_name":"a","output_hash":"bb","elapsed":{"secs":3,"nanos":500000000}}),
-            json!({"kind":"stage_skipped","node_idx":1,"stage_name":"b","cache_key":"cc"}),
+            json!({"kind":"stage_end","node_idx":0,"stage_name":"a","content_id":"bb","elapsed":{"secs":3,"nanos":500000000}}),
+            json!({"kind":"stage_skipped","node_idx":1,"stage_name":"b","invocation_key":"cc","content_id":"dd"}),
             json!({"kind":"stage_failed","node_idx":2,"stage_name":"c","error":"cancelled during stage"}),
             json!({"kind":"stage_failed","node_idx":3,"stage_name":"d","error":"Out of memory: Killed process 9"}),
             json!({"kind":"stage_pruned","node_idx":4,"stage_name":"e","reason":"condition false"}),
@@ -460,8 +456,8 @@ mod tests {
         // A duplicate/late terminal event (log replay/rotation) must not
         // downgrade the node: FIRST terminal wins, metadata preserved.
         let l = lines(&[
-            json!({"kind":"stage_end","node_idx":0,"stage_name":"a","output_hash":"good","elapsed":{"secs":2,"nanos":0}}),
-            json!({"kind":"stage_skipped","node_idx":0,"stage_name":"a","cache_key":"zz"}),
+            json!({"kind":"stage_end","node_idx":0,"stage_name":"a","content_id":"good","elapsed":{"secs":2,"nanos":0}}),
+            json!({"kind":"stage_skipped","node_idx":0,"stage_name":"a","invocation_key":"zz"}),
             json!({"kind":"stage_failed","node_idx":0,"stage_name":"a","error":"boom"}),
         ]);
         let o = fold_status(&l, 1);
@@ -476,6 +472,20 @@ mod tests {
             !o[0].cache_hit,
             "late stage_skipped must not flip cache_hit"
         );
+    }
+
+    #[test]
+    fn legacy_logical_hash_is_not_reported_as_content_identity() {
+        let l = lines(&[json!({
+            "kind":"stage_end",
+            "node_idx":0,
+            "stage_name":"legacy",
+            "output_hash":"logical-only",
+            "elapsed":{"secs":1,"nanos":0}
+        })]);
+        let o = fold_status(&l, 1);
+        assert_eq!(o[0].status, Some(NodeStatus::Done));
+        assert!(o[0].output_hash.is_none());
     }
 
     #[test]

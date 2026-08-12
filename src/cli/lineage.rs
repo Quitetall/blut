@@ -94,16 +94,19 @@ pub(super) fn run_lineage(id_query: &str, json: bool) -> Result<()> {
         return Ok(());
     }
     for n in &nodes {
-        let inp = n.input_hash.as_deref().unwrap_or("-");
-        let out = n.output_hash.as_deref().unwrap_or("-");
         let short = |h: &str| h.chars().take(12).collect::<String>();
+        let input = n.input_hash.map(|hash| hash.to_hex());
+        let inp = input.as_deref().unwrap_or("-");
+        let out = n
+            .output_content_id
+            .map(|id| short(&id.to_hex()))
+            .or_else(|| {
+                n.legacy_output_hash
+                    .map(|hash| format!("legacy:{}", short(&hash.to_hex())))
+            })
+            .unwrap_or_else(|| "-".into());
         if n.cached {
-            println!(
-                "  {:>2} {:<28} [CACHE HIT {}]",
-                n.node_idx,
-                n.stage,
-                short(out)
-            );
+            println!("  {:>2} {:<28} [CACHE HIT {}]", n.node_idx, n.stage, out);
         } else {
             let took = n
                 .elapsed
@@ -114,7 +117,7 @@ pub(super) fn run_lineage(id_query: &str, json: bool) -> Result<()> {
                 n.node_idx,
                 n.stage,
                 short(inp),
-                short(out),
+                out,
                 took
             );
         }

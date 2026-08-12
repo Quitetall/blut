@@ -596,10 +596,16 @@ pub trait Artifact: Send + Sync + serde::Serialize + serde::de::DeserializeOwned
 pub struct ArtifactMetadata {
     pub kind: String,
     pub schema: u32,
-    /// Legacy wire name retained for readers predating A09. The digest is the
-    /// portable [`ContentId`], not an invocation key or producer-local logical
-    /// fingerprint.
-    pub content_hash: ContentHash,
+    /// Portable identity written by A09+ producers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_id: Option<ContentId>,
+    /// Pre-A09 ambiguous hash preserved for audit and legacy display only.
+    #[serde(
+        default,
+        rename = "content_hash",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub legacy_content_hash: Option<ContentHash>,
     /// Existing artifact-level hash used for invocation-key derivation. Omitted
     /// on legacy sidecars and on callers that only know the portable identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -618,11 +624,30 @@ pub struct ArtifactMetadata {
 }
 
 impl ArtifactMetadata {
-    pub fn new(kind: impl Into<String>, schema: u32, content_hash: ContentHash) -> Self {
+    pub fn new(kind: impl Into<String>, schema: u32, content_id: ContentId) -> Self {
         Self {
             kind: kind.into(),
             schema,
-            content_hash,
+            content_id: Some(content_id),
+            legacy_content_hash: None,
+            logical_hash: None,
+            produced_by_stage: None,
+            produced_at_unix_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    /// Construct metadata whose producer did not know a portable identity.
+    /// Kept for pre-A09 import/tests; new execution code must use [`Self::new`].
+    pub fn legacy(kind: impl Into<String>, schema: u32, content_hash: ContentHash) -> Self {
+        Self {
+            kind: kind.into(),
+            schema,
+            content_id: None,
+            legacy_content_hash: Some(content_hash),
             logical_hash: None,
             produced_by_stage: None,
             produced_at_unix_secs: SystemTime::now()
@@ -643,9 +668,15 @@ impl ArtifactMetadata {
         self
     }
 
-    /// Typed view of the legacy `content_hash` wire field.
-    pub fn content_id(&self) -> ContentId {
-        ContentId::from_digest(self.content_hash)
+    pub fn content_id(&self) -> Option<ContentId> {
+        self.content_id
+    }
+
+    /// Best available digest for legacy display/search only.
+    pub fn display_hash(&self) -> Option<ContentHash> {
+        self.content_id
+            .map(ContentId::digest)
+            .or(self.legacy_content_hash)
     }
 
     pub fn with_extra(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
@@ -771,6 +802,7 @@ pub struct BranchDecision {
 impl Artifact for BranchDecision {
     const KIND: &'static str = "blut.branch-decision";
     const SCHEMA: u32 = 1;
+    const INLINE: bool = true;
 
     fn content_hash(&self) -> ContentHash {
         ContentHash::of_bytes(&[u8::from(self.value)])
@@ -1241,9 +1273,13 @@ mod tests {
 
     #[test]
     fn metadata_round_trip() {
-        let md = ArtifactMetadata::new("dataset.jsonl", 1, ContentHash::of_bytes(b"x"))
+        let id = ContentId::from_digest(ContentHash::of_bytes(b"x"));
+        let md = ArtifactMetadata::new("dataset.jsonl", 1, id)
             .with_stage("materialize_conversations")
             .with_extra("n_examples", serde_json::json!(42));
+        let wire = serde_json::to_value(&md).unwrap();
+        assert_eq!(wire["content_id"], id.to_hex());
+        assert!(wire.get("content_hash").is_none());
         let td = tempfile::tempdir().unwrap();
         let p = td.path().join("artifact.bin");
         std::fs::write(&p, b"payload").unwrap();
@@ -1252,12 +1288,29 @@ mod tests {
         let back = ArtifactMetadata::read_from(&sidecar).unwrap();
         assert_eq!(back.kind, "dataset.jsonl");
         assert_eq!(back.schema, 1);
-        assert_eq!(back.content_hash, md.content_hash);
+        assert_eq!(back.content_id(), Some(id));
+        assert!(back.legacy_content_hash.is_none());
         assert_eq!(
             back.produced_by_stage.as_deref(),
             Some("materialize_conversations")
         );
         assert_eq!(back.extra.get("n_examples"), Some(&serde_json::json!(42)));
+    }
+
+    #[test]
+    fn legacy_metadata_hash_does_not_manufacture_content_id() {
+        let legacy_hash = ContentHash::of_bytes(b"legacy logical hash");
+        let metadata: ArtifactMetadata = serde_json::from_value(serde_json::json!({
+            "kind": "dataset.jsonl",
+            "schema": 1,
+            "content_hash": legacy_hash.to_hex(),
+            "produced_by_stage": null,
+            "produced_at_unix_secs": 1
+        }))
+        .unwrap();
+
+        assert_eq!(metadata.content_id(), None);
+        assert_eq!(metadata.legacy_content_hash, Some(legacy_hash));
     }
 
     #[test]

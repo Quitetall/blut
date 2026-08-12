@@ -668,7 +668,11 @@ impl LineageDb {
                 };
                 let path = Path::new(&path);
                 let metadata_live = crate::framework::ArtifactMetadata::read_from(path)
-                    .map(|metadata| metadata.content_hash.to_hex() == artifact.content_hash)
+                    .map(|metadata| {
+                        metadata
+                            .content_id()
+                            .is_some_and(|content_id| content_id.to_hex() == artifact.content_hash)
+                    })
                     .unwrap_or(false);
                 let cache_live = path
                     .parent()
@@ -1554,11 +1558,14 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
         args_json,
     })?;
     for rec in crate::framework::lineage::scan_artifacts(job_id)?.into_iter() {
+        let Some(content_id) = rec.meta.content_id() else {
+            continue;
+        };
         db.record_artifact(&ArtifactRow {
             job_id: job_id.to_string(),
             stage_idx: stage_idx_of(&rec.sidecar_path) as i64,
             stage_name: rec.meta.produced_by_stage.clone().unwrap_or_default(),
-            content_hash: rec.meta.content_hash.to_hex(),
+            content_hash: content_id.to_hex(),
             kind: rec.meta.kind.clone(),
             schema_ver: rec.meta.schema as i64,
             sidecar_path: Some(rec.sidecar_path.display().to_string()),
@@ -1566,7 +1573,7 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
         })?;
     }
     for node in crate::framework::lineage::job_lineage(job_id)?.into_iter() {
-        let Some(output) = node.output_hash else {
+        let Some(output) = node.output_content_id else {
             continue;
         };
         // Legacy `input_hash` values belong to the logical invocation domain,
@@ -1576,8 +1583,8 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
             db.record_edge(&EdgeRow {
                 job_id: job_id.to_string(),
                 to_idx: node.node_idx as i64,
-                input_hash: input,
-                output_hash: output.clone(),
+                input_hash: input.to_hex(),
+                output_hash: output.to_hex(),
             })?;
         }
     }

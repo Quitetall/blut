@@ -2148,7 +2148,7 @@ async fn run_node_with_admission(
             let metadata = ArtifactMetadata::new(
                 hit.artifact.kind.clone(),
                 hit.artifact.schema,
-                hit.content_id.digest(),
+                hit.content_id,
             )
             .with_logical_hash(logical)
             .with_extra("persisted", serde_json::Value::Bool(true))
@@ -2782,7 +2782,7 @@ async fn run_node_with_admission(
         debug_assert_eq!(stored.manifest.logical_hash, logical_hash);
     }
     let persisted = stored.is_some();
-    let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, content_id.digest())
+    let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, content_id)
         .with_logical_hash(logical_hash)
         .with_extra("persisted", serde_json::Value::Bool(persisted))
         .with_stage(stage_name.clone());
@@ -2818,7 +2818,8 @@ async fn run_node_with_admission(
     env.status.emit(StageEvent::StageEnd {
         node_idx: idx,
         stage_name: stage_name.clone(),
-        content_id,
+        content_id: Some(content_id),
+        legacy_output_hash: None,
         elapsed: run_elapsed,
     });
 
@@ -3579,7 +3580,7 @@ fn publish_speculative_inner(
         return Err(NodeFailure::Plan(error));
     }
     let persisted = stored.is_some();
-    let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, content_id.digest())
+    let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, content_id)
         .with_logical_hash(output_hash)
         .with_extra("persisted", serde_json::Value::Bool(persisted))
         .with_stage(prepared.stage_name.clone());
@@ -3665,7 +3666,8 @@ fn publish_speculative_inner(
     env.status.emit(StageEvent::StageEnd {
         node_idx: idx,
         stage_name: prepared.stage_name.clone(),
-        content_id,
+        content_id: Some(content_id),
+        legacy_output_hash: None,
         elapsed: prepared.elapsed,
     });
     if let Some(cache_guard) = pipeline_cache_guard {
@@ -6008,16 +6010,13 @@ impl ParallelExecutor {
                                                                 input_hash,
                                                                 &canon_args,
                                                             );
-                                                            // Match the local run_node path: `output_hash`
-                                                            // must be a content hash of the ARTIFACT, not
-                                                            // `key` (a hash of the job's inputs). Lineage
-                                                            // tooling reads this field expecting content
-                                                            // addressability regardless of whether the node
-                                                            // ran locally or was P2P-dispatched.
+                                                            // Match local execution: record portable content
+                                                            // identity, never invocation or logical hash.
                                                             status.emit(StageEvent::StageEnd {
                                                                 node_idx,
                                                                 stage_name: stage_name.clone(),
-                                                                content_id: hit.content_id,
+                                                                content_id: Some(hit.content_id),
+                                                                legacy_output_hash: None,
                                                                 elapsed: start.elapsed(),
                                                             });
                                                             Ok(vec![NodeOutcome {

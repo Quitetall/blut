@@ -217,6 +217,7 @@ fn bench_cache_write_then_read(c: &mut Criterion) {
     impl Artifact for Toy {
         const KIND: &'static str = "test.cache_toy";
         const SCHEMA: u32 = 1;
+        const INLINE: bool = true;
         fn content_hash(&self) -> ContentHash {
             ContentHash::of_bytes(&self.n.to_le_bytes())
         }
@@ -288,6 +289,7 @@ struct ToyA;
 impl Artifact for ToyA {
     const KIND: &'static str = "bench.toy_a";
     const SCHEMA: u32 = 1;
+    const INLINE: bool = true;
     fn content_hash(&self) -> ContentHash {
         ContentHash::of_bytes(b"a")
     }
@@ -301,6 +303,7 @@ struct ToyB;
 impl Artifact for ToyB {
     const KIND: &'static str = "bench.toy_b";
     const SCHEMA: u32 = 1;
+    const INLINE: bool = true;
     fn content_hash(&self) -> ContentHash {
         ContentHash::of_bytes(b"b")
     }

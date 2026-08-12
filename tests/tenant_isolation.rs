@@ -341,17 +341,19 @@ async fn same_graph_executes_in_disjoint_tenant_cache_namespaces() {
         (0, 2)
     );
 
-    // ADR-0078 keys remain tenant-independent: the two real executions create
-    // the same key names below different tenant roots.
+    // ADR-0078 keys remain tenant-independent. TestSource owns its portable
+    // output and publishes one invocation record. CheckJsonl returns that
+    // ancestor-owned path, so fail-closed persistence correctly leaves it
+    // uncached instead of publishing an invalid direct mapping.
     let entry_names = |root: &std::path::Path| {
-        std::fs::read_dir(root)
+        std::fs::read_dir(root.join("v1/cache-invocations"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<std::collections::BTreeSet<_>>()
     };
     let research_keys = entry_names(&gr);
     let clinical_keys = entry_names(&gc);
-    assert_eq!(research_keys.len(), 2, "both graph stages must materialize");
+    assert_eq!(research_keys.len(), 1, "portable source must materialize");
     assert_eq!(
         research_keys, clinical_keys,
         "same graph must keep the same keys"

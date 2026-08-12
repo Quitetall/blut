@@ -173,9 +173,13 @@ mod tests {
 
         // Record combo[0] complete with a live sidecar (hash must match).
         let sidecar = cache.path().join("out.metadata.json");
-        ArtifactMetadata::new("ckpt", 1, ContentHash([9u8; 32]))
-            .write_to(&sidecar)
-            .unwrap();
+        ArtifactMetadata::new(
+            "ckpt",
+            1,
+            crate::framework::ContentId::from_digest(ContentHash([9u8; 32])),
+        )
+        .write_to(&sidecar)
+        .unwrap();
         sweep_index::record_completion(fp0, "job-x", ContentHash([9u8; 32]), sidecar).unwrap();
 
         let after = expand(dir, "config", &[], &sweep).unwrap();

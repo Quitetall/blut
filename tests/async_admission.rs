@@ -198,6 +198,7 @@ struct Value(u32);
 impl Artifact for Value {
     const KIND: &'static str = "async-admission.value";
     const SCHEMA: u32 = 1;
+    const INLINE: bool = true;
 
     fn content_hash(&self) -> ContentHash {
         ContentHash::of_bytes(&self.0.to_le_bytes())

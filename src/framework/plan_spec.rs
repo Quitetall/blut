@@ -496,6 +496,7 @@ mod tests {
     impl Artifact for A {
         const KIND: &'static str = "spec.a";
         const SCHEMA: u32 = 1;
+        const INLINE: bool = true;
         fn content_hash(&self) -> ContentHash {
             ContentHash::of_bytes(b"a")
         }
@@ -508,6 +509,7 @@ mod tests {
     impl Artifact for B {
         const KIND: &'static str = "spec.b";
         const SCHEMA: u32 = 1;
+        const INLINE: bool = true;
         fn content_hash(&self) -> ContentHash {
             ContentHash::of_bytes(b"b")
         }
@@ -610,6 +612,7 @@ mod tests {
     impl Artifact for Item {
         const KIND: &'static str = "spec.item";
         const SCHEMA: u32 = 1;
+        const INLINE: bool = true;
         fn content_hash(&self) -> ContentHash {
             ContentHash::of_bytes(b"item")
         }

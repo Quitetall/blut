@@ -124,7 +124,9 @@ pub fn load_index(index_path: &Path) -> std::collections::HashMap<String, SweepR
 /// `false` (re-run).
 pub fn is_record_live(rec: &SweepRecord) -> bool {
     match ArtifactMetadata::read_from(&rec.sidecar_path) {
-        Ok(meta) => meta.content_hash.to_hex() == rec.final_output_hash,
+        Ok(meta) => meta
+            .content_id()
+            .is_some_and(|content_id| content_id.to_hex() == rec.final_output_hash),
         Err(_) => false,
     }
 }
@@ -148,9 +150,13 @@ mod tests {
 
     fn write_sidecar(dir: &Path, hash: ContentHash) -> PathBuf {
         let p = dir.join("output.metadata.json");
-        ArtifactMetadata::new("ckpt".to_string(), 1, hash)
-            .write_to(&p)
-            .unwrap();
+        ArtifactMetadata::new(
+            "ckpt".to_string(),
+            1,
+            crate::framework::artifact::ContentId::from_digest(hash),
+        )
+        .write_to(&p)
+        .unwrap();
         p
     }
 

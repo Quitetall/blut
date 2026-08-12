@@ -790,9 +790,10 @@ mod tests {
                 StageEvent::StageEnd {
                     node_idx: 3,
                     stage_name: "worker-stage".into(),
-                    content_id: crate::framework::ContentId::from_digest(ContentHash::of_bytes(
-                        b"o",
+                    content_id: Some(crate::framework::ContentId::from_digest(
+                        ContentHash::of_bytes(b"o"),
                     )),
+                    legacy_output_hash: None,
                     elapsed: std::time::Duration::from_millis(2),
                 },
             )

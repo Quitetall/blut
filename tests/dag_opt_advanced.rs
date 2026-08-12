@@ -1402,7 +1402,9 @@ fn materialized_hashes(job_dir: &std::path::Path) -> Vec<ContentHash> {
                 .expect("read materialized output metadata");
             serde_json::from_slice::<ArtifactMetadata>(&body)
                 .expect("decode materialized output metadata")
-                .content_hash
+                .content_id()
+                .expect("A09+ materialization carries ContentId")
+                .digest()
         })
         .collect()
 }
@@ -1524,12 +1526,12 @@ fn canonical_pipeline_child_dirs(job_dir: &std::path::Path) -> Vec<std::path::Pa
 }
 
 fn completed_local_cache_entries(job_dir: &std::path::Path) -> usize {
-    std::fs::read_dir(job_dir.join("_cache/invocations"))
+    std::fs::read_dir(job_dir.join("_cache/v1/cache-invocations"))
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.join("record.bin").is_file())
+        .filter(|path| path.is_file())
         .count()
 }
 

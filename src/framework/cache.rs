@@ -27,9 +27,9 @@
 //!
 //! Cache roots contain two disjoint namespaces:
 //!
-//! - `invocations/<InvocationKey>/record.bin` maps one invocation to a
+//! - `v1/cache-invocations/<InvocationKey>` maps one invocation to a
 //!   [`ContentId`] plus the expected artifact kind/schema.
-//! - `objects/<ContentId>/artifact.bin` owns the canonical payload, portable
+//! - `v1/artifacts/<ContentId>` owns the canonical payload, portable
 //!   handle, integrity metadata, and validation material.
 //!
 //! A lookup is not a metadata read. It restores and independently validates the

@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::Result;
-use crate::framework::artifact::ArtifactMetadata;
+use crate::framework::artifact::{ArtifactMetadata, ContentHash, ContentId};
 use crate::framework::status::StageEvent;
 use crate::jobs;
 
@@ -24,10 +24,12 @@ use crate::jobs;
 pub struct LineageNode {
     pub node_idx: u32,
     pub stage: String,
-    pub input_hash: Option<String>,
+    pub input_hash: Option<ContentHash>,
     /// Portable predecessor identities. Multi-input stages retain every edge.
-    pub input_content_ids: Vec<String>,
-    pub output_hash: Option<String>,
+    pub input_content_ids: Vec<ContentId>,
+    pub output_content_id: Option<ContentId>,
+    /// Preserved pre-A09 logical hash; never promoted into content identity.
+    pub legacy_output_hash: Option<ContentHash>,
     /// `true` if the stage was served from cache (a `StageSkipped`).
     pub cached: bool,
     pub elapsed: Option<Duration>,
@@ -53,23 +55,20 @@ pub fn job_lineage(job_id: &str) -> Result<Vec<LineageNode>> {
                 input_hash,
                 input_content_ids,
             } => {
-                let identities: Vec<String> = input_content_ids
-                    .into_iter()
-                    .map(|content_id| content_id.to_hex())
-                    .collect();
-                let logical = input_hash.to_hex();
                 let node = ensure_node(&mut by_idx, node_idx, &stage_name);
-                node.input_hash = Some(logical);
-                node.input_content_ids = identities;
+                node.input_hash = Some(input_hash);
+                node.input_content_ids = input_content_ids;
             }
             StageEvent::StageEnd {
                 node_idx,
                 stage_name,
                 content_id,
+                legacy_output_hash,
                 elapsed,
             } => {
                 let n = ensure_node(&mut by_idx, node_idx, &stage_name);
-                n.output_hash = Some(content_id.to_hex());
+                n.output_content_id = content_id;
+                n.legacy_output_hash = legacy_output_hash;
                 n.elapsed = Some(elapsed);
             }
             StageEvent::StageSkipped {
@@ -81,7 +80,7 @@ pub fn job_lineage(job_id: &str) -> Result<Vec<LineageNode>> {
                 let n = ensure_node(&mut by_idx, node_idx, &stage_name);
                 n.cached = true;
                 if let Some(content_id) = content_id {
-                    n.output_hash = Some(content_id.to_hex());
+                    n.output_content_id = Some(content_id);
                 }
             }
             _ => {}
@@ -298,7 +297,8 @@ fn ensure_node<'a>(
         stage: name.to_string(),
         input_hash: None,
         input_content_ids: Vec::new(),
-        output_hash: None,
+        output_content_id: None,
+        legacy_output_hash: None,
         cached: false,
         elapsed: None,
     })
@@ -384,7 +384,11 @@ pub fn find_by_hash_prefix(prefix: &str) -> Result<Vec<ArtifactRecord>> {
                 continue;
             };
             for rec in scan_artifacts(&job_id).unwrap_or_default() {
-                if rec.meta.content_hash.to_hex().starts_with(&prefix) {
+                if rec
+                    .meta
+                    .display_hash()
+                    .is_some_and(|hash| hash.to_hex().starts_with(&prefix))
+                {
                     out.push(rec);
                 }
             }
@@ -433,9 +437,12 @@ mod tests {
 
         let nodes = job_lineage(job).unwrap();
         assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].input_hash.as_deref(), Some(logical_input.as_str()));
+        assert_eq!(
+            nodes[0].input_hash.map(ContentHash::to_hex).as_deref(),
+            Some(logical_input.as_str())
+        );
         assert!(nodes[0].input_content_ids.is_empty());
-        assert!(nodes[0].output_hash.is_none());
+        assert!(nodes[0].output_content_id.is_none());
         assert!(nodes[0].cached);
 
         unsafe {

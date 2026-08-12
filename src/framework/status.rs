@@ -39,9 +39,9 @@ use crate::framework::resource::Resource;
 /// audit trail. The broadcast is for the live UI only.
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 4096;
 
-/// During the 7.8 bridge, `StageSkipped.invocation_key` serializes as
-/// `cache_key` and `StageEnd.content_id` serializes as `output_hash`. Those
-/// fields now belong to different hash domains and must not be compared.
+/// Legacy invocation keys remain aliases of the same typed domain. Legacy
+/// `StageEnd.output_hash` values do not: they deserialize into a separate field
+/// and never manufacture a portable [`ContentId`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -70,9 +70,16 @@ pub enum StageEvent {
     StageEnd {
         node_idx: u32,
         stage_name: String,
-        /// Serialized as the legacy `output_hash` field during the 7.8 bridge.
-        #[serde(rename = "output_hash")]
-        content_id: ContentId,
+        /// Portable output identity. Absent only on a pre-A09 status record.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_id: Option<ContentId>,
+        /// Pre-A09 logical output hash, preserved only for display/audit.
+        #[serde(
+            default,
+            rename = "output_hash",
+            skip_serializing_if = "Option::is_none"
+        )]
+        legacy_output_hash: Option<ContentHash>,
         elapsed: Duration,
     },
     /// Stage was skipped because the cache hit on
@@ -81,7 +88,7 @@ pub enum StageEvent {
         node_idx: u32,
         stage_name: String,
         /// Serialized as the legacy `cache_key` field during the 7.8 bridge.
-        #[serde(rename = "cache_key")]
+        #[serde(rename = "invocation_key", alias = "cache_key")]
         invocation_key: InvocationKey,
         /// Absent only when replaying a pre-A09 status record.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -570,22 +577,41 @@ mod tests {
     }
 
     #[test]
-    fn stage_end_retains_legacy_output_hash_wire_key() {
+    fn stage_end_uses_explicit_content_id_and_preserves_legacy_hash_as_unknown() {
         let content = ContentId::from_digest(ContentHash::of_bytes(b"content"));
         let event = StageEvent::StageEnd {
             node_idx: 1,
             stage_name: "producer".into(),
-            content_id: content,
+            content_id: Some(content),
+            legacy_output_hash: None,
             elapsed: Duration::from_millis(12),
         };
 
         let value = serde_json::to_value(&event).unwrap();
-        assert_eq!(value["output_hash"], content.to_hex());
-        assert!(value.get("content_id").is_none());
+        assert_eq!(value["content_id"], content.to_hex());
+        assert!(value.get("output_hash").is_none());
         let round_trip: StageEvent = serde_json::from_value(value).unwrap();
         assert!(matches!(
             round_trip,
-            StageEvent::StageEnd { content_id, .. } if content_id == content
+            StageEvent::StageEnd { content_id: Some(content_id), legacy_output_hash: None, .. }
+                if content_id == content
+        ));
+
+        let legacy: StageEvent = serde_json::from_value(serde_json::json!({
+            "kind": "stage_end",
+            "node_idx": 1,
+            "stage_name": "producer",
+            "output_hash": ContentHash::of_bytes(b"legacy logical").to_hex(),
+            "elapsed": {"secs": 0, "nanos": 0}
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            StageEvent::StageEnd {
+                content_id: None,
+                legacy_output_hash: Some(_),
+                ..
+            }
         ));
     }
 
@@ -601,7 +627,7 @@ mod tests {
         };
 
         let value = serde_json::to_value(&event).unwrap();
-        assert_eq!(value["cache_key"], invocation.to_hex());
+        assert_eq!(value["invocation_key"], invocation.to_hex());
         assert_eq!(value["content_id"], content.to_hex());
         let round_trip: StageEvent = serde_json::from_value(value).unwrap();
         assert!(matches!(
@@ -635,7 +661,8 @@ mod tests {
         let event = StageEvent::StageEnd {
             node_idx: 2,
             stage_name: "train".into(),
-            content_id: ContentId::from_digest(ContentHash::of_bytes(b"out")),
+            content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"out"))),
+            legacy_output_hash: None,
             elapsed: Duration::from_secs(1),
         };
         // No host → the field is omitted (old single-host readers unaffected).
@@ -681,7 +708,8 @@ mod tests {
             StageEvent::StageEnd {
                 node_idx: 5,
                 stage_name: "remote".into(),
-                content_id: ContentId::from_digest(ContentHash::of_bytes(b"o")),
+                content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"o"))),
+                legacy_output_hash: None,
                 elapsed: Duration::from_millis(3),
             },
         );
@@ -730,7 +758,8 @@ mod tests {
         hub.emit(StageEvent::StageEnd {
             node_idx: 0,
             stage_name: "after-abort".into(),
-            content_id: ContentId::from_digest(ContentHash::of_bytes(b"out")),
+            content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"out"))),
+            legacy_output_hash: None,
             elapsed: Duration::from_millis(1),
         });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -806,7 +835,8 @@ mod tests {
         tx.send(StageEvent::StageEnd {
             node_idx: 1,
             stage_name: "filter_dataset".into(),
-            content_id: ContentId::from_digest(h),
+            content_id: Some(ContentId::from_digest(h)),
+            legacy_output_hash: None,
             elapsed: Duration::from_millis(42),
         })
         .unwrap();
@@ -881,7 +911,8 @@ mod tests {
         hub.emit(StageEvent::StageEnd {
             node_idx: 0,
             stage_name: "flooded".into(),
-            content_id: ContentId::from_digest(ContentHash::of_bytes(b"out")),
+            content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"out"))),
+            legacy_output_hash: None,
             elapsed: Duration::from_millis(1),
         });
 

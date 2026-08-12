@@ -203,6 +203,7 @@ struct Counter {
 impl Artifact for Counter {
     const KIND: &'static str = "test.counter";
     const SCHEMA: u32 = 1;
+    const INLINE: bool = true;
     fn content_hash(&self) -> ContentHash {
         ContentHash::of_bytes(&self.n.to_le_bytes())
     }
@@ -1426,7 +1427,7 @@ async fn external_reference_succeeds_without_entering_portable_cache() {
         metadata.extra.get("persisted"),
         Some(&serde_json::json!(false))
     );
-    assert!(!job.path().join("_cache/invocations").exists());
+    assert_eq!(cache_entry_count(job.path()), 0);
 
     let rerun = Plan::<(), LamuTrainerBackend>::new("external", serde_json::json!({}))
         .start(
@@ -1574,7 +1575,7 @@ async fn downstream_lineage_uses_predecessor_content_id() {
                 node_idx: 0,
                 content_id,
                 ..
-            } => producer = Some(content_id),
+            } => producer = content_id,
             StageEvent::StageBegin {
                 node_idx: 1,
                 input_content_ids,
@@ -1611,16 +1612,15 @@ async fn recorded_output_hash(abs_path: &str, content: u8) -> CH {
             ..
         } = evt
         {
-            found = Some(content_id.digest());
+            found = content_id.map(ContentId::digest);
         }
     }
-    found.expect("StageEnd must carry an output_hash")
+    found.expect("StageEnd must carry a ContentId")
 }
 
 #[tokio::test]
 async fn recorded_output_hash_is_content_based_and_path_stable() {
-    // A09: the EMITTED StageEnd.output_hash (legacy wire name) is the portable
-    // ContentId. It is path-stable but intentionally lives in a different domain
+    // A09: the emitted StageEnd.content_id is path-stable and intentionally lives in a different domain
     // from the logical artifact hash used by downstream invocation keys.
     let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let h1 = recorded_output_hash("/machine-a/jobs/r1/stages/0-make/out", 7).await;
@@ -1705,16 +1705,12 @@ fn leftover_tmp_dirs(job_dir: &Path) -> Vec<PathBuf> {
 }
 
 fn cache_entry_count(job_dir: &Path) -> usize {
-    let cache_root = job_dir.join("_cache/invocations");
-    let mut n = 0;
-    if let Ok(rd) = std::fs::read_dir(&cache_root) {
-        for e in rd.flatten() {
-            if e.path().join("record.bin").exists() {
-                n += 1;
-            }
-        }
-    }
-    n
+    std::fs::read_dir(job_dir.join("_cache/v1/cache-invocations"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .count()
 }
 
 #[tokio::test]

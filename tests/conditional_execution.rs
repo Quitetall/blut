@@ -106,6 +106,7 @@ struct TestValue {
 impl Artifact for TestValue {
     const KIND: &'static str = "conditional-test.value";
     const SCHEMA: u32 = 1;
+    const INLINE: bool = true;
 
     fn content_hash(&self) -> ContentHash {
         ContentHash::of_bytes(&self.value.to_le_bytes())
@@ -775,10 +776,10 @@ fn is_pruned_stage(event: &StageEvent, expected: &str) -> bool {
 }
 
 fn cache_entry_count(job_dir: &Path) -> usize {
-    std::fs::read_dir(job_dir.join("_cache/invocations"))
+    std::fs::read_dir(job_dir.join("_cache/v1/cache-invocations"))
         .expect("job-local invocation cache exists")
         .filter_map(Result::ok)
-        .filter(|entry| entry.path().join("record.bin").is_file())
+        .filter(|entry| entry.path().is_file())
         .count()
 }
 

@@ -79,6 +79,7 @@ fn fmt_job_id_date(id: &str) -> String {
 
 /// First `n` chars of a hash, or `—` when absent. Keeps the analytic tables
 /// narrow without losing the disambiguating prefix.
+#[cfg(test)]
 fn short_hash(h: &Option<String>, n: usize) -> String {
     h.as_deref()
         .map(|s| s.chars().take(n).collect())
@@ -246,12 +247,29 @@ pub fn artifacts_for(job_id: &str) -> Vec<ArtifactRow> {
         .into_iter()
         .map(|a| {
             let ts = a.meta.produced_at_unix_secs;
+            let hash = a
+                .meta
+                .content_id()
+                .map(|id| id.to_hex().chars().take(12).collect())
+                .or_else(|| {
+                    a.meta.legacy_content_hash.map(|hash| {
+                        format!(
+                            "legacy:{}",
+                            hash.to_hex().chars().take(12).collect::<String>()
+                        )
+                    })
+                })
+                .unwrap_or_else(|| "unknown".into());
+            let stage = a
+                .meta
+                .produced_by_stage
+                .unwrap_or_else(|| "—".into());
             (
                 ts,
                 ArtifactRow {
                     kind: a.meta.kind,
-                    stage: a.meta.produced_by_stage.unwrap_or_else(|| "—".into()),
-                    hash: a.meta.content_hash.to_hex().chars().take(12).collect(),
+                    stage,
+                    hash,
                     when: fmt_unix(ts),
                 },
             )
@@ -293,8 +311,18 @@ pub fn lineage_for(job_id: &str) -> LineageView {
         .map(|n| LineageRow {
             node_idx: n.node_idx,
             stage: n.stage,
-            input: short_hash(&n.input_hash, 10),
-            output: short_hash(&n.output_hash, 10),
+            input: n
+                .input_hash
+                .map(|hash| hash.to_hex().chars().take(10).collect())
+                .unwrap_or_else(|| "—".into()),
+            output: n
+                .output_content_id
+                .map(|id| id.to_hex().chars().take(10).collect())
+                .or_else(|| {
+                    n.legacy_output_hash
+                        .map(|hash| format!("legacy:{}", hash.to_hex().chars().take(10).collect::<String>()))
+                })
+                .unwrap_or_else(|| "—".into()),
             cached: n.cached,
             elapsed: n
                 .elapsed

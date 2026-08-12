@@ -1194,10 +1194,14 @@ pub(super) fn record_sweep_completion(fp: crate::framework::ContentHash, job_id:
         tracing::warn!("sweep completion {job_id}: no artifacts to anchor liveness");
         return;
     };
+    let Some(content_id) = rec.meta.content_id() else {
+        tracing::warn!("sweep completion {job_id}: terminal artifact has no portable ContentId");
+        return;
+    };
     if let Err(e) = crate::config::sweep_index::record_completion(
         fp,
         job_id,
-        rec.meta.content_hash,
+        content_id.digest(),
         rec.sidecar_path.clone(),
     ) {
         tracing::warn!("sweep completion {job_id}: record: {e}");

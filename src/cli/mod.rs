@@ -2155,11 +2155,17 @@ fn run_artifact_cmd(cmd: ArtifactCommand) -> Result<()> {
             for r in &recs {
                 let hash = r
                     .meta
-                    .content_hash
-                    .to_hex()
-                    .chars()
-                    .take(12)
-                    .collect::<String>();
+                    .content_id()
+                    .map(|id| id.to_hex().chars().take(12).collect())
+                    .or_else(|| {
+                        r.meta.legacy_content_hash.map(|hash| {
+                            format!(
+                                "legacy:{}",
+                                hash.to_hex().chars().take(12).collect::<String>()
+                            )
+                        })
+                    })
+                    .unwrap_or_else(|| "unknown".into());
                 let stage = r.meta.produced_by_stage.as_deref().unwrap_or("-");
                 println!(
                     "{:<24} {:<14} v{:<9} {stage}",
@@ -2188,7 +2194,17 @@ fn run_artifact_cmd(cmd: ArtifactCommand) -> Result<()> {
                 many => {
                     eprintln!("ambiguous prefix '{hash}' — {} matches:", many.len());
                     for r in many {
-                        eprintln!("  {} ({})", r.meta.content_hash.to_hex(), r.job_id);
+                        let hash = r
+                            .meta
+                            .content_id()
+                            .map(|id| id.to_hex())
+                            .or_else(|| {
+                                r.meta
+                                    .legacy_content_hash
+                                    .map(|hash| format!("legacy:{}", hash.to_hex()))
+                            })
+                            .unwrap_or_else(|| "unknown".into());
+                        eprintln!("  {hash} ({})", r.job_id);
                     }
                     Err(anyhow!("give a longer prefix"))
                 }

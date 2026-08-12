@@ -151,7 +151,10 @@ fn stage_end_content_id(events: &[StageEvent]) -> ContentId {
     events
         .iter()
         .find_map(|event| match event {
-            StageEvent::StageEnd { content_id, .. } => Some(*content_id),
+            StageEvent::StageEnd {
+                content_id: Some(content_id),
+                ..
+            } => Some(*content_id),
             _ => None,
         })
         .expect("cold run emits StageEnd")

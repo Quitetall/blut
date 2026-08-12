@@ -299,7 +299,7 @@ impl ConsoleModel {
         let (mut hits, mut ran) = (0u32, 0u32);
         let mut any_fail = false;
 
-        let short = |hex: String| hex.chars().take(8).collect::<String>();
+        let short = |hex: &str| hex.chars().take(8).collect::<String>();
         let set = |nodes: &mut HashMap<u32, DagNode>, idx, name: String, st, note: String| {
             nodes.insert(
                 idx,
@@ -326,19 +326,29 @@ impl ConsoleModel {
                     node_idx,
                     stage_name,
                     NodeState::Running,
-                    format!("{} · running", short(input_hash.to_hex())),
+                    format!("{} · running", short(&input_hash.to_hex())),
                 ),
                 StageEvent::StageEnd {
                     node_idx,
                     stage_name,
                     content_id,
+                    legacy_output_hash,
                     elapsed,
                 } => {
                     ran += 1;
+                    let observed = content_id.map(|id| id.to_hex());
+                    let display = observed
+                        .as_deref()
+                        .map(short)
+                        .or_else(|| {
+                            legacy_output_hash
+                                .map(|hash| format!("legacy:{}", short(&hash.to_hex())))
+                        })
+                        .unwrap_or_else(|| "unknown".into());
                     cache.push(CacheEvent {
                         hit: false,
                         stage: stage_name.clone(),
-                        hash: short(content_id.to_hex()),
+                        hash: display.clone(),
                         note: format!("ran {:.1}s", elapsed.as_secs_f64()),
                     });
                     set(
@@ -346,7 +356,7 @@ impl ConsoleModel {
                         node_idx,
                         stage_name,
                         NodeState::Done,
-                        short(content_id.to_hex()),
+                        display,
                     );
                 }
                 StageEvent::StageSkipped {
@@ -355,22 +365,31 @@ impl ConsoleModel {
                     invocation_key,
                     content_id,
                 } => {
-                    let observed = content_id
-                        .map(|id| id.to_hex())
-                        .unwrap_or_else(|| invocation_key.to_hex());
+                    let observed = content_id.map(|id| id.to_hex());
                     hits += 1;
+                    let display = observed
+                        .as_deref()
+                        .map(short)
+                        .unwrap_or_else(|| format!("inv:{}", short(&invocation_key.to_hex())));
                     cache.push(CacheEvent {
                         hit: true,
                         stage: stage_name.clone(),
-                        hash: short(observed.clone()),
-                        note: "reused".into(),
+                        hash: display.clone(),
+                        note: if observed.is_some() {
+                            "reused".into()
+                        } else {
+                            "legacy identity unknown".into()
+                        },
                     });
                     set(
                         &mut nodes,
                         node_idx,
                         stage_name,
                         NodeState::Cached,
-                        format!("{} · reused", short(observed)),
+                        observed.map_or_else(
+                            || format!("{display} · invocation only"),
+                            |_| format!("{display} · reused"),
+                        ),
                     );
                 }
                 StageEvent::StageFailed {
@@ -1083,6 +1102,8 @@ mod tests {
         use std::time::Duration;
         let h = |e| HostedEvent {
             host: None,
+            trace_id: None,
+            parent_span_id: None,
             event: e,
         };
         let lines = [
@@ -1101,7 +1122,8 @@ mod tests {
             h(StageEvent::StageEnd {
                 node_idx: 1,
                 stage_name: "train_joint".into(),
-                content_id: ContentId::from_digest(ContentHash::of_bytes(b"c")),
+                content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"c"))),
+                legacy_output_hash: None,
                 elapsed: Duration::from_secs(4),
             }),
             h(StageEvent::StageBegin {
@@ -1134,22 +1156,50 @@ mod tests {
     }
 
     #[test]
+    fn legacy_cache_event_keeps_count_and_labels_invocation_domain() {
+        use blut::framework::artifact::{ContentHash, InvocationKey};
+
+        let invocation = InvocationKey::from_digest(ContentHash::of_bytes(b"legacy invocation"));
+        let line = serde_json::json!({
+            "kind": "stage_skipped",
+            "node_idx": 0,
+            "stage_name": "legacy_cached",
+            "cache_key": invocation.to_hex()
+        });
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("status.jsonl");
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let mut model = ConsoleModel::demo();
+        assert!(model.apply_status_jsonl(&path));
+        assert_eq!(model.cache_hit_pct, 100);
+        assert_eq!(model.cache.len(), 1);
+        assert!(model.cache[0].hash.starts_with("inv:"));
+        assert_eq!(model.cache[0].note, "legacy identity unknown");
+    }
+
+    #[test]
     fn control_prune_is_a_successful_accounted_stage() {
-        use blut::framework::artifact::ContentHash;
+        use blut::framework::artifact::{ContentHash, ContentId};
         use std::time::Duration;
 
         let events = [
             HostedEvent {
                 host: None,
+                trace_id: None,
+                parent_span_id: None,
                 event: StageEvent::StageEnd {
                     node_idx: 0,
                     stage_name: "decision".into(),
-                    output_hash: ContentHash::of_bytes(b"decision"),
+                    content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"decision"))),
+                    legacy_output_hash: None,
                     elapsed: Duration::from_millis(1),
                 },
             },
             HostedEvent {
                 host: None,
+                trace_id: None,
+                parent_span_id: None,
                 event: StageEvent::StagePruned {
                     node_idx: 1,
                     stage_name: "guarded".into(),

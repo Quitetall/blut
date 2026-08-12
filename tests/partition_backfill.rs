@@ -11,6 +11,7 @@ use blut::config::partition::{
     BackfillSelector, CellStatus, PartitionDim, PartitionKey, PartitionSet, PartitionSpec,
     PartitionStatus, PartitionValue, select_backfill_targets, status_matrix,
 };
+use blut::framework::object_store::ObjectKey;
 use blut::framework::stage::{Stage, StageContext};
 use blut::framework::{CacheHandle, ContentHash, InvocationKey};
 use blut::framework::{Resource, StageError};
@@ -156,10 +157,14 @@ fn partition_backfill_matrix_is_lineage_derived_and_selector_exact() {
         let hash = ContentHash::of_bytes(key.as_bytes());
         let stage_dir = temp.path().join(job_id);
         let sidecar = stage_dir.join("output.metadata.json");
-        blut::framework::ArtifactMetadata::new("report", 1, hash)
-            .with_stage("evaluate")
-            .write_to(&sidecar)
-            .unwrap();
+        blut::framework::ArtifactMetadata::new(
+            "report",
+            1,
+            blut::framework::ContentId::from_digest(hash),
+        )
+        .with_stage("evaluate")
+        .write_to(&sidecar)
+        .unwrap();
         let cache_key =
             InvocationKey::from_digest(ContentHash::of_bytes(format!("cache-{key}").as_bytes()));
         let cache_root = temp.path().join("cache");
@@ -170,10 +175,7 @@ fn partition_backfill_matrix_is_lineage_derived_and_selector_exact() {
             .unwrap();
         blut::framework::cache::CacheProof {
             key: cache_key,
-            entry_path: cache_root
-                .join("invocations")
-                .join(cache_key.to_hex())
-                .join("record.bin"),
+            entry_path: cache_root.join(ObjectKey::CacheInvocation(cache_key).relative_path()),
         }
         .write_to(&stage_dir.join("cache-proof.json"))
         .unwrap();
@@ -331,13 +333,11 @@ fn partition_backfill_matrix_is_lineage_derived_and_selector_exact() {
         "force exposes Restricted so admission can refuse it rather than silently skip it"
     );
 
-    let fresh_cache_key = ContentHash::of_bytes(b"cache-corpus=fresh");
+    let fresh_cache_key = InvocationKey::from_digest(ContentHash::of_bytes(b"cache-corpus=fresh"));
     std::fs::remove_file(
         temp.path()
             .join("cache")
-            .join("invocations")
-            .join(fresh_cache_key.to_hex())
-            .join("record.bin"),
+            .join(ObjectKey::CacheInvocation(fresh_cache_key).relative_path()),
     )
     .unwrap();
     assert_eq!(
