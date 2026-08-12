@@ -42,6 +42,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::framework::artifact::{ContentHash, ContentId};
+use crate::framework::object_store::MAX_OBJECT_SIZE;
 use crate::framework::stage::{ErasedArtifact, StageDyn};
 
 /// Artifact persistence format. Version 2 validates input/output roles
@@ -150,6 +151,16 @@ pub enum ArtifactStoreError {
     Empty(String),
     #[error("pack truncated or malformed at offset {0}")]
     MalformedPack(usize),
+    #[error("artifact pack is {size} bytes, above its {max}-byte bound")]
+    TooLarge { size: u64, max: u64 },
+    #[error("cannot reserve {size} bytes for artifact pack: {reason}")]
+    Allocation { size: u64, reason: String },
+    #[error("artifact restore failed ({primary}); cleanup also failed: {cleanup}")]
+    Cleanup {
+        primary: String,
+        #[source]
+        cleanup: std::io::Error,
+    },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -394,19 +405,77 @@ pub fn bundle(
         return Err(ArtifactStoreError::Empty(src_root.display().to_string()));
     }
 
-    let mut files = Vec::with_capacity(found.len());
-    let mut pack = Vec::new();
+    let mut planned_pack_len = 0_u64;
+    let mut planned = Vec::with_capacity(found.len());
     for (abs, rel) in &found {
         reject_unsafe_rel(rel)?;
-        let body = std::fs::read(abs)?;
-        pack.extend_from_slice(&(rel.len() as u32).to_le_bytes());
+        let rel_len = u32::try_from(rel.len()).map_err(|_| ArtifactStoreError::TooLarge {
+            size: rel.len() as u64,
+            max: u32::MAX as u64,
+        })?;
+        let body_len = std::fs::metadata(abs)?.len();
+        let frame_len = 4_u64
+            .checked_add(rel.len() as u64)
+            .and_then(|size| size.checked_add(8))
+            .and_then(|size| size.checked_add(body_len))
+            .ok_or(ArtifactStoreError::TooLarge {
+                size: u64::MAX,
+                max: MAX_OBJECT_SIZE,
+            })?;
+        planned_pack_len =
+            planned_pack_len
+                .checked_add(frame_len)
+                .ok_or(ArtifactStoreError::TooLarge {
+                    size: u64::MAX,
+                    max: MAX_OBJECT_SIZE,
+                })?;
+        if planned_pack_len > MAX_OBJECT_SIZE {
+            return Err(ArtifactStoreError::TooLarge {
+                size: planned_pack_len,
+                max: MAX_OBJECT_SIZE,
+            });
+        }
+        planned.push((abs, rel, rel_len, body_len));
+    }
+
+    let pack_capacity =
+        usize::try_from(planned_pack_len).map_err(|_| ArtifactStoreError::TooLarge {
+            size: planned_pack_len,
+            max: usize::MAX as u64,
+        })?;
+    let mut pack = Vec::new();
+    pack.try_reserve_exact(pack_capacity)
+        .map_err(|error| ArtifactStoreError::Allocation {
+            size: planned_pack_len,
+            reason: error.to_string(),
+        })?;
+    let mut files = Vec::with_capacity(planned.len());
+    for (abs, rel, rel_len, expected_body_len) in planned {
+        use std::io::Read;
+
+        pack.extend_from_slice(&rel_len.to_le_bytes());
         pack.extend_from_slice(rel.as_bytes());
-        pack.extend_from_slice(&(body.len() as u64).to_le_bytes());
-        pack.extend_from_slice(&body);
+        pack.extend_from_slice(&expected_body_len.to_le_bytes());
+        let body_start = pack.len();
+        std::fs::File::open(abs)?
+            .take(expected_body_len.saturating_add(1))
+            .read_to_end(&mut pack)?;
+        let actual_body_len = (pack.len() - body_start) as u64;
+        if actual_body_len != expected_body_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "artifact backing {} changed during capture: expected {expected_body_len} bytes, read {actual_body_len}",
+                    abs.display()
+                ),
+            )
+            .into());
+        }
+        let body = &pack[body_start..];
         files.push(ArtifactFile {
             rel: rel.clone(),
             mode: file_mode(abs),
-            hash: ContentHash::of_bytes(&body),
+            hash: ContentHash::of_bytes(body),
         });
     }
 
@@ -532,10 +601,14 @@ pub fn unbundle(
         .join(manifest.content_id.to_hex());
     match unbundle_inner(stage, manifest, pack, &import_root, role) {
         Ok(rebased) => Ok(rebased),
-        Err(error) => {
-            let _ = std::fs::remove_dir_all(&import_root);
-            Err(error)
-        }
+        Err(primary) => match std::fs::remove_dir_all(&import_root) {
+            Ok(()) => Err(primary),
+            Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => Err(primary),
+            Err(cleanup) => Err(ArtifactStoreError::Cleanup {
+                primary: primary.to_string(),
+                cleanup,
+            }),
+        },
     }
 }
 
@@ -578,14 +651,19 @@ fn unbundle_inner(
             got: derived_content_id.to_hex(),
         });
     }
-    let _ = std::fs::remove_dir_all(import_root);
+    match std::fs::remove_dir_all(import_root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     std::fs::create_dir_all(import_root)?;
 
     // Unpack the framed pack: [u32 rel_len][rel][u64 body_len][body]*
     // `len_usize` fails closed if a length exceeds usize (a malicious pack on a
     // 32-bit target — e.g. the riscv32 firmware build — claiming a >4 GiB body).
     let mut off = 0usize;
-    let mut written: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    let mut written: std::collections::HashMap<String, ContentHash> =
+        std::collections::HashMap::new();
     let mut written_casefold = std::collections::HashSet::new();
     while off < pack.len() {
         let at = off;
@@ -616,9 +694,10 @@ fn unbundle_inner(
         {
             return Err(ArtifactStoreError::UnsafePath { rel });
         }
+        let body_hash = ContentHash::of_bytes(&body);
         std::fs::write(&dest, &body)?;
         set_mode(&dest, manifest, &rel)?;
-        written.insert(rel, body);
+        written.insert(rel, body_hash);
     }
 
     // Gate 2: per-file hash — total coverage (catches partial transfer / drop).
@@ -636,7 +715,7 @@ fn unbundle_inner(
     }
     for f in &manifest.files {
         match written.get(&f.rel) {
-            Some(body) if ContentHash::of_bytes(body) == f.hash => {}
+            Some(hash) if *hash == f.hash => {}
             _ => return Err(ArtifactStoreError::FileHash { rel: f.rel.clone() }),
         }
     }
@@ -1279,6 +1358,32 @@ mod tests {
         );
     }
 
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn rejects_oversized_sparse_backing_before_reading_it() {
+        let src = tempfile::tempdir().unwrap();
+        let art_dir = src.path().join("oversized");
+        std::fs::create_dir_all(&art_dir).unwrap();
+        std::fs::File::create(art_dir.join("sparse.bin"))
+            .unwrap()
+            .set_len(MAX_OBJECT_SIZE + 1)
+            .unwrap();
+        let erased = ErasedArtifact::from_typed(&DirArt {
+            path: art_dir,
+            content_hash: ContentHash::of_bytes(b"oversized fixture"),
+        })
+        .unwrap();
+
+        let error = bundle(&DirStage, erased, src.path(), ArtifactRole::Output, None).unwrap_err();
+        assert!(matches!(
+            error,
+            ArtifactStoreError::TooLarge {
+                max: MAX_OBJECT_SIZE,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn rejects_tampered_blob() {
         let stage = DirStage;
@@ -1526,5 +1631,39 @@ mod tests {
         let pb: DirArt = b.into_typed().unwrap();
         assert_eq!(pa.path, pb.path, "same ContentId -> same import dir");
         assert_eq!(ContentHash::hash_dir(&pb.path).unwrap(), hash);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_cleanup_failure_aborts_restore() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let stage = DirStage;
+        let (src, erased, _) = make_dir_artifact();
+        let (manifest, pack) = bundle(&stage, erased, src.path(), BlobDir::Input, None).unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        unbundle(
+            &stage,
+            &manifest,
+            &pack,
+            dest.path(),
+            Some(manifest.content_id),
+            BlobDir::Input,
+        )
+        .unwrap();
+        let import_parent = dest.path().join(".artifact-import");
+        std::fs::set_permissions(&import_parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = unbundle(
+            &stage,
+            &manifest,
+            &pack,
+            dest.path(),
+            Some(manifest.content_id),
+            BlobDir::Input,
+        );
+        std::fs::set_permissions(&import_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(matches!(result, Err(ArtifactStoreError::Cleanup { .. })));
     }
 }

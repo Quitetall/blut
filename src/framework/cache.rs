@@ -39,14 +39,19 @@
 
 use std::path::{Path, PathBuf};
 
+use bincode::Options;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
 use crate::framework::artifact_store::{ArtifactRole, StoredArtifact, capture, restore};
-use crate::framework::object_store::{BlockingObjectStore, ObjectKey};
+use crate::framework::object_store::{BlockingObjectStore, MAX_OBJECT_SIZE, ObjectKey};
 use crate::framework::stage::{ErasedArtifact, StageDyn};
 
 const CACHE_RECORD_VERSION: u16 = 1;
+const MAX_CACHE_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CACHE_RECORD_BYTES: u64 = 1024 * 1024;
+const MAX_CACHE_PROOF_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CacheRecord {
@@ -279,7 +284,7 @@ impl CacheHandle {
     ) -> Option<CacheHit> {
         for base in self.search_order() {
             let record_path = record_path(base, key);
-            let record_bytes = match std::fs::read(&record_path) {
+            let record_bytes = match read_file_capped(&record_path, MAX_CACHE_RECORD_BYTES) {
                 Ok(bytes) => bytes,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
@@ -294,7 +299,7 @@ impl CacheHandle {
                 continue;
             };
             let object_path = object_path(base, record.content_id);
-            let object_bytes = match std::fs::read(&object_path) {
+            let object_bytes = match read_file_capped(&object_path, MAX_OBJECT_SIZE) {
                 Ok(bytes) => bytes,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
@@ -306,7 +311,7 @@ impl CacheHandle {
                 }
             };
             if let Some(hit) =
-                materialize_hit(&record, &object_bytes, stage, into_stage_dir, &object_path)
+                materialize_hit(&record, object_bytes, stage, into_stage_dir, &object_path)
             {
                 return Some(hit);
             }
@@ -348,7 +353,7 @@ impl CacheHandle {
         };
         let hit = materialize_hit(
             &record,
-            &object_bytes,
+            object_bytes.clone(),
             stage,
             into_stage_dir,
             &PathBuf::from(format!("remote:objects/{}", record.content_id)),
@@ -378,7 +383,7 @@ impl CacheHandle {
     ) -> std::io::Result<ContentId> {
         let stored = capture(stage, output.clone(), src_root, ArtifactRole::Output, None)
             .map_err(artifact_store_io)?;
-        self.insert_stored(key, &stored)
+        self.insert_stored(key, stored)
     }
 
     /// Persist an artifact already captured by the canonical store. The executor
@@ -387,7 +392,7 @@ impl CacheHandle {
     pub fn insert_stored(
         &self,
         key: InvocationKey,
-        stored: &StoredArtifact,
+        stored: StoredArtifact,
     ) -> std::io::Result<ContentId> {
         let content_id = stored.manifest.content_id;
         let record = CacheRecord {
@@ -397,8 +402,10 @@ impl CacheHandle {
             kind: stored.manifest.kind.clone(),
             schema: stored.manifest.schema,
         };
-        let object_bytes = bincode::serialize(stored).map_err(cache_encode_io)?;
+        let object_bytes = encode_stored(stored)?;
         let record_bytes = bincode::serialize(&record).map_err(cache_encode_io)?;
+        ensure_cache_bytes_bound(&object_bytes, MAX_OBJECT_SIZE, "content object")?;
+        ensure_cache_bytes_bound(&record_bytes, MAX_CACHE_RECORD_BYTES, "invocation record")?;
         let target = self.write_target();
 
         write_atomic(&object_path(target, content_id), &object_bytes)?;
@@ -455,7 +462,7 @@ impl CacheHandle {
     pub(crate) fn insert_optional_local(
         &self,
         key: InvocationKey,
-        stored: &StoredArtifact,
+        stored: StoredArtifact,
     ) -> std::io::Result<OptionalCacheWrite> {
         let content_id = stored.manifest.content_id;
         let record = CacheRecord {
@@ -465,8 +472,10 @@ impl CacheHandle {
             kind: stored.manifest.kind.clone(),
             schema: stored.manifest.schema,
         };
-        let object_bytes = bincode::serialize(stored).map_err(cache_encode_io)?;
+        let object_bytes = encode_stored(stored)?;
         let record_bytes = bincode::serialize(&record).map_err(cache_encode_io)?;
+        ensure_cache_bytes_bound(&object_bytes, MAX_OBJECT_SIZE, "content object")?;
+        ensure_cache_bytes_bound(&record_bytes, MAX_CACHE_RECORD_BYTES, "invocation record")?;
         let target = self.write_target();
         write_atomic(&object_path(target, content_id), &object_bytes)?;
         write_atomic(&record_path(target, key), &record_bytes)?;
@@ -548,13 +557,168 @@ fn object_path(base: &Path, content_id: ContentId) -> PathBuf {
         .join("artifact.bin")
 }
 
+fn ensure_cache_bytes_bound(bytes: &[u8], max_bytes: u64, label: &str) -> std::io::Result<()> {
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "cache {label} is {} bytes, above its {max_bytes}-byte bound",
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn read_file_capped(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    if size > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "cache file {} is {size} bytes, above its {max_bytes}-byte bound",
+                path.display()
+            ),
+        ));
+    }
+    let capacity = usize::try_from(size).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cache file {} does not fit address space", path.display()),
+        )
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|error| {
+        std::io::Error::other(format!(
+            "reserve {capacity} bytes for cache file {}: {error}",
+            path.display()
+        ))
+    })?;
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cache file {} grew beyond its bound", path.display()),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn deserialize_capped<T: DeserializeOwned>(bytes: &[u8], max_bytes: u64) -> bincode::Result<T> {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(max_bytes)
+        .deserialize(bytes)
+}
+
+/// Encode metadata ahead of the existing pack allocation. `StoredArtifact`'s
+/// bincode layout is `manifest || vec_length || pack`, so serializing only the
+/// manifest and writing the vector length preserves byte compatibility while
+/// avoiding a second full-pack allocation.
+fn encode_stored(stored: StoredArtifact) -> std::io::Result<Vec<u8>> {
+    let manifest_bytes = bincode::serialize(&stored.manifest).map_err(cache_encode_io)?;
+    ensure_cache_bytes_bound(
+        &manifest_bytes,
+        MAX_CACHE_MANIFEST_BYTES,
+        "artifact manifest",
+    )?;
+    let prefix_len = std::mem::size_of::<u64>()
+        .checked_add(manifest_bytes.len())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cache object size overflow",
+            )
+        })?;
+    let final_len = prefix_len.checked_add(stored.pack.len()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "cache object size overflow",
+        )
+    })?;
+    if final_len as u64 > MAX_OBJECT_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "cache content object is {final_len} bytes, above its {MAX_OBJECT_SIZE}-byte bound"
+            ),
+        ));
+    }
+
+    let mut object = stored.pack;
+    object.try_reserve_exact(prefix_len).map_err(|error| {
+        std::io::Error::other(format!(
+            "reserve {prefix_len} bytes for cache object header: {error}"
+        ))
+    })?;
+    let pack_len = object.len();
+    object.resize(final_len, 0);
+    object.copy_within(..pack_len, prefix_len);
+    object[..manifest_bytes.len()].copy_from_slice(&manifest_bytes);
+    object[manifest_bytes.len()..prefix_len].copy_from_slice(&(pack_len as u64).to_le_bytes());
+    Ok(object)
+}
+
+/// Decode the manifest, then compact pack bytes over the header in the same
+/// allocation returned by the object store.
+fn decode_stored(mut object: Vec<u8>) -> std::io::Result<StoredArtifact> {
+    use std::io::Cursor;
+
+    ensure_cache_bytes_bound(&object, MAX_OBJECT_SIZE, "content object")?;
+    let mut cursor = Cursor::new(object.as_slice());
+    let manifest = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(MAX_CACHE_MANIFEST_BYTES)
+        .deserialize_from::<_, crate::framework::artifact_store::ArtifactManifest>(&mut cursor)
+        .map_err(cache_encode_io)?;
+    let manifest_end = usize::try_from(cursor.position()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "cache manifest does not fit address space",
+        )
+    })?;
+    let pack_offset = manifest_end
+        .checked_add(std::mem::size_of::<u64>())
+        .filter(|offset| *offset <= object.len())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cache pack length is truncated",
+            )
+        })?;
+    let declared_pack_len = u64::from_le_bytes(
+        object[manifest_end..pack_offset]
+            .try_into()
+            .expect("fixed length slice"),
+    );
+    let pack_len = object.len() - pack_offset;
+    if declared_pack_len != pack_len as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cache pack length {declared_pack_len} != stored {pack_len}"),
+        ));
+    }
+    object.copy_within(pack_offset.., 0);
+    object.truncate(pack_len);
+    Ok(StoredArtifact {
+        manifest,
+        pack: object,
+    })
+}
+
 fn decode_record(
     bytes: &[u8],
     key: InvocationKey,
     stage: &dyn StageDyn,
     source: &Path,
 ) -> Option<CacheRecord> {
-    let record = match bincode::deserialize::<CacheRecord>(bytes) {
+    let record = match deserialize_capped::<CacheRecord>(bytes, MAX_CACHE_RECORD_BYTES) {
         Ok(record) => record,
         Err(error) => {
             tracing::warn!(
@@ -580,12 +744,12 @@ fn decode_record(
 
 fn materialize_hit(
     record: &CacheRecord,
-    object_bytes: &[u8],
+    object_bytes: Vec<u8>,
     stage: &dyn StageDyn,
     into_stage_dir: &Path,
     source: &Path,
 ) -> Option<CacheHit> {
-    let stored = match bincode::deserialize::<StoredArtifact>(object_bytes) {
+    let stored = match decode_stored(object_bytes) {
         Ok(stored) => stored,
         Err(error) => {
             tracing::warn!(
@@ -681,9 +845,11 @@ pub fn lru_prune(cache_root: &Path, max_bytes: u64) -> std::io::Result<u64> {
             .accessed()
             .or_else(|_| meta.modified())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let content_id = std::fs::read(path.join("record.bin"))
+        let content_id = read_file_capped(&path.join("record.bin"), MAX_CACHE_RECORD_BYTES)
             .ok()
-            .and_then(|bytes| bincode::deserialize::<CacheRecord>(&bytes).ok())
+            .and_then(|bytes| {
+                deserialize_capped::<CacheRecord>(&bytes, MAX_CACHE_RECORD_BYTES).ok()
+            })
             .filter(|record| record.version == CACHE_RECORD_VERSION)
             .map(|record| record.content_id);
         if let Some(content_id) = content_id {
@@ -801,7 +967,7 @@ impl CacheProof {
     }
 
     pub fn read_from(path: &Path) -> std::io::Result<Self> {
-        let body = std::fs::read(path)?;
+        let body = read_file_capped(path, MAX_CACHE_PROOF_BYTES)?;
         serde_json::from_slice(&body).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -825,18 +991,18 @@ impl CacheProof {
         let Some(base) = self.entry_path.ancestors().nth(3) else {
             return false;
         };
-        let Some(record) = std::fs::read(&self.entry_path)
+        let Some(record) = read_file_capped(&self.entry_path, MAX_CACHE_RECORD_BYTES)
             .ok()
-            .and_then(|body| bincode::deserialize::<CacheRecord>(&body).ok())
+            .and_then(|body| deserialize_capped::<CacheRecord>(&body, MAX_CACHE_RECORD_BYTES).ok())
             .filter(|record| {
                 record.version == CACHE_RECORD_VERSION && record.invocation_key == self.key
             })
         else {
             return false;
         };
-        std::fs::read(object_path(base, record.content_id))
+        read_file_capped(&object_path(base, record.content_id), MAX_OBJECT_SIZE)
             .ok()
-            .and_then(|body| bincode::deserialize::<StoredArtifact>(&body).ok())
+            .and_then(|body| decode_stored(body).ok())
             .is_some_and(|stored| stored.manifest.content_id == record.content_id)
     }
 }
@@ -1137,6 +1303,62 @@ mod tests {
             h.lookup(key, &FileStage, &td.path().join("consumer"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn lookup_rejects_oversized_local_record_before_reading_it() {
+        let td = tempfile::tempdir().unwrap();
+        let h = CacheHandle::job_local(td.path().to_path_buf());
+        let key = invocation(b"oversized-record");
+        let path = record_path(td.path(), key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_CACHE_RECORD_BYTES + 1)
+            .unwrap();
+
+        assert!(
+            h.lookup(key, &FileStage, &td.path().join("consumer"))
+                .is_none(),
+            "oversized sparse record must be rejected from metadata"
+        );
+    }
+
+    #[test]
+    fn lookup_rejects_oversized_local_object_before_reading_it() {
+        let td = tempfile::tempdir().unwrap();
+        let cache = td.path().join("cache");
+        let producer = td.path().join("producer");
+        let h = CacheHandle::job_local(cache.clone());
+        let key = invocation(b"oversized-object");
+        let (artifact, _) = file_artifact(&producer, b"small valid payload");
+        let content_id = h.insert(key, &FileStage, &artifact, &producer).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(object_path(&cache, content_id))
+            .unwrap()
+            .set_len(MAX_OBJECT_SIZE + 1)
+            .unwrap();
+
+        assert!(
+            h.lookup(key, &FileStage, &td.path().join("consumer"))
+                .is_none(),
+            "oversized sparse object must be rejected from metadata"
+        );
+    }
+
+    #[test]
+    fn cache_decode_reuses_object_allocation_for_pack() {
+        let td = tempfile::tempdir().unwrap();
+        let producer = td.path().join("producer");
+        let (artifact, _) = file_artifact(&producer, b"allocation identity fixture");
+        let stored = capture(&FileStage, artifact, &producer, ArtifactRole::Output, None).unwrap();
+        let object = encode_stored(stored).unwrap();
+        let allocation = object.as_ptr();
+
+        let decoded = decode_stored(object).unwrap();
+
+        assert_eq!(decoded.pack.as_ptr(), allocation);
     }
 
     /// A truncated once-valid invocation record must downgrade to a

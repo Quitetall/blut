@@ -2792,9 +2792,10 @@ async fn run_node_with_admission(
     if let Some(stored) = &stored {
         debug_assert_eq!(stored.manifest.logical_hash, logical_hash);
     }
+    let persisted = stored.is_some();
     let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, content_id.digest())
         .with_logical_hash(logical_hash)
-        .with_extra("persisted", serde_json::Value::Bool(stored.is_some()))
+        .with_extra("persisted", serde_json::Value::Bool(persisted))
         .with_stage(stage_name.clone());
     if let Err(e) = metadata.write_to(&final_stage_dir.join("output.metadata.json")) {
         tracing::warn!(
@@ -2805,7 +2806,7 @@ async fn run_node_with_admission(
     // Cache insert — STRICTLY after the atomic promote (the load-bearing
     // FW-2 ordering: the resume oracle appears only once the output is
     // fully in place).
-    if let Some(stored) = &stored {
+    if let Some(stored) = stored {
         match env.cache.insert_stored(task.key, stored) {
             Ok(stored_id) => {
                 debug_assert_eq!(stored_id, content_id);
@@ -3588,9 +3589,10 @@ fn publish_speculative_inner(
     if let Some(error) = plan_stop_error(deadline, plan_started, &env.cancel) {
         return Err(NodeFailure::Plan(error));
     }
+    let persisted = stored.is_some();
     let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, content_id.digest())
         .with_logical_hash(output_hash)
-        .with_extra("persisted", serde_json::Value::Bool(stored.is_some()))
+        .with_extra("persisted", serde_json::Value::Bool(persisted))
         .with_stage(prepared.stage_name.clone());
     if let Err(error) = metadata.write_to(&final_stage_dir.join("output.metadata.json")) {
         tracing::warn!(
@@ -3606,7 +3608,7 @@ fn publish_speculative_inner(
     }
     let mut pipeline_cache_guard = None;
     let mut optional_cache_body = None;
-    if let Some(stored) = &stored {
+    if let Some(stored) = stored {
         match env.cache.insert_optional_local(prepared.key, stored) {
             Ok(body) => {
                 optional_cache_body = Some(body);
