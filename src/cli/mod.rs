@@ -137,12 +137,6 @@ enum Command {
         #[command(subcommand)]
         cmd: ChecksCommand,
     },
-    /// Dataset catalog (ADR 0100): search / show / tag / rebuild a read-only
-    /// projection over the datasets registry + lineage.
-    Catalog {
-        #[command(subcommand)]
-        cmd: CatalogCommand,
-    },
     /// Ecosystem connectors (ADR 0112): list the registered connector stages +
     /// their typed I/O kinds, and validate the registry.
     Connectors {
@@ -165,12 +159,8 @@ enum Command {
         #[command(subcommand)]
         cmd: ScheduleCommand,
     },
-    /// Manage the datasets registry.
-    Data {
-        #[command(subcommand)]
-        cmd: DataCommand,
-    },
-    /// Immutable, tenant-scoped `dataset://<name>@<version>` bindings (ADR 0090).
+    /// Dataset lifecycle: ingest sources, pin/resolve immutable versions, and
+    /// inspect the read-only catalog projection (ADR 0170).
     Dataset {
         #[command(subcommand)]
         cmd: DatasetCommand,
@@ -593,7 +583,7 @@ enum ArtifactCommand {
 }
 
 #[derive(Subcommand, Debug)]
-enum DataCommand {
+enum DatasetIngestCommand {
     /// List registered datasets, newest first.
     List,
     /// Register a source file under a name.
@@ -623,7 +613,12 @@ enum DataCommand {
 
 #[derive(Subcommand, Debug)]
 enum DatasetCommand {
-    /// Pin an existing `blut data add` source to an immutable version URI.
+    /// Manage mutable source records before they are pinned.
+    Ingest {
+        #[command(subcommand)]
+        cmd: DatasetIngestCommand,
+    },
+    /// Pin an existing `blut dataset ingest add` source to an immutable URI.
     Pin {
         /// Existing raw dataset-registry name.
         source: String,
@@ -642,6 +637,11 @@ enum DatasetCommand {
         launcher: String,
         #[arg(long)]
         json: bool,
+    },
+    /// Search and inspect the read-only dataset catalog projection.
+    Catalog {
+        #[command(subcommand)]
+        cmd: CatalogCommand,
     },
 }
 
@@ -695,6 +695,21 @@ fn run_external(argv: Vec<String>) -> Result<()> {
     let (name, rest) = argv
         .split_first()
         .ok_or_else(|| anyhow!("empty external subcommand"))?;
+    if matches!(name.as_str(), "data" | "catalog") {
+        let replacement = if name == "data" {
+            "blut dataset ingest"
+        } else {
+            "blut dataset catalog"
+        };
+        let suffix = if rest.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", rest.join(" "))
+        };
+        return Err(anyhow!(
+            "`blut {name}` was removed by ADR 0170; use `{replacement}{suffix}`"
+        ));
+    }
     // ALLOWLIST the name (cargo's own convention for `cargo-<cmd>`): only
     // `[A-Za-z0-9_-]`. Strictly safer than blocklisting separators — no path
     // component, escape, or platform-specific separator can survive, so the child
@@ -773,8 +788,9 @@ fn run_connectors_cmd(cmd: ConnectorsCommand) -> Result<()> {
     }
 }
 
-/// `blut catalog {rebuild,search,show,tag}` (ADR 0100) — a read-only projection
-/// over the datasets registry + lineage, with a persisted tags table.
+/// `blut dataset catalog {rebuild,search,show,tag}` (ADRs 0100 and 0170) — a
+/// read-only projection over the datasets registry + lineage, with persisted
+/// tags.
 fn run_catalog_cmd(cmd: CatalogCommand) -> Result<()> {
     use crate::catalog;
     let datasets = crate::datasets_db::open().map_err(|e| anyhow!("{e}"))?;
@@ -999,12 +1015,10 @@ pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>)
         }
         Some(Command::Errors { cmd }) => run_errors(&reg, cmd),
         Some(Command::Checks { cmd }) => run_checks_cmd(cmd),
-        Some(Command::Catalog { cmd }) => run_catalog_cmd(cmd),
         Some(Command::Connectors { cmd }) => run_connectors_cmd(cmd),
         Some(Command::Partition { cmd }) => run_partition(&reg, cmd).await,
         Some(Command::Artifact { cmd }) => run_artifact_cmd(cmd),
         Some(Command::Schedule { cmd }) => run_schedule_cmd(&reg, cmd),
-        Some(Command::Data { cmd }) => run_data(cmd),
         Some(Command::Dataset { cmd }) => run_dataset_cmd(cmd),
         Some(Command::Policy { cmd }) => run_policy(cmd),
         Some(Command::Recipe { cmd }) => run_recipe(&reg, cmd).await,
@@ -1140,19 +1154,50 @@ mod external_subcommand_tests {
             "error must name the sidecar binary + the dispatch: {msg}"
         );
     }
+
+    #[test]
+    fn removed_dataset_roots_fail_with_canonical_routes() {
+        for (old, expected) in [
+            (
+                vec!["data", "add", "raw", "recording.edf"],
+                "blut dataset ingest add raw recording.edf",
+            ),
+            (
+                vec!["catalog", "search", "modality:eeg"],
+                "blut dataset catalog search modality:eeg",
+            ),
+        ] {
+            let err = run_external(old.into_iter().map(str::to_string).collect())
+                .expect_err("removed dataset root must fail before sidecar dispatch");
+            let message = err.to_string();
+            assert!(message.contains("removed by ADR 0170"), "{message}");
+            assert!(message.contains(expected), "{message}");
+        }
+    }
 }
 
 #[cfg(test)]
 mod registry_completion_cli_tests {
     use super::{
-        Cli, Command, DatasetCommand, ExperimentCommand, ModelCommand, PlanCommand, RecipeCommand,
-        RecipeMarker, ensure_resume_registry_snapshot, governed_aliases,
+        CatalogCommand, Cli, Command, DatasetCommand, DatasetIngestCommand, ExperimentCommand,
+        ModelCommand, PlanCommand, RecipeCommand, RecipeMarker, ensure_resume_registry_snapshot,
+        governed_aliases,
     };
     use clap::Parser;
     use std::time::Duration;
 
     #[test]
-    fn dataset_pin_and_exp_compare_parse_as_builtins() {
+    fn dataset_namespace_and_exp_compare_parse_as_builtins() {
+        let ingest = Cli::try_parse_from(["blut", "dataset", "ingest", "list"]).unwrap();
+        assert!(matches!(
+            ingest.command,
+            Some(Command::Dataset {
+                cmd: DatasetCommand::Ingest {
+                    cmd: DatasetIngestCommand::List
+                }
+            })
+        ));
+
         let dataset = Cli::try_parse_from([
             "blut",
             "dataset",
@@ -1168,6 +1213,28 @@ mod registry_completion_cli_tests {
             Some(Command::Dataset {
                 cmd: DatasetCommand::Pin { source, uri, tenant }
             }) if source == "raw" && uri == "dataset://tuh@v3" && tenant == "research/dev"
+        ));
+
+        let catalog = Cli::try_parse_from([
+            "blut",
+            "dataset",
+            "catalog",
+            "search",
+            "modality:eeg",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            catalog.command,
+            Some(Command::Dataset {
+                cmd: DatasetCommand::Catalog {
+                    cmd: CatalogCommand::Search {
+                        query,
+                        cloud: false,
+                        json: true
+                    }
+                }
+            }) if query == "modality:eeg"
         ));
 
         let experiment = Cli::try_parse_from([
@@ -1795,13 +1862,14 @@ async fn run_model_cmd(cmd: ModelCommand) -> Result<()> {
 }
 
 fn run_dataset_cmd(cmd: DatasetCommand) -> Result<()> {
-    let conn = crate::datasets_db::open().map_err(|e| anyhow!("{e}"))?;
     match cmd {
+        DatasetCommand::Ingest { cmd } => run_dataset_ingest(cmd),
         DatasetCommand::Pin {
             source,
             uri,
             tenant,
         } => {
+            let conn = crate::datasets_db::open().map_err(|e| anyhow!("{e}"))?;
             let tenant = crate::tenant::Tenant::parse(&tenant)
                 .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
             let binding = crate::dataset_registry::pin(&conn, &source, &uri, &tenant, now_unix())
@@ -1821,6 +1889,7 @@ fn run_dataset_cmd(cmd: DatasetCommand) -> Result<()> {
             launcher,
             json,
         } => {
+            let conn = crate::datasets_db::open().map_err(|e| anyhow!("{e}"))?;
             let tenant = crate::tenant::Tenant::parse(&tenant)
                 .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
             let target: crate::config::launcher::LaunchTarget = launcher
@@ -1835,6 +1904,7 @@ fn run_dataset_cmd(cmd: DatasetCommand) -> Result<()> {
             }
             Ok(())
         }
+        DatasetCommand::Catalog { cmd } => run_catalog_cmd(cmd),
     }
 }
 
@@ -2353,11 +2423,11 @@ fn run_policy(cmd: PolicyCommand) -> Result<()> {
     Ok(())
 }
 
-fn run_data(cmd: DataCommand) -> Result<()> {
+fn run_dataset_ingest(cmd: DatasetIngestCommand) -> Result<()> {
     use crate::datasets_db;
     let conn = datasets_db::open()?;
     match cmd {
-        DataCommand::List => {
+        DatasetIngestCommand::List => {
             let rows = datasets_db::list(&conn)?;
             if rows.is_empty() {
                 println!("no datasets registered.");
@@ -2378,7 +2448,7 @@ fn run_data(cmd: DataCommand) -> Result<()> {
                 );
             }
         }
-        DataCommand::Add {
+        DatasetIngestCommand::Add {
             name,
             path,
             kind,
@@ -2395,7 +2465,7 @@ fn run_data(cmd: DataCommand) -> Result<()> {
                 rec.n_examples, rec.sha256
             );
         }
-        DataCommand::Rm { name } => {
+        DatasetIngestCommand::Rm { name } => {
             let removed = datasets_db::remove(&conn, &name)?;
             if removed {
                 println!("removed '{name}'");
@@ -2403,7 +2473,7 @@ fn run_data(cmd: DataCommand) -> Result<()> {
                 return Err(anyhow!("no dataset named '{name}'"));
             }
         }
-        DataCommand::Show { name } => match datasets_db::get_by_name(&conn, &name)? {
+        DatasetIngestCommand::Show { name } => match datasets_db::get_by_name(&conn, &name)? {
             Some(rec) => {
                 println!(
                     "{}",

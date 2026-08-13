@@ -334,10 +334,13 @@ invocation opens the console over its live registry); with plain `run`, the
 `tui` subcommand execs the `blut-tui` binary from PATH via the external
 dispatch, and a bare invocation prints help.
 
-`blut dataset pin` binds an existing raw source to an immutable
-`dataset://name@version`; `blut exp compare` compares the two newest lineage
-runs for an explicit `--experiment` campaign and tenant (falling back to the
-recipe name for legacy/default runs); and governed `blut model promote`
+`blut dataset` is the sole dataset namespace: `dataset ingest` manages mutable
+source records, `dataset pin` and `dataset resolve` govern immutable
+`dataset://name@version` bindings, and `dataset catalog` queries the read-only
+catalog projection. Removed top-level `data` and `catalog` commands fail with
+their canonical replacement route. `blut exp compare` compares the two newest
+lineage runs for an explicit `--experiment` campaign and tenant (falling back
+to the recipe name for legacy/default runs); governed `blut model promote`
 processes run asynchronously under `--gate-timeout` (default five minutes).
 `recipe run`, resumable recipe markers, HPO, declarative TOML, JSON PlanSpecs,
 frozen registry PlanSpecs, and Starlark build/stage args resolve these URIs
