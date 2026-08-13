@@ -75,7 +75,7 @@ fn canonical_request(
                 &serde_json::json!({}),
             )),
             args: serde_json::json!({}),
-            input: stored,
+            input: Some(stored),
             expected_content_id: None,
             resources: ExecutionResources::default(),
             data_class: DataClassification::Public,

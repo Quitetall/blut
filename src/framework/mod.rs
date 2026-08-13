@@ -77,7 +77,7 @@ pub use execution::{
     ExecutionAdapter, ExecutionArtifact, ExecutionDeadline, ExecutionFailure, ExecutionFailureKind,
     ExecutionHandle, ExecutionLifecycle, ExecutionMode, ExecutionPhase, ExecutionRequest,
     ExecutionResources, ExecutionResult, ExecutionSnapshot, ExecutionTerminal, LifecycleError,
-    drive_execution,
+    LocalExecutionAdapter, drive_execution,
 };
 pub use executor::{ExecCtx, ParallelExecutor, PlanResult, SequentialExecutor, execute_plan};
 pub use graph::{GraphSnapshot, NodeStatus, PlanGraph, graph_snapshot};

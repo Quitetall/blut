@@ -476,10 +476,13 @@ pub async fn dispatch_stored_to_peer(
             request.execution_id
         )));
     }
-    let manifest_bytes = bincode::serialize(&request.input.manifest)
+    let input = request.input.as_ref().ok_or_else(|| {
+        ExecutionFailure::protocol("P2P execution requires a portable input artifact")
+    })?;
+    let manifest_bytes = bincode::serialize(&input.manifest)
         .map_err(|e| ExecutionFailure::artifact(format!("serialize input manifest: {e}")))?;
     let encrypted_input = crypto::encrypt(&manifest_bytes, &peer.x25519_pub);
-    let sealed_input = seal_blob(&request.input.pack, &peer.x25519_pub)
+    let sealed_input = seal_blob(&input.pack, &peer.x25519_pub)
         .map_err(|e| ExecutionFailure::artifact(format!("seal input blob: {e}")))?;
     let mut task = TaskManifest {
         protocol_version: crate::p2p::task::TASK_PROTOCOL_VERSION,
@@ -487,7 +490,7 @@ pub async fn dispatch_stored_to_peer(
         coordinator_id: PeerId::from_pubkey(&coordinator_kp.verifying),
         stage_name: request.stage_name.clone(),
         stage_schema: request.stage_schema,
-        input_content_id: request.input.manifest.content_id,
+        input_content_id: input.manifest.content_id,
         invocation_key: request.invocation_key,
         args_hash: request.args_hash,
         expected_content_id: request.expected_content_id,
@@ -674,7 +677,7 @@ pub async fn dispatch_to_peer(
             &serde_json::to_vec(&args).map_err(|e| TrainError::other(format!("args hash: {e}")))?,
         ),
         args,
-        input: StoredArtifact { manifest, pack },
+        input: Some(StoredArtifact { manifest, pack }),
         expected_content_id,
         resources: crate::framework::execution::ExecutionResources::default(),
         data_class: data_class.into(),

@@ -16,7 +16,7 @@ use blut::framework::execution::{
     Assignment, DataClassification, EXECUTION_PROTOCOL_VERSION, ExecutionAdapter,
     ExecutionArtifact, ExecutionDeadline, ExecutionFailure, ExecutionHandle, ExecutionLifecycle,
     ExecutionMode, ExecutionPhase, ExecutionRequest, ExecutionResources, ExecutionResult,
-    ExecutionSnapshot, ExecutionTerminal, LifecycleError, drive_execution,
+    ExecutionSnapshot, ExecutionTerminal, LifecycleError, LocalExecutionAdapter, drive_execution,
 };
 use blut::framework::stage::ErasedArtifact;
 use blut::framework::{Resource, Stage, StageContext};
@@ -103,12 +103,18 @@ fn request(deadline: ExecutionDeadline) -> ExecutionRequest {
         invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"invocation")),
         args_hash: ContentHash::of_bytes(b"{}"),
         args: serde_json::json!({}),
-        input,
+        input: Some(input),
         expected_content_id: None,
         resources: ExecutionResources::default(),
         data_class: DataClassification::Public,
         deadline,
     }
+}
+
+fn local_request(deadline: ExecutionDeadline) -> ExecutionRequest {
+    let mut request = request(deadline);
+    request.input = None;
+    request
 }
 
 fn success(label: &[u8]) -> ExecutionTerminal {
@@ -155,6 +161,120 @@ fn every_mode_obeys_the_same_transition_and_terminal_contract() {
             "{mode:?} must keep exactly one terminal outcome"
         );
     }
+}
+
+fn enter_phase(lifecycle: &ExecutionLifecycle, phase: ExecutionPhase, assignment: &Assignment) {
+    match phase {
+        ExecutionPhase::Preparing => {}
+        ExecutionPhase::UploadingInput => {
+            lifecycle
+                .transition(ExecutionPhase::UploadingInput, None)
+                .unwrap();
+        }
+        ExecutionPhase::Queued => {
+            lifecycle.transition(ExecutionPhase::Queued, None).unwrap();
+        }
+        ExecutionPhase::Assigned => {
+            lifecycle
+                .transition(ExecutionPhase::Assigned, Some(assignment.clone()))
+                .unwrap();
+        }
+        ExecutionPhase::Running => {
+            lifecycle
+                .transition(ExecutionPhase::Assigned, Some(assignment.clone()))
+                .unwrap();
+            lifecycle.transition(ExecutionPhase::Running, None).unwrap();
+        }
+        ExecutionPhase::UploadingOutput => {
+            lifecycle
+                .transition(ExecutionPhase::Assigned, Some(assignment.clone()))
+                .unwrap();
+            lifecycle.transition(ExecutionPhase::Running, None).unwrap();
+            lifecycle
+                .transition(ExecutionPhase::UploadingOutput, None)
+                .unwrap();
+        }
+        ExecutionPhase::DownloadingOutput => {
+            lifecycle
+                .transition(ExecutionPhase::Assigned, Some(assignment.clone()))
+                .unwrap();
+            lifecycle.transition(ExecutionPhase::Running, None).unwrap();
+            lifecycle
+                .transition(ExecutionPhase::UploadingOutput, None)
+                .unwrap();
+            lifecycle
+                .transition(ExecutionPhase::DownloadingOutput, None)
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn every_mode_cancels_once_from_every_non_terminal_phase() {
+    let phases = [
+        ExecutionPhase::Preparing,
+        ExecutionPhase::UploadingInput,
+        ExecutionPhase::Queued,
+        ExecutionPhase::Assigned,
+        ExecutionPhase::Running,
+        ExecutionPhase::UploadingOutput,
+        ExecutionPhase::DownloadingOutput,
+    ];
+    for mode in [
+        ExecutionMode::Local,
+        ExecutionMode::P2p,
+        ExecutionMode::Cloud,
+    ] {
+        for phase in phases {
+            let lifecycle = ExecutionLifecycle::new(mode);
+            let assignment = Assignment::new(format!("{mode:?}-worker"), 1);
+            enter_phase(&lifecycle, phase, &assignment);
+            lifecycle
+                .finish(
+                    None,
+                    ExecutionTerminal::Cancelled {
+                        reason: format!("cancel during {phase:?}"),
+                    },
+                )
+                .unwrap();
+            assert!(matches!(
+                lifecycle.snapshot().terminal,
+                Some(ExecutionTerminal::Cancelled { .. })
+            ));
+            assert!(matches!(
+                lifecycle.finish(
+                    None,
+                    ExecutionTerminal::Failed {
+                        failure: ExecutionFailure::transport("late terminal")
+                    }
+                ),
+                Err(LifecycleError::AlreadyTerminal)
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn production_local_adapter_submits_and_cancels_through_canonical_handle() {
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let adapter = LocalExecutionAdapter::queued(1, cancellation.clone()).unwrap();
+    let handle = adapter
+        .submit(local_request(ExecutionDeadline::from_now(
+            None,
+            Duration::from_secs(5),
+        )))
+        .await
+        .unwrap();
+    assert_eq!(
+        handle.snapshot().await.unwrap().phase,
+        ExecutionPhase::Running
+    );
+    handle.cancel().await.unwrap();
+    assert!(cancellation.is_cancelled());
+    assert!(matches!(
+        adapter.snapshot().terminal,
+        Some(ExecutionTerminal::Cancelled { .. })
+    ));
 }
 
 #[test]
@@ -308,6 +428,97 @@ impl ExecutionHandle for ScriptHandleRef {
     }
 }
 
+struct PhasedHangHandle {
+    lifecycle: ExecutionLifecycle,
+    first_snapshot: std::sync::atomic::AtomicBool,
+    cancel_calls: AtomicUsize,
+}
+
+impl PhasedHangHandle {
+    fn new(mode: ExecutionMode, phase: ExecutionPhase) -> Arc<Self> {
+        let lifecycle = ExecutionLifecycle::new(mode);
+        let assignment = Assignment::new(format!("{mode:?}-worker"), 1);
+        enter_phase(&lifecycle, phase, &assignment);
+        Arc::new(Self {
+            lifecycle,
+            first_snapshot: std::sync::atomic::AtomicBool::new(true),
+            cancel_calls: AtomicUsize::new(0),
+        })
+    }
+}
+
+struct PhasedHangHandleRef(Arc<PhasedHangHandle>);
+
+#[async_trait]
+impl ExecutionHandle for PhasedHangHandleRef {
+    async fn snapshot(&self) -> Result<ExecutionSnapshot, ExecutionFailure> {
+        if self.0.first_snapshot.swap(false, Ordering::SeqCst) {
+            Ok(self.0.lifecycle.snapshot())
+        } else {
+            pending().await
+        }
+    }
+
+    async fn cancel(&self) -> Result<(), ExecutionFailure> {
+        self.0.cancel_calls.fetch_add(1, Ordering::SeqCst);
+        let _ = self.0.lifecycle.finish(
+            None,
+            ExecutionTerminal::Cancelled {
+                reason: "phase hang cancelled".into(),
+            },
+        );
+        Ok(())
+    }
+}
+
+struct PhasedHangAdapter(Arc<PhasedHangHandle>);
+
+#[async_trait]
+impl ExecutionAdapter for PhasedHangAdapter {
+    fn mode(&self) -> ExecutionMode {
+        self.0.lifecycle.snapshot().mode
+    }
+
+    async fn submit(
+        &self,
+        _request: ExecutionRequest,
+    ) -> Result<Box<dyn ExecutionHandle>, ExecutionFailure> {
+        Ok(Box::new(PhasedHangHandleRef(self.0.clone())))
+    }
+}
+
+struct SnapshotFailureAdapter {
+    mode: ExecutionMode,
+    failure: ExecutionFailure,
+}
+
+struct SnapshotFailureHandle(ExecutionFailure);
+
+#[async_trait]
+impl ExecutionAdapter for SnapshotFailureAdapter {
+    fn mode(&self) -> ExecutionMode {
+        self.mode
+    }
+
+    async fn submit(
+        &self,
+        _request: ExecutionRequest,
+    ) -> Result<Box<dyn ExecutionHandle>, ExecutionFailure> {
+        Ok(Box::new(SnapshotFailureHandle(self.failure.clone())))
+    }
+}
+
+#[async_trait]
+impl ExecutionHandle for SnapshotFailureHandle {
+    async fn snapshot(&self) -> Result<ExecutionSnapshot, ExecutionFailure> {
+        Err(self.0.clone())
+    }
+
+    async fn cancel(&self) -> Result<(), ExecutionFailure> {
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn cancellation_interrupts_a_hanging_submit() {
     let adapter = ScriptAdapter {
@@ -326,6 +537,33 @@ async fn cancellation_interrupts_a_hanging_submit() {
         _ = cancellation.cancelled() => {}
         _ = &mut submit => panic!("hanging submit unexpectedly completed"),
     }
+}
+
+#[tokio::test]
+async fn peer_disconnect_preserves_typed_failure_identity() {
+    let adapter = SnapshotFailureAdapter {
+        mode: ExecutionMode::P2p,
+        failure: ExecutionFailure::disconnected("peer lease connection closed"),
+    };
+    let destination = tempfile::tempdir().unwrap();
+    let result = drive_execution(
+        &adapter,
+        request(ExecutionDeadline::from_now(None, Duration::from_secs(5))),
+        &tokio_util::sync::CancellationToken::new(),
+        Arc::new(ContractStage),
+        destination.path(),
+        Duration::from_millis(1),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        ExecutionResult::Failed(ExecutionFailure {
+            kind: blut::framework::execution::ExecutionFailureKind::Disconnected,
+            code,
+            retryable: true,
+            ..
+        }) if code == "EXECUTION_DISCONNECTED"
+    ));
 }
 
 #[tokio::test]
@@ -386,46 +624,101 @@ async fn driver_restores_a_validated_success_artifact() {
     )
     .unwrap();
     let content_id = stored.manifest.content_id;
-    let handle = ScriptHandle::completed(
+    for mode in [
         ExecutionMode::Local,
-        ExecutionTerminal::Succeeded {
-            artifact: ExecutionArtifact {
-                content_id,
-                stored: Some(stored),
+        ExecutionMode::P2p,
+        ExecutionMode::Cloud,
+    ] {
+        let handle = ScriptHandle::completed(
+            mode,
+            ExecutionTerminal::Succeeded {
+                artifact: ExecutionArtifact {
+                    content_id,
+                    stored: Some(stored.clone()),
+                },
+                wall_time_ms: 9,
             },
-            wall_time_ms: 9,
-        },
-    );
-    let adapter = ScriptAdapter {
-        mode: ExecutionMode::Local,
-        behavior: AdapterBehavior::Handle(handle),
-    };
-    let mut execution_request = request(ExecutionDeadline::from_now(None, Duration::from_secs(5)));
-    execution_request.expected_content_id = Some(content_id);
-    let destination = tempfile::tempdir().unwrap();
+        );
+        let adapter = ScriptAdapter {
+            mode,
+            behavior: AdapterBehavior::Handle(handle),
+        };
+        let mut execution_request =
+            request(ExecutionDeadline::from_now(None, Duration::from_secs(5)));
+        execution_request.expected_content_id = Some(content_id);
+        let destination = tempfile::tempdir().unwrap();
 
-    let result = drive_execution(
-        &adapter,
-        execution_request,
-        &tokio_util::sync::CancellationToken::new(),
-        stage,
-        destination.path(),
-        Duration::from_millis(1),
-    )
-    .await;
-    match result {
-        ExecutionResult::Succeeded {
-            artifact,
-            content_id: actual,
-            wall_time_ms,
-        } => {
-            let restored = artifact.into_typed::<ContractFile>().unwrap();
-            assert_eq!(actual, content_id);
-            assert_eq!(wall_time_ms, 9);
-            assert_eq!(std::fs::read(restored.primary_path()).unwrap(), b"RESTORED");
-            assert!(restored.primary_path().starts_with(destination.path()));
+        let result = drive_execution(
+            &adapter,
+            execution_request,
+            &tokio_util::sync::CancellationToken::new(),
+            stage.clone(),
+            destination.path(),
+            Duration::from_millis(1),
+        )
+        .await;
+        match result {
+            ExecutionResult::Succeeded {
+                artifact,
+                content_id: actual,
+                wall_time_ms,
+            } => {
+                let restored = artifact.into_typed::<ContractFile>().unwrap();
+                assert_eq!(actual, content_id, "{mode:?}");
+                assert_eq!(wall_time_ms, 9, "{mode:?}");
+                assert_eq!(
+                    std::fs::read(restored.primary_path()).unwrap(),
+                    b"RESTORED",
+                    "{mode:?}"
+                );
+                assert!(restored.primary_path().starts_with(destination.path()));
+            }
+            _ => panic!("{mode:?}: validated success did not complete"),
         }
-        _ => panic!("validated success did not complete"),
+    }
+}
+
+#[tokio::test]
+async fn every_mode_rejects_success_without_portable_validated_output() {
+    for mode in [
+        ExecutionMode::Local,
+        ExecutionMode::P2p,
+        ExecutionMode::Cloud,
+    ] {
+        let handle = ScriptHandle::completed(
+            mode,
+            ExecutionTerminal::Succeeded {
+                artifact: ExecutionArtifact {
+                    content_id: content_id(b"missing"),
+                    stored: None,
+                },
+                wall_time_ms: 1,
+            },
+        );
+        let adapter = ScriptAdapter {
+            mode,
+            behavior: AdapterBehavior::Handle(handle),
+        };
+        let destination = tempfile::tempdir().unwrap();
+        let result = drive_execution(
+            &adapter,
+            request(ExecutionDeadline::from_now(None, Duration::from_secs(5))),
+            &tokio_util::sync::CancellationToken::new(),
+            Arc::new(ContractStage),
+            destination.path(),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                ExecutionResult::Failed(ExecutionFailure {
+                    kind: blut::framework::execution::ExecutionFailureKind::Artifact,
+                    ..
+                })
+            ),
+            "{mode:?}"
+        );
     }
 }
 
@@ -453,24 +746,67 @@ async fn driver_hard_deadline_interrupts_hanging_poll_and_cancels_handle() {
 
 #[tokio::test]
 async fn driver_pre_cancel_interrupts_hanging_submit() {
-    let adapter = ScriptAdapter {
-        mode: ExecutionMode::P2p,
-        behavior: AdapterBehavior::HangSubmit,
-    };
-    let cancellation = tokio_util::sync::CancellationToken::new();
-    cancellation.cancel();
-    let destination = tempfile::tempdir().unwrap();
+    for mode in [
+        ExecutionMode::Local,
+        ExecutionMode::P2p,
+        ExecutionMode::Cloud,
+    ] {
+        let adapter = ScriptAdapter {
+            mode,
+            behavior: AdapterBehavior::HangSubmit,
+        };
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let destination = tempfile::tempdir().unwrap();
 
-    let result = drive_execution(
-        &adapter,
-        request(ExecutionDeadline::from_now(None, Duration::from_secs(5))),
-        &cancellation,
-        Arc::new(ContractStage),
-        destination.path(),
-        Duration::from_millis(1),
-    )
-    .await;
-    assert!(matches!(result, ExecutionResult::Cancelled));
+        let result = drive_execution(
+            &adapter,
+            request(ExecutionDeadline::from_now(None, Duration::from_secs(5))),
+            &cancellation,
+            Arc::new(ContractStage),
+            destination.path(),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(matches!(result, ExecutionResult::Cancelled), "{mode:?}");
+    }
+}
+
+#[tokio::test]
+async fn every_mode_times_out_and_cancels_hanging_stage_or_transfer_phase() {
+    let phases = [
+        ExecutionPhase::UploadingInput,
+        ExecutionPhase::Queued,
+        ExecutionPhase::Assigned,
+        ExecutionPhase::Running,
+        ExecutionPhase::UploadingOutput,
+        ExecutionPhase::DownloadingOutput,
+    ];
+    for mode in [
+        ExecutionMode::Local,
+        ExecutionMode::P2p,
+        ExecutionMode::Cloud,
+    ] {
+        for phase in phases {
+            let handle = PhasedHangHandle::new(mode, phase);
+            let adapter = PhasedHangAdapter(handle.clone());
+            let destination = tempfile::tempdir().unwrap();
+            let result = drive_execution(
+                &adapter,
+                request(ExecutionDeadline::from_now(None, Duration::from_millis(20))),
+                &tokio_util::sync::CancellationToken::new(),
+                Arc::new(ContractStage),
+                destination.path(),
+                Duration::from_millis(1),
+            )
+            .await;
+            assert!(
+                matches!(result, ExecutionResult::TimedOut { phase: actual, .. } if actual == phase),
+                "{mode:?} {phase:?}"
+            );
+            assert_eq!(handle.cancel_calls.load(Ordering::SeqCst), 1);
+        }
+    }
 }
 
 #[test]

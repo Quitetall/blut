@@ -560,7 +560,7 @@ mod e2e {
             ),
             args_hash: ContentHash::of_bytes(b"{}"),
             args: serde_json::json!({}),
-            input: stored,
+            input: Some(stored),
             expected_content_id: None,
             resources: ExecutionResources::default(),
             data_class: DataClassification::Public,

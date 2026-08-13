@@ -268,19 +268,23 @@ impl CloudAttempt {
 
     async fn run_inner(&self) -> Result<(), ExecutionFailure> {
         transition(&self.lifecycle, ExecutionPhase::UploadingInput, None)?;
-        let input_key = ContentHash::of_bytes(&self.request.input.pack);
-        if input_key != self.request.input.manifest.blob_sha256
-            || self.request.input.pack.len() as u64 != self.request.input.manifest.blob_len
+        let Some(input) = self.request.input.as_ref() else {
+            return Err(ExecutionFailure::protocol(
+                "cloud execution requires a portable input artifact",
+            ));
+        };
+        let input_key = ContentHash::of_bytes(&input.pack);
+        if input_key != input.manifest.blob_sha256
+            || input.pack.len() as u64 != input.manifest.blob_len
         {
             return Err(ExecutionFailure::artifact(
                 "canonical input pack does not match its manifest",
             ));
         }
 
-        let upload = self.store.put(
-            ObjectKey::DispatchBundle(input_key),
-            self.request.input.pack.clone(),
-        );
+        let upload = self
+            .store
+            .put(ObjectKey::DispatchBundle(input_key), input.pack.clone());
         tokio::pin!(upload);
         tokio::select! {
             result = &mut upload => {
@@ -319,7 +323,7 @@ impl CloudAttempt {
             args_hash: self.request.args_hash,
             args: self.request.args.clone(),
             input_blob_key: input_key,
-            input_manifest: self.request.input.manifest.clone(),
+            input_manifest: input.manifest.clone(),
             expected_content_id: self.request.expected_content_id,
             resources: ResourceRequest {
                 cpu_cores: self.request.resources.cpu_cores,

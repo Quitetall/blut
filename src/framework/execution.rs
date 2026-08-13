@@ -22,7 +22,7 @@ use crate::framework::error_domain::StageFailure;
 use crate::framework::stage::{ErasedArtifact, StageDyn};
 
 /// Version of the transport-neutral execution request/outcome contract.
-pub const EXECUTION_PROTOCOL_VERSION: u16 = 1;
+pub const EXECUTION_PROTOCOL_VERSION: u16 = 2;
 
 /// Default hard ceiling for a remote attempt whose stage and plan set no bound.
 pub const DEFAULT_REMOTE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -188,7 +188,11 @@ pub struct ExecutionRequest {
     pub invocation_key: InvocationKey,
     pub args_hash: ContentHash,
     pub args: serde_json::Value,
-    pub input: StoredArtifact,
+    /// Portable input for adapters that cross a process or host boundary.
+    /// Local placement keeps the already-admitted in-memory input in the
+    /// executor and therefore submits `None`; P2P and cloud MUST reject a
+    /// request without this value.
+    pub input: Option<StoredArtifact>,
     pub expected_content_id: Option<ContentId>,
     pub resources: ExecutionResources,
     pub data_class: DataClassification,
@@ -543,6 +547,161 @@ pub trait ExecutionAdapter: Send + Sync {
         &self,
         request: ExecutionRequest,
     ) -> Result<Box<dyn ExecutionHandle>, ExecutionFailure>;
+}
+
+/// Local placement adapter over the canonical execution lifecycle.
+///
+/// Stage work stays in the executor so fused typed handoff never serializes.
+/// This adapter owns placement-specific submission, cancellation, assignment,
+/// and terminal publication; the executor owns admitted stage invocation and
+/// calls the terminal methods only after output identity is established.
+pub struct LocalExecutionAdapter {
+    lifecycle: ExecutionLifecycle,
+    assignment: Assignment,
+    cancellation: CancellationToken,
+}
+
+impl LocalExecutionAdapter {
+    pub fn queued(
+        generation: u64,
+        cancellation: CancellationToken,
+    ) -> Result<Self, LifecycleError> {
+        let lifecycle = ExecutionLifecycle::new(ExecutionMode::Local);
+        lifecycle.transition(ExecutionPhase::Queued, None)?;
+        Ok(Self {
+            lifecycle,
+            assignment: Assignment::new("local", generation),
+            cancellation,
+        })
+    }
+
+    pub fn snapshot(&self) -> ExecutionSnapshot {
+        self.lifecycle.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lifecycle(&self) -> ExecutionLifecycle {
+        self.lifecycle.clone()
+    }
+
+    pub fn succeed(
+        &self,
+        content_id: ContentId,
+        stored: Option<StoredArtifact>,
+        wall_time: Duration,
+    ) -> Result<ExecutionSnapshot, LifecycleError> {
+        self.lifecycle.finish(
+            Some(&self.assignment),
+            ExecutionTerminal::Succeeded {
+                artifact: ExecutionArtifact { content_id, stored },
+                wall_time_ms: duration_ms(wall_time),
+            },
+        )
+    }
+
+    pub fn fail(
+        &self,
+        stage_name: &str,
+        error: &StageError,
+    ) -> Result<ExecutionSnapshot, LifecycleError> {
+        let terminal = if matches!(error, StageError::Cancelled) {
+            ExecutionTerminal::Cancelled {
+                reason: "local stage cancelled".into(),
+            }
+        } else {
+            ExecutionTerminal::Failed {
+                failure: ExecutionFailure::from_stage_error(stage_name, error),
+            }
+        };
+        self.lifecycle.finish(Some(&self.assignment), terminal)
+    }
+
+    pub fn timeout(
+        &self,
+        phase: ExecutionPhase,
+        deadline_unix_ms: u64,
+    ) -> Result<ExecutionSnapshot, LifecycleError> {
+        self.lifecycle.finish(
+            Some(&self.assignment),
+            ExecutionTerminal::TimedOut {
+                phase,
+                deadline_unix_ms,
+            },
+        )
+    }
+}
+
+impl Drop for LocalExecutionAdapter {
+    fn drop(&mut self) {
+        if self.lifecycle.snapshot().terminal.is_none() {
+            self.cancellation.cancel();
+            let _ = self.lifecycle.finish(
+                None,
+                ExecutionTerminal::Failed {
+                    failure: ExecutionFailure::new(
+                        ExecutionFailureKind::Unknown,
+                        "EXECUTION_ABANDONED",
+                        "local attempt exited before recording a terminal outcome",
+                    ),
+                },
+            );
+        }
+    }
+}
+
+#[async_trait]
+impl ExecutionAdapter for LocalExecutionAdapter {
+    fn mode(&self) -> ExecutionMode {
+        ExecutionMode::Local
+    }
+
+    async fn submit(
+        &self,
+        request: ExecutionRequest,
+    ) -> Result<Box<dyn ExecutionHandle>, ExecutionFailure> {
+        if request.protocol_version != EXECUTION_PROTOCOL_VERSION {
+            return Err(ExecutionFailure::protocol(format!(
+                "execution protocol {} unsupported (want {})",
+                request.protocol_version, EXECUTION_PROTOCOL_VERSION
+            )));
+        }
+        if request.input.is_some() {
+            return Err(ExecutionFailure::protocol(
+                "local execution request must retain input in the executor",
+            ));
+        }
+        self.lifecycle
+            .transition(ExecutionPhase::Assigned, Some(self.assignment.clone()))
+            .and_then(|_| self.lifecycle.transition(ExecutionPhase::Running, None))
+            .map_err(|error| ExecutionFailure::protocol(error.to_string()))?;
+        Ok(Box::new(LocalExecutionHandle {
+            lifecycle: self.lifecycle.clone(),
+            cancellation: self.cancellation.clone(),
+        }))
+    }
+}
+
+struct LocalExecutionHandle {
+    lifecycle: ExecutionLifecycle,
+    cancellation: CancellationToken,
+}
+
+#[async_trait]
+impl ExecutionHandle for LocalExecutionHandle {
+    async fn snapshot(&self) -> Result<ExecutionSnapshot, ExecutionFailure> {
+        Ok(self.lifecycle.snapshot())
+    }
+
+    async fn cancel(&self) -> Result<(), ExecutionFailure> {
+        let _ = self.lifecycle.finish(
+            None,
+            ExecutionTerminal::Cancelled {
+                reason: "local execution cancelled".into(),
+            },
+        );
+        self.cancellation.cancel();
+        Ok(())
+    }
 }
 
 /// Validated completion returned to the executor after success has been restored

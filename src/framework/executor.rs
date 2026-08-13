@@ -54,13 +54,9 @@ use crate::framework::cache::{CacheHandle, CacheHit};
 use crate::framework::control::{Control, ControlPolicy, StepMetrics};
 use crate::framework::error::{PlanError, StageError};
 use crate::framework::execution::{
-    Assignment, ExecutionArtifact, ExecutionFailure, ExecutionFailureKind, ExecutionLifecycle,
-    ExecutionMode, ExecutionPhase, ExecutionTerminal,
-};
-#[cfg(feature = "p2p")]
-use crate::framework::execution::{
     DEFAULT_REMOTE_TIMEOUT, DataClassification, EXECUTION_PROTOCOL_VERSION, ExecutionAdapter,
-    ExecutionDeadline, ExecutionRequest, ExecutionResources, ExecutionResult, drive_execution,
+    ExecutionDeadline, ExecutionFailureKind, ExecutionRequest, ExecutionResources, ExecutionResult,
+    LocalExecutionAdapter, drive_execution,
 };
 use crate::framework::plan::{CompiledPlan, NodeId};
 use crate::framework::resource::Resource;
@@ -1258,111 +1254,30 @@ enum NodeFailure {
     },
 }
 
-/// Local work records assignment and exactly one terminal result through the
-/// same A08 lifecycle used by remote adapters.
-struct LocalExecutionAttempt {
-    lifecycle: ExecutionLifecycle,
-    assignment: Assignment,
-}
-
-impl LocalExecutionAttempt {
-    fn queued(attempt: u32) -> Self {
-        let lifecycle = ExecutionLifecycle::new(ExecutionMode::Local);
-        let assignment = Assignment::new("local", u64::from(attempt));
-        lifecycle
-            .transition(ExecutionPhase::Queued, None)
-            .expect("fresh local lifecycle can queue");
-        Self {
-            lifecycle,
-            assignment,
-        }
-    }
-
-    fn start(&self) {
-        self.lifecycle
-            .transition(ExecutionPhase::Assigned, Some(self.assignment.clone()))
-            .expect("queued local lifecycle accepts assignment");
-        self.lifecycle
-            .transition(ExecutionPhase::Running, None)
-            .expect("assigned local lifecycle can run");
-    }
-
-    fn succeed(&self, content_id: ContentId, elapsed: std::time::Duration) {
-        let _ = self.lifecycle.finish(
-            Some(&self.assignment),
-            ExecutionTerminal::Succeeded {
-                artifact: ExecutionArtifact {
-                    content_id,
-                    stored: None,
-                },
-                wall_time_ms: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
-            },
-        );
-    }
-
-    fn fail(&self, stage_name: &str, error: &StageError) {
-        let terminal = if matches!(error, StageError::Cancelled) {
-            ExecutionTerminal::Cancelled {
-                reason: "local stage cancelled".into(),
-            }
-        } else {
-            ExecutionTerminal::Failed {
-                failure: ExecutionFailure::from_stage_error(stage_name, error),
-            }
-        };
-        let _ = self.lifecycle.finish(Some(&self.assignment), terminal);
-    }
-
-    fn timeout(&self, deadline: Option<Instant>) {
-        let phase = self.lifecycle.snapshot().phase;
-        let now_instant = Instant::now();
-        let now_system = std::time::SystemTime::now();
-        let deadline_system = match deadline {
-            Some(deadline) if deadline >= now_instant => now_system
-                .checked_add(deadline.duration_since(now_instant))
-                .unwrap_or(now_system),
-            Some(deadline) => now_system
-                .checked_sub(now_instant.duration_since(deadline))
-                .unwrap_or(std::time::UNIX_EPOCH),
-            None => now_system,
-        };
-        let deadline_unix_ms = deadline_system
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX);
-        let _ = self.lifecycle.finish(
-            Some(&self.assignment),
-            ExecutionTerminal::TimedOut {
-                phase,
-                deadline_unix_ms,
-            },
-        );
-    }
-}
-
 fn deadline_failure(env: &NodeEnv) -> NodeFailure {
     NodeFailure::DeadlineExceeded {
         elapsed: env.started_at.elapsed(),
     }
 }
 
-impl Drop for LocalExecutionAttempt {
-    fn drop(&mut self) {
-        if self.lifecycle.snapshot().terminal.is_none() {
-            let _ = self.lifecycle.finish(
-                Some(&self.assignment),
-                ExecutionTerminal::Failed {
-                    failure: ExecutionFailure::new(
-                        ExecutionFailureKind::Unknown,
-                        "EXECUTION_ABANDONED",
-                        "local attempt exited before recording a terminal outcome",
-                    ),
-                },
-            );
-        }
-    }
+fn deadline_unix_ms(deadline: Option<Instant>) -> u64 {
+    let now_instant = Instant::now();
+    let now_system = std::time::SystemTime::now();
+    let deadline_system = match deadline {
+        Some(deadline) if deadline >= now_instant => now_system
+            .checked_add(deadline.duration_since(now_instant))
+            .unwrap_or(now_system),
+        Some(deadline) => now_system
+            .checked_sub(now_instant.duration_since(deadline))
+            .unwrap_or(std::time::UNIX_EPOCH),
+        None => now_system,
+    };
+    deadline_system
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 /// Classify a cancel observed inside `run_node`: a targeted KILL (this
@@ -2155,8 +2070,7 @@ async fn acquire_admission(
     })
 }
 
-#[cfg(feature = "p2p")]
-fn remote_deadline(task: &NodeTask, env: &NodeEnv) -> ExecutionDeadline {
+fn execution_deadline(task: &NodeTask, env: &NodeEnv) -> ExecutionDeadline {
     let plan_remaining = env
         .deadline
         .map(|deadline| deadline.saturating_duration_since(Instant::now()));
@@ -2165,6 +2079,39 @@ fn remote_deadline(task: &NodeTask, env: &NodeEnv) -> ExecutionDeadline {
         hard = hard.min(remaining);
     }
     ExecutionDeadline::from_now(task.timeout.soft, hard)
+}
+
+fn build_local_request(task: &NodeTask, env: &NodeEnv, attempt: u32) -> ExecutionRequest {
+    let resources = task.stage.resources();
+    ExecutionRequest {
+        protocol_version: EXECUTION_PROTOCOL_VERSION,
+        execution_id: format!(
+            "exec-{}-{}-{}",
+            task.node_idx,
+            attempt,
+            uuid::Uuid::new_v4()
+        ),
+        tenant: env.tenant.clone(),
+        stage_name: task.stage.name().to_string(),
+        stage_schema: task.stage.schema(),
+        invocation_key: task.key,
+        args_hash: ContentHash::of_bytes(&task.canon_args),
+        args: task.args.clone(),
+        input: None,
+        expected_content_id: None,
+        resources: ExecutionResources {
+            cpu_cores: task.stage.cpu_cores(),
+            memory_gib: task.stage.memory_gib(),
+            gpu: resources.contains(&Resource::Gpu),
+            gpu_vram_gib: None,
+        },
+        data_class: if env.tenant.is_restricted() {
+            DataClassification::Restricted
+        } else {
+            DataClassification::Internal
+        },
+        deadline: execution_deadline(task, env),
+    }
 }
 
 #[cfg(feature = "p2p")]
@@ -2216,7 +2163,7 @@ fn build_remote_request(task: &NodeTask, env: &NodeEnv, attempt: u32) -> Option<
         invocation_key: task.key,
         args_hash: ContentHash::of_bytes(&task.canon_args),
         args: task.args.clone(),
-        input,
+        input: Some(input),
         expected_content_id: None,
         resources: ExecutionResources {
             cpu_cores: task.stage.cpu_cores(),
@@ -2225,7 +2172,7 @@ fn build_remote_request(task: &NodeTask, env: &NodeEnv, attempt: u32) -> Option<
             gpu_vram_gib: None,
         },
         data_class,
-        deadline: remote_deadline(task, env),
+        deadline: execution_deadline(task, env),
     })
 }
 
@@ -2437,7 +2384,16 @@ async fn run_node_with_admission(
         let is_remote = remote_request.is_some();
         #[cfg(not(feature = "p2p"))]
         let is_remote = false;
-        let local_attempt = (!is_remote).then(|| LocalExecutionAttempt::queued(attempt));
+        let local_request = (!is_remote).then(|| build_local_request(&task, &env, attempt));
+        let local_attempt = if is_remote {
+            None
+        } else {
+            Some(
+                LocalExecutionAdapter::queued(u64::from(attempt), stage_cancel.clone()).map_err(
+                    |error| NodeFailure::Other(format!("initialize local execution: {error}")),
+                )?,
+            )
+        };
         let mut stage_ctx = StageContext {
             job_dir: env.job_dir.clone(),
             stage_dir: tmp_stage_dir.clone(),
@@ -2592,9 +2548,22 @@ async fn run_node_with_admission(
                 .or(stage_ctx.device_index);
         }
 
-        if let Some(local) = &local_attempt {
-            local.start();
-        }
+        // Keep the canonical handle alive for the attempt's whole run. Local
+        // work executes inline for fused handoff; the handle remains the
+        // cancellation/snapshot capability exposed by the adapter contract.
+        let _local_handle = match (&local_attempt, local_request) {
+            (Some(local), Some(request)) => Some(
+                ExecutionAdapter::submit(local, request)
+                    .await
+                    .map_err(|failure| NodeFailure::Stage {
+                        idx,
+                        stage: stage_name.clone(),
+                        source: failure.into_stage_error(),
+                    })?,
+            ),
+            (None, None) => None,
+            _ => return Err(NodeFailure::Other("local adapter/request skew".into())),
+        };
         let stage_started = Instant::now();
 
         // ── GPU-saturation sampler (E2) ─────────────────────────────
@@ -2757,14 +2726,15 @@ async fn run_node_with_admission(
                                 .deadline
                                 .is_some_and(|deadline| Instant::now() >= deadline)
                         {
-                            local_attempt.timeout(env.deadline);
+                            let phase = local_attempt.snapshot().phase;
+                            let _ = local_attempt.timeout(phase, deadline_unix_ms(env.deadline));
                             if let Some(handle) = gpu_sampler {
                                 handle.stop().await;
                             }
                             let _ = std::fs::remove_dir_all(&tmp_stage_dir);
                             return Err(deadline_failure(&env));
                         }
-                        local_attempt.fail(&stage_name, &error);
+                        let _ = local_attempt.fail(&stage_name, &error);
                         Err(error)
                     }
                     Err(panic_payload) => {
@@ -2835,7 +2805,7 @@ async fn run_node_with_admission(
                 // cooperative cancel.
                 if stage_cancel.is_cancelled() {
                     if let Some(local) = &local_attempt {
-                        local.fail(&stage_name, &StageError::Cancelled);
+                        let _ = local.fail(&stage_name, &StageError::Cancelled);
                     }
                     let _ = std::fs::remove_dir_all(&tmp_stage_dir);
                     match diverged_detail {
@@ -3097,7 +3067,7 @@ async fn run_node_with_admission(
         debug_assert_eq!(stored.manifest.logical_hash, logical_hash);
     }
     if let Some(local_attempt) = &local_attempt {
-        local_attempt.succeed(content_id, run_elapsed);
+        let _ = local_attempt.succeed(content_id, None, run_elapsed);
     }
     let persisted = stored.is_some();
     let metadata = ArtifactMetadata::new(output.kind.clone(), output.schema, content_id)

@@ -4354,20 +4354,21 @@ async fn plan_deadline_interrupts_local_resource_queue_before_stage_runs() {
 }
 
 #[test]
-fn local_attempt_drop_latches_one_fail_closed_terminal() {
-    let attempt = LocalExecutionAttempt::queued(1);
-    attempt.start();
-    let lifecycle = attempt.lifecycle.clone();
+fn local_adapter_drop_latches_one_fail_closed_terminal() {
+    let cancellation = CancellationToken::new();
+    let attempt = LocalExecutionAdapter::queued(1, cancellation.clone()).unwrap();
+    let lifecycle = attempt.lifecycle();
     drop(attempt);
+    assert!(cancellation.is_cancelled());
     let snapshot = lifecycle.snapshot();
     assert!(matches!(
         snapshot.terminal,
-        Some(ExecutionTerminal::Failed { .. })
+        Some(crate::framework::execution::ExecutionTerminal::Failed { .. })
     ));
     assert!(matches!(
         lifecycle.finish(
             snapshot.assignment.as_ref(),
-            ExecutionTerminal::Cancelled {
+            crate::framework::execution::ExecutionTerminal::Cancelled {
                 reason: "late".into()
             }
         ),
