@@ -180,17 +180,24 @@ impl NotifySink for ExecSink {
             .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|e| format!("spawn {:?}: {e}", self.program))?;
-        child
+        let write_result = child
             .stdin
             .take()
             .ok_or_else(|| "no stdin pipe".to_string())?
-            .write_all(&body)
-            .map_err(|e| e.to_string())?;
+            .write_all(&body);
         let status = child.wait().map_err(|e| e.to_string())?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("exec sink exited with {status}"))
+        if !status.success() {
+            return Err(format!("exec sink exited with {status}"));
+        }
+        // A successful command may deliberately exit without reading stdin
+        // (`true` is the minimal example). Its early close races the parent
+        // write and can report BrokenPipe even though delivery completed by the
+        // sink's declared exit-status contract. Other write failures remain
+        // observable after successful termination.
+        match write_result {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(error) => Err(error.to_string()),
         }
     }
 }
