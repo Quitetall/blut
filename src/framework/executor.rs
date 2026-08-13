@@ -55,9 +55,10 @@ use crate::framework::control::{Control, ControlPolicy, StepMetrics};
 use crate::framework::error::{PlanError, StageError};
 use crate::framework::execution::{
     DEFAULT_REMOTE_TIMEOUT, DataClassification, EXECUTION_PROTOCOL_VERSION, ExecutionAdapter,
-    ExecutionDeadline, ExecutionFailureKind, ExecutionRequest, ExecutionResources, ExecutionResult,
-    LocalExecutionAdapter, drive_execution,
+    ExecutionDeadline, ExecutionRequest, ExecutionResources, LocalExecutionAdapter,
 };
+#[cfg(feature = "p2p")]
+use crate::framework::execution::{ExecutionFailureKind, ExecutionResult, drive_execution};
 use crate::framework::plan::{CompiledPlan, NodeId};
 use crate::framework::resource::Resource;
 use crate::framework::stage::{ErasedArtifact, InProcessArtifact, StageContext, StageDyn};
@@ -716,6 +717,16 @@ struct StageRunOutput {
     erased: ErasedArtifact,
     in_process: Option<InProcessArtifact>,
 }
+
+#[cfg(not(feature = "p2p"))]
+type AttemptRunResult = Result<
+    (
+        StageRunOutput,
+        Option<ContentId>,
+        Option<LocalExecutionAdapter>,
+    ),
+    StageError,
+>;
 
 /// A private speculative result. Until this value is consumed by
 /// `publish_speculative`, every byte and status event remains under the scratch
@@ -2657,16 +2668,7 @@ async fn run_node_with_admission(
                 None
             };
         #[cfg(not(feature = "p2p"))]
-        let remote_result: Option<
-            Result<
-                (
-                    StageRunOutput,
-                    Option<ContentId>,
-                    Option<LocalExecutionAttempt>,
-                ),
-                StageError,
-            >,
-        > = None;
+        let remote_result: Option<AttemptRunResult> = None;
 
         #[cfg(feature = "p2p")]
         let remote_result = remote_result
