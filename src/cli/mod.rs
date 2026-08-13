@@ -613,7 +613,7 @@ enum DatasetIngestCommand {
 
 #[derive(Subcommand, Debug)]
 enum DatasetCommand {
-    /// Manage mutable source records before they are pinned.
+    /// Manage mutable source records: list, add, remove, or show.
     Ingest {
         #[command(subcommand)]
         cmd: DatasetIngestCommand,
@@ -1122,7 +1122,8 @@ mod external_subcommand_tests {
     //! ADR 0083 — the cargo-style external-subcommand seam. `blut <cmd>` with no
     //! built-in match execs `blut-<cmd>` from PATH. These pin the two
     //! fail-closed guards without needing a real sidecar on PATH.
-    use super::run_external;
+    use super::{Cli, Command, run_external};
+    use clap::Parser;
 
     #[test]
     fn rejects_path_traversal_names() {
@@ -1167,7 +1168,12 @@ mod external_subcommand_tests {
                 "blut dataset catalog search modality:eeg",
             ),
         ] {
-            let err = run_external(old.into_iter().map(str::to_string).collect())
+            let parsed = Cli::try_parse_from(std::iter::once("blut").chain(old.iter().copied()))
+                .expect("removed root must reach fail-loud external dispatch");
+            let Command::External(argv) = parsed.command.expect("command must be present") else {
+                panic!("removed dataset root must not remain a built-in command");
+            };
+            let err = run_external(argv)
                 .expect_err("removed dataset root must fail before sidecar dispatch");
             let message = err.to_string();
             assert!(message.contains("removed by ADR 0170"), "{message}");
@@ -1271,6 +1277,47 @@ mod registry_completion_cli_tests {
                 }
             }) if name == "campaign-a"
         ));
+    }
+
+    #[test]
+    fn every_dataset_verb_parses_below_the_canonical_namespace() {
+        let cases: &[&[&str]] = &[
+            &["blut", "dataset", "ingest", "list"],
+            &[
+                "blut",
+                "dataset",
+                "ingest",
+                "add",
+                "raw",
+                "recording.edf",
+                "--kind",
+                "edf",
+                "--n-examples",
+                "1",
+                "--metadata",
+                "{}",
+            ],
+            &["blut", "dataset", "ingest", "rm", "raw"],
+            &["blut", "dataset", "ingest", "show", "raw"],
+            &["blut", "dataset", "pin", "raw", "dataset://tuh@v3"],
+            &["blut", "dataset", "resolve", "dataset://tuh@v3", "--json"],
+            &["blut", "dataset", "catalog", "rebuild"],
+            &[
+                "blut",
+                "dataset",
+                "catalog",
+                "search",
+                "modality:eeg",
+                "--cloud",
+                "--json",
+            ],
+            &["blut", "dataset", "catalog", "show", "tuh@v3", "--json"],
+            &["blut", "dataset", "catalog", "tag", "tuh@v3", "verified"],
+        ];
+        for args in cases {
+            Cli::try_parse_from(*args)
+                .unwrap_or_else(|error| panic!("canonical dataset route {args:?}: {error}"));
+        }
     }
 
     #[test]
