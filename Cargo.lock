@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "abir"
 version = "0.1.0"
-source = "git+https://github.com/Quitetall/ABIR.git?rev=510339dc6a19943eeb6edfc89f5cc70b87f19b81#510339dc6a19943eeb6edfc89f5cc70b87f19b81"
+source = "git+https://github.com/Quitetall/ABIR.git?rev=9d877fa11aeacdc95fc12c2428f15df39507bc47#9d877fa11aeacdc95fc12c2428f15df39507bc47"
 dependencies = [
  "blake3",
  "serde_json",
@@ -14,7 +14,7 @@ dependencies = [
 [[package]]
 name = "abir-bcs"
 version = "0.1.0"
-source = "git+https://github.com/Quitetall/ABIR.git?rev=510339dc6a19943eeb6edfc89f5cc70b87f19b81#510339dc6a19943eeb6edfc89f5cc70b87f19b81"
+source = "git+https://github.com/Quitetall/ABIR.git?rev=9d877fa11aeacdc95fc12c2428f15df39507bc47#9d877fa11aeacdc95fc12c2428f15df39507bc47"
 dependencies = [
  "abir",
  "blake3",
@@ -28,7 +28,7 @@ dependencies = [
 [[package]]
 name = "abir-training"
 version = "0.1.0"
-source = "git+https://github.com/Quitetall/ABIR.git?rev=510339dc6a19943eeb6edfc89f5cc70b87f19b81#510339dc6a19943eeb6edfc89f5cc70b87f19b81"
+source = "git+https://github.com/Quitetall/ABIR.git?rev=9d877fa11aeacdc95fc12c2428f15df39507bc47#9d877fa11aeacdc95fc12c2428f15df39507bc47"
 dependencies = [
  "abir",
  "abir-bcs",
@@ -243,9 +243,9 @@ checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
 name = "blake3"
-version = "1.5.5"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8ee0c1824c4dea5b5f81736aff91bae041d2c07ee1192bec91054e10e3e601e"
+checksum = "3888aaa89e4b2a40fca9848e400f6a658a5a3978de7be858e209cafa8be9a4a0"
 dependencies = [
  "arrayref",
  "arrayvec",
