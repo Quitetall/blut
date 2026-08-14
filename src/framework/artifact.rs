@@ -349,7 +349,6 @@ pub struct ArtifactContentId(AbirContentId);
 
 /// BLUT artifact projection wrapper over ABIR content IDs.
 /// The stored value is an [`AbirContentId`].
-
 impl ArtifactContentId {
     pub const fn from_abir(content_id: AbirContentId) -> Self {
         Self(content_id)
