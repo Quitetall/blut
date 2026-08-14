@@ -253,7 +253,7 @@ impl CloudQueue for MemQueue {
 mod tests {
     use super::*;
     use crate::cloud::job::JobOutcome;
-    use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
+    use crate::framework::artifact::{ArtifactContentId, ContentHash, InvocationKey};
     use crate::framework::stage::ErasedArtifact;
     use crate::p2p::bundle::BundleManifest;
     use crate::p2p::task::ResourceRequest;
@@ -270,7 +270,7 @@ mod tests {
             },
             kind: "test".into(),
             schema: 1,
-            content_id: ContentId::from_digest(ContentHash::of_bytes(b"")),
+            content_id: ArtifactContentId::from_digest(ContentHash::of_bytes(b"")),
             logical_hash: ContentHash::of_bytes(b""),
             handle_root: std::path::PathBuf::from("__test_artifact_root__"),
             files: vec![],
@@ -291,7 +291,9 @@ mod tests {
             args: serde_json::json!({}),
             input_blob_key: ContentHash::of_bytes(id.as_bytes()),
             input_manifest: dummy_manifest(),
-            expected_content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"out"))),
+            expected_content_id: Some(ArtifactContentId::from_digest(ContentHash::of_bytes(
+                b"out",
+            ))),
             resources: ResourceRequest::default(),
             data_class: DataClass::Public,
             priority,
@@ -311,7 +313,7 @@ mod tests {
             outcome: JobOutcome::Succeeded,
             output_blob_key: Some(ContentHash::of_bytes(b"ok")),
             output_manifest: None,
-            content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"ok"))),
+            content_id: Some(ArtifactContentId::from_digest(ContentHash::of_bytes(b"ok"))),
             wall_time_ms: 5,
             failure: None,
             timeout_phase: None,

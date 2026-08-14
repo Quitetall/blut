@@ -153,7 +153,7 @@ mod tests {
         ArtifactMetadata::new(
             "ckpt".to_string(),
             1,
-            crate::framework::artifact::ContentId::from_digest(hash),
+            crate::framework::artifact::ArtifactContentId::from_digest(hash),
         )
         .write_to(&p)
         .unwrap();

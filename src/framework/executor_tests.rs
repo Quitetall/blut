@@ -1590,7 +1590,10 @@ async fn downstream_lineage_uses_predecessor_content_id() {
             _ => {}
         }
     }
-    assert_eq!(consumer_inputs, vec![producer.expect("producer ContentId")]);
+    assert_eq!(
+        consumer_inputs,
+        vec![producer.expect("producer ArtifactContentId")]
+    );
 }
 
 /// Capture the EMITTED `StageEnd.output_hash` for node 0 of a single-stage
@@ -1618,10 +1621,10 @@ async fn recorded_output_hash(abs_path: &str, content: u8) -> CH {
             ..
         } = evt
         {
-            found = content_id.map(ContentId::digest);
+            found = content_id.map(ArtifactContentId::digest);
         }
     }
-    found.expect("StageEnd must carry a ContentId")
+    found.expect("StageEnd must carry a ArtifactContentId")
 }
 
 #[tokio::test]
@@ -1642,7 +1645,7 @@ async fn recorded_output_hash_is_content_based_and_path_stable() {
     assert_ne!(
         h1,
         art.content_hash(),
-        "ContentId and logical content_hash use distinct domains"
+        "ArtifactContentId and logical content_hash use distinct domains"
     );
     let erased = ErasedArtifact::from_typed(&art).unwrap();
     assert_ne!(
@@ -4407,7 +4410,7 @@ impl crate::p2p::dispatch::DispatchPolicy for MockDispatchPolicy {
     fn verify_result(
         &self,
         _result: &crate::p2p::task::TaskResult,
-        _expected: Option<crate::framework::ContentId>,
+        _expected: Option<crate::framework::ArtifactContentId>,
         _peer_pubkey: &ed25519_dalek::VerifyingKey,
     ) -> crate::p2p::dispatch::DispatchVerdict {
         unimplemented!("not exercised by the executor dispatch path")

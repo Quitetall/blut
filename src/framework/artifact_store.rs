@@ -10,7 +10,7 @@
 //! beneath a consumer-owned directory.
 //!
 //! [`ArtifactManifest`] contains the handle, a complete per-file integrity table,
-//! and a typed [`ContentId`]. [`StoredArtifact`] combines it with the deterministic
+//! and a typed [`ArtifactContentId`]. [`StoredArtifact`] combines it with the deterministic
 //! payload pack for cache or object-store persistence. Streaming transports use
 //! [`bundle`] and [`unbundle`] to carry the same representation as two pieces;
 //! encryption and framing remain adapters and do not own artifact semantics.
@@ -30,7 +30,7 @@
 //!    `DatasetSplit.eval` — or an EXTRA unlisted file).
 //! 3. Hard-error rebase: a coordinator/peer struct skew makes decode fail →
 //!    reject, never a silent no-op leaving dead producer-absolute paths.
-//! 4. Store-owned [`ContentId`] recomputation over the canonical kind, schema,
+//! 4. Store-owned [`ArtifactContentId`] recomputation over the canonical kind, schema,
 //!    relative paths, modes, and bytes. This identity never depends on a producer
 //!    path, mtime, or invocation key. Artifacts whose logical hash is byte-based
 //!    additionally rerun their typed `recompute_content_hash()` law.
@@ -43,12 +43,12 @@ use abir::ContentId as AbirContentId;
 use abir_training::TrainingArtifactContentHasher;
 use serde::{Deserialize, Serialize};
 
-use crate::framework::artifact::{ContentHash, ContentId};
+use crate::framework::artifact::{ArtifactContentId, ContentHash};
 use crate::framework::object_store::MAX_OBJECT_SIZE;
 use crate::framework::stage::{ErasedArtifact, StageDyn};
 
 /// Artifact persistence format. Version 3 binds persisted artifacts to ABIR's
-/// canonical training-artifact `ContentId` domain.
+/// canonical training-artifact `ArtifactContentId` domain.
 pub const ARTIFACT_FORMAT_VERSION: u16 = 3;
 // Keep this explicit: a future format version must not silently reinterpret
 // its identity field using version 2's SHA-256 derivation.
@@ -96,7 +96,7 @@ pub struct ArtifactManifest {
     pub schema: u32,
     /// Whole-artifact identity derived from the typed artifact, never from an
     /// invocation key or serialized path-bearing handle.
-    pub content_id: ContentId,
+    pub content_id: ArtifactContentId,
     /// Existing artifact-level hash used by invocation-key derivation. This may
     /// intentionally be a producer-local stat fingerprint when
     /// `Artifact::HASH_CONTENTS` is false; it is not the portable object key.
@@ -289,7 +289,7 @@ pub fn capture(
     erased: ErasedArtifact,
     src_root: &Path,
     role: ArtifactRole,
-    expected_content_id: Option<ContentId>,
+    expected_content_id: Option<ArtifactContentId>,
 ) -> Result<StoredArtifact, ArtifactStoreError> {
     let (manifest, pack) = bundle(stage, erased, src_root, role, expected_content_id)?;
     Ok(StoredArtifact { manifest, pack })
@@ -302,7 +302,7 @@ pub fn restore(
     stored: &StoredArtifact,
     into_stage_dir: &Path,
     role: ArtifactRole,
-    expected_content_id: Option<ContentId>,
+    expected_content_id: Option<ArtifactContentId>,
 ) -> Result<ErasedArtifact, ArtifactStoreError> {
     unbundle(
         stage,
@@ -331,7 +331,7 @@ pub fn unpersisted_content_id(
     erased: &ErasedArtifact,
     role: ArtifactRole,
     logical_hash: ContentHash,
-) -> ContentId {
+) -> ArtifactContentId {
     let identity = match role {
         ArtifactRole::Input => stage.input_portable_identity(erased),
         ArtifactRole::Output => stage.output_portable_identity(erased),
@@ -346,7 +346,7 @@ pub fn unpersisted_content_id(
         hasher.update(&(identity.len() as u64).to_le_bytes());
         hasher.update(&identity);
     }
-    ContentId::from_abir(hasher.finalize())
+    ArtifactContentId::from_abir(hasher.finalize())
 }
 
 /// Streaming form of [`capture`]: return the manifest and plaintext pack as
@@ -356,7 +356,7 @@ pub fn bundle(
     erased: ErasedArtifact,
     src_root: &Path,
     role: ArtifactRole,
-    expected_content_id: Option<ContentId>,
+    expected_content_id: Option<ArtifactContentId>,
 ) -> Result<(ArtifactManifest, Vec<u8>), ArtifactStoreError> {
     let (
         expected_kind,
@@ -567,7 +567,7 @@ pub fn unbundle(
     manifest: &ArtifactManifest,
     pack: &[u8],
     into_stage_dir: &Path,
-    expected_content_id: Option<ContentId>,
+    expected_content_id: Option<ArtifactContentId>,
     role: ArtifactRole,
 ) -> Result<ErasedArtifact, ArtifactStoreError> {
     if !matches!(
@@ -792,7 +792,7 @@ fn unbundle_inner(
     // Gate 4b: when the artifact declares a byte-derived logical hash, rerun its
     // typed law over the consumer-local files. `HASH_CONTENTS = false` artifacts
     // deliberately retain a path/stat logical hash; their complete bytes were
-    // already bound independently by ContentId + the per-file table above.
+    // already bound independently by ArtifactContentId + the per-file table above.
     let hashes_contents = match role {
         ArtifactRole::Input => stage.input_hashes_contents(),
         ArtifactRole::Output => stage.output_hashes_contents(),
@@ -826,7 +826,7 @@ fn derive_content_id(
     files: &[ArtifactFile],
     pack: &[u8],
     erased: &ErasedArtifact,
-) -> Result<ContentId, ArtifactStoreError> {
+) -> Result<ArtifactContentId, ArtifactStoreError> {
     let identity = portable_identity(stage, role, erased)?;
     let mut hasher = TrainingArtifactContentHasher::new();
     feed_artifact_identity(
@@ -837,7 +837,7 @@ fn derive_content_id(
         files,
         pack,
     );
-    Ok(ContentId::from_abir(hasher.finalize()))
+    Ok(ArtifactContentId::from_abir(hasher.finalize()))
 }
 
 fn derive_legacy_content_id(
@@ -848,7 +848,7 @@ fn derive_legacy_content_id(
     files: &[ArtifactFile],
     pack: &[u8],
     erased: &ErasedArtifact,
-) -> Result<ContentId, ArtifactStoreError> {
+) -> Result<ArtifactContentId, ArtifactStoreError> {
     use sha2::{Digest, Sha256};
     let identity = portable_identity(stage, role, erased)?;
     let mut hasher = Sha256::new();
@@ -861,7 +861,7 @@ fn derive_legacy_content_id(
         files,
         pack,
     );
-    Ok(ContentId::from_digest(ContentHash(
+    Ok(ArtifactContentId::from_digest(ContentHash(
         hasher.finalize().into(),
     )))
 }
@@ -1274,7 +1274,7 @@ mod tests {
         let (src, erased, hash) = make_dir_artifact();
         let (manifest, pack) =
             bundle(&stage, erased, src.path(), ArtifactRole::Output, None).unwrap();
-        assert_ne!(manifest.content_id, ContentId::from_digest(hash));
+        assert_ne!(manifest.content_id, ArtifactContentId::from_digest(hash));
         assert_eq!(manifest.logical_hash, hash);
         let portable: DirArt = manifest.erased.clone().into_typed().unwrap();
         assert!(!portable.path.is_absolute());
@@ -1404,7 +1404,7 @@ mod tests {
         assert_ne!(a_manifest.logical_hash, b_manifest.logical_hash);
         assert_eq!(
             a_manifest.content_id, b_manifest.content_id,
-            "producer path/stat identity must not enter ContentId"
+            "producer path/stat identity must not enter ArtifactContentId"
         );
         assert_eq!(a_manifest.files.len(), 2, "both path fields are persisted");
 
@@ -1413,7 +1413,7 @@ mod tests {
         let (c_manifest, _) = bundle(&stage, c, host_c.path(), ArtifactRole::Output, None).unwrap();
         assert_ne!(
             a_manifest.content_id, c_manifest.content_id,
-            "semantic handle metadata participates in ContentId"
+            "semantic handle metadata participates in ArtifactContentId"
         );
 
         let consumer = tempfile::tempdir().unwrap();
@@ -1630,7 +1630,7 @@ mod tests {
             &manifest,
             &pack,
             dest.path(),
-            Some(ContentId::from_digest(wrong)),
+            Some(ArtifactContentId::from_digest(wrong)),
             BlobDir::Input,
         );
         assert!(matches!(r, Err(BundleError::IdentityBinding { .. })));
@@ -1782,7 +1782,10 @@ mod tests {
         .unwrap();
         let pa: DirArt = a.into_typed().unwrap();
         let pb: DirArt = b.into_typed().unwrap();
-        assert_eq!(pa.path, pb.path, "same ContentId -> same import dir");
+        assert_eq!(
+            pa.path, pb.path,
+            "same ArtifactContentId -> same import dir"
+        );
         assert_eq!(ContentHash::hash_dir(&pb.path).unwrap(), hash);
     }
 

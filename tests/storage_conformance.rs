@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use blut::framework::artifact::{ContentHash, ContentId, InvocationKey};
+use blut::framework::artifact::{ArtifactContentId, ContentHash, InvocationKey};
 use blut::framework::object_store::{
     BlockingObjectStore, MAX_OBJECT_SIZE, ObjectKey, ObjectStore, PutOutcome, StoreError,
 };
@@ -150,7 +150,7 @@ async fn assert_async_contract(fixture: Fixture) {
 
     let digest = ContentHash::of_bytes(b"typed-namespace-digest");
     let cache_key = ObjectKey::CacheInvocation(InvocationKey::from_digest(digest));
-    let artifact_key = ObjectKey::Artifact(ContentId::from_digest(digest));
+    let artifact_key = ObjectKey::Artifact(ArtifactContentId::from_digest(digest));
     fixture
         .store
         .put(cache_key, b"invocation".to_vec())
@@ -206,7 +206,7 @@ fn assert_blocking_contract(fixture: Fixture) {
 
     let digest = ContentHash::of_bytes(b"blocking-typed-namespace-digest");
     let cache_key = ObjectKey::CacheInvocation(InvocationKey::from_digest(digest));
-    let artifact_key = ObjectKey::Artifact(ContentId::from_digest(digest));
+    let artifact_key = ObjectKey::Artifact(ArtifactContentId::from_digest(digest));
     store.put(cache_key, b"invocation").unwrap();
     store.put(artifact_key, b"artifact").unwrap();
     assert_ne!(cache_key.relative_path(), artifact_key.relative_path());

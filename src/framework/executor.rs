@@ -45,7 +45,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::framework::artifact::{
-    ArtifactMetadata, BranchDecision, ContentHash, ContentId, InvocationKey,
+    ArtifactContentId, ArtifactMetadata, BranchDecision, ContentHash, InvocationKey,
 };
 use crate::framework::artifact_store::{
     ArtifactRole, ArtifactStoreError, capture, unpersisted_content_id,
@@ -677,7 +677,7 @@ struct NodeTask {
     input: ErasedArtifact,
     /// Portable identities of predecessor outputs. Kept distinct from
     /// `input_hash`, which is the folded logical digest used by invocation keys.
-    input_content_ids: Vec<ContentId>,
+    input_content_ids: Vec<ArtifactContentId>,
     /// Logical predecessor identity used only for deterministic invocation keys.
     input_hash: ContentHash,
     key: InvocationKey,
@@ -708,7 +708,7 @@ struct NodeOutcome {
     /// Present only on the fused fast path. The next stage consumes this box
     /// directly instead of decoding `output` through bincode again.
     in_process_output: Option<InProcessArtifact>,
-    content_id: ContentId,
+    content_id: ArtifactContentId,
     logical: ContentHash,
     cache_hit: bool,
 }
@@ -722,7 +722,7 @@ struct StageRunOutput {
 type AttemptRunResult = Result<
     (
         StageRunOutput,
-        Option<ContentId>,
+        Option<ArtifactContentId>,
         Option<LocalExecutionAdapter>,
     ),
     StageError,
@@ -739,7 +739,7 @@ struct SpeculativePrepared {
     stage: Arc<dyn StageDyn>,
     stage_name: String,
     input_hash: ContentHash,
-    input_content_ids: Vec<ContentId>,
+    input_content_ids: Vec<ArtifactContentId>,
     canon_args: Vec<u8>,
     key: InvocationKey,
     output: ErasedArtifact,
@@ -838,7 +838,7 @@ struct SpilledPipelinePrepared {
     stage: Arc<dyn StageDyn>,
     stage_name: String,
     input_hash: ContentHash,
-    input_content_ids: Vec<ContentId>,
+    input_content_ids: Vec<ArtifactContentId>,
     canon_args: Vec<u8>,
     key: InvocationKey,
     elapsed: std::time::Duration,
@@ -2596,77 +2596,78 @@ async fn run_node_with_admission(
             });
 
         #[cfg(feature = "p2p")]
-        let remote_result: Option<Result<(StageRunOutput, Option<ContentId>), StageError>> =
-            if let Some(request) = remote_request {
-                let request_deadline = request.deadline;
-                let hard_limit = request_deadline.hard_remaining();
-                let soft_limit = request_deadline.soft_remaining();
-                let adapter = env
-                    .execution_adapter
-                    .as_ref()
-                    .expect("remote request requires execution adapter");
-                let result = drive_execution(
-                    adapter.as_ref(),
-                    request,
-                    &stage_cancel,
-                    task.stage.clone(),
-                    &tmp_stage_dir,
-                    std::time::Duration::from_millis(100),
-                )
-                .await;
-                Some(match result {
-                    ExecutionResult::Succeeded {
-                        artifact,
-                        content_id,
-                        ..
-                    } => Ok((
-                        StageRunOutput {
-                            erased: artifact,
-                            in_process: None,
-                        },
-                        Some(content_id),
-                    )),
-                    ExecutionResult::Failed(failure)
-                        if failure.kind == ExecutionFailureKind::Unavailable =>
+        let remote_result: Option<
+            Result<(StageRunOutput, Option<ArtifactContentId>), StageError>,
+        > = if let Some(request) = remote_request {
+            let request_deadline = request.deadline;
+            let hard_limit = request_deadline.hard_remaining();
+            let soft_limit = request_deadline.soft_remaining();
+            let adapter = env
+                .execution_adapter
+                .as_ref()
+                .expect("remote request requires execution adapter");
+            let result = drive_execution(
+                adapter.as_ref(),
+                request,
+                &stage_cancel,
+                task.stage.clone(),
+                &tmp_stage_dir,
+                std::time::Duration::from_millis(100),
+            )
+            .await;
+            Some(match result {
+                ExecutionResult::Succeeded {
+                    artifact,
+                    content_id,
+                    ..
+                } => Ok((
+                    StageRunOutput {
+                        erased: artifact,
+                        in_process: None,
+                    },
+                    Some(content_id),
+                )),
+                ExecutionResult::Failed(failure)
+                    if failure.kind == ExecutionFailureKind::Unavailable =>
+                {
+                    tracing::warn!(
+                        "remote execution unavailable for node {idx} ({stage_name}); running locally"
+                    );
+                    remote_enabled = false;
+                    attempt = attempt.saturating_sub(1);
+                    if let Some(owned) = owned_admission.as_mut() {
+                        owned.release_non_gpu_resources();
+                    }
+                    let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+                    drop(stage_ctx);
+                    continue;
+                }
+                ExecutionResult::Failed(failure) => Err(failure.into_stage_error()),
+                ExecutionResult::Cancelled => Err(StageError::Cancelled),
+                ExecutionResult::TimedOut {
+                    deadline_unix_ms, ..
+                } => {
+                    if env
+                        .deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline)
                     {
-                        tracing::warn!(
-                            "remote execution unavailable for node {idx} ({stage_name}); running locally"
-                        );
-                        remote_enabled = false;
-                        attempt = attempt.saturating_sub(1);
-                        if let Some(owned) = owned_admission.as_mut() {
-                            owned.release_non_gpu_resources();
-                        }
                         let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-                        drop(stage_ctx);
-                        continue;
+                        return Err(deadline_failure(&env));
                     }
-                    ExecutionResult::Failed(failure) => Err(failure.into_stage_error()),
-                    ExecutionResult::Cancelled => Err(StageError::Cancelled),
-                    ExecutionResult::TimedOut {
-                        deadline_unix_ms, ..
-                    } => {
-                        if env
-                            .deadline
-                            .is_some_and(|deadline| Instant::now() >= deadline)
-                        {
-                            let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-                            return Err(deadline_failure(&env));
-                        }
-                        let limit = if request_deadline.soft_unix_ms == Some(deadline_unix_ms) {
-                            soft_limit.unwrap_or(hard_limit)
-                        } else {
-                            hard_limit
-                        };
-                        Err(StageError::Timeout {
-                            limit,
-                            elapsed: stage_started.elapsed(),
-                        })
-                    }
-                })
-            } else {
-                None
-            };
+                    let limit = if request_deadline.soft_unix_ms == Some(deadline_unix_ms) {
+                        soft_limit.unwrap_or(hard_limit)
+                    } else {
+                        hard_limit
+                    };
+                    Err(StageError::Timeout {
+                        limit,
+                        elapsed: stage_started.elapsed(),
+                    })
+                }
+            })
+        } else {
+            None
+        };
         #[cfg(not(feature = "p2p"))]
         let remote_result: Option<AttemptRunResult> = None;
 
@@ -4174,7 +4175,7 @@ fn build_task(
     edges: &[crate::framework::plan::PlanEdge],
     outputs: &HashMap<NodeId, ErasedArtifact>,
     logical_outputs: &HashMap<NodeId, ContentHash>,
-    content_outputs: &HashMap<NodeId, ContentId>,
+    content_outputs: &HashMap<NodeId, ArtifactContentId>,
     node_cancel: KillSlot,
 ) -> Result<NodeTask, PlanError> {
     let preds = predecessors(edges, node.id);
@@ -4936,7 +4937,7 @@ struct Prelude {
     env: Arc<NodeEnv>,
     outputs: HashMap<NodeId, ErasedArtifact>,
     logical_outputs: HashMap<NodeId, ContentHash>,
-    content_outputs: HashMap<NodeId, ContentId>,
+    content_outputs: HashMap<NodeId, ArtifactContentId>,
 }
 
 fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> {
@@ -4953,7 +4954,7 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
 
     let mut outputs: HashMap<NodeId, ErasedArtifact> = HashMap::new();
     let mut logical_outputs: HashMap<NodeId, ContentHash> = HashMap::new();
-    let content_outputs: HashMap<NodeId, ContentId> = HashMap::new();
+    let content_outputs: HashMap<NodeId, ArtifactContentId> = HashMap::new();
     for (id, art) in view.initial {
         let lh = content_hash_from_erased(art);
         outputs.insert(*id, art.clone());

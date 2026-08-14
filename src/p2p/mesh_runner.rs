@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::error::TrainError;
-use crate::framework::artifact::ContentId;
+use crate::framework::artifact::ArtifactContentId;
 use crate::framework::artifact_store::StoredArtifact;
 use crate::framework::cache::CacheHandle;
 use crate::framework::cookbook::Registry;
@@ -76,7 +76,7 @@ impl SharedCacheRunner {
     }
 
     /// Scheduler-side: bundle `input` (rooted at `src_root`) and publish it to
-    /// the shared store under its store-derived [`ContentId`], so a worker's
+    /// the shared store under its store-derived [`ArtifactContentId`], so a worker's
     /// [`run`](Self::run) can source it. The stage resolves the artifact's
     /// backing paths.
     pub async fn publish_input(
@@ -85,7 +85,7 @@ impl SharedCacheRunner {
         stage_name: &str,
         input: ErasedArtifact,
         src_root: &std::path::Path,
-    ) -> Result<ContentId, TrainError> {
+    ) -> Result<ArtifactContentId, TrainError> {
         let ctor = registry.find_erased_stage(stage_name).ok_or_else(|| {
             TrainError::other(format!("publish_input: unknown stage '{stage_name}'"))
         })?;
@@ -107,7 +107,7 @@ impl SharedCacheRunner {
     pub async fn fetch_output(
         &self,
         stage_name: &str,
-        content_id: ContentId,
+        content_id: ArtifactContentId,
         into_dir: &std::path::Path,
     ) -> Result<ErasedArtifact, TrainError> {
         let ctor = self.registry.find_erased_stage(stage_name).ok_or_else(|| {
@@ -126,7 +126,10 @@ impl SharedCacheRunner {
         .map_err(|e| TrainError::other(format!("unbundle output: {e}")))
     }
 
-    async fn read_bundle(&self, content_id: ContentId) -> Result<StoredArtifact, TrainError> {
+    async fn read_bundle(
+        &self,
+        content_id: ArtifactContentId,
+    ) -> Result<StoredArtifact, TrainError> {
         let bytes = self
             .store
             .get(ObjectKey::Artifact(content_id))
@@ -389,10 +392,10 @@ mod tests {
             coordinator_id: PeerId::from_pubkey(&coordinator.verifying),
             stage_name: SMOKE_STAGE.into(),
             stage_schema: 1,
-            input_content_id: ContentId::from_digest(ContentHash::of_bytes(b"i")),
+            input_content_id: ArtifactContentId::from_digest(ContentHash::of_bytes(b"i")),
             invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"x")),
             args_hash: ContentHash::of_bytes(b"{}"),
-            expected_content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"o"))),
+            expected_content_id: Some(ArtifactContentId::from_digest(ContentHash::of_bytes(b"o"))),
             args: serde_json::json!({}),
             resources: crate::p2p::task::ResourceRequest::default(),
             data_class: crate::p2p::trust::DataClass::Public,

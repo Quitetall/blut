@@ -26,7 +26,7 @@ use super::CloudError;
 use super::job::{CloudJob, JobOutcome};
 use super::queue::{CloudQueue, JobStatus};
 use crate::framework::Registry;
-use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
+use crate::framework::artifact::{ArtifactContentId, ContentHash, InvocationKey};
 use crate::framework::artifact_store::StoredArtifact;
 use crate::framework::cache::CacheHandle;
 use crate::framework::execution::{
@@ -51,7 +51,7 @@ pub struct CloudSubmitSpec {
     pub input: ErasedArtifact,
     pub src_root: PathBuf,
     pub args: Value,
-    pub expected_content_id: Option<ContentId>,
+    pub expected_content_id: Option<ArtifactContentId>,
     pub data_class: DataClass,
     pub resources: ResourceRequest,
     pub priority: i32,
@@ -694,7 +694,7 @@ pub struct CloudJobHandle {
     registry: Arc<Registry>,
     job_id: String,
     stage_name: String,
-    expected_content_id: Option<ContentId>,
+    expected_content_id: Option<ArtifactContentId>,
 }
 
 impl CloudJobHandle {

@@ -27,7 +27,7 @@ use std::sync::Arc;
 use quinn::Connection as QuinnConnection;
 
 use crate::error::TrainError;
-use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
+use crate::framework::artifact::{ArtifactContentId, ContentHash, InvocationKey};
 use crate::framework::artifact_store::StoredArtifact;
 use crate::framework::cache::CacheHandle;
 use crate::framework::cookbook::Registry;
@@ -417,7 +417,7 @@ pub(crate) fn is_safe_task_id(id: &str) -> bool {
 /// plus the peer that produced it.
 pub struct DispatchedOutput {
     pub output: ErasedArtifact,
-    pub content_id: ContentId,
+    pub content_id: ArtifactContentId,
     pub peer_id: PeerId,
 }
 
@@ -425,7 +425,7 @@ pub struct DispatchedOutput {
 /// it into its own attempt directory.
 pub struct DispatchedStoredOutput {
     pub stored: StoredArtifact,
-    pub content_id: ContentId,
+    pub content_id: ArtifactContentId,
     pub peer_id: PeerId,
     pub wall_time_ms: u64,
 }
@@ -651,7 +651,7 @@ pub async fn dispatch_to_peer(
     src_root: &std::path::Path,
     args: serde_json::Value,
     invocation_key: InvocationKey,
-    expected_content_id: Option<ContentId>,
+    expected_content_id: Option<ArtifactContentId>,
     tenant: crate::tenant::Tenant,
     data_class: crate::p2p::DataClass,
     timeout_secs: u64,

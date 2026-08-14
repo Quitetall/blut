@@ -19,7 +19,7 @@ use blut::framework::ExecCtx;
 use blut::framework::Registry;
 use blut::framework::artifact::ContentHash;
 #[cfg(feature = "p2p")]
-use blut::framework::artifact::{ContentId, InvocationKey};
+use blut::framework::artifact::{ArtifactContentId, InvocationKey};
 use blut::framework::cookbook::Cookbook;
 use blut::framework::error::StageError;
 use blut::framework::executor::SequentialExecutor;
@@ -389,7 +389,7 @@ async fn restricted_tenant_is_refused_by_real_coordinator_submit() {
     .unwrap();
 
     let args = serde_json::json!({"payload": "patient-name-must-not-leak"});
-    let input_id = ContentId::from_digest(ContentHash::of_bytes(b"input"));
+    let input_id = ArtifactContentId::from_digest(ContentHash::of_bytes(b"input"));
     let erased = ErasedArtifact::from_typed(&()).unwrap();
     let input = StoredArtifact {
         manifest: ArtifactManifest {
@@ -416,7 +416,9 @@ async fn restricted_tenant_is_refused_by_real_coordinator_submit() {
         args_hash: ContentHash::of_bytes(b"args"),
         args: args.clone(),
         input: Some(input.clone()),
-        expected_content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"output"))),
+        expected_content_id: Some(ArtifactContentId::from_digest(ContentHash::of_bytes(
+            b"output",
+        ))),
         resources: ExecutionResources::default(),
         data_class: DataClassification::Public,
         deadline: ExecutionDeadline::from_now(None, std::time::Duration::from_secs(1)),
@@ -439,7 +441,9 @@ async fn restricted_tenant_is_refused_by_real_coordinator_submit() {
         args_hash: ContentHash::of_bytes(b"args"),
         args,
         input: Some(input),
-        expected_content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"output"))),
+        expected_content_id: Some(ArtifactContentId::from_digest(ContentHash::of_bytes(
+            b"output",
+        ))),
         resources: ExecutionResources::default(),
         data_class: DataClassification::Restricted,
         deadline: ExecutionDeadline::from_now(None, std::time::Duration::from_secs(1)),

@@ -304,9 +304,9 @@ impl<'de> Deserialize<'de> for ContentHash {
 /// artifact payload bytes.
 ///
 /// ```compile_fail
-/// use blut::framework::{ContentHash, ContentId, InvocationKey};
+/// use blut::framework::{ContentHash, ArtifactContentId, InvocationKey};
 /// fn lookup(_: InvocationKey) {}
-/// let content = ContentId::from_digest(ContentHash::of_bytes(b"payload"));
+/// let content = ArtifactContentId::from_digest(ContentHash::of_bytes(b"payload"));
 /// lookup(content);
 /// ```
 #[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -347,9 +347,8 @@ impl std::fmt::Debug for InvocationKey {
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct ArtifactContentId(AbirContentId);
 
-/// Compatibility name for the artifact projection. This is not a second
-/// `ContentId` definition; its only stored value is an ABIR `ContentId`.
-pub type ContentId = ArtifactContentId;
+/// BLUT artifact projection wrapper over ABIR content IDs.
+/// The stored value is an [`AbirContentId`].
 
 impl ArtifactContentId {
     pub const fn from_abir(content_id: AbirContentId) -> Self {
@@ -404,7 +403,7 @@ impl std::fmt::Display for ArtifactContentId {
 
 impl std::fmt::Debug for ArtifactContentId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ContentId({})", self.to_hex())
+        write!(f, "ArtifactContentId({})", self.to_hex())
     }
 }
 
@@ -535,7 +534,7 @@ pub trait Artifact: Send + Sync + serde::Serialize + serde::de::DeserializeOwned
     /// Logical artifact hash used by deterministic invocation keys. Most
     /// artifacts hash canonical bytes; large artifacts may retain the documented
     /// `HASH_CONTENTS = false` path/stat fingerprint. Portable persistence uses
-    /// [`ContentId`], derived independently by the artifact store.
+    /// [`ArtifactContentId`], derived independently by the artifact store.
     fn content_hash(&self) -> ContentHash;
 
     /// Read-only path the user can `ls`. Always inside a stable
@@ -543,7 +542,7 @@ pub trait Artifact: Send + Sync + serde::Serialize + serde::de::DeserializeOwned
     /// tmpfile that might disappear.
     fn primary_path(&self) -> &Path;
 
-    /// Canonical semantic metadata for portable [`ContentId`] derivation.
+    /// Canonical semantic metadata for portable [`ArtifactContentId`] derivation.
     /// Absolute path hints are normalized and the conventional top-level
     /// `content_hash` field is omitted because it may be a producer-local stat
     /// fingerprint. Composite Artifact implementations must call this method on
@@ -637,7 +636,7 @@ pub struct ArtifactMetadata {
     /// Identity bytes carried by this sidecar. Only values paired with the
     /// canonical `identity_scheme` are exposed as ABIR semantic identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_id: Option<ContentId>,
+    pub content_id: Option<ArtifactContentId>,
     /// Declares the meaning of `content_id`; absent on pre-ADR0169 sidecars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_scheme: Option<String>,
@@ -666,7 +665,7 @@ pub struct ArtifactMetadata {
 }
 
 impl ArtifactMetadata {
-    pub fn new(kind: impl Into<String>, schema: u32, content_id: ContentId) -> Self {
+    pub fn new(kind: impl Into<String>, schema: u32, content_id: ArtifactContentId) -> Self {
         Self {
             kind: kind.into(),
             schema,
@@ -712,7 +711,7 @@ impl ArtifactMetadata {
         self
     }
 
-    pub fn content_id(&self) -> Option<ContentId> {
+    pub fn content_id(&self) -> Option<ArtifactContentId> {
         (self.identity_scheme.as_deref() == Some("abir-content-id-v1"))
             .then_some(self.content_id)
             .flatten()
@@ -721,7 +720,7 @@ impl ArtifactMetadata {
     /// Best available digest for legacy display/search only.
     pub fn display_hash(&self) -> Option<ContentHash> {
         self.content_id
-            .map(ContentId::digest)
+            .map(ArtifactContentId::digest)
             .or(self.legacy_content_hash)
     }
 
@@ -1199,9 +1198,12 @@ mod tests {
 
         let digest = ContentHash::of_bytes(b"same digest, different meaning");
         let invocation = InvocationKey::from_digest(digest);
-        let content = ContentId::from_digest(digest);
+        let content = ArtifactContentId::from_digest(digest);
 
-        assert_ne!(TypeId::of::<InvocationKey>(), TypeId::of::<ContentId>());
+        assert_ne!(
+            TypeId::of::<InvocationKey>(),
+            TypeId::of::<ArtifactContentId>()
+        );
         assert_eq!(invocation.digest(), digest);
         assert_eq!(content.digest(), digest);
         let encoded = format!("\"{}\"", digest.to_hex());
@@ -1319,7 +1321,7 @@ mod tests {
 
     #[test]
     fn metadata_round_trip() {
-        let id = ContentId::from_digest(ContentHash::of_bytes(b"x"));
+        let id = ArtifactContentId::from_digest(ContentHash::of_bytes(b"x"));
         let md = ArtifactMetadata::new("dataset.jsonl", 1, id)
             .with_stage("materialize_conversations")
             .with_extra("n_examples", serde_json::json!(42));
@@ -1362,7 +1364,7 @@ mod tests {
 
     #[test]
     fn unlabeled_pre_adr0169_identity_is_not_promoted_to_abir() {
-        let legacy_id = ContentId::from_digest(ContentHash::of_bytes(b"legacy object key"));
+        let legacy_id = ArtifactContentId::from_digest(ContentHash::of_bytes(b"legacy object key"));
         let metadata: ArtifactMetadata = serde_json::from_value(serde_json::json!({
             "kind": "checkpoint",
             "schema": 1,

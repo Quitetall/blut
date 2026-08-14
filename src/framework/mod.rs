@@ -51,7 +51,8 @@ pub mod stage;
 pub mod status;
 
 pub use artifact::{
-    Artifact, ArtifactMetadata, BranchDecision, ContentHash, ContentId, InvocationKey, ListOf,
+    Artifact, ArtifactContentId, ArtifactMetadata, BranchDecision, ContentHash, InvocationKey,
+    ListOf,
 };
 pub use artifact_store::{
     ARTIFACT_FORMAT_VERSION, ArtifactManifest, ArtifactRole, ArtifactStoreError, StoredArtifact,

@@ -999,7 +999,7 @@ pub trait StageDyn: Send + Sync + 'static {
     }
     /// Whether the artifact's logical hash is portable and can be independently
     /// re-derived from restored bytes. `false` preserves large-artifact stat
-    /// fingerprints while the store validates those bytes through `ContentId`.
+    /// fingerprints while the store validates those bytes through `ArtifactContentId`.
     fn input_hashes_contents(&self) -> bool {
         true
     }

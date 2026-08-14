@@ -463,7 +463,7 @@ impl DispatchPolicy for ProfileDispatchPolicy {
     fn verify_result(
         &self,
         _result: &TaskResult,
-        _expected: Option<blut::framework::artifact::ContentId>,
+        _expected: Option<blut::framework::artifact::ArtifactContentId>,
         _peer_pubkey: &ed25519_dalek::VerifyingKey,
     ) -> DispatchVerdict {
         DispatchVerdict::Reject("not exercised".into())

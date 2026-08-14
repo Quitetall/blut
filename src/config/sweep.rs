@@ -176,7 +176,7 @@ mod tests {
         ArtifactMetadata::new(
             "ckpt",
             1,
-            crate::framework::ContentId::from_digest(ContentHash([9u8; 32])),
+            crate::framework::ArtifactContentId::from_digest(ContentHash([9u8; 32])),
         )
         .write_to(&sidecar)
         .unwrap();

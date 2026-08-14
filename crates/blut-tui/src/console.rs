@@ -1098,7 +1098,7 @@ mod tests {
 
     #[test]
     fn applies_a_real_status_jsonl() {
-        use blut::framework::artifact::{ContentHash, ContentId, InvocationKey};
+        use blut::framework::artifact::{ContentHash, ArtifactContentId, InvocationKey};
         use std::time::Duration;
         let h = |e| HostedEvent {
             host: None,
@@ -1111,7 +1111,7 @@ mod tests {
                 node_idx: 0,
                 stage_name: "codec_ready".into(),
                 invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"a")),
-                content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"cached"))),
+                content_id: Some(ArtifactContentId::from_digest(ContentHash::of_bytes(b"cached"))),
             }),
             h(StageEvent::StageBegin {
                 node_idx: 1,
@@ -1122,7 +1122,7 @@ mod tests {
             h(StageEvent::StageEnd {
                 node_idx: 1,
                 stage_name: "train_joint".into(),
-                content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"c"))),
+                content_id: Some(ArtifactContentId::from_digest(ContentHash::of_bytes(b"c"))),
                 legacy_output_hash: None,
                 elapsed: Duration::from_secs(4),
             }),
@@ -1180,7 +1180,7 @@ mod tests {
 
     #[test]
     fn control_prune_is_a_successful_accounted_stage() {
-        use blut::framework::artifact::{ContentHash, ContentId};
+        use blut::framework::artifact::{ContentHash, ArtifactContentId};
         use std::time::Duration;
 
         let events = [
@@ -1191,7 +1191,7 @@ mod tests {
                 event: StageEvent::StageEnd {
                     node_idx: 0,
                     stage_name: "decision".into(),
-                    content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"decision"))),
+                    content_id: Some(ArtifactContentId::from_digest(ContentHash::of_bytes(b"decision"))),
                     legacy_output_hash: None,
                     elapsed: Duration::from_millis(1),
                 },

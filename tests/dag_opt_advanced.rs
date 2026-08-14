@@ -1405,7 +1405,7 @@ fn materialized_hashes(job_dir: &std::path::Path) -> Vec<ContentHash> {
             serde_json::from_slice::<ArtifactMetadata>(&body)
                 .expect("decode materialized output metadata")
                 .content_id()
-                .expect("A09+ materialization carries ContentId")
+                .expect("A09+ materialization carries ArtifactContentId")
                 .digest()
         })
         .collect()

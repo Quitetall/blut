@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use blut::framework::artifact::{ContentHash, ContentId, InvocationKey};
+use blut::framework::artifact::{ArtifactContentId, ContentHash, InvocationKey};
 use blut::p2p::Coordinator;
 use blut::p2p::crypto::KeyPair;
 use blut::p2p::dispatch::{DefaultDispatchPolicy, DispatchPolicy};
@@ -101,10 +101,10 @@ async fn task_manifest_sign_verify_roundtrip() {
         coordinator_id: PeerId::from_pubkey(&kp.verifying),
         stage_name: "warm_fb_cache".into(),
         stage_schema: 1,
-        input_content_id: ContentId::from_digest(input_hash),
+        input_content_id: ArtifactContentId::from_digest(input_hash),
         invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"test-task-1")),
         args_hash,
-        expected_content_id: Some(ContentId::from_digest(expected_output_hash)),
+        expected_content_id: Some(ArtifactContentId::from_digest(expected_output_hash)),
         args: serde_json::json!({"lma_root": "/data"}),
         resources: ResourceRequest::default(),
         data_class: DataClass::Public,
@@ -146,7 +146,7 @@ async fn task_result_sign_verify_roundtrip() {
         protocol_version: blut::p2p::task::TASK_PROTOCOL_VERSION,
         task_id: "test-task-1".into(),
         peer_id: PeerId::from_pubkey(&kp.verifying),
-        content_id: ContentId::from_digest(output_hash),
+        content_id: ArtifactContentId::from_digest(output_hash),
         encrypted_output: None,
         wall_time_ms: 1500,
         signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
@@ -352,7 +352,7 @@ mod e2e {
         fn verify_result(
             &self,
             _r: &TaskResult,
-            _e: Option<ContentId>,
+            _e: Option<ArtifactContentId>,
             _k: &ed25519_dalek::VerifyingKey,
         ) -> DispatchVerdict {
             DispatchVerdict::Accept

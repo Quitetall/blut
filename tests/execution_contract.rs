@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use blut::framework::artifact::{Artifact, ContentHash, ContentId, InvocationKey};
+use blut::framework::artifact::{Artifact, ArtifactContentId, ContentHash, InvocationKey};
 use blut::framework::artifact_store::{ARTIFACT_FORMAT_VERSION, ArtifactManifest, StoredArtifact};
 use blut::framework::error::StageError;
 use blut::framework::error_domain::StageFailure;
@@ -65,8 +65,8 @@ impl Stage for ContractStage {
     }
 }
 
-fn content_id(label: &[u8]) -> ContentId {
-    ContentId::from_digest(ContentHash::of_bytes(label))
+fn content_id(label: &[u8]) -> ArtifactContentId {
+    ArtifactContentId::from_digest(ContentHash::of_bytes(label))
 }
 
 fn stored(label: &[u8]) -> StoredArtifact {

@@ -28,8 +28,8 @@
 //! Cache roots contain two disjoint namespaces:
 //!
 //! - `v1/cache-invocations/<InvocationKey>` maps one invocation to a
-//!   [`ContentId`] plus the expected artifact kind/schema.
-//! - `v1/artifacts/<ContentId>` owns the canonical payload, portable
+//!   [`ArtifactContentId`] plus the expected artifact kind/schema.
+//! - `v1/artifacts/<ArtifactContentId>` owns the canonical payload, portable
 //!   handle, integrity metadata, and validation material.
 //!
 //! A lookup is not a metadata read. It restores and independently validates the
@@ -43,7 +43,7 @@ use bincode::Options;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
+use crate::framework::artifact::{ArtifactContentId, ContentHash, InvocationKey};
 use crate::framework::artifact_store::{ArtifactRole, StoredArtifact, capture, restore};
 use crate::framework::object_store::{
     BlockingObjectStore, MAX_OBJECT_SIZE, ObjectKey, ObjectNamespace,
@@ -59,7 +59,7 @@ const MAX_CACHE_PROOF_BYTES: u64 = 1024 * 1024;
 pub struct CacheRecord {
     pub version: u16,
     pub invocation_key: InvocationKey,
-    pub content_id: ContentId,
+    pub content_id: ArtifactContentId,
     pub kind: String,
     pub schema: u32,
 }
@@ -67,7 +67,7 @@ pub struct CacheRecord {
 /// Canonical object and invocation bytes held until optional execution commits.
 pub(crate) struct OptionalCacheWrite {
     key: InvocationKey,
-    pub(crate) content_id: ContentId,
+    pub(crate) content_id: ArtifactContentId,
     object_bytes: Vec<u8>,
     record_bytes: Vec<u8>,
 }
@@ -275,7 +275,7 @@ impl CacheHandle {
     /// Resolve an invocation to a content object, restore that object beneath
     /// `into_stage_dir`, and validate it as this stage's output. Any missing,
     /// corrupt, mismatched, or unrehydratable value is a cache miss. Restore
-    /// removes its private `.artifact-import/<ContentId>` subtree on failure;
+    /// removes its private `.artifact-import/<ArtifactContentId>` subtree on failure;
     /// the executor's cold path removes the enclosing final stage directory
     /// before atomic promotion, so a failed lookup cannot poison a rerun.
     pub fn lookup(
@@ -404,7 +404,7 @@ impl CacheHandle {
         stage: &dyn StageDyn,
         output: &ErasedArtifact,
         src_root: &Path,
-    ) -> std::io::Result<ContentId> {
+    ) -> std::io::Result<ArtifactContentId> {
         let stored = capture(stage, output.clone(), src_root, ArtifactRole::Output, None)
             .map_err(artifact_store_io)?;
         self.insert_stored(key, stored)
@@ -417,7 +417,7 @@ impl CacheHandle {
         &self,
         key: InvocationKey,
         stored: StoredArtifact,
-    ) -> std::io::Result<ContentId> {
+    ) -> std::io::Result<ArtifactContentId> {
         let content_id = stored.manifest.content_id;
         let record = CacheRecord {
             version: CACHE_RECORD_VERSION,
@@ -583,7 +583,7 @@ fn record_path(base: &Path, key: InvocationKey) -> PathBuf {
 }
 
 #[cfg(test)]
-fn object_path(base: &Path, content_id: ContentId) -> PathBuf {
+fn object_path(base: &Path, content_id: ArtifactContentId) -> PathBuf {
     base.join(ObjectKey::Artifact(content_id).relative_path())
 }
 
@@ -877,7 +877,7 @@ pub fn lru_prune(cache_root: &Path, max_bytes: u64) -> std::io::Result<u64> {
     }
 
     let mut entries = Vec::new();
-    let mut references: std::collections::HashMap<ContentId, usize> =
+    let mut references: std::collections::HashMap<ArtifactContentId, usize> =
         std::collections::HashMap::new();
     for entry in invocation_objects {
         let content_id = store
@@ -896,7 +896,7 @@ pub fn lru_prune(cache_root: &Path, max_bytes: u64) -> std::io::Result<u64> {
     }
 
     let mut freed = 0u64;
-    let mut artifact_by_id: std::collections::HashMap<ContentId, _> = artifact_objects
+    let mut artifact_by_id: std::collections::HashMap<ArtifactContentId, _> = artifact_objects
         .into_iter()
         .filter_map(|object| match object.key {
             ObjectKey::Artifact(content_id) => Some((content_id, object)),
@@ -983,7 +983,7 @@ fn dir_size(path: &Path) -> std::io::Result<u64> {
 #[derive(Clone, Debug)]
 pub struct CacheHit {
     pub artifact: ErasedArtifact,
-    pub content_id: ContentId,
+    pub content_id: ArtifactContentId,
 }
 
 /// Durable proof tying a completed stage to the cache entry that made it
@@ -1410,7 +1410,7 @@ mod tests {
         let record = CacheRecord {
             version: CACHE_RECORD_VERSION,
             invocation_key: key,
-            content_id: ContentId::from_digest(ContentHash::of_bytes(b"content")),
+            content_id: ArtifactContentId::from_digest(ContentHash::of_bytes(b"content")),
             kind: FileArtifact::KIND.into(),
             schema: FileArtifact::SCHEMA,
         };

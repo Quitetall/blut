@@ -17,7 +17,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::TrainError;
-use crate::framework::artifact::ContentId;
+use crate::framework::artifact::ArtifactContentId;
 use crate::framework::execution::{
     Assignment, ExecutionAdapter, ExecutionArtifact, ExecutionDeadline, ExecutionFailure,
     ExecutionFailureKind, ExecutionHandle, ExecutionLifecycle, ExecutionMode, ExecutionPhase,
@@ -93,7 +93,7 @@ impl Coordinator {
     pub async fn verify_result(
         &self,
         result: &TaskResult,
-        expected: Option<ContentId>,
+        expected: Option<ArtifactContentId>,
     ) -> DispatchVerdict {
         let peers = self.server.peers.read().await;
         if let Some(peer) = peers.get(&result.peer_id) {

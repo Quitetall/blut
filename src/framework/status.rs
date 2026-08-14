@@ -21,7 +21,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
-use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
+use crate::framework::artifact::{ArtifactContentId, ContentHash, InvocationKey};
 use crate::framework::error_domain::FailureSummary;
 use crate::framework::resource::Resource;
 
@@ -43,7 +43,7 @@ pub const DEFAULT_BROADCAST_CAPACITY: usize = 4096;
 /// `content_id` and `invocation_key` explicitly. Current readers retain aliases
 /// for pre-A09 fields. Legacy invocation keys remain in the same typed domain;
 /// legacy `StageEnd.output_hash` values do not and therefore deserialize into a
-/// separate field instead of manufacturing a portable [`ContentId`].
+/// separate field instead of manufacturing a portable [`ArtifactContentId`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -66,7 +66,7 @@ pub enum StageEvent {
         /// Portable identities of predecessor artifacts, in dependency order.
         /// Empty for graph roots and legacy status records.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        input_content_ids: Vec<ContentId>,
+        input_content_ids: Vec<ArtifactContentId>,
     },
     /// Stage successfully produced output.
     StageEnd {
@@ -74,7 +74,7 @@ pub enum StageEvent {
         stage_name: String,
         /// Portable output identity. Absent only on a pre-A09 status record.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        content_id: Option<ContentId>,
+        content_id: Option<ArtifactContentId>,
         /// Pre-A09 logical output hash, preserved only for display/audit.
         #[serde(
             default,
@@ -94,7 +94,7 @@ pub enum StageEvent {
         invocation_key: InvocationKey,
         /// Absent only when replaying a pre-A09 status record.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        content_id: Option<ContentId>,
+        content_id: Option<ArtifactContentId>,
     },
     /// Stage failed. `error` is the `Display` form of the
     /// `StageError`. When the error chain contains a [`crate::framework::error_domain::StageFailure`],
@@ -580,7 +580,7 @@ mod tests {
 
     #[test]
     fn stage_end_uses_explicit_content_id_and_preserves_legacy_hash_as_unknown() {
-        let content = ContentId::from_digest(ContentHash::of_bytes(b"content"));
+        let content = ArtifactContentId::from_digest(ContentHash::of_bytes(b"content"));
         let event = StageEvent::StageEnd {
             node_idx: 1,
             stage_name: "producer".into(),
@@ -620,7 +620,7 @@ mod tests {
     #[test]
     fn skipped_event_serializes_invocation_and_content_identity() {
         let invocation = InvocationKey::from_digest(ContentHash::of_bytes(b"invocation"));
-        let content = ContentId::from_digest(ContentHash::of_bytes(b"content"));
+        let content = ArtifactContentId::from_digest(ContentHash::of_bytes(b"content"));
         let event = StageEvent::StageSkipped {
             node_idx: 3,
             stage_name: "cached".into(),
@@ -663,7 +663,9 @@ mod tests {
         let event = StageEvent::StageEnd {
             node_idx: 2,
             stage_name: "train".into(),
-            content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"out"))),
+            content_id: Some(ArtifactContentId::from_digest(ContentHash::of_bytes(
+                b"out",
+            ))),
             legacy_output_hash: None,
             elapsed: Duration::from_secs(1),
         };
@@ -710,7 +712,7 @@ mod tests {
             StageEvent::StageEnd {
                 node_idx: 5,
                 stage_name: "remote".into(),
-                content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"o"))),
+                content_id: Some(ArtifactContentId::from_digest(ContentHash::of_bytes(b"o"))),
                 legacy_output_hash: None,
                 elapsed: Duration::from_millis(3),
             },
@@ -760,7 +762,9 @@ mod tests {
         hub.emit(StageEvent::StageEnd {
             node_idx: 0,
             stage_name: "after-abort".into(),
-            content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"out"))),
+            content_id: Some(ArtifactContentId::from_digest(ContentHash::of_bytes(
+                b"out",
+            ))),
             legacy_output_hash: None,
             elapsed: Duration::from_millis(1),
         });
@@ -837,7 +841,7 @@ mod tests {
         tx.send(StageEvent::StageEnd {
             node_idx: 1,
             stage_name: "filter_dataset".into(),
-            content_id: Some(ContentId::from_digest(h)),
+            content_id: Some(ArtifactContentId::from_digest(h)),
             legacy_output_hash: None,
             elapsed: Duration::from_millis(42),
         })
@@ -913,7 +917,9 @@ mod tests {
         hub.emit(StageEvent::StageEnd {
             node_idx: 0,
             stage_name: "flooded".into(),
-            content_id: Some(ContentId::from_digest(ContentHash::of_bytes(b"out"))),
+            content_id: Some(ArtifactContentId::from_digest(ContentHash::of_bytes(
+                b"out",
+            ))),
             legacy_output_hash: None,
             elapsed: Duration::from_millis(1),
         });

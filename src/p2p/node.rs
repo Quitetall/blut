@@ -488,14 +488,14 @@ mod tests {
             coordinator_id: from.clone(),
             stage_name: "p2p-echo".into(),
             stage_schema: 1,
-            input_content_id: crate::framework::ContentId::from_digest(ContentHash::of_bytes(
-                b"in",
-            )),
+            input_content_id: crate::framework::ArtifactContentId::from_digest(
+                ContentHash::of_bytes(b"in"),
+            ),
             invocation_key: crate::framework::InvocationKey::from_digest(ContentHash::of_bytes(
                 b"echo-invocation",
             )),
             args_hash: ContentHash::of_bytes(b"args"),
-            expected_content_id: Some(crate::framework::ContentId::from_digest(
+            expected_content_id: Some(crate::framework::ArtifactContentId::from_digest(
                 ContentHash::of_bytes(b"out"),
             )),
             args: serde_json::json!({}),
@@ -794,7 +794,7 @@ mod tests {
                 StageEvent::StageEnd {
                     node_idx: 3,
                     stage_name: "worker-stage".into(),
-                    content_id: Some(crate::framework::ContentId::from_digest(
+                    content_id: Some(crate::framework::ArtifactContentId::from_digest(
                         ContentHash::of_bytes(b"o"),
                     )),
                     legacy_output_hash: None,

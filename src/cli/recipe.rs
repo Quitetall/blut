@@ -1195,7 +1195,9 @@ pub(super) fn record_sweep_completion(fp: crate::framework::ContentHash, job_id:
         return;
     };
     let Some(content_id) = rec.meta.content_id() else {
-        tracing::warn!("sweep completion {job_id}: terminal artifact has no portable ContentId");
+        tracing::warn!(
+            "sweep completion {job_id}: terminal artifact has no portable ArtifactContentId"
+        );
         return;
     };
     if let Err(e) = crate::config::sweep_index::record_completion(

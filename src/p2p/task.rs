@@ -10,7 +10,7 @@
 use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 
-use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
+use crate::framework::artifact::{ArtifactContentId, ContentHash, InvocationKey};
 use crate::framework::execution::ExecutionDeadline;
 use crate::p2p::crypto::EncryptedPayload;
 use crate::p2p::peer::PeerId;
@@ -39,7 +39,7 @@ pub struct TaskManifest {
     pub stage_schema: u32,
     /// Content identity of the input artifact.
     #[serde(rename = "input_hash")]
-    pub input_content_id: ContentId,
+    pub input_content_id: ArtifactContentId,
     /// Invocation identity used only to correlate the returned content object
     /// with the coordinator cache. It is never an expected content hash.
     pub invocation_key: InvocationKey,
@@ -48,7 +48,7 @@ pub struct TaskManifest {
     /// Expected output identity only when the stage contract can derive it
     /// analytically before execution. Generic dispatch leaves this `None`.
     #[serde(rename = "expected_output_hash")]
-    pub expected_content_id: Option<ContentId>,
+    pub expected_content_id: Option<ArtifactContentId>,
     /// JSON-encoded stage args.
     pub args: serde_json::Value,
     /// Resource requirements for this task.
@@ -211,7 +211,7 @@ pub struct TaskResult {
     /// Content identity of the output artifact, independently verified by the
     /// receiving artifact store before the result is accepted.
     #[serde(rename = "output_hash")]
-    pub content_id: ContentId,
+    pub content_id: ArtifactContentId,
     /// Encrypted output data (None if output is on shared filesystem).
     pub encrypted_output: Option<EncryptedPayload>,
     /// Wall-clock time for the task (milliseconds, integer for deterministic signing).
@@ -267,10 +267,12 @@ mod tests {
             coordinator_id: crate::p2p::peer::PeerId::from_pubkey(&kp.verifying),
             stage_name: "warm_fb_cache".into(),
             stage_schema: 1,
-            input_content_id: ContentId::from_digest(input_hash),
+            input_content_id: ArtifactContentId::from_digest(input_hash),
             invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"invocation")),
             args_hash,
-            expected_content_id: Some(ContentId::from_digest(ContentHash::of_bytes(&[3u8; 32]))),
+            expected_content_id: Some(ArtifactContentId::from_digest(ContentHash::of_bytes(
+                &[3u8; 32],
+            ))),
             args: serde_json::json!({"lma_root": "/data"}),
             resources: ResourceRequest::default(),
             data_class: DataClass::Public,
@@ -343,7 +345,7 @@ mod tests {
     #[test]
     fn result_sign_verify() {
         let kp = KeyPair::generate();
-        let content_id = ContentId::from_digest(ContentHash::of_bytes(&[3u8; 32]));
+        let content_id = ArtifactContentId::from_digest(ContentHash::of_bytes(&[3u8; 32]));
         let mut result = TaskResult {
             protocol_version: TASK_PROTOCOL_VERSION,
             task_id: "test-task-1".into(),
@@ -365,7 +367,7 @@ mod tests {
             protocol_version: TASK_PROTOCOL_VERSION,
             task_id: "test-task-1".into(),
             peer_id: crate::p2p::peer::PeerId::from_pubkey(&kp.verifying),
-            content_id: ContentId::from_digest(ContentHash::of_bytes(&[3u8; 32])),
+            content_id: ArtifactContentId::from_digest(ContentHash::of_bytes(&[3u8; 32])),
             encrypted_output: None,
             wall_time_ms: 42500,
             signature: kp.sign(b"test"),
@@ -398,10 +400,12 @@ mod tests {
             coordinator_id: crate::p2p::peer::PeerId::from_pubkey(&kp.verifying),
             stage_name: "warm_fb_cache".into(),
             stage_schema: 1,
-            input_content_id: ContentId::from_digest(input_hash),
+            input_content_id: ArtifactContentId::from_digest(input_hash),
             invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"invocation")),
             args_hash,
-            expected_content_id: Some(ContentId::from_digest(ContentHash::of_bytes(&[3u8; 32]))),
+            expected_content_id: Some(ArtifactContentId::from_digest(ContentHash::of_bytes(
+                &[3u8; 32],
+            ))),
             args,
             resources: ResourceRequest::default(),
             data_class: DataClass::Public,

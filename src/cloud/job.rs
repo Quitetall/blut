@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
+use crate::framework::artifact::{ArtifactContentId, ContentHash, InvocationKey};
 use crate::framework::execution::{
     Assignment, ExecutionDeadline, ExecutionFailure, ExecutionPhase,
 };
@@ -46,7 +46,7 @@ pub struct CloudJob {
     /// Analytically known output identity, when the stage can provide one before
     /// execution. Otherwise the worker derives and returns the actual identity.
     #[serde(rename = "expected_output_hash")]
-    pub expected_content_id: Option<ContentId>,
+    pub expected_content_id: Option<ArtifactContentId>,
     pub resources: ResourceRequest,
     /// Data sensitivity — the reused `DispatchMatrix` refuses `Restricted` to a
     /// cloud worker below `Trusted` (clinical EEG hard-block in v1).
@@ -86,7 +86,7 @@ pub struct CloudResult {
     pub output_manifest: Option<BundleManifest>,
     /// The output artifact's content identity (None on failure).
     #[serde(rename = "output_hash")]
-    pub content_id: Option<ContentId>,
+    pub content_id: Option<ArtifactContentId>,
     /// Wall-clock the stage ran on the worker — the billing signal (T3.1e).
     pub wall_time_ms: u64,
     /// Typed failure identity when `outcome == Failed`.

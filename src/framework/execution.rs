@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
+use crate::framework::artifact::{ArtifactContentId, ContentHash, InvocationKey};
 use crate::framework::artifact_store::{ArtifactRole, StoredArtifact, restore};
 use crate::framework::error::StageError;
 use crate::framework::error_domain::StageFailure;
@@ -193,7 +193,7 @@ pub struct ExecutionRequest {
     /// executor and therefore submits `None`; P2P and cloud MUST reject a
     /// request without this value.
     pub input: Option<StoredArtifact>,
-    pub expected_content_id: Option<ContentId>,
+    pub expected_content_id: Option<ArtifactContentId>,
     pub resources: ExecutionResources,
     pub data_class: DataClassification,
     pub deadline: ExecutionDeadline,
@@ -326,7 +326,7 @@ impl std::error::Error for ExecutionFailure {}
 /// local execution may use `None` only for an explicitly non-portable artifact.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionArtifact {
-    pub content_id: ContentId,
+    pub content_id: ArtifactContentId,
     pub stored: Option<StoredArtifact>,
 }
 
@@ -586,7 +586,7 @@ impl LocalExecutionAdapter {
 
     pub fn succeed(
         &self,
-        content_id: ContentId,
+        content_id: ArtifactContentId,
         stored: Option<StoredArtifact>,
         wall_time: Duration,
     ) -> Result<ExecutionSnapshot, LifecycleError> {
@@ -709,7 +709,7 @@ impl ExecutionHandle for LocalExecutionHandle {
 pub enum ExecutionResult {
     Succeeded {
         artifact: ErasedArtifact,
-        content_id: ContentId,
+        content_id: ArtifactContentId,
         wall_time_ms: u64,
     },
     Failed(ExecutionFailure),
@@ -832,7 +832,7 @@ async fn sleep_optional(duration: Option<Duration>) {
 
 async fn validate_terminal(
     terminal: ExecutionTerminal,
-    expected_content_id: Option<ContentId>,
+    expected_content_id: Option<ArtifactContentId>,
     stage: Arc<dyn StageDyn>,
     output_dir: std::path::PathBuf,
     deadline: ExecutionDeadline,

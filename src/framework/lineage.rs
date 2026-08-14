@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::Result;
-use crate::framework::artifact::{ArtifactMetadata, ContentHash, ContentId};
+use crate::framework::artifact::{ArtifactContentId, ArtifactMetadata, ContentHash};
 use crate::framework::status::StageEvent;
 use crate::jobs;
 
@@ -26,8 +26,8 @@ pub struct LineageNode {
     pub stage: String,
     pub input_hash: Option<ContentHash>,
     /// Portable predecessor identities. Multi-input stages retain every edge.
-    pub input_content_ids: Vec<ContentId>,
-    pub output_content_id: Option<ContentId>,
+    pub input_content_ids: Vec<ArtifactContentId>,
+    pub output_content_id: Option<ArtifactContentId>,
     /// Preserved pre-A09 logical hash; never promoted into content identity.
     pub legacy_output_hash: Option<ContentHash>,
     /// `true` if the stage was served from cache (a `StageSkipped`).

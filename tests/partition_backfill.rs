@@ -160,7 +160,7 @@ fn partition_backfill_matrix_is_lineage_derived_and_selector_exact() {
         blut::framework::ArtifactMetadata::new(
             "report",
             1,
-            blut::framework::ContentId::from_digest(hash),
+            blut::framework::ArtifactContentId::from_digest(hash),
         )
         .with_stage("evaluate")
         .write_to(&sidecar)

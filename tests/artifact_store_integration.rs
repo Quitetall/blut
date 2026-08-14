@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use blut::backends::TrainingBackend;
-use blut::framework::artifact::{Artifact, ContentHash, ContentId};
+use blut::framework::artifact::{Artifact, ArtifactContentId, ContentHash};
 use blut::framework::artifact_store::StoredArtifact;
 use blut::framework::compat::Compatible;
 use blut::framework::executor::{ExecCtx, SequentialExecutor};
@@ -147,7 +147,7 @@ fn lifecycle_events(job_dir: &Path) -> Vec<StageEvent> {
         .collect()
 }
 
-fn stage_end_content_id(events: &[StageEvent]) -> ContentId {
+fn stage_end_content_id(events: &[StageEvent]) -> ArtifactContentId {
     events
         .iter()
         .find_map(|event| match event {
@@ -160,7 +160,7 @@ fn stage_end_content_id(events: &[StageEvent]) -> ContentId {
         .expect("cold run emits StageEnd")
 }
 
-fn stage_skipped_content_id(events: &[StageEvent]) -> ContentId {
+fn stage_skipped_content_id(events: &[StageEvent]) -> ArtifactContentId {
     events
         .iter()
         .find_map(|event| match event {
@@ -197,7 +197,7 @@ async fn shared_cache_rehydrates_file_and_directory_after_producer_deletion() {
     assert_ne!(
         cold_id.digest(),
         cold_typed.content_hash,
-        "portable ContentId is independent from the artifact logical hash"
+        "portable ArtifactContentId is independent from the artifact logical hash"
     );
 
     std::fs::remove_dir_all(&host_a).unwrap();

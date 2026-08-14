@@ -21,7 +21,7 @@ use async_trait::async_trait;
 #[cfg(feature = "cloud")]
 use object_store::ObjectStoreExt;
 
-use crate::framework::artifact::{ContentHash, ContentId, InvocationKey};
+use crate::framework::artifact::{ArtifactContentId, ContentHash, InvocationKey};
 
 /// Maximum payload accepted by every production object-store adapter.
 pub const MAX_OBJECT_SIZE: u64 = 16 * 1024 * 1024 * 1024;
@@ -78,7 +78,7 @@ impl ObjectNamespace {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ObjectKey {
     CacheInvocation(InvocationKey),
-    Artifact(ContentId),
+    Artifact(ArtifactContentId),
     DispatchBundle(ContentHash),
     Chunk(ContentHash),
 }
@@ -116,7 +116,7 @@ impl ObjectKey {
             ObjectNamespace::CacheInvocation => {
                 Self::CacheInvocation(InvocationKey::from_digest(digest))
             }
-            ObjectNamespace::Artifact => Self::Artifact(ContentId::from_digest(digest)),
+            ObjectNamespace::Artifact => Self::Artifact(ArtifactContentId::from_digest(digest)),
             ObjectNamespace::DispatchBundle => Self::DispatchBundle(digest),
             ObjectNamespace::Chunk => Self::Chunk(digest),
         }
