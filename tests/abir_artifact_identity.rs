@@ -1,5 +1,5 @@
 use abir::ContentId as AbirContentId;
-use blut::framework::ContentId;
+use blut::framework::{ContentHash, ContentId};
 
 #[test]
 fn blut_artifact_identity_is_an_abir_projection() {
@@ -10,6 +10,20 @@ fn blut_artifact_identity_is_an_abir_projection() {
     assert_eq!(projected.to_hex(), semantic.to_string());
     assert_eq!(
         serde_json::from_str::<ContentId>(&serde_json::to_string(&projected).unwrap()).unwrap(),
+        projected
+    );
+}
+
+#[test]
+fn legacy_content_hash_and_abir_projection_share_bincode_wire_shape() {
+    let legacy = ContentHash::of_bytes(b"pre-ADR0169 object identity");
+    let projected = ContentId::from_digest(legacy);
+
+    let legacy_wire = bincode::serialize(&legacy).unwrap();
+    let projected_wire = bincode::serialize(&projected).unwrap();
+    assert_eq!(projected_wire, legacy_wire);
+    assert_eq!(
+        bincode::deserialize::<ContentId>(&legacy_wire).unwrap(),
         projected
     );
 }

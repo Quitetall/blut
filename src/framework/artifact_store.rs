@@ -47,9 +47,11 @@ use crate::framework::artifact::{ContentHash, ContentId};
 use crate::framework::object_store::MAX_OBJECT_SIZE;
 use crate::framework::stage::{ErasedArtifact, StageDyn};
 
-/// Artifact persistence format. Version 2 validates input/output roles
-/// independently and binds manifests to a typed [`ContentId`].
+/// Artifact persistence format. Version 3 binds persisted artifacts to ABIR's
+/// canonical training-artifact `ContentId` domain.
 pub const ARTIFACT_FORMAT_VERSION: u16 = 3;
+// Keep this explicit: a future format version must not silently reinterpret
+// its identity field using version 2's SHA-256 derivation.
 const LEGACY_ARTIFACT_FORMAT_VERSION: u16 = 2;
 /// Compatibility name retained for P2P callers during the 7.8 bridge.
 pub const BUNDLE_VERSION: u16 = ARTIFACT_FORMAT_VERSION;
@@ -111,10 +113,11 @@ pub struct ArtifactManifest {
 }
 
 impl ArtifactManifest {
-    /// Canonical ABIR identity carried by v3+ manifests. Version 2 retained a
-    /// SHA-256-derived legacy object key in the same wire slot.
+    /// Canonical ABIR identity carried by version 3 manifests. Version 2
+    /// retained a SHA-256-derived legacy object key in the same wire slot;
+    /// unknown future versions must be interpreted only by their own reader.
     pub const fn abir_content_id(&self) -> Option<AbirContentId> {
-        if self.format_version >= ARTIFACT_FORMAT_VERSION {
+        if self.format_version == ARTIFACT_FORMAT_VERSION {
             Some(self.content_id.as_abir())
         } else {
             None
@@ -320,6 +323,9 @@ pub fn restore(
 /// reuses derived work when the external artifact's logical hash is unchanged.
 /// Artifacts using stat fingerprints intentionally produce host-local identities
 /// and therefore conservatively miss shared downstream caches across machines.
+/// `UNPERSISTED_ID_DOMAIN` is an input tag inside ABIR's canonical
+/// training-artifact domain, not a competing outer hash domain. Changing this
+/// subtype tag or canonical feed safely invalidates downstream cache reuse.
 pub fn unpersisted_content_id(
     stage: &dyn StageDyn,
     erased: &ErasedArtifact,
@@ -1199,6 +1205,10 @@ mod tests {
             manifest.content_id.to_hex(),
             "ed3fbf83cf55e070e75f32c9a95d0e701fe70f028715c27f23f2f2fca1f69aab"
         );
+
+        manifest.format_version = ARTIFACT_FORMAT_VERSION + 1;
+        assert_eq!(manifest.abir_content_id(), None);
+        manifest.format_version = ARTIFACT_FORMAT_VERSION;
 
         let legacy = derive_legacy_content_id(
             &stage,
