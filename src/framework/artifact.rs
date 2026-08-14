@@ -27,6 +27,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use abir::ContentId as AbirContentId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -338,33 +339,70 @@ impl std::fmt::Debug for InvocationKey {
     }
 }
 
-/// Identity of canonical artifact payload bytes. This addresses stored
-/// artifacts and lineage, never stage invocations.
-#[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ContentId(ContentHash);
+/// BLUT projection of ABIR's canonical semantic [`AbirContentId`].
+///
+/// BLUT owns artifact canonicalization and storage integrity. ABIR owns the
+/// resulting identity type. This wrapper preserves BLUT's public type safety
+/// and historical 64-hex serialization without defining another identity.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct ArtifactContentId(AbirContentId);
 
-impl ContentId {
-    pub fn from_digest(digest: ContentHash) -> Self {
-        Self(digest)
+/// Compatibility name for the artifact projection. This is not a second
+/// `ContentId` definition; its only stored value is an ABIR `ContentId`.
+pub type ContentId = ArtifactContentId;
+
+impl ArtifactContentId {
+    pub const fn from_abir(content_id: AbirContentId) -> Self {
+        Self(content_id)
     }
 
-    pub fn digest(self) -> ContentHash {
+    pub const fn as_abir(self) -> AbirContentId {
         self.0
     }
 
+    /// Reconstruct an already-derived identity from its exact wire bytes.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(AbirContentId::from_bytes(bytes))
+    }
+
+    /// Read compatibility for pre-ADR0169 callers that stored identity bytes in
+    /// `ContentHash`. New identity producers must use ABIR sealers.
+    pub const fn from_digest(digest: ContentHash) -> Self {
+        Self::from_bytes(digest.0)
+    }
+
+    pub fn digest(self) -> ContentHash {
+        ContentHash(self.0.to_bytes())
+    }
+
     pub fn to_hex(self) -> String {
-        self.0.to_hex()
+        self.0.to_string()
     }
 }
 
-impl std::fmt::Display for ContentId {
+impl Serialize for ArtifactContentId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for ArtifactContentId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+
+        let text = String::deserialize(deserializer)?;
+        let digest = ContentHash::from_hex(&text).map_err(D::Error::custom)?;
+        Ok(Self::from_bytes(digest.0))
+    }
+}
+
+impl std::fmt::Display for ArtifactContentId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-impl std::fmt::Debug for ContentId {
+impl std::fmt::Debug for ArtifactContentId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ContentId({})", self.to_hex())
     }
@@ -596,9 +634,13 @@ pub trait Artifact: Send + Sync + serde::Serialize + serde::de::DeserializeOwned
 pub struct ArtifactMetadata {
     pub kind: String,
     pub schema: u32,
-    /// Portable identity written by A09+ producers.
+    /// Identity bytes carried by this sidecar. Only values paired with the
+    /// canonical `identity_scheme` are exposed as ABIR semantic identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_id: Option<ContentId>,
+    /// Declares the meaning of `content_id`; absent on pre-ADR0169 sidecars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_scheme: Option<String>,
     /// Pre-A09 ambiguous hash preserved for audit and legacy display only.
     #[serde(
         default,
@@ -629,6 +671,7 @@ impl ArtifactMetadata {
             kind: kind.into(),
             schema,
             content_id: Some(content_id),
+            identity_scheme: Some("abir-content-id-v1".to_owned()),
             legacy_content_hash: None,
             logical_hash: None,
             produced_by_stage: None,
@@ -647,6 +690,7 @@ impl ArtifactMetadata {
             kind: kind.into(),
             schema,
             content_id: None,
+            identity_scheme: None,
             legacy_content_hash: Some(content_hash),
             logical_hash: None,
             produced_by_stage: None,
@@ -669,7 +713,9 @@ impl ArtifactMetadata {
     }
 
     pub fn content_id(&self) -> Option<ContentId> {
-        self.content_id
+        (self.identity_scheme.as_deref() == Some("abir-content-id-v1"))
+            .then_some(self.content_id)
+            .flatten()
     }
 
     /// Best available digest for legacy display/search only.
@@ -1279,6 +1325,7 @@ mod tests {
             .with_extra("n_examples", serde_json::json!(42));
         let wire = serde_json::to_value(&md).unwrap();
         assert_eq!(wire["content_id"], id.to_hex());
+        assert_eq!(wire["identity_scheme"], "abir-content-id-v1");
         assert!(wire.get("content_hash").is_none());
         let td = tempfile::tempdir().unwrap();
         let p = td.path().join("artifact.bin");
@@ -1311,6 +1358,22 @@ mod tests {
 
         assert_eq!(metadata.content_id(), None);
         assert_eq!(metadata.legacy_content_hash, Some(legacy_hash));
+    }
+
+    #[test]
+    fn unlabeled_pre_adr0169_identity_is_not_promoted_to_abir() {
+        let legacy_id = ContentId::from_digest(ContentHash::of_bytes(b"legacy object key"));
+        let metadata: ArtifactMetadata = serde_json::from_value(serde_json::json!({
+            "kind": "checkpoint",
+            "schema": 1,
+            "content_id": legacy_id.to_hex(),
+            "produced_by_stage": null,
+            "produced_at_unix_secs": 1
+        }))
+        .unwrap();
+
+        assert_eq!(metadata.content_id(), None);
+        assert_eq!(metadata.display_hash(), Some(legacy_id.digest()));
     }
 
     #[test]

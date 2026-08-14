@@ -59,6 +59,8 @@ path = "src/lib.rs"
 # ADR 0083: the wasm32-safe keystone. The engine re-exports its types at their
 # old paths, so this is zero-churn downstream.
 blut-types = { path = "crates/blut-types", version = "=0.2.0-alpha.1" }
+abir = { version = "=0.1.0", git = "https://github.com/Quitetall/ABIR.git", rev = "510339dc6a19943eeb6edfc89f5cc70b87f19b81" }
+abir-training = { version = "=0.1.0", git = "https://github.com/Quitetall/ABIR.git", rev = "510339dc6a19943eeb6edfc89f5cc70b87f19b81" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

@@ -39,6 +39,8 @@
 
 use std::path::{Path, PathBuf};
 
+use abir::ContentId as AbirContentId;
+use abir_training::TrainingArtifactContentHasher;
 use serde::{Deserialize, Serialize};
 
 use crate::framework::artifact::{ContentHash, ContentId};
@@ -47,11 +49,12 @@ use crate::framework::stage::{ErasedArtifact, StageDyn};
 
 /// Artifact persistence format. Version 2 validates input/output roles
 /// independently and binds manifests to a typed [`ContentId`].
-pub const ARTIFACT_FORMAT_VERSION: u16 = 2;
+pub const ARTIFACT_FORMAT_VERSION: u16 = 3;
+const LEGACY_ARTIFACT_FORMAT_VERSION: u16 = 2;
 /// Compatibility name retained for P2P callers during the 7.8 bridge.
 pub const BUNDLE_VERSION: u16 = ARTIFACT_FORMAT_VERSION;
 const PORTABLE_ROOT: &str = "__blut_artifact_root_v2__";
-const CONTENT_ID_DOMAIN: &[u8] = b"blut.artifact.content.v1";
+const LEGACY_CONTENT_ID_DOMAIN: &[u8] = b"blut.artifact.content.v1";
 const UNPERSISTED_ID_DOMAIN: &[u8] = b"blut.artifact.unpersisted.v1";
 
 /// Which typed side of a stage the persisted artifact represents.
@@ -105,6 +108,18 @@ pub struct ArtifactManifest {
     pub blob_len: u64,
     /// SHA-256 over the whole plaintext pack (fail-fast before unpack).
     pub blob_sha256: ContentHash,
+}
+
+impl ArtifactManifest {
+    /// Canonical ABIR identity carried by v3+ manifests. Version 2 retained a
+    /// SHA-256-derived legacy object key in the same wire slot.
+    pub const fn abir_content_id(&self) -> Option<AbirContentId> {
+        if self.format_version >= ARTIFACT_FORMAT_VERSION {
+            Some(self.content_id.as_abir())
+        } else {
+            None
+        }
+    }
 }
 /// Compatibility name retained for transport callers.
 pub type BundleManifest = ArtifactManifest;
@@ -311,22 +326,21 @@ pub fn unpersisted_content_id(
     role: ArtifactRole,
     logical_hash: ContentHash,
 ) -> ContentId {
-    use sha2::{Digest, Sha256};
     let identity = match role {
         ArtifactRole::Input => stage.input_portable_identity(erased),
         ArtifactRole::Output => stage.output_portable_identity(erased),
     };
-    let mut hasher = Sha256::new();
+    let mut hasher = TrainingArtifactContentHasher::new();
     hasher.update(UNPERSISTED_ID_DOMAIN);
-    hasher.update((erased.kind.len() as u64).to_le_bytes());
+    hasher.update(&(erased.kind.len() as u64).to_le_bytes());
     hasher.update(erased.kind.as_bytes());
-    hasher.update(erased.schema.to_le_bytes());
-    hasher.update(logical_hash.0);
+    hasher.update(&erased.schema.to_le_bytes());
+    hasher.update(&logical_hash.0);
     if let Some(identity) = identity {
-        hasher.update((identity.len() as u64).to_le_bytes());
-        hasher.update(identity);
+        hasher.update(&(identity.len() as u64).to_le_bytes());
+        hasher.update(&identity);
     }
-    ContentId::from_digest(ContentHash(hasher.finalize().into()))
+    ContentId::from_abir(hasher.finalize())
 }
 
 /// Streaming form of [`capture`]: return the manifest and plaintext pack as
@@ -550,7 +564,10 @@ pub fn unbundle(
     expected_content_id: Option<ContentId>,
     role: ArtifactRole,
 ) -> Result<ErasedArtifact, ArtifactStoreError> {
-    if manifest.format_version != ARTIFACT_FORMAT_VERSION {
+    if !matches!(
+        manifest.format_version,
+        LEGACY_ARTIFACT_FORMAT_VERSION | ARTIFACT_FORMAT_VERSION
+    ) {
         return Err(ArtifactStoreError::Version {
             want: ARTIFACT_FORMAT_VERSION,
             got: manifest.format_version,
@@ -641,15 +658,27 @@ fn unbundle_inner(
 
     // The object key is recomputed from the representation the receiver
     // actually received, not trusted from the manifest or typed handle.
-    let derived_content_id = derive_content_id(
-        stage,
-        role,
-        &manifest.kind,
-        manifest.schema,
-        &manifest.files,
-        pack,
-        &manifest.erased,
-    )?;
+    let derived_content_id = if manifest.format_version == LEGACY_ARTIFACT_FORMAT_VERSION {
+        derive_legacy_content_id(
+            stage,
+            role,
+            &manifest.kind,
+            manifest.schema,
+            &manifest.files,
+            pack,
+            &manifest.erased,
+        )?
+    } else {
+        derive_content_id(
+            stage,
+            role,
+            &manifest.kind,
+            manifest.schema,
+            &manifest.files,
+            pack,
+            &manifest.erased,
+        )?
+    };
     if derived_content_id != manifest.content_id {
         return Err(ArtifactStoreError::ContentMismatch {
             want: manifest.content_id.to_hex(),
@@ -792,35 +821,83 @@ fn derive_content_id(
     pack: &[u8],
     erased: &ErasedArtifact,
 ) -> Result<ContentId, ArtifactStoreError> {
+    let identity = portable_identity(stage, role, erased)?;
+    let mut hasher = TrainingArtifactContentHasher::new();
+    feed_artifact_identity(
+        |bytes| hasher.update(bytes),
+        kind,
+        schema,
+        &identity,
+        files,
+        pack,
+    );
+    Ok(ContentId::from_abir(hasher.finalize()))
+}
+
+fn derive_legacy_content_id(
+    stage: &dyn StageDyn,
+    role: ArtifactRole,
+    kind: &str,
+    schema: u32,
+    files: &[ArtifactFile],
+    pack: &[u8],
+    erased: &ErasedArtifact,
+) -> Result<ContentId, ArtifactStoreError> {
     use sha2::{Digest, Sha256};
+    let identity = portable_identity(stage, role, erased)?;
     let mut hasher = Sha256::new();
-    hasher.update(CONTENT_ID_DOMAIN);
-    hasher.update((kind.len() as u64).to_le_bytes());
-    hasher.update(kind.as_bytes());
-    hasher.update(schema.to_le_bytes());
-    let identity = match role {
-        ArtifactRole::Input => stage.input_portable_identity(erased),
-        ArtifactRole::Output => stage.output_portable_identity(erased),
-    }
-    .ok_or(ArtifactStoreError::Undecodable)?;
-    hasher.update((identity.len() as u64).to_le_bytes());
-    hasher.update(identity);
-    if files.is_empty() {
-        hasher.update([0]);
-    } else {
-        hasher.update([1]);
-        hasher.update((files.len() as u64).to_le_bytes());
-        for file in files {
-            hasher.update((file.rel.len() as u64).to_le_bytes());
-            hasher.update(file.rel.as_bytes());
-            hasher.update((file.mode & 0o777).to_le_bytes());
-        }
-        hasher.update((pack.len() as u64).to_le_bytes());
-        hasher.update(pack);
-    }
+    hasher.update(LEGACY_CONTENT_ID_DOMAIN);
+    feed_artifact_identity(
+        |bytes| hasher.update(bytes),
+        kind,
+        schema,
+        &identity,
+        files,
+        pack,
+    );
     Ok(ContentId::from_digest(ContentHash(
         hasher.finalize().into(),
     )))
+}
+
+fn portable_identity(
+    stage: &dyn StageDyn,
+    role: ArtifactRole,
+    erased: &ErasedArtifact,
+) -> Result<Vec<u8>, ArtifactStoreError> {
+    match role {
+        ArtifactRole::Input => stage.input_portable_identity(erased),
+        ArtifactRole::Output => stage.output_portable_identity(erased),
+    }
+    .ok_or(ArtifactStoreError::Undecodable)
+}
+
+fn feed_artifact_identity(
+    mut update: impl FnMut(&[u8]),
+    kind: &str,
+    schema: u32,
+    identity: &[u8],
+    files: &[ArtifactFile],
+    pack: &[u8],
+) {
+    update(&(kind.len() as u64).to_le_bytes());
+    update(kind.as_bytes());
+    update(&schema.to_le_bytes());
+    update(&(identity.len() as u64).to_le_bytes());
+    update(identity);
+    if files.is_empty() {
+        update(&[0]);
+    } else {
+        update(&[1]);
+        update(&(files.len() as u64).to_le_bytes());
+        for file in files {
+            update(&(file.rel.len() as u64).to_le_bytes());
+            update(file.rel.as_bytes());
+            update(&(file.mode & 0o777).to_le_bytes());
+        }
+        update(&(pack.len() as u64).to_le_bytes());
+        update(pack);
+    }
 }
 
 #[cfg(unix)]
@@ -1104,6 +1181,53 @@ mod tests {
         };
         let erased = ErasedArtifact::from_typed(&art).unwrap();
         (src, erased, hash)
+    }
+
+    #[test]
+    fn v3_writes_abir_identity_and_v2_remains_readable() {
+        let stage = DirStage;
+        let (src, erased, _) = make_dir_artifact();
+        let (mut manifest, pack) =
+            bundle(&stage, erased, src.path(), BlobDir::Input, None).unwrap();
+
+        assert_eq!(manifest.format_version, ARTIFACT_FORMAT_VERSION);
+        assert_eq!(
+            manifest.abir_content_id(),
+            Some(manifest.content_id.as_abir())
+        );
+        assert_eq!(
+            manifest.content_id.to_hex(),
+            "ed3fbf83cf55e070e75f32c9a95d0e701fe70f028715c27f23f2f2fca1f69aab"
+        );
+
+        let legacy = derive_legacy_content_id(
+            &stage,
+            BlobDir::Input,
+            &manifest.kind,
+            manifest.schema,
+            &manifest.files,
+            &pack,
+            &manifest.erased,
+        )
+        .unwrap();
+        assert_ne!(legacy, manifest.content_id);
+
+        manifest.format_version = LEGACY_ARTIFACT_FORMAT_VERSION;
+        manifest.content_id = legacy;
+        assert_eq!(manifest.abir_content_id(), None);
+        let dest = tempfile::tempdir().unwrap();
+        let restored = unbundle(
+            &stage,
+            &manifest,
+            &pack,
+            dest.path(),
+            Some(legacy),
+            BlobDir::Input,
+        )
+        .unwrap()
+        .into_typed::<DirArt>()
+        .unwrap();
+        assert!(restored.path.starts_with(dest.path()));
     }
 
     #[test]
