@@ -16,6 +16,7 @@
 //!   and trial tracking.
 
 pub mod asha;
+pub mod gp;
 pub mod median;
 pub mod pareto;
 pub mod pbt;
@@ -28,6 +29,7 @@ pub mod surrogate;
 pub mod tpe;
 
 pub use asha::AshaStop;
+pub use gp::{GpConfig, GpModel, GpSampler, ehvi_mc, expected_improvement};
 pub use median::MedianStop;
 pub use pareto::{
     Direction, ParetoPoint, ParetoReport, dominates, hypervolume_2d, non_dominated, pareto_front,
