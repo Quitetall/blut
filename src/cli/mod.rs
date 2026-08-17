@@ -90,6 +90,12 @@ enum Command {
         #[command(subcommand)]
         cmd: HpoCommand,
     },
+    /// Read-only registry manifest (ADR 0111): the recipe catalog + arg
+    /// schemas that `blut-sdk` validates against before submitting a plan.
+    Registry {
+        #[command(subcommand)]
+        cmd: registry_export::RegistryCommand,
+    },
     /// Multi-objective studies (ADR 0109): run trials through the ordinary HPO
     /// path and report the Pareto front instead of a single winner.
     Study {
@@ -1000,6 +1006,7 @@ pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>)
         Some(Command::Ledger { cmd }) => run_ledger_cmd(cmd),
         Some(Command::Hpo { cmd }) => run_hpo(&reg, cmd).await.map(|_| ()),
         Some(Command::Study { cmd }) => study::run_study(&reg, cmd).await,
+        Some(Command::Registry { cmd }) => registry_export::run_registry(&reg, cmd),
         Some(Command::Dag { job, json }) => run_dag(job, json),
         Some(Command::Compare { a, b }) => run_compare(&a, &b),
         Some(Command::Results {
@@ -2642,6 +2649,7 @@ use recipe::*;
 mod runs;
 use runs::*;
 
+mod registry_export;
 mod stale;
 mod study;
 use stale::*;
