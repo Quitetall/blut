@@ -90,6 +90,12 @@ enum Command {
         #[command(subcommand)]
         cmd: HpoCommand,
     },
+    /// Multi-objective studies (ADR 0109): run trials through the ordinary HPO
+    /// path and report the Pareto front instead of a single winner.
+    Study {
+        #[command(subcommand)]
+        cmd: study::StudyCommand,
+    },
     /// Render a job's DAG: per-node status + edges (the graph backend, v0.20).
     Dag {
         /// Job id (defaults to the most recent job).
@@ -992,7 +998,8 @@ pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>)
         Some(Command::Runs { cmd }) => run_runs_cmd(cmd),
         Some(Command::Lineage { cmd }) => run_lineage_cmd(cmd),
         Some(Command::Ledger { cmd }) => run_ledger_cmd(cmd),
-        Some(Command::Hpo { cmd }) => run_hpo(&reg, cmd).await,
+        Some(Command::Hpo { cmd }) => run_hpo(&reg, cmd).await.map(|_| ()),
+        Some(Command::Study { cmd }) => study::run_study(&reg, cmd).await,
         Some(Command::Dag { job, json }) => run_dag(job, json),
         Some(Command::Compare { a, b }) => run_compare(&a, &b),
         Some(Command::Results {
@@ -2636,4 +2643,5 @@ mod runs;
 use runs::*;
 
 mod stale;
+mod study;
 use stale::*;

@@ -361,6 +361,123 @@ impl StudyLedger {
     }
 }
 
+/// Rebuild a study's ledger from the manifest plus the raw `status.jsonl`
+/// lines, reading EVERY declared objective per trial.
+///
+/// This is the multi-objective sibling of
+/// [`results::reconstruct`](super::results::reconstruct), and it differs in the
+/// one way that matters: that function keeps the best value of ONE metric, so a
+/// trial that reported it is done. Here a trial is only `Done` when it reported
+/// **all** of them — a config that optimised error but never emitted a ratio is
+/// not a point on the front, and treating it as one would put a half-measured
+/// config where a real trade-off belongs.
+///
+/// Per objective the best value in that objective's OWN direction is kept, for
+/// the same reason single-objective HPO keeps a best rather than a last: a
+/// training curve reports many steps, and the trial's result is its best, not
+/// wherever it happened to stop.
+///
+/// `stage_skipped` is the DAG cache hit ADR 0109 relies on ("re-proposing an
+/// already-evaluated config is a cache hit, i.e. free, no special-casing") —
+/// the node was not re-run, so it is recorded as [`TrialStatus::CacheHit`]
+/// rather than as work performed.
+pub fn reconstruct_study(
+    spec: &StudySpec,
+    manifest: &super::results::HpoManifest,
+    status_lines: &[String],
+) -> StudyLedger {
+    use super::scheduler::dotted_f64;
+    use serde_json::Value;
+
+    let n_obj = spec.objectives.len();
+    let n = manifest.trials.len();
+    let mut best: Vec<Vec<Option<f64>>> = vec![vec![None; n_obj]; n];
+    let mut skipped = vec![false; n];
+    let mut failed = vec![false; n];
+
+    let trial_of = |topo: u32| -> Option<usize> {
+        manifest
+            .trial_of_topo
+            .get(topo as usize)
+            .copied()
+            .flatten()
+            .map(|t| t as usize)
+    };
+
+    for line in status_lines {
+        let Ok(ev) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let kind = ev.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+        let Some(topo) = ev.get("node_idx").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let Some(t) = trial_of(topo as u32) else {
+            continue;
+        };
+        match kind {
+            "stage_step" => {
+                let Some(update) = ev.get("update") else {
+                    continue;
+                };
+                for (i, obj) in spec.objectives.iter().enumerate() {
+                    let Some(v) = dotted_f64(update, &obj.metric) else {
+                        continue;
+                    };
+                    if !v.is_finite() {
+                        continue;
+                    }
+                    best[t][i] = Some(match best[t][i] {
+                        None => v,
+                        Some(b) => match obj.direction {
+                            Direction::Maximize => b.max(v),
+                            Direction::Minimize => b.min(v),
+                        },
+                    });
+                }
+            }
+            // The cache hit the ADR relies on: the node was NOT re-run.
+            "stage_skipped" => skipped[t] = true,
+            "stage_failed" => {
+                // Same discrimination the single-objective path documents: a
+                // cancel is a scheduler kill, anything else is a real crash.
+                // Match only "cancel" — never "kill", which would misread the
+                // Linux OOM killer's "Killed process …" as a scheduler action.
+                let err = ev.get("error").and_then(|e| e.as_str()).unwrap_or("");
+                if !err.to_ascii_lowercase().contains("cancel") {
+                    failed[t] = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut ledger = StudyLedger::new();
+    for (t, rec) in manifest.trials.iter().enumerate() {
+        let objectives = best[t].clone();
+        let complete = objectives.iter().all(|o| o.is_some_and(|v| v.is_finite()));
+        let status = if failed[t] {
+            TrialStatus::Failed
+        } else if complete && skipped[t] {
+            TrialStatus::CacheHit
+        } else if complete {
+            TrialStatus::Done
+        } else {
+            TrialStatus::Unmeasured
+        };
+        ledger.trials.push(StudyTrial {
+            trial_id: rec.trial_id,
+            overlay: rec.overlay.clone(),
+            objectives,
+            status,
+            cost: None,
+            refusal: None,
+        });
+    }
+    ledger.next_id = ledger.trials.len() as u32;
+    ledger
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,6 +797,115 @@ high = 1.0
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"objectives\":[\"prd\",\"ratio\"]"));
         assert!(json.contains("\"directions\":[\"minimize\",\"maximize\"]"));
+    }
+
+    // ── read-back from status.jsonl ─────────────────────────────────────
+    fn manifest_for(n: usize) -> crate::hpo::results::HpoManifest {
+        crate::hpo::results::HpoManifest {
+            recipe: "demo".into(),
+            algo: "mvtpe".into(),
+            metric: "eval.prd".into(),
+            mode: "min".into(),
+            budget_key: "epoch".into(),
+            trials: (0..n)
+                .map(|i| crate::hpo::results::TrialRec {
+                    trial_id: i as u32,
+                    overlay: ov(0.01 * (i + 1) as f64, 32),
+                    n_nodes: 1,
+                })
+                .collect(),
+            // node_idx i belongs to trial i
+            trial_of_topo: (0..n).map(|i| Some(i as u32)).collect(),
+        }
+    }
+
+    fn step(node: usize, prd: f64, ratio: f64) -> String {
+        json!({"kind":"stage_step","node_idx":node,
+               "update":{"eval":{"prd":prd,"compression_ratio":ratio}}})
+        .to_string()
+    }
+
+    #[test]
+    fn read_back_keeps_each_objective_s_best_in_its_own_direction() {
+        let spec = StudySpec::from_toml(spec_toml()).unwrap();
+        let m = manifest_for(1);
+        // prd is minimised, ratio maximised — from the SAME stream the trial's
+        // result must be min(prd) and max(ratio), not the last pair seen.
+        let lines = vec![step(0, 0.9, 5.0), step(0, 0.4, 11.0), step(0, 0.7, 8.0)];
+        let led = reconstruct_study(&spec, &m, &lines);
+        assert_eq!(led.trials()[0].status, TrialStatus::Done);
+        assert_eq!(led.trials()[0].objectives, vec![Some(0.4), Some(11.0)]);
+    }
+
+    #[test]
+    fn a_trial_reporting_only_one_objective_is_unmeasured_not_done() {
+        let spec = StudySpec::from_toml(spec_toml()).unwrap();
+        let m = manifest_for(1);
+        // Reports prd only. Single-objective HPO would call this finished;
+        // a study must not, or a half-measured config lands on the front.
+        let lines = vec![
+            json!({"kind":"stage_step","node_idx":0,"update":{"eval":{"prd":0.3}}}).to_string(),
+        ];
+        let led = reconstruct_study(&spec, &m, &lines);
+        assert_eq!(led.trials()[0].status, TrialStatus::Unmeasured);
+        assert!(led.trials()[0].point().is_none());
+    }
+
+    #[test]
+    fn a_skipped_stage_is_recorded_as_the_cache_hit_it_is() {
+        let spec = StudySpec::from_toml(spec_toml()).unwrap();
+        let m = manifest_for(1);
+        let lines = vec![
+            step(0, 0.2, 14.0),
+            json!({"kind":"stage_skipped","node_idx":0}).to_string(),
+        ];
+        let led = reconstruct_study(&spec, &m, &lines);
+        assert_eq!(
+            led.trials()[0].status,
+            TrialStatus::CacheHit,
+            "a re-proposed config resolved from cache is free, not work performed"
+        );
+        assert!(led.trials()[0].point().is_some(), "and still a real point");
+    }
+
+    #[test]
+    fn a_crash_is_failed_but_a_cancel_is_not() {
+        let spec = StudySpec::from_toml(spec_toml()).unwrap();
+        let m = manifest_for(2);
+        let lines = vec![
+            step(0, 0.3, 9.0),
+            json!({"kind":"stage_failed","node_idx":0,"error":"Killed process 123 (OOM)"})
+                .to_string(),
+            step(1, 0.4, 8.0),
+            json!({"kind":"stage_failed","node_idx":1,"error":"stage cancelled by scheduler"})
+                .to_string(),
+        ];
+        let led = reconstruct_study(&spec, &m, &lines);
+        assert_eq!(
+            led.trials()[0].status,
+            TrialStatus::Failed,
+            "an OOM is a crash"
+        );
+        assert_ne!(
+            led.trials()[1].status,
+            TrialStatus::Failed,
+            "a scheduler cancel is not a crash"
+        );
+    }
+
+    #[test]
+    fn read_back_ignores_events_for_nodes_owned_by_no_trial() {
+        let spec = StudySpec::from_toml(spec_toml()).unwrap();
+        let mut m = manifest_for(1);
+        m.trial_of_topo.push(None); // node 1 belongs to no trial
+        let lines = vec![step(0, 0.5, 7.0), step(1, 0.01, 99.0)];
+        let led = reconstruct_study(&spec, &m, &lines);
+        assert_eq!(
+            led.trials()[0].objectives,
+            vec![Some(0.5), Some(7.0)],
+            "a non-trial node must not contribute a spectacular fake result"
+        );
+        assert_eq!(led.len(), 1);
     }
 
     #[test]

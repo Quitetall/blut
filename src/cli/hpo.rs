@@ -373,15 +373,21 @@ fn constrain_dynamic_hpo_admission(
     Ok(node)
 }
 
-pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -> Result<()> {
+/// Returns the job id of the run that executed, or `None` for the read-only
+/// subcommands. `blut study run` needs the id to read the trial stream back
+/// out; resolving "the latest hpo job" afterwards would race a concurrent run.
+pub(super) async fn run_hpo(
+    reg: &crate::framework::Registry,
+    cmd: HpoCommand,
+) -> Result<Option<String>> {
     use crate::framework::ExecCtx;
     use crate::hpo::{RandomSampler, Sampler, SearchSpace};
 
     // The read-only subcommands need no executor — dispatch (borrowing `cmd`) and
     // return before the launch machinery; only `Run` falls through.
     match &cmd {
-        HpoCommand::Show { job, json } => return run_hpo_show(job.clone(), *json),
-        HpoCommand::Best { job, json } => return run_hpo_best(job.clone(), *json),
+        HpoCommand::Show { job, json } => return run_hpo_show(job.clone(), *json).map(|()| None),
+        HpoCommand::Best { job, json } => return run_hpo_best(job.clone(), *json).map(|()| None),
         HpoCommand::Run { .. } => {}
     }
     let HpoCommand::Run {
@@ -845,7 +851,7 @@ pub(super) async fn run_hpo(reg: &crate::framework::Registry, cmd: HpoCommand) -
                  winning config: `blut hpo best {job_id}`.",
                 trials.len()
             );
-            Ok(())
+            Ok(Some(job_id))
         }
         Err(e) => {
             let _ = crate::jobs::write_state(&job_id, JobState::Failed);
