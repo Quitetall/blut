@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Brian Lam
+#
+# `blut-sdk` — the pure-Python client from ADR 0111.
+#
+# It lives beside the engine crate rather than in its own repository for one
+# reason: this package MIRRORS the PlanSpec v1 IR defined in
+# `src/framework/plan_spec.rs`. Co-locating them means an IR change and the
+# SDK compat entry that answers it land in the same commit, and engine CI can
+# run the parity gate. A separate repo would let the two drift by exactly one
+# unsynchronised push, which is the failure ADR 0111's Validation section names.
+#
+# No compiled extension and no runtime dependencies: the whole point is that it
+# installs anywhere a notebook runs, needing only a `blut` binary on PATH.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blut-sdk"
+version = "0.2.0a1"
+description = "Author BLUT DAGs in Python: emit canonical PlanSpec v1 JSON and drive runs through the blut CLI"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "Brian Lam" }]
+keywords = ["blut", "dag", "orchestration", "ml", "planspec"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Distributed Computing",
+]
+# Deliberately empty. A dependency here would have to be installable in every
+# environment the SDK claims to work in, and nothing it does needs one:
+# canonical JSON, the IR mirror, and subprocess control are all stdlib.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.urls]
+Homepage = "https://github.com/Quitetall/blut"
+Repository = "https://github.com/Quitetall/blut"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# The parity gate ships WITH the package: `python -m blut_sdk.tests.parity` is
+# ADR 0111's acceptance gate, so its fixtures must survive installation. A gate
+# that only runs from a source checkout is a gate nobody runs.
+blut_sdk = ["tests/fixtures/*.json", "tests/fixtures/*.star"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

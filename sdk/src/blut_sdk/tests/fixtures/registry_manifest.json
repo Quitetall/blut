@@ -1,0 +1,4455 @@
+{
+  "manifest_version": 1,
+  "engine_version": "0.2.0-alpha.1",
+  "plan_spec_version": 1,
+  "stages": [
+    {
+      "name": "assert",
+      "input_kind": "checks.jsonl",
+      "output_kind": "checks.jsonl",
+      "args_schema": {
+        "$ref": "#/definitions/AssertArgs",
+        "definitions": {
+          "AssertArgs": {
+            "description": "Args for [`Assert`]: a scalar predicate `actual <op> expected` (± tolerance).",
+            "properties": {
+              "actual": {
+                "description": "The measured value (typically threaded in from an upstream metric).",
+                "format": "double",
+                "type": "number"
+              },
+              "expected": {
+                "description": "The bound to compare against.",
+                "format": "double",
+                "type": "number"
+              },
+              "on_breach": {
+                "$ref": "#/definitions/OnBreach",
+                "default": "block",
+                "description": "Breach policy (default: `block`)."
+              },
+              "op": {
+                "$ref": "#/definitions/CmpOp",
+                "default": "ge",
+                "description": "The comparison operator."
+              },
+              "tolerance": {
+                "default": 0.0,
+                "description": "Absolute tolerance applied to the comparison (default 0). Band semantics: `Ge`/`Gt` relax the bound to `expected - tolerance`; `Le`/`Lt` relax it to `expected + tolerance`; `Eq`/`Ne` treat `|actual - expected| <= tolerance` as equal. Note a `NaN` `actual` fails every predicate except `Ne` (NaN is unequal to everything) — intentional: an unmeasured value never satisfies a data-quality floor.",
+                "format": "double",
+                "type": "number"
+              }
+            },
+            "required": [
+              "actual",
+              "expected"
+            ],
+            "type": "object"
+          },
+          "CmpOp": {
+            "description": "Comparison operator for [`Assert`].",
+            "enum": [
+              "ge",
+              "gt",
+              "le",
+              "lt",
+              "eq",
+              "ne"
+            ],
+            "type": "string"
+          },
+          "OnBreach": {
+            "description": "How a check treats a breach. `Block` fails the node (fail-closed — the executor skips every downstream); `Warn` records a lineage breach event and passes through so the DAG continues.",
+            "enum": [
+              "block",
+              "warn"
+            ],
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "check_jsonl",
+      "input_kind": "checks.jsonl",
+      "output_kind": "checks.jsonl",
+      "args_schema": {
+        "$ref": "#/definitions/CheckJsonlArgs",
+        "definitions": {
+          "CheckJsonlArgs": {
+            "description": "Args for [`CheckJsonl`]: row-count bounds + breach policy.",
+            "properties": {
+              "max_rows": {
+                "default": null,
+                "description": "Maximum row count (inclusive). `None` = no upper bound.",
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "min_rows": {
+                "default": null,
+                "description": "Minimum row count (inclusive). `None` = no lower bound.",
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "on_breach": {
+                "$ref": "#/definitions/OnBreach",
+                "default": "block",
+                "description": "Breach policy (default: `block` — fail-closed)."
+              }
+            },
+            "type": "object"
+          },
+          "OnBreach": {
+            "description": "How a check treats a breach. `Block` fails the node (fail-closed — the executor skips every downstream); `Warn` records a lineage breach event and passes through so the DAG continues.",
+            "enum": [
+              "block",
+              "warn"
+            ],
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "connector_fetch",
+      "input_kind": "connector.object_ref",
+      "output_kind": "connector.dataset_ref",
+      "args_schema": {
+        "$ref": "#/definitions/ToolArgs",
+        "definitions": {
+          "ToolArgs": {
+            "description": "Args for the shell-out connectors: the external tool binary + optional verb.",
+            "properties": {
+              "dest_uri": {
+                "default": null,
+                "description": "For `connector_store`: the destination object-store URI to PUT to (the returned `ObjectRef.uri`). `None` ⇒ a content-addressed `connector://<hash>` sink (round-trippable only within this store).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "extra": {
+                "default": [],
+                "description": "Extra args threaded verbatim after the verb.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "tool": {
+                "description": "The external tool to delegate to (e.g. `aws`, `rclone`, `duckdb`).",
+                "type": "string"
+              }
+            },
+            "required": [
+              "tool"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "connector_object",
+      "input_kind": "()",
+      "output_kind": "connector.object_ref",
+      "args_schema": {
+        "$ref": "#/definitions/ObjectRefArgs",
+        "definitions": {
+          "ObjectRefArgs": {
+            "description": "Declare an object-store reference from args (a graph SOURCE) — the entry point of a connector graph (`input = ()`).",
+            "properties": {
+              "content_hash": {
+                "description": "The object's content hash (hex) — its identity.",
+                "type": "string"
+              },
+              "uri": {
+                "description": "The object-store URI (e.g. `s3://bucket/key`).",
+                "type": "string"
+              }
+            },
+            "required": [
+              "content_hash",
+              "uri"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "connector_store",
+      "input_kind": "connector.dataset_ref",
+      "output_kind": "connector.object_ref",
+      "args_schema": {
+        "$ref": "#/definitions/ToolArgs",
+        "definitions": {
+          "ToolArgs": {
+            "description": "Args for the shell-out connectors: the external tool binary + optional verb.",
+            "properties": {
+              "dest_uri": {
+                "default": null,
+                "description": "For `connector_store`: the destination object-store URI to PUT to (the returned `ObjectRef.uri`). `None` ⇒ a content-addressed `connector://<hash>` sink (round-trippable only within this store).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "extra": {
+                "default": [],
+                "description": "Extra args threaded verbatim after the verb.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "tool": {
+                "description": "The external tool to delegate to (e.g. `aws`, `rclone`, `duckdb`).",
+                "type": "string"
+              }
+            },
+            "required": [
+              "tool"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "convert_gguf",
+      "input_kind": "checkpoint.hf",
+      "output_kind": "model.gguf",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "name": {
+                "description": "Output filename stem (the gguf path becomes `<stem>.<quant>.gguf` next to the HF checkpoint dir).",
+                "type": "string"
+              },
+              "quant": {
+                "description": "`Q4_K_M`, `Q5_K_M`, `Q8_0`, `f16`. f16 skips quantize.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "quant"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "distill_train",
+      "input_kind": "tuple<2>",
+      "output_kind": "checkpoint.hf",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "batch_size": {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "epochs": {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "grad_accum": {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "kl_weight": {
+                "format": "float",
+                "type": "number"
+              },
+              "lr": {
+                "format": "float",
+                "type": "number"
+              },
+              "output_name": {
+                "type": "string"
+              },
+              "seed": {
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "seq_len": {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "student_base": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "batch_size",
+              "epochs",
+              "grad_accum",
+              "kl_weight",
+              "lr",
+              "output_name",
+              "seed",
+              "seq_len",
+              "student_base"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "dpo_train",
+      "input_kind": "dataset.preferences",
+      "output_kind": "checkpoint.hf",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "base_model": {
+                "type": "string"
+              },
+              "batch_size": {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "beta": {
+                "description": "DPO temperature. Smaller = stronger preference signal.",
+                "format": "float",
+                "type": "number"
+              },
+              "epochs": {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "grad_accum": {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "lr": {
+                "format": "float",
+                "type": "number"
+              },
+              "output_name": {
+                "type": "string"
+              },
+              "seed": {
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "seq_len": {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "base_model",
+              "batch_size",
+              "beta",
+              "epochs",
+              "grad_accum",
+              "lr",
+              "output_name",
+              "seed",
+              "seq_len"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "eval_judge",
+      "input_kind": "tuple<2>",
+      "output_kind": "eval.report",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "judge_model": {
+                "type": "string"
+              },
+              "n_samples": {
+                "default": 20,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "prompts": {
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "judge_model"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "eval_lm_harness",
+      "input_kind": "tuple<2>",
+      "output_kind": "eval.report",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "num_fewshot": {
+                "default": 0,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "tasks": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "tasks"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "eval_loss",
+      "input_kind": "tuple<2>",
+      "output_kind": "eval.report",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "batch_size": {
+                "default": 1,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "max_seq": {
+                "default": 4096,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "filter_dataset",
+      "input_kind": "dataset.jsonl",
+      "output_kind": "dataset.jsonl",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "drop_errors": {
+                "default": false,
+                "type": "boolean"
+              },
+              "max_msg_bytes": {
+                "default": 0,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "min_turns": {
+                "default": 0,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "hf_dpo_train",
+      "input_kind": "dataset.preferences",
+      "output_kind": "checkpoint.hf",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "base_model": {
+                "type": "string"
+              },
+              "batch_size": {
+                "default": 1,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "beta": {
+                "format": "float",
+                "type": "number"
+              },
+              "epochs": {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "extra": {
+                "additionalProperties": true,
+                "default": {},
+                "type": "object"
+              },
+              "grad_accum": {
+                "default": 8,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "lr": {
+                "format": "float",
+                "type": "number"
+              },
+              "seed": {
+                "default": 42,
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "seq_len": {
+                "default": 4096,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "base_model",
+              "beta",
+              "epochs",
+              "lr"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "hf_sft_train",
+      "input_kind": "dataset.jsonl",
+      "output_kind": "checkpoint.hf",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "alpha": {
+                "default": 32,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "base_model": {
+                "type": "string"
+              },
+              "batch_size": {
+                "default": 1,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "epochs": {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "eval_dataset_path": {
+                "default": "",
+                "description": "Optional eval dataset path (string for clean JSON args).",
+                "type": "string"
+              },
+              "extra": {
+                "additionalProperties": true,
+                "default": {},
+                "description": "Free-form `TrainingArguments` overrides (optim, scheduler, warmup_ratio, etc.) folded into the runner's `extra`.",
+                "type": "object"
+              },
+              "grad_accum": {
+                "default": 8,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "lr": {
+                "format": "float",
+                "type": "number"
+              },
+              "method": {
+                "default": "qlora",
+                "description": "\"lora\" | \"qlora\" | \"full\". Drives PEFT config.",
+                "type": "string"
+              },
+              "rank": {
+                "default": 16,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "seed": {
+                "default": 42,
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "seq_len": {
+                "default": 4096,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "base_model",
+              "epochs",
+              "lr"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_build_manifest",
+      "input_kind": "()",
+      "output_kind": "lamquant.manifest",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "lamquant_home": {
+                "default": "",
+                "description": "LamQuant repo root. Empty string → fall back to `$LAMQUANT_HOME` env, then `~/Desktop/LamQuant`.",
+                "type": "string"
+              },
+              "output_rel": {
+                "default": "",
+                "description": "Output manifest path, relative to `lamquant_home`. Empty = builder default `ai_models/dataset_sim/manifest_v3.json`.",
+                "type": "string"
+              },
+              "q31_dir": {
+                "default": "",
+                "description": "Optional override for the q31_events dir. Empty = builder's own default (`ai_models/dataset_sim/q31_events`).",
+                "type": "string"
+              },
+              "seed": {
+                "default": 42,
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "v2_path": {
+                "default": "",
+                "description": "Optional path to a prior v2 manifest.",
+                "type": "string"
+              },
+              "val_fraction": {
+                "default": 0.05000000074505806,
+                "format": "float",
+                "type": "number"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_build_split_manifest",
+      "input_kind": "lamquant.lma_corpus",
+      "output_kind": "lamquant.split_manifest",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "labels_dir": {
+                "default": "",
+                "description": "`--labels <dir>` — per-stem `<stem>_labels.npz` directory. Empty = the unified canonical labels root (`crate::paths::DEFAULT_LABELS_DIR`, RCP-6).",
+                "type": "string"
+              },
+              "lamquant_home": {
+                "default": "",
+                "description": "LamQuant repo root. Empty → detected `ai_models_root` (the `LamQuant-Neural` submodule).",
+                "type": "string"
+              },
+              "lma_root": {
+                "default": "",
+                "description": "`--lma-root <dir>` — the encoded LMA corpus root. Empty = use the upstream `LmaCorpus` input's `root` (the corpus produced by an upstream `encode_lma` / `convert_lma` stage).",
+                "type": "string"
+              },
+              "out": {
+                "description": "`--out <path>` — where to write `split_manifest.json`. Required.",
+                "type": "string"
+              },
+              "val_fraction": {
+                "default": 0.10000000149011612,
+                "description": "`--val-fraction` — proportion of subjects assigned to val, applied independently within each seizure bucket.",
+                "format": "float",
+                "type": "number"
+              }
+            },
+            "required": [
+              "out"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_encode_lma",
+      "input_kind": "()",
+      "output_kind": "lamquant.lma_corpus",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "corpus": {
+                "default": "",
+                "description": "Optional human label for the corpus (e.g. \"tusz_v2.0.6\"). Recorded in status events; does not affect the command line.",
+                "type": "string"
+              },
+              "edf_dir": {
+                "description": "Input EDF/BDF corpus directory (raw recordings). Required. Passed verbatim to `lml encode <edf_dir>` — may be a symlink-farm (`_farm/<corpus>`) or a direct source dir, exactly as `encode_corpora.sh` does.",
+                "type": "string"
+              },
+              "out_dir": {
+                "description": "Output LMA corpus directory. Required. `lml encode -o <out_dir>` writes one `<stem>.lma` per recording here.",
+                "type": "string"
+              },
+              "quiet": {
+                "default": true,
+                "description": "Pass `-q` (quiet) to suppress `lml`'s log output. Default true to match `encode_corpora.sh`; status/progress still flow via the tqdm parser on the remaining stderr lines.",
+                "type": "boolean"
+              },
+              "verify": {
+                "default": false,
+                "description": "Pass `--verify`: decode each `.lma` back and assert a clean roundtrip before declaring success. Off by default (doubles the work); recipes that want belt-and-suspenders set it true.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "edf_dir",
+              "out_dir"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_export_firmware",
+      "input_kind": "tuple<3>",
+      "output_kind": "lamquant.firmware_bundle",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "bundle_dir_rel": {
+                "default": "",
+                "description": "Output bundle directory relative to lamquant_home. Empty = builder default `firmware/export/<target>/`.",
+                "type": "string"
+              },
+              "include_snn": {
+                "default": true,
+                "description": "Pass `--include-snn` so the SNN ckpt is bundled. Defaults true since SNN is part of the production firmware payload.",
+                "type": "boolean"
+              },
+              "lamquant_home": {
+                "default": "",
+                "type": "string"
+              },
+              "target": {
+                "default": "rp2350",
+                "description": "Target MCU. Drives memory layout in the export script. Accepted: rp2350 | nrf54l15 | esp32p4 | stm32n6.",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_generate_snn_labels",
+      "input_kind": "tuple<2>",
+      "output_kind": "lamquant.snn_labels",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "dataset_id": {
+                "description": "Dataset variant: chbmit | tuh_seizure | tuh_artifact | tuh_epilepsy.",
+                "type": "string"
+              },
+              "input_rel": {
+                "default": "",
+                "description": "Input corpus directory (raw EDF source, relative to lamquant_home). Empty = builder default `ai_models/dataset_sim/datasets/<dataset_id>`.",
+                "type": "string"
+              },
+              "lamquant_home": {
+                "default": "",
+                "type": "string"
+              },
+              "manifest_rel": {
+                "default": "",
+                "description": "Manifest path relative to lamquant_home. Empty = builder default.",
+                "type": "string"
+              },
+              "output_rel": {
+                "default": "",
+                "description": "Output labels directory relative to lamquant_home. Empty = builder default `ai_models/snn/labels`.",
+                "type": "string"
+              },
+              "training_only": {
+                "default": false,
+                "description": "Restrict to training-split stems only. Required for some downstream eval setups.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "dataset_id"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_harden_artifacts",
+      "input_kind": "tuple<2>",
+      "output_kind": "lamquant.ckpt.hardened",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "batch_size": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "epochs": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "lamquant_home": {
+                "default": "",
+                "type": "string"
+              },
+              "lr": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "output_rel": {
+                "default": "",
+                "description": "Output ckpt path relative to lamquant_home. Empty = builder default `ai_models/student/student_hardened.ckpt`.",
+                "type": "string"
+              },
+              "route_b": {
+                "default": true,
+                "description": "`--route-b` flag — produces a Route-B-compatible hardened ckpt (the typical case post-LMA pivot).",
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_measure",
+      "input_kind": "()",
+      "output_kind": "lamquant.measure_report",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "expected_outputs_rel": {
+                "default": [],
+                "description": "Paths (relative to `lamquant_home`) the script promises to write; the backend verifies they exist post-run (missing ⇒ the run is a failure, not a silent pass). Empty = the script writes no contracted output.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "extra_args": {
+                "default": [],
+                "description": "Verbatim args appended to the script's argv (the eval's own flags).",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "extra_env": {
+                "default": [],
+                "description": "Extra child env as `KEY=VALUE`, `--setenv`'d into the contained unit (which inherits NOTHING — see `blut_env`). E.g. a device or data-root override the script reads.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "home_relative": {
+                "default": false,
+                "description": "Resolve `script_rel` under `lamquant_home` (via `script_path`) rather than the BLUT python tree. For a script that still lives under the repo root.",
+                "type": "boolean"
+              },
+              "lamquant_home": {
+                "default": "",
+                "description": "LamQuant repo root. Empty = env / default (the resolved ai_models_root).",
+                "type": "string"
+              },
+              "mem_gib": {
+                "default": 24,
+                "description": "cgroup `MemoryMax` cap in GiB (never-OOM ceiling for the eval). Default 24 — an eval that loads a codec + decodes windows is lighter than a train, but the cap is the hard floor regardless. Must be > 0.",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "script_rel": {
+                "description": "REQUIRED: the measurement script as relative path components. Resolved under the BLUT-owned `blut/python` tree by default (so `lamquant.*` imports resolve), e.g. `[\"python\",\"lamquant\",\"eval\",\"eval_finite_rate.py\"]`. Set `home_relative` to resolve under `lamquant_home` instead.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "script_rel"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_pccp_gate_decoder",
+      "input_kind": "lamquant.ckpt.joint",
+      "output_kind": "lamquant.pccp_verdict",
+      "args_schema": {
+        "$ref": "#/definitions/DecoderArgs",
+        "definitions": {
+          "DecoderArgs": {
+            "properties": {
+              "author": {
+                "default": "BLUT",
+                "type": "string"
+              },
+              "change_class": {
+                "default": "A.1",
+                "type": "string"
+              },
+              "change_id": {
+                "default": "PCCP-CHG-DRYRUN",
+                "type": "string"
+              },
+              "description": {
+                "default": "(blut decoder gate)",
+                "type": "string"
+              },
+              "dry_run": {
+                "default": true,
+                "type": "boolean"
+              },
+              "lamquant_home": {
+                "default": "",
+                "type": "string"
+              },
+              "no_promote": {
+                "default": true,
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_pccp_gate_encoder",
+      "input_kind": "lamquant.ckpt.joint",
+      "output_kind": "lamquant.pccp_verdict",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "author": {
+                "default": "BLUT",
+                "type": "string"
+              },
+              "change_class": {
+                "default": "A.1",
+                "type": "string"
+              },
+              "change_id": {
+                "default": "PCCP-CHG-DRYRUN",
+                "type": "string"
+              },
+              "description": {
+                "default": "(blut encoder gate)",
+                "type": "string"
+              },
+              "dry_run": {
+                "default": true,
+                "type": "boolean"
+              },
+              "lamquant_home": {
+                "default": "",
+                "type": "string"
+              },
+              "no_promote": {
+                "default": true,
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_pccp_gate_snn",
+      "input_kind": "lamquant.ckpt.snn",
+      "output_kind": "lamquant.pccp_verdict",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "author": {
+                "default": "BLUT",
+                "type": "string"
+              },
+              "change_class": {
+                "default": "A.1",
+                "description": "Modification class per 01-modifications.md (e.g. \"A.1\").",
+                "type": "string"
+              },
+              "change_id": {
+                "default": "PCCP-CHG-DRYRUN",
+                "description": "PCCP change identifier (e.g. \"PCCP-CHG-2026-05-11-001\"). Defaults to a dry-run-style sentinel if unset.",
+                "type": "string"
+              },
+              "description": {
+                "default": "(no description provided)",
+                "type": "string"
+              },
+              "dry_run": {
+                "default": true,
+                "description": "`--dry-run` — evaluate without committing to a PCCP change. Default `true`: a recipe that wants real promotion must explicitly opt in, matching the safe-by-default contract. (The gate still writes the verdict file under `pccp/verification_records/` on dry-run; only promotion to registry + CHANGELOG is skipped.)",
+                "type": "boolean"
+              },
+              "lamquant_home": {
+                "default": "",
+                "type": "string"
+              },
+              "no_promote": {
+                "default": true,
+                "description": "`--no-promote` — on PASS, skip registry + CHANGELOG writes. Default `true`: same safe-by-default reason as `dry_run`.",
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_pccp_gate_tnn",
+      "input_kind": "lamquant.ckpt.tnn",
+      "output_kind": "lamquant.pccp_verdict",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "author": {
+                "default": "BLUT",
+                "type": "string"
+              },
+              "change_class": {
+                "default": "A.1",
+                "type": "string"
+              },
+              "change_id": {
+                "default": "PCCP-CHG-DRYRUN",
+                "type": "string"
+              },
+              "description": {
+                "default": "(blut encoder gate)",
+                "type": "string"
+              },
+              "dry_run": {
+                "default": true,
+                "type": "boolean"
+              },
+              "lamquant_home": {
+                "default": "",
+                "type": "string"
+              },
+              "no_promote": {
+                "default": true,
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_precompute_fullband",
+      "input_kind": "lamquant.manifest",
+      "output_kind": "lamquant.fullband_memmap",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "lamquant_home": {
+                "default": "",
+                "type": "string"
+              },
+              "out_dir_rel": {
+                "default": "",
+                "description": "Output dir for `fullband_{split}.dat` + `.meta.json`. Empty = builder default `ai_models/dataset_sim/`.",
+                "type": "string"
+              },
+              "splits": {
+                "default": [
+                  "train",
+                  "val"
+                ],
+                "description": "Splits to materialize; default [\"train\", \"val\"].",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_precompute_l3",
+      "input_kind": "lamquant.fullband_memmap",
+      "output_kind": "lamquant.l3_cache",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "input_dir": {
+                "default": "",
+                "description": "Override Q31 NPZ input dir. Empty = builder default `ai_models/dataset_sim/q31_events`.",
+                "type": "string"
+              },
+              "lamquant_home": {
+                "default": "",
+                "type": "string"
+              },
+              "workers": {
+                "default": 8,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_pretrain_mae",
+      "input_kind": "abir.training_snapshot",
+      "output_kind": "lamquant.ckpt.mae",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "batch_size": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "epochs": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "lamquant_home": {
+                "default": "",
+                "type": "string"
+              },
+              "lr": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "mask_ratio": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "output_rel": {
+                "default": "",
+                "description": "Output ckpt path. Empty = `ai_models/student/pretrained_mae.ckpt`.",
+                "type": "string"
+              },
+              "patch_size": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "seed": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_pretrain_ssl_tueg",
+      "input_kind": "abir.training_snapshot",
+      "output_kind": "lamquant.ckpt.snn",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "batch_size": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "d_model": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "d_state": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "epochs": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "extra_args": {
+                "default": [],
+                "description": "Verbatim extra flags appended to the argv — escape hatch.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "grad_clip": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "lamquant_home": {
+                "default": "",
+                "description": "LamQuant repo root. Empty → `$LAMQUANT_HOME` / detected default. Used for the backbone output path only.",
+                "type": "string"
+              },
+              "lr": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "lr_min": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "mask_frac": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "max_steps_per_epoch": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "mean_span": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "n_layers": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "optimizer": {
+                "default": "",
+                "description": "`--optimizer` — `adamw` (default) or `esoap`. Empty → python default. Validated at the recipe boundary.",
+                "type": "string"
+              },
+              "out_rel": {
+                "default": "",
+                "description": "Backbone output ckpt path relative to `lamquant_home`. Empty → `weights/snn/ssl_backbone.pt`. (`--out` is required on the python side; the stage always supplies it.)",
+                "type": "string"
+              },
+              "seed": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "smoke": {
+                "default": false,
+                "description": "`--smoke` — tiny fast self-test run.",
+                "type": "boolean"
+              },
+              "warmup_frac": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "weight_decay": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_train_4state_controller",
+      "input_kind": "abir.paired_training_snapshots",
+      "output_kind": "lamquant.ckpt.snn",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "batch_size": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "checkpoint_rel": {
+                "default": "",
+                "description": "Output ckpt path relative to `lamquant_home`. Empty → `weights/snn/snn_4state_best.pt`.",
+                "type": "string"
+              },
+              "crit_alpha": {
+                "default": null,
+                "description": "`--crit-alpha` — dual-ascent target for the floor.",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "crit_floor": {
+                "default": null,
+                "description": "`--crit-floor` — CRITICAL-state recall feasibility floor.",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "d_model": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "d_state": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "distill": {
+                "default": "",
+                "description": "`--distill <teacher.pt>` — optional teacher checkpoint for distillation. Empty → no distillation.",
+                "type": "string"
+              },
+              "early_stop_patience": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "epochs": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "extra_args": {
+                "default": [],
+                "description": "Verbatim extra flags appended to the argv — escape hatch for knobs the typed args don't cover (`--target-T`, `--rare-frac`, `--calib-windows`, `--crit-dual-eta`, `--logger wandb`, …).",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "grad_clip": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "head": {
+                "default": "",
+                "description": "`--head` — `attention_softmax` (default) or `crf`. Empty → python default (`attention_softmax`).",
+                "type": "string"
+              },
+              "infinite_lr": {
+                "default": false,
+                "description": "`--infinite-lr` continual-training mode.",
+                "type": "boolean"
+              },
+              "init_backbone": {
+                "default": "",
+                "description": "`--init-backbone <path>` — SSL-pretrained backbone checkpoint (output of `pretrain_ssl_tueg`), loaded `strict=False`. Empty → train the backbone from scratch. Path is passed verbatim (absolute paths allowed — it is a read-side checkpoint, not an output relocation).",
+                "type": "string"
+              },
+              "lambda_distill": {
+                "default": null,
+                "description": "`--lambda-distill` — distillation loss weight (only meaningful when `distill` is set).",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "lambda_spike": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "lamquant_home": {
+                "default": "",
+                "description": "LamQuant repo root. Empty → `$LAMQUANT_HOME` / detected default. Used for checkpoint output (Neural `weights/snn/`) only — the trainer script itself is resolved from the BLUT python tree.",
+                "type": "string"
+              },
+              "lr": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "lr_min": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "n_layers": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "optimizer": {
+                "default": "",
+                "description": "`--optimizer` — `esoap` (default), `soap`, `adamw`, … Empty → python default (`esoap`). Validated at the recipe boundary.",
+                "type": "string"
+              },
+              "ordinal": {
+                "default": false,
+                "description": "`--ordinal` ordinal-regression head variant.",
+                "type": "boolean"
+              },
+              "seed": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "spectral": {
+                "default": false,
+                "description": "`--spectral` auxiliary spectral feature path.",
+                "type": "boolean"
+              },
+              "warmup_frac": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "weight_decay": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_train_combined",
+      "input_kind": "abir.paired_training_snapshots",
+      "output_kind": "tuple<2>",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "batch_size": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "bottleneck_attn": {
+                "default": false,
+                "type": "boolean"
+              },
+              "channel_attn": {
+                "default": false,
+                "type": "boolean"
+              },
+              "decoder_epochs": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "decoder_lr": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "decoder_tier": {
+                "default": 3,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "lamquant_home": {
+                "default": "",
+                "type": "string"
+              },
+              "lr_min": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "student_checkpoint_rel": {
+                "default": "",
+                "type": "string"
+              },
+              "teacher_epochs": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "teacher_lr": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "teacher_r_loss": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "teacher_strides": {
+                "default": "",
+                "description": "`--teacher-strides` like \"1,2,2\". Empty = script default.",
+                "type": "string"
+              },
+              "teacher_width": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_train_joint",
+      "input_kind": "abir.paired_training_snapshots",
+      "output_kind": "lamquant.ckpt.joint",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "band_loss_weight": {
+                "default": null,
+                "description": "`--band-loss-weight <float>`: scalar weight on the per-band relative loss (the band-allocation lever, E1). Trainer default is preset-driven (0.5).",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "band_loss_weights": {
+                "default": null,
+                "description": "`--band-loss-weights <json>`: per-band clinical weights as a JSON object, e.g. `{\"delta\":1.0,\"theta\":1.0,\"alpha\":1.0,\"beta\":2.0,\"gamma\":2.0}`. Passed verbatim — the trainer parses the JSON. `None` ⇒ flat (all 1.0).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "batch_size": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "clinical_sampling": {
+                "default": null,
+                "description": "`--clinical-sampling` / `--no-clinical-sampling`.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "decoder_init_rel": {
+                "default": "",
+                "description": "Decoder warm-start ckpt path relative to lamquant_home (ADR 0071 B4, A.2 cascade). Empty = decoder trains from init. Forwarded as `--decoder-init` (strict=False + full-miss guard in the kernel).",
+                "type": "string"
+              },
+              "denoise_mode": {
+                "default": null,
+                "description": "`--denoise-mode <lowpass|spectral>` (ADR 0063): how the de-noise is applied — `lowpass` (hard cut) or `spectral` (adaptive per-window Wiener subtraction).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "denoise_target_hz": {
+                "default": null,
+                "description": "`--denoise-target-hz <float>` (ADR 0063): de-noise the fullband target above this cutoff (Hz) so the codec is scored against a de-noised signal. Off (0).",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "detail_bands": {
+                "default": null,
+                "description": "`--detail-bands <choice>`: encoder input bands. One of `none` | `l3_detail` | `all` (the trainer default is `all`).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "detail_stack_mode": {
+                "default": null,
+                "description": "`--detail-stack-mode <choice>`: how detail bands stack onto L3 (ADR 0031). One of `interp` | `fold` (the trainer default is `fold`).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "encoder_blocks": {
+                "default": null,
+                "description": "`--encoder-blocks <int>`: override the preset encoder depth / n_blocks (e.g. 12).",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "encoder_init_rel": {
+                "default": "",
+                "description": "MAE / SFT init path relative to lamquant_home. Empty = train from scratch.",
+                "type": "string"
+              },
+              "encoder_kernels": {
+                "default": null,
+                "description": "`--encoder-kernels <csv>`: override per-block kernels, comma-separated, `len == encoder_blocks` (e.g. \"3,5,7,9,11,13,15,17,19,21,23,25\"). Passed verbatim — the trainer parses the comma list.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "encoder_lr_scale": {
+                "default": null,
+                "description": "Multiplier on the encoder param-group LR at warm + QAT (ADR 0071 B4, A.6 differential-LR lever). `None` ⇒ no flag ⇒ trainer default 1.0.",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "encoder_width": {
+                "default": null,
+                "description": "`--encoder-width <int>`: override the preset encoder width (e.g. 256).",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "entropy_model": {
+                "default": false,
+                "description": "Enable learned entropy model for rate-distortion training.",
+                "type": "boolean"
+              },
+              "entropy_warmup_epochs": {
+                "default": 50,
+                "description": "Warmup epochs with λ=0 before rate pressure kicks in. Default 50.",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "epochs": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "extra_args": {
+                "default": [],
+                "description": "Verbatim extra flags appended to the train_joint.py argv — a passthrough escape hatch (ADR 0044 transitional bridge). Lets a recipe express train_joint flags the stage does not enumerate.\n\nA4: E1 codec-quality-probe args (`encoder_width`/`encoder_blocks`/ `encoder_kernels`/`detail_bands`/`detail_stack_mode`/`soap_max_precond_dim`) are now TYPED fields above and emitted by the cmd-arg builder; use those, not `extra_args`. Resource-driving duplicates are rejected by preflight; other passthrough remains last-write-wins.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "extra_env": {
+                "default": [],
+                "description": "Extra child-process env as `KEY=VALUE` strings, set BEFORE python starts so DataLoader fork-workers inherit it. Load-bearing for the detail-band selection is intentionally excluded here: use the typed `detail_bands`/`detail_stack_mode` fields so admission and the trainer derive one identical input shape.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "gan": {
+                "default": null,
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "gan_disc_chunk": {
+                "default": null,
+                "description": "`--gan-disc-chunk <int>` (ADR 0063): channel chunk size for the GAN discriminator (now covers ALL channels in chunks; was 4-of-21). Default 7.",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "grad_accum_steps": {
+                "default": null,
+                "description": "`--grad-accum-steps <int>`: gradient accumulation steps (effective batch = batch_size × this). Trainer default is 1.",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "infinite_lr": {
+                "default": false,
+                "type": "boolean"
+              },
+              "lambda_rate": {
+                "default": 0.009999999776482582,
+                "description": "Rate loss weight (λ in D + λR). Default 0.01.",
+                "format": "float",
+                "type": "number"
+              },
+              "lamquant_home": {
+                "default": "",
+                "type": "string"
+              },
+              "latent_dim": {
+                "default": null,
+                "description": "`--latent-dim <int>`: FSQ latent channels (ADR 0045). `None` ⇒ no flag ⇒ the trainer uses the PRESET's `cfg.latent_dim` (e1/MONITOR = 32, l1 = 64). Set explicitly to override the preset (e.g. 96/128 for the CLINICAL teacher).",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "line_length_weight": {
+                "default": null,
+                "description": "`--line-length-weight <float>` (ADR 0063): amplitude-invariant line-length (morphology) loss weight — high-freq texture without fitting noise. Off (0).",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "lr": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "nnodes": {
+                "default": null,
+                "description": "Multi-node DDP: number of nodes (with `nproc_per_node` per node). `None`/ `Some(1)` = single-node. World size = nnodes × nproc_per_node. Requires a cluster launcher (Slurm) to set MASTER_ADDR / NODE_RANK per node.",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "no_resume": {
+                "default": false,
+                "description": "Durable-resume override: force a FRESH start even when a resumable recovery checkpoint exists for this config. The trainer still writes recovery checkpoints (so a later kill is resumable); this only suppresses the auto-resume DECISION for this run.",
+                "type": "boolean"
+              },
+              "nproc_per_node": {
+                "default": null,
+                "description": "torchrun `--nproc_per_node`: number of DDP ranks (GPUs) for ONE job. `None`/`Some(1)` = single-process (byte-identical to before). `Some(n)` launches n ranks data-parallel via NCCL. PARTICIPATES IN THE CACHE KEY: per-rank batch is fixed, so the effective GLOBAL batch (and the trained output) scales with nproc. The stage requests `nproc` GPU permits (`gpu_permits`) and scales the RAM footprint ×nproc.",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "parallel_strategy": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/ParallelStrategy"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Multi-GPU parallel strategy: `None`/`Ddp` (default — replicate, the historical path; emits NO extra argv so existing specs are byte-identical) or `Fsdp` (FSDP2 fully_shard — shard encoder/decoder params/grads/optim state, ZeRO-3). Only meaningful when `nproc_per_node > 1`. PARTICIPATES IN THE CACHE KEY (it changes the trained artifact's sharding/save path). A typed enum so a typo is rejected at deserialize time, not at the Python CLI boundary."
+              },
+              "preset": {
+                "default": "production",
+                "description": "`--config` preset (fast | medium | production). LamQuant uses TrainingConfig presets.",
+                "type": "string"
+              },
+              "resume": {
+                "default": "",
+                "description": "Optional explicit `--resume <path>` (or \"auto\"). Empty = let durable resume (Phase D) decide. A non-empty value is an OPERATOR OVERRIDE — it resumes from exactly that path and bypasses the crash-gated auto policy.",
+                "type": "string"
+              },
+              "seed": {
+                "default": 42,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "seizure_head": {
+                "default": null,
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "soap_max_precond_dim": {
+                "default": null,
+                "description": "`--soap-max-precond-dim <int>`: SOAP full-matrix preconditioner dim cap (the trainer default is 10000; lower to ~2048 to fit big tier-5+ decoders).",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "tier": {
+                "default": 3,
+                "description": "Decoder tier (1..4).",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "ParallelStrategy": {
+            "description": "Multi-GPU parallel strategy. `Ddp` (default) replicates the model per rank; `Fsdp` (FSDP2 fully_shard) shards params/grads/optimizer state (ZeRO-3). A typed enum so an invalid value is rejected at deserialize time rather than silently passed to the Python CLI.",
+            "enum": [
+              "ddp",
+              "fsdp"
+            ],
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_train_l3_teacher",
+      "input_kind": "abir.training_snapshot",
+      "output_kind": "lamquant.ckpt.teacher",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "batch_size": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "device": {
+                "default": "",
+                "description": "`--device` (default \"auto\"). Empty = pass nothing.",
+                "type": "string"
+              },
+              "epochs": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "lamquant_home": {
+                "default": "",
+                "type": "string"
+              },
+              "lr": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "lr_min": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "resume": {
+                "default": false,
+                "type": "boolean"
+              },
+              "width": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_train_teacher",
+      "input_kind": "abir.training_snapshot",
+      "output_kind": "lamquant.ckpt.teacher",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "force_batch_size": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "freq_weighted_loss": {
+                "default": false,
+                "type": "boolean"
+              },
+              "headless": {
+                "default": true,
+                "type": "boolean"
+              },
+              "lamquant_home": {
+                "default": "",
+                "type": "string"
+              },
+              "logger": {
+                "default": "",
+                "description": "Optional `--logger wandb|mlflow`. Empty = skip.",
+                "type": "string"
+              },
+              "resume": {
+                "default": false,
+                "type": "boolean"
+              },
+              "seed": {
+                "default": 42,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_train_vocos_decoder",
+      "input_kind": "abir.training_snapshot",
+      "output_kind": "lamquant.ckpt.joint",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "adv_ramp_epochs": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "adv_start_epoch": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "adversarial": {
+                "default": false,
+                "type": "boolean"
+              },
+              "batch_size": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "cfm_postfilter": {
+                "default": false,
+                "type": "boolean"
+              },
+              "cfm_start_epoch": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "dac_init": {
+                "default": false,
+                "type": "boolean"
+              },
+              "device": {
+                "default": "",
+                "type": "string"
+              },
+              "disc_lr": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "epochs": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "lamquant_home": {
+                "default": "",
+                "type": "string"
+              },
+              "lr": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "lr_min": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "perceptual_loss": {
+                "default": false,
+                "type": "boolean"
+              },
+              "perceptual_weight": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "resume": {
+                "default": false,
+                "type": "boolean"
+              },
+              "student_checkpoint_rel": {
+                "default": "",
+                "description": "Path relative to lamquant_home of the student encoder ckpt to condition the decoder on. Required for the production flow; empty triggers the script's own default.",
+                "type": "string"
+              },
+              "tier": {
+                "default": 3,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "materialize_conversations",
+      "input_kind": "()",
+      "output_kind": "dataset.jsonl",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "since_seconds": {
+                "description": "How far back to pull, in seconds. Recipes convert humantime strings to seconds before constructing Args so the JsonSchema is a clean integer.",
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "since_seconds"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "materialize_dataset_path",
+      "input_kind": "()",
+      "output_kind": "dataset.jsonl",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "path": {
+                "default": null,
+                "description": "Path to a JSONL dataset on disk. Exclusive with `registered_name`.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "registered_name": {
+                "default": null,
+                "description": "Registered dataset name in `datasets_db`. Exclusive with `path`.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "materialize_for_eval",
+      "input_kind": "()",
+      "output_kind": "tuple<2>",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "base_model": {
+                "default": "",
+                "description": "Recorded base model id (for provenance).",
+                "type": "string"
+              },
+              "dataset_path": {
+                "description": "Path to the eval JSONL.",
+                "type": "string"
+              },
+              "model_path": {
+                "description": "Path to the HuggingFace checkpoint directory.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "dataset_path",
+              "model_path"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "merge_lora",
+      "input_kind": "checkpoint.hf",
+      "output_kind": "checkpoint.hf",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "passthrough_only": {
+                "default": false,
+                "description": "When false, attempt a real merge subprocess. When true, only relabel the method_tag (useful for tests + for already-merged checkpoints). Defaults to false (do the work).",
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "merge_reports",
+      "input_kind": "tuple<3>",
+      "output_kind": "eval.report",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "register_dataset",
+      "input_kind": "dataset.jsonl",
+      "output_kind": "dataset.jsonl",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "kind": {
+                "default": "sft",
+                "description": "Free-form tag: `\"sft\"`, `\"dpo\"`, `\"distill\"`, etc.",
+                "type": "string"
+              },
+              "metadata": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "register_model",
+      "input_kind": "model.gguf",
+      "output_kind": "model.gguf",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "arch": {
+                "default": "trained",
+                "description": "Architecture tag for the registry. Defaults to \"trained\".",
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "notes": {
+                "default": "",
+                "description": "Free-form notes preserved with the registry entry for audit.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "sft_train",
+      "input_kind": "dataset.jsonl",
+      "output_kind": "checkpoint.hf",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "alpha": {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "base_model": {
+                "type": "string"
+              },
+              "batch_size": {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "epochs": {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "grad_accum": {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "lr": {
+                "format": "float",
+                "type": "number"
+              },
+              "method": {
+                "description": "`qlora`, `lora`, or `full`.",
+                "type": "string"
+              },
+              "optimizer": {
+                "type": "string"
+              },
+              "output_name": {
+                "type": "string"
+              },
+              "rank": {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "seed": {
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "seq_len": {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "alpha",
+              "base_model",
+              "batch_size",
+              "epochs",
+              "grad_accum",
+              "lr",
+              "method",
+              "optimizer",
+              "output_name",
+              "rank",
+              "seed",
+              "seq_len"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "split_train_eval",
+      "input_kind": "dataset.jsonl",
+      "output_kind": "dataset.split",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "eval_ratio": {
+                "description": "Fraction of examples for the eval split. Must be in (0, 1).",
+                "format": "float",
+                "type": "number"
+              },
+              "seed": {
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "eval_ratio",
+              "seed"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "take_train",
+      "input_kind": "dataset.split",
+      "output_kind": "dataset.jsonl",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "type": "object"
+          }
+        }
+      }
+    }
+  ],
+  "recipes": [
+    {
+      "name": "hf_sft",
+      "description": "HuggingFace Trainer SFT bridge (guest recipe over HfTrainerBackend): finetune an LLM from a JSONL/registered dataset — PEFT LoRA/QLoRA + bitsandbytes, auto-managed venv — then merge + convert to GGUF + register. Hosted in the LamQuant cookbook so the `blut` TUI can launch it.",
+      "backend_id": "hf_trainer",
+      "category": "user",
+      "input_kinds": [
+        "dataset.jsonl"
+      ],
+      "output_kind": "checkpoint.hf",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "alpha": {
+                "default": 32,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "base_model": {
+                "default": "Qwen/Qwen3-7B",
+                "type": "string"
+              },
+              "batch_size": {
+                "default": 1,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "dataset_path": {
+                "default": null,
+                "description": "SFT corpus: a JSONL path on disk. Exactly one of `dataset_path` / `registered_dataset` is required.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "epochs": {
+                "default": 3,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "grad_accum": {
+                "default": 8,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "hf_extra": {
+                "additionalProperties": true,
+                "default": {},
+                "description": "`TrainingArguments` overrides forwarded to `transformers.Trainer`.",
+                "type": "object"
+              },
+              "lr": {
+                "default": 0.00019999999494757503,
+                "format": "float",
+                "type": "number"
+              },
+              "method": {
+                "default": "qlora",
+                "type": "string"
+              },
+              "notes": {
+                "default": "",
+                "type": "string"
+              },
+              "output_name": {
+                "description": "Output model name (the gguf + the registry entry).",
+                "type": "string"
+              },
+              "quant": {
+                "default": "Q4_K_M",
+                "type": "string"
+              },
+              "rank": {
+                "default": 16,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "registered_dataset": {
+                "default": null,
+                "description": "SFT corpus by registered-dataset name (datasets_db). Exactly one of `dataset_path` / `registered_dataset` is required.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "seed": {
+                "default": 42,
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "seq_len": {
+                "default": 4096,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "output_name"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_decoder_solo",
+      "description": "Decoder-solo: train the Vocos decoder alone on a FROZEN student encoder over a governed ABIR/BCS2 snapshot → JointCkpt → PCCP decoder gate. (For the fullband decoder-solo cascade use train_joint --freeze-encoder via lamquant_joint_codec.) Safe-by-default PCCP.",
+      "backend_id": "lamquant",
+      "category": "train",
+      "input_kinds": [],
+      "output_kind": "lamquant.pccp_verdict",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "adversarial": {
+                "default": false,
+                "description": "GAN/adversarial decoder finetune.",
+                "type": "boolean"
+              },
+              "batch_size": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "dac_init": {
+                "default": false,
+                "description": "DAC-initialized decoder weights.",
+                "type": "boolean"
+              },
+              "epochs": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "lamquant_home": {
+                "default": "",
+                "description": "LamQuant repo root. Empty = env / default.",
+                "type": "string"
+              },
+              "lr": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "pccp_author": {
+                "default": "BLUT",
+                "type": "string"
+              },
+              "pccp_change_class": {
+                "default": "A.1",
+                "type": "string"
+              },
+              "pccp_change_id": {
+                "default": "PCCP-CHG-DRYRUN",
+                "type": "string"
+              },
+              "pccp_description": {
+                "default": "(blut/lamquant_decoder_solo recipe run)",
+                "type": "string"
+              },
+              "pccp_dry_run": {
+                "default": true,
+                "type": "boolean"
+              },
+              "pccp_no_promote": {
+                "default": true,
+                "type": "boolean"
+              },
+              "perceptual_loss": {
+                "default": false,
+                "description": "Perceptual (feature-distillation) loss.",
+                "type": "boolean"
+              },
+              "resume": {
+                "default": false,
+                "description": "Resume from the stage's last decoder checkpoint.",
+                "type": "boolean"
+              },
+              "student_checkpoint_rel": {
+                "default": "",
+                "description": "Frozen student encoder ckpt (relative to lamquant_home) the decoder is conditioned on. Empty = the script's own default.",
+                "type": "string"
+              },
+              "tier": {
+                "default": 3,
+                "description": "Decoder Vocos tier (1..=8).",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "training_snapshot": {
+                "$ref": "#/definitions/TrainingSnapshotSourceArgs",
+                "description": "REQUIRED governed ABIR/BCS2 input."
+              }
+            },
+            "required": [
+              "training_snapshot"
+            ],
+            "type": "object"
+          },
+          "TrainingSnapshotSourceArgs": {
+            "properties": {
+              "abir_distribution": {
+                "default": "abir-biosignal",
+                "type": "string"
+              },
+              "abir_revision": {
+                "default": "a8f0251891c07570e373230a8fed89264147e096",
+                "type": "string"
+              },
+              "artifact_path": {
+                "description": "Local access path for the sealed BCS2 Training Snapshot.",
+                "type": "string"
+              },
+              "artifact_sha256": {
+                "type": "string"
+              },
+              "dataset_roots": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "decision_log_id": {
+                "type": "string"
+              },
+              "fitted_state_id": {
+                "type": "string"
+              },
+              "preprocessing_graph_id": {
+                "type": "string"
+              },
+              "snapshot_id": {
+                "type": "string"
+              },
+              "spec_id": {
+                "type": "string"
+              },
+              "split_id": {
+                "type": "string"
+              },
+              "view_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "artifact_path",
+              "artifact_sha256",
+              "dataset_roots",
+              "decision_log_id",
+              "fitted_state_id",
+              "preprocessing_graph_id",
+              "snapshot_id",
+              "spec_id",
+              "split_id",
+              "view_id"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_gauge_retrain",
+      "description": "ADR 0120 reference-gauge A/B: retrain the joint EEG codec on an intrinsic channel representation (reference_mode raw|car|edge, injected as LAMQUANT_REFERENCE_MODE) → JointCkpt → PCCP gate. Delegates to lamquant_joint_codec with the gauge env set.",
+      "backend_id": "lamquant",
+      "category": "train",
+      "input_kinds": [],
+      "output_kind": "lamquant.pccp_verdict",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "band_loss_weight": {
+                "default": null,
+                "description": "`--band-loss-weight <float>`: scalar weight on the per-band relative loss (band-allocation lever, E1). Trainer default is preset-driven (0.5).",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "band_loss_weights": {
+                "default": null,
+                "description": "`--band-loss-weights <json>`: per-band clinical weights, e.g. `{\"delta\":1.0,\"theta\":1.0,\"alpha\":1.0,\"beta\":2.0,\"gamma\":2.0}` (verbatim).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "batch_size": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "clinical_sampling": {
+                "default": null,
+                "description": "`--clinical-sampling` / `--no-clinical-sampling`. Selection is executed by the sealed ABIR TrainingProgram; `true` requires a label-stratified train snapshot at runtime.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "decoder_init_rel": {
+                "default": "",
+                "description": "Decoder warm-start ckpt path relative to lamquant_home (ADR 0071 B4, A.2 cascade). Empty = decoder trains from init. `--decoder-init` in the kernel (strict=False + full-miss guard).",
+                "type": "string"
+              },
+              "denoise_mode": {
+                "default": null,
+                "description": "`--denoise-mode <lowpass|spectral>` (ADR 0063): `lowpass` (hard cut) or `spectral` (adaptive per-window Wiener subtraction of the noise floor).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "denoise_target_hz": {
+                "default": null,
+                "description": "`--denoise-target-hz <float>` (ADR 0063): de-noise the fullband target above this cutoff (Hz) so the codec is scored against a de-noised signal. Off (0).",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "detail_bands": {
+                "default": null,
+                "description": "`--detail-bands <choice>`: encoder input bands — one of `none` | `l3_detail` | `all` (validated at compile; trainer default `all`).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "detail_stack_mode": {
+                "default": null,
+                "description": "`--detail-stack-mode <choice>`: how detail bands stack onto L3 (ADR 0031) — one of `interp` | `fold` (validated at compile; trainer default `fold`).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "encoder_blocks": {
+                "default": null,
+                "description": "`--encoder-blocks <int>`: override the preset encoder depth / n_blocks (e.g. 12).",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "encoder_init_rel": {
+                "default": "",
+                "description": "Encoder init (MAE / SFT) path relative to lamquant_home. Empty = train the encoder from scratch.",
+                "type": "string"
+              },
+              "encoder_kernels": {
+                "default": null,
+                "description": "`--encoder-kernels <csv>`: per-block kernels, comma-separated, with `len == encoder_blocks` (e.g. \"3,5,7\"). Passed verbatim to the trainer.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "encoder_lr_scale": {
+                "default": null,
+                "description": "Multiplier on the encoder param-group LR at warm + QAT (ADR 0071 B4, A.6 differential-LR lever). `None` ⇒ trainer default 1.0.",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "encoder_width": {
+                "default": null,
+                "description": "`--encoder-width <int>`: override the preset encoder width (e.g. 256).",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "entropy_model": {
+                "default": false,
+                "description": "Enable learned entropy model for rate-distortion training. When true, the entropy model predicts the distribution of FSQ indices and the rate term R = Σ -log₂ p(index) is added to the loss with weight `lambda_rate`.",
+                "type": "boolean"
+              },
+              "entropy_warmup_epochs": {
+                "default": 50,
+                "description": "Warmup epochs with λ=0 before rate pressure kicks in. Default 50. Only used when `entropy_model` is true.",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "epochs": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "extra_args": {
+                "default": [],
+                "description": "Verbatim extra flags forwarded to train_joint.py (passthrough escape hatch — ADR 0044 transitional bridge). Lets this recipe express configs the typed args don't cover yet.\n\nA4: E1 codec-quality-probe args are now TYPED fields above (`encoder_width`, `encoder_blocks`, `encoder_kernels`, `detail_bands`, `detail_stack_mode`, `soap_max_precond_dim`) — set the E1 probe via those, e.g. `encoder_width: 256, encoder_blocks: 12, detail_bands: \"all\"`, NOT through `extra_args`. (A flag set BOTH here and via a typed field duplicates on the argv; argparse last-wins, but prefer the typed field.) `extra_args` remains the escape hatch for everything else, e.g. `[\"--epochs-warmup\",\"2\",\"--epochs-quant\",\"0\"]`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "extra_env": {
+                "default": [],
+                "description": "Extra child env as `KEY=VALUE`, set before python starts so DataLoader fork-workers inherit it. Detail-band configuration belongs in the typed `detail_bands` / `detail_stack_mode` fields. Legacy `SNN_DETAIL_BANDS` / `SNN_DETAIL_STACK_MODE` entries are migrated at the recipe boundary and removed before stage preflight.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "gan": {
+                "default": null,
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "gan_disc_chunk": {
+                "default": null,
+                "description": "`--gan-disc-chunk <int>` (ADR 0063): GAN discriminator channel chunk size (now covers ALL channels in chunks; was 4-of-21). Default 7.",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "grad_accum_steps": {
+                "default": null,
+                "description": "`--grad-accum-steps <int>`: gradient accumulation (effective batch = batch_size × this). Trainer default is 1.",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "infinite_lr": {
+                "default": false,
+                "type": "boolean"
+              },
+              "lambda_rate": {
+                "default": 0.009999999776482582,
+                "description": "Rate loss weight (λ in D + λR). Higher = more rate pressure. Default 0.01. Only used when `entropy_model` is true.",
+                "format": "float",
+                "type": "number"
+              },
+              "lamquant_home": {
+                "default": "",
+                "description": "LamQuant repo root. Empty = env / default.",
+                "type": "string"
+              },
+              "latent_dim": {
+                "default": null,
+                "description": "`--latent-dim <int>`: FSQ latent channels (ADR 0045). `None` ⇒ the trainer uses the preset's `cfg.latent_dim` (e1 = 32, l1 = 64). Set to override.",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "line_length_weight": {
+                "default": null,
+                "description": "`--line-length-weight <float>` (ADR 0063): amplitude-invariant line-length (morphology) loss weight — high-freq texture without fitting noise. Off (0).",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "lr": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "nnodes": {
+                "default": null,
+                "description": "Multi-node DDP: number of nodes (with `nproc_per_node` per node). Default single-node. World size = nnodes × nproc_per_node. Requires `--launcher slurm` to set MASTER_ADDR / NODE_RANK per node.",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "no_resume": {
+                "default": false,
+                "description": "Durable-resume override: force a FRESH start even if a resumable checkpoint exists for this config (recovery is still written, so a later kill remains resumable). Use to deliberately re-train a config from scratch without deleting its resume dir.",
+                "type": "boolean"
+              },
+              "nproc_per_node": {
+                "default": null,
+                "description": "Single-job multi-GPU (DDP). `None`/`Some(1)` = single-process (default). `Some(n)` trains ONE job data-parallel across n GPUs via torchrun+NCCL. Participates in the cache key (per-rank batch fixed → global batch scales with nproc). On a multi-GPU box this is the way to use all cards for one model; for N independent jobs use `partition backfill` instead.",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "parallel_strategy": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/ParallelStrategy"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Multi-GPU parallel strategy: `None`/`Ddp` (default) or `Fsdp` (FSDP2 fully_shard — shard encoder/decoder state, ZeRO-3). Only meaningful when `nproc_per_node > 1`; threaded recipe → stage → trainer."
+              },
+              "pccp_author": {
+                "default": "BLUT",
+                "type": "string"
+              },
+              "pccp_change_class": {
+                "default": "A.1",
+                "type": "string"
+              },
+              "pccp_change_id": {
+                "default": "PCCP-CHG-DRYRUN",
+                "type": "string"
+              },
+              "pccp_description": {
+                "default": "(blut/lamquant_joint_codec recipe run)",
+                "type": "string"
+              },
+              "pccp_dry_run": {
+                "default": true,
+                "type": "boolean"
+              },
+              "pccp_no_promote": {
+                "default": true,
+                "type": "boolean"
+              },
+              "preset": {
+                "default": "production",
+                "description": "`--config` preset (fast | medium | production).",
+                "type": "string"
+              },
+              "reference_mode": {
+                "description": "REQUIRED: the reference gauge — `raw` | `car` | `edge` (ADR 0120).",
+                "type": "string"
+              },
+              "resume": {
+                "default": "",
+                "description": "Explicit `--resume <path>` operator override. Empty = let durable resume (Phase D) decide: a re-run after a crash auto-resumes from the last recovery checkpoint for this exact config; a clean prior run or a new config starts fresh. Requires `LAMQUANT_DATA_ROOT` (the resume dir lives under it); unset ⇒ durable resume is off.",
+                "type": "string"
+              },
+              "seed": {
+                "default": 42,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "seizure_head": {
+                "default": null,
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "soap_max_precond_dim": {
+                "default": null,
+                "description": "`--soap-max-precond-dim <int>`: SOAP preconditioner dim cap (trainer default 10000; lower to ~2048 to fit big tier-5+ decoders).",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "tier": {
+                "default": 3,
+                "description": "Decoder tier (1..=4).",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "training_snapshots": {
+                "$ref": "#/definitions/PairedTrainingSnapshotsSourceArgs",
+                "description": "REQUIRED governed train/validation ABIR/BCS2 snapshots."
+              }
+            },
+            "required": [
+              "reference_mode",
+              "training_snapshots"
+            ],
+            "type": "object"
+          },
+          "PairedTrainingSnapshotsSourceArgs": {
+            "properties": {
+              "train": {
+                "$ref": "#/definitions/TrainingSnapshotSourceArgs"
+              },
+              "val": {
+                "$ref": "#/definitions/TrainingSnapshotSourceArgs"
+              }
+            },
+            "required": [
+              "train",
+              "val"
+            ],
+            "type": "object"
+          },
+          "ParallelStrategy": {
+            "description": "Multi-GPU parallel strategy. `Ddp` (default) replicates the model per rank; `Fsdp` (FSDP2 fully_shard) shards params/grads/optimizer state (ZeRO-3). A typed enum so an invalid value is rejected at deserialize time rather than silently passed to the Python CLI.",
+            "enum": [
+              "ddp",
+              "fsdp"
+            ],
+            "type": "string"
+          },
+          "TrainingSnapshotSourceArgs": {
+            "properties": {
+              "abir_distribution": {
+                "default": "abir-biosignal",
+                "type": "string"
+              },
+              "abir_revision": {
+                "default": "a8f0251891c07570e373230a8fed89264147e096",
+                "type": "string"
+              },
+              "artifact_path": {
+                "description": "Local access path for the sealed BCS2 Training Snapshot.",
+                "type": "string"
+              },
+              "artifact_sha256": {
+                "type": "string"
+              },
+              "dataset_roots": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "decision_log_id": {
+                "type": "string"
+              },
+              "fitted_state_id": {
+                "type": "string"
+              },
+              "preprocessing_graph_id": {
+                "type": "string"
+              },
+              "snapshot_id": {
+                "type": "string"
+              },
+              "spec_id": {
+                "type": "string"
+              },
+              "split_id": {
+                "type": "string"
+              },
+              "view_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "artifact_path",
+              "artifact_sha256",
+              "dataset_roots",
+              "decision_log_id",
+              "fitted_state_id",
+              "preprocessing_graph_id",
+              "snapshot_id",
+              "spec_id",
+              "split_id",
+              "view_id"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_joint_codec",
+      "description": "Train the joint EEG codec (encoder + decoder) from governed paired ABIR Training Snapshots → JointCkpt → PCCP gate. Safe-by-default PCCP.",
+      "backend_id": "lamquant",
+      "category": "train",
+      "input_kinds": [],
+      "output_kind": "lamquant.pccp_verdict",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "band_loss_weight": {
+                "default": null,
+                "description": "`--band-loss-weight <float>`: scalar weight on the per-band relative loss (band-allocation lever, E1). Trainer default is preset-driven (0.5).",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "band_loss_weights": {
+                "default": null,
+                "description": "`--band-loss-weights <json>`: per-band clinical weights, e.g. `{\"delta\":1.0,\"theta\":1.0,\"alpha\":1.0,\"beta\":2.0,\"gamma\":2.0}` (verbatim).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "batch_size": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "clinical_sampling": {
+                "default": null,
+                "description": "`--clinical-sampling` / `--no-clinical-sampling`. Selection is executed by the sealed ABIR TrainingProgram; `true` requires a label-stratified train snapshot at runtime.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "decoder_init_rel": {
+                "default": "",
+                "description": "Decoder warm-start ckpt path relative to lamquant_home (ADR 0071 B4, A.2 cascade). Empty = decoder trains from init. `--decoder-init` in the kernel (strict=False + full-miss guard).",
+                "type": "string"
+              },
+              "denoise_mode": {
+                "default": null,
+                "description": "`--denoise-mode <lowpass|spectral>` (ADR 0063): `lowpass` (hard cut) or `spectral` (adaptive per-window Wiener subtraction of the noise floor).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "denoise_target_hz": {
+                "default": null,
+                "description": "`--denoise-target-hz <float>` (ADR 0063): de-noise the fullband target above this cutoff (Hz) so the codec is scored against a de-noised signal. Off (0).",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "detail_bands": {
+                "default": null,
+                "description": "`--detail-bands <choice>`: encoder input bands — one of `none` | `l3_detail` | `all` (validated at compile; trainer default `all`).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "detail_stack_mode": {
+                "default": null,
+                "description": "`--detail-stack-mode <choice>`: how detail bands stack onto L3 (ADR 0031) — one of `interp` | `fold` (validated at compile; trainer default `fold`).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "encoder_blocks": {
+                "default": null,
+                "description": "`--encoder-blocks <int>`: override the preset encoder depth / n_blocks (e.g. 12).",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "encoder_init_rel": {
+                "default": "",
+                "description": "Encoder init (MAE / SFT) path relative to lamquant_home. Empty = train the encoder from scratch.",
+                "type": "string"
+              },
+              "encoder_kernels": {
+                "default": null,
+                "description": "`--encoder-kernels <csv>`: per-block kernels, comma-separated, with `len == encoder_blocks` (e.g. \"3,5,7\"). Passed verbatim to the trainer.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "encoder_lr_scale": {
+                "default": null,
+                "description": "Multiplier on the encoder param-group LR at warm + QAT (ADR 0071 B4, A.6 differential-LR lever). `None` ⇒ trainer default 1.0.",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "encoder_width": {
+                "default": null,
+                "description": "`--encoder-width <int>`: override the preset encoder width (e.g. 256).",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "entropy_model": {
+                "default": false,
+                "description": "Enable learned entropy model for rate-distortion training. When true, the entropy model predicts the distribution of FSQ indices and the rate term R = Σ -log₂ p(index) is added to the loss with weight `lambda_rate`.",
+                "type": "boolean"
+              },
+              "entropy_warmup_epochs": {
+                "default": 50,
+                "description": "Warmup epochs with λ=0 before rate pressure kicks in. Default 50. Only used when `entropy_model` is true.",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "epochs": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "extra_args": {
+                "default": [],
+                "description": "Verbatim extra flags forwarded to train_joint.py (passthrough escape hatch — ADR 0044 transitional bridge). Lets this recipe express configs the typed args don't cover yet.\n\nA4: E1 codec-quality-probe args are now TYPED fields above (`encoder_width`, `encoder_blocks`, `encoder_kernels`, `detail_bands`, `detail_stack_mode`, `soap_max_precond_dim`) — set the E1 probe via those, e.g. `encoder_width: 256, encoder_blocks: 12, detail_bands: \"all\"`, NOT through `extra_args`. (A flag set BOTH here and via a typed field duplicates on the argv; argparse last-wins, but prefer the typed field.) `extra_args` remains the escape hatch for everything else, e.g. `[\"--epochs-warmup\",\"2\",\"--epochs-quant\",\"0\"]`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "extra_env": {
+                "default": [],
+                "description": "Extra child env as `KEY=VALUE`, set before python starts so DataLoader fork-workers inherit it. Detail-band configuration belongs in the typed `detail_bands` / `detail_stack_mode` fields. Legacy `SNN_DETAIL_BANDS` / `SNN_DETAIL_STACK_MODE` entries are migrated at the recipe boundary and removed before stage preflight.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "gan": {
+                "default": null,
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "gan_disc_chunk": {
+                "default": null,
+                "description": "`--gan-disc-chunk <int>` (ADR 0063): GAN discriminator channel chunk size (now covers ALL channels in chunks; was 4-of-21). Default 7.",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "grad_accum_steps": {
+                "default": null,
+                "description": "`--grad-accum-steps <int>`: gradient accumulation (effective batch = batch_size × this). Trainer default is 1.",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "infinite_lr": {
+                "default": false,
+                "type": "boolean"
+              },
+              "lambda_rate": {
+                "default": 0.009999999776482582,
+                "description": "Rate loss weight (λ in D + λR). Higher = more rate pressure. Default 0.01. Only used when `entropy_model` is true.",
+                "format": "float",
+                "type": "number"
+              },
+              "lamquant_home": {
+                "default": "",
+                "description": "LamQuant repo root. Empty = env / default.",
+                "type": "string"
+              },
+              "latent_dim": {
+                "default": null,
+                "description": "`--latent-dim <int>`: FSQ latent channels (ADR 0045). `None` ⇒ the trainer uses the preset's `cfg.latent_dim` (e1 = 32, l1 = 64). Set to override.",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "line_length_weight": {
+                "default": null,
+                "description": "`--line-length-weight <float>` (ADR 0063): amplitude-invariant line-length (morphology) loss weight — high-freq texture without fitting noise. Off (0).",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "lr": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "nnodes": {
+                "default": null,
+                "description": "Multi-node DDP: number of nodes (with `nproc_per_node` per node). Default single-node. World size = nnodes × nproc_per_node. Requires `--launcher slurm` to set MASTER_ADDR / NODE_RANK per node.",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "no_resume": {
+                "default": false,
+                "description": "Durable-resume override: force a FRESH start even if a resumable checkpoint exists for this config (recovery is still written, so a later kill remains resumable). Use to deliberately re-train a config from scratch without deleting its resume dir.",
+                "type": "boolean"
+              },
+              "nproc_per_node": {
+                "default": null,
+                "description": "Single-job multi-GPU (DDP). `None`/`Some(1)` = single-process (default). `Some(n)` trains ONE job data-parallel across n GPUs via torchrun+NCCL. Participates in the cache key (per-rank batch fixed → global batch scales with nproc). On a multi-GPU box this is the way to use all cards for one model; for N independent jobs use `partition backfill` instead.",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "parallel_strategy": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/ParallelStrategy"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Multi-GPU parallel strategy: `None`/`Ddp` (default) or `Fsdp` (FSDP2 fully_shard — shard encoder/decoder state, ZeRO-3). Only meaningful when `nproc_per_node > 1`; threaded recipe → stage → trainer."
+              },
+              "pccp_author": {
+                "default": "BLUT",
+                "type": "string"
+              },
+              "pccp_change_class": {
+                "default": "A.1",
+                "type": "string"
+              },
+              "pccp_change_id": {
+                "default": "PCCP-CHG-DRYRUN",
+                "type": "string"
+              },
+              "pccp_description": {
+                "default": "(blut/lamquant_joint_codec recipe run)",
+                "type": "string"
+              },
+              "pccp_dry_run": {
+                "default": true,
+                "type": "boolean"
+              },
+              "pccp_no_promote": {
+                "default": true,
+                "type": "boolean"
+              },
+              "preset": {
+                "default": "production",
+                "description": "`--config` preset (fast | medium | production).",
+                "type": "string"
+              },
+              "resume": {
+                "default": "",
+                "description": "Explicit `--resume <path>` operator override. Empty = let durable resume (Phase D) decide: a re-run after a crash auto-resumes from the last recovery checkpoint for this exact config; a clean prior run or a new config starts fresh. Requires `LAMQUANT_DATA_ROOT` (the resume dir lives under it); unset ⇒ durable resume is off.",
+                "type": "string"
+              },
+              "seed": {
+                "default": 42,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "seizure_head": {
+                "default": null,
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "soap_max_precond_dim": {
+                "default": null,
+                "description": "`--soap-max-precond-dim <int>`: SOAP preconditioner dim cap (trainer default 10000; lower to ~2048 to fit big tier-5+ decoders).",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "tier": {
+                "default": 3,
+                "description": "Decoder tier (1..=4).",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "training_snapshots": {
+                "$ref": "#/definitions/PairedTrainingSnapshotsSourceArgs",
+                "description": "REQUIRED governed train/validation ABIR/BCS2 snapshots."
+              }
+            },
+            "required": [
+              "training_snapshots"
+            ],
+            "type": "object"
+          },
+          "PairedTrainingSnapshotsSourceArgs": {
+            "properties": {
+              "train": {
+                "$ref": "#/definitions/TrainingSnapshotSourceArgs"
+              },
+              "val": {
+                "$ref": "#/definitions/TrainingSnapshotSourceArgs"
+              }
+            },
+            "required": [
+              "train",
+              "val"
+            ],
+            "type": "object"
+          },
+          "ParallelStrategy": {
+            "description": "Multi-GPU parallel strategy. `Ddp` (default) replicates the model per rank; `Fsdp` (FSDP2 fully_shard) shards params/grads/optimizer state (ZeRO-3). A typed enum so an invalid value is rejected at deserialize time rather than silently passed to the Python CLI.",
+            "enum": [
+              "ddp",
+              "fsdp"
+            ],
+            "type": "string"
+          },
+          "TrainingSnapshotSourceArgs": {
+            "properties": {
+              "abir_distribution": {
+                "default": "abir-biosignal",
+                "type": "string"
+              },
+              "abir_revision": {
+                "default": "a8f0251891c07570e373230a8fed89264147e096",
+                "type": "string"
+              },
+              "artifact_path": {
+                "description": "Local access path for the sealed BCS2 Training Snapshot.",
+                "type": "string"
+              },
+              "artifact_sha256": {
+                "type": "string"
+              },
+              "dataset_roots": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "decision_log_id": {
+                "type": "string"
+              },
+              "fitted_state_id": {
+                "type": "string"
+              },
+              "preprocessing_graph_id": {
+                "type": "string"
+              },
+              "snapshot_id": {
+                "type": "string"
+              },
+              "spec_id": {
+                "type": "string"
+              },
+              "split_id": {
+                "type": "string"
+              },
+              "view_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "artifact_path",
+              "artifact_sha256",
+              "dataset_roots",
+              "decision_log_id",
+              "fitted_state_id",
+              "preprocessing_graph_id",
+              "snapshot_id",
+              "spec_id",
+              "split_id",
+              "view_id"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_mae_pretrain",
+      "description": "MAE self-supervised pretrain of the EEG encoder on a governed ABIR/BCS2 snapshot → MaeCkpt that seeds train_joint via encoder_init. No PCCP (training artifact, not a promotable model).",
+      "backend_id": "lamquant",
+      "category": "pretrain",
+      "input_kinds": [],
+      "output_kind": "lamquant.ckpt.mae",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "batch_size": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "epochs": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "lamquant_home": {
+                "default": "",
+                "description": "LamQuant repo root. Empty = env / default.",
+                "type": "string"
+              },
+              "lr": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "mask_ratio": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "output_rel": {
+                "default": "",
+                "description": "Encoder ckpt output path relative to lamquant_home. Empty = `ai_models/student/pretrained_mae.ckpt`.",
+                "type": "string"
+              },
+              "patch_size": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "seed": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "training_snapshot": {
+                "$ref": "#/definitions/TrainingSnapshotSourceArgs",
+                "description": "REQUIRED governed ABIR/BCS2 input. A separate rollback stage owns LMA."
+              }
+            },
+            "required": [
+              "training_snapshot"
+            ],
+            "type": "object"
+          },
+          "TrainingSnapshotSourceArgs": {
+            "properties": {
+              "abir_distribution": {
+                "default": "abir-biosignal",
+                "type": "string"
+              },
+              "abir_revision": {
+                "default": "a8f0251891c07570e373230a8fed89264147e096",
+                "type": "string"
+              },
+              "artifact_path": {
+                "description": "Local access path for the sealed BCS2 Training Snapshot.",
+                "type": "string"
+              },
+              "artifact_sha256": {
+                "type": "string"
+              },
+              "dataset_roots": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "decision_log_id": {
+                "type": "string"
+              },
+              "fitted_state_id": {
+                "type": "string"
+              },
+              "preprocessing_graph_id": {
+                "type": "string"
+              },
+              "snapshot_id": {
+                "type": "string"
+              },
+              "spec_id": {
+                "type": "string"
+              },
+              "split_id": {
+                "type": "string"
+              },
+              "view_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "artifact_path",
+              "artifact_sha256",
+              "dataset_roots",
+              "decision_log_id",
+              "fitted_state_id",
+              "preprocessing_graph_id",
+              "snapshot_id",
+              "spec_id",
+              "split_id",
+              "view_id"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_measure",
+      "description": "Run an ad-hoc measurement / eval script under the SAME contained env + venv training uses (venv python, blut/python PYTHONPATH, cgroup MemoryMax). () → MeasureReport. BLUT_METRIC lines fold into the metric store (visible via `blut results`). Out of PCCP scope.",
+      "backend_id": "lamquant",
+      "category": "eval",
+      "input_kinds": [],
+      "output_kind": "lamquant.measure_report",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "expected_outputs_rel": {
+                "default": [],
+                "description": "Paths (relative to `lamquant_home`) the script promises to write.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "extra_args": {
+                "default": [],
+                "description": "Verbatim args appended to the script's argv.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "extra_env": {
+                "default": [],
+                "description": "Extra child env as `KEY=VALUE`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "home_relative": {
+                "default": false,
+                "description": "Resolve `script_rel` under `lamquant_home` rather than the BLUT python tree.",
+                "type": "boolean"
+              },
+              "lamquant_home": {
+                "default": "",
+                "description": "LamQuant repo root. Empty = env / default.",
+                "type": "string"
+              },
+              "mem_gib": {
+                "default": 24,
+                "description": "cgroup `MemoryMax` cap in GiB (default 24; must be > 0).",
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "script_rel": {
+                "description": "REQUIRED: the measurement script as relative path components (under the BLUT python tree by default; see `home_relative`).",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "script_rel"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_snn_4state",
+      "description": "Canonical SNN: train the 4-state needs-precision compression-tier controller (ADR 0029 constrained R-D) on governed ABIR/BCS2 snapshots → SnnCkpt → PCCP gate. Supersedes lamquant_snn (archived mamba seizure detector). Safe-by-default PCCP.",
+      "backend_id": "lamquant",
+      "category": "train",
+      "input_kinds": [],
+      "output_kind": "lamquant.pccp_verdict",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "batch_size": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "checkpoint_rel": {
+                "default": "",
+                "description": "Output ckpt path relative to lamquant_home. Empty = `weights/snn/snn_4state_best.pt`.",
+                "type": "string"
+              },
+              "crit_alpha": {
+                "default": null,
+                "description": "`--crit-alpha`: dual-ascent target for the floor.",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "crit_floor": {
+                "default": null,
+                "description": "`--crit-floor`: ADR 0029 CRITICAL-recall feasibility floor.",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "d_model": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "d_state": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "epochs": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "extra_args": {
+                "default": [],
+                "description": "Verbatim extra flags forwarded to train_4state_controller.py.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "head": {
+                "default": "attention_softmax",
+                "description": "`--head`: `attention_softmax` (default) or `crf`.",
+                "type": "string"
+              },
+              "infinite_lr": {
+                "default": false,
+                "type": "boolean"
+              },
+              "init_backbone": {
+                "default": "",
+                "description": "`--init-backbone <path>`: SSL-pretrained backbone (output of the `lamquant_ssl_pretrain` recipe). Empty = from scratch.",
+                "type": "string"
+              },
+              "lambda_spike": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "lamquant_home": {
+                "default": "",
+                "description": "LamQuant repo root. Empty = env / default.",
+                "type": "string"
+              },
+              "lr": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "n_layers": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "optimizer": {
+                "default": "esoap",
+                "description": "`--optimizer`: `esoap` (default), `soap`, `adamw`.",
+                "type": "string"
+              },
+              "pccp_author": {
+                "default": "BLUT",
+                "type": "string"
+              },
+              "pccp_change_class": {
+                "default": "A.1",
+                "type": "string"
+              },
+              "pccp_change_id": {
+                "default": "PCCP-CHG-DRYRUN",
+                "type": "string"
+              },
+              "pccp_description": {
+                "default": "(blut/lamquant_snn_4state recipe run)",
+                "type": "string"
+              },
+              "pccp_dry_run": {
+                "default": true,
+                "type": "boolean"
+              },
+              "pccp_no_promote": {
+                "default": true,
+                "type": "boolean"
+              },
+              "seed": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "training_snapshots": {
+                "$ref": "#/definitions/PairedTrainingSnapshotsSourceArgs",
+                "description": "REQUIRED governed train/validation ABIR snapshots."
+              }
+            },
+            "required": [
+              "training_snapshots"
+            ],
+            "type": "object"
+          },
+          "PairedTrainingSnapshotsSourceArgs": {
+            "properties": {
+              "train": {
+                "$ref": "#/definitions/TrainingSnapshotSourceArgs"
+              },
+              "val": {
+                "$ref": "#/definitions/TrainingSnapshotSourceArgs"
+              }
+            },
+            "required": [
+              "train",
+              "val"
+            ],
+            "type": "object"
+          },
+          "TrainingSnapshotSourceArgs": {
+            "properties": {
+              "abir_distribution": {
+                "default": "abir-biosignal",
+                "type": "string"
+              },
+              "abir_revision": {
+                "default": "a8f0251891c07570e373230a8fed89264147e096",
+                "type": "string"
+              },
+              "artifact_path": {
+                "description": "Local access path for the sealed BCS2 Training Snapshot.",
+                "type": "string"
+              },
+              "artifact_sha256": {
+                "type": "string"
+              },
+              "dataset_roots": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "decision_log_id": {
+                "type": "string"
+              },
+              "fitted_state_id": {
+                "type": "string"
+              },
+              "preprocessing_graph_id": {
+                "type": "string"
+              },
+              "snapshot_id": {
+                "type": "string"
+              },
+              "spec_id": {
+                "type": "string"
+              },
+              "split_id": {
+                "type": "string"
+              },
+              "view_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "artifact_path",
+              "artifact_sha256",
+              "dataset_roots",
+              "decision_log_id",
+              "fitted_state_id",
+              "preprocessing_graph_id",
+              "snapshot_id",
+              "spec_id",
+              "split_id",
+              "view_id"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "lamquant_ssl_pretrain",
+      "description": "SSL masked-reconstruction pretrain of the MambaSNN backbone on a governed ABIR/BCS2 snapshot (ADR-0027). Produces a backbone-only ckpt that lamquant_snn_4state loads via init_backbone. No PCCP (training artifact, not a promotable model).",
+      "backend_id": "lamquant",
+      "category": "pretrain",
+      "input_kinds": [],
+      "output_kind": "lamquant.ckpt.snn",
+      "args_schema": {
+        "$ref": "#/definitions/Args",
+        "definitions": {
+          "Args": {
+            "properties": {
+              "batch_size": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "d_model": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "d_state": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "epochs": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "extra_args": {
+                "default": [],
+                "description": "Verbatim extra flags forwarded to pretrain_ssl_tueg.py.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "lamquant_home": {
+                "default": "",
+                "description": "LamQuant repo root. Empty = env / default.",
+                "type": "string"
+              },
+              "lr": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "mask_frac": {
+                "default": null,
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "n_layers": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "optimizer": {
+                "default": "adamw",
+                "description": "`--optimizer`: `adamw` (default) or `esoap`.",
+                "type": "string"
+              },
+              "out_rel": {
+                "default": "",
+                "description": "Backbone output ckpt path relative to lamquant_home. Empty = `weights/snn/ssl_backbone.pt`.",
+                "type": "string"
+              },
+              "seed": {
+                "default": null,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "smoke": {
+                "default": false,
+                "type": "boolean"
+              },
+              "training_snapshot": {
+                "$ref": "#/definitions/TrainingSnapshotSourceArgs",
+                "description": "REQUIRED governed ABIR/BCS2 input. LMA is available only via rollback."
+              }
+            },
+            "required": [
+              "training_snapshot"
+            ],
+            "type": "object"
+          },
+          "TrainingSnapshotSourceArgs": {
+            "properties": {
+              "abir_distribution": {
+                "default": "abir-biosignal",
+                "type": "string"
+              },
+              "abir_revision": {
+                "default": "a8f0251891c07570e373230a8fed89264147e096",
+                "type": "string"
+              },
+              "artifact_path": {
+                "description": "Local access path for the sealed BCS2 Training Snapshot.",
+                "type": "string"
+              },
+              "artifact_sha256": {
+                "type": "string"
+              },
+              "dataset_roots": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "decision_log_id": {
+                "type": "string"
+              },
+              "fitted_state_id": {
+                "type": "string"
+              },
+              "preprocessing_graph_id": {
+                "type": "string"
+              },
+              "snapshot_id": {
+                "type": "string"
+              },
+              "spec_id": {
+                "type": "string"
+              },
+              "split_id": {
+                "type": "string"
+              },
+              "view_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "artifact_path",
+              "artifact_sha256",
+              "dataset_roots",
+              "decision_log_id",
+              "fitted_state_id",
+              "preprocessing_graph_id",
+              "snapshot_id",
+              "spec_id",
+              "split_id",
+              "view_id"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    }
+  ]
+}

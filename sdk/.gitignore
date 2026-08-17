@@ -1,0 +1,8 @@
+# Python build artifacts. Not in the engine's root .gitignore because that file
+# governs a Rust tree and knows nothing about setuptools.
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
