@@ -25,6 +25,7 @@ pub mod results;
 pub mod sampler;
 pub mod scheduler;
 pub mod space;
+pub mod study;
 pub mod surrogate;
 pub mod tpe;
 
@@ -40,6 +41,7 @@ pub use results::{HpoManifest, TrialOutcome, TrialRec, leaderboard};
 pub use sampler::{RandomSampler, Sampler};
 pub use scheduler::{EarlyStop, HpoScheduler, build_trial_of_topo};
 pub use space::{Dist, Overlay, SearchSpace, TrialResult, apply_overlay};
+pub use study::{Objective, Proposal, StudyLedger, StudySpec, StudyTrial, TrialStatus, config_key};
 pub use surrogate::{
     CostModel, CostObservation, GridSampler, MvTpeConfig, MvTpeSampler, acq_per_cost,
 };

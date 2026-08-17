@@ -185,6 +185,14 @@ fn back_sub(l: &[Vec<f64>], z: &[f64]) -> Vec<f64> {
 #[derive(Clone, Debug)]
 pub struct GpModel {
     cfg: GpConfig,
+    /// The space this model was FITTED on. Owned rather than re-supplied at
+    /// predict time: `encode` lays out coordinates per declared dimension, and
+    /// `sq_dist` zips, so encoding a query against a different space silently
+    /// truncates to the shorter vector and returns a CONFIDENT wrong answer
+    /// (measured: a model fitted on one dim, queried against two, reported
+    /// mu=10.0 sd=0.001 instead of refusing). Owning the space deletes that
+    /// failure mode rather than asserting against it.
+    space: SearchSpace,
     xs: Vec<Vec<f64>>,
     /// `K⁻¹ y` in standardised target space.
     alpha: Vec<f64>,
@@ -243,6 +251,7 @@ impl GpModel {
         let alpha = back_sub(&chol, &forward_sub(&chol, &yz));
         Some(GpModel {
             cfg,
+            space: space.clone(),
             xs,
             alpha,
             chol,
@@ -254,8 +263,8 @@ impl GpModel {
     /// Posterior mean and standard deviation at `overlay`, in the ORIGINAL
     /// objective units. `sd` is clamped at zero — a tiny negative from
     /// round-off is not evidence of negative variance.
-    pub fn predict(&self, space: &SearchSpace, overlay: &Overlay) -> (f64, f64) {
-        let x = encode(space, overlay);
+    pub fn predict(&self, overlay: &Overlay) -> (f64, f64) {
+        let x = encode(&self.space, overlay);
         let ks: Vec<f64> = self
             .xs
             .iter()
@@ -310,7 +319,6 @@ pub struct HypervolumeTarget<'a> {
 /// for any other arity rather than a number that looks meaningful.
 pub fn ehvi_mc(
     models: &[GpModel],
-    space: &SearchSpace,
     candidate: &Overlay,
     target: &HypervolumeTarget<'_>,
     samples: usize,
@@ -325,7 +333,7 @@ pub fn ehvi_mc(
         return 0.0;
     }
     let base = hypervolume_2d(front, reference, dirs);
-    let posteriors: Vec<(f64, f64)> = models.iter().map(|m| m.predict(space, candidate)).collect();
+    let posteriors: Vec<(f64, f64)> = models.iter().map(|m| m.predict(candidate)).collect();
 
     let mut acc = 0.0;
     for _ in 0..samples {
@@ -432,7 +440,7 @@ impl super::sampler::Sampler for GpSampler {
         let mut chosen: Option<(f64, Overlay)> = None;
         for _ in 0..self.n_candidates.max(1) {
             let cand = space.sample(&mut self.rng);
-            let (mu, sd) = model.predict(space, &cand);
+            let (mu, sd) = model.predict(&cand);
             let ei = expected_improvement(mu, sd, best, 0.0, self.maximize);
             if ei.is_finite() && chosen.as_ref().is_none_or(|(b, _)| ei > *b) {
                 chosen = Some((ei, cand));
@@ -546,7 +554,7 @@ mod tests {
         ];
         let m = GpModel::fit(&sp, &obs, GpConfig::default()).unwrap();
         for (x, y) in [(0.1, 1.0), (0.5, 5.0), (0.9, 2.0)] {
-            let (mu, sd) = m.predict(&sp, &at(x));
+            let (mu, sd) = m.predict(&at(x));
             assert!(
                 (mu - y).abs() < 0.05,
                 "at {x}: predicted {mu}, observed {y}"
@@ -567,8 +575,8 @@ mod tests {
             tr(vec![("x", json!(0.05))], 1.1),
         ];
         let m = GpModel::fit(&sp, &obs, GpConfig::default()).unwrap();
-        let (_, near) = m.predict(&sp, &at(0.03));
-        let (_, far) = m.predict(&sp, &at(0.98));
+        let (_, near) = m.predict(&at(0.03));
+        let (_, far) = m.predict(&at(0.98));
         assert!(
             far > near,
             "sd must grow away from data: far {far} !> near {near}"
@@ -607,7 +615,7 @@ mod tests {
             tr(vec![("x", json!(0.7))], 4.0),
         ];
         let m = GpModel::fit(&sp, &obs, GpConfig::default()).expect("must still fit");
-        let (mu, sd) = m.predict(&sp, &at(0.3));
+        let (mu, sd) = m.predict(&at(0.3));
         assert!(mu.is_finite() && sd.is_finite(), "mu {mu} sd {sd}");
         assert!((mu - 2.0).abs() < 0.2, "predicted {mu}");
     }
@@ -620,7 +628,7 @@ mod tests {
             tr(vec![("x", json!(0.8))], 7.0),
         ];
         let m = GpModel::fit(&sp, &obs, GpConfig::default()).unwrap();
-        let (mu, sd) = m.predict(&sp, &at(0.5));
+        let (mu, sd) = m.predict(&at(0.5));
         assert!(
             (mu - 7.0).abs() < 1e-6,
             "constant target ⇒ constant model: {mu}"
@@ -665,7 +673,7 @@ mod tests {
                         ("k".to_string(), json!(k)),
                         ("mode".to_string(), json!(mode)),
                     ];
-                    let (mu, sd) = m.predict(&sp, &o);
+                    let (mu, sd) = m.predict(&o);
                     assert!(
                         mu.is_finite() && sd.is_finite() && sd >= 0.0,
                         "{lr} {k} {mode}"
@@ -728,7 +736,7 @@ mod tests {
             dirs: &dirs,
             reference: [10.0, 10.0],
         };
-        let v = ehvi_mc(&[m0, m1], &sp, &at(0.0), &target, 200, &mut rng);
+        let v = ehvi_mc(&[m0, m1], &at(0.0), &target, 200, &mut rng);
         assert!(v < 0.5, "a dominated candidate should barely register: {v}");
     }
 
@@ -755,18 +763,11 @@ mod tests {
         };
         let good = {
             let mut r = StdRng::seed_from_u64(11);
-            ehvi_mc(
-                &[m0.clone(), m1.clone()],
-                &sp,
-                &at(0.05),
-                &target,
-                400,
-                &mut r,
-            )
+            ehvi_mc(&[m0.clone(), m1.clone()], &at(0.05), &target, 400, &mut r)
         };
         let bad = {
             let mut r = StdRng::seed_from_u64(11);
-            ehvi_mc(&[m0, m1], &sp, &at(0.95), &target, 400, &mut r)
+            ehvi_mc(&[m0, m1], &at(0.95), &target, 400, &mut r)
         };
         assert!(
             good > bad,
@@ -789,10 +790,10 @@ mod tests {
         };
         // One model for two objectives — not computable, must be 0.0 not a guess.
         let one = std::slice::from_ref(&m);
-        assert_eq!(ehvi_mc(one, &sp, &at(0.5), &target, 32, &mut rng), 0.0);
+        assert_eq!(ehvi_mc(one, &at(0.5), &target, 32, &mut rng), 0.0);
         // Zero samples likewise.
         assert_eq!(
-            ehvi_mc(&[m.clone(), m], &sp, &at(0.5), &target, 0, &mut rng),
+            ehvi_mc(&[m.clone(), m], &at(0.5), &target, 0, &mut rng),
             0.0
         );
     }

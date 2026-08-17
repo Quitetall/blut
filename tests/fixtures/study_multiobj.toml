@@ -1,0 +1,40 @@
+# ADR 0109 multi-objective study fixture — the one named by the acceptance gate
+# (`blut study run tests/fixtures/study_multiobj.toml --max-trials 24`).
+#
+# Two objectives that genuinely COMPETE: reconstruction error and compression
+# ratio. A codec config that compresses harder reconstructs worse, so no single
+# config wins both and the deliverable is a front rather than a "best". A
+# fixture whose objectives did not conflict would produce a one-point front and
+# would pass a >=2-point gate only by accident.
+
+recipe = "demo_codec"
+sampler = "mvtpe"
+seed = 7
+
+# Declared, not measured: admission has to answer BEFORE the trial is spawned,
+# which is what makes an over-budget proposal cost nothing.
+trial_ram_gib = 4.0
+
+[[objectives]]
+name = "prd"
+metric = "eval.prd"
+direction = "minimize"
+
+[[objectives]]
+name = "compression_ratio"
+metric = "eval.compression_ratio"
+direction = "maximize"
+
+[space.dims.lr]
+dist = "log_uniform"
+low = 1e-5
+high = 1e-1
+
+[space.dims."codec.batch_size"]
+dist = "int_uniform"
+low = 8
+high = 64
+
+[space.dims."codec.mode"]
+dist = "choice"
+choices = ["fast", "balanced", "max_ratio"]
