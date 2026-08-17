@@ -143,7 +143,7 @@ pub enum PlanSpecError {
     /// A named stage is in no registered cookbook (dynamic loading is
     /// forbidden — the author must name a compiled-in stage).
     #[error(
-        "plan spec '{name}': stage '{stage}' is not in any registered cookbook (see `blut stage list`)"
+        "plan spec '{name}': stage '{stage}' is not in any registered cookbook (see `blut registry export`)"
     )]
     UnknownStage { name: String, stage: String },
     /// The graph failed structural/kind validation (delegated to

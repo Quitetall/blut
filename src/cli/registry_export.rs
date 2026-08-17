@@ -16,6 +16,15 @@
 //! a substitute for the real check, and a client that skipped it would be
 //! caught anyway.
 //!
+//! **Two namespaces, both exported, not interchangeable.** A `PlanSpec` node
+//! names a STAGE (resolved via `find_erased_stage` over `stages_erased`); a
+//! recipe is a named pre-composed chain (resolved via `find` over `recipes`).
+//! They are separate registries with barely-overlapping contents, so a client
+//! handed only one of them would either reject every valid plan or fail to
+//! catch any typo. `stages` also carries each stage's input/output kinds — the
+//! information that decides which stages may legally be wired together, and
+//! the only part of the kind-check a client can approximate before submitting.
+//!
 //! The args schema is the recipe's OWN `args_schema_fn`, not a re-description
 //! of it. A second hand-written description of the same arguments is exactly
 //! the drift ADR 0092 invariant 2 forbids — one canonical owner per contract.
@@ -52,15 +61,39 @@ pub struct RecipeManifest {
     pub args_schema: serde_json::Value,
 }
 
+/// One STAGE, as the SDK sees it — the vocabulary a `PlanSpec` node names.
+///
+/// Distinct from a recipe and not interchangeable with one: `SpecNode::stage`
+/// resolves through [`Registry::find_erased_stage`], which reads
+/// `Cookbook::stages_erased`, while a recipe is a named, pre-composed chain
+/// resolved through `Registry::find`. A client that validated plan nodes
+/// against the recipe list would reject every legitimate plan, because the two
+/// namespaces barely overlap.
+#[derive(Debug, Serialize)]
+pub struct StageManifest {
+    pub name: String,
+    /// Artifact kind consumed. The unit kind for a graph source.
+    pub input_kind: String,
+    pub output_kind: String,
+    /// Element kind when `output_kind` is a list — the kind a `map_output`
+    /// template's root receives. Absent for a non-list output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub element_kind: Option<String>,
+}
+
 /// The exported catalog.
 #[derive(Debug, Serialize)]
 pub struct RegistryManifest {
     /// Manifest format version. Bumped when the SHAPE changes, so an SDK
     /// pinned to an older engine can refuse loudly instead of mis-reading a
-    /// field that moved.
+    /// field that moved. Additive fields do NOT bump it — same rule as
+    /// `PLAN_SPEC_VERSION`.
     pub manifest_version: u32,
     /// Engine version that produced it, for the same reason.
     pub engine_version: String,
+    /// The stage palette: what a `PlanSpec` node may name, with the kinds that
+    /// decide which stages may be wired together.
+    pub stages: Vec<StageManifest>,
     pub recipes: Vec<RecipeManifest>,
 }
 
@@ -85,9 +118,22 @@ pub fn build_manifest(reg: &crate::framework::Registry) -> RegistryManifest {
     // reordered itself would show a spurious diff every time it was regenerated,
     // and any consumer checksumming it would thrash.
     recipes.sort_by(|a, b| a.name.cmp(&b.name));
+    // `ingredient_palette` already sorts by name and de-duplicates across
+    // cookbooks, which is the ordering guarantee this export needs.
+    let stages = reg
+        .ingredient_palette()
+        .into_iter()
+        .map(|i| StageManifest {
+            name: i.stage,
+            input_kind: i.input_kind,
+            output_kind: i.output_kind,
+            element_kind: i.element_kind,
+        })
+        .collect();
     RegistryManifest {
         manifest_version: MANIFEST_VERSION,
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
+        stages,
         recipes,
     }
 }
@@ -144,6 +190,52 @@ mod tests {
         assert!(v.get("manifest_version").is_some());
         assert!(v.get("engine_version").is_some());
         assert!(v["recipes"].is_array());
+        assert!(v["stages"].is_array());
+    }
+
+    #[test]
+    fn stages_are_exported_separately_from_recipes() {
+        // A `PlanSpec` node names a STAGE, never a recipe. Exporting only the
+        // recipe list would give a client a catalog that rejects every valid
+        // plan while looking like it validated one, so the two namespaces must
+        // both be present and must not be conflated.
+        let reg = crate::framework::Registry::new();
+        let m = build_manifest(&reg);
+        let v = serde_json::to_value(&m).unwrap();
+        assert!(
+            v.as_object().unwrap().contains_key("stages"),
+            "the stage palette is the plan vocabulary and must always be present"
+        );
+        // Bare blut-core registers neither, but the KEYS must exist regardless
+        // so a client can tell "no stages" from "no such field".
+        assert!(v["stages"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stage_entries_expose_the_kinds_that_decide_wiring() {
+        // Kinds are what `from_erased_graph` checks. Without them the manifest
+        // could only catch name typos, not a producer wired into a consumer
+        // that cannot accept its output.
+        let s = StageManifest {
+            name: "x".into(),
+            input_kind: "unit".into(),
+            output_kind: "list<thing>".into(),
+            element_kind: Some("thing".into()),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["input_kind"], "unit");
+        assert_eq!(v["output_kind"], "list<thing>");
+        assert_eq!(v["element_kind"], "thing");
+        // A non-list stage omits `element_kind` rather than emitting null, so
+        // "absent" reads the same as the Rust `Option::None` it came from.
+        let plain = StageManifest {
+            name: "y".into(),
+            input_kind: "a".into(),
+            output_kind: "b".into(),
+            element_kind: None,
+        };
+        let v = serde_json::to_value(&plain).unwrap();
+        assert!(v.as_object().unwrap().get("element_kind").is_none());
     }
 
     #[test]

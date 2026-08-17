@@ -73,7 +73,7 @@ pub enum DeclarativeError {
     NoStages { recipe: String },
     #[error(
         "declarative recipe '{recipe}': stage '{stage}' is not in any registered \
-         cookbook (see `blut stage list`)"
+         cookbook (see `blut registry export`)"
     )]
     UnknownStage { recipe: String, stage: String },
     /// A plan-build failure (the runtime kind-chain check).
