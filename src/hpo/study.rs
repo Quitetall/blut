@@ -60,10 +60,24 @@ pub struct StudySpec {
     /// rather than measured because admission must happen BEFORE the spawn.
     #[serde(default)]
     pub trial_ram_gib: f64,
+    /// Budget (in `epoch` units) at which a trial counts as COMPLETE and
+    /// becomes an observation.
+    ///
+    /// Deliberately NOT inherited from `blut hpo run`, whose default is 0.
+    /// `budget >= 0` is vacuously true, so a study inheriting it would treat
+    /// every trial as finished on its first reporting step and fit the
+    /// surrogate on epoch-0 values. Defaults to 1 here: one completed unit of
+    /// budget is the least that can honestly be called a result.
+    #[serde(default = "default_max_budget")]
+    pub max_budget: u32,
 }
 
 fn default_sampler() -> String {
     "mvtpe".to_string()
+}
+
+fn default_max_budget() -> u32 {
+    1
 }
 
 impl StudySpec {
@@ -94,6 +108,13 @@ impl StudySpec {
             if !seen.insert(&o.name) {
                 return Err(format!("duplicate objective name '{}'", o.name));
             }
+        }
+        if self.max_budget == 0 {
+            return Err(
+                "max_budget must be >= 1: at 0 every trial is 'complete' on its \
+                 first reporting step, so the search would fit on unfinished trials"
+                    .into(),
+            );
         }
         if self.space.dims.is_empty() {
             return Err("study declares an empty search space".into());

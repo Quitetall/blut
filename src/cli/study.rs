@@ -68,7 +68,6 @@ pub(super) enum StudyCommand {
 const HPO_BUDGET_KEY: &str = "epoch";
 const HPO_ETA: u32 = 3;
 const HPO_MIN_BUDGET: u32 = 1;
-const HPO_MAX_BUDGET: u32 = 0;
 const HPO_GRACE: u32 = 1;
 const HPO_PERCENTILE: u32 = 50;
 
@@ -172,7 +171,8 @@ pub(super) async fn run_study(reg: &crate::framework::Registry, cmd: StudyComman
                 metric_budget_key: HPO_BUDGET_KEY.to_string(),
                 eta: HPO_ETA,
                 min_budget: HPO_MIN_BUDGET,
-                max_budget: HPO_MAX_BUDGET,
+                // NOT hpo run's default of 0 — see StudySpec::max_budget.
+                max_budget: spec.max_budget,
                 grace: HPO_GRACE,
                 percentile: HPO_PERCENTILE,
                 shared_cache: false,
@@ -319,7 +319,11 @@ mod tests {
                 assert_eq!(metric_budget_key, HPO_BUDGET_KEY);
                 assert_eq!(eta, HPO_ETA);
                 assert_eq!(min_budget, HPO_MIN_BUDGET);
-                assert_eq!(max_budget, HPO_MAX_BUDGET);
+                // A study does NOT inherit this one. `hpo run` defaults it to
+                // 0, and `budget >= 0` is vacuously true, so a study inheriting
+                // it would treat every trial as complete on its first reporting
+                // step. StudySpec declares its own, defaulting to 1.
+                assert_eq!(max_budget, 0, "hpo run's default, deliberately overridden");
                 assert_eq!(grace, HPO_GRACE);
                 assert_eq!(percentile, HPO_PERCENTILE);
             }

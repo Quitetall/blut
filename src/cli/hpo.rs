@@ -382,6 +382,36 @@ fn constrain_dynamic_hpo_admission(
 /// Returns the job id of the run that executed, or `None` for the read-only
 /// subcommands. `blut study run` needs the id to read the trial stream back
 /// out; resolving "the latest hpo job" afterwards would race a concurrent run.
+/// The per-trial overlays plus the factory that compiles a suggested config
+/// into a sub-plan.
+///
+/// Shared by the `tpe` and `surrogate` branches ON PURPOSE. Both need the same
+/// three things — the overlays, the recipe's `compile_fn`, and a closure that
+/// applies an overlay over the base args — and when this was duplicated, "one
+/// application path" (ADR 0092 invariant 4) was enforced by convention and a
+/// test on the output. A shared helper enforces it structurally: the two
+/// branches cannot drift on how a proposed trial becomes a node, because there
+/// is only one place that decides.
+fn fresh_trial_factory(
+    reg: &crate::framework::Registry,
+    name: &str,
+    base_args: &serde_json::Value,
+    trials: &[crate::hpo::TrialPlan],
+) -> Result<(Vec<crate::hpo::Overlay>, crate::hpo::FreshFactory)> {
+    let overlays: Vec<crate::hpo::Overlay> = trials.iter().map(|t| t.overlay.clone()).collect();
+    let def = reg
+        .find(name)
+        .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+    let cfn = def.compile_fn;
+    let base = base_args.clone();
+    let factory: crate::hpo::FreshFactory = std::sync::Arc::new(move |overlay| {
+        let mut a = base.clone();
+        crate::hpo::apply_overlay(&mut a, overlay);
+        cfn(a).map_err(|e| format!("{e}"))
+    });
+    Ok((overlays, factory))
+}
+
 pub(super) async fn run_hpo(
     reg: &crate::framework::Registry,
     cmd: HpoCommand,
@@ -753,18 +783,7 @@ pub(super) async fn run_hpo(
                 "tpe needs --max-budget >= 1 (the per-trial completion budget)"
             ));
         }
-        let trial_overlays: Vec<crate::hpo::Overlay> =
-            trials.iter().map(|t| t.overlay.clone()).collect();
-        let def = reg
-            .find(&name)
-            .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
-        let cfn = def.compile_fn;
-        let base_for_factory = base_args.clone();
-        let factory: crate::hpo::FreshFactory = std::sync::Arc::new(move |overlay| {
-            let mut a = base_for_factory.clone();
-            crate::hpo::apply_overlay(&mut a, overlay);
-            cfn(a).map_err(|e| format!("{e}"))
-        });
+        let (trial_overlays, factory) = fresh_trial_factory(reg, &name, &base_args, &trials)?;
         let sampler = TpeSampler::new(
             TpeConfig {
                 maximize: mode == "max",
@@ -795,6 +814,17 @@ pub(super) async fn run_hpo(
         // exactly — same overlays, same compile_fn factory, same control seam —
         // so a study and an HPO run cannot diverge on how a proposed trial
         // becomes a node.
+        if max_budget == 0 {
+            // `budget >= max_budget` is vacuously true at 0 on a u64, so every
+            // trial would count as COMPLETE on its first reporting step and the
+            // surrogate would fit on epoch-0 values while calling them results.
+            // The tpe branch guards the same way.
+            return Err(anyhow!(
+                "surrogate needs --max-budget >= 1 (the per-trial completion budget); \
+                 at 0 a trial is 'complete' on its first step and the model learns \
+                 from unfinished trials"
+            ));
+        }
         let objectives_json = objectives.as_deref().ok_or_else(|| {
             anyhow!(
                 "--algo surrogate needs --objectives: it scores candidates by                  expected hypervolume improvement over a declared objective                  VECTOR, and there is no meaningful default. `blut study run`                  supplies it from the study spec."
@@ -803,18 +833,7 @@ pub(super) async fn run_hpo(
         let objs: Vec<crate::hpo::study::Objective> = serde_json::from_str(objectives_json)
             .map_err(|e| anyhow!("--objectives is not a valid objective list: {e}"))?;
 
-        let trial_overlays: Vec<crate::hpo::Overlay> =
-            trials.iter().map(|t| t.overlay.clone()).collect();
-        let def = reg
-            .find(&name)
-            .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
-        let cfn = def.compile_fn;
-        let base_for_factory = base_args.clone();
-        let factory: crate::hpo::FreshFactory = std::sync::Arc::new(move |overlay| {
-            let mut a = base_for_factory.clone();
-            crate::hpo::apply_overlay(&mut a, overlay);
-            cfn(a).map_err(|e| format!("{e}"))
-        });
+        let (trial_overlays, factory) = fresh_trial_factory(reg, &name, &base_args, &trials)?;
         let names: Vec<String> = objs.iter().map(|o| o.name.clone()).collect();
         let cfg = crate::hpo::SurrogateConfig {
             objectives: objs,
