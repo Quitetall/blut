@@ -127,13 +127,21 @@ pub enum TrialStatus {
     Unmeasured,
     /// Genuine crash.
     Failed,
+    /// Stopped early by the scheduler (ASHA/median) or a plan cancel. Its
+    /// reported values ARE real measurements — early-stop happens AFTER a trial
+    /// reports — so it still contributes a point; the status exists so the
+    /// operator can see the point came from a trial that never ran to budget.
+    Killed,
 }
 
 impl TrialStatus {
     /// Whether this trial contributes a point to the Pareto front. Only a
     /// complete, finite measurement does.
     pub fn is_measured(self) -> bool {
-        matches!(self, TrialStatus::Done | TrialStatus::CacheHit)
+        matches!(
+            self,
+            TrialStatus::Done | TrialStatus::CacheHit | TrialStatus::Killed
+        )
     }
 }
 
@@ -394,6 +402,7 @@ pub fn reconstruct_study(
     let mut best: Vec<Vec<Option<f64>>> = vec![vec![None; n_obj]; n];
     let mut skipped = vec![false; n];
     let mut failed = vec![false; n];
+    let mut killed = vec![false; n];
 
     let trial_of = |topo: u32| -> Option<usize> {
         manifest
@@ -444,7 +453,11 @@ pub fn reconstruct_study(
                 // Match only "cancel" — never "kill", which would misread the
                 // Linux OOM killer's "Killed process …" as a scheduler action.
                 let err = ev.get("error").and_then(|e| e.as_str()).unwrap_or("");
-                if !err.to_ascii_lowercase().contains("cancel") {
+                if err.to_ascii_lowercase().contains("cancel") {
+                    killed[t] = true;
+                } else {
+                    // No error string is a crash, not a cancel: every cancel
+                    // path stamps a "cancelled…" message.
                     failed[t] = true;
                 }
             }
@@ -458,12 +471,16 @@ pub fn reconstruct_study(
         let complete = objectives.iter().all(|o| o.is_some_and(|v| v.is_finite()));
         let status = if failed[t] {
             TrialStatus::Failed
-        } else if complete && skipped[t] {
-            TrialStatus::CacheHit
-        } else if complete {
-            TrialStatus::Done
-        } else {
+        } else if !complete {
+            // Incomplete beats every other label: a trial that never reported
+            // all its objectives is not a point, however it ended.
             TrialStatus::Unmeasured
+        } else if killed[t] {
+            TrialStatus::Killed
+        } else if skipped[t] {
+            TrialStatus::CacheHit
+        } else {
+            TrialStatus::Done
         };
         ledger.trials.push(StudyTrial {
             trial_id: rec.trial_id,
@@ -866,6 +883,44 @@ high = 1.0
             "a re-proposed config resolved from cache is free, not work performed"
         );
         assert!(led.trials()[0].point().is_some(), "and still a real point");
+    }
+
+    #[test]
+    fn an_early_stopped_trial_is_killed_but_still_a_point() {
+        let spec = StudySpec::from_toml(spec_toml()).unwrap();
+        let m = manifest_for(1);
+        // ASHA stops underperformers AFTER they report, so the values are real
+        // measurements — but the operator must be able to see that this point
+        // came from a trial that never ran to budget.
+        let lines = vec![
+            step(0, 0.45, 6.0),
+            json!({"kind":"stage_failed","node_idx":0,"error":"cancelled by scheduler (asha rung 1)"})
+                .to_string(),
+        ];
+        let led = reconstruct_study(&spec, &m, &lines);
+        assert_eq!(led.trials()[0].status, TrialStatus::Killed);
+        assert!(
+            led.trials()[0].point().is_some(),
+            "an early-stopped trial's reported values are still measurements"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_trial_is_unmeasured_however_it_ended() {
+        let spec = StudySpec::from_toml(spec_toml()).unwrap();
+        let m = manifest_for(1);
+        // Killed before it reported the second objective: not a point.
+        let lines = vec![
+            json!({"kind":"stage_step","node_idx":0,"update":{"eval":{"prd":0.5}}}).to_string(),
+            json!({"kind":"stage_failed","node_idx":0,"error":"cancelled"}).to_string(),
+        ];
+        let led = reconstruct_study(&spec, &m, &lines);
+        assert_eq!(
+            led.trials()[0].status,
+            TrialStatus::Unmeasured,
+            "incomplete must beat Killed — a partial measurement is not a point"
+        );
+        assert!(led.trials()[0].point().is_none());
     }
 
     #[test]

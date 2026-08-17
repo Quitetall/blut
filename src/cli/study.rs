@@ -60,6 +60,18 @@ pub(super) enum StudyCommand {
     },
 }
 
+// Early-stop knobs a study does not declare, mirroring `blut hpo run`'s clap
+// defaults. Named rather than inlined so the coupling is greppable: if those
+// defaults move, a study would otherwise keep scheduling on the old values and
+// nobody would see the divergence at the call site. `study_defaults_track_hpo_run`
+// pins them.
+const HPO_BUDGET_KEY: &str = "epoch";
+const HPO_ETA: u32 = 3;
+const HPO_MIN_BUDGET: u32 = 1;
+const HPO_MAX_BUDGET: u32 = 0;
+const HPO_GRACE: u32 = 1;
+const HPO_PERCENTILE: u32 = 50;
+
 /// Map a study's sampler name onto the HPO `--algo` that carries it.
 ///
 /// The multi-objective samplers are not reachable through `--algo` yet, so a
@@ -142,12 +154,12 @@ pub(super) async fn run_study(reg: &crate::framework::Registry, cmd: StudyComman
                 mode: mode.to_string(),
                 max_trials,
                 seed: spec.seed,
-                metric_budget_key: "epoch".to_string(),
-                eta: 3,
-                min_budget: 1,
-                max_budget: 0,
-                grace: 1,
-                percentile: 50,
+                metric_budget_key: HPO_BUDGET_KEY.to_string(),
+                eta: HPO_ETA,
+                min_budget: HPO_MIN_BUDGET,
+                max_budget: HPO_MAX_BUDGET,
+                grace: HPO_GRACE,
+                percentile: HPO_PERCENTILE,
                 shared_cache: false,
                 launcher,
                 sync_io: false,
@@ -265,6 +277,38 @@ mod tests {
                 assert!(job.is_none(), "omitted job means the most recent");
             }
             other => panic!("expected study report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn study_defaults_track_hpo_run() {
+        // A study does not declare early-stop knobs, so it inherits `blut hpo
+        // run`'s. Parse an hpo run with none supplied and require the clap
+        // defaults to equal the constants used here — if someone retunes
+        // `hpo run`, this fails instead of a study silently scheduling on the
+        // old values.
+        let cli = Cli::try_parse_from(["blut", "hpo", "run", "demo"]).expect("parse");
+        match cli.command {
+            Some(Command::Hpo {
+                cmd:
+                    crate::cli::hpo::HpoCommand::Run {
+                        metric_budget_key,
+                        eta,
+                        min_budget,
+                        max_budget,
+                        grace,
+                        percentile,
+                        ..
+                    },
+            }) => {
+                assert_eq!(metric_budget_key, HPO_BUDGET_KEY);
+                assert_eq!(eta, HPO_ETA);
+                assert_eq!(min_budget, HPO_MIN_BUDGET);
+                assert_eq!(max_budget, HPO_MAX_BUDGET);
+                assert_eq!(grace, HPO_GRACE);
+                assert_eq!(percentile, HPO_PERCENTILE);
+            }
+            other => panic!("expected hpo run, got {other:?}"),
         }
     }
 
