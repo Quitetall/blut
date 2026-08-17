@@ -42,6 +42,12 @@ pub(super) enum HpoCommand {
         /// Optimization direction.
         #[arg(long, default_value = "max", value_parser = ["max", "min"])]
         mode: String,
+        /// Declared objectives as JSON (`[{"name","metric","direction"}, …]`),
+        /// required by `--algo surrogate`. This is how `blut study run` hands a
+        /// multi-objective contract through the ONE launch path rather than
+        /// standing up a second one; a single-objective run never sets it.
+        #[arg(long)]
+        objectives: Option<String>,
         /// Number of trials to sample.
         #[arg(long, default_value_t = 8)]
         max_trials: u32,
@@ -398,6 +404,7 @@ pub(super) async fn run_hpo(
         algo,
         metric,
         mode,
+        objectives,
         max_trials,
         seed,
         metric_budget_key,
@@ -444,13 +451,13 @@ pub(super) async fn run_hpo(
     let mut sampler: Box<dyn Sampler> = match algo.as_str() {
         // TPE's initial population is also random (the model-based ask conditions
         // on completed trials, which arrive only at runtime via the policy).
-        "random" | "median" | "percentile" | "asha" | "pbt" | "tpe" => {
+        "random" | "median" | "percentile" | "asha" | "pbt" | "tpe" | "surrogate" => {
             Box::new(RandomSampler::new(seed))
         }
         other => {
             return Err(anyhow!(
                 "--algo '{other}' is not recognized — v0.20 ships \
-                 random/median/percentile/asha/pbt/tpe"
+                 random/median/percentile/asha/pbt/tpe/surrogate"
             ));
         }
     };
@@ -782,6 +789,56 @@ pub(super) async fn run_hpo(
         ctx = ctx.with_control(with_nan_safety(std::sync::Arc::new(sched)));
         eprintln!(
             "hpo: tpe (metric={metric} {mode}, complete@{max_budget}, ≤{max_trials} suggested)"
+        );
+    } else if algo == "surrogate" {
+        // ADR 0109's multi-objective driver. Shares the tpe branch's shape
+        // exactly — same overlays, same compile_fn factory, same control seam —
+        // so a study and an HPO run cannot diverge on how a proposed trial
+        // becomes a node.
+        let objectives_json = objectives.as_deref().ok_or_else(|| {
+            anyhow!(
+                "--algo surrogate needs --objectives: it scores candidates by                  expected hypervolume improvement over a declared objective                  VECTOR, and there is no meaningful default. `blut study run`                  supplies it from the study spec."
+            )
+        })?;
+        let objs: Vec<crate::hpo::study::Objective> = serde_json::from_str(objectives_json)
+            .map_err(|e| anyhow!("--objectives is not a valid objective list: {e}"))?;
+
+        let trial_overlays: Vec<crate::hpo::Overlay> =
+            trials.iter().map(|t| t.overlay.clone()).collect();
+        let def = reg
+            .find(&name)
+            .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+        let cfn = def.compile_fn;
+        let base_for_factory = base_args.clone();
+        let factory: crate::hpo::FreshFactory = std::sync::Arc::new(move |overlay| {
+            let mut a = base_for_factory.clone();
+            crate::hpo::apply_overlay(&mut a, overlay);
+            cfn(a).map_err(|e| format!("{e}"))
+        });
+        let names: Vec<String> = objs.iter().map(|o| o.name.clone()).collect();
+        let cfg = crate::hpo::SurrogateConfig {
+            objectives: objs,
+            budget_key: metric_budget_key.clone(),
+            max_budget: max_budget as u64,
+            max_spawns: (max_trials as usize).max(1),
+            ..crate::hpo::SurrogateConfig::default()
+        };
+        // Construction REFUSES a study it cannot actually search (not exactly
+        // two objectives, empty space, no spawn budget) rather than degrading
+        // to random — surfaced here as a launch error, before any trial runs.
+        let sched = crate::hpo::SurrogatePolicy::new(
+            trial_of_topo,
+            trial_overlays,
+            sp.clone(),
+            cfg,
+            factory,
+            seed,
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        ctx = ctx.with_control(with_nan_safety(std::sync::Arc::new(sched)));
+        eprintln!(
+            "hpo: surrogate/EHVI (objectives={}, complete@{max_budget}, ≤{max_trials} suggested)",
+            names.join(", ")
         );
     }
 

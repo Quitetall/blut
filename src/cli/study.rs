@@ -74,23 +74,27 @@ const HPO_PERCENTILE: u32 = 50;
 
 /// Map a study's sampler name onto the HPO `--algo` that carries it.
 ///
-/// The multi-objective samplers are not reachable through `--algo` yet, so a
-/// study naming one is REFUSED rather than silently downgraded to `random`: a
-/// study that quietly searched with the wrong sampler would still produce a
-/// plausible front, and nobody would know the model was never used.
+/// An unrecognised sampler is REFUSED rather than silently downgraded: a study
+/// that quietly searched with the wrong algorithm still produces a plausible
+/// front, and nobody would know the model was never used.
 fn algo_for(sampler: &str) -> Result<&'static str> {
     match sampler.trim().to_ascii_lowercase().as_str() {
         "random" => Ok("random"),
         "tpe" => Ok("tpe"),
         "asha" => Ok("asha"),
+        // The model-based samplers run through the ADR 0109 search driver: it
+        // fits a GP per objective and scores candidates by expected
+        // hypervolume improvement against the live front. All three names map
+        // to the same driver because the GP+EHVI path IS the surrogate search
+        // this ADR specifies; `grid` is a deterministic baseline and stays out.
+        "gp" | "mvtpe" | "surrogate" => Ok("surrogate"),
         other => Err(anyhow!(
-            "sampler '{other}' is declared but not yet reachable from `blut study run`: \
-             the search loop (hpo::study::StudyLedger) and the samplers \
-             (hpo::surrogate, hpo::gp) are implemented and tested, but the \
-             search-driver node that feeds them per-round results is not wired \
-             (ADR 0109). Use sampler = \"random\" | \"tpe\" | \"asha\" until it is, \
-             rather than running a study that silently searched with a different \
-             algorithm than it declared."
+            "sampler '{other}' is not a search algorithm `blut study run` can \
+             dispatch. Use random | tpe | asha for the single-objective \
+             schedulers, or gp | mvtpe | surrogate for the ADR 0109 \
+             multi-objective driver. Refusing rather than picking one for you, \
+             because a study that silently searched with a different algorithm \
+             than it declared still produces a plausible front."
         )),
     }
 }
@@ -152,6 +156,17 @@ pub(super) async fn run_study(reg: &crate::framework::Registry, cmd: StudyComman
                 algo: algo.to_string(),
                 metric: primary.metric.clone(),
                 mode: mode.to_string(),
+                // Only the surrogate driver consumes this; the single-objective
+                // schedulers ignore it and must not be handed a vector they
+                // would silently reduce to its first element.
+                objectives: if algo == "surrogate" {
+                    Some(
+                        serde_json::to_string(&spec.objectives)
+                            .map_err(|e| anyhow!("encode objectives: {e}"))?,
+                    )
+                } else {
+                    None
+                },
                 max_trials,
                 seed: spec.seed,
                 metric_budget_key: HPO_BUDGET_KEY.to_string(),
@@ -313,18 +328,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unreachable_sampler_is_refused_rather_than_downgraded() {
-        // The model-based samplers exist but their driver is not wired. A study
-        // declaring one must FAIL, not quietly run random search and hand back
-        // a plausible-looking front.
-        for s in ["gp", "mvtpe", "grid"] {
-            let err = algo_for(s).unwrap_err().to_string();
-            assert!(err.contains("not yet reachable"), "{s}: {err}");
-            assert!(err.contains("ADR 0109"), "{s}: should cite the ADR");
-        }
-    }
-
-    #[test]
     fn the_reachable_samplers_map_to_their_hpo_algo() {
         assert_eq!(algo_for("random").unwrap(), "random");
         assert_eq!(algo_for("TPE").unwrap(), "tpe", "case-insensitive");
@@ -332,13 +335,86 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_fixture_is_refused_today_and_says_why() {
-        // The shipped fixture declares mvtpe. Until the driver is wired,
-        // `blut study run` on it must refuse with a message that explains the
-        // gap rather than producing a front from the wrong search.
+    fn the_objectives_study_encodes_are_what_the_driver_decodes() {
+        // The two sides are joined by a JSON string on the command, so nothing
+        // in the type system pins them together. This does: encode exactly as
+        // `run_study` does, decode exactly as the surrogate branch does, and
+        // require the objectives to survive intact — including direction, which
+        // is what decides which way the front grows.
+        let spec =
+            StudySpec::from_toml(include_str!("../../tests/fixtures/study_multiobj.toml")).unwrap();
+        let wire = serde_json::to_string(&spec.objectives).expect("encode");
+        let decoded: Vec<crate::hpo::study::Objective> =
+            serde_json::from_str(&wire).expect("the driver must be able to decode it");
+        assert_eq!(decoded, spec.objectives);
+        assert_eq!(decoded[0].direction, Direction::Minimize);
+        assert_eq!(decoded[1].direction, Direction::Maximize);
+        assert_eq!(
+            decoded[0].metric, "eval.prd",
+            "the dotted metric key survives"
+        );
+    }
+
+    #[test]
+    fn only_the_surrogate_algo_is_handed_an_objective_vector() {
+        // A single-objective scheduler handed a vector would silently reduce it
+        // to its first element and report a front it never searched for, so the
+        // field is populated for exactly one algo.
+        for (sampler, expect_some) in [
+            ("mvtpe", true),
+            ("gp", true),
+            ("tpe", false),
+            ("random", false),
+            ("asha", false),
+        ] {
+            let algo = algo_for(sampler).unwrap();
+            assert_eq!(
+                algo == "surrogate",
+                expect_some,
+                "{sampler} → {algo}: objective vector is passed iff the driver runs"
+            );
+        }
+    }
+
+    #[test]
+    fn the_model_based_samplers_reach_the_adr_0109_driver() {
+        // gp / mvtpe / surrogate all dispatch to the search driver: the GP+EHVI
+        // path IS the surrogate search this ADR specifies, so they are one
+        // algorithm under three names a spec might reasonably use.
+        for s in ["gp", "mvtpe", "surrogate", "MVTPE", " gp "] {
+            assert_eq!(algo_for(s).unwrap(), "surrogate", "{s}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_sampler_is_refused_rather_than_downgraded() {
+        // `grid` is a deterministic baseline, not a search algorithm this
+        // command dispatches; nonsense is likewise refused. Neither may quietly
+        // become random search — that still produces a plausible front.
+        for s in ["grid", "bananas", ""] {
+            let err = algo_for(s).expect_err("must refuse").to_string();
+            assert!(
+                err.contains("Refusing rather than picking one"),
+                "{s}: {err}"
+            );
+            assert!(err.contains("plausible front"), "{s}: must say why: {err}");
+        }
+    }
+
+    #[test]
+    fn the_gate_fixture_now_dispatches_to_the_driver() {
+        // The shipped fixture declares mvtpe. With the driver wired it must
+        // reach `--algo surrogate` — previously this asserted the opposite,
+        // which was the honest state before the factory existed.
         let spec =
             StudySpec::from_toml(include_str!("../../tests/fixtures/study_multiobj.toml")).unwrap();
         assert_eq!(spec.sampler, "mvtpe");
-        assert!(algo_for(&spec.sampler).is_err());
+        assert_eq!(algo_for(&spec.sampler).unwrap(), "surrogate");
+        assert_eq!(
+            spec.objectives.len(),
+            2,
+            "the driver refuses anything but 2 objectives, so the fixture must \
+             declare exactly 2 or the gate cannot run"
+        );
     }
 }
