@@ -79,6 +79,13 @@ pub struct StageManifest {
     /// template's root receives. Absent for a non-list output.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub element_kind: Option<String>,
+    /// The stage's own args JSON schema (`StageDyn::args_schema`), verbatim.
+    ///
+    /// Without this a client can only catch a misspelled STAGE, while the
+    /// mistake people actually make is a misspelled ARG — the stage resolves,
+    /// the plan submits, and the run fails later against a schema the client
+    /// could have checked up front.
+    pub args_schema: serde_json::Value,
 }
 
 /// The exported catalog.
@@ -91,6 +98,14 @@ pub struct RegistryManifest {
     pub manifest_version: u32,
     /// Engine version that produced it, for the same reason.
     pub engine_version: String,
+    /// The IR version this engine compiles (`PLAN_SPEC_VERSION`).
+    ///
+    /// ADR 0111's Validation section names version skew as the way this
+    /// decision rots: an SDK mirroring PlanSpec v1 against an engine that
+    /// moved to v2 would emit plans that parse and mean something subtly
+    /// different. Publishing the number here is what lets a client detect that
+    /// itself, instead of the skew being found in the field.
+    pub plan_spec_version: u32,
     /// The stage palette: what a `PlanSpec` node may name, with the kinds that
     /// decide which stages may be wired together.
     pub stages: Vec<StageManifest>,
@@ -119,11 +134,24 @@ pub fn build_manifest(reg: &crate::framework::Registry) -> RegistryManifest {
     // and any consumer checksumming it would thrash.
     recipes.sort_by(|a, b| a.name.cmp(&b.name));
     // `ingredient_palette` already sorts by name and de-duplicates across
-    // cookbooks, which is the ordering guarantee this export needs.
+    // cookbooks, which is the ordering guarantee this export needs. It does
+    // not carry the args schema, so the stage is re-resolved to read it rather
+    // than widening `Ingredient` — that struct is the console DAG builder's
+    // contract, and a field only this command wants does not belong in it.
+    // Constructing a stage is a trivial `Arc::new` and nothing runs, which is
+    // the same assumption the palette itself makes.
     let stages = reg
         .ingredient_palette()
         .into_iter()
         .map(|i| StageManifest {
+            args_schema: reg
+                .find_erased_stage(&i.stage)
+                .map(|ctor| ctor().args_schema())
+                // Unreachable: the name came from the palette, which is built
+                // from the same `stages_erased` list this resolves against.
+                // Emitting an empty schema rather than panicking keeps a
+                // corrupt registry from taking down a read-only command.
+                .unwrap_or(serde_json::Value::Null),
             name: i.stage,
             input_kind: i.input_kind,
             output_kind: i.output_kind,
@@ -133,6 +161,7 @@ pub fn build_manifest(reg: &crate::framework::Registry) -> RegistryManifest {
     RegistryManifest {
         manifest_version: MANIFEST_VERSION,
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
+        plan_spec_version: crate::framework::plan_spec::PLAN_SPEC_VERSION,
         stages,
         recipes,
     }
@@ -191,6 +220,11 @@ mod tests {
         assert!(v.get("engine_version").is_some());
         assert!(v["recipes"].is_array());
         assert!(v["stages"].is_array());
+        assert_eq!(
+            v["plan_spec_version"],
+            crate::framework::plan_spec::PLAN_SPEC_VERSION,
+            "the manifest must publish the IR version a client is expected to mirror"
+        );
     }
 
     #[test]
@@ -221,6 +255,7 @@ mod tests {
             input_kind: "unit".into(),
             output_kind: "list<thing>".into(),
             element_kind: Some("thing".into()),
+            args_schema: serde_json::json!({}),
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["input_kind"], "unit");
@@ -233,6 +268,7 @@ mod tests {
             input_kind: "a".into(),
             output_kind: "b".into(),
             element_kind: None,
+            args_schema: serde_json::json!({}),
         };
         let v = serde_json::to_value(&plain).unwrap();
         assert!(v.as_object().unwrap().get("element_kind").is_none());
