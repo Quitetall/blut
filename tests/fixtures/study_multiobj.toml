@@ -7,6 +7,13 @@
 # fixture whose objectives did not conflict would produce a one-point front and
 # would pass a >=2-point gate only by accident.
 
+# PLACEHOLDER, and deliberately not silently swapped for a real one. No recipe
+# named `demo_codec` is registered (the catalogue holds lamquant_joint_codec,
+# lamquant_measure, lamquant_snn_4state, ...), so `blut study run` on this
+# fixture fails at recipe resolution. That is the honest state: the study
+# machinery is complete and tested, but no end-to-end run has produced a
+# pareto.json, and ADR 0109's gate is not claimed. Point this at a catalogued
+# recipe with real args to run the gate for real.
 recipe = "demo_codec"
 sampler = "mvtpe"
 seed = 7
