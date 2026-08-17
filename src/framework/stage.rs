@@ -1438,12 +1438,26 @@ impl<S: Stage> StageDyn for S {
     fn args_schema(&self) -> serde_json::Value {
         // schemars 0.8: schema_for! is a proc macro requiring a
         // type literal, so we go through `gen.subschema_for`
-        // instead. The fallback here is "best-effort" — if a
-        // future schemars upgrade breaks this we'll see test
-        // failures, not silent wrong schemas.
+        // instead.
         let mut schema_gen = schemars::r#gen::SchemaGenerator::default();
         let schema = schema_gen.subschema_for::<S::Args>();
-        serde_json::to_value(schema).expect("schemars-derived JsonSchema must serialize cleanly")
+        let mut value =
+            serde_json::to_value(schema).expect("schemars-derived JsonSchema must serialize");
+        // `subschema_for` returns `{"$ref": "#/definitions/Args"}` and parks
+        // the actual definition INSIDE the generator. Dropping the generator
+        // here — as this did — shipped a reference to a definitions map that
+        // was never emitted, so every consumer resolved it to nothing and saw
+        // a stage with no arguments. Carry the definitions across with it.
+        let definitions = schema_gen.take_definitions();
+        if !definitions.is_empty()
+            && let Some(object) = value.as_object_mut()
+        {
+            object.insert(
+                "definitions".to_string(),
+                serde_json::to_value(definitions).expect("schemars definitions must serialize"),
+            );
+        }
+        value
     }
 
     fn output_content_hash(&self, art: &ErasedArtifact) -> Option<ContentHash> {
@@ -2245,13 +2259,32 @@ mod tests {
         assert!(!s.pipeline_input_safe());
         assert_eq!(s.input_kind(), "test.words");
         assert_eq!(s.output_kind(), "test.count");
-        // args_schema returns SOMETHING valid (not Null) for a
-        // type with JsonSchema.
+        // `args_schema` must be RESOLVABLE, not merely non-null. Asserting
+        // only `!= Null` is what let a dangling `$ref` — a reference into a
+        // definitions map that was never emitted — pass for as long as it did,
+        // while every consumer resolved it to a stage with no arguments.
         let schema = s.args_schema();
         assert!(
             schema != serde_json::Value::Null,
             "args_schema unexpectedly null"
         );
+        if let Some(reference) = schema.get("$ref").and_then(|r| r.as_str()) {
+            let key = reference
+                .strip_prefix("#/definitions/")
+                .unwrap_or_else(|| panic!("unexpected $ref form {reference}"));
+            let target = schema
+                .get("definitions")
+                .and_then(|d| d.get(key))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "args_schema $ref '{reference}' has no definition; consumers see no args"
+                    )
+                });
+            assert!(
+                target.get("properties").is_some(),
+                "resolved args schema carries no properties"
+            );
+        }
     }
 
     #[test]
