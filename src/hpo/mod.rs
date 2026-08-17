@@ -16,6 +16,7 @@
 //!   and trial tracking.
 
 pub mod asha;
+pub mod driver;
 pub mod gp;
 pub mod median;
 pub mod pareto;
@@ -30,6 +31,7 @@ pub mod surrogate;
 pub mod tpe;
 
 pub use asha::AshaStop;
+pub use driver::{SurrogateConfig, SurrogatePolicy};
 pub use gp::{GpConfig, GpModel, GpSampler, ehvi_mc, expected_improvement};
 pub use median::MedianStop;
 pub use pareto::{
