@@ -195,6 +195,72 @@ jobs:
       - name: In-tree public example smoke
         run: cargo run --locked --example first_cookbook
 
+  sdk-parity:
+    name: blut-sdk parity gate (ADR 0111)
+    runs-on: ubuntu-latest
+    # ADR 0111's Validation section names the specific way this decision rots:
+    # the SDK mirrors the PlanSpec v1 IR, and if the two drift in the field
+    # without a compat entry the parity gate has rotted. Arming it here is what
+    # makes that impossible to do quietly — the SDK lives in this repo so an IR
+    # change and this job fail in the same commit.
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
+        with:
+          toolchain: stable
+
+      # Build the Starlark front-end so the gate compares against TODAY's
+      # blut-dsl, not only the checked-in golden. Without it the gate still
+      # runs and still catches a builder that drifted from the fixture, but it
+      # cannot notice a fixture that has gone stale against the emitter.
+      - name: Build blut-dsl (the parity counterpart)
+        run: cargo build --locked --release --manifest-path crates/blut-dsl/Cargo.toml
+
+      - name: Install the SDK
+        working-directory: sdk
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Unit tests
+        working-directory: sdk
+        run: python -m pytest tests -q
+
+      - name: Parity gate
+        working-directory: sdk
+        run: |
+          output=$(python -m blut_sdk.tests.parity)
+          echo "$output"
+          # The gate exits non-zero on failure, but a SKIPped live-DSL check
+          # would still exit 0 — and a silently skipped check is how a gate
+          # becomes vacuous. blut-dsl was just built, so a SKIP here means the
+          # discovery path broke and the comparison is no longer running.
+          if echo "$output" | grep -q "SKIP  fixture vs live blut-dsl"; then
+            echo "::error::live blut-dsl comparison was skipped despite the binary being built"
+            exit 1
+          fi
+
+      # NOT covered here, stated so nobody reads this job as broader than it
+      # is: the gate's second half — `blut recipe declare <plan>` compiling an
+      # SDK-authored plan through `from_erased_graph` — needs a COOKBOOK. This
+      # repo's engine registers no stages of its own, so a bare `blut` would
+      # reject the example's every node for the same reason a correct plan and
+      # a typo'd one both fail against an empty registry. That half runs
+      # against a cookbook binary (`lqt`) and is recorded in ADR 0111's
+      # Completion block. What is checked here is that the example still emits
+      # a well-formed v1 plan of the expected shape.
+      - name: Example emits a well-formed plan
+        working-directory: sdk
+        run: |
+          plan=$(python -m blut_sdk.examples.fanout --emit "$RUNNER_TEMP/sdk_plan.json")
+          test -s "$plan"
+          python -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['version']==1; assert len(d['nodes'])==5" "$plan"
+
   operator-internal:
     name: unpublished operator · Rust 1.89
     runs-on: ubuntu-latest
