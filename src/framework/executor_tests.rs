@@ -312,7 +312,7 @@ impl Drop for OptionalLocalInsertHookReset {
 
 #[test]
 fn dag_opt_advanced_gate_pipeline_cancel_after_cache_rename_rolls_back_before_lifecycle() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let job_dir = temp.path().join("job");
     let remote_root = temp.path().join("remote");
@@ -430,7 +430,7 @@ fn dag_opt_advanced_gate_pipeline_cancel_after_cache_rename_rolls_back_before_li
 
 #[test]
 fn ordinary_speculation_cache_insert_is_the_cancellation_linearization_point() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let job_dir = temp.path().join("job");
     let remote_root = temp.path().join("remote");
@@ -543,7 +543,7 @@ fn ordinary_speculation_cache_insert_is_the_cancellation_linearization_point() {
 
 #[test]
 fn speculative_external_reference_succeeds_without_portable_cache() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let job_dir = temp.path().join("job");
     let external = tempfile::tempdir().unwrap();
