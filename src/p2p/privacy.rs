@@ -303,8 +303,7 @@ impl PrivacyLedger {
             })?;
         if &actual != expected {
             return Err(TrainError::other(format!(
-                "privacy ledger tenant mismatch: stored '{}' != requested '{}' (cross-tenant read denied)",
-                actual, expected
+                "privacy ledger tenant mismatch: stored '{actual}' != requested '{expected}' (cross-tenant read denied)"
             )));
         }
         Ok(())
