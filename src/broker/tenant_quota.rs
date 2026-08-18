@@ -243,6 +243,38 @@ pub fn process_tracker() -> &'static TenantQuotaTracker {
     TRACKER.get_or_init(TenantQuotaTracker::new)
 }
 
+/// The snapshot a launch admits against.
+///
+/// Production probes the live machine. Under `cfg(test)` it is a FIXED
+/// snapshot, because a unit test must not depend on how much RAM the host
+/// happens to have free at that instant. Two `cli::partition` backfill tests
+/// drove real admission and failed on CI with "effective RAM ceiling 0.101 GiB
+/// ... is below the executor's 1 GiB accounting quantum" — the broker was
+/// right, the runner genuinely had ~100 MiB free mid-suite, and the tests were
+/// asserting on partition orchestration rather than on admission at all.
+///
+/// This removes NO coverage. The refusal path is tested deliberately and
+/// explicitly, with hand-built snapshots, in this module's own tests
+/// (`live_sub_gib.executor_budget_gib(..).is_err()`), which is where a
+/// low-memory assertion belongs. A sibling partition test already injects a
+/// fixed snapshot via `from_snapshot_for_test` for the same reason; this
+/// extends that idiom to the tests that go through the CLI entry point and
+/// therefore cannot pass one in.
+fn launch_snapshot() -> ResourceSnapshot {
+    #[cfg(test)]
+    {
+        ResourceSnapshot {
+            mem_total_gb: 64.0,
+            mem_avail_gb: 32.0,
+            ..Default::default()
+        }
+    }
+    #[cfg(not(test))]
+    {
+        ResourceSnapshot::probe()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,37 +307,5 @@ mod tests {
         let probe_miss_fractional =
             TenantAdmission::from_snapshot(tenant, 0.5, ResourceSnapshot::default());
         assert!(probe_miss_fractional.executor_budget_gib(6.0).is_err());
-    }
-}
-
-/// The snapshot a launch admits against.
-///
-/// Production probes the live machine. Under `cfg(test)` it is a FIXED
-/// snapshot, because a unit test must not depend on how much RAM the host
-/// happens to have free at that instant. Two `cli::partition` backfill tests
-/// drove real admission and failed on CI with "effective RAM ceiling 0.101 GiB
-/// ... is below the executor's 1 GiB accounting quantum" — the broker was
-/// right, the runner genuinely had ~100 MiB free mid-suite, and the tests were
-/// asserting on partition orchestration rather than on admission at all.
-///
-/// This removes NO coverage. The refusal path is tested deliberately and
-/// explicitly, with hand-built snapshots, in this module's own tests
-/// (`live_sub_gib.executor_budget_gib(..).is_err()`), which is where a
-/// low-memory assertion belongs. A sibling partition test already injects a
-/// fixed snapshot via `from_snapshot_for_test` for the same reason; this
-/// extends that idiom to the tests that go through the CLI entry point and
-/// therefore cannot pass one in.
-fn launch_snapshot() -> ResourceSnapshot {
-    #[cfg(test)]
-    {
-        ResourceSnapshot {
-            mem_total_gb: 64.0,
-            mem_avail_gb: 32.0,
-            ..Default::default()
-        }
-    }
-    #[cfg(not(test))]
-    {
-        ResourceSnapshot::probe()
     }
 }
