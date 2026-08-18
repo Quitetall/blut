@@ -770,9 +770,12 @@ fn truth_ledger_rows_at(root: &std::path::Path) -> Result<Vec<TruthLedgerRow>> {
             ));
         }
         for (name, column) in [("Value", value_column), ("Run id / source", source_column)] {
-            if !column
+            // `is_none_or(empty)` rather than `!is_some_and(!empty)` — same
+            // truth table, and MSRV clippy (1.88) rejects the doubly-negated
+            // form as `nonminimal_bool` under `-D warnings`.
+            if column
                 .and_then(|index| cells.get(index))
-                .is_some_and(|cell| !cell.is_empty())
+                .is_none_or(|cell| cell.is_empty())
             {
                 return Err(anyhow!(
                     "{} §2 provenance row has empty {name}",

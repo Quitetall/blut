@@ -159,8 +159,12 @@ fn forward_sub(l: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
     let mut z = vec![0.0; n];
     for i in 0..n {
         let mut s = b[i];
-        for k in 0..i {
-            s -= l[i][k] * z[k];
+        // `z.iter().enumerate().take(i)` rather than `for k in 0..i`: the
+        // borrow ends with the inner loop, so the `z[i] = …` write below is
+        // still fine, and MSRV clippy (1.88) rejects the index form under
+        // `-D warnings` even though a newer clippy does not.
+        for (k, zk) in z.iter().enumerate().take(i) {
+            s -= l[i][k] * zk;
         }
         z[i] = s / l[i][i];
     }
