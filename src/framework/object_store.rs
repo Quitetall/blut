@@ -885,10 +885,10 @@ async fn read_provider_capped(
         Err(object_store::Error::NotFound { .. }) => return Ok(None),
         Err(error) => return Err(StoreError::backend("head", key, error)),
     };
-    if meta.size as u64 > MAX_STORED_SIZE {
+    if meta.size > MAX_STORED_SIZE {
         return Err(StoreError::TooLarge {
             key,
-            size: (meta.size as u64).saturating_sub(OBJECT_HEADER_LEN as u64),
+            size: meta.size.saturating_sub(OBJECT_HEADER_LEN as u64),
             max: MAX_OBJECT_SIZE,
         });
     }
@@ -898,7 +898,7 @@ async fn read_provider_capped(
         Err(error) => return Err(StoreError::backend("get", key, error)),
     };
     let mut stream = result.into_stream();
-    let mut stored = Vec::with_capacity((meta.size as u64).min(8 * 1024 * 1024) as usize);
+    let mut stored = Vec::with_capacity(meta.size.min(8 * 1024 * 1024) as usize);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| StoreError::backend("read", key, error))?;
         let next_len = stored
