@@ -513,26 +513,63 @@ mod tests {
         pid_alive(pid) == PidStatus::Gone
     }
 
-    /// Spawn a real parent→grandchild process tree as a new session
-    /// leader. The child backgrounds a grandchild (`sleep 300 &`),
-    /// prints the grandchild pid, then **closes its stdout** (so the
-    /// reader hits EOF immediately) and `exec`s into its own
-    /// `sleep 300`. Both processes live in the same process group
-    /// (`pgid == child pid`, courtesy of `setsid`). Returns
-    /// `(child_identity, grandchild_pid)`.
+    /// A spawned tree that ALWAYS dies with the test.
     ///
-    /// Both the grandchild AND the child must drop the stdout pipe
-    /// before the final long sleep, or `read_to_string` blocks for
-    /// the whole sleep (the grandchild inherits fd 1; the exec'd
-    /// child inherits fd 1). So: grandchild stdout → /dev/null, echo
-    /// the pid, `exec 1>&-` to close the child's copy, then exec into
-    /// `sleep`. EOF then arrives on the reader immediately.
-    fn spawn_tree() -> (ChildIdentity, u32) {
+    /// Every test here spawns real `sleep 300` processes, and one of them
+    /// (`identity_guard_refuses_recycled_pid`) exercises the REFUSAL path on
+    /// purpose — the API under test declines to signal, so nothing else would
+    /// ever reap that tree. Two `sleep 300` orphans then outlive the run. Under
+    /// `cargo test` that is invisible; under a CI runner it is "Cleaning up
+    /// orphan processes" and a step that never completes.
+    ///
+    /// Drop kills the group unconditionally, so leaking is not something a test
+    /// author has to remember.
+    struct Tree {
+        id: ChildIdentity,
+        grandchild: u32,
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            #[allow(unused_imports)]
+            use nix::sys::signal::{Signal, killpg};
+            use nix::unistd::Pid;
+            // SIGKILL, not SIGTERM: this is a teardown backstop, and `sleep`
+            // ignoring a term would leave exactly the orphan being prevented.
+            let _ = killpg(Pid::from_raw(self.id.pgid as i32), Signal::SIGKILL);
+        }
+    }
+
+    /// Spawn a real parent→grandchild process tree as a new session leader.
+    ///
+    /// The child backgrounds a grandchild (`sleep 300 &`), records its pid, and
+    /// `exec`s into its own `sleep 300`. Both live in the same process group
+    /// (`pgid == child pid`, courtesy of `setsid`).
+    ///
+    /// **The grandchild pid travels through a FILE, and all three stdio streams
+    /// are `/dev/null`.** The previous fixture piped stdout and blocked in
+    /// `read_to_string` until EOF, which required the shell to close fd 1 mid
+    /// script (`exec 1>&-`) before its final `exec sleep 300`. That is
+    /// shell-dependent: it holds on the bash that `/bin/sh` points at locally
+    /// and did not on CI, where `/bin/sh` is dash — so the read never returned,
+    /// the test thread blocked forever, the harness never printed a summary,
+    /// and the whole job was cancelled with 23 tests never reporting. A bounded
+    /// poll on a file cannot hang, and null stdio means a stray child can never
+    /// hold the harness's pipes open.
+    fn spawn_tree() -> Tree {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("grandchild.pid");
+        // `sleep 300 & echo $! > file` then exec into the child's own sleep.
+        // No fd juggling, so no shell-specific behaviour to depend on.
+        let script = format!(
+            "sleep 300 & echo $! > {} ; exec sleep 300",
+            pidfile.display()
+        );
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
-            .arg("sleep 300 >/dev/null 2>&1 & echo $! ; exec 1>&- ; exec sleep 300")
+            .arg(&script)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             .stderr(Stdio::null());
         // SAFETY: setsid is async-signal-safe and the closure does no
         // allocation — sound to run between fork and exec.
@@ -540,31 +577,40 @@ mod tests {
         unsafe {
             cmd.pre_exec(pre_exec_setsid);
         }
-        let mut child = cmd.spawn().expect("spawn sh tree");
+        let child = cmd.spawn().expect("spawn sh tree");
         let pid = child.id();
-        // Read the single echoed grandchild pid line; EOF arrives as
-        // soon as the shell closes fd 1.
-        use std::io::Read;
-        let mut buf = String::new();
-        child
-            .stdout
-            .take()
-            .unwrap()
-            .read_to_string(&mut buf)
-            .expect("read grandchild pid");
-        let grandchild: u32 = buf.trim().parse().expect("parse grandchild pid");
-        // Detach: we waitpid-reap via graceful_kill, not via child.wait.
+        // Detach: the tree is reaped by `graceful_kill_group` (what these tests
+        // exercise) or by `Tree::drop`, never by `child.wait`.
         std::mem::forget(child);
+
+        // Bounded: a fixture that cannot produce a pid must FAIL the test, not
+        // stall the suite.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let grandchild = loop {
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(parsed) = text.trim().parse::<u32>()
+            {
+                break parsed;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture never recorded a grandchild pid at {}",
+                pidfile.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
         let id = capture_identity(pid);
-        // Give the backgrounded grandchild a beat to actually be
-        // exec'd into `sleep` before the test probes it.
+        // Give the backgrounded grandchild a beat to actually be exec'd into
+        // `sleep` before the test probes it.
         std::thread::sleep(Duration::from_millis(50));
-        (id, grandchild)
+        Tree { id, grandchild }
     }
 
     #[tokio::test]
     async fn killpg_kills_child_and_grandchild() {
-        let (id, grandchild) = spawn_tree();
+        let tree = spawn_tree();
+        let (id, grandchild) = (tree.id, tree.grandchild);
         // Both alive at the start.
         assert_eq!(pid_alive(id.pid), PidStatus::Alive, "child not alive");
         assert_eq!(
@@ -592,7 +638,8 @@ mod tests {
 
     #[tokio::test]
     async fn graceful_kill_reaps_no_zombie() {
-        let (id, grandchild) = spawn_tree();
+        let tree = spawn_tree();
+        let (id, grandchild) = (tree.id, tree.grandchild);
         graceful_kill_group(id.pgid, Some(id), Duration::from_secs(3)).await;
         assert!(wait_dead(id.pid, Duration::from_secs(5)));
         // After reap, /proc/<pid>/stat is gone entirely (not "Z").
@@ -617,7 +664,8 @@ mod tests {
     async fn identity_guard_refuses_recycled_pid() {
         // Build a fake identity for a pid that is alive but whose
         // recorded start-time is deliberately wrong (simulating reuse).
-        let (id, _grandchild) = spawn_tree();
+        let tree = spawn_tree();
+        let id = tree.id;
         let mut forged = id;
         forged.start_time = Some(id.start_time.unwrap_or(0).wrapping_add(999_999));
         // The guard must classify this as Reused and NOT signal.
