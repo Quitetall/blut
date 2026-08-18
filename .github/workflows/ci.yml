@@ -32,6 +32,29 @@ jobs:
         with:
           persist-credentials: false
 
+      # This job compiles EIGHT separate workspaces — the engine (three feature
+      # combinations, all targets) plus blut-dsl, blut-notify, blut-web,
+      # blut-web-ui on wasm32, blut-metrics, blut-semantic and blut-tui — each
+      # with its own `target/`. A hosted runner ships ~14 GiB free, and the run
+      # died partway through the wasm32 leg with "final link failed: No space
+      # left on device". That is a capacity failure, not a code failure, and it
+      # surfaces as a linker error deep in a dependency, which reads like a
+      # broken toolchain until you get to the last line.
+      #
+      # Reclaiming the preinstalled SDKs this repository never uses buys ~20 GiB
+      # for a few seconds of `rm`. Sizes are printed so a future squeeze is
+      # visible in the log rather than inferred.
+      - name: Reclaim runner disk
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost || true
+          echo "after:";  df -h / | tail -1
+
       - name: Install MSRV toolchain (clippy + rustfmt)
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
         with:
