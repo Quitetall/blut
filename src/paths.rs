@@ -189,7 +189,21 @@ pub fn resolve_trainer_script_named(name: &str) -> Result<PathBuf> {
 }
 
 pub fn resolve_trainer_script() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("LAMU_TRAINER_PY") {
+    resolve_trainer_script_with(std::env::var("LAMU_TRAINER_PY").ok())
+}
+
+/// [`resolve_trainer_script`] with the override passed in rather than read from
+/// the process environment.
+///
+/// The env read is lifted to the caller so tests can exercise both branches
+/// WITHOUT mutating global state. They used to `unsafe { env::set_var(...) }`
+/// around a shared mutex, which serializes the two tests against each other but
+/// not against the hundreds of others reading env concurrently — that is the
+/// data race that made `set_var` unsafe in Rust 2024. It passed on a 32-core
+/// dev box and failed both tests on a 4-core CI runner, where the interleaving
+/// differs.
+fn resolve_trainer_script_with(override_path: Option<String>) -> Result<PathBuf> {
+    if let Some(p) = override_path {
         return Ok(PathBuf::from(p));
     }
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -305,44 +319,30 @@ mod tests {
 
     #[test]
     fn resolve_trainer_errors_without_python_in_engine() {
-        // Engine carve (v1.0): the engine ships ZERO python — the
-        // generic `trainer.py` moved to `blut-backends`. With no env
-        // override and no checked-in `python/trainer.py`, resolution
-        // must fail-closed with a clear error (not silently succeed).
-        let _g = lock();
-        let prev = std::env::var("LAMU_TRAINER_PY").ok();
-        unsafe {
-            std::env::remove_var("LAMU_TRAINER_PY");
-        }
-        let err = resolve_trainer_script()
+        // Engine carve (v1.0): the engine ships ZERO python — the generic
+        // `trainer.py` moved to `blut-backends`. With no override and no
+        // checked-in `python/trainer.py`, resolution must fail-closed with a
+        // clear error (not silently succeed).
+        //
+        // No env mutation and no lock: the override is a parameter. The
+        // previous form wrote LAMU_TRAINER_PY with `unsafe { set_var }`, which
+        // races every concurrent env reader in the suite and failed on CI while
+        // passing locally.
+        let err = resolve_trainer_script_with(None)
             .expect_err("pure engine ships no trainer.py — resolution must error");
         assert!(
             err.to_string().contains("trainer.py not found"),
             "got: {err}"
         );
-        unsafe {
-            if let Some(v) = prev {
-                std::env::set_var("LAMU_TRAINER_PY", v);
-            }
-        }
     }
 
     #[test]
     fn resolve_trainer_respects_env() {
-        let _g = lock();
-        let prev = std::env::var("LAMU_TRAINER_PY").ok();
-        unsafe {
-            std::env::set_var("LAMU_TRAINER_PY", "/some/custom/trainer.py");
-        }
+        // Same reason: the override is passed in, not written to the process
+        // environment.
         assert_eq!(
-            resolve_trainer_script().unwrap(),
+            resolve_trainer_script_with(Some("/some/custom/trainer.py".to_string())).unwrap(),
             PathBuf::from("/some/custom/trainer.py")
         );
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("LAMU_TRAINER_PY", v),
-                None => std::env::remove_var("LAMU_TRAINER_PY"),
-            }
-        }
     }
 }
