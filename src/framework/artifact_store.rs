@@ -39,11 +39,9 @@
 
 use std::path::{Path, PathBuf};
 
-use abir::ContentId as AbirContentId;
-use abir_training::TrainingArtifactContentHasher;
 use serde::{Deserialize, Serialize};
 
-use crate::framework::artifact::{ArtifactContentId, ContentHash};
+use crate::framework::artifact::{ArtifactContentHasher, ArtifactContentId, ContentHash};
 use crate::framework::object_store::MAX_OBJECT_SIZE;
 use crate::framework::stage::{ErasedArtifact, StageDyn};
 
@@ -113,12 +111,12 @@ pub struct ArtifactManifest {
 }
 
 impl ArtifactManifest {
-    /// Canonical ABIR identity carried by version 3 manifests. Version 2
+    /// Canonical content identity carried by version 3 manifests. Version 2
     /// retained a SHA-256-derived legacy object key in the same wire slot;
     /// unknown future versions must be interpreted only by their own reader.
-    pub const fn abir_content_id(&self) -> Option<AbirContentId> {
+    pub const fn semantic_content_id(&self) -> Option<ArtifactContentId> {
         if self.format_version == ARTIFACT_FORMAT_VERSION {
-            Some(self.content_id.as_abir())
+            Some(self.content_id)
         } else {
             None
         }
@@ -336,7 +334,7 @@ pub fn unpersisted_content_id(
         ArtifactRole::Input => stage.input_portable_identity(erased),
         ArtifactRole::Output => stage.output_portable_identity(erased),
     };
-    let mut hasher = TrainingArtifactContentHasher::new();
+    let mut hasher = ArtifactContentHasher::new();
     hasher.update(UNPERSISTED_ID_DOMAIN);
     hasher.update(&(erased.kind.len() as u64).to_le_bytes());
     hasher.update(erased.kind.as_bytes());
@@ -346,7 +344,7 @@ pub fn unpersisted_content_id(
         hasher.update(&(identity.len() as u64).to_le_bytes());
         hasher.update(&identity);
     }
-    ArtifactContentId::from_abir(hasher.finalize())
+    hasher.finalize()
 }
 
 /// Streaming form of [`capture`]: return the manifest and plaintext pack as
@@ -828,7 +826,7 @@ fn derive_content_id(
     erased: &ErasedArtifact,
 ) -> Result<ArtifactContentId, ArtifactStoreError> {
     let identity = portable_identity(stage, role, erased)?;
-    let mut hasher = TrainingArtifactContentHasher::new();
+    let mut hasher = ArtifactContentHasher::new();
     feed_artifact_identity(
         |bytes| hasher.update(bytes),
         kind,
@@ -837,7 +835,7 @@ fn derive_content_id(
         files,
         pack,
     );
-    Ok(ArtifactContentId::from_abir(hasher.finalize()))
+    Ok(hasher.finalize())
 }
 
 fn derive_legacy_content_id(
@@ -1197,17 +1195,14 @@ mod tests {
             bundle(&stage, erased, src.path(), BlobDir::Input, None).unwrap();
 
         assert_eq!(manifest.format_version, ARTIFACT_FORMAT_VERSION);
-        assert_eq!(
-            manifest.abir_content_id(),
-            Some(manifest.content_id.as_abir())
-        );
+        assert_eq!(manifest.semantic_content_id(), Some(manifest.content_id));
         assert_eq!(
             manifest.content_id.to_hex(),
             "ed3fbf83cf55e070e75f32c9a95d0e701fe70f028715c27f23f2f2fca1f69aab"
         );
 
         manifest.format_version = ARTIFACT_FORMAT_VERSION + 1;
-        assert_eq!(manifest.abir_content_id(), None);
+        assert_eq!(manifest.semantic_content_id(), None);
         manifest.format_version = ARTIFACT_FORMAT_VERSION;
 
         let legacy = derive_legacy_content_id(
@@ -1224,7 +1219,7 @@ mod tests {
 
         manifest.format_version = LEGACY_ARTIFACT_FORMAT_VERSION;
         manifest.content_id = legacy;
-        assert_eq!(manifest.abir_content_id(), None);
+        assert_eq!(manifest.semantic_content_id(), None);
         let dest = tempfile::tempdir().unwrap();
         let restored = unbundle(
             &stage,

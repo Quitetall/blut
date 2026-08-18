@@ -27,7 +27,6 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use abir::ContentId as AbirContentId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -339,42 +338,101 @@ impl std::fmt::Debug for InvocationKey {
     }
 }
 
-/// BLUT projection of ABIR's canonical semantic [`AbirContentId`].
+/// A BLUT artifact's content identity: 32 bytes, serialized as 64 hex.
 ///
-/// BLUT owns artifact canonicalization and storage integrity. ABIR owns the
-/// resulting identity type. This wrapper preserves BLUT's public type safety
-/// and historical 64-hex serialization without defining another identity.
+/// Owned by the engine. It previously wrapped `abir::ContentId`, which put a
+/// dependency on a BIOSIGNAL crate ("Atomic Biosignal Intermediate
+/// Representation") into the domain-agnostic engine — the exact edge ADR 0143
+/// says `blut` "MUST NOT" have and retired once already, and ADR 0150 restates
+/// as an invariant. ABIR vocabulary belongs in the `blut-semantic` sidecar or a
+/// cookbook; the identity itself is a plain 32-byte digest and needs no domain
+/// crate to express.
+///
+/// The VALUE is unchanged. The bytes are still produced by
+/// [`ArtifactContentHasher`], whose domain string is byte-for-byte what it
+/// always was, so every stored artifact id, cache entry and manifest stays
+/// valid across this change. See `content_id_hash_is_byte_stable_across_the_abir_cut`.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
-pub struct ArtifactContentId(AbirContentId);
+pub struct ArtifactContentId([u8; 32]);
 
-/// BLUT artifact projection wrapper over ABIR content IDs.
-/// The stored value is an [`AbirContentId`].
 impl ArtifactContentId {
-    pub const fn from_abir(content_id: AbirContentId) -> Self {
-        Self(content_id)
+    /// Reconstruct an already-derived identity from its exact wire bytes.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
 
-    pub const fn as_abir(self) -> AbirContentId {
+    /// The raw 32 bytes.
+    pub const fn to_bytes(self) -> [u8; 32] {
         self.0
     }
 
-    /// Reconstruct an already-derived identity from its exact wire bytes.
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(AbirContentId::from_bytes(bytes))
-    }
-
     /// Read compatibility for pre-ADR0169 callers that stored identity bytes in
-    /// `ContentHash`. New identity producers must use ABIR sealers.
+    /// `ContentHash`. New identity producers must use [`ArtifactContentHasher`].
     pub const fn from_digest(digest: ContentHash) -> Self {
         Self::from_bytes(digest.0)
     }
 
     pub fn digest(self) -> ContentHash {
-        ContentHash(self.0.to_bytes())
+        ContentHash(self.0)
     }
 
     pub fn to_hex(self) -> String {
-        self.0.to_string()
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+/// Domain-separation label mixed into every artifact content id.
+///
+/// **Do not "clean up" the `abir` in this string.** It is not a code
+/// dependency — it is the wire identity. Every artifact id, cache-invocation
+/// key and manifest ever written was derived under this exact label, so
+/// changing a single byte silently re-keys the entire content store: nothing
+/// errors, every lookup simply misses and every artifact is recomputed once
+/// and stored twice. The engine no longer depends on the ABIR *crate*; it
+/// keeps the ABIR *label* because that is what the stored bytes mean.
+const ARTIFACT_CONTENT_DOMAIN: &str = "org.quitetall.abir.training.artifact-v1";
+
+/// Streaming hasher for artifact content ids.
+///
+/// BLAKE3, pre-seeded with [`ARTIFACT_CONTENT_DOMAIN`] and a NUL separator —
+/// byte-for-byte what `abir_training::TrainingArtifactContentHasher` did, which
+/// is the whole of what the engine used that crate for. Pinned against golden
+/// vectors captured from the ABIR implementation before it was removed
+/// (`content_id_hash_is_byte_stable_across_the_abir_cut`).
+#[derive(Clone)]
+pub struct ArtifactContentHasher(blake3::Hasher);
+
+impl ArtifactContentHasher {
+    pub fn new() -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(ARTIFACT_CONTENT_DOMAIN.as_bytes());
+        // The NUL is part of the domain separation, not a formatting accident:
+        // without it, a domain label that is a prefix of another would collide
+        // with it under a shifted input.
+        hasher.update(&[0]);
+        Self(hasher)
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    pub fn finalize(self) -> ArtifactContentId {
+        // Fully-qualified on purpose. When any crate in the build enables
+        // blake3's `digest` trait feature — as one does in the `blut-dsl`
+        // workspace — `Digest::finalize` comes into scope and shadows the
+        // inherent method, returning a `GenericArray` instead of `Hash`.
+        // Method-call syntax then fails to compile in that workspace and
+        // compiles fine in this one, which is the same feature-unification
+        // trap ADR 0078 records for `serde_json/arbitrary_precision`.
+        let hash = blake3::Hasher::finalize(&self.0);
+        ArtifactContentId::from_bytes(*hash.as_bytes())
+    }
+}
+
+impl Default for ArtifactContentHasher {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -396,7 +454,11 @@ impl<'de> Deserialize<'de> for ArtifactContentId {
 
 impl std::fmt::Display for ArtifactContentId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        // Lower-case 64-hex, the historical serialization.
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
     }
 }
 
@@ -1169,6 +1231,56 @@ pub(crate) fn decode_list_children(
 
 #[cfg(test)]
 mod tests {
+
+    /// The hash bytes must NOT move now that the engine owns the hasher.
+    ///
+    /// These four vectors were captured by RUNNING
+    /// `abir_training::TrainingArtifactContentHasher` immediately before the
+    /// dependency was removed. They are the real thing, not a re-derivation: if
+    /// the domain label, the NUL separator, the algorithm, or the update order
+    /// ever drifts, every artifact id and cache-invocation key in every existing
+    /// store silently re-keys — nothing errors, every lookup just misses.
+    #[test]
+    fn content_id_hash_is_byte_stable_across_the_abir_cut() {
+        let cases: [(&[&[u8]], &str); 4] = [
+            (
+                &[],
+                "26dff847cc04c38dc9c666f40bfb28251f9a5755216a5391bd6db152daa11877",
+            ),
+            (
+                &[b"hello"],
+                "8fe7d81af044d643fa45ccbb12c335bff19799c8a415125b30e8ebdcc771ae21",
+            ),
+            (
+                &[b"a", b"bb", b"ccc"],
+                "a9bb15fa0a1f991048288d0639d658da3900a2f989aa2af4f68d29126e0c6c5b",
+            ),
+            (
+                &[&[0u8, 1, 2, 255], &[128u8; 40]],
+                "51364dc12d015ca0e0413073bb013a6be16b12ee4e7ee10050c9aa434aad6934",
+            ),
+        ];
+        for (parts, expected) in cases {
+            let mut hasher = ArtifactContentHasher::new();
+            for part in parts {
+                hasher.update(part);
+            }
+            assert_eq!(
+                hasher.finalize().to_hex(),
+                expected,
+                "content id drifted for {parts:?}; every stored artifact id would re-key"
+            );
+        }
+    }
+
+    /// The domain label is wire data, not a name to tidy.
+    #[test]
+    fn the_content_domain_label_is_frozen() {
+        assert_eq!(
+            ARTIFACT_CONTENT_DOMAIN, "org.quitetall.abir.training.artifact-v1",
+            "this label is mixed into every stored content id; changing it re-keys the store"
+        );
+    }
     use super::*;
 
     // --------- ContentHash ---------------------------------------
