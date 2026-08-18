@@ -351,13 +351,7 @@ impl ConsoleModel {
                         hash: display.clone(),
                         note: format!("ran {:.1}s", elapsed.as_secs_f64()),
                     });
-                    set(
-                        &mut nodes,
-                        node_idx,
-                        stage_name,
-                        NodeState::Done,
-                        display,
-                    );
+                    set(&mut nodes, node_idx, stage_name, NodeState::Done, display);
                 }
                 StageEvent::StageSkipped {
                     node_idx,
@@ -1098,7 +1092,7 @@ mod tests {
 
     #[test]
     fn applies_a_real_status_jsonl() {
-        use blut::framework::artifact::{ContentHash, ArtifactContentId, InvocationKey};
+        use blut::framework::artifact::{ArtifactContentId, ContentHash, InvocationKey};
         use std::time::Duration;
         let h = |e| HostedEvent {
             host: None,
@@ -1111,7 +1105,9 @@ mod tests {
                 node_idx: 0,
                 stage_name: "codec_ready".into(),
                 invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"a")),
-                content_id: Some(ArtifactContentId::from_digest(ContentHash::of_bytes(b"cached"))),
+                content_id: Some(ArtifactContentId::from_digest(ContentHash::of_bytes(
+                    b"cached",
+                ))),
             }),
             h(StageEvent::StageBegin {
                 node_idx: 1,
@@ -1180,7 +1176,7 @@ mod tests {
 
     #[test]
     fn control_prune_is_a_successful_accounted_stage() {
-        use blut::framework::artifact::{ContentHash, ArtifactContentId};
+        use blut::framework::artifact::{ArtifactContentId, ContentHash};
         use std::time::Duration;
 
         let events = [
@@ -1191,7 +1187,9 @@ mod tests {
                 event: StageEvent::StageEnd {
                     node_idx: 0,
                     stage_name: "decision".into(),
-                    content_id: Some(ArtifactContentId::from_digest(ContentHash::of_bytes(b"decision"))),
+                    content_id: Some(ArtifactContentId::from_digest(ContentHash::of_bytes(
+                        b"decision",
+                    ))),
                     legacy_output_hash: None,
                     elapsed: Duration::from_millis(1),
                 },

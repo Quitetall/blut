@@ -260,10 +260,7 @@ pub fn artifacts_for(job_id: &str) -> Vec<ArtifactRow> {
                     })
                 })
                 .unwrap_or_else(|| "unknown".into());
-            let stage = a
-                .meta
-                .produced_by_stage
-                .unwrap_or_else(|| "—".into());
+            let stage = a.meta.produced_by_stage.unwrap_or_else(|| "—".into());
             (
                 ts,
                 ArtifactRow {
@@ -319,8 +316,12 @@ pub fn lineage_for(job_id: &str) -> LineageView {
                 .output_content_id
                 .map(|id| id.to_hex().chars().take(10).collect())
                 .or_else(|| {
-                    n.legacy_output_hash
-                        .map(|hash| format!("legacy:{}", hash.to_hex().chars().take(10).collect::<String>()))
+                    n.legacy_output_hash.map(|hash| {
+                        format!(
+                            "legacy:{}",
+                            hash.to_hex().chars().take(10).collect::<String>()
+                        )
+                    })
                 })
                 .unwrap_or_else(|| "—".into()),
             cached: n.cached,
