@@ -394,7 +394,7 @@ const ARTIFACT_CONTENT_DOMAIN: &str = "org.quitetall.abir.training.artifact-v1";
 
 /// Streaming hasher for artifact content ids.
 ///
-/// BLAKE3, pre-seeded with [`ARTIFACT_CONTENT_DOMAIN`] and a NUL separator —
+/// BLAKE3, pre-seeded with `ARTIFACT_CONTENT_DOMAIN` and a NUL separator —
 /// byte-for-byte what `abir_training::TrainingArtifactContentHasher` did, which
 /// is the whole of what the engine used that crate for. Pinned against golden
 /// vectors captured from the ABIR implementation before it was removed

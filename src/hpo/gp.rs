@@ -38,7 +38,7 @@ use super::tpe::{support_t, to_t};
 /// length scale over a normalised space is not the binding constraint.
 #[derive(Clone, Debug)]
 pub struct GpConfig {
-    /// Matérn length scale, in units of the normalised [0,1] space.
+    /// Matérn length scale, in units of the normalised \[0,1\] space.
     pub length_scale: f64,
     /// Kernel amplitude. Applied to STANDARDISED targets, so 1.0 means "one
     /// standard deviation of the observed objective".
