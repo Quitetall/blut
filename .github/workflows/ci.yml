@@ -211,12 +211,19 @@ jobs:
           ! grep -E '^(\.claude/|docker/|docs/|scripts/(k8s_kind|minio)_smoke\.sh)' /tmp/blut-package.txt
           cargo publish --dry-run --locked --manifest-path crates/blut-types/Cargo.toml
           cargo package --locked --list --manifest-path crates/blut-dsl/Cargo.toml > /tmp/blut-dsl-package.txt
-          if cargo info blut-types@0.2.0-alpha.1 >/dev/null 2>&1; then
+          # `cargo info <name>@<ver>` must be asked from OUTSIDE this workspace.
+          # Run inside it, cargo answers from the local PATH member and exits 0
+          # for a version that was never published, so the guards below always
+          # took their "already indexed" branch and ran `cargo package`, which
+          # then failed with "no matching package named `blut-types` found". A
+          # conditional that cannot take its false branch is not a guard.
+          indexed() { ( cd "$RUNNER_TEMP" && cargo info "$1" ) >/dev/null 2>&1; }
+          if indexed blut-types@0.2.0-alpha.1; then
             cargo package --locked
           else
             echo "::notice::blut tarball verification awaits blut-types 0.2.0-alpha.1 indexing; rerun this exact SHA after publishing blut-types"
           fi
-          if cargo info blut@0.2.0-alpha.1 >/dev/null 2>&1; then
+          if indexed blut@0.2.0-alpha.1; then
             cargo package --locked --manifest-path crates/blut-dsl/Cargo.toml
           else
             echo "::notice::blut-dsl tarball verification awaits blut 0.2.0-alpha.1 indexing; rerun this exact SHA after publishing blut"
