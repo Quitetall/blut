@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly portability sweep. The macOS leg bills at 10x and exists to catch
+  # portability drift, which weekly catches just as well as per-commit -- see
+  # the `macos-build` job below.
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,6 +26,7 @@ jobs:
   build-test-lint:
     name: build · test · clippy · fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -198,6 +205,7 @@ jobs:
   sdk-parity:
     name: blut-sdk parity gate (ADR 0111)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     # ADR 0111's Validation section names the specific way this decision rots:
     # the SDK mirrors the PlanSpec v1 IR, and if the two drift in the field
     # without a compat entry the parity gate has rotted. Arming it here is what
@@ -264,6 +272,7 @@ jobs:
   operator-internal:
     name: unpublished operator · Rust 1.89
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -283,7 +292,16 @@ jobs:
 
   macos-build:
     name: macOS compile-check (containment degrades)
+    # WEEKLY, not per-commit. macOS bills at 10x, and this job ran on every
+    # push to main AND every pull request -- the single most expensive lane in
+    # the fleet, for a check that only proves the crate still COMPILES on a
+    # non-Linux Unix host. Compile-portability drifts on the timescale of
+    # dependency and edition changes, not individual commits, so a weekly
+    # sweep catches it at roughly a twentieth of the billed minutes.
+    # Force one on a branch: `gh workflow run ci.yml --ref <branch>`.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
+    timeout-minutes: 60
     # blut is a Linux-first engine: the never-OOM cgroup containment needs
     # Linux + systemd, and off-systemd it degrades to a bare spawn. This job
     # only proves the crate COMPILES on a non-Linux Unix host (the realistic
@@ -316,6 +334,7 @@ jobs:
   wasm32-keystone:
     name: blut-types wasm32 keystone (ADR 0083)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     # ADR 0083: `blut-types` is the wasm32-SAFE keystone crate — the pure-serde
     # wire types shared by the engine and the Leptos+WASM `blut-web` sidecar. It
     # must NEVER pull in tokio / rusqlite / filesystem / an engine dep, or the
@@ -349,6 +368,7 @@ jobs:
   security:
     name: advisories · licenses · secrets
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
