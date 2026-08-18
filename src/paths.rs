@@ -247,7 +247,9 @@ mod tests {
     use super::*;
 
     fn lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::TEST_ENV_LOCK.lock().unwrap()
+        crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     #[test]

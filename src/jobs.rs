@@ -625,7 +625,9 @@ mod tests {
     }
 
     fn with_jobs_dir<F: FnOnce()>(f: F) {
-        let _g = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let td = tempfile::tempdir().unwrap();
         let prev = std::env::var("LAMU_TRAIN_JOBS_DIR").ok();
         unsafe {
@@ -767,7 +769,9 @@ mod tests {
 
     #[test]
     fn list_jobs_handles_missing_dir() {
-        let _g = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let prev = std::env::var("LAMU_TRAIN_JOBS_DIR").ok();
         unsafe {
             std::env::set_var(

@@ -1696,7 +1696,9 @@ mod declare_dispatch_tests {
         // BLUT_DSL_BIN at a path that certainly doesn't exist. (This engine
         // test binary no longer links starlark, so there is no pre-main thread
         // and this scoped env set is sound; TEST_ENV_LOCK serializes it.)
-        let _g = crate::TEST_ENV_LOCK.lock().unwrap();
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let td = tempfile::tempdir().unwrap();
         let p = write(td.path(), "r.star", "def build(args):\n    add(\"x\")\n");
         let prev = std::env::var("BLUT_DSL_BIN").ok();

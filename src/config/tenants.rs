@@ -180,7 +180,15 @@ mod tests {
 
     #[test]
     fn explicit_override_path_must_exist() {
-        let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+        // Poison-tolerant: this mutex guards ENV MUTATION ordering, not data
+        // invariants. One test panicking while holding it must not convert a
+        // single real failure into a cascade of unrelated ones — which is
+        // exactly what `.unwrap()` did here (17 tests failed on CI for one
+        // underlying cause). `into_inner` keeps the ordering guarantee and
+        // drops the poison flag.
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let old = std::env::var(TENANTS_CONFIG_ENV).ok();
         // SAFETY: TEST_ENV_LOCK serializes this process-global mutation.
         unsafe { std::env::set_var(TENANTS_CONFIG_ENV, "/definitely/missing/blut-tenants.toml") };
