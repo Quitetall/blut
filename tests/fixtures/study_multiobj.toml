@@ -1,3 +1,14 @@
+# SUPERSEDED 2026-08-18 by
+# training/cookbooks/lamquant/evidence/adr0109-codec-footprint/study_codec_footprint.toml
+# (recorded in ADR 0109's Progress Log). That fixture RUNS: it measures the
+# shipped lossless codec on real EEG and produced an 8-point front over
+# encode throughput vs peak RSS.
+#
+# This file is kept, unchanged, as the historical record of what the ADR
+# originally proposed. It is still not runnable — no `demo_codec` is
+# registered, and the objectives below need a trained neural codec — which is
+# exactly why a new basis was recorded instead of re-pointing this one.
+#
 # ADR 0109 multi-objective study fixture — the one named by the acceptance gate
 # (`blut study run tests/fixtures/study_multiobj.toml --max-trials 24`).
 #
