@@ -1371,11 +1371,20 @@ mod tests {
         let key = invocation(b"oversized-object");
         let (artifact, _) = file_artifact(&producer, b"small valid payload");
         let content_id = h.insert(key, &FileStage, &artifact, &producer).unwrap();
+        // MAX_STORED_SIZE + 1, not MAX_OBJECT_SIZE + 1. The metadata guard in
+        // `BlockingObjectStore::get` compares the FILE length against
+        // MAX_STORED_SIZE (payload + header), so a file of MAX_OBJECT_SIZE + 1
+        // is BELOW it: the cheap check passes and execution falls through to
+        // `read_to_end`, which pulls all 16 GiB into memory before the payload
+        // check rejects it. The assertion still held — the object was rejected
+        // — so the test looked fine on a machine with the RAM to absorb it, and
+        // hung the CI runner, taking the whole suite's summary with it. The
+        // name says "before reading it"; this is the size that makes that true.
         std::fs::OpenOptions::new()
             .write(true)
             .open(object_path(&cache, content_id))
             .unwrap()
-            .set_len(MAX_OBJECT_SIZE + 1)
+            .set_len(crate::framework::object_store::MAX_STORED_SIZE + 1)
             .unwrap();
 
         assert!(

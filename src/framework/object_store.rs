@@ -29,7 +29,11 @@ pub const MAX_OBJECT_SIZE: u64 = 16 * 1024 * 1024 * 1024;
 const OBJECT_MAGIC: &[u8; 8] = b"BLUTOS01";
 const OBJECT_FORMAT_VERSION: u16 = 1;
 const OBJECT_HEADER_LEN: usize = 8 + 2 + 1 + 32 + 8 + 32;
-const MAX_STORED_SIZE: u64 = MAX_OBJECT_SIZE + OBJECT_HEADER_LEN as u64;
+/// Largest legitimate ON-DISK object file: a full payload plus its header.
+/// This — not `MAX_OBJECT_SIZE` — is the bound the metadata guard in `get`
+/// compares a file's length against, so it is what a test must exceed to
+/// exercise rejection BEFORE the read.
+pub(crate) const MAX_STORED_SIZE: u64 = MAX_OBJECT_SIZE + OBJECT_HEADER_LEN as u64;
 
 /// Closed storage namespaces. A digest cannot alias a different kind of value.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
