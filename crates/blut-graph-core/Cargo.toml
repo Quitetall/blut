@@ -31,7 +31,16 @@ readme = "README.md"
 # can be read but not checked, which is half of what "auditable" means. The
 # subgraph-lowering test and the two evidence examples are the executable part
 # of that story, and they cost ~5 KiB compressed.
-include = ["/src/**", "/tests/**", "/examples/**", "/Cargo.toml", "/README.md"]
+#
+# `/LICENSE` is NOT optional here. Setting `include` at all makes it an
+# exhaustive allowlist, and cargo does not re-add the licence text for you --
+# so the first draft of this list shipped an AGPL-3.0-or-later crate with no
+# copy of the AGPL in the tarball. AGPL-3.0 section 4 requires giving every
+# recipient a copy of the licence along with the program, and the `license =`
+# field above does not satisfy that: it is an SPDX identifier for the crates.io
+# index, not a distribution of the licence. The engine root carries the text but
+# the root is outside this package, so it is copied in beside the crate.
+include = ["/src/**", "/tests/**", "/examples/**", "/Cargo.toml", "/README.md", "/LICENSE"]
 
 [lib]
 path = "src/lib.rs"
