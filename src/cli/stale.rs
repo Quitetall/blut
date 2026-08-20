@@ -273,7 +273,7 @@ mod stale_rebuild_tests {
     use super::crate_dir_for_installed_bin;
 
     const SAMPLE: &str = r#"[v1]
-"blut-lamquant 1.0.0 (path+file:///mnt/4tb/LamQuant/training/cookbooks/lamquant)" = ["blut"]
+"blut-lamquant 1.0.0 (path+file:///home/u/cookbooks/lamquant)" = ["blut"]
 "ripgrep 14.0.0 (registry+https://github.com/rust-lang/crates.io-index)" = ["rg"]
 "some-multi 0.1.0 (path+file:///home/u/multi)" = ["foo", "blutx", "bar"]
 "#;
@@ -282,7 +282,7 @@ mod stale_rebuild_tests {
     fn finds_path_install_dir_for_bin() {
         assert_eq!(
             crate_dir_for_installed_bin(SAMPLE, "blut").as_deref(),
-            Some("/mnt/4tb/LamQuant/training/cookbooks/lamquant"),
+            Some("/home/u/cookbooks/lamquant"),
         );
     }
 
