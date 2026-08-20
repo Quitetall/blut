@@ -3,41 +3,6 @@
 version = 4
 
 [[package]]
-name = "abir"
-version = "0.1.0"
-source = "git+https://github.com/Quitetall/ABIR.git?rev=83fb2a82f5cbcfefc8328d7842b50e16174ff37a#83fb2a82f5cbcfefc8328d7842b50e16174ff37a"
-dependencies = [
- "blake3",
- "serde_json",
-]
-
-[[package]]
-name = "abir-bcs"
-version = "0.1.0"
-source = "git+https://github.com/Quitetall/ABIR.git?rev=83fb2a82f5cbcfefc8328d7842b50e16174ff37a#83fb2a82f5cbcfefc8328d7842b50e16174ff37a"
-dependencies = [
- "abir",
- "blake3",
- "chacha20poly1305",
- "minicbor",
- "serde",
- "serde_json",
- "zeroize",
-]
-
-[[package]]
-name = "abir-training"
-version = "0.1.0"
-source = "git+https://github.com/Quitetall/ABIR.git?rev=83fb2a82f5cbcfefc8328d7842b50e16174ff37a#83fb2a82f5cbcfefc8328d7842b50e16174ff37a"
-dependencies = [
- "abir",
- "abir-bcs",
- "blake3",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "aead"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -246,8 +211,6 @@ dependencies = [
 name = "blut"
 version = "0.2.0-alpha.1"
 dependencies = [
- "abir",
- "abir-training",
  "aes-gcm",
  "anyhow",
  "async-trait",
@@ -360,30 +323,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
-name = "chacha20"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
-dependencies = [
- "cfg-if",
- "cipher",
- "cpufeatures",
-]
-
-[[package]]
-name = "chacha20poly1305"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
-dependencies = [
- "aead",
- "chacha20",
- "cipher",
- "poly1305",
- "zeroize",
-]
-
-[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -403,7 +342,6 @@ checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common",
  "inout",
- "zeroize",
 ]
 
 [[package]]
@@ -1189,26 +1127,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "minicbor"
-version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0452a60c1863c1f50b5f77cd295e8d2786849f35883f0b9e18e7e6e1b5691b0"
-dependencies = [
- "minicbor-derive",
-]
-
-[[package]]
-name = "minicbor-derive"
-version = "0.15.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd2209fff77f705b00c737016a48e73733d7fbccb8b007194db148f03561fb70"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "mio"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1339,17 +1257,6 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
-
-[[package]]
-name = "poly1305"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8159bd90725d2df49889a078b54f4f79e87f1f8a8444194cdca81d38f5393abf"
-dependencies = [
- "cpufeatures",
- "opaque-debug",
- "universal-hash",
-]
 
 [[package]]
 name = "polyval"
