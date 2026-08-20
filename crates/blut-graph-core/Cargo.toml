@@ -17,11 +17,21 @@ publish = ["crates-io"]
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
 description = "Deterministic no_std compiler and execution contracts for capability-driven ABIR node graphs."
-repository = "https://github.com/Quitetall/blut"
-homepage = "https://github.com/Quitetall/blut"
+# No `repository`/`homepage`. The source repository is private, and a metadata
+# link that 404s for every anonymous visitor is worse than no link: it reads as
+# a dead project rather than a deliberately closed one. AGPL obligations are met
+# by the published tarball, which carries the crate's complete source. Add the
+# link when a public home exists -- crates.io takes updated metadata on any
+# later version.
 documentation = "https://docs.rs/blut-graph-core"
 readme = "README.md"
-include = ["/src/**", "/Cargo.toml", "/README.md"]
+# Tests and examples SHIP. This crate is published so that a downstream
+# open-source consumer (codec-lossless) can be built and verified by someone
+# with no access to this repository -- and a crate whose test suite is withheld
+# can be read but not checked, which is half of what "auditable" means. The
+# subgraph-lowering test and the two evidence examples are the executable part
+# of that story, and they cost ~5 KiB compressed.
+include = ["/src/**", "/tests/**", "/examples/**", "/Cargo.toml", "/README.md"]
 
 [lib]
 path = "src/lib.rs"
