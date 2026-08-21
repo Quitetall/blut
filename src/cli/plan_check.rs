@@ -19,12 +19,13 @@
 //! # The one property that makes it worth having
 //!
 //! [`check`] calls the same two functions publish calls, in the same order —
-//! `serde_json::from_str::<PlanSpec>` then [`PlanSpec::compile`]. It does not
-//! reimplement either. That is deliberate: a second validator written to
-//! approximate the first drifts, and once it drifts, a caller trusting the
-//! cheap check is trusting a different question than the one deployment asks.
-//! The test `check_and_publish_agree_on_every_case` holds the two to the same
-//! verdict.
+//! `serde_json::from_str::<PlanSpec>` then the shared typecheck. It does not
+//! reimplement either — the typecheck half is literally
+//! [`crate::registry_db::typecheck`], the function `publish` gates on. That is
+//! deliberate: a second validator written to approximate the first drifts, and
+//! once it drifts, a caller trusting the cheap check is trusting a different
+//! question than the one deployment asks. Sharing the function makes the
+//! agreement structural rather than something a test has to keep asserting.
 //!
 //! # What acceptance does and does not mean
 //!
@@ -62,8 +63,7 @@ pub struct Accepted {
 pub fn check(reg: &Registry, text: &str) -> Result<Accepted, String> {
     let spec: PlanSpec =
         serde_json::from_str(text).map_err(|e| format!("PlanSpec JSON does not parse: {e}"))?;
-    spec.compile(reg)
-        .map_err(|e| format!("PlanSpec does not typecheck: {e}"))?;
+    crate::registry_db::typecheck(reg, &spec).map_err(|e| e.to_string())?;
     let fingerprint = crate::registry_db::fingerprint(&spec);
     Ok(Accepted { spec, fingerprint })
 }
@@ -189,11 +189,18 @@ mod tests {
     /// agree. If they ever disagree, a spec could pass CI and be refused at
     /// deploy — the failure mode a pre-flight check exists to prevent.
     ///
-    /// Publishing needs a database, so this compares `check`'s verdict against
-    /// publish's own typecheck expression (`PlanSpec::compile`) rather than
-    /// against a live insert.
+    /// This calls `registry_db::typecheck` — the same function `publish` calls,
+    /// not a copy of its body. An earlier version inlined
+    /// `from_str + compile` here, which would have kept passing if publish grew
+    /// a third gate: the test would have gone on certifying an agreement that
+    /// had already ended. Sharing the function is what makes the agreement
+    /// structural instead of asserted.
+    ///
+    /// It does not cover publish's tenant-isolation rule, and should not —
+    /// that one is about who is publishing, not about whether the spec is
+    /// well-formed, and a pre-flight check has no business answering it.
     #[test]
-    fn check_and_publish_agree_on_every_case() {
+    fn check_and_publish_share_the_gate_they_agree_on() {
         let reg = toy_registry();
         let bare = Registry::new();
         let cases: &[(&Registry, &str)] = &[
@@ -206,10 +213,9 @@ mod tests {
         ];
         for (registry, text) in cases {
             let mine = check(registry, text).is_ok();
-            // Exactly what `registry_db::publish` gates on, inlined.
             let theirs = serde_json::from_str::<PlanSpec>(text)
                 .ok()
-                .is_some_and(|s| s.compile(registry).is_ok());
+                .is_some_and(|s| crate::registry_db::typecheck(registry, &s).is_ok());
             assert_eq!(mine, theirs, "check and publish disagreed on: {text}");
         }
     }

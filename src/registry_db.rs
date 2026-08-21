@@ -113,9 +113,31 @@ pub fn open_at(path: &std::path::Path) -> Result<Connection> {
 /// The ADR-0078 fingerprint that keys a spec in `deployments` — deterministic
 /// over the spec's canonical bytes, so re-publishing identical bytes yields the
 /// same id (idempotent).
+///
+/// This must stay a pure function of `spec`. `blut plan check` reports it
+/// without holding a database handle, so if it ever came to depend on stored
+/// state — a registry version, a per-tenant salt — check would report an id
+/// that publish does not key by, and every recorded id would be a dead
+/// reference. Keying on anything but spec content also breaks the idempotence
+/// this function exists to provide.
 pub fn fingerprint(spec: &PlanSpec) -> String {
     spec.provenance_fingerprint("", &serde_json::Value::Null)
         .to_hex()
+}
+
+/// The fail-closed typecheck that gates entry to the `deployments` table: a
+/// spec must resolve against the compiled-in stages and kind-check as a graph.
+///
+/// Factored out so `blut plan check` can ask exactly this question instead of
+/// a copy of it. That is the whole point — a pre-flight check that
+/// *approximates* the deploy-time gate is worse than none, because a spec can
+/// then pass review and be refused at deploy, which is the failure a pre-flight
+/// check exists to prevent. Anything that must hold before a spec is publishable
+/// belongs in here, not in [`publish`]'s body, or the two drift apart again.
+pub fn typecheck(reg: &Registry, spec: &PlanSpec) -> Result<()> {
+    spec.compile(reg)
+        .map_err(|e| TrainError::other(format!("PlanSpec does not typecheck: {e}")))?;
+    Ok(())
 }
 
 /// Publish a PlanSpec: TYPECHECK it against `reg` (fail-closed — a spec that does
@@ -132,11 +154,7 @@ pub fn publish(
     now_unix: i64,
 ) -> Result<String> {
     // Fail-closed typecheck: the spec must resolve against the compiled stages.
-    spec.compile(reg).map_err(|e| {
-        TrainError::other(format!(
-            "publish refused — PlanSpec does not typecheck: {e}"
-        ))
-    })?;
+    typecheck(reg, spec).map_err(|e| TrainError::other(format!("publish refused — {e}")))?;
     let fp = fingerprint(spec);
 
     // The fingerprint is over spec CONTENT only, so identical bytes published
