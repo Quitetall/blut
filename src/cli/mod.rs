@@ -366,6 +366,20 @@ enum PlanCommand {
         #[arg(long)]
         args: String,
     },
+    /// Typecheck a `.json` PlanSpec against the compiled-in stages WITHOUT
+    /// publishing it. Runs exactly the check `plan publish` runs — schema
+    /// (`deny_unknown_fields`), stage resolution against this binary's
+    /// cookbooks, and the graph kind-check — then stops. Touches no registry
+    /// database and writes nothing, so it is safe to run in CI or from a
+    /// foreign tool that needs to know whether a spec it generated would be
+    /// accepted. Exit 0 = accepted; non-zero prints the refusal.
+    Check {
+        /// Path to a `.json` PlanSpec.
+        spec: std::path::PathBuf,
+        /// Emit the verdict as a JSON object instead of a text line.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Publish a `.json` PlanSpec to the deployment registry (ADR 0085):
     /// typecheck fail-closed, then store an immutable fingerprint-keyed row.
     Publish {
@@ -1744,6 +1758,60 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             print!("{rendered}");
             Ok(())
         }
+        PlanCommand::Check { spec, json } => {
+            let text = std::fs::read_to_string(&spec)
+                .with_context(|| format!("read PlanSpec {}", spec.display()))?;
+            // `recipes_registered` is reported on BOTH paths on purpose: a
+            // refusal from a binary with an empty registry means "this build
+            // has no cookbooks", not "your spec is wrong", and the caller
+            // cannot tell those apart from the message alone.
+            let recipes = reg.all().count();
+            match plan_check::check(reg, &text) {
+                Ok(ok) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "accepted": true,
+                                "spec": spec.to_string_lossy(),
+                                "name": ok.spec.name,
+                                "nodes": ok.spec.nodes.len(),
+                                "edges": ok.spec.edges.len(),
+                                "fingerprint": ok.fingerprint,
+                                "recipes_registered": recipes,
+                            })
+                        );
+                    } else {
+                        println!(
+                            "accepted  {}  ({} nodes, {} edges)  fingerprint={}",
+                            ok.spec.name,
+                            ok.spec.nodes.len(),
+                            ok.spec.edges.len(),
+                            ok.fingerprint
+                        );
+                    }
+                    Ok(())
+                }
+                Err(why) => {
+                    // Machine verdict on stdout, human diagnostic on stderr
+                    // via the returned error. A `--json` caller that only
+                    // reads stdout still gets a parseable refusal instead of
+                    // an empty stream plus a non-zero exit.
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "accepted": false,
+                                "spec": spec.to_string_lossy(),
+                                "error": why,
+                                "recipes_registered": recipes,
+                            })
+                        );
+                    }
+                    Err(anyhow!("{why}"))
+                }
+            }
+        }
         PlanCommand::Publish { spec, tenant } => {
             let text = std::fs::read_to_string(&spec)
                 .with_context(|| format!("read PlanSpec {}", spec.display()))?;
@@ -2629,6 +2697,10 @@ mod ledger;
 mod lineage;
 use ledger::*;
 use lineage::*;
+
+// Not glob-imported: `check` is a name several of these modules would like,
+// so the `plan check` arm calls it path-qualified.
+mod plan_check;
 
 #[cfg(feature = "p2p")]
 mod p2p;
