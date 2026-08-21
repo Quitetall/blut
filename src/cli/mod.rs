@@ -380,6 +380,45 @@ enum PlanCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// EXECUTE a `.json` PlanSpec: typecheck it, then launch it as a job.
+    ///
+    /// The counterpart to `check`. ADR 0085's deployment registry could publish
+    /// a plan identity, promote it and roll it back, but nothing could dispatch
+    /// one — `registry_db`'s own module doc described a `blut run
+    /// registry://plan@prod` that was never written. A deploy identity you
+    /// cannot deploy is a rehearsal.
+    ///
+    /// Runs through the same executor `recipe run` uses, with no
+    /// `RecipeMarker`: there is no registry recipe to re-compile from, which is
+    /// the case `launch_compiled_plan` already documents. Prints the job id,
+    /// so `blut lineage`, `blut log` and `blut dag` all work on the result.
+    Run {
+        /// Path to a `.json` PlanSpec.
+        spec: std::path::PathBuf,
+        /// Promote outputs to the global cache for future re-use.
+        #[arg(long, default_value_t = false)]
+        shared_cache: bool,
+        /// Bypass the stage cache READ so every stage runs.
+        #[arg(long = "no-cache", alias = "force", default_value_t = false)]
+        no_cache: bool,
+        /// Force async-I/O lanes onto their synchronous fallback.
+        #[arg(long, default_value_t = false)]
+        sync_io: bool,
+        /// Tenant that owns the launched job (ADR 0096).
+        ///
+        /// `default`, NOT `publish`'s `shared`. Two different namespaces wear
+        /// the word "tenant": the deployment registry keys rows under
+        /// `shared`/`restricted`, while the quota policy that admits a RUN
+        /// knows `default` and whatever a config declares. Defaulting this to
+        /// `shared` made the verb fail admission out of the box.
+        #[arg(long, default_value = "default")]
+        tenant: String,
+        /// Validate and compile without running anything: typecheck the spec,
+        /// admit the tenant, confirm the plan compiles, then stop. Answers
+        /// "would this launch?" without spending the machine on finding out.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     /// Publish a `.json` PlanSpec to the deployment registry (ADR 0085):
     /// typecheck fail-closed, then store an immutable fingerprint-keyed row.
     Publish {
@@ -1384,6 +1423,77 @@ mod registry_completion_cli_tests {
         ));
     }
 
+    /// `plan run` must expose the same execution switches `recipe run` does.
+    /// A verb that can only run one way is a verb people work around.
+    #[test]
+    fn plan_run_parses_its_execution_switches() {
+        let cli = Cli::try_parse_from([
+            "blut",
+            "plan",
+            "run",
+            "/tmp/spec.json",
+            "--no-cache",
+            "--sync-io",
+            "--shared-cache",
+            "--tenant",
+            "restricted",
+        ])
+        .unwrap();
+        let Some(Command::Plan {
+            cmd:
+                PlanCommand::Run {
+                    spec,
+                    shared_cache,
+                    no_cache,
+                    sync_io,
+                    tenant,
+                    dry_run,
+                },
+        }) = cli.command
+        else {
+            panic!("plan run did not parse");
+        };
+        assert_eq!(spec, std::path::PathBuf::from("/tmp/spec.json"));
+        assert!(shared_cache && no_cache && sync_io);
+        assert_eq!(tenant, "restricted");
+        assert!(
+            !dry_run,
+            "dry_run must be opt-in — a run that silently did not run is worse than one that failed"
+        );
+    }
+
+    /// `--force` is the alias `recipe run` accepts, and someone who learned it
+    /// there will type it here.
+    #[test]
+    fn plan_run_accepts_the_force_alias_for_no_cache() {
+        let cli = Cli::try_parse_from(["blut", "plan", "run", "s.json", "--force"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Plan {
+                cmd: PlanCommand::Run { no_cache: true, .. }
+            })
+        ));
+    }
+
+    /// The default tenant must be one the quota policy actually admits, and
+    /// must never be a clinical namespace: a run that silently defaulted to
+    /// `restricted` would put ordinary work under the ADR 0061 boundary.
+    #[test]
+    fn plan_run_defaults_to_the_shared_tenant() {
+        let cli = Cli::try_parse_from(["blut", "plan", "run", "s.json"]).unwrap();
+        let Some(Command::Plan {
+            cmd: PlanCommand::Run { tenant, .. },
+        }) = cli.command
+        else {
+            panic!("plan run did not parse");
+        };
+        // `default`, the quota-policy tenant — deliberately NOT
+        // `registry_db::SHARED_TENANT`. This assertion used to name the latter,
+        // and agreed with a default that made every run fail admission: the
+        // test encoded the bug rather than catching it.
+        assert_eq!(tenant, "default");
+    }
+
     #[test]
     fn governed_alias_override_can_only_widen_prod_boundary() {
         assert_eq!(governed_aliases(None), vec!["prod"]);
@@ -1811,6 +1921,70 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                     Err(anyhow!("{why}"))
                 }
             }
+        }
+        PlanCommand::Run {
+            spec,
+            shared_cache,
+            no_cache,
+            sync_io,
+            tenant,
+            dry_run,
+        } => {
+            let text = std::fs::read_to_string(&spec)
+                .with_context(|| format!("read PlanSpec {}", spec.display()))?;
+            // The SAME gate `check` and `publish` use. A plan that typechecks
+            // for review and then fails a different check at launch would make
+            // the pre-flight verb worthless.
+            let accepted = plan_check::check(reg, &text).map_err(|e| anyhow!("{e}"))?;
+            // Parse the tenant before any job directory exists — the same
+            // fail-fast ADR 0096 discipline `recipe run` applies.
+            let tenant = crate::tenant::Tenant::parse(&tenant)
+                .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
+            // M2.1, as `recipe run` does it: fail on a tenant the active quota
+            // policy does not know BEFORE compiling. Admission fails inside the
+            // launcher anyway, but by then the caller has waited for a
+            // compilation whose result is about to be discarded.
+            crate::config::tenants::TenantQuotaPolicy::load()?
+                .fraction_for(&tenant)
+                .map_err(|e| anyhow!("{e}"))?;
+            let plan = accepted
+                .spec
+                .compile(reg)
+                .map_err(|e| anyhow!("plan compile: {e}"))?;
+            if dry_run {
+                // `--dry-run` means nothing runs. `recipe run` records that its
+                // own dry-run once fell through and executed every stage before
+                // producing a value; this returns before the launcher exists.
+                println!(
+                    "would launch {}  ({} node(s), fingerprint {})  — nothing was run",
+                    accepted.spec.name,
+                    accepted.spec.nodes.len(),
+                    accepted.fingerprint
+                );
+                return Ok(());
+            }
+            let job_id = recipe::launch_compiled_plan(
+                &accepted.spec.name,
+                plan,
+                // No RecipeMarker: nothing here came from a registry recipe, so
+                // `plan resume` has no oracle to re-compile from. Claiming one
+                // would make resume re-run a DIFFERENT graph.
+                None,
+                None,
+                shared_cache,
+                crate::config::launcher::LaunchTarget::Local,
+                None,
+                no_cache,
+                sync_io,
+                tenant,
+                None,
+            )
+            .await?;
+            println!(
+                "launched {job_id}  (plan {}, fingerprint {})",
+                accepted.spec.name, accepted.fingerprint
+            );
+            Ok(())
         }
         PlanCommand::Publish { spec, tenant } => {
             let text = std::fs::read_to_string(&spec)
