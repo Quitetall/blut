@@ -128,16 +128,19 @@ pub fn fingerprint(spec: &PlanSpec) -> String {
 /// The fail-closed typecheck that gates entry to the `deployments` table: a
 /// spec must resolve against the compiled-in stages and kind-check as a graph.
 ///
+/// Returns the compiled plan, so a caller that intends to RUN what it just
+/// checked executes that object rather than compiling a second time and hoping
+/// the two agree. `publish` discards it; `plan run` uses it.
+///
 /// Factored out so `blut plan check` can ask exactly this question instead of
 /// a copy of it. That is the whole point — a pre-flight check that
 /// *approximates* the deploy-time gate is worse than none, because a spec can
 /// then pass review and be refused at deploy, which is the failure a pre-flight
 /// check exists to prevent. Anything that must hold before a spec is publishable
 /// belongs in here, not in [`publish`]'s body, or the two drift apart again.
-pub fn typecheck(reg: &Registry, spec: &PlanSpec) -> Result<()> {
+pub fn typecheck(reg: &Registry, spec: &PlanSpec) -> Result<crate::framework::plan::CompiledPlan> {
     spec.compile(reg)
-        .map_err(|e| TrainError::other(format!("PlanSpec does not typecheck: {e}")))?;
-    Ok(())
+        .map_err(|e| TrainError::other(format!("PlanSpec does not typecheck: {e}")))
 }
 
 /// Publish a PlanSpec: TYPECHECK it against `reg` (fail-closed — a spec that does
@@ -154,6 +157,7 @@ pub fn publish(
     now_unix: i64,
 ) -> Result<String> {
     // Fail-closed typecheck: the spec must resolve against the compiled stages.
+    // The compiled plan is discarded: publishing stores bytes, not a plan.
     typecheck(reg, spec).map_err(|e| TrainError::other(format!("publish refused — {e}")))?;
     let fp = fingerprint(spec);
 

@@ -392,6 +392,16 @@ enum PlanCommand {
     /// `RecipeMarker`: there is no registry recipe to re-compile from, which is
     /// the case `launch_compiled_plan` already documents. Prints the job id,
     /// so `blut lineage`, `blut log` and `blut dag` all work on the result.
+    ///
+    /// LOCAL launches only. `recipe run` takes a `--launcher` and can dispatch
+    /// to Slurm, Ray, P2P or k8s; this does not, because none of those paths has
+    /// been exercised from a PlanSpec and offering an untested flag is worse
+    /// than not offering one.
+    ///
+    /// The spec path is trusted as far as any CLI argument is. A spec can only
+    /// name stages compiled into this binary — dynamic loading is forbidden —
+    /// but it chooses their ARGS, so running one is as privileged as
+    /// `recipe run --args`, not as cheap as `plan check`.
     Run {
         /// Path to a `.json` PlanSpec.
         spec: std::path::PathBuf,
@@ -1479,7 +1489,7 @@ mod registry_completion_cli_tests {
     /// must never be a clinical namespace: a run that silently defaulted to
     /// `restricted` would put ordinary work under the ADR 0061 boundary.
     #[test]
-    fn plan_run_defaults_to_the_shared_tenant() {
+    fn plan_run_defaults_to_the_quota_policy_tenant_not_the_registry_one() {
         let cli = Cli::try_parse_from(["blut", "plan", "run", "s.json"]).unwrap();
         let Some(Command::Plan {
             cmd: PlanCommand::Run { tenant, .. },
@@ -1947,10 +1957,6 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             crate::config::tenants::TenantQuotaPolicy::load()?
                 .fraction_for(&tenant)
                 .map_err(|e| anyhow!("{e}"))?;
-            let plan = accepted
-                .spec
-                .compile(reg)
-                .map_err(|e| anyhow!("plan compile: {e}"))?;
             if dry_run {
                 // `--dry-run` means nothing runs. `recipe run` records that its
                 // own dry-run once fell through and executed every stage before
@@ -1965,7 +1971,9 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             }
             let job_id = recipe::launch_compiled_plan(
                 &accepted.spec.name,
-                plan,
+                // The plan the typecheck produced — not a second compilation of
+                // the same spec. What was checked is what runs.
+                accepted.plan,
                 // No RecipeMarker: nothing here came from a registry recipe, so
                 // `plan resume` has no oracle to re-compile from. Claiming one
                 // would make resume re-run a DIFFERENT graph.

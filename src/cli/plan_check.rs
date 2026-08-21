@@ -43,15 +43,33 @@
 use crate::framework::Registry;
 use crate::framework::plan_spec::PlanSpec;
 
-/// A spec that typechecked, and the id publishing it would key on.
-#[derive(Debug)]
+/// A spec that typechecked, the plan it compiled to, and the id publishing it
+/// would key on.
 pub struct Accepted {
     pub spec: PlanSpec,
+    /// The compiled plan the typecheck produced. Carried so `plan run` executes
+    /// the object that was checked instead of compiling again — two compiles of
+    /// the same spec agree today, and "agree today" is not a property worth
+    /// resting execution on.
+    pub plan: crate::framework::plan::CompiledPlan,
     /// The ADR-0078 fingerprint, from [`crate::registry_db::fingerprint`] —
     /// the same function `publish` keys its row by, so a caller can bind
     /// evidence to spec content and have that id still mean something after
     /// the spec is deployed.
     pub fingerprint: String,
+}
+
+/// Hand-written because `CompiledPlan` has no `Debug` and should not grow one
+/// for this: it is a whole executable graph, and a test that failed would print
+/// it instead of the two fields anyone wants to read.
+impl std::fmt::Debug for Accepted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Accepted")
+            .field("spec", &self.spec)
+            .field("fingerprint", &self.fingerprint)
+            .field("plan", &"<compiled>")
+            .finish()
+    }
 }
 
 /// Typecheck `text` as a PlanSpec against `reg`. `Err` carries the refusal
@@ -63,9 +81,13 @@ pub struct Accepted {
 pub fn check(reg: &Registry, text: &str) -> Result<Accepted, String> {
     let spec: PlanSpec =
         serde_json::from_str(text).map_err(|e| format!("PlanSpec JSON does not parse: {e}"))?;
-    crate::registry_db::typecheck(reg, &spec).map_err(|e| e.to_string())?;
+    let plan = crate::registry_db::typecheck(reg, &spec).map_err(|e| e.to_string())?;
     let fingerprint = crate::registry_db::fingerprint(&spec);
-    Ok(Accepted { spec, fingerprint })
+    Ok(Accepted {
+        spec,
+        plan,
+        fingerprint,
+    })
 }
 
 #[cfg(test)]
