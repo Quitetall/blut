@@ -67,7 +67,10 @@ impl std::fmt::Debug for Accepted {
         f.debug_struct("Accepted")
             .field("spec", &self.spec)
             .field("fingerprint", &self.fingerprint)
-            .field("plan", &"<compiled>")
+            // A summary, not the DAG and not an opaque marker: a failing test
+            // gets the two numbers that would tell it the plan is the wrong
+            // shape, without printing a whole executable graph.
+            .field("plan", &format_args!("<{} node(s)>", self.plan.n_nodes()))
             .finish()
     }
 }
