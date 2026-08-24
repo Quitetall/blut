@@ -6,11 +6,22 @@
 //! uploads it, and `complete`s the job (success OR failure — a claimed job is never
 //! left stranded on its lease). Loop `run_one` to drain a queue.
 //!
-//! Two gates run before any work, mirroring the P2P peer:
+//! Three gates run before any work, mirroring the P2P peer. Stated in the order
+//! they actually fire, because the first one shadows the others for PHI:
+//!   0. `custody_allows_off_box(tenant, data_class)` — the clinical hard-block.
+//!      This is what refuses `Restricted` (PHI EEG) at the worker, and it is
+//!      UNCONDITIONAL: no trust level and no operator-set policy reaches it.
+//!      The submitter runs the same check, so this is the second, independent
+//!      line — it holds even when a job reaches the queue by some path that
+//!      skipped the submitter (an older client, a bug, a bypass).
 //!   1. `policy.is_dispatchable` — training stages never leave home.
-//!   2. `matrix.can_dispatch(data_class, worker_trust)` — the clinical hard-block.
-//!      A v1 cloud worker is `Registered`, so the default matrix refuses
-//!      `Restricted` (PHI EEG) here even if a job slips into the queue.
+//!   2. `matrix.can_dispatch(data_class, worker_trust)` — trust-vs-class policy.
+//!      Its `Restricted` branch is unreachable here (gate 0 already returned)
+//!      and `DispatchMatrix::can_dispatch` independently returns false for
+//!      `Restricted` before indexing the trust row. Both are deliberate
+//!      redundancy: do not "simplify" either away on the grounds that the other
+//!      covers it. `restricted_job_is_refused_by_a_registered_cloud_worker`
+//!      (tests/cloud_integration.rs) pins the behaviour.
 //!
 //! It also re-validates `job.id` as traversal-safe — defense in depth, so the worker
 //! never trusts a foreign queue implementation before joining it into a path.

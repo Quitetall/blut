@@ -416,3 +416,162 @@ fn poll_label(p: &CloudPoll) -> &'static str {
         CloudPoll::Unknown => "Unknown",
     }
 }
+
+/// ADR 0082's second named acceptance test: the clinical hard-block at the
+/// WORKER, not just at submit.
+///
+/// `restricted_job_is_refused_before_cloud_enqueue` proves the first gate — the
+/// submitter's custody check refuses `Restricted` before any byte reaches object
+/// storage. This proves the SECOND, independent gate: if a `Restricted` job
+/// reaches the queue *anyway* — an older client, a bug, a compromised or
+/// bypassed submitter — a cloud worker must still refuse to execute it. Only a
+/// test that puts such a job in the queue can demonstrate that, so this one
+/// enqueues directly and deliberately skips `CloudSubmitter`.
+///
+/// The refusal is UNCONDITIONAL, which is stronger than "a v1 worker is only
+/// `Registered`": `DispatchMatrix::can_dispatch` returns false for
+/// `DataClass::Restricted` before it ever indexes the trust row
+/// (`blut-types/src/trust.rs`), so no trust level and no operator-set policy
+/// cell can turn it on. The control below is therefore a PUBLIC job on the same
+/// worker — not a higher-trust worker, which would prove nothing.
+#[tokio::test]
+async fn restricted_job_is_refused_by_a_registered_cloud_worker() {
+    let store_root = tempfile::tempdir().unwrap();
+    let store = ObjectStore::local_provider(store_root.path(), "cloud-test").unwrap();
+    let queue = Arc::new(MemQueue::new());
+    let reg = smoke_registry();
+    let submitter = CloudSubmitter::new(store.clone(), queue.clone(), reg.clone());
+
+    // Submit a legitimate Public job purely to get a REAL uploaded bundle: the
+    // point is to test the classification gate, so the smuggled job must be
+    // well-formed in every other respect. A malformed one would be rejected by
+    // an earlier check and the test would pass for the wrong reason.
+    let (erased, _src) = make_input("phi payload");
+    submitter
+        .submit(CloudSubmitSpec {
+            job_id: "job-seed".into(),
+            tenant: blut::tenant::Tenant::default(),
+            stage_name: SMOKE_STAGE.into(),
+            invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(b"job-seed")),
+            input: erased,
+            src_root: _src.path().to_path_buf(),
+            args: serde_json::json!({}),
+            expected_content_id: None,
+            data_class: DataClass::Public,
+            resources: ResourceRequest::default(),
+            priority: 0,
+            timeout_secs: 30,
+        })
+        .await
+        .expect("seed submit");
+    let seed = queue
+        .claim("scratch-worker", 30)
+        .await
+        .unwrap()
+        .expect("seed job claimable")
+        .job;
+
+    // The smuggled job: byte-identical to the seed except its classification.
+    let mut smuggled = seed.clone();
+    smuggled.id = "job-phi-slipped".into();
+    smuggled.data_class = DataClass::Restricted;
+    queue
+        .enqueue(smuggled)
+        .await
+        .expect("enqueue bypasses the submitter on purpose");
+
+    let policy = DefaultDispatchPolicy::new(DispatchMatrix::default());
+    let matrix = DispatchMatrix::default();
+    let work_root = tempfile::tempdir().unwrap();
+    let ledger = blut::cloud::cost::CostLedger::new(Default::default());
+    let ran = run_one(
+        &store,
+        queue.as_ref(),
+        reg.as_ref(),
+        &policy,
+        &matrix,
+        "cloud-worker-1",
+        TrustLevel::Registered,
+        30,
+        work_root.path(),
+        Some(&ledger),
+    )
+    .await
+    .expect("worker drains the queue without erroring out");
+    assert_eq!(
+        ran.as_deref(),
+        Some("job-phi-slipped"),
+        "the worker must CLAIM the job and then refuse it — silently leaving it \
+         pending would let another worker pick it up"
+    );
+
+    match queue.status("job-phi-slipped").await.unwrap() {
+        JobStatus::Done(result) => {
+            assert!(
+                matches!(result.outcome, blut::cloud::job::JobOutcome::Failed),
+                "restricted job must terminate as Failed, got {:?}",
+                result.outcome
+            );
+            let failure = result.failure.expect("a refusal carries a typed failure");
+            let text = failure.to_string();
+            // The worker refuses at its own CUSTODY check
+            // (`custody_allows_off_box`, worker.rs), which runs before the
+            // trust-matrix gate. That ordering means `can_dispatch`'s
+            // Restricted branch is a redundant second line here rather than the
+            // one that fires — worth stating, because a reader looking only at
+            // the matrix would conclude this path is what stops PHI, and would
+            // then be free to "simplify" the custody check away.
+            assert!(
+                text.contains("Restricted")
+                    && (text.contains("custody policy") || text.contains("not permitted")),
+                "the failure must name the classification refusal, got: {text}"
+            );
+        }
+        other => panic!("expected a terminal refusal, got {other:?}"),
+    }
+
+    // The stage never ran, so there is nothing to bill. A cost entry here would
+    // mean the worker executed before checking, i.e. the block came too late.
+    assert!(
+        ledger.entries().is_empty(),
+        "refused work must not be billed — a ledger entry implies it executed"
+    );
+    // And it left no output bundle behind in the store.
+    assert!(
+        !work_root.path().join("job-phi-slipped").exists(),
+        "a refused job must not materialize a stage directory"
+    );
+
+    // CONTROL: the identical job, classified Public, IS executed by the SAME
+    // worker at the SAME trust level. Without this the assertions above would
+    // also pass if the job were simply broken.
+    let mut allowed = seed.clone();
+    allowed.id = "job-public-control".into();
+    allowed.data_class = DataClass::Public;
+    queue.enqueue(allowed).await.expect("enqueue control");
+    let ran = run_one(
+        &store,
+        queue.as_ref(),
+        reg.as_ref(),
+        &policy,
+        &matrix,
+        "cloud-worker-1",
+        TrustLevel::Registered,
+        30,
+        work_root.path(),
+        Some(&ledger),
+    )
+    .await
+    .expect("worker run");
+    assert_eq!(ran.as_deref(), Some("job-public-control"));
+    match queue.status("job-public-control").await.unwrap() {
+        JobStatus::Done(result) => assert!(
+            matches!(result.outcome, blut::cloud::job::JobOutcome::Succeeded),
+            "the control job proves only the CLASSIFICATION was refused, not the job; \
+             got {:?} ({:?})",
+            result.outcome,
+            result.failure
+        ),
+        other => panic!("expected the control job to succeed, got {other:?}"),
+    }
+}
