@@ -57,10 +57,17 @@ pub mod model_registry;
 /// Gated behind the `p2p` feature.
 #[cfg(feature = "p2p")]
 pub mod p2p;
+
 pub mod paths;
 pub mod policy;
 pub mod protocol;
 pub mod python_kill;
+/// Highly-available scheduler state via embedded Raft (ADR 0106) — leader
+/// election plus replicated dispatch decisions, so losing the coordinator
+/// mid-DAG cannot lose the in-flight table or re-dispatch running work.
+/// Gated behind the `raft` feature (which implies `p2p`).
+#[cfg(feature = "raft")]
+pub mod raft;
 pub mod rbac;
 pub mod recipes;
 pub mod registry;

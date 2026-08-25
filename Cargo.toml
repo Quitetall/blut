@@ -139,6 +139,14 @@ p2p = ["dep:ed25519-dalek", "dep:aes-gcm", "dep:x25519-dalek", "dep:hkdf", "dep:
 # object store in place of QUIC, so it depends on `p2p`. Object-store transport
 # is dev-testable on the local filesystem (no cloud account).
 cloud = ["p2p", "dep:object_store", "dep:bytes"]
+# Highly-available scheduler state (ADR 0106): an embedded Raft group
+# replicating dispatch decisions so a coordinator crash cannot lose the
+# in-flight table or re-dispatch running work. Depends on `p2p` because
+# consensus rides the mesh as another authenticated frame — ADR 0034
+# forbids a second transport or an in-engine HTTP service. Default-OFF:
+# disabling it reverts to ADR 0079's single-driver scheduler, which is
+# exactly the ADR's stated rollback.
+raft = ["p2p"]
 
 # NOTE (ADR 0078): the Starlark DSL is NOT a feature of this crate. `starlark`
 # hard-depends on `serde_json/arbitrary_precision`, which Cargo feature
