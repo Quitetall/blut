@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Brian Lam
-//! BLUT — Brian Lam's Universal Trainer.
+//! BLUT — Basically Less Unsound Training (affectionately, Brian Lam's
+//! Universal Trainer).
 //!
 //! A standalone, domain-agnostic Rust framework for orchestrating ML workflows
 //! via typed stages, plans, and recipes. Compile-time DAG enforcement

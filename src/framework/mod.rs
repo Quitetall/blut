@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Brian Lam
 //! BLUT framework core — typed Stages, Plans, Recipes.
 //!
-//! BLUT (Brian Lam's Universal Trainer) is built around three layers:
+//! BLUT (Basically Less Unsound Training) is built around three layers:
 //!
 //!   - **Artifacts** — typed in-memory handles to on-disk bytes,
 //!     content-addressed by a deterministic hash. The boundary

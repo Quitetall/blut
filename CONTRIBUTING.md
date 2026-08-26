@@ -1,6 +1,7 @@
 # Contributing to blut
 
-Thanks for your interest in `blut` (Brian Lam's Universal Trainer) — a
+Thanks for your interest in `blut` (Basically Less Unsound Training;
+affectionately, Brian Lam's Universal Trainer) — a
 Rust-native, compile-time-typed orchestration framework for local ML
 training. It's a **library crate**, not an application: you depend on it,
 you don't install a tool from it.

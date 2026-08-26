@@ -1,11 +1,16 @@
-# BLUT — Brian Lam's Universal Trainer
+# BLUT — Basically Less Unsound Training
 
-A **Rust-native, compile-time-typed orchestration framework for ML training.**
-You wire stages into a typed DAG; BLUT runs it against a content-addressed
-cache, with memory admission, available process containment, and structured
-observability. BLUT refuses to wire two stages whose types do not line up.
-Local orchestration is exercised; multi-GPU, cluster, P2P, and cloud paths have
-only the bounded evidence recorded in the [scaling ladder](#scaling-ladder).
+<sub>(affectionately, *Brian Lam's Universal Trainer*.)</sub>
+
+A **semantic compiler for ML pipelines.** You declare what each node *means* —
+how deterministic it is, what effects it has, whether it may produce gaps — and
+BLUT kind-checks the graph, fuses what is safe to fuse, lowers it to an
+execution realm, and then **runs it under the semantics you declared.**
+
+The name is the design goal, hedges included. Not *sound* — soundness is a
+strong word and this is alpha software. **Basically less unsound**: every
+release should make it harder to express a pipeline whose behaviour does not
+match what it claims, and honest about how far that has got.
 
 ```toml
 [dependencies]
@@ -14,7 +19,52 @@ blut = "=0.2.0-alpha.1"
 
 ## What BLUT is
 
-BLUT is a DAG orchestrator. Everything else, resource brokerage, containment, P2P, HPO, lineage, cloud compute, is just a layer on top.
+Most pipeline tools schedule tasks: they decide *when* things run. BLUT
+compiles a graph: it decides whether the graph is *meaningful*, rewrites it, and
+emits a plan whose execution protocol follows from the declaration.
+
+Every node carries three declared properties, and they are lattices, not tags:
+
+```
+Determinism : BitExact → NumericallyEquivalent → Seeded → Nondeterministic
+Effect      : Pure → Idempotent → Transactional → AtMostOnce → AtLeastOnce
+Partiality  : Atomic | ExplicitGaps
+```
+
+**Those declarations select the runtime protocol.** Declare `Transactional` and
+the executor drives prepare / commit / abort with derived idempotency keys;
+declare `ExplicitGaps` and a partial result must produce a structured gap
+receipt rather than quietly succeeding. The compiler's front end and the
+runtime are not two systems agreeing by convention — the declaration *is* the
+interface between them, and the executor branches on it.
+
+The same compiled graph targets more than one **execution realm**:
+
+```
+McuAot        ahead-of-time plan for a microcontroller
+HostStream    streaming host execution
+BlutDurable   durable, cache-backed host execution
+```
+
+The compiler core lives in [`crates/blut-graph-core`](crates/blut-graph-core)
+— roughly 9k lines, three dependencies (blake3, serde, postcard), `no_std`-capable
+— and is published separately so it can be used without the rest of the engine.
+Fusion is guarded by an identity property (`fusion_preserves_semantic_identity`):
+a fused graph must denote what the unfused graph denoted.
+
+Everything else in this repository — the resource broker, containment,
+content-addressed cache, lineage, HPO, P2P, cloud queue — is the **runtime and
+standard library** that makes those declarations enforceable on a real machine.
+
+### What is exercised, and what is not
+
+Local, single-box execution is exercised: the engine's own suite runs in CI, and
+the codec cookbook that drives this project has hundreds of completed runs in
+its ledger. Multi-GPU, cluster, P2P, and cloud paths carry only the bounded
+evidence recorded in the [scaling ladder](#scaling-ladder) — **BLUT is a
+single-box system in practice today.** Distributed scheduling is designed and
+partially built, not proven. Treat the scaling ladder, not this paragraph, as
+the authority.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -71,6 +121,9 @@ let result = ParallelExecutor::execute(plan.into_compiled(), ctx).await?;
 
 | Feature | What |
 |---------|------|
+| **Semantic compiler** | per-node determinism / effect / partiality; kind-checked graph; fusion guarded by an identity property |
+| **Realm lowering** | one graph → `McuAot`, `HostStream`, or `BlutDurable` |
+| **Effect-directed runtime** | `Transactional` drives prepare/commit/abort; `ExplicitGaps` requires a structured gap receipt |
 | **DAG orchestrator** | Stage → Plan → Recipe, typed wiring, content-addressed cache |
 | **Parallel executor** | Resource semaphores (GPU/CPU/Disk/Network), box-fit budget |
 | **Broker** | RAM admission gate, footprint estimation, OOM-aware calibration |
