@@ -119,37 +119,74 @@ pub enum Layout {
     Opaque,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum AbirRootType {
-    Dataset,
-    Recording,
-    Stream,
-    SignalBlock,
-    TemporalTable,
-    Table,
-    Tensor,
-    EncodedBlock,
-    BlobRef,
-    Unknown(String),
+/// An opaque, domain-supplied classification token.
+///
+/// `blut-graph-core` NEVER interprets these. The compiler does exactly three
+/// things with a token: compares it to another for edge compatibility, rejects
+/// it when empty, and folds its bytes into the plan hash. It has no opinion
+/// about what any particular token *means*.
+///
+/// That is the point. The vocabulary belongs to the domain layer (ADR 0034) —
+/// a biosignal domain names recordings and signal blocks, a vision domain names
+/// frames and tensors, and the compiler stays ignorant of both. Before the 2026-08-26 domain-token migration this
+/// slot was a pair of enums (`AbirRootType`/`AbirViewType`) that hard-coded one
+/// domain's taxonomy into the compiler; consumers were already escaping it
+/// through an `Unknown(String)` variant in 10 of 22 call sites, which is the
+/// shape below with extra steps.
+///
+/// Construction is deliberately permissive — an empty token is representable and
+/// is rejected by [`crate::compile`]'s port-contract validation, exactly as the
+/// empty `Unknown("")` was. Validity is the compiler's judgement, not the
+/// constructor's.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DomainToken(String);
+
+impl DomainToken {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum AbirViewType {
-    Root,
-    Recording,
-    Stream,
-    Block,
-    Tensor,
-    Atom,
-    Unknown(String),
+impl From<&str> for DomainToken {
+    fn from(value: &str) -> Self {
+        Self(value.into())
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct AbirSemanticType {
-    pub root: AbirRootType,
-    pub view: AbirViewType,
+impl From<String> for DomainToken {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+/// A port's domain classification: the artifact, and the projection of it.
+///
+/// `root` names the thing that exists; `view` names the way this port looks at
+/// it. The distinction is real and worth keeping structured — a dataset read as
+/// a stream is not the same contract as a dataset read whole — but both sides
+/// are domain vocabulary, so both are opaque [`DomainToken`]s.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DomainType {
+    pub root: DomainToken,
+    pub view: DomainToken,
+}
+
+impl DomainType {
+    pub fn new(root: impl Into<DomainToken>, view: impl Into<DomainToken>) -> Self {
+        Self {
+            root: root.into(),
+            view: view.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,7 +249,7 @@ pub struct PortDescriptor {
     pub optional: bool,
     pub layouts: Vec<Layout>,
     pub max_bytes: u64,
-    pub abir: AbirSemanticType,
+    pub domain: DomainType,
     pub proof: ProofContract,
     pub policy: PolicyContract,
     pub fidelity: FidelityContract,
@@ -233,9 +270,9 @@ impl PortDescriptor {
             optional: false,
             layouts: alloc::vec![Layout::Canonical],
             max_bytes,
-            abir: AbirSemanticType {
-                root: AbirRootType::BlobRef,
-                view: AbirViewType::Atom,
+            domain: DomainType {
+                root: DomainToken::new("blob-ref"),
+                view: DomainToken::new("atom"),
             },
             proof: ProofContract {
                 requires: Vec::new(),
@@ -541,7 +578,7 @@ pub struct CompiledPortContract {
     pub optional: bool,
     pub layout: Layout,
     pub max_bytes: u64,
-    pub abir: AbirSemanticType,
+    pub domain: DomainType,
     pub proof: ProofContract,
     pub policy: PolicyContract,
     pub fidelity: FidelityContract,
@@ -563,7 +600,7 @@ impl CompiledPortContract {
             optional: port.optional,
             layout,
             max_bytes: port.max_bytes,
-            abir: port.abir,
+            domain: port.domain,
             proof: port.proof,
             policy: port.policy,
             fidelity: port.fidelity,

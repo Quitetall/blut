@@ -31,15 +31,15 @@ pub use mcu::{
     StaticExecutor, StaticKernel, StaticReceipt,
 };
 pub use model::{
-    AbirRootType, AbirSemanticType, AbirViewType, AuthorizedPlan, BufferId, BufferPlan, Capability,
-    CheckpointContract, CheckpointMode, CompiledNode, CompiledPlan, CompiledPortContract,
-    DelayContract, DelayInitial, Determinism, Edge, Effect, ExecutionRealm, ExtentContract,
-    FailureContract, FeedbackEdge, FeedbackId, FeedbackPlan, FidelityContract, Graph, GraphId,
-    ImplementationId, InputBinding, KernelDescriptor, KernelId, Layout, LayoutConversion,
-    LeaseAccess, LeaseContract, LeaseLifetime, MaterializedSubgraph, NodeDescriptor, NodeId,
-    NodeInstance, NodeTypeRef, OutputBinding, Partiality, PlanId, PolicyContract, PortDescriptor,
-    PortMap, PortRef, ProofContract, ResourceEnvelope, SessionContract, StateContract, StateScope,
-    StepId, SubgraphConfigMap, SubgraphId, SubgraphInterfacePort, SubgraphLowering, SubgraphNode,
+    AuthorizedPlan, BufferId, BufferPlan, Capability, CheckpointContract, CheckpointMode,
+    CompiledNode, CompiledPlan, CompiledPortContract, DelayContract, DelayInitial, Determinism,
+    DomainToken, DomainType, Edge, Effect, ExecutionRealm, ExtentContract, FailureContract,
+    FeedbackEdge, FeedbackId, FeedbackPlan, FidelityContract, Graph, GraphId, ImplementationId,
+    InputBinding, KernelDescriptor, KernelId, Layout, LayoutConversion, LeaseAccess, LeaseContract,
+    LeaseLifetime, MaterializedSubgraph, NodeDescriptor, NodeId, NodeInstance, NodeTypeRef,
+    OutputBinding, Partiality, PlanId, PolicyContract, PortDescriptor, PortMap, PortRef,
+    ProofContract, ResourceEnvelope, SessionContract, StateContract, StateScope, StepId,
+    SubgraphConfigMap, SubgraphId, SubgraphInterfacePort, SubgraphLowering, SubgraphNode,
     SubgraphSchema, Target,
 };
 pub use plugin::{

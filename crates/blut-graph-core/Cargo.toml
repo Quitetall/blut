@@ -10,19 +10,24 @@
 
 [package]
 name = "blut-graph-core"
-version = "0.1.0-alpha.1"
+version = "0.2.0-alpha.1"
 edition = "2024"
 rust-version = "1.88"
 publish = ["crates-io"]
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
-description = "Deterministic no_std compiler and execution contracts for capability-driven ABIR node graphs."
+description = "Deterministic no_std semantic compiler for capability-driven node graphs: kind-checks declared determinism, effect and partiality, fuses only where semantics are preserved, and lowers to an execution realm."
 # No `repository`/`homepage`. The source repository is private, and a metadata
 # link that 404s for every anonymous visitor is worse than no link: it reads as
 # a dead project rather than a deliberately closed one. AGPL obligations are met
 # by the published tarball, which carries the crate's complete source. Add the
 # link when a public home exists -- crates.io takes updated metadata on any
 # later version.
+# crates.io facets. Absent until the 2026-08-26 domain-token migration: the crate was published describing
+# itself as ABIR (biosignal) infrastructure, so it was neither discoverable as
+# what it is nor honest about what it requires. It requires no domain at all.
+keywords = ["dag", "compiler", "semantics", "pipeline", "no-std"]
+categories = ["compilers", "no-std", "development-tools"]
 documentation = "https://docs.rs/blut-graph-core"
 readme = "README.md"
 # Tests and examples SHIP. This crate is published so that a downstream

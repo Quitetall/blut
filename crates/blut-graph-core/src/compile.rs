@@ -707,8 +707,8 @@ pub(crate) fn valid_port_contract(port: &PortDescriptor) -> bool {
         return false;
     }
     valid_contract_names(&port.proof, &port.policy)
-        && !matches!(&port.abir.root, crate::AbirRootType::Unknown(name) if name.is_empty())
-        && !matches!(&port.abir.view, crate::AbirViewType::Unknown(name) if name.is_empty())
+        && !port.domain.root.is_empty()
+        && !port.domain.view.is_empty()
 }
 
 pub(crate) fn valid_state_contract(state: &StateContract) -> bool {
@@ -751,7 +751,7 @@ pub(crate) fn valid_state_contract(state: &StateContract) -> bool {
 
 fn port_contract_satisfies(output: &PortDescriptor, input: &PortDescriptor) -> bool {
     output.semantic_type == input.semantic_type
-        && output.abir == input.abir
+        && output.domain == input.domain
         && (!output.optional || input.optional)
         && output.max_bytes <= input.max_bytes
         && output.extent.rank == input.extent.rank
@@ -785,7 +785,7 @@ pub(crate) fn compiled_port_contract_satisfies(
 ) -> bool {
     output.layout == input.layout
         && output.semantic_type == input.semantic_type
-        && output.abir == input.abir
+        && output.domain == input.domain
         && (!output.optional || input.optional)
         && output.max_bytes <= input.max_bytes
         && output.extent.rank == input.extent.rank
@@ -829,7 +829,7 @@ fn compiled_port_contract(port: &PortDescriptor, layout: Layout) -> CompiledPort
         optional: port.optional,
         layout,
         max_bytes: port.max_bytes,
-        abir: port.abir.clone(),
+        domain: port.domain.clone(),
         proof: port.proof.clone(),
         policy: port.policy.clone(),
         fidelity: port.fidelity.clone(),
@@ -857,7 +857,7 @@ fn compiled_port_matches(compiled: &CompiledPortContract, descriptor: &PortDescr
         && compiled.optional == descriptor.optional
         && descriptor.layouts.contains(&compiled.layout)
         && compiled.max_bytes == descriptor.max_bytes
-        && compiled.abir == descriptor.abir
+        && compiled.domain == descriptor.domain
         && compiled.proof == descriptor.proof
         && compiled.policy == descriptor.policy
         && compiled.fidelity == descriptor.fidelity
@@ -880,7 +880,7 @@ fn conversion_contracts_match(
         && output.layout == conversion.to
         && input.max_bytes <= conversion.max_input_bytes
         && output.max_bytes == conversion.max_output_bytes
-        && input.abir == output.abir
+        && input.domain == output.domain
         && input.proof == output.proof
         && input.policy == output.policy
         && input.fidelity == output.fidelity
@@ -3003,7 +3003,7 @@ fn hash_descriptor(hasher: &mut blake3::Hasher, descriptor: &NodeDescriptor) {
                 put_u32(hasher, layout as u32);
             }
             hasher.update(&port.max_bytes.to_le_bytes());
-            hash_abir_type(hasher, &port.abir);
+            hash_domain_type(hasher, &port.domain);
             hash_proof(hasher, &port.proof);
             hash_policy(hasher, &port.policy);
             hash_fidelity(hasher, &port.fidelity);
@@ -3195,70 +3195,16 @@ fn hash_config_schema(hasher: &mut blake3::Hasher, schema: &crate::ConfigSchema)
     }
 }
 
-fn hash_abir_type(hasher: &mut blake3::Hasher, abir: &crate::AbirSemanticType) {
-    fn hash_root(hasher: &mut blake3::Hasher, root: &crate::AbirRootType) {
-        match root {
-            crate::AbirRootType::Dataset => {
-                hasher.update(&[0]);
-            }
-            crate::AbirRootType::Recording => {
-                hasher.update(&[1]);
-            }
-            crate::AbirRootType::Stream => {
-                hasher.update(&[2]);
-            }
-            crate::AbirRootType::SignalBlock => {
-                hasher.update(&[3]);
-            }
-            crate::AbirRootType::TemporalTable => {
-                hasher.update(&[4]);
-            }
-            crate::AbirRootType::Table => {
-                hasher.update(&[5]);
-            }
-            crate::AbirRootType::Tensor => {
-                hasher.update(&[6]);
-            }
-            crate::AbirRootType::EncodedBlock => {
-                hasher.update(&[7]);
-            }
-            crate::AbirRootType::BlobRef => {
-                hasher.update(&[8]);
-            }
-            crate::AbirRootType::Unknown(value) => {
-                hasher.update(&[9]);
-                put_str(hasher, value);
-            }
-        };
-    }
-    fn hash_view(hasher: &mut blake3::Hasher, view: &crate::AbirViewType) {
-        match view {
-            crate::AbirViewType::Root => {
-                hasher.update(&[0]);
-            }
-            crate::AbirViewType::Recording => {
-                hasher.update(&[1]);
-            }
-            crate::AbirViewType::Stream => {
-                hasher.update(&[2]);
-            }
-            crate::AbirViewType::Block => {
-                hasher.update(&[3]);
-            }
-            crate::AbirViewType::Tensor => {
-                hasher.update(&[4]);
-            }
-            crate::AbirViewType::Atom => {
-                hasher.update(&[5]);
-            }
-            crate::AbirViewType::Unknown(value) => {
-                hasher.update(&[6]);
-                put_str(hasher, value);
-            }
-        };
-    }
-    hash_root(hasher, &abir.root);
-    hash_view(hasher, &abir.view);
+fn hash_domain_type(hasher: &mut blake3::Hasher, domain: &crate::DomainType) {
+    // Tokens are opaque, so the plan hash folds their BYTES. The pre-migration shape
+    // hashed a numeric discriminant per enum variant plus the string only for the
+    // `Unknown` escape; hashing the string uniformly is what makes the compiler
+    // independent of any domain's variant list. Absolute plan ids therefore move
+    // once, at this commit -- nothing pins one (every assertion in this crate is
+    // relational: `assert_eq!(a.plan_id, b.plan_id)`), and the alpha has no
+    // persisted plan cache to invalidate.
+    put_str(hasher, domain.root.as_str());
+    put_str(hasher, domain.view.as_str());
 }
 
 fn hash_proof(hasher: &mut blake3::Hasher, proof: &crate::ProofContract) {
@@ -3371,7 +3317,7 @@ fn hash_compiled_ports(hasher: &mut blake3::Hasher, ports: &[CompiledPortContrac
         hasher.update(&[u8::from(port.optional)]);
         put_u32(hasher, port.layout as u32);
         hasher.update(&port.max_bytes.to_le_bytes());
-        hash_abir_type(hasher, &port.abir);
+        hash_domain_type(hasher, &port.domain);
         hash_proof(hasher, &port.proof);
         hash_policy(hasher, &port.policy);
         hash_fidelity(hasher, &port.fidelity);
@@ -3570,9 +3516,9 @@ mod tests {
 
     use super::*;
     use crate::model::{
-        Capability, Determinism, Effect, FidelityContract, ImplementationId, KernelDescriptor,
-        Layout, NodeInstance, NodeTypeRef, PolicyContract, PortRef, ProofContract,
-        ResourceEnvelope,
+        Capability, Determinism, DomainToken, DomainType, Effect, FidelityContract,
+        ImplementationId, KernelDescriptor, Layout, NodeInstance, NodeTypeRef, PolicyContract,
+        PortRef, ProofContract, ResourceEnvelope,
     };
 
     struct SemanticKernels;
@@ -3622,24 +3568,24 @@ mod tests {
             inputs: if input {
                 vec![PortDescriptor {
                     name: "in".to_string(),
-                    semantic_type: "abir.block".to_string(),
+                    semantic_type: "sample.block".to_string(),
                     optional: false,
                     layouts: vec![Layout::Canonical],
                     max_bytes: 64,
-                    ..PortDescriptor::opaque("in", "abir.block", 64)
+                    ..PortDescriptor::opaque("in", "sample.block", 64)
                 }]
             } else {
                 vec![]
             },
             outputs: vec![PortDescriptor {
                 name: "out".to_string(),
-                semantic_type: "abir.block".to_string(),
+                semantic_type: "sample.block".to_string(),
                 optional: false,
                 layouts: vec![Layout::Canonical],
                 max_bytes: 64,
-                ..PortDescriptor::opaque("out", "abir.block", 64)
+                ..PortDescriptor::opaque("out", "sample.block", 64)
             }],
-            capabilities: vec![Capability("abir".to_string())],
+            capabilities: vec![Capability("sample".to_string())],
             targets: vec![Target::Host, Target::McuAot, Target::BlutDurable],
             resources: ResourceEnvelope::bounded(64, 0, 1),
             determinism: Determinism::BitExact,
@@ -3782,7 +3728,7 @@ mod tests {
             ],
             feedback: vec![],
             invocation_inputs: vec![],
-            required_capabilities: vec![Capability("abir".to_string())],
+            required_capabilities: vec![Capability("sample".to_string())],
             required_proofs: vec![],
             policy: vec![],
             minimum_fidelity: u16::MAX,
@@ -3937,7 +3883,7 @@ mod tests {
             .extend(["proof-a".to_string(), "proof-b".to_string()]);
         graph
             .required_capabilities
-            .push(Capability("abir".to_string()));
+            .push(Capability("sample".to_string()));
         let canonical = Compiler::new(&registry, ExecutionRealm::HostStream)
             .compile(&graph)
             .unwrap();
@@ -3950,7 +3896,7 @@ mod tests {
         reordered.required_capabilities.reverse();
         reordered
             .required_capabilities
-            .push(Capability("abir".to_string()));
+            .push(Capability("sample".to_string()));
         let duplicate = Compiler::new(&registry, ExecutionRealm::HostStream)
             .compile(&reordered)
             .unwrap();
@@ -4075,6 +4021,43 @@ mod tests {
                 1
             ))
         );
+    }
+
+    #[test]
+    fn descriptor_registration_rejects_empty_domain_tokens() {
+        // The compiler treats a domain token as opaque, so "is it a
+        // legal token" reduces to "is it non-empty". That is the ONLY structural
+        // claim graph-core still makes about domain vocabulary, and it replaces
+        // the pre-migration rejection of `AbirRootType::Unknown("")`. Neither the old
+        // check nor this one had a test until now; a guard nothing exercises is
+        // indistinguishable from a guard that cannot fire.
+        let mut registry = KernelRegistry::default();
+
+        let mut empty_root = descriptor("empty-domain-root", false);
+        empty_root.outputs[0].domain.root = DomainToken::default();
+        assert_eq!(
+            registry.register_descriptor(empty_root),
+            Err(CompileError::InvalidDescriptor(
+                "empty-domain-root".to_string(),
+                1
+            ))
+        );
+
+        let mut empty_view = descriptor("empty-domain-view", false);
+        empty_view.outputs[0].domain.view = DomainToken::new("");
+        assert_eq!(
+            registry.register_descriptor(empty_view),
+            Err(CompileError::InvalidDescriptor(
+                "empty-domain-view".to_string(),
+                1
+            ))
+        );
+
+        // A non-empty token graph-core has never heard of is ACCEPTED -- that is
+        // the whole point of moving the vocabulary out of the compiler.
+        let mut foreign = descriptor("foreign-domain-vocabulary", false);
+        foreign.outputs[0].domain = DomainType::new("dicom-series", "frame");
+        assert!(registry.register_descriptor(foreign).is_ok());
     }
 
     #[test]
@@ -4221,11 +4204,11 @@ mod tests {
             .unwrap()
             .inputs = vec![PortDescriptor {
             name: "seed".to_string(),
-            semantic_type: "abir.block".to_string(),
+            semantic_type: "sample.block".to_string(),
             optional: false,
             layouts: vec![Layout::Canonical],
             max_bytes: 64,
-            ..PortDescriptor::opaque("seed", "abir.block", 64)
+            ..PortDescriptor::opaque("seed", "sample.block", 64)
         }];
         let seed = PortRef {
             node: NodeId(0),
@@ -4292,11 +4275,11 @@ mod tests {
             .outputs
             .push(PortDescriptor {
                 name: "audit".to_string(),
-                semantic_type: "abir.block".to_string(),
+                semantic_type: "sample.block".to_string(),
                 optional: false,
                 layouts: vec![Layout::Canonical],
                 max_bytes: 64,
-                ..PortDescriptor::opaque("audit", "abir.block", 64)
+                ..PortDescriptor::opaque("audit", "sample.block", 64)
             });
         let plan = Compiler::new(&registry, ExecutionRealm::HostStream)
             .compile(&graph)
@@ -4569,7 +4552,7 @@ mod tests {
             implements: vec![],
             implementation_id: ImplementationId([id as u8; 32]),
             conversion: Some(crate::LayoutConversion {
-                semantic_type: "abir.block".to_string(),
+                semantic_type: "sample.block".to_string(),
                 from,
                 to,
                 max_input_bytes: 64,
@@ -4829,15 +4812,15 @@ mod tests {
     }
 
     #[test]
-    fn per_port_abir_contract_mismatch_fails_before_kernel_selection() {
+    fn per_port_domain_contract_mismatch_fails_before_kernel_selection() {
         let (mut registry, graph) = fixture(false);
         registry
             .descriptors
             .get_mut(&("process".into(), 1))
             .unwrap()
             .inputs[0]
-            .abir
-            .root = crate::AbirRootType::Recording;
+            .domain
+            .root = crate::DomainToken::new("recording");
         assert!(matches!(
             Compiler::new(&registry, ExecutionRealm::HostStream).compile(&graph),
             Err(CompileError::PortContractMismatch(
@@ -4853,7 +4836,7 @@ mod tests {
     fn session_feedback_has_explicit_binding_and_exact_bounded_state() {
         let (mut registry, mut graph) = fixture(false);
         let source = registry.descriptors.get_mut(&("source".into(), 1)).unwrap();
-        let mut history = PortDescriptor::opaque("history", "abir.block", 64);
+        let mut history = PortDescriptor::opaque("history", "sample.block", 64);
         history.optional = true;
         source.inputs.push(history);
         registry
@@ -4938,7 +4921,7 @@ mod tests {
             .unwrap()
             .outputs[0]
             .layouts = vec![Layout::Canonical, Layout::TimeMajor];
-        let mut history_2 = PortDescriptor::opaque("history-2", "abir.block", 64);
+        let mut history_2 = PortDescriptor::opaque("history-2", "sample.block", 64);
         history_2.optional = true;
         history_2.layouts = vec![Layout::ChannelMajor, Layout::TimeMajor];
         overlapping_layouts

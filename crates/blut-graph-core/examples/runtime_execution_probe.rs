@@ -97,12 +97,12 @@ fn descriptor(name: &str, input: bool) -> NodeDescriptor {
         type_name: name.to_owned(),
         version: 1,
         inputs: if input {
-            vec![PortDescriptor::opaque("in", "abir.block", 4096)]
+            vec![PortDescriptor::opaque("in", "sample.block", 4096)]
         } else {
             vec![]
         },
-        outputs: vec![PortDescriptor::opaque("out", "abir.block", 4096)],
-        capabilities: vec![Capability("abir".to_owned())],
+        outputs: vec![PortDescriptor::opaque("out", "sample.block", 4096)],
+        capabilities: vec![Capability("sample".to_owned())],
         targets: vec![Target::Host, Target::McuAot, Target::BlutDurable],
         resources: ResourceEnvelope::bounded(4096, 1024, 1),
         determinism: Determinism::BitExact,
@@ -193,7 +193,7 @@ fn fixture() -> (KernelRegistry, Graph) {
             edges,
             feedback: vec![],
             invocation_inputs: vec![],
-            required_capabilities: vec![Capability("abir".to_owned())],
+            required_capabilities: vec![Capability("sample".to_owned())],
             required_proofs: vec![],
             policy: vec![POLICY.to_owned()],
             minimum_fidelity: 65_000,

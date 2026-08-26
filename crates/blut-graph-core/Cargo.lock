@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "blut-graph-core"
-version = "0.1.0-alpha.1"
+version = "0.2.0-alpha.1"
 dependencies = [
  "blake3",
  "postcard",

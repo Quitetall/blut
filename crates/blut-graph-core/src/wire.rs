@@ -73,7 +73,7 @@ fn valid_compiled_port(port: &crate::CompiledPortContract) -> bool {
         optional: port.optional,
         layouts: alloc::vec![port.layout],
         max_bytes: port.max_bytes,
-        abir: port.abir.clone(),
+        domain: port.domain.clone(),
         proof: port.proof.clone(),
         policy: port.policy.clone(),
         fidelity: port.fidelity.clone(),

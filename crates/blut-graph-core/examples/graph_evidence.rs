@@ -80,24 +80,24 @@ fn descriptor(name: &str, input: bool) -> NodeDescriptor {
         inputs: if input {
             vec![PortDescriptor {
                 name: "in".to_owned(),
-                semantic_type: "abir.block".to_owned(),
+                semantic_type: "sample.block".to_owned(),
                 optional: false,
                 layouts: vec![Layout::Canonical],
                 max_bytes: 4096,
-                ..PortDescriptor::opaque("in", "abir.block", 4096)
+                ..PortDescriptor::opaque("in", "sample.block", 4096)
             }]
         } else {
             vec![]
         },
         outputs: vec![PortDescriptor {
             name: "out".to_owned(),
-            semantic_type: "abir.block".to_owned(),
+            semantic_type: "sample.block".to_owned(),
             optional: false,
             layouts: vec![Layout::Canonical],
             max_bytes: 4096,
-            ..PortDescriptor::opaque("out", "abir.block", 4096)
+            ..PortDescriptor::opaque("out", "sample.block", 4096)
         }],
-        capabilities: vec![Capability("abir".to_owned())],
+        capabilities: vec![Capability("sample".to_owned())],
         targets: vec![Target::Host, Target::McuAot, Target::BlutDurable],
         resources: ResourceEnvelope::bounded(4096, 1024, 1),
         determinism: Determinism::BitExact,
@@ -186,7 +186,7 @@ fn fixture() -> (KernelRegistry, Graph) {
             edges,
             feedback: vec![],
             invocation_inputs: vec![],
-            required_capabilities: vec![Capability("abir".to_owned())],
+            required_capabilities: vec![Capability("sample".to_owned())],
             required_proofs: vec![],
             policy: vec!["research".to_owned()],
             minimum_fidelity: 65_000,
