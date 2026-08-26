@@ -5,6 +5,21 @@
 # Start from the upstream default ruleset — this file NARROWS it with reviewed
 # exceptions only. Never add a broad path or rule exemption here: a scan that
 # is taught to ignore whole directories stops being a gate.
+#
+# THAT IS NOT A STYLE PREFERENCE — IT IS WHY THERE IS NO `paths` BELOW.
+# A gitleaks allowlist combines its criteria with OR, so `paths` + `regexes`
+# does NOT mean "this shape in this location": the path alone exempts
+# everything under it and the regex narrows nothing. `condition = "AND"` looks
+# like the fix and is NOT honoured by the build in use here. MEASURED
+# 2026-08-26: with paths + regexes + condition="AND", planted `ghp_…` and
+# `sk_live_…` tokens on lines matching neither regex were BOTH suppressed;
+# dropping `paths` catches both.
+#
+# This file previously carried `paths = ['crates/blut-reapi/vendor/UPSTREAM.md']`
+# and therefore blanket-exempted that file from every rule — a real hole in a
+# live gate, found by planting rather than by reading. The allowlist is now
+# REGEX-ONLY: it exempts a value SHAPE wherever it appears, and no path is ever
+# exempt.
 
 [extend]
 useDefault = true
@@ -23,6 +38,5 @@ credential material. Recording them is the POINT of the file (reproducible
 vendoring). Scoped to that one path and that one rule so any real credential
 elsewhere, or any other rule firing on this path, still fails the gate.
 """
-paths = ['''crates/blut-reapi/vendor/UPSTREAM\.md''']
 regexes = ['''\b[0-9a-f]{40}\b''']
 regexTarget = "match"
