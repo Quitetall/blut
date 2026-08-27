@@ -1,10 +1,29 @@
 # blut-graph-core
 
-`blut-graph-core` is the domain-neutral, `no_std + alloc` semantic compiler for
-capability-driven ABIR node graphs. It verifies typed ports and capability,
-proof, policy, fidelity, resource, effect, and target contracts before producing
-a deterministic `CompiledPlan` shared by MCU AOT, host/stream, and BLUT durable
-execution realms.
+`blut-graph-core` is a domain-neutral, `no_std + alloc` **semantic compiler for
+node graphs**. You declare what each node *means*; it kind-checks the graph,
+fuses only where the meaning survives, and lowers the result to an execution
+realm.
+
+Three properties are declared per node, and each is a lattice rather than a tag:
+
+```text
+Determinism : BitExact -> NumericallyEquivalent -> Seeded -> Nondeterministic
+Effect      : Pure -> Idempotent -> Transactional -> AtMostOnce -> AtLeastOnce
+Partiality  : Atomic | ExplicitGaps
+```
+
+Those declarations are not documentation. They select the execution protocol:
+`Transactional` drives prepare/commit/abort with invocation-bound idempotency
+keys, and a node declared `ExplicitGaps` must emit a structured gap receipt
+rather than quietly succeeding. The compiler verifies typed ports and
+capability, proof, policy, fidelity, resource, effect, and target contracts
+before producing a deterministic `CompiledPlan` shared by MCU AOT, host/stream,
+and BLUT durable execution realms.
+
+The crate is domain-agnostic in the literal sense: it contains no vocabulary for
+any problem domain, and it cannot acquire one, because the only domain-shaped
+field on a port is an opaque token it never interprets (see `DomainToken`).
 
 Node configuration is a sealed exact-value algebra (`bool`, signed/unsigned
 integers, bounded text/choice/bytes) validated against a normalized descriptor
@@ -12,12 +31,16 @@ schema. Defaults are materialized before semantic identity is calculated, so
 implicit and explicit defaults compile to the same `GraphId` and `PlanId`.
 Unknown, missing, mistyped, and out-of-range values fail before kernel search.
 
-Every physical port carries its ABIR root/view semantic type plus proof, policy,
-fidelity, extent, layout, and lease contract. These contracts survive fusion,
-layout conversion, AOT serialization, and durable-plan adaptation; an edge is
-admitted only when the producer contract satisfies the consumer contract.
+Every physical port carries a `DomainType` — a `root`/`view` pair of opaque
+`DomainToken`s — plus proof, policy, fidelity, extent, layout, and lease
+contracts. `root` names the artifact, `view` names the projection of it; both
+are domain vocabulary, so the compiler compares and hashes them and never asks
+what they mean. The only structural rule it enforces is that a token is
+non-empty. These contracts survive fusion, layout conversion, AOT
+serialization, and durable-plan adaptation; an edge is admitted only when the
+producer contract satisfies the consumer contract.
 
-The crate owns no biosignal semantics, filesystem, network, async runtime, or
+The crate owns no domain semantics, filesystem, network, async runtime, or
 plugin process. Those remain implementation concerns behind the kernel,
 transaction, and process-host traits.
 
@@ -96,3 +119,59 @@ lineage plus ordered physical port identities in the durable recipe record. It
 rejects ambiguous multi-port mappings, invocation inputs, explicit gaps,
 non-pure effects, resource under-declaration, retry drift, determinism drift,
 or missing implementation/checkpoint/policy rechecks.
+
+## Running the shipped examples
+
+Both examples are evidence generators rather than tutorials, and they take
+different arguments. Neither runs bare — `cargo run --example …` with no
+arguments panics on a missing one, which is worth knowing before you conclude
+something is broken:
+
+```sh
+# compile/lower a fixture graph and emit timing + identity evidence as JSON
+cargo run --example graph_evidence -- --output evidence.json --revision "$(git rev-parse HEAD)"
+
+# execute a fixture plan in one realm; --inject-fault exercises the failure path
+cargo run --example runtime_execution_probe -- host-stream
+cargo run --example runtime_execution_probe -- mcu-aot
+cargo run --example runtime_execution_probe -- blut-durable
+cargo run --example runtime_execution_probe -- host-stream --inject-fault
+```
+
+Tests and examples ship inside the published tarball deliberately, so the crate
+can be verified by someone with no access to its source repository.
+
+## Upgrading from 0.1.0-alpha.1
+
+0.2.0-alpha.1 is a **breaking** change and the only one of consequence is the
+port's domain field:
+
+| 0.1.0-alpha.1 | 0.2.0-alpha.1 |
+| --- | --- |
+| `port.abir: AbirSemanticType` | `port.domain: DomainType` |
+| `AbirRootType::Tensor` | `DomainToken::new("tensor")` |
+| `AbirViewType::Atom` | `DomainToken::new("atom")` |
+| `AbirRootType::Unknown(s)` | `DomainToken::new(s)` |
+
+Token strings are byte-identical to the kebab-case names the old enums
+serialized to, and `DomainToken` is `#[serde(transparent)]`, so **serialized
+plans keep their wire names**. Absolute `PlanId`s do change: the hash previously
+folded a numeric discriminant per variant and now folds the token bytes
+uniformly, which is what removes the compiler's dependence on any domain's
+variant list.
+
+The enums carried one problem domain's taxonomy in a general compiler's public
+API. In practice most callers had already routed around it — the majority of
+real uses were the `Unknown(String)` escape — so for those the change is a
+rename.
+
+## Status and licence
+
+Alpha. The API is not stable, and the version is pre-release for that reason.
+Single-process compilation and the host/stream realm are exercised hardest; the
+MCU AOT subset is narrower by construction and fails closed outside it.
+
+Licensed **AGPL-3.0-or-later**. That is a strong copyleft with a network clause
+— if you distribute a work built from this crate, or offer it to users over a
+network, the AGPL's obligations apply to that combined work. Check that this
+suits you before depending on it.
