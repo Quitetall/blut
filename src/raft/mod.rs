@@ -12,20 +12,20 @@
 //! This module replicates the scheduler's durable facts across an
 //! operator-declared quorum so a failover can reason instead of guess.
 //!
-//! - [`consensus`] — the Raft core. Deterministic and tick-driven: no timers,
+//! - [`crate::raft::consensus`] — the Raft core. Deterministic and tick-driven: no timers,
 //!   no threads, no clock reads, because a consensus gate that reproduces a bug
 //!   one run in twenty is not a gate.
-//! - [`state`] — the replicated state machine. Metadata ONLY (stage status,
+//! - [`crate::raft::state`] — the replicated state machine. Metadata ONLY (stage status,
 //!   peer ids, content hashes, cloud job handles); no artifact bytes and no
 //!   gradients, which is what keeps the clinical hard-block true by
 //!   construction rather than by audit.
-//! - [`ha`] — commit-before-dispatch, reconcile-not-re-dispatch, and
+//! - [`crate::raft::ha`] — commit-before-dispatch, reconcile-not-re-dispatch, and
 //!   fail-closed-on-quorum-loss.
 //!
 //! **Transport.** ADR 0106 specifies Raft riding the existing mesh as another
 //! authenticated frame — no HTTP, no second service, per the ADR 0034 charter.
 //! The core here is transport-agnostic: it consumes and returns messages and
-//! never performs I/O, so the mesh carries [`consensus::RaftMessage`] as a
+//! never performs I/O, so the mesh carries [`crate::raft::consensus::RaftMessage`] as a
 //! `MeshFrame` payload and the in-process harness delivers it directly. That
 //! split is what lets ADR 0106's software gate run in CI with no network at
 //! all, which is the half of its acceptance gate that is not hardware-gated.
