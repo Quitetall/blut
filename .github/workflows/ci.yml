@@ -419,3 +419,7 @@ jobs:
         uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Absolute, not relative: the action runs gitleaks in a container and
+          # silently ignores a relative GITLEAKS_CONFIG, so .gitleaks.toml's
+          # allowlist was never applied here (same defect the meta fixed 2026-08-28).
+          GITLEAKS_CONFIG: ${{ github.workspace }}/.gitleaks.toml
