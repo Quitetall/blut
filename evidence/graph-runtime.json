@@ -1,9 +1,9 @@
 {
   "compile_benchmark_realm": "host-stream",
-  "compile_ops_s": 85545.48467535194,
-  "compiled_plan_bytes": 598,
+  "compile_ops_s": 59571.466697167256,
+  "compiled_plan_bytes": 668,
   "completion_eligible": true,
-  "decode_ops_s": 169685.76961345633,
+  "decode_ops_s": 111381.22915535103,
   "deferred_compile_optimization": [
     "hierarchical-subgraph-inline-expansion"
   ],
@@ -15,7 +15,7 @@
     "bpc2-supervised-process-plugin-lifecycle"
   ],
   "durable_adapter_validation": "cargo test -p blut semantic_plan::tests --lib",
-  "encode_ops_s": 877364.6842640871,
+  "encode_ops_s": 888968.8565762538,
   "executor_checked_realms": [
     "mcu-aot",
     "host-stream",
@@ -30,7 +30,7 @@
     "distinct-allocation-free-static-mcu-executor",
     "identity-bound-hierarchical-composition"
   ],
-  "graph_id": "a686aac93bbf1baafa3031a5ac819ebfd939cc7ae8536020432c32cf81a31ab3",
+  "graph_id": "1bdfdfd98f0018601e2aef4b70e30e545524c9e49d5302bf27d2a52b760fb5e3",
   "identity_checked_realms": [
     "mcu-aot",
     "host-stream",
@@ -40,8 +40,8 @@
   "mcu_fixed_arena_bytes": 13312,
   "peak_bytes": 13312,
   "persistent_state_bytes": 0,
-  "plan_id": "df763175480870aeae0112c18df42c2111b245a034b5b3da75a69add5dc1decc",
-  "revision": "5b0a9557d0052d46af99e317e346c78aa21c57ac",
+  "plan_id": "d4e11ab2c4676b2a3727ac5e5bea9248acf1e122c2997dc9108226c25b9c7cf6",
+  "revision": "a0ff53fe06d68f578a01ed0901f5832ea75c8654",
   "schema": "blut.graph-runtime-evidence/v1",
   "schema_version": 3,
   "scope_note": "blut-graph-core is the domain-neutral compiler + plan + reference/static executors (ADR 0139 ownership); it depends on no ABIR or LamQuant crate. Real per-realm runtime execution (host I/O, durable receipts, session/feedback stores, checkpoint barriers, supervised-process plugins) is certified by the P5 runtime gate over lamquant-runtime's tested implementations.",
