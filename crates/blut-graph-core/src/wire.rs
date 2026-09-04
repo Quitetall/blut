@@ -54,6 +54,9 @@ pub enum PlanDecodeError {
     InvalidBuffer,
     InvalidPlan,
     RealmMismatch,
+    /// A vocabulary token this version assigns no meaning to. Before 0.3.0 the
+    /// derived enum bound produced `Malformed` for the same input.
+    UnknownToken,
     UnauthorizedPlan,
 }
 
@@ -131,6 +134,29 @@ impl CompiledPlan {
         }
         if plan.schema_version != 3 {
             return Err(PlanDecodeError::UnsupportedSchema(plan.schema_version));
+        }
+        // The vocabulary tokens became transparent `u32` newtypes in 0.3.0, and
+        // that quietly removed a check nobody had written down: the derived
+        // `Deserialize` of a fieldless enum rejects an out-of-range variant
+        // index, so `realm = 7` could never survive a decode. A newtype accepts
+        // any `u32`, so the check is explicit here. Untrusted bytes reach this
+        // function by construction — that is what it is for.
+        if !plan.realm.is_known() {
+            return Err(PlanDecodeError::UnknownToken);
+        }
+        if plan.buffers.iter().any(|buffer| !buffer.layout.is_known()) {
+            return Err(PlanDecodeError::UnknownToken);
+        }
+        if plan.nodes.iter().any(|node| {
+            node.input_contracts
+                .iter()
+                .chain(node.output_contracts.iter())
+                .any(|contract| !contract.layout.is_known())
+                || node.conversion.as_ref().is_some_and(|conversion| {
+                    !conversion.from.is_known() || !conversion.to.is_known()
+                })
+        }) {
+            return Err(PlanDecodeError::UnknownToken);
         }
         if plan.nodes.len() > limits.max_nodes
             || plan.order.len() > limits.max_nodes

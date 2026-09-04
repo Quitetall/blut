@@ -141,6 +141,39 @@ cargo run --example runtime_execution_probe -- host-stream --inject-fault
 Tests and examples ship inside the published tarball deliberately, so the crate
 can be verified by someone with no access to its source repository.
 
+## Upgrading from 0.2.0-alpha.1
+
+0.3.0 is a **breaking** change to the API and **not** to the wire. The three
+execution-vocabulary types — `Target`, `ExecutionRealm` and `Layout` — were
+fieldless enums and are now opaque `#[serde(transparent)]` newtypes over `u32`,
+for the same reason `DomainToken` replaced the ABIR enums in 0.2: a general
+compiler should not carry one problem domain's taxonomy in its public API. It
+compares these tokens, orders them, and folds them into the plan hash. It has no
+opinion about what any of them means.
+
+Every historical name is preserved as an associated constant, so
+`Target::Host`, `ExecutionRealm::McuAot` and `Layout::Canonical` still compile,
+in expressions and in patterns. What breaks is code that matched exhaustively
+over a variant list, or cast with `as u32`; use `token()` and `from_token()`,
+which are greppable in a way a cast is not.
+
+**The wire does not move, and that is measured rather than argued.**
+`tests/wire_stability.rs` pins each realm's `graph_id`, `plan_id` and complete
+BGP3 byte string as literals, taken at 0.2.0-alpha.1 and unchanged here. This is
+the opposite of the 0.2 migration recorded below, which kept the serialized
+names and moved every absolute `PlanId`: here the ordinals are preserved
+exactly, `#[serde(transparent)]` makes postcard emit the same varint a variant
+index did, and `Debug` is hand-written to print the same spellings — which
+matters because `KernelDescriptor::lowering` is conventionally
+`format!("{target:?}")` and `lowering` is hashed. A derived `Debug` would have
+moved every plan id in the fleet without touching an ordinal.
+
+One behaviour is restored rather than preserved. A fieldless enum's derived
+`Deserialize` rejected an out-of-range variant index for free; a newtype accepts
+any `u32`. `from_aot_bytes` now range-checks every token it decodes and returns
+the new `PlanDecodeError::UnknownToken`, where 0.2 returned `Malformed` for the
+same input.
+
 ## Upgrading from 0.1.0-alpha.1
 
 0.2.0-alpha.1 is a **breaking** change and the only one of consequence is the

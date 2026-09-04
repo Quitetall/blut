@@ -49,28 +49,139 @@ pub struct NodeTypeRef {
 #[serde(transparent)]
 pub struct Capability(pub String);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Target {
-    McuAot,
-    Host,
-    BlutDurable,
+/// An opaque execution target token.
+///
+/// This was an enum until 0.3.0, and the change is deliberate: the compiler
+/// has no business knowing that a target is called "host". It compares tokens,
+/// orders them, and folds them into the plan hash — nothing more. The domain
+/// layer names them (ADR 0034), exactly as it already names `DomainToken`.
+///
+/// THE ORDINALS ARE WIRE. They are folded into `graph_id` and `plan_id` as
+/// little-endian `u32`, and `#[serde(transparent)]` makes the postcard encoding
+/// byte-identical to the variant indices the enum emitted. The values below are
+/// therefore historically assigned and may never be renumbered.
+///
+/// `Debug` is wire too, and that is less obvious: `KernelDescriptor::lowering`
+/// is conventionally built as `format!("{target:?}")`, and `lowering` is a
+/// hashed field. The hand-written `Debug` below reproduces the enum's output
+/// exactly for that reason; a derived one would print `Target(1)` and move every
+/// plan id in the fleet without touching an ordinal.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Target(u32);
+
+#[allow(non_upper_case_globals)]
+impl Target {
+    /// Historically assigned 0.
+    pub const McuAot: Self = Self(0);
+    /// Historically assigned 1.
+    pub const Host: Self = Self(1);
+    /// Historically assigned 2.
+    pub const BlutDurable: Self = Self(2);
+
+    /// Every token this version of the crate knows, in ordinal order.
+    pub const KNOWN: [Self; 3] = [Self::McuAot, Self::Host, Self::BlutDurable];
+
+    /// The wire value. Named `token` rather than `as u32` so that the cast
+    /// sites are greppable and cannot be written by accident.
+    pub const fn token(self) -> u32 {
+        self.0
+    }
+
+    /// Build a token from a wire value, WITHOUT range checking — decoding
+    /// untrusted bytes must call `is_known` as well. See `is_known`.
+    pub const fn from_token(token: u32) -> Self {
+        Self(token)
+    }
+
+    /// Whether this token is one this version assigns a meaning to.
+    ///
+    /// The enum's derived `Deserialize` used to reject an out-of-range variant
+    /// index for free. A transparent newtype accepts any `u32`, so the check
+    /// that was implicit is explicit here, and `from_aot_bytes` calls it.
+    pub const fn is_known(self) -> bool {
+        self.0 <= 2
+    }
+
+    const fn name(self) -> Option<&'static str> {
+        match self.0 {
+            0 => Some("McuAot"),
+            1 => Some("Host"),
+            2 => Some("BlutDurable"),
+            _ => None,
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ExecutionRealm {
-    McuAot,
-    HostStream,
-    BlutDurable,
+impl core::fmt::Debug for Target {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.name() {
+            Some(name) => formatter.write_str(name),
+            None => write!(formatter, "Target({})", self.0),
+        }
+    }
 }
 
+/// An opaque execution realm token. See [`Target`] for why this is a newtype,
+/// why the ordinals are wire, and why `Debug` is hand-written.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ExecutionRealm(u32);
+
+#[allow(non_upper_case_globals)]
 impl ExecutionRealm {
+    /// Historically assigned 0.
+    pub const McuAot: Self = Self(0);
+    /// Historically assigned 1.
+    pub const HostStream: Self = Self(1);
+    /// Historically assigned 2.
+    pub const BlutDurable: Self = Self(2);
+
+    /// Every token this version of the crate knows, in ordinal order.
+    pub const KNOWN: [Self; 3] = [Self::McuAot, Self::HostStream, Self::BlutDurable];
+
+    pub const fn token(self) -> u32 {
+        self.0
+    }
+
+    pub const fn from_token(token: u32) -> Self {
+        Self(token)
+    }
+
+    pub const fn is_known(self) -> bool {
+        self.0 <= 2
+    }
+
+    /// The target a realm lowers to.
+    ///
+    /// Kept as a total function on the realm because the compile-side selection
+    /// and the decode-side authorization must not be able to disagree; an
+    /// unknown realm maps to an unknown target rather than to a default, so a
+    /// forged plan cannot borrow the host's target by being out of range.
     pub const fn target(self) -> Target {
-        match self {
-            Self::McuAot => Target::McuAot,
-            Self::HostStream => Target::Host,
-            Self::BlutDurable => Target::BlutDurable,
+        match self.0 {
+            0 => Target::McuAot,
+            1 => Target::Host,
+            2 => Target::BlutDurable,
+            other => Target::from_token(other),
+        }
+    }
+
+    const fn name(self) -> Option<&'static str> {
+        match self.0 {
+            0 => Some("McuAot"),
+            1 => Some("HostStream"),
+            2 => Some("BlutDurable"),
+            _ => None,
+        }
+    }
+}
+
+impl core::fmt::Debug for ExecutionRealm {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.name() {
+            Some(name) => formatter.write_str(name),
+            None => write!(formatter, "ExecutionRealm({})", self.0),
         }
     }
 }
@@ -109,14 +220,70 @@ pub struct FailureContract {
     pub domains: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Layout {
-    Canonical,
-    ChannelMajor,
-    TimeMajor,
-    Packed,
-    Opaque,
+/// An opaque buffer-layout token. See [`Target`] for why this is a newtype,
+/// why the ordinals are wire, and why `Debug` is hand-written.
+///
+/// `Ord` is load-bearing beyond hashing here: `select_layout` resolves a port's
+/// admissible layouts with `.min()`, so the ordinal order IS the selection
+/// rule, and two further sites sort or compare layouts to break routing ties.
+/// Derived `Ord` over the `u32` preserves all three exactly.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Layout(u32);
+
+#[allow(non_upper_case_globals)]
+impl Layout {
+    /// Historically assigned 0.
+    pub const Canonical: Self = Self(0);
+    /// Historically assigned 1.
+    pub const ChannelMajor: Self = Self(1);
+    /// Historically assigned 2.
+    pub const TimeMajor: Self = Self(2);
+    /// Historically assigned 3.
+    pub const Packed: Self = Self(3);
+    /// Historically assigned 4.
+    pub const Opaque: Self = Self(4);
+
+    /// Every token this version of the crate knows, in ordinal order.
+    pub const KNOWN: [Self; 5] = [
+        Self::Canonical,
+        Self::ChannelMajor,
+        Self::TimeMajor,
+        Self::Packed,
+        Self::Opaque,
+    ];
+
+    pub const fn token(self) -> u32 {
+        self.0
+    }
+
+    pub const fn from_token(token: u32) -> Self {
+        Self(token)
+    }
+
+    pub const fn is_known(self) -> bool {
+        self.0 <= 4
+    }
+
+    const fn name(self) -> Option<&'static str> {
+        match self.0 {
+            0 => Some("Canonical"),
+            1 => Some("ChannelMajor"),
+            2 => Some("TimeMajor"),
+            3 => Some("Packed"),
+            4 => Some("Opaque"),
+            _ => None,
+        }
+    }
+}
+
+impl core::fmt::Debug for Layout {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.name() {
+            Some(name) => formatter.write_str(name),
+            None => write!(formatter, "Layout({})", self.0),
+        }
+    }
 }
 
 /// An opaque, domain-supplied classification token.

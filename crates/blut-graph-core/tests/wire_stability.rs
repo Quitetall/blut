@@ -340,3 +340,43 @@ fn debug_spellings_are_frozen() {
         "[McuAot, HostStream, BlutDurable]"
     );
 }
+
+/// A token this version assigns no meaning to must not survive a decode.
+///
+/// Before 0.3.0 the three vocabulary types were fieldless enums, and their
+/// derived `Deserialize` rejected an out-of-range variant index for free — so
+/// nothing in this crate ever wrote the check down. Transparent `u32` newtypes
+/// accept any value, which would have made `realm = 7` decode cleanly and then
+/// authorize against a target no kernel declares. `from_aot_bytes` checks it
+/// explicitly now, and this test is the demonstration that the check bites.
+#[test]
+fn an_unknown_token_is_refused_at_decode() {
+    let (registry, graph) = fixture();
+    let authorized = Compiler::new(&registry, ExecutionRealm::HostStream)
+        .compile(&graph)
+        .expect("the fixture graph compiles in every realm");
+
+    let mut forged = authorized.as_plan().clone();
+    forged.realm = ExecutionRealm::from_token(7);
+    let bytes = forged.to_aot_bytes().expect("a forged plan still encodes");
+    assert!(
+        !ExecutionRealm::from_token(7).is_known(),
+        "the plant must use a token this version really does not know"
+    );
+    assert!(
+        CompiledPlan::from_aot_bytes(&bytes, PlanLimits::default()).is_err(),
+        "an unknown realm token decoded successfully"
+    );
+
+    let mut forged_layout = authorized.as_plan().clone();
+    if let Some(buffer) = forged_layout.buffers.first_mut() {
+        buffer.layout = Layout::from_token(9);
+        let bytes = forged_layout
+            .to_aot_bytes()
+            .expect("a forged plan still encodes");
+        assert!(
+            CompiledPlan::from_aot_bytes(&bytes, PlanLimits::default()).is_err(),
+            "an unknown layout token decoded successfully"
+        );
+    }
+}

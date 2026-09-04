@@ -3000,7 +3000,7 @@ fn hash_descriptor(hasher: &mut blake3::Hasher, descriptor: &NodeDescriptor) {
             layouts.dedup();
             put_u32(hasher, layouts.len() as u32);
             for layout in layouts {
-                put_u32(hasher, layout as u32);
+                put_u32(hasher, layout.token());
             }
             hasher.update(&port.max_bytes.to_le_bytes());
             hash_domain_type(hasher, &port.domain);
@@ -3026,7 +3026,7 @@ fn hash_descriptor(hasher: &mut blake3::Hasher, descriptor: &NodeDescriptor) {
     targets.dedup();
     put_u32(hasher, targets.len() as u32);
     for target in targets {
-        put_u32(hasher, target as u32);
+        put_u32(hasher, target.token());
     }
     hasher.update(&descriptor.resources.peak_bytes.to_le_bytes());
     hasher.update(&descriptor.resources.scratch_bytes.to_le_bytes());
@@ -3315,7 +3315,7 @@ fn hash_compiled_ports(hasher: &mut blake3::Hasher, ports: &[CompiledPortContrac
         put_str(hasher, &port.name);
         put_str(hasher, &port.semantic_type);
         hasher.update(&[u8::from(port.optional)]);
-        put_u32(hasher, port.layout as u32);
+        put_u32(hasher, port.layout.token());
         hasher.update(&port.max_bytes.to_le_bytes());
         hash_domain_type(hasher, &port.domain);
         hash_proof(hasher, &port.proof);
@@ -3335,7 +3335,7 @@ pub(crate) fn hash_plan(plan: &CompiledPlan) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key("blut.compiled-plan.v3");
     put_u32(&mut hasher, plan.schema_version);
     hasher.update(&plan.graph_id.0);
-    put_u32(&mut hasher, plan.realm as u32);
+    put_u32(&mut hasher, plan.realm.token());
     put_u32(&mut hasher, plan.order.len() as u32);
     for node in &plan.order {
         put_u32(&mut hasher, node.0);
@@ -3380,8 +3380,8 @@ pub(crate) fn hash_plan(plan: &CompiledPlan) -> [u8; 32] {
             Some(conversion) => {
                 hasher.update(&[1]);
                 put_str(&mut hasher, &conversion.semantic_type);
-                put_u32(&mut hasher, conversion.from as u32);
-                put_u32(&mut hasher, conversion.to as u32);
+                put_u32(&mut hasher, conversion.from.token());
+                put_u32(&mut hasher, conversion.to.token());
                 hasher.update(&conversion.max_input_bytes.to_le_bytes());
                 hasher.update(&conversion.max_output_bytes.to_le_bytes());
             }
@@ -3455,7 +3455,7 @@ pub(crate) fn hash_plan(plan: &CompiledPlan) -> [u8; 32] {
     put_u32(&mut hasher, plan.buffers.len() as u32);
     for buffer in &plan.buffers {
         put_u32(&mut hasher, buffer.id.0);
-        put_u32(&mut hasher, buffer.layout as u32);
+        put_u32(&mut hasher, buffer.layout.token());
         hasher.update(&buffer.capacity_bytes.to_le_bytes());
         put_u32(&mut hasher, buffer.producer.0);
         put_u32(&mut hasher, buffer.consumers.len() as u32);
