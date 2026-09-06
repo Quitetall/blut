@@ -19,7 +19,7 @@ rust-version = "1.85"
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
 description = "BLUT interactive cockpit — ratatui console over the engine's jobs/lineage/cache/graph stores (ADR 0083)."
-publish = false
+repository = "https://github.com/Quitetall/blut"
 
 [[bin]]
 name = "blut-tui"
@@ -34,7 +34,7 @@ path = "src/lib.rs"
 p2p = ["blut/p2p"]
 
 [dependencies]
-blut = { path = "../.." }
+blut = { path = "../..", version = "=0.2.0-alpha.1" }
 anyhow = "1"
 ratatui = "0.30"
 crossterm = "0.28"
