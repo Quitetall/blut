@@ -1,0 +1,106 @@
+# The BLUT 1.0 release graph, checked by tools/check_blut_release_state.py.
+#
+# It lived in Quitetall/LamQuant until 2026-09-07, where every manifest path was
+# spelled `training/engine/...` -- the submodule path that repository happened
+# to reach this one through. Nothing here is a fact about that tree: it is this
+# repository's package set, this repository's publish order and this
+# repository's release workflow. LQ-WAR-0001 M4 named the move as owed;
+# this is it. The paths are the only thing that changed.
+#
+# `engine_prefix` is empty and `release_workflow` is relative because the
+# packages and the workflow are in THIS repository. Both are declared rather
+# than assumed so the gate derives its SBOM component paths from the catalog
+# instead of from a checkout shape.
+schema_version = 1
+release_version = "1.0.0"
+release_tag = "v1.0.0"
+engine_prefix = ""
+release_workflow = ".github/workflows/release.yml"
+publish_chain = ["blut-types", "blut", "blut-metrics", "blut-dsl", "blut-notify"]
+binary_artifacts = ["blut-tui", "blut-web", "blut-operator", "blut-metrics", "blut-notify", "blut-reapi"]
+
+[toolchain]
+engine_rust = "1.88.0"
+operator_rust = "1.89.0"
+mdbook = "0.4.40"
+cargo_deny = "0.20.2"
+cargo_local_registry = "0.2.12"
+cargo_sbom = "0.10.0"
+wasm_bindgen_cli = "0.2.126"
+kind = "0.31.0"
+kind_linux_amd64_sha256 = "eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa"
+kubectl = "1.36.2"
+kubectl_linux_amd64_sha256 = "1e9045ec32bea85da43de85f0065358529ea7c7a152eca78154fba5b58c27d82"
+
+[[rust_packages]]
+name = "blut"
+manifest = "Cargo.toml"
+distribution = "crates-io"
+
+[[rust_packages]]
+name = "blut-types"
+manifest = "crates/blut-types/Cargo.toml"
+distribution = "crates-io"
+
+[[rust_packages]]
+name = "blut-metrics"
+manifest = "crates/blut-metrics/Cargo.toml"
+distribution = "crates-io"
+binary = true
+
+[[rust_packages]]
+name = "blut-dsl"
+manifest = "crates/blut-dsl/Cargo.toml"
+distribution = "crates-io"
+
+[[rust_packages]]
+name = "blut-notify"
+manifest = "crates/blut-notify/Cargo.toml"
+distribution = "crates-io"
+binary = true
+
+[[rust_packages]]
+name = "blut-tui"
+manifest = "crates/blut-tui/Cargo.toml"
+distribution = "binary"
+
+[[rust_packages]]
+name = "blut-web"
+manifest = "crates/blut-web/Cargo.toml"
+distribution = "binary"
+
+[[rust_packages]]
+name = "blut-web-ui"
+manifest = "crates/blut-web/ui/Cargo.toml"
+distribution = "embedded"
+
+[[rust_packages]]
+name = "blut-operator"
+manifest = "crates/blut-operator/Cargo.toml"
+distribution = "binary"
+
+[[rust_packages]]
+name = "blut-reapi"
+manifest = "crates/blut-reapi/Cargo.toml"
+distribution = "binary"
+
+[[python_packages]]
+name = "blut-sdk"
+manifest = "sdk/pyproject.toml"
+
+# Components the BLUT 1.0 release ships that are NOT in this repository. Each
+# names the environment variable holding its checkout; the gate reports an
+# external with no checkout as unchecked rather than skipping it, because a
+# release component nobody looked at is the hole the gate exists to refuse.
+[external.blut_backends]
+env = "BLUT_BACKENDS_REPO"
+name = "blut-cookbook-standard"
+manifest = "Cargo.toml"
+
+# Moved here from `rust_packages` in the 2026-09-07 migration: it was listed as
+# `training/cookbooks/lamquant/Cargo.toml`, a path in the LamQuant meta-repo,
+# and reading it as an in-repo package was only ever true from that checkout.
+[external.blut_cookbook_lamquant]
+env = "BLUT_COOKBOOK_LAMQUANT_REPO"
+name = "blut-cookbook-lamquant"
+manifest = "Cargo.toml"

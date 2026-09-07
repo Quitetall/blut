@@ -423,3 +423,57 @@ jobs:
           # silently ignores a relative GITLEAKS_CONFIG, so .gitleaks.toml's
           # allowlist was never applied here (same defect the meta fixed 2026-08-28).
           GITLEAKS_CONFIG: ${{ github.workspace }}/.gitleaks.toml
+
+  release-gates:
+    name: release-state · I4-evidence checkers
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # These two checkers arrived from Quitetall/LamQuant on 2026-09-07, where
+    # they had accreted among forty-two gate-shaped commands and measured
+    # nothing about that tree: one validates THIS repository's BLUT 1.0 release
+    # catalog against THIS repository's manifests and release workflow, the
+    # other verifies a signed `blut-1.0-i4` evidence bundle. LQ-WAR-0001 M4
+    # named the move as owed and could not perform it. A gate that stops
+    # running in both repositories is a gate deleted, so this job is the other
+    # half of the move.
+    #
+    # WHY THE UNIT SUITES AND NOT THE CHECKERS THEMSELVES, stated so nobody
+    # reads this job as broader than it is. `check_blut_release_state.py`
+    # asserts against a 1.0 release that does not exist yet -- the catalog
+    # names `blut-reapi`, which is not a crate here, and every version is
+    # 0.2.0-alpha.1 -- so running it bare in CI would produce a permanently red
+    # lane that nobody could act on. It runs for real in release.yml's `gate`
+    # job, which is the only place it CAN pass, and where it must.
+    # `check_blut_i4_evidence.py` needs a signed bundle and two other
+    # repositories' checkouts, which exist only during a real I4 campaign.
+    # What runs here is what can run here: the suites that prove each checker
+    # still refuses what it is supposed to refuse.
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Checker unit suites
+        run: python -m pytest -q tools/test_check_blut_release_state.py tools/test_check_blut_i4_evidence.py
+      - name: The release-state checker still runs and still reports
+        # NOT a pass/fail gate on the release itself -- see above. It asserts
+        # that the command executes against the committed catalog and produces
+        # a verdict, so an import error, a moved catalog or a renamed field
+        # cannot sit undetected until release day. Exit 0 (PASS), 1 (INVALID)
+        # and 2 (BLOCKED) are all verdicts; a crash is not.
+        run: |
+          set +e
+          python3 tools/check_blut_release_state.py --repo . 2>&1 | tee verdict.txt
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "checker exit: $status"
+          if [ "$status" -gt 2 ]; then
+            echo "::error::release-state checker crashed rather than reporting"
+            exit 1
+          fi
+          grep -q "BLUT 1.0 release state:" verdict.txt || {
+            echo "::error::checker produced no verdict line"
+            exit 1
+          }

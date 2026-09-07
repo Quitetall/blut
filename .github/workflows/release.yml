@@ -107,6 +107,28 @@ jobs:
           cargo test --locked
           ./target/debug/blut-tui --check
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The BLUT 1.0 release catalog against this repository's manifests, this
+      # repository's publish order and this workflow's own SBOM matrix,
+      # checksum and dashboard-fallback fragments. This is the one place the
+      # checker can pass, and therefore the one place it must: `ci.yml`'s
+      # release-gates job proves it still runs, this proves the release is
+      # actually in the state the catalog declares.
+      #
+      # The two components the release ships that are NOT in this repository --
+      # blut-cookbook-standard and blut-cookbook-lamquant -- are declared
+      # externals. Neither is checked out here, so the checker reports them
+      # unchecked and this step BLOCKS. That is the correct verdict, not a
+      # limitation to work around: publishing 1.0 means checking out both and
+      # passing --external, and a release that could not name its own
+      # components has not been validated. It arrived from
+      # Quitetall/LamQuant on 2026-09-07 (LQ-WAR-0001 M4).
+      - name: BLUT 1.0 release state
+        run: python3 tools/check_blut_release_state.py --repo .
+
   # The operator intentionally has a newer MSRV than the public crate chain.
   # Gate it separately, then exercise its CRDs against a real API server.
   operator-gate:
