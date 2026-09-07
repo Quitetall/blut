@@ -18,7 +18,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from check_blut_release_state import validate_release_state
+from check_blut_release_state import (
+    ReleaseStateError,
+    load_toml,
+    resolve_externals,
+    validate_release_state,
+)
 
 
 CATALOG = """
@@ -274,6 +279,44 @@ class ReleaseStateTests(unittest.TestCase):
     def test_missing_backends_checkout_blocks(self) -> None:
         errors = validate_release_state(self.fixture.repo, self.fixture.catalog, {})
         self.assertTrue(any("BLUT_BACKENDS_REPO" in e for e in errors))
+
+    def test_a_malformed_catalog_entry_is_a_finding_not_a_traceback(self) -> None:
+        """Every entry loop reports; none of them raises.
+
+        Three places indexed `package["name"]` past the loop that had already
+        recorded the entry as invalid, and the python_packages loop was not
+        guarded at all. A gate that crashes on malformed input has declined to
+        answer, which is indistinguishable from not running.
+        """
+        catalog = self.fixture.catalog.read_text(encoding="utf-8")
+        self.fixture.write(
+            "release.toml",
+            catalog
+            + '\n[[rust_packages]]\nmanifest = "training/engine/ghost/Cargo.toml"\n'
+            + 'distribution = "crates-io"\n'
+            + '\n[[python_packages]]\nname = "nameless"\n',
+        )
+        errors = validate_release_state(
+            self.fixture.repo,
+            self.fixture.catalog,
+            {"blut_backends": self.fixture.backends},
+        )
+        self.assertTrue(any("invalid fields" in e for e in errors), errors)
+
+    def test_an_undeclared_external_flag_is_refused(self) -> None:
+        """A mistyped --external name must not be silently ignored.
+
+        It would land under a key nothing reads, and the component the caller
+        MEANT to supply would still be reported unchecked -- which reads as the
+        release being incomplete rather than the command being wrong.
+        """
+        catalog = load_toml(self.fixture.catalog)
+        self.assertEqual(
+            resolve_externals(catalog, ["blut_backends=/tmp/x"]),
+            {"blut_backends": Path("/tmp/x")},
+        )
+        with self.assertRaisesRegex(ReleaseStateError, "names no \\[external.typo\\]"):
+            resolve_externals(catalog, ["typo=/tmp/x"])
 
     def test_a_second_declared_external_is_also_required(self) -> None:
         """Externals are a TABLE, and every entry is checked or reported.

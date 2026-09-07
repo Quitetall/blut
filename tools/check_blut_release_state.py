@@ -249,10 +249,22 @@ def validate_release_state(
     if not isinstance(python_packages, list):
         raise ReleaseStateError("python_packages must be an array of tables")
     for package in python_packages:
-        manifest_path = repo / package["manifest"]
+        # Guarded like the rust_packages loop above, which it was not: a
+        # python_packages entry that is not a table, or has no name or
+        # manifest, raised TypeError or KeyError. A malformed catalog must
+        # produce a FINDING; a traceback is the gate declining to answer.
+        if not isinstance(package, dict):
+            errors.append("release catalog python_packages entries must be tables")
+            continue
+        name = package.get("name")
+        relative = package.get("manifest")
+        if not isinstance(name, str) or not isinstance(relative, str):
+            errors.append("release catalog python package entry has invalid fields")
+            continue
+        manifest_path = repo / relative
         manifest = load_toml(manifest_path)
         project = manifest.get("project", {})
-        if project.get("name") != package["name"]:
+        if project.get("name") != name:
             errors.append(f"{manifest_path}: Python project name mismatch")
         if project.get("version") != expected:
             errors.append(f"{manifest_path}: version must equal {expected}")
@@ -292,17 +304,24 @@ def validate_release_state(
         isinstance(item, str) for item in binary_artifacts
     ):
         raise ReleaseStateError("binary_artifacts must be an array of strings")
+    # `package["name"]` in both comprehensions: an entry with a distribution
+    # and no name reached them past the loop that had already recorded it, and
+    # raised KeyError there instead. Same repair as the SBOM loop below.
     registry_names = {
         package["name"]
         for package in packages
-        if package.get("distribution") == "crates-io"
+        if isinstance(package, dict)
+        and isinstance(package.get("name"), str)
+        and package.get("distribution") == "crates-io"
     }
     if set(publish_chain) != registry_names or len(publish_chain) != len(registry_names):
         errors.append("publish_chain must contain every crates-io package exactly once")
     expected_binaries = {
         package["name"]
         for package in packages
-        if package.get("distribution") == "binary" or package.get("binary") is True
+        if isinstance(package, dict)
+        and isinstance(package.get("name"), str)
+        and (package.get("distribution") == "binary" or package.get("binary") is True)
     }
     if set(binary_artifacts) != expected_binaries or len(binary_artifacts) != len(
         expected_binaries
@@ -375,10 +394,20 @@ def resolve_externals(catalog: dict[str, Any], flags: list[str]) -> dict[str, Pa
             value = os.environ.get(variable, "") if isinstance(variable, str) else ""
             if value.strip():
                 resolved[key] = Path(value).absolute()
+    known = set(declared) if isinstance(declared, dict) else set()
     for flag in flags:
         name, separator, path = flag.partition("=")
         if not separator or not name or not path:
             raise ReleaseStateError(f"--external must be NAME=PATH, got {flag!r}")
+        if name not in known:
+            # A mistyped name would otherwise be accepted, land in the map
+            # under a key nothing reads, and leave the component the caller
+            # MEANT to supply reported as unchecked -- which reads as the
+            # release being incomplete rather than the command being wrong.
+            raise ReleaseStateError(
+                f"--external {name}=... names no [external.{name}] in the catalog; "
+                f"declared: {sorted(known) or 'none'}"
+            )
         resolved[name] = Path(path).absolute()
     return resolved
 
