@@ -15,3 +15,9 @@
 
 # mdBook build artifact (ADR 0083 M6)
 /book
+
+# OpenWarrant `war gate --run` probe scratch output. Governed Warrant evidence
+# lives under the Warrant's own gate-runs/ and remains tracked.
+/docs/receipts/*.receipt.json
+/docs/receipts/*.stdout.txt
+/docs/receipts/*.stderr.txt
