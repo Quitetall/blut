@@ -423,6 +423,14 @@ jobs:
           # silently ignores a relative GITLEAKS_CONFIG, so .gitleaks.toml's
           # allowlist was never applied here (same defect the meta fixed 2026-08-28).
           GITLEAKS_CONFIG: ${{ github.workspace }}/.gitleaks.toml
+          # Pin the scanner. The action defaults to 8.24.3, which predates the
+          # top-level `[[allowlists]]` table .gitleaks.toml uses (8.25.0+), so
+          # the reviewed commit-pin exemption was silently ignored and the job
+          # failed on the googleapis SHA in crates/blut-reapi/vendor/UPSTREAM.md
+          # (reachable from tag archive/feat/blut-1.0-integrations). MEASURED on
+          # the same 845 commits CI scans: 8.24.3 -> 1 leak, 8.30.1 -> none;
+          # and on planted `ghp_` + `sk_live_` tokens 8.30.1 still fails both.
+          GITLEAKS_VERSION: 8.30.1
 
   release-gates:
     name: release-state · I4-evidence checkers
@@ -456,7 +464,13 @@ jobs:
         with:
           python-version: '3.12'
       - name: Checker unit suites
-        run: python -m pytest -q tools/test_check_blut_release_state.py tools/test_check_blut_i4_evidence.py
+        # stdlib `unittest`, not pytest: both suites import only the standard
+        # library, and the runner image ships no pytest -- so `python -m pytest`
+        # failed with "No module named pytest" on every run since the job
+        # arrived, and the suites it names never executed in CI at all.
+        # `-m unittest` runs the same 27 tests with nothing to install.
+        working-directory: tools
+        run: python -m unittest -v test_check_blut_release_state test_check_blut_i4_evidence
       - name: The release-state checker still runs and still reports
         # NOT a pass/fail gate on the release itself -- see above. It asserts
         # that the command executes against the committed catalog and produces
