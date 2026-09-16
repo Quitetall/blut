@@ -13,6 +13,13 @@ complete. Read `war next` and `war pins --resolved-only` before changing a
 Warrant or a file named by one. `docs/roadmap/README.md` maps governance lanes;
 the SAS and individual Warrant atoms carry the actual contracts.
 
+OpenWarrant v1.0.0 has an adopter-phase projection defect: with BLUT's five
+§98 phases, `war status`, `war next`, and generated corpus status pages show
+OpenWarrant's eleven internal phase titles under a BLUT prefix. Use BLUT's SAS
+§98 for objective names and exits; do not rely on `war next` phase priority
+until an upstream fix is pinned. Leave generated pages untouched and keep
+BLUT's phases independent of the tool's count.
+
 An agent may draft, implement, test, and report. A human owns SAS acceptance,
 Warrant authorization, resolution, signer roles, and correction of pinned
 deliverables. An independent verifier owns verification. Emit requests for

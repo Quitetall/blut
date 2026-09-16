@@ -252,6 +252,11 @@ BLUT now carries a draft [OpenWarrant SAS](docs/sas/BLUT_SAS.md), a first
 adoption Warrant, and a local repository gate. `war check` validates their
 structure; no SAS acceptance, Warrant authorization, independent verification,
 or release qualification is implied. `AGENTS.md` states the agent/human boundary.
+OpenWarrant v1.0.0 currently mislabels generated objective views with its own
+eleven internal phases when an adopter SAS has a different phase count; BLUT's
+five phases in the SAS remain authoritative. The generated corpus status and
+`war next` objective labels and phase priority are not reliable until the
+upstream fix is pinned.
 
 **Source version: 0.2.0-alpha.1.** Check crates.io before assuming registry
 availability. Local 1.x tags are preserved as internal milestone history, not
