@@ -248,6 +248,11 @@ as an optional fallback.
 
 ## Status
 
+BLUT now carries a draft [OpenWarrant SAS](docs/sas/BLUT_SAS.md), a first
+adoption Warrant, and a local repository gate. `war check` validates their
+structure; no SAS acceptance, Warrant authorization, independent verification,
+or release qualification is implied. `AGENTS.md` states the agent/human boundary.
+
 **Source version: 0.2.0-alpha.1.** Check crates.io before assuming registry
 availability. Local 1.x tags are preserved as internal milestone history, not
 public-release evidence.

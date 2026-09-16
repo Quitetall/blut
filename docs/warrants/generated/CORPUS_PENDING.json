@@ -1,0 +1,1 @@
+{"acts":[{"action":"authorize","command":"war sign BLUT-WAR-0001","warrant":"BLUT-WAR-0001","why":"revision 1 awaits authorization"},{"action":"accept","command":"war sign 0.1.0","warrant":"SAS 0.1.0","why":"a proposed SAS revision awaits acceptance"}],"count":2,"schema":"oh.war/corpus-pending/v1"}

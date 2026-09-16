@@ -1,0 +1,48 @@
+schema = "oh.war/repository-config/v1"
+
+[project]
+name = "BLUT"
+namespace = "BLUT"
+
+[paths]
+sas = "docs/sas"
+roadmap = "docs/roadmap"
+adrs = "docs/adr"
+warrants = "docs/warrants"
+gates = "docs/gates"
+receipts = "docs/receipts"
+
+[generated]
+commit = true
+verify_drift = true
+
+# No independence control is configured yet. This explicit declaration removes
+# ambiguity; it does not qualify a verifier or satisfy a Warrant.
+[independence]
+performer_transcript_blind = false
+performer_rationale_blind = false
+separate_writable_workspace = false
+cannot_modify_subject_artifacts = false
+cannot_modify_gate_definition = false
+cannot_modify_gate_fixtures = false
+separate_context_compilation = false
+distinct_model_required = false
+distinct_human_required = false
+
+[policy]
+allow_automated_resolution = false
+
+[plan]
+drafter_argv = []
+drafter_timeout_secs = 0
+drafter_name = ""
+
+[context]
+
+[verify]
+verifier_argv = []
+verifier_timeout_secs = 0
+max_excerpt_bytes = 0
+
+[run]
+default_wall_time_seconds = 0

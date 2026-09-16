@@ -1,0 +1,18 @@
+schema = "oh.war/sas-revision/v1"
+version = "0.1.0"
+source = "docs/sas/BLUT_SAS.md"
+sha256 = "9a75e23d7b05f5d9e3e0f96e59694fbc0fd78aa36dcaa53ab9c6487cdc71265c"
+state = "proposed"
+architecture_changing = false
+
+[requirements]
+BLUT-SAS-RQ-001 = "This SAS is accepted by a human and each authorized Warrant pins the accepted revision."
+BLUT-SAS-RQ-002 = "A human authorizes and resolves each delivery Warrant; an agent cannot perform either act."
+BLUT-SAS-RQ-003 = "Resolution requires bounded gate evidence and verification independent of the performer."
+BLUT-SAS-RQ-004 = "Graph kind checks, rewrites, and lowering preserve the declared semantic identity over stated fixtures."
+BLUT-SAS-RQ-005 = "Effect and partiality declarations select tested runtime protocols, including explicit refusal and gap paths."
+BLUT-SAS-RQ-006 = "Durable resume proves recovery and cache identity under named crash and replay fixtures."
+BLUT-SAS-RQ-007 = "External cookbooks can run typed plans and their own TUI without adopting BLUT's widget toolkit."
+BLUT-SAS-RQ-008 = "Web, ingress, notification, and telemetry sidecars enforce their declared authorization and custody boundaries."
+BLUT-SAS-RQ-009 = "Distributed capabilities are claimed rung by rung only at the scale directly exercised."
+BLUT-SAS-RQ-010 = "A release candidate has reproducible package, documentation, smoke, CI, provenance, and rollback evidence before publication."

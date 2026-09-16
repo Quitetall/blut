@@ -23,6 +23,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  governance:
+    name: OpenWarrant · record integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install OpenWarrant toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
+        with:
+          toolchain: 1.97.1
+      - name: Install pinned OpenWarrant CLI
+        run: |
+          cargo install --locked --git https://github.com/Quitetall/OpenWarrant.git --rev 5ab3636597461e28712d777fed847150db6af8c3 openwarrant-cli
+          test "$(war --version)" = "war 1.0.0"
+      - name: Check authored records and committed projections
+        run: war check --generated
+      - name: Probe repository gate
+        run: war gate --run --gate software.repo.war-check@1.0.0
+
   build-test-lint:
     name: build · test · clippy · fmt
     runs-on: ubuntu-latest

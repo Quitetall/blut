@@ -1,0 +1,82 @@
+# OpenWarrant v1.0.0's `war check --generated` definition, adopted as a local
+# candidate. Its qualification metadata describes upstream conformance, not a
+# BLUT-specific independent qualification or an institutional gate.
+
+gate_id: "software.repo.war-check"
+version: "1.0.0"
+lifecycle: "qualified"
+implementation_ref: "artifact://openwarrant-cli/war-check"
+output_schema_ref: "schema://war-check-report/v1"
+provenance: "local_candidate"
+input_kinds: ["warrant-corpus"]
+
+# The active `war` binary must be v1.0.0. CI installs the pinned upstream tag;
+# locally, `war --version` identifies which binary actually ran. `war check`
+# validates records; it never recursively executes this gate.
+argv: ["war", "check", "--generated"]
+
+# This gate reads; it changes nothing.
+mutating: "false"
+
+# Deadline for the bound process.
+timeout_secs: "120"
+
+# What this gate claims to detect. Every entry has a recorded detection result
+# below, because §43.4 qualification is about DECLARED fault classes.
+fault_model: ["manifest-malformed", "atom-missing", "stale-parent-contract-digest", "generated-view-drift", "frontmatter-injection", "adr-malformed", "composition-cycle", "milestone-graph-invalid", "obligation-malformed", "adequacy-review-absent"]
+
+# §43.2. Stating these is what keeps fault_model honest rather than aspirational.
+known_blind_spots: ["Does not execute a Warrant's acceptance gates; a well-formed record is not a satisfied contract (Phase 6, OW-WAR-0020).", "Cannot resolve `ref =` bound atoms offline, so a bound atom's content is unverified.", "Cannot judge whether an adequacy review was any good, only that one was conducted (SAS 39.5).", "Does not detect a semantically wrong but structurally valid claim: an obligation may cite real evidence for the wrong thing."]
+
+# Qualification inherited from OpenWarrant v1.0.0's conformance battery.
+# A BLUT-local positive probe is required before citing this gate as evidence.
+
+qualification_qualifier: "OpenWarrant v1.0.0 conformance/plant.sh, upstream source tag 5ab3636597461e28712d777fed847150db6af8c3"
+# Deliberately empty. A qualification digest is computed over the qualification
+# record; nothing computes one yet (OW-WAR-0020). An empty field reads as "not
+# computed"; a placeholder like "sha256:pending" would render in a gate report
+# exactly where a reader expects an integrity value, and `validate()` now refuses
+# any non-empty value that is not a real sha256.
+qualification_digest: ""
+
+qualification_positive_controls: ["Upstream conformance plants reject named malformations by rule and detail string; BLUT does not claim to have rerun that battery."]
+
+qualification_negative_controls: ["Upstream `pass` plant requires the unmodified OpenWarrant corpus to exit 0; BLUT runs its own unmodified corpus probe separately."]
+
+qualification_mutation_classes: ["deletion (atom file, required manifest entry, adequacy section)", "substitution (digest, ordinal, status, gate reference)", "injection (YAML anchor, self-parent edge, dependency cycle)", "hand-edit of a generated view"]
+
+qualification_environments: ["OpenWarrant v1.0.0 on linux-x86_64 with Rust 1.97.1", "BLUT's Ubuntu governance job installs that pinned tag"]
+
+qualification_limitations: ["Qualification is inherited from the upstream tool and its corpus, not repeated on BLUT's corpus.", "Plants are single-fault; interacting defects and semantic truth of valid records are not covered.", "BLUT's gate probe checks only its current corpus, not every declared fault class."]
+
+detection_results:
+  - fault_class: "manifest-malformed"
+    mutation: "removed a required atom; duplicated an ordinal; declared an unknown role; fabricated an enterprise id"
+    detected: "true"
+  - fault_class: "atom-missing"
+    mutation: "deleted 20-basis.md while leaving it declared in the manifest"
+    detected: "true"
+  - fault_class: "stale-parent-contract-digest"
+    mutation: "left a child pinning a parent contract digest that no longer matches"
+    detected: "true"
+  - fault_class: "generated-view-drift"
+    mutation: "hand-edited generated/WAR.md; deleted generated/WAR.json; hand-edited both overviews"
+    detected: "true"
+  - fault_class: "frontmatter-injection"
+    mutation: "injected a YAML anchor into atom frontmatter"
+    detected: "true"
+  - fault_class: "adr-malformed"
+    mutation: "set an unknown ADR status; removed a required frontmatter key"
+    detected: "true"
+  - fault_class: "composition-cycle"
+    mutation: "made a Warrant its own parent"
+    detected: "true"
+  - fault_class: "milestone-graph-invalid"
+    mutation: "dangling stage_ref; dependency cycle; a milestone carrying a stage-only field"
+    detected: "true"
+  - fault_class: "obligation-malformed"
+    mutation: "removed an obligation's scope; pointed obligation_refs at OBL-999"
+    detected: "true"
+  - fault_class: "adequacy-review-absent"
+    mutation: "deleted the Gate Adequacy section from a controlled Warrant; replaced a review body with confident prose containing no question"
+    detected: "true"
