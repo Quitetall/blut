@@ -33,7 +33,7 @@ blut-types = { path = "../blut-types" }
 axum = "0.8"
 async-stream = "0.3"
 sha2 = "0.10"
-hmac = "0.12"
+hmac = "0.13"
 faster-hex = "0.10"
 include_dir = "0.7"
 tokio = { version = "1", features = ["full"] }
