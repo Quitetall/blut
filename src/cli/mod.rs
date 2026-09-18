@@ -278,6 +278,18 @@ enum Command {
         #[arg(long, default_value_t = false)]
         check: bool,
     },
+    /// Report whether the installed binary is behind what is published, and
+    /// optionally perform the upgrade. Asks `cargo info` rather than a registry
+    /// over HTTP: ADR 0034 keeps network clients out of the engine, and cargo
+    /// already holds the user's registry configuration.
+    Update {
+        /// Only report; never offer to install.
+        #[arg(long)]
+        check: bool,
+        /// Run the upgrade instead of printing the command.
+        #[arg(long)]
+        yes: bool,
+    },
     /// A cargo-style EXTERNAL subcommand (ADR 0083): `blut <cmd> …` with no
     /// built-in match execs `blut-<cmd>` from PATH with the remaining args — the
     /// seam by which `blut web`/`blut notify` (and eventually `blut tui`) route
@@ -1134,6 +1146,7 @@ pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>)
                 run_external(argv)
             }
         },
+        Some(Command::Update { check, yes }) => run_update(check, yes),
         Some(Command::External(argv)) => run_external(argv),
         // Bare invocation: a binary with an attached cockpit opens it (the
         // cookbook binaries); the bare engine prints help — interactive mode
@@ -2883,6 +2896,8 @@ use lineage::*;
 // Not glob-imported: `check` is a name several of these modules would like,
 // so the `plan check` arm calls it path-qualified.
 mod plan_check;
+mod update;
+use update::*;
 
 #[cfg(feature = "p2p")]
 mod p2p;

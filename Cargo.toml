@@ -92,6 +92,9 @@ memmap2 = "0.9"
 faster-hex = "0.10"
 uuid = { version = "1", features = ["v4"] }
 toml = "0.8"
+# `blut update` compares an installed version against the published one, and
+# prereleases order backwards under string comparison. Already in the lockfile.
+semver = "1"
 schemars = "0.8"
 tokio-util = "0.7"
 rayon = "1"
