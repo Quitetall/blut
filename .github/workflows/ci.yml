@@ -411,10 +411,11 @@ jobs:
       - name: Install cargo-deny
         run: cargo install cargo-deny --version 0.20.2 --locked
       - name: Dependency policy
-        run: |
-          cargo deny --locked check
-          cargo deny --locked --manifest-path crates/blut-dsl/Cargo.toml --config deny.toml check
-          cargo deny --locked --manifest-path crates/blut-operator/Cargo.toml --config deny.toml check
+        # Every workspace, derived from the committed lockfiles -- not a
+        # hand-kept list. The three manifests named here before covered 3 of 10
+        # workspaces, and RUSTSEC-2026-0285 (rustls) sat in blut-operator,
+        # blut-tui and fuzz while this job reported success.
+        run: bash scripts/dependency_policy.sh
       - name: Secret scan
         uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
         env:

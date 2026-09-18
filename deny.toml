@@ -11,6 +11,7 @@ ignore = [
     { id = "RUSTSEC-2025-0012", reason = "unmaintained-only backoff is transitive through unpublished kube 0.96 operator; replace when operator is revived" },
     { id = "RUSTSEC-2024-0384", reason = "unmaintained-only instant is transitive through unpublished kube 0.96 operator; replace when operator is revived" },
     { id = "RUSTSEC-2025-0134", reason = "unmaintained-only rustls-pemfile is transitive through unpublished kube 0.96 operator; replace when operator is revived" },
+    { id = "RUSTSEC-2026-0173", reason = "unmaintained-only proc-macro-error2 is transitive through the Leptos dashboard in crates/blut-web/ui, which is publish = false; no known vulnerability, replace when Leptos drops it" },
 ]
 
 [licenses]
@@ -27,6 +28,12 @@ allow = [
     "ISC",
     "MIT",
     "MPL-2.0",
+    # libfuzzer-sys is "(MIT OR Apache-2.0) AND NCSA", so the NCSA term must be
+    # allowed for the conjunction to satisfy. NCSA (University of Illinois/NCSA
+    # Open Source License) is OSI-approved and permissive -- BSD-3-Clause plus
+    # an MIT-style documentation grant. It enters only through fuzz/, which is
+    # publish = false and ships in no artifact.
+    "NCSA",
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Unlicense",
@@ -40,6 +47,13 @@ ignore = false
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Sidecar workspaces reference their siblings by bare path
+# (`blut-types = { path = "../blut-types" }`). cargo-deny counts that as a
+# wildcard, but it is the correct shape for an unpublished sibling: a version
+# requirement on a crate that is never resolved from a registry is decoration.
+# Wildcards on REGISTRY dependencies stay denied by the line above -- this
+# narrows the rule to paths, it does not switch it off.
+allow-wildcard-paths = true
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"

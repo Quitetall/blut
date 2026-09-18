@@ -13,6 +13,10 @@
 name = "blut-fuzz"
 version = "0.0.0"
 publish = false
+# Same licence as the crate it fuzzes. Without it `cargo deny` rejects this
+# workspace as unlicensed -- which it was, unnoticed, because the dependency
+# gate never looked at this manifest.
+license = "AGPL-3.0-or-later"
 edition = "2024"
 
 # Detach from the parent `blut` crate's empty `[workspace]` table -- without

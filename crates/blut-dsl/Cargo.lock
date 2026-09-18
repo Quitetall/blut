@@ -270,6 +270,7 @@ dependencies = [
  "rayon",
  "rusqlite",
  "schemars",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",
