@@ -417,7 +417,7 @@ jobs:
         # blut-tui and fuzz while this job reported success.
         run: bash scripts/dependency_policy.sh
       - name: Secret scan
-        uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Absolute, not relative: the action runs gitleaks in a container and
