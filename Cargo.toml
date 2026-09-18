@@ -113,7 +113,7 @@ bincode = "1.3"
 rand = "0.8"
 # P2P deps — optional, behind the `p2p` feature.
 ed25519-dalek = { version = "2.1", features = ["rand_core"], optional = true }
-aes-gcm = { version = "0.10", optional = true }
+aes-gcm = { version = "0.11", optional = true }
 x25519-dalek = { version = "2.0", features = ["static_secrets"], optional = true }
 # Artifact content ids (framework/artifact.rs) hash with BLAKE3 on every build,
 # so this is unconditional. It was already unconditional in practice — it just
