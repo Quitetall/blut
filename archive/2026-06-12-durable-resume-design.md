@@ -1,5 +1,14 @@
 # Durable Resume (BLUT-API Phase D) — Design
 
+> **ARCHIVED — HISTORICAL DESIGN SPEC, NOT CURRENT STATE.**
+>
+> Approved 2026-06-12, for durable resume. It refers to cookbook internals
+> (`train_joint.py`, SOAP preconditioners, `warm_latest.ckpt`) that live in a
+> different repository and are not part of this engine. The feature it designed
+> shipped; this is the design note, not documentation of the result. It also
+> sat under a `docs/superpowers/` directory that was an agent-tooling artifact.
+
+
 **Status:** approved 2026-06-12. **Scope:** in-process stage retry + cross-invocation
 re-run + clean optimizer resume. **Approach:** Hybrid (Rust orchestrator owns the
 crash-gated *policy*; Python trainer owns the checkpoint *mechanics*).

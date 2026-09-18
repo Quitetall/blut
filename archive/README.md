@@ -19,6 +19,8 @@ one, and it keeps the audit trail intact.
 | Path | What it was | Superseded by |
 |---|---|---|
 | `2026-05-28-state-review-and-test-plan.md` | Six-subsystem diagnostic of the pre-split, LamQuant-first, single-crate engine | ADR 0034 (engine is domain-agnostic); current capability boundaries live in [`docs/DISTRIBUTED_VALIDATION.md`](../docs/DISTRIBUTED_VALIDATION.md) |
+| `2026-06-08-verbatim-metrics-tooling.md` | A note on `read_metric` and an anti-confabulation workflow for LLM-assisted development | The metric store as documented in [`API.md`](../API.md) |
+| `2026-06-12-durable-resume-design.md` | Design spec for durable resume, written against cookbook internals in another repository | The shipped feature; see `CHANGELOG.md` |
 | `experimental-k8s/` | Early Kubernetes packaging experiment | `crates/blut-operator` (unpublished, `publish = false`, separate Rust 1.89 lane) |
 
 ## Where current truth lives
