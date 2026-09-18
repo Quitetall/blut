@@ -87,7 +87,7 @@ clap = { version = "4", features = ["derive"] }
 humantime = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
-sha2 = "0.10"
+sha2 = "0.11"
 memmap2 = "0.9"
 faster-hex = "0.10"
 uuid = { version = "1", features = ["v4"] }
