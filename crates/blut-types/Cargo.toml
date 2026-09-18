@@ -33,4 +33,4 @@ sha2 = "0.10"
 # 0.10's SIMD is std/target-gated with a pure fallback, so it wasm32-checks clean
 # (the `wasm32-keystone` CI job is the guard).
 faster-hex = "0.10"
-schemars = "0.8"
+schemars = "1.2"
