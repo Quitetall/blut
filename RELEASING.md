@@ -76,9 +76,17 @@ Also gate detached workspaces:
 Required GitHub checks must be green at this exact SHA. Do not infer release
 readiness from an older successful run.
 
-Every commit in the candidate range must also have a recorded `PASS` or
-`PASS WITH NITS` verdict from `mcp__local-llm__review_commit`. A missing or
-unavailable reviewer is a release blocker, not a waiver. The benchmark command
+Every commit in the candidate range must have been reviewed, and the review
+recorded. This used to name `mcp__local-llm__review_commit` as the only
+acceptable reviewer and call an unavailable one a release blocker. That cannot
+survive publication: it is a private, local tool that no outside contributor can
+run, so as written the procedure said nobody but this machine may cut a release.
+
+What the requirement actually protects is that no commit reaches a release
+unexamined. Human review on a pull request satisfies it. So does a recorded
+model review where one is available. What does not satisfy it is a commit that
+went straight to `main` with nothing but CI behind it — CI checks that the code
+builds and passes its gates, which is not the same as somebody having read it. The benchmark command
 above requires the committed `release-0.2` quiet-host baseline; establish it
 with `bash scripts/run_benchmarks.sh --save` only on the designated quiet host.
 GitHub's heterogeneous hosted runners compile the benchmark harness but do not
@@ -137,5 +145,51 @@ cargo check
 cargo install blut-dsl --version =0.2.0-alpha.1
 ```
 
-Create `v0.2.0-alpha.1` only at the reviewed SHA. Release notes must link this
-changelog, exact CI run, package checksums, and supported-version statement.
+## Tagging
+
+Tag at the reviewed SHA, **after** publishing, one tag per crate published:
+
+```bash
+git tag -a blut-types-v0.2.0-alpha.1 -F tagmsg.txt <sha>
+git push origin blut-types-v0.2.0-alpha.1
+```
+
+**The `<crate>-v<version>` shape is load-bearing, not cosmetic.** A single
+umbrella tag cannot be accurate: the 0.2.0-alpha.1 train shipped from two
+commits (`blut`/`blut-types`/`blut-notify` from `e34c557`, `blut-dsl`/`blut-tui`
+from `ffecee5`), and `blut-graph-core` releases on its own schedule entirely.
+The prefix also keeps these tags clear of `release.yml`'s `v*` trigger, so
+recording a release fires no build — which is what makes backfilling history
+safe.
+
+Verify the tag against what was actually published rather than trusting the
+commit you think you cut it from. Every published `.crate` carries
+`.cargo_vcs_info.json`:
+
+```bash
+curl -sL https://static.crates.io/crates/<crate>/<crate>-<version>.crate \
+  | tar xzO '<crate>-<version>/.cargo_vcs_info.json'
+```
+
+Release notes must link this changelog, the exact CI run, package checksums, and
+the supported-version statement. Mark alpha releases prerelease, or GitHub will
+advertise one as "Latest".
+
+## Two gates in this document do not pass today
+
+Both are recorded here rather than quietly worked around.
+
+**`scripts/run_benchmarks.sh compare` cannot pass.** It defaults to the baseline
+name `release-0.2`, and the only baseline committed under `bench-baselines/` is
+`opt0`, so it exits 2 with `missing committed benchmark baseline 'release-0.2'`.
+Either establish the baseline on the designated quiet host
+(`bash scripts/run_benchmarks.sh --save`) or run the comparison against the
+baseline that exists (`BLUT_BENCH_BASELINE=opt0`). Do not delete the check.
+
+**`release.yml`'s `gate` job ends BLOCKED by design.** Its last step runs
+`tools/check_blut_release_state.py`, which reports BLOCKED whenever the two
+external cookbook components (`blut-cookbook-standard`, `blut-cookbook-lamquant`)
+are not checked out — which they never are in CI. A `v*` tag therefore produces a
+red release run that is not evidence of a problem. `ci.yml` treats any verdict of
+exit ≤ 2 as a report rather than a failure; until `release.yml` does the same, or
+the externals are fetched, read that red with this paragraph in hand.
