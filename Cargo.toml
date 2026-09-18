@@ -129,7 +129,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # just exposes the existing dependency directly rather than hand-rolling a
 # DER parser over attacker-controlled certificate bytes.
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc"], optional = true }
-rcgen = { version = "0.13", optional = true }
+rcgen = { version = "0.14", optional = true }
 [features]
 # The cockpit moved to the `crates/blut-tui` sidecar (ADR 0083 M2); the lean
 # CLI is now THE default build — no terminal-UI deps in the engine tree.
