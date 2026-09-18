@@ -28,7 +28,7 @@ blut = { path = "../..", version = "=0.2.0-alpha.1" }
 starlark = "0.14"
 serde_json = "1"
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
