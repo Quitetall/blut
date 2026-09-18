@@ -481,6 +481,47 @@ jobs:
       - name: Golden status stream conforms to the frozen v1 contract
         run: python3 scripts/contract_lint.py --stream tests/contract/status_stream_v1.golden.jsonl
 
+  coverage:
+    name: coverage (report only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Weekly and on demand, NOT per push. It re-instruments and re-runs the
+    # whole suite, and the queue on this repository is already the slowest part
+    # of a change landing. Report-only on purpose: there is no threshold and it
+    # gates nothing. A coverage number is a map of what the tests touch, and
+    # turning it into a pass/fail invites tests written to colour the map.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.88.0
+          components: llvm-tools-preview
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --version 0.9.1 --locked
+      - name: Measure
+        run: |
+          cargo llvm-cov --locked --workspace --lcov --output-path lcov.info
+          cargo llvm-cov report --summary-only | tee coverage-summary.txt
+      - name: Publish the numbers as an artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage
+          path: |
+            lcov.info
+            coverage-summary.txt
+          retention-days: 30
+
   release-gates:
     name: release-state · I4-evidence checkers
     runs-on: ubuntu-latest
