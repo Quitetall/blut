@@ -30,7 +30,7 @@ path = "src/lib.rs"
 blut = { path = "../.." }
 blut-graph-core = { path = "../blut-graph-core" }
 # Versions match the engine's so a workspace-unified build cannot diverge.
-thiserror = "1"
+thiserror = "2"
 serde_json = "1"
 
 [dev-dependencies]
