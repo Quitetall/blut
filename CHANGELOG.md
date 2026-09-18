@@ -22,7 +22,12 @@ depend on this crate.
 - SLA breach rows and webhook events deduplicate durably across repeated checks
   and daemon restarts.
 
-## 0.2.0-alpha.1
+## [0.2.0-alpha.1] — published 2026-08-27
+
+Published to crates.io from two commits, recorded here because the tarballs are
+the only place that pairing is visible: `blut`, `blut-types` and `blut-notify`
+from `e34c557`; `blut-dsl` from `ffecee5` on 2026-09-06. `blut-graph-core` is
+not part of this train and released separately as 0.3.0 from `e01f32f`.
 
 ### Changed
 - **Version truth repair.** The package family is reset to

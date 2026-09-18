@@ -7,7 +7,12 @@ Evidence ledger for engine `0.2.0-alpha.1`. Status means:
   tested; no scale claim.
 - **Deferred:** unsupported in public preview.
 
-Last updated: 2026-07-12.
+Last updated: 2026-09-17.
+
+Nothing in the table below changed when the crates were published on
+2026-08-27. Publication moves code, not evidence: every row still says exactly
+what was and was not exercised, and the four Deferred rows are the ones to read
+first if you are deciding whether to depend on this.
 
 | Capability | Status | Evidence boundary |
 |---|---|---|
