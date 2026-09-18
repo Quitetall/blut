@@ -245,7 +245,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
@@ -433,6 +433,54 @@ jobs:
           # and on planted `ghp_` + `sk_live_` tokens 8.30.1 still fails both.
           GITLEAKS_VERSION: 8.30.1
 
+  semver-compat:
+    name: published API compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Has anything already on crates.io been broken? Nothing asked this before,
+    # so the only thing standing between an accidental removal and a published
+    # breaking change was noticing by hand.
+    #
+    # Runs with --release-type minor on purpose: on main the current version
+    # equals the published one, and without it cargo-semver-checks reports
+    # "no change; assume major" and runs ZERO checks. See scripts/semver_checks.sh.
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: ${{ runner.os }}-semver-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install cargo-semver-checks
+        run: cargo install cargo-semver-checks --version 0.50.0 --locked
+      - name: Published API compatibility
+        run: bash scripts/semver_checks.sh
+
+  trainer-contract:
+    name: trainer contract v1 (CONTRACT.md)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # scripts/contract_lint.py has existed, with golden fixtures, and no
+    # workflow ever ran it. CONTRACT.md calls those fixtures its executable
+    # form; that is only true if something executes them.
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Golden status stream conforms to the frozen v1 contract
+        run: python3 scripts/contract_lint.py --stream tests/contract/status_stream_v1.golden.jsonl
+
   release-gates:
     name: release-state · I4-evidence checkers
     runs-on: ubuntu-latest
@@ -461,7 +509,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
       - name: Checker unit suites

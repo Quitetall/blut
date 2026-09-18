@@ -326,6 +326,7 @@ A **commercial license** is available from the maintainer on request.
 ## Links
 
 - [API reference](API.md)
+- [Roadmap](ROADMAP.md) — what 1.0 needs, stated as missing evidence
 - [Validation status](https://github.com/Quitetall/blut/blob/blut-v0.2.0-alpha.1/docs/DISTRIBUTED_VALIDATION.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)

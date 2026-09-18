@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Review ownership. One maintainer today; this file exists so that stays TRUE
+# rather than implied, and so the release-critical surfaces are named.
+*                       @Quitetall
+
+# Anything that decides what ships, or what a gate is allowed to let past.
+/.github/workflows/     @Quitetall
+/scripts/               @Quitetall
+/deny.toml              @Quitetall
+/.gitleaks.toml         @Quitetall
+/RELEASING.md           @Quitetall
+/docs/release/          @Quitetall
+
+# The charter boundary: the engine is domain-agnostic (ADR 0034).
+/src/framework/         @Quitetall
+/CONTRACT.md            @Quitetall
