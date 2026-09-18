@@ -62,7 +62,7 @@ blut-types = { path = "crates/blut-types", version = "=0.2.0-alpha.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-thiserror = "1"
+thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -80,25 +80,25 @@ async-trait = "0.1"
 # DOWNSTREAM consumer (the cookbooks, codec-lossless, firmware) failed too. A
 # feature a crate needs must be declared by that crate; borrowing it from a
 # sibling only works until someone depends on you.
-nix = { version = "0.29", features = ["signal", "process", "resource", "fs"] }
-dirs = "5"
+nix = { version = "0.31", features = ["signal", "process", "resource", "fs"] }
+dirs = "7"
 parking_lot = "0.12"
 clap = { version = "4", features = ["derive"] }
 humantime = "2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
-sha2 = "0.10"
+sha2 = "0.11"
 memmap2 = "0.9"
 faster-hex = "0.10"
 uuid = { version = "1", features = ["v4"] }
-toml = "0.8"
+toml = "1.1"
 # `blut update` compares an installed version against the published one, and
 # prereleases order backwards under string comparison. Already in the lockfile.
 semver = "1"
-schemars = "0.8"
+schemars = "1.2"
 tokio-util = "0.7"
 rayon = "1"
-which = "6"
+which = "8"
 # Local-filesystem object store used by the experimental cloud queue. Public
 # preview excludes network providers until their XML dependency chain clears
 # the advisory gate.
@@ -108,19 +108,19 @@ bytes = { version = "1", optional = true }
 # features (drops the heavy `oldtime`/`serde`/`wasm` baggage), `clock`
 # pulls only the local-tz lookup.
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-cron = "0.15"
-bincode = "1.3"
-rand = "0.8"
+cron = "0.17"
+bincode = "3.0"
+rand = "0.10"
 # P2P deps — optional, behind the `p2p` feature.
-ed25519-dalek = { version = "2.1", features = ["rand_core"], optional = true }
-aes-gcm = { version = "0.10", optional = true }
-x25519-dalek = { version = "2.0", features = ["static_secrets"], optional = true }
+ed25519-dalek = { version = "3.0", features = ["rand_core"], optional = true }
+aes-gcm = { version = "0.11", optional = true }
+x25519-dalek = { version = "3.0", features = ["static_secrets"], optional = true }
 # Artifact content ids (framework/artifact.rs) hash with BLAKE3 on every build,
 # so this is unconditional. It was already unconditional in practice — it just
 # arrived transitively through abir-training, which made a CORE dependency look
 # like a p2p extra.
 blake3 = "1"
-hkdf = { version = "0.12", optional = true }
+hkdf = { version = "0.13", optional = true }
 quinn = { version = "0.11", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 # X.509/SPKI parsing for PinnedVerifier (p2p/transport.rs) to extract a
@@ -129,7 +129,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # just exposes the existing dependency directly rather than hand-rolling a
 # DER parser over attacker-controlled certificate bytes.
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc"], optional = true }
-rcgen = { version = "0.13", optional = true }
+rcgen = { version = "0.14", optional = true }
 [features]
 # The cockpit moved to the `crates/blut-tui` sidecar (ADR 0083 M2); the lean
 # CLI is now THE default build — no terminal-UI deps in the engine tree.
