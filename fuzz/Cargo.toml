@@ -32,7 +32,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 serde_json = "1"
-bincode = "1"
+bincode = "3"
 
 # `p2p` is required for the two p2p-boundary targets (bundle manifest, wire
 # message) since `blut::p2p` is `#[cfg(feature = "p2p")]`-gated. Building it
