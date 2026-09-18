@@ -1,25 +1,15 @@
-# ============================================================================
-# PAUSED — this file is INERT at this filename.
+# Re-enabled 2026-09-18, when the repository became public and standard-runner
+# minutes stopped being billed.
 #
-# Dependabot reads `.github/dependabot.yml` exactly. Renamed, it does nothing.
+# It was paused on its first day for economics, not correctness: ten workspaces
+# means every round opens work in ten places, every pull request runs the
+# nine-job CI matrix, and the day it ran cost ~2,256 billable runner-minutes on
+# a private repository. The configuration below is the corrected one -- one
+# GROUPED pull request per workspace covering every update type, limit 2 -- and
+# it is what keeps that from recurring. Security advisories still arrive
+# individually regardless of grouping, which is the case that must never be
+# batched into a pile nobody reads.
 #
-# WHY. Ten workspaces means every update round opens work in ten places, and
-# every pull request runs the full nine-job CI matrix, and every PR event also
-# wakes the CLA workflow. Measured on 2026-09-18, its first day on:
-#
-#     122 of the day's 322 workflow runs in this repository were dependabot's,
-#     and the day's total was ~2,256 billable runner-minutes (~$18) on a
-#     PRIVATE repository, where minutes are charged.
-#
-# The updater is not wrong and the configuration below is the corrected,
-# grouped one. The economics are wrong while the repository is private.
-#
-# RE-ENABLE by renaming this file back to `.github/dependabot.yml` AFTER the
-# repository is public, where Actions minutes on standard runners are free.
-# Until then, `scripts/dependency_policy.sh` is what actually holds the line on
-# dependencies, and it runs in CI on every push at no extra cost.
-# ============================================================================
-
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Dependency updates.
 #

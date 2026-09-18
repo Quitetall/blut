@@ -287,9 +287,14 @@ as an optional fallback.
 
 ## Status
 
-**Source version: 0.2.0-alpha.1.** Check crates.io before assuming registry
-availability. Local 1.x tags are preserved as internal milestone history, not
-public-release evidence.
+**Source version: 0.2.0-alpha.1**, published on crates.io and tagged here. Each
+published crate has a `<crate>-v<version>` tag and a GitHub release pointing at
+the exact commit it was built from, recovered from the published tarball's own
+`.cargo_vcs_info.json`.
+
+Earlier `0.10`/`0.11`/`1.x` tags are gone: they were internal milestones, never
+crates.io releases, and they sorted above the real version. The CHANGELOG still
+records what they were.
 
 **Experimental:** P2P module, DDP launch wiring, and DAG optimizer remain under
 active validation; per-rung status lives in the

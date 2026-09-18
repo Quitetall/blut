@@ -19,9 +19,10 @@ on:
   schedule:
     - cron: "41 5 * * 2" # Tuesday 05:41 UTC, offset from the Monday CI sweep
   workflow_dispatch:
-  # NO push trigger. Scorecard cannot analyse a private repository, so a
-  # per-commit trigger only spends minutes failing. Add `push: branches: [main]`
-  # back when the repository is public, if per-commit scoring is wanted at all.
+  # Still no push trigger, now for a different reason. The repository is public
+  # as of 2026-09-18, so Scorecard can finally analyse it -- but a score is a
+  # weekly-moving number, not a per-commit one, and a run per commit buys
+  # nothing but noise. Weekly and on demand.
 
 permissions: read-all
 
