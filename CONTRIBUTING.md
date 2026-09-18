@@ -46,6 +46,20 @@ will be redirected to a cookbook crate. If you think the engine is
 missing a *generic* seam that your domain needs, open an issue describing
 the seam, not the domain.
 
+## Minimum supported Rust version
+
+**1.88.0**, and CI builds/clippies/tests on exactly that toolchain — so a newer
+compiler is not evidence. `cargo +1.88` before you push, or expect the gate to
+disagree with your stable.
+
+Newer toolchains are not supersets: clippy gains and loses lints between
+releases, and this repository has shipped a red gate twice because a clean run
+on a newer clippy was mistaken for a clean run on the pinned one.
+
+An MSRV increase is a minor version bump while the crates are `0.x`, and belongs
+in `CHANGELOG.md`. `blut-operator` deliberately requires 1.89 and has its own
+lane.
+
 ## API preview
 
 The current `0.2.0-alpha.1` surface is a preview of the intended 1.0 contract —

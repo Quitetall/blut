@@ -13,8 +13,9 @@ domain-agnostic), so nothing in the chain depends on it. Publish it on its own
 schedule once its surface settles; it is the newest and fastest-moving crate in
 the repo.
 
-The standalone-workspace sidecars `blut-tui`, `blut-web`,
-and `blut-operator` are `publish = false`. The `release.yml` `binaries` job
+`blut-tui` IS published (0.2.0-alpha.1 is on crates.io) and its manifest now
+says so. The standalone-workspace sidecars `blut-web` and `blut-operator` are
+`publish = false`. The `release.yml` `binaries` job
 attaches those three plus the runnable `blut-notify` member binary to the GitHub
 Release. (`blut-worker` was deleted at ADR 0083 M3 — superseded by `src/cloud`
 and the `blut-web` sidecar.)

@@ -12,7 +12,9 @@
 name = "blut-web-ui"
 version = "0.2.0-alpha.1"
 edition = "2024"
-rust-version = "1.85"
+# 1.88, not 1.85. The 1.85 claim was never true and never tested: cargo
+# +1.85 refuses this manifest outright because its `blut-types` dependency requires 1.88.
+rust-version = "1.88"
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
 description = "BLUT dashboard — Leptos CSR front-end embedded in the blut-web sidecar (ADR 0083)."

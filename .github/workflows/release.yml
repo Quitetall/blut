@@ -212,8 +212,10 @@ jobs:
 
   # ── publish: the crate chain to crates.io, in dependency order ──────
   # MANUAL + owner-gated. blut-types → blut → blut-dsl → blut-notify. The
-  # standalone-workspace sidecars (blut-tui/blut-web/blut-operator) are
-  # publish=false — they ship as the binaries above, not as crates.
+  # blut-web and blut-operator are publish=false and ship as the binaries above.
+  # blut-tui is NOT: it is published (0.2.0-alpha.1 is on crates.io) and ships
+  # both ways. It is not in this chain because the chain is the four crates the
+  # release train publishes together.
   publish-crates:
     name: publish crate chain (IRREVERSIBLE)
     needs: kind-smoke

@@ -15,7 +15,12 @@
 name = "blut-tui"
 version = "0.2.0-alpha.1"
 edition = "2024"
-rust-version = "1.85"
+# 1.88, not 1.85. The 1.85 claim was never true and never tested: cargo
+# +1.85 refuses this manifest outright because its `blut` and `ratatui` dependencies both require 1.88.
+rust-version = "1.88"
+# Explicit, because two documents used to claim the opposite while this manifest
+# carried no `publish` key at all -- and blut-tui 0.2.0-alpha.1 is on crates.io.
+publish = ["crates-io"]
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
 description = "BLUT interactive cockpit — ratatui console over the engine's jobs/lineage/cache/graph stores (ADR 0083)."

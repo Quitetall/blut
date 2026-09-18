@@ -2,6 +2,12 @@
 
 <sub>(affectionately, *Brian Lam's Universal Trainer*.)</sub>
 
+[![CI](https://github.com/Quitetall/blut/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Quitetall/blut/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/blut.svg)](https://crates.io/crates/blut)
+[![docs.rs](https://img.shields.io/docsrs/blut)](https://docs.rs/blut)
+[![MSRV](https://img.shields.io/badge/rustc-1.88+-blue.svg)](#minimum-supported-rust-version)
+[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
+
 A **semantic compiler for ML pipelines.** You declare what each node *means* —
 how deterministic it is, what effects it has, whether it may produce gaps — and
 BLUT kind-checks the graph, fuses what is safe to fuse, lowers it to an
@@ -12,10 +18,40 @@ strong word and this is alpha software. **Basically less unsound**: every
 release should make it harder to express a pipeline whose behaviour does not
 match what it claims, and honest about how far that has got.
 
+## Install
+
+**`blut` is a library, not an application.** The root crate is lib-only: there
+is no `blut` binary to install from it. You get a `blut` command by writing a
+*cookbook* — a crate that registers your stages and calls `blut::cli::run` — and
+building that. [Build your own cookbook](#build-your-own-cookbook) is the short
+version; `examples/first_cookbook.rs` is the working one.
+
+Use it as a dependency:
+
 ```toml
 [dependencies]
 blut = "=0.2.0-alpha.1"
 ```
+
+Two binaries do install directly, both published:
+
+```bash
+cargo install blut-dsl --version =0.2.0-alpha.1   # .star → PlanSpec front-end
+cargo install blut-tui --version =0.2.0-alpha.1   # the terminal cockpit
+```
+
+## Quickstart
+
+One command, no cookbook of your own, from a clone of this repository. It builds
+a two-stage typed DAG, runs it cold, then re-runs it to show the content-
+addressed cache serving the second run:
+
+```bash
+git clone https://github.com/Quitetall/blut && cd blut
+cargo run --locked --example first_cookbook
+```
+
+CI runs this same command on every push, so it is never allowed to rot.
 
 ## What BLUT is
 
@@ -106,6 +142,8 @@ pipeline with admission control, available process containment, durable state,
 and placement seams that can grow beyond one GPU without rewriting the DAG:
 
 ```rust
+// Sketch, not a compilable file: the stages, backend and context are yours.
+// For something that builds and runs today, see the Quickstart above.
 let plan = Plan::<(), MyBackend>::new("train", json!({}))
     .start(PrepareData, prep_args)
     .then(Train, train_args)
@@ -143,7 +181,7 @@ on resume. Model and recipe commands both default to tenant `default`; use
 
 Landed in the development tree, but not yet cut as a release. Validation status
 per capability is tracked in the
-[distributed-validation ledger](https://github.com/Quitetall/blut/blob/v0.2.0-alpha.1/docs/DISTRIBUTED_VALIDATION.md):
+[distributed-validation ledger](https://github.com/Quitetall/blut/blob/blut-v0.2.0-alpha.1/docs/DISTRIBUTED_VALIDATION.md):
 
 | Feature | What |
 |---------|------|
@@ -209,7 +247,8 @@ fn resource_envelope(&self, args: &Self::Args) -> ResourceEnvelope {
 }
 ```
 
-(The full working version lives in `examples/first_cookbook.rs` — CI runs it.)
+(The full working version lives in `examples/first_cookbook.rs` — run it with
+`cargo run --locked --example first_cookbook`; CI runs it too.)
 
 
 ```rust
@@ -254,12 +293,25 @@ public-release evidence.
 
 **Experimental:** P2P module, DDP launch wiring, and DAG optimizer remain under
 active validation; per-rung status lives in the
-[distributed-validation ledger](https://github.com/Quitetall/blut/blob/v0.2.0-alpha.1/docs/DISTRIBUTED_VALIDATION.md).
+[distributed-validation ledger](https://github.com/Quitetall/blut/blob/blut-v0.2.0-alpha.1/docs/DISTRIBUTED_VALIDATION.md).
 
 Engine integration and property tests run in CI; exact counts live in CI, not
 this README. The standalone fuzz workspace is not yet CI-gated. Deprecated
 worker and experimental operator prototypes are not part of the public preview
 or published packages.
+
+## Minimum supported Rust version
+
+**1.88.0.** Every published crate declares `rust-version = "1.88"` and CI builds,
+clippies and tests them on exactly that toolchain — the floor is measured, not
+asserted.
+
+- An MSRV increase is a **minor** version bump while the crates are `0.x`, and
+  will be called out in [CHANGELOG.md](CHANGELOG.md).
+- The unpublished `blut-operator` deliberately requires **1.89** and runs in its
+  own CI lane; it is not part of the published chain.
+- Newer toolchains are not assumed to be supersets. A lint that fires only on a
+  newer clippy is not a release blocker, and one that fires on 1.88 is.
 
 ## License
 
@@ -274,7 +326,7 @@ A **commercial license** is available from the maintainer on request.
 ## Links
 
 - [API reference](API.md)
-- [Validation status](https://github.com/Quitetall/blut/blob/v0.2.0-alpha.1/docs/DISTRIBUTED_VALIDATION.md)
+- [Validation status](https://github.com/Quitetall/blut/blob/blut-v0.2.0-alpha.1/docs/DISTRIBUTED_VALIDATION.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Release procedure](RELEASING.md)
