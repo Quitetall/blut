@@ -98,7 +98,7 @@ semver = "1"
 schemars = "0.8"
 tokio-util = "0.7"
 rayon = "1"
-which = "6"
+which = "8"
 # Local-filesystem object store used by the experimental cloud queue. Public
 # preview excludes network providers until their XML dependency chain clears
 # the advisory gate.
