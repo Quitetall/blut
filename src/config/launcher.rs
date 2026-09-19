@@ -776,23 +776,58 @@ impl RayJob {
     }
 
     /// Parse `ray job status <id>` output into a [`JobState`].
+    ///
+    /// The shapes below were CAPTURED from `ray job status` against a live
+    /// two-node cluster (Ray 2.x), not inferred. This previously scanned for a
+    /// `Status:` line and a bare `SUCCEEDED` token, which Ray does not emit for
+    /// a terminal job -- so every poll of a finished job returned
+    /// `Unknown("could not parse ray job status")`, and the launcher could
+    /// never observe a job succeed or fail. The four real forms are:
+    ///
+    /// ```text
+    /// SUCC cli.py:64 -- Job 'my-id' succeeded
+    /// ERR  cli.py:72 -- Job 'my-id' failed
+    /// WARN cli.py:82 -- Job 'my-id' was stopped
+    /// INFO cli.py:89 -- Status for job 'my-id': RUNNING
+    /// ```
+    ///
+    /// Terminal words are matched first: a finished job's output also carries a
+    /// `Status message:` line, and for a failure that message embeds the tail of
+    /// the job's own logs, which can contain anything at all -- including the
+    /// word `succeeded`. Order matters here.
     fn parse_ray_status(output: &str) -> JobState {
-        // Ray job status typically outputs a table like:
-        //   Status: SUCCEEDED
-        //   ...
-        // or a JSON blob. We scan for a "Status:" line.
+        // `Status for job '<id>': <STATE>` — the non-terminal form.
         for line in output.lines() {
-            let trimmed = line.trim();
-            if let Some(status) = trimmed.strip_prefix("Status:") {
-                let status = status.trim();
-                return match status {
-                    "SUCCEEDED" => JobState::Succeeded,
-                    "FAILED" => JobState::Failed("FAILED".to_string()),
-                    "RUNNING" | "PENDING" | "WAITING" | "CONSTRUCTOR" => JobState::Running,
-                    "STOPPED" | "CANCELLED" => JobState::Cancelled,
-                    "UNKNOWN" => JobState::Unknown("UNKNOWN".to_string()),
-                    other => JobState::Unknown(other.to_string()),
-                };
+            if let Some((_, rest)) = line.split_once("Status for job ") {
+                if let Some((_, state)) = rest.rsplit_once(": ") {
+                    let state = state.trim();
+                    return match state {
+                        "SUCCEEDED" => JobState::Succeeded,
+                        "FAILED" => JobState::Failed("FAILED".to_string()),
+                        "RUNNING" | "PENDING" | "WAITING" | "CONSTRUCTOR" => JobState::Running,
+                        "STOPPED" | "CANCELLED" => JobState::Cancelled,
+                        other => JobState::Unknown(other.to_string()),
+                    };
+                }
+            }
+        }
+        // Terminal prose. Scan only up to the `Status message:` line: past it,
+        // the text is the job's own captured output and proves nothing.
+        for line in output.lines() {
+            if line.contains("Status message:") {
+                break;
+            }
+            if !line.contains("Job '") {
+                continue;
+            }
+            if line.contains("' succeeded") {
+                return JobState::Succeeded;
+            }
+            if line.contains("' failed") {
+                return JobState::Failed("FAILED".to_string());
+            }
+            if line.contains("' was stopped") {
+                return JobState::Cancelled;
             }
         }
         JobState::Unknown("could not parse ray job status".to_string())
@@ -1361,52 +1396,65 @@ mod tests {
     }
 
     // --- RemoteJob: ray job status parsing ---
+    //
+    // Every fixture below is REAL `ray job status` output, captured from a live
+    // two-node Ray 2.x cluster on 2026-09-19 (ANSI colour stripped, timestamps
+    // kept). The tests these replaced asserted on `"Status: SUCCEEDED\n"`, a
+    // string Ray does not emit for a terminal job. Parser and tests shared one
+    // invented format, so they agreed with each other and with nothing else,
+    // and `poll()` returned Unknown for every finished job.
 
     #[test]
     fn ray_parse_status_succeeded() {
-        assert_eq!(
-            RayJob::parse_ray_status("Status: SUCCEEDED\n"),
-            JobState::Succeeded
-        );
+        let real = "2026-09-19 09:11:33,856\tSUCC cli.py:63 -- --------------------------------\n\
+                    2026-09-19 09:11:33,856\tSUCC cli.py:64 -- Job 'blut-ray-proof-1' succeeded\n\
+                    2026-09-19 09:11:33,856\tSUCC cli.py:65 -- --------------------------------\n";
+        assert_eq!(RayJob::parse_ray_status(real), JobState::Succeeded);
     }
 
     #[test]
     fn ray_parse_status_failed() {
+        let real = "2026-09-19 09:11:32,014\tERR cli.py:72 -- Job 'blut-fail-1' failed\n\
+                    2026-09-19 09:11:32,014\tINFO cli.py:86 -- Status message: Job entrypoint \
+                    command failed with exit code 3, last available logs (truncated to 20,000 chars):\n";
         assert_eq!(
-            RayJob::parse_ray_status("Status: FAILED\n"),
+            RayJob::parse_ray_status(real),
             JobState::Failed("FAILED".to_string())
         );
     }
 
     #[test]
     fn ray_parse_status_running() {
-        assert_eq!(
-            RayJob::parse_ray_status("Status: RUNNING\n"),
-            JobState::Running
-        );
-    }
-
-    #[test]
-    fn ray_parse_status_pending() {
-        assert_eq!(
-            RayJob::parse_ray_status("Status: PENDING\n"),
-            JobState::Running
-        );
+        let real = "2026-09-19 09:11:43,680\tINFO cli.py:89 -- Status for job 'blut-run-2': RUNNING\n\
+                    2026-09-19 09:11:43,680\tINFO cli.py:91 -- Status message: Job is currently running.\n";
+        assert_eq!(RayJob::parse_ray_status(real), JobState::Running);
     }
 
     #[test]
     fn ray_parse_status_stopped() {
-        assert_eq!(
-            RayJob::parse_ray_status("Status: STOPPED\n"),
-            JobState::Cancelled
-        );
+        let real = "2026-09-19 09:11:32,922\tWARN cli.py:82 -- Job 'blut-run-1' was stopped\n";
+        assert_eq!(RayJob::parse_ray_status(real), JobState::Cancelled);
     }
 
     #[test]
-    fn ray_parse_status_cancelled() {
+    fn ray_parse_status_pending_is_running() {
+        let real = "2026-09-19 09:11:43,680\tINFO cli.py:89 -- Status for job 'x': PENDING\n";
+        assert_eq!(RayJob::parse_ray_status(real), JobState::Running);
+    }
+
+    #[test]
+    fn a_failure_log_that_contains_the_word_succeeded_is_still_a_failure() {
+        // `Status message:` for a failed job embeds the tail of the job's own
+        // output, which can say anything. Scanning the whole blob for
+        // "succeeded" would report a failed job as successful.
+        let real = "2026-09-19 09:11:32,014\tERR cli.py:72 -- Job 'j' failed\n\
+                    2026-09-19 09:11:32,014\tINFO cli.py:86 -- Status message: Job entrypoint \
+                    command failed with exit code 1, last available logs:\n\
+                    step 3 succeeded\n\
+                    Traceback (most recent call last): ...\n";
         assert_eq!(
-            RayJob::parse_ray_status("Status: CANCELLED\n"),
-            JobState::Cancelled
+            RayJob::parse_ray_status(real),
+            JobState::Failed("FAILED".to_string())
         );
     }
 
