@@ -21,7 +21,8 @@ first if you are deciding whether to depend on this.
 | `blut-types` on wasm32 | CI-gated | Rust 1.88 `wasm32-unknown-unknown` check |
 | Single-node GPU admission and per-device permits | Component-tested | Deterministic scheduler and executor tests |
 | Single-node `torchrun` argument construction | Component-tested | Launch contract tests; cookbook owns trainer semantics |
-| Multi-node Slurm and Ray launchers | Component-tested | Command/parser tests only; no cluster-scale claim |
+| Ray launcher against a live cluster | Validated | Two-node Ray 2.x, submit + stream + poll to Succeeded, 2026-09-19 |
+| Multi-node Slurm launcher | Component-tested | Command/parser tests only; see the Slurm note below |
 | P2P crypto, policy, transport, and loopback dispatch | Component-tested | Unit and loopback integration tests |
 | P2P dispatch between separate network namespaces | Validated | Two containers, own IPs, real QUIC over a bridge — see below |
 | Live multi-host P2P mesh | Deferred | Requires independent-host validation |
@@ -90,6 +91,33 @@ gates both behind cargo features; the published cookbook left them off, so the
 subcommands were compiled out of the only shipped binary. `blut-cookbook-standard`
 now exposes `p2p`, `cloud`, `raft` and `distributed`, and both runs above were
 performed through it.
+
+## Recorded run: Ray launcher against a live cluster (2026-09-19)
+
+Two containers on a bridge — a Ray head and a worker, 40 CPUs — driven through
+`blut::config::launcher::RayLauncher`, not by calling `ray` by hand:
+
+```
+submitted id=blut-ray-proof-fixed
+  [log] BLUT_RAY_PROOF node= rayhead cpus= 40.0
+terminal state: Succeeded
+```
+
+Submission, placement, log streaming and terminal-state polling all ran.
+
+**It found a real defect on the first attempt.** `parse_ray_status` scanned for
+a `Status:` line that Ray 2.x does not emit for a terminal job, so `poll()`
+returned `Unknown` for every finished job — the launcher could not observe a job
+succeed or fail, and never had been able to. Its seven unit tests asserted on
+the same invented string, so they agreed with the parser and with nothing else.
+Fixed against captured output; the run above is the same cluster after the fix.
+
+**Slurm is not validated and this run says nothing about it.** A real `sbatch` /
+`sacct` / `scancel` path needs accounting (slurmdbd + a database) and, on Debian
+12's Slurm 22.05 with cgroup/v2, a systemd instance as PID 1 for `slurmd` to
+create its scope over dbus. That is an environment constraint rather than
+anything about BLUT, and it was not solved here. The row stays
+Component-tested.
 
 ## Required evidence before stronger claims
 
