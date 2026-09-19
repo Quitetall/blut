@@ -35,14 +35,28 @@
 # same set from `git ls-files '*Cargo.lock'`.
 #
 # cla.yml already allowlists dependabot[bot], so these PRs are not CLA-blocked.
+# CADENCE IS MONTHLY, LIMIT 1, ON PURPOSE.
+#
+# Ten workspaces each carry their own Cargo.lock, and every one of them is a
+# separate update surface. That split is deliberate and stays: blut-dsl must not
+# share a feature graph with the engine (serde_json/arbitrary_precision would
+# break internally-tagged enums), blut-web/ui targets wasm, blut-operator holds
+# a 1.89 MSRV lane, and the sidecars dispatch as external subcommands. So the
+# surface cannot be collapsed -- only the cadence can.
+#
+# Weekly x 10 workspaces produced roughly 26 pull requests and the matching mail
+# in a single night, each dragging a CI run behind it. Monthly with a limit of 1
+# turns that into a handful. Security advisories are unaffected: Dependabot
+# raises those immediately regardless of schedule, which is the only class that
+# should ever interrupt.
+#
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: "/"
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 2
+      interval: monthly
+    open-pull-requests-limit: 1
     labels: ["dependencies"]
     groups:
       # Minor and patch only. These are the ones that land as a batch, because
@@ -58,9 +72,8 @@ updates:
   - package-ecosystem: cargo
     directory: "/crates/blut-dsl"
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 2
+      interval: monthly
+    open-pull-requests-limit: 1
     labels: ["dependencies"]
     groups:
       # Minor and patch only. These are the ones that land as a batch, because
@@ -76,9 +89,8 @@ updates:
   - package-ecosystem: cargo
     directory: "/crates/blut-graph-core"
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 2
+      interval: monthly
+    open-pull-requests-limit: 1
     labels: ["dependencies"]
     groups:
       # Minor and patch only. These are the ones that land as a batch, because
@@ -94,9 +106,8 @@ updates:
   - package-ecosystem: cargo
     directory: "/crates/blut-metrics"
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 2
+      interval: monthly
+    open-pull-requests-limit: 1
     labels: ["dependencies"]
     groups:
       # Minor and patch only. These are the ones that land as a batch, because
@@ -112,9 +123,8 @@ updates:
   - package-ecosystem: cargo
     directory: "/crates/blut-operator"
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 2
+      interval: monthly
+    open-pull-requests-limit: 1
     labels: ["dependencies"]
     groups:
       # Minor and patch only. These are the ones that land as a batch, because
@@ -130,9 +140,8 @@ updates:
   - package-ecosystem: cargo
     directory: "/crates/blut-semantic"
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 2
+      interval: monthly
+    open-pull-requests-limit: 1
     labels: ["dependencies"]
     groups:
       # Minor and patch only. These are the ones that land as a batch, because
@@ -148,9 +157,8 @@ updates:
   - package-ecosystem: cargo
     directory: "/crates/blut-tui"
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 2
+      interval: monthly
+    open-pull-requests-limit: 1
     labels: ["dependencies"]
     groups:
       # Minor and patch only. These are the ones that land as a batch, because
@@ -166,9 +174,8 @@ updates:
   - package-ecosystem: cargo
     directory: "/crates/blut-web"
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 2
+      interval: monthly
+    open-pull-requests-limit: 1
     labels: ["dependencies"]
     groups:
       # Minor and patch only. These are the ones that land as a batch, because
@@ -184,9 +191,8 @@ updates:
   - package-ecosystem: cargo
     directory: "/crates/blut-web/ui"
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 2
+      interval: monthly
+    open-pull-requests-limit: 1
     labels: ["dependencies"]
     groups:
       # Minor and patch only. These are the ones that land as a batch, because
@@ -202,9 +208,8 @@ updates:
   - package-ecosystem: cargo
     directory: "/fuzz"
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 2
+      interval: monthly
+    open-pull-requests-limit: 1
     labels: ["dependencies"]
     groups:
       # Minor and patch only. These are the ones that land as a batch, because
@@ -220,9 +225,8 @@ updates:
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 2
+      interval: monthly
+    open-pull-requests-limit: 1
     labels: ["dependencies", "ci"]
     groups:
       all-actions:
