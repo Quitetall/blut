@@ -25,7 +25,7 @@ first if you are deciding whether to depend on this.
 | P2P crypto, policy, transport, and loopback dispatch | Component-tested | Unit and loopback integration tests |
 | P2P dispatch between separate network namespaces | Validated | Two containers, own IPs, real QUIC over a bridge — see below |
 | Live multi-host P2P mesh | Deferred | Requires independent-host validation |
-| Cloud queue over local object storage | Component-tested | Local-filesystem loopback smoke |
+| Cloud queue over local object storage | Validated | `blut cloud smoke` round-trip through the shipped cookbook binary, 2026-09-19 |
 | Network object storage (S3/R2/GCS/MinIO) | Deferred | Removed from public preview pending dependency and infrastructure gates |
 | `blut-worker` REST prototype | Deleted (ADR 0083 M3) | Superseded by `src/cloud` + the `blut-web` sidecar |
 | Kubernetes operator | Unsupported | Unpublished prototype; separate Rust 1.89 compile/test lane |
@@ -63,6 +63,33 @@ It moves the claim from "loopback only" to "crosses a real network boundary
 between independent network stacks", and no further. The row for a live
 multi-host mesh stays Deferred until it runs on hardware that is genuinely
 separate.
+
+## Recorded run: cloud queue through the shipped binary (2026-09-19)
+
+Run with `blut-standard` built from `blut-cookbook-standard --features
+distributed` — an installed-shape binary, not a test harness:
+
+```
+submitting p2p-echo to the cloud queue (store: …/cloudstore)…
+running a cloud worker…
+✔ cloud round-trip verified over …/cloudstore; output:
+DOGFOOD CLOUD QUEUE 2026-09-19
+```
+
+Submit, worker pickup, execution and verification all ran; the output came back
+transformed, so this is the queue working rather than a file being written.
+
+**Boundary:** the object store is the local filesystem. Network object storage
+(S3/R2/GCS/MinIO) is a different row and stays Deferred — it needs the
+`object_store` feature set this crate does not enable, plus the advisory, secret
+handling and TLS gates that removed it from the preview.
+
+**Reachability, which was the real defect.** Until 2026-09-19 neither this nor
+the P2P run was possible from anything BLUT ships. The engine is lib-only and
+gates both behind cargo features; the published cookbook left them off, so the
+subcommands were compiled out of the only shipped binary. `blut-cookbook-standard`
+now exposes `p2p`, `cloud`, `raft` and `distributed`, and both runs above were
+performed through it.
 
 ## Required evidence before stronger claims
 
