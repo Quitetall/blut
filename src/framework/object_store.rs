@@ -300,6 +300,58 @@ impl ObjectStore {
         })
     }
 
+    /// Open a store from a URL, choosing the provider from the scheme.
+    ///
+    /// | scheme | provider |
+    /// |---|---|
+    /// | `s3://bucket/prefix` | S3, and any S3-compatible endpoint |
+    /// | `file:///abs/path` | local filesystem provider |
+    ///
+    /// Credentials and endpoint come from the environment, the same variables
+    /// the AWS CLI reads (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+    /// `AWS_REGION`, `AWS_ENDPOINT`/`AWS_ENDPOINT_URL`, `AWS_ALLOW_HTTP`). They
+    /// are deliberately NOT accepted as arguments: a credential passed on a
+    /// command line lands in the shell history, the process table and any log
+    /// that records argv.
+    ///
+    /// The returned store is a [`Backend::Provider`], so every canonical
+    /// address rule, size ceiling and content check still applies. A provider
+    /// is wrapped, never trusted.
+    #[cfg(feature = "s3")]
+    pub fn from_url(url: &str, prefix: impl AsRef<str>) -> Result<Self, StoreError> {
+        let parsed = url::Url::parse(url)
+            .map_err(|error| StoreError::InvalidAddress(format!("{url}: {error}")))?;
+        match parsed.scheme() {
+            "s3" => {
+                let bucket = parsed.host_str().ok_or_else(|| {
+                    StoreError::InvalidAddress(format!("{url}: no bucket in s3 URL"))
+                })?;
+                let inner = object_store::aws::AmazonS3Builder::from_env()
+                    .with_bucket_name(bucket)
+                    .build()
+                    .map_err(|error| StoreError::initialization("s3", error))?;
+                // A path inside the URL prefixes the caller's prefix, so
+                // `s3://bucket/runs` + "cloud" addresses `runs/cloud/…`.
+                let url_prefix = parsed.path().trim_matches('/');
+                let prefix = match (url_prefix, prefix.as_ref().trim_matches('/')) {
+                    ("", p) => p.to_string(),
+                    (u, "") => u.to_string(),
+                    (u, p) => format!("{u}/{p}"),
+                };
+                Self::provider(Arc::new(inner), prefix)
+            }
+            "file" => {
+                let path = parsed.to_file_path().map_err(|()| {
+                    StoreError::InvalidAddress(format!("{url}: not a valid file path"))
+                })?;
+                Self::local_provider(path, prefix)
+            }
+            other => Err(StoreError::InvalidAddress(format!(
+                "unsupported object-store scheme {other:?} in {url}"
+            ))),
+        }
+    }
+
     /// Local `object_store` provider adapter for development and conformance
     /// tests. The directory must already exist.
     #[cfg(feature = "cloud")]
@@ -937,6 +989,39 @@ fn block_on_isolated<T: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(feature = "s3")]
+    mod from_url_tests {
+        use super::super::{ObjectStore, StoreError};
+
+        #[test]
+        fn an_unsupported_scheme_is_refused_by_name() {
+            let err = ObjectStore::from_url("gs://bucket/x", "cloud").unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("gs"), "error should name the scheme: {msg}");
+        }
+
+        #[test]
+        fn an_s3_url_without_a_bucket_is_refused() {
+            let err = ObjectStore::from_url("s3:///just-a-path", "cloud").unwrap_err();
+            assert!(matches!(err, StoreError::InvalidAddress(_)));
+        }
+
+        #[test]
+        fn a_malformed_url_is_refused_rather_than_treated_as_a_path() {
+            // No scheme at all: from_url is only reached for URLs, and this must
+            // not silently become a relative directory.
+            let err = ObjectStore::from_url("not a url", "cloud").unwrap_err();
+            assert!(matches!(err, StoreError::InvalidAddress(_)));
+        }
+
+        #[test]
+        fn a_file_url_opens_a_local_provider() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let url = format!("file://{}", dir.path().display());
+            ObjectStore::from_url(&url, "cloud").expect("file:// opens a local provider");
+        }
+    }
     use super::*;
 
     #[test]

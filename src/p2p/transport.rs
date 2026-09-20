@@ -747,6 +747,7 @@ impl P2pServer {
 
         // Mutual auth (ADR 0079 A1): require + verify a client cert unless the
         // operator opted into legacy no-client-auth for the transition.
+        ensure_crypto_provider();
         let builder = rustls::ServerConfig::builder();
         let mut server_crypto = if allow_legacy {
             builder.with_no_client_auth()
@@ -1058,6 +1059,7 @@ impl P2pClient {
         // identity via the same `identity_cert` the server uses, so the SPKI
         // the server extracts equals our `keypair.verifying`.
         let (cert_der, key_der) = identity_cert(keypair)?;
+        ensure_crypto_provider();
         let mut crypto = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(verifier)
@@ -1604,4 +1606,28 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
             .signature_verification_algorithms
             .supported_schemes()
     }
+}
+
+/// Install `ring` as the process-wide rustls `CryptoProvider`, once.
+///
+/// rustls picks a provider automatically only when EXACTLY ONE of its `ring`
+/// and `aws-lc-rs` features is enabled. The engine uses `ring` everywhere,
+/// including the signature verification in this file. Enabling the `s3`
+/// feature pulls `object_store/aws`, which brings `aws-lc-rs` into the same
+/// build — and rustls then refuses to guess, panicking with "Could not
+/// automatically determine the process-level CryptoProvider" the first time a
+/// QUIC connection is built.
+///
+/// Measured: with `--features s3`, eleven p2p tests panicked exactly there.
+/// This is the cross-feature hazard ADR 0078 records for
+/// `serde_json/arbitrary_precision`, in a different crate.
+///
+/// Idempotent and non-overriding: `install_default` fails if a provider is
+/// already set, and that failure is correct — an embedder who chose their own
+/// provider keeps it.
+pub(crate) fn ensure_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }

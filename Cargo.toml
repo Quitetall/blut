@@ -102,7 +102,13 @@ which = "6"
 # Local-filesystem object store used by the experimental cloud queue. Public
 # preview excludes network providers until their XML dependency chain clears
 # the advisory gate.
+# `aws` is additive and only compiled under the `s3` feature below. It brings
+# the HTTP client and signing path, which is why network object storage was
+# held out of the preview until it could be audited.
 object_store = { version = "0.14", default-features = false, features = ["fs"], optional = true }
+# Only for parsing the `s3://` / `file://` store URL; already in the lock via
+# object_store, so this adds no package.
+url = { version = "2", optional = true }
 bytes = { version = "1", optional = true }
 # Local-time quiet-hours (honours host TZ + DST). Minimal: no default
 # features (drops the heavy `oldtime`/`serde`/`wasm` baggage), `clock`
@@ -142,6 +148,11 @@ p2p = ["dep:ed25519-dalek", "dep:aes-gcm", "dep:x25519-dalek", "dep:hkdf", "dep:
 # object store in place of QUIC, so it depends on `p2p`. Object-store transport
 # is dev-testable on the local filesystem (no cloud account).
 cloud = ["p2p", "dep:object_store", "dep:bytes"]
+# Network object storage (S3 and any S3-compatible endpoint: MinIO, R2, GCS
+# via its S3 gateway). Additive over `cloud`; the canonical addressing,
+# size ceilings and content validation in framework::object_store apply
+# unchanged, because a provider is wrapped rather than trusted.
+s3 = ["cloud", "object_store/aws", "dep:url"]
 # Highly-available scheduler state (ADR 0106): an embedded Raft group
 # replicating dispatch decisions so a coordinator crash cannot lose the
 # in-flight table or re-dispatch running work. Depends on `p2p` because
