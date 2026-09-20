@@ -27,7 +27,7 @@ first if you are deciding whether to depend on this.
 | P2P dispatch between separate network namespaces | Validated | Two containers, own IPs, real QUIC over a bridge — see below |
 | Live multi-host P2P mesh | Deferred | Requires independent-host validation |
 | Cloud queue over local object storage | Validated | `blut cloud smoke` round-trip through the shipped cookbook binary, 2026-09-19 |
-| Network object storage (S3/R2/GCS/MinIO) | Deferred | Removed from public preview pending dependency and infrastructure gates |
+| Network object storage (S3/R2/GCS/MinIO) | Validated | `s3` feature; full cloud round-trip against MinIO over HTTP, 2026-09-20 |
 | `blut-worker` REST prototype | Deleted (ADR 0083 M3) | Superseded by `src/cloud` + the `blut-web` sidecar |
 | Kubernetes operator | Unsupported | Unpublished prototype; separate Rust 1.89 compile/test lane |
 | Windows containment | Deferred | Bare fallback only; Job Object implementation absent |
@@ -118,6 +118,45 @@ Fixed against captured output; the run above is the same cluster after the fix.
 create its scope over dbus. That is an environment constraint rather than
 anything about BLUT, and it was not solved here. The row stays
 Component-tested.
+
+## Recorded run: cloud queue over S3 (2026-09-20)
+
+Built with `--features s3`, pointed at a MinIO endpoint over HTTP:
+
+```
+submitting p2p-echo to the cloud queue (store: s3://blut-cloud/runs)…
+✔ cloud round-trip verified over s3://blut-cloud/runs; output:
+S3 AFTER PROVIDER FIX 2026-09-20
+```
+
+The bytes are in the bucket, under canonical addressing with the URL's own path
+applied as a prefix:
+
+```
+runs/cloud/v1/dispatch-bundles/3d121ea13b4f…
+```
+
+Credentials and endpoint came from the environment (`AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT`, `AWS_ALLOW_HTTP`), which
+is the only way the CLI accepts them.
+
+**The gates that deferred this were re-measured rather than assumed.** Enabling
+`s3` adds 50 packages — aws-lc-rs, hyper, h2, reqwest and their trees. With
+`all-features = true` in `deny.toml`: advisories ok, bans ok, licenses ok,
+sources ok.
+
+**It also broke P2P, and that is fixed here.** `object_store/aws` pulls
+`aws-lc-rs`, so rustls saw two crypto providers and refused to choose; eleven
+p2p tests panicked under `s3` while passing under `cloud`. The transport now
+installs `ring` explicitly. Feature matrix after the fix, each run separately:
+default 1000, p2p 1140, cloud 1159, s3 1163, all-features 1163 — zero failures.
+
+**Boundaries.** MinIO over plain HTTP on a container network: this exercises the
+S3 API, the signing path and the provider wiring. It is not a test of TLS to a
+public endpoint, of IAM roles, of regional latency, or of any commercial
+provider's quirks. And it is not yet reachable from a shipped binary —
+`blut-cookbook-standard` cannot enable `s3` until an engine release carrying the
+feature is published.
 
 ## Required evidence before stronger claims
 
