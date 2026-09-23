@@ -460,7 +460,16 @@ jobs:
             target
           key: ${{ runner.os }}-semver-${{ hashFiles('**/Cargo.lock') }}
       - name: Install cargo-semver-checks
-        run: cargo install cargo-semver-checks --version 0.50.0 --locked
+        # The cache restores ~/.cargo/bin but not cargo's install records,
+        # so on a cache hit the binary exists untracked and a bare
+        # `cargo install` fails with "binary already exists in destination".
+        # Install only when the cached binary is missing or a different version.
+        run: |
+          if cargo semver-checks --version 2>/dev/null | grep -qF "0.50.0"; then
+            echo "cargo-semver-checks 0.50.0 restored from cache"
+          else
+            cargo install cargo-semver-checks --version 0.50.0 --locked --force
+          fi
       - name: Published API compatibility
         run: bash scripts/semver_checks.sh
 
@@ -508,7 +517,16 @@ jobs:
             target
           key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.lock') }}
       - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --version 0.9.1 --locked
+        # The cache restores ~/.cargo/bin but not cargo's install records,
+        # so on a cache hit the binary exists untracked and a bare
+        # `cargo install` fails with "binary already exists in destination".
+        # Install only when the cached binary is missing or a different version.
+        run: |
+          if cargo llvm-cov --version 2>/dev/null | grep -qF "0.9.1"; then
+            echo "cargo-llvm-cov 0.9.1 restored from cache"
+          else
+            cargo install cargo-llvm-cov --version 0.9.1 --locked --force
+          fi
       - name: Measure
         run: |
           cargo llvm-cov --locked --workspace --lcov --output-path lcov.info
