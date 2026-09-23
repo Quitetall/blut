@@ -314,7 +314,7 @@ impl ObjectStore {
     /// command line lands in the shell history, the process table and any log
     /// that records argv.
     ///
-    /// The returned store is a [`Backend::Provider`], so every canonical
+    /// The returned store is a `Backend::Provider`, so every canonical
     /// address rule, size ceiling and content check still applies. A provider
     /// is wrapped, never trusted.
     #[cfg(feature = "s3")]
