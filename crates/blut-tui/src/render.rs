@@ -1311,7 +1311,10 @@ mod render_tests {
     fn test_app() -> App {
         // Force unicode + color on so the alignment test sees `┌`/`│`/`└`
         // and the section-heading assertions are charset-stable.
-        theme::detect("always", "unicode");
+        {
+            let _theme = crate::theme::test_lock();
+            theme::detect("always", "unicode");
+        }
         super::isolate_datasets_db_for_tests();
         // The analytic views read the global lineage DB / jobs store lazily
         // (only when `set_view`/refresh runs); the render tests set `app.view`
@@ -1569,6 +1572,7 @@ mod render_tests {
         // F2 form + raw fallback, the F3 dataset picker, the recipe picker)
         // headless without panicking, returning Ok. The fixture registry has a
         // recipe, so the overlay branches that need one are exercised here.
+        let _theme = crate::theme::test_lock();
         theme::detect("always", "unicode");
         super::isolate_datasets_db_for_tests();
         super::check(test_registry())

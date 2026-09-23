@@ -26,9 +26,61 @@ pub const WHITE: Color = Color::White;
 // functions can read without a Mutex.
 
 /// 0 = enabled, 1 = disabled.
+#[cfg(not(test))]
 static COLOR_DISABLED: AtomicBool = AtomicBool::new(false);
 /// 0 = unicode, 1 = ascii.
+#[cfg(not(test))]
 static CHARSET: AtomicU8 = AtomicU8::new(0);
+
+// Under test, each test thread gets its own theme state. The state is
+// process-global in the binary, where one `detect` runs at startup; in the
+// test harness dozens of tests call `detect` concurrently, and with shared
+// atomics any of them could flip another's colors between its `detect` and
+// its assertion — `detect_no_color_disables` and
+// `not_selected_uses_neutral_status_style` both failed intermittently in CI.
+// libtest runs every test on its own thread, so thread-local state makes each
+// test see exactly what it set.
+#[cfg(test)]
+thread_local! {
+    static COLOR_DISABLED: AtomicBool = const { AtomicBool::new(false) };
+    static CHARSET: AtomicU8 = const { AtomicU8::new(0) };
+}
+
+#[cfg(not(test))]
+fn store_color_disabled(disabled: bool) {
+    COLOR_DISABLED.store(disabled, Ordering::Relaxed);
+}
+#[cfg(test)]
+fn store_color_disabled(disabled: bool) {
+    COLOR_DISABLED.with(|c| c.store(disabled, Ordering::Relaxed));
+}
+
+#[cfg(not(test))]
+fn load_color_disabled() -> bool {
+    COLOR_DISABLED.load(Ordering::Relaxed)
+}
+#[cfg(test)]
+fn load_color_disabled() -> bool {
+    COLOR_DISABLED.with(|c| c.load(Ordering::Relaxed))
+}
+
+#[cfg(not(test))]
+fn store_charset(charset: u8) {
+    CHARSET.store(charset, Ordering::Relaxed);
+}
+#[cfg(test)]
+fn store_charset(charset: u8) {
+    CHARSET.with(|c| c.store(charset, Ordering::Relaxed));
+}
+
+#[cfg(not(test))]
+fn load_charset() -> u8 {
+    CHARSET.load(Ordering::Relaxed)
+}
+#[cfg(test)]
+fn load_charset() -> u8 {
+    CHARSET.with(|c| c.load(Ordering::Relaxed))
+}
 
 /// Re-detect from environment (and optionally an explicit cfg pref).
 /// Should be called once at startup. `cfg_color`: "auto" | "always" |
@@ -41,7 +93,7 @@ pub fn detect(cfg_color: &str, cfg_charset: &str) {
         "always" => false,
         _ => no_color || term_dumb,
     };
-    COLOR_DISABLED.store(color_off, Ordering::Relaxed);
+    store_color_disabled(color_off);
 
     let lang = std::env::var("LANG").unwrap_or_default();
     let lc_ctype = std::env::var("LC_CTYPE").unwrap_or_default();
@@ -53,18 +105,33 @@ pub fn detect(cfg_color: &str, cfg_charset: &str) {
         "unicode" => false,
         _ => term_dumb || !utf8_locale,
     };
-    CHARSET.store(if charset_ascii { 1 } else { 0 }, Ordering::Relaxed);
+    store_charset(if charset_ascii { 1 } else { 0 });
+}
+
+/// Serializes tests around the environment variables `detect` reads.
+///
+/// Theme state is per-thread under test (see above), but the environment is
+/// not: the theme tests set `NO_COLOR`, `TERM` and `LANG`, and every `detect`
+/// call reads them. Reading the environment while another thread writes it
+/// is exactly what Rust 2024's `unsafe` on `set_var` warns about. Every test
+/// that calls `detect` holds this lock around the call.
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[inline]
 fn color_enabled() -> bool {
-    !COLOR_DISABLED.load(Ordering::Relaxed)
+    !load_color_disabled()
 }
 
 /// True when the terminal cannot reliably render Unicode (e.g.
 /// `TERM=dumb` or a non-UTF-8 locale).
 pub fn ascii_only() -> bool {
-    CHARSET.load(Ordering::Relaxed) == 1
+    load_charset() == 1
 }
 
 /// Color-disable passthrough: returns `s` when color is enabled,
@@ -182,18 +249,9 @@ pub fn tab_active() -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    /// Process-wide lock for theme tests. `cargo test` runs cases in
-    /// parallel; without this lock two cases that mutate the same env
-    /// vars + global atomics race and observe each other's state.
-    fn env_lock() -> &'static Mutex<()> {
-        static L: OnceLock<Mutex<()>> = OnceLock::new();
-        L.get_or_init(|| Mutex::new(()))
-    }
 
     // Rust 2024 makes `set_var`/`remove_var` unsafe (they can race other
-    // threads reading the environment). All callers below hold `env_lock`
+    // threads reading the environment). All callers below hold `test_lock`
     // for their whole body, so within a single test there is no concurrent
     // env reader — the `unsafe` precondition is satisfied by the lock.
     fn set_env(key: &str, val: &str) {
@@ -205,7 +263,7 @@ mod tests {
 
     #[test]
     fn detect_no_color_disables() {
-        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _g = test_lock();
         unset_env("LANG");
         set_env("NO_COLOR", "1");
         detect("auto", "auto");
@@ -216,7 +274,7 @@ mod tests {
 
     #[test]
     fn explicit_always_overrides_no_color() {
-        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _g = test_lock();
         set_env("NO_COLOR", "1");
         detect("always", "auto");
         assert!(color_enabled());
@@ -225,7 +283,7 @@ mod tests {
 
     #[test]
     fn explicit_never_disables_even_without_no_color() {
-        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _g = test_lock();
         unset_env("NO_COLOR");
         detect("never", "auto");
         assert!(!color_enabled());
@@ -233,7 +291,7 @@ mod tests {
 
     #[test]
     fn term_dumb_forces_ascii() {
-        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _g = test_lock();
         set_env("TERM", "dumb");
         detect("auto", "auto");
         assert!(ascii_only());
@@ -242,14 +300,14 @@ mod tests {
 
     #[test]
     fn explicit_ascii_charset() {
-        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _g = test_lock();
         detect("auto", "ascii");
         assert!(ascii_only());
     }
 
     #[test]
     fn explicit_unicode_charset_even_on_dumb_term() {
-        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _g = test_lock();
         set_env("TERM", "dumb");
         detect("auto", "unicode");
         assert!(!ascii_only());

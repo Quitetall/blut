@@ -1070,6 +1070,7 @@ mod tests {
 
     #[test]
     fn draws_without_panicking_at_several_sizes() {
+        let _theme = crate::theme::test_lock();
         theme::detect("always", "unicode");
         let m = ConsoleModel::demo();
         for (w, h) in [(120u16, 40u16), (80, 30), (200, 60), (60, 24)] {
@@ -1232,6 +1233,7 @@ mod tests {
 
     #[test]
     fn every_tab_draws_without_panicking() {
+        let _theme = crate::theme::test_lock();
         theme::detect("always", "unicode");
         let m = ConsoleModel::demo();
         for tab in ConsoleTab::ALL {
@@ -1265,6 +1267,7 @@ mod tests {
 
     #[test]
     fn ascii_fallback_draws() {
+        let _theme = crate::theme::test_lock();
         theme::detect("never", "ascii");
         let m = ConsoleModel::demo();
         let backend = TestBackend::new(100, 36);
