@@ -17,6 +17,13 @@ depend on this crate.
   ntfy, SMTP, and exec sinks.
 
 ### Fixed
+- `EvalReport` artifacts can cross the stage boundary. Their free-form
+  `metrics` (a `serde_json::Value`) could not be decoded from the engine's
+  bincode transport, so every stage that produced one — any evaluation stage in
+  any cookbook — failed at finalization with "artifact handle did not decode as
+  the selected stage role", after its evaluation had already run. Binary
+  encodings now carry the metrics as a JSON string; JSON is unchanged.
+  `EvalReport::SCHEMA` is 2.
 - Web job/status/SSE exports now fail closed for restricted tenants and unknown
   GETs no longer create job directories.
 - SLA breach rows and webhook events deduplicate durably across repeated checks
