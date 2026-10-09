@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Blank issues are off so that reports arrive with the environment fields the
+# bug template asks for. The two things a blank issue was being used for --
+# questions, and security reports -- get their own routes below, because a
+# vulnerability filed as a public issue is already disclosed.
+blank_issues_enabled: false
+contact_links:
+  - name: Question or idea
+    url: https://github.com/Quitetall/blut/discussions
+    about: >-
+      Usage questions, design discussion, and "is this the right shape?" —
+      anything that is not yet a bug or a concrete proposal.
+  - name: Security vulnerability
+    url: https://github.com/Quitetall/blut/security/policy
+    about: >-
+      Report privately. Do NOT open a public issue — see SECURITY.md for the
+      supported versions and what to include.
+  - name: Is this the engine or a cookbook?
+    url: https://github.com/Quitetall/blut/blob/main/README.md#build-your-own-cookbook
+    about: >-
+      blut is domain-agnostic and ships no domain stages or recipes. Training
+      behaviour usually belongs to the cookbook that defines the stage.

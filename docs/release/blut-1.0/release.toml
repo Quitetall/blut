@@ -11,13 +11,20 @@
 # packages and the workflow are in THIS repository. Both are declared rather
 # than assumed so the gate derives its SBOM component paths from the catalog
 # instead of from a checkout shape.
+# blut-reapi is NOT in this catalog. It was carried over from the LamQuant
+# copy, but the crate has never existed on this repository's main branch --
+# `git log origin/main -- crates/blut-reapi` is empty and the tree appears only
+# under the tag archive/feat/blut-1.0-integrations. Naming a manifest that is
+# not there made check_blut_release_state.py report INVALID on every run, so the
+# gate said "I cannot read this catalog" rather than anything about the release.
+#
 schema_version = 1
 release_version = "1.0.0"
 release_tag = "v1.0.0"
 engine_prefix = ""
 release_workflow = ".github/workflows/release.yml"
 publish_chain = ["blut-types", "blut", "blut-metrics", "blut-dsl", "blut-notify"]
-binary_artifacts = ["blut-tui", "blut-web", "blut-operator", "blut-metrics", "blut-notify", "blut-reapi"]
+binary_artifacts = ["blut-tui", "blut-web", "blut-operator", "blut-metrics", "blut-notify"]
 
 [toolchain]
 engine_rust = "1.88.0"
@@ -77,11 +84,6 @@ distribution = "embedded"
 [[rust_packages]]
 name = "blut-operator"
 manifest = "crates/blut-operator/Cargo.toml"
-distribution = "binary"
-
-[[rust_packages]]
-name = "blut-reapi"
-manifest = "crates/blut-reapi/Cargo.toml"
 distribution = "binary"
 
 [[python_packages]]

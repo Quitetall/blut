@@ -1,5 +1,15 @@
 # Verbatim metrics — `read_metric` + training-run logging
 
+> **ARCHIVED — HISTORICAL, NOT CURRENT GUIDANCE.**
+>
+> A 2026-06-08 note about `read_metric` and an anti-confabulation workflow for
+> an LLM-in-the-loop development process. It describes a LamQuant-flavoured
+> trainer, `journald` and `wandb` pipeline that is not part of this engine, and
+> nothing in the tree links to it. Kept for provenance; read
+> [`docs/metrics`](../API.md) and the metric-store section of `API.md` for what
+> the engine actually exposes.
+
+
 New tooling (2026-06-08) for **anti-confabulation**: training runs write a
 structured metric store; `read_metric` reads it back **verbatim, with no LLM in
 the path**. Use this whenever you need "what did the run actually do" — never

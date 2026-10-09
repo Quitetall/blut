@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           persist-credentials: false
       - name: Install OpenWarrant toolchain
@@ -54,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           persist-credentials: false
 
@@ -88,7 +88,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Cache cargo registry + git + target
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -251,15 +251,20 @@ jobs:
           # then failed with "no matching package named `blut-types` found". A
           # conditional that cannot take its false branch is not a guard.
           indexed() { ( cd "$RUNNER_TEMP" && cargo info "$1" ) >/dev/null 2>&1; }
-          if indexed blut-types@0.2.0-alpha.1; then
+          # The release train shares one version; read it from the manifest so
+          # a version bump cannot leave the guards asking about the old one.
+          ver=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "blut") | .version')
+          test -n "$ver"
+          if indexed "blut-types@$ver"; then
             cargo package --locked
           else
-            echo "::notice::blut tarball verification awaits blut-types 0.2.0-alpha.1 indexing; rerun this exact SHA after publishing blut-types"
+            echo "::notice::blut tarball verification awaits blut-types $ver indexing; rerun this exact SHA after publishing blut-types"
           fi
-          if indexed blut@0.2.0-alpha.1; then
+          if indexed "blut@$ver"; then
             cargo package --locked --manifest-path crates/blut-dsl/Cargo.toml
           else
-            echo "::notice::blut-dsl tarball verification awaits blut 0.2.0-alpha.1 indexing; rerun this exact SHA after publishing blut"
+            echo "::notice::blut-dsl tarball verification awaits blut $ver indexing; rerun this exact SHA after publishing blut"
           fi
 
       - name: In-tree public example smoke
@@ -275,10 +280,10 @@ jobs:
     # makes that impossible to do quietly — the SDK lives in this repo so an IR
     # change and this job fail in the same commit.
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
@@ -337,7 +342,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           persist-credentials: false
       - name: Install operator MSRV
@@ -374,7 +379,7 @@ jobs:
     env:
       RUSTFLAGS: ""
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           persist-credentials: false
       - name: Install MSRV toolchain
@@ -382,7 +387,7 @@ jobs:
         with:
           toolchain: 1.88.0
       - name: Cache cargo registry + git + target
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -405,7 +410,7 @@ jobs:
     # adds a non-wasm dependency to blut-types breaks the `wasm32-unknown-unknown`
     # check here before it can reach main.
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           persist-credentials: false
       - name: Install MSRV toolchain + wasm32 target
@@ -414,7 +419,7 @@ jobs:
           toolchain: 1.88.0
           targets: wasm32-unknown-unknown
       - name: Cache cargo registry + git + target
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -433,7 +438,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -444,10 +449,11 @@ jobs:
       - name: Install cargo-deny
         run: cargo install cargo-deny --version 0.20.2 --locked
       - name: Dependency policy
-        run: |
-          cargo deny --locked check
-          cargo deny --locked --manifest-path crates/blut-dsl/Cargo.toml --config deny.toml check
-          cargo deny --locked --manifest-path crates/blut-operator/Cargo.toml --config deny.toml check
+        # Every workspace, derived from the committed lockfiles -- not a
+        # hand-kept list. The three manifests named here before covered 3 of 10
+        # workspaces, and RUSTSEC-2026-0285 (rustls) sat in blut-operator,
+        # blut-tui and fuzz while this job reported success.
+        run: bash scripts/dependency_policy.sh
       - name: Secret scan
         uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
         env:
@@ -456,6 +462,121 @@ jobs:
           # silently ignores a relative GITLEAKS_CONFIG, so .gitleaks.toml's
           # allowlist was never applied here (same defect the meta fixed 2026-08-28).
           GITLEAKS_CONFIG: ${{ github.workspace }}/.gitleaks.toml
+          # Pin the scanner. The action defaults to 8.24.3, which predates the
+          # top-level `[[allowlists]]` table .gitleaks.toml uses (8.25.0+), so
+          # the reviewed commit-pin exemption was silently ignored and the job
+          # failed on the googleapis SHA in crates/blut-reapi/vendor/UPSTREAM.md
+          # (reachable from tag archive/feat/blut-1.0-integrations). MEASURED on
+          # the same 845 commits CI scans: 8.24.3 -> 1 leak, 8.30.1 -> none;
+          # and on planted `ghp_` + `sk_live_` tokens 8.30.1 still fails both.
+          GITLEAKS_VERSION: 8.30.1
+
+  semver-compat:
+    name: published API compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Has anything already on crates.io been broken? Nothing asked this before,
+    # so the only thing standing between an accidental removal and a published
+    # breaking change was noticing by hand.
+    #
+    # Runs with --release-type minor on purpose: on main the current version
+    # equals the published one, and without it cargo-semver-checks reports
+    # "no change; assume major" and runs ZERO checks. See scripts/semver_checks.sh.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: ${{ runner.os }}-semver-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install cargo-semver-checks
+        # The cache restores ~/.cargo/bin but not cargo's install records,
+        # so on a cache hit the binary exists untracked and a bare
+        # `cargo install` fails with "binary already exists in destination".
+        # Install only when the cached binary is missing or a different version.
+        run: |
+          if cargo semver-checks --version 2>/dev/null | grep -qF "0.50.0"; then
+            echo "cargo-semver-checks 0.50.0 restored from cache"
+          else
+            cargo install cargo-semver-checks --version 0.50.0 --locked --force
+          fi
+      - name: Published API compatibility
+        run: bash scripts/semver_checks.sh
+
+  trainer-contract:
+    name: trainer contract v1 (CONTRACT.md)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # scripts/contract_lint.py has existed, with golden fixtures, and no
+    # workflow ever ran it. CONTRACT.md calls those fixtures its executable
+    # form; that is only true if something executes them.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Golden status stream conforms to the frozen v1 contract
+        run: python3 scripts/contract_lint.py --stream tests/contract/status_stream_v1.golden.jsonl
+
+  coverage:
+    name: coverage (report only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Weekly and on demand, NOT per push. It re-instruments and re-runs the
+    # whole suite, and the queue on this repository is already the slowest part
+    # of a change landing. Report-only on purpose: there is no threshold and it
+    # gates nothing. A coverage number is a map of what the tests touch, and
+    # turning it into a pass/fail invites tests written to colour the map.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.88.0
+          components: llvm-tools-preview
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install cargo-llvm-cov
+        # The cache restores ~/.cargo/bin but not cargo's install records,
+        # so on a cache hit the binary exists untracked and a bare
+        # `cargo install` fails with "binary already exists in destination".
+        # Install only when the cached binary is missing or a different version.
+        run: |
+          if cargo llvm-cov --version 2>/dev/null | grep -qF "0.9.1"; then
+            echo "cargo-llvm-cov 0.9.1 restored from cache"
+          else
+            cargo install cargo-llvm-cov --version 0.9.1 --locked --force
+          fi
+      - name: Measure
+        run: |
+          cargo llvm-cov --locked --workspace --lcov --output-path lcov.info
+          cargo llvm-cov report --summary-only | tee coverage-summary.txt
+      - name: Publish the numbers as an artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage
+          path: |
+            lcov.info
+            coverage-summary.txt
+          retention-days: 30
 
   release-gates:
     name: release-state · I4-evidence checkers
@@ -482,16 +603,20 @@ jobs:
     # What runs here is what can run here: the suites that prove each checker
     # still refuses what it is supposed to refuse.
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
       - name: Checker unit suites
-        # Both suites use unittest.TestCase, including module setup. Run them
-        # with the standard library; this job does not install pytest.
-        run: python -m unittest -q tools.test_check_blut_release_state tools.test_check_blut_i4_evidence
+        # stdlib `unittest`, not pytest: both suites import only the standard
+        # library, and the runner image ships no pytest -- so `python -m pytest`
+        # failed with "No module named pytest" on every run since the job
+        # arrived, and the suites it names never executed in CI at all.
+        # `-m unittest` runs the same 27 tests with nothing to install.
+        working-directory: tools
+        run: python -m unittest -v test_check_blut_release_state test_check_blut_i4_evidence
       - name: The release-state checker still runs and still reports
         # NOT a pass/fail gate on the release itself -- see above. It asserts
         # that the command executes against the committed catalog and produces

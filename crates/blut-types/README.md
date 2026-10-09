@@ -8,7 +8,7 @@ Version follows BLUT public preview release train. Depend on exact preview
 versions until 1.0:
 
 ```toml
-blut-types = "=0.2.0-alpha.1"
+blut-types = "=0.2.0-alpha.2"
 ```
 
 Licensed under AGPL-3.0-or-later.

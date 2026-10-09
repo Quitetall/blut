@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# OpenSSF Scorecard — an outside, mechanical read of this repository's supply
+# chain posture (branch protection, pinned dependencies, token permissions,
+# dangerous workflow patterns, published vulnerabilities).
+#
+# It is deliberately NOT a required check. Scorecard grades practices, and some
+# of its checks want things this project has decided against (for example
+# Signed-Releases via cosign, and Fuzzing detection that does not see a
+# cargo-fuzz workspace). A grader whose opinions are only mostly yours is
+# useful as a signal and wrong as a gate.
+#
+# Requires a PUBLIC repository: the analysis reads public metadata and the
+# upload step publishes to the OpenSSF API. On a private repository this
+# workflow simply fails, which is why it lands with the flip to public.
+name: scorecard
+
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: "41 5 * * 2" # Tuesday 05:41 UTC, offset from the Monday CI sweep
+  workflow_dispatch:
+  # Still no push trigger, now for a different reason. The repository is public
+  # as of 2026-09-18, so Scorecard can finally analyse it -- but a score is a
+  # weekly-moving number, not a per-commit one, and a run per commit buys
+  # nothing but noise. Weekly and on demand.
+
+permissions: read-all
+
+concurrency:
+  group: scorecard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      security-events: write # upload the SARIF to the code-scanning dashboard
+      id-token: write # publish the result so the README badge can resolve
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+      - name: Run analysis
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # publish_results is what makes the badge in README.md resolve; it
+          # publishes the SCORE, not the source.
+          publish_results: true
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scorecard-results
+          path: results.sarif
+          retention-days: 5
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v3
+        with:
+          sarif_file: results.sarif

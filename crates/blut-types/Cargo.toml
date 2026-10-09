@@ -7,7 +7,7 @@
 # keeps this invariant green (the Leptos+WASM UI depends on it).
 [package]
 name = "blut-types"
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.2"
 edition = "2024"
 # Keep one tested MSRV across the public 0.2 preview crates.
 rust-version = "1.88"
@@ -32,5 +32,5 @@ sha2 = "0.10"
 # — the content-hash hex is produced identically on both sides of the split.
 # 0.10's SIMD is std/target-gated with a pure fallback, so it wasm32-checks clean
 # (the `wasm32-keystone` CI job is the guard).
-faster-hex = "0.10"
+faster-hex = "0.10.1"
 schemars = "0.8"

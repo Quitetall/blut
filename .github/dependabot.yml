@@ -1,0 +1,234 @@
+# Re-enabled 2026-09-18, when the repository became public and standard-runner
+# minutes stopped being billed.
+#
+# It was paused on its first day for economics, not correctness: ten workspaces
+# means every round opens work in ten places, every pull request runs the
+# nine-job CI matrix, and the day it ran cost ~2,256 billable runner-minutes on
+# a private repository. The configuration below is the corrected one -- one
+# GROUPED pull request per workspace covering every update type, limit 2 -- and
+# it is what keeps that from recurring. Security advisories still arrive
+# individually regardless of grouping, which is the case that must never be
+# batched into a pile nobody reads.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Dependency updates.
+#
+# One `cargo` entry per WORKSPACE, not one for the repository. There are ten,
+# each committing its own Cargo.lock, and an update to one does not touch the
+# others. A single root entry would have left nine unwatched -- which is how
+# RUSTSEC-2026-0285 (rustls) came to sit in three lockfiles at once while
+# everything looked green.
+#
+# VOLUME IS THE WHOLE DESIGN PROBLEM. Ten workspaces share most of their
+# dependency graph, so an ungrouped configuration opens the SAME bump ten times.
+# Measured: the first configuration here used the default one-PR-per-dependency
+# behaviour with a limit of 5 and immediately opened 48 pull requests. A review
+# queue nobody can read is indistinguishable from no updates at all, and on a
+# public repository it is the first thing a visitor sees.
+#
+# So: ONE grouped PR per workspace covering every update type, limit 2. A
+# security advisory still arrives on its own regardless of grouping -- that is
+# Dependabot's behaviour for security updates and it is the case that must never
+# be buried.
+#
+# Keep this list in step with `scripts/dependency_policy.sh`, which derives the
+# same set from `git ls-files '*Cargo.lock'`.
+#
+# cla.yml already allowlists dependabot[bot], so these PRs are not CLA-blocked.
+# CADENCE IS MONTHLY, LIMIT 1, ON PURPOSE.
+#
+# Ten workspaces each carry their own Cargo.lock, and every one of them is a
+# separate update surface. That split is deliberate and stays: blut-dsl must not
+# share a feature graph with the engine (serde_json/arbitrary_precision would
+# break internally-tagged enums), blut-web/ui targets wasm, blut-operator holds
+# a 1.89 MSRV lane, and the sidecars dispatch as external subcommands. So the
+# surface cannot be collapsed -- only the cadence can.
+#
+# Weekly x 10 workspaces produced roughly 26 pull requests and the matching mail
+# in a single night, each dragging a CI run behind it. Monthly with a limit of 1
+# turns that into a handful. Security advisories are unaffected: Dependabot
+# raises those immediately regardless of schedule, which is the only class that
+# should ever interrupt.
+#
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    labels: ["dependencies"]
+    groups:
+      # Minor and patch only. These are the ones that land as a batch, because
+      # a batch of them is reviewable and usually green.
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # Majors deliberately stay UNGROUPED, arriving one per dependency.
+    # Measured 2026-09-18: grouping every update type produced a single PR of 22
+    # updates for the root workspace that failed four CI jobs at once, with no
+    # way to tell which bump broke what. A major bump is code work; it needs its
+    # own pull request and its own red-to-green.
+  - package-ecosystem: cargo
+    directory: "/crates/blut-dsl"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    labels: ["dependencies"]
+    groups:
+      # Minor and patch only. These are the ones that land as a batch, because
+      # a batch of them is reviewable and usually green.
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # Majors deliberately stay UNGROUPED, arriving one per dependency.
+    # Measured 2026-09-18: grouping every update type produced a single PR of 22
+    # updates for the root workspace that failed four CI jobs at once, with no
+    # way to tell which bump broke what. A major bump is code work; it needs its
+    # own pull request and its own red-to-green.
+  - package-ecosystem: cargo
+    directory: "/crates/blut-graph-core"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    labels: ["dependencies"]
+    groups:
+      # Minor and patch only. These are the ones that land as a batch, because
+      # a batch of them is reviewable and usually green.
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # Majors deliberately stay UNGROUPED, arriving one per dependency.
+    # Measured 2026-09-18: grouping every update type produced a single PR of 22
+    # updates for the root workspace that failed four CI jobs at once, with no
+    # way to tell which bump broke what. A major bump is code work; it needs its
+    # own pull request and its own red-to-green.
+  - package-ecosystem: cargo
+    directory: "/crates/blut-metrics"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    labels: ["dependencies"]
+    groups:
+      # Minor and patch only. These are the ones that land as a batch, because
+      # a batch of them is reviewable and usually green.
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # Majors deliberately stay UNGROUPED, arriving one per dependency.
+    # Measured 2026-09-18: grouping every update type produced a single PR of 22
+    # updates for the root workspace that failed four CI jobs at once, with no
+    # way to tell which bump broke what. A major bump is code work; it needs its
+    # own pull request and its own red-to-green.
+  - package-ecosystem: cargo
+    directory: "/crates/blut-operator"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    labels: ["dependencies"]
+    groups:
+      # Minor and patch only. These are the ones that land as a batch, because
+      # a batch of them is reviewable and usually green.
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # Majors deliberately stay UNGROUPED, arriving one per dependency.
+    # Measured 2026-09-18: grouping every update type produced a single PR of 22
+    # updates for the root workspace that failed four CI jobs at once, with no
+    # way to tell which bump broke what. A major bump is code work; it needs its
+    # own pull request and its own red-to-green.
+  - package-ecosystem: cargo
+    directory: "/crates/blut-semantic"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    labels: ["dependencies"]
+    groups:
+      # Minor and patch only. These are the ones that land as a batch, because
+      # a batch of them is reviewable and usually green.
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # Majors deliberately stay UNGROUPED, arriving one per dependency.
+    # Measured 2026-09-18: grouping every update type produced a single PR of 22
+    # updates for the root workspace that failed four CI jobs at once, with no
+    # way to tell which bump broke what. A major bump is code work; it needs its
+    # own pull request and its own red-to-green.
+  - package-ecosystem: cargo
+    directory: "/crates/blut-tui"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    labels: ["dependencies"]
+    groups:
+      # Minor and patch only. These are the ones that land as a batch, because
+      # a batch of them is reviewable and usually green.
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # Majors deliberately stay UNGROUPED, arriving one per dependency.
+    # Measured 2026-09-18: grouping every update type produced a single PR of 22
+    # updates for the root workspace that failed four CI jobs at once, with no
+    # way to tell which bump broke what. A major bump is code work; it needs its
+    # own pull request and its own red-to-green.
+  - package-ecosystem: cargo
+    directory: "/crates/blut-web"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    labels: ["dependencies"]
+    groups:
+      # Minor and patch only. These are the ones that land as a batch, because
+      # a batch of them is reviewable and usually green.
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # Majors deliberately stay UNGROUPED, arriving one per dependency.
+    # Measured 2026-09-18: grouping every update type produced a single PR of 22
+    # updates for the root workspace that failed four CI jobs at once, with no
+    # way to tell which bump broke what. A major bump is code work; it needs its
+    # own pull request and its own red-to-green.
+  - package-ecosystem: cargo
+    directory: "/crates/blut-web/ui"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    labels: ["dependencies"]
+    groups:
+      # Minor and patch only. These are the ones that land as a batch, because
+      # a batch of them is reviewable and usually green.
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # Majors deliberately stay UNGROUPED, arriving one per dependency.
+    # Measured 2026-09-18: grouping every update type produced a single PR of 22
+    # updates for the root workspace that failed four CI jobs at once, with no
+    # way to tell which bump broke what. A major bump is code work; it needs its
+    # own pull request and its own red-to-green.
+  - package-ecosystem: cargo
+    directory: "/fuzz"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    labels: ["dependencies"]
+    groups:
+      # Minor and patch only. These are the ones that land as a batch, because
+      # a batch of them is reviewable and usually green.
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # Majors deliberately stay UNGROUPED, arriving one per dependency.
+    # Measured 2026-09-18: grouping every update type produced a single PR of 22
+    # updates for the root workspace that failed four CI jobs at once, with no
+    # way to tell which bump broke what. A major bump is code work; it needs its
+    # own pull request and its own red-to-green.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    labels: ["dependencies", "ci"]
+    groups:
+      all-actions:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]

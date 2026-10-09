@@ -10,19 +10,54 @@ depend on this crate.
 
 ## [Unreleased]
 
+## [0.2.0-alpha.2] — 2026-10-09
+
+`blut-types`, `blut`, `blut-dsl`, `blut-notify` and `blut-tui`, all at
+0.2.0-alpha.2. `blut-types` and `blut-notify` carry no code change; they move
+because the train shares one exact version.
+
 ### Added
-- ADR 0094 eventing is complete: file-drop, threshold-spool, and cron triggers;
-  signed/replay-safe webhooks; durable exact-admission acknowledgement; measured
-  SLA freshness; and a rule-driven notification daemon with Slack, Discord,
-  ntfy, SMTP, and exec sinks.
+- `s3` cargo feature: network object storage. `ObjectStore::from_url` opens
+  `s3://bucket/prefix` (AWS S3 or any S3-compatible endpoint: MinIO, R2, GCS's
+  S3 gateway) and `file://` stores, and `blut cloud --store` accepts a URL as
+  well as a directory. Credentials come only from the standard AWS environment
+  variables, never from flags. Validated end to end against MinIO; TLS to a
+  public endpoint and IAM roles are not yet exercised.
+- `blut update` reports whether the running binary is behind the version on
+  crates.io.
 
 ### Fixed
-- Web job/status/SSE exports now fail closed for restricted tenants and unknown
-  GETs no longer create job directories.
-- SLA breach rows and webhook events deduplicate durably across repeated checks
-  and daemon restarts.
+- `EvalReport` artifacts can cross the stage boundary. Their free-form
+  `metrics` (a `serde_json::Value`) could not be decoded from the engine's
+  bincode transport, so every stage that produced one — any evaluation stage in
+  any cookbook — failed at finalization with "artifact handle did not decode as
+  the selected stage role", after its evaluation had already run. Binary
+  encodings now carry the metrics as a JSON string; JSON is unchanged.
+  `EvalReport::SCHEMA` is 2.
+- The Ray launcher's job-status parser matched a line format Ray never emits,
+  so it could never report success or failure. It now parses Ray 2.x output,
+  and stops at `Status message:` so a failed job's log tail containing
+  "succeeded" cannot read as success.
+- Enabling `s3` alongside `p2p` made rustls panic on the first QUIC
+  connection ("Could not automatically determine the process-level
+  CryptoProvider"), because `object_store/aws` pulls in a second provider.
+  The P2P transport now installs `ring` explicitly, once.
 
-## 0.2.0-alpha.1
+### Security
+- rustls 0.23.45 everywhere, closing RUSTSEC-2026-0285 (TLS 1.3 handshake
+  messages accepted across encryption-level boundaries). `blut-tui`
+  0.2.0-alpha.1 shipped a lockfile pinning 0.23.43, which `cargo install
+  --locked blut-tui` would use; 0.2.0-alpha.2 does not.
+- `faster-hex` floor raised to 0.10.1 in `blut` and `blut-types`, closing
+  RUSTSEC-2026-0306 (the safe `hex_decode_unchecked` AVX2 path read past its
+  input). Every committed lockfile now resolves 0.10.1.
+
+## [0.2.0-alpha.1] — published 2026-08-27
+
+Published to crates.io from two commits, recorded here because the tarballs are
+the only place that pairing is visible: `blut`, `blut-types` and `blut-notify`
+from `e34c557`; `blut-dsl` from `ffecee5` on 2026-09-06. `blut-graph-core` is
+not part of this train and released separately as 0.3.0 from `e01f32f`.
 
 ### Changed
 - **Version truth repair.** The package family is reset to
@@ -65,6 +100,10 @@ depend on this crate.
 - **Public release gates.** Rustdoc with warnings denied, declared-MSRV builds,
   package-content checks, dependency/advisory/license policy, secret scanning,
   and in-tree public-example coverage.
+- ADR 0094 eventing is complete: file-drop, threshold-spool, and cron triggers;
+  signed/replay-safe webhooks; durable exact-admission acknowledgement; measured
+  SLA freshness; and a rule-driven notification daemon with Slack, Discord,
+  ntfy, SMTP, and exec sinks.
 
 ### Fixed
 - P2P certificate pinning, signed-task argument coverage, authenticated receive
@@ -75,6 +114,10 @@ depend on this crate.
   cases now preserve their safety invariants.
 - Public documentation, packaged links, version claims, and rustdoc links match
   the library-only preview surface.
+- Web job/status/SSE exports now fail closed for restricted tenants and unknown
+  GETs no longer create job directories.
+- SLA breach rows and webhook events deduplicate durably across repeated checks
+  and daemon restarts.
 
 ### Security
 - Deprecated worker job IDs are validated as flat ASCII identifiers at API and

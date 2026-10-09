@@ -16,7 +16,7 @@
 
 [package]
 name = "blut"
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.2"
 edition = "2024"
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
@@ -58,7 +58,7 @@ path = "src/lib.rs"
 [dependencies]
 # ADR 0083: the wasm32-safe keystone. The engine re-exports its types at their
 # old paths, so this is zero-churn downstream.
-blut-types = { path = "crates/blut-types", version = "=0.2.0-alpha.1" }
+blut-types = { path = "crates/blut-types", version = "=0.2.0-alpha.2" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -89,9 +89,12 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
 sha2 = "0.10"
 memmap2 = "0.9"
-faster-hex = "0.10"
+faster-hex = "0.10.1"
 uuid = { version = "1", features = ["v4"] }
 toml = "0.8"
+# `blut update` compares an installed version against the published one, and
+# prereleases order backwards under string comparison. Already in the lockfile.
+semver = "1"
 schemars = "0.8"
 tokio-util = "0.7"
 rayon = "1"
@@ -99,7 +102,13 @@ which = "6"
 # Local-filesystem object store used by the experimental cloud queue. Public
 # preview excludes network providers until their XML dependency chain clears
 # the advisory gate.
+# `aws` is additive and only compiled under the `s3` feature below. It brings
+# the HTTP client and signing path, which is why network object storage was
+# held out of the preview until it could be audited.
 object_store = { version = "0.14", default-features = false, features = ["fs"], optional = true }
+# Only for parsing the `s3://` / `file://` store URL; already in the lock via
+# object_store, so this adds no package.
+url = { version = "2", optional = true }
 bytes = { version = "1", optional = true }
 # Local-time quiet-hours (honours host TZ + DST). Minimal: no default
 # features (drops the heavy `oldtime`/`serde`/`wasm` baggage), `clock`
@@ -141,6 +150,11 @@ p2p = ["dep:ed25519-dalek", "dep:aes-gcm", "dep:x25519-dalek", "dep:hkdf", "dep:
 # object store in place of QUIC, so it depends on `p2p`. Object-store transport
 # is dev-testable on the local filesystem (no cloud account).
 cloud = ["p2p", "dep:object_store", "dep:bytes"]
+# Network object storage (S3 and any S3-compatible endpoint: MinIO, R2, GCS
+# via its S3 gateway). Additive over `cloud`; the canonical addressing,
+# size ceilings and content validation in framework::object_store apply
+# unchanged, because a provider is wrapped rather than trusted.
+s3 = ["cloud", "object_store/aws", "dep:url"]
 # Highly-available scheduler state (ADR 0106): an embedded Raft group
 # replicating dispatch decisions so a coordinator crash cannot lose the
 # in-flight table or re-dispatch running work. Depends on `p2p` because
@@ -160,7 +174,7 @@ raft = ["p2p"]
 
 [dev-dependencies]
 tempfile = "3"
-blut-notify = { path = "crates/blut-notify", version = "0.2.0-alpha.1" }
+blut-notify = { path = "crates/blut-notify", version = "0.2.0-alpha.2" }
 criterion = { version = "0.5", features = ["async_tokio"] }
 # Property-based testing (ADR 0072 A7) — monotonicity / soundness / never-panics
 # properties over random inputs, layered on top of the hand-written unit tests.

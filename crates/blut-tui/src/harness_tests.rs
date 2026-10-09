@@ -127,7 +127,10 @@ fn compare_col(id: &str) -> views::CompareCol {
 /// An App with every per-view cache populated with reasonable data.
 fn populated_app() -> App {
     super::isolate_datasets_db_for_tests();
-    theme::detect("always", "unicode");
+    {
+        let _theme = crate::theme::test_lock();
+        theme::detect("always", "unicode");
+    }
     let mut app = App::new(test_registry());
     // The harness exercises the training-cockpit surface (view switches, recipe
     // picker, per-job panels), so run it in cookbook mode as run_cockpit does.
