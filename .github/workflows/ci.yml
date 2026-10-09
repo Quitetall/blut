@@ -484,7 +484,9 @@ jobs:
         with:
           python-version: '3.12'
       - name: Checker unit suites
-        run: python -m pytest -q tools/test_check_blut_release_state.py tools/test_check_blut_i4_evidence.py
+        # Both suites use unittest.TestCase, including module setup. Run them
+        # with the standard library; this job does not install pytest.
+        run: python -m unittest -q tools.test_check_blut_release_state tools.test_check_blut_i4_evidence
       - name: The release-state checker still runs and still reports
         # NOT a pass/fail gate on the release itself -- see above. It asserts
         # that the command executes against the committed catalog and produces
