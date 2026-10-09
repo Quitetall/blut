@@ -2,7 +2,7 @@
 schema: oh.war/atom/v1
 warrant_uuid: 01a122ab-ee43-7108-85fb-baffadf67560
 role: adr
-jurisdiction: authored
+jurisdiction: bound
 order: 30
 classification: internal
 ---

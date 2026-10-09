@@ -31,7 +31,7 @@ required = true
 [[atoms]]
 ordinal = 30
 role = "adr"
-path = "atoms/30-decision.md"
+path = "../../adr/atoms/BLUT-ADR-0001-native-openwarrant-receipts.md"
 required = true
 
 [[atoms]]
