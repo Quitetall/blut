@@ -64,6 +64,35 @@ impl Stage for Produce {
         Ok(Proof { path })
     }
 }
+struct Fail;
+#[async_trait]
+impl Stage for Fail {
+    const NAME: &'static str = "receipt_test_fail";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    type Input = ();
+    type Output = Proof;
+    type Args = ();
+    async fn run(&self, _: &StageContext, _: (), _: &()) -> Result<Proof, StageError> {
+        Err(StageError::BadInput("deliberate fixture failure".into()))
+    }
+}
+struct Warn;
+#[async_trait]
+impl Stage for Warn {
+    const NAME: &'static str = "receipt_test_warn";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const ADVISORY: bool = true;
+    type Input = ();
+    type Output = Proof;
+    type Args = ();
+    async fn run(&self, _: &StageContext, _: (), _: &()) -> Result<Proof, StageError> {
+        Err(StageError::BadInput(
+            "deliberate advisory fixture failure".into(),
+        ))
+    }
+}
 struct Book;
 impl Cookbook for Book {
     fn name(&self) -> &'static str {
@@ -73,9 +102,13 @@ impl Cookbook for Book {
         &[]
     }
     fn stages_erased(&self) -> &'static [(&'static str, ErasedStageCtor)] {
-        static STAGES: &[(&str, ErasedStageCtor)] = &[("receipt_test_produce", || {
-            Arc::new(Produce) as Arc<dyn StageDyn>
-        })];
+        static STAGES: &[(&str, ErasedStageCtor)] = &[
+            ("receipt_test_produce", || {
+                Arc::new(Produce) as Arc<dyn StageDyn>
+            }),
+            ("receipt_test_fail", || Arc::new(Fail) as Arc<dyn StageDyn>),
+            ("receipt_test_warn", || Arc::new(Warn) as Arc<dyn StageDyn>),
+        ];
         STAGES
     }
 }
@@ -118,6 +151,7 @@ async fn actual_cpu_execution_yields_a_verifiable_dispatch_bound_receipt() {
     let result = run.result.unwrap();
     assert_eq!(result.n_stages, 1);
     assert_eq!(result.n_cache_hits, 0);
+    let proof = result.final_output.unwrap().into_typed::<Proof>().unwrap();
     let verified = verify(
         &run.envelope,
         &signer.verifying_key(),
@@ -130,7 +164,21 @@ async fn actual_cpu_execution_yields_a_verifiable_dispatch_bound_receipt() {
     .unwrap();
     assert_eq!(verified.binding, expected);
     assert_eq!(verified.outcome, Outcome::Completed);
-    assert!(std::fs::read_dir(&job).unwrap().next().is_some());
+    let proof_ref = proof.path.strip_prefix(&job).unwrap().to_str().unwrap();
+    let artifact = verified
+        .native_files
+        .iter()
+        .find(|f| f.path == proof_ref)
+        .unwrap();
+    assert_eq!(artifact.bytes, 26);
+    assert_eq!(
+        std::fs::read(job.join(&artifact.path)).unwrap(),
+        b"native execution happened\n"
+    );
+    let lineage = verified.lineage_reference.as_ref().unwrap();
+    assert_eq!(lineage.path, "status.jsonl");
+    assert!(lineage.bytes > 0);
+    assert!(verified.native_files.contains(lineage));
 }
 
 #[tokio::test]
@@ -169,6 +217,12 @@ async fn wrong_basis_key_payload_and_native_bytes_cannot_validate_completion() {
         verify(&run.envelope, &wrong, &expected, &plan, &reg, &job, &exe),
         Err(ReceiptError::Rejected(_))
     ));
+    let mut bad_signature = run.envelope.clone();
+    bad_signature.signature[0] ^= 1;
+    assert!(matches!(
+        verify(&bad_signature, &key, &expected, &plan, &reg, &job, &exe),
+        Err(ReceiptError::Rejected(_))
+    ));
     let mut other = expected.clone();
     other.attempt_id = "another-attempt".into();
     assert!(matches!(
@@ -204,12 +258,15 @@ async fn wrong_basis_key_payload_and_native_bytes_cannot_validate_completion() {
         Err(ReceiptError::Rejected(_))
     ));
     let mut altered = run.envelope.clone();
-    altered.payload[0] ^= 1;
+    let mut otherwise_valid: serde_json::Value = serde_json::from_slice(&altered.payload).unwrap();
+    otherwise_valid["ended_unix_ms"] =
+        serde_json::json!(otherwise_valid["ended_unix_ms"].as_u64().unwrap() + 1);
+    altered.payload = serde_json::to_vec(&otherwise_valid).unwrap();
     assert!(matches!(
         verify(&altered, &key, &expected, &plan, &reg, &job, &exe),
         Err(ReceiptError::Rejected(_))
     ));
-    std::fs::write(&proof.path, b"altered output\n").unwrap();
+    std::fs::write(&proof.path, b"Native execution happened\n").unwrap();
     assert!(matches!(
         verify(&run.envelope, &key, &expected, &plan, &reg, &job, &exe),
         Err(ReceiptError::Rejected(_))
@@ -362,4 +419,96 @@ async fn authenticated_malformed_or_contradictory_payload_is_refused() {
             Err(ReceiptError::Rejected(_))
         ));
     }
+}
+
+#[tokio::test]
+async fn actual_deadline_expiry_is_not_completed_or_cancelled() {
+    let td = tempfile::tempdir().unwrap();
+    let job = td.path().join("deadline");
+    let signer = SigningKey::from_bytes(&[7; 32]);
+    let reg = registry();
+    let plan = spec();
+    let expected = binding();
+    let mut ctx = ExecCtx::new(job.clone());
+    ctx.deadline = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    let run = execute_with_receipt(&plan, &reg, ctx, expected.clone(), &signer)
+        .await
+        .unwrap();
+    assert!(matches!(
+        run.result,
+        Err(blut::framework::PlanError::DeadlineExceeded { .. })
+    ));
+    let result = verify(
+        &run.envelope,
+        &signer.verifying_key(),
+        &expected,
+        &plan,
+        &reg,
+        &job,
+        &std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result.outcome, Outcome::DeadlineExceeded);
+}
+
+#[tokio::test]
+async fn actual_stage_failure_cannot_be_reported_as_completed() {
+    let td = tempfile::tempdir().unwrap();
+    let job = td.path().join("failed");
+    let signer = SigningKey::from_bytes(&[7; 32]);
+    let reg = registry();
+    let plan: PlanSpec = serde_json::from_str(r#"{"name":"receipt-failure","nodes":[{"stage":"receipt_test_fail","args":null}],"edges":[]}"#).unwrap();
+    let expected = binding();
+    let run = execute_with_receipt(
+        &plan,
+        &reg,
+        ExecCtx::new(job.clone()),
+        expected.clone(),
+        &signer,
+    )
+    .await
+    .unwrap();
+    assert!(run.result.is_err());
+    let result = verify(
+        &run.envelope,
+        &signer.verifying_key(),
+        &expected,
+        &plan,
+        &reg,
+        &job,
+        &std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result.outcome, Outcome::Failed);
+}
+
+#[tokio::test]
+async fn actual_advisory_failure_remains_completion_with_warnings() {
+    let td = tempfile::tempdir().unwrap();
+    let job = td.path().join("warnings");
+    let signer = SigningKey::from_bytes(&[7; 32]);
+    let reg = registry();
+    let plan: PlanSpec = serde_json::from_str(r#"{"name":"receipt-warning","nodes":[{"stage":"receipt_test_warn","args":null}],"edges":[]}"#).unwrap();
+    let expected = binding();
+    let run = execute_with_receipt(
+        &plan,
+        &reg,
+        ExecCtx::new(job.clone()),
+        expected.clone(),
+        &signer,
+    )
+    .await
+    .unwrap();
+    assert_eq!(run.result.unwrap().warnings.len(), 1);
+    let result = verify(
+        &run.envelope,
+        &signer.verifying_key(),
+        &expected,
+        &plan,
+        &reg,
+        &job,
+        &std::env::current_exe().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result.outcome, Outcome::CompletedWithWarnings);
 }

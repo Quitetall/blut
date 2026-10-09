@@ -69,13 +69,18 @@ pub struct SealedRun {
     pub result: Result<PlanResult, PlanError>,
 }
 /// Native signature/source validation only, never OpenWarrant Verified status.
+#[derive(Debug, Serialize)]
 pub struct VerifiedRun {
     pub binding: DispatchBinding,
     pub outcome: Outcome,
     pub run_id: String,
     pub receipt_digest: String,
     pub registry_digest: String,
-    pub lineage_reference: String,
+    /// Verified native files, relative to the caller-established job directory.
+    pub native_files: Vec<NativeFileReference>,
+    /// The retained nonempty lifecycle stream, when available. No missing path
+    /// is invented for attempts that fail before a lifecycle writer starts.
+    pub lineage_reference: Option<NativeFileReference>,
 }
 #[derive(Debug, thiserror::Error)]
 pub enum ReceiptError {
@@ -121,11 +126,11 @@ fn now() -> Result<u64, ReceiptError> {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NativeFile {
-    path: String,
-    bytes: u64,
-    digest: String,
-    mode: u32,
+pub struct NativeFileReference {
+    pub path: String,
+    pub bytes: u64,
+    pub digest: String,
+    pub mode: u32,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -141,7 +146,7 @@ struct Payload {
     outcome: Outcome,
     warnings: usize,
     stages: usize,
-    native_files: Vec<NativeFile>,
+    native_files: Vec<NativeFileReference>,
 }
 fn hash_file(path: &Path, max: u64) -> Result<(u64, String, u32), ReceiptError> {
     let meta = fs::symlink_metadata(path).map_err(unavailable)?;
@@ -187,12 +192,12 @@ fn hash_file(path: &Path, max: u64) -> Result<(u64, String, u32), ReceiptError> 
     let mode = 0;
     Ok((bytes, format!("blake3:{}", hash.finalize().to_hex()), mode))
 }
-fn files(root: &Path) -> Result<Vec<NativeFile>, ReceiptError> {
+fn files(root: &Path) -> Result<Vec<NativeFileReference>, ReceiptError> {
     fn walk(
         root: &Path,
         dir: &Path,
         depth: usize,
-        out: &mut Vec<NativeFile>,
+        out: &mut Vec<NativeFileReference>,
         total: &mut u64,
     ) -> Result<(), ReceiptError> {
         if depth > 32 {
@@ -234,7 +239,7 @@ fn files(root: &Path) -> Result<Vec<NativeFile>, ReceiptError> {
                 components.push(name);
             }
             let rel = components.join("/");
-            out.push(NativeFile {
+            out.push(NativeFileReference {
                 path: rel,
                 bytes,
                 digest: hash,
@@ -392,13 +397,15 @@ pub fn verify(
     {
         return Err(rejected("native input records changed or mixed"));
     }
+    let lineage_reference = payload
+        .native_files
+        .iter()
+        .find(|f| f.path == "status.jsonl" && f.bytes > 0)
+        .cloned();
     if matches!(
         payload.outcome,
         Outcome::Completed | Outcome::CompletedWithWarnings
-    ) && !payload
-        .native_files
-        .iter()
-        .any(|f| f.path == "status.jsonl" && f.bytes > 0)
+    ) && lineage_reference.is_none()
     {
         return Err(rejected("completed receipt has no native lifecycle stream"));
     }
@@ -410,6 +417,7 @@ pub fn verify(
         run_id: payload.run_id,
         receipt_digest: digest(&receipt_identity),
         registry_digest: payload.registry_digest,
-        lineage_reference: job.join("status.jsonl").display().to_string(),
+        native_files: payload.native_files,
+        lineage_reference,
     })
 }
