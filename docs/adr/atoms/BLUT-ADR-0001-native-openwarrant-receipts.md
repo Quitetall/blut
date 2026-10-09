@@ -1,6 +1,10 @@
 ---
 schema: oh.war/atom/v1
-warrant_uuid: 01a122ab-ee43-7108-85fb-baffadf67560
+adr_uuid: ea1c3c27-5fd3-4747-a203-7a1b8a584584
+local_alias: BLUT-ADR-0001
+status: proposed
+governs:
+  - "war://01a122ab-ee43-7108-85fb-baffadf67560"
 role: adr
 jurisdiction: bound
 order: 30
