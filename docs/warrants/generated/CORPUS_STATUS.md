@@ -27,28 +27,18 @@ Source: every Warrant under the configured warrants path, its sidecar records, a
 
 | Objective | Exit Warrant | Achieved | invalid | draft | ready | would_satisfy | resolved |
 |---|---|---|---|---|---|---|---|
-| roadmap://BLUT-PHASE-0: Telemetry shim | — | not derivable — no Warrant names this phase | 0 | 0 | 0 | 0 | 0 |
-| roadmap://BLUT-PHASE-1: File-native WAR compiler | — | not derivable — no member carries the `exit` slug | 0 | 1 | 0 | 0 | 0 |
-| roadmap://BLUT-PHASE-2: Agent planner | — | not derivable — no Warrant names this phase | 0 | 0 | 0 | 0 | 0 |
-| roadmap://BLUT-PHASE-3: ADR federation | — | not derivable — no Warrant names this phase | 0 | 0 | 0 | 0 | 0 |
-| roadmap://BLUT-PHASE-4: Knowledge Fabric registration | — | not derivable — no Warrant names this phase | 0 | 0 | 0 | 0 | 0 |
-| roadmap://BLUT-PHASE-5: Dispatch and Katana execution | — | not derivable — no Warrant names this phase | 0 | 0 | 0 | 0 | 0 |
-| roadmap://BLUT-PHASE-6: Gate Registry and assurance case | — | not derivable — no Warrant names this phase | 0 | 0 | 0 | 0 | 0 |
-| roadmap://BLUT-PHASE-7: BLUT adapter | — | not derivable — no Warrant names this phase | 0 | 0 | 0 | 0 | 0 |
-| roadmap://BLUT-PHASE-8: Liminal production compiler | — | not derivable — no Warrant names this phase | 0 | 0 | 0 | 0 | 0 |
-| roadmap://BLUT-PHASE-9: High-assurance controls | — | not derivable — §98 defines no Exit for this phase | 0 | 0 | 0 | 0 | 0 |
-| roadmap://BLUT-PHASE-10: Contractor Work Order profile | — | not derivable — §98 defines no Exit for this phase | 0 | 0 | 0 | 0 | 0 |
-| *unassigned — declares no [[roadmap]]* | — | not derivable — a Warrant naming no phase belongs to no Objective | 0 | 0 | 0 | 0 | 0 |
+| roadmap://BLUT-PHASE-1: Establish governance | — | not derivable — no member carries the `exit` slug | 0 | 1 | 0 | 0 | 0 |
+| roadmap://BLUT-PHASE-2: Prove single-box contract | — | not derivable — no Warrant names this phase | 0 | 0 | 0 | 0 | 0 |
+| roadmap://BLUT-PHASE-3: Prove sidecar and operations boundaries | — | not derivable — no Warrant names this phase | 0 | 0 | 0 | 0 | 0 |
+| roadmap://BLUT-PHASE-4: Prove distributed rungs | — | not derivable — no Warrant names this phase | 0 | 0 | 0 | 0 | 0 |
+| roadmap://BLUT-PHASE-5: Release train | — | not derivable — no Warrant names this phase | 0 | 0 | 0 | 0 | 0 |
+| *unassigned — declares no [[roadmap]]* | — | not derivable — a Warrant naming no phase belongs to no Objective | 0 | 1 | 0 | 0 | 0 |
 
-- **roadmap://BLUT-PHASE-0** exit: real distributions for authoring cost, amendment types, and failure causes.
-- **roadmap://BLUT-PHASE-1** exit: OpenWarrant development uses WARs.
-- **roadmap://BLUT-PHASE-2** exit: a vague engineering request produces a reviewable valid draft without direct model file mutation.
-- **roadmap://BLUT-PHASE-3** exit: no managed normative decision exists only inline.
-- **roadmap://BLUT-PHASE-4** exit: registered WARs use KF as institutional authority while Git may remain Source Holder.
-- **roadmap://BLUT-PHASE-5** exit: one WAR stage can be compiled, executed by a stateless Katana agent, and returned without authority confusion.
-- **roadmap://BLUT-PHASE-6** exit: a delivery can close only through bounded, provenance-preserving proof.
-- **roadmap://BLUT-PHASE-7** exit: compatible computational WARs execute without duplicating BLUT.
-- **roadmap://BLUT-PHASE-8** exit: Liminal is the single production document semantic compiler.
+- **roadmap://BLUT-PHASE-1** exit: `BLUT-WAR-0001` has a human-signed resolution with independent verification
+- **roadmap://BLUT-PHASE-2** exit: each accepted requirement has a resolved Warrant and reproducible local
+- **roadmap://BLUT-PHASE-3** exit: independent verification records cover declared trust boundaries and the
+- **roadmap://BLUT-PHASE-4** exit: each promoted rung has its own reproducible proof. Component or loopback
+- **roadmap://BLUT-PHASE-5** exit: human release decision cites exact candidate and evidence; no alpha source
 
 ## Next actionable
 
@@ -60,17 +50,17 @@ Warrants blocked on each requirement. Names, not a score: this says what to fix.
 
 | requirement | Warrants blocked |
 |---|---|
-| artifact digests verify | 1 |
-| every required gate has admissible result | 1 |
-| every required obligation is dispositioned | 1 |
-| exact authorized Contract Revision | 1 |
-| independence requirements are met | 1 |
-| no blocker remains | 1 |
-| no required unknown remains | 1 |
-| required deliverables exist | 1 |
-| required judgments exist | 1 |
-| residual risks have sufficient authority | 1 |
-| resolver holds the role | 1 |
+| artifact digests verify | 2 |
+| every required gate has admissible result | 2 |
+| every required obligation is dispositioned | 2 |
+| exact authorized Contract Revision | 2 |
+| independence requirements are met | 2 |
+| no blocker remains | 2 |
+| no required unknown remains | 2 |
+| required deliverables exist | 2 |
+| required judgments exist | 2 |
+| residual risks have sufficient authority | 2 |
+| resolver holds the role | 2 |
 
 ## Requirements (SAS §106, §34.3)
 
@@ -99,11 +89,12 @@ Warrants blocked on each requirement. Names, not a score: this says what to fix.
 | `BLUT-SAS-RQ-009` | unaddressed | 0 | — |
 | `BLUT-SAS-RQ-010` | unaddressed | 0 | — |
 
-## Warrants (1) — invalid 0 · draft 1 · ready_to_resolve 0 · would_satisfy 0 · resolved **0**
+## Warrants (2) — invalid 0 · draft 2 · ready_to_resolve 0 · would_satisfy 0 · resolved **0**
 
 | Warrant | rung | §38.6 | blocking unknowns | milestones evidenced | first unmet |
 |---|---|---|---|---|---|
 | `BLUT-WAR-0001` Adopt OpenWarrant in BLUT | draft | unknown | 0 | 0 of 2 | exact authorized Contract Revision |
+| `BLUT-WAR-0002` Bind native BLUT plan receipts to an OpenWarrant Dispatch | draft | unknown | 0 | — | exact authorized Contract Revision |
 
 ## Not reported here
 

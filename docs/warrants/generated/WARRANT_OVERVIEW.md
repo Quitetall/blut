@@ -5,13 +5,14 @@ Source: the Warrants under the configured warrants path.
 
 # Warrant Overview
 
-1 Warrant(s) in this repository.
+2 Warrant(s) in this repository.
 
 ## Summary
 
 | Warrant | Title | Phase | Currency | Standing | Assurance | Milestones |
 |---|---|---|---|---|---|---|
 | [BLUT-WAR-0001](docs/warrants/BLUT-WAR-0001/manifest.toml) | Adopt OpenWarrant in BLUT | `draft` | `current` | `valid` | `basic` | 2M / 2S |
+| [BLUT-WAR-0002](docs/warrants/BLUT-WAR-0002/manifest.toml) | Bind native BLUT plan receipts to an OpenWarrant Dispatch | `draft` | `current` | `valid` | `basic` | — |
 
 ## Claimed SAS requirement coverage
 
