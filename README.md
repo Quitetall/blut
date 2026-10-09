@@ -30,14 +30,14 @@ Use it as a dependency:
 
 ```toml
 [dependencies]
-blut = "=0.2.0-alpha.1"
+blut = "=0.2.0-alpha.2"
 ```
 
 Two binaries do install directly, both published:
 
 ```bash
-cargo install blut-dsl --version =0.2.0-alpha.1   # .star → PlanSpec front-end
-cargo install blut-tui --version =0.2.0-alpha.1   # the terminal cockpit
+cargo install blut-dsl --version =0.2.0-alpha.2   # .star → PlanSpec front-end
+cargo install blut-tui --version =0.2.0-alpha.2   # the terminal cockpit
 ```
 
 ## Quickstart

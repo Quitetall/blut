@@ -7,7 +7,7 @@
 # keeps this invariant green (the Leptos+WASM UI depends on it).
 [package]
 name = "blut-types"
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.2"
 edition = "2024"
 # Keep one tested MSRV across the public 0.2 preview crates.
 rust-version = "1.88"

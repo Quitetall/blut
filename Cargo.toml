@@ -16,7 +16,7 @@
 
 [package]
 name = "blut"
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.2"
 edition = "2024"
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
@@ -58,7 +58,7 @@ path = "src/lib.rs"
 [dependencies]
 # ADR 0083: the wasm32-safe keystone. The engine re-exports its types at their
 # old paths, so this is zero-churn downstream.
-blut-types = { path = "crates/blut-types", version = "=0.2.0-alpha.1" }
+blut-types = { path = "crates/blut-types", version = "=0.2.0-alpha.2" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -172,7 +172,7 @@ raft = ["p2p"]
 
 [dev-dependencies]
 tempfile = "3"
-blut-notify = { path = "crates/blut-notify", version = "0.2.0-alpha.1" }
+blut-notify = { path = "crates/blut-notify", version = "0.2.0-alpha.2" }
 criterion = { version = "0.5", features = ["async_tokio"] }
 # Property-based testing (ADR 0072 A7) — monotonicity / soundness / never-panics
 # properties over random inputs, layered on top of the hand-written unit tests.

@@ -13,7 +13,7 @@
 
 [package]
 name = "blut-tui"
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.2"
 edition = "2024"
 # 1.88, not 1.85. The 1.85 claim was never true and never tested: cargo
 # +1.85 refuses this manifest outright because its `blut` and `ratatui` dependencies both require 1.88.
@@ -39,7 +39,7 @@ path = "src/lib.rs"
 p2p = ["blut/p2p"]
 
 [dependencies]
-blut = { path = "../..", version = "=0.2.0-alpha.1" }
+blut = { path = "../..", version = "=0.2.0-alpha.2" }
 anyhow = "1"
 ratatui = "0.30"
 crossterm = "0.28"

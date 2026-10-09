@@ -4,7 +4,7 @@ Hermetic Starlark front-end for BLUT `PlanSpec` JSON. Evaluation happens out of
 process so Starlark dependency features cannot alter BLUT engine serialization.
 
 ```bash
-cargo install blut-dsl --version =0.2.0-alpha.1
+cargo install blut-dsl --version =0.2.0-alpha.2
 blut-dsl recipe.star --args '{"corpus":"demo"}'
 ```
 
