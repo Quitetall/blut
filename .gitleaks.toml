@@ -40,3 +40,17 @@ elsewhere, or any other rule firing on this path, still fails the gate.
 """
 regexes = ['''\b[0-9a-f]{40}\b''']
 regexTarget = "match"
+
+[[allowlists]]
+description = """
+Two exact public OpenWarrant draft-created event idempotency digests. Each
+recomputes as SHA-256(warrant_uuid + newline + type + newline + payload), as
+implemented by OpenWarrant journal_cmd.rs. They deduplicate journal events;
+they grant no access. Exempt only these exact field/value matches, not all
+SHA-256 values, journal paths or generic-api-key findings.
+"""
+regexTarget = "match"
+regexes = [
+    '''idempotency_key"\s*:\s*"9480a64f44a5006ea42d2f13aa72af0a23d00aa13fb312a38508cef780b0339d"''',
+    '''idempotency_key"\s*:\s*"487f41729ce07168d05fffa1799f39f468f393ffe970502c37f36c6c27ebc64b"''',
+]
