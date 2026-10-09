@@ -1,0 +1,12 @@
+   Compiling blut v0.2.0-alpha.1 (/mnt/4tb/tmp/openwarrant-blut-native-receipts)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 59s
+     Running tests/openwarrant_receipt.rs (/mnt/4tb/OpenWarrant/target/debug/deps/openwarrant_receipt-b50599af76f5315c)
+
+running 4 tests
+test existing_job_is_preserved_and_never_executed_again ... ok
+test actual_cancelled_execution_remains_cancelled ... ok
+test actual_cpu_execution_yields_a_verifiable_dispatch_bound_receipt ... ok
+test wrong_basis_key_payload_and_native_bytes_cannot_validate_completion ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.79s
+

@@ -1,0 +1,18 @@
+{
+  "schema": "oh.war/viewer-work-report/v1",
+  "warrant": "BLUT-WAR-0002",
+  "work_state": "in-progress",
+  "reported_by": "agent://codex",
+  "revision": "49ed0907c51dc33559e945f634ab43d16dc2d2d1",
+  "summary": "Native plan receipt producer and offline verifier implemented; four CPU/crypto/source controls and all-target optional-feature Clippy passed. Draft contract remains unaccepted; remaining outcome controls, transport, OpenWarrant integration and qualification are open.",
+  "notes": "docs/warrants/BLUT-WAR-0002/implementation/README.md",
+  "evidence": [
+    "docs/warrants/BLUT-WAR-0002/implementation/native-controls.log",
+    "docs/warrants/BLUT-WAR-0002/implementation/clippy-final.log"
+  ],
+  "next_steps": [
+    "Exercise warning, failure, deadline, malformed authenticated input and native reference controls.",
+    "Connect the provider-owned verification API to the OpenWarrant runtime assessment through explicit transport.",
+    "Run an actual recorded Dispatch integration and obtain independent/operator qualification; do not infer acceptance from tests."
+  ]
+}

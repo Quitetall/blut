@@ -1,0 +1,14 @@
+{
+  "source_commit": "49ed0907c51dc33559e945f634ab43d16dc2d2d1",
+  "rustc": "1.99.0 (b940084d7 2026-09-28)",
+  "public_red": "FAIL: producer not implemented",
+  "positive_and_refusal_suite": "4 PASS",
+  "all_target_feature_clippy": "PASS after reproducing and repairing one pre-existing test lint",
+  "fmt": "PASS",
+  "full_ci": "NOT RUN",
+  "native_openwarrant_integration": "NOT IMPLEMENTED",
+  "operator_key_custody": "UNKNOWN",
+  "independent_qualification": "NOT ESTABLISHED",
+  "human_acceptance": "NOT ESTABLISHED",
+  "cold_builds": "two 300-second UNKNOWN deadlines; a detached build then exposed fixture compile errors, corrected before the genuine RED"
+}
