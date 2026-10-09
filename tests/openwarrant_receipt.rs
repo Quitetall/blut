@@ -303,3 +303,63 @@ async fn ambiguous_native_path_is_not_sealed_as_completed() {
         matches!(result, Err(ReceiptError::Rejected(ref reason)) if reason.contains("ambiguous native path"))
     );
 }
+
+#[tokio::test]
+async fn authenticated_malformed_or_contradictory_payload_is_refused() {
+    use blut::framework::openwarrant_receipt::{Envelope, ReceiptError};
+    use ed25519_dalek::Signer;
+    let td = tempfile::tempdir().unwrap();
+    let job = td.path().join("typed-refusals");
+    let signer = SigningKey::from_bytes(&[7; 32]);
+    let reg = registry();
+    let plan = spec();
+    let expected = binding();
+    let run = execute_with_receipt(
+        &plan,
+        &reg,
+        ExecCtx::new(job.clone()),
+        expected.clone(),
+        &signer,
+    )
+    .await
+    .unwrap();
+    assert!(run.result.is_ok());
+    let original = std::str::from_utf8(&run.envelope.payload).unwrap();
+    let mut unsupported: serde_json::Value = serde_json::from_slice(&run.envelope.payload).unwrap();
+    unsupported["version"] = serde_json::json!(2);
+    let mut contradictory: serde_json::Value =
+        serde_json::from_slice(&run.envelope.payload).unwrap();
+    contradictory["outcome"] = serde_json::json!("completed_with_warnings");
+    for payload in [
+        format!("{},\"version\":1}}", original.strip_suffix('}').unwrap()).into_bytes(),
+        format!(
+            "{},\"unrecognized\":true}}",
+            original.strip_suffix('}').unwrap()
+        )
+        .into_bytes(),
+        serde_json::to_vec(&unsupported).unwrap(),
+        serde_json::to_vec(&contradictory).unwrap(),
+    ] {
+        // Sign exact bytes using the proposed public wire protocol. A valid seal
+        // must not make duplicate fields, unknown fields or contradictions valid.
+        let mut message = b"blut-openwarrant-receipt-v1".to_vec();
+        message.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        message.extend_from_slice(&payload);
+        let envelope = Envelope {
+            signature: signer.sign(&message).to_bytes().to_vec(),
+            payload,
+        };
+        assert!(matches!(
+            verify(
+                &envelope,
+                &signer.verifying_key(),
+                &expected,
+                &plan,
+                &reg,
+                &job,
+                &std::env::current_exe().unwrap()
+            ),
+            Err(ReceiptError::Rejected(_))
+        ));
+    }
+}
