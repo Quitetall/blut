@@ -218,15 +218,20 @@ jobs:
           # then failed with "no matching package named `blut-types` found". A
           # conditional that cannot take its false branch is not a guard.
           indexed() { ( cd "$RUNNER_TEMP" && cargo info "$1" ) >/dev/null 2>&1; }
-          if indexed blut-types@0.2.0-alpha.1; then
+          # The release train shares one version; read it from the manifest so
+          # a version bump cannot leave the guards asking about the old one.
+          ver=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "blut") | .version')
+          test -n "$ver"
+          if indexed "blut-types@$ver"; then
             cargo package --locked
           else
-            echo "::notice::blut tarball verification awaits blut-types 0.2.0-alpha.1 indexing; rerun this exact SHA after publishing blut-types"
+            echo "::notice::blut tarball verification awaits blut-types $ver indexing; rerun this exact SHA after publishing blut-types"
           fi
-          if indexed blut@0.2.0-alpha.1; then
+          if indexed "blut@$ver"; then
             cargo package --locked --manifest-path crates/blut-dsl/Cargo.toml
           else
-            echo "::notice::blut-dsl tarball verification awaits blut 0.2.0-alpha.1 indexing; rerun this exact SHA after publishing blut"
+            echo "::notice::blut-dsl tarball verification awaits blut $ver indexing; rerun this exact SHA after publishing blut"
           fi
 
       - name: In-tree public example smoke

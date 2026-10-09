@@ -48,6 +48,9 @@ because the train shares one exact version.
   messages accepted across encryption-level boundaries). `blut-tui`
   0.2.0-alpha.1 shipped a lockfile pinning 0.23.43, which `cargo install
   --locked blut-tui` would use; 0.2.0-alpha.2 does not.
+- `faster-hex` floor raised to 0.10.1 in `blut` and `blut-types`, closing
+  RUSTSEC-2026-0306 (the safe `hex_decode_unchecked` AVX2 path read past its
+  input). Every committed lockfile now resolves 0.10.1.
 
 ## [0.2.0-alpha.1] — published 2026-08-27
 

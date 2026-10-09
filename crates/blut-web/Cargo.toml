@@ -34,7 +34,7 @@ axum = "0.8"
 async-stream = "0.3"
 sha2 = "0.10"
 hmac = "0.12"
-faster-hex = "0.10"
+faster-hex = "0.10.1"
 include_dir = "0.7"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
