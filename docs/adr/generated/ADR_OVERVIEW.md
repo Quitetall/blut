@@ -46,3 +46,15 @@ Completed, completed-with-warnings, failed, cancelled and deadline-exceeded rema
 ## Implementation order
 
 First prove exact-byte signing and refusal through a public provider API. Then wire producer to actual execution and capture native references. Then connect the OpenWarrant ReceiptVerifier seam and run an actual bounded CPU plan. Only independently qualified, authorized integration may clear formal assurance.
+
+## Candidate implementation details
+
+The optional `openwarrant-receipts` feature exposes `framework::openwarrant_receipt`. It enables Ed25519 only; it adds no P2P transport or cloud dependency. `execute_with_receipt` accepts a PlanSpec, the actual Registry, an ExecCtx, a checked caller-supplied Dispatch binding and an in-memory signing key. It refuses any existing job directory and compiles before creating a new one.
+
+The envelope contains exact payload bytes and a 64-byte signature. The version-1 typed payload contains the complete Dispatch binding, generated native run UUID, plan/catalog/executable BLAKE3 identities, start/end milliseconds, terminal outcome, warning/stage counts and a sorted table of native job file paths, lengths, BLAKE3 hashes and modes. Native input records retain the exact canonical plan, live catalogue and run/Dispatch binding. The executor's persisted status stream is captured after its writer is drained. The signing message is the one defined above. Provider receipt identity is BLAKE3 over that signing message followed by the exact 64-byte signature; OpenWarrant raw-envelope SHA-256 remains a separate identity.
+
+The offline `verify` API takes the envelope, independently trusted public key, expected Dispatch, PlanSpec, Registry, retained native job and exact retained producer executable. It rechecks the complete native file table and input records, plus plan/catalog/executable identities. It does not choose trust from a receipt field. Missing native evidence is unavailable; an observed mismatch is rejected. A clean-completion claim requires nonzero stage count, zero warnings and a nonempty native lifecycle stream. The producer does not accept an asserted terminal status.
+
+Resource bounds: payload at most 2 MiB, 4096 job files, 64 MiB per job file, 256 MiB total, 32 directory levels, producer executable at most 1 GiB. Symbolic links and nonregular job files refuse capture. Signing keys are never persisted by this API. Capture can fail after execution; callers must retain the job and must not automatically repeat execution just because receipt capture failed.
+
+This first prototype has no operator key-custody qualification, OpenWarrant callback/CLI integration, confinement proof or metered cost proof. CPU fixture keys are synthetic and confer no project authority. Positive execution, cancellation and refusal tests are implementation evidence. Warnings, deadline expiry, malformed authenticated payloads, public transport and broader integration still need explicit controls before qualification.
