@@ -40,8 +40,22 @@ impl Stage for Produce {
     const RESOURCES: &'static [Resource] = &[Resource::Cpu];
     type Input = ();
     type Output = Proof;
-    type Args = ();
-    async fn run(&self, ctx: &StageContext, _: (), _: &()) -> Result<Proof, StageError> {
+    type Args = Option<bool>;
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        _: (),
+        args: &Option<bool>,
+    ) -> Result<Proof, StageError> {
+        if *args == Some(true) {
+            let ambiguous = ctx.stage_dir.join("a\\b.txt");
+            std::fs::write(&ambiguous, b"ambiguous native path").map_err(|source| {
+                StageError::Io {
+                    path: ambiguous,
+                    source,
+                }
+            })?;
+        }
         let path = ctx.stage_dir.join("proof.txt");
         std::fs::write(&path, b"native execution happened\n").map_err(|source| StageError::Io {
             path: path.clone(),
@@ -268,4 +282,24 @@ async fn existing_job_is_preserved_and_never_executed_again() {
     ));
     assert_eq!(std::fs::read(marker).unwrap(), b"preserve");
     assert_eq!(std::fs::read_dir(job).unwrap().count(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ambiguous_native_path_is_not_sealed_as_completed() {
+    use blut::framework::openwarrant_receipt::ReceiptError;
+    let td = tempfile::tempdir().unwrap();
+    let plan: PlanSpec = serde_json::from_str(r#"{"name":"ambiguous-path","nodes":[{"stage":"receipt_test_produce","args":true}],"edges":[]}"#).unwrap();
+    let signer = SigningKey::from_bytes(&[7; 32]);
+    let result = execute_with_receipt(
+        &plan,
+        &registry(),
+        ExecCtx::new(td.path().join("job")),
+        binding(),
+        &signer,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(ReceiptError::Rejected(ref reason)) if reason.contains("ambiguous native path"))
+    );
 }

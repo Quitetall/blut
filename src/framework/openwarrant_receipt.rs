@@ -219,12 +219,21 @@ fn files(root: &Path) -> Result<Vec<NativeFile>, ReceiptError> {
             if *total > MAX_TOTAL {
                 return Err(rejected("native total byte budget"));
             }
-            let rel = path
-                .strip_prefix(root)
-                .map_err(unavailable)?
-                .to_str()
-                .ok_or_else(|| rejected("non-UTF8 native path"))?
-                .replace('\\', "/");
+            let relative = path.strip_prefix(root).map_err(unavailable)?;
+            let mut components = Vec::new();
+            for component in relative.components() {
+                let std::path::Component::Normal(name) = component else {
+                    return Err(rejected("ambiguous native path"));
+                };
+                let name = name
+                    .to_str()
+                    .ok_or_else(|| rejected("non-UTF8 native path"))?;
+                if name.contains('\\') || name.chars().any(char::is_control) {
+                    return Err(rejected("ambiguous native path"));
+                }
+                components.push(name);
+            }
+            let rel = components.join("/");
             out.push(NativeFile {
                 path: rel,
                 bytes,
