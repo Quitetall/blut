@@ -1,0 +1,37 @@
+    Checking rustls v0.23.45
+    Checking faster-hex v0.10.1
+    Checking blut-types v0.2.0-alpha.2 (/mnt/4tb/tmp/openwarrant-blut-native-receipts/crates/blut-types)
+    Checking tokio-rustls v0.26.4
+    Checking hyper-rustls v0.27.9
+   Compiling blut v0.2.0-alpha.2 (/mnt/4tb/tmp/openwarrant-blut-native-receipts)
+    Checking lettre v0.11.23
+    Checking reqwest v0.12.28
+    Checking semver v1.0.28
+    Checking blut-notify v0.2.0-alpha.2 (/mnt/4tb/tmp/openwarrant-blut-native-receipts/crates/blut-notify)
+error: this `if` statement can be collapsed
+   --> src/config/launcher.rs:801:13
+    |
+801 | /             if let Some((_, rest)) = line.split_once("Status for job ") {
+802 | |                 if let Some((_, state)) = rest.rsplit_once(": ") {
+803 | |                     let state = state.trim();
+804 | |                     return match state {
+...   |
+812 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_if
+    = note: `-D clippy::collapsible-if` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::collapsible_if)]`
+help: collapse nested if block
+    |
+801 ~             if let Some((_, rest)) = line.split_once("Status for job ")
+802 ~                 && let Some((_, state)) = rest.rsplit_once(": ") {
+803 |                     let state = state.trim();
+...
+810 |                     };
+811 ~                 }
+    |
+
+error: could not compile `blut` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `blut` (lib test) due to 1 previous error

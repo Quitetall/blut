@@ -1,0 +1,14 @@
+   Compiling blut v0.2.0-alpha.2 (/mnt/4tb/tmp/openwarrant-blut-native-receipts)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5m 47s
+     Running unittests src/lib.rs (/mnt/4tb/OpenWarrant/target/debug/deps/blut-59b33d4735218011)
+
+running 6 tests
+test config::launcher::tests::ray_parse_status_stopped ... ok
+test config::launcher::tests::ray_parse_status_running ... ok
+test config::launcher::tests::ray_parse_status_pending_is_running ... ok
+test config::launcher::tests::ray_parse_status_failed ... ok
+test config::launcher::tests::ray_parse_status_succeeded ... ok
+test config::launcher::tests::ray_parse_status_unknown ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 997 filtered out; finished in 0.00s
+

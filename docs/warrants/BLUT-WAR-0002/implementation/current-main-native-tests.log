@@ -1,0 +1,26 @@
+   Compiling rustls v0.23.45
+   Compiling semver v1.0.28
+   Compiling rustc_version v0.4.1
+   Compiling faster-hex v0.10.1
+   Compiling curve25519-dalek v4.1.3
+   Compiling blut-types v0.2.0-alpha.2 (/mnt/4tb/tmp/openwarrant-blut-native-receipts/crates/blut-types)
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-rustls v0.27.9
+   Compiling blut v0.2.0-alpha.2 (/mnt/4tb/tmp/openwarrant-blut-native-receipts)
+   Compiling lettre v0.11.23
+   Compiling reqwest v0.12.28
+   Compiling ed25519-dalek v2.2.0
+   Compiling blut-notify v0.2.0-alpha.2 (/mnt/4tb/tmp/openwarrant-blut-native-receipts/crates/blut-notify)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9m 14s
+     Running tests/openwarrant_receipt.rs (/mnt/4tb/OpenWarrant/target/debug/deps/openwarrant_receipt-e38198f21ff67c48)
+
+running 6 tests
+test existing_job_is_preserved_and_never_executed_again ... ok
+test actual_cancelled_execution_remains_cancelled ... ok
+test ambiguous_native_path_is_not_sealed_as_completed ... ok
+test authenticated_malformed_or_contradictory_payload_is_refused ... ok
+test actual_cpu_execution_yields_a_verifiable_dispatch_bound_receipt ... ok
+test wrong_basis_key_payload_and_native_bytes_cannot_validate_completion ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.67s
+

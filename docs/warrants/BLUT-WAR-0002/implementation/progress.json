@@ -3,15 +3,18 @@
   "warrant": "BLUT-WAR-0002",
   "work_state": "in-progress",
   "reported_by": "agent://codex",
-  "revision": "49ed0907c51dc33559e945f634ab43d16dc2d2d1",
-  "summary": "Native plan receipt producer and offline verifier implemented; four CPU/crypto/source controls and all-target optional-feature Clippy passed. Draft contract remains unaccepted; remaining outcome controls, transport, OpenWarrant integration and qualification are open.",
+  "revision": "e639905c51b65b900e054e0e1533cfda351f1ff6",
+  "summary": "Native producer/offline verifier prototype: six receipt tests and six Ray parser regression tests pass; formatting, record integrity and optional-feature all-target Clippy pass. Full hosted CI, public file-reference API/transport, Dispatch integration and qualification remain open.",
   "notes": "docs/warrants/BLUT-WAR-0002/implementation/README.md",
   "evidence": [
-    "docs/warrants/BLUT-WAR-0002/implementation/native-controls.log",
-    "docs/warrants/BLUT-WAR-0002/implementation/clippy-final.log"
+    "docs/warrants/BLUT-WAR-0002/implementation/current-main-native-tests.log",
+    "docs/warrants/BLUT-WAR-0002/implementation/ambiguous-path-red.log",
+    "docs/warrants/BLUT-WAR-0002/implementation/current-main-record-check.log",
+    "docs/warrants/BLUT-WAR-0002/implementation/current-main-native-clippy-final.log",
+    "docs/warrants/BLUT-WAR-0002/implementation/current-main-ray-tests.log"
   ],
   "next_steps": [
-    "Exercise warning, failure, deadline, malformed authenticated input and native reference controls.",
+    "Expose verified native file references, complete CI, and exercise warning, failure and deadline controls.",
     "Connect the provider-owned verification API to the OpenWarrant runtime assessment through explicit transport.",
     "Run an actual recorded Dispatch integration and obtain independent/operator qualification; do not infer acceptance from tests."
   ]
