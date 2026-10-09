@@ -1,0 +1,21 @@
+    Checking blut-types v0.2.0-alpha.2 (/mnt/4tb/tmp/openwarrant-blut-native-receipts/crates/blut-types)
+   Compiling blut v0.2.0-alpha.2 (/mnt/4tb/tmp/openwarrant-blut-native-receipts)
+    Checking blut-notify v0.2.0-alpha.2 (/mnt/4tb/tmp/openwarrant-blut-native-receipts/crates/blut-notify)
+error[E0609]: no field `native_files` on type `VerifiedRun`
+   --> tests/openwarrant_receipt.rs:135:29
+    |
+135 |     let artifact = verified.native_files.iter().find(|f| f.path == proof_ref).unwrap();
+    |                             ^^^^^^^^^^^^ unknown field
+    |
+    = note: available fields are: `binding`, `outcome`, `run_id`, `receipt_digest`, `registry_digest`, `lineage_reference`
+
+error[E0609]: no field `native_files` on type `VerifiedRun`
+   --> tests/openwarrant_receipt.rs:141:22
+    |
+141 |     assert!(verified.native_files.contains(lineage));
+    |                      ^^^^^^^^^^^^ unknown field
+    |
+    = note: available fields are: `binding`, `outcome`, `run_id`, `receipt_digest`, `registry_digest`, `lineage_reference`
+
+For more information about this error, try `rustc --explain E0609`.
+error: could not compile `blut` (test "openwarrant_receipt") due to 2 previous errors

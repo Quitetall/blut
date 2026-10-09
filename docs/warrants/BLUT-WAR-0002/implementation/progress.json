@@ -3,19 +3,17 @@
   "warrant": "BLUT-WAR-0002",
   "work_state": "in-progress",
   "reported_by": "agent://codex",
-  "revision": "e639905c51b65b900e054e0e1533cfda351f1ff6",
-  "summary": "Native producer/offline verifier prototype: six receipt tests and six Ray parser regression tests pass; formatting, record integrity and optional-feature all-target Clippy pass. Full hosted CI, public file-reference API/transport, Dispatch integration and qualification remain open.",
+  "revision": "ba1fb20fc2673eb40a860191ad3ccd36e4ff6ac0",
+  "summary": "Native producer/verifier exposes checked file references and optional retained lifecycle reference. Nine CPU/receipt controls pass, including all terminal outcomes, same-length artifact mutation and altered seals. All-target feature Clippy/formatting pass; transport, recorded Dispatch integration and qualification remain open.",
   "notes": "docs/warrants/BLUT-WAR-0002/implementation/README.md",
   "evidence": [
-    "docs/warrants/BLUT-WAR-0002/implementation/current-main-native-tests.log",
-    "docs/warrants/BLUT-WAR-0002/implementation/ambiguous-path-red.log",
-    "docs/warrants/BLUT-WAR-0002/implementation/current-main-record-check.log",
-    "docs/warrants/BLUT-WAR-0002/implementation/current-main-native-clippy-final.log",
-    "docs/warrants/BLUT-WAR-0002/implementation/current-main-ray-tests.log"
+    "docs/warrants/BLUT-WAR-0002/implementation/file-reference-red.log",
+    "docs/warrants/BLUT-WAR-0002/implementation/file-outcome-controls.log",
+    "docs/warrants/BLUT-WAR-0002/implementation/file-outcome-clippy.log"
   ],
   "next_steps": [
-    "Expose verified native file references, complete CI, and exercise warning, failure and deadline controls.",
-    "Connect the provider-owned verification API to the OpenWarrant runtime assessment through explicit transport.",
-    "Run an actual recorded Dispatch integration and obtain independent/operator qualification; do not infer acceptance from tests."
+    "Expose provider-owned process transport without importing the BLUT engine into the OpenWarrant SDK.",
+    "Connect native verification to an actual recorded Dispatch and retain native source/binary/job/receipt evidence.",
+    "Complete broader native reference/budget controls, CI and independent/operator qualification; no human acceptance is inferred."
   ]
 }

@@ -1,4 +1,12 @@
-# Native BLUT receipt prototype — 2026-10-09
+# Current native receipt prototype checkpoint
+
+Code revision: ba1fb20fc2673eb40a860191ad3ccd36e4ff6ac0. Nine public native CPU/receipt tests and optional-feature all-target Clippy pass on Rust 1.99.0. Formatting passes. The verifier returns the checked native file table and an optional nonempty lifecycle reference; it does not invent missing paths. Raw version-1 payload bytes and signing preimage are unchanged.
+
+Observed outcomes: actual clean completion, advisory failure with warnings, fatal stage failure, cancellation, and deadline expiry. Controls reject changed keys/signatures, otherwise-valid changed payloads, wrong attempt/plan/binary, same-length output mutation, unavailable job evidence, ambiguous paths and authenticated invalid/contradictory payloads. The file-reference API's initial public missing-field error and subsequent passing suite are retained. All keys are synthetic test keys and confer no authority.
+
+Full current-head CI remains pending. OpenWarrant process transport/callback, real recorded Dispatch integration, additional reference/budget controls, operator key custody and independent qualification remain. No confinement, metered spend, human assurance, authorization or resolution is claimed. The contract remains proposed.
+
+# Earlier checkpoint — 2026-10-09
 
 Current code: e639905c51b65b900e054e0e1533cfda351f1ff6, based on BLUT main 680a698. The native suite ran at the 3a3e7ea source plus its committed test additions; the equivalent Ray parser simplification is covered separately by six parser tests and all-target Clippy. Six public CPU/receipt tests passed on Rust 1.99.0, including ambiguous native paths and authenticated invalid payloads. Formatting passed. Current optional-feature all-target Clippy passed after simplifying an existing nested-if in main's Ray status parser; the original failure is retained. The equivalent parser change's six existing Ray status regression tests passed. Full hosted CI remains pending. Earlier Clippy passed at 49ed090. Record checks passed: 35 pass, 3 warnings, 0 errors. These checks do not execute acceptance gates.
 
