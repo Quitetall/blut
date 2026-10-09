@@ -131,6 +131,8 @@ rcgen = { version = "0.13", optional = true }
 # The cockpit moved to the `crates/blut-tui` sidecar (ADR 0083 M2); the lean
 # CLI is now THE default build — no terminal-UI deps in the engine tree.
 default = []
+# Native OpenWarrant receipt signing; no P2P transport or cloud dependencies.
+openwarrant-receipts = ["dep:ed25519-dalek"]
 # P2P distributed compute — trust model, encryption, task dispatch.
 p2p = ["dep:ed25519-dalek", "dep:aes-gcm", "dep:x25519-dalek", "dep:hkdf", "dep:quinn", "dep:rustls", "dep:webpki", "dep:rcgen"]
 # Cloud compute queue (T3.1 / ADR 0082) — "submit a job, get the result back,

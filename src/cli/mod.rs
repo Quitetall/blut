@@ -2903,7 +2903,7 @@ use recipe::*;
 mod runs;
 use runs::*;
 
-mod registry_export;
+pub(crate) mod registry_export;
 mod stale;
 mod study;
 use stale::*;

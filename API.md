@@ -402,3 +402,19 @@ not a public contract); the `Slurm` / `Ray` launchers (deferred); the
 hidden transitional `broker::Drivers` recipe-JSON path (being replaced by
 `Stage::resource_envelope` per ADR 0133 — do not build against it); and the non-exhaustive async-I/O profile and status-event variants.
 Treat anything not listed under "Preview surface" as subject to change.
+
+
+## Candidate OpenWarrant native receipts
+
+With `--features openwarrant-receipts`, `framework::openwarrant_receipt`
+provides `execute_with_receipt` and offline `verify`. The producer runs a
+PlanSpec through the existing executor in a fresh job and signs its observed
+native outcome and references. The verifier requires an independently trusted
+key and the expected Dispatch, plan, registry, native job and producer binary.
+It does not infer permission, confinement, dollar spend or human acceptance.
+
+The candidate wire contract and limits are in
+[BLUT-ADR-0001](docs/adr/atoms/BLUT-ADR-0001-native-openwarrant-receipts.md).
+That decision is proposed. This API is a prototype, not release qualification.
+Run its actual CPU and refusal scenarios with
+`cargo test --locked --features openwarrant-receipts --test openwarrant_receipt`.

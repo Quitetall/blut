@@ -112,6 +112,13 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
 
+      # Candidate native receipts are optional. Exercise the real executor and
+      # signature/source refusal controls without enabling network transports.
+      - name: OpenWarrant native receipt controls
+        run: |
+          cargo clippy --locked -p blut --features openwarrant-receipts --all-targets -- -D warnings
+          cargo test --locked -p blut --features openwarrant-receipts --test openwarrant_receipt
+
       # P2P distributed compute is off-by-default; without an explicit gate
       # the entire src/p2p tree (and the executor's #[cfg(feature = "p2p")]
       # dispatch path) never compiles in CI and rots silently.
