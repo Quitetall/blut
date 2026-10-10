@@ -1,0 +1,53 @@
+PASS gate.registered                    software.repo.war-check@1.0.0: local candidate, qualified against its declared fault model
+WARN independence.insufficient          2 basic Warrant(s): basic assurance requires verifier_controlled_execution, and the declared independence does not provide it: cannot_modify_subject_artifacts, cannot_modify_gate_definition, cannot_modify_gate_fixtures, separate_writable_workspace. §27.4 — role separation by one person is not organizational independence
+                                             → openwarrant.toml
+WARN authority.unprotected              no protected authority store is configured (`[authority] store`). docs/authority/roles.toml, docs/authority/allowed_signers and the policy keys that decide whether work may close ([independence], allow_automated_resolution, require_user_presence, verifier_argv) are working-tree files the performer can write; review of them is the control (THREAT_MODEL row 6, docs/AUTHENTICATION.md)
+                                             → openwarrant.toml
+PASS manifest.valid                     BLUT-WAR-0001: manifest and composition are well-formed
+PASS traceability.refs                  BLUT-WAR-0001: 1 requirement ref(s) and 1 roadmap ref(s) parse
+PASS journal.append-only                BLUT-WAR-0001: 1 event(s), 0 backfilled, extends the committed journal
+PASS gate.resolved                      BLUT-WAR-0001: 1 cited gate(s) resolve to a bindable definition
+PASS milestones.valid                   BLUT-WAR-0001: 2 milestone(s), 2 stage(s), acyclic with no dangling refs
+PASS obligations.valid                  BLUT-WAR-0001: 2 obligation(s), each with a bounded scope and evidence
+PASS generated.drift                    BLUT-WAR-0001: 2 generated view(s) match a fresh compilation
+PASS manifest.valid                     BLUT-WAR-0002: manifest and composition are well-formed
+PASS capability.not-applicable          BLUT-WAR-0002: profile decision does not select `stages` (the milestone graph and §56.1 requirement 12's runtime receipts): not applicable, not passed (OW-ADR-0031)
+PASS journal.append-only                BLUT-WAR-0002: 1 event(s), 0 backfilled, extends the committed journal
+PASS obligations.valid                  BLUT-WAR-0002: 4 obligation(s), each with a bounded scope and evidence
+PASS generated.drift                    BLUT-WAR-0002: 2 generated view(s) match a fresh compilation
+PASS composition.acyclic                parent graph is acyclic across 2 Warrant(s)
+PASS adr.parsed                         1 ADR(s) parsed
+PASS identity.duplicate-uuid            2 Warrant UUID(s), each naming one Warrant
+PASS identity.duplicate-uuid            1 ADR UUID(s), each naming one ADR
+PASS identity.atom-mismatch             BLUT-WAR-0001: 4 atom(s) name this Warrant's UUID
+PASS identity.atom-mismatch             BLUT-WAR-0002: 3 atom(s) name this Warrant's UUID
+PASS identity.changed                   2 committed manifest UUID(s) unchanged since HEAD, 0 new
+PASS identity.alias-ref                 0 parent and supersedes reference(s), each by UUID
+WARN identity.adr-not-v7                BLUT-ADR-0001: adr_uuid ea1c3c27-5fd3-4747-a203-7a1b8a584584 is a version-4 UUID; §12.1 requires a UUIDv7 for every ADR. Reported, not re-minted — §12.2 says an identity never changes
+                                             → docs/adr/atoms/BLUT-ADR-0001-native-openwarrant-receipts.md
+PASS sas-normative.section-labels       no unsupported numbered SAS heading hides or mislabels a normative body statement
+PASS sas.pinned                         docs/sas/BLUT_SAS.md matches revision 0.1.0 (proposed), sha256:9a75e23d7b05
+PASS warrant-overview.drift             WARRANT_OVERVIEW.md matches a fresh compilation
+PASS adr-overview.drift                 ADR_OVERVIEW.md matches a fresh compilation
+PASS corpus-status.drift                CORPUS_STATUS.md matches a fresh compilation
+PASS corpus-status.drift                CORPUS_STATUS.json matches a fresh compilation
+PASS corpus-status.drift                CORPUS_STATUS.html matches a fresh compilation
+PASS corpus-timeline.drift              CORPUS_TIMELINE.json matches a fresh compilation
+PASS corpus-pending.drift               CORPUS_PENDING.json matches a fresh compilation
+PASS sas-normative.drift                NORMATIVE.md matches a fresh compilation
+PASS sas-normative.drift                NORMATIVE.json matches a fresh compilation
+PASS sas-sections.drift                 SECTIONS.md matches a fresh compilation
+PASS sas-sections.drift                 SECTIONS.json matches a fresh compilation
+PASS generated.drift                    CURRENT.md matches a fresh compilation
+
+35 pass · 3 warn · 0 unknown · 0 error   (worst: WARN)
+
+NOT CHECKED:
+  · 2 of 2 Warrant(s) have no disposed              obligations — §38.6 yields no resolution verdict for them, which is the              expected state of work that has not been assessed
+  · contract digest covers 8 of 17 §28.5 elements — missing: deliverables, capabilities, autonomy, resources, gates, obligations, rollback, amendment_policy, assurance_requirements
+  · gate execution — `war gate --run` executes a registered gate (§44), but `war check` does not invoke it, so nothing here is evidence that a Warrant's acceptance gates were run
+  · Preflight readiness (§32.7) — 'well-formed' is a claim about the record only
+  · bound-atom resolution — `ref =` atoms cannot be fetched offline
+  · Source Holder ambiguity and classification propagation (§91.2 tests 14, 15) — narrowed by OW-ADR-0008: test 14 needs a `source_holder` on atoms, which §13 requires and none declares; test 15 needs a classification ordering, which the SAS does not give. Neither is undecided — both are undeclared
+
+WELL-FORMED (record only — Preflight is not implemented, and `war check` does not run gates)

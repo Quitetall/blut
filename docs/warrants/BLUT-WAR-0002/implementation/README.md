@@ -1,0 +1,48 @@
+# Current file and process transport checkpoint
+
+## Unqualified catalog and execution-fixture candidate
+
+The current candidate additionally exports `registry_digest(&Registry)` using
+the existing native manifest bytes and hash domain. This lets a trusted caller
+resolve the expected catalog without copying a receipt's assertion or a schema
+pin. Its public transport test first failed with a missing API; the subsequent
+Rust 1.99.0 test passed, comparing the independently resolved catalog with the
+native file-transport result and distinguishing an empty registry. This is one
+bounded test; current all-target Clippy and cross-project qualification remain
+pending. RED/GREEN logs are retained in the project's runtime-evidence folder.
+
+`examples/openwarrant_fixture_producer.rs` is explicitly test-only. It runs one
+local CPU `connector_object` stage, writes a native receipt and retains its exact
+producer binary. The stage declares an object reference; it does not fetch or
+prove the referenced object's availability. The signing key is public synthetic
+test material held in memory; only the public half is written. This producer
+must not be used for authority or production collection. A recorded OpenWarrant
+Dispatch integration fixture is being prepared; its execution and the new
+producer's build are not yet established. The earlier passing checkpoint below
+applies to its named revision.
+
+Code revision: 9f75a3fff4f818eb82ca0e220388827c9ca3e50a. Eleven native receipt tests pass, including file transport against an actual CPU run and refusals for missing, malformed, oversized and symlink inputs. Three process controls pass: missing evidence reports unavailable; malformed and oversized receipt JSON report rejected. All return the documented JSON schema, leave the job absent and claim no assurance. A valid process response against a real recorded OpenWarrant Dispatch has not been established.
+
+Optional-feature all-target Clippy with warnings denied, formatting and the redacted working-tree secret scan pass. The missing file API and missing CLI command have retained RED observations. The initial cache-changing check attempt timed out without a test verdict; the redundant test build was stopped after discovering the machine's changed intermediate-cache configuration. The first CLI build exceeded its 180-second deadline without a verdict; the formatted-source build passed with a 600-second bound. These are not passing tests. Existing project intermediates were reused with an explicit build.build-dir override; no other process or cache was removed.
+
+The previous saved head 9824fe9 passed CI 38005970687. CI for this new code is not established yet. The draft PR's CLA check remains failed because of its stored-record format; no consent/signature records were edited. OpenWarrant callback and real recorded Dispatch integration, additional native reference/budget controls, independent/operator qualification and collector key custody remain. This proposed contract does not confer authority, confinement, spend accounting, human assurance or resolution.
+
+# Earlier native receipt prototype checkpoint
+
+Code revision: ba1fb20fc2673eb40a860191ad3ccd36e4ff6ac0. Nine public native CPU/receipt tests and optional-feature all-target Clippy pass on Rust 1.99.0. Formatting passes. The verifier returns the checked native file table and an optional nonempty lifecycle reference; it does not invent missing paths. Raw version-1 payload bytes and signing preimage are unchanged.
+
+Observed outcomes: actual clean completion, advisory failure with warnings, fatal stage failure, cancellation, and deadline expiry. Controls reject changed keys/signatures, otherwise-valid changed payloads, wrong attempt/plan/binary, same-length output mutation, unavailable job evidence, ambiguous paths and authenticated invalid/contradictory payloads. The file-reference API's initial public missing-field error and subsequent passing suite are retained. All keys are synthetic test keys and confer no authority.
+
+Full current-head CI remains pending. OpenWarrant process transport/callback, real recorded Dispatch integration, additional reference/budget controls, operator key custody and independent qualification remain. No confinement, metered spend, human assurance, authorization or resolution is claimed. The contract remains proposed.
+
+# Earlier checkpoint — 2026-10-09
+
+Current code: e639905c51b65b900e054e0e1533cfda351f1ff6, based on BLUT main 680a698. The native suite ran at the 3a3e7ea source plus its committed test additions; the equivalent Ray parser simplification is covered separately by six parser tests and all-target Clippy. Six public CPU/receipt tests passed on Rust 1.99.0, including ambiguous native paths and authenticated invalid payloads. Formatting passed. Current optional-feature all-target Clippy passed after simplifying an existing nested-if in main's Ray status parser; the original failure is retained. The equivalent parser change's six existing Ray status regression tests passed. Full hosted CI remains pending. Earlier Clippy passed at 49ed090. Record checks passed: 35 pass, 3 warnings, 0 errors. These checks do not execute acceptance gates.
+
+The tests use the actual executor and synthetic in-memory test keys. No operator secret, human authorization, consent or assurance mark was created. Controls cover actual CPU completion, cancellation, existing-job preservation, wrong key/binding/plan/binary, altered payload/native output, missing native evidence, ambiguous paths, duplicate/unknown fields, unsupported version and contradictory outcome. The path refusal has retained RED evidence followed by the passing six-test suite. Earlier compile deadlines, the obsolete-base cancellation and CI failures remain in the external evidence directory.
+
+Secret-scan exceptions cover two exact independently recomputed public journal digests. Original journal records are unchanged. The scanner still detects a different idempotency key and a non-sequential synthetic GitHub credential in the same file. The first sequential credential plant was not detected; that failed control is retained externally. This is not evidence of actual credential validity.
+
+This is bounded implementation evidence. Warning/deadline/failure controls, provider transport, OpenWarrant callback, real recorded Dispatch integration, independent qualification and operator key custody remain. Retained test logs cannot replace production receipts or a consenting-user study.
+
+Three pre-existing bootstrap commits (b4fc30d, b6cefbd, 6eedf20) remain dependency history. Current BLUT main was merged INTO the draft at 8dcab1c; this draft has not been merged into BLUT main. PR #103 remains a draft. CLA store-format failure remains unresolved and no signature records have been changed.

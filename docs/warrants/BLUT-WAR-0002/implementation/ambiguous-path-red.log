@@ -1,0 +1,24 @@
+    Blocking waiting for file lock on package cache
+   Compiling blut v0.2.0-alpha.1 (/mnt/4tb/tmp/openwarrant-blut-native-receipts)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 48s
+     Running tests/openwarrant_receipt.rs (/mnt/4tb/OpenWarrant/target/debug/deps/openwarrant_receipt-b50599af76f5315c)
+
+running 1 test
+test ambiguous_native_path_is_not_sealed_as_completed ... FAILED
+
+failures:
+
+---- ambiguous_native_path_is_not_sealed_as_completed stdout ----
+
+thread 'ambiguous_native_path_is_not_sealed_as_completed' (2822605) panicked at tests/openwarrant_receipt.rs:290:5:
+assertion failed: matches!(result, Err(ReceiptError::Rejected(ref reason)) if
+    reason.contains("ambiguous native path"))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    ambiguous_native_path_is_not_sealed_as_completed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 3.75s
+
+error: test failed, to rerun pass `-p blut --test openwarrant_receipt`

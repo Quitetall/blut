@@ -287,7 +287,16 @@ as an optional fallback.
 
 ## Status
 
-**Source version: 0.2.0-alpha.1**, published on crates.io and tagged here. Each
+BLUT carries a draft [OpenWarrant SAS](docs/sas/BLUT_SAS.md), adoption Warrants,
+and a local repository gate. `war check` validates their structure; no SAS
+acceptance, Warrant authorization, independent verification, or release
+qualification is implied. `AGENTS.md` states the agent/human boundary. BLUT's
+five phases in its SAS define this project's scope; the tool's own release
+phases do not qualify BLUT. The draft integration pins a tested OpenWarrant
+prerelease for its generated views.
+
+**Source version: 0.2.0-alpha.2.** The earlier **0.2.0-alpha.1** was published
+on crates.io and tagged here. Each
 published crate has a `<crate>-v<version>` tag and a GitHub release pointing at
 the exact commit it was built from, recovered from the published tarball's own
 `.cargo_vcs_info.json`.

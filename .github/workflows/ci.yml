@@ -23,6 +23,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  governance:
+    name: OpenWarrant · record integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+      - name: Install OpenWarrant toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
+        with:
+          toolchain: 1.97.1
+      - name: Install pinned OpenWarrant CLI
+        run: |
+          # Match the tested prerelease compiler used for these draft projections.
+          # A record-integrity pass is not authorization or qualification.
+          cargo install --locked --git https://github.com/Quitetall/OpenWarrant.git --rev 41b5f92d6a1be9e8f361bd842133f736807aad9e openwarrant-cli
+          case "$(war --version)" in
+            "war 1.0.0-alpha.2 "*) ;;
+            *) echo "unexpected OpenWarrant compiler version" >&2; exit 1 ;;
+          esac
+      - name: Check authored records and committed projections
+        run: war check --generated
+      - name: Probe repository gate
+        run: war gate --run --gate software.repo.war-check@1.0.0
+
   build-test-lint:
     name: build · test · clippy · fmt
     runs-on: ubuntu-latest
@@ -90,6 +116,15 @@ jobs:
 
       - name: Test
         run: cargo test --locked --workspace
+
+      # Candidate native receipts are optional. Exercise the real executor and
+      # signature/source refusal controls without enabling network transports.
+      - name: OpenWarrant native receipt controls
+        run: |
+          cargo clippy --locked -p blut --features openwarrant-receipts --all-targets -- -D warnings
+          cargo test --locked -p blut --features openwarrant-receipts --test openwarrant_receipt
+          cargo build --locked -p blut --features openwarrant-receipts --example openwarrant_verifier
+          python3 tools/check_openwarrant_transport.py target/debug/examples/openwarrant_verifier
 
       # P2P distributed compute is off-by-default; without an explicit gate
       # the entire src/p2p tree (and the executor's #[cfg(feature = "p2p")]

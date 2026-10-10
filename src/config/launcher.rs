@@ -798,17 +798,18 @@ impl RayJob {
     fn parse_ray_status(output: &str) -> JobState {
         // `Status for job '<id>': <STATE>` — the non-terminal form.
         for line in output.lines() {
-            if let Some((_, rest)) = line.split_once("Status for job ") {
-                if let Some((_, state)) = rest.rsplit_once(": ") {
-                    let state = state.trim();
-                    return match state {
-                        "SUCCEEDED" => JobState::Succeeded,
-                        "FAILED" => JobState::Failed("FAILED".to_string()),
-                        "RUNNING" | "PENDING" | "WAITING" | "CONSTRUCTOR" => JobState::Running,
-                        "STOPPED" | "CANCELLED" => JobState::Cancelled,
-                        other => JobState::Unknown(other.to_string()),
-                    };
-                }
+            if let Some((_, state)) = line
+                .split_once("Status for job ")
+                .and_then(|(_, rest)| rest.rsplit_once(": "))
+            {
+                let state = state.trim();
+                return match state {
+                    "SUCCEEDED" => JobState::Succeeded,
+                    "FAILED" => JobState::Failed("FAILED".to_string()),
+                    "RUNNING" | "PENDING" | "WAITING" | "CONSTRUCTOR" => JobState::Running,
+                    "STOPPED" | "CANCELLED" => JobState::Cancelled,
+                    other => JobState::Unknown(other.to_string()),
+                };
             }
         }
         // Terminal prose. Scan only up to the `Status message:` line: past it,

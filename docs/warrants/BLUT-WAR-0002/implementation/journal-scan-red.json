@@ -1,0 +1,42 @@
+[
+ {
+  "RuleID": "generic-api-key",
+  "Description": "Detected a Generic API Key, potentially exposing access to various services and sensitive operations.",
+  "StartLine": 1,
+  "EndLine": 1,
+  "StartColumn": 311,
+  "EndColumn": 393,
+  "Match": "idempotency_key\":\"REDACTED\"",
+  "Secret": "REDACTED",
+  "File": "receipt-scan-controls/BLUT-WAR-0002.jsonl",
+  "SymlinkFile": "",
+  "Commit": "",
+  "Entropy": 3.7776716,
+  "Author": "",
+  "Email": "",
+  "Date": "",
+  "Message": "",
+  "Tags": [],
+  "Fingerprint": "receipt-scan-controls/BLUT-WAR-0002.jsonl:generic-api-key:1"
+ },
+ {
+  "RuleID": "generic-api-key",
+  "Description": "Detected a Generic API Key, potentially exposing access to various services and sensitive operations.",
+  "StartLine": 1,
+  "EndLine": 1,
+  "StartColumn": 287,
+  "EndColumn": 369,
+  "Match": "idempotency_key\":\"REDACTED\"",
+  "Secret": "REDACTED",
+  "File": "receipt-scan-controls/BLUT-WAR-0001.jsonl",
+  "SymlinkFile": "",
+  "Commit": "",
+  "Entropy": 3.7228315,
+  "Author": "",
+  "Email": "",
+  "Date": "",
+  "Message": "",
+  "Tags": [],
+  "Fingerprint": "receipt-scan-controls/BLUT-WAR-0001.jsonl:generic-api-key:1"
+ }
+]

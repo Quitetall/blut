@@ -1,0 +1,22 @@
+   Compiling blut v0.2.0-alpha.1 (/mnt/4tb/tmp/openwarrant-blut-native-receipts)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 45s
+     Running tests/openwarrant_receipt.rs (/mnt/4tb/OpenWarrant/target/debug/deps/openwarrant_receipt-b50599af76f5315c)
+
+running 1 test
+test actual_cpu_execution_yields_a_verifiable_dispatch_bound_receipt ... FAILED
+
+failures:
+
+---- actual_cpu_execution_yields_a_verifiable_dispatch_bound_receipt stdout ----
+
+thread 'actual_cpu_execution_yields_a_verifiable_dispatch_bound_receipt' (2315976) panicked at tests/openwarrant_receipt.rs:54:103:
+called `Result::unwrap()` on an `Err` value: Unavailable("producer not implemented")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    actual_cpu_execution_yields_a_verifiable_dispatch_bound_receipt
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test openwarrant_receipt`

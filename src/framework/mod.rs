@@ -42,6 +42,8 @@ pub mod gpu_sampler;
 pub mod graph;
 pub mod lineage;
 pub mod object_store;
+#[cfg(feature = "openwarrant-receipts")]
+pub mod openwarrant_receipt;
 pub mod plan;
 pub mod plan_spec;
 pub mod resource;

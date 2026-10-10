@@ -1,0 +1,11 @@
+   Compiling blut v0.2.0-alpha.2 (/mnt/4tb/tmp/openwarrant-blut-native-receipts)
+error[E0432]: unresolved imports `blut::framework::openwarrant_receipt::VerificationFiles`, `blut::framework::openwarrant_receipt::verify_files`
+   --> tests/openwarrant_receipt.rs:135:48
+    |
+135 |     use blut::framework::openwarrant_receipt::{VerificationFiles, verify_files};
+    |                                                ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^ no `verify_files` in `framework::openwarrant_receipt`
+    |                                                |
+    |                                                no `VerificationFiles` in `framework::openwarrant_receipt`
+
+For more information about this error, try `rustc --explain E0432`.
+error: could not compile `blut` (test "openwarrant_receipt") due to 1 previous error
