@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -88,6 +88,79 @@ pub enum ReceiptError {
     Unavailable(String),
     #[error("native-receipt-rejected: {0}")]
     Rejected(String),
+}
+/// Paths established by the caller, never selected by receipt contents.
+/// Transport limits: 8 MiB + 1 KiB envelope JSON, 32 KiB binding JSON,
+/// 2 MiB plan JSON. These limits apply before deserialization/allocation.
+#[derive(Debug)]
+pub struct VerificationFiles {
+    pub receipt: PathBuf,
+    pub binding: PathBuf,
+    pub plan: PathBuf,
+    pub job: PathBuf,
+    pub producer_executable: PathBuf,
+}
+
+fn read_transport(path: &Path, max: u64) -> Result<Vec<u8>, ReceiptError> {
+    let meta = fs::symlink_metadata(path).map_err(unavailable)?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return Err(rejected("transport input is not a regular file"));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Refuse final-component links; do not block on a swapped FIFO.
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(unavailable)?;
+    let opened = file.metadata().map_err(unavailable)?;
+    if !opened.is_file() || opened.len() > max {
+        return Err(rejected("transport input type or byte budget"));
+    }
+    let mut bytes = Vec::new();
+    file.take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unavailable)?;
+    if bytes.len() as u64 > max || bytes.len() as u64 != opened.len() {
+        return Err(rejected("transport input byte budget or changed length"));
+    }
+    Ok(bytes)
+}
+
+/// Read-only file transport for the native verifier. Missing evidence remains
+/// unavailable; malformed or oversized input is rejected. No plan is executed.
+pub fn verify_files(
+    request: &VerificationFiles,
+    trusted_key: &VerifyingKey,
+    reg: &Registry,
+) -> Result<VerifiedRun, ReceiptError> {
+    fn decode<T: serde::de::DeserializeOwned>(path: &Path, max: u64) -> Result<T, ReceiptError> {
+        serde_json::from_slice(&read_transport(path, max)?)
+            .map_err(|e| rejected(format!("transport JSON: {e}")))
+    }
+    let envelope: Envelope = decode(&request.receipt, 8 * 1024 * 1024 + 1024)?;
+    let binding: DispatchBinding = decode(&request.binding, 32 * 1024)?;
+    let spec: PlanSpec = decode(&request.plan, MAX_PAYLOAD as u64)?;
+    verify(
+        &envelope,
+        trusted_key,
+        &binding,
+        &spec,
+        reg,
+        &request.job,
+        &request.producer_executable,
+    )
+}
+
+/// Load exactly 32 raw bytes of a caller-trusted Ed25519 PUBLIC key.
+/// This function never reads a private key or selects trust from a receipt.
+pub fn read_verification_key(path: &Path) -> Result<VerifyingKey, ReceiptError> {
+    let bytes: [u8; 32] = read_transport(path, 32)?
+        .try_into()
+        .map_err(|_| rejected("public key must contain exactly 32 raw bytes"))?;
+    VerifyingKey::from_bytes(&bytes).map_err(|_| rejected("invalid public key"))
 }
 fn rejected(v: impl Into<String>) -> ReceiptError {
     ReceiptError::Rejected(v.into())

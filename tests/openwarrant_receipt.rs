@@ -131,6 +131,101 @@ fn binding() -> DispatchBinding {
 }
 
 #[tokio::test]
+async fn file_transport_checks_native_receipt_without_executing_again() {
+    use blut::framework::openwarrant_receipt::{VerificationFiles, verify_files};
+    let td = tempfile::tempdir().unwrap();
+    let job = td.path().join("transport-job");
+    let signer = SigningKey::from_bytes(&[7; 32]);
+    let reg = registry();
+    let plan = spec();
+    let expected = binding();
+    let run = execute_with_receipt(
+        &plan,
+        &reg,
+        ExecCtx::new(job.clone()),
+        expected.clone(),
+        &signer,
+    )
+    .await
+    .unwrap();
+    run.result.unwrap();
+    let receipt = td.path().join("receipt.json");
+    let binding_file = td.path().join("binding.json");
+    let plan_file = td.path().join("plan.json");
+    std::fs::write(&receipt, serde_json::to_vec(&run.envelope).unwrap()).unwrap();
+    std::fs::write(&binding_file, serde_json::to_vec(&expected).unwrap()).unwrap();
+    std::fs::write(&plan_file, serde_json::to_vec(&plan).unwrap()).unwrap();
+    let request = VerificationFiles {
+        receipt,
+        binding: binding_file,
+        plan: plan_file,
+        job,
+        producer_executable: std::env::current_exe().unwrap(),
+    };
+    let verified = verify_files(&request, &signer.verifying_key(), &reg).unwrap();
+    assert_eq!(verified.outcome, Outcome::Completed);
+    assert_eq!(verified.binding, expected);
+    assert_eq!(verified.lineage_reference.unwrap().path, "status.jsonl");
+}
+
+#[test]
+fn file_transport_refuses_oversized_malformed_and_missing_inputs() {
+    use blut::framework::openwarrant_receipt::{
+        ReceiptError, VerificationFiles, read_verification_key, verify_files,
+    };
+    let td = tempfile::tempdir().unwrap();
+    let receipt = td.path().join("receipt.json");
+    let key_file = td.path().join("public-key.bin");
+    let key = SigningKey::from_bytes(&[7; 32]).verifying_key();
+    std::fs::write(&key_file, key.as_bytes()).unwrap();
+    assert_eq!(read_verification_key(&key_file).unwrap(), key);
+    std::fs::write(&key_file, [7; 33]).unwrap();
+    assert!(matches!(
+        read_verification_key(&key_file),
+        Err(ReceiptError::Rejected(_))
+    ));
+    let request = VerificationFiles {
+        receipt: receipt.clone(),
+        binding: td.path().join("binding.json"),
+        plan: td.path().join("plan.json"),
+        job: td.path().join("job"),
+        producer_executable: std::env::current_exe().unwrap(),
+    };
+    let reg = registry();
+    assert!(matches!(
+        verify_files(&request, &key, &reg),
+        Err(ReceiptError::Unavailable(_))
+    ));
+    std::fs::write(&receipt, b"{broken}").unwrap();
+    assert!(matches!(
+        verify_files(&request, &key, &reg),
+        Err(ReceiptError::Rejected(_))
+    ));
+    let oversized = std::fs::File::create(&receipt).unwrap();
+    oversized.set_len(8 * 1024 * 1024 + 1025).unwrap();
+    assert!(matches!(
+        verify_files(&request, &key, &reg),
+        Err(ReceiptError::Rejected(_))
+    ));
+    #[cfg(unix)]
+    {
+        let link = td.path().join("link.json");
+        std::os::unix::fs::symlink(&receipt, &link).unwrap();
+        assert!(matches!(
+            verify_files(
+                &VerificationFiles {
+                    receipt: link,
+                    ..request
+                },
+                &key,
+                &reg
+            ),
+            Err(ReceiptError::Rejected(_))
+        ));
+    }
+}
+
+#[tokio::test]
 async fn actual_cpu_execution_yields_a_verifiable_dispatch_bound_receipt() {
     let td = tempfile::tempdir().unwrap();
     let job = td.path().join("job-1");

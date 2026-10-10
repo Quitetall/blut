@@ -123,6 +123,8 @@ jobs:
         run: |
           cargo clippy --locked -p blut --features openwarrant-receipts --all-targets -- -D warnings
           cargo test --locked -p blut --features openwarrant-receipts --test openwarrant_receipt
+          cargo build --locked -p blut --features openwarrant-receipts --example openwarrant_verifier
+          python3 tools/check_openwarrant_transport.py target/debug/examples/openwarrant_verifier
 
       # P2P distributed compute is off-by-default; without an explicit gate
       # the entire src/p2p tree (and the executor's #[cfg(feature = "p2p")]

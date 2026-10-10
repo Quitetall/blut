@@ -96,6 +96,12 @@ enum Command {
         #[command(subcommand)]
         cmd: registry_export::RegistryCommand,
     },
+    /// Validate retained native receipt evidence (never execute or authorize).
+    #[cfg(feature = "openwarrant-receipts")]
+    Openwarrant {
+        #[command(subcommand)]
+        cmd: openwarrant::ReceiptCommand,
+    },
     /// Multi-objective studies (ADR 0109): run trials through the ordinary HPO
     /// path and report the Pareto front instead of a single winner.
     Study {
@@ -1082,6 +1088,8 @@ pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>)
         Some(Command::Hpo { cmd }) => run_hpo(&reg, cmd).await.map(|_| ()),
         Some(Command::Study { cmd }) => study::run_study(&reg, cmd).await,
         Some(Command::Registry { cmd }) => registry_export::run_registry(&reg, cmd),
+        #[cfg(feature = "openwarrant-receipts")]
+        Some(Command::Openwarrant { cmd }) => openwarrant::run(&reg, cmd),
         Some(Command::Dag { job, json }) => run_dag(job, json),
         Some(Command::Compare { a, b }) => run_compare(&a, &b),
         Some(Command::Results {
@@ -2918,6 +2926,8 @@ use recipe::*;
 mod runs;
 use runs::*;
 
+#[cfg(feature = "openwarrant-receipts")]
+mod openwarrant;
 pub(crate) mod registry_export;
 mod stale;
 mod study;
