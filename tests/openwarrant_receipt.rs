@@ -132,11 +132,15 @@ fn binding() -> DispatchBinding {
 
 #[tokio::test]
 async fn file_transport_checks_native_receipt_without_executing_again() {
-    use blut::framework::openwarrant_receipt::{VerificationFiles, verify_files};
+    use blut::framework::openwarrant_receipt::{VerificationFiles, registry_digest, verify_files};
     let td = tempfile::tempdir().unwrap();
     let job = td.path().join("transport-job");
     let signer = SigningKey::from_bytes(&[7; 32]);
     let reg = registry();
+    // Resolve the expected native catalog from a trusted registry before the
+    // receipt exists. Do not use a schema pin or borrow identity from payload.
+    let expected_catalog = registry_digest(&reg).unwrap();
+    assert_ne!(expected_catalog, registry_digest(&Registry::new()).unwrap());
     let plan = spec();
     let expected = binding();
     let run = execute_with_receipt(
@@ -165,6 +169,7 @@ async fn file_transport_checks_native_receipt_without_executing_again() {
     let verified = verify_files(&request, &signer.verifying_key(), &reg).unwrap();
     assert_eq!(verified.outcome, Outcome::Completed);
     assert_eq!(verified.binding, expected);
+    assert_eq!(verified.registry_digest, expected_catalog);
     assert_eq!(verified.lineage_reference.unwrap().path, "status.jsonl");
 }
 

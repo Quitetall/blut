@@ -189,6 +189,12 @@ fn canonical<T: Serialize>(v: &T) -> Result<Vec<u8>, ReceiptError> {
 fn registry_bytes(reg: &Registry) -> Result<Vec<u8>, ReceiptError> {
     canonical(&crate::cli::registry_export::build_manifest(reg))
 }
+/// Resolve the native catalog identity from a caller-trusted registry, without
+/// borrowing identity from a receipt or a schema/version pin. Uses exactly the
+/// manifest bytes and BLAKE3 domain used by the native producer and verifier.
+pub fn registry_digest(reg: &Registry) -> Result<String, ReceiptError> {
+    registry_bytes(reg).map(|bytes| digest(&bytes))
+}
 fn now() -> Result<u64, ReceiptError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

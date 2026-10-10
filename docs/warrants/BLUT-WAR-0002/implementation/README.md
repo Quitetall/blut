@@ -1,5 +1,22 @@
 # Current file and process transport checkpoint
 
+## Unqualified catalog and execution-fixture candidate
+
+The current candidate additionally exports `registry_digest(&Registry)` using
+the existing native manifest bytes and hash domain. This lets a trusted caller
+resolve the expected catalog without copying a receipt's assertion or a schema
+pin. Its public transport test first failed with a missing API; the subsequent
+test build is pending. These changes have not received a passing test verdict.
+
+`examples/openwarrant_fixture_producer.rs` is explicitly test-only. It runs one
+local CPU `connector_object` stage, writes a native receipt and retains its exact
+producer binary. The stage declares an object reference; it does not fetch or
+prove the referenced object's availability. The signing key is public synthetic
+test material held in memory; only the public half is written. This producer
+must not be used for authority or production collection. A recorded OpenWarrant
+Dispatch integration fixture is being prepared; its execution is not yet
+established. The earlier passing checkpoint below applies to its named revision.
+
 Code revision: 9f75a3fff4f818eb82ca0e220388827c9ca3e50a. Eleven native receipt tests pass, including file transport against an actual CPU run and refusals for missing, malformed, oversized and symlink inputs. Three process controls pass: missing evidence reports unavailable; malformed and oversized receipt JSON report rejected. All return the documented JSON schema, leave the job absent and claim no assurance. A valid process response against a real recorded OpenWarrant Dispatch has not been established.
 
 Optional-feature all-target Clippy with warnings denied, formatting and the redacted working-tree secret scan pass. The missing file API and missing CLI command have retained RED observations. The initial cache-changing check attempt timed out without a test verdict; the redundant test build was stopped after discovering the machine's changed intermediate-cache configuration. The first CLI build exceeded its 180-second deadline without a verdict; the formatted-source build passed with a 600-second bound. These are not passing tests. Existing project intermediates were reused with an explicit build.build-dir override; no other process or cache was removed.
