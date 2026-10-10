@@ -6,7 +6,10 @@ The current candidate additionally exports `registry_digest(&Registry)` using
 the existing native manifest bytes and hash domain. This lets a trusted caller
 resolve the expected catalog without copying a receipt's assertion or a schema
 pin. Its public transport test first failed with a missing API; the subsequent
-test build is pending. These changes have not received a passing test verdict.
+Rust 1.99.0 test passed, comparing the independently resolved catalog with the
+native file-transport result and distinguishing an empty registry. This is one
+bounded test; current all-target Clippy and cross-project qualification remain
+pending. RED/GREEN logs are retained in the project's runtime-evidence folder.
 
 `examples/openwarrant_fixture_producer.rs` is explicitly test-only. It runs one
 local CPU `connector_object` stage, writes a native receipt and retains its exact
@@ -14,8 +17,9 @@ producer binary. The stage declares an object reference; it does not fetch or
 prove the referenced object's availability. The signing key is public synthetic
 test material held in memory; only the public half is written. This producer
 must not be used for authority or production collection. A recorded OpenWarrant
-Dispatch integration fixture is being prepared; its execution is not yet
-established. The earlier passing checkpoint below applies to its named revision.
+Dispatch integration fixture is being prepared; its execution and the new
+producer's build are not yet established. The earlier passing checkpoint below
+applies to its named revision.
 
 Code revision: 9f75a3fff4f818eb82ca0e220388827c9ca3e50a. Eleven native receipt tests pass, including file transport against an actual CPU run and refusals for missing, malformed, oversized and symlink inputs. Three process controls pass: missing evidence reports unavailable; malformed and oversized receipt JSON report rejected. All return the documented JSON schema, leave the job absent and claim no assurance. A valid process response against a real recorded OpenWarrant Dispatch has not been established.
 
