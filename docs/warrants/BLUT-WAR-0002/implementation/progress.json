@@ -3,17 +3,18 @@
   "warrant": "BLUT-WAR-0002",
   "work_state": "in-progress",
   "reported_by": "agent://codex",
-  "revision": "ba1fb20fc2673eb40a860191ad3ccd36e4ff6ac0",
-  "summary": "Native producer/verifier exposes checked file references and optional retained lifecycle reference. Nine CPU/receipt controls pass, including all terminal outcomes, same-length artifact mutation and altered seals. All-target feature Clippy/formatting pass; transport, recorded Dispatch integration and qualification remain open.",
+  "revision": "9f75a3fff4f818eb82ca0e220388827c9ca3e50a",
+  "summary": "Native verification now has bounded file inputs and a read-only JSON process command. Eleven native tests, three process refusal controls, all-target feature Clippy, formatting and secret scan pass. Actual recorded Dispatch integration and qualification remain open.",
   "notes": "docs/warrants/BLUT-WAR-0002/implementation/README.md",
   "evidence": [
-    "docs/warrants/BLUT-WAR-0002/implementation/file-reference-red.log",
-    "docs/warrants/BLUT-WAR-0002/implementation/file-outcome-controls.log",
-    "docs/warrants/BLUT-WAR-0002/implementation/file-outcome-clippy.log"
+    "docs/warrants/BLUT-WAR-0002/implementation/file-transport-cached-red.log",
+    "docs/warrants/BLUT-WAR-0002/implementation/transport-final-tests.log",
+    "docs/warrants/BLUT-WAR-0002/implementation/transport-clippy.log",
+    "docs/warrants/BLUT-WAR-0002/implementation/cli-transport-controls.log"
   ],
   "next_steps": [
-    "Expose provider-owned process transport without importing the BLUT engine into the OpenWarrant SDK.",
-    "Connect native verification to an actual recorded Dispatch and retain native source/binary/job/receipt evidence.",
-    "Complete broader native reference/budget controls, CI and independent/operator qualification; no human acceptance is inferred."
+    "Connect the provider-owned process response to the OpenWarrant ReceiptVerifier interface without linking the AGPL engine into the SDK.",
+    "Prove a valid process call against an actual recorded Dispatch, retaining native source/binary/job/receipt evidence.",
+    "Complete remaining reference/budget controls and independent/operator qualification; clear legitimate merge gates without inventing consent."
   ]
 }

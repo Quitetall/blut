@@ -249,6 +249,22 @@ The envelope contains exact payload bytes and a 64-byte signature. The version-1
 
 The offline `verify` API takes the envelope, independently trusted public key, expected Dispatch, PlanSpec, Registry, retained native job and exact retained producer executable. It rechecks the complete native file table and input records, plus plan/catalog/executable identities. It does not choose trust from a receipt field. After these checks, `VerifiedRun.native_files` exposes the checked relative paths, byte counts, BLAKE3 content identities and native modes as `NativeFileReference` values. The table includes native metadata and lifecycle files as well as outputs; an entry does not mean an accepted deliverable. `lineage_reference` is an optional checked reference to the retained nonempty `status.jsonl` stream. It is absent when no such stream was retained; the API does not invent a path. These returned fields change no version-1 signed payload bytes or signature preimage. Missing native evidence is unavailable; an observed mismatch is rejected. A clean-completion claim requires nonzero stage count, zero warnings and a nonempty native lifecycle stream. The producer does not accept an asserted terminal status.
 
+### Candidate process transport
+
+With `openwarrant-receipts` enabled, a cookbook binary exposes:
+
+```text
+blut openwarrant verify --receipt ENVELOPE.json --public-key TRUSTED-PUBLIC-KEY.bin \
+  --binding EXPECTED-BINDING.json --plan EXPECTED-PLAN.json --job RETAINED-JOB \
+  --producer-executable RETAINED-PRODUCER
+```
+
+The public key contains exactly 32 raw Ed25519 public-key bytes. This command has no private-key argument, execution action or authority activation. The caller selects every path and the trusted key independently of receipt contents. The live cookbook catalog includes the CLI's built-in checks and connectors; the producer must have used that same registry. The empty-cookbook `openwarrant_verifier` example demonstrates the process surface with built-ins only; it cannot validate a different cookbook's catalog.
+
+`verify_files` bounds reads before JSON parsing: envelope JSON at 8 MiB + 1 KiB, binding JSON at 32 KiB and plan JSON at 2 MiB. The signed payload's separate 2 MiB limit remains unchanged. Excess whitespace can exceed the transport limit even when the decoded payload fits. Nonregular inputs and final-component symlinks are refused. These checks do not prove ancestor-directory stability, collector isolation or trusted key custody.
+
+One JSON response uses schema `blut/openwarrant-verification/v1`. Status `validated` carries the native facts and exits successfully; `unavailable` and `rejected` carry a reason and exit unsuccessfully. Every response says `assurance: not-established`. Invalid command arguments are ordinary CLI usage errors, not native verification responses. Consumers must reject missing/malformed responses and must preserve the difference between unavailable evidence and an observed rejection. The OpenWarrant adapter and a valid process call against an actual recorded Dispatch remain integration work; this response is not an OpenWarrant assurance disposition.
+
 Resource bounds: payload at most 2 MiB, 4096 job files, 64 MiB per job file, 256 MiB total, 32 directory levels, producer executable at most 1 GiB. Symbolic links and nonregular job files refuse capture. Native paths use UTF-8 normal components joined by `/`; components containing backslashes or control characters refuse capture instead of being renamed in the receipt. This preserves distinct file identities on Unix and Windows. Signing keys are never persisted by this API. Capture can fail after execution; callers must retain the job and must not automatically repeat execution just because receipt capture failed.
 
 This first prototype has no operator key-custody qualification, OpenWarrant callback/CLI integration, confinement proof or metered cost proof. CPU fixture keys are synthetic and confer no project authority. Positive execution, cancellation and refusal tests are implementation evidence. Authenticated duplicate/unknown fields, unsupported versions and contradictory outcome payloads are refused by public-seam controls. Actual failed stages, advisory warnings, cancellation and deadline expiry retain their distinct terminal outcomes. Same-length native output changes and altered signatures over otherwise valid payloads are refused. Public transport and broader integration still need explicit controls before qualification.

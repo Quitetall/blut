@@ -1,0 +1,4 @@
+    Checking blut-types v0.2.0-alpha.2 (/mnt/4tb/tmp/openwarrant-blut-native-receipts/crates/blut-types)
+   Compiling blut v0.2.0-alpha.2 (/mnt/4tb/tmp/openwarrant-blut-native-receipts)
+    Checking blut-notify v0.2.0-alpha.2 (/mnt/4tb/tmp/openwarrant-blut-native-receipts/crates/blut-notify)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 39s

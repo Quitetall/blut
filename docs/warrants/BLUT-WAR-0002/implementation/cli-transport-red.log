@@ -1,0 +1,5 @@
+    Blocking waiting for file lock on build directory
+   Compiling blut v0.2.0-alpha.2 (/mnt/4tb/tmp/openwarrant-blut-native-receipts)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 37.97s
+     Running `/mnt/4tb/OpenWarrant/target/debug/examples/openwarrant_verifier openwarrant verify --help`
+Error: `blut-openwarrant` could not be executed — `blut openwarrant` dispatches to the `blut-openwarrant` sidecar binary (ADR 0083); install it or check PATH: No such file or directory (os error 2)

@@ -1,4 +1,12 @@
-# Current native receipt prototype checkpoint
+# Current file and process transport checkpoint
+
+Code revision: 9f75a3fff4f818eb82ca0e220388827c9ca3e50a. Eleven native receipt tests pass, including file transport against an actual CPU run and refusals for missing, malformed, oversized and symlink inputs. Three process controls pass: missing evidence reports unavailable; malformed and oversized receipt JSON report rejected. All return the documented JSON schema, leave the job absent and claim no assurance. A valid process response against a real recorded OpenWarrant Dispatch has not been established.
+
+Optional-feature all-target Clippy with warnings denied, formatting and the redacted working-tree secret scan pass. The missing file API and missing CLI command have retained RED observations. The initial cache-changing check attempt timed out without a test verdict; the redundant test build was stopped after discovering the machine's changed intermediate-cache configuration. The first CLI build exceeded its 180-second deadline without a verdict; the formatted-source build passed with a 600-second bound. These are not passing tests. Existing project intermediates were reused with an explicit build.build-dir override; no other process or cache was removed.
+
+The previous saved head 9824fe9 passed CI 38005970687. CI for this new code is not established yet. The draft PR's CLA check remains failed because of its stored-record format; no consent/signature records were edited. OpenWarrant callback and real recorded Dispatch integration, additional native reference/budget controls, independent/operator qualification and collector key custody remain. This proposed contract does not confer authority, confinement, spend accounting, human assurance or resolution.
+
+# Earlier native receipt prototype checkpoint
 
 Code revision: ba1fb20fc2673eb40a860191ad3ccd36e4ff6ac0. Nine public native CPU/receipt tests and optional-feature all-target Clippy pass on Rust 1.99.0. Formatting passes. The verifier returns the checked native file table and an optional nonempty lifecycle reference; it does not invent missing paths. Raw version-1 payload bytes and signing preimage are unchanged.
 
