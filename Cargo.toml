@@ -56,6 +56,7 @@ include = [
 path = "src/lib.rs"
 
 [dependencies]
+rustix = { version = "1.1.4", features = ["fs", "process"], optional = true }
 # ADR 0083: the wasm32-safe keystone. The engine re-exports its types at their
 # old paths, so this is zero-churn downstream.
 blut-types = { path = "crates/blut-types", version = "=0.2.0-alpha.2" }
@@ -141,7 +142,7 @@ rcgen = { version = "0.13", optional = true }
 # CLI is now THE default build — no terminal-UI deps in the engine tree.
 default = []
 # Native OpenWarrant receipt signing; no P2P transport or cloud dependencies.
-openwarrant-receipts = ["dep:ed25519-dalek"]
+openwarrant-receipts = ["dep:ed25519-dalek", "dep:rustix"]
 # P2P distributed compute — trust model, encryption, task dispatch.
 p2p = ["dep:ed25519-dalek", "dep:aes-gcm", "dep:x25519-dalek", "dep:hkdf", "dep:quinn", "dep:rustls", "dep:webpki", "dep:rcgen"]
 # Cloud compute queue (T3.1 / ADR 0082) — "submit a job, get the result back,

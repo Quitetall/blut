@@ -424,6 +424,35 @@ pub fn verify(
     job: &Path,
     producer_executable: &Path,
 ) -> Result<VerifiedRun, ReceiptError> {
+    let (payload, signed_message) = verify_basis(envelope, trusted_key, expected, spec, reg)?;
+    if payload.binary_digest != hash_file(producer_executable, MAX_BINARY)?.1 {
+        return Err(rejected("plan, registry or producer binary changed"));
+    }
+    let observed = files(job)?;
+    let mut records = std::collections::BTreeMap::new();
+    for name in ["binding", "plan", "registry"] {
+        let path = format!("_openwarrant_inputs/{name}.json");
+        records.insert(path.clone(), read_transport(&job.join(path), MAX_FILE)?);
+    }
+    finish_verification(
+        envelope,
+        payload,
+        signed_message,
+        expected,
+        spec,
+        reg,
+        observed,
+        records,
+    )
+}
+
+fn verify_basis(
+    envelope: &Envelope,
+    trusted_key: &VerifyingKey,
+    expected: &DispatchBinding,
+    spec: &PlanSpec,
+    reg: &Registry,
+) -> Result<(Payload, Vec<u8>), ReceiptError> {
     expected.validate()?;
     let signature =
         Signature::from_slice(&envelope.signature).map_err(|_| rejected("signature shape"))?;
@@ -458,21 +487,39 @@ pub fn verify(
     }
     if payload.plan_digest != digest(&spec.canonical_bytes())
         || payload.registry_digest != digest(&registry_bytes(reg)?)
-        || payload.binary_digest != hash_file(producer_executable, MAX_BINARY)?.1
     {
         return Err(rejected("plan, registry or producer binary changed"));
     }
-    if payload.native_files != files(job)? {
+    Ok((payload, signed_message))
+}
+#[allow(clippy::too_many_arguments)]
+fn finish_verification(
+    envelope: &Envelope,
+    payload: Payload,
+    signed_message: Vec<u8>,
+    expected: &DispatchBinding,
+    spec: &PlanSpec,
+    reg: &Registry,
+    observed: Vec<NativeFileReference>,
+    records: std::collections::BTreeMap<String, Vec<u8>>,
+) -> Result<VerifiedRun, ReceiptError> {
+    if payload.native_files != observed {
         return Err(rejected("native job files changed or mixed"));
     }
     let expected_binding =
         canonical(&serde_json::json!({"run_id":payload.run_id,"dispatch":expected}))?;
-    if fs::read(job.join("_openwarrant_inputs/binding.json")).map_err(unavailable)?
-        != expected_binding
-        || fs::read(job.join("_openwarrant_inputs/plan.json")).map_err(unavailable)?
-            != spec.canonical_bytes()
-        || fs::read(job.join("_openwarrant_inputs/registry.json")).map_err(unavailable)?
-            != registry_bytes(reg)?
+    if records
+        .get("_openwarrant_inputs/binding.json")
+        .ok_or_else(|| rejected("missing native binding record"))?
+        != &expected_binding
+        || records
+            .get("_openwarrant_inputs/plan.json")
+            .ok_or_else(|| rejected("missing native plan record"))?
+            != &spec.canonical_bytes()
+        || records
+            .get("_openwarrant_inputs/registry.json")
+            .ok_or_else(|| rejected("missing native registry record"))?
+            != &registry_bytes(reg)?
     {
         return Err(rejected("native input records changed or mixed"));
     }
@@ -499,4 +546,175 @@ pub fn verify(
         native_files: payload.native_files,
         lineage_reference,
     })
+}
+
+/// Explicit sealed-input transport. The caller supplies independent trust and
+/// complete captured job metadata; no producer is executed or key discovered.
+#[derive(Debug)]
+pub struct SealedVerificationFiles {
+    pub receipt: PathBuf,
+    pub binding: PathBuf,
+    pub inputs: PathBuf,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedInputs {
+    schema: String,
+    public_key: PathBuf,
+    plan: PathBuf,
+    producer_executable: PathBuf,
+    files: Vec<SealedNativeFile>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedNativeFile {
+    path: String,
+    mode: u32,
+    descriptor: PathBuf,
+}
+/// Original signature, expected plan/catalog and frozen native bytes must all
+/// agree. The source modes are separately captured caller metadata, not the
+/// descriptor's execution mode. Transport validation never grants assurance.
+pub fn verify_sealed_files(
+    request: &SealedVerificationFiles,
+    reg: &Registry,
+) -> Result<VerifiedRun, ReceiptError> {
+    let inputs: SealedInputs =
+        serde_json::from_slice(&read_transport(&request.inputs, 8 * 1024 * 1024)?)
+            .map_err(|e| rejected(format!("sealed inputs JSON: {e}")))?;
+    if inputs.schema != "blut/openwarrant-sealed-inputs/v1"
+        || inputs.files.is_empty()
+        || inputs.files.len() > MAX_FILES
+    {
+        return Err(rejected("sealed input schema or native file-count budget"));
+    }
+    let key_bytes: [u8; 32] = read_sealed(&inputs.public_key, 32)?
+        .try_into()
+        .map_err(|_| rejected("public key must contain exactly 32 raw bytes"))?;
+    let key = VerifyingKey::from_bytes(&key_bytes).map_err(|_| rejected("invalid public key"))?;
+    let spec: PlanSpec = serde_json::from_slice(&read_sealed(&inputs.plan, MAX_PAYLOAD as u64)?)
+        .map_err(|e| rejected(format!("sealed plan JSON: {e}")))?;
+    let expected: DispatchBinding =
+        serde_json::from_slice(&read_transport(&request.binding, 32 * 1024)?)
+            .map_err(|e| rejected(format!("binding JSON: {e}")))?;
+    let envelope: Envelope =
+        serde_json::from_slice(&read_transport(&request.receipt, 8 * 1024 * 1024 + 1024)?)
+            .map_err(|e| rejected(format!("receipt JSON: {e}")))?;
+    let (payload, signed_message) = verify_basis(&envelope, &key, &expected, &spec, reg)?;
+    if payload.binary_digest != digest(&read_sealed(&inputs.producer_executable, MAX_BINARY)?) {
+        return Err(rejected("plan, registry or producer binary changed"));
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    let mut observed = Vec::with_capacity(inputs.files.len());
+    let mut records = std::collections::BTreeMap::new();
+    let mut total = 0u64;
+    for file in inputs.files {
+        if file.path.is_empty()
+            || file.path.len() > 4096
+            || file.path.contains('\\')
+            || file.path.chars().any(char::is_control)
+            || file.path.starts_with('/')
+            || file
+                .path
+                .split('/')
+                .any(|c| c.is_empty() || c == "." || c == "..")
+            || !paths.insert(file.path.clone())
+            || file.mode & 0o170000 != 0o100000
+            || file.mode & 0o022 != 0
+        {
+            return Err(rejected(
+                "invalid, duplicate or writable native source metadata",
+            ));
+        }
+        let bytes = read_sealed(&file.descriptor, MAX_FILE)?;
+        total = total
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| rejected("native byte overflow"))?;
+        if total > MAX_TOTAL {
+            return Err(rejected("native total byte budget"));
+        }
+        observed.push(NativeFileReference {
+            path: file.path.clone(),
+            bytes: bytes.len() as u64,
+            digest: digest(&bytes),
+            mode: file.mode,
+        });
+        if [
+            "_openwarrant_inputs/binding.json",
+            "_openwarrant_inputs/plan.json",
+            "_openwarrant_inputs/registry.json",
+        ]
+        .contains(&file.path.as_str())
+        {
+            records.insert(file.path, bytes);
+        }
+    }
+    observed.sort_by(|a, b| a.path.cmp(&b.path));
+    finish_verification(
+        &envelope,
+        payload,
+        signed_message,
+        &expected,
+        &spec,
+        reg,
+        observed,
+        records,
+    )
+}
+#[cfg(target_os = "linux")]
+fn read_sealed(path: &Path, max: u64) -> Result<Vec<u8>, ReceiptError> {
+    use rustix::fs::{SealFlags, fcntl_get_seals};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let text = path
+        .to_str()
+        .ok_or_else(|| rejected("descriptor is not UTF-8"))?;
+    let pieces: Vec<_> = text.split('/').collect();
+    let canonical = |s: &str| s.parse::<u32>().ok().filter(|v| v.to_string() == s);
+    let parent = rustix::process::getppid()
+        .map(|p| p.as_raw_pid() as u32)
+        .ok_or_else(|| unavailable("native parent process unavailable"))?;
+    if pieces.len() != 5
+        || !pieces[0].is_empty()
+        || pieces[1] != "proc"
+        || pieces[3] != "fd"
+        || canonical(pieces[2]) != Some(parent)
+        || canonical(pieces[4]).is_none()
+    {
+        return Err(rejected("canonical immediate-parent descriptor required"));
+    }
+    // This is the explicit procfs transport. Ordinary file readers retain
+    // O_NOFOLLOW; arbitrary links cannot substitute for a sealed kernel object.
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(path)
+        .map_err(unavailable)?;
+    let m = f.metadata().map_err(unavailable)?;
+    if !m.is_file() || m.mode() & 0o111 != 0 || m.len() > max {
+        return Err(rejected(
+            "sealed regular non-executable input within byte budget required",
+        ));
+    }
+    let required =
+        SealFlags::WRITE | SealFlags::GROW | SealFlags::SHRINK | SealFlags::EXEC | SealFlags::SEAL;
+    if !fcntl_get_seals(&f)
+        .map_err(|_| rejected("native descriptor is not sealable"))?
+        .contains(required)
+    {
+        return Err(rejected("native descriptor lacks required kernel seals"));
+    }
+    let mut bytes = Vec::new();
+    f.take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unavailable)?;
+    if bytes.len() as u64 != m.len() || bytes.len() as u64 > max {
+        return Err(rejected("sealed input byte budget"));
+    }
+    Ok(bytes)
+}
+#[cfg(not(target_os = "linux"))]
+fn read_sealed(_: &Path, _: u64) -> Result<Vec<u8>, ReceiptError> {
+    Err(unavailable(
+        "sealed native input transport unsupported on this platform",
+    ))
 }
