@@ -612,3 +612,205 @@ async fn actual_advisory_failure_remains_completion_with_warnings() {
     .unwrap();
     assert_eq!(result.outcome, Outcome::CompletedWithWarnings);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "child helper selected by sealed_native_inputs_use_frozen_job_and_keep_v1_refusal"]
+fn sealed_transport_child() {
+    use blut::framework::openwarrant_receipt::{
+        ReceiptError, SealedVerificationFiles, read_verification_key, verify_sealed_files,
+    };
+    let root = PathBuf::from(std::env::var_os("BLUT_SEALED_TEST_ROOT").unwrap());
+    let request = |name: &str| SealedVerificationFiles {
+        receipt: root.join("sealed-receipt.json"),
+        binding: root.join("sealed-binding.json"),
+        inputs: root.join(name),
+    };
+    let good = verify_sealed_files(&request("sealed-inputs.json"), &registry()).unwrap();
+    assert!(matches!(good.outcome, Outcome::Completed));
+    assert!(good.lineage_reference.is_some());
+    for name in [
+        "mutable-inputs.json",
+        "changed-inputs.json",
+        "wrong-mode-inputs.json",
+        "duplicate-inputs.json",
+    ] {
+        assert!(
+            matches!(
+                verify_sealed_files(&request(name), &registry()),
+                Err(ReceiptError::Rejected(_))
+            ),
+            "{name}"
+        );
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("sealed-inputs.json")).unwrap()).unwrap();
+    assert!(matches!(
+        read_verification_key(Path::new(v["public_key"].as_str().unwrap())),
+        Err(ReceiptError::Rejected(_))
+    ));
+    println!(
+        "sealed BLUT child: original signature and frozen job accepted; mutable, changed bytes, wrong mode, duplicate file and v1 descriptor refused"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn sealed_native_inputs_use_frozen_job_and_keep_v1_refusal() {
+    use rustix::fs::{MemfdFlags, Mode, SealFlags, fchmod, fcntl_add_seals, memfd_create};
+    use std::{
+        io::Write,
+        os::{fd::AsRawFd, unix::fs::MetadataExt},
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let plan = spec();
+    let expected = binding();
+    let signer = SigningKey::from_bytes(&[7; 32]);
+    let job = root.join("job");
+    let run = execute_with_receipt(
+        &plan,
+        &registry(),
+        ExecCtx::new(job.clone()),
+        expected.clone(),
+        &signer,
+    )
+    .await
+    .unwrap();
+    run.result.unwrap();
+    std::fs::write(
+        root.join("sealed-receipt.json"),
+        serde_json::to_vec(&run.envelope).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("sealed-binding.json"),
+        serde_json::to_vec(&expected).unwrap(),
+    )
+    .unwrap();
+    let mut held = Vec::<std::fs::File>::new();
+    fn hold(bytes: &[u8], seal: bool, held: &mut Vec<std::fs::File>) -> String {
+        let fd = memfd_create(
+            "blut-test-data",
+            MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING | MemfdFlags::NOEXEC_SEAL,
+        )
+        .unwrap();
+        let mut image = std::fs::File::from(fd);
+        image.write_all(bytes).unwrap();
+        fchmod(&image, Mode::from_bits_truncate(0o400)).unwrap();
+        if seal {
+            fcntl_add_seals(
+                &image,
+                SealFlags::WRITE
+                    | SealFlags::GROW
+                    | SealFlags::SHRINK
+                    | SealFlags::EXEC
+                    | SealFlags::SEAL,
+            )
+            .unwrap();
+        }
+        let path = format!("/proc/{}/fd/{}", std::process::id(), image.as_raw_fd());
+        held.push(image);
+        path
+    }
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        held: &mut Vec<std::fs::File>,
+        files: &mut Vec<serde_json::Value>,
+    ) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let m = std::fs::symlink_metadata(&path).unwrap();
+            if m.is_dir() {
+                walk(root, &path, held, files);
+            } else {
+                files.push(serde_json::json!({"path":path.strip_prefix(root).unwrap().to_str().unwrap(),"mode":m.mode(),"descriptor":hold(&std::fs::read(&path).unwrap(),true,held)}));
+            }
+        }
+    }
+    let mut files = vec![];
+    walk(&job, &job, &mut held, &mut files);
+    files.sort_by(|a, b| a["path"].as_str().unwrap().cmp(b["path"].as_str().unwrap()));
+    let key = hold(&signer.verifying_key().to_bytes(), true, &mut held);
+    let plan_input = hold(&serde_json::to_vec(&plan).unwrap(), true, &mut held);
+    let producer = hold(
+        &std::fs::read(std::env::current_exe().unwrap()).unwrap(),
+        true,
+        &mut held,
+    );
+    let valid = serde_json::json!({"schema":"blut/openwarrant-sealed-inputs/v1","public_key":key,"plan":plan_input,"producer_executable":producer,"files":files});
+    std::fs::write(
+        root.join("sealed-inputs.json"),
+        serde_json::to_vec(&valid).unwrap(),
+    )
+    .unwrap();
+    let mut mutable = valid.clone();
+    mutable["public_key"] =
+        serde_json::json!(hold(&signer.verifying_key().to_bytes(), false, &mut held));
+    std::fs::write(
+        root.join("mutable-inputs.json"),
+        serde_json::to_vec(&mutable).unwrap(),
+    )
+    .unwrap();
+    let mut changed = valid.clone();
+    changed["files"][0]["descriptor"] =
+        serde_json::json!(hold(b"different native bytes", true, &mut held));
+    std::fs::write(
+        root.join("changed-inputs.json"),
+        serde_json::to_vec(&changed).unwrap(),
+    )
+    .unwrap();
+    let mut mode = valid.clone();
+    mode["files"][0]["mode"] = serde_json::json!(0o100600);
+    std::fs::write(
+        root.join("wrong-mode-inputs.json"),
+        serde_json::to_vec(&mode).unwrap(),
+    )
+    .unwrap();
+    let mut duplicate = valid.clone();
+    let first = duplicate["files"][0].clone();
+    duplicate["files"].as_array_mut().unwrap().push(first);
+    std::fs::write(
+        root.join("duplicate-inputs.json"),
+        serde_json::to_vec(&duplicate).unwrap(),
+    )
+    .unwrap();
+    // Real native evidence is now captured. Removing the original tree must
+    // not trigger execution or make the held exact snapshot disappear.
+    std::fs::remove_dir_all(&job).unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "sealed_transport_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("BLUT_SEALED_TEST_ROOT", root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("native child deadline exceeded");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("test sealed_transport_child ... ok"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("sealed BLUT child:"));
+    drop(held);
+}
