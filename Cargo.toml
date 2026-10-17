@@ -182,6 +182,13 @@ proptest = "1"
 name = "framework"
 harness = false
 
+# SHA-256 runs over every artifact, chunk and blob. Unoptimized it is ~10x
+# slower, and the P2P transfer tests hash ~24 MB per round trip: under a debug
+# build on a loaded host that ran past their hang timeout. Applies only to this
+# workspace's own dev/test builds, never to a crate that depends on blut.
+[profile.dev.package.sha2]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
