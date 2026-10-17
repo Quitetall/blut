@@ -74,13 +74,22 @@ pub(super) fn parse_installed_origin(crates_toml: &str, bin: &str) -> Option<Ori
     None
 }
 
-/// Pull the version out of `cargo info` output. The command prints a block of
-/// `key: value` lines; only the first bare `version:` is the published one
+/// Pull the newest published version out of `cargo info` output. The command
+/// prints a block of `key: value` lines; only the first bare `version:` counts
 /// (later lines can carry `rust-version:`, which must not match).
+///
+/// When the newest release needs a newer Rust than the local toolchain, cargo
+/// shows the newest one the toolchain can build and appends the true newest:
+/// `version: 0.17.3 (latest 0.20.0)`. The question here is "what is
+/// published", so the `latest` value wins.
 pub(super) fn parse_cargo_info_version(stdout: &str) -> Option<String> {
     stdout.lines().find_map(|l| {
-        let l = l.trim();
-        l.strip_prefix("version:").map(|v| v.trim().to_string())
+        let v = l.trim().strip_prefix("version:")?.trim();
+        let v = match v.split_once("(latest ") {
+            Some((_, rest)) => rest.trim_end().trim_end_matches(')'),
+            None => v,
+        };
+        Some(v.trim().to_string())
     })
 }
 
@@ -97,6 +106,11 @@ pub(super) enum Verdict {
     Ahead {
         latest: String,
     },
+    /// The installed build is a stable release and the only newer version is
+    /// a prerelease. A stable install is never moved onto an alpha.
+    NewerPrereleaseOnly {
+        latest: String,
+    },
 }
 
 /// Compare with real semver ordering, because string comparison gets
@@ -108,6 +122,11 @@ pub(super) fn verdict(installed: &str, latest: &str) -> Result<Verdict> {
     let new = semver::Version::parse(latest.trim())
         .with_context(|| format!("published version {latest:?} is not semver"))?;
     Ok(match cur.cmp(&new) {
+        std::cmp::Ordering::Less if cur.pre.is_empty() && !new.pre.is_empty() => {
+            Verdict::NewerPrereleaseOnly {
+                latest: new.to_string(),
+            }
+        }
         std::cmp::Ordering::Less => Verdict::Behind {
             latest: new.to_string(),
         },
@@ -140,15 +159,18 @@ pub(super) fn upgrade_argv(pkg: &str, version: &str) -> Vec<String> {
 /// reports a version that was never published — the exact defect that made a
 /// release guard in this repository's CI unable to take its false branch.
 fn published_version(pkg: &str) -> Result<String> {
-    let scratch = std::env::temp_dir().join(format!("blut-update-{}", std::process::id()));
-    std::fs::create_dir_all(&scratch)
-        .with_context(|| format!("create scratch dir {}", scratch.display()))?;
+    // A fresh, unpredictable directory: a reused or guessable one could be
+    // pre-seeded with a `.cargo/config.toml` that points at another registry.
+    let scratch = tempfile::Builder::new()
+        .prefix("blut-update-")
+        .tempdir()
+        .context("create scratch dir for `cargo info`")?;
     let out = Proc::new("cargo")
         .args(["info", pkg])
-        .current_dir(&scratch)
+        .current_dir(scratch.path())
         .output()
         .context("run `cargo info` (is cargo on PATH?)")?;
-    let _ = std::fs::remove_dir_all(&scratch);
+    drop(scratch);
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(anyhow!(
@@ -186,8 +208,10 @@ fn installed_origin() -> Result<Origin> {
     })
 }
 
-/// `blut update` — report, and on `--yes` perform, an upgrade of the installed
-/// binary. Exit status is a verdict, never a crash: 0 when nothing is owed.
+/// `blut update` — report, and on `--yes` perform, an upgrade of the binary
+/// cargo's install ledger records (not necessarily the one running). Exit
+/// status 0 means a verdict was reached, "behind" included; non-zero means no
+/// verdict could be reached or the upgrade failed.
 pub(super) fn run_update(check_only: bool, assume_yes: bool) -> Result<()> {
     let origin = installed_origin()?;
     match &origin {
@@ -210,6 +234,15 @@ pub(super) fn run_update(check_only: bool, assume_yes: bool) -> Result<()> {
                     println!(
                         "{pkg} {version} is installed; the registry's newest is {latest}. \
                          Nothing to update."
+                    );
+                    Ok(())
+                }
+                Verdict::NewerPrereleaseOnly { latest } => {
+                    println!(
+                        "{pkg} {version} is installed; the registry's newest is the \
+                         prerelease {latest}. A stable install is not moved onto a \
+                         prerelease; install it explicitly with:\n  {}",
+                        upgrade_argv(pkg, &latest).join(" ")
                     );
                     Ok(())
                 }
@@ -291,6 +324,33 @@ mod update_tests {
     fn version_line_is_the_package_version_not_the_rust_version() {
         let out = "blut #training\ndescription: engine\nversion: 0.3.1\nlicense: AGPL\nrust-version: 1.88\n";
         assert_eq!(parse_cargo_info_version(out).as_deref(), Some("0.3.1"));
+    }
+
+    #[test]
+    fn a_toolchain_limited_version_reports_the_true_latest() {
+        let out = "bevy\nversion: 0.17.3 (latest 0.20.0)\nrust-version: 1.85\n";
+        assert_eq!(parse_cargo_info_version(out).as_deref(), Some("0.20.0"));
+        let out = "wasmtime\nversion: 38.0.4 (latest 50.0.0-rc.1)\n";
+        assert_eq!(
+            parse_cargo_info_version(out).as_deref(),
+            Some("50.0.0-rc.1")
+        );
+    }
+
+    #[test]
+    fn a_stable_install_is_not_offered_a_prerelease_but_a_prerelease_is() {
+        assert_eq!(
+            verdict("0.2.0", "0.3.0-alpha.1").unwrap(),
+            Verdict::NewerPrereleaseOnly {
+                latest: "0.3.0-alpha.1".into()
+            }
+        );
+        assert_eq!(
+            verdict("0.2.0-alpha.2", "0.2.0-alpha.10").unwrap(),
+            Verdict::Behind {
+                latest: "0.2.0-alpha.10".into()
+            }
+        );
     }
 
     #[test]

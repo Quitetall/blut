@@ -747,8 +747,9 @@ impl P2pServer {
 
         // Mutual auth (ADR 0079 A1): require + verify a client cert unless the
         // operator opted into legacy no-client-auth for the transition.
-        ensure_crypto_provider();
-        let builder = rustls::ServerConfig::builder();
+        let builder = rustls::ServerConfig::builder_with_provider(ring_provider())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| TrainError::other(format!("TLS config: {e}")))?;
         let mut server_crypto = if allow_legacy {
             builder.with_no_client_auth()
         } else {
@@ -1059,8 +1060,9 @@ impl P2pClient {
         // identity via the same `identity_cert` the server uses, so the SPKI
         // the server extracts equals our `keypair.verifying`.
         let (cert_der, key_der) = identity_cert(keypair)?;
-        ensure_crypto_provider();
-        let mut crypto = rustls::ClientConfig::builder()
+        let mut crypto = rustls::ClientConfig::builder_with_provider(ring_provider())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| TrainError::other(format!("TLS client config: {e}")))?
             .dangerous()
             .with_custom_certificate_verifier(verifier)
             .with_client_auth_cert(vec![cert_der], key_der.into())
@@ -1608,26 +1610,16 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
     }
 }
 
-/// Install `ring` as the process-wide rustls `CryptoProvider`, once.
+/// The rustls `CryptoProvider` every P2P TLS config is built with: `ring`,
+/// the provider the signature verification in this file also uses.
 ///
-/// rustls picks a provider automatically only when EXACTLY ONE of its `ring`
-/// and `aws-lc-rs` features is enabled. The engine uses `ring` everywhere,
-/// including the signature verification in this file. Enabling the `s3`
-/// feature pulls `object_store/aws`, which brings `aws-lc-rs` into the same
-/// build — and rustls then refuses to guess, panicking with "Could not
-/// automatically determine the process-level CryptoProvider" the first time a
-/// QUIC connection is built.
-///
-/// Measured: with `--features s3`, eleven p2p tests panicked exactly there.
-/// This is the cross-feature hazard ADR 0078 records for
-/// `serde_json/arbitrary_precision`, in a different crate.
-///
-/// Idempotent and non-overriding: `install_default` fails if a provider is
-/// already set, and that failure is correct — an embedder who chose their own
-/// provider keeps it.
-pub(crate) fn ensure_crypto_provider() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
+/// Passed explicitly rather than read from the process-wide default. rustls
+/// picks a default automatically only when EXACTLY ONE of its `ring` and
+/// `aws-lc-rs` features is enabled; the `s3` feature pulls `object_store/aws`,
+/// which brings `aws-lc-rs` into the same build, and then `builder()` panics
+/// with "Could not automatically determine the process-level CryptoProvider".
+/// Installing a process default from a library would instead break an
+/// embedder that installs its own afterwards, so the engine never does.
+fn ring_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
 }

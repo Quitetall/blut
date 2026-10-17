@@ -80,10 +80,9 @@ DOGFOOD CLOUD QUEUE 2026-09-19
 Submit, worker pickup, execution and verification all ran; the output came back
 transformed, so this is the queue working rather than a file being written.
 
-**Boundary:** the object store is the local filesystem. Network object storage
-(S3/R2/GCS/MinIO) is a different row and stays Deferred — it needs the
-`object_store` feature set this crate does not enable, plus the advisory, secret
-handling and TLS gates that removed it from the preview.
+**Boundary:** the object store here is the local filesystem. Network object
+storage is a separate row, validated against MinIO with the `s3` feature (see
+below).
 
 **Reachability, which was the real defect.** Until 2026-09-19 neither this nor
 the P2P run was possible from anything BLUT ships. The engine is lib-only and

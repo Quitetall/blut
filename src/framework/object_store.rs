@@ -319,10 +319,28 @@ impl ObjectStore {
     /// is wrapped, never trusted.
     #[cfg(feature = "s3")]
     pub fn from_url(url: &str, prefix: impl AsRef<str>) -> Result<Self, StoreError> {
+        // The raw string is not echoed on a parse failure: it may carry
+        // credentials that were never meant to be printed.
         let parsed = url::Url::parse(url)
-            .map_err(|error| StoreError::InvalidAddress(format!("{url}: {error}")))?;
+            .map_err(|error| StoreError::InvalidAddress(format!("object-store URL: {error}")))?;
         match parsed.scheme() {
             "s3" => {
+                // Credentials and the endpoint come from the environment only.
+                // A URL that carries userinfo, a port or a query would be
+                // silently half-ignored (and later echoed), so refuse it
+                // without repeating it.
+                if !parsed.username().is_empty()
+                    || parsed.password().is_some()
+                    || parsed.port().is_some()
+                    || parsed.query().is_some()
+                    || parsed.fragment().is_some()
+                {
+                    return Err(StoreError::InvalidAddress(
+                        "s3 URL must be s3://bucket[/prefix]: credentials, port and \
+                         endpoint come from AWS_* environment variables, not the URL"
+                            .to_string(),
+                    ));
+                }
                 let bucket = parsed.host_str().ok_or_else(|| {
                     StoreError::InvalidAddress(format!("{url}: no bucket in s3 URL"))
                 })?;
@@ -989,6 +1007,27 @@ fn block_on_isolated<T: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "s3")]
+    #[test]
+    fn an_s3_url_carrying_credentials_port_or_query_is_refused_without_echo() {
+        for url in [
+            "s3://AKIAEXAMPLE:SECRETEXAMPLE@bucket/p",
+            "s3://AKIAEXAMPLE@bucket/p",
+            "s3://bucket:9000/p",
+            "s3://bucket/p?endpoint=http://x",
+            "s3://bucket/p#frag",
+        ] {
+            let err = match ObjectStore::from_url(url, "") {
+                Ok(_) => panic!("{url} was accepted"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                !err.contains("SECRETEXAMPLE") && !err.contains("AKIAEXAMPLE"),
+                "{err}"
+            );
+            assert!(err.contains("s3://bucket[/prefix]"), "{err}");
+        }
+    }
 
     #[cfg(feature = "s3")]
     mod from_url_tests {

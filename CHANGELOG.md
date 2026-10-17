@@ -23,8 +23,10 @@ because the train shares one exact version.
   well as a directory. Credentials come only from the standard AWS environment
   variables, never from flags. Validated end to end against MinIO; TLS to a
   public endpoint and IAM roles are not yet exercised.
-- `blut update` reports whether the running binary is behind the version on
-  crates.io.
+- `blut update` reports whether the binary cargo installed (per its install
+  ledger) is behind the newest version on crates.io, and with `--yes` runs the
+  pinned `cargo install --locked`. A stable install is never moved onto a
+  prerelease.
 
 ### Fixed
 - `EvalReport` artifacts can cross the stage boundary. Their free-form
@@ -37,11 +39,14 @@ because the train shares one exact version.
 - The Ray launcher's job-status parser matched a line format Ray never emits,
   so it could never report success or failure. It now parses Ray 2.x output,
   and stops at `Status message:` so a failed job's log tail containing
-  "succeeded" cannot read as success.
+  "succeeded", or a child job's `Status for job …: SUCCEEDED` line, cannot
+  read as success.
 - Enabling `s3` alongside `p2p` made rustls panic on the first QUIC
   connection ("Could not automatically determine the process-level
   CryptoProvider"), because `object_store/aws` pulls in a second provider.
-  The P2P transport now installs `ring` explicitly, once.
+  The P2P transport now builds its TLS configs with `ring` passed explicitly
+  and never installs a process-wide provider, so an embedder that installs
+  its own later is unaffected.
 
 ### Security
 - rustls 0.23.45 everywhere, closing RUSTSEC-2026-0285 (TLS 1.3 handshake

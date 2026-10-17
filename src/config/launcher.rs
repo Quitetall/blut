@@ -791,17 +791,19 @@ impl RayJob {
     /// INFO cli.py:89 -- Status for job 'my-id': RUNNING
     /// ```
     ///
-    /// Terminal words are matched first: a finished job's output also carries a
-    /// `Status message:` line, and for a failure that message embeds the tail of
-    /// the job's own logs, which can contain anything at all -- including the
-    /// word `succeeded`. Order matters here.
+    /// Scanning stops at the `Status message:` line: for a failure that message
+    /// embeds the tail of the job's own logs, which can contain anything at all
+    /// -- including the word `succeeded`, or a child job's own
+    /// `Status for job '...': SUCCEEDED` line.
     fn parse_ray_status(output: &str) -> JobState {
-        // `Status for job '<id>': <STATE>` — the non-terminal form.
         for line in output.lines() {
+            if line.contains("Status message:") {
+                break;
+            }
+            // `Status for job '<id>': <STATE>` — the non-terminal form.
             if let Some((_, rest)) = line.split_once("Status for job ") {
                 if let Some((_, state)) = rest.rsplit_once(": ") {
-                    let state = state.trim();
-                    return match state {
+                    return match state.trim() {
                         "SUCCEEDED" => JobState::Succeeded,
                         "FAILED" => JobState::Failed("FAILED".to_string()),
                         "RUNNING" | "PENDING" | "WAITING" | "CONSTRUCTOR" => JobState::Running,
@@ -810,13 +812,7 @@ impl RayJob {
                     };
                 }
             }
-        }
-        // Terminal prose. Scan only up to the `Status message:` line: past it,
-        // the text is the job's own captured output and proves nothing.
-        for line in output.lines() {
-            if line.contains("Status message:") {
-                break;
-            }
+            // Terminal prose.
             if !line.contains("Job '") {
                 continue;
             }
@@ -1456,6 +1452,25 @@ mod tests {
             RayJob::parse_ray_status(real),
             JobState::Failed("FAILED".to_string())
         );
+    }
+
+    #[test]
+    fn a_failure_log_that_quotes_another_jobs_status_is_still_a_failure() {
+        // A job that submits or polls child Ray jobs prints their status lines;
+        // after a failure those lines sit in the `Status message:` log tail.
+        for child in ["SUCCEEDED", "RUNNING"] {
+            let real = format!(
+                "2026-09-19 09:11:32,014\tERR cli.py:72 -- Job 'j' failed\n\
+                 2026-09-19 09:11:32,014\tINFO cli.py:86 -- Status message: Job entrypoint \
+                 command failed with exit code 1, last available logs:\n\
+                 INFO cli.py:89 -- Status for job 'child': {child}\n"
+            );
+            assert_eq!(
+                RayJob::parse_ray_status(&real),
+                JobState::Failed("FAILED".to_string()),
+                "child status {child} leaked through the log tail"
+            );
+        }
     }
 
     #[test]
