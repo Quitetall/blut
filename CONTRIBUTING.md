@@ -20,6 +20,11 @@ cargo clippy --locked --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 ```
 
+On a shared or heavily loaded machine, point the tests' temp directories at
+a RAM-backed filesystem: `TMPDIR=/dev/shm cargo test --locked`. The cache
+fsyncs every entry, as it must in production, and on a busy disk a single
+fsync can stall for tens of seconds, long enough to trip a test's hang guard.
+
 Then sanity-check the core path end to end:
 
 ```bash

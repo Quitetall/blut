@@ -563,11 +563,10 @@ mod tests {
             .expect("A connects to C");
         let task = echo_task(a.node_id(), &_a_kp);
         let expected_out = task.expected_content_id.unwrap();
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(10), a.dispatch(&conn, task))
-                .await
-                .expect("dispatch must not hang")
-                .expect("worker executes the dispatched task");
+        let result = tokio::time::timeout(crate::TEST_HANG_GUARD, a.dispatch(&conn, task))
+            .await
+            .expect("dispatch must not hang")
+            .expect("worker executes the dispatched task");
 
         assert_eq!(result.content_id, expected_out, "worker echoed the output");
         assert_eq!(result.peer_id, c_id, "result came from worker C");
@@ -607,13 +606,10 @@ mod tests {
             .await
             .unwrap();
         let task = echo_task(client.node_id(), &client_kp);
-        let err = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            client.dispatch(&conn, task),
-        )
-        .await
-        .expect("must not hang")
-        .expect_err("scheduler-only server has no worker capability");
+        let err = tokio::time::timeout(crate::TEST_HANG_GUARD, client.dispatch(&conn, task))
+            .await
+            .expect("must not hang")
+            .expect_err("scheduler-only server has no worker capability");
         assert!(
             format!("{err}").contains("worker capability"),
             "clean capability error, got: {err}"
@@ -662,7 +658,7 @@ mod tests {
             .await
             .unwrap();
         tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            crate::TEST_HANG_GUARD,
             a.dispatch(&conn, echo_task(&a_id, &a_kp)),
         )
         .await
@@ -806,7 +802,7 @@ mod tests {
 
         // Flush the writer (drop the hub) and read the initiator's status.jsonl.
         drop(hub);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), writer).await;
+        let _ = tokio::time::timeout(crate::TEST_HANG_GUARD, writer).await;
         let body = std::fs::read_to_string(td.path().join("status.jsonl")).unwrap();
         assert!(
             body.contains(&format!("\"host\":\"{worker_host}\"")) && body.contains("worker-stage"),
@@ -835,7 +831,7 @@ mod tests {
             .connect_to(server.local_addr().unwrap(), server_kp.verifying.to_bytes())
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), client.ping(&conn, 7))
+        tokio::time::timeout(crate::TEST_HANG_GUARD, client.ping(&conn, 7))
             .await
             .expect("ping must not hang")
             .expect("pong");

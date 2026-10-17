@@ -105,4 +105,11 @@ pub mod trust;
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Bound for a test's "this must finish" wait. It is a hang guard, not a
+/// latency assertion: generous enough that a debug build on a saturated host
+/// still finishes, so tripping it means a real hang. A test that asserts
+/// promptness keeps its own, tighter bound.
+#[cfg(test)]
+pub(crate) const TEST_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub use error::TrainError;

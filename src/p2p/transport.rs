@@ -1416,8 +1416,7 @@ mod pinned_verifier_tests {
         // the cert-pinning behavior under test.
         tokio::spawn(async move {
             if let Ok((_, conn)) = server.accept_peer().await {
-                let _ =
-                    tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
+                let _ = tokio::time::timeout(crate::TEST_HANG_GUARD, conn.closed()).await;
             }
         });
 
@@ -1425,7 +1424,7 @@ mod pinned_verifier_tests {
         let client =
             P2pClient::with_coordinator_pin(client_keypair, server_keypair.verifying.to_bytes());
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), client.connect(addr))
+        let result = tokio::time::timeout(crate::TEST_HANG_GUARD, client.connect(addr))
             .await
             .expect("connect() must not hang");
         assert!(
@@ -1451,7 +1450,7 @@ mod pinned_verifier_tests {
         let wrong_pubkey = KeyPair::generate().verifying.to_bytes();
         let client = P2pClient::with_coordinator_pin(client_keypair, wrong_pubkey);
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), client.connect(addr))
+        let result = tokio::time::timeout(crate::TEST_HANG_GUARD, client.connect(addr))
             .await
             .expect("connect() must not hang even on rejection");
         assert!(
@@ -1474,7 +1473,7 @@ mod pinned_verifier_tests {
             let (peer_id, conn) = server.accept_peer().await?;
             // Hold the connection open briefly so the ack lands (see the
             // correct-pin test's rationale).
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
+            let _ = tokio::time::timeout(crate::TEST_HANG_GUARD, conn.closed()).await;
             Ok::<_, TrainError>(peer_id)
         });
 
@@ -1483,12 +1482,12 @@ mod pinned_verifier_tests {
         let client =
             P2pClient::with_coordinator_pin(client_keypair, server_keypair.verifying.to_bytes());
         let (_conn, client_side_id) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), client.connect(addr))
+            tokio::time::timeout(crate::TEST_HANG_GUARD, client.connect(addr))
                 .await
                 .expect("connect must not hang")
                 .expect("mutual-auth connect must succeed");
 
-        let bound = tokio::time::timeout(std::time::Duration::from_secs(10), accept)
+        let bound = tokio::time::timeout(crate::TEST_HANG_GUARD, accept)
             .await
             .expect("accept must not hang")
             .unwrap()
@@ -1531,12 +1530,11 @@ mod pinned_verifier_tests {
 
             // Establish BOTH connections first (accept + connect must overlap —
             // connect() waits for the ack accept_peer() sends).
-            let (accept_r, connect_r) =
-                tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                    tokio::join!(server.accept_peer(), client.connect(addr))
-                })
-                .await
-                .expect("handshake must not hang");
+            let (accept_r, connect_r) = tokio::time::timeout(crate::TEST_HANG_GUARD, async {
+                tokio::join!(server.accept_peer(), client.connect(addr))
+            })
+            .await
+            .expect("handshake must not hang");
             let (_peer, server_conn) = accept_r.expect("accept_peer");
             let (client_conn, _id) = connect_r.expect("mutual-auth connect");
 
@@ -1544,15 +1542,14 @@ mod pinned_verifier_tests {
             // Run both transfer halves concurrently, holding BOTH connections
             // alive through the join — so the completion ack can't race a
             // connection teardown.
-            let (send_r, recv_r) =
-                tokio::time::timeout(std::time::Duration::from_secs(15), async {
-                    tokio::join!(
-                        send_blob_deduped(&client_conn, &send_store, &blob),
-                        recv_blob_deduped(&server_conn, &recv_store, u64::MAX),
-                    )
-                })
-                .await
-                .expect("transfer must not hang");
+            let (send_r, recv_r) = tokio::time::timeout(crate::TEST_HANG_GUARD, async {
+                tokio::join!(
+                    send_blob_deduped(&client_conn, &send_store, &blob),
+                    recv_blob_deduped(&server_conn, &recv_store, u64::MAX),
+                )
+            })
+            .await
+            .expect("transfer must not hang");
 
             send_r.expect("send_blob_deduped");
             let got = recv_r.expect("recv_blob_deduped");

@@ -217,6 +217,15 @@ struct EmptyArgs;
 
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Wait until `counter` reaches `at_least`. Tests use it to order events
+/// across concurrent stages explicitly; a sleep only orders them on a quiet
+/// host. Bounded by the caller's hang guard.
+async fn until_count(counter: &AtomicU32, at_least: u32) {
+    while counter.load(Ordering::SeqCst) < at_least {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 static MAKE_RUN_COUNT: AtomicU32 = AtomicU32::new(0);
 
 // --- next_ready: cache/priority/critical-path ready-node selection -------
@@ -1982,7 +1991,7 @@ async fn parallel_cpu_stages_genuinely_overlap() {
         .finish()
         .into_compiled();
     let fut = ParallelExecutor::execute(plan, ctx);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
         .await
         .expect("parallel CPU stages must overlap (barrier would deadlock if serialized)")
         .unwrap();
@@ -2528,9 +2537,9 @@ async fn hard_timeout_fails_a_hung_stage() {
         .finish()
         .into_compiled();
     let fut = SequentialExecutor::execute(plan, ctx);
-    let r = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+    let r = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
         .await
-        .expect("hard timeout must fire well before the test's 5s guard");
+        .expect("hard timeout must fire before the test's hang guard");
     match r {
         Err(PlanError::StageFailed { source, .. }) => {
             assert!(
@@ -2583,6 +2592,31 @@ impl Stage for Diverger {
     }
 }
 impl Compatible<LamuTrainerBackend> for Diverger {}
+
+/// [`Diverger`], but it holds its non-finite step until the `Increment`
+/// sibling has run. Without that ordering the test raced: on a loaded host the
+/// kill and the fail-fast could land before the sibling was ever scheduled,
+/// and fail-fast correctly never starts it.
+struct DivergeAfterIncrement;
+#[async_trait]
+impl Stage for DivergeAfterIncrement {
+    const NAME: &'static str = "diverger";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Gpu];
+    type Input = Counter;
+    type Output = Counter;
+    type Args = EmptyArgs;
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        input: Counter,
+        args: &EmptyArgs,
+    ) -> Result<Counter, StageError> {
+        until_count(&INC_RUN_COUNT, 1).await;
+        Diverger.run(ctx, input, args).await
+    }
+}
+impl Compatible<LamuTrainerBackend> for DivergeAfterIncrement {}
 
 /// Emits a non-finite step then returns Ok immediately. With NO control
 /// policy the metric is inert data — the stage completes normally, proving
@@ -2639,7 +2673,7 @@ async fn divergence_kill_single_attempt_fails_and_frees_gpu() {
         .finish()
         .into_compiled();
     let fut = ParallelExecutor::execute(plan, ctx);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
         .await
         .expect("divergence kill must fire — a parked Diverger would otherwise hang");
 
@@ -2692,15 +2726,15 @@ async fn divergence_kill_lets_concurrent_sibling_finish_before_failfast() {
     let (_td, base) = fresh_ctx();
     let ctx = base.with_control(std::sync::Arc::new(crate::framework::control::KillOnNaN));
 
-    // MakeOne → fork(Diverger[Gpu], Increment[Cpu]) → merge(SumTwo).
+    // MakeOne → fork(DivergeAfterIncrement[Gpu], Increment[Cpu]) → merge(SumTwo).
     let plan = Plan::<(), LamuTrainerBackend>::new("kill_fork", serde_json::json!({}))
         .start(MakeOne, EmptyArgs)
-        .fork(Diverger, EmptyArgs, Increment, EmptyArgs)
+        .fork(DivergeAfterIncrement, EmptyArgs, Increment, EmptyArgs)
         .merge(SumTwo, EmptyArgs)
         .finish()
         .into_compiled();
     let fut = ParallelExecutor::execute(plan, ctx);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
         .await
         .expect("sibling must finish + divergence kill must fire");
 
@@ -2851,7 +2885,7 @@ async fn divergence_kill_retries_resumes_and_completes() {
         .finish()
         .into_compiled();
     let fut = ParallelExecutor::execute(plan, ctx);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
         .await
         .expect("divergence kill must fire + retry — a parked stage would hang")
         .expect("a diverged-then-resumed run RECOVERS → execute returns Ok");
@@ -2922,7 +2956,7 @@ async fn always_diverges_exhausts_retries_then_fails_not_pruned() {
         .finish()
         .into_compiled();
     let fut = ParallelExecutor::execute(plan, ctx);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
         .await
         .expect("repeated divergence must keep firing the kill + bounded retry");
 
@@ -3100,7 +3134,7 @@ async fn multi_step_divergence_burst_does_not_re_kill_the_retry() {
         .finish()
         .into_compiled();
     let fut = ParallelExecutor::execute(plan, ctx);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(8), fut)
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
         .await
         .expect("divergence kill must fire + retry — a parked stage would hang")
         // THE BUG: without the latch, stale step #2/#3 cancel attempt 2's
@@ -3180,7 +3214,7 @@ async fn multi_step_always_diverge_exhausts_exactly_max_attempts() {
         .finish()
         .into_compiled();
     let fut = ParallelExecutor::execute(plan, ctx);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
         .await
         .expect("repeated multi-step divergence must keep firing the kill + bounded retry");
 
@@ -3253,12 +3287,14 @@ async fn plan_cancel_of_non_diverging_node_does_not_retry() {
         .finish()
         .into_compiled();
     let fut = ParallelExecutor::execute(plan, ctx);
-    // Fire a plan cancel shortly after launch — SlowOnce is parked, not diverged.
+    // Fire a plan cancel once SlowOnce is running — parked, not diverged.
+    // Cancelling on a timer instead raced the launch: on a loaded host the
+    // cancel could land before SlowOnce started, and it then never ran.
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        until_count(&TARGETED_KILL_RAN, 1).await;
         cancel.cancel();
     });
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
         .await
         .expect("plan cancel must unwind promptly");
     assert!(
@@ -3335,7 +3371,7 @@ async fn divergence_check_override_fires_kill_and_retry() {
         .finish()
         .into_compiled();
     let fut = ParallelExecutor::execute(plan, ctx);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
         .await
         .expect("divergence_check kill must fire + retry")
         .expect("diverged-then-recovered → Ok");
@@ -3369,6 +3405,9 @@ impl Stage for QuietSibling {
         input: Counter,
         _args: &EmptyArgs,
     ) -> Result<Counter, StageError> {
+        // Stay in flight until the diverging branch has been killed once and
+        // retried, so a kill demonstrably happens while this node is running.
+        until_count(&SIB_DIV_RAN, 2).await;
         SIB_OK_RAN.fetch_add(1, Ordering::SeqCst);
         Ok(Counter { n: input.n + 10 })
     }
@@ -3398,7 +3437,12 @@ impl Stage for AlwaysDivergeGpu {
         _input: Counter,
         _args: &EmptyArgs,
     ) -> Result<Counter, StageError> {
-        SIB_DIV_RAN.fetch_add(1, Ordering::SeqCst);
+        let attempt = SIB_DIV_RAN.fetch_add(1, Ordering::SeqCst) + 1;
+        // The final attempt diverges only after the sibling has completed, so
+        // the plan's fail-fast cannot pre-empt a sibling that had not yet run.
+        if attempt == Self::RETRY.max_attempts {
+            until_count(&SIB_OK_RAN, 1).await;
+        }
         let _ = ctx.status_tx.send(StageEvent::StageStep {
             node_idx: ctx.node_idx,
             stage_name: Self::NAME.to_string(),
@@ -3428,7 +3472,7 @@ async fn divergence_kill_does_not_affect_concurrent_sibling() {
         .finish()
         .into_compiled();
     let fut = ParallelExecutor::execute(plan, ctx);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
         .await
         .expect("sibling must finish; diverging branch must exhaust + fail");
 
@@ -3935,7 +3979,7 @@ async fn conditional_runtime_spawn_cannot_replace_original_terminal() {
         }));
 
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            crate::TEST_HANG_GUARD,
             execute_plan(conditional_spawn_parent(decision), ctx),
         )
         .await
@@ -4031,7 +4075,7 @@ async fn spawn_injects_subplan_and_runs_to_completion() {
         .finish()
         .into_compiled();
     let fut = ParallelExecutor::execute(plan, ctx);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
         .await
         .expect("spawn run must terminate")
         .expect("a spawn is not a failure → Ok");
@@ -4111,7 +4155,7 @@ async fn repeated_spawns_stay_bounded_and_terminate() {
         .finish()
         .into_compiled();
     let fut = ParallelExecutor::execute(plan, ctx);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
         .await
         .expect("repeated spawns must still terminate (no infinite loop)")
         .expect("spawns are not failures → Ok");
@@ -4151,13 +4195,10 @@ async fn runtime_hpo_spawn_larger_than_job_reservation_is_rejected() {
         .then(StepThenSleep, EmptyArgs)
         .finish()
         .into_compiled();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        ParallelExecutor::execute(plan, ctx),
-    )
-    .await
-    .expect("guarded spawn run must terminate")
-    .expect("an oversized best-effort HPO suggestion is dropped, not fatal");
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, ParallelExecutor::execute(plan, ctx))
+        .await
+        .expect("guarded spawn run must terminate")
+        .expect("an oversized best-effort HPO suggestion is dropped, not fatal");
 
     assert_eq!(OVERSIZED_SPAWN_RAN.load(Ordering::SeqCst), 0);
     assert_eq!(result.n_stages, 2, "oversized sub-plan was never injected");
@@ -4186,7 +4227,7 @@ async fn composite_kills_nan_under_hpo_spawner() {
         .finish()
         .into_compiled();
     let fut = ParallelExecutor::execute(plan, ctx);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
         .await
         .expect("composite kill must keep firing + bounded retry");
 
@@ -4233,7 +4274,7 @@ async fn composite_spawns_when_finite() {
         .finish()
         .into_compiled();
     let fut = ParallelExecutor::execute(plan, ctx);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
         .await
         .expect("composite spawn run must terminate")
         .expect("a spawn is not a failure → Ok");
@@ -4695,12 +4736,9 @@ async fn panicking_gpu_stage_is_reported_and_does_not_hang() {
         .start(PanickingGpuStage, EmptyArgs)
         .finish()
         .into_compiled();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        ParallelExecutor::execute(plan, ctx),
-    )
-    .await
-    .expect("a panicking GPU-resource stage must not hang the plan");
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, ParallelExecutor::execute(plan, ctx))
+        .await
+        .expect("a panicking GPU-resource stage must not hang the plan");
     match result {
         Err(PlanError::Other(msg)) => {
             assert!(

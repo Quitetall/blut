@@ -385,19 +385,18 @@ mod tests {
             };
             write_frame(&mut send, &resp).await.expect("write response");
             // Keep the connection alive until the client is done reading.
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
+            let _ = tokio::time::timeout(crate::TEST_HANG_GUARD, conn.closed()).await;
         });
 
         let client_kp = Arc::new(KeyPair::generate());
         let client = P2pClient::with_coordinator_pin(client_kp, server_kp.verifying.to_bytes());
-        let (conn, _id) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), client.connect(bound))
-                .await
-                .expect("connect must not hang")
-                .expect("mutual-auth connect");
+        let (conn, _id) = tokio::time::timeout(crate::TEST_HANG_GUARD, client.connect(bound))
+            .await
+            .expect("connect must not hang")
+            .expect("mutual-auth connect");
 
         let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            crate::TEST_HANG_GUARD,
             mesh_request(&conn, &MeshFrame::Ping { nonce: 99 }),
         )
         .await
