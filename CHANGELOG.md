@@ -201,7 +201,6 @@ train shares one exact version.
 - `blut plan resume` on a job launched from a plan file (`recipe declare
   --run`, `plan run`) failed with a bare "No such file or directory". It now
   says such a job has no recipe to re-compile and must be launched again.
-||||||| 8d7eb4d
 - The crate builds on Windows. `python_kill::graceful_kill_group` had no
   non-Unix definition, the run ledger's non-Unix lock fallback did not
   type-check, and `blut-notify` took its cursor lock with `flock`
@@ -213,6 +212,47 @@ train shares one exact version.
 - On Windows a scheduler lock left by a dead process could never be reclaimed:
   liveness always answered "alive". It now asks the OS whether the pid has
   exited; a pid it cannot open for any other reason still counts as alive.
+- P2P sessions under hostile network conditions (found on emulated latency,
+  loss, partition, NAT and clock skew between containers, and on a real
+  Oregon-to-France run):
+  - A worker exited about 30 s after the smoke coordinator. The coordinator
+    exited without a close the worker reliably received, so the worker waited
+    out the QUIC idle timeout. Coordinators now end each session with a
+    `Goodbye` on a reliable stream, close with an application code, and wait
+    (at most 5 s) for the close to go out. `p2p serve` does the same on Ctrl-C.
+    The worker acknowledges the `Goodbye` and lets the coordinator close
+    first, so neither side waits on a close the other never sent.
+  - `p2p serve` never exited on Ctrl-C: once the endpoint closed, its accept
+    loop spun without yielding, flooding the log with "QUIC endpoint closed".
+  - An idle worker was disconnected after 30 s, and a session did not survive
+    a 20 s partition even after it healed, because nothing was sent between the
+    heal and the idle timeout. Every P2P connection now sends a keep-alive
+    every 5 s; the idle timeout stays 30 s.
+  - A worker that lost its coordinator (partition, crash) printed "coordinator
+    connection closed." and exited 0. It now exits nonzero and says why, for
+    example "timed out: nothing heard from the other side for 30s".
+  - A worker whose clock ran ahead of the coordinator's read the task's
+    absolute deadline as already passed, so any stage that yielded was killed
+    with a hard-deadline failure. When the clocks disagree by more than 5 s the
+    worker now uses the coordinator's relative budget and logs the skew.
+  - A transfer abandoned on its deadline kept sending: `send_blob` returned
+    once quinn had buffered a chunk, so the data went on being transmitted for
+    nobody, and under congestion it held the connection's CLOSE frame back
+    (quinn gates it behind pending stream data), so the worker again waited
+    out the idle timeout. Each chunk now waits for the peer's acknowledgement
+    and is reset if the transfer is abandoned; the worker sees "stream reset
+    by peer" at once.
+  - The coordinator's connect hint named its bind address (`0.0.0.0:9320`); it
+    now prints `<this-host>:9320` for a wildcard bind.
+  - Dial errors say what to check: an unanswered dial names the 30 s bound and
+    the UDP port; a wrong `--coordinator-pubkey` names the presented and the
+    pinned key instead of "ApplicationVerificationFailure"; a pubkey of the
+    wrong length says 128 hex characters are expected; a lost transfer names
+    the connection's close reason. `p2p connect` accepts a host name.
+  - One failed handshake (a worker with the wrong pin, a port scanner) made
+    `p2p serve --smoke-stage` exit; it now reports it and keeps waiting. The
+    application handshake after QUIC connects is bounded to 10 s, so a silent
+    client cannot hold the accept loop.
 
 ### Security
 - rustls 0.23.45 everywhere, closing RUSTSEC-2026-0285 (TLS 1.3 handshake

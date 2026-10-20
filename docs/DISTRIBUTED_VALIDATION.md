@@ -27,6 +27,7 @@ first if you are deciding whether to depend on this.
 | P2P crypto, policy, transport, and loopback dispatch | Component-tested | Unit and loopback integration tests |
 | P2P dispatch between separate network namespaces | Validated | Two containers, own IPs, real QUIC over a bridge — see below |
 | P2P dispatch between independent hosts over the internet | Validated | Oregon ↔ France, both behind NAT, real QUIC over the public internet, 2026-10-20 — see below |
+| P2P under latency, loss, partition, NAT and clock skew | Validated (emulated) | Containers on one host; impairment emulated, not a real WAN, 2026-10-20 — see below |
 | Live multi-host P2P mesh (N nodes, `p2p node`) | Deferred | Two-host coordinator/worker dispatch only so far |
 | Cloud queue over local object storage | Validated | `blut cloud smoke` round-trip through the shipped cookbook binary, 2026-09-19 |
 | Network object storage (S3-compatible) | Validated (MinIO) | `s3` feature; full cloud round-trip against MinIO over HTTP, 2026-09-20. Backblaze B2 over TLS refused: no conditional writes, 2026-10-20 — see below |
@@ -356,11 +357,127 @@ capability; before, it surfaced a generic 501 after ten retries.
   key variables were.
 - AWS S3 itself has not been run against.
 
+## Recorded run: P2P under hostile network conditions (2026-10-20)
+
+The P2P smoke path, `p2p serve --smoke-stage p2p-echo` on a coordinator and
+`p2p connect` on a worker, run between containers while the network between
+them was made hostile. Every process ran under a timeout, and a hang counted as
+a failure.
+
+**Rig.** Arch Linux containers on one host (kernel 7.2.9-2-cachyos, Docker),
+each with its own network namespace, IP and Ed25519/X25519 identity. The driver
+was a throwaway crate calling `blut::cli::run`, built from this branch with
+`features = ["p2p"]`. The rig used three impairment mechanisms:
+
+- *Kernel*, for NAT and idle partitions. The worker sat on a second network
+  behind a router container doing `MASQUERADE`, with `iptables` `DROP` inside the
+  worker's namespace.
+- *A userspace UDP relay* on the router, for delay, jitter, loss and timed
+  partitions. `tc netem` could not be used because the running kernel's modules
+  directory had been removed by an upgrade, so `sch_netem` would not load. The
+  relay applies independent per-direction random loss and per-packet delay plus
+  uniform jitter, delivered in order. A partition starts after N forwarded
+  packets so it lands mid-transfer. The relay can also rebind to a new source
+  port, as a NAT does.
+- *`libfaketime`* for clock skew.
+
+The 4 MiB payloads could not go through `--smoke-input`, because Linux caps one
+argument at 128 KiB. For those the driver read the file and called the same
+library path: `P2pServer::bind`, `accept_peer`, `smoke_dispatch_once`, then
+`end_session`. The worker was the stock `p2p connect`.
+
+Results with the fixed engine. Wall times are per process. The coordinator's
+includes up to 5 s spent closing the session.
+
+| # | Scenario | Expected | Observed | Wall | Result |
+|---|---|---|---|---|---|
+| 1 | Baseline, bridge, ×3 | verified output, both exit 0 | as expected | coord 1.1 s, worker ≤0.1 s | pass |
+| 2 | Delay 200 ms ± 50 ms each way, ×3 | completes | as expected | worker 2.6–2.7 s, coord 5.3–5.4 s | pass |
+| 2b | Same delay, 4 MiB payload | completes | as expected | 21.5 s | pass |
+| 3 | 5 % loss each way, ×10 | completes | 10/10 | 1.1–1.4 s | pass |
+| 3b | 30 % loss each way, ×10 | completes | 10/10 | 1.3–8.4 s | pass |
+| 4 | 20 s partition mid-transfer (4 MiB, 50 ms each way), ×2 | completes after the heal, or a bounded error | completes after the heal | 37.7–38.5 s | pass |
+| 4b | Permanent partition mid-transfer | bounded error, both exit nonzero | both exit 1: "timed out: nothing heard from the other side for 30s (QUIC idle timeout)" | 32 s | pass |
+| 4c | Idle worker, 60 s, no traffic | session stays up | stays up; `serve` exits on SIGINT, worker exits 0 | 60 s | pass |
+| 4d | Idle worker, kernel `DROP` for 20 s, then heal | session survives | survives | 60 s | pass |
+| 4e | Idle worker, kernel `DROP` permanently | worker fails, bounded | worker exits 1 after 30 s idle | 45 s (15 + 30) | pass |
+| 5 | Worker behind `MASQUERADE`, dialing out | completes | completes. The coordinator sees the router's address (conntrack) | 1.1 s | pass |
+| 5b | NAT rebinding mid-transfer: new masquerade port range and conntrack flush | QUIC migrates, or a clean failure | migrates and completes (mapping moved to a new port) | 1.4 s | pass |
+| 5c | Relay rebinds to a new source port mid-transfer (4 MiB, 50 ms), ×2 | QUIC migrates | migrates and completes | 4.9 s | pass |
+| 6 | Dial a host that does not exist / a closed port | bounded, clear, nonzero | exit 1 after 30.0 s: "no QUIC response from … within 30s … UDP port 9320 is reachable" | 30.0 s | pass |
+| 6b | Wrong `--coordinator-pubkey` | clear, nonzero | exit 1 at once, naming the presented and the pinned key. The coordinator logs the attempt and keeps waiting | 0.0 s | pass |
+| 6c | Truncated pubkey, unparsable address, host name | clear errors; names resolve | as expected | 0.0 s | pass |
+| 7 | Clock skew ±10 min, on the worker or the coordinator | no false rejection | all four complete. The worker logs the skew and uses the relative budget | 1.1 s | pass |
+| 8 | 4 MiB, 5 % loss, ×3 | completes | 3/3 | 10.3–11.1 s | pass |
+| 8b | 4 MiB, 5 % loss plus 100 ms each way | completes or meets its deadline | misses the 120 s deadline; coordinator exits 1 at 152 s, worker exits 1.6 s later ("stream reset by peer") | 152 s | bounded failure |
+| x | 4 MiB, 200 ± 50 ms with reordering, as `netem` jitter does | — | misses its deadline the same way | 154 s | bounded failure |
+
+Rows 8b and x are throughput, not hangs. Loss-based congestion control at
+5 % loss and 200 ms RTT sustains about 30 KB/s. Heavy reordering reads to QUIC
+as loss. Both runs ended at the deadline with clear errors on both sides.
+
+**What it found.** The same matrix against the base commit:
+
+- **A worker exited about 30 s late.** In 4 of 13 delayed or lossy smoke runs,
+  and on a real Oregon-to-France run, the coordinator exited before its close reached
+  the worker. The worker then waited out the 30 s idle timeout. The
+  coordinator now sends `Goodbye` on a reliable stream, waits up to 5 s for the
+  acknowledgement, closes with an application code, and drains before exiting.
+  The worker lets the coordinator close first.
+- **An idle worker was dropped after 30 s, and a 20 s partition was fatal.**
+  The transport set no keep-alive. Mid-transfer, PTO backoff left nothing sent
+  between the heal at 20 s and the idle timeout at 30 s, so the session died
+  even though the network had come back. Every connection now sends a
+  keep-alive every 5 s. Row 4 completes; before, both sides failed at about
+  36 s, the worker with exit 0.
+- **A worker that lost its coordinator exited 0** and printed "coordinator
+  connection closed.". It now exits 1 and gives the reason.
+- **`p2p serve` never exited on Ctrl-C.** After the endpoint closed, the accept
+  loop spun without yielding: 7.9 million "QUIC endpoint closed" log lines in
+  5 s, and then the process had to be SIGKILLed.
+- **An abandoned transfer kept sending.** `send_blob` returned once quinn had
+  buffered the data. After a dispatch deadline, the coordinator kept
+  transmitting the input for nobody. Under congestion, quinn also held the
+  CONNECTION_CLOSE frame behind that pending data (seen in a quinn trace), so
+  the worker learned of the end only by idle timeout. Each chunk now waits for
+  the acknowledgement and is reset if abandoned.
+- **Clock skew.** The worker read the coordinator's absolute deadline on its
+  own clock. A worker 10 minutes ahead therefore saw every task as already
+  expired. `p2p-echo` finishes within one poll, so the smoke run passed anyway;
+  any stage that yields would have been killed. Unit tests pin the corrected
+  budget. No handshake, certificate or replay check depends on wall time:
+  certificate validity is not checked, because identity is the pinned key.
+- **Errors and hints.** The coordinator's hint printed its bind address
+  (`0.0.0.0:9320`). A wrong pin surfaced as "ApplicationVerificationFailure". A
+  short pubkey reported "Invalid input length 128". `p2p connect` rejected host
+  names. One stray handshake made the smoke coordinator exit.
+
+**Timeouts in effect.** QUIC idle timeout 30 s, which also bounds an
+unanswered dial. Keep-alive every 5 s. The application handshake after QUIC
+connects: 10 s. Orderly close: up to 5 s for `Goodbye` to be acknowledged, plus
+up to 5 s to drain. Smoke dispatch: 60 s stage deadline, and the coordinator
+gives up on the reply at 90 s (`timeout_secs + 30`). Clock-skew tolerance
+before the worker switches to the relative budget: 5 s. Host-name resolution:
+10 s. A smoke coordinator waits for its first worker without a time limit, like
+any server.
+
+**Boundaries.** One host, one kernel, one Docker bridge. Delay, jitter, loss
+and partitions were emulated, in userspace for all but NAT and the idle
+partitions, and are not a real WAN. Real paths differ in queueing, bursty loss,
+middleboxes and MTU. NAT was Linux `MASQUERADE` only: no symmetric or
+carrier-grade NAT, and no NAT on both sides. IPv4 only. Only the
+coordinator/worker smoke path was exercised, not the symmetric `p2p node` mesh
+or multi-peer dispatch. Evidence: `artifacts/BLUT/keep/2026-10-20-p2p-hostile/`
+on the validation host.
+
 ## Required evidence before stronger claims
 
-- Record multi-node failure recovery, and artifact hashes across nodes. Topology,
-  versions and global-batch parity are recorded above.
-- Exercise P2P across independent hosts and hostile-network cases.
+- BLUT's own durable resume after a node loss (Slurm's requeue is recorded
+  above), and artifact hashes compared across nodes. Topology, versions and
+  global-batch parity are recorded above.
+- An N-node `p2p node` mesh across independent hosts, and the hostile-network
+  cases on a real WAN. Two-host dispatch over the internet and the emulated
+  impairment matrix are recorded above.
 - Run the S3 path against AWS S3 (or another provider with conditional writes)
   on public TLS, and with IAM-role credentials.
 - Publish cookbook-specific DDP evidence in each cookbook repository. Engine
