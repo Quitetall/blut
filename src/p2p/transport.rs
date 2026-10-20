@@ -34,7 +34,12 @@ use crate::p2p::task::{TaskManifest, TaskResult};
 use crate::p2p::trust::TrustLevel;
 
 /// Messages exchanged between coordinator and peer over QUIC streams.
+///
+/// Non-exhaustive: the protocol gains messages over time (`Goodbye` arrived in
+/// 0.2.0-alpha.2), and a peer must already treat an unknown message as an
+/// error, so code outside this crate should too.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum WireMessage {
     /// Peer → Coordinator: initial handshake with identity.
     Handshake {

@@ -273,10 +273,47 @@ of its truncated log.
 beginning. Resuming BLUT's own DAG from its last completed stage after a node
 loss (`plan resume`) was not exercised here.
 
+## Recorded run: durable resume after losing a node (2026-10-20)
+
+A rented 16-core machine ran two `slurmd` nodes (`n0`, `n1`) in one container
+under Slurm 21.08. It ran the standard cookbook's `train_from_dataset` with
+`--launcher slurm`, `nnodes=2`, CPU ranks over gloo, and SmolLM2-135M on 1200
+wikitext rows.
+
+1. **Node loss.** Mid-epoch, `n1`'s `slurmd` and its training rank were killed
+   with SIGKILL. Seconds later the job failed with `plan stage
+   'train_model_on_split' (idx 2) failed`, exit 1. Nothing hung.
+2. **Resume.** With `n1` back, `blut-core plan resume <job>` ran:
+
+```
+resuming 20261020-204247-001040720 with --launcher slurm (as it was run)
+[trainer] epoch 1/1: loss=3.1975
+[trainer] replicas agree across 2 ranks: params sha256 b2f7f10d3f19f932…
+[evaluator] metrics: {'loss': 3.0972, 'n_rows': 120, 'n_items': 61}
+done — 5 ingredients, 2 cache hits, 3 misses        exit 0
+```
+
+The two stages that had finished before the loss came from the cache. Training
+ran again on both nodes and the job completed.
+
+**What it found.**
+- `plan resume` dropped the job's launcher: every resume ran locally. A
+  two-node Slurm job resumed that way failed at once ("multi-node training
+  needs MASTER_ADDR"). The launcher is now recorded with the job, and resume
+  places stages where the run did. Jobs recorded before this resume locally,
+  as they did before.
+- The trainer now checks that DDP replicas agree. Every rank hashes its
+  parameters, and the run fails before saving if any rank differs. That gives
+  an artifact hash compared across nodes, from the training process itself.
+  Both runs above agreed.
+
+**Boundaries.**
+- One host, CPU ranks, a short run.
+- Resume restarts the interrupted stage from its beginning. There is no
+  mid-stage checkpoint resume.
+
 ## Required evidence (Slurm, still open)
 
-- BLUT durable resume (`plan resume`) after losing a node, as opposed to
-  Slurm's own requeue.
 - A cluster with cgroup enforcement and GPU binding, rather than placeholder
   devices.
 
@@ -472,9 +509,9 @@ on the validation host.
 
 ## Required evidence before stronger claims
 
-- BLUT's own durable resume after a node loss (Slurm's requeue is recorded
-  above), and artifact hashes compared across nodes. Topology, versions and
-  global-batch parity are recorded above.
+- Mid-stage checkpoint resume for long training stages. Node loss, durable
+  resume, replica hashes, topology, versions and global-batch parity are
+  recorded above.
 - An N-node `p2p node` mesh across independent hosts, and the hostile-network
   cases on a real WAN. Two-host dispatch over the internet and the emulated
   impairment matrix are recorded above.

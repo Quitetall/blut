@@ -212,6 +212,10 @@ train shares one exact version.
 - On Windows a scheduler lock left by a dead process could never be reclaimed:
   liveness always answered "alive". It now asks the OS whether the pid has
   exited; a pid it cannot open for any other reason still counts as alive.
+- `blut plan resume` dropped the job's `--launcher`, so a Slurm job resumed
+  on the local machine; a multi-node one failed at once ("multi-node training
+  needs MASTER_ADDR"). The launcher is now recorded with the job and restored
+  on resume. Jobs recorded before this resume locally, as before.
 - `blut p2p connect` checked only the identity (Ed25519) half of
   `--coordinator-pubkey`. With the right first half and a wrong second (X25519)
   half, a worker connected, ran the task, sealed the result to a key nobody

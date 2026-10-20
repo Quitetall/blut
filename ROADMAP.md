@@ -24,9 +24,9 @@ PlanSpec IR, the Starlark front-end and the Python SDK. That is what
 launcher has run against a live two-node cluster, a two-node Ray cluster has
 run jobs to completion, and cookbook training has run across two machines over
 NCCL with global-batch parity. A node lost mid-job is detected and the job is
-requeued and completes once the node returns. Still missing: BLUT's own
-durable resume after a node loss, artifact hashes compared across nodes, and
-an N-node P2P mesh (item 2).
+requeued and completes once the node returns. `plan resume` after a node loss
+picks up from the cache on the same launcher, and DDP replicas are checked to
+be bit-identical across nodes. Still missing: an N-node P2P mesh (item 2).
 
 **2. P2P across independent hosts, including hostile networks.** Loopback proves
 the protocol, not the mesh. Needs separate machines, NAT, loss and partition.

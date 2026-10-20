@@ -1667,6 +1667,7 @@ mod registry_completion_cli_tests {
                     pinned_at: 1,
                 }],
             },
+            launcher: Some("slurm".into()),
         };
         let encoded = serde_json::to_value(&marker).unwrap();
         assert_eq!(encoded["source_args"]["data"], "dataset://train@v1");
@@ -1677,6 +1678,8 @@ mod registry_completion_cli_tests {
         );
         let round_tripped: RecipeMarker = serde_json::from_value(encoded).unwrap();
         assert_eq!(round_tripped.resolved_handles, marker.resolved_handles);
+        // Resume must place stages where the run did.
+        assert_eq!(round_tripped.launcher.as_deref(), Some("slurm"));
         assert!(ensure_resume_registry_snapshot(&marker, &marker.args).is_ok());
         assert!(
             ensure_resume_registry_snapshot(
@@ -1697,6 +1700,10 @@ mod registry_completion_cli_tests {
             legacy.resolved_handles.is_empty(),
             "a marker written before resolved_handles existed must still load"
         );
+        assert!(
+            legacy.launcher.is_none(),
+            "a marker written before the launcher was recorded resumes locally"
+        );
 
         // A URI-free run serialises no empty scaffolding.
         let plain = RecipeMarker {
@@ -1704,9 +1711,11 @@ mod registry_completion_cli_tests {
             args: serde_json::json!({"epochs": 3}),
             source_args: Some(serde_json::json!({"epochs": 3})),
             resolved_handles: crate::registry_args::ResolvedHandles::default(),
+            launcher: None,
         };
         let encoded_plain = serde_json::to_value(&plain).unwrap();
         assert!(encoded_plain.get("resolved_handles").is_none());
+        assert!(encoded_plain.get("launcher").is_none());
     }
 }
 
@@ -1821,6 +1830,10 @@ struct RecipeMarker {
         skip_serializing_if = "crate::registry_args::ResolvedHandles::is_empty"
     )]
     resolved_handles: crate::registry_args::ResolvedHandles,
+    /// The `--launcher` the run used, so `plan resume` places stages where the
+    /// run did. Markers written before this field existed resume locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launcher: Option<String>,
 }
 
 impl RecipeMarker {
@@ -1880,12 +1893,26 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             let tenant = crate::jobs::read_tenant(&job_id)
                 .with_context(|| format!("read tenant for {job_id}"))?;
             let source_args = marker.source_args.as_ref().unwrap_or(&marker.args).clone();
-            let args = crate::registry_args::resolve_recipe_args(
-                source_args,
-                &tenant,
-                crate::config::launcher::LaunchTarget::Local,
-            )
-            .map_err(|e| anyhow!("registry arg revalidation: {e}"))?;
+            // Resume where the run ran: a multi-node Slurm job resumed locally
+            // would fail at the first distributed stage, after re-running
+            // nothing useful.
+            let launch_target: crate::config::launcher::LaunchTarget = marker
+                .launcher
+                .as_deref()
+                .unwrap_or("local")
+                .parse()
+                .map_err(|e| anyhow!("job {job_id} records an unknown launcher: {e}"))?;
+            crate::config::launcher::check_launcher_env(launch_target)
+                .map_err(|e| anyhow!("--launcher {}: {e}", launch_target.as_str()))?;
+            if launch_target != crate::config::launcher::LaunchTarget::Local {
+                eprintln!(
+                    "resuming {job_id} with --launcher {} (as it was run)",
+                    launch_target.as_str()
+                );
+            }
+            let args =
+                crate::registry_args::resolve_recipe_args(source_args, &tenant, launch_target)
+                    .map_err(|e| anyhow!("registry arg revalidation: {e}"))?;
             ensure_resume_registry_snapshot(&marker, &args)?;
             let r = reg.find(&marker.name).ok_or_else(|| {
                 anyhow!(
@@ -1912,7 +1939,10 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             )?;
 
             let mut ctx = ExecCtx::new(job_dir.clone());
-            ctx = ctx.with_tenant(tenant.clone()).with_sync_io(sync_io);
+            ctx = ctx
+                .with_tenant(tenant.clone())
+                .with_sync_io(sync_io)
+                .with_launch_target(launch_target);
             if let Some(budget) = tenant_admission
                 .executor_budget_gib(crate::broker::admission::DEFAULT_FLOOR_GIB)
                 .map_err(|e| anyhow!("tenant admission: {e}"))?
@@ -1934,7 +1964,7 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                 admitted_batch_size,
                 footprint,
                 snapshot,
-                crate::config::launcher::LaunchTarget::Local,
+                launch_target,
             )?;
             footprint = prepared_footprint;
             if shared_cache {

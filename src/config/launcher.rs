@@ -1172,6 +1172,20 @@ pub enum LaunchTarget {
     Cloud,
 }
 
+impl LaunchTarget {
+    /// The `--launcher` value that selects this target; `parse` round-trips it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Slurm => "slurm",
+            Self::Ray => "ray",
+            Self::P2P => "p2p",
+            Self::K8s => "k8s",
+            Self::Cloud => "cloud",
+        }
+    }
+}
+
 impl std::str::FromStr for LaunchTarget {
     type Err = TrainError;
     fn from_str(s: &str) -> Result<Self> {
@@ -1722,6 +1736,20 @@ mod tests {
     }
 
     // --- launcher env validation ---
+
+    #[test]
+    fn launch_target_as_str_round_trips_through_parse() {
+        for t in [
+            LaunchTarget::Local,
+            LaunchTarget::Slurm,
+            LaunchTarget::Ray,
+            LaunchTarget::P2P,
+            LaunchTarget::K8s,
+            LaunchTarget::Cloud,
+        ] {
+            assert_eq!(t.as_str().parse::<LaunchTarget>().unwrap(), t);
+        }
+    }
 
     #[test]
     fn launcher_env_typo_is_an_error_not_a_default() {

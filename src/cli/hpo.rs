@@ -880,6 +880,7 @@ pub(super) async fn run_hpo(
         args: base_args.clone(),
         source_args: Some(source_args),
         resolved_handles,
+        launcher: Some(launch_target.as_str().to_string()),
     }
     .write_to(&job_dir)?;
     crate::jobs::write_state(&job_id, JobState::Running)
