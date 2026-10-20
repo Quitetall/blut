@@ -27,7 +27,7 @@
 //!
 //! The args schema is the recipe's OWN `args_schema_fn`, not a re-description
 //! of it. A second hand-written description of the same arguments is exactly
-//! the drift ADR 0092 invariant 2 forbids — one canonical owner per contract.
+//! the drift the module-ownership rule forbids — one canonical owner per contract.
 
 use anyhow::Result;
 use clap::Subcommand;

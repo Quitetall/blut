@@ -2,8 +2,8 @@
 //!
 //! Replaces `abir_artifact_identity.rs`. That file asserted `ArtifactContentId`
 //! was a projection of `abir::ContentId`, which required the domain-agnostic
-//! engine to link a BIOSIGNAL crate — the edge ADR 0143 says `blut` "MUST NOT"
-//! have. The projection is gone; everything below is the part that was actually
+//! engine to link a BIOSIGNAL crate — the edge the project's module
+//! boundaries say `blut` "MUST NOT" have. The projection is gone; everything below is the part that was actually
 //! load-bearing and is unchanged by the cut.
 
 use blut::framework::{ArtifactContentId, ContentHash};
@@ -37,11 +37,11 @@ fn identity_survives_a_serde_round_trip() {
 
 #[test]
 fn legacy_content_hash_and_identity_share_bincode_wire_shape() {
-    // Load-bearing for readers of already-written artifacts: pre-ADR0169
+    // Load-bearing for readers of already-written artifacts: older
     // callers stored identity bytes in a `ContentHash`, so the two types must
     // occupy the SAME bincode wire slot. If they diverge, an old manifest
     // deserializes into the wrong shape rather than failing loudly.
-    let legacy = ContentHash::of_bytes(b"pre-ADR0169 object identity");
+    let legacy = ContentHash::of_bytes(b"legacy object identity");
     let projected = ArtifactContentId::from_digest(legacy);
 
     let legacy_wire = bincode::serialize(&legacy).unwrap();

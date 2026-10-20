@@ -73,7 +73,7 @@ pub(super) fn detect_stale_binary() -> Option<StaleInfo> {
 /// Local builds with `BLUT_EMBED_SRC_DIR=1` stamp the build-time hash and source
 /// dir; [`detect_stale_binary`] re-resolves that dir's live HEAD at runtime.
 /// Registry builds never embed a host path. When `BLUT_AUTO_REBUILD=1` (opt-in,
-/// ADR 0071 A4) a stale binary is
+/// ADR 0156 A4) a stale binary is
 /// rebuilt + re-exec'd instead of merely warned; default OFF (warn-only) so
 /// there are no surprise rebuilds.
 pub(super) fn warn_if_stale_binary() {
@@ -176,7 +176,7 @@ pub(super) fn resolve_rebuild_command() -> Option<Vec<String>> {
     ])
 }
 
-/// Opt-in (`BLUT_AUTO_REBUILD=1`) rebuild + re-exec of a stale binary (ADR 0071
+/// Opt-in (`BLUT_AUTO_REBUILD=1`) rebuild + re-exec of a stale binary (ADR 0156
 /// A4). On a successful rebuild this re-execs the fresh binary with the same
 /// args and DOES NOT RETURN. Returns (falling through to the warning) when:
 /// the opt-in is off, a rebuild already ran this chain (loop guard), the target

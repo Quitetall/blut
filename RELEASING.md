@@ -6,7 +6,7 @@ it, so it must be indexed on crates.io before `blut` will package — otherwise
 `no matching package named 'blut-types' found`. Members share the exact preview
 version.
 
-`blut-graph-core` is NOT part of this train. The ADR 0139 adapter that used it
+`blut-graph-core` is NOT part of this train. The LamQuant semantic-graph adapter that used it
 moved out of the engine into the unpublished `crates/blut-semantic` sidecar
 (ADR 0034 — graph-core carries ABIR domain vocabulary and the engine is
 domain-agnostic), so nothing in the chain depends on it. Publish it on its own

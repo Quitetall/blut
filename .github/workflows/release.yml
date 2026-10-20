@@ -274,7 +274,7 @@ jobs:
           publish blut-dsl --manifest-path crates/blut-dsl/Cargo.toml
           publish blut-notify
           # blut-graph-core is INDEPENDENT of this chain: nothing in the train
-          # depends on it since the ADR 0139 adapter moved to the (unpublished)
+          # depends on it since the LamQuant semantic-graph adapter moved to the (unpublished)
           # blut-semantic sidecar. Publish it on its own schedule once its
           # surface settles — it is the newest, fastest-moving crate here.
           # publish blut-graph-core

@@ -678,7 +678,7 @@ pub trait Stage: Send + Sync + 'static {
     /// args-aware pair rather than widening this const.
     const CPU_CORES: u32 = 1;
 
-    /// Whether this stage is ADVISORY (ADR 0071). An advisory stage's failure is
+    /// Whether this stage is ADVISORY (ADR 0156). An advisory stage's failure is
     /// recorded as a non-fatal warning and PRUNES its descendants, but does NOT
     /// fail the plan / exit non-zero — the canonical case is a `--dry-run` /
     /// verdict gate that runs after training: its verdict is information, not a
@@ -928,7 +928,7 @@ pub trait StageDyn: Send + Sync + 'static {
     fn cpu_cores(&self) -> u32 {
         1
     }
-    /// Whether this stage is advisory (ADR 0071 · `Stage::ADVISORY`). Defaulted
+    /// Whether this stage is advisory (ADR 0156 · `Stage::ADVISORY`). Defaulted
     /// `false` so manual `StageDyn` impls keep the fatal semantics; the blanket
     /// impl below forwards `S::ADVISORY`.
     fn is_advisory(&self) -> bool {

@@ -45,11 +45,15 @@ designated quiet host, or the gate is honest about naming `opt0`.
 **5. Windows containment.** Bare fallback only; no Job Object implementation.
 Either implemented or stated as unsupported rather than "deferred".
 
-**6. The ADR problem.** 805 citations across 208 files name decision records
-this repository does not contain — they live in a private meta-repository.
-Either the engine-facing ADRs are federated into this repo, or the citations
-stop pretending to be references. `book_src/adrs.md` currently discloses the gap
-instead of hiding it.
+**6. The ADR problem.** Federated, pending owner review before publication. The
+engine-facing decision records (41 of them) now live in
+[`docs/adr/`](docs/adr/README.md), redacted where marked, so the engine's
+citations resolve. Citations of product decisions that were not federated were
+rewritten as plain rationale; two citation numbers that predate a renumbering
+now point at the records' current numbers. What is left: plain-text
+"ADR NNNN" mentions are not hyperlinks (the index resolves them), and captured
+data — an SDK test fixture exported from a cookbook, and recorded graph-runtime
+evidence — still carries non-federated numbers verbatim.
 
 ## Explicitly not planned
 

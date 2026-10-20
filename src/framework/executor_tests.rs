@@ -862,7 +862,7 @@ impl Stage for AlwaysFail {
 impl Compatible<LamuTrainerBackend> for AlwaysFail {}
 
 // An ADVISORY gate that always fails — models a dry-run/verdict gate after
-// training (ADR 0071). Its failure must NOT fail the plan.
+// training (ADR 0156). Its failure must NOT fail the plan.
 struct AdvisoryGate;
 #[async_trait]
 impl Stage for AdvisoryGate {
@@ -915,7 +915,7 @@ async fn linear_plan_executes_in_order() {
 
 #[tokio::test]
 async fn advisory_gate_failure_is_non_fatal_and_preserves_output() {
-    // ADR 0071: train (MakeOne) → an advisory gate that FAILS. The plan must
+    // ADR 0156: train (MakeOne) → an advisory gate that FAILS. The plan must
     // NOT fail; the warning is recorded and the train output is surfaced.
     let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     MAKE_RUN_COUNT.store(0, Ordering::SeqCst);

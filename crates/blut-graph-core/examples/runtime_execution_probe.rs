@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! ADR 0139 P5 runtime slice: per-realm graph execution evidence.
+//! P5 runtime slice of the LamQuant graph program: per-realm graph execution evidence.
 //!
 //! Compiles the conformance graph for one execution realm, runs it, and prints a
 //! deterministic JSON line describing what the run preserved:
