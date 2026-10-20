@@ -371,9 +371,29 @@ pub(super) async fn run_cancel(id_query: &str, grace: Duration) -> Result<()> {
     Ok(())
 }
 
+/// What `blut log` says when it has nothing to print. It renders trainer
+/// progress (`StatusUpdate`) only; a job whose stages run in-process records
+/// stage events instead, and the log printed nothing at all with exit 0, as
+/// if the job had never run. The hint goes to stderr so `--json` stays clean.
+fn empty_log_hint(id: &str) -> Result<String> {
+    let n = jobs::read_status_lines(id)?.len();
+    Ok(if n == 0 {
+        format!("no log entries recorded for {id} yet.")
+    } else {
+        format!(
+            "no trainer progress in {id}'s log; its {n} stage event(s) are shown by \
+             `blut dag {id}` (and `blut lineage show {id}`)."
+        )
+    })
+}
+
 pub(super) fn run_log(id_query: &str, tail: usize, json: bool) -> Result<()> {
     let id = jobs::resolve_job_id(id_query)?;
     let updates = jobs::read_status(&id)?;
+    if updates.is_empty() {
+        eprintln!("{}", empty_log_hint(&id)?);
+        return Ok(());
+    }
     if json {
         // Raw status stream as JSON lines (one StatusUpdate per line),
         // tail-trimmed like the rendered view.
@@ -401,4 +421,43 @@ pub(super) fn run_log(id_query: &str, tail: usize, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod empty_log_hint_tests {
+    use super::empty_log_hint;
+
+    /// A job with only stage events printed an empty log; the hint must point
+    /// at the command that shows them.
+    #[test]
+    fn a_stage_event_only_log_points_at_dag() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("LAMU_TRAIN_JOBS_DIR");
+        // SAFETY: TEST_ENV_LOCK serializes env mutation; restored below.
+        unsafe { std::env::set_var("LAMU_TRAIN_JOBS_DIR", td.path()) };
+        let id = "20261020-000000-000000010";
+        let dir = td.path().join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = empty_log_hint(id).unwrap();
+        std::fs::write(
+            dir.join("status.jsonl"),
+            "{\"kind\":\"stage_begin\",\"node_idx\":0,\"stage_name\":\"s\",\"input_hash\":\"x\"}\n",
+        )
+        .unwrap();
+        let events = empty_log_hint(id).unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("LAMU_TRAIN_JOBS_DIR", v),
+                None => std::env::remove_var("LAMU_TRAIN_JOBS_DIR"),
+            }
+        }
+        assert!(empty.contains("no log entries"), "{empty}");
+        assert!(
+            events.contains("1 stage event") && events.contains("blut dag"),
+            "{events}"
+        );
+    }
 }

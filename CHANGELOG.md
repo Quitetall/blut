@@ -115,6 +115,9 @@ because the train shares one exact version.
   went to the default location instead. They are read as OS strings now,
   except `LAMU_TRAIN_JOBS_DIR` and `LAMU_TRAIN_DATA_DIR`, whose paths are
   recorded in JSON: a non-UTF-8 value there is refused, naming the variable.
+- `blut log` printed nothing, with exit 0, for a job whose stages run
+  in-process: it renders trainer progress only, and such a job records stage
+  events instead. It now says so on stderr and points at `blut dag <job>`.
 
 ### Security
 - rustls 0.23.45 everywhere, closing RUSTSEC-2026-0285 (TLS 1.3 handshake
