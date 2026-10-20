@@ -65,6 +65,12 @@ because the train shares one exact version.
 - Ctrl-C or SIGTERM during `blut plan resume` killed blut outright, leaving
   the job `running` and any trainer subprocess (which runs in its own session)
   orphaned. Resume now installs the same cancel handler as `recipe run`.
+- `blut update` printed `cargo install --path /my%20dir` for a checkout whose
+  path contains a space (cargo records it as a URL), and reinstalled without
+  the features the binary was installed with, so `--yes` on a
+  `--features cloud` install silently removed `blut cloud`. The path is now
+  decoded and shell-quoted, and the feature selection recorded in
+  `.crates2.json` is passed back to `cargo install`.
 
 ### Security
 - rustls 0.23.45 everywhere, closing RUSTSEC-2026-0285 (TLS 1.3 handshake

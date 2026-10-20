@@ -59,7 +59,9 @@ pub(super) fn parse_installed_origin(crates_toml: &str, bin: &str) -> Option<Ori
         let version = parts.next()?.to_string();
         let source = key.split_once('(')?.1;
         if let Some(rest) = source.split_once("path+file://") {
-            let dir = rest.1.split(')').next()?.trim().to_string();
+            // Cargo records the path as a URL: a space is `%20`. Handing that
+            // back verbatim printed a `cargo install --path` that cannot work.
+            let dir = percent_decode(rest.1.split(')').next()?.trim())?;
             if dir.is_empty() {
                 return None;
             }
@@ -72,6 +74,84 @@ pub(super) fn parse_installed_origin(crates_toml: &str, bin: &str) -> Option<Ori
         return None;
     }
     None
+}
+
+/// Decode the `%XX` escapes of a `file://` URL path. `None` on a malformed
+/// escape or a result that is not UTF-8, so a mangled ledger yields no advice
+/// rather than a wrong path.
+fn percent_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The feature selection the binary `bin` was installed with, read from
+/// cargo's `.crates2.json`, as `cargo install` arguments. Reinstalling without
+/// them silently drops the features: a `--features cloud` install would come
+/// back from `blut update --yes` without `blut cloud`. Unknown or unreadable
+/// input yields no flags.
+pub(super) fn parse_install_flags(crates2_json: &str, bin: &str) -> Vec<String> {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(crates2_json) else {
+        return Vec::new();
+    };
+    let Some(installs) = doc.get("installs").and_then(|i| i.as_object()) else {
+        return Vec::new();
+    };
+    let Some(entry) = installs.values().find(|entry| {
+        entry
+            .get("bins")
+            .and_then(|b| b.as_array())
+            .is_some_and(|bins| bins.iter().any(|b| b.as_str() == Some(bin)))
+    }) else {
+        return Vec::new();
+    };
+    let mut flags = Vec::new();
+    if entry.get("all_features").and_then(|v| v.as_bool()) == Some(true) {
+        flags.push("--all-features".to_string());
+    }
+    if entry.get("no_default_features").and_then(|v| v.as_bool()) == Some(true) {
+        flags.push("--no-default-features".to_string());
+    }
+    let features: Vec<&str> = entry
+        .get("features")
+        .and_then(|f| f.as_array())
+        .map(|f| f.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    if !features.is_empty() {
+        flags.push("--features".to_string());
+        flags.push(features.join(","));
+    }
+    flags
+}
+
+/// Render an argv for a POSIX shell, quoting only the words that need it, so
+/// a printed command can be pasted as-is.
+pub(super) fn shell_join(argv: &[String]) -> String {
+    argv.iter()
+        .map(|word| {
+            let plain = !word.is_empty()
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./=:,+@%".contains(c));
+            if plain {
+                word.clone()
+            } else {
+                format!("'{}'", word.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Pull the newest published version out of `cargo info` output. The command
@@ -140,8 +220,8 @@ pub(super) fn verdict(installed: &str, latest: &str) -> Result<Verdict> {
 /// The command that performs the upgrade. `--locked` is not optional here: it
 /// installs the dependency versions the release was tested with instead of
 /// whatever resolves today.
-pub(super) fn upgrade_argv(pkg: &str, version: &str) -> Vec<String> {
-    vec![
+pub(super) fn upgrade_argv(pkg: &str, version: &str, install_flags: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
         "cargo".into(),
         "install".into(),
         pkg.into(),
@@ -149,7 +229,22 @@ pub(super) fn upgrade_argv(pkg: &str, version: &str) -> Vec<String> {
         version.into(),
         "--locked".into(),
         "--force".into(),
-    ]
+    ];
+    argv.extend(install_flags.iter().cloned());
+    argv
+}
+
+/// The command that rebuilds a `cargo install --path` binary from its checkout.
+pub(super) fn path_reinstall_argv(dir: &str, install_flags: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
+        "cargo".into(),
+        "install".into(),
+        "--path".into(),
+        dir.into(),
+        "--force".into(),
+    ];
+    argv.extend(install_flags.iter().cloned());
+    argv
 }
 
 /// Ask the registry what the newest version of `pkg` is.
@@ -184,8 +279,9 @@ fn published_version(pkg: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("`cargo info {pkg}` printed no version line"))
 }
 
-/// Resolve the origin of the running binary from cargo's own install ledger.
-fn installed_origin() -> Result<Origin> {
+/// Resolve the origin of the running binary from cargo's own install ledger,
+/// with the feature flags it was installed with.
+fn installed_origin() -> Result<(Origin, Vec<String>)> {
     let exe = std::env::current_exe().context("resolve current executable")?;
     let bin = exe
         .file_stem()
@@ -199,13 +295,17 @@ fn installed_origin() -> Result<Origin> {
     let ledger = cargo_home.join(".crates.toml");
     let text =
         std::fs::read_to_string(&ledger).with_context(|| format!("read {}", ledger.display()))?;
-    parse_installed_origin(&text, &bin).ok_or_else(|| {
+    let origin = parse_installed_origin(&text, &bin).ok_or_else(|| {
         anyhow!(
             "{} lists no registry or path install for the binary {bin:?}; \
              nothing to compare against",
             ledger.display()
         )
-    })
+    })?;
+    let flags = std::fs::read_to_string(cargo_home.join(".crates2.json"))
+        .map(|json| parse_install_flags(&json, &bin))
+        .unwrap_or_default();
+    Ok((origin, flags))
 }
 
 /// `blut update` — report, and on `--yes` perform, an upgrade of the binary
@@ -213,13 +313,13 @@ fn installed_origin() -> Result<Origin> {
 /// status 0 means a verdict was reached, "behind" included; non-zero means no
 /// verdict could be reached or the upgrade failed.
 pub(super) fn run_update(check_only: bool, assume_yes: bool) -> Result<()> {
-    let origin = installed_origin()?;
+    let (origin, flags) = installed_origin()?;
     match &origin {
         Origin::Path { pkg, dir } => {
             println!("{pkg} was installed from a local checkout ({dir}).");
             println!(
-                "The registry cannot speak for it. Update the checkout and reinstall:\n  \
-                 cargo install --path {dir} --force"
+                "The registry cannot speak for it. Update the checkout and reinstall:\n  {}",
+                shell_join(&path_reinstall_argv(dir, &flags))
             );
             Ok(())
         }
@@ -242,21 +342,21 @@ pub(super) fn run_update(check_only: bool, assume_yes: bool) -> Result<()> {
                         "{pkg} {version} is installed; the registry's newest is the \
                          prerelease {latest}. A stable install is not moved onto a \
                          prerelease; install it explicitly with:\n  {}",
-                        upgrade_argv(pkg, &latest).join(" ")
+                        shell_join(&upgrade_argv(pkg, &latest, &flags))
                     );
                     Ok(())
                 }
                 Verdict::Behind { latest } => {
-                    let argv = upgrade_argv(pkg, &latest);
+                    let argv = upgrade_argv(pkg, &latest, &flags);
                     println!("{pkg} {version} is installed; {latest} is published.");
                     if check_only || !assume_yes {
-                        println!("Update with:\n  {}", argv.join(" "));
+                        println!("Update with:\n  {}", shell_join(&argv));
                         if !check_only {
                             println!("Or re-run with --yes to do it now.");
                         }
                         return Ok(());
                     }
-                    println!("Running: {}", argv.join(" "));
+                    println!("Running: {}", shell_join(&argv));
                     let status = Proc::new(&argv[0])
                         .args(&argv[1..])
                         .status()
@@ -413,7 +513,7 @@ mod update_tests {
     #[test]
     fn the_upgrade_command_pins_the_version_and_the_lockfile() {
         assert_eq!(
-            upgrade_argv("blut-lamquant", "0.3.0"),
+            upgrade_argv("blut-lamquant", "0.3.0", &[]),
             vec![
                 "cargo",
                 "install",
@@ -424,5 +524,51 @@ mod update_tests {
                 "--force"
             ]
         );
+    }
+
+    /// Cargo writes a path install as a URL (`my%20dir`). The advice printed
+    /// that verbatim, so the suggested `cargo install --path` failed.
+    #[test]
+    fn a_path_install_with_a_space_prints_a_command_that_works() {
+        let ledger = "[v1]\n\"tinyx 0.1.0 (path+file:///home/u/my%20dir/tiny)\" = [\"tinyx\"]\n";
+        let Some(Origin::Path { dir, .. }) = parse_installed_origin(ledger, "tinyx") else {
+            panic!("expected a path install");
+        };
+        assert_eq!(dir, "/home/u/my dir/tiny");
+        assert_eq!(
+            shell_join(&path_reinstall_argv(&dir, &[])),
+            "cargo install --path '/home/u/my dir/tiny' --force"
+        );
+    }
+
+    /// `blut update --yes` reinstalled without the features the binary was
+    /// installed with, silently dropping e.g. `blut cloud`.
+    #[test]
+    fn the_upgrade_keeps_the_installed_feature_selection() {
+        let crates2 = r#"{"installs":{"blut-lamquant 0.2.0-alpha.1 (registry+https://github.com/rust-lang/crates.io-index)":{"version_req":null,"bins":["blut"],"features":["cloud","p2p"],"all_features":false,"no_default_features":true,"profile":"release"}}}"#;
+        let flags = parse_install_flags(crates2, "blut");
+        assert_eq!(
+            upgrade_argv("blut-lamquant", "0.2.0-alpha.2", &flags),
+            vec![
+                "cargo",
+                "install",
+                "blut-lamquant",
+                "--version",
+                "0.2.0-alpha.2",
+                "--locked",
+                "--force",
+                "--no-default-features",
+                "--features",
+                "cloud,p2p"
+            ]
+        );
+        assert!(parse_install_flags(crates2, "other").is_empty());
+        assert!(parse_install_flags("not json", "blut").is_empty());
+    }
+
+    #[test]
+    fn a_malformed_percent_escape_yields_no_advice() {
+        let ledger = "[v1]\n\"x 0.1.0 (path+file:///home/u/bad%2)\" = [\"x\"]\n";
+        assert_eq!(parse_installed_origin(ledger, "x"), None);
     }
 }
