@@ -39,7 +39,7 @@ pub fn build_hpo_plan(
 ) -> Result<(CompiledPlan, Vec<TrialPlan>), String> {
     let def = reg
         .find(recipe)
-        .ok_or_else(|| format!("recipe '{recipe}' not in catalog"))?;
+        .ok_or_else(|| format!("recipe '{recipe}' not in catalog (see `blut recipe list`)"))?;
     if n_trials == 0 {
         return Err("n_trials must be >= 1".into());
     }

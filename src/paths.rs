@@ -18,13 +18,30 @@ use crate::error::{Result, TrainError};
 /// Default: `~/.local/share/lamu/train-jobs/`
 /// Override: `$LAMU_TRAIN_JOBS_DIR`
 pub fn jobs_dir() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("LAMU_TRAIN_JOBS_DIR") {
-        return Ok(PathBuf::from(p));
+    if let Some(p) = utf8_path_env("LAMU_TRAIN_JOBS_DIR")? {
+        return Ok(p);
     }
     let base = dirs::data_local_dir().ok_or_else(|| {
         TrainError::other("data_local_dir() unavailable; set $LAMU_TRAIN_JOBS_DIR")
     })?;
     Ok(base.join("lamu").join("train-jobs"))
+}
+
+/// A directory override whose paths end up inside JSON (artifact handles,
+/// sidecars, lineage). A non-UTF-8 value cannot be recorded there, so it is
+/// refused up front, naming the variable, rather than ignored (it used to
+/// fall back to the default directory without a word) or accepted only for
+/// the first stage to fail serializing its output.
+fn utf8_path_env(name: &str) -> Result<Option<PathBuf>> {
+    match std::env::var(name) {
+        Ok(p) => Ok(Some(PathBuf::from(p))),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(raw)) => Err(TrainError::other(format!(
+            "${name} ({}) is not valid UTF-8; blut records job paths in JSON, so \
+             point it at a UTF-8 path",
+            raw.to_string_lossy()
+        ))),
+    }
 }
 
 /// Directory for one job. Created on demand.
@@ -42,8 +59,8 @@ pub fn job_dir(job_id: &str) -> Result<PathBuf> {
 /// Default: `~/.local/share/lamu/train-data/`
 /// Override: `$LAMU_TRAIN_DATA_DIR`
 pub fn data_dir() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("LAMU_TRAIN_DATA_DIR") {
-        return Ok(PathBuf::from(p));
+    if let Some(p) = utf8_path_env("LAMU_TRAIN_DATA_DIR")? {
+        return Ok(p);
     }
     let base = dirs::data_local_dir().ok_or_else(|| {
         TrainError::other("data_local_dir() unavailable; set $LAMU_TRAIN_DATA_DIR")
@@ -118,7 +135,7 @@ pub fn join_existing(
 ///      ever created — placeholder; venv bootstrap is a future step)
 ///   4. `python3` on `$PATH` (last resort; deps may be missing)
 pub fn resolve_python() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("LAMU_TRAIN_PYTHON") {
+    if let Some(p) = std::env::var_os("LAMU_TRAIN_PYTHON") {
         return Ok(PathBuf::from(p));
     }
     let home = dirs::home_dir()
@@ -346,5 +363,31 @@ mod tests {
             resolve_trainer_script_with(Some("/some/custom/trainer.py".to_string())).unwrap(),
             PathBuf::from("/some/custom/trainer.py")
         );
+    }
+
+    /// A non-UTF-8 jobs dir was read with `env::var(..).ok()`, so it was
+    /// dropped and jobs silently went to the default
+    /// `~/.local/share/lamu/train-jobs`. It cannot be honoured either (job
+    /// paths are recorded in JSON), so it is refused, naming the variable.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_jobs_dir_is_refused_not_ignored() {
+        use std::os::unix::ffi::OsStrExt;
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = std::ffi::OsStr::from_bytes(b"/nonexistent/jobs-\xff");
+        let prev = std::env::var_os("LAMU_TRAIN_JOBS_DIR");
+        // SAFETY: TEST_ENV_LOCK serializes env mutation; restored below.
+        unsafe { std::env::set_var("LAMU_TRAIN_JOBS_DIR", dir) };
+        let got = jobs_dir();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("LAMU_TRAIN_JOBS_DIR", v),
+                None => std::env::remove_var("LAMU_TRAIN_JOBS_DIR"),
+            }
+        }
+        let err = got.expect_err("must refuse, not fall back").to_string();
+        assert!(err.contains("LAMU_TRAIN_JOBS_DIR"), "{err}");
     }
 }

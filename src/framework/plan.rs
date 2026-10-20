@@ -1200,6 +1200,14 @@ impl CompiledPlan {
                 )));
             }
         }
+        // Args are checked now, not when each node is reached: a bad argument
+        // to the last stage used to surface only after every earlier stage
+        // had run.
+        for (i, (stage, args)) in chain.iter().enumerate() {
+            stage.check_args(args).map_err(|e| {
+                PlanError::Other(format!("stage '{}' (node {i}): {e}", stage.name()))
+            })?;
+        }
         let mut nodes: Vec<PlanNode> = Vec::with_capacity(chain.len());
         let mut edges: Vec<PlanEdge> = Vec::new();
         for (i, (stage, args)) in chain.into_iter().enumerate() {

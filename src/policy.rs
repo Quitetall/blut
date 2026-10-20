@@ -157,7 +157,7 @@ pub enum Decision {
 /// Path to the policy file. Override via `$LAMU_TRAIN_POLICY` for
 /// hermetic tests + bespoke installs.
 pub fn policy_path() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("LAMU_TRAIN_POLICY") {
+    if let Some(p) = std::env::var_os("LAMU_TRAIN_POLICY") {
         return Ok(PathBuf::from(p));
     }
     let dir = dirs::config_dir()
@@ -237,9 +237,7 @@ pub fn decide(
     inference_lock_held: bool,
 ) -> Decision {
     if !policy.enabled {
-        return Decision::Skip(
-            "auto-trigger disabled (run `lamu-train policy enable` to opt in)".into(),
-        );
+        return Decision::Skip("auto-trigger disabled (run `blut policy enable` to opt in)".into());
     }
     let (start, end) = match parse_quiet_hours(&policy.quiet_hours) {
         Ok(p) => p,

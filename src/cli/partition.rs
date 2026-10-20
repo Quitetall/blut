@@ -176,7 +176,7 @@ fn partition_matrix(
                 .and_then(|resolved| {
                     let recipe = reg.find(&set.recipe).ok_or_else(|| {
                         crate::error::TrainError::other(format!(
-                            "recipe '{}' not in catalog",
+                            "recipe '{}' not in catalog (see `blut recipe list`)",
                             set.recipe
                         ))
                     })?;
@@ -258,7 +258,9 @@ pub(super) async fn run_partition(
             partitions,
         } => {
             if reg.find(&recipe).is_none() {
-                return Err(anyhow!("recipe '{recipe}' not in catalog"));
+                return Err(anyhow!(
+                    "recipe '{recipe}' not in catalog (see `blut recipe list`)"
+                ));
             }
             let dims: Vec<PartitionDim> = if let Some(spec) = spec {
                 let spec: crate::config::partition::PartitionSpec = serde_json::from_str(&spec)

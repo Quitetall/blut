@@ -82,6 +82,98 @@ because the train shares one exact version.
   The P2P transport now builds its TLS configs with `ring` passed explicitly
   and never installs a process-wide provider, so an embedder that installs
   its own later is unaffected.
+- `blut cancel` on a job whose stages run in the blut process (no trainer
+  subprocess) printed "cancelled." and exited 0 while the job ran on to
+  `done`. Each job now records the blut process executing it, and `cancel`
+  stops that process through its own SIGTERM handler, escalating to SIGKILL
+  after `--grace`. A process running several jobs (a sweep or backfill) is
+  not stopped to cancel one of them; the refusal names the batch.
+- `blut cancel` on a finished job rewrote `done` or `failed` as `cancelled`.
+  It now reports that the job already finished and changes nothing.
+- A job whose blut process was killed (SIGKILL, OOM killer, power loss), or
+  that exited without being able to write its final state (a full disk),
+  stayed `running` in `blut jobs` forever when no trainer subprocess had
+  recorded a pid. It is now reported `failed`.
+- `blut plan resume` on a job that is still running started a second executor
+  in the same job directory, and when the scheduler lock refused it marked the
+  live job `failed`. It now refuses with the running pid. A resume refused by
+  admission or the scheduler lock no longer rewrites the job's state.
+- Ctrl-C or SIGTERM during `blut plan resume` killed blut outright, leaving
+  the job `running` and any trainer subprocess (which runs in its own session)
+  orphaned. Resume now installs the same cancel handler as `recipe run`.
+- `blut update` printed `cargo install --path /my%20dir` for a checkout whose
+  path contains a space (cargo records it as a URL), and reinstalled without
+  the features the binary was installed with, so `--yes` on a
+  `--features cloud` install silently removed `blut cloud`. The path is now
+  decoded and shell-quoted, and the feature selection recorded in
+  `.crates2.json` is passed back to `cargo install`.
+- A misspelled recipe or stage argument was dropped without a word: serde
+  ignores unknown keys unless the args type opts out, so
+  `--args '{"epoch": 50}'` against an `epochs` field trained on the default.
+  Recipe args (`recipe run`, `--set`, sweeps, HPO) and stage args in
+  `.toml`, `.json` and `.star` plans now refuse a key the args schema does not
+  declare, naming the accepted keys. Schemas that admit extra keys (a
+  flattened map) are unaffected. A `.toml` recipe also refuses unknown keys
+  of its own, so `arg = {…}` for `args` is an error instead of a stage run
+  with no arguments.
+- Stage args in `.toml`, `.json` and `.star` plans were checked only when the
+  executor reached each node, so `plan check` and `recipe declare` reported
+  success for a plan whose last stage could not decode its args, and the
+  earlier stages ran (for hours, in a training plan) before it failed. They
+  are now checked when the plan is built.
+- A plan node that omits `args` passed JSON `null`, which an args struct
+  whose fields all have defaults rejects at run time. `null` and `{}` are
+  now each tried in place of the other, as recipe args already were.
+- `blut cache prune --max-gb=-1` (or `NaN`) cast the cap to 0 bytes and
+  emptied the whole shared cache, then printed the cap it was given. A
+  negative or non-finite cap is now refused, and so is an unparseable
+  `LAMU_CACHE_MAX_GB`, which silently meant 50 GiB. `--max-gb 0` still
+  empties the cache on purpose.
+- `blut policy enable` printed a crontab line running `blut auto`, a verb
+  `blut` does not have, so the advertised auto-trigger failed every 30
+  minutes into its log. It now prints a line that gates on
+  `blut sensor eval auto-train-policy` and runs a recipe the operator names,
+  with paths shell-quoted.
+- Error messages named commands that do not exist: `lamu-train jobs` and
+  `lamu-train policy enable` (now `blut jobs`, `blut policy enable`), and
+  `--allow-evict` when the scheduler lock is held (now: wait, or
+  `blut cancel <job>`). "recipe not in catalog" now points at
+  `blut recipe list`.
+- On/off environment switches parsed inconsistently. `BLUT_NO_CONTAIN` and
+  `BLUT_AUTO_REBUILD` were on whenever set, so `BLUT_NO_CONTAIN=0` switched
+  memory containment off and `BLUT_AUTO_REBUILD=0` switched rebuild-and-re-exec
+  on; `BLUT_KILL_ON_NAN` and `BLUT_STRICT_DECLARATIONS` accepted only `1`. All
+  of them, with `BLUT_STRICT_ADVISORY`, now read `1/true/yes/on` as on and
+  `0/false/no/off` or empty as off, and warn on anything else.
+- Path variables (`LAMU_TRAIN_JOBS_DIR`, `BLUT_HOME`, `BLUT_DSL_BIN` and the
+  other `*_DIR`/`*_PATH`/`*_DB` overrides) were read as UTF-8 strings, so a
+  non-UTF-8 value was ignored without a word and jobs, caches and registries
+  went to the default location instead. They are read as OS strings now,
+  except `LAMU_TRAIN_JOBS_DIR` and `LAMU_TRAIN_DATA_DIR`, whose paths are
+  recorded in JSON: a non-UTF-8 value there is refused, naming the variable.
+- `blut log` printed nothing, with exit 0, for a job whose stages run
+  in-process: it renders trainer progress only, and such a job records stage
+  events instead. It now says so on stderr and points at `blut dag <job>`.
+- `blut schedule install` checked only that `--args` was JSON, so args the
+  recipe rejects installed a timer that failed every time it fired, visible
+  only in the journal. The args are now compiled at install. The generated
+  `ExecStart=` also left the binary path unquoted (a path with a space ran
+  the wrong program) and used shell escaping, which systemd does not
+  understand; `%` and `$` in args were open to systemd's specifier and
+  variable expansion. Words are now quoted and escaped per systemd.syntax(7).
+- `RayLauncher::submit_async` built its own `ray job submit` argv without
+  `--entrypoint-num-gpus`, so an asynchronously submitted job reserved no GPU.
+  Both paths now share one argument builder. A non-numeric
+  `BLUT_RAY_NUM_GPUS` (or any `BLUT_SLURM_*` count) was dropped without a
+  word; it is still ignored but now warns, and an empty `RAY_ADDRESS` (or
+  other launcher setting) counts as unset instead of producing `--address=`.
+- `recipe run --sweep … --dry-run` listed the expanded combos without
+  compiling them, so a sweep whose every combo would fail (a misspelled
+  `--sweep` key) dry-ran clean. Each combo is now resolved and compiled, as
+  the single-run `--dry-run` already did, and the dry run fails if any would.
+- `blut plan resume` on a job launched from a plan file (`recipe declare
+  --run`, `plan run`) failed with a bare "No such file or directory". It now
+  says such a job has no recipe to re-compile and must be launched again.
 
 ### Security
 - rustls 0.23.45 everywhere, closing RUSTSEC-2026-0285 (TLS 1.3 handshake

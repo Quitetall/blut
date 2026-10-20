@@ -234,7 +234,7 @@ CREATE TABLE IF NOT EXISTS catalog_tags (
 /// Path to the catalog tags store (`~/.blut/catalog.db`; `$BLUT_CATALOG_DB`
 /// override).
 pub fn catalog_db_path() -> Result<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("BLUT_CATALOG_DB") {
+    if let Some(p) = std::env::var_os("BLUT_CATALOG_DB") {
         return Ok(std::path::PathBuf::from(p));
     }
     let dir = dirs::home_dir()

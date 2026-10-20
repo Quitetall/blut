@@ -194,8 +194,47 @@ pub fn validate_args_against_schema(
                 ));
             }
         }
+        // A key the args type does not declare is a typo serde would drop in
+        // silence for any `#[serde(default)]` field: `{"epoch": 50}` against
+        // `epochs` trained on the default. Refuse it, naming the accepted
+        // keys. Skipped when the schema admits extra keys (a flattened map)
+        // or is composed from subschemas this shallow check cannot see into.
+        if closed_object(root) {
+            let unknown: Vec<&str> = obj
+                .keys()
+                .filter(|k| !props.contains_key(k.as_str()))
+                .map(String::as_str)
+                .collect();
+            if !unknown.is_empty() {
+                let mut known: Vec<&str> = props.keys().map(String::as_str).collect();
+                known.sort_unstable();
+                return bad(format!(
+                    "unknown arg(s) {} (accepted: {})",
+                    unknown
+                        .iter()
+                        .map(|k| format!("'{k}'"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    known.join(", ")
+                ));
+            }
+        }
     }
     Ok(())
+}
+
+/// Whether an object schema lists every key it accepts: no
+/// `additionalProperties` schema/`true`, and no `allOf`/`anyOf`/`oneOf`/`$ref`
+/// that could contribute keys of its own.
+fn closed_object(root: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let extra_allowed = match root.get("additionalProperties") {
+        None | Some(serde_json::Value::Bool(false)) => false,
+        Some(_) => true,
+    };
+    !extra_allowed
+        && !["allOf", "anyOf", "oneOf", "$ref"]
+            .iter()
+            .any(|k| root.contains_key(*k))
 }
 
 fn json_kind(v: &serde_json::Value) -> &'static str {
@@ -516,6 +555,80 @@ mod tests {
         // A unit/`()`-args recipe serializes its args as null → tolerated.
         let empty = serde_json::json!({"type": "object", "properties": {}});
         assert!(validate_args_against_schema("r", &empty, &serde_json::Value::Null).is_ok());
+    }
+
+    /// `--args '{"step": 5}'` against a defaulted `steps` field compiled and
+    /// ran on the default: serde drops unknown keys unless the args type
+    /// opts into `deny_unknown_fields`, and almost none do.
+    #[test]
+    fn validate_args_refuses_an_unknown_key_and_names_the_accepted_ones() {
+        #[derive(schemars::JsonSchema, serde::Deserialize, Default)]
+        #[serde(default)]
+        #[allow(dead_code)]
+        struct Args {
+            steps: u32,
+            sleep_ms: u64,
+        }
+        let schema = schema_of::<Args>();
+        let e = validate_args_against_schema("count", &schema, &serde_json::json!({"step": 5}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("'step'") && e.contains("sleep_ms, steps"),
+            "names the typo and the accepted keys: {e}"
+        );
+        assert!(validate_args_against_schema("count", &schema, &serde_json::json!({})).is_ok());
+    }
+
+    /// Flattened fields count as declared; a flattened map admits any key.
+    #[test]
+    fn validate_args_accepts_flattened_fields_and_open_maps() {
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Inner {
+            tier: u32,
+        }
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Args {
+            mode: String,
+            #[serde(flatten)]
+            inner: Inner,
+        }
+        let schema = schema_of::<Args>();
+        assert!(
+            validate_args_against_schema(
+                "r",
+                &schema,
+                &serde_json::json!({"mode": "car", "tier": 2})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_args_against_schema(
+                "r",
+                &schema,
+                &serde_json::json!({"mode": "car", "tier": 2, "tierr": 3})
+            )
+            .is_err()
+        );
+
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Open {
+            mode: String,
+            #[serde(flatten)]
+            extra: std::collections::BTreeMap<String, serde_json::Value>,
+        }
+        let schema = schema_of::<Open>();
+        assert!(
+            validate_args_against_schema(
+                "r",
+                &schema,
+                &serde_json::json!({"mode": "car", "anything": 1})
+            )
+            .is_ok()
+        );
     }
 
     #[test]

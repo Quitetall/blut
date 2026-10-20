@@ -19,7 +19,7 @@ pub(super) fn footprint_or_floor(
     match declared_fp {
         Some(fp) => Ok(fp),
         None => {
-            if std::env::var("BLUT_STRICT_DECLARATIONS").is_ok_and(|v| v == "1") {
+            if crate::config::env_flag("BLUT_STRICT_DECLARATIONS") {
                 anyhow::bail!(
                     "'{name}' declares no resource envelope and BLUT_STRICT_DECLARATIONS=1 \
                      — implement Stage::resource_envelope (ADR 0133)"

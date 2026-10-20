@@ -401,7 +401,7 @@ fn fresh_trial_factory(
     let overlays: Vec<crate::hpo::Overlay> = trials.iter().map(|t| t.overlay.clone()).collect();
     let def = reg
         .find(name)
-        .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+        .ok_or_else(|| anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)"))?;
     let cfn = def.compile_fn;
     let base = base_args.clone();
     let factory: crate::hpo::FreshFactory = std::sync::Arc::new(move |overlay| {
@@ -745,7 +745,7 @@ pub(super) async fn run_hpo(
         // `compile_fn` is a plain fn pointer (`'static`), so it captures cleanly.
         let def = reg
             .find(&name)
-            .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+            .ok_or_else(|| anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)"))?;
         let cfn = def.compile_fn;
         let base_for_factory = base_args.clone();
         let factory: crate::hpo::TrialFactory = std::sync::Arc::new(move |overlay, resume| {
@@ -883,6 +883,7 @@ pub(super) async fn run_hpo(
     .write_to(&job_dir)?;
     crate::jobs::write_state(&job_id, JobState::Running)
         .with_context(|| format!("write Running state for {job_id}"))?;
+    let _driver = crate::jobs::record_driver(&job_id);
     crate::python_kill::bind_current_job(job_id.clone());
     install_cancel_handler(ctx.cancel.clone());
 

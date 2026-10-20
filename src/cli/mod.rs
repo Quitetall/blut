@@ -764,6 +764,51 @@ enum PolicyCommand {
     Disable,
 }
 
+/// What `blut policy enable` tells the operator to put in cron. It used to
+/// print `<exe> auto`, a verb `blut` does not have, so the advertised cron
+/// line failed every 30 minutes into a log nobody reads. The policy is read
+/// by the `auto-train-policy` sensor; `sensor eval` exits 0 only when every
+/// gate passes, so it chains in front of the recipe the operator picks.
+fn policy_cron_hint(exe: &str, log_path: &str) -> String {
+    let exe = update::shell_join(&[exe.to_string()]);
+    let log = update::shell_join(&[log_path.to_string()]);
+    format!(
+        "# The policy gates the `auto-train-policy` sensor (exit 0 = run now).\n\
+         # To act on it every 30 min, add to crontab with your recipe and args:\n\
+         */30 * * * * {exe} sensor eval auto-train-policy >> {log} 2>&1 && \
+         {exe} recipe run <RECIPE> --args '<JSON>' >> {log} 2>&1\n"
+    )
+}
+
+/// The `cache prune` cap in GiB: `--max-gb`, else `$LAMU_CACHE_MAX_GB`, else
+/// 50. A negative or non-finite cap is refused: cast to bytes it was 0, so
+/// `--max-gb=-1` or `--max-gb NaN` deleted the whole shared cache and then
+/// reported the cap it had been given. An unparseable `$LAMU_CACHE_MAX_GB`
+/// is refused too, instead of quietly meaning 50.
+fn resolve_prune_cap_gb(flag: Option<f64>, env: Option<std::ffi::OsString>) -> Result<f64> {
+    let (cap, source) = match (flag, env) {
+        (Some(cap), _) => (cap, "--max-gb".to_string()),
+        (None, Some(raw)) => {
+            let text = raw.to_str().unwrap_or("").trim().to_string();
+            let cap = text.parse::<f64>().map_err(|_| {
+                anyhow!(
+                    "LAMU_CACHE_MAX_GB={raw:?} is not a number of GiB; set it to e.g. 50, \
+                     or unset it for the 50 GiB default"
+                )
+            })?;
+            (cap, "LAMU_CACHE_MAX_GB".to_string())
+        }
+        (None, None) => (50.0, String::new()),
+    };
+    if !cap.is_finite() || cap < 0.0 {
+        return Err(anyhow!(
+            "{source} {cap} is not a usable cache cap: give a size in GiB, 0 or more \
+             (0 empties the cache)"
+        ));
+    }
+    Ok(cap)
+}
+
 fn parse_duration(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| format!("{e}"))
 }
@@ -1273,6 +1318,80 @@ mod external_subcommand_tests {
 }
 
 #[cfg(test)]
+mod policy_cron_hint_tests {
+    use super::{Cli, policy_cron_hint};
+    use clap::Parser;
+
+    /// The suggested cron line must call verbs that exist: it used to run
+    /// `blut auto`, which is not a subcommand.
+    #[test]
+    fn the_cron_line_names_real_verbs_and_quotes_paths() {
+        let hint = policy_cron_hint("/opt/my tools/blut", "/var/log/a b.log");
+        assert!(!hint.contains(" auto "), "{hint}");
+        assert!(
+            hint.contains("'/opt/my tools/blut' sensor eval auto-train-policy"),
+            "{hint}"
+        );
+        assert!(hint.contains("'/var/log/a b.log'"), "{hint}");
+        assert!(Cli::try_parse_from(["blut", "sensor", "eval", "auto-train-policy"]).is_ok());
+        assert!(
+            crate::sensor::registry()
+                .iter()
+                .any(|s| s.name() == "auto-train-policy")
+        );
+    }
+}
+
+#[cfg(test)]
+mod resume_marker_tests {
+    use super::RecipeMarker;
+
+    /// Resuming a job launched from a plan file failed with a bare
+    /// "No such file or directory".
+    #[test]
+    fn resuming_a_plan_file_job_says_why_it_cannot() {
+        let td = tempfile::tempdir().unwrap();
+        let err = RecipeMarker::read_from(td.path())
+            .err()
+            .expect("no marker")
+            .to_string();
+        assert!(err.contains("launched from a plan file"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod cache_prune_cap_tests {
+    use super::resolve_prune_cap_gb;
+
+    /// `--max-gb=-1` and `--max-gb NaN` cast to a 0-byte cap and emptied the
+    /// whole shared cache.
+    #[test]
+    fn a_negative_or_non_finite_cap_is_refused() {
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            let err = resolve_prune_cap_gb(Some(bad), None).expect_err("must refuse");
+            assert!(err.to_string().contains("--max-gb"), "{err}");
+        }
+        assert_eq!(resolve_prune_cap_gb(Some(0.0), None).unwrap(), 0.0);
+        assert_eq!(resolve_prune_cap_gb(Some(12.5), None).unwrap(), 12.5);
+    }
+
+    /// A garbage `$LAMU_CACHE_MAX_GB` quietly meant 50 GiB; the flag still
+    /// wins over the variable, and no setting at all is the 50 GiB default.
+    #[test]
+    fn the_env_cap_is_validated_and_the_flag_wins() {
+        let err = resolve_prune_cap_gb(None, Some("fifty".into())).expect_err("must refuse");
+        assert!(err.to_string().contains("LAMU_CACHE_MAX_GB"), "{err}");
+        assert!(resolve_prune_cap_gb(None, Some("-3".into())).is_err());
+        assert_eq!(resolve_prune_cap_gb(None, Some(" 7 ".into())).unwrap(), 7.0);
+        assert_eq!(
+            resolve_prune_cap_gb(Some(1.0), Some("fifty".into())).unwrap(),
+            1.0
+        );
+        assert_eq!(resolve_prune_cap_gb(None, None).unwrap(), 50.0);
+    }
+}
+
+#[cfg(test)]
 mod registry_completion_cli_tests {
     use super::{
         CatalogCommand, Cli, Command, DatasetCommand, DatasetIngestCommand, ExperimentCommand,
@@ -1714,6 +1833,20 @@ impl RecipeMarker {
     }
     fn read_from(job_dir: &std::path::Path) -> Result<Self> {
         let path = job_dir.join("recipe.json");
+        // A plan launched from a file (`recipe declare --run`, `plan run`)
+        // writes no marker on purpose: there is no registry recipe to
+        // re-compile. The bare ENOENT this produced did not say that.
+        if !path.exists() {
+            return Err(anyhow!(
+                "job {} cannot be resumed: it was launched from a plan file \
+                 (`recipe declare --run` or `plan run`), not a registry recipe, so \
+                 there is nothing to re-compile. Launch the file again.",
+                job_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ));
+        }
         let body = std::fs::read(&path)
             .with_context(|| format!("read recipe marker {}", path.display()))?;
         serde_json::from_slice(&body).context("parse recipe marker")
@@ -1732,6 +1865,15 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             let job_id = crate::jobs::resolve_job_id(&id).with_context(|| {
                 format!("resolve job id '{id}' (ambiguous prefix or missing job)")
             })?;
+            // Resuming a job that is still executing would run a second
+            // executor in the same job dir, and the old code then marked the
+            // live job `failed` when the scheduler lock refused.
+            if let Some(pid) = crate::jobs::live_driver(&job_id) {
+                return Err(anyhow!(
+                    "job {job_id} is still running (blut pid {pid}); wait for it to finish, \
+                     or stop it with `blut cancel {job_id}`, then resume"
+                ));
+            }
             let job_dir =
                 paths::job_dir(&job_id).with_context(|| format!("resolve job dir for {job_id}"))?;
             let marker = RecipeMarker::read_from(&job_dir)?;
@@ -1745,9 +1887,12 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             )
             .map_err(|e| anyhow!("registry arg revalidation: {e}"))?;
             ensure_resume_registry_snapshot(&marker, &args)?;
-            let r = reg
-                .find(&marker.name)
-                .ok_or_else(|| anyhow!("recipe '{}' not in catalog", marker.name))?;
+            let r = reg.find(&marker.name).ok_or_else(|| {
+                anyhow!(
+                    "recipe '{}' not in catalog (see `blut recipe list`)",
+                    marker.name
+                )
+            })?;
             let plan = (r.compile_fn)(args.clone()).map_err(|e| anyhow!("recipe compile: {e}"))?;
             let tenant_admission =
                 crate::broker::tenant_quota::TenantAdmission::prepare(tenant.clone())
@@ -1811,37 +1956,33 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                 }
             }
 
-            crate::jobs::write_state(&job_id, JobState::Running)
-                .with_context(|| format!("write Running state for {job_id}"))?;
-
-            let _tenant_reservation = match tenant_admission
+            // Admission and the scheduler lock come BEFORE the job is marked
+            // running: a resume refused here never started, so the job keeps
+            // the state it had (a refused resume of a `done` job used to
+            // rewrite it as `failed`).
+            let _tenant_reservation = tenant_admission
                 .reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
-            {
-                Ok(reservation) => reservation,
-                Err(reason) => {
-                    let _ = crate::jobs::write_state(&job_id, JobState::Failed);
-                    return Err(anyhow!(
-                        "resume '{}' admission refused: {reason}",
-                        marker.name
-                    ));
-                }
-            };
+                .map_err(|reason| {
+                    anyhow!("resume '{}' admission refused: {reason}", marker.name)
+                })?;
 
             // GPU lock — same arbitration as initial runs. Without
             // this, two resumes (or a resume + a fresh recipe run)
             // on the same machine could both touch the GPU.
-            let lock = match scheduler_lock::acquire_exclusive(
+            let lock = scheduler_lock::acquire_exclusive(
                 format!("blut-resume:{job_id}"),
                 LockKind::Training,
-            ) {
-                Ok(l) => l,
-                Err(e) => {
-                    if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                        tracing::warn!("write Failed state for {job_id}: {se}");
-                    }
-                    return Err(anyhow!("acquire_exclusive: {e}"));
-                }
-            };
+            )
+            .map_err(|e| anyhow!("acquire_exclusive: {e}"))?;
+
+            crate::jobs::write_state(&job_id, JobState::Running)
+                .with_context(|| format!("write Running state for {job_id}"))?;
+            let _driver = crate::jobs::record_driver(&job_id);
+            // The same signal discipline as `recipe run`: Ctrl-C / SIGTERM
+            // cancels the executor and kills the trainer groups, instead of
+            // the default action killing blut and orphaning a setsid trainer.
+            crate::python_kill::bind_current_job(job_id.clone());
+            install_cancel_handler(ctx.cancel.clone());
 
             eprintln!("resuming {} ({})", marker.name, job_id);
             eprintln!("dir      {}", job_dir.display());
@@ -1849,6 +1990,7 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             persist_plan_graph(&plan, &job_dir);
             let result = crate::framework::execute_plan(plan, ctx).await;
             drop(lock);
+            crate::python_kill::unbind_current_job();
             match result {
                 Ok(r) => {
                     crate::jobs::write_state(&job_id, JobState::Done)
@@ -1879,9 +2021,9 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             }
         }
         PlanCommand::Inspect { name, args } => {
-            let r = reg
-                .find(&name)
-                .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+            let r = reg.find(&name).ok_or_else(|| {
+                anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)")
+            })?;
             let raw: serde_json::Value = serde_json::from_str(&args)
                 .with_context(|| format!("parse --args as JSON: {args}"))?;
             let plan = (r.compile_fn)(raw).map_err(|e| anyhow!("recipe compile: {e}"))?;
@@ -2484,13 +2626,7 @@ fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
         CacheCommand::Prune { max_gb } => {
             // Resolution order: --max-gb flag → $LAMU_CACHE_MAX_GB →
             // 50 GiB default. The default matches the plan's spec.
-            let cap_gb = max_gb
-                .or_else(|| {
-                    std::env::var("LAMU_CACHE_MAX_GB")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                })
-                .unwrap_or(50.0);
+            let cap_gb = resolve_prune_cap_gb(max_gb, std::env::var_os("LAMU_CACHE_MAX_GB"))?;
             let cap_bytes = (cap_gb * 1024.0 * 1024.0 * 1024.0) as u64;
             let freed = crate::framework::cache::lru_prune(&global, cap_bytes)
                 .with_context(|| format!("lru_prune {}", global.display()))?;
@@ -2629,9 +2765,9 @@ fn run_schedule_cmd(reg: &crate::framework::Registry, cmd: ScheduleCommand) -> R
         } => {
             // Validate the recipe exists + the args parse before touching
             // systemd, so a typo doesn't leave a broken unit behind.
-            let def = reg
-                .find(&recipe)
-                .ok_or_else(|| anyhow!("recipe '{recipe}' not in catalog"))?;
+            let def = reg.find(&recipe).ok_or_else(|| {
+                anyhow!("recipe '{recipe}' not in catalog (see `blut recipe list`)")
+            })?;
             // `--calendar` wins; otherwise fall back to the recipe's built-in
             // SCHEDULE (E1↔E5). Neither present → hard error (no silent default).
             let calendar = calendar
@@ -2641,8 +2777,13 @@ fn run_schedule_cmd(reg: &crate::framework::Registry, cmd: ScheduleCommand) -> R
                         "recipe '{recipe}' has no built-in SCHEDULE; pass --calendar <OnCalendar>"
                     )
                 })?;
-            let _: serde_json::Value = serde_json::from_str(&args)
+            let parsed: serde_json::Value = serde_json::from_str(&args)
                 .with_context(|| format!("parse --args as JSON: {args}"))?;
+            // Compile now, as `recipe run` will when the timer fires: args
+            // that only parsed as JSON used to install a timer that failed
+            // every time it ran, visible only in the journal.
+            (def.compile_fn)(parsed)
+                .map_err(|e| anyhow!("recipe '{recipe}' rejects these --args: {e}"))?;
             schedule::install(&recipe, &calendar, &args).map_err(|e| anyhow!("{e}"))?;
             eprintln!("installed timer blut-{recipe}.timer (OnCalendar={calendar})");
             eprintln!("inspect: systemctl --user list-timers | grep {recipe}");
@@ -2724,10 +2865,9 @@ fn run_policy(cmd: PolicyCommand) -> Result<()> {
             let path = policy::policy_path()?;
             println!("auto-trigger enabled (policy: {})", path.display());
             println!();
-            println!("# Add to crontab so the heuristic runs every 30 min:");
             let exe = std::env::current_exe()
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "lamu-train".into());
+                .unwrap_or_else(|_| "blut".into());
             // cron doesn't run through a shell that expands ~ , so
             // resolve the log path to an absolute string before
             // printing. Falls back to /tmp if XDG resolution fails.
@@ -2735,7 +2875,10 @@ fn run_policy(cmd: PolicyCommand) -> Result<()> {
                 .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
                 .join("lamu")
                 .join("train-auto.log");
-            println!("*/30 * * * * {exe} auto >> {} 2>&1", log_path.display());
+            print!(
+                "{}",
+                policy_cron_hint(&exe, &log_path.display().to_string())
+            );
         }
         PolicyCommand::Disable => {
             let mut p = policy::load().context("load policy")?;
