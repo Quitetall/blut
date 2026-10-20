@@ -1732,6 +1732,15 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             let job_id = crate::jobs::resolve_job_id(&id).with_context(|| {
                 format!("resolve job id '{id}' (ambiguous prefix or missing job)")
             })?;
+            // Resuming a job that is still executing would run a second
+            // executor in the same job dir, and the old code then marked the
+            // live job `failed` when the scheduler lock refused.
+            if let Some(pid) = crate::jobs::live_driver(&job_id) {
+                return Err(anyhow!(
+                    "job {job_id} is still running (blut pid {pid}); wait for it to finish, \
+                     or stop it with `blut cancel {job_id}`, then resume"
+                ));
+            }
             let job_dir =
                 paths::job_dir(&job_id).with_context(|| format!("resolve job dir for {job_id}"))?;
             let marker = RecipeMarker::read_from(&job_dir)?;
@@ -1811,37 +1820,33 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                 }
             }
 
-            crate::jobs::write_state(&job_id, JobState::Running)
-                .with_context(|| format!("write Running state for {job_id}"))?;
-
-            let _tenant_reservation = match tenant_admission
+            // Admission and the scheduler lock come BEFORE the job is marked
+            // running: a resume refused here never started, so the job keeps
+            // the state it had (a refused resume of a `done` job used to
+            // rewrite it as `failed`).
+            let _tenant_reservation = tenant_admission
                 .reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
-            {
-                Ok(reservation) => reservation,
-                Err(reason) => {
-                    let _ = crate::jobs::write_state(&job_id, JobState::Failed);
-                    return Err(anyhow!(
-                        "resume '{}' admission refused: {reason}",
-                        marker.name
-                    ));
-                }
-            };
+                .map_err(|reason| {
+                    anyhow!("resume '{}' admission refused: {reason}", marker.name)
+                })?;
 
             // GPU lock — same arbitration as initial runs. Without
             // this, two resumes (or a resume + a fresh recipe run)
             // on the same machine could both touch the GPU.
-            let lock = match scheduler_lock::acquire_exclusive(
+            let lock = scheduler_lock::acquire_exclusive(
                 format!("blut-resume:{job_id}"),
                 LockKind::Training,
-            ) {
-                Ok(l) => l,
-                Err(e) => {
-                    if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                        tracing::warn!("write Failed state for {job_id}: {se}");
-                    }
-                    return Err(anyhow!("acquire_exclusive: {e}"));
-                }
-            };
+            )
+            .map_err(|e| anyhow!("acquire_exclusive: {e}"))?;
+
+            crate::jobs::write_state(&job_id, JobState::Running)
+                .with_context(|| format!("write Running state for {job_id}"))?;
+            let _driver = crate::jobs::record_driver(&job_id);
+            // The same signal discipline as `recipe run`: Ctrl-C / SIGTERM
+            // cancels the executor and kills the trainer groups, instead of
+            // the default action killing blut and orphaning a setsid trainer.
+            crate::python_kill::bind_current_job(job_id.clone());
+            install_cancel_handler(ctx.cancel.clone());
 
             eprintln!("resuming {} ({})", marker.name, job_id);
             eprintln!("dir      {}", job_dir.display());
@@ -1849,6 +1854,7 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             persist_plan_graph(&plan, &job_dir);
             let result = crate::framework::execute_plan(plan, ctx).await;
             drop(lock);
+            crate::python_kill::unbind_current_job();
             match result {
                 Ok(r) => {
                     crate::jobs::write_state(&job_id, JobState::Done)

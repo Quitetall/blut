@@ -450,6 +450,94 @@ fn identity_matches(expected: &ChildIdentity) -> IdentityCheck {
     }
 }
 
+/// Whether the exact process `identity` names is still running: it exists, it
+/// is not a zombie, and (when a start time was captured) its pid has not been
+/// recycled. Used for the job DRIVER, the blut process executing a job, where
+/// "the pid exists" is not enough to say the job is alive.
+#[cfg(unix)]
+pub(crate) fn identity_alive(identity: &ChildIdentity) -> bool {
+    matches!(identity_matches(identity), IdentityCheck::Match) && !is_zombie(identity.pid)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn identity_alive(_identity: &ChildIdentity) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let state = stat.rsplit_once(')')?.1.split_whitespace().next()?;
+            Some(state == "Z")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn is_zombie(_pid: u32) -> bool {
+    false
+}
+
+/// Stop ONE process (not a group): SIGTERM, wait up to `grace` for it to
+/// exit, then SIGKILL. This is how `blut cancel` stops a job's driver, whose
+/// own SIGTERM handler cancels the executor and kills its trainer groups.
+/// Refuses to signal a recycled pid. `Err` only when the process cannot be
+/// signalled or outlives SIGKILL.
+#[cfg(unix)]
+pub(crate) async fn terminate_process(
+    identity: &ChildIdentity,
+    grace: Duration,
+) -> std::result::Result<(), String> {
+    use nix::errno::Errno;
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    if !identity_alive(identity) {
+        return Ok(());
+    }
+    let pid = Pid::from_raw(identity.pid as i32);
+    match kill(pid, Signal::SIGTERM) {
+        Ok(()) | Err(Errno::ESRCH) => {}
+        Err(e) => return Err(format!("cannot signal pid {}: {e}", identity.pid)),
+    }
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if !identity_alive(identity) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tracing::warn!(
+        "pid {} ignored SIGTERM for {:?}, escalating to SIGKILL",
+        identity.pid,
+        grace
+    );
+    if identity_alive(identity) {
+        let _ = kill(pid, Signal::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !identity_alive(identity) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(format!("pid {} survived SIGKILL", identity.pid))
+}
+
+#[cfg(not(unix))]
+pub(crate) async fn terminate_process(
+    identity: &ChildIdentity,
+    _grace: Duration,
+) -> std::result::Result<(), String> {
+    Err(format!(
+        "cannot stop pid {} on this platform; stop it from the terminal that started it",
+        identity.pid
+    ))
+}
+
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GroupStatus {

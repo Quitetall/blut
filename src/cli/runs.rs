@@ -355,6 +355,16 @@ pub(super) fn run_runs_cmd(cmd: RunsCommand) -> Result<()> {
 
 pub(super) async fn run_cancel(id_query: &str, grace: Duration) -> Result<()> {
     let id = jobs::resolve_job_id(id_query)?;
+    let state = jobs::read_state(&id).ok();
+    if let Some(state @ (JobState::Done | JobState::Failed | JobState::Cancelled)) = state
+        && jobs::live_driver(&id).is_none()
+    {
+        eprintln!(
+            "{id} already finished ({}); nothing to cancel.",
+            state.as_str()
+        );
+        return Ok(());
+    }
     eprintln!("cancelling {id} (grace {grace:?})...");
     jobs::cancel_job(&id, grace).await?;
     eprintln!("cancelled.");

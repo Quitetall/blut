@@ -915,6 +915,7 @@ impl PreparedRecipeLaunch {
 
         crate::jobs::write_state(&job_id, JobState::Running)
             .with_context(|| format!("write Running state for {job_id}"))?;
+        let _driver = crate::jobs::record_driver(&job_id);
 
         // KILL-2/KILL-3: bind this job so backend spawns mirror the python
         // child's PROCESS GROUP id into the job pid file (not blut's own pid).

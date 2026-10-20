@@ -883,6 +883,7 @@ pub(super) async fn run_hpo(
     .write_to(&job_dir)?;
     crate::jobs::write_state(&job_id, JobState::Running)
         .with_context(|| format!("write Running state for {job_id}"))?;
+    let _driver = crate::jobs::record_driver(&job_id);
     crate::python_kill::bind_current_job(job_id.clone());
     install_cancel_handler(ctx.cancel.clone());
 

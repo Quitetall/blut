@@ -47,6 +47,24 @@ because the train shares one exact version.
   The P2P transport now builds its TLS configs with `ring` passed explicitly
   and never installs a process-wide provider, so an embedder that installs
   its own later is unaffected.
+- `blut cancel` on a job whose stages run in the blut process (no trainer
+  subprocess) printed "cancelled." and exited 0 while the job ran on to
+  `done`. Each job now records the blut process executing it, and `cancel`
+  stops that process through its own SIGTERM handler, escalating to SIGKILL
+  after `--grace`. A process running several jobs (a sweep or backfill) is
+  not stopped to cancel one of them; the refusal names the batch.
+- `blut cancel` on a finished job rewrote `done` or `failed` as `cancelled`.
+  It now reports that the job already finished and changes nothing.
+- A job whose blut process was killed (SIGKILL, OOM killer, power loss) stayed
+  `running` in `blut jobs` forever when no trainer subprocess had recorded a
+  pid. It is now reported `failed`.
+- `blut plan resume` on a job that is still running started a second executor
+  in the same job directory, and when the scheduler lock refused it marked the
+  live job `failed`. It now refuses with the running pid. A resume refused by
+  admission or the scheduler lock no longer rewrites the job's state.
+- Ctrl-C or SIGTERM during `blut plan resume` killed blut outright, leaving
+  the job `running` and any trainer subprocess (which runs in its own session)
+  orphaned. Resume now installs the same cancel handler as `recipe run`.
 
 ### Security
 - rustls 0.23.45 everywhere, closing RUSTSEC-2026-0285 (TLS 1.3 handshake

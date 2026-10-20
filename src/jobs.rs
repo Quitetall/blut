@@ -363,7 +363,19 @@ fn summarize(id: &str) -> JobSummary {
     // cockpit shows it Running indefinitely. Reconcile liveness against
     // the recorded pid: if a Running job has a real recorded pid that is
     // *definitively* gone, report it as Failed instead.
-    let state = reconcile_liveness(on_disk_state, pid);
+    // The child pid alone cannot see a job whose stages run IN-PROCESS (no
+    // trainer child, so no `pid` file): kill -9 of the blut process left it
+    // `running` forever. The recorded driver closes that gap.
+    let state = if on_disk_state == JobState::Running
+        && read_driver(id)
+            .ok()
+            .flatten()
+            .is_some_and(|d| driver_gone(&d))
+    {
+        JobState::Failed
+    } else {
+        reconcile_liveness(on_disk_state, pid)
+    };
     JobSummary {
         id: id.to_string(),
         state,
@@ -530,17 +542,175 @@ pub fn resolve_job_id(query: &str) -> Result<String> {
     }
 }
 
-/// `lamu-train cancel` core. Reads pid file, sends SIGTERM, waits
-/// up to `grace` for exit, falls back to SIGKILL. Marks the job
-/// state Cancelled regardless. Idempotent: if no pid, no-op success.
+/// `blut cancel` core.
+///
+/// A job whose blut process (its DRIVER, see [`record_driver`]) is still
+/// alive is stopped through that process: SIGTERM runs its cancel handler,
+/// which cancels the executor and kills every trainer group, and after
+/// `grace` it is SIGKILLed. Stopping only the trainer child is not enough —
+/// a job with no subprocess stage has no child at all, and a retrying stage
+/// would spawn a new one. With no live driver, the recorded trainer group (a
+/// child orphaned by a crashed driver) is SIGTERMed and then SIGKILLed.
+///
+/// A job that already finished (`done`/`failed`/`cancelled`) with nothing
+/// left running is left exactly as it is; its state is never rewritten.
+/// Refuses, without signalling anything, when the driver also runs other
+/// jobs (a sweep or backfill), because stopping it would stop them all.
 pub async fn cancel_job(job_id: &str, grace: std::time::Duration) -> Result<()> {
+    let state = read_state(job_id).ok();
+    let driver = read_driver(job_id)?
+        .filter(|d| d.pid != std::process::id() && crate::python_kill::identity_alive(d));
+    if let Some(driver) = driver {
+        let siblings = jobs_sharing_driver(job_id, &driver);
+        if !siblings.is_empty() {
+            return Err(TrainError::other(format!(
+                "job {job_id} runs in blut process {} together with {} other running \
+                 job(s) ({}); cancelling it alone is not possible. Stop the whole batch \
+                 with `kill -TERM {}`.",
+                driver.pid,
+                siblings.len(),
+                siblings.join(", "),
+                driver.pid
+            )));
+        }
+        crate::python_kill::terminate_process(&driver, grace)
+            .await
+            .map_err(|e| TrainError::other(format!("cancel {job_id}: {e}")))?;
+    } else if matches!(
+        state,
+        Some(JobState::Done | JobState::Failed | JobState::Cancelled)
+    ) {
+        return Ok(());
+    }
     let pid = read_pid(job_id)?;
     if let Some(pid) = pid {
         crate::python_kill::graceful_kill_pid(pid, grace).await;
     }
     let _ = write_state(job_id, JobState::Cancelled);
     let _ = clear_pid(job_id);
+    let _ = clear_driver(job_id);
     Ok(())
+}
+
+/// File naming the blut process that executes a job in-process.
+const DRIVER_FILE: &str = "driver";
+
+/// Record THIS process as the driver of `job_id` until the returned guard
+/// drops. The record is what lets a separate process tell a live job from a
+/// dead one when no trainer child exists (`blut jobs`), stop it (`blut
+/// cancel`), and refuse to resume it underneath itself (`blut plan resume`).
+/// It survives only an abnormal exit (SIGKILL, OOM kill, power loss), which
+/// is exactly the case it is there to detect. Recording is best-effort: a
+/// failure is logged and the job runs as before.
+pub fn record_driver(job_id: &str) -> DriverRecord {
+    let me = crate::python_kill::capture_identity(std::process::id());
+    let body = match me.start_time {
+        Some(start) => format!("{} {start}", me.pid),
+        None => me.pid.to_string(),
+    };
+    let written = paths::job_dir(job_id)
+        .and_then(|dir| {
+            let path = dir.join(DRIVER_FILE);
+            std::fs::write(&path, body).map_err(|e| TrainError::Io { path, source: e })
+        })
+        .map_err(|e| tracing::warn!("record driver for {job_id}: {e}"))
+        .is_ok();
+    DriverRecord {
+        job_id: job_id.to_string(),
+        written,
+    }
+}
+
+/// Guard returned by [`record_driver`]; removes the record on drop.
+#[must_use = "the driver record is removed when this guard drops"]
+pub struct DriverRecord {
+    job_id: String,
+    written: bool,
+}
+
+impl Drop for DriverRecord {
+    fn drop(&mut self) {
+        if self.written {
+            let _ = clear_driver(&self.job_id);
+        }
+    }
+}
+
+/// The recorded driver of `job_id`, if any (`pid` and, where the platform
+/// exposes it, the process start time that guards against pid reuse).
+pub fn read_driver(job_id: &str) -> Result<Option<crate::python_kill::ChildIdentity>> {
+    let path = paths::job_dir(job_id)?.join(DRIVER_FILE);
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(TrainError::Io { path, source: e }),
+    };
+    let mut parts = body.split_whitespace();
+    let Some(pid) = parts.next().and_then(|p| p.parse::<u32>().ok()) else {
+        return Ok(None);
+    };
+    let start_time = parts.next().and_then(|s| s.parse::<u64>().ok());
+    Ok(Some(crate::python_kill::ChildIdentity {
+        pid,
+        pgid: pid,
+        start_time,
+    }))
+}
+
+fn clear_driver(job_id: &str) -> Result<()> {
+    let path = paths::job_dir(job_id)?.join(DRIVER_FILE);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// The pid of the process still executing `job_id`, or `None` when no
+/// driver is recorded or the recorded one is gone (or its pid was reused).
+pub fn live_driver(job_id: &str) -> Option<u32> {
+    read_driver(job_id)
+        .ok()
+        .flatten()
+        .filter(crate::python_kill::identity_alive)
+        .map(|d| d.pid)
+}
+
+/// True only when the recorded driver is definitively not running. Off Unix
+/// liveness cannot be probed, so this never claims a driver is gone there.
+#[cfg(unix)]
+fn driver_gone(d: &crate::python_kill::ChildIdentity) -> bool {
+    !crate::python_kill::identity_alive(d)
+}
+
+#[cfg(not(unix))]
+fn driver_gone(_d: &crate::python_kill::ChildIdentity) -> bool {
+    false
+}
+
+/// Other `running` jobs whose recorded driver is the same live process.
+fn jobs_sharing_driver(job_id: &str, driver: &crate::python_kill::ChildIdentity) -> Vec<String> {
+    let Ok(dir) = paths::jobs_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(id) = entry.file_name().into_string() else {
+            continue;
+        };
+        if id == job_id || !entry.path().join(DRIVER_FILE).is_file() {
+            continue;
+        }
+        if read_state(&id).ok() == Some(JobState::Running)
+            && read_driver(&id).ok().flatten().is_some_and(|other| {
+                other.pid == driver.pid && other.start_time == driver.start_time
+            })
+        {
+            out.push(id);
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Remove a job's `pid` file (called when the job's last live child
@@ -958,5 +1128,166 @@ mod tests {
         if let Err(p) = result {
             std::panic::resume_unwind(p);
         }
+    }
+
+    // ── Job driver: cancel / liveness for in-process jobs ───────────
+
+    /// Spawn `sleep 30` as a stand-in driver and reap it on a thread, so its
+    /// exit is observable (an unreaped child would linger as a zombie).
+    #[cfg(target_os = "linux")]
+    fn spawn_driver_stand_in() -> (
+        crate::python_kill::ChildIdentity,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn `sleep 30`");
+        let identity = crate::python_kill::capture_identity(child.id());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+            let _ = tx.send(());
+        });
+        (identity, rx)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_driver_file(id: &str, d: &crate::python_kill::ChildIdentity) {
+        let body = format!("{} {}", d.pid, d.start_time.expect("linux start time"));
+        std::fs::write(paths::job_dir(id).unwrap().join(DRIVER_FILE), body).unwrap();
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    /// `blut cancel` on a job whose stages run in-process (no trainer child,
+    /// so no `pid` file) used to print "cancelled." and exit 0 while the job
+    /// ran on to `done`. It must stop the driving process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancel_stops_the_driver_of_an_in_process_job() {
+        let (driver, exited) = spawn_driver_stand_in();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_jobs_dir(|| {
+                let id = "20261020-000000-000000001";
+                write_state(id, JobState::Running).unwrap();
+                write_driver_file(id, &driver);
+                block_on(cancel_job(id, std::time::Duration::from_secs(5))).unwrap();
+                assert!(
+                    exited
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .is_ok(),
+                    "the driver must have been stopped"
+                );
+                assert_eq!(read_state(id).unwrap(), JobState::Cancelled);
+                assert!(read_driver(id).unwrap().is_none());
+            })
+        }));
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(driver.pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        if let Err(p) = result {
+            std::panic::resume_unwind(p);
+        }
+    }
+
+    /// A driver that runs several jobs (a sweep or backfill) is not stopped to
+    /// cancel one of them; the refusal says how to stop the batch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancel_refuses_a_driver_shared_with_other_running_jobs() {
+        let (driver, exited) = spawn_driver_stand_in();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_jobs_dir(|| {
+                for id in ["20261020-000000-000000002", "20261020-000000-000000003"] {
+                    write_state(id, JobState::Running).unwrap();
+                    write_driver_file(id, &driver);
+                }
+                let err = block_on(cancel_job(
+                    "20261020-000000-000000002",
+                    std::time::Duration::from_secs(1),
+                ))
+                .expect_err("must refuse");
+                assert!(err.to_string().contains("kill -TERM"), "{err}");
+                assert!(
+                    exited
+                        .recv_timeout(std::time::Duration::from_millis(300))
+                        .is_err(),
+                    "the shared driver must not be signalled"
+                );
+                assert_eq!(
+                    read_state("20261020-000000-000000002").unwrap(),
+                    JobState::Running
+                );
+            })
+        }));
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(driver.pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        if let Err(p) = result {
+            std::panic::resume_unwind(p);
+        }
+    }
+
+    /// Cancelling a job that already finished must not rewrite its state:
+    /// `done` used to become `cancelled`.
+    #[test]
+    fn cancel_leaves_a_finished_job_alone() {
+        with_jobs_dir(|| {
+            let id = "20261020-000000-000000004";
+            write_state(id, JobState::Done).unwrap();
+            block_on(cancel_job(id, std::time::Duration::from_secs(1))).unwrap();
+            assert_eq!(read_state(id).unwrap(), JobState::Done);
+        });
+    }
+
+    /// A job whose driver was SIGKILLed (no trainer child, so no `pid` file)
+    /// used to stay `running` forever in `blut jobs`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_job_whose_driver_died_is_reported_failed() {
+        let (driver, exited) = spawn_driver_stand_in();
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(driver.pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        exited
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("driver stand-in exits");
+        with_jobs_dir(|| {
+            let id = "20261020-000000-000000005";
+            write_state(id, JobState::Running).unwrap();
+            write_driver_file(id, &driver);
+            let job = list_jobs()
+                .unwrap()
+                .into_iter()
+                .find(|j| j.id == id)
+                .unwrap();
+            assert_eq!(job.state, JobState::Failed);
+            assert_eq!(live_driver(id), None);
+        });
+    }
+
+    /// The record names this process while the guard lives and is removed
+    /// when it drops (the normal-exit path).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn driver_record_names_this_process_until_dropped() {
+        with_jobs_dir(|| {
+            let id = "20261020-000000-000000006";
+            let guard = record_driver(id);
+            assert_eq!(live_driver(id), Some(std::process::id()));
+            drop(guard);
+            assert!(read_driver(id).unwrap().is_none());
+        });
     }
 }
