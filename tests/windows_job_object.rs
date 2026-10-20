@@ -265,11 +265,14 @@ async fn dropping_the_last_teardown_handle_kills_the_tree() {
     // KILL_ON_JOB_CLOSE: the job closes with its last handle.
     drop(wr);
 
-    let status = tokio::time::timeout(Duration::from_secs(30), child.wait())
+    // No exit-code check: Windows reports processes killed by
+    // KILL_ON_JOB_CLOSE with exit code 0 (observed on windows-latest). The
+    // timeout proves the 600 s sleeper was killed; the grandchild check
+    // below proves the kill reached the whole tree.
+    tokio::time::timeout(Duration::from_secs(30), child.wait())
         .await
         .expect("child died within 30 s of the job closing")
         .expect("wait");
-    assert!(!status.success(), "child exit {status:?}");
     assert!(
         grandchild.exited_within(30_000),
         "grandchild survived the job closing"
