@@ -40,8 +40,11 @@ in the release gate and cannot pass: only an `opt0` baseline is committed, and
 the gate names `release-0.2`. Either the baseline gets established on the
 designated quiet host, or the gate is honest about naming `opt0`.
 
-**5. Windows containment.** Bare fallback only; no Job Object implementation.
-Either implemented or stated as unsupported rather than "deferred".
+**5. Windows containment.** The Job Object backend is implemented and
+CI-gated on `windows-latest` (cap, peak, tree kill; see the ledger row). Still
+missing: a cookbook runner calling `Containment::after_spawn` on Windows, the
+`LocalSystemd` launcher (which still spawns bare there), and a recorded
+training run on a Windows host.
 
 **6. The ADR problem.** 805 citations across 208 files name decision records
 this repository does not contain — they live in a private meta-repository.

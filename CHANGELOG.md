@@ -13,8 +13,8 @@ depend on this crate.
 ## [0.2.0-alpha.2] — 2026-10-09
 
 `blut-types`, `blut`, `blut-dsl`, `blut-notify` and `blut-tui`, all at
-0.2.0-alpha.2. `blut-types` and `blut-notify` carry no code change; they move
-because the train shares one exact version.
+0.2.0-alpha.2. `blut-types` carries no code change; it moves because the
+train shares one exact version.
 
 ### Added
 - `s3` cargo feature: network object storage. `ObjectStore::from_url` opens
@@ -27,6 +27,19 @@ because the train shares one exact version.
   ledger) is behind the newest version on crates.io, and with `--yes` runs the
   pinned `cargo install --locked`. A stable install is never moved onto a
   prerelease.
+
+- Windows Job Object containment (`containment::windows::WindowsJobObject`),
+  selected by `containment_for()` on Windows or `BLUT_CONTAINMENT=windows-job-object`.
+  One job per run: `mem_max` (else `$MEMMAX`) becomes a tree-wide committed-memory
+  cap (`JOB_OBJECT_LIMIT_JOB_MEMORY`; an allocation past it fails rather than
+  killing the tree), `cancel` is `TerminateJobObject`, the peak is
+  `PeakJobMemoryUsed`, and closing the job kills whatever is left in it.
+  `mem_high` and `swap_max` are not mapped; `CapSpec` has no CPU field, so no
+  CPU rate limit is set. CI-gated on `windows-latest`.
+- `Containment::after_spawn` (provided, default no-op) and
+  `containment::spawn_attached`. The Windows backend spawns the child suspended
+  and assigns it to the job here, so a Windows caller must use one of them; a
+  skipped call leaves the child suspended, never running uncapped.
 
 ### Fixed
 - `EvalReport` artifacts can cross the stage boundary. Their free-form
@@ -47,6 +60,17 @@ because the train shares one exact version.
   The P2P transport now builds its TLS configs with `ring` passed explicitly
   and never installs a process-wide provider, so an embedder that installs
   its own later is unaffected.
+- The crate builds on Windows. `python_kill::graceful_kill_group` had no
+  non-Unix definition, the run ledger's non-Unix lock fallback did not
+  type-check, and `blut-notify` took its cursor lock with `flock`
+  unconditionally (on Windows it now holds the lock file open with share
+  mode 0).
+- On Windows a checked run-ledger append was refused outright, so a promotion
+  or clear could never win; it now takes an exclusive `LockFileEx` lock (on one
+  byte far past the end, so concurrent readers are not blocked).
+- On Windows a scheduler lock left by a dead process could never be reclaimed:
+  liveness always answered "alive". It now asks the OS whether the pid has
+  exited; a pid it cannot open for any other reason still counts as alive.
 
 ### Security
 - rustls 0.23.45 everywhere, closing RUSTSEC-2026-0285 (TLS 1.3 handshake

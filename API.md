@@ -367,8 +367,11 @@ without blocking unrelated safe selector targets.
 
 Containment (per-stage systemd-cgroup `MemoryMax`) requires **Linux + systemd**.
 Off-systemd, `LocalSystemd::wrap` degrades to a bare spawn with a warning;
-`BLUT_NO_CONTAIN=1` forces it. The crate compiles on macOS (containment off);
-Windows is unsupported.
+`BLUT_NO_CONTAIN=1` forces it. The crate compiles on macOS (containment off).
+On Windows the `containment_for()` factory selects the Job Object backend
+(`containment::windows`), which caps the tree's committed memory and kills the
+tree on cancel; a caller must spawn through `containment::spawn_attached` (or
+call `Containment::after_spawn`). `LocalSystemd::wrap` stays bare on Windows.
 
 ---
 
