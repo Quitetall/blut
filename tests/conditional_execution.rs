@@ -55,6 +55,8 @@ struct ProbeSignals {
     target_runs: AtomicUsize,
     hold_target: AtomicBool,
     panic_first_target: AtomicBool,
+    // Read only by the Unix permission-sealing fixtures.
+    #[cfg_attr(not(unix), allow(dead_code))]
     seal_target_scratch: AtomicBool,
     profile_target: AtomicBool,
     target_steps: AtomicUsize,
@@ -652,6 +654,8 @@ fn speculation_same_key_supersede_plan(registry: &Registry) -> CompiledPlan {
     .0
 }
 
+// Used only by a Unix-gated test.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn speculation_with_unrelated_failure_plan(registry: &Registry) -> CompiledPlan {
     let conditional = speculation_spec(true)
         .compile(registry)

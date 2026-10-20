@@ -344,9 +344,9 @@ impl RunLedger {
         #[cfg(not(unix))]
         {
             let _ = (record, validate);
-            return Err(TrainError::other(
+            Err(TrainError::other(
                 "checked ledger append requires cross-process locking unavailable on this platform",
-            ));
+            ))
         }
 
         #[cfg(unix)]
@@ -498,8 +498,29 @@ fn lock_exclusive(file: std::fs::File) -> Result<nix::fcntl::Flock<std::fs::File
 /// Off unix ordinary append safety degrades to `O_APPEND`. Checked curation is
 /// rejected by [`RunLedger::append_checked`] before reaching this fallback.
 #[cfg(not(unix))]
-fn lock_exclusive(file: std::fs::File) -> Result<std::fs::File> {
-    Ok(file)
+fn lock_exclusive(file: std::fs::File) -> Result<UnlockedFile> {
+    Ok(UnlockedFile(file))
+}
+
+/// The non-Unix stand-in for `Flock<File>`: the same `Deref`/`DerefMut` shape
+/// so `append_inner` reads identically on every platform, but it holds NO
+/// lock. That is safe only because checked appends never reach it.
+#[cfg(not(unix))]
+struct UnlockedFile(std::fs::File);
+
+#[cfg(not(unix))]
+impl std::ops::Deref for UnlockedFile {
+    type Target = std::fs::File;
+    fn deref(&self) -> &std::fs::File {
+        &self.0
+    }
+}
+
+#[cfg(not(unix))]
+impl std::ops::DerefMut for UnlockedFile {
+    fn deref_mut(&mut self) -> &mut std::fs::File {
+        &mut self.0
+    }
 }
 
 #[cfg(test)]
