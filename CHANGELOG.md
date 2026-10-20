@@ -118,6 +118,13 @@ because the train shares one exact version.
 - `blut log` printed nothing, with exit 0, for a job whose stages run
   in-process: it renders trainer progress only, and such a job records stage
   events instead. It now says so on stderr and points at `blut dag <job>`.
+- `blut schedule install` checked only that `--args` was JSON, so args the
+  recipe rejects installed a timer that failed every time it fired, visible
+  only in the journal. The args are now compiled at install. The generated
+  `ExecStart=` also left the binary path unquoted (a path with a space ran
+  the wrong program) and used shell escaping, which systemd does not
+  understand; `%` and `$` in args were open to systemd's specifier and
+  variable expansion. Words are now quoted and escaped per systemd.syntax(7).
 
 ### Security
 - rustls 0.23.45 everywhere, closing RUSTSEC-2026-0285 (TLS 1.3 handshake

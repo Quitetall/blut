@@ -58,6 +58,33 @@ fn validate_recipe_name(recipe: &str) -> Result<()> {
     }
 }
 
+/// Quote one word for a systemd `ExecStart=` line (systemd.syntax(7)), which
+/// is not a shell: `%` starts a specifier and `$` an environment
+/// substitution even inside quotes, so they are doubled; backslash and the
+/// quote are C-escaped. The old shell-style `'\''` escaping left an exe path
+/// with a space split in two and let `%`/`$` in recipe args be rewritten.
+fn systemd_quote(word: &str) -> String {
+    let escaped = word
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('%', "%%")
+        .replace('$', "$$");
+    format!("'{escaped}'")
+}
+
+/// The `oneshot` service a timer fires.
+fn render_service(exe: &str, recipe: &str, args_json: &str) -> String {
+    format!(
+        "[Unit]\n\
+         Description=BLUT scheduled recipe: {recipe}\n\n\
+         [Service]\n\
+         Type=oneshot\n\
+         ExecStart={} recipe run {recipe} --args {}\n",
+        systemd_quote(exe),
+        systemd_quote(args_json),
+    )
+}
+
 /// Validate an `OnCalendar` expression via `systemd-analyze calendar`.
 /// Returns the normalized form on success.
 pub fn validate_calendar(expr: &str) -> Result<()> {
@@ -88,15 +115,7 @@ pub fn install(recipe: &str, calendar: &str, args_json: &str) -> Result<()> {
         .map_err(|e| TrainError::other(format!("mkdir {}: {e}", dir.display())))?;
     let stem = unit_stem(recipe);
 
-    let service = format!(
-        "[Unit]\n\
-         Description=BLUT scheduled recipe: {recipe}\n\n\
-         [Service]\n\
-         Type=oneshot\n\
-         ExecStart={exe} recipe run {recipe} --args '{args}'\n",
-        exe = exe.display(),
-        args = args_json.replace('\'', "'\\''"),
-    );
+    let service = render_service(&exe.to_string_lossy(), recipe, args_json);
     let timer = format!(
         "[Unit]\n\
          Description=BLUT timer for {recipe}\n\n\
@@ -165,6 +184,25 @@ fn systemctl(args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An exe path with a space was written unquoted (the unit ran
+    /// `/opt/my`), and `%`/`$` in args were left for systemd to expand.
+    #[test]
+    fn exec_start_quotes_the_exe_and_escapes_specifiers() {
+        let unit = render_service(
+            "/opt/my tools/blut",
+            "count",
+            r#"{"note": "50%d $HOME it's"}"#,
+        );
+        let exec = unit
+            .lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .expect("ExecStart line");
+        assert_eq!(
+            exec,
+            r#"ExecStart='/opt/my tools/blut' recipe run count --args '{"note": "50%%d $$HOME it\'s"}'"#
+        );
+    }
 
     #[test]
     fn unit_stem_sanitizes() {

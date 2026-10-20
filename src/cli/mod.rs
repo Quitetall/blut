@@ -2746,8 +2746,13 @@ fn run_schedule_cmd(reg: &crate::framework::Registry, cmd: ScheduleCommand) -> R
                         "recipe '{recipe}' has no built-in SCHEDULE; pass --calendar <OnCalendar>"
                     )
                 })?;
-            let _: serde_json::Value = serde_json::from_str(&args)
+            let parsed: serde_json::Value = serde_json::from_str(&args)
                 .with_context(|| format!("parse --args as JSON: {args}"))?;
+            // Compile now, as `recipe run` will when the timer fires: args
+            // that only parsed as JSON used to install a timer that failed
+            // every time it ran, visible only in the journal.
+            (def.compile_fn)(parsed)
+                .map_err(|e| anyhow!("recipe '{recipe}' rejects these --args: {e}"))?;
             schedule::install(&recipe, &calendar, &args).map_err(|e| anyhow!("{e}"))?;
             eprintln!("installed timer blut-{recipe}.timer (OnCalendar={calendar})");
             eprintln!("inspect: systemctl --user list-timers | grep {recipe}");
