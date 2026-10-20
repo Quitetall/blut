@@ -55,9 +55,10 @@ because the train shares one exact version.
   not stopped to cancel one of them; the refusal names the batch.
 - `blut cancel` on a finished job rewrote `done` or `failed` as `cancelled`.
   It now reports that the job already finished and changes nothing.
-- A job whose blut process was killed (SIGKILL, OOM killer, power loss) stayed
-  `running` in `blut jobs` forever when no trainer subprocess had recorded a
-  pid. It is now reported `failed`.
+- A job whose blut process was killed (SIGKILL, OOM killer, power loss), or
+  that exited without being able to write its final state (a full disk),
+  stayed `running` in `blut jobs` forever when no trainer subprocess had
+  recorded a pid. It is now reported `failed`.
 - `blut plan resume` on a job that is still running started a second executor
   in the same job directory, and when the scheduler lock refused it marked the
   live job `failed`. It now refuses with the running pid. A resume refused by

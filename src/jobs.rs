@@ -630,7 +630,11 @@ pub struct DriverRecord {
 
 impl Drop for DriverRecord {
     fn drop(&mut self) {
-        if self.written {
+        // Keep the record when the job is still marked `running`: the run
+        // ended without recording a final state (the state write failed, e.g.
+        // on a full disk), and the record is then the only thing that lets
+        // `blut jobs` see that this process is gone.
+        if self.written && read_state(&self.job_id).ok() != Some(JobState::Running) {
             let _ = clear_driver(&self.job_id);
         }
     }
@@ -1287,6 +1291,21 @@ mod tests {
             let guard = record_driver(id);
             assert_eq!(live_driver(id), Some(std::process::id()));
             drop(guard);
+            assert!(read_driver(id).unwrap().is_none());
+        });
+    }
+
+    /// A run that could not write its final state (full disk) left the job
+    /// `running` with no trace of its process, so it looked live forever.
+    #[test]
+    fn driver_record_outlives_a_run_that_never_left_running() {
+        with_jobs_dir(|| {
+            let id = "20261020-000000-000000007";
+            write_state(id, JobState::Running).unwrap();
+            drop(record_driver(id));
+            assert!(read_driver(id).unwrap().is_some());
+            write_state(id, JobState::Done).unwrap();
+            drop(record_driver(id));
             assert!(read_driver(id).unwrap().is_none());
         });
     }
