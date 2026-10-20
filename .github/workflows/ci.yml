@@ -411,7 +411,7 @@ jobs:
       - name: Job Object containment tests
         run: cargo test --locked --test windows_job_object -- --nocapture
       - name: Test
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --no-fail-fast
 
   wasm32-keystone:
     name: blut-types wasm32 keystone (ADR 0083)

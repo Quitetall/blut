@@ -3,6 +3,41 @@
 //! ADR 0092 A10: one storage contract across adapters and caller modes.
 
 use std::path::PathBuf;
+
+/// Extend a stored object past `MAX_OBJECT_SIZE` (16 GiB) without writing
+/// it: the store must refuse it from its metadata alone. Unix filesystems
+/// leave the extension unallocated; NTFS allocates it unless the file is
+/// marked sparse first, which fills a CI runner's disk.
+fn grow_past_object_limit(path: &std::path::Path) {
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+        let mut returned = 0u32;
+        // SAFETY: a valid open file handle, no input or output buffers.
+        let ok = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle() as _,
+                FSCTL_SET_SPARSE,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            ok,
+            0,
+            "FSCTL_SET_SPARSE failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    file.set_len(MAX_OBJECT_SIZE + 1024).unwrap();
+}
 use std::sync::Arc;
 
 use blut::framework::artifact::{ArtifactContentId, ContentHash, InvocationKey};
@@ -139,12 +174,7 @@ async fn assert_async_contract(fixture: Fixture) {
         .put(oversize_key, oversize_payload)
         .await
         .unwrap();
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(fixture.raw_path(oversize_key))
-        .unwrap()
-        .set_len(MAX_OBJECT_SIZE + 1024)
-        .unwrap();
+    grow_past_object_limit(&fixture.raw_path(oversize_key));
     let error = fixture.store.get(oversize_key).await.unwrap_err();
     assert!(matches!(error, StoreError::TooLarge { .. }));
 
@@ -261,12 +291,7 @@ fn assert_blocking_contract(fixture: Fixture) {
     let oversize_payload = b"blocking-oversize".to_vec();
     let oversize_key = content_key(&oversize_payload);
     store.put(oversize_key, &oversize_payload).unwrap();
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(fixture.raw_path(oversize_key))
-        .unwrap()
-        .set_len(MAX_OBJECT_SIZE + 1024)
-        .unwrap();
+    grow_past_object_limit(&fixture.raw_path(oversize_key));
     let error = store.get(oversize_key).unwrap_err();
     assert!(matches!(error, StoreError::TooLarge { .. }));
 }

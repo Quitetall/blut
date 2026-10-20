@@ -152,6 +152,11 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
 ] }
 
+# Test-only: `tests/storage_conformance.rs` marks a file sparse before growing
+# it to 16 GiB, which NTFS would otherwise allocate on the runner's disk.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_IO", "Win32_System_Ioctl"] }
+
 [features]
 # The cockpit moved to the `crates/blut-tui` sidecar (ADR 0083 M2); the lean
 # CLI is now THE default build — no terminal-UI deps in the engine tree.
