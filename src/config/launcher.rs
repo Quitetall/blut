@@ -1209,8 +1209,11 @@ fn numeric_launcher_env(target: LaunchTarget) -> &'static [&'static str] {
 /// Call it before any work starts.
 pub fn check_launcher_env(target: LaunchTarget) -> Result<()> {
     for key in numeric_launcher_env(target) {
-        if let Ok(value) = std::env::var(key) {
-            match value.trim().parse::<u32>() {
+        // Empty is unset, as in `launcher_for`.
+        if let Ok(value) = std::env::var(key).map(|v| v.trim().to_string())
+            && !value.is_empty()
+        {
+            match value.parse::<u32>() {
                 Ok(n) if n > 0 => {}
                 _ => {
                     return Err(TrainError::other(format!(
@@ -1734,6 +1737,9 @@ mod tests {
         unsafe { std::env::set_var("BLUT_SLURM_NODES", "0") };
         assert!(check_launcher_env(LaunchTarget::Slurm).is_err());
         unsafe { std::env::set_var("BLUT_SLURM_NODES", "2") };
+        assert!(check_launcher_env(LaunchTarget::Slurm).is_ok());
+        // Empty means unset, as `launcher_for` reads it.
+        unsafe { std::env::set_var("BLUT_SLURM_NODES", "") };
         assert!(check_launcher_env(LaunchTarget::Slurm).is_ok());
         // Local runs never read it.
         unsafe { std::env::set_var("BLUT_SLURM_NODES", "two") };
