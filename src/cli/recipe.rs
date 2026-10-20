@@ -1278,13 +1278,37 @@ pub(super) async fn run_recipe_sweep(
 
     if dry_run {
         eprintln!("args subtree key: '{key}'");
+        let def = reg
+            .find(name)
+            .ok_or_else(|| anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)"))?;
+        let mut invalid = 0usize;
         for (i, e) in entries.iter().enumerate() {
+            let verdict = match check_sweep_combo(
+                def,
+                project_args(e.config.json.clone(), &key),
+                &tenant,
+                launch_target,
+            ) {
+                Ok(()) => "ok".to_string(),
+                Err(error) => {
+                    invalid += 1;
+                    format!("INVALID: {error}")
+                }
+            };
             eprintln!(
-                "[{i}] fp={} skip={} overrides={:?}",
+                "[{i}] fp={} skip={} overrides={:?} {verdict}",
                 e.fingerprint.to_hex(),
                 e.cache_skip,
                 e.overrides,
             );
+        }
+        // A dry run that lists combos without compiling them reported a sweep
+        // as fine when every combo would fail at launch (e.g. a misspelled
+        // `--sweep` key). It now compiles each, as the single-run dry run does.
+        if invalid > 0 {
+            return Err(anyhow!(
+                "{invalid} of {total} sweep combo(s) would fail to compile; nothing was run"
+            ));
         }
         return Ok(());
     }
@@ -1338,6 +1362,21 @@ pub(super) async fn run_recipe_sweep(
 /// Args. Otherwise (a flat config with no such subtree) return the whole config
 /// as-is (it feeds the Args directly, but top-level overrides can't apply — a
 /// compose-grammar limitation; `warn_dotless_overrides` surfaces it).
+/// Resolve and compile one sweep combo's args without running anything (the
+/// check `recipe run --dry-run` applies to a single invocation).
+fn check_sweep_combo(
+    def: &crate::recipes::recipe::RecipeDef,
+    args: serde_json::Value,
+    tenant: &crate::tenant::Tenant,
+    launch_target: crate::config::launcher::LaunchTarget,
+) -> Result<()> {
+    let args = crate::registry_args::resolve_recipe_args(args, tenant, launch_target)
+        .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
+    (def.compile_fn)(args)
+        .map(|_| ())
+        .map_err(|e| anyhow!("{e}"))
+}
+
 pub(super) fn project_args(mut config: serde_json::Value, key: &str) -> serde_json::Value {
     if let serde_json::Value::Object(map) = &mut config
         && let Some(sub) = map.get_mut(key)
@@ -1722,5 +1761,54 @@ mod declare_dispatch_tests {
             msg.contains("blut-dsl") && msg.contains(".json"),
             "actionable evaluator-missing error: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod sweep_dry_run_tests {
+    use super::check_sweep_combo;
+    use crate::recipes::recipe::{RecipeCategory, RecipeDef};
+
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct SweepArgs {
+        #[serde(default)]
+        steps: u32,
+    }
+
+    static DEF: RecipeDef = RecipeDef {
+        name: "sweep_dry",
+        description: "d",
+        backend_id: "b",
+        category: RecipeCategory::User,
+        input_kinds: &[],
+        output_kind: "k",
+        schedule: None,
+        args_schema_fn: crate::recipes::recipe::schema_of::<SweepArgs>,
+        compile_fn: |raw| {
+            crate::recipes::recipe::validate_args_against_schema(
+                "sweep_dry",
+                &crate::recipes::recipe::schema_of::<SweepArgs>(),
+                &raw,
+            )?;
+            Ok(crate::framework::plan::CompiledPlan::from_components(
+                "sweep_dry".into(),
+                raw,
+                vec![],
+            )
+            .0)
+        },
+    };
+
+    /// `--sweep count.stpes=1,2 --dry-run` listed both combos as fine; the
+    /// real run then failed every one.
+    #[test]
+    fn a_dry_run_combo_is_compiled_not_just_listed() {
+        let tenant = crate::tenant::Tenant::default();
+        let local = crate::config::launcher::LaunchTarget::Local;
+        assert!(check_sweep_combo(&DEF, serde_json::json!({"steps": 2}), &tenant, local).is_ok());
+        let err = check_sweep_combo(&DEF, serde_json::json!({"stpes": 2}), &tenant, local)
+            .expect_err("a misspelled key must fail the dry run");
+        assert!(err.to_string().contains("stpes"), "{err}");
     }
 }

@@ -132,6 +132,10 @@ because the train shares one exact version.
   `BLUT_RAY_NUM_GPUS` (or any `BLUT_SLURM_*` count) was dropped without a
   word; it is still ignored but now warns, and an empty `RAY_ADDRESS` (or
   other launcher setting) counts as unset instead of producing `--address=`.
+- `recipe run --sweep … --dry-run` listed the expanded combos without
+  compiling them, so a sweep whose every combo would fail (a misspelled
+  `--sweep` key) dry-ran clean. Each combo is now resolved and compiled, as
+  the single-run `--dry-run` already did, and the dry run fails if any would.
 
 ### Security
 - rustls 0.23.45 everywhere, closing RUSTSEC-2026-0285 (TLS 1.3 handshake
