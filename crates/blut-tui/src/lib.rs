@@ -951,7 +951,7 @@ impl App {
     fn recipe_menu(
         catalog: &[&'static blut::recipes::RecipeDef],
     ) -> Vec<(Option<char>, &'static blut::recipes::RecipeDef)> {
-        // Menu order = each course's pipeline position (ADR 0051).
+        // Menu order = each course's pipeline position (ADR 0055).
         // `Course::order()` is a compiler-forced exhaustive match, so a
         // newly-added course can't silently drop to the bottom here.
         let mut sorted: Vec<&'static blut::recipes::RecipeDef> = catalog.to_vec();

@@ -10,6 +10,20 @@ depend on this crate.
 
 ## [Unreleased]
 
+### Added
+- `docs/adr/`: the 41 engine-facing architecture decision records, federated
+  from the project's decision log with private material redacted inline as
+  `[redacted: <category>]`, plus an index. "ADR NNNN" citations in the engine
+  now resolve to a document in this repository; `book_src/adrs.md` points at
+  the index instead of describing the gap.
+
+### Changed
+- Citations of decisions that were not federated (product, codec and platform
+  records) are rewritten as the rationale they stood for. Citations written
+  before the decision log renumbered two records now use the current numbers:
+  experiment-execution UX is ADR 0156 (was 0071), cookbook taxonomy is ADR 0055
+  (was 0051).
+
 ## [0.2.0-alpha.2] — 2026-10-09
 
 `blut-types`, `blut`, `blut-dsl`, `blut-notify` and `blut-tui`, all at
@@ -188,7 +202,7 @@ published, so the milestone moves forward rather than down to a `0.9.0` marker.
 
 ### Added
 
-#### Cookbook taxonomy + ingredient registry (ADR 0050 / 0051)
+#### Cookbook taxonomy + ingredient registry (ADR 0055)
 
 - **Course** — `RecipeCategory` renamed to `Course`, the culinary layer in
   BLUT ▸ Cookbook ▸ Course ▸ Recipe ▸ Ingredient, with new `Pretraining` and
@@ -197,7 +211,7 @@ published, so the milestone moves forward rather than down to a `0.9.0` marker.
 - **Ingredient registry** — `IngredientSpec` + a fail-closed
   `build_ingredient(kind, name, cfg, **extra)` over 13 kinds (data / sampler /
   preprocess / model / forward / loss / optimizer / scheduler / step / ema /
-  eval / checkpoint / logging), generalizing ADR 0050's optimizer registry. Each
+  eval / checkpoint / logging), generalizing the lamquant cookbook's optimizer registry. Each
   spec coerces a frozen dataclass config and declares whether its selection
   changes the cached artifact (`cache_relevant`).
 - **Trainer decomposition** — the canonical trainers' sub-stages are extracted

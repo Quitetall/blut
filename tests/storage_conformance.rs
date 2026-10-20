@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Brian Lam
-//! ADR 0092 A10: one storage contract across adapters and caller modes.
+//! Ownership contract A10: one storage contract across adapters and caller modes.
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -118,7 +118,7 @@ enum Command {
         /// Second job id.
         b: String,
     },
-    /// One run's results from the metric store (ADR 0071 A3): best val_r +
+    /// One run's results from the metric store (ADR 0156 A3): best val_r +
     /// trajectory + per-band PRD + ckpt path. `blut results <job> [--json]` —
     /// replaces grepping BLUT_METRIC out of raw logs + `ls -t`-hunting a CSV.
     Results {
@@ -1178,7 +1178,7 @@ pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>)
     result
 }
 
-/// See the call in [`run`]. Mirrors the terseness of the ADR-0071
+/// See the call in [`run`]. Mirrors the terseness of the ADR-0156
 /// advisory-warning print (`⚠ training OK — completed with N advisory
 /// warning(s)...` below `run_recipe`): a short header line, then one
 /// `    · field: value` bullet per populated field. Fields left `None`

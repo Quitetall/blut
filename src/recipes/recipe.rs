@@ -336,7 +336,7 @@ macro_rules! register_recipe {
 /// for filtered CLI browsing.
 ///
 /// "Course" is the culinary cookbook-taxonomy grouping layer
-/// (ADR 0051: BLUT → Cookbook → Course → Recipe → Ingredient) — a
+/// (ADR 0055: BLUT → Cookbook → Course → Recipe → Ingredient) — a
 /// static tag, not a registered object. `RecipeCategory` remains as a
 /// back-compat alias below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -402,7 +402,7 @@ impl Course {
     }
 }
 
-/// Back-compat alias. The canonical name is [`Course`] (ADR 0051 — the
+/// Back-compat alias. The canonical name is [`Course`] (ADR 0055 — the
 /// culinary cookbook taxonomy BLUT → Cookbook → Course → Recipe →
 /// Ingredient). Existing `RecipeCategory` references keep compiling; new
 /// code should prefer `Course`.

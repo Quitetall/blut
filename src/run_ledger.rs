@@ -126,7 +126,7 @@ pub struct RunIdentity {
     pub checkpoint_sha256: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pccp_change_id: Option<String>,
-    /// ADR 0144 evidence directory, referenced rather than duplicated.
+    /// Attestation evidence directory, referenced rather than duplicated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestation_ref: Option<String>,
     /// `TRUTH_LEDGER` §2 row ids this run is cited by (e.g. `2.6`).

@@ -40,7 +40,7 @@ pub const GIB: u64 = 1024 * 1024 * 1024;
 /// recipe JSON.
 pub const UNCALIBRATED_WORKER_CAP: u32 = 2;
 
-/// Upper bound on auto-tuned DataLoader workers (ADR 0071). Decode saturates the
+/// Upper bound on auto-tuned DataLoader workers (ADR 0156). Decode saturates the
 /// GPU feed well before the core count on a many-core box, and each worker holds a
 /// multi-GiB prefetch buffer, so raising past this just burns RAM for no throughput.
 pub const MAX_AUTO_WORKERS: u32 = 16;
@@ -117,7 +117,7 @@ pub fn envelope_sync_base(env: &blut_types::envelope::ResourceEnvelope, warm: bo
 }
 
 /// Increment-3 (ADR 0133): fit-and-saturate over a DECLARED cost term — the
-/// engine's search mechanism (ADR 0071 semantics preserved: decrement from the
+/// engine's search mechanism (ADR 0156 semantics preserved: decrement from the
 /// target until the footprint fits `avail − floor`, always ≥ 1), the
 /// cookbook's enumeration (`max_units` can only be tightened by `target`).
 /// `avail_bytes == 0` (no probe) ⇒ the term's DECLARED units — a box we can't

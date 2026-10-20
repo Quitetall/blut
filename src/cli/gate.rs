@@ -264,7 +264,7 @@ pub(super) fn configure_training_io_admission(
     Ok((plan, admitted))
 }
 
-/// ADR 0071 A2: auto-tune the decode worker count to FIT-AND-SATURATE from a SINGLE
+/// ADR 0156 A2: auto-tune the decode worker count to FIT-AND-SATURATE from a SINGLE
 /// memory snapshot. Returns `Some(W)` for a train-shaped recipe (so RESOLVE +
 /// RECORD share the cached count), or `None` for a light/arg-less recipe or when
 /// the mem probe is unavailable (keep the conservative cap = unchanged behaviour).
@@ -324,7 +324,7 @@ pub(super) fn admitted_workers_for(
     Some(w)
 }
 
-/// E2: auto-tune the batch size to FIT the RAM budget, extending ADR 0071 A2's
+/// E2: auto-tune the batch size to FIT the RAM budget, extending ADR 0156 A2's
 /// fit-and-saturate auto-tune to a second knob. Runs ONLY when `resolved_workers`
 /// came from [`admitted_workers_for`] on this SAME admission call (batch is
 /// searched against the residual budget after workers is already fixed — see

@@ -837,7 +837,7 @@ impl LineageDb {
     }
 
     /// The per-step TRAJECTORY of `metric` for a job (real samples, `step >= 0`),
-    /// ordered by step — for `blut results` (ADR 0071 A3). Excludes the `step = -1`
+    /// ordered by step — for `blut results` (ADR 0156 A3). Excludes the `step = -1`
     /// final marker so the series is the live curve, not the headline.
     ///
     /// Job-level aggregate (no `node_idx` filter), consistent with `final_metrics`:

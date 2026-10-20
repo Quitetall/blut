@@ -176,7 +176,7 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test
 
-      # ADR 0139 / ADR 0034: the semantic-graph adapter is a SIDECAR (standalone
+      # ADR 0034: the LamQuant semantic-graph adapter is a SIDECAR (standalone
       # workspace) so the domain-agnostic engine carries no ABIR vocabulary and
       # no blut-graph-core code. Gate it or the adapter rots.
       - name: Build + lint + test blut-semantic (standalone workspace)

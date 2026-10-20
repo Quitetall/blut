@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# blut-semantic — the ADR 0139 semantic-graph ADAPTER, a SIDECAR library.
+# blut-semantic — the LamQuant semantic-graph ADAPTER, a SIDECAR library.
 #
 # Bridges `blut-graph-core`'s compiled semantic graphs onto the engine's
 # durable plan contracts. It lives OUTSIDE the engine because graph-core's
@@ -20,7 +20,7 @@ edition = "2024"
 rust-version = "1.88"
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
-description = "Semantic-graph adapter bridging blut-graph-core plans onto BLUT durable execution contracts (ADR 0139)."
+description = "Semantic-graph adapter bridging blut-graph-core plans onto BLUT durable execution contracts."
 publish = false
 
 [lib]

@@ -388,7 +388,8 @@ fn constrain_dynamic_hpo_admission(
 /// Shared by the `tpe` and `surrogate` branches ON PURPOSE. Both need the same
 /// three things — the overlays, the recipe's `compile_fn`, and a closure that
 /// applies an overlay over the base args — and when this was duplicated, "one
-/// application path" (ADR 0092 invariant 4) was enforced by convention and a
+/// application path" (the module-ownership invariant that CLI, TUI, local and
+/// remote share one application module) was enforced by convention and a
 /// test on the output. A shared helper enforces it structurally: the two
 /// branches cannot drift on how a proposed trial becomes a node, because there
 /// is only one place that decides.

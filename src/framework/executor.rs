@@ -495,7 +495,7 @@ pub struct PlanResult {
     pub n_cache_hits: usize,
     pub n_cache_misses: usize,
     pub elapsed: std::time::Duration,
-    /// Advisory stages that FAILED (ADR 0071): each warns + prunes its
+    /// Advisory stages that FAILED (ADR 0156): each warns + prunes its
     /// descendants but does not fail the plan. NON-EMPTY ⇒ the run completed
     /// "with warnings" — the machine-parseable signal that distinguishes this
     /// from a clean success (both exit 0). Tooling that acts on `final_output`
@@ -503,7 +503,7 @@ pub struct PlanResult {
     pub warnings: Vec<StageWarning>,
 }
 
-/// One advisory stage that tripped (ADR 0071).
+/// One advisory stage that tripped (ADR 0156).
 #[derive(Debug, Clone)]
 pub struct StageWarning {
     /// Topo index of the advisory stage.
@@ -518,7 +518,7 @@ pub struct StageWarning {
     pub origin: Option<crate::framework::error_domain::FaultOrigin>,
 }
 
-/// Whether advisory stages are forced FATAL for this run (ADR 0071 strict mode),
+/// Whether advisory stages are forced FATAL for this run (ADR 0156 strict mode),
 /// via `BLUT_STRICT_ADVISORY=1` — for CI that wants the old fail-hard behaviour.
 fn strict_advisory() -> bool {
     std::env::var("BLUT_STRICT_ADVISORY")
@@ -5209,7 +5209,7 @@ impl SequentialExecutor {
                     content_outputs.insert(outcome.node_id, outcome.content_id);
                 }
                 Err(f) => {
-                    // ADR 0071: an advisory stage's failure is a non-fatal warning,
+                    // ADR 0156: an advisory stage's failure is a non-fatal warning,
                     // not a plan failure — record it and STOP (the remaining topo
                     // nodes are its descendants and can't run). `strict_advisory()`
                     // forces the old fail-hard behaviour for CI.
@@ -5238,7 +5238,7 @@ impl SequentialExecutor {
 
         // If an advisory stage pruned the terminal node, surface the last COMPLETED
         // node in topo order (the upstream train ckpt in the canonical linear
-        // train→gate plan) rather than None (ADR 0071).
+        // train→gate plan) rather than None (ADR 0156).
         let final_output = if warnings.is_empty() {
             order.last().and_then(|id| outputs.remove(id))
         } else {
@@ -7401,7 +7401,7 @@ impl ParallelExecutor {
         // If the terminal node was pruned, there is no final output — a killed
         // branch legitimately changed the graph (the caller sees the missing
         // output + the StageFailed events in status.jsonl). EXCEPT when an
-        // advisory stage did the pruning (ADR 0071): surface the last completed
+        // advisory stage did the pruning (ADR 0156): surface the last completed
         // node in topo order (the upstream train ckpt for a linear train→gate plan)
         // so the operator gets it live.
         let final_output = if warnings.is_empty() {

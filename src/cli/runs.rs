@@ -101,10 +101,10 @@ pub(super) fn run_compare(a: &str, b: &str) -> Result<()> {
 }
 
 /// `blut results <job> [--json] [--metric M]` — one run's results from the
-/// metric store (ADR 0071 A3): best (peak) value + per-step trajectory +
+/// metric store (ADR 0156 A3): best (peak) value + per-step trajectory +
 /// per-band PRD + the produced ckpt path. Replaces grepping `BLUT_METRIC` out
 /// of raw logs and `ls -t`-hunting the run CSV. The metric store is a derived,
-/// rebuildable index (ADR 0071 §3) — an un-flushed/just-started job has no rows
+/// rebuildable index (ADR 0156 §3) — an un-flushed/just-started job has no rows
 /// yet, so we say "no data yet" rather than erroring.
 pub(super) fn run_results(
     job: &str,

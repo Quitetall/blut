@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Brian Lam
-//! ADR 0092 A09: cross-host artifact ownership and identity contract.
+//! Ownership contract A09: cross-host artifact ownership and identity contract.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,7 +26,7 @@ struct TestBackend;
 
 impl TrainingBackend for TestBackend {
     const ID: &'static str = "a09-test";
-    const DESCRIPTION: &'static str = "ADR 0092 A09 integration-test backend";
+    const DESCRIPTION: &'static str = "A09 integration-test backend";
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
