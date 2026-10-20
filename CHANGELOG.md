@@ -18,11 +18,13 @@ because the train shares one exact version.
 
 ### Added
 - `s3` cargo feature: network object storage. `ObjectStore::from_url` opens
-  `s3://bucket/prefix` (AWS S3 or any S3-compatible endpoint: MinIO, R2, GCS's
-  S3 gateway) and `file://` stores, and `blut cloud --store` accepts a URL as
-  well as a directory. Credentials come only from the standard AWS environment
-  variables, never from flags. Validated end to end against MinIO; TLS to a
-  public endpoint and IAM roles are not yet exercised.
+  `s3://bucket/prefix` (AWS S3, or an S3-compatible endpoint that supports
+  conditional writes) and `file://` stores, and `blut cloud --store` accepts a
+  URL as well as a directory. Credentials come only from the standard AWS
+  environment variables, never from flags. Validated end to end against MinIO.
+  An endpoint without conditional writes (Backblaze B2) is refused with an error
+  that says so, instead of a generic 501 after ten retries; objects are never
+  written without the create-only guarantee.
 - `blut update` reports whether the binary cargo installed (per its install
   ledger) is behind the newest version on crates.io, and with `--yes` runs the
   pinned `cargo install --locked`. A stable install is never moved onto a

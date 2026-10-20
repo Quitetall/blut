@@ -28,7 +28,7 @@ first if you are deciding whether to depend on this.
 | P2P dispatch between separate network namespaces | Validated | Two containers, own IPs, real QUIC over a bridge — see below |
 | Live multi-host P2P mesh | Deferred | Requires independent-host validation |
 | Cloud queue over local object storage | Validated | `blut cloud smoke` round-trip through the shipped cookbook binary, 2026-09-19 |
-| Network object storage (S3/R2/GCS/MinIO) | Validated | `s3` feature; full cloud round-trip against MinIO over HTTP, 2026-09-20 |
+| Network object storage (S3-compatible) | Validated (MinIO) | `s3` feature; full cloud round-trip against MinIO over HTTP, 2026-09-20. Backblaze B2 over TLS refused: no conditional writes, 2026-10-20 — see below |
 | `blut-worker` REST prototype | Deleted (ADR 0083 M3) | Superseded by `src/cloud` + the `blut-web` sidecar |
 | Kubernetes operator | Unsupported | Unpublished prototype; separate Rust 1.89 compile/test lane |
 | Windows containment | Deferred | Bare fallback only; Job Object implementation absent |
@@ -246,13 +246,51 @@ provider's quirks. And it is not yet reachable from a shipped binary —
 `blut-cookbook-standard` cannot enable `s3` until an engine release carrying the
 feature is published.
 
+## Recorded run: S3 over TLS, and a provider that cannot host it (2026-10-20)
+
+Built with `--features s3` and driven through `blut cloud smoke`.
+
+**TLS.** MinIO served HTTPS with a certificate from a private CA created for the
+run:
+
+```
+untrusted CA:              failed to verify TLS certificate: invalid peer certificate: UnknownIssuer   (exit 1)
+SSL_CERT_FILE=<that CA>:   ✔ cloud round-trip verified over s3://blut-tls/run1; output: TLS ROUND TRIP 2026-10-20
+```
+
+So certificate verification is enforced, and the platform trust store, or
+`SSL_CERT_FILE`, is what decides.
+
+**Backblaze B2, a commercial S3-compatible endpoint, over public TLS.** The TLS
+handshake and request signing succeeded, then every create-only `PUT` was
+refused:
+
+```
+501 Not Implemented  <Code>NotImplemented</Code>
+A header you provided implies functionality that is not implemented
+```
+
+B2 does not implement `If-None-Match: *` on `PUT`. BLUT publishes every object
+that way, so a second writer can never replace the first. Cache invocations are
+keyed by their inputs, not their bytes, so without the guarantee two workers
+could silently overwrite each other's cached result. There is therefore no
+fallback. BLUT now refuses such an endpoint with an error naming the missing
+capability; before, it surfaced a generic 501 after ten retries.
+
+**Boundaries.**
+- TLS was proven against MinIO with a private CA, not against a public CA chain
+  on a commercial provider that also supports conditional writes.
+- IAM roles, STS and instance credentials were not exercised. Only the static
+  key variables were.
+- AWS S3 itself has not been run against.
+
 ## Required evidence before stronger claims
 
 - Record multi-node failure recovery, and artifact hashes across nodes. Topology,
   versions and global-batch parity are recorded above.
 - Exercise P2P across independent hosts and hostile-network cases.
-- Restore network object-store support only after dependency advisories, secret
-  handling, TLS, and provider integration tests pass.
+- Run the S3 path against AWS S3 (or another provider with conditional writes)
+  on public TLS, and with IAM-role credentials.
 - Publish cookbook-specific DDP evidence in each cookbook repository. Engine
   tests prove orchestration contracts, not model-training correctness.
 

@@ -30,10 +30,11 @@ across machines (item 2).
 **2. P2P across independent hosts, including hostile networks.** Loopback proves
 the protocol, not the mesh. Needs separate machines, NAT, loss and partition.
 
-**3. Network object storage.** The cloud queue proves itself against the local
-filesystem. S3/R2/GCS/MinIO were removed from the preview pending dependency
-advisories, secret handling and TLS. Restoring them means code plus provider
-integration tests, not a feature flag.
+**3. Network object storage.** The `s3` feature round-trips against MinIO,
+over plain HTTP and over TLS with certificate verification enforced. Backblaze
+B2 cannot host it: it has no conditional writes, and BLUT refuses it with an
+error that says so. Still missing: a run against AWS S3 or another provider with
+conditional writes on public TLS, and IAM-role credentials.
 
 **4. A benchmark baseline that exists.** `scripts/run_benchmarks.sh compare` is
 in the release gate and cannot pass: only an `opt0` baseline is committed, and
