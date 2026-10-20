@@ -136,6 +136,9 @@ because the train shares one exact version.
   compiling them, so a sweep whose every combo would fail (a misspelled
   `--sweep` key) dry-ran clean. Each combo is now resolved and compiled, as
   the single-run `--dry-run` already did, and the dry run fails if any would.
+- `blut plan resume` on a job launched from a plan file (`recipe declare
+  --run`, `plan run`) failed with a bare "No such file or directory". It now
+  says such a job has no recipe to re-compile and must be launched again.
 
 ### Security
 - rustls 0.23.45 everywhere, closing RUSTSEC-2026-0285 (TLS 1.3 handshake

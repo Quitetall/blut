@@ -1343,6 +1343,23 @@ mod policy_cron_hint_tests {
 }
 
 #[cfg(test)]
+mod resume_marker_tests {
+    use super::RecipeMarker;
+
+    /// Resuming a job launched from a plan file failed with a bare
+    /// "No such file or directory".
+    #[test]
+    fn resuming_a_plan_file_job_says_why_it_cannot() {
+        let td = tempfile::tempdir().unwrap();
+        let err = RecipeMarker::read_from(td.path())
+            .err()
+            .expect("no marker")
+            .to_string();
+        assert!(err.contains("launched from a plan file"), "{err}");
+    }
+}
+
+#[cfg(test)]
 mod cache_prune_cap_tests {
     use super::resolve_prune_cap_gb;
 
@@ -1816,6 +1833,20 @@ impl RecipeMarker {
     }
     fn read_from(job_dir: &std::path::Path) -> Result<Self> {
         let path = job_dir.join("recipe.json");
+        // A plan launched from a file (`recipe declare --run`, `plan run`)
+        // writes no marker on purpose: there is no registry recipe to
+        // re-compile. The bare ENOENT this produced did not say that.
+        if !path.exists() {
+            return Err(anyhow!(
+                "job {} cannot be resumed: it was launched from a plan file \
+                 (`recipe declare --run` or `plan run`), not a registry recipe, so \
+                 there is nothing to re-compile. Launch the file again.",
+                job_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ));
+        }
         let body = std::fs::read(&path)
             .with_context(|| format!("read recipe marker {}", path.display()))?;
         serde_json::from_slice(&body).context("parse recipe marker")
