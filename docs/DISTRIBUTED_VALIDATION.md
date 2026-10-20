@@ -26,7 +26,8 @@ first if you are deciding whether to depend on this.
 | Multi-node NCCL training through Slurm | Validated (cookbook) | Two physical machines, 2× RTX 5090, NCCL over a private network, 2026-10-20 — see below |
 | P2P crypto, policy, transport, and loopback dispatch | Component-tested | Unit and loopback integration tests |
 | P2P dispatch between separate network namespaces | Validated | Two containers, own IPs, real QUIC over a bridge — see below |
-| Live multi-host P2P mesh | Deferred | Requires independent-host validation |
+| P2P dispatch between independent hosts over the internet | Validated | Oregon ↔ France, both behind NAT, real QUIC over the public internet, 2026-10-20 — see below |
+| Live multi-host P2P mesh (N nodes, `p2p node`) | Deferred | Two-host coordinator/worker dispatch only so far |
 | Cloud queue over local object storage | Validated | `blut cloud smoke` round-trip through the shipped cookbook binary, 2026-09-19 |
 | Network object storage (S3-compatible) | Validated (MinIO) | `s3` feature; full cloud round-trip against MinIO over HTTP, 2026-09-20. Backblaze B2 over TLS refused: no conditional writes, 2026-10-20 — see below |
 | `blut-worker` REST prototype | Deleted (ADR 0083 M3) | Superseded by `src/cloud` + the `blut-web` sidecar |
@@ -113,6 +114,43 @@ the same invented string, so they agreed with the parser and with nothing else.
 Fixed against captured output; the run above is the same cluster after the fix.
 
 This run says nothing about Slurm; the Slurm runs are recorded below.
+
+## Recorded run: P2P dispatch across the internet (2026-10-20)
+
+Two rented machines on different continents, sharing no network: a coordinator
+in Oregon (US) and a worker in France. Each was a container behind its
+provider's NAT. The coordinator was reachable only through a port forward
+(public UDP 45026 → container 9320); the worker dialled out through ordinary
+outbound NAT. Each side ran the same statically linked binary
+(`blut::cli::run` with `features = ["p2p"]`) and had its own generated identity.
+
+```
+coordinator (Oregon)                          worker (France)
+blut p2p serve --addr 0.0.0.0:9320 \           blut p2p connect 15.218.195.24:45026 \
+  --smoke-stage p2p-echo                          --coordinator-pubkey eb5c597a…
+P2P peer connected: a34788959fecd3cb (trust: anonymous)
+✔ stage 'p2p-echo' ran on peer a34788959fecd3cb; verified output:
+WAN OREGON TO FRANCE, RUN TWO
+```
+
+The input was lowercase (`wan oregon to france, run two`) and came back
+uppercased and verified. So the identity exchange, the transatlantic QUIC
+connection, dispatch, remote execution and result verification all crossed a
+real WAN, not an emulated one. It ran twice; both passed.
+
+**What it found.** The coordinator finished in 4.9 s, but the worker took
+30.7 s to exit. The coordinator ended without a graceful QUIC close, so the
+worker only noticed after the idle timeout. The coordinator's printed hint
+also told users to connect to `0.0.0.0:9320`, its bind address, which no peer
+can reach.
+
+**Boundaries.**
+- Two hosts and one dispatch, with the coordinator/worker roles, not an N-node
+  `p2p node` mesh.
+- No induced loss or partition here; the loss, latency, partition and NAT
+  cases are a separate emulated matrix.
+- NAT traversal relied on a provider port forward on the coordinator; there
+  was no hole punching.
 
 ## Recorded run: the Slurm launcher on a live cluster (2026-10-20)
 
