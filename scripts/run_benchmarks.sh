@@ -5,6 +5,9 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
 baseline=${BLUT_BENCH_BASELINE:-release-0.2}
+# A comparison fails when a benchmark's median is slower than the baseline by
+# more than this fraction even at its confidence interval's lower bound.
+max_regression=${BLUT_BENCH_MAX_REGRESSION:-0.10}
 mode=${1:-compare}
 cargo_cmd=(cargo +1.88)
 
@@ -40,7 +43,11 @@ save_baseline() {
 case "$mode" in
   compare)
     restore_baseline
+    # Drop change estimates from earlier comparisons so only this run is judged.
+    find target/criterion -type d -name change -prune -exec rm -rf -- {} +
     "${cargo_cmd[@]}" bench -p blut --bench framework -- --baseline "$baseline"
+    # Criterion reports a regression but still exits 0; this is the gate.
+    python3 scripts/bench_regression_gate.py target/criterion "$max_regression"
     ;;
   --save)
     save_baseline
