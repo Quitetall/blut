@@ -239,9 +239,43 @@ batch of 16, different hardware. That is the global-batch parity check.
   cgroup GPU confinement.
 - Neither run exercised failure recovery: no node was lost mid-run.
 
+## Recorded run: losing a node mid-job (2026-10-20)
+
+Same two-node cluster, with `SlurmdTimeout=30`. A two-node `sbatch` job
+streamed through `SlurmLauncher`; 12 s in, node `n1`'s container was killed.
+
+```
+  | rank=0 tick=1
+  | rank=1 tick=1
+  | srun: error: Node failure on n1
+  | slurmstepd-n0: error: *** JOB 1 ON n0 CANCELLED AT … DUE TO NODE FAILURE ***
+  | [blut] slurm job 1: requeued, now PENDING (BeginTime)
+                                  (n1 restarted here)
+  | rank=0 tick=1
+  | rank=1 tick=1
+  | [blut] slurm job 1: running again
+  | rank=1 tick=30
+  | rank=0 tick=30
+stream returned after 227s: Ok(())      poll: Succeeded
+```
+
+**What it found.** Slurm requeues a batch job whose node fails. The job went
+back to `PENDING`, and while its node stayed down it waited there
+indefinitely. The stream waited too, which is correct, but it said nothing, so
+the operator could not tell that the job had been killed and was waiting for
+hardware. The stream now notes a requeue, a suspension, a hold, or a wait for
+anything other than the job's turn, each once and with Slurm's reason, and
+notes when the job is running again. The rerun's output streamed from the start
+of its truncated log.
+
+**Boundaries.** Slurm-level recovery only: the job restarted from the
+beginning. Resuming BLUT's own DAG from its last completed stage after a node
+loss (`plan resume`) was not exercised here.
+
 ## Required evidence (Slurm, still open)
 
-- Node loss mid-run and recovery through durable resume.
+- BLUT durable resume (`plan resume`) after losing a node, as opposed to
+  Slurm's own requeue.
 - A cluster with cgroup enforcement and GPU binding, rather than placeholder
   devices.
 

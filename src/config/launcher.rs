@@ -600,15 +600,29 @@ impl SlurmJob {
 
     /// Pull `JobState=…` out of one-line `scontrol show job -o` output.
     fn parse_scontrol_state(output: &str) -> Option<String> {
+        Self::scontrol_field(output, "JobState")
+    }
+
+    /// One `Key=value` field of `scontrol show job -o` output. Values with
+    /// spaces are not split by Slurm in this format (it uses `_`).
+    fn scontrol_field(output: &str, key: &str) -> Option<String> {
+        let prefix = format!("{key}=");
         output
             .split_whitespace()
-            .find_map(|kv| kv.strip_prefix("JobState="))
+            .find_map(|kv| kv.strip_prefix(prefix.as_str()))
             .map(str::to_string)
     }
 
-    /// The job's raw scheduler state. `scontrol` first (works without
-    /// accounting); `sacct` only after the controller has purged the record.
+    /// The job's raw scheduler state and, when the controller still knows the
+    /// job, why it is in it.
     fn raw_state(&self) -> Result<String> {
+        self.raw_status().map(|(state, _)| state)
+    }
+
+    /// `(state, reason)`. `scontrol` first (works without accounting);
+    /// `sacct` only after the controller has purged the record, and it gives
+    /// no reason.
+    fn raw_status(&self) -> Result<(String, Option<String>)> {
         let ctl = Command::new("scontrol")
             .args(["show", "job", "-o", &self.job_id])
             .output()
@@ -616,7 +630,8 @@ impl SlurmJob {
         let ctl_stdout = String::from_utf8_lossy(&ctl.stdout);
         if ctl.status.success() {
             if let Some(state) = Self::parse_scontrol_state(&ctl_stdout) {
-                return Ok(state);
+                let reason = Self::scontrol_field(&ctl_stdout, "Reason");
+                return Ok((state, reason));
             }
         }
         let ctl_stderr = String::from_utf8_lossy(&ctl.stderr);
@@ -635,7 +650,7 @@ impl SlurmJob {
             .map_err(|e| TrainError::other(format!("sacct invocation failed: {e}")))?;
         let acct_stdout = String::from_utf8_lossy(&acct.stdout);
         match acct_stdout.lines().map(str::trim).find(|l| !l.is_empty()) {
-            Some(state) if acct.status.success() => Ok(state.to_string()),
+            Some(state) if acct.status.success() => Ok((state.to_string(), None)),
             _ => Err(TrainError::other(format!(
                 "slurm job {} is unknown to the controller (purged after MinJobAge, or never \
                  existed) and sacct has no record of it: {}",
@@ -647,6 +662,39 @@ impl SlurmJob {
 }
 
 impl SlurmJob {
+    /// A line for the log stream when the job's situation changes in a way
+    /// its own output can't show: it was requeued, suspended or held, or it
+    /// is stuck waiting for a reason other than ordinary queueing. `None`
+    /// while it simply waits its turn or runs.
+    fn status_note(
+        now: &(String, Option<String>),
+        before: Option<&(String, Option<String>)>,
+        has_run: bool,
+    ) -> Option<String> {
+        if before == Some(now) {
+            return None;
+        }
+        let (state, reason) = now;
+        let reason = reason.as_deref().filter(|r| *r != "None");
+        let describe = || match reason {
+            Some(r) => format!("{state} ({})", r.replace('_', " ")),
+            None => state.clone(),
+        };
+        match state.as_str() {
+            "RUNNING" if has_run && before.is_some_and(|(s, _)| s != "RUNNING") => {
+                Some("running again".to_string())
+            }
+            "RUNNING" | "COMPLETING" | "CONFIGURING" => None,
+            "PENDING" if has_run => Some(format!("requeued, now {}", describe())),
+            // Ordinary queueing: waiting for its turn or for free resources.
+            "PENDING" if matches!(reason, None | Some("Priority" | "Resources" | "BeginTime")) => {
+                None
+            }
+            _ if Self::classify_state(state) == JobState::Running => Some(describe()),
+            _ => None,
+        }
+    }
+
     /// Append whatever is new in the log since `offset` to `sink`. A log that
     /// does not exist yet (job still queued) is not an error.
     fn drain_log(&self, offset: &mut u64, sink: &dyn Fn(&str)) -> Result<()> {
@@ -718,12 +766,20 @@ impl RemoteJob for SlurmJob {
                 self.job_id
             ));
         }
+        let mut last_seen: Option<(String, Option<String>)> = None;
+        let mut has_run = false;
         loop {
             self.drain_log(&mut offset, sink)?;
-            let state = match self.raw_state() {
-                Ok(raw) => {
+            let state = match self.raw_status() {
+                Ok(status) => {
                     failing_since = None;
-                    Self::classify_state(&raw)
+                    if let Some(note) = Self::status_note(&status, last_seen.as_ref(), has_run) {
+                        sink(&format!("[blut] slurm job {}: {note}", self.job_id));
+                    }
+                    has_run |= status.0 == "RUNNING";
+                    let state = Self::classify_state(&status.0);
+                    last_seen = Some(status);
+                    state
                 }
                 Err(e) => {
                     let since = *failing_since.get_or_insert_with(std::time::Instant::now);
@@ -1550,6 +1606,54 @@ mod tests {
         // Default fixed-width `sacct` truncates that to "CANCELLED+".
         assert_eq!(SlurmJob::classify_state("CANCELLED+"), JobState::Cancelled);
         assert_eq!(SlurmJob::classify_state(" COMPLETED "), JobState::Succeeded);
+    }
+
+    #[test]
+    fn slurm_stream_notes_a_requeue_but_not_ordinary_queueing() {
+        let s = |state: &str, reason: &str| (state.to_string(), Some(reason.to_string()));
+        // Waiting its turn, then running: nothing to add to the job's own log.
+        assert_eq!(
+            SlurmJob::status_note(&s("PENDING", "Priority"), None, false),
+            None
+        );
+        assert_eq!(
+            SlurmJob::status_note(
+                &s("RUNNING", "None"),
+                Some(&s("PENDING", "Resources")),
+                false
+            ),
+            None
+        );
+        // Node failure: scontrol showed exactly this after a node was killed.
+        let requeued = s(
+            "PENDING",
+            "Nodes_required_for_job_are_DOWN,_DRAINED_or_reserved_for_jobs_in_higher_priority_partitions",
+        );
+        let note = SlurmJob::status_note(&requeued, Some(&s("RUNNING", "None")), true).unwrap();
+        assert!(
+            note.starts_with("requeued, now PENDING (Nodes required for job are DOWN"),
+            "{note}"
+        );
+        // Said once, not every poll.
+        assert_eq!(
+            SlurmJob::status_note(&requeued, Some(&requeued), true),
+            None
+        );
+        assert_eq!(
+            SlurmJob::status_note(&s("RUNNING", "None"), Some(&requeued), true).as_deref(),
+            Some("running again")
+        );
+        // Never ran, but stuck on something other than its turn.
+        let held = s("PENDING", "JobHeldUser");
+        assert_eq!(
+            SlurmJob::status_note(&held, None, false).as_deref(),
+            Some("PENDING (JobHeldUser)")
+        );
+        assert_eq!(
+            SlurmJob::status_note(&s("SUSPENDED", "None"), Some(&s("RUNNING", "None")), true)
+                .as_deref(),
+            Some("SUSPENDED")
+        );
     }
 
     #[test]

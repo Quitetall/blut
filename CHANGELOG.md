@@ -53,6 +53,10 @@ because the train shares one exact version.
   - `CANCELLED by <uid>`, `PREEMPTED`, `COMPLETING`, `REQUEUED` and the other
     states Slurm reports are recognised rather than ending the stream as
     unknown.
+  - A job requeued after a node failure went back to waiting without a word.
+    The stream now notes a requeue, suspension or hold, and anything other
+    than ordinary queueing, once each with Slurm's reason, and notes when the
+    job is running again.
   `tests/slurm_live.rs` holds the live checks.
 - A `BLUT_SLURM_*` or `BLUT_RAY_NUM_GPUS` value that is not a positive integer
   (`BLUT_SLURM_NODES=two`) was silently ignored, so the job ran with the default
