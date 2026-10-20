@@ -23,6 +23,31 @@ use crate::config::hydra::{ConfigLoader, ConfigValue};
 use crate::framework::artifact::ContentHash;
 use crate::framework::cache::CacheHandle;
 
+/// Read an on/off environment switch (`BLUT_NO_CONTAIN`, `BLUT_KILL_ON_NAN`,
+/// ...). `1`, `true`, `yes` and `on` (any case) mean on; unset, empty, `0`,
+/// `false`, `no` and `off` mean off. Anything else is off with a warning
+/// naming the variable. Each switch used to parse its own way: some were on
+/// whenever SET, so `BLUT_NO_CONTAIN=0` switched memory containment OFF and
+/// `BLUT_AUTO_REBUILD=0` turned auto-rebuild ON, while others accepted only
+/// `1`, so `BLUT_KILL_ON_NAN=true` did nothing.
+pub fn env_flag(name: &str) -> bool {
+    let Some(raw) = std::env::var_os(name) else {
+        return false;
+    };
+    let value = raw.to_string_lossy().trim().to_ascii_lowercase();
+    match value.as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "" | "0" | "false" | "no" | "off" => false,
+        _ => {
+            tracing::warn!(
+                "{name}={raw:?} is not an on/off value; treating it as off \
+                 (use 1/true/yes/on or 0/false/no/off)"
+            );
+            false
+        }
+    }
+}
+
 /// A composed + frozen configuration: the live composed value, its
 /// canonical JSON projection, and a content-hash fingerprint suitable
 /// for cache keying / run identity.
@@ -358,5 +383,86 @@ mod tests {
         let s = freeze_to_json_string(&rc).unwrap();
         assert!(s.contains('\n'), "pretty JSON must contain newlines");
         assert!(s.contains("\"a\""));
+    }
+}
+
+#[cfg(test)]
+mod env_flag_tests {
+    use super::env_flag;
+
+    fn with_env<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev: Vec<_> = vars
+            .iter()
+            .map(|(k, _)| (*k, std::env::var_os(k)))
+            .collect();
+        // SAFETY: TEST_ENV_LOCK serializes env mutation; restored below.
+        unsafe {
+            for (k, v) in vars {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe {
+            for (k, v) in prev {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        r.unwrap_or_else(|p| std::panic::resume_unwind(p))
+    }
+
+    #[test]
+    fn on_and_off_spellings() {
+        const V: &str = "BLUT_TEST_ENV_FLAG_SPELLINGS";
+        for (value, expected) in [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some("false"), false),
+            (Some("OFF"), false),
+            (Some("no"), false),
+            (Some("maybe"), false),
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some(" Yes "), true),
+            (Some("on"), true),
+        ] {
+            assert_eq!(
+                with_env(&[(V, value)], || env_flag(V)),
+                expected,
+                "{value:?}"
+            );
+        }
+    }
+
+    /// `BLUT_NO_CONTAIN=0` used to switch memory containment OFF: the variable
+    /// was tested for presence, not value.
+    #[cfg(unix)]
+    #[test]
+    fn no_contain_zero_keeps_containment_on() {
+        let kind = with_env(
+            &[
+                ("BLUT_NO_CONTAIN", Some("0")),
+                ("BLUT_CONTAINMENT", Some("rlimit")),
+            ],
+            || crate::containment::containment_for().kind(),
+        );
+        assert_eq!(kind, "rlimit");
+        let kind = with_env(
+            &[
+                ("BLUT_NO_CONTAIN", Some("1")),
+                ("BLUT_CONTAINMENT", Some("rlimit")),
+            ],
+            || crate::containment::containment_for().kind(),
+        );
+        assert_eq!(kind, "bare");
     }
 }

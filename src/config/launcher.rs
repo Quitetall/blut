@@ -188,7 +188,7 @@ const RUN_CONTAINED_SH: &str = include_str!("../../scripts/run_contained.sh");
 /// (macOS / a container without systemd) and `BLUT_NO_CONTAIN` degrade to a
 /// bare spawn — see [`LocalSystemd::wrap`].
 fn containment_available() -> bool {
-    if std::env::var_os("BLUT_NO_CONTAIN").is_some() {
+    if crate::config::env_flag("BLUT_NO_CONTAIN") {
         return false;
     }
     which::which("systemd-run").is_ok()
@@ -296,7 +296,7 @@ impl Launcher for LocalSystemd {
             let Some((program, rest)) = inner.split_first() else {
                 return Err(TrainError::other("wrap: empty inner command"));
             };
-            if std::env::var_os("BLUT_NO_CONTAIN").is_none() {
+            if !crate::config::env_flag("BLUT_NO_CONTAIN") {
                 tracing::warn!(
                     "systemd-run unavailable — running unit '{unit}' UNCONTAINED (no memory cap). \
                      Containment requires Linux + systemd --user. Set BLUT_NO_CONTAIN=1 to silence."

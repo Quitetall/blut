@@ -521,9 +521,7 @@ pub struct StageWarning {
 /// Whether advisory stages are forced FATAL for this run (ADR 0071 strict mode),
 /// via `BLUT_STRICT_ADVISORY=1` — for CI that wants the old fail-hard behaviour.
 fn strict_advisory() -> bool {
-    std::env::var("BLUT_STRICT_ADVISORY")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false)
+    crate::config::env_flag("BLUT_STRICT_ADVISORY")
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -1424,11 +1422,7 @@ async fn cache_presence_probe_off_thread(
 }
 
 fn install_builtin_control(ctx: &mut ExecCtx) {
-    if ctx.control.is_none()
-        && std::env::var("BLUT_KILL_ON_NAN")
-            .map(|value| value == "1")
-            .unwrap_or(false)
-    {
+    if ctx.control.is_none() && crate::config::env_flag("BLUT_KILL_ON_NAN") {
         ctx.control = Some(Arc::new(crate::framework::control::KillOnNaN));
     }
 }

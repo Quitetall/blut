@@ -182,7 +182,7 @@ pub(super) fn resolve_rebuild_command() -> Option<Vec<String>> {
 /// the opt-in is off, a rebuild already ran this chain (loop guard), the target
 /// can't be resolved, or the rebuild/exec failed.
 pub(super) fn maybe_auto_rebuild(info: &StaleInfo) {
-    if std::env::var_os("BLUT_AUTO_REBUILD").is_none() {
+    if !crate::config::env_flag("BLUT_AUTO_REBUILD") {
         return;
     }
     // Loop guard: we rebuild+re-exec at most once per invocation chain. If the

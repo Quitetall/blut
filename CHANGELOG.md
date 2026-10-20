@@ -103,6 +103,12 @@ because the train shares one exact version.
   `--allow-evict` when the scheduler lock is held (now: wait, or
   `blut cancel <job>`). "recipe not in catalog" now points at
   `blut recipe list`.
+- On/off environment switches parsed inconsistently. `BLUT_NO_CONTAIN` and
+  `BLUT_AUTO_REBUILD` were on whenever set, so `BLUT_NO_CONTAIN=0` switched
+  memory containment off and `BLUT_AUTO_REBUILD=0` switched rebuild-and-re-exec
+  on; `BLUT_KILL_ON_NAN` and `BLUT_STRICT_DECLARATIONS` accepted only `1`. All
+  of them, with `BLUT_STRICT_ADVISORY`, now read `1/true/yes/on` as on and
+  `0/false/no/off` or empty as off, and warn on anything else.
 
 ### Security
 - rustls 0.23.45 everywhere, closing RUSTSEC-2026-0285 (TLS 1.3 handshake

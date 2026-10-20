@@ -174,7 +174,7 @@ pub trait Containment: Send + Sync {
 /// the common rented-GPU case) it's `RlimitAddressSpace` — a REAL cap, not
 /// Bare; only a box with none of the above falls to `Bare` with a warning.
 pub fn containment_for() -> Box<dyn Containment> {
-    if std::env::var_os("BLUT_NO_CONTAIN").is_some() {
+    if crate::config::env_flag("BLUT_NO_CONTAIN") {
         return Box::new(bare::Bare);
     }
 
