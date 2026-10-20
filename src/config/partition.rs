@@ -644,7 +644,7 @@ impl PartitionSet {
     /// Directory holding all partition definitions + status logs
     /// (`~/.config/blut/partitions/`). `$BLUT_PARTITIONS_DIR` overrides (tests).
     pub fn dir() -> Result<PathBuf> {
-        if let Ok(p) = std::env::var("BLUT_PARTITIONS_DIR") {
+        if let Some(p) = std::env::var_os("BLUT_PARTITIONS_DIR") {
             return Ok(PathBuf::from(p));
         }
         let base = dirs::config_dir().ok_or_else(|| {

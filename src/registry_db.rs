@@ -78,7 +78,7 @@ pub struct HistoryEntry {
 /// Path to the deployment registry DB (`~/.blut/registry.db`).
 /// `$BLUT_REGISTRY_DB` overrides it (tests, alternate homes).
 pub fn registry_db_path() -> Result<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("BLUT_REGISTRY_DB") {
+    if let Some(p) = std::env::var_os("BLUT_REGISTRY_DB") {
         return Ok(std::path::PathBuf::from(p));
     }
     let dir = dirs::home_dir()

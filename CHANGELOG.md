@@ -109,6 +109,12 @@ because the train shares one exact version.
   on; `BLUT_KILL_ON_NAN` and `BLUT_STRICT_DECLARATIONS` accepted only `1`. All
   of them, with `BLUT_STRICT_ADVISORY`, now read `1/true/yes/on` as on and
   `0/false/no/off` or empty as off, and warn on anything else.
+- Path variables (`LAMU_TRAIN_JOBS_DIR`, `BLUT_HOME`, `BLUT_DSL_BIN` and the
+  other `*_DIR`/`*_PATH`/`*_DB` overrides) were read as UTF-8 strings, so a
+  non-UTF-8 value was ignored without a word and jobs, caches and registries
+  went to the default location instead. They are read as OS strings now,
+  except `LAMU_TRAIN_JOBS_DIR` and `LAMU_TRAIN_DATA_DIR`, whose paths are
+  recorded in JSON: a non-UTF-8 value there is refused, naming the variable.
 
 ### Security
 - rustls 0.23.45 everywhere, closing RUSTSEC-2026-0285 (TLS 1.3 handshake

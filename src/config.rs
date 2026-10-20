@@ -170,10 +170,10 @@ pub fn expand_and_fingerprint(
 ///   2. `$BLUT_LLAMACPP_DIR` env var (preferred new name)
 ///   3. `~/llama.cpp` (default for users who built from source in $HOME)
 pub fn llamacpp_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("BLUT_LLAMACPP_DIR") {
+    if let Some(p) = std::env::var_os("BLUT_LLAMACPP_DIR") {
         return PathBuf::from(p);
     }
-    if let Ok(p) = std::env::var("LAMU_LLAMACPP_DIR") {
+    if let Some(p) = std::env::var_os("LAMU_LLAMACPP_DIR") {
         return PathBuf::from(p);
     }
     dirs::home_dir().unwrap_or_default().join("llama.cpp")
@@ -207,10 +207,10 @@ pub fn llama_tool(name: &str) -> Result<PathBuf> {
 /// Override: `$BLUT_REGISTRY_PATH` (preferred) or `$LAMU_REGISTRY_PATH`
 /// (back-compat).
 pub fn registry_path() -> PathBuf {
-    if let Ok(p) = std::env::var("BLUT_REGISTRY_PATH") {
+    if let Some(p) = std::env::var_os("BLUT_REGISTRY_PATH") {
         return PathBuf::from(p);
     }
-    if let Ok(p) = std::env::var("LAMU_REGISTRY_PATH") {
+    if let Some(p) = std::env::var_os("LAMU_REGISTRY_PATH") {
         return PathBuf::from(p);
     }
     dirs::config_dir()
@@ -229,7 +229,7 @@ pub fn registry_path() -> PathBuf {
 /// Default: `~/.config/blut/footprints.json`
 /// Override: `$BLUT_FOOTPRINT_PATH`
 pub fn footprint_store_path() -> PathBuf {
-    if let Ok(p) = std::env::var("BLUT_FOOTPRINT_PATH") {
+    if let Some(p) = std::env::var_os("BLUT_FOOTPRINT_PATH") {
         return PathBuf::from(p);
     }
     dirs::config_dir()

@@ -202,7 +202,7 @@ fn containment_available() -> bool {
 ///      refreshed when content-stale, where `<base>` is `$BLUT_HOME` or the
 ///      XDG cache dir.
 fn resolve_run_contained_script() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("BLUT_RUN_CONTAINED") {
+    if let Some(p) = std::env::var_os("BLUT_RUN_CONTAINED") {
         let p = PathBuf::from(p);
         if p.is_file() {
             return Ok(p);
@@ -212,9 +212,9 @@ fn resolve_run_contained_script() -> Result<PathBuf> {
             p.display()
         )));
     }
-    let base = match std::env::var("BLUT_HOME") {
-        Ok(h) => PathBuf::from(h),
-        Err(_) => dirs::cache_dir().ok_or_else(|| {
+    let base = match std::env::var_os("BLUT_HOME") {
+        Some(h) => PathBuf::from(h),
+        None => dirs::cache_dir().ok_or_else(|| {
             TrainError::other("cache_dir() unavailable; set $BLUT_HOME or $BLUT_RUN_CONTAINED")
         })?,
     };

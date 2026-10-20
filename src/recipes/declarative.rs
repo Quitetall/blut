@@ -147,7 +147,7 @@ impl DeclarativeRecipe {
 /// F4: the user declarative-recipes directory — `$BLUT_USER_RECIPES_DIR`
 /// else `~/.config/blut/recipes`.
 pub fn user_recipes_dir() -> Option<PathBuf> {
-    if let Ok(d) = std::env::var("BLUT_USER_RECIPES_DIR") {
+    if let Some(d) = std::env::var_os("BLUT_USER_RECIPES_DIR") {
         return Some(PathBuf::from(d));
     }
     dirs::config_dir().map(|d| d.join("blut").join("recipes"))

@@ -824,7 +824,7 @@ fn resolve_declarative_args_with(
 /// sibling of the current executable (the usual install layout), else bare
 /// `blut-dsl` resolved on `$PATH`.
 fn blut_dsl_binary() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("BLUT_DSL_BIN") {
+    if let Some(p) = std::env::var_os("BLUT_DSL_BIN") {
         return std::path::PathBuf::from(p);
     }
     if let Ok(exe) = std::env::current_exe()

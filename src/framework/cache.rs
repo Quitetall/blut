@@ -159,7 +159,7 @@ impl CacheHandle {
     /// Default global cache location: `$XDG_DATA_HOME/lamu/train-cache/`.
     /// Override with `$LAMU_TRAIN_CACHE_DIR`.
     pub fn default_global_path() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("LAMU_TRAIN_CACHE_DIR") {
+        if let Some(p) = std::env::var_os("LAMU_TRAIN_CACHE_DIR") {
             return Some(PathBuf::from(p));
         }
         dirs::data_local_dir().map(|d| d.join("lamu").join("train-cache"))

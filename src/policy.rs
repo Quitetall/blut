@@ -157,7 +157,7 @@ pub enum Decision {
 /// Path to the policy file. Override via `$LAMU_TRAIN_POLICY` for
 /// hermetic tests + bespoke installs.
 pub fn policy_path() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("LAMU_TRAIN_POLICY") {
+    if let Some(p) = std::env::var_os("LAMU_TRAIN_POLICY") {
         return Ok(PathBuf::from(p));
     }
     let dir = dirs::config_dir()

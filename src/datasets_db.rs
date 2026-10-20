@@ -114,7 +114,7 @@ pub fn count_jsonl_examples(path: &Path) -> Result<i64> {
 /// Path to the datasets registry — same file LAMU's memory uses.
 /// Override via `$LAMU_MEMORY_DB` (matches `conversations::memory_db_path`).
 pub fn registry_path() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("LAMU_MEMORY_DB") {
+    if let Some(p) = std::env::var_os("LAMU_MEMORY_DB") {
         return Ok(PathBuf::from(p));
     }
     let dir = dirs::data_local_dir()
