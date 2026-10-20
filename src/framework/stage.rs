@@ -1016,6 +1016,14 @@ pub trait StageDyn: Send + Sync + 'static {
         None
     }
     fn args_schema(&self) -> serde_json::Value;
+    /// Validate `args` when a plan is BUILT from erased stages (a `.toml`,
+    /// `.json` or `.star` recipe, `plan check`), so a bad argument to the
+    /// fifth stage is reported before the first four run rather than after.
+    /// Applies the recipe-args preflight (unknown keys, missing required
+    /// fields, scalar types) and the exact decode the executor performs.
+    fn check_args(&self, _args: &serde_json::Value) -> Result<(), StageError> {
+        Ok(())
+    }
     fn retry(&self) -> crate::framework::retry::RetryPolicy;
     fn timeout(&self) -> crate::framework::retry::StageTimeout;
 
@@ -1252,10 +1260,24 @@ fn decode_stage_input<S: Stage>(input: ErasedArtifact) -> Result<S::Input, Stage
 }
 
 fn decode_stage_args<S: Stage>(args: serde_json::Value) -> Result<S::Args, StageError> {
-    serde_json::from_value(args).map_err(|source| StageError::ArgsDeserialize {
-        stage: S::NAME,
-        source,
-    })
+    // An erased node with no `args` carries JSON `null`, which an all-defaults
+    // struct does not accept (it wants `{}`), while a unit `Args` wants `null`
+    // and not `{}`. Try the other empty form before failing, as recipe args
+    // already do, so omitting `args` works for either kind of stage.
+    let alternate = match &args {
+        serde_json::Value::Null => Some(serde_json::json!({})),
+        serde_json::Value::Object(map) if map.is_empty() => Some(serde_json::Value::Null),
+        _ => None,
+    };
+    serde_json::from_value(args)
+        .or_else(|error| match alternate {
+            Some(other) => serde_json::from_value(other).map_err(|_| error),
+            None => Err(error),
+        })
+        .map_err(|source| StageError::ArgsDeserialize {
+            stage: S::NAME,
+            source,
+        })
 }
 
 fn encode_stage_output<S: Stage>(output: &S::Output) -> Result<ErasedArtifact, StageError> {
@@ -1435,6 +1457,20 @@ impl<S: Stage> StageDyn for S {
     fn output_portable_identity(&self, art: &ErasedArtifact) -> Option<Vec<u8>> {
         portable_identity_typed::<S::Output>(art)
     }
+    fn check_args(&self, args: &serde_json::Value) -> Result<(), StageError> {
+        crate::recipes::recipe::validate_args_against_schema(S::NAME, &self.args_schema(), args)
+            .map_err(|error| {
+                let message = match error {
+                    crate::framework::RecipeError::InvalidArgs { message, .. } => message,
+                    other => other.to_string(),
+                };
+                StageError::ArgsDeserialize {
+                    stage: S::NAME,
+                    source: <serde_json::Error as serde::de::Error>::custom(message),
+                }
+            })?;
+        decode_stage_args::<S>(args.clone()).map(|_| ())
+    }
     fn args_schema(&self) -> serde_json::Value {
         // schemars 0.8: schema_for! is a proc macro requiring a
         // type literal, so we go through `gen.subschema_for`
@@ -1593,11 +1629,7 @@ impl<S: Stage> StageDyn for S {
     }
 
     async fn preflight_erased(&self, args: &serde_json::Value) -> Result<(), StageError> {
-        let typed: S::Args =
-            serde_json::from_value(args.clone()).map_err(|source| StageError::ArgsDeserialize {
-                stage: S::NAME,
-                source,
-            })?;
+        let typed: S::Args = decode_stage_args::<S>(args.clone())?;
         self.preflight(&typed).await
     }
 
@@ -2232,6 +2264,64 @@ mod tests {
         assert!(
             matches!(r, Err(StageError::ArgsDeserialize { stage, .. }) if stage == "word_count")
         );
+    }
+
+    /// A stage whose args all have defaults: the shape most cookbook stages
+    /// use, and the one where a typo'd key used to vanish without a trace.
+    struct DefaultedWordCount;
+
+    #[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+    #[serde(default)]
+    struct DefaultedArgs {
+        delimiter: String,
+    }
+
+    #[async_trait]
+    impl Stage for DefaultedWordCount {
+        const NAME: &'static str = "defaulted_word_count";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = Words;
+        type Output = Count;
+        type Args = DefaultedArgs;
+
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            input: Self::Input,
+            _args: &Self::Args,
+        ) -> Result<Self::Output, StageError> {
+            Ok(Count {
+                n: input.text.len(),
+            })
+        }
+    }
+
+    #[test]
+    fn check_args_refuses_unknown_keys_and_bad_types_before_anything_runs() {
+        let s: Box<dyn StageDyn> = Box::new(DefaultedWordCount);
+        let err = s
+            .check_args(&serde_json::json!({"delimitor": " "}))
+            .expect_err("a typo'd key must not be dropped");
+        assert!(err.to_string().contains("'delimitor'"), "{err}");
+        let s: Box<dyn StageDyn> = Box::new(WordCount);
+        assert!(matches!(
+            s.check_args(&serde_json::json!({"delimiter": 42})),
+            Err(StageError::ArgsDeserialize { stage, .. }) if stage == "word_count"
+        ));
+        assert!(s.check_args(&serde_json::json!({"delimiter": " "})).is_ok());
+    }
+
+    /// A `.toml`/`.json` node that omits `args` carries `null`; an
+    /// all-defaults args struct used to fail on it at run time.
+    #[tokio::test]
+    async fn omitted_args_decode_for_an_all_defaults_stage() {
+        let s: Box<dyn StageDyn> = Box::new(DefaultedWordCount);
+        assert!(s.check_args(&serde_json::Value::Null).is_ok());
+        assert!(s.preflight_erased(&serde_json::Value::Null).await.is_ok());
+        // A stage with a required field still refuses `null`.
+        let s: Box<dyn StageDyn> = Box::new(WordCount);
+        assert!(s.check_args(&serde_json::Value::Null).is_err());
     }
 
     #[tokio::test]

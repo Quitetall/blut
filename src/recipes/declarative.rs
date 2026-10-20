@@ -35,7 +35,11 @@ use crate::framework::Registry;
 use crate::framework::plan::CompiledPlan;
 
 /// A declarative recipe parsed from a `.toml` file.
+///
+/// Unknown keys are refused at both levels, as `PlanSpec` refuses them: a
+/// stage written with `arg = {…}` for `args` used to run with no args at all.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeclarativeRecipe {
     pub name: String,
     /// Informational backend tag (the resolved stages carry the real,
@@ -47,6 +51,7 @@ pub struct DeclarativeRecipe {
 
 /// One stage in a declarative chain.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeclStage {
     /// Stage name — must exist in a registered cookbook's `stages_erased()`.
     pub stage: String,
@@ -227,6 +232,16 @@ mod tests {
         assert_eq!(r.stages[0].args["y"], serde_json::json!("z"));
         // omitted args default to null.
         assert!(r.stages[1].args.is_null());
+    }
+
+    /// `arg = {…}` for `args` parsed fine and ran the stage with no args.
+    #[test]
+    fn a_misspelled_key_is_refused_not_ignored() {
+        let toml = "name = \"x\"\n[[stages]]\nstage = \"a\"\narg = { fail = true }\n";
+        let err = DeclarativeRecipe::parse(toml, "x.toml").unwrap_err();
+        assert!(err.to_string().contains("arg"), "{err}");
+        let toml = "name = \"x\"\nstage = []\n[[stages]]\nstage = \"a\"\n";
+        assert!(DeclarativeRecipe::parse(toml, "x.toml").is_err());
     }
 
     #[test]

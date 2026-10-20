@@ -71,6 +71,23 @@ because the train shares one exact version.
   `--features cloud` install silently removed `blut cloud`. The path is now
   decoded and shell-quoted, and the feature selection recorded in
   `.crates2.json` is passed back to `cargo install`.
+- A misspelled recipe or stage argument was dropped without a word: serde
+  ignores unknown keys unless the args type opts out, so
+  `--args '{"epoch": 50}'` against an `epochs` field trained on the default.
+  Recipe args (`recipe run`, `--set`, sweeps, HPO) and stage args in
+  `.toml`, `.json` and `.star` plans now refuse a key the args schema does not
+  declare, naming the accepted keys. Schemas that admit extra keys (a
+  flattened map) are unaffected. A `.toml` recipe also refuses unknown keys
+  of its own, so `arg = {…}` for `args` is an error instead of a stage run
+  with no arguments.
+- Stage args in `.toml`, `.json` and `.star` plans were checked only when the
+  executor reached each node, so `plan check` and `recipe declare` reported
+  success for a plan whose last stage could not decode its args, and the
+  earlier stages ran (for hours, in a training plan) before it failed. They
+  are now checked when the plan is built.
+- A plan node that omits `args` passed JSON `null`, which an args struct
+  whose fields all have defaults rejects at run time. `null` and `{}` are
+  now each tried in place of the other, as recipe args already were.
 
 ### Security
 - rustls 0.23.45 everywhere, closing RUSTSEC-2026-0285 (TLS 1.3 handshake

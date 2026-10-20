@@ -229,7 +229,20 @@ impl PlanSpec {
                         name: self.name.clone(),
                         stage: sn.stage.clone(),
                     })?;
-            nodes.push((ctor(), sn.args.clone()));
+            let stage = ctor();
+            // Checked at compile, so `plan check` and a `.json`/`.star`
+            // launch refuse bad args before any node runs.
+            stage
+                .check_args(&sn.args)
+                .map_err(|e| PlanSpecError::Plan {
+                    name: self.name.clone(),
+                    source: PlanError::Other(format!(
+                        "node {} stage '{}': {e}",
+                        nodes.len(),
+                        sn.stage
+                    )),
+                })?;
+            nodes.push((stage, sn.args.clone()));
         }
         Ok(nodes)
     }
@@ -1095,6 +1108,24 @@ mod tests {
             version: 1,
         };
         assert_ne!(a.canonical_bytes(), c.canonical_bytes());
+    }
+
+    /// Node args are checked when the spec compiles (what `plan check` and a
+    /// `.json`/`.star` launch run), not when the executor reaches the node:
+    /// a bad argument to the last node used to pass `plan check` and fail
+    /// only after every earlier node had run.
+    #[test]
+    fn compile_refuses_bad_node_args_before_anything_runs() {
+        let mut spec = linear_spec();
+        let last = spec.nodes.len() - 1;
+        spec.nodes[last].args = serde_json::json!("not an object");
+        let Err(err) = spec.compile(&toy_registry()) else {
+            panic!("bad args must fail the compile");
+        };
+        assert!(
+            err.to_string().contains(&format!("node {last}")),
+            "names the node: {err}"
+        );
     }
 
     #[test]
