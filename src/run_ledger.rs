@@ -29,9 +29,10 @@
 //! unstated `O_APPEND` atomicity, which POSIX only guarantees for writes up to
 //! `PIPE_BUF` (4096 bytes). A run record with a long argv exceeds that. So every
 //! append here takes an advisory `flock(LOCK_EX)` for the duration of the write.
-//! On non-unix ordinary appends degrade to O_APPEND, but checked curation
-//! fails closed because its read-validate-append transaction requires a real
-//! cross-process lock.
+//! On Windows the same exclusion is a `LockFileEx` lock on a byte past the end
+//! of the data (see `lock_exclusive`). On any other platform ordinary appends
+//! degrade to O_APPEND, but checked curation fails closed because its
+//! read-validate-append transaction requires a real cross-process lock.
 //!
 //! READS ARE LENIENT, AND SAY SO. A malformed line is skipped, but the count is
 //! returned in [`LedgerRead::malformed`] rather than swallowed. Silently
@@ -341,7 +342,7 @@ impl RunLedger {
     where
         F: FnOnce(&LedgerRead) -> Result<()>,
     {
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (record, validate);
             Err(TrainError::other(
@@ -349,7 +350,7 @@ impl RunLedger {
             ))
         }
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         self.append_inner(record, validate, true)
     }
 
@@ -495,32 +496,100 @@ fn lock_exclusive(file: std::fs::File) -> Result<nix::fcntl::Flock<std::fs::File
         .map_err(|(_file, errno)| TrainError::other(format!("lock ledger: {errno}")))
 }
 
-/// Off unix ordinary append safety degrades to `O_APPEND`. Checked curation is
-/// rejected by [`RunLedger::append_checked`] before reaching this fallback.
-#[cfg(not(unix))]
-fn lock_exclusive(file: std::fs::File) -> Result<UnlockedFile> {
-    Ok(UnlockedFile(file))
+/// Windows: an exclusive `LockFileEx` lock, held until the guard drops. It
+/// is the same cross-process exclusion `flock` gives on Unix, so checked
+/// curation works here too.
+///
+/// Windows byte-range locks are MANDATORY: a locked range refuses reads and
+/// writes from every other handle. Locking the data itself would make a
+/// concurrent [`RunLedger::read`] fail while an append is in flight, so the
+/// lock covers one byte at [`LEDGER_LOCK_OFFSET`], far past any real ledger
+/// length. Locking beyond end-of-file is allowed, and no I/O ever touches that
+/// byte, so the lock excludes other appenders and nothing else.
+#[cfg(windows)]
+fn lock_exclusive(file: std::fs::File) -> Result<WindowsFileLock> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped = lock_overlapped();
+    // SAFETY: the handle is live for the call (owned by `file`); `overlapped`
+    // is a valid OVERLAPPED that outlives this synchronous (blocking) call.
+    #[allow(unsafe_code)]
+    let ok = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as _,
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            1,
+            0,
+            &mut overlapped as *mut OVERLAPPED,
+        )
+    } != 0;
+    if !ok {
+        return Err(TrainError::other(format!(
+            "lock ledger: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(WindowsFileLock(file))
 }
 
-/// The non-Unix stand-in for `Flock<File>`: the same `Deref`/`DerefMut` shape
-/// so `append_inner` reads identically on every platform, but it holds NO
-/// lock. That is safe only because checked appends never reach it.
-#[cfg(not(unix))]
-struct UnlockedFile(std::fs::File);
+/// Where the Windows ledger lock byte lives: 2^62, beyond any ledger.
+#[cfg(windows)]
+const LEDGER_LOCK_OFFSET: u64 = 1 << 62;
 
-#[cfg(not(unix))]
-impl std::ops::Deref for UnlockedFile {
+#[cfg(windows)]
+fn lock_overlapped() -> windows_sys::Win32::System::IO::OVERLAPPED {
+    let mut o = windows_sys::Win32::System::IO::OVERLAPPED::default();
+    o.Anonymous.Anonymous.Offset = LEDGER_LOCK_OFFSET as u32;
+    o.Anonymous.Anonymous.OffsetHigh = (LEDGER_LOCK_OFFSET >> 32) as u32;
+    o
+}
+
+/// The Windows counterpart of `Flock<File>`: owns the locked file, derefs to
+/// it so writes go through the locked handle, and unlocks on drop. (Closing
+/// the handle would release the lock as well; the explicit unlock makes the
+/// release immediate rather than whenever the OS finishes closing.)
+#[cfg(windows)]
+struct WindowsFileLock(std::fs::File);
+
+#[cfg(windows)]
+impl Drop for WindowsFileLock {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+        let mut overlapped = lock_overlapped();
+        // SAFETY: same live handle and range that `lock_exclusive` locked.
+        #[allow(unsafe_code)]
+        unsafe {
+            UnlockFileEx(self.0.as_raw_handle() as _, 0, 1, 0, &mut overlapped);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl std::ops::Deref for WindowsFileLock {
     type Target = std::fs::File;
     fn deref(&self) -> &std::fs::File {
         &self.0
     }
 }
 
-#[cfg(not(unix))]
-impl std::ops::DerefMut for UnlockedFile {
+#[cfg(windows)]
+impl std::ops::DerefMut for WindowsFileLock {
     fn deref_mut(&mut self) -> &mut std::fs::File {
         &mut self.0
     }
+}
+
+/// Neither Unix nor Windows: ordinary append safety degrades to `O_APPEND`.
+/// Checked curation is rejected by [`RunLedger::append_checked`] before
+/// reaching this fallback.
+#[cfg(not(any(unix, windows)))]
+fn lock_exclusive(file: std::fs::File) -> Result<Box<std::fs::File>> {
+    // Boxed only so `&mut *file` reads the same as the guard types above.
+    Ok(Box::new(file))
 }
 
 #[cfg(test)]
