@@ -102,13 +102,26 @@ fn notifier_daemon_tails_sla_rule_once_into_exec_sink() {
         detected_unix: 100,
     };
     std::fs::write(&sla_path, format!("{}\n", breach.to_line())).unwrap();
+    // The sink appends its stdin to `output`. The path is its own argument in
+    // a TOML literal string, so a Windows path's backslashes stay literal.
+    #[cfg(unix)]
+    let (program, script) = ("/bin/sh", r#"cat >> "$0""#);
+    #[cfg(windows)]
+    let (program, script) = (
+        "python",
+        "import sys; open(sys.argv[1], 'a').write(sys.stdin.read())",
+    );
+    #[cfg(unix)]
+    let program_args = format!("'-c', '{script}'");
+    #[cfg(windows)]
+    let program_args = format!("'-c', \"{script}\"");
     let config = blut_notify::config::NotifyConfig::parse(&format!(
         r#"
 [[sink]]
 name = "local"
 kind = "exec"
-program = "/bin/sh"
-args = ["-c", "cat >> {}"]
+program = "{program}"
+args = [{program_args}, '{}']
 
 [[rule]]
 name = "sla-cap"
