@@ -347,7 +347,11 @@ pub struct SlurmLauncher {
     pub mem: Option<String>,
     /// `--cpus-per-task`.
     pub cpus: Option<u32>,
-    /// `--gpus` (per-node GPU count).
+    /// `--gpus` — the job's TOTAL GPU count across all its nodes (Slurm's
+    /// semantics for `--gpus`), and this launcher's [`capacity`](Launcher::capacity).
+    /// For a per-node count pass `--gpus-per-node=N` in [`extra`](Self::extra).
+    /// Slurm accepts both when they agree (this = nodes × N) and refuses the
+    /// job at submission when they don't.
     pub gpus: Option<u32>,
     /// `--time` (e.g. `"08:00:00"`).
     pub time: Option<String>,
@@ -414,13 +418,27 @@ impl Launcher for SlurmLauncher {
 
 /// A handle to a submitted Slurm job, returned by
 /// [`SlurmLauncher::submit_async`]. Supports polling, log streaming, and
-/// cancellation via `sacct` / `scancel`.
+/// cancellation via `scontrol` / `sacct` / `scancel`.
+///
+/// State comes from `scontrol show job`, which needs no accounting database
+/// and knows a job from submission until `MinJobAge` after it ends. Only once
+/// the controller has purged the record does polling fall back to `sacct`,
+/// which needs `slurmdbd`.
 pub struct SlurmJob {
     /// Slurm-assigned numeric job ID.
     job_id: String,
-    /// Path to the Slurm output log (`slurm-<id>.out`).
-    log_path: PathBuf,
+    /// Absolute path of the job's output log, or `None` when the `--output`
+    /// pattern passed in `extra` cannot be resolved to one file.
+    log_path: Option<PathBuf>,
+    /// When `sbatch` was invoked. A log last modified before this is a
+    /// previous job's (Slurm reuses job ids after its state is reset or the
+    /// counter wraps) and must not be streamed as this one's.
+    submitted_at: std::time::SystemTime,
 }
+
+/// How long [`SlurmJob::stream`] tolerates consecutive failed state queries (a
+/// controller restart, a transient RPC error) before giving up on the job.
+const SLURM_POLL_ERROR_GRACE: Duration = Duration::from_secs(300);
 
 impl SlurmJob {
     /// Shell-escape a single argument for safe interpolation into a bash script.
@@ -484,52 +502,194 @@ impl SlurmJob {
             lines.push(format!("#SBATCH {x}"));
         }
         lines.push(String::new());
-        // Multi-node preamble: export MASTER_ADDR from Slurm's allocation so
-        // torchrun's c10d rendezvous can find the coordinator. Only needed when
-        // nodes > 1; single-node torchrun uses --standalone.
-        if launcher.nodes.unwrap_or(1) > 1 {
+        // The inner command — shell-escape each arg to prevent injection.
+        let escaped: Vec<String> = inner.iter().map(|a| Self::shell_escape(a)).collect();
+        // A batch script runs once, on the allocation's first node. When the
+        // job asks for more than one task, launch the inner command as a job
+        // step so it runs once per task on every node; otherwise every node
+        // but the first would sit idle.
+        let multi_task =
+            launcher.nodes.unwrap_or(1) > 1 || launcher.ntasks_per_node.unwrap_or(1) > 1;
+        if multi_task {
+            // Rendezvous for torchrun's c10d backend: the coordinator is the
+            // allocation's first host. NODE_RANK must be read inside each
+            // task — in the batch script itself SLURM_NODEID is always 0.
             lines.push(
-                "# Multi-node rendezvous: resolve MASTER_ADDR from Slurm allocation".to_string(),
+                "# Multi-task rendezvous: the coordinator is the allocation's first host"
+                    .to_string(),
             );
             lines.push(
-                "export MASTER_ADDR=$(scontrol show hostnames \"$SLURM_JOB_NODELIST\" | head -n1)"
+                "export MASTER_ADDR=${MASTER_ADDR:-$(scontrol show hostnames \"$SLURM_JOB_NODELIST\" | head -n1)}"
                     .to_string(),
             );
             lines.push("export MASTER_PORT=${MASTER_PORT:-29500}".to_string());
-            lines.push("export NODE_RANK=${SLURM_NODEID:-0}".to_string());
             lines.push(String::new());
+            lines.push(format!(
+                "srun --kill-on-bad-exit=1 bash -c 'export NODE_RANK=\"$SLURM_NODEID\"; exec \"$@\"' blut-task {}",
+                escaped.join(" ")
+            ));
+        } else {
+            lines.push(escaped.join(" "));
         }
-        // The inner command — shell-escape each arg to prevent injection.
-        let escaped: Vec<String> = inner.iter().map(|a| Self::shell_escape(a)).collect();
-        lines.push(escaped.join(" "));
         lines.join("\n")
     }
 
-    /// Parse `sacct -j <id> -n -o State` output into a [`JobState`].
-    fn parse_sacct_state(output: &str) -> JobState {
-        // sacct may produce multiple lines (per-step entries). The first
-        // non-empty token is the job-level state.
-        for line in output.lines() {
-            let state = line.trim();
-            if state.is_empty() {
+    /// Where `sbatch` will write the job's output, made absolute against the
+    /// submit directory (or `--chdir`). `None` when `extra` sets an `--output`
+    /// pattern this can't resolve to one file (anything but `%j`, `%x`, `%%`).
+    fn resolve_log_path(
+        launcher: &SlurmLauncher,
+        unit: &str,
+        job_id: &str,
+        submit_dir: &std::path::Path,
+    ) -> Option<PathBuf> {
+        let flag_value = |names: &[&str]| -> Option<String> {
+            launcher.extra.iter().find_map(|x| {
+                names
+                    .iter()
+                    .find_map(|n| x.strip_prefix(n).map(str::to_string))
+            })
+        };
+        let base = match flag_value(&["--chdir=", "-D="]) {
+            Some(d) => submit_dir.join(d),
+            None => submit_dir.to_path_buf(),
+        };
+        let pattern = flag_value(&["--output=", "-o="]).unwrap_or_else(|| "slurm-%j.out".into());
+        let mut out = String::new();
+        let mut chars = pattern.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                out.push(c);
                 continue;
             }
-            // Strip extended info after a "+" (e.g. "FAILED+TIMEOUT" or just
-            // take the first word if space-separated).
-            let base = state.split('+').next().unwrap_or(state).trim();
-            return match base {
-                "COMPLETED" => JobState::Succeeded,
-                "FAILED" => JobState::Failed(state.to_string()),
-                "TIMEOUT" => JobState::Failed("TIMEOUT".to_string()),
-                "OUT_OF_MEMORY" => JobState::Failed("OutOfMemory".to_string()),
-                "NODE_FAIL" => JobState::Failed("NODE_FAIL".to_string()),
-                "RUNNING" | "PENDING" | "CONFIGURING" | "SUSPENDED" => JobState::Running,
-                "CANCELLED" => JobState::Cancelled,
-                "BOOT_FAIL" | "DEADLINE" => JobState::Failed(state.to_string()),
-                _ => JobState::Unknown(state.to_string()),
-            };
+            match chars.next() {
+                Some('j') => out.push_str(job_id),
+                Some('x') => out.push_str(unit),
+                Some('%') => out.push('%'),
+                // %N, %t, %A, … expand per node/task/array: no single file.
+                _ => return None,
+            }
         }
-        JobState::Unknown("empty sacct output".to_string())
+        Some(base.join(out))
+    }
+
+    /// Map a Slurm job state name (as printed by `scontrol` or `sacct -P`) to a
+    /// [`JobState`]. Accepts `sacct`'s decorations: `CANCELLED by 1000`, and
+    /// the `+` it appends when a fixed-width column truncates the name.
+    fn classify_state(raw: &str) -> JobState {
+        let name = raw
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('+');
+        match name {
+            "COMPLETED" => JobState::Succeeded,
+            "CANCELLED" => JobState::Cancelled,
+            "TIMEOUT" => JobState::Failed("TIMEOUT".to_string()),
+            "OUT_OF_MEMORY" => JobState::Failed("OutOfMemory".to_string()),
+            "FAILED" | "NODE_FAIL" | "BOOT_FAIL" | "DEADLINE" | "PREEMPTED" | "REVOKED"
+            | "SPECIAL_EXIT" => JobState::Failed(raw.trim().to_string()),
+            // Queued, starting, running, or between states (requeue, resize,
+            // stage-out, epilog): not finished, keep waiting.
+            "PENDING" | "CONFIGURING" | "RUNNING" | "COMPLETING" | "SUSPENDED" | "STOPPED"
+            | "REQUEUED" | "REQUEUE_HOLD" | "REQUEUE_FED" | "RESIZING" | "SIGNALING"
+            | "STAGE_OUT" | "RESV_DEL_HOLD" | "POWER_UP_NODE" | "UPDATE_DB" => JobState::Running,
+            _ => JobState::Unknown(raw.trim().to_string()),
+        }
+    }
+
+    /// Pull `JobState=…` out of one-line `scontrol show job -o` output.
+    fn parse_scontrol_state(output: &str) -> Option<String> {
+        output
+            .split_whitespace()
+            .find_map(|kv| kv.strip_prefix("JobState="))
+            .map(str::to_string)
+    }
+
+    /// The job's raw scheduler state. `scontrol` first (works without
+    /// accounting); `sacct` only after the controller has purged the record.
+    fn raw_state(&self) -> Result<String> {
+        let ctl = Command::new("scontrol")
+            .args(["show", "job", "-o", &self.job_id])
+            .output()
+            .map_err(|e| TrainError::other(format!("scontrol invocation failed: {e}")))?;
+        let ctl_stdout = String::from_utf8_lossy(&ctl.stdout);
+        if ctl.status.success() {
+            if let Some(state) = Self::parse_scontrol_state(&ctl_stdout) {
+                return Ok(state);
+            }
+        }
+        let ctl_stderr = String::from_utf8_lossy(&ctl.stderr);
+        if !ctl_stderr.contains("Invalid job id") {
+            return Err(TrainError::other(format!(
+                "scontrol show job {} failed (exit {}): {}",
+                self.job_id,
+                ctl.status.code().map_or("signal".into(), |c| c.to_string()),
+                ctl_stderr.trim()
+            )));
+        }
+        // The controller no longer knows the job: ask accounting.
+        let acct = Command::new("sacct")
+            .args(["-X", "-P", "-n", "-o", "State", "-j", &self.job_id])
+            .output()
+            .map_err(|e| TrainError::other(format!("sacct invocation failed: {e}")))?;
+        let acct_stdout = String::from_utf8_lossy(&acct.stdout);
+        match acct_stdout.lines().map(str::trim).find(|l| !l.is_empty()) {
+            Some(state) if acct.status.success() => Ok(state.to_string()),
+            _ => Err(TrainError::other(format!(
+                "slurm job {} is unknown to the controller (purged after MinJobAge, or never \
+                 existed) and sacct has no record of it: {}",
+                self.job_id,
+                String::from_utf8_lossy(&acct.stderr).trim()
+            ))),
+        }
+    }
+}
+
+impl SlurmJob {
+    /// Append whatever is new in the log since `offset` to `sink`. A log that
+    /// does not exist yet (job still queued) is not an error.
+    fn drain_log(&self, offset: &mut u64, sink: &dyn Fn(&str)) -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+        let Some(path) = self.log_path.as_ref() else {
+            return Ok(());
+        };
+        let io_err = |source| TrainError::Io {
+            path: path.clone(),
+            source,
+        };
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io_err(e)),
+        };
+        let meta = file.metadata().map_err(io_err)?;
+        if meta.modified().is_ok_and(|m| m < self.submitted_at) {
+            // Still the previous owner's file: this job has not opened it yet.
+            return Ok(());
+        }
+        if meta.len() < *offset {
+            // Truncated under us (the job opened a file we had already read
+            // from): everything in it now is this job's.
+            *offset = 0;
+        }
+        let mut reader = std::io::BufReader::new(file);
+        reader.seek(SeekFrom::Start(*offset)).map_err(io_err)?;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).map_err(io_err)?;
+            // Stop at EOF, and before a partial last line: it is re-read whole
+            // on the next pass instead of being split in two.
+            if n == 0 || !line.ends_with('\n') {
+                return Ok(());
+            }
+            *offset += n as u64;
+            let trimmed = line.trim_end_matches('\n');
+            if !trimmed.is_empty() {
+                sink(trimmed);
+            }
+        }
     }
 }
 
@@ -539,100 +699,66 @@ impl RemoteJob for SlurmJob {
     }
 
     fn poll(&self) -> Result<JobState> {
-        let out = Command::new("sacct")
-            .args(["-j", &self.job_id, "-n", "-o", "State", "--noheader"])
-            .output()
-            .map_err(|e| TrainError::other(format!("sacct invocation failed: {e}")))?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let code = match out.status.code() {
-                Some(c) => c.to_string(),
-                None => "signal".to_string(),
-            };
-            return Err(TrainError::other(format!(
-                "sacct -j {} failed (exit {}): {}",
-                self.job_id,
-                code,
-                stderr.trim()
-            )));
-        }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        Ok(Self::parse_sacct_state(&stdout))
+        Ok(Self::classify_state(&self.raw_state()?))
     }
 
     fn stream(&self, sink: &dyn Fn(&str)) -> Result<()> {
-        // Tail-follow the log file, polling sacct every 2s for terminal state.
-        // Returns Ok(()) on success, Err on failure/cancel/timeout.
+        // Tail-follow the log, polling the scheduler every 2s, until the job
+        // reaches a terminal state. There is deliberately no silence timeout:
+        // a job may queue for hours or train quietly, and giving up here would
+        // report a failure while the job kept its allocation. The job's
+        // `--time` limit is what bounds it.
         let poll_interval = Duration::from_secs(2);
-        let max_idle = Duration::from_secs(3600); // 1h idle → timeout
         let mut offset: u64 = 0;
-        let mut idle_since = std::time::Instant::now();
+        let mut failing_since: Option<std::time::Instant> = None;
+        if self.log_path.is_none() {
+            sink(&format!(
+                "[blut] slurm job {}: the --output pattern names more than one file; \
+                 log lines will not be streamed",
+                self.job_id
+            ));
+        }
         loop {
-            // Stream whatever is new in the log file.
-            if self.log_path.exists() {
-                use std::io::{Seek, SeekFrom};
-                let file = std::fs::File::open(&self.log_path).map_err(|e| TrainError::Io {
-                    path: self.log_path.clone(),
-                    source: e,
-                })?;
-                let mut reader = std::io::BufReader::new(file);
-                reader
-                    .seek(SeekFrom::Start(offset))
-                    .map_err(|e| TrainError::Io {
-                        path: self.log_path.clone(),
-                        source: e,
-                    })?;
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    let n = reader.read_line(&mut line).map_err(|e| TrainError::Io {
-                        path: self.log_path.clone(),
-                        source: e,
-                    })?;
-                    if n == 0 {
-                        break;
-                    }
-                    offset += n as u64;
-                    idle_since = std::time::Instant::now();
-                    let trimmed = line.trim_end_matches('\n');
-                    if !trimmed.is_empty() {
-                        sink(trimmed);
-                    }
+            self.drain_log(&mut offset, sink)?;
+            let state = match self.raw_state() {
+                Ok(raw) => {
+                    failing_since = None;
+                    Self::classify_state(&raw)
                 }
-            }
-            // Check if the job has finished.
-            match self.poll()? {
-                JobState::Running => {
-                    if idle_since.elapsed() > max_idle {
+                Err(e) => {
+                    let since = *failing_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() > SLURM_POLL_ERROR_GRACE {
                         return Err(TrainError::other(format!(
-                            "slurm job {} stream timed out after no output for {}s",
+                            "slurm job {}: could not read its state for {}s (it may still be \
+                             running; check `squeue -j {0}`): {e}",
                             self.job_id,
-                            max_idle.as_secs()
+                            SLURM_POLL_ERROR_GRACE.as_secs()
                         )));
                     }
-                    thread::sleep(poll_interval);
-                    continue;
+                    JobState::Running
                 }
-                JobState::Succeeded => return Ok(()),
-                JobState::Failed(ref reason) => {
-                    return Err(TrainError::other(format!(
-                        "slurm job {} failed: {reason}",
-                        self.job_id,
-                    )));
-                }
-                JobState::Cancelled => {
-                    return Err(TrainError::other(format!(
-                        "slurm job {} was cancelled",
-                        self.job_id,
-                    )));
-                }
-                JobState::Unknown(ref s) => {
-                    return Err(TrainError::other(format!(
-                        "slurm job {} ended in unknown state: {s}",
-                        self.job_id,
-                    )));
-                }
+            };
+            if state == JobState::Running {
+                thread::sleep(poll_interval);
+                continue;
             }
+            // Terminal: pick up lines written between the last read and now.
+            self.drain_log(&mut offset, sink)?;
+            return match state {
+                JobState::Succeeded => Ok(()),
+                JobState::Failed(reason) => Err(TrainError::other(format!(
+                    "slurm job {} failed: {reason}",
+                    self.job_id,
+                ))),
+                JobState::Cancelled => Err(TrainError::other(format!(
+                    "slurm job {} was cancelled",
+                    self.job_id,
+                ))),
+                other => Err(TrainError::other(format!(
+                    "slurm job {} ended in a state blut does not recognise: {other:?}",
+                    self.job_id,
+                ))),
+            };
         }
     }
 
@@ -665,6 +791,16 @@ impl SlurmLauncher {
             return Err(TrainError::other("slurm submit_async: empty inner command"));
         }
         let script = SlurmJob::build_sbatch_script(unit, self, inner);
+        // Truncate to whole seconds: some filesystems store mtimes that
+        // coarsely, and the job's first write must not compare as older.
+        let submitted_at = {
+            let now = std::time::SystemTime::now();
+            let secs = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            std::time::UNIX_EPOCH + Duration::from_secs(secs)
+        };
         use std::io::Write;
         let mut child = Command::new("sbatch")
             .arg("--parsable")
@@ -700,8 +836,18 @@ impl SlurmLauncher {
         if job_id.is_empty() {
             return Err(TrainError::other("sbatch --parsable returned empty job ID"));
         }
-        let log_path = PathBuf::from(format!("slurm-{job_id}.out"));
-        Ok(Box::new(SlurmJob { job_id, log_path }))
+        // sbatch resolves a relative --output against the directory it was run
+        // from; pin that now so a later chdir by the caller can't break streaming.
+        let submit_dir = std::env::current_dir().map_err(|e| TrainError::Io {
+            path: PathBuf::from("."),
+            source: e,
+        })?;
+        let log_path = SlurmJob::resolve_log_path(self, unit, &job_id, &submit_dir);
+        Ok(Box::new(SlurmJob {
+            job_id,
+            log_path,
+            submitted_at,
+        }))
     }
 }
 
@@ -989,6 +1135,40 @@ impl std::str::FromStr for LaunchTarget {
             ))),
         }
     }
+}
+
+/// The numeric launcher env vars [`launcher_for`] reads for `target`.
+fn numeric_launcher_env(target: LaunchTarget) -> &'static [&'static str] {
+    match target {
+        LaunchTarget::Slurm => &[
+            "BLUT_SLURM_CPUS",
+            "BLUT_SLURM_GPUS",
+            "BLUT_SLURM_NODES",
+            "BLUT_SLURM_NTASKS_PER_NODE",
+        ],
+        LaunchTarget::Ray => &["BLUT_RAY_NUM_GPUS"],
+        _ => &[],
+    }
+}
+
+/// Reject launcher env vars [`launcher_for`] would otherwise drop: a numeric
+/// setting that is not a positive integer (`BLUT_SLURM_NODES=two`,
+/// `BLUT_SLURM_GPUS=4x`) would silently fall back to the default allocation.
+/// Call it before any work starts.
+pub fn check_launcher_env(target: LaunchTarget) -> Result<()> {
+    for key in numeric_launcher_env(target) {
+        if let Ok(value) = std::env::var(key) {
+            match value.trim().parse::<u32>() {
+                Ok(n) if n > 0 => {}
+                _ => {
+                    return Err(TrainError::other(format!(
+                        "{key}={value:?} is not a positive integer; fix or unset it"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The configured [`Launcher`] for a target. Slurm/Ray read their cluster
@@ -1322,73 +1502,120 @@ mod tests {
         }
     }
 
-    // --- RemoteJob: sacct parsing ---
+    // --- RemoteJob: Slurm state parsing ---
+    //
+    // Every input string below was captured from Slurm 21.08 (Ubuntu 22.04
+    // packages) on a two-node test cluster, not written from the docs.
 
     #[test]
-    fn slurm_parse_sacct_completed() {
+    fn slurm_scontrol_state_is_read_from_the_one_line_record() {
+        // `scontrol show job -o <id>` (abridged; the real line is ~1.5 KB).
+        let line = "JobId=2 JobName=wrap UserId=root(0) GroupId=root(0) Priority=1 \
+                    JobState=FAILED Reason=NonZeroExitCode Dependency=(null) ExitCode=3:0";
         assert_eq!(
-            SlurmJob::parse_sacct_state("COMPLETED\n"),
-            JobState::Succeeded
+            SlurmJob::parse_scontrol_state(line).as_deref(),
+            Some("FAILED")
         );
+        assert_eq!(SlurmJob::parse_scontrol_state(""), None);
     }
 
     #[test]
-    fn slurm_parse_sacct_failed() {
-        let s = SlurmJob::parse_sacct_state("FAILED\n");
-        match s {
-            JobState::Failed(reason) => assert!(reason.contains("FAILED")),
-            other => panic!("expected Failed, got {other:?}"),
+    fn slurm_states_classify_as_terminal_or_waiting() {
+        let cases = [
+            ("COMPLETED", JobState::Succeeded),
+            ("PENDING", JobState::Running),
+            ("RUNNING", JobState::Running),
+            // Epilog still running: not finished, exit status not final.
+            ("COMPLETING", JobState::Running),
+            ("REQUEUED", JobState::Running),
+            ("CANCELLED", JobState::Cancelled),
+            ("FAILED", JobState::Failed("FAILED".into())),
+            ("TIMEOUT", JobState::Failed("TIMEOUT".into())),
+            ("OUT_OF_MEMORY", JobState::Failed("OutOfMemory".into())),
+            ("NODE_FAIL", JobState::Failed("NODE_FAIL".into())),
+            ("PREEMPTED", JobState::Failed("PREEMPTED".into())),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(SlurmJob::classify_state(raw), want, "{raw}");
         }
     }
 
     #[test]
-    fn slurm_parse_sacct_timeout() {
+    fn slurm_sacct_decorations_do_not_hide_the_state() {
+        // `sacct -X -P -o State` for a job cancelled by uid 0.
         assert_eq!(
-            SlurmJob::parse_sacct_state("TIMEOUT\n"),
-            JobState::Failed("TIMEOUT".to_string())
-        );
-    }
-
-    #[test]
-    fn slurm_parse_sacct_oom() {
-        assert_eq!(
-            SlurmJob::parse_sacct_state("OUT_OF_MEMORY\n"),
-            JobState::Failed("OutOfMemory".to_string())
-        );
-    }
-
-    #[test]
-    fn slurm_parse_sacct_running() {
-        assert_eq!(SlurmJob::parse_sacct_state("RUNNING\n"), JobState::Running);
-    }
-
-    #[test]
-    fn slurm_parse_sacct_pending() {
-        assert_eq!(SlurmJob::parse_sacct_state("PENDING\n"), JobState::Running);
-    }
-
-    #[test]
-    fn slurm_parse_sacct_cancelled() {
-        assert_eq!(
-            SlurmJob::parse_sacct_state("CANCELLED+\n"),
+            SlurmJob::classify_state("CANCELLED by 0"),
             JobState::Cancelled
         );
+        // Default fixed-width `sacct` truncates that to "CANCELLED+".
+        assert_eq!(SlurmJob::classify_state("CANCELLED+"), JobState::Cancelled);
+        assert_eq!(SlurmJob::classify_state(" COMPLETED "), JobState::Succeeded);
     }
 
     #[test]
-    fn slurm_parse_sacct_empty() {
-        assert!(matches!(
-            SlurmJob::parse_sacct_state(""),
-            JobState::Unknown(_)
-        ));
-    }
-
-    #[test]
-    fn slurm_parse_sacct_node_fail() {
+    fn slurm_unrecognised_state_is_reported_verbatim() {
         assert_eq!(
-            SlurmJob::parse_sacct_state("NODE_FAIL\n"),
-            JobState::Failed("NODE_FAIL".to_string())
+            SlurmJob::classify_state("BRAND_NEW_STATE"),
+            JobState::Unknown("BRAND_NEW_STATE".into())
         );
+    }
+
+    // --- sbatch output path ---
+
+    #[test]
+    fn slurm_log_path_is_absolute_against_the_submit_dir() {
+        let dir = std::path::Path::new("/work/run");
+        let p = SlurmJob::resolve_log_path(&SlurmLauncher::default(), "u", "42", dir);
+        assert_eq!(p, Some(PathBuf::from("/work/run/slurm-42.out")));
+    }
+
+    #[test]
+    fn slurm_log_path_follows_an_output_override_and_chdir() {
+        let launcher = SlurmLauncher {
+            extra: vec!["--chdir=sub".into(), "--output=logs/%x-%j.log".into()],
+            ..Default::default()
+        };
+        let p = SlurmJob::resolve_log_path(&launcher, "train", "7", std::path::Path::new("/w"));
+        assert_eq!(p, Some(PathBuf::from("/w/sub/logs/train-7.log")));
+        let abs = SlurmLauncher {
+            extra: vec!["--output=/abs/%j.out".into()],
+            ..Default::default()
+        };
+        let p = SlurmJob::resolve_log_path(&abs, "u", "9", std::path::Path::new("/w"));
+        assert_eq!(p, Some(PathBuf::from("/abs/9.out")));
+    }
+
+    #[test]
+    fn slurm_log_path_per_node_pattern_has_no_single_file() {
+        let launcher = SlurmLauncher {
+            extra: vec!["--output=out-%N.log".into()],
+            ..Default::default()
+        };
+        let p = SlurmJob::resolve_log_path(&launcher, "u", "1", std::path::Path::new("/w"));
+        assert_eq!(p, None);
+    }
+
+    // --- launcher env validation ---
+
+    #[test]
+    fn launcher_env_typo_is_an_error_not_a_default() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized by TEST_ENV_LOCK; removed below.
+        unsafe { std::env::set_var("BLUT_SLURM_NODES", "two") };
+        let err = check_launcher_env(LaunchTarget::Slurm)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("BLUT_SLURM_NODES"), "{err}");
+        unsafe { std::env::set_var("BLUT_SLURM_NODES", "0") };
+        assert!(check_launcher_env(LaunchTarget::Slurm).is_err());
+        unsafe { std::env::set_var("BLUT_SLURM_NODES", "2") };
+        assert!(check_launcher_env(LaunchTarget::Slurm).is_ok());
+        // Local runs never read it.
+        unsafe { std::env::set_var("BLUT_SLURM_NODES", "two") };
+        assert!(check_launcher_env(LaunchTarget::Local).is_ok());
+        unsafe { std::env::remove_var("BLUT_SLURM_NODES") };
     }
 
     // --- RemoteJob: ray job status parsing ---
@@ -1535,7 +1762,12 @@ mod tests {
         // Multi-node preamble exports rendezvous env vars.
         assert!(script.contains("MASTER_ADDR"));
         assert!(script.contains("scontrol show hostnames"));
-        assert!(script.contains("NODE_RANK"));
+        // The batch script runs once; the work must be a step on every node,
+        // and NODE_RANK must be read inside the task, not in the batch shell.
+        assert!(script.contains(
+            "srun --kill-on-bad-exit=1 bash -c 'export NODE_RANK=\"$SLURM_NODEID\"; exec \"$@\"' blut-task python train.py"
+        ));
+        assert!(!script.contains("export NODE_RANK=${SLURM_NODEID"));
     }
 
     #[test]
@@ -1548,6 +1780,7 @@ mod tests {
         let script = SlurmJob::build_sbatch_script("single", &launcher, &["echo".into()]);
         assert!(!script.contains("MASTER_ADDR"));
         assert!(!script.contains("scontrol"));
+        assert!(!script.contains("srun"), "one task needs no job step");
     }
 
     #[test]

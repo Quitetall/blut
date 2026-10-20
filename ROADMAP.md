@@ -20,12 +20,12 @@ PlanSpec IR, the Starlark front-end and the Python SDK. That is what
 
 ## Before 1.0
 
-**1. Distributed claims need runs, not command construction.** Multi-node
-Slurm/Ray launchers, `torchrun` rendezvous and the P2P mesh are
-*component-tested*: the commands and parsers have tests, nothing has been
-executed across machines. Closing this means recorded runs with topology,
-versions, global-batch parity, failure recovery and artifact hashes — and until
-those exist the ledger keeps saying so.
+**1. Distributed claims need runs, not command construction.** The Slurm
+launcher has run against a live two-node cluster, a two-node Ray cluster has
+run jobs to completion, and cookbook training has run across two machines over
+NCCL with global-batch parity. What is still missing: failure recovery when a
+node is lost mid-run, artifact hashes compared across nodes, and the P2P mesh
+across machines (item 2).
 
 **2. P2P across independent hosts, including hostile networks.** Loopback proves
 the protocol, not the mesh. Needs separate machines, NAT, loss and partition.

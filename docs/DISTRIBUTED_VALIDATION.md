@@ -1,13 +1,13 @@
 # BLUT Distributed and Cross-Platform Validation
 
-Evidence ledger for engine `0.2.0-alpha.1`. Status means:
+Evidence ledger for engine `0.2.0-alpha.2`. Status means:
 
 - **Validated:** exercised on named runtime or exact CI gate.
 - **Component-tested:** parser, command construction, or loopback component
   tested; no scale claim.
 - **Deferred:** unsupported in public preview.
 
-Last updated: 2026-09-19.
+Last updated: 2026-10-20.
 
 Nothing in the table below changed when the crates were published on
 2026-08-27. Publication moves code, not evidence: every row still says exactly
@@ -22,7 +22,8 @@ first if you are deciding whether to depend on this.
 | Single-node GPU admission and per-device permits | Component-tested | Deterministic scheduler and executor tests |
 | Single-node `torchrun` argument construction | Component-tested | Launch contract tests; cookbook owns trainer semantics |
 | Ray launcher against a live cluster | Validated | Two-node Ray 2.x, submit + stream + poll to Succeeded, 2026-09-19 |
-| Multi-node Slurm launcher | Component-tested | Command/parser tests only; see the Slurm note below |
+| Slurm launcher: `sbatch` submit, stream, poll, cancel; `srun` steps | Validated | Two-node Slurm 21.08 cluster, with and without accounting, 2026-10-20 — see below |
+| Multi-node NCCL training through Slurm | Validated (cookbook) | Two physical machines, 2× RTX 5090, NCCL over a private network, 2026-10-20 — see below |
 | P2P crypto, policy, transport, and loopback dispatch | Component-tested | Unit and loopback integration tests |
 | P2P dispatch between separate network namespaces | Validated | Two containers, own IPs, real QUIC over a bridge — see below |
 | Live multi-host P2P mesh | Deferred | Requires independent-host validation |
@@ -111,12 +112,100 @@ succeed or fail, and never had been able to. Its seven unit tests asserted on
 the same invented string, so they agreed with the parser and with nothing else.
 Fixed against captured output; the run above is the same cluster after the fix.
 
-**Slurm is not validated and this run says nothing about it.** A real `sbatch` /
-`sacct` / `scancel` path needs accounting (slurmdbd + a database) and, on Debian
-12's Slurm 22.05 with cgroup/v2, a systemd instance as PID 1 for `slurmd` to
-create its scope over dbus. That is an environment constraint rather than
-anything about BLUT, and it was not solved here. The row stays
-Component-tested.
+This run says nothing about Slurm; the Slurm runs are recorded below.
+
+## Recorded run: the Slurm launcher on a live cluster (2026-10-20)
+
+A two-node cluster: two containers on one bridge, Slurm 21.08.5 from Ubuntu
+22.04, `slurmctld` and `slurmd` on `n0`, `slurmd` on `n1`, and a volume both
+nodes mount as the shared filesystem. It was run twice: once with
+`AccountingStorageType=accounting_storage/none` and once with `slurmdbd` backed
+by MariaDB. `cgroup` and `TaskPlugin` were off (`proctrack/linuxproc`), so this
+exercises scheduling and process launch, not resource enforcement.
+
+`tests/slurm_live.rs` drives `SlurmLauncher` through its public API, checking
+eight things:
+
+- a job's output streams in order and it ends `Succeeded`;
+- `exit 3` ends `Failed`;
+- `scancel` ends `Cancelled`;
+- a two-node batch job runs on both nodes, each with its own `NODE_RANK` and
+  one agreed `MASTER_ADDR`;
+- a job queued behind an exclusive one is waited for, not failed;
+- a job the controller has purged is answered by accounting, or refused with a
+  clear message without it;
+- `srun` wrapping runs on every node;
+- a previous job's log under a reused job id is not streamed.
+
+```
+                                   accounting off   accounting on
+code before this run (8d7eb4d)     1/8 pass         2/8 pass
+code after                         8/8 pass         8/8 pass
+```
+
+**What it found.**
+- Job state came only from `sacct`. Without accounting, `sacct` exits 1 ("Slurm
+  accounting storage is disabled"). With accounting, it prints nothing for a
+  job it has not recorded yet. Either way, streaming gave up immediately after
+  submission.
+- A multi-node batch script ran its command once, on node 0, and set
+  `NODE_RANK` from the batch shell, where it is always 0.
+- Slurm reuses job ids after its state is reset. The previous job's
+  `slurm-<id>.out` was then read as the new job's output, then seeked past the
+  end when the new job truncated it.
+- The parser's tests asserted `CANCELLED+`. That is `sacct` truncating
+  `CANCELLED by 0` to fit its column, not a state; the parser handled it only
+  by accident.
+
+All of the parser inputs in the unit tests are now captured from this cluster.
+
+**Boundaries.** One host and one kernel, with Slurm 21.08 only. No cgroup
+enforcement, no GPU binding (GPUs were declared with placeholder device files to
+check how Slurm treats `--gpus` with `--gpus-per-node`), no preemption, no node
+failure, and no federation.
+
+## Recorded run: multi-node training through Slurm (2026-10-17, 2026-10-20)
+
+The engine places stages; the cookbook owns training. These runs used the
+standard cookbook's `train_from_dataset` recipe:
+
+```
+blut-core recipe run train_from_dataset --launcher slurm
+```
+
+It trained SmolLM2-135M on `Salesforce/wikitext` with `nnodes=2` and one rank
+per node.
+
+| | 2026-10-17 | 2026-10-20 |
+|---|---|---|
+| Machines | one host, two `slurmd` | **two physical machines** |
+| GPUs | 2× RTX 3060 | 2× RTX 5090 |
+| Network | loopback | private overlay network between the machines |
+| NCCL transport | — | `NET/Socket` over the overlay, `eth0` |
+| World size | 2 | 2 |
+| Train loss (epoch 1) | 3.5554 | 3.5554 |
+| Eval loss | 3.36 | 3.3595 |
+| Exit | 0 | 0 |
+
+Both runs used Slurm 21.08, torch 2.8.0+cu128 and transformers 5.7.0. The
+engine was `8d7eb4d`.
+
+The train loss is identical across the two topologies: same seed, same global
+batch of 16, different hardware. That is the global-batch parity check.
+
+**Caveats.**
+- The containers could not mount NFS or FUSE. On 2026-10-20 a wrapper around
+  `srun` copied the job directory to the second machine before each step,
+  standing in for the shared filesystem real clusters provide.
+- On 2026-10-17 a task prolog pinned each node's GPU, because there was no
+  cgroup GPU confinement.
+- Neither run exercised failure recovery: no node was lost mid-run.
+
+## Required evidence (Slurm, still open)
+
+- Node loss mid-run and recovery through durable resume.
+- A cluster with cgroup enforcement and GPU binding, rather than placeholder
+  devices.
 
 ## Recorded run: cloud queue over S3 (2026-09-20)
 
@@ -159,8 +248,8 @@ feature is published.
 
 ## Required evidence before stronger claims
 
-- Record real multi-node NCCL runs with topology, versions, global-batch parity,
-  failure recovery, and artifact hashes.
+- Record multi-node failure recovery, and artifact hashes across nodes. Topology,
+  versions and global-batch parity are recorded above.
 - Exercise P2P across independent hosts and hostile-network cases.
 - Restore network object-store support only after dependency advisories, secret
   handling, TLS, and provider integration tests pass.
