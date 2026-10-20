@@ -179,12 +179,27 @@ advertise one as "Latest".
 
 Both are recorded here rather than quietly worked around.
 
-**`scripts/run_benchmarks.sh compare` cannot pass.** It defaults to the baseline
-name `release-0.2`, and the only baseline committed under `bench-baselines/` is
-`opt0`, so it exits 2 with `missing committed benchmark baseline 'release-0.2'`.
-Either establish the baseline on the designated quiet host
-(`bash scripts/run_benchmarks.sh --save`) or run the comparison against the
-baseline that exists (`BLUT_BENCH_BASELINE=opt0`). Do not delete the check.
+**`scripts/run_benchmarks.sh compare` cannot pass yet.** It defaults to the
+baseline name `release-0.2`, and the only baseline committed under
+`bench-baselines/` is `opt0`, so it exits 2 with `missing committed benchmark
+baseline 'release-0.2'`. Establish the baseline on the designated quiet host
+(`bash scripts/run_benchmarks.sh --save`), at the release candidate's SHA. Do
+not delete the check.
+
+Until 2026-10-20 the comparison could not fail either. Criterion prints
+"Performance has regressed" and still exits 0. `compare` now ends with
+`scripts/bench_regression_gate.py`. It fails when any benchmark's median is
+slower than the baseline by more than `BLUT_BENCH_MAX_REGRESSION` (default
+`0.10`), even at the lower bound of its confidence interval. A planted +40%
+regression fails it.
+
+**What "quiet host" has to mean.** A trial on a rented, shared 8-core
+instance compared unchanged code against its own baseline. The medians moved
+between −11.8% and +7.7%, with tight confidence intervals: other tenants'
+load, not sampling noise. A 10% limit is not safe on such a host. The
+designated host must be a whole machine nobody else is using: owned
+hardware, or a rented machine taken in full. Record its CPU model, core count
+and kernel with the baseline.
 
 **`release.yml`'s `gate` job ends BLOCKED by design.** Its last step runs
 `tools/check_blut_release_state.py`, which reports BLOCKED whenever the two

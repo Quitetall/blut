@@ -189,7 +189,7 @@ per capability is tracked in the
 | **P2P module** | Trust model, Ed25519, AES-256-GCM, QUIC transport, dispatch policy |
 | **RemoteJob trait** | Slurm + Ray launchers |
 | **DDP single-node** | `torchrun --nproc_per_node=N`, auto-detect from `WORLD_SIZE` |
-| **DDP multi-node** | `MASTER_ADDR`/`MASTER_PORT`/`NODE_RANK` → torchrun rendezvous (multi-node NCCL run still pending hardware) |
+| **DDP multi-node** | `MASTER_ADDR`/`MASTER_PORT`/`NODE_RANK` → torchrun rendezvous; real two-machine NCCL run recorded (cookbook training through Slurm) |
 | **Multi-GPU discovery** | Per-GPU VRAM via nvidia-smi + rocm-smi |
 | **DAG optimizer** | Dead code elimination, critical path scheduling, cache/memory-aware ordering |
 | **Event daemon** | `blut sensord`: file-drop, spool-threshold, and cron triggers → durable dedupe → exact recipe admission acknowledgement |
@@ -205,8 +205,8 @@ webhook signing contract, SLA rules, notification sinks, and restart semantics.
 |------|-------|-----------------|--------|
 | **1 GPU** | 1 machine | Typed orchestration and resource admission | Locally exercised; cookbook runtime evidence is separate |
 | **Multi-GPU** | 1 machine, N GPUs | `torchrun` argument construction | Component-tested; real training parity is cookbook-owned |
-| **Multi-Node** | 1 cluster, N machines | Slurm/torchrun rendezvous wiring | Component-tested; NCCL run pending |
-| **Cluster** | 1 datacenter | Ray `RemoteJob` command construction | Component-tested; at-scale run pending |
+| **Multi-Node** | 1 cluster, N machines | Slurm submit/track/cancel; torchrun rendezvous | Validated on a two-node Slurm cluster and a two-machine NCCL run ([Slurm guide](docs/SLURM.md)) |
+| **Cluster** | 1 datacenter | Ray `RemoteJob` submit/stream/poll | Two-node Ray cluster validated; at-scale run pending |
 | **P2P Mesh** | N machines, async | Trust-based dispatch and transport | Loopback/component-tested; independent-host run pending |
 
 ## Platform support

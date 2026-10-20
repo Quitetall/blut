@@ -18,17 +18,52 @@ because the train shares one exact version.
 
 ### Added
 - `s3` cargo feature: network object storage. `ObjectStore::from_url` opens
-  `s3://bucket/prefix` (AWS S3 or any S3-compatible endpoint: MinIO, R2, GCS's
-  S3 gateway) and `file://` stores, and `blut cloud --store` accepts a URL as
-  well as a directory. Credentials come only from the standard AWS environment
-  variables, never from flags. Validated end to end against MinIO; TLS to a
-  public endpoint and IAM roles are not yet exercised.
+  `s3://bucket/prefix` (AWS S3, or an S3-compatible endpoint that supports
+  conditional writes) and `file://` stores, and `blut cloud --store` accepts a
+  URL as well as a directory. Credentials come only from the standard AWS
+  environment variables, never from flags. Validated end to end against MinIO.
+  An endpoint without conditional writes (Backblaze B2) is refused with an error
+  that says so, instead of a generic 501 after ten retries; objects are never
+  written without the create-only guarantee.
 - `blut update` reports whether the binary cargo installed (per its install
   ledger) is behind the newest version on crates.io, and with `--yes` runs the
   pinned `cargo install --locked`. A stable install is never moved onto a
   prerelease.
 
 ### Fixed
+- The Slurm launcher's `sbatch` path (`SlurmLauncher::submit_async` and its
+  `RemoteJob`) now works on a real cluster. Against a two-node Slurm 21.08
+  cluster the previous code failed 7 of 8 live checks without accounting and 6
+  of 8 with it:
+  - Job state came only from `sacct`, which fails outright on a cluster
+    without `slurmdbd` and prints nothing for a job it has not recorded yet, so
+    `stream` gave up on every job straight after submitting it. State now comes
+    from `scontrol show job`, with `sacct -X -P` only for a job the controller
+    has purged; a transient query failure is retried for five minutes.
+  - A multi-node batch job ran its command once, on the first node, with
+    `NODE_RANK=0`. The command now runs as a job step on every task, each
+    reading its own `NODE_RANK`.
+  - A job that waited in the queue for an hour was reported as timed out while
+    it was still queued. Streaming now waits until the job ends; the job's
+    `--time` limit bounds it.
+  - When Slurm reused a job id, the previous job's `slurm-<id>.out` was
+    streamed as the new job's output. The log is now made absolute at submit
+    time, honours `--output` and `--chdir` passed in `extra`, and is ignored
+    until this job writes it.
+  - `CANCELLED by <uid>`, `PREEMPTED`, `COMPLETING`, `REQUEUED` and the other
+    states Slurm reports are recognised rather than ending the stream as
+    unknown.
+  - A job requeued after a node failure went back to waiting without a word.
+    The stream now notes a requeue, suspension or hold, and anything other
+    than ordinary queueing, once each with Slurm's reason, and notes when the
+    job is running again.
+  `tests/slurm_live.rs` holds the live checks.
+- A `BLUT_SLURM_*` or `BLUT_RAY_NUM_GPUS` value that is not a positive integer
+  (`BLUT_SLURM_NODES=two`) was silently ignored, so the job ran with the default
+  allocation. `blut recipe run --launcher` now refuses it before any work starts.
+- `SlurmLauncher::gpus` was documented as a per-node count; it is Slurm's
+  `--gpus`, the job's total. The documentation now says so and points to
+  `--gpus-per-node` for a per-node count.
 - `EvalReport` artifacts can cross the stage boundary. Their free-form
   `metrics` (a `serde_json::Value`) could not be decoded from the engine's
   bincode transport, so every stage that produced one — any evaluation stage in

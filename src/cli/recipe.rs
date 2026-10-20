@@ -304,6 +304,8 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             let launch_target: crate::config::launcher::LaunchTarget = launcher
                 .parse()
                 .map_err(|e| anyhow!("invalid --launcher {launcher:?}: {e}"))?;
+            crate::config::launcher::check_launcher_env(launch_target)
+                .map_err(|e| anyhow!("--launcher {launcher}: {e}"))?;
             // ADR 0096: parse the tenant up front (same fail-fast discipline).
             let tenant = crate::tenant::Tenant::parse(&tenant)
                 .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;

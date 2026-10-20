@@ -199,6 +199,43 @@ impl StoreError {
     }
 }
 
+/// The endpoint refused a create-only write (`If-None-Match: *`). Every
+/// object is published that way so a concurrent writer can never replace it;
+/// without that guarantee two workers finishing the same invocation could
+/// silently overwrite each other's cached result, so there is no fallback.
+#[cfg(feature = "cloud")]
+#[derive(Debug)]
+struct ConditionalPutUnsupported(String);
+
+#[cfg(feature = "cloud")]
+impl std::fmt::Display for ConditionalPutUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this S3 endpoint does not support conditional writes (`If-None-Match: *`), \
+             which BLUT needs to publish immutable objects safely. AWS S3 and MinIO \
+             support them; Backblaze B2 does not. Provider response: {}",
+            self.0
+        )
+    }
+}
+
+#[cfg(feature = "cloud")]
+impl std::error::Error for ConditionalPutUnsupported {}
+
+/// Whether a failed create-only PUT means the provider does not implement
+/// conditional writes, as opposed to a transient or permission failure.
+/// Recognises the S3 `NotImplemented` error code that Backblaze B2 returns
+/// with HTTP 501.
+#[cfg(feature = "cloud")]
+fn rejects_conditional_put(error: &object_store::Error) -> bool {
+    if matches!(error, object_store::Error::NotImplemented { .. }) {
+        return true;
+    }
+    let text = error.to_string();
+    text.contains("501 Not Implemented") || text.contains("<Code>NotImplemented</Code>")
+}
+
 /// Outcome of an immutable create operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PutOutcome {
@@ -497,6 +534,11 @@ impl ObjectStore {
                 match inner.put_opts(&path, payload, options).await {
                     Ok(_) => Ok(RawCreate::Created),
                     Err(object_store::Error::AlreadyExists { .. }) => Ok(RawCreate::AlreadyExists),
+                    Err(error) if rejects_conditional_put(&error) => Err(StoreError::backend(
+                        "put",
+                        key,
+                        ConditionalPutUnsupported(error.to_string()),
+                    )),
                     Err(error) => Err(StoreError::backend("put", key, error)),
                 }
             }
@@ -1007,6 +1049,35 @@ fn block_on_isolated<T: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cloud")]
+    #[test]
+    fn a_provider_without_conditional_writes_is_named_not_retried_into_a_generic_error() {
+        // Backblaze B2's response to `PUT` with `If-None-Match: *`, captured
+        // 2026-10-20 (bucket and key elided).
+        let b2 = "Error performing PUT https://s3.us-east-005.backblazeb2.com/b/k in 1.2s, \
+                  after 10 retries: Server returned non-2xx status code: 501 Not Implemented: \
+                  <?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Error>\n    \
+                  <Code>NotImplemented</Code>\n    <Message>A header you provided implies \
+                  functionality that is not implemented</Message>\n</Error>";
+        let generic = |msg: &str| object_store::Error::Generic {
+            store: "S3",
+            source: msg.to_string().into(),
+        };
+        assert!(rejects_conditional_put(&generic(b2)));
+        // Transient and permission failures keep their own error.
+        assert!(!rejects_conditional_put(&generic(
+            "Server returned non-2xx status code: 503 Service Unavailable: SlowDown"
+        )));
+        assert!(!rejects_conditional_put(&generic(
+            "Server returned non-2xx status code: 403 Forbidden: AccessDenied"
+        )));
+        let shown = ConditionalPutUnsupported(b2.into()).to_string();
+        assert!(
+            shown.contains("If-None-Match") && shown.contains("Backblaze B2"),
+            "{shown}"
+        );
+    }
+
     #[cfg(feature = "s3")]
     #[test]
     fn an_s3_url_carrying_credentials_port_or_query_is_refused_without_echo() {
