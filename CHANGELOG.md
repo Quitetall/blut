@@ -212,6 +212,14 @@ train shares one exact version.
 - On Windows a scheduler lock left by a dead process could never be reclaimed:
   liveness always answered "alive". It now asks the OS whether the pid has
   exited; a pid it cannot open for any other reason still counts as alive.
+- `blut p2p connect` checked only the identity (Ed25519) half of
+  `--coordinator-pubkey`. With the right first half and a wrong second (X25519)
+  half, a worker connected, ran the task, sealed the result to a key nobody
+  holds, and exited 0; only the coordinator saw "failed to unseal". The
+  coordinator's TLS certificate now also publishes its X25519 key, and the
+  worker refuses a mismatch before any work, naming both keys. A coordinator
+  from an earlier release publishes none and is not checked. Found on a real
+  Nevada-to-France run.
 - P2P sessions under hostile network conditions (found on emulated latency,
   loss, partition, NAT and clock skew between containers, and on a real
   Oregon-to-France run):

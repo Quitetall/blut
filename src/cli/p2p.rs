@@ -568,11 +568,11 @@ pub(super) async fn run_p2p_connect(
     std::fs::create_dir_all(&work_root)
         .with_context(|| format!("create peer work root {}", work_root.display()))?;
 
-    let client = P2pClient::with_coordinator_pin(std::sync::Arc::new(clone_keypair(&keypair)), {
-        let mut k = [0u8; 32];
-        k.copy_from_slice(verifying.as_bytes());
-        k
-    });
+    let client = P2pClient::with_coordinator_keys(
+        std::sync::Arc::new(clone_keypair(&keypair)),
+        verifying.to_bytes(),
+        x_arr,
+    );
     let (conn, my_id) = client
         .connect(sockaddr)
         .await

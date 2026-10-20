@@ -947,7 +947,11 @@ fn identity_cert(
         &rcgen::PKCS_ED25519,
     )
     .map_err(|e| TrainError::other(format!("derive TLS keypair from identity: {e}")))?;
-    let rcgen_cert = rcgen::CertificateParams::new(vec!["blut-p2p".into()])
+    let names = vec![
+        "blut-p2p".to_string(),
+        x25519_dns_name(&keypair.x25519_public.to_bytes()),
+    ];
+    let rcgen_cert = rcgen::CertificateParams::new(names)
         .map_err(|e| TrainError::other(format!("cert params: {e}")))?
         .self_signed(&cert_key_pair)
         .map_err(|e| TrainError::other(format!("generate cert: {e}")))?;
@@ -1018,6 +1022,33 @@ fn ed25519_pubkey_from_spki(spki: &[u8]) -> Option<[u8; 32]> {
     Some(key)
 }
 
+/// The DNS name an identity cert carries to publish its holder's X25519
+/// (sealing) key: `x25519-<first 16 bytes>.<last 16 bytes>.blut-p2p.invalid`,
+/// hex, split so no label exceeds 63 characters. Only the holder of the cert's
+/// Ed25519 key can complete a TLS handshake with it, so a peer that pinned
+/// that key can trust the value. `.invalid` can never resolve.
+fn x25519_dns_name(x25519_pub: &[u8; 32]) -> String {
+    let hex = faster_hex::hex_string(x25519_pub);
+    format!("x25519-{}.{}.blut-p2p.invalid", &hex[..32], &hex[32..])
+}
+
+/// The X25519 key published by [`x25519_dns_name`], if a cert carries one.
+/// Certs from releases before this name existed carry none.
+fn x25519_from_dns_names<'a>(names: impl Iterator<Item = &'a str>) -> Option<[u8; 32]> {
+    names.into_iter().find_map(|name| {
+        let rest = name
+            .strip_prefix("x25519-")?
+            .strip_suffix(".blut-p2p.invalid")?;
+        let (first, second) = rest.split_once('.')?;
+        if first.len() != 32 || second.len() != 32 {
+            return None;
+        }
+        let mut key = [0u8; 32];
+        faster_hex::hex_decode(format!("{first}{second}").as_bytes(), &mut key).ok()?;
+        Some(key)
+    })
+}
+
 /// Extract the Ed25519 identity that TLS mutually authenticated for `conn` —
 /// i.e. the public key the peer PROVED it holds the private half of during the
 /// handshake (via its client cert + `CertificateVerify`). `None` if the peer
@@ -1039,6 +1070,10 @@ pub struct P2pClient {
     keypair: Arc<KeyPair>,
     /// Expected Ed25519 public key of the coordinator (for TLS cert pinning).
     coordinator_pubkey: Option<[u8; 32]>,
+    /// Expected X25519 key of the coordinator, checked against the one its
+    /// pinned cert publishes. Results are sealed to this key, so a wrong one
+    /// means work whose output nobody can open.
+    coordinator_x25519: Option<[u8; 32]>,
 }
 
 impl P2pClient {
@@ -1047,6 +1082,7 @@ impl P2pClient {
         Self {
             keypair,
             coordinator_pubkey: None,
+            coordinator_x25519: None,
         }
     }
 
@@ -1057,6 +1093,23 @@ impl P2pClient {
         Self {
             keypair,
             coordinator_pubkey: Some(coordinator_pubkey),
+            coordinator_x25519: None,
+        }
+    }
+
+    /// Pin both halves of the coordinator's public key: the Ed25519 identity
+    /// (checked against its TLS cert) and the X25519 key results are sealed
+    /// to (checked against the key that cert publishes, when it publishes
+    /// one). A mismatch in either refuses the connection before any work.
+    pub fn with_coordinator_keys(
+        keypair: Arc<KeyPair>,
+        coordinator_pubkey: [u8; 32],
+        coordinator_x25519: [u8; 32],
+    ) -> Self {
+        Self {
+            keypair,
+            coordinator_pubkey: Some(coordinator_pubkey),
+            coordinator_x25519: Some(coordinator_x25519),
         }
     }
 
@@ -1067,8 +1120,13 @@ impl P2pClient {
         coordinator_addr: SocketAddr,
     ) -> Result<(QuinnConnection, PeerId), TrainError> {
         let pin_mismatch = Arc::new(std::sync::Mutex::new(None));
-        let client_config =
-            Self::make_client_config(&self.keypair, self.coordinator_pubkey, pin_mismatch.clone())?;
+        let advertised_x25519: AdvertisedX25519 = Arc::new(std::sync::Mutex::new(None));
+        let client_config = Self::make_client_config(
+            &self.keypair,
+            self.coordinator_pubkey,
+            pin_mismatch.clone(),
+            advertised_x25519.clone(),
+        )?;
         let bind: SocketAddr = if coordinator_addr.is_ipv6() {
             (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
         } else {
@@ -1091,6 +1149,21 @@ impl P2pClient {
                     presented,
                 ))
             })?;
+
+        let advertised = *advertised_x25519.lock().unwrap_or_else(|p| p.into_inner());
+        if let (Some(expected), Some(advertised)) = (self.coordinator_x25519, advertised)
+            && expected != advertised
+        {
+            conn.close(0u32.into(), b"x25519 pin mismatch");
+            return Err(TrainError::other(format!(
+                "coordinator {coordinator_addr} proved the pinned identity, but its sealing \
+                 (X25519) key is {} while the second half of --coordinator-pubkey is {}. \
+                 Results would be sealed to a key the coordinator cannot open; copy the whole \
+                 `pubkey` line from `blut p2p keys show` on the coordinator",
+                faster_hex::hex_string(&advertised),
+                faster_hex::hex_string(&expected),
+            )));
+        }
 
         // Send handshake, read ack — bounded (HANDSHAKE_MESSAGE_TIMEOUT).
         let handshake = WireMessage::Handshake {
@@ -1237,6 +1310,7 @@ impl P2pClient {
         keypair: &KeyPair,
         coordinator_pubkey: Option<[u8; 32]>,
         pin_mismatch: PinMismatch,
+        advertised_x25519: AdvertisedX25519,
     ) -> Result<quinn::ClientConfig, TrainError> {
         // If a coordinator pubkey is provided, pin it — reject connections
         // from servers whose TLS cert doesn't match. Otherwise accept any
@@ -1246,6 +1320,7 @@ impl P2pClient {
                 Arc::new(PinnedVerifier {
                     expected_pubkey: pubkey,
                     mismatch: pin_mismatch,
+                    advertised_x25519,
                 })
             } else {
                 Arc::new(InsecureVerifier)
@@ -1278,6 +1353,9 @@ impl P2pClient {
 /// not match the pin (`Some(None)`: not an Ed25519 key), so the dial error can
 /// say so instead of surfacing a bare TLS alert.
 type PinMismatch = Arc<std::sync::Mutex<Option<Option<[u8; 32]>>>>;
+
+/// Where [`PinnedVerifier`] leaves the X25519 key the pinned cert publishes.
+type AdvertisedX25519 = Arc<std::sync::Mutex<Option<[u8; 32]>>>;
 
 /// Turn a failed dial into an error an operator can act on.
 fn describe_dial_error(
@@ -1337,6 +1415,7 @@ fn describe_dial_error(
 struct PinnedVerifier {
     expected_pubkey: [u8; 32],
     mismatch: PinMismatch,
+    advertised_x25519: AdvertisedX25519,
 }
 
 impl rustls::client::danger::ServerCertVerifier for PinnedVerifier {
@@ -1359,6 +1438,10 @@ impl rustls::client::danger::ServerCertVerifier for PinnedVerifier {
                 rustls::CertificateError::ApplicationVerificationFailure,
             ));
         }
+        *self
+            .advertised_x25519
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = x25519_from_dns_names(cert.valid_dns_names());
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -1511,6 +1594,7 @@ mod pinned_verifier_tests {
         let correct_pin = PinnedVerifier {
             expected_pubkey: coordinator.verifying.to_bytes(),
             mismatch: Default::default(),
+            advertised_x25519: Default::default(),
         };
         assert!(
             correct_pin
@@ -1523,6 +1607,7 @@ mod pinned_verifier_tests {
         let wrong_pin = PinnedVerifier {
             expected_pubkey: impostor.verifying.to_bytes(),
             mismatch: Default::default(),
+            advertised_x25519: Default::default(),
         };
         let result = wrong_pin.verify_server_cert(&cert_der, &[], &server_name, &[], now);
         assert!(
@@ -1679,6 +1764,75 @@ mod pinned_verifier_tests {
     /// than hang — this is what makes the bug exploitable (MITM presents an
     /// unrelated cert and the old code accepted it unconditionally).
     #[tokio::test]
+    async fn wrong_sealing_half_of_the_pin_is_refused_before_any_work() {
+        // Found on a real WAN run: a --coordinator-pubkey with the right
+        // Ed25519 half but a wrong X25519 half connected, ran the task, sealed
+        // the result to a key nobody holds, and exited 0.
+        let (server, server_keypair) = bind_loopback_server().await;
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = server.accept_peer().await;
+        });
+        let wrong_x25519 = KeyPair::generate().x25519_public.to_bytes();
+        let client = P2pClient::with_coordinator_keys(
+            std::sync::Arc::new(KeyPair::generate()),
+            server_keypair.verifying.to_bytes(),
+            wrong_x25519,
+        );
+        let err = tokio::time::timeout(crate::TEST_HANG_GUARD, client.connect(addr))
+            .await
+            .expect("connect() must not hang on a sealing-key mismatch")
+            .expect_err("a wrong X25519 half must be refused")
+            .to_string();
+        assert!(
+            err.contains(&faster_hex::hex_string(
+                &server_keypair.x25519_public.to_bytes()
+            )) && err.contains(&faster_hex::hex_string(&wrong_x25519))
+                && err.contains("keys show"),
+            "the error must name both sealing keys and the fix: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn both_halves_of_the_right_pin_connect() {
+        let (server, server_keypair) = bind_loopback_server().await;
+        let addr = server.local_addr().unwrap();
+        // Hold the accepted connection open, as in the single-pin test: a
+        // dropped handle tears QUIC down under the in-flight HandshakeAck.
+        tokio::spawn(async move {
+            if let Ok((_, conn)) = server.accept_peer().await {
+                let _ = tokio::time::timeout(crate::TEST_HANG_GUARD, conn.closed()).await;
+            }
+        });
+        let client = P2pClient::with_coordinator_keys(
+            std::sync::Arc::new(KeyPair::generate()),
+            server_keypair.verifying.to_bytes(),
+            server_keypair.x25519_public.to_bytes(),
+        );
+        tokio::time::timeout(crate::TEST_HANG_GUARD, client.connect(addr))
+            .await
+            .expect("connect() must not hang")
+            .expect("the full, correct pubkey must connect");
+    }
+
+    #[test]
+    fn x25519_dns_name_round_trips_and_ignores_other_names() {
+        let key = KeyPair::generate().x25519_public.to_bytes();
+        let name = x25519_dns_name(&key);
+        assert!(name.split('.').all(|label| label.len() <= 63), "{name}");
+        assert_eq!(
+            x25519_from_dns_names(["blut-p2p", name.as_str()].into_iter()),
+            Some(key)
+        );
+        // A cert from before the name existed publishes none.
+        assert_eq!(x25519_from_dns_names(["blut-p2p"].into_iter()), None);
+        assert_eq!(
+            x25519_from_dns_names(["x25519-zz.zz.blut-p2p.invalid"].into_iter()),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn connect_with_wrong_pin_fails_end_to_end() {
         let (server, _server_keypair) = bind_loopback_server().await;
         let addr = server.local_addr().unwrap();
@@ -1740,7 +1894,8 @@ mod pinned_verifier_tests {
         let server = format!("{:?}", P2pServer::make_server_config(&kp, false).unwrap());
         let client = format!(
             "{:?}",
-            P2pClient::make_client_config(&kp, None, Default::default()).unwrap()
+            P2pClient::make_client_config(&kp, None, Default::default(), Default::default())
+                .unwrap()
         );
         for (side, dbg) in [("server", server), ("client", client)] {
             assert!(
