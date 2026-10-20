@@ -764,6 +764,35 @@ enum PolicyCommand {
     Disable,
 }
 
+/// The `cache prune` cap in GiB: `--max-gb`, else `$LAMU_CACHE_MAX_GB`, else
+/// 50. A negative or non-finite cap is refused: cast to bytes it was 0, so
+/// `--max-gb=-1` or `--max-gb NaN` deleted the whole shared cache and then
+/// reported the cap it had been given. An unparseable `$LAMU_CACHE_MAX_GB`
+/// is refused too, instead of quietly meaning 50.
+fn resolve_prune_cap_gb(flag: Option<f64>, env: Option<std::ffi::OsString>) -> Result<f64> {
+    let (cap, source) = match (flag, env) {
+        (Some(cap), _) => (cap, "--max-gb".to_string()),
+        (None, Some(raw)) => {
+            let text = raw.to_str().unwrap_or("").trim().to_string();
+            let cap = text.parse::<f64>().map_err(|_| {
+                anyhow!(
+                    "LAMU_CACHE_MAX_GB={raw:?} is not a number of GiB; set it to e.g. 50, \
+                     or unset it for the 50 GiB default"
+                )
+            })?;
+            (cap, "LAMU_CACHE_MAX_GB".to_string())
+        }
+        (None, None) => (50.0, String::new()),
+    };
+    if !cap.is_finite() || cap < 0.0 {
+        return Err(anyhow!(
+            "{source} {cap} is not a usable cache cap: give a size in GiB, 0 or more \
+             (0 empties the cache)"
+        ));
+    }
+    Ok(cap)
+}
+
 fn parse_duration(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| format!("{e}"))
 }
@@ -1269,6 +1298,38 @@ mod external_subcommand_tests {
             assert!(message.contains("removed by ADR 0170"), "{message}");
             assert!(message.contains(expected), "{message}");
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_prune_cap_tests {
+    use super::resolve_prune_cap_gb;
+
+    /// `--max-gb=-1` and `--max-gb NaN` cast to a 0-byte cap and emptied the
+    /// whole shared cache.
+    #[test]
+    fn a_negative_or_non_finite_cap_is_refused() {
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            let err = resolve_prune_cap_gb(Some(bad), None).expect_err("must refuse");
+            assert!(err.to_string().contains("--max-gb"), "{err}");
+        }
+        assert_eq!(resolve_prune_cap_gb(Some(0.0), None).unwrap(), 0.0);
+        assert_eq!(resolve_prune_cap_gb(Some(12.5), None).unwrap(), 12.5);
+    }
+
+    /// A garbage `$LAMU_CACHE_MAX_GB` quietly meant 50 GiB; the flag still
+    /// wins over the variable, and no setting at all is the 50 GiB default.
+    #[test]
+    fn the_env_cap_is_validated_and_the_flag_wins() {
+        let err = resolve_prune_cap_gb(None, Some("fifty".into())).expect_err("must refuse");
+        assert!(err.to_string().contains("LAMU_CACHE_MAX_GB"), "{err}");
+        assert!(resolve_prune_cap_gb(None, Some("-3".into())).is_err());
+        assert_eq!(resolve_prune_cap_gb(None, Some(" 7 ".into())).unwrap(), 7.0);
+        assert_eq!(
+            resolve_prune_cap_gb(Some(1.0), Some("fifty".into())).unwrap(),
+            1.0
+        );
+        assert_eq!(resolve_prune_cap_gb(None, None).unwrap(), 50.0);
     }
 }
 
@@ -2490,13 +2551,7 @@ fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
         CacheCommand::Prune { max_gb } => {
             // Resolution order: --max-gb flag → $LAMU_CACHE_MAX_GB →
             // 50 GiB default. The default matches the plan's spec.
-            let cap_gb = max_gb
-                .or_else(|| {
-                    std::env::var("LAMU_CACHE_MAX_GB")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                })
-                .unwrap_or(50.0);
+            let cap_gb = resolve_prune_cap_gb(max_gb, std::env::var_os("LAMU_CACHE_MAX_GB"))?;
             let cap_bytes = (cap_gb * 1024.0 * 1024.0 * 1024.0) as u64;
             let freed = crate::framework::cache::lru_prune(&global, cap_bytes)
                 .with_context(|| format!("lru_prune {}", global.display()))?;

@@ -88,6 +88,11 @@ because the train shares one exact version.
 - A plan node that omits `args` passed JSON `null`, which an args struct
   whose fields all have defaults rejects at run time. `null` and `{}` are
   now each tried in place of the other, as recipe args already were.
+- `blut cache prune --max-gb=-1` (or `NaN`) cast the cap to 0 bytes and
+  emptied the whole shared cache, then printed the cap it was given. A
+  negative or non-finite cap is now refused, and so is an unparseable
+  `LAMU_CACHE_MAX_GB`, which silently meant 50 GiB. `--max-gb 0` still
+  empties the cache on purpose.
 
 ### Security
 - rustls 0.23.45 everywhere, closing RUSTSEC-2026-0285 (TLS 1.3 handshake
