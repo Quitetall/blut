@@ -417,7 +417,10 @@ pub(super) async fn run_p2p_serve(
     eprintln!("coordinator listening on {bound}");
     eprintln!("peer id   {pid}");
     eprintln!("pubkey    {}", p2p_pubkey_hex(&keypair));
-    eprintln!("(peers: `blut p2p connect {bound} --coordinator-pubkey <pubkey>`)");
+    eprintln!(
+        "(peers: `blut p2p connect {} --coordinator-pubkey <pubkey>`)",
+        connect_hint(bound)
+    );
     eprintln!("Ctrl-C to stop.");
 
     // Persist the registry on shutdown so newly-handshaked peers survive a restart.
@@ -430,8 +433,19 @@ pub(super) async fn run_p2p_serve(
             eprintln!("warning: failed to persist peer registry: {e}");
         }
     }
-    coordinator.shutdown();
+    coordinator.shutdown_gracefully().await;
     Ok(())
+}
+
+/// The address a worker should dial, for the hint a coordinator prints. A
+/// wildcard bind (`0.0.0.0` / `::`) is not dialable, so name a placeholder.
+#[cfg(feature = "p2p")]
+pub(super) fn connect_hint(bound: std::net::SocketAddr) -> String {
+    if bound.ip().is_unspecified() {
+        format!("<this-host>:{}", bound.port())
+    } else {
+        bound.to_string()
+    }
 }
 
 /// Turnkey smoke serve (ADR 0067 · T2.3): bind a one-shot QUIC server, accept ONE
@@ -474,24 +488,42 @@ pub(super) async fn run_p2p_smoke_serve(
     let bound = server.local_addr().map_err(|e| anyhow!("{e}"))?;
     eprintln!("smoke coordinator listening on {bound}");
     eprintln!("pubkey    {}", p2p_pubkey_hex(&keypair));
-    eprintln!("(on the worker: `blut p2p connect {bound} --coordinator-pubkey <pubkey>`)");
+    eprintln!(
+        "(on the worker: `blut p2p connect {} --coordinator-pubkey <pubkey>`)",
+        connect_hint(bound)
+    );
     eprintln!("waiting for ONE worker to connect, then dispatching stage '{stage}'…");
 
-    let (peer_id, conn) = server
-        .accept_peer()
-        .await
-        .map_err(|e| anyhow!("accept worker: {e}"))?;
+    // A failed handshake (a worker with the wrong pin, a port scanner) is not
+    // the worker this smoke run is waiting for: report it and keep waiting.
+    let (peer_id, conn) = loop {
+        match server.accept_peer().await {
+            Ok(accepted) => break accepted,
+            Err(e) if server.is_endpoint_closed() => return Err(anyhow!("accept worker: {e}")),
+            Err(e) => eprintln!("rejected a connection attempt: {e} — still waiting"),
+        }
+    };
     eprintln!("worker {peer_id} connected — dispatching…");
 
-    let out = crate::p2p::smoke::smoke_dispatch_once(
+    let dispatched = crate::p2p::smoke::smoke_dispatch_once(
         &server, &conn, &keypair, reg, &peer_id, &stage, &input, 60,
     )
-    .await
-    .map_err(|e| anyhow!("smoke dispatch: {e}"))?;
+    .await;
+    let lost = crate::p2p::transport::connection_end_reason(&conn);
+    // End the session in order either way, so the worker exits promptly
+    // instead of waiting out the idle timeout for a close that never arrives.
+    crate::p2p::transport::end_session(&conn, "smoke run finished").await;
+    server.shutdown();
+    server
+        .drain(crate::p2p::transport::CLOSE_DRAIN_TIMEOUT)
+        .await;
+    let out = dispatched.map_err(|e| match lost {
+        Some(reason) => anyhow!("smoke dispatch: {e} (connection {reason})"),
+        None => anyhow!("smoke dispatch: {e}"),
+    })?;
 
     println!("✔ stage '{stage}' ran on peer {peer_id}; verified output:");
     println!("{out}");
-    server.shutdown();
     Ok(())
 }
 
@@ -508,13 +540,19 @@ pub(super) async fn run_p2p_connect(
     use crate::p2p::transport::P2pClient;
     use crate::p2p::trust::DispatchMatrix;
 
-    let sockaddr: std::net::SocketAddr = coordinator
-        .parse()
-        .with_context(|| format!("parse coordinator addr '{coordinator}'"))?;
+    let sockaddr = resolve_coordinator(&coordinator).await?;
 
     // Decode the coordinator's 64-byte public key (Ed25519 ‖ X25519).
+    let pubkey_hex = coordinator_pubkey_hex.trim();
+    if pubkey_hex.len() != 128 {
+        return Err(anyhow!(
+            "--coordinator-pubkey must be 128 hex characters (64 bytes: Ed25519 ‖ X25519, \
+             the `pubkey` line of `blut p2p keys show` on the coordinator); got {}",
+            pubkey_hex.len()
+        ));
+    }
     let mut pub64 = [0u8; 64];
-    faster_hex::hex_decode(coordinator_pubkey_hex.as_bytes(), &mut pub64)
+    faster_hex::hex_decode(pubkey_hex.as_bytes(), &mut pub64)
         .map_err(|e| anyhow!("invalid --coordinator-pubkey hex: {e}"))?;
     let verifying = ed25519_dalek::VerifyingKey::from_bytes(&pub64[..32].try_into().unwrap())
         .map_err(|e| anyhow!("invalid coordinator Ed25519 key: {e}"))?;
@@ -545,8 +583,32 @@ pub(super) async fn run_p2p_connect(
     run_peer_loop(&conn, &keypair, &coord_keys, reg, &policy, &work_root)
         .await
         .map_err(|e| anyhow!("peer loop: {e}"))?;
-    eprintln!("coordinator connection closed.");
+    eprintln!("coordinator ended the session.");
     Ok(())
+}
+
+/// Resolve `host:port` (an IP literal or a DNS name) to the address to dial.
+#[cfg(feature = "p2p")]
+async fn resolve_coordinator(coordinator: &str) -> Result<std::net::SocketAddr> {
+    if let Ok(addr) = coordinator.parse() {
+        return Ok(addr);
+    }
+    let lookup = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::net::lookup_host(coordinator),
+    )
+    .await
+    .map_err(|_| anyhow!("resolve coordinator '{coordinator}': timed out after 10s"))?
+    .with_context(|| {
+        format!("coordinator address '{coordinator}' is neither host:port nor ip:port")
+    })?;
+    let addrs: Vec<_> = lookup.collect();
+    addrs
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| addrs.first())
+        .copied()
+        .ok_or_else(|| anyhow!("coordinator '{coordinator}' resolved to no addresses"))
 }
 
 /// `KeyPair` doesn't derive Clone (it holds secrets); reconstruct from bytes
@@ -883,5 +945,40 @@ mod p2p_cli_tests {
             opts2.open(&path).unwrap_err().kind(),
             std::io::ErrorKind::AlreadyExists
         );
+    }
+}
+
+#[cfg(all(test, feature = "p2p"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_hint_never_names_a_wildcard_bind() {
+        // The hint used to read `blut p2p connect 0.0.0.0:9320 …`, which no
+        // worker can dial.
+        assert_eq!(
+            connect_hint("0.0.0.0:9320".parse().unwrap()),
+            "<this-host>:9320"
+        );
+        assert_eq!(
+            connect_hint("[::]:9320".parse().unwrap()),
+            "<this-host>:9320"
+        );
+        assert_eq!(
+            connect_hint("192.0.2.7:9320".parse().unwrap()),
+            "192.0.2.7:9320"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_address_accepts_names_and_literals() {
+        assert_eq!(
+            resolve_coordinator("192.0.2.7:9320").await.unwrap(),
+            "192.0.2.7:9320".parse::<std::net::SocketAddr>().unwrap()
+        );
+        let local = resolve_coordinator("localhost:9320").await.unwrap();
+        assert!(local.ip().is_loopback() && local.port() == 9320, "{local}");
+        let err = resolve_coordinator("not-an-addr").await.unwrap_err();
+        assert!(format!("{err:#}").contains("not-an-addr"), "{err:#}");
     }
 }

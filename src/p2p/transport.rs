@@ -16,6 +16,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use quinn::{Connection as QuinnConnection, Endpoint, ServerConfig};
 use serde::{Deserialize, Serialize};
@@ -82,6 +83,104 @@ pub enum WireMessage {
         task_id: String,
         dir: crate::p2p::bundle::BlobDir,
     },
+    /// Coordinator → Peer: the session is over and the peer should close and
+    /// exit. Sent on a reliable stream before the QUIC close, because the
+    /// CONNECTION_CLOSE frame itself is not retransmitted: if it is lost and the
+    /// coordinator process has exited, the peer would otherwise wait out the
+    /// idle timeout. A peer that predates this variant fails to decode it and
+    /// ends its loop, which is also an exit.
+    Goodbye { reason: String },
+}
+
+/// What a worker can receive between tasks.
+#[derive(Clone, Debug)]
+pub enum PeerInbound {
+    /// A task to execute.
+    Task(Box<TaskManifest>),
+    /// The coordinator ended the session in order.
+    Goodbye(String),
+    /// A cancel for a task that is not running here (late or duplicate).
+    StrayCancel(String),
+}
+
+/// QUIC idle timeout for every P2P connection: a connection that hears nothing
+/// from its peer for this long is closed with `timed out`. This is also the
+/// bound on an unanswered dial (no QUIC response at all).
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Keep-alive PING interval. Without it an idle session (a worker waiting for
+/// tasks) is torn down after [`IDLE_TIMEOUT`] even though both ends are alive,
+/// and a session that loses connectivity mid-transfer does not send anything
+/// for long stretches (PTO backoff) once the path heals, so the idle timer
+/// fires first. A PING every few seconds both keeps the session up and probes
+/// a healed path promptly.
+pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Bound on the application-level handshake (`Handshake` / `HandshakeAck`)
+/// after QUIC connects, so a client that completes QUIC but never speaks cannot
+/// hold an accept loop (keep-alives would otherwise keep it from idling out).
+pub const HANDSHAKE_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on an orderly close: how long [`end_session`] waits for the peer to
+/// acknowledge `Goodbye`, and how long [`P2pServer::drain`] waits for closes
+/// to be sent before the process may exit.
+pub const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// QUIC application close code for an orderly end of session.
+pub const SESSION_DONE: u32 = 0x5d;
+
+/// The transport parameters every P2P endpoint uses (server and client).
+fn transport_config() -> Arc<quinn::TransportConfig> {
+    let mut t = quinn::TransportConfig::default();
+    // 30 s is well inside the QUIC varint range, so this cannot fail.
+    t.max_idle_timeout(quinn::IdleTimeout::try_from(IDLE_TIMEOUT).ok());
+    t.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+    Arc::new(t)
+}
+
+/// Why a connection ended, in words an operator can act on. `None` while the
+/// connection is still open.
+pub fn connection_end_reason(conn: &QuinnConnection) -> Option<String> {
+    conn.close_reason().map(|e| connection_end_reason_of(&e))
+}
+
+/// [`connection_end_reason`] for an already-extracted close reason.
+pub fn connection_end_reason_of(e: &quinn::ConnectionError) -> String {
+    match e {
+        quinn::ConnectionError::TimedOut => format!(
+            "timed out: nothing heard from the other side for {}s (QUIC idle \
+             timeout) — a network partition, a crashed process, or UDP blocked",
+            IDLE_TIMEOUT.as_secs()
+        ),
+        quinn::ConnectionError::ApplicationClosed(c) => format!(
+            "closed by the other side (code {}, reason {:?})",
+            c.error_code,
+            String::from_utf8_lossy(&c.reason)
+        ),
+        other => other.to_string(),
+    }
+}
+
+/// End a session in order from the coordinator side: send `Goodbye` on a
+/// reliable stream, wait (at most [`CLOSE_DRAIN_TIMEOUT`]) until the peer has
+/// received it, then close with [`SESSION_DONE`]. Best-effort and bounded: a
+/// peer that is already gone costs at most the drain timeout.
+pub async fn end_session(conn: &QuinnConnection, reason: &str) {
+    let goodbye = async {
+        let mut stream = conn.open_uni().await.ok()?;
+        send_message(
+            &mut stream,
+            &WireMessage::Goodbye {
+                reason: reason.to_string(),
+            },
+        )
+        .await
+        .ok()?;
+        // Resolves once the peer has acknowledged every byte of the stream.
+        stream.stopped().await.ok()
+    };
+    let _ = tokio::time::timeout(CLOSE_DRAIN_TIMEOUT, goodbye).await;
+    conn.close(SESSION_DONE.into(), reason.as_bytes());
 }
 
 /// Terminal reply for one dispatched P2P task. The coordinator adapter maps
@@ -180,12 +279,22 @@ pub async fn send_blob(
     for (seq, chunk) in pack.chunks(CHUNK_MAX).enumerate() {
         let seq = u32::try_from(seq)
             .map_err(|_| TrainError::other("blob has too many chunks (seq overflow)"))?;
-        let mut s = conn
+        let s = conn
             .open_uni()
             .await
             .map_err(|e| TrainError::other(format!("open blob-chunk stream: {e}")))?;
+        // Held until the peer has acknowledged the chunk: if this transfer is
+        // abandoned (the caller's deadline fires), the guard resets the stream
+        // so the unsent megabytes are dropped instead of being transmitted for
+        // nobody — a backlog that also held the connection's CLOSE frame behind
+        // congestion control, leaving the worker to wait out the idle timeout.
+        let mut guard = ResetOnDrop(Some(s));
+        let stream = guard
+            .0
+            .as_mut()
+            .expect("guard holds the stream until acked");
         send_message(
-            &mut s,
+            stream,
             &WireMessage::BundleBlobChunk {
                 task_id: task_id.to_string(),
                 dir,
@@ -194,6 +303,14 @@ pub async fn send_blob(
             },
         )
         .await?;
+        // `Some(code)`: the receiver stopped the stream. quinn does that when a
+        // receiver drops a stream it has read the whole message from but not
+        // yet seen FIN on, so it is not a failure; the receiver's own reply
+        // says whether the blob was accepted. Only a lost connection is.
+        if let Err(e) = stream.stopped().await {
+            return Err(TrainError::other(format!("blob chunk {seq}: {e}")));
+        }
+        guard.0 = None;
     }
     {
         let mut s = conn
@@ -210,6 +327,19 @@ pub async fn send_blob(
         .await?;
     }
     Ok(())
+}
+
+/// A send stream that is reset when dropped while still holding it (see the
+/// chunk loop in [`send_blob`]). Resetting discards data quinn has buffered
+/// but not yet sent, even after `finish`.
+struct ResetOnDrop(Option<quinn::SendStream>);
+
+impl Drop for ResetOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut stream) = self.0.take() {
+            let _ = stream.reset(SESSION_DONE.into());
+        }
+    }
 }
 
 /// Receive a bundle blob sent by `send_blob`: accept uni streams, expect a
@@ -578,7 +708,13 @@ impl P2pServer {
             .endpoint
             .accept()
             .await
-            .ok_or_else(|| TrainError::other("QUIC endpoint closed"))?
+            .ok_or_else(|| {
+                // `accept()` yields None only once the endpoint is closed, which
+                // is terminal: record it so accept loops stop.
+                self.closing
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                TrainError::other("QUIC endpoint closed")
+            })?
             .await
             .map_err(|e| TrainError::other(format!("accept connection: {e}")))?;
 
@@ -592,12 +728,23 @@ impl P2pServer {
             ));
         }
 
-        // Read the handshake message.
-        let mut stream = conn
-            .accept_uni()
-            .await
-            .map_err(|e| TrainError::other(format!("accept stream: {e}")))?;
-        let msg = recv_message(&mut stream).await?;
+        // Read the handshake message, bounded (see HANDSHAKE_MESSAGE_TIMEOUT).
+        let msg = tokio::time::timeout(HANDSHAKE_MESSAGE_TIMEOUT, async {
+            let mut stream = conn
+                .accept_uni()
+                .await
+                .map_err(|e| TrainError::other(format!("accept stream: {e}")))?;
+            recv_message(&mut stream).await
+        })
+        .await
+        .map_err(|_| {
+            conn.close(0u32.into(), b"handshake timeout");
+            TrainError::other(format!(
+                "peer {} sent no handshake within {}s",
+                conn.remote_address(),
+                HANDSHAKE_MESSAGE_TIMEOUT.as_secs()
+            ))
+        })??;
 
         let (peer_id, trust) = match msg {
             WireMessage::Handshake {
@@ -731,6 +878,13 @@ impl P2pServer {
         self.endpoint.close(0u32.into(), b"shutdown");
     }
 
+    /// Wait (at most `max`) until every connection on this endpoint has
+    /// finished closing, so the close frames are on the wire before the process
+    /// exits. Call after [`end_session`] / [`shutdown`](Self::shutdown).
+    pub async fn drain(&self, max: Duration) {
+        let _ = tokio::time::timeout(max, self.endpoint.wait_idle()).await;
+    }
+
     fn make_server_config(
         keypair: &KeyPair,
         allow_legacy: bool,
@@ -759,10 +913,12 @@ impl P2pServer {
         .map_err(|e| TrainError::other(format!("TLS config: {e}")))?;
         server_crypto.alpn_protocols = vec![b"blut-p2p".to_vec()];
 
-        Ok(ServerConfig::with_crypto(Arc::new(
+        let mut config = ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
                 .map_err(|e| TrainError::other(format!("QUIC server config: {e}")))?,
-        )))
+        ));
+        config.transport_config(transport_config());
+        Ok(config)
     }
 }
 
@@ -910,8 +1066,15 @@ impl P2pClient {
         &self,
         coordinator_addr: SocketAddr,
     ) -> Result<(QuinnConnection, PeerId), TrainError> {
-        let client_config = Self::make_client_config(&self.keypair, self.coordinator_pubkey)?;
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
+        let pin_mismatch = Arc::new(std::sync::Mutex::new(None));
+        let client_config =
+            Self::make_client_config(&self.keypair, self.coordinator_pubkey, pin_mismatch.clone())?;
+        let bind: SocketAddr = if coordinator_addr.is_ipv6() {
+            (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+        } else {
+            (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+        };
+        let mut endpoint = Endpoint::client(bind)
             .map_err(|e| TrainError::other(format!("create client endpoint: {e}")))?;
         endpoint.set_default_client_config(client_config);
 
@@ -919,26 +1082,42 @@ impl P2pClient {
             .connect(coordinator_addr, "blut-p2p")
             .map_err(|e| TrainError::other(format!("connect: {e}")))?
             .await
-            .map_err(|e| TrainError::other(format!("QUIC handshake: {e}")))?;
+            .map_err(|e| {
+                let presented = *pin_mismatch.lock().unwrap_or_else(|p| p.into_inner());
+                TrainError::other(describe_dial_error(
+                    coordinator_addr,
+                    &e,
+                    self.coordinator_pubkey,
+                    presented,
+                ))
+            })?;
 
-        // Send handshake.
+        // Send handshake, read ack — bounded (HANDSHAKE_MESSAGE_TIMEOUT).
         let handshake = WireMessage::Handshake {
             pubkey: self.keypair.verifying.to_bytes(),
             x25519_pub: self.keypair.x25519_public.to_bytes(),
             capabilities: PeerCapabilities::default(),
         };
-        let mut stream = conn
-            .open_uni()
-            .await
-            .map_err(|e| TrainError::other(format!("open handshake stream: {e}")))?;
-        send_message(&mut stream, &handshake).await?;
-
-        // Read ack.
-        let mut ack_stream = conn
-            .accept_uni()
-            .await
-            .map_err(|e| TrainError::other(format!("accept ack stream: {e}")))?;
-        let msg = recv_message(&mut ack_stream).await?;
+        let msg = tokio::time::timeout(HANDSHAKE_MESSAGE_TIMEOUT, async {
+            let mut stream = conn
+                .open_uni()
+                .await
+                .map_err(|e| TrainError::other(format!("open handshake stream: {e}")))?;
+            send_message(&mut stream, &handshake).await?;
+            let mut ack_stream = conn
+                .accept_uni()
+                .await
+                .map_err(|e| TrainError::other(format!("accept ack stream: {e}")))?;
+            recv_message(&mut ack_stream).await
+        })
+        .await
+        .map_err(|_| {
+            TrainError::other(format!(
+                "coordinator {coordinator_addr} accepted the QUIC connection but sent \
+                 no handshake reply within {}s",
+                HANDSHAKE_MESSAGE_TIMEOUT.as_secs()
+            ))
+        })??;
         let peer_id = match msg {
             WireMessage::HandshakeAck { peer_id, trust } => {
                 tracing::info!(
@@ -955,6 +1134,21 @@ impl P2pClient {
         };
 
         Ok((conn, peer_id))
+    }
+
+    /// Wait for the next message a worker acts on between tasks: a task, an
+    /// orderly `Goodbye`, or a cancel for a task that is not running.
+    pub async fn recv_inbound(conn: &QuinnConnection) -> Result<PeerInbound, TrainError> {
+        let mut stream = conn
+            .accept_uni()
+            .await
+            .map_err(|e| TrainError::other(format!("accept task stream: {e}")))?;
+        match recv_message(&mut stream).await? {
+            WireMessage::Task(task) => Ok(PeerInbound::Task(Box::new(task))),
+            WireMessage::Goodbye { reason } => Ok(PeerInbound::Goodbye(reason)),
+            WireMessage::Cancel { task_id } => Ok(PeerInbound::StrayCancel(task_id)),
+            other => Err(TrainError::other(format!("unexpected message: {other:?}"))),
+        }
     }
 
     /// Wait for a task from the coordinator.
@@ -1042,6 +1236,7 @@ impl P2pClient {
     fn make_client_config(
         keypair: &KeyPair,
         coordinator_pubkey: Option<[u8; 32]>,
+        pin_mismatch: PinMismatch,
     ) -> Result<quinn::ClientConfig, TrainError> {
         // If a coordinator pubkey is provided, pin it — reject connections
         // from servers whose TLS cert doesn't match. Otherwise accept any
@@ -1050,6 +1245,7 @@ impl P2pClient {
             if let Some(pubkey) = coordinator_pubkey {
                 Arc::new(PinnedVerifier {
                     expected_pubkey: pubkey,
+                    mismatch: pin_mismatch,
                 })
             } else {
                 Arc::new(InsecureVerifier)
@@ -1069,11 +1265,50 @@ impl P2pClient {
             .map_err(|e| TrainError::other(format!("TLS client cert: {e}")))?;
         crypto.alpn_protocols = vec![b"blut-p2p".to_vec()];
 
-        Ok(quinn::ClientConfig::new(Arc::new(
+        let mut config = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
                 .map_err(|e| TrainError::other(format!("QUIC client config: {e}")))?,
-        )))
+        ));
+        config.transport_config(transport_config());
+        Ok(config)
     }
+}
+
+/// Where [`PinnedVerifier`] records the key a coordinator presented when it did
+/// not match the pin (`Some(None)`: not an Ed25519 key), so the dial error can
+/// say so instead of surfacing a bare TLS alert.
+type PinMismatch = Arc<std::sync::Mutex<Option<Option<[u8; 32]>>>>;
+
+/// Turn a failed dial into an error an operator can act on.
+fn describe_dial_error(
+    addr: SocketAddr,
+    e: &quinn::ConnectionError,
+    pinned: Option<[u8; 32]>,
+    presented: Option<Option<[u8; 32]>>,
+) -> String {
+    if let (Some(pinned), Some(presented)) = (pinned, presented) {
+        let presented = match presented {
+            Some(k) => faster_hex::hex_string(&k),
+            None => "a non-Ed25519 key".to_string(),
+        };
+        return format!(
+            "the coordinator at {addr} is not the one --coordinator-pubkey names: it \
+             presented Ed25519 key {presented}, the pin is {}. Copy the pubkey from \
+             `blut p2p keys show` on that coordinator (the first 64 hex characters \
+             are the Ed25519 part)",
+            faster_hex::hex_string(&pinned)
+        );
+    }
+    if matches!(e, quinn::ConnectionError::TimedOut) {
+        return format!(
+            "no QUIC response from {addr} within {}s. Check that the coordinator is \
+             running and listening on that address and port, and that UDP port {} \
+             is reachable (firewalls and NAT often pass TCP but drop UDP)",
+            IDLE_TIMEOUT.as_secs(),
+            addr.port()
+        );
+    }
+    format!("QUIC handshake with {addr}: {e}")
 }
 
 /// TLS cert verifier enforcing `--coordinator-pubkey` pinning.
@@ -1101,6 +1336,7 @@ impl P2pClient {
 #[derive(Debug)]
 struct PinnedVerifier {
     expected_pubkey: [u8; 32],
+    mismatch: PinMismatch,
 }
 
 impl rustls::client::danger::ServerCertVerifier for PinnedVerifier {
@@ -1117,6 +1353,8 @@ impl rustls::client::danger::ServerCertVerifier for PinnedVerifier {
         })?;
         let expected_spki = ed25519_spki_der(&self.expected_pubkey);
         if cert.subject_public_key_info().as_ref() != expected_spki.as_slice() {
+            let presented = ed25519_pubkey_from_spki(cert.subject_public_key_info().as_ref());
+            *self.mismatch.lock().unwrap_or_else(|p| p.into_inner()) = Some(presented);
             return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::ApplicationVerificationFailure,
             ));
@@ -1272,6 +1510,7 @@ mod pinned_verifier_tests {
 
         let correct_pin = PinnedVerifier {
             expected_pubkey: coordinator.verifying.to_bytes(),
+            mismatch: Default::default(),
         };
         assert!(
             correct_pin
@@ -1283,6 +1522,7 @@ mod pinned_verifier_tests {
         let impostor = KeyPair::generate();
         let wrong_pin = PinnedVerifier {
             expected_pubkey: impostor.verifying.to_bytes(),
+            mismatch: Default::default(),
         };
         let result = wrong_pin.verify_server_cert(&cert_der, &[], &server_name, &[], now);
         assert!(
@@ -1453,10 +1693,186 @@ mod pinned_verifier_tests {
         let result = tokio::time::timeout(crate::TEST_HANG_GUARD, client.connect(addr))
             .await
             .expect("connect() must not hang even on rejection");
+        let err = result
+            .expect_err(
+                "connecting with the WRONG --coordinator-pubkey must be rejected \
+                 (regression test for the PinnedVerifier stub that accepted any cert)",
+            )
+            .to_string();
+        // The error must say what is wrong, not surface a bare TLS alert
+        // ("invalid peer certificate: ApplicationVerificationFailure").
         assert!(
-            result.is_err(),
-            "connecting with the WRONG --coordinator-pubkey must be rejected \
-             (regression test for the PinnedVerifier stub that accepted any cert)"
+            err.contains("is not the one --coordinator-pubkey names")
+                && err.contains(&faster_hex::hex_string(
+                    &_server_keypair.verifying.to_bytes()
+                ))
+                && err.contains(&faster_hex::hex_string(&wrong_pubkey)),
+            "wrong-pin error must name the presented and the pinned key: {err}"
+        );
+    }
+
+    #[test]
+    fn unanswered_dial_error_names_the_bound_and_udp() {
+        let addr: SocketAddr = "192.0.2.1:9320".parse().unwrap();
+        let msg = describe_dial_error(addr, &quinn::ConnectionError::TimedOut, None, None);
+        assert!(
+            msg.contains("no QUIC response from 192.0.2.1:9320 within 30s")
+                && msg.contains("UDP port 9320"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn every_endpoint_gets_keep_alive_and_explicit_idle_timeout() {
+        // Without keep-alive an idle worker was torn down after 30 s even
+        // though both ends were up, and a session did not recover from a 20 s
+        // partition because nothing was sent between the heal and the idle
+        // timeout (PTO backoff). Both configs must carry the shared parameters.
+        let cfg = format!("{:?}", transport_config());
+        assert!(
+            cfg.contains(&format!(
+                "keep_alive_interval: Some({KEEP_ALIVE_INTERVAL:?})"
+            )),
+            "{cfg}"
+        );
+        assert!(KEEP_ALIVE_INTERVAL * 3 < IDLE_TIMEOUT);
+        let kp = KeyPair::generate();
+        let server = format!("{:?}", P2pServer::make_server_config(&kp, false).unwrap());
+        let client = format!(
+            "{:?}",
+            P2pClient::make_client_config(&kp, None, Default::default()).unwrap()
+        );
+        for (side, dbg) in [("server", server), ("client", client)] {
+            assert!(
+                dbg.contains(&format!(
+                    "keep_alive_interval: Some({KEEP_ALIVE_INTERVAL:?})"
+                )),
+                "{side} config lacks keep-alive: {dbg}"
+            );
+        }
+    }
+
+    /// A UDP relay for tests: forwards between one client and `upstream`, and
+    /// drops everything while `blackhole` is set (a partition).
+    async fn spawn_relay(
+        upstream: SocketAddr,
+        blackhole: Arc<std::sync::atomic::AtomicBool>,
+    ) -> SocketAddr {
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut client: Option<SocketAddr> = None;
+            let mut buf = vec![0u8; 65536];
+            while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+                if blackhole.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+                let to = if from == upstream {
+                    match client {
+                        Some(c) => c,
+                        None => continue,
+                    }
+                } else {
+                    client = Some(from);
+                    upstream
+                };
+                let _ = sock.send_to(&buf[..n], to).await;
+            }
+        });
+        addr
+    }
+
+    /// An abandoned blob transfer is cancelled, not delivered later. Before the
+    /// fix `send_blob` returned as soon as quinn had BUFFERED a chunk, so a
+    /// dispatch dropped on its deadline left the data queued: it kept going out
+    /// for nobody and, under congestion, held the connection's CLOSE frame
+    /// behind it, so the worker waited out the idle timeout.
+    #[tokio::test]
+    async fn abandoned_blob_send_is_reset_not_delivered() {
+        let (server, server_keypair) = bind_loopback_server().await;
+        let blackhole = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let relay = spawn_relay(server.local_addr().unwrap(), blackhole.clone()).await;
+        let client = P2pClient::with_coordinator_pin(
+            Arc::new(KeyPair::generate()),
+            server_keypair.verifying.to_bytes(),
+        );
+        let (accepted, connected) = tokio::time::timeout(crate::TEST_HANG_GUARD, async {
+            tokio::join!(server.accept_peer(), client.connect(relay))
+        })
+        .await
+        .expect("connect through the relay must not hang");
+        let (_peer, receiver) = accepted.unwrap();
+        let (sender, _id) = connected.unwrap();
+
+        // Partition, then send a blob small enough to be buffered at once: it
+        // cannot be acknowledged, and the sender gives up after a second.
+        blackhole.store(true, std::sync::atomic::Ordering::Relaxed);
+        let blob = vec![7u8; 64 * 1024];
+        let abandoned = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            send_blob(&sender, "t1", BlobDir::Input, &blob),
+        )
+        .await;
+        assert!(
+            abandoned.is_err(),
+            "send_blob must wait for the peer to acknowledge the chunk, not just buffer it"
+        );
+
+        // Heal. The abandoned chunk must arrive as a reset, not as data.
+        blackhole.store(false, std::sync::atomic::Ordering::Relaxed);
+        let received = tokio::time::timeout(
+            crate::TEST_HANG_GUARD,
+            recv_blob(&receiver, "t1", BlobDir::Input, MAX_BLOB_SIZE),
+        )
+        .await
+        .expect("recv_blob must not hang on a reset transfer");
+        assert!(
+            received.is_err(),
+            "an abandoned transfer must not be delivered after the sender gave up"
+        );
+    }
+
+    /// The coordinator ends a session with `Goodbye`; the worker's loop must
+    /// return promptly and cleanly instead of waiting out the idle timeout.
+    #[tokio::test]
+    async fn end_session_lets_the_worker_exit_promptly() {
+        let (server, server_keypair) = bind_loopback_server().await;
+        let addr = server.local_addr().unwrap();
+        let client_keypair = std::sync::Arc::new(KeyPair::generate());
+        let client =
+            P2pClient::with_coordinator_pin(client_keypair, server_keypair.verifying.to_bytes());
+        let (accepted, connected) = tokio::time::timeout(crate::TEST_HANG_GUARD, async {
+            tokio::join!(server.accept_peer(), client.connect(addr))
+        })
+        .await
+        .expect("loopback connect must not hang");
+        let (_peer, server_conn) = accepted.unwrap();
+        let (client_conn, _id) = connected.unwrap();
+
+        let started = std::time::Instant::now();
+        let (_, inbound) = tokio::time::timeout(crate::TEST_HANG_GUARD, async {
+            tokio::join!(
+                end_session(&server_conn, "smoke done"),
+                P2pClient::recv_inbound(&client_conn)
+            )
+        })
+        .await
+        .expect("goodbye must not hang");
+        match inbound {
+            Ok(PeerInbound::Goodbye(reason)) => assert_eq!(reason, "smoke done"),
+            other => panic!("worker must receive Goodbye, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < CLOSE_DRAIN_TIMEOUT,
+            "the goodbye was acknowledged, so end_session must not wait out the drain bound"
+        );
+        server.drain(CLOSE_DRAIN_TIMEOUT).await;
+        assert!(
+            matches!(
+                server_conn.close_reason(),
+                Some(quinn::ConnectionError::LocallyClosed)
+            ),
+            "the coordinator closed the connection itself"
         );
     }
 
@@ -1481,11 +1897,14 @@ mod pinned_verifier_tests {
         let expected = PeerId::from_pubkey(&client_keypair.verifying);
         let client =
             P2pClient::with_coordinator_pin(client_keypair, server_keypair.verifying.to_bytes());
-        let (_conn, client_side_id) =
+        let (conn, client_side_id) =
             tokio::time::timeout(crate::TEST_HANG_GUARD, client.connect(addr))
                 .await
                 .expect("connect must not hang")
                 .expect("mutual-auth connect must succeed");
+        // Close the client side so the server task's `conn.closed()` returns.
+        // (With keep-alive the session no longer idles out on its own.)
+        drop(conn);
 
         let bound = tokio::time::timeout(crate::TEST_HANG_GUARD, accept)
             .await

@@ -52,9 +52,14 @@ pub struct CoordinatorKeys {
     pub x25519_pub: x25519_dalek::PublicKey,
 }
 
-/// Run the peer execution loop until the connection closes. Each iteration
+/// Run the peer execution loop until the session ends. Each iteration
 /// handles one dispatched task; an error on a single task is reported back to
 /// the coordinator (`send_error`) and the loop continues to the next.
+///
+/// Returns `Ok(())` only for an orderly end: the coordinator sent `Goodbye` or
+/// closed the connection itself. A session that is lost (idle timeout after a
+/// partition, a reset, a protocol error) is an `Err`, so a worker binary exits
+/// nonzero instead of reporting a lost coordinator as a normal close.
 ///
 /// `work_root` is where the peer materializes inputs + runs stages (one subdir
 /// per task). `keypair` is the peer's own identity (to decrypt inputs sealed to
@@ -68,13 +73,23 @@ pub async fn run_peer_loop(
     work_root: &std::path::Path,
 ) -> Result<(), TrainError> {
     loop {
-        // recv_task surfaces a closed connection as an Err — that ends the loop.
-        let task = match P2pClient::recv_task(conn).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::debug!("peer loop: recv_task ended ({e})");
+        let task = match P2pClient::recv_inbound(conn).await {
+            Ok(transport::PeerInbound::Task(t)) => *t,
+            Ok(transport::PeerInbound::Goodbye(reason)) => {
+                tracing::debug!("peer loop: coordinator said goodbye ({reason})");
+                // Let the coordinator close: it waits for our acknowledgement
+                // of the goodbye, which a close sent from here (and the process
+                // exiting right after) could pre-empt, costing it the full
+                // drain timeout. Close ourselves only if its close never comes.
+                let _ = tokio::time::timeout(transport::CLOSE_DRAIN_TIMEOUT, conn.closed()).await;
+                conn.close(transport::SESSION_DONE.into(), b"goodbye");
                 return Ok(());
             }
+            Ok(transport::PeerInbound::StrayCancel(task_id)) => {
+                tracing::debug!("peer loop: ignoring cancel for task {task_id} (not running)");
+                continue;
+            }
+            Err(e) => return session_end(conn.close_reason(), e),
         };
         let task_id = task.task_id.clone();
         match execute_one(
@@ -99,6 +114,30 @@ pub async fn run_peer_loop(
                 let _ = P2pClient::send_execution_failure(conn, &task_id, &failure).await;
             }
         }
+    }
+}
+
+/// Classify how a worker session ended (see [`run_peer_loop`]).
+fn session_end(
+    reason: Option<quinn::ConnectionError>,
+    recv_error: TrainError,
+) -> Result<(), TrainError> {
+    match reason {
+        Some(quinn::ConnectionError::ApplicationClosed(c)) => {
+            tracing::debug!(
+                "peer loop: coordinator closed the session (code {})",
+                c.error_code
+            );
+            Ok(())
+        }
+        Some(quinn::ConnectionError::LocallyClosed) => Ok(()),
+        Some(lost) => Err(TrainError::other(format!(
+            "lost the coordinator: {}",
+            transport::connection_end_reason_of(&lost)
+        ))),
+        None => Err(TrainError::other(format!(
+            "coordinator session failed: {recv_error}"
+        ))),
     }
 }
 
@@ -166,6 +205,18 @@ async fn execute_one(
     work_root: &std::path::Path,
     task: TaskManifest,
 ) -> Result<(), ExecutionFailure> {
+    // Fix the stage budget on THIS host's clock at receipt (see local_budget).
+    let received = std::time::Instant::now();
+    let budget = local_budget(task.deadline, task.timeout_secs, unix_now_ms());
+    if let Some(skew_ms) = budget.skew_ms {
+        tracing::warn!(
+            "task {}: this host's clock is ~{:+.1}s off the coordinator's; running the \
+             stage under the coordinator's relative budget ({}s) instead of its absolute deadline",
+            task.task_id,
+            skew_ms as f64 / 1000.0,
+            budget.hard.as_secs()
+        );
+    }
     if task.protocol_version != crate::p2p::task::TASK_PROTOCOL_VERSION {
         return Err(ExecutionFailure::protocol(format!(
             "task protocol v{} unsupported (want v{})",
@@ -331,7 +382,7 @@ async fn execute_one(
             stage_cancel.cancel();
             return Err(ExecutionFailure::disconnected("coordinator connection closed while stage ran"));
         }
-        _ = sleep_until_deadline(task.deadline.soft_remaining()) => {
+        _ = sleep_until_deadline(budget.soft.map(|d| d.saturating_sub(received.elapsed()))) => {
             stage_cancel.cancel();
             return Err(ExecutionFailure::new(
                 ExecutionFailureKind::Stage,
@@ -339,7 +390,7 @@ async fn execute_one(
                 format!("stage '{}' exceeded soft execution deadline", task.stage_name),
             ));
         }
-        _ = tokio::time::sleep(task.deadline.hard_remaining()) => {
+        _ = tokio::time::sleep(budget.hard.saturating_sub(received.elapsed())) => {
             stage_cancel.cancel();
             return Err(ExecutionFailure::new(
                 ExecutionFailureKind::Stage,
@@ -391,6 +442,65 @@ async fn execute_one(
         .await
         .map_err(|e| ExecutionFailure::transport(format!("send output blob: {e}")))?;
     Ok(())
+}
+
+/// Clock difference (ms) below which this host's clock is taken to agree with
+/// the coordinator's. It also absorbs manifest transit time and the 1 s
+/// rounding of `timeout_secs`.
+const CLOCK_SKEW_TOLERANCE_MS: u64 = 5_000;
+
+/// A task's stage budget on this host, measured from receipt.
+#[derive(Debug, PartialEq)]
+struct LocalBudget {
+    soft: Option<std::time::Duration>,
+    hard: std::time::Duration,
+    /// `Some(local - coordinator)` when the clocks disagree beyond tolerance.
+    skew_ms: Option<i64>,
+}
+
+/// Translate the coordinator's absolute deadline to this host.
+///
+/// The deadline is wall-clock time on the COORDINATOR's clock. Read against a
+/// worker clock that runs ahead, it has already passed when the task arrives
+/// and every stage that yields even once is killed with a hard-deadline
+/// failure (a worker 10 minutes ahead failed every non-trivial task); a clock
+/// that runs behind stretches it. The manifest also carries `timeout_secs`, the
+/// hard budget the coordinator had left when it signed (floored to whole
+/// seconds), so `hard_unix_ms - timeout_secs` is the signing time on the
+/// coordinator's clock. If that agrees with this host's clock (within
+/// [`CLOCK_SKEW_TOLERANCE_MS`]) the absolute deadline is used as before, so
+/// queueing and transfer time still count. Otherwise the clocks disagree and the
+/// relative budget is used, with the soft deadline kept at the same distance
+/// before the hard one.
+fn local_budget(deadline: ExecutionDeadline, timeout_secs: u64, local_now_ms: u64) -> LocalBudget {
+    let ms = std::time::Duration::from_millis;
+    let relative_hard_ms = timeout_secs.max(1).saturating_mul(1000);
+    let signed_at_ms = deadline.hard_unix_ms.saturating_sub(relative_hard_ms);
+    let skew_ms = i128::from(local_now_ms) - i128::from(signed_at_ms);
+    if skew_ms.unsigned_abs() <= u128::from(CLOCK_SKEW_TOLERANCE_MS) {
+        return LocalBudget {
+            soft: deadline
+                .soft_unix_ms
+                .map(|soft| ms(soft.saturating_sub(local_now_ms))),
+            hard: ms(deadline.hard_unix_ms.saturating_sub(local_now_ms)),
+            skew_ms: None,
+        };
+    }
+    let soft_before_hard = |soft: u64| deadline.hard_unix_ms.saturating_sub(soft);
+    LocalBudget {
+        soft: deadline
+            .soft_unix_ms
+            .map(|soft| ms(relative_hard_ms.saturating_sub(soft_before_hard(soft)))),
+        hard: ms(relative_hard_ms),
+        skew_ms: Some(skew_ms.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64),
+    }
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 async fn sleep_until_deadline(duration: Option<std::time::Duration>) {
@@ -727,6 +837,7 @@ pub fn default_work_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn safe_task_id_rejects_traversal() {
@@ -861,5 +972,76 @@ mod tests {
         let sealed = seal_blob(&plaintext, &kp.x25519_public).unwrap();
         let opened = open_blob(&sealed, &kp).unwrap();
         assert_eq!(opened, plaintext);
+    }
+
+    // ── Clock skew between coordinator and worker ──────────────────────────
+
+    /// A coordinator signs at `signed` (its clock) with `budget_s` left; the
+    /// worker reads the manifest at `signed + skew` on its own clock.
+    fn deadline_signed_at(
+        signed: u64,
+        budget_s: u64,
+        soft_s: Option<u64>,
+    ) -> (ExecutionDeadline, u64) {
+        let hard = signed + budget_s * 1000;
+        let soft = soft_s.map(|s| signed + s * 1000);
+        (ExecutionDeadline::absolute(soft, hard).unwrap(), budget_s)
+    }
+
+    const SIGNED: u64 = 1_792_000_000_000;
+
+    #[test]
+    fn worker_clock_ten_minutes_ahead_keeps_the_budget() {
+        // Before: hard_remaining() on the worker's clock was 0, so a stage that
+        // yielded once lost the race to an already-expired deadline.
+        let (d, t) = deadline_signed_at(SIGNED, 60, Some(45));
+        let b = local_budget(d, t, SIGNED + 600_000 + 40);
+        assert_eq!(b.hard, Duration::from_secs(60));
+        assert_eq!(b.soft, Some(Duration::from_secs(45)));
+        assert!(
+            b.skew_ms.is_some_and(|s| (599_000..=601_000).contains(&s)),
+            "{b:?}"
+        );
+    }
+
+    #[test]
+    fn worker_clock_ten_minutes_behind_is_not_stretched() {
+        let (d, t) = deadline_signed_at(SIGNED, 60, None);
+        let b = local_budget(d, t, SIGNED - 600_000);
+        assert_eq!(b.hard, Duration::from_secs(60), "not 11 minutes");
+        assert_eq!(b.soft, None);
+        assert!(b.skew_ms.is_some_and(|s| s < 0));
+    }
+
+    #[test]
+    fn agreeing_clocks_keep_the_absolute_deadline() {
+        // Transit and queueing still count: 2.5 s after signing, 57.5 s are left.
+        let (d, t) = deadline_signed_at(SIGNED, 60, Some(30));
+        let b = local_budget(d, t, SIGNED + 2_500);
+        assert_eq!(b.hard, Duration::from_millis(57_500));
+        assert_eq!(b.soft, Some(Duration::from_millis(27_500)));
+        assert_eq!(b.skew_ms, None);
+    }
+
+    #[test]
+    fn session_end_is_ok_only_for_an_orderly_close() {
+        let err = || TrainError::other("accept task stream: closed");
+        let app_closed = quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: transport::SESSION_DONE.into(),
+            reason: Default::default(),
+        });
+        assert!(session_end(Some(app_closed), err()).is_ok());
+        assert!(session_end(Some(quinn::ConnectionError::LocallyClosed), err()).is_ok());
+        // A partition or a vanished coordinator ends in an idle timeout: that
+        // is a failure, and the message must say what happened.
+        let lost = session_end(Some(quinn::ConnectionError::TimedOut), err())
+            .unwrap_err()
+            .to_string();
+        assert!(lost.contains("lost the coordinator: timed out"), "{lost}");
+        assert!(session_end(Some(quinn::ConnectionError::Reset), err()).is_err());
+        assert!(
+            session_end(None, err()).is_err(),
+            "protocol error on a live connection"
+        );
     }
 }
