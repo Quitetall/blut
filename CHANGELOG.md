@@ -57,6 +57,13 @@ train shares one exact version.
   and assigns it to the job here, so a Windows caller must use one of them; a
   skipped call leaves the child suspended, never running uncapped.
 
+### Changed
+- **Breaking (P2P API):** `p2p::transport::WireMessage` gains `Goodbye`, the
+  orderly end of a session, and is now `#[non_exhaustive]` so later messages
+  are not breaking. Code outside `blut` that matches on it needs a wildcard
+  arm. This is the only finding `scripts/semver_checks.sh` accepts against
+  0.2.0-alpha.1, recorded in `scripts/semver_exemptions.tsv`.
+
 ### Fixed
 - The Slurm launcher's `sbatch` path (`SlurmLauncher::submit_async` and its
   `RemoteJob`) now works on a real cluster. Against a two-node Slurm 21.08

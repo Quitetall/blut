@@ -48,10 +48,18 @@ for entry in "${TARGETS[@]}"; do
   else
     args=(-p "$crate")
   fi
+  log=$(mktemp)
   if ! cargo semver-checks check-release "${args[@]}" \
-        --baseline-version "$baseline" --release-type minor; then
-    failed+=("$crate")
+        --baseline-version "$baseline" --release-type minor 2>&1 | tee "$log"; then
+    # Accept the run only if every finding is listed for this crate and
+    # baseline in scripts/semver_exemptions.tsv.
+    if python3 scripts/semver_exempt.py "$crate" "$baseline" "$log" scripts/semver_exemptions.tsv; then
+      echo "semver_checks: $crate: every finding is a recorded exemption"
+    else
+      failed+=("$crate")
+    fi
   fi
+  rm -f "$log"
 done
 
 echo
