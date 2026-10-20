@@ -723,16 +723,17 @@ pub struct RayLauncher {
     pub extra: Vec<String>,
 }
 
-impl Launcher for RayLauncher {
-    fn wrap(&self, unit: &str, inner: &[String]) -> Result<WrappedCommand> {
-        if inner.is_empty() {
-            return Err(TrainError::other("ray launcher: empty inner command"));
+impl RayLauncher {
+    /// `ray job submit` arguments, shared by the blocking [`Launcher::wrap`]
+    /// path and [`RayLauncher::submit_async`] so the two cannot drift: the
+    /// async path used to omit `--entrypoint-num-gpus`, so a job submitted
+    /// through it reserved no GPU and could be placed on a CPU-only node.
+    fn job_submit_args(&self, unit: &str, inner: &[String], no_wait: bool) -> Vec<String> {
+        let mut args = vec!["job".to_string(), "submit".to_string()];
+        if no_wait {
+            args.push("--no-wait".to_string());
         }
-        let mut args = vec![
-            "job".to_string(),
-            "submit".to_string(),
-            format!("--submission-id={unit}"),
-        ];
+        args.push(format!("--submission-id={unit}"));
         if let Some(a) = &self.address {
             args.push(format!("--address={a}"));
         }
@@ -747,6 +748,16 @@ impl Launcher for RayLauncher {
         args.extend(self.extra.iter().filter(|x| *x != "--").cloned());
         args.push("--".to_string());
         args.extend(inner.iter().cloned());
+        args
+    }
+}
+
+impl Launcher for RayLauncher {
+    fn wrap(&self, unit: &str, inner: &[String]) -> Result<WrappedCommand> {
+        if inner.is_empty() {
+            return Err(TrainError::other("ray launcher: empty inner command"));
+        }
+        let args = self.job_submit_args(unit, inner, false);
         Ok(WrappedCommand {
             program: "ray".to_string(),
             args,
@@ -918,22 +929,7 @@ impl RayLauncher {
         if inner.is_empty() {
             return Err(TrainError::other("ray submit_async: empty inner command"));
         }
-        let mut args = vec![
-            "job".to_string(),
-            "submit".to_string(),
-            "--no-wait".to_string(),
-            format!("--submission-id={unit}"),
-        ];
-        if let Some(a) = &self.address {
-            args.push(format!("--address={a}"));
-        }
-        if let Some(re) = &self.runtime_env {
-            args.push("--runtime-env-json".to_string());
-            args.push(re.clone());
-        }
-        args.extend(self.extra.iter().filter(|x| *x != "--").cloned());
-        args.push("--".to_string());
-        args.extend(inner.iter().cloned());
+        let args = self.job_submit_args(unit, inner, true);
         let output = Command::new("ray")
             .args(&args)
             .output()
@@ -996,8 +992,9 @@ impl std::str::FromStr for LaunchTarget {
 /// the DAG itself stays portable — the same recipe runs locally or on a cluster
 /// by flipping `--launcher`, no recipe edit.
 pub fn launcher_for(target: LaunchTarget) -> Box<dyn Launcher> {
-    let env = |k: &str| std::env::var(k).ok();
-    let env_u32 = |k: &str| env(k).and_then(|s| s.parse::<u32>().ok());
+    // An empty value is unset: `RAY_ADDRESS=` used to submit `--address=`.
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let env_u32 = |k: &str| env_count(k, env(k));
     match target {
         LaunchTarget::Local => Box::new(LocalSystemd::default()),
         LaunchTarget::Slurm => Box::new(SlurmLauncher {
@@ -1026,6 +1023,28 @@ pub fn launcher_for(target: LaunchTarget) -> Box<dyn Launcher> {
         // Cloud dispatch is handled by the cloud submit path (CloudSubmitter +
         // CloudQueue), not Launcher — same precedent as P2P. Fall through to local.
         LaunchTarget::Cloud => Box::new(LocalSystemd::default()),
+    }
+}
+
+/// A whole-number launcher setting (`BLUT_RAY_NUM_GPUS`, `BLUT_SLURM_GPUS`, ...).
+/// An unparseable value used to vanish, so `BLUT_RAY_NUM_GPUS=two` submitted
+/// the job with no GPU request at all. It is still treated as unset (the
+/// signature of [`launcher_for`] has no error path), but loudly.
+fn env_count(name: &str, value: Option<String>) -> Option<u32> {
+    let value = value?;
+    match value.trim().parse::<u32>() {
+        Ok(n) => Some(n),
+        Err(_) => {
+            tracing::warn!(
+                "{name}={value:?} is not a whole number; IGNORING it, so the job is \
+                 submitted without that request. Fix or unset {name}."
+            );
+            eprintln!(
+                "warning: {name}={value:?} is not a whole number; the job is submitted \
+                 without it"
+            );
+            None
+        }
     }
 }
 
@@ -1571,6 +1590,51 @@ mod tests {
     fn slurm_submit_async_rejects_empty_inner() {
         let l = SlurmLauncher::default();
         assert!(l.submit_async("unit", &[]).is_err());
+    }
+
+    /// `submit_async` built its own argv and left out the GPU reservation the
+    /// blocking path emits.
+    #[test]
+    fn ray_async_submit_reserves_the_same_gpus_as_wrap() {
+        let l = RayLauncher {
+            num_gpus: Some(2),
+            address: Some("http://h:8265".into()),
+            ..Default::default()
+        };
+        let inner = ["python".to_string()];
+        let async_args = l.job_submit_args("u", &inner, true);
+        assert!(async_args.contains(&"--entrypoint-num-gpus=2".to_string()));
+        assert!(async_args.contains(&"--no-wait".to_string()));
+        let mut blocking = l.wrap("u", &inner).unwrap().args;
+        blocking.retain(|a| a != "--no-wait");
+        let mut async_args = async_args;
+        async_args.retain(|a| a != "--no-wait");
+        assert_eq!(async_args, blocking);
+    }
+
+    #[test]
+    fn launcher_counts_are_parsed_and_empty_settings_are_unset() {
+        assert_eq!(env_count("X", Some(" 2 ".into())), Some(2));
+        assert_eq!(env_count("X", Some("two".into())), None);
+        assert_eq!(env_count("X", None), None);
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var_os("RAY_ADDRESS");
+        // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+        unsafe { std::env::set_var("RAY_ADDRESS", "") };
+        let cmd = launcher_for(LaunchTarget::Ray).build_command("u", &["echo".into()]);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("RAY_ADDRESS", v),
+                None => std::env::remove_var("RAY_ADDRESS"),
+            }
+        }
+        assert!(
+            !argv(&cmd.unwrap())
+                .iter()
+                .any(|a| a.starts_with("--address"))
+        );
     }
 
     #[test]

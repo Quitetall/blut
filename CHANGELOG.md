@@ -125,6 +125,12 @@ because the train shares one exact version.
   the wrong program) and used shell escaping, which systemd does not
   understand; `%` and `$` in args were open to systemd's specifier and
   variable expansion. Words are now quoted and escaped per systemd.syntax(7).
+- `RayLauncher::submit_async` built its own `ray job submit` argv without
+  `--entrypoint-num-gpus`, so an asynchronously submitted job reserved no GPU.
+  Both paths now share one argument builder. A non-numeric
+  `BLUT_RAY_NUM_GPUS` (or any `BLUT_SLURM_*` count) was dropped without a
+  word; it is still ignored but now warns, and an empty `RAY_ADDRESS` (or
+  other launcher setting) counts as unset instead of producing `--address=`.
 
 ### Security
 - rustls 0.23.45 everywhere, closing RUSTSEC-2026-0285 (TLS 1.3 handshake
