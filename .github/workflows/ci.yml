@@ -326,7 +326,7 @@ jobs:
           cargo test --locked
 
   macos-build:
-    name: macOS compile-check (containment degrades)
+    name: macOS · compile-check (containment RLIMIT_AS)
     # WEEKLY, not per-commit. macOS bills at 10x, and this job ran on every
     # push to main AND every pull request -- the single most expensive lane in
     # the fleet, for a check that only proves the crate still COMPILES on a
@@ -337,10 +337,10 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     timeout-minutes: 60
-    # blut is a Linux-first engine: the never-OOM cgroup containment needs
-    # Linux + systemd, and off-systemd it degrades to a bare spawn. This job
-    # only proves the crate COMPILES on a non-Linux Unix host (the realistic
-    # `cargo add blut` target) — it does not run the systemd-dependent tests.
+    # blut is a Linux-first engine: the cgroup containment needs Linux, and on
+    # macOS the `containment_for()` factory selects the RLIMIT_AS backend. This
+    # job only proves the crate COMPILES on a non-Linux Unix host (the
+    # realistic `cargo add blut` target) — it runs no containment tests.
     # Build-only (no `-D warnings`) so a macOS-specific lint can't mask the
     # compile signal.
     env:
@@ -365,6 +365,53 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
       - name: Build (lib + all targets)
         run: cargo build --locked --workspace --all-targets
+
+  windows-build:
+    name: Windows · build · Job Object containment tests
+    # Per push and pull request, unlike the weekly macOS lane: this job is the
+    # only thing that EXECUTES the Windows Job Object backend, and a runtime
+    # containment guarantee that is checked weekly can sit broken on main for
+    # a week. Windows bills at 2x (macOS 10x). To demote it to the weekly
+    # sweep, copy the macOS job's `if:`.
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+      # The containment tests run real `python` children (allocation past the
+      # cap, a child that spawns a grandchild). Pinned, not "whatever the image
+      # ships", so a runner-image change cannot silently change the subject.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install MSRV toolchain (clippy)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
+        with:
+          toolchain: 1.88.0
+          components: clippy
+      - name: Cache cargo registry + git + target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Build (lib + all targets)
+        run: cargo build --locked --workspace --all-targets
+      - name: Clippy (deny warnings)
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # The proof the Windows backend works: a 512 MiB allocation fails under a
+      # 128 MiB job cap and succeeds under a 2 GiB one, the peak covers what was
+      # committed, and both TerminateJobObject and closing the job kill a
+      # grandchild that was alive a moment before.
+      - name: Job Object containment tests
+        run: cargo test --locked --test windows_job_object -- --nocapture
+      - name: Test
+        run: cargo test --locked --workspace --no-fail-fast
 
   wasm32-keystone:
     name: blut-types wasm32 keystone (ADR 0083)

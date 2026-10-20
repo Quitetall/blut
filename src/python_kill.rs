@@ -38,7 +38,9 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 /// A spawned training child's identity. `pid` is the direct child,
 /// `pgid` its process group (== pid after `setsid`). `start_time` is
@@ -276,6 +278,9 @@ async fn read_capped(
 }
 
 struct BoundedProcessGuard {
+    // Read only by the Unix `killpg` teardown; off Unix `kill_on_drop` on the
+    // direct child is the whole teardown.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pgid: Option<u32>,
 }
 
@@ -326,6 +331,18 @@ pub async fn graceful_kill_pid(pgid: u32, grace: Duration) {
 #[cfg(not(unix))]
 pub async fn graceful_kill_pid(_pgid: u32, _grace: Duration) {
     // No-op on non-Unix; cancel is best-effort.
+}
+
+/// Non-Unix counterpart of the group kill: there are no process groups to
+/// signal, so this is the same best-effort no-op as [`graceful_kill_pid`]. On
+/// Windows the hard tree teardown is the Job Object backend's
+/// `TerminateJobObject` (`containment::windows`), not a signal.
+#[cfg(not(unix))]
+pub async fn graceful_kill_group(
+    _pgid: u32,
+    _expected_identity: Option<ChildIdentity>,
+    _grace: Duration,
+) {
 }
 
 /// Group-aware kill with an optional identity guard. If

@@ -2770,15 +2770,18 @@ mod tests {
     #[test]
     fn rebase_path_strings_exact_and_child_prefix() {
         use serde_json::json;
-        let mut v = json!({
-            "exact": "/a/b",
-            "child": "/a/b/c/d.txt",
-            "sibling": "/a/bc",       // must NOT match
-            "unrelated": "/x/y",
-            "nested": {"p": "/a/b/inner"},
-            "list": ["/a/b/k", "keep"],
-        });
+        // Every path is built with the host separator, because that is the
+        // separator `rebase_path_strings` matches on; on Unix these are the
+        // same "/a/b"-style literals as before.
         let sep = std::path::MAIN_SEPARATOR;
+        let mut v = json!({
+            "exact": format!("{sep}a{sep}b"),
+            "child": format!("{sep}a{sep}b{sep}c{sep}d.txt"),
+            "sibling": format!("{sep}a{sep}bc"),       // must NOT match
+            "unrelated": format!("{sep}x{sep}y"),
+            "nested": {"p": format!("{sep}a{sep}b{sep}inner")},
+            "list": [format!("{sep}a{sep}b{sep}k"), "keep"],
+        });
         let from = format!("{sep}a{sep}b");
         let to = format!("{sep}new{sep}root");
         rebase_path_strings(&mut v, &from, &to);

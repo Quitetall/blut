@@ -34,7 +34,13 @@ struct Cursor {
 }
 
 struct LockGuard {
+    #[cfg(unix)]
     _file: nix::fcntl::Flock<std::fs::File>,
+    /// Windows has no `flock`; the file is opened with share mode 0, so the
+    /// open HANDLE itself is the exclusive lock (a second opener gets a
+    /// sharing violation) until this guard drops.
+    #[cfg(windows)]
+    _file: std::fs::File,
 }
 
 /// One notifier process. Holds an exclusive cursor lock for its lifetime so two
@@ -73,12 +79,20 @@ impl Notifier {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            // Share mode 0: no other handle may open the lock file while this
+            // one is live. That is the exclusive, non-blocking lock.
+            options.share_mode(0);
+        }
         let lock_file = options.open(&lock_path).map_err(|error| {
             format!(
                 "notification cursor {} lock is unavailable: {error}",
                 cursor_path.display()
             )
         })?;
+        #[cfg(unix)]
         let lock_file =
             nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
                 .map_err(|_| {

@@ -32,7 +32,7 @@ first if you are deciding whether to depend on this.
 | Network object storage (S3-compatible) | Validated (MinIO) | `s3` feature; full cloud round-trip against MinIO over HTTP, 2026-09-20. Backblaze B2 over TLS refused: no conditional writes, 2026-10-20 — see below |
 | `blut-worker` REST prototype | Deleted (ADR 0083 M3) | Superseded by `src/cloud` + the `blut-web` sidecar |
 | Kubernetes operator | Unsupported | Unpublished prototype; separate Rust 1.89 compile/test lane |
-| Windows containment | Deferred | Bare fallback only; Job Object implementation absent |
+| Windows containment | CI-gated | `windows-latest` job, Rust 1.88, per push: a 512 MiB allocation fails under a 128 MiB Job Object cap and succeeds under 2 GiB; the reported peak covers the commit; `TerminateJobObject` and closing the job each kill a grandchild that was alive a moment before. Covers the `containment_for()` + `after_spawn` path only: the `LocalSystemd` launcher still spawns bare on Windows, `mem_high`/`swap_max` are not mapped, and no cookbook run on Windows is recorded. The same job runs the full workspace test suite (34 test binaries, 0 failures on 2026-10-20) |
 
 ## Recorded run: P2P dispatch across network namespaces (2026-09-19)
 
