@@ -93,6 +93,16 @@ because the train shares one exact version.
   negative or non-finite cap is now refused, and so is an unparseable
   `LAMU_CACHE_MAX_GB`, which silently meant 50 GiB. `--max-gb 0` still
   empties the cache on purpose.
+- `blut policy enable` printed a crontab line running `blut auto`, a verb
+  `blut` does not have, so the advertised auto-trigger failed every 30
+  minutes into its log. It now prints a line that gates on
+  `blut sensor eval auto-train-policy` and runs a recipe the operator names,
+  with paths shell-quoted.
+- Error messages named commands that do not exist: `lamu-train jobs` and
+  `lamu-train policy enable` (now `blut jobs`, `blut policy enable`), and
+  `--allow-evict` when the scheduler lock is held (now: wait, or
+  `blut cancel <job>`). "recipe not in catalog" now points at
+  `blut recipe list`.
 
 ### Security
 - rustls 0.23.45 everywhere, closing RUSTSEC-2026-0285 (TLS 1.3 handshake

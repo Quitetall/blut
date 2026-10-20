@@ -764,6 +764,22 @@ enum PolicyCommand {
     Disable,
 }
 
+/// What `blut policy enable` tells the operator to put in cron. It used to
+/// print `<exe> auto`, a verb `blut` does not have, so the advertised cron
+/// line failed every 30 minutes into a log nobody reads. The policy is read
+/// by the `auto-train-policy` sensor; `sensor eval` exits 0 only when every
+/// gate passes, so it chains in front of the recipe the operator picks.
+fn policy_cron_hint(exe: &str, log_path: &str) -> String {
+    let exe = update::shell_join(&[exe.to_string()]);
+    let log = update::shell_join(&[log_path.to_string()]);
+    format!(
+        "# The policy gates the `auto-train-policy` sensor (exit 0 = run now).\n\
+         # To act on it every 30 min, add to crontab with your recipe and args:\n\
+         */30 * * * * {exe} sensor eval auto-train-policy >> {log} 2>&1 && \
+         {exe} recipe run <RECIPE> --args '<JSON>' >> {log} 2>&1\n"
+    )
+}
+
 /// The `cache prune` cap in GiB: `--max-gb`, else `$LAMU_CACHE_MAX_GB`, else
 /// 50. A negative or non-finite cap is refused: cast to bytes it was 0, so
 /// `--max-gb=-1` or `--max-gb NaN` deleted the whole shared cache and then
@@ -1302,6 +1318,31 @@ mod external_subcommand_tests {
 }
 
 #[cfg(test)]
+mod policy_cron_hint_tests {
+    use super::{Cli, policy_cron_hint};
+    use clap::Parser;
+
+    /// The suggested cron line must call verbs that exist: it used to run
+    /// `blut auto`, which is not a subcommand.
+    #[test]
+    fn the_cron_line_names_real_verbs_and_quotes_paths() {
+        let hint = policy_cron_hint("/opt/my tools/blut", "/var/log/a b.log");
+        assert!(!hint.contains(" auto "), "{hint}");
+        assert!(
+            hint.contains("'/opt/my tools/blut' sensor eval auto-train-policy"),
+            "{hint}"
+        );
+        assert!(hint.contains("'/var/log/a b.log'"), "{hint}");
+        assert!(Cli::try_parse_from(["blut", "sensor", "eval", "auto-train-policy"]).is_ok());
+        assert!(
+            crate::sensor::registry()
+                .iter()
+                .any(|s| s.name() == "auto-train-policy")
+        );
+    }
+}
+
+#[cfg(test)]
 mod cache_prune_cap_tests {
     use super::resolve_prune_cap_gb;
 
@@ -1815,9 +1856,12 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             )
             .map_err(|e| anyhow!("registry arg revalidation: {e}"))?;
             ensure_resume_registry_snapshot(&marker, &args)?;
-            let r = reg
-                .find(&marker.name)
-                .ok_or_else(|| anyhow!("recipe '{}' not in catalog", marker.name))?;
+            let r = reg.find(&marker.name).ok_or_else(|| {
+                anyhow!(
+                    "recipe '{}' not in catalog (see `blut recipe list`)",
+                    marker.name
+                )
+            })?;
             let plan = (r.compile_fn)(args.clone()).map_err(|e| anyhow!("recipe compile: {e}"))?;
             let tenant_admission =
                 crate::broker::tenant_quota::TenantAdmission::prepare(tenant.clone())
@@ -1946,9 +1990,9 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             }
         }
         PlanCommand::Inspect { name, args } => {
-            let r = reg
-                .find(&name)
-                .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+            let r = reg.find(&name).ok_or_else(|| {
+                anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)")
+            })?;
             let raw: serde_json::Value = serde_json::from_str(&args)
                 .with_context(|| format!("parse --args as JSON: {args}"))?;
             let plan = (r.compile_fn)(raw).map_err(|e| anyhow!("recipe compile: {e}"))?;
@@ -2690,9 +2734,9 @@ fn run_schedule_cmd(reg: &crate::framework::Registry, cmd: ScheduleCommand) -> R
         } => {
             // Validate the recipe exists + the args parse before touching
             // systemd, so a typo doesn't leave a broken unit behind.
-            let def = reg
-                .find(&recipe)
-                .ok_or_else(|| anyhow!("recipe '{recipe}' not in catalog"))?;
+            let def = reg.find(&recipe).ok_or_else(|| {
+                anyhow!("recipe '{recipe}' not in catalog (see `blut recipe list`)")
+            })?;
             // `--calendar` wins; otherwise fall back to the recipe's built-in
             // SCHEDULE (E1↔E5). Neither present → hard error (no silent default).
             let calendar = calendar
@@ -2785,10 +2829,9 @@ fn run_policy(cmd: PolicyCommand) -> Result<()> {
             let path = policy::policy_path()?;
             println!("auto-trigger enabled (policy: {})", path.display());
             println!();
-            println!("# Add to crontab so the heuristic runs every 30 min:");
             let exe = std::env::current_exe()
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "lamu-train".into());
+                .unwrap_or_else(|_| "blut".into());
             // cron doesn't run through a shell that expands ~ , so
             // resolve the log path to an absolute string before
             // printing. Falls back to /tmp if XDG resolution fails.
@@ -2796,7 +2839,10 @@ fn run_policy(cmd: PolicyCommand) -> Result<()> {
                 .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
                 .join("lamu")
                 .join("train-auto.log");
-            println!("*/30 * * * * {exe} auto >> {} 2>&1", log_path.display());
+            print!(
+                "{}",
+                policy_cron_hint(&exe, &log_path.display().to_string())
+            );
         }
         PolicyCommand::Disable => {
             let mut p = policy::load().context("load policy")?;

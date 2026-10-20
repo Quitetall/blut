@@ -178,7 +178,9 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             }
         }
         RecipeCommand::Show { name } => {
-            let r = find_recipe(&name).ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+            let r = find_recipe(&name).ok_or_else(|| {
+                anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)")
+            })?;
             println!("name        : {}", r.name);
             println!("category    : {}", r.category.label());
             println!("backend     : {}", r.backend_id);
@@ -361,9 +363,9 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                     // dry-run can't report "OK" on invalid args — B/P5), then report
                     // the resolved RAM footprint and return WITHOUT executing or
                     // touching any resource (compile builds the plan; it never runs).
-                    let def = reg
-                        .find(&name)
-                        .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+                    let def = reg.find(&name).ok_or_else(|| {
+                        anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)")
+                    })?;
                     let plan = (def.compile_fn)(raw.clone()).map_err(|e| anyhow!("{e}"))?;
                     let fp = plan.declared_footprint();
                     if !plan.has_resource_declarations() {
@@ -547,7 +549,7 @@ pub(super) fn prepare_one_partitioned_recipe(
     .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
     let recipe = reg
         .find(name)
-        .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+        .ok_or_else(|| anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)"))?;
     let plan = (recipe.compile_fn)(resolved_args.clone())
         .map_err(|error| anyhow!("recipe compile failed: {error}"))?
         .with_partition(partition);
@@ -602,7 +604,7 @@ async fn run_one_recipe_resolved(
 ) -> Result<(String, serde_json::Value, String)> {
     let r = reg
         .find(name)
-        .ok_or_else(|| anyhow!("recipe '{name}' not in catalog"))?;
+        .ok_or_else(|| anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)"))?;
     let mut plan =
         (r.compile_fn)(args.clone()).map_err(|e| anyhow!("recipe compile failed: {e}"))?;
     if let Some(partition) = partition {
@@ -1252,7 +1254,9 @@ pub(super) async fn run_recipe_sweep(
 ) -> Result<()> {
     // Fail on a bad recipe name before composing anything.
     if reg.find(name).is_none() {
-        return Err(anyhow!("recipe '{name}' not in catalog"));
+        return Err(anyhow!(
+            "recipe '{name}' not in catalog (see `blut recipe list`)"
+        ));
     }
     let dir = config_dir.ok_or_else(|| anyhow!("--config-dir is required in config/sweep mode"))?;
     let cfg_name =

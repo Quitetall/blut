@@ -182,7 +182,7 @@ pub fn acquire_exclusive_at(
         if pid_alive(existing.pid) {
             return Err(Error::Other(format!(
                 "GPU held by '{}' (pid {}, kind {:?}, since unix {}). \
-                 Wait or pass --allow-evict.",
+                 Wait for it to finish (`blut jobs`), or stop it with `blut cancel <job>`.",
                 existing.holder, existing.pid, existing.kind, existing.since_unix
             )));
         }
@@ -343,9 +343,11 @@ mod tests {
             .expect_err("second acquire must fail");
         let msg = format!("{err}");
         assert!(msg.contains("first"), "msg should name the holder: {msg}");
+        // The hint must name commands that exist: `--allow-evict` is not a
+        // flag of any `blut` verb, yet the message used to suggest it.
         assert!(
-            msg.contains("--allow-evict"),
-            "msg should hint --allow-evict: {msg}"
+            msg.contains("blut cancel") && !msg.contains("--allow-evict"),
+            "msg should say how to free the lock: {msg}"
         );
     }
 

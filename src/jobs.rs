@@ -519,7 +519,7 @@ pub fn unix_to_ymdhms_pub(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
 pub fn resolve_job_id(query: &str) -> Result<String> {
     if query.trim().is_empty() {
         return Err(TrainError::other(
-            "job id is empty. Run `lamu-train jobs` to list.",
+            "job id is empty. Run `blut jobs` to list.",
         ));
     }
     let jobs = list_jobs()?;
@@ -530,7 +530,7 @@ pub fn resolve_job_id(query: &str) -> Result<String> {
     let prefix: Vec<_> = jobs.iter().filter(|j| j.id.starts_with(query)).collect();
     match prefix.len() {
         0 => Err(TrainError::other(format!(
-            "no job matches '{query}'. Run `lamu-train jobs` to list."
+            "no job matches '{query}'. Run `blut jobs` to list."
         ))),
         1 => Ok(prefix[0].id.clone()),
         n => {

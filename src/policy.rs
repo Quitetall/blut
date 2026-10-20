@@ -237,9 +237,7 @@ pub fn decide(
     inference_lock_held: bool,
 ) -> Decision {
     if !policy.enabled {
-        return Decision::Skip(
-            "auto-trigger disabled (run `lamu-train policy enable` to opt in)".into(),
-        );
+        return Decision::Skip("auto-trigger disabled (run `blut policy enable` to opt in)".into());
     }
     let (start, end) = match parse_quiet_hours(&policy.quiet_hours) {
         Ok(p) => p,
