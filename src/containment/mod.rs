@@ -154,9 +154,8 @@ pub trait Containment: Send + Sync {
     ///
     /// Default `Ok(())`: the Unix backends contain the child before `exec`
     /// (wrapper binary or `pre_exec` hook) and need nothing afterwards. The
-    /// Windows Job Object backend spawns the child suspended and assigns it to
-    /// the job here before letting it run, so skipping this call there leaves
-    /// the child suspended forever rather than running it uncapped.
+    /// Windows Job Object backend assigns the child (started suspended by
+    /// [`Containment::before_spawn`]) to the job here, then lets it run.
     fn after_spawn(
         &self,
         _child: &tokio::process::Child,
@@ -164,6 +163,12 @@ pub trait Containment: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Adjust the wrapped command immediately before it is spawned. Default
+    /// no-op. The Windows Job Object backend starts the child suspended so
+    /// [`Containment::after_spawn`] can assign it before it runs.
+    /// [`spawn_attached`] calls both.
+    fn before_spawn(&self, _command: &mut tokio::process::Command) {}
 
     /// Parse a peak from a stderr line (StderrLine backends). Default `None`.
     fn parse_peak(&self, _line: &str) -> Option<u64> {
@@ -200,6 +205,7 @@ pub async fn spawn_attached(
     command: &mut tokio::process::Command,
     teardown: &TeardownHandle,
 ) -> Result<tokio::process::Child> {
+    backend.before_spawn(command);
     let mut child = command
         .spawn()
         .map_err(|e| crate::error::TrainError::other(format!("containment spawn: {e}")))?;
