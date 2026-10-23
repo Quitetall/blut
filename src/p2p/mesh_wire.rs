@@ -231,7 +231,17 @@ pub async fn read_frame(stream: &mut quinn::RecvStream) -> Result<MeshFrame, Tra
         .read_exact(&mut version)
         .await
         .map_err(|e| TrainError::other(format!("read frame version: {e}")))?;
-    check_frame_version(version[0])?;
+    read_frame_after_version(version[0], stream).await
+}
+
+/// The rest of [`read_frame`] once its version byte has been read. The node's
+/// stream router reads that first byte itself to tell a mesh frame from an
+/// object-plane stream ([`crate::p2p::objects::OBJECT_STREAM_TAG`]).
+pub(crate) async fn read_frame_after_version(
+    version: u8,
+    stream: &mut quinn::RecvStream,
+) -> Result<MeshFrame, TrainError> {
+    check_frame_version(version)?;
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)

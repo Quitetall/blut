@@ -7,7 +7,7 @@ Evidence ledger for engine `0.2.0-alpha.2`. Status means:
   tested; no scale claim.
 - **Deferred:** unsupported in public preview.
 
-Last updated: 2026-10-20.
+Last updated: 2026-10-23.
 
 Nothing in the table below changed when the crates were published on
 2026-08-27. Publication moves code, not evidence: every row still says exactly
@@ -28,7 +28,8 @@ first if you are deciding whether to depend on this.
 | P2P dispatch between separate network namespaces | Validated | Two containers, own IPs, real QUIC over a bridge — see below |
 | P2P dispatch between independent hosts over the internet | Validated | Oregon ↔ France, both behind NAT, real QUIC over the public internet, 2026-10-20 — see below |
 | P2P under latency, loss, partition, NAT and clock skew | Validated (emulated) | Containers on one host; impairment emulated, not a real WAN, 2026-10-20 — see below |
-| P2P mesh across independent hosts (`p2p node`) | Validated (connectivity + signed dispatch) | Four hosts on four continents, every node probing every other, 12/12, 2026-10-20 — see below. Real stage data over the mesh needs a shared cache and is not covered |
+| P2P mesh across independent hosts (`p2p node`) | Validated (connectivity + signed dispatch) | Four hosts on four continents, every node probing every other, 12/12, 2026-10-20 — see below. Gossip and stage data over the mesh were not part of that run |
+| P2P mesh gossip and stage data without a shared cache | Validated (network namespaces) | Four containers on one bridge: a node seeded with one peer learned the other two by gossip and probed all three; 48 MiB of stage data moved to a worker with an empty cache and back, verified, 2026-10-23 — see below. Not yet run between independent hosts |
 | Cloud queue over local object storage | Validated | `blut cloud smoke` round-trip through the shipped cookbook binary, 2026-09-19 |
 | Network object storage (S3-compatible) | Validated (MinIO) | `s3` feature; full cloud round-trip against MinIO over HTTP, 2026-09-20. Backblaze B2 over TLS refused: no conditional writes, 2026-10-20 — see below |
 | `blut-worker` REST prototype | Deleted (ADR 0083 M3) | Superseded by `src/cloud` + the `blut-web` sidecar |
@@ -153,6 +154,56 @@ can reach.
 - NAT traversal relied on a provider port forward on the coordinator; there
   was no hole punching.
 
+## Using the mesh (`blut p2p node`)
+
+Each machine runs `blut p2p keys generate` once and then `blut p2p node`. Pass
+peers as `addr@pubkey`, where `pubkey` is the `pubkey` line printed by
+`blut p2p keys show` on that peer. The command needs a build with the `p2p`
+feature.
+
+**Finding peers.** One `--seed` is enough. Nodes exchange signed peer lists
+(gossip) on connect and every `--gossip-interval` seconds (30 by default), and
+dial what they learn. Each dial pins the key the peer was advertised with, so
+a learned address can only reach that identity. Gossip never changes a peer's
+trust, and `--no-gossip` turns it off.
+
+**Addresses.** Normally nothing needs setting. A node advertises its listen
+address; with a wildcard listen address such as `0.0.0.0:9320`, each peer
+fills in the IP it actually sees the node on. Behind NAT or a port forward
+whose public port differs from the listen port, give the public address:
+`--advertise 203.0.113.9:40001`.
+
+**Checking the mesh.** `blut p2p node --seed <one peer> --probe` dials the
+seed, waits `--discover-secs` (5 by default) for gossip, then sends a signed
+task to every connected peer, learned ones included. It exits 0 only if all
+of them answer. A long-running node logs a `mesh: N connected, M known: …`
+line whenever its view changes.
+
+**Moving stage data.**
+- **Worker:** start it with `--coordinator-pubkey <dispatcher pubkey>`. It
+  runs stages only for that dispatcher.
+- **Dispatcher:** run
+
+  ```
+  blut p2p node --seed <one peer> --dispatch-stage p2p-echo \
+      --input big.txt --to <worker id prefix> --out result.txt
+  ```
+- **What happens:** the worker fetches the input from the dispatcher by
+  content id, runs the stage and returns a signed result. The dispatcher then
+  fetches and verifies the output.
+- **Access:** an object is served only to the peer it was granted to (the
+  task's worker, or the dispatching peer for an output).
+- **Verification:** every chunk and the whole object are hash-checked before
+  anything is used or stored.
+- **Limits:** `--max-object-mb` (default 2048) caps what a node fetches.
+- **Shared storage:** nodes with shared storage can pass the same
+  `--shared-store <dir|file://…|s3://…>`, and an object already there is not
+  transferred. `s3://` needs the `s3` feature.
+
+`--dispatch-stage` builds its input from a file, which only the built-in
+`p2p-echo` stage (UTF-8 text in, uppercase out) accepts. Library callers
+dispatch any stage with `blut::p2p::dispatch_stage`.
+
 ## Recorded run: a four-continent P2P mesh (2026-10-20)
 
 Four rented machines in Nevada (US), Germany, South Korea and Australia. Each
@@ -183,12 +234,82 @@ and a message naming the presented and pinned keys.
 
 **Boundaries.**
 - The mesh's built-in worker answers a connectivity task; it does not move
-  stage data. Real stages over the mesh (`--coordinator-pubkey` on a worker
-  node) read and write a content-addressed cache that every node must share,
-  and none was shared here.
+  stage data. At the time, real stages over the mesh (`--coordinator-pubkey`
+  on a worker node) read and wrote a content-addressed cache that every node
+  had to share, and none was shared here. Since 2026-10-23 objects move over
+  the mesh instead (recorded below, not yet between independent hosts).
 - Stage data across the internet is covered by the coordinator/worker path
   above.
 - Gossip (peer exchange) was not exercised.
+
+## Recorded run: mesh gossip and stage data across network namespaces (2026-10-23)
+
+**Setup.**
+- **Nodes:** four containers (A, B, C, D) on one user-defined bridge, each with
+  its own network namespace, IP address, identity and data directory. There is
+  no shared filesystem.
+- **Binary:** a static musl build of `blut` with the `p2p` feature, through a
+  throwaway driver crate that calls `blut::cli::run`.
+- **Topology:** every node listened on `0.0.0.0:9320` with
+  `--gossip-interval 5`. B, C and D were each given only A as `--seed`; nobody
+  was told about anyone else.
+
+**Phase 1: gossip and probe.** All workers were smoke workers. D ran
+`p2p node --seed A --probe`:
+
+```
+mesh: 3 connected, 3 known: 0fef…@172.29.77.2:9320(seed,up) 298d…@172.29.77.3:9320(gossip,up) e1ab…@172.29.77.4:9320(gossip,up)
+probe 172.29.77.2:9320 (seed): ok, peer 0fefcf03eb92249f ran a signed task in 1 ms
+probe 172.29.77.3:9320 (gossip): ok, peer 298d1e6e0faaf514 ran a signed task in 0 ms
+probe 172.29.77.4:9320 (gossip): ok, peer e1abae2bdcb9418f ran a signed task in 0 ms
+probe: all 3 connected peers answered (1 seeds, 2 learned, 0 known but not connected)
+```
+
+D learned B and C from A's signed exchange, dialed them with the keys A
+advertised, and each answered a signed task. Exit 0 in 1.1 s wall. Nodes
+advertised a wildcard address, and each receiver filled in the IP it saw.
+
+**Phase 2: stage data.**
+- **Workers:** B and C were restarted with `--coordinator-pubkey <D>`, and C's
+  store was emptied.
+- **Dispatcher:** D, again seeded only with A, ran
+  `p2p node --dispatch-stage p2p-echo --input in.txt --to <C id prefix>`.
+- **Input:** 50,331,648 bytes of base64 text, which spans several 12 MiB
+  transfer chunks.
+
+| Run | State | Publish | Dispatch → signed result | Output back | Total |
+|---|---|---|---|---|---|
+| 1 | C and D cold | 154 ms | 835 ms (C fetched the input from D: 50,332,230 bytes in 299 ms; stage 89 ms) | fetched from C, 852 ms | 1.85 s |
+| 2 | both warm | 196 ms | 453 ms (input already in C's store, not fetched) | already in D's store, 1,249 ms | 1.90 s |
+| 3 | C warm, D's store emptied | 132 ms | 420 ms (not fetched) | fetched from C, 2,859 ms | 3.41 s |
+
+Each run printed `verified: output == uppercase(input), signed by
+e1abae2bdcb9418f`. Outside BLUT, `sha256(uppercase(in.txt))` and
+`sha256(out.txt)` were equal (`7c963444…be1ba`). B's store never received the
+input.
+
+**Environment.** Kernel 7.3.0-3-cachyos, Docker 29.9.2, `archlinux@sha256:8b15f4618d79`,
+bridge 172.29.77.0/24, 2 GiB memory per container. Data directories were on
+`tmpfs`.
+
+**Why tmpfs.** The host disk was saturated by another job: IO pressure "full"
+was about 45%, and one synchronous 12 MiB write took 1.2–7.9 s. On the
+disk-backed first attempt, the same cold dispatch took 75 s (C's input fetch
+alone took 72 s). Some dials also timed out, because the peer registry is
+fsynced while an inbound handshake is in progress. The tmpfs run measures the
+protocol; the disk-backed numbers are what a node on a disk that slow will
+see.
+
+**What it found.** The node completed inbound handshakes one at a time, so a
+slow or silent handshake held up every other peer. It also served only the
+connections it accepted, and a malformed frame ended service of the whole
+connection. All three are fixed (see the changelog). The gossip loop could
+also dial a seed a second time while the first explicit dial was still in
+flight; a dial in progress now blocks a duplicate.
+
+**Boundaries.** One host and one bridge: no NAT, no loss, no latency, and no
+separate machines. `--advertise` was not needed and was not exercised.
+`--shared-store s3://` was not exercised over the mesh.
 
 ## Recorded run: hostile conditions on a real WAN (2026-10-20)
 
@@ -579,8 +700,9 @@ on the validation host.
 - Mid-stage checkpoint resume for long training stages. Node loss, durable
   resume, replica hashes, topology, versions and global-batch parity are
   recorded above.
-- Stage data over the N-node mesh, which needs a cache shared by the nodes;
-  gossip; and fairness of the BBR opt-in against competing traffic. Two-host
+- Gossip and stage data over the N-node mesh between independent hosts (run
+  so far only across network namespaces on one host), and fairness of the BBR
+  opt-in against competing traffic. Two-host
   dispatch, a four-continent mesh probe, the emulated matrix and real-WAN
   impairment are recorded above.
 - Run the S3 path against AWS S3 (or another provider with conditional writes)

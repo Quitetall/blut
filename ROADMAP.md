@@ -33,8 +33,9 @@ dispatch. Stage data and results have crossed the internet between continents,
 and a four-continent `p2p node` mesh answered 12 of 12 signed probes. Loss,
 latency, partition, NAT and clock skew have run emulated, and loss and
 partition have run on a real WAN; the real-WAN runs led to the opt-in BBR
-controller. Still missing: stage data over the N-node mesh (it needs a shared
-cache) and gossip.
+controller. Gossip and stage data over the mesh without a shared cache are
+built and have run across network namespaces on one host. Still missing: the
+same run between independent hosts.
 
 **3. Network object storage.** The `s3` feature round-trips against MinIO,
 over plain HTTP and over TLS with certificate verification enforced. Backblaze

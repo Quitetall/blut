@@ -21,6 +21,7 @@ pub mod introduction;
 pub mod mesh_runner;
 pub mod mesh_wire;
 pub mod node;
+pub mod objects;
 pub mod peer;
 pub mod peer_exec;
 pub mod privacy;
@@ -38,11 +39,14 @@ pub use dispatch::{DefaultDispatchPolicy, DispatchPolicy, DispatchVerdict};
 pub use fedround::{CollectedDelta, FedRoundConfig, RoundOutcome, finalize_round};
 pub use gossip::{PeerExchange, PeerRecord};
 pub use introduction::{IntroError, Introduction, MAX_INTRODUCED_TRUST};
-pub use mesh_runner::SharedCacheRunner;
+pub use mesh_runner::{MeshDispatch, SharedCacheRunner, dispatch_stage};
 pub use mesh_wire::{
     MeshFrame, MeshHello, PROTOCOL_VERSION, Wire, accept_request, mesh_request, negotiate,
 };
-pub use node::{MeshNode, MeshTaskRunner, NodeCapabilities};
+pub use node::{
+    GossipConfig, MeshNode, MeshPeerView, MeshTaskRunner, NodeCapabilities, PeerSource, TaskOrigin,
+};
+pub use objects::MeshObjects;
 pub use peer::{PeerCapabilities, PeerId, PeerInfo};
 pub use privacy::{DpConfig, GradientStatus, PrivacyLedger, gate_gradient_dispatch};
 pub use registry::PeerRegistry;

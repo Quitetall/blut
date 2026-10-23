@@ -80,11 +80,66 @@ pub(super) enum P2pCommand {
         /// Identity key file (defaults to the standard p2p key path).
         #[arg(long)]
         key: Option<std::path::PathBuf>,
-        /// Probe the mesh and exit instead of running: dial every seed,
-        /// dispatch one signed connectivity task to each, verify each signed
-        /// reply, print one line per seed, and exit 0 only if all answered.
+        /// Probe the mesh and exit instead of running: dial every seed, let
+        /// gossip find the rest for `--discover-secs`, dispatch one signed
+        /// connectivity task to every connected peer (seeds and learned ones),
+        /// verify each signed reply, print one line per peer, and exit 0 only
+        /// if every seed connected and every peer answered.
         #[arg(long, default_value_t = false)]
         probe: bool,
+        /// The address to advertise for this node in gossip (host:port). Needed
+        /// behind NAT or a port forward whose public port differs from the
+        /// listen port. Default: the listen address; a wildcard listen address
+        /// is advertised as "my listen port at the IP you see me on".
+        #[arg(long)]
+        advertise: Option<String>,
+        /// Don't exchange peer addresses (gossip): know only the seeds.
+        #[arg(long, default_value_t = false)]
+        no_gossip: bool,
+        /// Seconds between gossip pushes to every connected peer (a push also
+        /// goes to each new connection immediately).
+        #[arg(long, default_value_t = 30)]
+        gossip_interval: u64,
+        /// Stop dialing learned peers once this many are connected.
+        #[arg(long, default_value_t = 32)]
+        max_peers: usize,
+        /// With `--probe` / `--dispatch-stage`: seconds to let gossip learn
+        /// and connect peers before acting (ends early once every known peer
+        /// is connected).
+        #[arg(long, default_value_t = 5)]
+        discover_secs: u64,
+        /// The content-addressed store stage data is published to and served
+        /// from: a directory, or a `file://` / `s3://bucket/prefix` URL (URLs
+        /// need the `s3` feature). Default: `<data_dir>/p2p/shared-cache`, a
+        /// local directory; nodes need not share it, objects move over the
+        /// mesh.
+        #[arg(long)]
+        shared_store: Option<String>,
+        /// Largest object (MiB) this node fetches from a peer.
+        #[arg(long, default_value_t = 2048)]
+        max_object_mb: u64,
+        /// Dispatch a real stage over the mesh and exit: publish `--input`,
+        /// send a signed task to `--to`, which fetches the input from this node,
+        /// runs the stage and returns a signed result; then fetch and verify
+        /// the output. Only the built-in `p2p-echo` (UTF-8 text in, uppercase
+        /// out) can be built from a file here.
+        #[arg(long, requires_all = ["input", "to"])]
+        dispatch_stage: Option<String>,
+        /// Input file for `--dispatch-stage` (UTF-8 text for `p2p-echo`).
+        #[arg(long)]
+        input: Option<std::path::PathBuf>,
+        /// The peer to dispatch to: a peer id (or unique prefix) of a connected
+        /// or learned peer, or `addr@pubkey-hex`.
+        #[arg(long)]
+        to: Option<String>,
+        /// Write the verified output here (otherwise only its size and hash
+        /// are printed).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Bound on the worker's input fetch + stage run, and on the output
+        /// fetch, in seconds.
+        #[arg(long, default_value_t = 600)]
+        timeout_secs: u64,
     },
     /// Peer registry: list / set-trust / remove.
     Peers {
@@ -308,26 +363,58 @@ pub(super) async fn run_p2p_cmd(
             coordinator_pubkey,
             key,
             probe,
+            advertise,
+            no_gossip,
+            gossip_interval,
+            max_peers,
+            discover_secs,
+            shared_store,
+            max_object_mb,
+            dispatch_stage,
+            input,
+            to,
+            out,
+            timeout_secs,
         } => {
             let path = key.map(Ok).unwrap_or_else(default_key_path)?;
             let kp = std::sync::Arc::new(load_keypair(&path)?);
-            if probe && no_scheduler {
+            if (probe || dispatch_stage.is_some()) && no_scheduler {
                 return Err(anyhow!(
-                    "--probe dispatches tasks, so it needs the scheduler capability; drop --no-scheduler"
+                    "--probe and --dispatch-stage dispatch tasks, so they need the scheduler \
+                     capability; drop --no-scheduler"
                 ));
             }
-            run_p2p_node(
-                reg,
+            if probe && dispatch_stage.is_some() {
+                return Err(anyhow!("use --probe or --dispatch-stage, not both"));
+            }
+            let dispatch = match dispatch_stage {
+                Some(stage) => Some(NodeDispatch {
+                    stage,
+                    input: input.ok_or_else(|| anyhow!("--dispatch-stage needs --input"))?,
+                    to: to.ok_or_else(|| anyhow!("--dispatch-stage needs --to"))?,
+                    out,
+                    timeout: std::time::Duration::from_secs(timeout_secs.max(1)),
+                }),
+                None => None,
+            };
+            let opts = NodeOptions {
                 listen,
                 seeds,
-                !no_worker,
-                !no_scheduler,
-                allow_legacy_peers,
+                worker: !no_worker,
+                scheduler: !no_scheduler,
+                allow_legacy: allow_legacy_peers,
                 coordinator_pubkey,
-                kp,
                 probe,
-            )
-            .await
+                advertise,
+                gossip: !no_gossip,
+                gossip_interval: std::time::Duration::from_secs(gossip_interval.max(1)),
+                max_peers: max_peers.max(1),
+                discover: std::time::Duration::from_secs(discover_secs),
+                shared_store,
+                max_object_bytes: max_object_mb.max(1).saturating_mul(1024 * 1024),
+                dispatch,
+            };
+            run_p2p_node(reg, opts, kp).await
         }
         P2pCommand::Peers { cmd } => {
             let reg_path = default_registry_path()?;
@@ -753,60 +840,190 @@ impl crate::p2p::node::MeshTaskRunner for SmokeRunner {
     }
 }
 
-/// Run a symmetric mesh node until Ctrl-C (ADR 0079 A3).
+/// `p2p node --dispatch-stage` parameters.
 #[cfg(feature = "p2p")]
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_p2p_node(
-    reg: crate::framework::Registry,
+#[derive(Debug)]
+pub(super) struct NodeDispatch {
+    stage: String,
+    input: std::path::PathBuf,
+    to: String,
+    out: Option<std::path::PathBuf>,
+    timeout: std::time::Duration,
+}
+
+/// Everything `p2p node` was asked to do.
+#[cfg(feature = "p2p")]
+#[derive(Debug)]
+pub(super) struct NodeOptions {
     listen: String,
     seeds: Vec<String>,
     worker: bool,
     scheduler: bool,
     allow_legacy: bool,
     coordinator_pubkey: Option<String>,
-    keypair: std::sync::Arc<crate::p2p::crypto::KeyPair>,
     probe: bool,
-) -> Result<()> {
-    use crate::p2p::node::{MeshNode, MeshTaskRunner, NodeCapabilities};
-    use crate::p2p::registry::PeerRegistry;
+    advertise: Option<String>,
+    gossip: bool,
+    gossip_interval: std::time::Duration,
+    max_peers: usize,
+    discover: std::time::Duration,
+    shared_store: Option<String>,
+    max_object_bytes: u64,
+    dispatch: Option<NodeDispatch>,
+}
 
-    let sockaddr: std::net::SocketAddr = listen
+/// Decode an Ed25519 key given as 64 hex, or as the whole 128-hex `pubkey`
+/// line of `blut p2p keys show` (Ed25519 ‖ X25519; the first half is used).
+#[cfg(feature = "p2p")]
+fn parse_ed25519_hex(what: &str, hex: &str) -> Result<ed25519_dalek::VerifyingKey> {
+    let hex = hex.trim();
+    if hex.len() != 64 && hex.len() != 128 {
+        return Err(anyhow!(
+            "{what} must be 64 or 128 hex characters (the `pubkey` line of \
+             `blut p2p keys show`); got {}",
+            hex.len()
+        ));
+    }
+    let mut kbytes = [0u8; 32];
+    faster_hex::hex_decode(&hex.as_bytes()[..64], &mut kbytes)
+        .map_err(|e| anyhow!("{what} hex: {e}"))?;
+    ed25519_dalek::VerifyingKey::from_bytes(&kbytes)
+        .map_err(|e| anyhow!("{what}: invalid Ed25519 key: {e}"))
+}
+
+/// Open the store `--shared-store` names (default: a local directory).
+#[cfg(feature = "p2p")]
+fn open_node_store(spec: Option<&str>) -> Result<crate::framework::object_store::ObjectStore> {
+    use crate::framework::object_store::ObjectStore;
+    let Some(spec) = spec else {
+        return Ok(ObjectStore::filesystem(
+            paths::data_dir()?.join("p2p").join("shared-cache"),
+        ));
+    };
+    if spec.contains("://") {
+        #[cfg(feature = "s3")]
+        {
+            return ObjectStore::from_url(spec, "").map_err(|e| anyhow!("--shared-store: {e}"));
+        }
+        #[cfg(not(feature = "s3"))]
+        {
+            return Err(anyhow!(
+                "--shared-store URLs need a build with the `s3` feature; give a directory instead"
+            ));
+        }
+    }
+    Ok(ObjectStore::filesystem(std::path::PathBuf::from(spec)))
+}
+
+/// Resolve `--advertise host:port` (an IP literal or a DNS name).
+#[cfg(feature = "p2p")]
+async fn resolve_advertise(spec: &str) -> Result<std::net::SocketAddr> {
+    resolve_coordinator(spec)
+        .await
+        .with_context(|| format!("--advertise '{spec}'"))
+}
+
+/// One line describing the mesh view, for the status log.
+#[cfg(feature = "p2p")]
+fn mesh_view_line(view: &[crate::p2p::node::MeshPeerView]) -> String {
+    let connected = view.iter().filter(|p| p.connected).count();
+    let peers: Vec<String> = view
+        .iter()
+        .map(|p| {
+            format!(
+                "{}@{}({}{})",
+                p.id.short(),
+                p.addr.map_or_else(|| "?".to_string(), |a| a.to_string()),
+                p.source.label(),
+                if p.connected { ",up" } else { "" }
+            )
+        })
+        .collect();
+    format!(
+        "mesh: {connected} connected, {} known: {}",
+        view.len(),
+        peers.join(" ")
+    )
+}
+
+/// Wait up to `window` for gossip to settle: return early once at least one
+/// peer is connected and every known, dialable peer is connected.
+#[cfg(feature = "p2p")]
+async fn discover(node: &crate::p2p::node::MeshNode, window: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + window;
+    // Give the first exchanges a moment even when everything is already up.
+    let settle = tokio::time::Instant::now() + window.min(std::time::Duration::from_secs(1));
+    loop {
+        let view = node.mesh_view().await;
+        let all_up = !view.is_empty() && view.iter().all(|p| p.connected || p.failures > 0);
+        let now = tokio::time::Instant::now();
+        if now >= deadline || (all_up && now >= settle) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Run a symmetric mesh node until Ctrl-C (ADR 0079 A3), or probe the mesh /
+/// dispatch one stage over it and exit.
+#[cfg(feature = "p2p")]
+pub(super) async fn run_p2p_node(
+    reg: crate::framework::Registry,
+    opts: NodeOptions,
+    keypair: std::sync::Arc<crate::p2p::crypto::KeyPair>,
+) -> Result<()> {
+    use crate::p2p::node::{GossipConfig, MeshNode, MeshTaskRunner, NodeCapabilities};
+    use crate::p2p::objects::MeshObjects;
+    use crate::p2p::registry::PeerRegistry;
+    use std::sync::Arc;
+
+    let sockaddr: std::net::SocketAddr = opts
+        .listen
         .parse()
-        .with_context(|| format!("parse listen addr '{listen}'"))?;
+        .with_context(|| format!("parse listen addr '{}'", opts.listen))?;
     let reg_path = p2p_cli::default_registry_path()?;
     let peers = PeerRegistry::load(&reg_path).map_err(|e| anyhow!("load peer registry: {e}"))?;
+    let reg = Arc::new(reg);
 
-    let caps = NodeCapabilities { worker, scheduler };
-    let runner: Option<std::sync::Arc<dyn MeshTaskRunner>> = if worker {
-        match &coordinator_pubkey {
-            // Real stage execution via the shared content-addressed cache.
+    // Every node has an object plane: a worker fetches inputs into it and
+    // serves outputs from it; a dispatcher publishes inputs into it.
+    let store = open_node_store(opts.shared_store.as_deref())?;
+    let objects = Arc::new(
+        MeshObjects::new(store.clone(), paths::data_dir()?.join("p2p").join("chunks"))
+            .with_max_object_bytes(opts.max_object_bytes),
+    );
+
+    let caps = NodeCapabilities {
+        worker: opts.worker,
+        scheduler: opts.scheduler,
+    };
+    let runner: Option<Arc<dyn MeshTaskRunner>> = if opts.worker {
+        match &opts.coordinator_pubkey {
+            // Real stage execution: inputs from the store, or fetched from the
+            // dispatching peer over the mesh.
             Some(hex) => {
-                use crate::framework::object_store::ObjectStore;
                 use crate::p2p::dispatch::{DefaultDispatchPolicy, DispatchPolicy};
                 use crate::p2p::mesh_runner::SharedCacheRunner;
                 use crate::p2p::trust::DispatchMatrix;
 
-                let mut kbytes = [0u8; 32];
-                faster_hex::hex_decode(hex.as_bytes(), &mut kbytes)
-                    .map_err(|e| anyhow!("--coordinator-pubkey hex: {e}"))?;
-                let coord = ed25519_dalek::VerifyingKey::from_bytes(&kbytes)
-                    .map_err(|e| anyhow!("--coordinator-pubkey: invalid Ed25519 key: {e}"))?;
-                let cache_dir = paths::data_dir()?.join("p2p").join("shared-cache");
+                let coord = parse_ed25519_hex("--coordinator-pubkey", hex)?;
                 let work_root = paths::data_dir()?.join("p2p").join("work");
-                let store = ObjectStore::filesystem(cache_dir);
-                let policy: std::sync::Arc<dyn DispatchPolicy> =
-                    std::sync::Arc::new(DefaultDispatchPolicy::new(DispatchMatrix::default()));
-                Some(std::sync::Arc::new(SharedCacheRunner::new(
-                    std::sync::Arc::new(reg),
-                    store,
-                    work_root,
-                    keypair.clone(),
-                    policy,
-                    coord,
-                )))
+                let policy: Arc<dyn DispatchPolicy> =
+                    Arc::new(DefaultDispatchPolicy::new(DispatchMatrix::default()));
+                Some(Arc::new(
+                    SharedCacheRunner::new(
+                        reg.clone(),
+                        store.clone(),
+                        work_root,
+                        keypair.clone(),
+                        policy,
+                        coord,
+                    )
+                    .with_mesh_objects(objects.clone()),
+                ))
             }
             // No scheduler pinned → the connectivity smoke runner.
-            None => Some(std::sync::Arc::new(SmokeRunner {
+            None => Some(Arc::new(SmokeRunner {
                 keypair: keypair.clone(),
             })),
         }
@@ -814,83 +1031,314 @@ pub(super) async fn run_p2p_node(
         None
     };
 
-    let node = MeshNode::bind(sockaddr, keypair.clone(), peers, caps, runner, allow_legacy)
-        .await
-        .map_err(|e| anyhow!("bind mesh node: {e}"))?;
+    let node = MeshNode::bind(
+        sockaddr,
+        keypair.clone(),
+        peers,
+        caps,
+        runner,
+        opts.allow_legacy,
+    )
+    .await
+    .map_err(|e| anyhow!("bind mesh node: {e}"))?;
+    node.set_objects(objects.clone());
+    if let Some(spec) = &opts.advertise {
+        node.set_advertise_addr(resolve_advertise(spec).await?);
+    }
     let bound = node.local_addr().map_err(|e| anyhow!("{e}"))?;
     eprintln!("mesh node {} listening on {bound}", node.node_id());
     eprintln!("pubkey       {}", p2p_pubkey_hex(&keypair));
-    let runner_mode = if !worker {
+    let runner_mode = if !opts.worker {
         "none"
-    } else if coordinator_pubkey.is_some() {
-        "shared-cache (real stages)"
+    } else if opts.coordinator_pubkey.is_some() {
+        "stages (inputs from the store or fetched over the mesh)"
     } else {
         "smoke (echo only)"
     };
-    eprintln!("capabilities worker={worker} scheduler={scheduler} allow_legacy={allow_legacy}");
+    eprintln!(
+        "capabilities worker={} scheduler={} allow_legacy={} gossip={}",
+        opts.worker, opts.scheduler, opts.allow_legacy, opts.gossip
+    );
     eprintln!("worker runner {runner_mode}");
+    if opts.gossip {
+        node.start_gossip(
+            GossipConfig::default()
+                .with_interval(opts.gossip_interval)
+                .with_max_peers(opts.max_peers),
+        );
+    }
 
     // Dial seeds (best-effort — a down/hung seed must not block the others, so
     // each dial is time-bounded).
-    let mut probe_failures = 0usize;
-    for spec in &seeds {
+    let mut seed_failures = 0usize;
+    for spec in &opts.seeds {
         match parse_seed(spec) {
             Ok((addr, pubkey)) => {
+                if let Err(e) = node.add_seed(addr, pubkey).await {
+                    seed_failures += 1;
+                    eprintln!("seed {addr}: {e}");
+                    continue;
+                }
                 let dial = node.connect_to(addr, pubkey);
                 match tokio::time::timeout(std::time::Duration::from_secs(10), dial).await {
-                    Ok(Ok(conn)) => {
-                        eprintln!("connected to seed {addr}");
-                        if probe {
-                            let started = std::time::Instant::now();
-                            match probe_peer(&node, &conn, &keypair, &pubkey).await {
-                                Ok(peer) => println!(
-                                    "probe {addr}: ok, peer {peer} ran a signed task in {} ms",
-                                    started.elapsed().as_millis()
-                                ),
-                                Err(e) => {
-                                    probe_failures += 1;
-                                    println!("probe {addr}: FAILED: {e}");
-                                }
-                            }
-                            conn.close(0u32.into(), b"probe done");
-                        }
-                    }
+                    Ok(Ok(_)) => eprintln!("connected to seed {addr}"),
                     Ok(Err(e)) => {
-                        probe_failures += 1;
+                        seed_failures += 1;
                         eprintln!("seed {addr}: {e}");
                     }
                     Err(_) => {
-                        probe_failures += 1;
+                        seed_failures += 1;
                         eprintln!("seed {addr}: dial timed out");
                     }
                 }
             }
             Err(e) => {
-                probe_failures += 1;
+                seed_failures += 1;
                 eprintln!("bad --seed '{spec}': {e}");
             }
         }
     }
-    if probe {
-        if seeds.is_empty() {
+
+    if opts.probe {
+        if opts.seeds.is_empty() {
             return Err(anyhow!("--probe needs at least one --seed to probe"));
         }
-        return if probe_failures == 0 {
-            println!("probe: all {} seeds answered", seeds.len());
+        if opts.gossip {
+            discover(&node, opts.discover).await;
+        }
+        let view = node.mesh_view().await;
+        eprintln!("{}", mesh_view_line(&view));
+        let mut failures = seed_failures;
+        let mut probed = 0usize;
+        for peer in view.iter().filter(|p| p.connected) {
+            let (Some(conn), Some(key)) = (
+                node.connection_to(&peer.id).await,
+                node.peer_pubkey(&peer.id).await,
+            ) else {
+                continue;
+            };
+            probed += 1;
+            let addr = peer.addr.map_or_else(|| "?".to_string(), |a| a.to_string());
+            let started = std::time::Instant::now();
+            match probe_peer(&node, &conn, &keypair, &key.to_bytes()).await {
+                Ok(id) => println!(
+                    "probe {addr} ({}): ok, peer {id} ran a signed task in {} ms",
+                    peer.source.label(),
+                    started.elapsed().as_millis()
+                ),
+                Err(e) => {
+                    failures += 1;
+                    println!("probe {addr} ({}): FAILED: {e}", peer.source.label());
+                }
+            }
+        }
+        let unreached = view.iter().filter(|p| !p.connected).count();
+        return if failures == 0 && probed > 0 {
+            println!(
+                "probe: all {probed} connected peers answered ({} seeds, {} learned, {unreached} known but not connected)",
+                opts.seeds.len(),
+                probed.saturating_sub(opts.seeds.len())
+            );
             Ok(())
         } else {
             Err(anyhow!(
-                "probe: {probe_failures} of {} seeds failed",
-                seeds.len()
+                "probe: {failures} failed of {probed} probed peers and {} seeds",
+                opts.seeds.len()
             ))
         };
     }
 
+    if let Some(d) = &opts.dispatch {
+        if opts.gossip {
+            discover(&node, opts.discover).await;
+        }
+        eprintln!("{}", mesh_view_line(&node.mesh_view().await));
+        return run_node_dispatch(&node, &objects, &reg, &keypair, d).await;
+    }
+
     eprintln!("node running — Ctrl-C to stop");
+    let status = {
+        let node = node.clone();
+        tokio::spawn(async move {
+            let mut last = String::new();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let line = mesh_view_line(&node.mesh_view().await);
+                if line != last {
+                    eprintln!("{line}");
+                    last = line;
+                }
+            }
+        })
+    };
     if let Err(e) = tokio::signal::ctrl_c().await {
         eprintln!("signal wait failed: {e}");
     }
+    status.abort();
     eprintln!("shutting down mesh node");
+    Ok(())
+}
+
+/// Find the peer `--to` names: `addr@pubkey` (dialed directly), or a peer id
+/// / unique id prefix the node already knows.
+#[cfg(feature = "p2p")]
+async fn resolve_dispatch_target(
+    node: &crate::p2p::node::MeshNode,
+    to: &str,
+) -> Result<(
+    crate::p2p::peer::PeerId,
+    quinn::Connection,
+    ed25519_dalek::VerifyingKey,
+)> {
+    if to.contains('@') {
+        let (addr, pubkey) = parse_seed(to)?;
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&pubkey)
+            .map_err(|e| anyhow!("--to pubkey: {e}"))?;
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            node.connect_to(addr, pubkey),
+        )
+        .await
+        .map_err(|_| anyhow!("--to {addr}: dial timed out"))?
+        .map_err(|e| anyhow!("--to {addr}: {e}"))?;
+        return Ok((crate::p2p::peer::PeerId::from_pubkey(&key), conn, key));
+    }
+    let needle = to.to_lowercase();
+    let view = node.mesh_view().await;
+    let matches: Vec<_> = view
+        .iter()
+        .filter(|p| p.id.to_string().starts_with(&needle))
+        .collect();
+    let peer = match matches.as_slice() {
+        [one] => *one,
+        [] => {
+            return Err(anyhow!(
+                "--to '{to}' matches no known peer ({})",
+                mesh_view_line(&view)
+            ));
+        }
+        _ => {
+            return Err(anyhow!(
+                "--to '{to}' is ambiguous ({} peers)",
+                matches.len()
+            ));
+        }
+    };
+    let key = node
+        .peer_pubkey(&peer.id)
+        .await
+        .ok_or_else(|| anyhow!("no pinned key for {}", peer.id))?;
+    let conn = match node.connection_to(&peer.id).await {
+        Some(conn) => conn,
+        None => {
+            let addr = peer
+                .addr
+                .ok_or_else(|| anyhow!("{} has no known address", peer.id))?;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                node.connect_to(addr, key.to_bytes()),
+            )
+            .await
+            .map_err(|_| anyhow!("dial {} at {addr}: timed out", peer.id))?
+            .map_err(|e| anyhow!("dial {} at {addr}: {e}", peer.id))?
+        }
+    };
+    Ok((peer.id.clone(), conn, key))
+}
+
+/// `p2p node --dispatch-stage`: one real stage over the mesh, data included.
+#[cfg(feature = "p2p")]
+async fn run_node_dispatch(
+    node: &crate::p2p::node::MeshNode,
+    objects: &crate::p2p::objects::MeshObjects,
+    reg: &crate::framework::Registry,
+    keypair: &crate::p2p::crypto::KeyPair,
+    d: &NodeDispatch,
+) -> Result<()> {
+    use crate::framework::ContentHash;
+    use crate::framework::stage::ErasedArtifact;
+    use crate::p2p::smoke::{SMOKE_STAGE, SmokeText};
+
+    if d.stage != SMOKE_STAGE {
+        return Err(anyhow!(
+            "--dispatch-stage builds its input from a file, which only the built-in \
+             `{SMOKE_STAGE}` stage takes; got '{}'",
+            d.stage
+        ));
+    }
+    let text = std::fs::read_to_string(&d.input)
+        .with_context(|| format!("read --input {} (UTF-8 text)", d.input.display()))?;
+    let (peer, conn, key) = resolve_dispatch_target(node, &d.to).await?;
+
+    // Bundle from a private copy so the artifact root holds only the input.
+    let src = tempfile::tempdir().context("dispatch src dir")?;
+    let in_path = src.path().join("p2p-echo-in.txt");
+    std::fs::write(&in_path, text.as_bytes()).context("stage input copy")?;
+    let input = SmokeText {
+        content_hash: ContentHash::hash_file(&in_path).context("hash input")?,
+        path: in_path,
+    };
+    let input = ErasedArtifact::from_typed(&input).map_err(|e| anyhow!("erase input: {e}"))?;
+    let out_dir = tempfile::tempdir().context("dispatch out dir")?;
+    eprintln!(
+        "dispatching '{}' to {peer}: {} input bytes",
+        d.stage,
+        text.len()
+    );
+    let started = std::time::Instant::now();
+    let done = crate::p2p::mesh_runner::dispatch_stage(
+        node,
+        objects,
+        reg,
+        keypair,
+        &conn,
+        &key,
+        &d.stage,
+        input,
+        src.path(),
+        serde_json::json!({}),
+        d.timeout,
+        out_dir.path(),
+    )
+    .await
+    .map_err(|e| anyhow!("dispatch to {peer}: {e}"))?;
+    let total = started.elapsed();
+    let out: SmokeText = done
+        .output
+        .into_typed()
+        .map_err(|e| anyhow!("decode output: {e}"))?;
+    let body = std::fs::read(&out.path).context("read output")?;
+    let verified = body == text.to_uppercase().as_bytes();
+    println!(
+        "dispatch {} to {peer}: input {} bytes (content id {}), output {} bytes sha256 {}",
+        d.stage,
+        text.len(),
+        done.input_content_id,
+        body.len(),
+        ContentHash::of_bytes(&body).to_hex()
+    );
+    println!(
+        "timing: publish {} ms, remote fetch+run {} ms (stage {} ms), output {} {} ms, total {} ms",
+        done.publish.as_millis(),
+        done.remote.as_millis(),
+        done.result.wall_time_ms,
+        if done.output_fetched {
+            "fetched over the mesh in"
+        } else {
+            "read from the shared store in"
+        },
+        done.output_fetch.as_millis(),
+        total.as_millis()
+    );
+    if let Some(path) = &d.out {
+        std::fs::write(path, &body).with_context(|| format!("write --out {}", path.display()))?;
+    }
+    if !verified {
+        return Err(anyhow!(
+            "output is not uppercase(input): verification FAILED"
+        ));
+    }
+    println!("verified: output == uppercase(input), signed by {peer}");
     Ok(())
 }
 
@@ -970,6 +1418,57 @@ mod p2p_cli_tests {
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn node_parses_gossip_and_dispatch_flags() {
+        match p2p_of(&[
+            "blut",
+            "p2p",
+            "node",
+            "--advertise",
+            "203.0.113.9:40000",
+            "--gossip-interval",
+            "5",
+            "--max-peers",
+            "4",
+            "--shared-store",
+            "/srv/store",
+            "--dispatch-stage",
+            "p2p-echo",
+            "--input",
+            "in.txt",
+            "--to",
+            "abcd",
+        ]) {
+            P2pCommand::Node {
+                advertise,
+                no_gossip,
+                gossip_interval,
+                max_peers,
+                shared_store,
+                dispatch_stage,
+                input,
+                to,
+                discover_secs,
+                ..
+            } => {
+                assert_eq!(advertise.as_deref(), Some("203.0.113.9:40000"));
+                assert!(!no_gossip, "gossip is on by default");
+                assert_eq!(gossip_interval, 5);
+                assert_eq!(max_peers, 4);
+                assert_eq!(shared_store.as_deref(), Some("/srv/store"));
+                assert_eq!(dispatch_stage.as_deref(), Some("p2p-echo"));
+                assert_eq!(input.unwrap().to_str(), Some("in.txt"));
+                assert_eq!(to.as_deref(), Some("abcd"));
+                assert_eq!(discover_secs, 5);
+            }
+            other => panic!("got {other:?}"),
+        }
+        // --dispatch-stage without --input / --to does not parse.
+        assert!(
+            Cli::try_parse_from(["blut", "p2p", "node", "--dispatch-stage", "p2p-echo"]).is_err()
+        );
     }
 
     #[test]
@@ -1145,6 +1644,24 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn coordinator_pubkey_accepts_both_key_forms() {
+        let kp = crate::p2p::crypto::KeyPair::generate();
+        let full = p2p_pubkey_hex(&kp);
+        let a = parse_ed25519_hex("k", &full).unwrap();
+        let b = parse_ed25519_hex("k", &full[..64]).unwrap();
+        assert_eq!(a, kp.verifying);
+        assert_eq!(b, kp.verifying);
+        assert!(parse_ed25519_hex("k", "abcd").is_err());
+    }
+
+    #[test]
+    fn shared_store_defaults_to_a_directory_and_gates_urls() {
+        assert!(open_node_store(Some("/tmp/x")).is_ok());
+        let url = open_node_store(Some("ftp://nope"));
+        assert!(url.is_err());
+    }
 
     #[test]
     fn connect_hint_never_names_a_wildcard_bind() {

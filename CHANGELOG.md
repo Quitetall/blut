@@ -40,6 +40,49 @@ train shares one exact version.
   each, verify each signed reply against the seed's pinned key, print one line
   per seed, and exit 0 only if all answered. Until now no shipped command could
   dispatch over the mesh: `p2p node` connected to its seeds and waited.
+- Peer exchange (gossip) in `blut p2p node`, on by default (`--no-gossip` turns
+  it off). A node sends its neighbours a signed list of the peers it has
+  reached, on every new connection and every `--gossip-interval` seconds
+  (default 30). It dials the peers it learns, pinning the key each was
+  advertised with. Dials are bounded by `--max-peers` (default 32), a 10 s
+  timeout, eight in flight, and a backoff that doubles from 5 s to 10 min.
+  Seeds are redialed after a drop. A receiver refuses an exchange in these
+  cases:
+  - its `from` is not the TLS identity of the connection it arrived on;
+  - it does not verify against that connection's key;
+  - it is stale, oversized, or older than the last one from that peer;
+  - it exceeds a per-peer rate limit.
+
+  Gossip never writes the peer registry, so it cannot change any peer's trust.
+  `--advertise host:port` sets the address a node advertises (needed behind
+  NAT or a port forward). With a wildcard listen address and no `--advertise`,
+  receivers use the IP they observe on the connection. Library:
+  `MeshNode::start_gossip`, `GossipConfig`, `mesh_view`, `connected_peers`,
+  `connection_to`, `add_seed`, `set_advertise_addr`.
+- Stage data over the mesh without a shared cache (`p2p::objects`). A worker
+  that lacks a task's input fetches it by content id from the node that
+  dispatched the task, and the dispatcher fetches the output back the same
+  way. The fetch reuses the deduplicated chunk transfer.
+  - **Access:** a node serves an object only to a peer it was granted to (the
+    task's worker for an input, the dispatching peer for an output), and only
+    after the task's signature has been checked.
+  - **Verification:** every chunk is hash-checked; the object must name the
+    requested content id and match its manifest; the full content-id check
+    runs before the object is used or stored.
+  - **Limits:** size is capped before any chunk is requested
+    (`--max-object-mb`, default 2048); every read stops after 60 s of silence;
+    the whole fetch is bounded by the task timeout.
+  - **Shared stores:** `--shared-store <dir|file://…|s3://…>` still lets
+    nodes share a store; an object already present is not fetched.
+
+  Library: `MeshObjects`, `SharedCacheRunner::with_mesh_objects`,
+  `mesh_runner::dispatch_stage`, and `MeshTaskRunner::run_from`, a provided
+  method, so existing runners are unaffected.
+- `blut p2p node --dispatch-stage p2p-echo --input FILE --to PEER`: dispatch a
+  real stage with real data over the mesh from the shipped CLI. PEER is a
+  learned peer's id prefix or `addr@pubkey`. The command verifies the signed
+  result and the output, then prints the timings. `--probe` now probes every
+  connected peer, learned ones included, after a `--discover-secs` window.
 - `s3` cargo feature: network object storage. `ObjectStore::from_url` opens
   `s3://bucket/prefix` (AWS S3, or an S3-compatible endpoint that supports
   conditional writes) and `file://` stores, and `blut cloud --store` accepts a
@@ -77,6 +120,22 @@ train shares one exact version.
   0.2.0-alpha.1, recorded in `scripts/semver_exemptions.tsv`.
 
 ### Fixed
+- A mesh node served only the connections it accepted, so a peer it dialed
+  could not send it anything back over that connection. It now serves every
+  connection in both directions. It also handled requests one at a time per
+  connection with no read timeout: a long task blocked every other request,
+  and a stream opened and left silent blocked the connection forever. Each
+  request now runs in its own task, 16 at a time per connection, with 30 s for
+  the first byte and 300 s for the frame.
+- A mesh node completed inbound handshakes one at a time. While one peer's
+  handshake was slow, stalled or deliberately silent (up to the 10 s handshake
+  bound), every other peer trying to connect waited behind it, and under load
+  dials timed out. Handshakes now run concurrently, at most 64 at once.
+- One malformed or too-new frame ended service of the whole connection. It
+  now fails only its own stream, with an error reply.
+- `p2p node --coordinator-pubkey` accepted only the 64-hex Ed25519 key; it now
+  also takes the whole 128-hex `pubkey` line that `keys show` prints, as
+  `--seed` does.
 - The Slurm launcher's `sbatch` path (`SlurmLauncher::submit_async` and its
   `RemoteJob`) now works on a real cluster. Against a two-node Slurm 21.08
   cluster the previous code failed 7 of 8 live checks without accounting and 6

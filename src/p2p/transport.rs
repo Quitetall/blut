@@ -520,13 +520,40 @@ async fn write_lp(stream: &mut quinn::SendStream, bytes: &[u8]) -> Result<(), Tr
         .map_err(|e| TrainError::other(format!("write lp body: {e}")))
 }
 
-/// Length-prefixed read, capped before allocation.
-async fn read_lp(stream: &mut quinn::RecvStream, cap: usize) -> Result<Vec<u8>, TrainError> {
+/// Bound one read by `stall` (None = unbounded, the caller's own deadline
+/// applies). A peer that goes quiet mid-transfer fails here instead of holding
+/// the transfer open until an outer deadline that may be hours away.
+async fn within_stall<T>(
+    stall: Option<Duration>,
+    what: &str,
+    fut: impl std::future::Future<Output = Result<T, TrainError>>,
+) -> Result<T, TrainError> {
+    match stall {
+        None => fut.await,
+        Some(limit) => tokio::time::timeout(limit, fut).await.map_err(|_| {
+            TrainError::other(format!(
+                "peer stalled: nothing received for {}s while reading {what}",
+                limit.as_secs()
+            ))
+        })?,
+    }
+}
+
+/// Length-prefixed read, capped before allocation, each read bounded by
+/// `stall` when given.
+async fn read_lp_stalled(
+    stream: &mut quinn::RecvStream,
+    cap: usize,
+    stall: Option<Duration>,
+) -> Result<Vec<u8>, TrainError> {
     let mut len = [0u8; 4];
-    stream
-        .read_exact(&mut len)
-        .await
-        .map_err(|e| TrainError::other(format!("read lp len: {e}")))?;
+    within_stall(stall, "a frame length", async {
+        stream
+            .read_exact(&mut len)
+            .await
+            .map_err(|e| TrainError::other(format!("read lp len: {e}")))
+    })
+    .await?;
     let n = u32::from_le_bytes(len) as usize;
     if n > cap {
         return Err(TrainError::other(format!(
@@ -534,10 +561,13 @@ async fn read_lp(stream: &mut quinn::RecvStream, cap: usize) -> Result<Vec<u8>, 
         )));
     }
     let mut buf = vec![0u8; n];
-    stream
-        .read_exact(&mut buf)
-        .await
-        .map_err(|e| TrainError::other(format!("read lp body: {e}")))?;
+    within_stall(stall, "a frame body", async {
+        stream
+            .read_exact(&mut buf)
+            .await
+            .map_err(|e| TrainError::other(format!("read lp body: {e}")))
+    })
+    .await?;
     Ok(buf)
 }
 
@@ -551,21 +581,34 @@ pub async fn send_blob_deduped(
     store: &crate::p2p::chunkstore::ChunkStore,
     blob: &[u8],
 ) -> Result<(), TrainError> {
-    let index = store
-        .put_blob(blob)
-        .map_err(|e| TrainError::other(format!("chunk blob: {e}")))?;
     let (mut send, mut recv) = conn
         .open_bi()
         .await
         .map_err(|e| TrainError::other(format!("open blob bi-stream: {e}")))?;
+    send_blob_deduped_on(&mut send, &mut recv, store, blob, None).await
+}
+
+/// The sender half of the deduped transfer over an already-open bi-stream.
+/// Shared by [`send_blob_deduped`] and the mesh object plane
+/// ([`crate::p2p::objects`]), which runs it after its own request header.
+pub(crate) async fn send_blob_deduped_on(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    store: &crate::p2p::chunkstore::ChunkStore,
+    blob: &[u8],
+    stall: Option<Duration>,
+) -> Result<(), TrainError> {
+    let index = store
+        .put_blob(blob)
+        .map_err(|e| TrainError::other(format!("chunk blob: {e}")))?;
 
     // 1. Offer the index.
     let idx_bytes = bincode::serialize(&index)
         .map_err(|e| TrainError::other(format!("serialize chunk index: {e}")))?;
-    write_lp(&mut send, &idx_bytes).await?;
+    write_lp(send, &idx_bytes).await?;
 
     // 2. Learn the receiver's missing set.
-    let needed_bytes = read_lp(&mut recv, MAX_CONTROL_FRAME).await?;
+    let needed_bytes = read_lp_stalled(recv, MAX_CONTROL_FRAME, stall).await?;
     let needed: Vec<u32> = bincode::deserialize(&needed_bytes)
         .map_err(|e| TrainError::other(format!("decode needed set: {e}")))?;
     // Fail fast on an implausible request: a receiver can't need more chunks
@@ -590,7 +633,7 @@ pub async fn send_blob_deduped(
         send.write_all(&seq.to_le_bytes())
             .await
             .map_err(|e| TrainError::other(format!("write chunk seq: {e}")))?;
-        write_lp(&mut send, &bytes).await?;
+        write_lp(send, &bytes).await?;
     }
     send.finish()
         .map_err(|e| TrainError::other(format!("finish blob stream: {e}")))?;
@@ -600,9 +643,12 @@ pub async fn send_blob_deduped(
     //    connection down while stream data is still in flight (esp. the 0-chunk
     //    resend, where the receiver never reads our send half to EOF).
     let mut ack = [0u8; 1];
-    recv.read_exact(&mut ack)
-        .await
-        .map_err(|e| TrainError::other(format!("read completion ack: {e}")))?;
+    within_stall(stall, "the completion ack", async {
+        recv.read_exact(&mut ack)
+            .await
+            .map_err(|e| TrainError::other(format!("read completion ack: {e}")))
+    })
+    .await?;
     Ok(())
 }
 
@@ -622,9 +668,21 @@ pub async fn recv_blob_deduped(
         .accept_bi()
         .await
         .map_err(|e| TrainError::other(format!("accept blob bi-stream: {e}")))?;
+    recv_blob_deduped_on(&mut send, &mut recv, store, max_blob_size, None).await
+}
 
+/// The receiver half of the deduped transfer over an already-open bi-stream.
+/// With `stall`, every read is bounded: a sender that goes quiet mid-transfer
+/// fails the receive instead of holding it open.
+pub(crate) async fn recv_blob_deduped_on(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    store: &crate::p2p::chunkstore::ChunkStore,
+    max_blob_size: u64,
+    stall: Option<Duration>,
+) -> Result<Vec<u8>, TrainError> {
     // 1. Read + validate the offered index.
-    let idx_bytes = read_lp(&mut recv, MAX_CONTROL_FRAME).await?;
+    let idx_bytes = read_lp_stalled(recv, MAX_CONTROL_FRAME, stall).await?;
     let index: crate::p2p::chunkstore::ChunkIndex = bincode::deserialize(&idx_bytes)
         .map_err(|e| TrainError::other(format!("decode chunk index: {e}")))?;
     index
@@ -644,7 +702,7 @@ pub async fn recv_blob_deduped(
     let needed: Vec<u32> = missing.iter().map(|&i| i as u32).collect();
     // Keep our send half OPEN (don't finish here) — the completion ack rides it.
     write_lp(
-        &mut send,
+        send,
         &bincode::serialize(&needed)
             .map_err(|e| TrainError::other(format!("serialize needed: {e}")))?,
     )
@@ -658,16 +716,19 @@ pub async fn recv_blob_deduped(
     let mut outstanding: std::collections::HashSet<usize> = missing.iter().copied().collect();
     while !outstanding.is_empty() {
         let mut seqb = [0u8; 4];
-        recv.read_exact(&mut seqb)
-            .await
-            .map_err(|e| TrainError::other(format!("read chunk seq: {e}")))?;
+        within_stall(stall, "a chunk header", async {
+            recv.read_exact(&mut seqb)
+                .await
+                .map_err(|e| TrainError::other(format!("read chunk seq: {e}")))
+        })
+        .await?;
         let seq = u32::from_le_bytes(seqb) as usize;
         if !outstanding.remove(&seq) {
             return Err(TrainError::other(format!(
                 "sender sent chunk {seq} that was not outstanding (unrequested or duplicate)"
             )));
         }
-        let bytes = read_lp(&mut recv, CHUNK_MAX).await?;
+        let bytes = read_lp_stalled(recv, CHUNK_MAX, stall).await?;
         // `seq` came from `outstanding` ⊆ the index range, so this is in range.
         store
             .store_chunk(index.chunk_hashes[seq], &bytes)
@@ -746,17 +807,33 @@ impl P2pServer {
     /// Accept the next incoming peer connection. Returns the peer's ID
     /// and the connection handle after a successful handshake.
     pub async fn accept_peer(&self) -> Result<(PeerId, QuinnConnection), TrainError> {
-        let conn = self
-            .endpoint
-            .accept()
-            .await
-            .ok_or_else(|| {
-                // `accept()` yields None only once the endpoint is closed, which
-                // is terminal: record it so accept loops stop.
-                self.closing
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                TrainError::other("QUIC endpoint closed")
-            })?
+        let incoming = self.accept_incoming().await?;
+        self.complete_incoming(incoming).await
+    }
+
+    /// The first half of [`accept_peer`](Self::accept_peer): wait for the next
+    /// connection attempt, without doing its handshake. A server that accepts
+    /// many peers hands each attempt to [`complete_incoming`] in its own task,
+    /// so one slow or stalled handshake does not hold up the others.
+    ///
+    /// [`complete_incoming`]: Self::complete_incoming
+    pub(crate) async fn accept_incoming(&self) -> Result<quinn::Incoming, TrainError> {
+        self.endpoint.accept().await.ok_or_else(|| {
+            // `accept()` yields None only once the endpoint is closed, which
+            // is terminal: record it so accept loops stop.
+            self.closing
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            TrainError::other("QUIC endpoint closed")
+        })
+    }
+
+    /// The second half of [`accept_peer`](Self::accept_peer): the QUIC and
+    /// mutual-TLS handshake, then the bounded handshake message.
+    pub(crate) async fn complete_incoming(
+        &self,
+        incoming: quinn::Incoming,
+    ) -> Result<(PeerId, QuinnConnection), TrainError> {
+        let conn = incoming
             .await
             .map_err(|e| TrainError::other(format!("accept connection: {e}")))?;
 
@@ -1097,7 +1174,7 @@ fn x25519_from_dns_names<'a>(names: impl Iterator<Item = &'a str>) -> Option<[u8
 /// presented no cert (legacy peer) or a non-Ed25519 cert. This is the value
 /// `accept_peer` binds the handshake-asserted `PeerId` against, closing the
 /// self-asserted-identity hole.
-fn tls_authenticated_pubkey(conn: &QuinnConnection) -> Option<[u8; 32]> {
+pub(crate) fn tls_authenticated_pubkey(conn: &QuinnConnection) -> Option<[u8; 32]> {
     let identity = conn.peer_identity()?;
     let certs = identity
         .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
@@ -1749,6 +1826,60 @@ mod pinned_verifier_tests {
                 .is_ok(),
             "InsecureVerifier (no-pin mode) must remain permissive"
         );
+    }
+
+    /// A peer that completes TLS but never sends its handshake message holds
+    /// a mesh node's handshake slot for up to HANDSHAKE_MESSAGE_TIMEOUT. It
+    /// must not hold up anyone else: before the fix the node accepted one
+    /// connection at a time, so every other peer waited (or timed out) behind
+    /// it.
+    #[tokio::test]
+    async fn a_stalled_handshake_does_not_block_other_peers_joining_the_mesh() {
+        use crate::p2p::node::{MeshNode, NodeCapabilities};
+        let node_kp = std::sync::Arc::new(KeyPair::generate());
+        let dir = tempfile::tempdir().unwrap();
+        let peers = PeerRegistry::load(&dir.path().join("peers.json")).unwrap();
+        let node = MeshNode::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            node_kp.clone(),
+            peers,
+            NodeCapabilities {
+                worker: false,
+                scheduler: true,
+            },
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let addr = node.local_addr().unwrap();
+        let pin = node_kp.verifying.to_bytes();
+
+        // Stalled peer: TLS completes, then silence.
+        let staller = KeyPair::generate();
+        let cfg = P2pClient::make_client_config(
+            &staller,
+            Some(pin),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        )
+        .unwrap();
+        let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(cfg);
+        let _stalled = endpoint
+            .connect(addr, "blut-p2p")
+            .unwrap()
+            .await
+            .expect("TLS completes");
+
+        // A well-behaved peer joins promptly regardless.
+        let client = P2pClient::with_coordinator_pin(std::sync::Arc::new(KeyPair::generate()), pin);
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), client.connect(addr))
+            .await
+            .expect("the second peer is not queued behind the stalled one")
+            .expect("connects");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     async fn bind_loopback_server() -> (P2pServer, std::sync::Arc<KeyPair>) {
