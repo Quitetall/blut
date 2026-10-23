@@ -26,16 +26,19 @@ run jobs to completion, and cookbook training has run across two machines over
 NCCL with global-batch parity. A node lost mid-job is detected and the job is
 requeued and completes once the node returns. `plan resume` after a node loss
 picks up from the cache on the same launcher, and DDP replicas are checked to
-be bit-identical across nodes. Still missing: an N-node P2P mesh (item 2).
+be bit-identical across nodes. Still missing: resuming a long stage from a
+mid-stage checkpoint (today a lost node restarts the stage from its start).
 
 **2. P2P across independent hosts, including hostile networks.** Done for
 dispatch. Stage data and results have crossed the internet between continents,
 and a four-continent `p2p node` mesh answered 12 of 12 signed probes. Loss,
 latency, partition, NAT and clock skew have run emulated, and loss and
 partition have run on a real WAN; the real-WAN runs led to the opt-in BBR
-controller. Gossip and stage data over the mesh without a shared cache are
-built and have run across network namespaces on one host. Still missing: the
-same run between independent hosts.
+controller. Peers find each other by gossip, and stage data moves over the
+mesh without a shared cache: on four hosts on four continents, each seeded
+with at most one peer, the mesh formed by gossip and 64 MB of stage data
+reached a worker with an empty cache and came back verified. Still missing:
+BBR measured against competing traffic before it can become the default.
 
 **3. Network object storage.** Done for static credentials. The `s3` feature
 round-trips through Cloudflare R2 over public TLS, which enforces the
@@ -44,10 +47,12 @@ HTTP and over verified TLS. Backblaze B2 lacks conditional writes and is
 refused with an error that says so. Still missing: IAM-role / STS credentials
 and a run against AWS S3 itself.
 
-**4. A benchmark baseline that exists.** `scripts/run_benchmarks.sh compare` is
-in the release gate and cannot pass: only an `opt0` baseline is committed, and
-the gate names `release-0.2`. Either the baseline gets established on the
-designated quiet host, or the gate is honest about naming `opt0`.
+**4. A benchmark baseline that exists.** The regression gate
+(`scripts/bench_regression_gate.py`) compares confidence bounds rather than
+raw medians, and `scripts/run_benchmarks.sh compare` names the `release-0.2`
+baseline. That baseline is not committed yet: it is recorded on a whole
+dedicated machine at the frozen release SHA, because a shared host drifted
+−12% to +8% on unchanged code.
 
 **5. Windows containment.** The Job Object backend is implemented and
 CI-gated on `windows-latest` (cap, peak, tree kill; see the ledger row). Still
@@ -55,7 +60,7 @@ missing: a cookbook runner calling `Containment::after_spawn` on Windows, the
 `LocalSystemd` launcher (which still spawns bare there), and a recorded
 training run on a Windows host.
 
-**6. The ADR problem.** Federated, pending owner review before publication. The
+**6. The ADR problem.** Federated and reviewed by the owner. The
 engine-facing decision records (41 of them) now live in
 [`docs/adr/`](docs/adr/README.md), redacted where marked, so the engine's
 citations resolve. Citations of product decisions that were not federated were

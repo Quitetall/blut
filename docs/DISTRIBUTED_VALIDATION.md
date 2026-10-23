@@ -29,7 +29,7 @@ first if you are deciding whether to depend on this.
 | P2P dispatch between independent hosts over the internet | Validated | Oregon ↔ France, both behind NAT, real QUIC over the public internet, 2026-10-20 — see below |
 | P2P under latency, loss, partition, NAT and clock skew | Validated (emulated) | Containers on one host; impairment emulated, not a real WAN, 2026-10-20 — see below |
 | P2P mesh across independent hosts (`p2p node`) | Validated (connectivity + signed dispatch) | Four hosts on four continents, every node probing every other, 12/12, 2026-10-20 — see below. Gossip and stage data over the mesh were not part of that run |
-| P2P mesh gossip and stage data without a shared cache | Validated (network namespaces) | Four containers on one bridge: a node seeded with one peer learned the other two by gossip and probed all three; 48 MiB of stage data moved to a worker with an empty cache and back, verified, 2026-10-23 — see below. Not yet run between independent hosts |
+| P2P mesh gossip and stage data without a shared cache | Validated (independent hosts) | Four vast.ai hosts on four continents, each seeded with at most one peer, formed a full mesh by gossip; a fresh identity seeded with one node probed all four, 4/4; 64,640,000 bytes of stage data moved from the US to an empty-cache worker in New Zealand and back, verified, 2026-10-23 — see below. Earlier the same day across network namespaces on one host |
 | Cloud queue over local object storage | Validated | `blut cloud smoke` round-trip through the shipped cookbook binary, 2026-09-19 |
 | Network object storage (S3-compatible) | Validated (R2 over public TLS; MinIO) | `s3` feature; cloud round-trip against Cloudflare R2 over public TLS with create-only writes enforced, 2026-10-22; MinIO over HTTP and TLS; Backblaze B2 refused (no conditional writes) — see below |
 | `blut-worker` REST prototype | Deleted (ADR 0083 M3) | Superseded by `src/cloud` + the `blut-web` sidecar |
@@ -310,6 +310,69 @@ flight; a dial in progress now blocks a duplicate.
 **Boundaries.** One host and one bridge: no NAT, no loss, no latency, and no
 separate machines. `--advertise` was not needed and was not exercised.
 `--shared-store s3://` was not exercised over the mesh.
+
+## Recorded run: mesh gossip and stage data between independent hosts (2026-10-23)
+
+**Setup.**
+- **Hosts:** four vast.ai instances (`ubuntu:22.04`, no GPU used) in
+  Wisconsin (US), Sweden, South Korea and New Zealand. Each had its own
+  identity and data directory, and only a UDP port forward to `9320`; there was
+  no shared filesystem and no overlay network.
+- **Binary:** the static musl build described above, from the alpha.2
+  candidate with the mesh work merged; the same sha256 on every host.
+- **Topology:** every node ran `p2p node --listen 0.0.0.0:9320 --advertise
+  <public ip>:<forwarded port> --gossip-interval 10` with
+  `BLUT_P2P_CONGESTION=bbr`. Wisconsin had no seed; Sweden seeded only
+  Wisconsin, South Korea only Sweden, New Zealand only South Korea.
+
+**Phase 1: gossip and probe.** Within a minute every node logged
+`mesh: 3 connected, 3 known`, with the peers it was not seeded with marked
+`gossip` or `inbound`. A fifth identity on the Wisconsin host, seeded only
+with New Zealand, then ran `--probe --discover-secs 20`:
+
+```
+mesh: 4 connected, 4 known: 4111…@114.23.254.176:52964(seed,up) d6c4…@212.100.111.103:20029(gossip,up) d6eb…@1.208.108.242:60782(gossip,up) ee6d…@167.237.110.62:48179(gossip,up)
+probe 114.23.254.176:52964 (seed): ok, peer 4111366410e76a45 ran a signed task in 187 ms
+probe 212.100.111.103:20029 (gossip): ok, peer d6c423ede22621be ran a signed task in 124 ms
+probe 1.208.108.242:60782 (gossip): ok, peer d6eb34491e2a692b ran a signed task in 176 ms
+probe 167.237.110.62:48179 (gossip): ok, peer ee6d170056d7527d ran a signed task in 2 ms
+probe: all 4 connected peers answered (1 seeds, 3 learned, 0 known but not connected)
+```
+
+Exit 0. The advertised public addresses were the ones gossip carried; no node
+was told the forwarded port of any peer except its one seed.
+
+**Phase 2: stage data.**
+- **Worker:** New Zealand, restarted with `--coordinator-pubkey <dispatcher>`
+  and its `shared-cache`, `chunks` and `work` directories removed.
+- **Dispatcher:** a separate identity on the Wisconsin host, seeded only with
+  Sweden, ran `p2p node --dispatch-stage p2p-echo --input big.txt --to
+  4111366410e76a45`. It had no inbound port forward; the worker fetched over
+  the connection the task arrived on.
+- **Input:** 64,640,000 bytes of base64 text.
+
+| Run | State | Publish | Dispatch → signed result | Output back | Total |
+|---|---|---|---|---|---|
+| 1 | worker cold | 1,165 ms | 23,165 ms (worker fetched 64,640,582 bytes in 17,980 ms, verified in 586 ms; stage 622 ms) | fetched over the mesh, 18,075 ms | 42.4 s |
+| 2 | both warm | 1,619 ms | 4,978 ms (not fetched; stage 557 ms) | read from the dispatcher's store, 1,586 ms | 8.2 s |
+
+Both runs printed `verified: output == uppercase(input), signed by
+4111366410e76a45`. On the dispatcher host, outside BLUT,
+`sha256(uppercase(big.txt))`, `sha256(out1.txt)` and `sha256(out2.txt)` were
+all `995373a1eda0c400…`. The worker logged exactly one `fetched object`. The
+Wisconsin, Sweden and South Korea nodes had no `shared-cache` or `chunks`
+directory afterwards: the data went only to the worker it was dispatched to.
+No node logged a warning or an error.
+
+**Rate.** About 3.6 MB/s (29 Mbit/s) each way between Wisconsin and New
+Zealand with BBR. That is one sample on one path; it is not a throughput
+claim.
+
+**Boundaries.** No injected loss or partition on this run (those are recorded
+separately below, for dispatch). `--shared-store s3://` over the mesh was not
+exercised. The probe and the real-stage worker cannot be the same process: a
+worker started with `--coordinator-pubkey` refuses the probe task, so the
+worker was restarted between phases.
 
 ## Recorded run: hostile conditions on a real WAN (2026-10-20)
 
