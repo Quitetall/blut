@@ -287,6 +287,10 @@ train shares one exact version.
     client cannot hold the accept loop.
 
 ### Security
+- rustls-webpki 0.103.16 and webpki-roots / webpki-root-certs 1.0.10 in
+  every lockfile, closing RUSTSEC-2026-0381, -0382 and -0383 (distrusted
+  emSign intermediates could be trusted). `blut` now requires rustls-webpki
+  0.103.16 or later.
 - rustls 0.23.45 everywhere, closing RUSTSEC-2026-0285 (TLS 1.3 handshake
   messages accepted across encryption-level boundaries). `blut-tui`
   0.2.0-alpha.1 shipped a lockfile pinning 0.23.43, which `cargo install

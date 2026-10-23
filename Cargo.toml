@@ -134,7 +134,7 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 # transitively — rustls's own "ring" feature enables "webpki/ring" — so this
 # just exposes the existing dependency directly rather than hand-rolling a
 # DER parser over attacker-controlled certificate bytes.
-webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc"], optional = true }
+webpki = { package = "rustls-webpki", version = "0.103.16", default-features = false, features = ["alloc"], optional = true }
 rcgen = { version = "0.13", optional = true }
 
 # Windows Job Object containment (src/containment/windows.rs), the run
