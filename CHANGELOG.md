@@ -36,10 +36,13 @@ train shares one exact version.
   `PeakJobMemoryUsed`, and closing the job kills whatever is left in it.
   `mem_high` and `swap_max` are not mapped; `CapSpec` has no CPU field, so no
   CPU rate limit is set. CI-gated on `windows-latest`.
-- `Containment::after_spawn` (provided, default no-op) and
-  `containment::spawn_attached`. The Windows backend spawns the child suspended
-  and assigns it to the job here, so a Windows caller must use one of them; a
-  skipped call leaves the child suspended, never running uncapped.
+- `Containment::before_spawn` and `Containment::after_spawn` (provided,
+  default no-op) and `containment::spawn_attached`, which calls both. On
+  Windows, `before_spawn` starts the child suspended and `after_spawn` assigns
+  it to the job before it runs, so use `spawn_attached`. A caller that spawns
+  the wrapped command itself gets a running child outside the job (uncapped,
+  not killed by cancel), and a warning naming `spawn_attached` when the run's
+  teardown handle is dropped; it is never left suspended.
 
 ### Fixed
 - `EvalReport` artifacts can cross the stage boundary. Their free-form

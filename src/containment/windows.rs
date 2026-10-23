@@ -50,13 +50,17 @@
 //! The job lives as long as the [`TeardownHandle`] (and its clones). Dropping
 //! the last one closes the job handle and, by `KILL_ON_JOB_CLOSE`, kills any
 //! process still in the job, so keep the handle until the run is over. A
-//! caller that sets `creation_flags` on the command after `wrap_command` must
-//! OR in `CREATE_SUSPENDED` (`0x4`) rather than replace it; without it the
-//! child starts running before it is assigned, and anything it spawns in that
-//! window escapes the job.
+//! caller must spawn through [`super::spawn_attached`]: it starts the child
+//! suspended ([`Containment::before_spawn`]), assigns it to the job, then lets
+//! it run, so nothing the child starts can escape. A caller that calls
+//! `spawn()` itself gets a running child that is NOT in the job (uncapped,
+//! and its processes outlive cancellation); when that run's teardown handle is
+//! dropped, a warning says so and names `spawn_attached`. That is deliberate:
+//! the earlier design left such a child suspended forever, a silent hang.
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
@@ -88,11 +92,27 @@ pub struct WindowsJobObject;
 /// `Arc`, so the job closes (and `KILL_ON_JOB_CLOSE` fires) when the last
 /// clone of the handle is dropped.
 #[derive(Debug)]
-pub(crate) struct JobHandle(OwnedHandle);
+pub(crate) struct JobHandle {
+    handle: OwnedHandle,
+    /// Set once a child has been assigned to the job by `after_spawn`.
+    attached: AtomicBool,
+}
 
 impl JobHandle {
     fn raw(&self) -> HANDLE {
-        self.0.as_raw_handle() as HANDLE
+        self.handle.as_raw_handle() as HANDLE
+    }
+}
+
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        if !self.attached.load(Ordering::Relaxed) {
+            tracing::warn!(
+                "windows job object: no child was ever assigned to this run's job, so it \
+                 ran without memory containment and outside cancellation; spawn the \
+                 wrapped command with blut::containment::spawn_attached"
+            );
+        }
     }
 }
 
@@ -114,7 +134,10 @@ fn create_job() -> Result<JobHandle> {
         if h.is_null() {
             return Err(last_os_error("CreateJobObjectW"));
         }
-        Ok(JobHandle(OwnedHandle::from_raw_handle(h as RawHandle)))
+        Ok(JobHandle {
+            handle: OwnedHandle::from_raw_handle(h as RawHandle),
+            attached: AtomicBool::new(false),
+        })
     }
 }
 
@@ -267,9 +290,9 @@ impl Containment for WindowsJobObject {
         for (k, v) in env {
             c.env(k, v);
         }
-        // Start suspended so `after_spawn` can assign the job before the
-        // child runs a single instruction.
-        c.creation_flags(CREATE_SUSPENDED);
+        // Not suspended here: `before_spawn` (called by `spawn_attached`)
+        // adds CREATE_SUSPENDED, so a caller that spawns directly gets a
+        // running child rather than one frozen forever.
 
         Ok(WrappedRun {
             command: c,
@@ -279,6 +302,11 @@ impl Containment for WindowsJobObject {
                 ..TeardownHandle::default()
             },
         })
+    }
+
+    fn before_spawn(&self, command: &mut tokio::process::Command) {
+        // Assign before the child runs a single instruction.
+        command.creation_flags(CREATE_SUSPENDED);
     }
 
     fn after_spawn(&self, child: &tokio::process::Child, teardown: &TeardownHandle) -> Result<()> {
@@ -297,6 +325,7 @@ impl Containment for WindowsJobObject {
         #[allow(unsafe_code)]
         let assigned = unsafe { AssignProcessToJobObject(job.raw(), process) } != 0;
         let attached = if assigned {
+            job.attached.store(true, Ordering::Relaxed);
             resume_process_threads(pid).map(|_| ())
         } else {
             Err(last_os_error("AssignProcessToJobObject"))

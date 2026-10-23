@@ -278,3 +278,19 @@ async fn dropping_the_last_teardown_handle_kills_the_tree() {
         "grandchild survived the job closing"
     );
 }
+
+/// A caller that spawns the wrapped command itself, skipping
+/// `spawn_attached`, used to get a child suspended forever: a silent hang.
+/// It now runs (outside the job, which a warning reports at teardown).
+#[tokio::test]
+async fn a_direct_spawn_runs_instead_of_hanging() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut wr = wrap(tmp.path(), "print('ran')", &caps(None));
+    let child = wr.command.spawn().expect("spawn");
+    let out = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
+        .await
+        .expect("a directly spawned child must not stay suspended")
+        .expect("wait");
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
+}
