@@ -256,6 +256,8 @@ engine's behavior is identical regardless of which front-end authored the JSON.
   private, and RELEASING.md treats that as a hard stop), and the CI job runs
   only the parity half — the engine-compiles half needs a cookbook binary,
   since a bare `blut` registers no stages.
+  *Note (2026-10): the engine repository has been public since
+  0.2.0-alpha.1; "this repo is private" describes it when this was written.*
 
 ## Related Decisions
 

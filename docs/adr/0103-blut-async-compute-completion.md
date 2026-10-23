@@ -252,8 +252,8 @@ backpressure contract that reports its memory footprint into broker admission:
 
 - _2026-07-15 — SOFTWARE CONTRACT LANDED; HARDWARE WITNESS OUTSTANDING. The
   corrected bounded-admission contract is implemented in BLUT engine
-  `ceba455ec9dc34155675b325ab870dbee8928722`, plus LamQuant cookbook and
-  standard cookbook backend revisions `[redacted: private repository]`; the
+  `ceba455ec9dc34155675b325ab870dbee8928722`, plus standard cookbook revision `78bd5292d5395de06e8cf039f269ff2b84ef91a1`
+  and a LamQuant cookbook revision `[redacted: private repository]`; the
   meta-repository integration is the commit containing this entry. Selection
   uses the post-DCE stage set and one immutable `TenantAdmission` snapshot. The
   exact selected profile, whole-job byte footprint, RAM permits, and cgroup limit
@@ -285,8 +285,8 @@ backpressure contract that reports its memory footprint into broker admission:
 - _2026-07-15 — BOUNDED PIPELINE CONSUMER LANDED; HARDWARE WITNESS STILL
   OUTSTANDING. [ADR 0102](0102-blut-dag-optimization-advanced.md) now reuses this
   admission/backpressure contract at engine
-  `ebe122486cf37a06fa6e7b46db6fe0340e693857` (standard backend and LamQuant
-  cookbook revisions `[redacted: private repository]`). The software gate proves
+  `ebe122486cf37a06fa6e7b46db6fe0340e693857` (standard backend `4a41560774b91e59d6a285de22d1f1ec16983ca4`; LamQuant
+  cookbook revision `[redacted: private repository]`). The software gate proves
   exact combined admission, bounded queued-plus-running capacity, bounded spill
   records, O(1) private-result rehydration, ordinary fallback, and canonical
   publication identity for the default-off local pipeline lane. It does not

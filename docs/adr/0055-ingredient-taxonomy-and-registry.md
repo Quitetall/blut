@@ -22,18 +22,13 @@ ADR 0050's `OptimizerSpec` as the `kind="optimizer"` special case.)
 The lamquant cookbook is being rebuilt to canon-only (lean but complete).
 Two structural problems motivate adding taxonomy layers in the same pass:
 
-1. **Sub-stage primitives are duplicated and monolithic.** Optimizer
-   selection is three drifting `if/elif` chains (ADR 0050's context).
-   Worse, a learning-rate scheduler is defined inside one trainer and
-   **cross-imported by other trainers** — one trainer reaching into another.
-   Optimizer param-group routing is copy-pasted byte-for-byte between two
-   trainers. And one trainer's `run()` is a ~2500-line monolith mixing data,
-   forward, a multi-term loss, several optimizer arms, an adversarial sub-step,
-   EMA, durable resume, and other model-specific logic in one function
-   `[redacted: codec research]`. ADR 0050
-   introduced the optimizer registry but **explicitly deferred** the full
-   trainer-into-primitives decomposition ("data → forward → loss → backward
-   → step → log → checkpoint") to "a later ADR." This is that ADR.
+1. **Sub-stage primitives are duplicated and monolithic.** Trainers repeated
+   optimizer, scheduler and step logic inline and imported pieces from each
+   other. ADR 0050 [not federated] introduced an optimizer registry but
+   deferred the full trainer-into-primitives decomposition to a later ADR.
+   This is that ADR. *The description of the domain trainers' internals is
+   omitted from the federated copy: it concerns a domain cookbook, not the
+   engine.*
 
 2. **Recipes have no grouping layer.** The cookbook exposes recipes under a
    flat `RecipeCategory` tag (DataPrep/Train/Eval/Export/Pipeline/User); the
@@ -178,16 +173,9 @@ cache key and serve a stale artifact. A CI lint enforces this.
 
 ## Validation
 
-- **Behavioral equivalence per trainer (the headline gate).** Fixed seed,
-  1 epoch, the `build_ingredient`-assembled `run()` must produce a
-  byte-identical loss trajectory (per-step `loss.item()`, ≤1e-6) **and**
-  identical param-group membership vs the pre-decomposition path, for each
-  of the 5 trainers. Also pin: RNG batch-stream hash, the model-specific
-  selection key, provenance hash, saved state_dict keys.
-- **Cross-trainer dedup proof.** The shared `build_param_groups` yields identical
-  groups whether called from either trainer's assembly.
-- **Sweep parity (from ADR 0050).** An N=1 sweep (a single-element `losses=[…]`)
-  equals the unswept run — the registry/sweep adds no behavioral delta.
+- *Per-trainer behavioural-equivalence, cross-trainer and sweep-parity gates
+  are omitted from the federated copy: they concern a domain cookbook's
+  trainers, not the engine.*
 - **Cache-key correctness.** A CI lint asserts no `cache_relevant=True`
   ingredient is selected via env var or Python default; a kernel/byte edit
   to a selected ingredient re-runs the stage (ADR 0050 `code_sha`).

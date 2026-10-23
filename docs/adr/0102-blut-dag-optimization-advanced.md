@@ -386,8 +386,8 @@ invariant) and emits a verifiable equivalence witness (below).
   bounded async-I/O admission/backpressure, then bounded pipeline parallelism
   and the full ADR 0102 freeze gate. ADR remains In progress._
 - _2026-07-15 — INCREMENT 5 LANDED AND ADR FROZEN (engine
-  `ebe122486cf37a06fa6e7b46db6fe0340e693857`; standard backend and LamQuant
-  cookbook revisions `[redacted: private repository]`): **default-off bounded
+  `ebe122486cf37a06fa6e7b46db6fe0340e693857`; standard backend `4a41560774b91e59d6a285de22d1f1ec16983ca4`; LamQuant
+  cookbook revision `[redacted: private repository]`): **default-off bounded
   `map_output` pipeline parallelism.** The optimizer may certify one
   deterministic `InProcess` list producer and one sequential private consumer.
   The producer supplies a manifest of element content hashes and emits through
@@ -442,7 +442,7 @@ invariant) and emits a verifiable equivalence witness (below).
   lane passed capacity, fallback, cancellation, spill, publication, and
   default-parity witnesses
 - **git_sha:** engine `ebe122486cf37a06fa6e7b46db6fe0340e693857` · standard backend
-  and LamQuant cookbook `[redacted: private repository]` · **artifact sha256:** n/a
+  `4a41560774b91e59d6a285de22d1f1ec16983ca4` · LamQuant cookbook `[redacted: private repository]` · **artifact sha256:** n/a
   (source-only change)
 
 ## Related Decisions

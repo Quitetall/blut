@@ -53,26 +53,7 @@ Diagnose with parent-RSS + cuda-mem + a dataloader-only probe BEFORE assuming a
 leak; a "survives once on a clean box" run does not prove robustness under load —
 re-verify under the real config and real box pressure.
 
-### 2. Codec dataloader is decode-bound; cache the WINDOWS, not the signal
-The codec's direct-from-archive dataset re-decodes the lossless recording
-every epoch (GPU ~0 %). **Fix (blut `ebe852f`/`a50e0fd`):** the disk cache
-stores only the **used training windows** keyed `(stem, win_idx)`, fp16 — tens of
-GB for a full manifest / a few GB per A/B, vs the old whole-recording cache
-(~600 GB, reclaimed). Epochs 2+ mmap the window, never re-decode. The cache stores
-decoded **values** (the decode is the cost) — it is not a LUT.
-`[redacted: codec research]` (window shape and corpus sizes).
-
-### 3. Cache + memmap locations are standardized and un-misconfigurable
-A cookbook cache-paths module `[redacted: private path]`: ONE knob (a data-root
-environment variable, else a canonical default) → fixed, auto-created,
-mutually-consistent per-layer subpaths; `apply_env()` force-overwrites the
-per-layer env so they can never disagree or be unset; fail-closed if the default
-root is missing; mandatory in the trainer (no skip flag). 4 contract tests.
-
-### 4. Production handoff
-A production roadmap `[redacted: private path]` enumerates every remaining
-deliverable to a shippable product `[redacted: non-engine product detail]`
-`[redacted: hardware]` `[redacted: codec research]`.
+*Sections 2–4 (the codec dataloader, its cache and memmap locations, and the production handoff) are omitted from the federated copy: they concern a domain cookbook, not the engine.*
 
 ## Consequences
 - Codec training is OOM-robust at workers=2 with cap headroom; the never-

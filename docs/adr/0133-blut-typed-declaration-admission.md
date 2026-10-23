@@ -10,8 +10,8 @@
 ## Status
 
 `Proposed 2026-07-17` → `Accepted 2026-07-18` → `Complete — frozen 2026-07-18`
-(engine `3873c94`; cookbook and backends commits [redacted: private repository]). This ADR formalizes the direction attempted
-by engine commit `ba40d6b` ("close final public-boundary gaps"), which was
+(engine `3873c94`, backends `48a8928`; cookbook commit [redacted: private repository]). This ADR formalizes the direction attempted
+by an unpublished engine commit [redacted: private repository] ("close final public-boundary gaps"), which was
 deliberately NOT carried through the 2026-07-17 reconciliation rebase because it
 half-replaced admission machinery that `origin/main`'s async-io line had just
 extended. The direction deserves a real decision, not a conflict-resolution
@@ -47,7 +47,7 @@ coexist after the 2026-07-17 reconciliation:
    reservation is refused — warn-and-drop for a best-effort suggestion,
    fail-closed for a required map shard).
 
-`ba40d6b` attempted to complete the flip in one commit: launch admission from
+That commit attempted to complete the flip in one commit: launch admission from
 declarations only, executor memory budget = the whole-job reservation (optionally
 tightened by the ADR 0096 tenant ceiling), and the engine never reading a recipe
 key. It collided with the async-io admission work and was split during the
@@ -121,7 +121,7 @@ increments that never regress the incumbent capabilities:
   Rejected as an end state: two footprint sources with different answers is a
   standing source of drift (which one refused this launch?), and the charter
   violation remains. Acceptable only as the migration's intermediate state.
-- **Complete the flip in one step (what `ba40d6b` attempted).** Rejected: it
+- **Complete the flip in one step (what that unpublished commit attempted).** Rejected: it
   silently dropped calibration, auto-tune, and async-io billing richness on the
   floor — the rebase review showed those capabilities have no typed-side
   equivalent yet. Capability-regression-free migration requires the parity gate.
@@ -171,7 +171,7 @@ increments that never regress the incumbent capabilities:
   `CompiledPlan::declared_footprint()` + dry-run report + runtime-spawn envelope
   guard (best-effort spawn = warn-drop, required map shard = fail-closed,
   covered by `runtime_hpo_spawn_larger_than_job_reservation_is_rejected` and the
-  map-shard rejection test). The `ba40d6b` full-flip attempt is recorded in that
+  map-shard rejection test). The unpublished full-flip attempt is recorded in that
   commit's message and the reconciliation notes; its executor-budget-from-
   reservation piece (`executor_memory_budget_gib`, tenant-ceiling-tightened) is
   a candidate for increment 2. **Discussion pending — do not implement past the
@@ -205,7 +205,7 @@ increments that never regress the incumbent capabilities:
   **No-regression contract (clarified against the "does the engine not already
   have calibration/auto-tune/billing?" question):** the engine's MECHANISMS
   (FootprintStore + OOM self-heal, fit-and-saturate, ADR 0103 billing) are NOT
-  moved — only their INPUT source changes (`ba40d6b` regressed by starving the
+  moved — only their INPUT source changes (the unpublished attempt regressed by starving the
   mechanisms, not by deleting them). Migration is a strangler pattern:
   Phase A = formula moves to the cookbook verbatim behind the envelope, no
   consumer; Phase B = SHADOW-MODE parity, CI-gated byte-equality on FIVE
@@ -298,8 +298,8 @@ increments that never regress the incumbent capabilities:
   exact at the true shape, never below the incumbent, shadow-logged where
   higher. Parity 6/6; engine 979/0; cookbook 285/0. Remaining to the endpoint:
   SOAK (shadow must stay silent), then Phase D._
-- _2026-07-18 — PHASE D EXECUTED, ADR FROZEN (engine `3873c94`; cookbook and
-  backends commits [redacted: private repository])._ (1) Cookbook took
+- _2026-07-18 — PHASE D EXECUTED, ADR FROZEN (engine `3873c94`, backends `48a8928`;
+  cookbook commits [redacted: private repository])._ (1) Cookbook took
   FULL formula ownership first (~25 call sites: trainer estimate, memmax, all
   constants, the WARM-stage model, the `--detail-bands` parser — the cookbook
   parsing the COOKBOOK's args) + cost-term envelopes on all 7 remaining
@@ -334,7 +334,7 @@ increments that never regress the incumbent capabilities:
 - **result:** engine 952/0 (JSON path gone, `grep from_args_json src/` empty
   outside the guard), clippy 0, scope PASS + plant-FAIL; cookbook 283/0;
   blut-backends 71/0; dry-run byte-continuous (40.0G via the seam).
-- **git_sha:** engine `3873c94` · cookbook and backends [redacted: private repository]
+- **git_sha:** engine `3873c94` · backends `48a8928` · cookbook [redacted: private repository]
 
 ## Related Decisions
 
