@@ -28,8 +28,13 @@ requeued and completes once the node returns. `plan resume` after a node loss
 picks up from the cache on the same launcher, and DDP replicas are checked to
 be bit-identical across nodes. Still missing: an N-node P2P mesh (item 2).
 
-**2. P2P across independent hosts, including hostile networks.** Loopback proves
-the protocol, not the mesh. Needs separate machines, NAT, loss and partition.
+**2. P2P across independent hosts, including hostile networks.** Done for
+dispatch. Stage data and results have crossed the internet between continents,
+and a four-continent `p2p node` mesh answered 12 of 12 signed probes. Loss,
+latency, partition, NAT and clock skew have run emulated, and loss and
+partition have run on a real WAN; the real-WAN runs led to the opt-in BBR
+controller. Still missing: stage data over the N-node mesh (it needs a shared
+cache) and gossip.
 
 **3. Network object storage.** The `s3` feature round-trips against MinIO,
 over plain HTTP and over TLS with certificate verification enforced. Backblaze

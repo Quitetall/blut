@@ -28,7 +28,7 @@ first if you are deciding whether to depend on this.
 | P2P dispatch between separate network namespaces | Validated | Two containers, own IPs, real QUIC over a bridge — see below |
 | P2P dispatch between independent hosts over the internet | Validated | Oregon ↔ France, both behind NAT, real QUIC over the public internet, 2026-10-20 — see below |
 | P2P under latency, loss, partition, NAT and clock skew | Validated (emulated) | Containers on one host; impairment emulated, not a real WAN, 2026-10-20 — see below |
-| Live multi-host P2P mesh (N nodes, `p2p node`) | Deferred | Two-host coordinator/worker dispatch only so far |
+| P2P mesh across independent hosts (`p2p node`) | Validated (connectivity + signed dispatch) | Four hosts on four continents, every node probing every other, 12/12, 2026-10-20 — see below. Real stage data over the mesh needs a shared cache and is not covered |
 | Cloud queue over local object storage | Validated | `blut cloud smoke` round-trip through the shipped cookbook binary, 2026-09-19 |
 | Network object storage (S3-compatible) | Validated (MinIO) | `s3` feature; full cloud round-trip against MinIO over HTTP, 2026-09-20. Backblaze B2 over TLS refused: no conditional writes, 2026-10-20 — see below |
 | `blut-worker` REST prototype | Deleted (ADR 0083 M3) | Superseded by `src/cloud` + the `blut-web` sidecar |
@@ -152,6 +152,73 @@ can reach.
   cases are a separate emulated matrix.
 - NAT traversal relied on a provider port forward on the coordinator; there
   was no hole punching.
+
+## Recorded run: a four-continent P2P mesh (2026-10-20)
+
+Four rented machines in Nevada (US), Germany, South Korea and Australia. Each
+was a container behind its provider's NAT, reachable only through a UDP port
+forward. Each ran `blut p2p node` with its own identity. Then each node ran
+`blut p2p node --probe` with the other three as `--seed`, given as the full
+`pubkey` line from `keys show`:
+
+```
+from au:  de ok 360 ms   kr ok 166 ms   nv ok 241 ms   all 3 seeds answered
+from de:  au ok 411 ms   kr ok 297 ms   nv ok 203 ms   all 3 seeds answered
+from kr:  au ok 173 ms   de ok 303 ms   nv ok 203 ms   all 3 seeds answered
+from nv:  au ok 219 ms   de ok 197 ms   kr ok 192 ms   all 3 seeds answered
+```
+
+Each line is a mutual-TLS connection pinned to the seed's key, then one task
+dispatched. The probe verifies that the reply comes from that peer, carries a
+valid signature from the seed's key, and names the same task and output. A seed
+with the wrong key and an unroutable seed both failed within 11 s, with exit 1
+and a message naming the presented and pinned keys.
+
+**What it found.**
+- Nothing could dispatch over the mesh from a shipped binary: `p2p node`
+  connected to its seeds and waited. `--probe` closes that.
+- `--seed` refused the 128-hex `pubkey` line that `keys show` prints.
+- A pin mismatch blamed `--coordinator-pubkey` even when the key came from
+  `--seed`.
+
+**Boundaries.**
+- The mesh's built-in worker answers a connectivity task; it does not move
+  stage data. Real stages over the mesh (`--coordinator-pubkey` on a worker
+  node) read and write a content-addressed cache that every node must share,
+  and none was shared here.
+- Stage data across the internet is covered by the coordinator/worker path
+  above.
+- Gossip (peer exchange) was not exercised.
+
+## Recorded run: hostile conditions on a real WAN (2026-10-20)
+
+- **Path.** The worker in Australia dialled a relay in South Korea, which
+  forwarded to the coordinator in Germany. That is two real intercontinental
+  legs, with loss and partitions injected at the relay.
+- **Payload.** 1 MiB each way, verified as uppercase(input).
+- **Variants.** Cubic is quinn's default controller. BBR is opt-in, via
+  `BLUT_P2P_CONGESTION=bbr`.
+
+| Case | Cubic | BBR |
+|---|---|---|
+| Direct, no relay | 9.6 s | — |
+| Through the relay, no loss | 12.1 s | 10.4 s |
+| 1% random loss | 87–145 s | 11.3 s |
+| 5% random loss | did not finish in 300 s (twice) | 14.2 s |
+| 20 s partition mid-transfer, then heal | completes, 44 s | completes at 5% loss, 38 s |
+| Permanent partition | both sides exit 1 within 36–42 s ("nothing heard from the other side for 30s") | same |
+
+**What it found.** Random loss on a long path collapses loss-based congestion
+control. At 5% loss, Cubic could not move 1 MiB in five minutes, which the
+emulated matrix had predicted on one host. BBR does not read random loss as
+congestion and stays close to the clean-path time. quinn marks its BBR
+implementation experimental, so it is an opt-in rather than the default.
+`BLUT_P2P_CONGESTION` accepts `cubic` (default) or `bbr`, and refuses anything
+else before any connection is made.
+
+**Boundaries.** Loss and partitions were injected at one relay. The
+underlying paths were real but healthy. Payloads were 1 MiB. Fairness against
+competing traffic was not measured.
 
 ## Recorded run: the Slurm launcher on a live cluster (2026-10-20)
 
@@ -512,9 +579,10 @@ on the validation host.
 - Mid-stage checkpoint resume for long training stages. Node loss, durable
   resume, replica hashes, topology, versions and global-batch parity are
   recorded above.
-- An N-node `p2p node` mesh across independent hosts, and the hostile-network
-  cases on a real WAN. Two-host dispatch over the internet and the emulated
-  impairment matrix are recorded above.
+- Stage data over the N-node mesh, which needs a cache shared by the nodes;
+  gossip; and fairness of the BBR opt-in against competing traffic. Two-host
+  dispatch, a four-continent mesh probe, the emulated matrix and real-WAN
+  impairment are recorded above.
 - Run the S3 path against AWS S3 (or another provider with conditional writes)
   on public TLS, and with IAM-role credentials.
 - Publish cookbook-specific DDP evidence in each cookbook repository. Engine

@@ -80,6 +80,11 @@ pub(super) enum P2pCommand {
         /// Identity key file (defaults to the standard p2p key path).
         #[arg(long)]
         key: Option<std::path::PathBuf>,
+        /// Probe the mesh and exit instead of running: dial every seed,
+        /// dispatch one signed connectivity task to each, verify each signed
+        /// reply, print one line per seed, and exit 0 only if all answered.
+        #[arg(long, default_value_t = false)]
+        probe: bool,
     },
     /// Peer registry: list / set-trust / remove.
     Peers {
@@ -211,6 +216,7 @@ pub(super) async fn run_p2p_cmd(
     // can resolve it via find_erased_stage.
     crate::p2p::smoke::register(&mut reg);
 
+    crate::p2p::transport::congestion_from_env().map_err(|e| anyhow!("{e}"))?;
     match cmd {
         P2pCommand::Keys { cmd } => match cmd {
             P2pKeysCommand::Generate { key, force } => {
@@ -301,9 +307,15 @@ pub(super) async fn run_p2p_cmd(
             allow_legacy_peers,
             coordinator_pubkey,
             key,
+            probe,
         } => {
             let path = key.map(Ok).unwrap_or_else(default_key_path)?;
             let kp = std::sync::Arc::new(load_keypair(&path)?);
+            if probe && no_scheduler {
+                return Err(anyhow!(
+                    "--probe dispatches tasks, so it needs the scheduler capability; drop --no-scheduler"
+                ));
+            }
             run_p2p_node(
                 reg,
                 listen,
@@ -313,6 +325,7 @@ pub(super) async fn run_p2p_cmd(
                 allow_legacy_peers,
                 coordinator_pubkey,
                 kp,
+                probe,
             )
             .await
         }
@@ -628,10 +641,80 @@ fn parse_seed(spec: &str) -> Result<(std::net::SocketAddr, [u8; 32])> {
     let addr: std::net::SocketAddr = addr
         .parse()
         .with_context(|| format!("seed address '{addr}'"))?;
+    // Accept the Ed25519 key alone (64 hex) or the whole `pubkey` line of
+    // `blut p2p keys show` (128 hex, Ed25519 ‖ X25519); the mesh pins the first.
+    let hex = hex.trim();
+    if hex.len() != 64 && hex.len() != 128 {
+        return Err(anyhow!(
+            "seed pubkey must be 64 or 128 hex characters (the `pubkey` line of \
+             `blut p2p keys show` on that node); got {}",
+            hex.len()
+        ));
+    }
     let mut pubkey = [0u8; 32];
-    faster_hex::hex_decode(hex.as_bytes(), &mut pubkey)
+    faster_hex::hex_decode(&hex.as_bytes()[..64], &mut pubkey)
         .map_err(|e| anyhow!("seed pubkey hex: {e}"))?;
     Ok((addr, pubkey))
+}
+
+/// Dispatch one signed connectivity task to `conn` and check the reply: signed
+/// by the pinned peer, for this task, carrying the expected content identity.
+#[cfg(feature = "p2p")]
+async fn probe_peer(
+    node: &crate::p2p::node::MeshNode,
+    conn: &quinn::Connection,
+    keypair: &crate::p2p::crypto::KeyPair,
+    peer_pubkey: &[u8; 32],
+) -> Result<crate::p2p::peer::PeerId> {
+    use crate::framework::{ArtifactContentId, ContentHash, InvocationKey};
+    let nonce = format!("{:x}", rand::random::<u64>());
+    let expected = ArtifactContentId::from_digest(ContentHash::of_bytes(nonce.as_bytes()));
+    let me = crate::p2p::peer::PeerId::from_pubkey(&keypair.verifying);
+    let mut task = crate::p2p::task::TaskManifest {
+        protocol_version: crate::p2p::task::TASK_PROTOCOL_VERSION,
+        task_id: format!("probe-{nonce}"),
+        coordinator_id: me,
+        stage_name: "p2p-echo".into(),
+        stage_schema: 1,
+        input_content_id: ArtifactContentId::from_digest(ContentHash::of_bytes(b"probe")),
+        invocation_key: InvocationKey::from_digest(ContentHash::of_bytes(nonce.as_bytes())),
+        args_hash: ContentHash::of_bytes(b"{}"),
+        expected_content_id: Some(expected),
+        args: serde_json::json!({}),
+        resources: crate::p2p::task::ResourceRequest::default(),
+        data_class: crate::p2p::trust::DataClass::Public,
+        timeout_secs: 30,
+        deadline: crate::framework::execution::ExecutionDeadline::from_now(
+            None,
+            std::time::Duration::from_secs(30),
+        ),
+        encrypted_input: None,
+        signature: keypair.sign(b"placeholder"),
+    };
+    task.signature = keypair.sign(&task.sign_payload());
+    let task_id = task.task_id.clone();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        node.dispatch(conn, task),
+    )
+    .await
+    .map_err(|_| anyhow!("no reply within 60s"))?
+    .map_err(|e| anyhow!("{e}"))?;
+    let verifying = ed25519_dalek::VerifyingKey::from_bytes(peer_pubkey)
+        .map_err(|e| anyhow!("seed pubkey: {e}"))?;
+    if result.peer_id != crate::p2p::peer::PeerId::from_pubkey(&verifying) {
+        return Err(anyhow!(
+            "reply came from {}, not the pinned seed",
+            result.peer_id
+        ));
+    }
+    verifying
+        .verify_strict(&result.sign_payload(), &result.signature)
+        .map_err(|e| anyhow!("reply signature does not verify against the seed's key: {e}"))?;
+    if result.task_id != task_id || result.content_id != expected {
+        return Err(anyhow!("reply is for a different task or output"));
+    }
+    Ok(result.peer_id)
 }
 
 /// A connectivity/smoke worker runner (ADR 0079 A3): returns a signed result
@@ -682,6 +765,7 @@ pub(super) async fn run_p2p_node(
     allow_legacy: bool,
     coordinator_pubkey: Option<String>,
     keypair: std::sync::Arc<crate::p2p::crypto::KeyPair>,
+    probe: bool,
 ) -> Result<()> {
     use crate::p2p::node::{MeshNode, MeshTaskRunner, NodeCapabilities};
     use crate::p2p::registry::PeerRegistry;
@@ -748,18 +832,58 @@ pub(super) async fn run_p2p_node(
 
     // Dial seeds (best-effort — a down/hung seed must not block the others, so
     // each dial is time-bounded).
+    let mut probe_failures = 0usize;
     for spec in &seeds {
         match parse_seed(spec) {
             Ok((addr, pubkey)) => {
                 let dial = node.connect_to(addr, pubkey);
                 match tokio::time::timeout(std::time::Duration::from_secs(10), dial).await {
-                    Ok(Ok(_conn)) => eprintln!("connected to seed {addr}"),
-                    Ok(Err(e)) => eprintln!("seed {addr}: {e}"),
-                    Err(_) => eprintln!("seed {addr}: dial timed out"),
+                    Ok(Ok(conn)) => {
+                        eprintln!("connected to seed {addr}");
+                        if probe {
+                            let started = std::time::Instant::now();
+                            match probe_peer(&node, &conn, &keypair, &pubkey).await {
+                                Ok(peer) => println!(
+                                    "probe {addr}: ok, peer {peer} ran a signed task in {} ms",
+                                    started.elapsed().as_millis()
+                                ),
+                                Err(e) => {
+                                    probe_failures += 1;
+                                    println!("probe {addr}: FAILED: {e}");
+                                }
+                            }
+                            conn.close(0u32.into(), b"probe done");
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        probe_failures += 1;
+                        eprintln!("seed {addr}: {e}");
+                    }
+                    Err(_) => {
+                        probe_failures += 1;
+                        eprintln!("seed {addr}: dial timed out");
+                    }
                 }
             }
-            Err(e) => eprintln!("bad --seed '{spec}': {e}"),
+            Err(e) => {
+                probe_failures += 1;
+                eprintln!("bad --seed '{spec}': {e}");
+            }
         }
+    }
+    if probe {
+        if seeds.is_empty() {
+            return Err(anyhow!("--probe needs at least one --seed to probe"));
+        }
+        return if probe_failures == 0 {
+            println!("probe: all {} seeds answered", seeds.len());
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "probe: {probe_failures} of {} seeds failed",
+                seeds.len()
+            ))
+        };
     }
 
     eprintln!("node running — Ctrl-C to stop");
@@ -950,6 +1074,76 @@ mod p2p_cli_tests {
 
 #[cfg(all(test, feature = "p2p"))]
 mod tests {
+    #[cfg(feature = "p2p")]
+    async fn mesh_node(
+        keypair: std::sync::Arc<crate::p2p::crypto::KeyPair>,
+        worker: bool,
+        scheduler: bool,
+    ) -> std::sync::Arc<crate::p2p::node::MeshNode> {
+        use crate::p2p::node::{MeshNode, MeshTaskRunner, NodeCapabilities};
+        let dir = tempfile::tempdir().unwrap();
+        let peers =
+            crate::p2p::registry::PeerRegistry::load(&dir.path().join("peers.json")).unwrap();
+        std::mem::forget(dir);
+        let runner: Option<std::sync::Arc<dyn MeshTaskRunner>> = worker.then(|| {
+            std::sync::Arc::new(SmokeRunner {
+                keypair: keypair.clone(),
+            }) as std::sync::Arc<dyn MeshTaskRunner>
+        });
+        MeshNode::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            keypair,
+            peers,
+            NodeCapabilities { worker, scheduler },
+            runner,
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[cfg(feature = "p2p")]
+    #[tokio::test]
+    async fn probe_verifies_each_seeds_signed_reply() {
+        use crate::p2p::crypto::KeyPair;
+        let worker_kp = std::sync::Arc::new(KeyPair::generate());
+        let worker = mesh_node(worker_kp.clone(), true, false).await;
+        let prober_kp = std::sync::Arc::new(KeyPair::generate());
+        let prober = mesh_node(prober_kp.clone(), false, true).await;
+        let pin = worker_kp.verifying.to_bytes();
+        let conn = prober
+            .connect_to(worker.local_addr().unwrap(), pin)
+            .await
+            .unwrap();
+        let peer = tokio::time::timeout(
+            crate::TEST_HANG_GUARD,
+            probe_peer(&prober, &conn, &prober_kp, &pin),
+        )
+        .await
+        .expect("probe must not hang")
+        .expect("a healthy worker answers the probe");
+        assert_eq!(&peer, worker.node_id());
+
+        // A reply checked against another key is refused, not reported ok.
+        let other = KeyPair::generate().verifying.to_bytes();
+        let err = probe_peer(&prober, &conn, &prober_kp, &other)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not the pinned seed"), "{err}");
+    }
+
+    #[test]
+    fn seed_accepts_the_whole_keys_show_line() {
+        let ed = "ab".repeat(32);
+        let full = format!("{ed}{}", "cd".repeat(32));
+        let (_, k64) = parse_seed(&format!("1.2.3.4:9320@{ed}")).unwrap();
+        let (_, k128) = parse_seed(&format!("1.2.3.4:9320@{full}")).unwrap();
+        assert_eq!(k64, k128);
+        let err = parse_seed("1.2.3.4:9320@abcd").unwrap_err().to_string();
+        assert!(err.contains("64 or 128 hex"), "{err}");
+    }
+
     use super::*;
 
     #[test]

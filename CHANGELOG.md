@@ -31,6 +31,15 @@ depend on this crate.
 train shares one exact version.
 
 ### Added
+- `BLUT_P2P_CONGESTION=bbr` selects BBR congestion control for P2P QUIC
+  connections (default `cubic`; any other value is refused). On a real
+  Australia-Korea-Germany path at 5% random loss, 1 MiB each way took 14.2 s
+  with BBR and did not finish in 300 s with Cubic. quinn marks its BBR
+  experimental, hence opt-in.
+- `blut p2p node --probe`: dial every `--seed`, dispatch one signed task to
+  each, verify each signed reply against the seed's pinned key, print one line
+  per seed, and exit 0 only if all answered. Until now no shipped command could
+  dispatch over the mesh: `p2p node` connected to its seeds and waited.
 - `s3` cargo feature: network object storage. `ObjectStore::from_url` opens
   `s3://bucket/prefix` (AWS S3, or an S3-compatible endpoint that supports
   conditional writes) and `file://` stores, and `blut cloud --store` accepts a
@@ -223,6 +232,10 @@ train shares one exact version.
   on the local machine; a multi-node one failed at once ("multi-node training
   needs MASTER_ADDR"). The launcher is now recorded with the job and restored
   on resume. Jobs recorded before this resume locally, as before.
+- `blut p2p node --seed addr@key` accepted only the 64-hex Ed25519 key, and
+  the whole `pubkey` line that `blut p2p keys show` prints (128 hex) failed with
+  "Invalid input length". Both are accepted now. A pin mismatch no longer
+  names `--coordinator-pubkey` when the key came from `--seed`.
 - `blut p2p connect` checked only the identity (Ed25519) half of
   `--coordinator-pubkey`. With the right first half and a wrong second (X25519)
   half, a worker connected, ran the task, sealed the result to a key nobody

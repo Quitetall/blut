@@ -134,12 +134,49 @@ pub const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// QUIC application close code for an orderly end of session.
 pub const SESSION_DONE: u32 = 0x5d;
 
+/// Environment variable that selects the QUIC congestion controller.
+pub const CONGESTION_ENV: &str = "BLUT_P2P_CONGESTION";
+
+/// The QUIC congestion controller P2P endpoints use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Congestion {
+    /// quinn's default, loss-based. Collapses on lossy long paths: on a real
+    /// Australia-to-Germany path, 1 MiB each way took 12 s clean, 87-145 s
+    /// at 1% random loss, and did not finish in 300 s at 5%.
+    Cubic,
+    /// Model-based, so random loss is not read as congestion: the same path
+    /// took 10.4 s clean, 11.3 s at 1% and 14.2 s at 5%. quinn marks its BBR
+    /// experimental, which is why it is opt-in.
+    Bbr,
+}
+
+/// The controller selected by [`CONGESTION_ENV`]: unset or `cubic` is
+/// [`Congestion::Cubic`], `bbr` is [`Congestion::Bbr`]; anything else is an
+/// error, so a typo never silently runs the default.
+pub fn congestion_from_env() -> Result<Congestion, TrainError> {
+    match std::env::var(CONGESTION_ENV) {
+        Err(_) => Ok(Congestion::Cubic),
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "" | "cubic" => Ok(Congestion::Cubic),
+            "bbr" => Ok(Congestion::Bbr),
+            other => Err(TrainError::other(format!(
+                "{CONGESTION_ENV}={other:?}: expected `cubic` (default) or `bbr`"
+            ))),
+        },
+    }
+}
+
 /// The transport parameters every P2P endpoint uses (server and client).
 fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut t = quinn::TransportConfig::default();
     // 30 s is well inside the QUIC varint range, so this cannot fail.
     t.max_idle_timeout(quinn::IdleTimeout::try_from(IDLE_TIMEOUT).ok());
     t.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+    // The CLI validates the variable before any endpoint exists; a library
+    // caller that skipped that gets the default rather than a panic here.
+    if matches!(congestion_from_env(), Ok(Congestion::Bbr)) {
+        t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    }
     Arc::new(t)
 }
 
@@ -1375,10 +1412,10 @@ fn describe_dial_error(
             None => "a non-Ed25519 key".to_string(),
         };
         return format!(
-            "the coordinator at {addr} is not the one --coordinator-pubkey names: it \
-             presented Ed25519 key {presented}, the pin is {}. Copy the pubkey from \
-             `blut p2p keys show` on that coordinator (the first 64 hex characters \
-             are the Ed25519 part)",
+            "the node at {addr} is not the one you pinned (--coordinator-pubkey, or the \
+             key in --seed): it presented Ed25519 key {presented}, the pin is {}. Copy \
+             the pubkey from `blut p2p keys show` on that node (the first 64 hex \
+             characters are the Ed25519 part)",
             faster_hex::hex_string(&pinned)
         );
     }
@@ -1820,6 +1857,58 @@ mod pinned_verifier_tests {
             .expect("the full, correct pubkey must connect");
     }
 
+    /// The variable must reach the live connection, not just the config.
+    // The env lock must span the awaits: both endpoints read the variable while
+    // they are built. Other holders are synchronous tests on their own threads,
+    // which only wait; this runtime keeps running, so nothing can deadlock.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn bbr_opt_in_reaches_the_connection() {
+        let guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized by TEST_ENV_LOCK; removed below.
+        unsafe { std::env::set_var(CONGESTION_ENV, "bbr") };
+        let (server, server_keypair) = bind_loopback_server().await;
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((_, conn)) = server.accept_peer().await {
+                let _ = tokio::time::timeout(crate::TEST_HANG_GUARD, conn.closed()).await;
+            }
+        });
+        let client = P2pClient::with_coordinator_pin(
+            std::sync::Arc::new(KeyPair::generate()),
+            server_keypair.verifying.to_bytes(),
+        );
+        let (conn, _) = client.connect(addr).await.unwrap();
+        unsafe { std::env::remove_var(CONGESTION_ENV) };
+        drop(guard);
+        let state = conn.congestion_state().into_any();
+        assert!(
+            state.downcast::<quinn::congestion::Bbr>().is_ok(),
+            "BLUT_P2P_CONGESTION=bbr must select BBR on the connection"
+        );
+    }
+
+    #[test]
+    fn congestion_env_selects_bbr_and_refuses_typos() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized by TEST_ENV_LOCK; removed below.
+        unsafe { std::env::remove_var(CONGESTION_ENV) };
+        assert_eq!(congestion_from_env().unwrap(), Congestion::Cubic);
+        unsafe { std::env::set_var(CONGESTION_ENV, "BBR") };
+        assert_eq!(congestion_from_env().unwrap(), Congestion::Bbr);
+        unsafe { std::env::set_var(CONGESTION_ENV, "bbr2") };
+        let err = congestion_from_env().unwrap_err().to_string();
+        assert!(
+            err.contains("BLUT_P2P_CONGESTION") && err.contains("bbr"),
+            "{err}"
+        );
+        unsafe { std::env::remove_var(CONGESTION_ENV) };
+    }
+
     #[test]
     fn x25519_dns_name_round_trips_and_ignores_other_names() {
         let key = KeyPair::generate().x25519_public.to_bytes();
@@ -1861,7 +1950,7 @@ mod pinned_verifier_tests {
         // The error must say what is wrong, not surface a bare TLS alert
         // ("invalid peer certificate: ApplicationVerificationFailure").
         assert!(
-            err.contains("is not the one --coordinator-pubkey names")
+            err.contains("is not the one you pinned")
                 && err.contains(&faster_hex::hex_string(
                     &_server_keypair.verifying.to_bytes()
                 ))
