@@ -1313,7 +1313,8 @@ impl P2pClient {
         let peer_id = match msg {
             WireMessage::HandshakeAck { peer_id, trust } => {
                 tracing::info!(
-                    "Connected to coordinator as {} (trust: {})",
+                    "handshake with {coordinator_addr} complete: it knows this node as {} \
+                     (trust: {})",
                     peer_id,
                     trust.label()
                 );

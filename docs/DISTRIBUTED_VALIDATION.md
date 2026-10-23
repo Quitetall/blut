@@ -792,11 +792,10 @@ exercised. AWS S3 itself has not been run against.
 - Mid-stage checkpoint resume for long training stages. Node loss, durable
   resume, replica hashes, topology, versions and global-batch parity are
   recorded above.
-- Gossip and stage data over the N-node mesh between independent hosts (run
-  so far only across network namespaces on one host), and fairness of the BBR
-  opt-in against competing traffic. Two-host
-  dispatch, a four-continent mesh probe, the emulated matrix and real-WAN
-  impairment are recorded above.
+- Fairness of the BBR opt-in against competing traffic, and gossip and mesh
+  stage data under injected loss and partition. Two-host dispatch, the
+  four-continent mesh, gossip and stage data between independent hosts, the
+  emulated matrix and real-WAN impairment of dispatch are recorded above.
 - Run the S3 path with IAM-role (STS) credentials, and against AWS S3 itself.
 - Publish cookbook-specific DDP evidence in each cookbook repository. Engine
   tests prove orchestration contracts, not model-training correctness.
