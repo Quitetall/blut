@@ -213,8 +213,8 @@ impl std::fmt::Display for ConditionalPutUnsupported {
         write!(
             f,
             "this S3 endpoint does not support conditional writes (`If-None-Match: *`), \
-             which BLUT needs to publish immutable objects safely. AWS S3 and MinIO \
-             support them; Backblaze B2 does not. Provider response: {}",
+             which BLUT needs to publish immutable objects safely. AWS S3, Cloudflare R2 \
+             and MinIO support them; Backblaze B2 does not. Provider response: {}",
             self.0
         )
     }

@@ -20,8 +20,8 @@ pub(super) enum CloudCommand {
         ///
         /// `s3://bucket/prefix` reaches AWS S3 or an S3-compatible endpoint
         /// when built with `--features s3`. The endpoint must support
-        /// conditional writes (`If-None-Match: *`): MinIO does, Backblaze B2
-        /// does not.
+        /// conditional writes (`If-None-Match: *`): Cloudflare R2 and MinIO do
+        /// (both checked), Backblaze B2 does not.
         /// Credentials and endpoint come from the environment -- the same
         /// variables the AWS CLI reads -- never from a flag, because an
         /// argument lands in shell history, the process table, and any log that

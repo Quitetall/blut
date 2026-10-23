@@ -44,7 +44,9 @@ train shares one exact version.
   `s3://bucket/prefix` (AWS S3, or an S3-compatible endpoint that supports
   conditional writes) and `file://` stores, and `blut cloud --store` accepts a
   URL as well as a directory. Credentials come only from the standard AWS
-  environment variables, never from flags. Validated end to end against MinIO.
+  environment variables, never from flags. Validated end to end against
+  Cloudflare R2 over public TLS (which enforces the create-only writes) and
+  MinIO.
   An endpoint without conditional writes (Backblaze B2) is refused with an error
   that says so, instead of a generic 501 after ten retries; objects are never
   written without the create-only guarantee.

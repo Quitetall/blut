@@ -36,11 +36,12 @@ partition have run on a real WAN; the real-WAN runs led to the opt-in BBR
 controller. Still missing: stage data over the N-node mesh (it needs a shared
 cache) and gossip.
 
-**3. Network object storage.** The `s3` feature round-trips against MinIO,
-over plain HTTP and over TLS with certificate verification enforced. Backblaze
-B2 cannot host it: it has no conditional writes, and BLUT refuses it with an
-error that says so. Still missing: a run against AWS S3 or another provider with
-conditional writes on public TLS, and IAM-role credentials.
+**3. Network object storage.** Done for static credentials. The `s3` feature
+round-trips through Cloudflare R2 over public TLS, which enforces the
+create-only writes BLUT depends on. It also round-trips through MinIO over
+HTTP and over verified TLS. Backblaze B2 lacks conditional writes and is
+refused with an error that says so. Still missing: IAM-role / STS credentials
+and a run against AWS S3 itself.
 
 **4. A benchmark baseline that exists.** `scripts/run_benchmarks.sh compare` is
 in the release gate and cannot pass: only an `opt0` baseline is committed, and

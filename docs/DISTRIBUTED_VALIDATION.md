@@ -30,7 +30,7 @@ first if you are deciding whether to depend on this.
 | P2P under latency, loss, partition, NAT and clock skew | Validated (emulated) | Containers on one host; impairment emulated, not a real WAN, 2026-10-20 — see below |
 | P2P mesh across independent hosts (`p2p node`) | Validated (connectivity + signed dispatch) | Four hosts on four continents, every node probing every other, 12/12, 2026-10-20 — see below. Real stage data over the mesh needs a shared cache and is not covered |
 | Cloud queue over local object storage | Validated | `blut cloud smoke` round-trip through the shipped cookbook binary, 2026-09-19 |
-| Network object storage (S3-compatible) | Validated (MinIO) | `s3` feature; full cloud round-trip against MinIO over HTTP, 2026-09-20. Backblaze B2 over TLS refused: no conditional writes, 2026-10-20 — see below |
+| Network object storage (S3-compatible) | Validated (R2 over public TLS; MinIO) | `s3` feature; cloud round-trip against Cloudflare R2 over public TLS with create-only writes enforced, 2026-10-22; MinIO over HTTP and TLS; Backblaze B2 refused (no conditional writes) — see below |
 | `blut-worker` REST prototype | Deleted (ADR 0083 M3) | Superseded by `src/cloud` + the `blut-web` sidecar |
 | Kubernetes operator | Unsupported | Unpublished prototype; separate Rust 1.89 compile/test lane |
 | Windows containment | CI-gated | `windows-latest` job, Rust 1.88, per push: a 512 MiB allocation fails under a 128 MiB Job Object cap and succeeds under 2 GiB; the reported peak covers the commit; `TerminateJobObject` and closing the job each kill a grandchild that was alive a moment before. Covers the `containment_for()` + `after_spawn` path only: the `LocalSystemd` launcher still spawns bare on Windows, `mem_high`/`swap_max` are not mapped, and no cookbook run on Windows is recorded. The same job runs the full workspace test suite (34 test binaries, 0 failures on 2026-10-20) |
@@ -574,6 +574,35 @@ coordinator/worker smoke path was exercised, not the symmetric `p2p node` mesh
 or multi-peer dispatch. Evidence: `artifacts/BLUT/keep/2026-10-20-p2p-hostile/`
 on the validation host.
 
+## Recorded run: S3 against Cloudflare R2 over public TLS (2026-10-22)
+
+The run used a bucket created for it and an API token scoped to that bucket
+alone, with a two-day expiry. Both were deleted, and the token revoked,
+afterwards. Built with `--features s3`, endpoint
+`https://<account>.r2.cloudflarestorage.com`, region `auto`:
+
+```
+✔ cloud round-trip verified over s3://blut-qa-2026-10-22/run1; output: R2 PUBLIC TLS ROUND TRIP 1
+✔ cloud round-trip verified over s3://blut-qa-2026-10-22/run2; output: R2 PUBLIC TLS ROUND TRIP 2
+```
+
+Create-only writes are enforced, not just accepted. A driver over
+`ObjectStore::from_url` wrote one cache key three times:
+
+```
+first put: Stored
+same bytes again: AlreadyPresent
+different bytes: refused as Conflict (create-only enforced)
+stored bytes unchanged: "first writer"
+```
+
+The R2 account endpoint failed TLS (`handshake failure`) for a while after R2
+was first enabled on the account; it worked once Cloudflare had issued its
+certificate. A brand-new account can hit this, and it clears by itself.
+
+**Boundaries.** Static key credentials only; IAM roles and STS were not
+exercised. AWS S3 itself has not been run against.
+
 ## Required evidence before stronger claims
 
 - Mid-stage checkpoint resume for long training stages. Node loss, durable
@@ -583,8 +612,7 @@ on the validation host.
   gossip; and fairness of the BBR opt-in against competing traffic. Two-host
   dispatch, a four-continent mesh probe, the emulated matrix and real-WAN
   impairment are recorded above.
-- Run the S3 path against AWS S3 (or another provider with conditional writes)
-  on public TLS, and with IAM-role credentials.
+- Run the S3 path with IAM-role (STS) credentials, and against AWS S3 itself.
 - Publish cookbook-specific DDP evidence in each cookbook repository. Engine
   tests prove orchestration contracts, not model-training correctness.
 
