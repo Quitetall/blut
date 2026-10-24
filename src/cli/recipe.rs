@@ -1018,6 +1018,16 @@ impl PreparedRecipeLaunch {
                 if let Err(error) = crate::lineage_db::ingest_job(&job_id, &name, "done") {
                     tracing::warn!("lineage index {job_id}: {error}");
                 }
+                write_run_summary(
+                    &job_id,
+                    &job_dir,
+                    RunOutcome::Succeeded {
+                        stages_total: result.n_stages,
+                        cache_hits: result.n_cache_hits,
+                        cache_misses: result.n_cache_misses,
+                        warnings: result.warnings.len(),
+                    },
+                );
                 Ok(job_id)
             }
             Err(error) => {
@@ -1027,7 +1037,9 @@ impl PreparedRecipeLaunch {
                 if let Err(index_error) = crate::lineage_db::ingest_job(&job_id, &name, "failed") {
                     tracing::debug!("lineage index (failed) {job_id}: {index_error}");
                 }
-                Err(anyhow::Error::from(error).context("plan execution failed"))
+                let error = anyhow::Error::from(error).context("plan execution failed");
+                write_run_summary(&job_id, &job_dir, RunOutcome::Failed { error: &error });
+                Err(error)
             }
         }
     }
@@ -1128,6 +1140,10 @@ pub(super) fn prepare_compiled_plan_launch(
         }
         ctx.cache = std::sync::Arc::new(cache_handle);
     }
+    if let Some(remote) = remote_cache_from_env(&tenant)? {
+        let cache_handle = (*ctx.cache).clone().with_remote(remote);
+        ctx.cache = std::sync::Arc::new(cache_handle);
+    }
 
     Ok(PreparedRecipeLaunch {
         name: name.to_string(),
@@ -1143,6 +1159,88 @@ pub(super) fn prepare_compiled_plan_launch(
         ctx,
         device_index,
     })
+}
+
+/// Environment variable naming the content-addressed remote cache tier for a
+/// recipe launch: a directory, or (with the `s3` feature) a `file://` or
+/// `s3://bucket/prefix` URL. Stage outputs are written through to it and a
+/// cold machine or pod reads earlier results back from it.
+pub(super) const REMOTE_CACHE_ENV: &str = "BLUT_REMOTE_CACHE";
+
+/// Open the remote cache tier named by [`REMOTE_CACHE_ENV`], if set.
+///
+/// Credentials for an `s3://` URL come from the `AWS_*` environment only, never
+/// from the value itself. The store is probed once here so a wrong endpoint or
+/// rejected credentials fail the launch before any stage runs: writes to the
+/// remote tier are best-effort later on, and a run that silently kept its
+/// outputs local would look like a success to whoever reads the store.
+fn remote_cache_from_env(
+    tenant: &crate::tenant::Tenant,
+) -> Result<Option<crate::framework::object_store::BlockingObjectStore>> {
+    let Some(raw) = std::env::var_os(REMOTE_CACHE_ENV) else {
+        return Ok(None);
+    };
+    let raw = raw
+        .into_string()
+        .map_err(|_| anyhow!("{REMOTE_CACHE_ENV} is not valid UTF-8"))?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let prefix = if tenant.is_default() {
+        "cache".to_string()
+    } else {
+        format!("cache/{}", tenant.as_path().display())
+    };
+    let store = open_remote_cache(raw, &prefix)?;
+    let probe =
+        crate::framework::object_store::ObjectKey::Chunk(crate::framework::ContentHash([0; 32]));
+    store
+        .contains(probe)
+        .map_err(|error| anyhow!("{REMOTE_CACHE_ENV}: remote cache is not reachable: {error}"))?;
+    eprintln!("remote cache {}", redact_store_location(raw));
+    Ok(Some(store))
+}
+
+fn open_remote_cache(
+    raw: &str,
+    prefix: &str,
+) -> Result<crate::framework::object_store::BlockingObjectStore> {
+    use crate::framework::object_store::BlockingObjectStore;
+    if raw.contains("://") {
+        #[cfg(feature = "s3")]
+        {
+            let store = crate::framework::object_store::ObjectStore::from_url(raw, prefix)
+                .map_err(|error| anyhow!("{REMOTE_CACHE_ENV}: {error}"))?;
+            return Ok(store.blocking());
+        }
+        #[cfg(not(feature = "s3"))]
+        {
+            let _ = prefix;
+            return Err(anyhow!(
+                "{REMOTE_CACHE_ENV} is a URL, but this binary was built without the \
+                 `s3` feature; rebuild with it, or name a local directory"
+            ));
+        }
+    }
+    let root = std::path::Path::new(raw).join(prefix);
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("create remote cache dir {}", root.display()))?;
+    Ok(BlockingObjectStore::filesystem(root))
+}
+
+/// Scheme and bucket only: a remote-cache location is printed in job logs, so
+/// anything after the bucket (and any userinfo, which `from_url` refuses
+/// anyway) stays out of them.
+fn redact_store_location(raw: &str) -> String {
+    match raw.split_once("://") {
+        Some((scheme, rest)) => {
+            let host = rest.split('/').next().unwrap_or("");
+            let host = host.rsplit('@').next().unwrap_or(host);
+            format!("{scheme}://{host}/…")
+        }
+        None => raw.to_string(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1814,5 +1912,51 @@ mod sweep_dry_run_tests {
         let err = check_sweep_combo(&DEF, serde_json::json!({"stpes": 2}), &tenant, local)
             .expect_err("a misspelled key must fail the dry run");
         assert!(err.to_string().contains("stpes"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod remote_cache_tests {
+    use super::{open_remote_cache, redact_store_location};
+    use crate::framework::ContentHash;
+    use crate::framework::object_store::ObjectKey;
+
+    #[test]
+    fn a_directory_opens_a_filesystem_tier_under_the_prefix() {
+        let td = tempfile::tempdir().unwrap();
+        let store = open_remote_cache(td.path().to_str().unwrap(), "cache").unwrap();
+        let key = ObjectKey::Chunk(ContentHash::of_bytes(b"remote tier"));
+        store.put(key, b"remote tier").unwrap();
+        assert!(store.contains(key).unwrap());
+        assert!(
+            td.path().join("cache").is_dir(),
+            "objects live under the prefix, not the root"
+        );
+    }
+
+    #[cfg(not(feature = "s3"))]
+    #[test]
+    fn a_url_without_the_s3_feature_is_refused_by_name() {
+        let err =
+            open_remote_cache("s3://bucket/runs", "cache").expect_err("a URL needs the s3 feature");
+        assert!(err.to_string().contains("s3"), "{err}");
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn an_s3_url_with_credentials_in_it_is_refused() {
+        let err = open_remote_cache("s3://key:secret@bucket/runs", "cache")
+            .expect_err("credentials in the URL must be refused");
+        assert!(!err.to_string().contains("secret"), "{err}");
+    }
+
+    #[test]
+    fn the_logged_location_keeps_only_scheme_and_bucket() {
+        assert_eq!(redact_store_location("s3://bucket/runs/a"), "s3://bucket/…");
+        assert_eq!(
+            redact_store_location("s3://user:pw@bucket/x"),
+            "s3://bucket/…"
+        );
+        assert_eq!(redact_store_location("/var/cache"), "/var/cache");
     }
 }

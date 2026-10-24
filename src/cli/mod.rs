@@ -1155,7 +1155,13 @@ pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>)
         Some(Command::Schedule { cmd }) => run_schedule_cmd(&reg, cmd),
         Some(Command::Dataset { cmd }) => run_dataset_cmd(cmd),
         Some(Command::Policy { cmd }) => run_policy(cmd),
-        Some(Command::Recipe { cmd }) => run_recipe(&reg, cmd).await,
+        Some(Command::Recipe { cmd }) => {
+            let result = run_recipe(&reg, cmd).await;
+            if let Err(error) = &result {
+                write_failed_run_summary_once(error);
+            }
+            result
+        }
         Some(Command::Plan { cmd }) => run_plan_cmd(&reg, cmd).await,
         Some(Command::Model { cmd }) => run_model_cmd(cmd).await,
         Some(Command::Experiment { cmd }) => run_experiment_cmd(cmd),
@@ -3087,6 +3093,9 @@ use partition::*;
 
 mod recipe;
 use recipe::*;
+
+mod run_summary;
+use run_summary::*;
 
 mod runs;
 use runs::*;
