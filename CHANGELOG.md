@@ -112,7 +112,20 @@ train shares one exact version.
   it to the job before it runs, so use `spawn_attached`. A caller that spawns
   the wrapped command itself gets a running child outside the job (uncapped,
   not killed by cancel), and a warning naming `spawn_attached` when the run's
-  teardown handle is dropped; it is never left suspended.
+  teardown handle is dropped; it is never left suspended. A failed `spawn()`
+  is returned as `TrainError::Io` (program as `path`, the OS error as
+  `source`), so a caller can still tell a missing program from other failures.
+- `containment::ContainedChild`: a spawned child together with its
+  containment. It spawns through `spawn_attached`, keeps the backend and
+  teardown handle until the child exits, reads the peak after exit
+  (`peak_bytes`), and kills the whole tree on `kill_tree`, on
+  `wait_or_cancel` when the token fires, or (Windows) when dropped.
+- `LocalSystemd::spawn_contained` and `LocalSystemd::cap_spec`: spawn a local
+  stage under `containment_for()` with the launcher's `mem_max`/`mem_high`/
+  `swap_max` as the cap. On Windows this is the Job Object, so a local stage
+  gets the memory cap, peak reporting and tree kill; `LocalSystemd::wrap`
+  cannot express a Job Object as a command line and now says so, naming
+  `spawn_contained`, instead of blaming a missing `systemd-run`.
 
 ### Changed
 - **Breaking (P2P API):** `p2p::transport::WireMessage` gains `Goodbye`, the

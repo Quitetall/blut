@@ -371,7 +371,11 @@ Off-systemd, `LocalSystemd::wrap` degrades to a bare spawn with a warning;
 On Windows the `containment_for()` factory selects the Job Object backend
 (`containment::windows`), which caps the tree's committed memory and kills the
 tree on cancel; a caller must spawn through `containment::spawn_attached` (or
-call `Containment::after_spawn`). `LocalSystemd::wrap` stays bare on Windows.
+call `Containment::after_spawn`). A local stage is contained on any host by
+`LocalSystemd::spawn_contained`, which applies the launcher's caps through
+`containment_for()` and returns a `containment::ContainedChild` (peak after
+exit, `kill_tree`, `wait_or_cancel`). `LocalSystemd::wrap` and `launch` stay
+bare on Windows: a Job Object is not a wrapper command.
 
 ---
 

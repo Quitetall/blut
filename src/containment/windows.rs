@@ -49,10 +49,12 @@
 //!
 //! The job lives as long as the [`TeardownHandle`] (and its clones). Dropping
 //! the last one closes the job handle and, by `KILL_ON_JOB_CLOSE`, kills any
-//! process still in the job, so keep the handle until the run is over. A
-//! caller must spawn through [`super::spawn_attached`]: it starts the child
-//! suspended ([`Containment::before_spawn`]), assigns it to the job, then lets
-//! it run, so nothing the child starts can escape. A caller that calls
+//! process still in the job, so keep the handle until the run is over;
+//! [`super::ContainedChild`] holds it for exactly that long. A caller must
+//! spawn through [`super::spawn_attached`] (which `ContainedChild` and
+//! `LocalSystemd::spawn_contained` use): it starts the child suspended
+//! ([`Containment::before_spawn`]), assigns it to the job, then lets it run,
+//! so nothing the child starts can escape. A caller that calls
 //! `spawn()` itself gets a running child that is NOT in the job (uncapped,
 //! and its processes outlive cancellation); when that run's teardown handle is
 //! dropped, a warning says so and names `spawn_attached`. That is deliberate:
