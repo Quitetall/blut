@@ -1267,17 +1267,32 @@ pub(super) async fn run_recipe_sweep(
     let dir = config_dir.ok_or_else(|| anyhow!("--config-dir is required in config/sweep mode"))?;
     let cfg_name =
         config_name.ok_or_else(|| anyhow!("--config-name is required in config/sweep mode"))?;
-    // Args subtree key (default = recipe name). Overrides/sweeps must be dotted
-    // paths INTO this subtree; dot-less keys are consumed by the compose layer
-    // as defaults-list group selections and silently never reach a config value.
+    // Args subtree key (default = recipe name). When the config nests the
+    // Args under it, overrides must be dotted paths into that subtree.
     let key = config_key.unwrap_or_else(|| name.to_string());
-    warn_dotless_overrides(set, "--set", &key);
-    warn_dotless_overrides(sweep, "--sweep", &key);
 
     let entries = crate::config::expand_and_fingerprint(&dir, &cfg_name, set, sweep)
         .map_err(|e| anyhow!("config compose/expand: {e}"))?;
     if entries.is_empty() {
         return Err(anyhow!("sweep expanded to 0 combos"));
+    }
+    if let Some(first) = entries.first() {
+        warn_overrides_outside_args(&first.config.json, &key, set, sweep);
+    }
+    // Two combos that hand the recipe the same args are one run, launched
+    // twice under different labels: an override did not reach the args.
+    let projected: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| project_args(e.config.json.clone(), &key))
+        .collect();
+    if let Some((i, j)) = first_duplicate(&projected) {
+        return Err(anyhow!(
+            "sweep combos {:?} and {:?} give the recipe identical args, so an override \
+             does not reach them; when the config nests the args under '{key}:', \
+             address them as '{key}.<field>=…'",
+            entries[i].overrides,
+            entries[j].overrides
+        ));
     }
     let total = entries.len();
     eprintln!("sweep: {total} combo(s) for recipe '{name}'");
@@ -1366,8 +1381,7 @@ pub(super) async fn run_recipe_sweep(
 /// nests them under `key` (the recipe name by default) as an object, return
 /// that subtree — so `--set`/`--sweep` dotted paths `<key>.field=v` reach the
 /// Args. Otherwise (a flat config with no such subtree) return the whole config
-/// as-is (it feeds the Args directly, but top-level overrides can't apply — a
-/// compose-grammar limitation; `warn_dotless_overrides` surfaces it).
+/// as-is; it feeds the Args directly and dot-less overrides reach it.
 /// Resolve and compile one sweep combo's args without running anything (the
 /// check `recipe run --dry-run` applies to a single invocation).
 fn check_sweep_combo(
@@ -1393,19 +1407,39 @@ pub(super) fn project_args(mut config: serde_json::Value, key: &str) -> serde_js
     config
 }
 
-/// Warn about `key=val` overrides whose key has no `.` — the compose layer
-/// treats those as defaults-list group selections, NOT config-value overrides,
-/// so they silently don't change a value (and the sweep would collapse to
-/// identical fingerprints). `subtree_key` is the Args subtree to target.
-pub(super) fn warn_dotless_overrides(items: &[String], flag: &str, subtree_key: &str) {
-    for it in items {
-        let key = it.split_once('=').map_or(it.as_str(), |(k, _)| k);
-        if !key.contains('.') {
-            eprintln!(
-                "warning: {flag} '{it}' key is dot-less — it is treated as a \
-                 defaults-list group selection, not a value override; nest Args under \
-                 '{subtree_key}:' and use a dotted path (e.g. '{subtree_key}.{key}=…')."
-            );
+/// The first pair of equal values, by index.
+fn first_duplicate(values: &[serde_json::Value]) -> Option<(usize, usize)> {
+    for (i, a) in values.iter().enumerate() {
+        if let Some(offset) = values[i + 1..].iter().position(|b| b == a) {
+            return Some((i, i + 1 + offset));
+        }
+    }
+    None
+}
+
+/// Warn about a dot-less `key=val` override when the composed config nests the
+/// recipe's Args under `subtree_key`: the override sets a top-level value the
+/// recipe never reads. (On a flat config, dot-less keys are value overrides
+/// and reach the Args directly.)
+pub(super) fn warn_overrides_outside_args(
+    composed: &serde_json::Value,
+    subtree_key: &str,
+    set: &[String],
+    sweep: &[String],
+) {
+    if !composed.get(subtree_key).is_some_and(|v| v.is_object()) {
+        return;
+    }
+    for (flag, items) in [("--set", set), ("--sweep", sweep)] {
+        for it in items {
+            let key = it.split_once('=').map_or(it.as_str(), |(k, _)| k);
+            let key = key.trim_start_matches(['+', '~']);
+            if !key.contains('.') && key != subtree_key && composed.get(key).is_some() {
+                eprintln!(
+                    "warning: {flag} '{it}' sets top-level '{key}', but the recipe args are \
+                     read from the '{subtree_key}:' subtree; use '{subtree_key}.{key}=…'."
+                );
+            }
         }
     }
 }
@@ -1805,6 +1839,50 @@ mod sweep_dry_run_tests {
             .0)
         },
     };
+
+    /// `--sweep seed=1,2` over a flat config ran two identical combos (the
+    /// dot-less key never reached a value), and over a nested config it still
+    /// sets a key the recipe never reads. The first now varies the args; the
+    /// second is caught before anything runs.
+    #[test]
+    fn a_sweep_axis_must_reach_the_recipe_args() {
+        let flat = tempfile::tempdir().unwrap();
+        std::fs::write(flat.path().join("config.yaml"), "steps: 0\n").unwrap();
+        let sweep = ["steps=1,2".to_string()];
+        let entries = crate::config::expand_and_fingerprint(
+            flat.path().to_str().unwrap(),
+            "config",
+            &[],
+            &sweep,
+        )
+        .unwrap();
+        let args: Vec<_> = entries
+            .iter()
+            .map(|e| super::project_args(e.config.json.clone(), "sweep_dry"))
+            .collect();
+        assert_eq!(args[0]["steps"], 1);
+        assert_eq!(args[1]["steps"], 2);
+        assert_eq!(super::first_duplicate(&args), None);
+
+        let nested = tempfile::tempdir().unwrap();
+        std::fs::write(
+            nested.path().join("config.yaml"),
+            "steps: 0\nsweep_dry:\n  steps: 0\n",
+        )
+        .unwrap();
+        let entries = crate::config::expand_and_fingerprint(
+            nested.path().to_str().unwrap(),
+            "config",
+            &[],
+            &sweep,
+        )
+        .unwrap();
+        let args: Vec<_> = entries
+            .iter()
+            .map(|e| super::project_args(e.config.json.clone(), "sweep_dry"))
+            .collect();
+        assert_eq!(super::first_duplicate(&args), Some((0, 1)));
+    }
 
     /// `--sweep count.stpes=1,2 --dry-run` listed both combos as fine; the
     /// real run then failed every one.
