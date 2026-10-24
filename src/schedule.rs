@@ -125,22 +125,55 @@ pub fn install(recipe: &str, calendar: &str, args_json: &str) -> Result<()> {
          [Install]\n\
          WantedBy=timers.target\n"
     );
-    std::fs::write(dir.join(format!("{stem}.service")), service)
-        .map_err(|e| TrainError::other(format!("write service: {e}")))?;
-    std::fs::write(dir.join(format!("{stem}.timer")), timer)
-        .map_err(|e| TrainError::other(format!("write timer: {e}")))?;
+    write_and_enable(&dir, &stem, &service, &timer, systemctl)
+}
 
-    systemctl(&["daemon-reload"])?;
-    systemctl(&["enable", "--now", &format!("{stem}.timer")])?;
+/// Write the unit pair and enable the timer. If systemd refuses, remove the
+/// files again: a failed install used to leave them behind, and `schedule
+/// list` (which reads the unit directory) then reported a timer that was
+/// never enabled.
+fn write_and_enable(
+    dir: &std::path::Path,
+    stem: &str,
+    service: &str,
+    timer: &str,
+    systemctl: impl Fn(&[&str]) -> Result<()>,
+) -> Result<()> {
+    let service_path = dir.join(format!("{stem}.service"));
+    let timer_path = dir.join(format!("{stem}.timer"));
+    let remove = || {
+        let _ = std::fs::remove_file(&timer_path);
+        let _ = std::fs::remove_file(&service_path);
+    };
+    std::fs::write(&service_path, service)
+        .map_err(|e| TrainError::other(format!("write service: {e}")))?;
+    if let Err(e) = std::fs::write(&timer_path, timer) {
+        remove();
+        return Err(TrainError::other(format!("write timer: {e}")));
+    }
+    let enabled = systemctl(&["daemon-reload"])
+        .and_then(|()| systemctl(&["enable", "--now", &format!("{stem}.timer")]));
+    if let Err(e) = enabled {
+        remove();
+        let _ = systemctl(&["daemon-reload"]);
+        return Err(e);
+    }
     Ok(())
 }
 
 /// Disable + remove a recipe's timer/service.
 pub fn uninstall(recipe: &str) -> Result<()> {
     let stem = unit_stem(recipe);
-    // Best-effort disable (ignore if not enabled).
-    let _ = systemctl(&["disable", "--now", &format!("{stem}.timer")]);
     let dir = user_units_dir()?;
+    // Uninstalling a timer that was never installed (a typo) used to report
+    // "removed timer" and exit 0.
+    if !dir.join(format!("{stem}.timer")).exists() && !dir.join(format!("{stem}.service")).exists()
+    {
+        return Err(TrainError::other(format!(
+            "no blut timer is installed for recipe '{recipe}' (see `blut schedule list`)"
+        )));
+    }
+    let _ = systemctl(&["disable", "--now", &format!("{stem}.timer")]);
     let _ = std::fs::remove_file(dir.join(format!("{stem}.timer")));
     let _ = std::fs::remove_file(dir.join(format!("{stem}.service")));
     systemctl(&["daemon-reload"])?;
@@ -184,6 +217,23 @@ fn systemctl(args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_enable_leaves_no_unit_files() {
+        let td = tempfile::tempdir().unwrap();
+        let refuse = |args: &[&str]| -> Result<()> {
+            if args.first() == Some(&"enable") {
+                Err(TrainError::other("Unit blut-x.timer does not exist"))
+            } else {
+                Ok(())
+            }
+        };
+        assert!(write_and_enable(td.path(), "blut-x", "s", "t", refuse).is_err());
+        assert!(!td.path().join("blut-x.timer").exists());
+        assert!(!td.path().join("blut-x.service").exists());
+        assert!(write_and_enable(td.path(), "blut-x", "s", "t", |_: &[&str]| Ok(())).is_ok());
+        assert!(td.path().join("blut-x.timer").exists());
+    }
 
     /// An exe path with a space was written unquoted (the unit ran
     /// `/opt/my`), and `%`/`$` in args were left for systemd to expand.

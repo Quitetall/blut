@@ -1240,6 +1240,34 @@ pub fn check_launcher_env(target: LaunchTarget) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a launcher whose client commands are not installed. `recipe run
+/// --launcher slurm` on a host with no Slurm client used to run every stage on
+/// the local machine and report success, because only launcher-aware stages
+/// ever reach `sbatch`. `docs/SLURM.md` lists the client commands as a
+/// requirement of the submit host.
+pub(crate) fn check_launcher_tools(target: LaunchTarget) -> Result<()> {
+    let required: &[&str] = match target {
+        LaunchTarget::Slurm => &["sbatch", "scontrol"],
+        _ => &[],
+    };
+    let on_path = |tool: &str| {
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(tool).is_file()))
+    };
+    let missing: Vec<&str> = required.iter().copied().filter(|t| !on_path(t)).collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(TrainError::other(format!(
+            "--launcher {} needs {} on PATH, and this host has no {}; run on a submit host \
+             with the client installed (see docs/SLURM.md), or use --launcher local",
+            target.as_str(),
+            required.join(", "),
+            missing.join(", ")
+        )))
+    }
+}
+
 /// The configured [`Launcher`] for a target. Slurm/Ray read their cluster
 /// config from env (`BLUT_SLURM_*` / `RAY_ADDRESS` / `BLUT_RAY_RUNTIME_ENV`) so
 /// the DAG itself stays portable — the same recipe runs locally or on a cluster
