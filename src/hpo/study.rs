@@ -51,7 +51,8 @@ pub struct StudySpec {
     pub objectives: Vec<Objective>,
     #[serde(default)]
     pub space: SearchSpace,
-    /// random | grid | tpe | mvtpe | gp
+    /// random | tpe | asha | gp | mvtpe | surrogate (`grid` is refused: see
+    /// `blut study run`).
     #[serde(default = "default_sampler")]
     pub sampler: String,
     #[serde(default)]

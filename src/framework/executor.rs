@@ -1385,6 +1385,28 @@ fn record_divergence_and_kill(
     tok.cancel();
 }
 
+/// Coordinator-side PRUNE kill: a policy's `KillBranch` on a step that did NOT
+/// diverge (HPO early stopping). Cancels the emitting node's token without a
+/// divergence-registry entry, so `run_node` unwinds to `NodeFailure::Killed`
+/// and the coordinator prunes the branch while the rest of the plan keeps
+/// running. A no-op when the node is already kill-flagged for a divergence
+/// this attempt, or its token already fired.
+fn prune_kill(
+    nid: Option<NodeId>,
+    node_tokens: &HashMap<NodeId, KillSlot>,
+    kill_flagged: &HashSet<NodeId>,
+) {
+    let Some(nid) = nid else { return };
+    if kill_flagged.contains(&nid) {
+        return;
+    }
+    if let Some(tok) = node_tokens.get(&nid)
+        && !tok.is_cancelled()
+    {
+        tok.cancel();
+    }
+}
+
 /// Run ONE node: cache lookup → tmp dir → resource permits → run →
 /// (cancel check) → atomic promote → rebase → sidecar → cache insert →
 /// events. The single home of the FW-2 atomicity contract. Emits
@@ -6385,16 +6407,27 @@ impl ParallelExecutor {
                                                     );
                                                 }
                                                 Control::Continue => {}
-                                                // A `KillBranch` IS a divergence kill — KillOnNaN
-                                                // is its only emitter (non-finite step metric); the
-                                                // separate `Spawn` arm below is NOT a kill. Record
-                                                // the divergence + cancel the token so `run_node`
-                                                // retries it (auto-resume) instead of pruning.
-                                                Control::KillBranch => {
+                                                // A `KillBranch` on a DIVERGED step (non-finite
+                                                // metric, or the stage's own `divergence_check`)
+                                                // is a divergence kill: record it + cancel the
+                                                // token so `run_node` retries it (auto-resume).
+                                                Control::KillBranch
+                                                    if stage_diverged || m.has_non_finite() =>
+                                                {
                                                     record_divergence_and_kill(
                                                         nid, node_idx, &stage_name, &update,
                                                         &node_tokens, &mut kill_flagged, &env,
                                                     );
+                                                }
+                                                // Any other `KillBranch` is the documented
+                                                // branch prune: HPO early stopping (ASHA /
+                                                // median / percentile / PBT cull) kills a
+                                                // HEALTHY trial whose metric is finite. Routing
+                                                // it through the divergence path turned every
+                                                // early stop into a retry and then a terminal
+                                                // `Diverged` that failed the whole HPO job.
+                                                Control::KillBranch => {
+                                                    prune_kill(nid, &node_tokens, &kill_flagged);
                                                 }
                                                 // Queue the delta; it is injected at
                                                 // the top of the loop (never mid-select!).

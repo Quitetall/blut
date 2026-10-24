@@ -24,7 +24,10 @@ pub(super) enum HpoCommand {
         /// Base args as inline JSON (the fixed part; search dims overlay it).
         #[arg(long, default_value = "{}")]
         args: String,
-        /// Search-space YAML file (`dims:` map of dotted-arg-path → distribution).
+        /// Search-space YAML file: a `dims:` map of dotted arg path →
+        /// distribution, e.g. `lr: { dist: log_uniform, low: 1.0e-5, high: 1.0e-2 }`.
+        /// `dist` is uniform | log_uniform | int_uniform | q_uniform (adds `q`) |
+        /// choice (`choices: [...]`).
         #[arg(long)]
         space: Option<String>,
         /// Inline search dim(s): `--param 'lr=loguniform(1e-5,1e-2)'` (repeatable;
@@ -32,7 +35,9 @@ pub(super) enum HpoCommand {
         #[arg(long = "param", value_name = "NAME=FN(...)")]
         param: Vec<String>,
         /// Search algorithm: asha (default) | random | median | percentile |
-        /// pbt (population-based, resume-on-promote) | tpe (Parzen ask-tell).
+        /// pbt (population-based; the recipe must accept a `resume_from` arg) |
+        /// tpe (Parzen ask-tell) | surrogate (multi-objective GP + EHVI; needs
+        /// --objectives, normally supplied by `blut study run`).
         #[arg(long, default_value = "asha")]
         algo: String,
         /// Objective metric — a dotted key read from each trial's StageStep
@@ -300,11 +305,29 @@ fn hpo_selected_footprint(
     Ok(worst)
 }
 
+/// The seed for a model-based sampler (TPE, surrogate) that runs AFTER the
+/// random initial population. Both samplers fall back to random draws until
+/// they have enough observations; seeded with the population's own seed, those
+/// draws replayed the population exactly and re-ran trials already evaluated.
+fn follow_up_seed(seed: u64) -> u64 {
+    seed ^ 0x9E37_79B9_7F4A_7C15
+}
+
+/// The recipe's compile function, used to read a runtime-injected trial's OWN
+/// declared resource envelope.
+type HpoCompileFn = fn(
+    serde_json::Value,
+) -> std::result::Result<
+    crate::framework::plan::CompiledPlan,
+    crate::framework::error::RecipeError,
+>;
+
 fn hpo_node_admission_resolver(
     recipe: String,
     snapshot: crate::broker::ResourceSnapshot,
     initial: impl IntoIterator<Item = (std::sync::Arc<serde_json::Value>, HpoTrialAdmission)>,
     dynamic_limit: std::sync::Arc<std::sync::OnceLock<crate::broker::Footprint>>,
+    compile_fn: Option<HpoCompileFn>,
 ) -> anyhow::Result<crate::framework::executor::TrainingIoNodeAdmissionResolver> {
     let mut initial_cache = std::collections::HashMap::new();
     for (recipe_args, admission) in initial {
@@ -329,10 +352,18 @@ fn hpo_node_admission_resolver(
             {
                 admission
             } else {
-                // Runtime-injected trial: no compiled sub-plan is threaded here; the
-                // JSON path bills it (the declared-envelope spawn guard already bounds
-                // any oversized suggestion). Per-trial envelopes cover initial trials.
-                let admission = hpo_trial_admission(&recipe, recipe_args, None, &snapshot);
+                // Runtime-injected trial (a TPE / surrogate suggestion or a PBT
+                // clone). Bill it its OWN declared envelope, read by compiling the
+                // recipe over the child's args — exactly how an initial trial is
+                // billed. Passing no envelope billed every child the 2 GiB
+                // compatibility floor: a recipe declaring less than that was
+                // refused against the held reservation on its first suggestion,
+                // and one declaring more was under-billed.
+                let declared = compile_fn
+                    .and_then(|compile| compile(recipe_args.clone()).ok())
+                    .and_then(|plan| plan.max_declared_envelope_in(0..plan.n_nodes() as u32));
+                let admission =
+                    hpo_trial_admission(&recipe, recipe_args, declared.as_ref(), &snapshot);
                 let mut cached = cache
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -344,7 +375,7 @@ fn hpo_node_admission_resolver(
 }
 
 /// A runtime PBT/TPE child must fit inside the one immutable reservation held
-/// for this HPO job. Its synchronous/legacy envelope and known VRAM cannot
+/// for this HPO job. Its resolved footprint and known VRAM cannot
 /// exceed the initial worst trial, while profile selection receives the same
 /// RAM ceiling so retained async bytes downgrade to Inline or refuse.
 fn constrain_dynamic_hpo_admission(
@@ -355,10 +386,13 @@ fn constrain_dynamic_hpo_admission(
     let Some(limit) = limit else {
         return Ok(node);
     };
-    let required_ram = admission
-        .resolved_footprint
-        .ram_bytes
-        .max(admission.sync_footprint.ram_bytes);
+    // Compare like with like: the held limit is built from each initial
+    // trial's resolved (or profile-selected) footprint, so a child is held to
+    // its resolved footprint too. The sync footprint of a stage with no cost
+    // terms is floored at 2 GiB for containment sizing only; counting it here
+    // refused every child of a recipe that declares less than that. A
+    // profile-declaring child is still bounded through `selection_budget_bytes`.
+    let required_ram = admission.resolved_footprint.ram_bytes;
     if required_ram > limit.ram_bytes {
         return Err(format!(
             "runtime HPO child needs {required_ram} RAM bytes, above the held {}-byte tenant reservation",
@@ -573,6 +607,7 @@ pub(super) async fn run_hpo(
             .cloned()
             .zip(trial_admissions.iter().copied()),
         std::sync::Arc::clone(&dynamic_admission_limit),
+        reg.find(&name).map(|def| def.compile_fn),
     )?;
 
     // Job + ExecCtx — mirror run_one_recipe while retaining one immutable HPO
@@ -748,6 +783,11 @@ pub(super) async fn run_hpo(
             .find(&name)
             .ok_or_else(|| anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)"))?;
         let cfn = def.compile_fn;
+        // Every PBT clone is the recipe recompiled with a `resume_from` arg. A
+        // recipe that does not take one ran the initial population, culled it,
+        // and then only logged "clone factory failed" for every clone: PBT
+        // degraded to a percentile cull without saying so. Refuse up front.
+        pbt_preflight(&name, cfn, &base_args, trials.first().map(|t| &t.overlay))?;
         let base_for_factory = base_args.clone();
         let factory: crate::hpo::TrialFactory = std::sync::Arc::new(move |overlay, resume| {
             let mut a = base_for_factory.clone();
@@ -790,7 +830,7 @@ pub(super) async fn run_hpo(
                 maximize: mode == "max",
                 ..TpeConfig::default()
             },
-            seed,
+            follow_up_seed(seed),
         );
         let cfg = TpePolicyConfig {
             metric_key: metric.clone(),
@@ -852,7 +892,7 @@ pub(super) async fn run_hpo(
             sp.clone(),
             cfg,
             factory,
-            seed,
+            follow_up_seed(seed),
         )
         .map_err(|e| anyhow!("{e}"))?;
         ctx = ctx.with_control(with_nan_safety(std::sync::Arc::new(sched)));
@@ -930,6 +970,13 @@ pub(super) async fn run_hpo(
                  winning config: `blut hpo best {job_id}`.",
                 trials.len()
             );
+            // A search whose objective no trial ever reported ranked nothing:
+            // every early-stop decision and the "winner" are meaningless. Say
+            // so and fail, instead of exiting 0 on a typo'd `--metric`.
+            let lines = crate::jobs::read_status_lines(&job_id).unwrap_or_default();
+            if let Some(err) = unreported_metric_error(&metric, &lines, &job_id) {
+                return Err(err);
+            }
             Ok(Some(job_id))
         }
         Err(e) => {
@@ -942,6 +989,69 @@ pub(super) async fn run_hpo(
             Err(anyhow::Error::from(e).context("hpo plan execution failed"))
         }
     }
+}
+
+/// Refuse `--algo pbt` for a recipe that cannot be warm-started: one whose
+/// args compile without `resume_from` but not with it.
+fn pbt_preflight(
+    name: &str,
+    compile: HpoCompileFn,
+    base_args: &serde_json::Value,
+    overlay: Option<&crate::hpo::Overlay>,
+) -> Result<()> {
+    let mut args = base_args.clone();
+    if let Some(overlay) = overlay {
+        crate::hpo::apply_overlay(&mut args, overlay);
+    }
+    if compile(args.clone()).is_err() {
+        // The plain trial does not compile either; the ordinary trial compile
+        // reports that with its own message.
+        return Ok(());
+    }
+    if let Some(obj) = args.as_object_mut() {
+        obj.insert("resume_from".into(), serde_json::json!("pbt-preflight"));
+    }
+    compile(args).map(|_| ()).map_err(|e| {
+        anyhow!(
+            "--algo pbt warm-starts each clone by passing `resume_from` (the \
+             winner's stage dir) to the recipe, and '{name}' does not accept it: {e}. \
+             Add a `resume_from` arg to the recipe, or use asha / median / percentile."
+        )
+    })
+}
+
+/// `Some(error)` when no `StageStep` in the job's status stream carries
+/// `metric` (dotted path), naming the step keys that WERE reported.
+fn unreported_metric_error(
+    metric: &str,
+    status_lines: &[String],
+    job_id: &str,
+) -> Option<anyhow::Error> {
+    let mut seen = std::collections::BTreeSet::new();
+    for line in status_lines {
+        let Ok(event) = serde_json::from_str::<crate::framework::status::StageEvent>(line) else {
+            continue;
+        };
+        let crate::framework::status::StageEvent::StageStep { update, .. } = event else {
+            continue;
+        };
+        // The same reader the schedulers and the leaderboard use.
+        if crate::hpo::scheduler::dotted_f64(&update, metric).is_some() {
+            return None;
+        }
+        if let Some(obj) = update.as_object() {
+            seen.extend(obj.keys().cloned());
+        }
+    }
+    let seen = if seen.is_empty() {
+        "none (no trial emitted a step)".to_string()
+    } else {
+        seen.into_iter().collect::<Vec<_>>().join(", ")
+    };
+    Some(anyhow!(
+        "no trial reported the objective metric '{metric}' (job {job_id}); \
+         step keys reported: {seen}. Check --metric."
+    ))
 }
 
 /// Resolve the HPO job to inspect: an explicit id (via `jobs::resolve_job_id`,
@@ -1048,13 +1158,46 @@ pub(super) fn run_hpo_best(job: Option<String>, json: bool) -> Result<()> {
     for (k, v) in &best.overlay {
         println!("  {k} = {v}");
     }
+    // The overlay alone is not the trial: it lands on the job's base args
+    // (`args.json`, written by the executor). Printing only the overlay told
+    // the user to re-run with the recipe defaults in place of their `--args`,
+    // and a dotted dim (`optimizer.lr`) came out as a literal top-level key.
+    let base = crate::jobs::job_dir_path(&id)
+        .ok()
+        .and_then(|dir| std::fs::read_to_string(dir.join("args.json")).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    let full = reproduce_args(base, &best.overlay);
     println!(
-        "\nreproduce: blut recipe run {} --args '{}'",
+        "\nreproduce: {} recipe run {} --args {}",
+        invoked_binary_name(),
         manifest.recipe,
-        serde_json::to_string(&serde_json::Value::Object(overlay_obj.clone()))
-            .unwrap_or_else(|_| "{}".into())
+        super::update::shell_join(&[serde_json::to_string(&full).unwrap_or_else(|_| "{}".into())])
     );
     Ok(())
+}
+
+/// A trial's full recipe args: its overlay deep-merged over the job's base
+/// args (an absent or unreadable base is the empty object).
+fn reproduce_args(
+    base: Option<serde_json::Value>,
+    overlay: &[(String, serde_json::Value)],
+) -> serde_json::Value {
+    let mut full = base.unwrap_or_else(|| serde_json::json!({}));
+    crate::hpo::apply_overlay(&mut full, &overlay.to_vec());
+    full
+}
+
+/// The name this binary was invoked as (`blut`, or a cookbook binary such as
+/// `blut-standard`), so a printed command can be pasted as-is.
+fn invoked_binary_name() -> String {
+    std::env::args_os()
+        .next()
+        .and_then(|arg0| {
+            std::path::Path::new(&arg0)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "blut".to_string())
 }
 
 #[cfg(test)]
@@ -1332,6 +1475,7 @@ mod hpo_run_flag_tests {
             crate::broker::ResourceSnapshot::default(),
             trial_args.iter().cloned().zip(admissions),
             Arc::new(std::sync::OnceLock::new()),
+            None,
         )
         .expect("node resolver");
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1366,6 +1510,7 @@ mod hpo_run_flag_tests {
             crate::broker::ResourceSnapshot::default(),
             trial_args.iter().cloned().zip(admissions),
             Arc::new(std::sync::OnceLock::new()),
+            None,
         )
         .expect("node resolver");
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1433,5 +1578,205 @@ mod hpo_run_flag_tests {
             profile.downgrade_reason,
             Some(TrainingIoDowngradeReason::BudgetPressure)
         );
+    }
+
+    /// A stage declaring a small envelope, standing in for a runtime TPE /
+    /// surrogate / PBT child.
+    struct SmallEnvelopeStage;
+
+    #[async_trait]
+    impl Stage for SmallEnvelopeStage {
+        const NAME: &'static str = "hpo_small_envelope_stage";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = ();
+        type Output = AdmissionValue;
+        type Args = AdmissionArgs;
+
+        fn resource_envelope(
+            &self,
+            _args: &AdmissionArgs,
+        ) -> blut_types::envelope::ResourceEnvelope {
+            blut_types::envelope::ResourceEnvelope {
+                ram_bytes: 64 * MIB,
+                ..Default::default()
+            }
+        }
+
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            _input: (),
+            _args: &AdmissionArgs,
+        ) -> Result<AdmissionValue, StageError> {
+            Ok(AdmissionValue)
+        }
+    }
+
+    fn small_child_compile(
+        recipe_args: serde_json::Value,
+    ) -> Result<CompiledPlan, crate::framework::error::RecipeError> {
+        let stage: Arc<dyn StageDyn> = Arc::new(SmallEnvelopeStage);
+        Ok(CompiledPlan::from_erased_chain(
+            "hpo-small-child",
+            recipe_args,
+            vec![(stage, serde_json::json!({}))],
+        )
+        .expect("compile small child"))
+    }
+
+    #[test]
+    fn runtime_child_is_billed_its_own_declared_envelope() {
+        // E2E regression: `blut hpo run --algo tpe` on a recipe declaring
+        // 64 MiB failed on its first suggestion — the child was billed the
+        // 2 GiB compatibility floor and refused against the 64 MiB held
+        // reservation. With the recipe's compile fn the child is billed what
+        // it declares and fits.
+        let limit = Footprint {
+            ram_bytes: 64 * MIB,
+            vram_mib: 0,
+        };
+        let child_args = serde_json::json!({"suggested": 1});
+        let with_envelope = hpo_node_admission_resolver(
+            "hpo-small-child".into(),
+            crate::broker::ResourceSnapshot::default(),
+            std::iter::empty(),
+            Arc::new(std::sync::OnceLock::from(limit)),
+            Some(small_child_compile),
+        )
+        .expect("node resolver");
+        assert!(
+            with_envelope(
+                SmallEnvelopeStage::NAME,
+                &serde_json::json!({}),
+                &child_args
+            )
+            .is_ok(),
+            "a child that declares 64 MiB fits a 64 MiB reservation"
+        );
+
+        let without = hpo_node_admission_resolver(
+            "hpo-small-child".into(),
+            crate::broker::ResourceSnapshot::default(),
+            std::iter::empty(),
+            Arc::new(std::sync::OnceLock::from(limit)),
+            None,
+        )
+        .expect("node resolver");
+        assert!(
+            without(
+                SmallEnvelopeStage::NAME,
+                &serde_json::json!({}),
+                &child_args
+            )
+            .is_err(),
+            "with no envelope the child bills the 2 GiB floor and is refused"
+        );
+    }
+
+    #[test]
+    fn follow_up_sampler_does_not_replay_the_initial_population() {
+        // E2E regression: `blut hpo run --algo tpe --seed 5` re-ran four of its
+        // six initial trials verbatim, because the TPE cold-start draws used
+        // the same seeded RNG stream as the random initial population.
+        use crate::hpo::{RandomSampler, Sampler, SearchSpace};
+        let space = SearchSpace::from_yaml(
+            "dims:\n  lr: { dist: log_uniform, low: 1.0e-5, high: 1.0e-1 }\n",
+        )
+        .expect("space");
+        let seed = 5;
+        let mut initial = RandomSampler::new(seed);
+        let population: Vec<_> = (0..4).map(|_| initial.ask(&space, &[])).collect();
+        let mut follow_up = crate::hpo::TpeSampler::new(
+            crate::hpo::TpeConfig::default(),
+            super::follow_up_seed(seed),
+        );
+        for _ in 0..4 {
+            let proposed = follow_up.ask(&space, &[]);
+            assert!(
+                !population.contains(&proposed),
+                "a cold-start suggestion replayed an initial trial: {proposed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reproduce_args_keep_the_base_args_and_nest_dotted_dims() {
+        // E2E regression: `blut hpo best` printed only the overlay, dropping
+        // the job's `--args '{"epochs":1}'`, so the "reproduce" command ran a
+        // different configuration than the winning trial.
+        let base = serde_json::json!({"epochs": 1, "optimizer": {"name": "adamw"}});
+        let overlay = vec![
+            ("lr".to_string(), serde_json::json!(0.001)),
+            ("optimizer.wd".to_string(), serde_json::json!(0.5)),
+        ];
+        assert_eq!(
+            super::reproduce_args(Some(base), &overlay),
+            serde_json::json!({
+                "epochs": 1,
+                "lr": 0.001,
+                "optimizer": {"name": "adamw", "wd": 0.5}
+            })
+        );
+        assert_eq!(
+            super::reproduce_args(None, &overlay[..1]),
+            serde_json::json!({"lr": 0.001})
+        );
+    }
+
+    #[test]
+    fn a_metric_no_trial_reported_is_an_error_naming_the_keys_seen() {
+        // E2E regression: `blut hpo run --metric nosuch` ran every trial,
+        // ranked nothing, and exited 0.
+        let step = |update: serde_json::Value| {
+            serde_json::to_string(&crate::framework::status::StageEvent::StageStep {
+                node_idx: 0,
+                stage_name: "toy".into(),
+                update,
+            })
+            .expect("serialize step")
+        };
+        let lines = vec![step(
+            serde_json::json!({"epoch": 1, "val_r": 0.5, "eval": {"prd": 3.0}}),
+        )];
+        let err = super::unreported_metric_error("nosuch", &lines, "job-1")
+            .expect("an unreported metric is an error");
+        let text = err.to_string();
+        assert!(
+            text.contains("'nosuch'") && text.contains("epoch, eval, val_r"),
+            "{text}"
+        );
+        assert!(super::unreported_metric_error("val_r", &lines, "job-1").is_none());
+        assert!(super::unreported_metric_error("eval.prd", &lines, "job-1").is_none());
+        assert!(
+            super::unreported_metric_error("val_r", &[], "job-1")
+                .expect("no steps at all")
+                .to_string()
+                .contains("no trial emitted a step")
+        );
+    }
+
+    fn strict_compile(
+        recipe_args: serde_json::Value,
+    ) -> Result<CompiledPlan, crate::framework::error::RecipeError> {
+        if recipe_args.get("resume_from").is_some() {
+            return Err(crate::framework::error::RecipeError::InvalidArgs {
+                field: Some("resume_from"),
+                message: "unknown arg(s) 'resume_from'".into(),
+            });
+        }
+        small_child_compile(recipe_args)
+    }
+
+    #[test]
+    fn pbt_refuses_a_recipe_that_cannot_take_resume_from() {
+        // E2E regression: `blut hpo run --algo pbt` on such a recipe exited 0
+        // after logging "pbt clone factory failed" for every clone.
+        let base = serde_json::json!({});
+        let err = super::pbt_preflight("strict", strict_compile, &base, None)
+            .expect_err("a recipe rejecting resume_from is refused for pbt");
+        assert!(err.to_string().contains("resume_from"), "{err}");
+        super::pbt_preflight("small", small_child_compile, &base, None)
+            .expect("a recipe that accepts resume_from passes");
     }
 }
