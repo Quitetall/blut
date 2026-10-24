@@ -914,6 +914,26 @@ impl PreparedRecipeLaunch {
             device_index,
         } = self;
 
+        // Admission and the scheduler lock come BEFORE anything is written for
+        // this job. A launch refused here never started: it used to leave a
+        // job directory marked `failed` behind, one per refused attempt, in
+        // `blut jobs` (the same reason `plan resume` takes them first).
+        //
+        // This reservation consumes the same exact footprint and immutable
+        // TenantAdmission snapshot used during profile selection. In
+        // particular, a prepared partition cell cannot silently re-probe or
+        // resolve a second async-I/O candidate before execution.
+        let _tenant_reservation = tenant_admission
+            .reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
+            .map_err(|reason| anyhow!("recipe '{name}' admission refused: {reason}"))?;
+
+        let holder = format!("blut-recipe:{job_id}");
+        let lock = match device_index {
+            Some(dev) => scheduler_lock::acquire_exclusive_device(dev, holder, LockKind::Training),
+            None => scheduler_lock::acquire_exclusive(holder, LockKind::Training),
+        }
+        .map_err(|error| anyhow!("acquire_exclusive: {error}"))?;
+
         // Preparation may wait behind an outer scheduler, so it must not leave
         // an orphan job directory merely by computing an admission witness.
         // Materialize persistent job state only once execution actually owns
@@ -945,39 +965,6 @@ impl PreparedRecipeLaunch {
         // KILL-3: trap SIGTERM/ctrl-c. On signal, cancel the executor token AND
         // killpg the live child group, then return so the scheduler lock drops.
         install_cancel_handler(ctx.cancel.clone());
-
-        // This reservation consumes the same exact footprint and immutable
-        // TenantAdmission snapshot used during profile selection. In
-        // particular, a prepared partition cell cannot silently re-probe or
-        // resolve a second async-I/O candidate before execution.
-        let _tenant_reservation = match tenant_admission
-            .reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
-        {
-            Ok(reservation) => reservation,
-            Err(reason) => {
-                crate::python_kill::unbind_current_job();
-                if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                    tracing::warn!("write Failed state for {job_id}: {se}");
-                }
-                return Err(anyhow!("recipe '{name}' admission refused: {reason}"));
-            }
-        };
-
-        let holder = format!("blut-recipe:{job_id}");
-        let lock = match device_index {
-            Some(dev) => scheduler_lock::acquire_exclusive_device(dev, holder, LockKind::Training),
-            None => scheduler_lock::acquire_exclusive(holder, LockKind::Training),
-        };
-        let lock = match lock {
-            Ok(lock) => lock,
-            Err(error) => {
-                crate::python_kill::unbind_current_job();
-                if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                    tracing::warn!("write Failed state for {job_id}: {se}");
-                }
-                return Err(anyhow!("acquire_exclusive: {error}"));
-            }
-        };
 
         // Sensord marks an event dispatched only after this exact recipe owns
         // both its tenant reservation and scheduler lock. The durable marker
@@ -1036,15 +1023,34 @@ impl PreparedRecipeLaunch {
                 Ok(job_id)
             }
             Err(error) => {
-                if let Err(state_error) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                    tracing::warn!("write Failed state for {job_id}: {state_error}");
+                let (state, outcome) = terminal_for_error(&error);
+                if let Err(state_error) = crate::jobs::write_state(&job_id, state) {
+                    tracing::warn!("write {outcome} state for {job_id}: {state_error}");
                 }
-                if let Err(index_error) = crate::lineage_db::ingest_job(&job_id, &name, "failed") {
-                    tracing::debug!("lineage index (failed) {job_id}: {index_error}");
+                if let Err(index_error) = crate::lineage_db::ingest_job(&job_id, &name, outcome) {
+                    tracing::debug!("lineage index ({outcome}) {job_id}: {index_error}");
                 }
                 Err(anyhow::Error::from(error).context("plan execution failed"))
             }
         }
+    }
+}
+
+/// The job state and lineage outcome for a plan that ended in `error`. A run
+/// stopped by `blut cancel` or Ctrl-C used to be recorded as `failed` in the
+/// lineage index, beside a `cancelled` job state.
+pub(super) fn terminal_for_error(error: &crate::framework::PlanError) -> (JobState, &'static str) {
+    let cancelled = match error {
+        crate::framework::PlanError::Cancelled => true,
+        crate::framework::PlanError::StageFailed { source, .. } => {
+            matches!(source, crate::framework::StageError::Cancelled)
+        }
+        _ => false,
+    };
+    if cancelled {
+        (JobState::Cancelled, "cancelled")
+    } else {
+        (JobState::Failed, "failed")
     }
 }
 
@@ -1454,6 +1460,95 @@ pub(super) fn warn_overrides_outside_args(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod launch_refusal_tests {
+    use super::{JobState, terminal_for_error};
+    use crate::framework::{PlanError, StageError};
+
+    #[test]
+    fn a_cancelled_plan_is_recorded_as_cancelled() {
+        assert_eq!(terminal_for_error(&PlanError::Cancelled).1, "cancelled");
+        let stage = PlanError::StageFailed {
+            idx: 1,
+            stage: "s".into(),
+            source: StageError::Cancelled,
+        };
+        assert_eq!(terminal_for_error(&stage).0, JobState::Cancelled);
+        let failed = PlanError::StageFailed {
+            idx: 1,
+            stage: "s".into(),
+            source: StageError::BadInput("x".into()),
+        };
+        assert_eq!(terminal_for_error(&failed), (JobState::Failed, "failed"));
+    }
+
+    /// A launch refused by the scheduler lock used to leave a `failed` job
+    /// directory behind in `blut jobs`.
+    // The env lock must span the awaited launch: the launch reads these vars.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_launch_refused_by_the_scheduler_lock_leaves_no_job() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let keys = [
+            "LAMU_TRAIN_JOBS_DIR",
+            "LAMU_TRAIN_DATA_DIR",
+            "XDG_DATA_HOME",
+        ];
+        let prev: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        // SAFETY: TEST_ENV_LOCK serializes env mutation; restored below.
+        unsafe {
+            std::env::set_var("LAMU_TRAIN_JOBS_DIR", td.path().join("jobs"));
+            std::env::set_var("LAMU_TRAIN_DATA_DIR", td.path().join("data"));
+            std::env::set_var("XDG_DATA_HOME", td.path().join("xdg"));
+        }
+        let held = crate::scheduler_lock::acquire_exclusive(
+            "test-holder",
+            crate::scheduler_lock::LockKind::Training,
+        );
+        let plan = crate::framework::plan::CompiledPlan::from_components(
+            "refused".into(),
+            serde_json::json!({}),
+            vec![],
+        )
+        .0;
+        let result = super::launch_compiled_plan(
+            "refused",
+            plan,
+            None,
+            None,
+            false,
+            crate::config::launcher::LaunchTarget::Local,
+            None,
+            false,
+            false,
+            crate::tenant::Tenant::default(),
+            None,
+        )
+        .await;
+        let jobs = crate::jobs::list_jobs();
+        drop(held);
+        unsafe {
+            for (k, v) in prev {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let err = result
+            .expect_err("the held lock must refuse the launch")
+            .to_string();
+        assert!(err.contains("acquire_exclusive"), "{err}");
+        assert!(
+            jobs.unwrap().is_empty(),
+            "a refused launch must not create a job"
+        );
     }
 }
 

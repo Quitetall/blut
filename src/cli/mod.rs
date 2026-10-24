@@ -2126,11 +2126,11 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                     Ok(())
                 }
                 Err(e) => {
-                    if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                        tracing::warn!("write Failed state for {job_id}: {se}");
+                    let (state, outcome) = recipe::terminal_for_error(&e);
+                    if let Err(se) = crate::jobs::write_state(&job_id, state) {
+                        tracing::warn!("write {outcome} state for {job_id}: {se}");
                     }
-                    if let Err(ie) = crate::lineage_db::ingest_job(&job_id, &marker.name, "failed")
-                    {
+                    if let Err(ie) = crate::lineage_db::ingest_job(&job_id, &marker.name, outcome) {
                         tracing::warn!("lineage index {job_id}: {ie}");
                     }
                     // `.context()` (not `anyhow!("...: {e}")`) — preserves `e` as the
