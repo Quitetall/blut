@@ -54,11 +54,16 @@ baseline. That baseline is not committed yet: it is recorded on a whole
 dedicated machine at the frozen release SHA, because a shared host drifted
 −12% to +8% on unchanged code.
 
-**5. Windows containment.** The Job Object backend is implemented and
-CI-gated on `windows-latest` (cap, peak, tree kill; see the ledger row). Still
-missing: a cookbook runner calling `Containment::after_spawn` on Windows, the
-`LocalSystemd` launcher (which still spawns bare there), and a recorded
-training run on a Windows host.
+**5. Windows containment.** Local stages are contained on Windows.
+`LocalSystemd::spawn_contained` places a stage process in a Job Object: a
+tree-wide commit cap, the peak at exit, and a tree kill on cancel, on a stage
+timeout, or when the driver dies. The standard and LamQuant cookbook runners
+spawn through `spawn_attached`, and a CPU training run through BLUT on
+`windows-latest` is recorded in the
+[validation ledger](docs/DISTRIBUTED_VALIDATION.md). Still open: `mem_high`
+and `swap_max` have no Job Object equivalent; `blut cancel` cannot stop a
+driver from another process on Windows; no GPU or DDP run on Windows has been
+recorded.
 
 **6. The ADR problem.** Federated and reviewed by the owner. The
 engine-facing decision records (41 of them) now live in
