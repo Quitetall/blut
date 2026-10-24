@@ -219,6 +219,10 @@ pub struct ExecCtx {
     training_io_node_admission_resolver: Option<TrainingIoNodeAdmissionResolver>,
     /// Force every declaring stage onto its explicit Inline candidate.
     pub sync_io: bool,
+    /// Where mid-stage checkpoint slots are created (CONTRACT.md §8).
+    /// `None` resolves [`crate::framework::stage_checkpoint::checkpoints_root`]
+    /// from `job_dir`.
+    pub checkpoint_root: Option<PathBuf>,
     /// Optional live-availability ceiling used only while selecting a profile.
     /// Executor permits still use `memory_budget_gib`; this tighter byte value
     /// prevents choosing a fast profile that whole-job admission would
@@ -315,6 +319,7 @@ impl ExecCtx {
             training_io_resolver: None,
             training_io_node_admission_resolver: None,
             sync_io: false,
+            checkpoint_root: None,
             training_io_selection_budget_bytes: None,
             training_io_whole_job_base_bytes: None,
             training_io_downgrade_reason: None,
@@ -373,6 +378,14 @@ impl ExecCtx {
     /// inline tail. This is execution-only and cache-neutral.
     pub fn with_sync_io(mut self, sync_io: bool) -> Self {
         self.sync_io = sync_io;
+        self
+    }
+
+    /// Create mid-stage checkpoint slots under `root` instead of the default
+    /// sibling of the jobs directory. It must outlive the job directory and,
+    /// for a multi-node stage, be reachable from the node that runs rank 0.
+    pub fn with_checkpoint_root(mut self, root: PathBuf) -> Self {
+        self.checkpoint_root = Some(root);
         self
     }
 
@@ -577,6 +590,12 @@ struct NodeEnv {
     dispatch_policy: Option<Arc<dyn crate::p2p::dispatch::DispatchPolicy>>,
     #[cfg(feature = "p2p")]
     execution_adapter: Option<Arc<dyn ExecutionAdapter>>,
+    /// Root of mid-stage checkpoint slots. `None` disables slots (private
+    /// speculative environments).
+    checkpoint_root: Option<PathBuf>,
+    /// Identity of this plan execution, shared by in-process retries and
+    /// different for a `plan resume` or a requeued job.
+    invocation: String,
 }
 
 impl NodeEnv {
@@ -2306,6 +2325,11 @@ async fn run_node_with_admission(
     let mut attempt = 0u32;
     #[cfg(feature = "p2p")]
     let mut remote_enabled = true;
+    // Mid-stage checkpoint slot (CONTRACT.md §8). The lease is taken by the
+    // first local attempt and held across retries until the node finishes,
+    // so no other BLUT process can drive this slot in between.
+    let wants_slot = env.checkpoint_root.is_some() && task.stage.checkpoint_slot_erased(&task.args);
+    let mut slot_lease: Option<crate::framework::stage_checkpoint::SlotLease> = None;
     let (stage_output, run_elapsed, returned_content_id, local_attempt) = loop {
         attempt += 1;
         if env
@@ -2434,6 +2458,7 @@ async fn run_node_with_admission(
             cache_key: task.key,
             attempt,
             resume_from: None,
+            checkpoint: None,
         };
 
         // ── Auto-resume on retry (S3 / P7) ──────────────────────────
@@ -2498,6 +2523,28 @@ async fn run_node_with_admission(
                             source: StageError::CheckpointBusy { detail: msg },
                         });
                     }
+                }
+            }
+        }
+
+        // ── Mid-stage checkpoint slot (CONTRACT.md §8) ─────────────
+        if wants_slot && !is_remote {
+            match prepare_checkpoint_slot(&env, &task, &stage_name, idx, attempt, &mut slot_lease) {
+                Ok(slot) => stage_ctx.checkpoint = slot,
+                Err(detail) => {
+                    let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+                    let msg = format!("checkpoint slot for '{stage_name}' is busy: {detail}");
+                    env.status.emit(StageEvent::StageFailed {
+                        node_idx: idx,
+                        stage_name: stage_name.clone(),
+                        error: msg.clone(),
+                        failure: None,
+                    });
+                    return Err(NodeFailure::Stage {
+                        idx,
+                        stage: stage_name,
+                        source: StageError::CheckpointBusy { detail: msg },
+                    });
                 }
             }
         }
@@ -2755,6 +2802,9 @@ async fn run_node_with_admission(
         // stopped it on the panic exit; this is the normal-return path).
         if let Some(h) = gpu_sampler {
             h.stop().await;
+        }
+        if let Some(slot) = stage_ctx.checkpoint.as_ref() {
+            report_checkpoint_outcome(&env, idx, &stage_name, attempt, slot);
         }
         // Preserve the historical ordinary-node boundary: CPU/network/disk
         // permits are available to other work before divergence classification
@@ -3080,6 +3130,7 @@ async fn run_node_with_admission(
     // Cache insert — STRICTLY after the atomic promote (the load-bearing
     // FW-2 ordering: the resume oracle appears only once the output is
     // fully in place).
+    let mut keep_slot: Option<String> = None;
     if let Some(stored) = stored {
         match env.cache.insert_stored(task.key, stored) {
             Ok(stored_id) => {
@@ -3096,8 +3147,16 @@ async fn run_node_with_admission(
                 tracing::warn!(
                     "executor: cache insert for stage '{stage_name}' failed: {e}; continuing"
                 );
+                keep_slot = Some(format!("cache insert failed: {e}"));
             }
         }
+    }
+
+    // The output is committed: its mid-stage checkpoints are no longer
+    // needed. If the cache insert failed they are kept, since a rerun would
+    // otherwise retrain from scratch.
+    if let Some(lease) = slot_lease.take() {
+        finish_checkpoint_slot(&env, idx, &stage_name, attempt, lease, keep_slot);
     }
 
     env.status.emit(StageEvent::StageEnd {
@@ -3129,6 +3188,192 @@ async fn run_node_with_admission(
         logical,
         cache_hit: false,
     })
+}
+
+/// Take (or keep) the node's checkpoint slot lease and decide whether this
+/// attempt resumes.
+///
+/// * `Ok(Some(slot))` — hand the slot to the stage.
+/// * `Ok(None)` — the slot could not be set up (an I/O error, logged): the
+///   attempt runs without one and restarts from step 0, as it would without
+///   checkpoint support. A storage problem must not stop training.
+/// * `Err(why)` — another process holds the slot, or a trainer from an earlier
+///   attempt may still be writing to it. Running now could put two trainers on
+///   one checkpoint directory, so the attempt is refused.
+fn prepare_checkpoint_slot(
+    env: &NodeEnv,
+    task: &NodeTask,
+    stage_name: &str,
+    idx: u32,
+    attempt: u32,
+    lease: &mut Option<crate::framework::stage_checkpoint::SlotLease>,
+) -> Result<Option<crate::framework::stage_checkpoint::CheckpointSlot>, String> {
+    use crate::framework::stage_checkpoint as sc;
+    let Some(root) = env.checkpoint_root.as_ref() else {
+        return Ok(None);
+    };
+    let dir = sc::slot_dir(root, &env.tenant, stage_name, &task.key);
+    let unavailable = |what: &str, e: &dyn std::fmt::Display| {
+        tracing::warn!(
+            "checkpoint: node {idx} ({stage_name}) attempt {attempt} runs without a slot: \
+             {what} {}: {e}",
+            dir.display()
+        );
+        Ok(None)
+    };
+    if lease.is_none() {
+        match sc::SlotLease::try_acquire(&dir) {
+            Ok(Some(l)) => *lease = Some(l),
+            Ok(None) => {
+                return Err(format!(
+                    "{} is locked by another BLUT process running the same stage",
+                    dir.display()
+                ));
+            }
+            Err(e) => return unavailable("lock", &e),
+        }
+    }
+    let Some(held) = lease.as_ref() else {
+        return Ok(None);
+    };
+    let run_id = env
+        .job_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let me = sc::SlotOwner::current(&run_id, &env.invocation, attempt);
+    let decision = sc::decide_slot(
+        sc::SlotMarker::read(&dir).as_ref(),
+        sc::SlotOwner::read(&dir).as_ref(),
+        &me,
+        sc::now_unix(),
+        crate::framework::resume::DEFAULT_STALE_AFTER_SECS,
+        &sc::pid_alive,
+    );
+    let offered = match decision {
+        sc::SlotDecision::Resume { step } => Some(step),
+        sc::SlotDecision::Fresh => {
+            if let Err(e) = held.clear() {
+                return unavailable("clear", &e);
+            }
+            None
+        }
+        sc::SlotDecision::Busy { reason } => return Err(reason),
+    };
+    if let Err(e) = me.write(&dir) {
+        return unavailable("write the owner record in", &e);
+    }
+    let mut slot = sc::CheckpointSlot::new(dir.clone(), offered.is_some(), run_id, me.attempt_id);
+    slot.offered_step = offered;
+    match offered {
+        Some(step) => tracing::info!(
+            "checkpoint: node {idx} ({stage_name}) attempt {attempt} resumes from step {step} in {}",
+            dir.display()
+        ),
+        None => tracing::info!(
+            "checkpoint: node {idx} ({stage_name}) attempt {attempt} starts fresh in {}",
+            dir.display()
+        ),
+    }
+    env.status.emit(StageEvent::StageCheckpoint {
+        node_idx: idx,
+        stage_name: stage_name.to_string(),
+        attempt,
+        action: if offered.is_some() {
+            sc::CheckpointAction::ResumeOffered
+        } else {
+            sc::CheckpointAction::Fresh
+        },
+        step: offered,
+        detail: Some(dir.to_string_lossy().into_owned()),
+    });
+    Ok(Some(slot))
+}
+
+/// After an attempt ran, record whether its trainer actually resumed (the
+/// trainer writes `resumed_from_step` into its marker once it has loaded a
+/// checkpoint).
+fn report_checkpoint_outcome(
+    env: &NodeEnv,
+    idx: u32,
+    stage_name: &str,
+    attempt: u32,
+    slot: &crate::framework::stage_checkpoint::CheckpointSlot,
+) {
+    use crate::framework::stage_checkpoint as sc;
+    if !slot.resume {
+        return;
+    }
+    let marker = sc::SlotMarker::read(&slot.dir)
+        .filter(|m| m.attempt_id.as_deref() == Some(slot.attempt_id.as_str()));
+    let (action, step, detail) = match marker.and_then(|m| m.resumed_from_step) {
+        Some(step) => {
+            tracing::info!(
+                "checkpoint: node {idx} ({stage_name}) attempt {attempt} resumed from step {step}"
+            );
+            (sc::CheckpointAction::Resumed, Some(step), None)
+        }
+        None => (
+            sc::CheckpointAction::Fresh,
+            None,
+            Some("offered a checkpoint, but the trainer recorded no resume".to_string()),
+        ),
+    };
+    env.status.emit(StageEvent::StageCheckpoint {
+        node_idx: idx,
+        stage_name: stage_name.to_string(),
+        attempt,
+        action,
+        step,
+        detail,
+    });
+}
+
+/// Delete a finished stage's slot, or keep it when its output did not reach
+/// the cache.
+fn finish_checkpoint_slot(
+    env: &NodeEnv,
+    idx: u32,
+    stage_name: &str,
+    attempt: u32,
+    lease: crate::framework::stage_checkpoint::SlotLease,
+    keep: Option<String>,
+) {
+    use crate::framework::stage_checkpoint::CheckpointAction;
+    let dir = lease.dir().to_path_buf();
+    let (action, detail) = match keep {
+        Some(why) => (CheckpointAction::Kept, why),
+        None => match lease.remove() {
+            Ok(()) => (
+                CheckpointAction::Cleaned,
+                dir.to_string_lossy().into_owned(),
+            ),
+            Err(e) => {
+                tracing::warn!("checkpoint: could not delete {}: {e}", dir.display());
+                (
+                    CheckpointAction::Kept,
+                    format!("delete {} failed: {e}", dir.display()),
+                )
+            }
+        },
+    };
+    env.status.emit(StageEvent::StageCheckpoint {
+        node_idx: idx,
+        stage_name: stage_name.to_string(),
+        attempt,
+        action,
+        step: None,
+        detail: Some(detail),
+    });
+}
+
+/// A process-unique id for one plan execution.
+fn new_invocation_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos:x}", std::process::id())
 }
 
 /// Execute one optimizer-authorized target against a job-private scratch
@@ -3210,6 +3455,8 @@ async fn prepare_private(
         training_io_profiles.insert(node_id, selected);
     }
     let private_env = Arc::new(NodeEnv {
+        checkpoint_root: None,
+        invocation: canonical_env.invocation.clone(),
         started_at: canonical_env.started_at,
         job_dir: scratch_root.clone(),
         cache: Arc::new(CacheHandle::job_local(scratch_root.join("_cache"))),
@@ -5001,7 +5248,14 @@ fn prelude(mut ctx: ExecCtx, plan: &CompiledPlan) -> Result<Prelude, PlanError> 
     let writer_handle = spawn_status_writer_checked(&ctx.status, lifecycle_rx, &ctx.job_dir)?;
 
     // MOVE ctx's fields into env — the hub Arc lives only here now.
+    let checkpoint_root = Some(
+        ctx.checkpoint_root
+            .clone()
+            .unwrap_or_else(|| crate::framework::stage_checkpoint::checkpoints_root(&ctx.job_dir)),
+    );
     let env = Arc::new(NodeEnv {
+        checkpoint_root,
+        invocation: new_invocation_id(),
         started_at: Instant::now(),
         job_dir: ctx.job_dir,
         cache: ctx.cache,
