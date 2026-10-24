@@ -126,7 +126,7 @@ fn last_os_error(what: &str) -> TrainError {
 }
 
 /// Create an anonymous, non-inheritable Job Object.
-fn create_job() -> Result<JobHandle> {
+fn create_job_object() -> Result<OwnedHandle> {
     // SAFETY: null security attributes (non-inheritable handle) and a null
     // name (anonymous job) are both documented inputs. A non-null return is a
     // fresh handle we own; ownership moves into `OwnedHandle`.
@@ -136,11 +136,16 @@ fn create_job() -> Result<JobHandle> {
         if h.is_null() {
             return Err(last_os_error("CreateJobObjectW"));
         }
-        Ok(JobHandle {
-            handle: OwnedHandle::from_raw_handle(h as RawHandle),
-            attached: AtomicBool::new(false),
-        })
+        Ok(OwnedHandle::from_raw_handle(h as RawHandle))
     }
+}
+
+/// A Job Object for one run. Dropping it unattached warns (see `Drop`).
+fn create_job() -> Result<JobHandle> {
+    Ok(JobHandle {
+        handle: create_job_object()?,
+        attached: AtomicBool::new(false),
+    })
 }
 
 fn query_extended(job: &JobHandle) -> Option<JOBOBJECT_EXTENDED_LIMIT_INFORMATION> {
@@ -248,10 +253,13 @@ fn resume_process_threads(pid: u32) -> Result<usize> {
 
 fn probe() -> Availability {
     static AVAIL: OnceLock<Availability> = OnceLock::new();
-    // Creating (and dropping) a job is the whole capability check: nested
+    // Creating (and closing) a job is the whole capability check: nested
     // jobs are supported since Windows 8, so a process that is itself inside
-    // a job (a CI runner, a service) can still create and assign its own.
-    *AVAIL.get_or_init(|| match create_job() {
+    // a job (a CI runner, a service) can still create and assign its own. A
+    // bare handle, not a `JobHandle`: the probe's job is never meant to hold a
+    // child, so it must not raise the "never assigned" warning a run's job
+    // raises (it did, once per process, ahead of every first contained spawn).
+    *AVAIL.get_or_init(|| match create_job_object() {
         Ok(_) => Availability::Present,
         Err(e) => {
             tracing::warn!("containment: Job Objects unavailable: {e}");
