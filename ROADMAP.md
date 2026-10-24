@@ -26,8 +26,11 @@ run jobs to completion, and cookbook training has run across two machines over
 NCCL with global-batch parity. A node lost mid-job is detected and the job is
 requeued and completes once the node returns. `plan resume` after a node loss
 picks up from the cache on the same launcher, and DDP replicas are checked to
-be bit-identical across nodes. Still missing: resuming a long stage from a
-mid-stage checkpoint (today a lost node restarts the stage from its start).
+be bit-identical across nodes. An interrupted training stage resumes from
+its newest checkpoint rather than step 0: after a Slurm requeue, after `plan
+resume`, and on a retry, each run on two machines with CPU ranks; the steps
+recomputed after each resume reproduced their losses exactly. Still missing: the same on GPUs over NCCL, mid-stage checkpoints for
+FSDP, and a cluster with cgroup enforcement and GPU binding.
 
 **2. P2P across independent hosts, including hostile networks.** Done for
 dispatch. Stage data and results have crossed the internet between continents,

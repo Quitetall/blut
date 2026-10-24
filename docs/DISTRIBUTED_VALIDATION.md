@@ -7,7 +7,7 @@ Evidence ledger for engine `0.2.0-alpha.2`. Status means:
   tested; no scale claim.
 - **Deferred:** unsupported in public preview.
 
-Last updated: 2026-10-23.
+Last updated: 2026-10-24.
 
 Nothing in the table below changed when the crates were published on
 2026-08-27. Publication moves code, not evidence: every row still says exactly
@@ -23,6 +23,7 @@ first if you are deciding whether to depend on this.
 | Single-node `torchrun` argument construction | Component-tested | Launch contract tests; cookbook owns trainer semantics |
 | Ray launcher against a live cluster | Validated | Two-node Ray 2.x, submit + stream + poll to Succeeded, 2026-09-19 |
 | Slurm launcher: `sbatch` submit, stream, poll, cancel; `srun` steps | Validated | Two-node Slurm 21.08 cluster, with and without accounting, 2026-10-20 — see below |
+| Mid-stage checkpoint resume (Slurm requeue, `plan resume`, stage retry) | Validated (CPU) | Two vast.ai VMs on different hosts, Slurm 21.08 over WireGuard, CPU DDP over gloo; each case resumed from its newest checkpoint and recomputed steps matched their losses exactly, 2026-10-24 — see below. No GPU, NCCL or FSDP run |
 | Multi-node NCCL training through Slurm | Validated (cookbook) | Two physical machines, 2× RTX 5090, NCCL over a private network, 2026-10-20 — see below |
 | P2P crypto, policy, transport, and loopback dispatch | Component-tested | Unit and loopback integration tests |
 | P2P dispatch between separate network namespaces | Validated | Two containers, own IPs, real QUIC over a bridge — see below |
@@ -563,10 +564,131 @@ ran again on both nodes and the job completed.
 - Resume restarts the interrupted stage from its beginning. There is no
   mid-stage checkpoint resume.
 
+## Recorded run: resuming a training stage from its checkpoint (2026-10-24)
+
+Two vast.ai virtual machines on different physical hosts at one site, each an
+Intel Xeon E5-2699 v4 with 21 vCPUs, joined by WireGuard (about 2 ms round
+trip). Slurm 21.08.5 from Ubuntu 22.04: `slurmctld` and `slurmd`
+on `n0`, `slurmd` on `n1`, `SlurmdTimeout=30`, `JobRequeue=1`. The standard
+cookbook's `train_from_dataset` trained SmolLM2-135M on wikitext
+(`max_samples` 1200, or 700 for the second and third cases) with
+`--launcher slurm`, `nnodes=2`, one CPU rank per node over gloo, torch 2.8.0,
+checkpointing every 10 steps (1.6 GB each: weights and AdamW state) and
+printing the loss every step. Engine `917e7b4`, cookbook `a6bcc11`.
+
+There was no shared filesystem. As in the earlier cross-host run, a wrapper
+around `srun` copied the jobs directory to `n1` before each step. Checkpoints
+were not copied: only rank 0, on `n0`, reads or writes them.
+
+"Node loss" below means SIGKILL to `n1`'s `slurmd`, its step daemon and its
+training rank.
+
+**1. Slurm requeue.** The recipe ran inside `sbatch --requeue --nodes=2`. At
+step 33 of 71, with the step-30 checkpoint written, `n1` was lost.
+
+```
+[rig] batch start: slurm job 5, restart 0, on n0
+ INFO checkpoint: node 2 (train_model_on_split) attempt 1 starts fresh in …/train_model_on_split-058b5a1f…
+[trainer] step 33/71 loss=3.3921
+                                  (n1 lost; 40 s later Slurm requeues job 5; n1 returns)
+slurmstepd-n0: error: *** JOB 5 ON n0 CANCELLED AT 07:10:40 DUE TO NODE FAILURE ***
+[rig] batch start: slurm job 5, restart 1, on n0
+ INFO checkpoint: node 2 (train_model_on_split) attempt 1 resumes from step 30 in …/train_model_on_split-058b5a1f…
+[trainer] resumed from step-0000000030.pt: step 30/71, epoch 1, batch 30/71
+[trainer] step 31/71 loss=3.3021
+[trainer] epoch 1/1: loss=3.1975
+[trainer] replicas agree across 2 ranks: params sha256 33ea5793…
+ INFO checkpoint: node 2 (train_model_on_split) attempt 1 resumed from step 30
+done — 5 ingredients, 0 cache hits, 5 misses        exit 0
+```
+
+The requeued run is a new BLUT job, so the dataset stages ran again; the
+training stage got the same cache key and therefore the same slot. The engine
+treated the slot as abandoned because the previous attempt had run in the same
+Slurm job with a lower `SLURM_RESTART_COUNT`, and resumed at once rather than
+waiting for the old heartbeat to go stale.
+
+**2. `plan resume` after the BLUT process dies.** Run directly on `n0`
+(seed 43, 39 steps). At step 23, with the step-20 checkpoint written, the
+`blut-core` process got SIGKILL.
+
+- Its `srun` step kept running: `srun`, both step daemons and both training
+  ranks were still alive 30 s later, and step 24 was logged after the kill.
+- The first `blut-core plan resume` refused before running the stage:
+  `checkpoint slot for 'train_model_on_split' is busy: trainer pid 215242 on
+  n0 (run 20261024-073108-…) wrote a heartbeat 27s ago; it may still be
+  running`.
+- After `scancel` of that step, the second `plan resume` resumed:
+  `2 cache hits, 3 misses`, `resumed from step-0000000020.pt: step 20/39`,
+  replicas agreed, exit 0.
+
+**3. Stage retry.** Run directly on `n0` with `train_attempts: 2` (seed 44,
+38 steps). At step 23, with the step-20 checkpoint written, `n1` was lost.
+The first attempt failed about 35 s later (gloo: connection closed by peer;
+`srun: error: Node failure on n1`). After the 10 s backoff the engine started
+attempt 2 in the same process, which waited in `srun` until `n1` was back:
+
+```
+ INFO checkpoint: node 2 (train_model_on_split) attempt 1 starts fresh in …/train_model_on_split-4d493d04…
+{"kind":"stage_retrying",…,"attempt":1,"max_attempts":2,"error":"backend: blut_core.trainer exited with exit status: 1","backoff_ms":10000}
+ INFO checkpoint: node 2 (train_model_on_split) attempt 2 resumes from step 20 in …/train_model_on_split-4d493d04…
+[trainer] resumed from step-0000000020.pt: step 20/38, epoch 1, batch 20/38
+[trainer] replicas agree across 2 ranks: params sha256 0680252c…
+done — 5 ingredients, 0 cache hits, 5 misses        exit 0
+```
+
+**Loss continuity.** In each case the steps between the newest checkpoint and
+the interruption ran twice, before and after it, and gave the same loss to the
+last printed digit of the float:
+
+```
+                  before the interruption        after resuming
+requeue, step 31   3.302097797393799              3.302097797393799
+requeue, step 33   3.3920702934265137             3.3920702934265137
+plan resume, 24    3.051217794418335              3.051217794418335
+retry, step 23      3.0574417114257812             3.0574417114257812
+```
+
+The requeue case was then run again with the same arguments and nothing
+interrupted. All 71 step losses matched the requeued run's at full printed
+precision, and so did the epoch loss (3.1975), the final parameter hash
+(`33ea5793…`, agreed by both ranks in both runs) and the held-out evaluation
+loss (3.0949). The resumed run ended with the weights an uninterrupted run
+produces.
+
+Each resume appears in the job's `status.jsonl`: `resume_offered` with the
+marker's step, `resumed` with the step the trainer loaded, then `cleaned` once
+the output was in the cache. No slot remained after any run.
+
+**What it found.**
+- Killing the BLUT process does not stop its training step, so a naive
+  `plan resume` would have put a second trainer on the same checkpoints. The
+  slot refuses that, and says which process to stop. BLUT does not yet record
+  the step's Slurm job id with the job, so stopping it is `scancel` by hand.
+- DDP replicas on different CPU models drift apart bit by bit. An earlier pair
+  of these VMs had an Intel Xeon E5-2699 v4 and an AMD Ryzen 9 3900X; after 12
+  steps the trainer's replica check failed with two different parameter
+  hashes and the stage failed. The run above used two machines with the same
+  CPU model, and the hashes agreed.
+- A local two-rank test showed why saves must be atomic: when rank 1 died
+  while rank 0 was writing its first checkpoint, `torchrun` killed rank 0
+  mid-write. Only a temporary file was left, so the next attempt found no
+  checkpoint and started at step 0 instead of loading half a file.
+
+**Boundaries.**
+- CPU ranks over gloo, one rank per node, two nodes; no GPU, NCCL or FSDP run.
+  FSDP stages do not checkpoint mid-stage.
+- No shared filesystem; the slot sat on rank 0's node.
+- Same site, low latency. The requeue case relied on Slurm's restart count;
+  a run whose previous owner is on another host and not in the same Slurm job
+  waits for the 180 s heartbeat timeout.
+
 ## Required evidence (Slurm, still open)
 
 - A cluster with cgroup enforcement and GPU binding, rather than placeholder
   devices.
+- Mid-stage resume on GPUs over NCCL, with a shared filesystem holding the
+  checkpoint slots.
 
 ## Recorded run: cloud queue over S3 (2026-09-20)
 
@@ -789,9 +911,10 @@ exercised. AWS S3 itself has not been run against.
 
 ## Required evidence before stronger claims
 
-- Mid-stage checkpoint resume for long training stages. Node loss, durable
-  resume, replica hashes, topology, versions and global-batch parity are
-  recorded above.
+- Mid-stage checkpoint resume on GPUs, over NCCL, and for FSDP, whose
+  sharded state is not checkpointed mid-stage. Resume after a requeue, a
+  `plan resume` and a retry is recorded above for CPU ranks, with node loss,
+  replica hashes, topology, versions and global-batch parity.
 - Fairness of the BBR opt-in against competing traffic, and gossip and mesh
   stage data under injected loss and partition. Two-host dispatch, the
   four-continent mesh, gossip and stage data between independent hosts, the
