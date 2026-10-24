@@ -282,6 +282,12 @@ pub struct BlutWorkerPoolSpec {
     /// The cookbook binary inside the image (default `blut`).
     #[serde(default)]
     pub command: Option<String>,
+    /// The public key (hex) of the scheduler whose signed tasks the workers
+    /// run (`--coordinator-pubkey`). Without it a worker runs only the mesh's
+    /// connectivity smoke stage.
+    #[serde(default)]
+    #[x_kube(validation = Rule::new("self.matches('^[0-9a-f]+$')").message("coordinatorPubkey must be lowercase hex"))]
+    pub coordinator_pubkey: Option<String>,
     /// Shared cache backing for the pool.
     #[serde(default)]
     pub cache: CacheConfig,

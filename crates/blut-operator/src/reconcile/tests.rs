@@ -654,6 +654,7 @@ fn pool(replicas: u32, res: PoolResources, cache: CacheConfig) -> BlutWorkerPool
             replicas,
             image: "ghcr.io/example/blut:1".into(),
             command: None,
+            coordinator_pubkey: None,
             cache,
             resources: res,
         },
@@ -688,6 +689,17 @@ fn pool_statefulset_is_a_no_scheduler_worker_on_udp() {
         "the mesh is QUIC"
     );
     assert_eq!(env_value(c, "BLUT_NO_CONTAIN"), Some("1"));
+    // Regression: `p2p node` exits at once without an identity key.
+    let init = &pod.init_containers.as_ref().unwrap()[0];
+    assert_eq!(
+        init.args.as_deref().unwrap(),
+        ["p2p", "keys", "generate", "--force"]
+    );
+    assert_eq!(
+        init.volume_mounts, c.volume_mounts,
+        "the key lands where the node reads it"
+    );
+    assert_eq!(env_value(init, "HOME"), env_value(c, "HOME"));
     let limits = c.resources.as_ref().unwrap().limits.as_ref().unwrap();
     assert_eq!(limits.get("nvidia.com/gpu").unwrap().0, "2");
     assert_eq!(limits.get("memory").unwrap().0, "16Gi");
@@ -804,4 +816,33 @@ fn the_status_apply_body_names_the_kind_and_drops_nulls() {
     assert_eq!(body["kind"], "BlutPlan");
     assert_eq!(body["status"]["phase"], "Running");
     assert!(body["status"].get("message").is_none(), "{body}");
+}
+
+#[test]
+fn a_pool_coordinator_key_makes_workers_run_real_stages() {
+    let mut p = pool(1, PoolResources::default(), CacheConfig::None {});
+    assert!(
+        !build_pool_statefulset(&p)
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .containers[0]
+            .args
+            .as_ref()
+            .unwrap()
+            .contains(&"--coordinator-pubkey".to_string())
+    );
+    p.spec.coordinator_pubkey = Some("ab01".into());
+    let sts = build_pool_statefulset(&p);
+    let args = sts.spec.unwrap().template.spec.unwrap().containers[0]
+        .args
+        .clone()
+        .unwrap();
+    let i = args
+        .iter()
+        .position(|a| a == "--coordinator-pubkey")
+        .unwrap();
+    assert_eq!(args[i + 1], "ab01");
 }

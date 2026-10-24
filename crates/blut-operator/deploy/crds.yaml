@@ -338,6 +338,16 @@ spec:
                 description: The cookbook binary inside the image (default `blut`).
                 nullable: true
                 type: string
+              coordinatorPubkey:
+                description: |-
+                  The public key (hex) of the scheduler whose signed tasks the workers
+                  run (`--coordinator-pubkey`). Without it a worker runs only the mesh's
+                  connectivity smoke stage.
+                nullable: true
+                type: string
+                x-kubernetes-validations:
+                - message: coordinatorPubkey must be lowercase hex
+                  rule: self.matches('^[0-9a-f]+$')
               image:
                 description: The node image; it must be built with the engine's `p2p` feature.
                 type: string

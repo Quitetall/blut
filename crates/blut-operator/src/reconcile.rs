@@ -881,8 +881,9 @@ fn pool_resource_requirements(cpu: u32, mem_gib: u32, gpus: u32) -> ResourceRequ
     }
 }
 
-/// Build the `StatefulSet` of worker node pods for a pool. Pods run
-/// `<command> p2p node --no-scheduler --listen 0.0.0.0:9320`.
+/// Build the `StatefulSet` of worker node pods for a pool. Pods generate an
+/// identity key, then run `<command> p2p node --no-scheduler --listen
+/// 0.0.0.0:9320`.
 pub fn build_pool_statefulset(pool: &BlutWorkerPool) -> StatefulSet {
     let instance = pool.name_any();
     let res = pool.spec.resources;
@@ -907,16 +908,40 @@ pub fn build_pool_statefulset(pool: &BlutWorkerPool) -> StatefulSet {
         args.push("--shared-store".into());
         args.push(CACHE_MOUNT_PATH.into());
     }
+    if let Some(key) = &pool.spec.coordinator_pubkey {
+        args.push("--coordinator-pubkey".into());
+        args.push(key.clone());
+    }
+
+    let command = pool
+        .spec
+        .command
+        .clone()
+        .unwrap_or_else(|| DEFAULT_COMMAND.to_string());
+    // `p2p node` refuses to start without an identity key, and the key lives
+    // on the pod's scratch volume, so each pod generates its own when it
+    // starts. `--force` because an init container also re-runs when the pod
+    // sandbox is recreated, and the volume (with the old key) survives that.
+    let keygen = Container {
+        name: "blut-node-key".into(),
+        image: Some(pool.spec.image.clone()),
+        command: Some(vec![command.clone()]),
+        args: Some(vec![
+            "p2p".into(),
+            "keys".into(),
+            "generate".into(),
+            "--force".into(),
+        ]),
+        env: Some(env.clone()),
+        volume_mounts: non_empty(mounts.clone()),
+        security_context: Some(restricted_security_context()),
+        ..Default::default()
+    };
 
     let container = Container {
         name: "blut-node".into(),
         image: Some(pool.spec.image.clone()),
-        command: Some(vec![
-            pool.spec
-                .command
-                .clone()
-                .unwrap_or_else(|| DEFAULT_COMMAND.to_string()),
-        ]),
+        command: Some(vec![command]),
         args: Some(args),
         env: Some(env),
         ports: Some(vec![ContainerPort {
@@ -936,6 +961,7 @@ pub fn build_pool_statefulset(pool: &BlutWorkerPool) -> StatefulSet {
     };
 
     let pod_spec = PodSpec {
+        init_containers: Some(vec![keygen]),
         containers: vec![container],
         volumes: non_empty(volumes),
         automount_service_account_token: Some(false),
