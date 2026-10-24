@@ -293,8 +293,13 @@ fn installed_origin() -> Result<(Origin, Vec<String>)> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
         .ok_or_else(|| anyhow!("neither CARGO_HOME nor HOME is set"))?;
     let ledger = cargo_home.join(".crates.toml");
-    let text =
-        std::fs::read_to_string(&ledger).with_context(|| format!("read {}", ledger.display()))?;
+    let text = std::fs::read_to_string(&ledger).with_context(|| {
+        format!(
+            "read {} (cargo's install ledger; `blut update` only knows binaries that \
+             `cargo install` put there)",
+            ledger.display()
+        )
+    })?;
     let origin = parse_installed_origin(&text, &bin).ok_or_else(|| {
         anyhow!(
             "{} lists no registry or path install for the binary {bin:?}; \
@@ -570,5 +575,13 @@ mod update_tests {
     fn a_malformed_percent_escape_yields_no_advice() {
         let ledger = "[v1]\n\"x 0.1.0 (path+file:///home/u/bad%2)\" = [\"x\"]\n";
         assert_eq!(parse_installed_origin(ledger, "x"), None);
+    }
+
+    #[test]
+    fn check_and_yes_cannot_be_combined() {
+        // E2E regression: `blut update --check --yes` silently ignored --yes.
+        use clap::Parser;
+        let err = Cli::try_parse_from(["blut", "update", "--check", "--yes"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

@@ -99,6 +99,12 @@ pub fn open_at(path: &std::path::Path) -> Result<Connection> {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
     )
     .map_err(|e| TrainError::other(format!("open {}: {e}", path.display())))?;
+    // Concurrent CLI invocations (two `promote`s, a promote racing a rollback,
+    // or a web reader) must WAIT for the writer lock, not fail with a raw
+    // "database is locked": without a busy timeout SQLite returns SQLITE_BUSY
+    // immediately, before the IMMEDIATE transactions below ever get to serialize.
+    conn.busy_timeout(std::time::Duration::from_secs(10))
+        .map_err(|e| TrainError::other(format!("busy_timeout: {e}")))?;
     let _ =
         conn.query_row::<rusqlite::types::Value, _, _>("PRAGMA journal_mode=WAL", [], |r| r.get(0));
     conn.execute_batch(CREATE_SCHEMA)
@@ -911,5 +917,38 @@ mod tests {
         assert_eq!(parse_model_uri("model://enc@"), None); // empty alias
         assert_eq!(parse_model_uri("model://a b@prod"), None); // unsafe name
         assert_eq!(parse_model_uri("model://enc@pr od"), None); // unsafe alias
+    }
+
+    #[test]
+    fn a_promote_waits_for_a_concurrent_writer_instead_of_failing() {
+        // E2E regression: twelve concurrent `blut model promote` calls on one
+        // alias — eleven failed with "promote txn: database is locked",
+        // because the connection had no busy timeout.
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("registry.db");
+        let mut holder = open_at(&path).unwrap();
+        register(&holder, HASH_A, "enc", "default", None, 1).unwrap();
+        let mut waiter = open_at(&path).unwrap();
+        let tx = holder
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let promoter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            promote(&mut waiter, HASH_A, "default", "enc", "staging", 2)
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        tx.commit().unwrap();
+        promoter
+            .join()
+            .unwrap()
+            .expect("the second writer waits for the lock and then promotes");
+        assert_eq!(
+            resolve_pointer(&holder, "default", "enc", "staging")
+                .unwrap()
+                .as_deref(),
+            Some(HASH_A)
+        );
     }
 }

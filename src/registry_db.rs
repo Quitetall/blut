@@ -102,6 +102,12 @@ pub fn open_at(path: &std::path::Path) -> Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
     )
     .map_err(|e| TrainError::other(format!("open {}: {e}", path.display())))?;
+    // Concurrent CLI invocations (two `promote`s, a promote racing a rollback,
+    // or a web reader) must WAIT for the writer lock, not fail with a raw
+    // "database is locked": without a busy timeout SQLite returns SQLITE_BUSY
+    // immediately, before the IMMEDIATE transactions below ever get to serialize.
+    conn.busy_timeout(std::time::Duration::from_secs(10))
+        .map_err(|e| TrainError::other(format!("busy_timeout: {e}")))?;
     // Best-effort WAL; a failure just leaves the default journal mode.
     let _ =
         conn.query_row::<rusqlite::types::Value, _, _>("PRAGMA journal_mode=WAL", [], |r| r.get(0));

@@ -207,6 +207,13 @@ fn open_smoke_store(store: &str) -> Result<crate::framework::object_store::Objec
     if looks_like_url(store) {
         #[cfg(feature = "s3")]
         {
+            // `--store` promises a directory "created if absent"; a `file://`
+            // URL to a missing directory failed with "Unable to canonicalize
+            // filesystem root" while the same path given bare worked.
+            if let Some(dir) = store.strip_prefix("file://").filter(|d| d.starts_with('/')) {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("create object-store dir {dir}"))?;
+            }
             return ObjectStore::from_url(store, "cloud")
                 .with_context(|| format!("open object store {store}"));
         }
@@ -255,5 +262,19 @@ mod cloud_store_arg_tests {
     fn a_windows_drive_letter_is_not_a_scheme() {
         // One-character "scheme" is a drive letter, not a URL.
         assert!(!looks_like_url("C://store"));
+    }
+}
+
+#[cfg(all(test, feature = "s3"))]
+mod cloud_file_url_tests {
+    #[test]
+    fn a_file_url_store_is_created_like_a_bare_path() {
+        // E2E regression: `blut cloud smoke --store file:///new/dir` failed
+        // with "Unable to canonicalize filesystem root".
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path().join("fresh");
+        let url = format!("file://{}", dir.display());
+        super::open_smoke_store(&url).expect("file:// store opens");
+        assert!(dir.is_dir());
     }
 }
