@@ -25,12 +25,17 @@ kind = "slack"
 webhook = { name = "BLUT_SLACK_WEBHOOK" }
 
 [[rule]]
-name = "run-failed"
+name = "stage-failed"
 source = "status"
 field = "kind"
-equals = "failed"
+equals = "stage_failed"
 sinks = ["ops"]
 ```
+
+`field` is a dotted path into one `status.jsonl` line. Stage lifecycle lines
+carry `kind` = `stage_begin`, `stage_step`, `stage_end`, `stage_skipped`,
+`stage_failed`, and so on; there is no `kind = "failed"` line, so a rule
+matching `"failed"` never fires.
 
 ```bash
 blut-notify --config ~/.blut/notify.toml
