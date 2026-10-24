@@ -2,22 +2,35 @@
 
 [package]
 name = "blut-operator"
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.2"
 edition = "2024"
-rust-version = "1.89"
-publish = false
+# The engine's MSRV. kube 4.0 supports it; kube 4.2 needs 1.89, and the
+# MSRV-aware resolver (resolver 3, edition 2024) keeps the lockfile on 4.0.x.
+rust-version = "1.88"
+publish = ["crates-io"]
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
-description = "BLUT Kubernetes operator — BlutPlan / BlutWorkerPool CRDs + reconcilers. K8s is an adapter, not the control plane (ADR 0037)."
+repository = "https://github.com/Quitetall/blut"
+homepage = "https://github.com/Quitetall/blut"
+documentation = "https://github.com/Quitetall/blut/blob/main/docs/OPERATOR.md"
+description = "Kubernetes operator for BLUT: runs BlutPlan resources as Jobs and keeps BlutWorkerPool StatefulSets alive."
+keywords = ["kubernetes", "operator", "ml", "orchestrator", "blut"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "/src/**",
+    "/deploy/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+]
 
 [[bin]]
 name = "blut-operator"
 path = "src/main.rs"
 
 [dependencies]
-kube = { version = "0.96", features = ["derive", "runtime", "client"] }
-k8s-openapi = { version = "0.23", features = ["latest"] }
-schemars = "0.8"
+kube = { version = "4", default-features = false, features = ["client", "rustls-tls", "ring", "derive", "runtime"] }
+k8s-openapi = { version = "0.28", features = ["v1_32"] }
+schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -26,6 +39,6 @@ futures = "0.3"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 [dev-dependencies]

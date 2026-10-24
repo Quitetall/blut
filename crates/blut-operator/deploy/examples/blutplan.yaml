@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# A BlutPlan running a three-stage CPU recipe from the standard cookbook
+# (materialize a JSONL dataset, filter it, split it), writing every stage's
+# output through to an S3-compatible store.
+#
+# Before applying:
+#   - the cookbook image must exist where your cluster can pull it (see
+#     docker/Dockerfile.cookbook);
+#   - create the credentials Secret yourself, for example
+#       kubectl create secret generic blut-store-credentials \
+#         --from-literal=AWS_ACCESS_KEY_ID=... --from-literal=AWS_SECRET_ACCESS_KEY=... \
+#         --from-literal=AWS_REGION=us-east-1 \
+#         --from-literal=AWS_ENDPOINT=https://s3.example.internal
+#     Never put credentials in this file or in the plan.
+#   - replace the two-line dataset with your own.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: split-recipe
+data:
+  split.toml: |
+    name = "split_example"
+
+    [[stages]]
+    stage = "materialize_dataset_path"
+    args = { path = "/blut/plan/train.jsonl" }
+
+    [[stages]]
+    stage = "filter_dataset"
+    args = { min_turns = 1 }
+
+    [[stages]]
+    stage = "split_train_eval"
+    args = { eval_ratio = 0.5, seed = 7 }
+  train.jsonl: |
+    {"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"}]}
+    {"messages":[{"role":"user","content":"2+2?"},{"role":"assistant","content":"4"}]}
+---
+apiVersion: blut.lamquant.dev/v1alpha1
+kind: BlutPlan
+metadata:
+  name: split-example
+spec:
+  cookbookImage: blut-cookbook:dev
+  dataClassCeiling: Internal
+  maxRetries: 2
+  timeoutSeconds: 900
+  resources:
+    cpuMillis: 500
+    memoryMib: 512
+  store:
+    url: s3://blut-store/examples
+    credentialsSecret: blut-store-credentials
+  planSource:
+    configMapRef:
+      name: split-recipe
+      key: split.toml
