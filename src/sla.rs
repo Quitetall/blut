@@ -119,35 +119,67 @@ pub fn evaluate(rules: &[SlaRule], runs: &[RunObservation], now: i64) -> Vec<Sla
             {
                 out.push(breach(rule, SlaKind::Deadline, obs, now, deadline, now));
             }
-            // Freshness: the run's data is older than the allowed window.
-            if let Some(window) = rule.freshness_secs
-                && let Some(age) = obs.data_age_secs
+        }
+    }
+    // Freshness is a property of the NEWEST data a recipe has produced, per
+    // tenant: one rule breaches when the freshest matching run is older than
+    // the window. Evaluated per run, every historical run past the window was
+    // a breach forever, and once runs were visible to SLA evaluation a single
+    // old run kept `sla check` failing however fresh the latest output was.
+    for rule in rules {
+        let Some(window) = rule.freshness_secs else {
+            continue;
+        };
+        for newest in newest_measured_per_tenant(rule, runs) {
+            if let Some(age) = newest.data_age_secs
                 && age > window
             {
-                out.push(breach(rule, SlaKind::Freshness, obs, age, window, now));
+                out.push(breach(rule, SlaKind::Freshness, newest, age, window, now));
             }
         }
     }
     out
 }
 
-/// Freshness rules are fail-closed: every matching run must carry a measured
-/// artifact timestamp. Returning an error is preferable to a false-clean SLA
-/// report when provenance is incomplete.
+/// For a freshness rule: per tenant, the matching run with the newest
+/// measured data, plus `None`-aged runs only for tenants with no measured run.
+fn newest_measured_per_tenant<'a>(
+    rule: &SlaRule,
+    runs: &'a [RunObservation],
+) -> Vec<&'a RunObservation> {
+    let mut by_tenant: std::collections::BTreeMap<&str, &RunObservation> =
+        std::collections::BTreeMap::new();
+    for obs in runs {
+        if rule.recipe.as_ref().is_some_and(|want| want != &obs.recipe) {
+            continue;
+        }
+        let entry = by_tenant.entry(obs.tenant.as_str()).or_insert(obs);
+        let newer = match (obs.data_age_secs, entry.data_age_secs) {
+            (Some(a), Some(b)) => a < b,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if newer {
+            *entry = obs;
+        }
+    }
+    by_tenant.into_values().collect()
+}
+
+/// Freshness rules are fail-closed: for every tenant with a matching run, at
+/// least one matching run must carry a measured artifact timestamp. Returning
+/// an error is preferable to a false-clean SLA report when provenance is
+/// incomplete. A run that produced nothing (one that failed early) does not
+/// make a tenant unmeasured when another of its runs is measured.
 pub fn require_freshness_measurements(
     rules: &[SlaRule],
     runs: &[RunObservation],
 ) -> Result<(), String> {
-    for observation in runs {
-        for rule in rules {
-            if rule.freshness_secs.is_none()
-                || rule
-                    .recipe
-                    .as_ref()
-                    .is_some_and(|recipe| recipe != &observation.recipe)
-            {
-                continue;
-            }
+    for rule in rules {
+        if rule.freshness_secs.is_none() {
+            continue;
+        }
+        for observation in newest_measured_per_tenant(rule, runs) {
             if observation.data_age_secs.is_none() {
                 return Err(format!(
                     "freshness rule '{}' is unmeasured for job '{}' (lineage has no produced_unix artifact)",
@@ -510,6 +542,38 @@ mod tests {
         let mut measured = runs[0].clone();
         measured.data_age_secs = Some(30);
         require_freshness_measurements(&rules, &[measured]).unwrap();
+    }
+
+    /// Freshness judged each run: every run older than the window breached,
+    /// so one old run kept `sla check` failing after a fresh run, and a run
+    /// that failed before producing anything made the rule unmeasured.
+    #[test]
+    fn freshness_judges_the_newest_measured_run_per_tenant() {
+        let rules = vec![SlaRule {
+            name: "fresh".into(),
+            recipe: Some("train".into()),
+            max_runtime_secs: None,
+            deadline_unix: None,
+            freshness_secs: Some(60),
+        }];
+        let aged = |job: &str, tenant: &str, age: Option<i64>| {
+            let mut o = obs("train", tenant, DataClass::Internal, 0, Some(10));
+            o.job_id = job.into();
+            o.data_age_secs = age;
+            o
+        };
+        let runs = vec![
+            aged("old", "a", Some(9_000)),
+            aged("fresh", "a", Some(5)),
+            aged("failed-early", "a", None),
+            aged("stale-b", "b", Some(600)),
+        ];
+        require_freshness_measurements(&rules, &runs).unwrap();
+        let breaches = evaluate(&rules, &runs, 10_000);
+        assert_eq!(breaches.len(), 1, "{breaches:?}");
+        assert_eq!(breaches[0].job_id, "stale-b");
+        // A tenant whose only runs are unmeasured stays fail-closed.
+        assert!(require_freshness_measurements(&rules, &[aged("x", "c", None)]).is_err());
     }
 
     #[test]

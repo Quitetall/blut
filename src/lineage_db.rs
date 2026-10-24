@@ -83,8 +83,9 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_hash ON artifacts(content_hash);
 -- it FOLDS its parents' `output_hash`es AND its data-source content hashes,
 -- so a single `input_hash`→`output_hash` edge encodes BOTH the parent edge
 -- (lineage) AND the data dependency. CODE provenance is carried separately,
--- per-run, on `runs.git_sha` (the cache key also busts on `code_sha`, surfaced
--- as `code_freshness`). So (data, code, parent) are each represented; only the
+-- per-run, on `runs.git_sha` (the launch directory's HEAD); the engine build
+-- commit the cache key busts on is in the job's provenance.json, surfaced as
+-- `code_freshness`). So (data, code, parent) are each represented; only the
 -- FIELD NAMING is terse — no extra columns are needed to recover any of them.
 CREATE TABLE IF NOT EXISTS lineage_edges (
     job_id      TEXT NOT NULL,
@@ -198,11 +199,12 @@ pub struct PartitionStatusRow {
     pub recorded_unix: i64,
 }
 
-/// FRESHNESS verdict for a run's code (Phase G): did the code that built
-/// this output drift from the current `HEAD`? `Stale` means a re-run would
-/// re-execute (the cache key includes `code_sha`); `Unknown` means there
-/// was no recorded git SHA or no git HEAD to compare against (not stale —
-/// just unverifiable).
+/// FRESHNESS verdict for a run's code (Phase G): was this output built by a
+/// different engine commit than the running binary? `Stale` means a re-run
+/// would re-execute (the cache key includes the build commit); `Unknown`
+/// means the run records no build commit, or either binary was built
+/// without git (not stale — just unverifiable). `git_sha`, `built_sha` and
+/// `head` hold engine build commits.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "freshness", rename_all = "snake_case")]
 pub enum CodeFreshness {
@@ -211,8 +213,14 @@ pub enum CodeFreshness {
     Unknown,
 }
 
-/// Pure freshness verdict (testable without a real git HEAD): compare a
-/// run's recorded git SHA against the current HEAD.
+/// A build commit that identifies code: `build.rs` stamps `unknown` when the
+/// engine is built without git (a crates.io source, a tarball).
+fn is_known_build(hash: &str) -> bool {
+    !hash.is_empty() && hash != "unknown"
+}
+
+/// Pure freshness verdict (testable without a real build): compare a run's
+/// recorded build commit against the running binary's.
 fn freshness_verdict(recorded: Option<String>, head: Option<String>) -> CodeFreshness {
     match (recorded, head) {
         (Some(r), Some(h)) if r == h => CodeFreshness::Fresh { git_sha: r },
@@ -1018,14 +1026,23 @@ impl LineageDb {
         Ok(rows)
     }
 
-    /// FRESHNESS (Phase G): is a job's output still current, or was it
-    /// built with code that has since drifted? The cache key already busts
-    /// on `code_sha` + `input_hash` (so a re-run RE-EXECUTES a stale node);
-    /// this just SURFACES that verdict without re-running — by comparing the
-    /// git SHA recorded for the run against the current `HEAD`.
+    /// FRESHNESS (Phase G): was a job built by a different engine commit than
+    /// the running binary? Every stage cache key folds in the engine build
+    /// commit (`BLUT_GIT_HASH`), so a different commit means a re-run
+    /// re-executes every stage. This surfaces that verdict without re-running,
+    /// by comparing the build commit recorded at launch (the job's
+    /// `provenance.json`) with this binary's.
+    ///
+    /// It used to compare `git rev-parse HEAD` of the directory the run was
+    /// indexed from with that of the current directory. Those are not part of
+    /// the cache key, so the verdict depended on where you stood: it reported
+    /// `Stale` for a run that a re-run then served entirely from cache.
     pub fn code_freshness(&self, job_id: &str) -> Result<CodeFreshness> {
-        let recorded = self.get_run(job_id)?.and_then(|r| r.git_sha);
-        Ok(freshness_verdict(recorded, git_head_sha()))
+        let recorded = crate::jobs::read_provenance(job_id)?.map(|p| p.blut_build);
+        Ok(freshness_verdict(
+            recorded.filter(|h| is_known_build(h)),
+            Some(env!("BLUT_GIT_HASH").to_string()).filter(|h| is_known_build(h)),
+        ))
     }
 
     /// A run's provenance row by job id.
@@ -1541,13 +1558,19 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
             });
         }
     };
+    // Provenance comes from the job directory, never from the indexing
+    // process: a reindex from another checkout must not rewrite history.
+    let provenance = crate::jobs::read_provenance(job_id)?;
     db.record_run(&RunRow {
         job_id: job_id.to_string(),
         recipe: recipe.to_string(),
         config_fingerprint: None, // (sweep/config path supplies this when present)
-        git_sha: git_head_sha(),
-        started_unix: None,
-        ended_unix: Some(chrono::Utc::now().timestamp()),
+        git_sha: provenance.as_ref().and_then(|p| p.git_sha.clone()),
+        started_unix: provenance
+            .as_ref()
+            .map(|p| p.started_unix)
+            .or_else(|| crate::jobs::job_id_unix(job_id)),
+        ended_unix: crate::jobs::terminal_state_unix(job_id),
         outcome: Some(outcome.to_string()),
         host: read_hostname(),
         gpu_name: None,
@@ -1599,7 +1622,8 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
 }
 
 /// Best-effort `git rev-parse HEAD` of the working tree (None if not a repo).
-fn git_head_sha() -> Option<String> {
+/// Recorded once at launch (see [`crate::jobs::LaunchProvenance`]).
+pub(crate) fn git_head_sha() -> Option<String> {
     let out = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
@@ -2097,6 +2121,155 @@ mod tests {
         .unwrap();
         let chain = db.trace("a").unwrap();
         assert!(chain.len() <= 2, "cycle guard bounds the walk");
+    }
+
+    /// Point the job and data dirs at a fresh tempdir for one test.
+    struct IsolatedDirs {
+        _td: tempfile::TempDir,
+        prev: [(&'static str, Option<std::ffi::OsString>); 2],
+    }
+    impl IsolatedDirs {
+        fn new() -> Self {
+            let td = tempfile::tempdir().unwrap();
+            let prev =
+                ["LAMU_TRAIN_JOBS_DIR", "LAMU_TRAIN_DATA_DIR"].map(|k| (k, std::env::var_os(k)));
+            // SAFETY: callers hold TEST_ENV_LOCK; restored in Drop.
+            unsafe {
+                std::env::set_var("LAMU_TRAIN_JOBS_DIR", td.path().join("jobs"));
+                std::env::set_var("LAMU_TRAIN_DATA_DIR", td.path().join("data"));
+            }
+            Self { _td: td, prev }
+        }
+    }
+    impl Drop for IsolatedDirs {
+        fn drop(&mut self) {
+            for (k, v) in &self.prev {
+                // SAFETY: still under the caller's TEST_ENV_LOCK.
+                unsafe {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A run's git SHA and timing came from the INDEXING process: `git
+    /// rev-parse HEAD` of wherever `blut lineage reindex` ran, `ended_unix =
+    /// now`, and no start time at all. They must come from the job directory.
+    #[test]
+    fn ingest_records_launch_provenance_not_the_indexing_process() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _dirs = IsolatedDirs::new();
+        let with = "20261023-010203-000000001";
+        let legacy = "20261023-010203-000000002";
+        crate::jobs::write_provenance(with, Some("launch-sha".into())).unwrap();
+        // Written once: a later call (a resume) keeps the launch record.
+        crate::jobs::write_provenance(with, Some("resume-sha".into())).unwrap();
+        crate::jobs::write_state(with, crate::jobs::JobState::Done).unwrap();
+        crate::jobs::write_state(legacy, crate::jobs::JobState::Failed).unwrap();
+        let recorded = crate::jobs::read_provenance(with).unwrap().unwrap();
+        ingest_job(with, "r", "done").unwrap();
+        ingest_job(legacy, "r", "failed").unwrap();
+        // Reindexing again (from any directory) changes nothing.
+        ingest_job(with, "r", "done").unwrap();
+
+        let db = LineageDb::open().unwrap();
+        let run = db.get_run(with).unwrap().unwrap();
+        assert_eq!(run.git_sha.as_deref(), Some("launch-sha"));
+        assert_eq!(run.started_unix, Some(recorded.started_unix));
+        assert!(
+            run.ended_unix
+                .is_some_and(|e| e >= recorded.started_unix - 1)
+        );
+        let old = db.get_run(legacy).unwrap().unwrap();
+        assert_eq!(
+            old.git_sha, None,
+            "no launch record: unknown, not the indexer's HEAD"
+        );
+        let id_time = chrono::NaiveDate::from_ymd_opt(2026, 10, 23)
+            .unwrap()
+            .and_hms_opt(1, 2, 3)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        assert_eq!(
+            old.started_unix,
+            Some(id_time),
+            "legacy start from the job id"
+        );
+        assert!(old.ended_unix.is_some());
+    }
+
+    /// `lineage freshness` and partition staleness compared the HEAD of the
+    /// launch directory with the HEAD of the current one, and reported STALE
+    /// ("a re-run re-executes") for a run a re-run then served from cache.
+    /// The verdict must compare what the cache key folds in: the engine build.
+    #[test]
+    fn code_freshness_compares_the_engine_build_commit() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _dirs = IsolatedDirs::new();
+        let this = "20261023-010203-000000003";
+        let other = "20261023-010203-000000004";
+        let legacy = "20261023-010203-000000005";
+        crate::jobs::write_provenance(this, Some("any".into())).unwrap();
+        crate::jobs::write_provenance(other, Some("any".into())).unwrap();
+        let path = crate::paths::job_dir(other)
+            .unwrap()
+            .join("provenance.json");
+        let mut rec = crate::jobs::read_provenance(other).unwrap().unwrap();
+        rec.blut_build = "0123456789ab".into();
+        std::fs::write(&path, serde_json::to_vec(&rec).unwrap()).unwrap();
+        crate::paths::job_dir(legacy).unwrap();
+        let db = LineageDb::open().unwrap();
+        let build = env!("BLUT_GIT_HASH");
+        if is_known_build(build) {
+            assert_eq!(
+                db.code_freshness(this).unwrap(),
+                CodeFreshness::Fresh {
+                    git_sha: build.into()
+                }
+            );
+            assert!(db.code_freshness(other).unwrap().is_stale());
+        } else {
+            assert_eq!(db.code_freshness(this).unwrap(), CodeFreshness::Unknown);
+            assert_eq!(db.code_freshness(other).unwrap(), CodeFreshness::Unknown);
+        }
+        assert_eq!(db.code_freshness(legacy).unwrap(), CodeFreshness::Unknown);
+    }
+
+    /// `blut sla check` evaluated "0 run(s)" forever: no run row ever carried
+    /// a start time, so every run was skipped. A finished run that exceeded a
+    /// `max_runtime_secs` bound must now breach.
+    #[test]
+    fn sla_check_sees_indexed_runs() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dirs = IsolatedDirs::new();
+        let job = "20261023-010203-000000006";
+        crate::jobs::write_provenance(job, None).unwrap();
+        let path = crate::paths::job_dir(job).unwrap().join("provenance.json");
+        let mut rec = crate::jobs::read_provenance(job).unwrap().unwrap();
+        rec.started_unix -= 600;
+        std::fs::write(&path, serde_json::to_vec(&rec).unwrap()).unwrap();
+        crate::jobs::write_state(job, crate::jobs::JobState::Done).unwrap();
+        ingest_job(job, "train", "done").unwrap();
+        let rules = dirs._td.path().join("sla.toml");
+        std::fs::write(
+            &rules,
+            "[[rule]]\nname = \"cap\"\nrecipe = \"train\"\nmax_runtime_secs = 60\n",
+        )
+        .unwrap();
+        let out = dirs._td.path().join("sla.jsonl");
+        let report = crate::sla::check_paths(&rules, &out).unwrap();
+        assert_eq!(report.run_count, 1);
+        assert_eq!(report.breaches.len(), 1, "{:?}", report.breaches);
     }
 
     #[test]

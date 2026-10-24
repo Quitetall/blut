@@ -144,6 +144,91 @@ pub fn read_tenant(job_id: &str) -> Result<Tenant> {
         })
 }
 
+/// What a job's launch knew about itself, recorded once when execution starts.
+///
+/// The lineage index is rebuilt from job directories, so anything it reports
+/// about a run has to be on disk in the job directory. It used to probe the
+/// indexing process instead: `git rev-parse HEAD` of whatever directory
+/// `blut` happened to run in, and "now" as the end time. A `lineage reindex`
+/// from another checkout rewrote every historical run's git SHA, and the
+/// start time was never recorded at all, so no SLA rule could ever match.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LaunchProvenance {
+    /// `git rev-parse HEAD` of the launch directory, when it is a repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_sha: Option<String>,
+    /// The engine build commit (`BLUT_GIT_HASH`) of the binary that launched
+    /// the job. This is the commit folded into every stage cache key.
+    pub blut_build: String,
+    /// Unix seconds when execution started.
+    pub started_unix: i64,
+}
+
+const PROVENANCE_FILE: &str = "provenance.json";
+
+/// Record [`LaunchProvenance`] for a job that is starting. Written once: a
+/// `plan resume` keeps the original launch's record.
+pub(crate) fn write_provenance(job_id: &str, git_sha: Option<String>) -> Result<()> {
+    let path = paths::job_dir(job_id)?.join(PROVENANCE_FILE);
+    if path.exists() {
+        return Ok(());
+    }
+    let record = LaunchProvenance {
+        git_sha,
+        blut_build: env!("BLUT_GIT_HASH").to_string(),
+        started_unix: chrono::Utc::now().timestamp(),
+    };
+    let body = serde_json::to_vec_pretty(&record)
+        .map_err(|e| TrainError::other(format!("serialize {PROVENANCE_FILE}: {e}")))?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, body).map_err(|source| TrainError::Io {
+        path: tmp.clone(),
+        source,
+    })?;
+    std::fs::rename(&tmp, &path).map_err(|source| TrainError::Io { path, source })
+}
+
+/// Read a job's [`LaunchProvenance`]. Jobs launched before it existed return
+/// `None`; a present but unreadable record is an error, never a guess.
+pub(crate) fn read_provenance(job_id: &str) -> Result<Option<LaunchProvenance>> {
+    let path = paths::jobs_dir()?.join(job_id).join(PROVENANCE_FILE);
+    let body = match std::fs::read(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(TrainError::Io { path, source }),
+    };
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|e| TrainError::other(format!("parse {}: {e}", path.display())))
+}
+
+/// The creation time encoded in a `YYYYMMDD-HHMMSS-NNNNNNNNN` job id (UTC), for
+/// jobs that predate [`LaunchProvenance`]. `None` for any other id shape.
+pub(crate) fn job_id_unix(job_id: &str) -> Option<i64> {
+    let stamp = job_id.get(..15)?;
+    let parsed = chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%d-%H%M%S").ok()?;
+    Some(parsed.and_utc().timestamp())
+}
+
+/// When a job reached its terminal state: the modification time of its
+/// `state` file, which is rewritten on every transition. `None` while the
+/// job is running or when the state cannot be read.
+pub(crate) fn terminal_state_unix(job_id: &str) -> Option<i64> {
+    let path = paths::jobs_dir().ok()?.join(job_id).join("state");
+    let body = std::fs::read_to_string(&path).ok()?;
+    match JobState::parse_label(&body)? {
+        JobState::Running => None,
+        _ => {
+            let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+            let secs = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            i64::try_from(secs).ok()
+        }
+    }
+}
+
 /// Persist the experiment grouping key used by `experiment://<name>/<run>`.
 /// Safe identifier grammar keeps the marker URI/log-safe and path-free.
 pub fn write_experiment(job_id: &str, experiment: &str) -> Result<()> {

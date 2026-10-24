@@ -65,9 +65,9 @@ pub(super) enum LineageCommand {
     /// Rebuild the lineage index from the job dirs (the DB is a derived index —
     /// safe to delete + reindex).
     Reindex,
-    /// FRESHNESS (G): is a job's output stale? Reports code-drift (the run's
-    /// git SHA vs current HEAD — a STALE result means a re-run would
-    /// re-execute, since the cache key includes code_sha). With
+    /// FRESHNESS (G): is a job's output stale? Reports code-drift (the engine
+    /// build commit that ran the job vs this binary's — a STALE result means a
+    /// re-run would re-execute, since every stage cache key includes it). With
     /// `--data-version <v>`, also flags any produced artifact whose recorded
     /// `data_version` (in its metadata `extra`) differs from `<v>`.
     Freshness {
@@ -247,8 +247,9 @@ pub(super) fn run_lineage_cmd(cmd: LineageCommand) -> Result<()> {
 }
 
 /// FRESHNESS (G): report whether a job's output is stale. Code-drift is
-/// always reported (the run's git SHA vs HEAD — STALE ⇒ a re-run
-/// re-executes because the cache key includes code_sha). With
+/// always reported (the engine build commit recorded at launch vs this
+/// binary's — STALE ⇒ a re-run re-executes because the cache key includes it).
+/// With
 /// `--data-version`, also flag artifacts whose recorded `extra.data_version`
 /// differs from the supplied current value.
 pub(super) fn run_lineage_freshness(
@@ -294,23 +295,29 @@ pub(super) fn run_lineage_freshness(
     }
 
     match &code {
-        crate::lineage_db::CodeFreshness::Fresh { git_sha } => {
-            println!(
-                "job {job_id}: code FRESH (built at HEAD {})",
-                short(git_sha)
-            )
-        }
+        crate::lineage_db::CodeFreshness::Fresh { git_sha } => println!(
+            "job {job_id}: code FRESH (built by engine commit {}, the same as this binary)",
+            short(git_sha)
+        ),
         crate::lineage_db::CodeFreshness::Stale { built_sha, head } => println!(
-            "job {job_id}: code STALE (built at {}, HEAD is {} — a re-run re-executes)",
+            "job {job_id}: code STALE (built by engine commit {}, this binary is {} — a \
+             re-run re-executes)",
             short(built_sha),
             short(head)
         ),
-        crate::lineage_db::CodeFreshness::Unknown => {
-            println!("job {job_id}: code UNKNOWN (no recorded git SHA to compare)")
-        }
+        crate::lineage_db::CodeFreshness::Unknown => println!(
+            "job {job_id}: code UNKNOWN (the run records no engine build commit, or a \
+             binary was built without git)"
+        ),
     }
     if let Some(current) = &data_version {
-        if data_stale.is_empty() {
+        if data_checked == 0 {
+            // Nothing to compare is not the same as nothing stale.
+            println!(
+                "data: UNKNOWN (no produced artifact records a data_version to compare \
+                 with {current})"
+            );
+        } else if data_stale.is_empty() {
             println!("data: FRESH ({data_checked} artifact(s) at data_version {current})");
         } else {
             for (stage, recorded) in &data_stale {

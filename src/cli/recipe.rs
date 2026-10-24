@@ -911,6 +911,8 @@ impl PreparedRecipeLaunch {
             .with_context(|| format!("persist tenant for {job_id}"))?;
         crate::jobs::write_experiment(&job_id, experiment.as_deref().unwrap_or(&name))
             .with_context(|| format!("persist experiment for {job_id}"))?;
+        crate::jobs::write_provenance(&job_id, crate::lineage_db::git_head_sha())
+            .with_context(|| format!("persist provenance for {job_id}"))?;
 
         // Mark recipe for plan resume — only for a registry recipe (a
         // declarative `.toml` launch passes `None`: there is no registry recipe
