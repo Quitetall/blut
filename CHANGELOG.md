@@ -24,6 +24,13 @@ depend on this crate.
   experiment-execution UX is ADR 0156 (was 0071), cookbook taxonomy is ADR 0055
   (was 0051).
 
+### Fixed
+- `blut dag` showed a node that failed and was then re-run to completion by
+  `plan resume` as `failed`, because the first terminal event in the job's
+  status log won. A later attempt (`stage_begin` or a cache hit) now reopens
+  a failed or killed node. `blut errors show` likewise reported the recovered
+  failure as the job's terminal failure next to `outcome : done`.
+
 ## [0.2.0-alpha.2] — 2026-10-09
 
 `blut-types`, `blut`, `blut-dsl`, `blut-notify` and `blut-tui`, all at
