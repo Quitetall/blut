@@ -189,7 +189,8 @@ pub(super) fn run_results(
         None => println!("best {metric}  — (no per-step samples recorded)"),
     }
     if let Some(p) = &ckpt {
-        println!("ckpt {p}");
+        // The final stage's artifact sidecar; `blut artifact inspect` reads it.
+        println!("output sidecar {p}");
     }
     if !per_band.is_empty() {
         println!("\nper-band PRD (final):");
@@ -319,7 +320,7 @@ pub(super) fn run_jobs(json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<24} {:<10} {:<6} {:<24} last",
+        "{:<25} {:<10} {:<8} {:<24} last",
         "id", "state", "pid", "output"
     );
     for j in jobs {
@@ -328,10 +329,20 @@ pub(super) fn run_jobs(json: bool) -> Result<()> {
             (Some(step), Some(loss), _) => format!("step={step} loss={loss:.4}"),
             _ => "-".into(),
         };
-        let pid = j.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+        // A job whose stages run in-process has no trainer pid; show the
+        // live `blut` process driving it, which is what `blut cancel` signals.
+        let pid = j
+            .pid
+            .or_else(|| {
+                (j.state == JobState::Running)
+                    .then(|| jobs::live_driver(&j.id))
+                    .flatten()
+            })
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "-".into());
         let output = j.output_name.unwrap_or_else(|| "-".into());
         println!(
-            "{:<24} {:<10} {:<6} {:<24} {}",
+            "{:<25} {:<10} {:<8} {:<24} {}",
             j.id,
             j.state.as_str(),
             pid,

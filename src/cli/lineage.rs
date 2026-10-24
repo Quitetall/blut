@@ -33,7 +33,7 @@ pub(super) enum LineageCommand {
     /// default; `--json` emits typed rows. Clinical/`restricted`-tenant nodes are
     /// fail-closed excluded from the export (ADR 0061).
     Graph {
-        /// Output content-hash (full, lowercased — the leaf artifact).
+        /// Output content-hash of the leaf artifact (or a unique prefix).
         hash: String,
         /// Emit typed JSON rows instead of Graphviz DOT.
         #[arg(long)]
@@ -44,7 +44,7 @@ pub(super) enum LineageCommand {
     /// outcome. Rebuilding on the same lineage yields a byte-identical
     /// `card_hash`. Clinical/`restricted` data is fail-closed excluded (export).
     Card {
-        /// The model artifact's content hash (full, lowercased).
+        /// The model artifact's content hash (or a unique prefix).
         hash: String,
         /// Emit the typed JSON card instead of the human summary.
         #[arg(long)]
@@ -65,9 +65,9 @@ pub(super) enum LineageCommand {
     /// Rebuild the lineage index from the job dirs (the DB is a derived index —
     /// safe to delete + reindex).
     Reindex,
-    /// FRESHNESS (G): is a job's output stale? Reports code-drift (the run's
-    /// git SHA vs current HEAD — a STALE result means a re-run would
-    /// re-execute, since the cache key includes code_sha). With
+    /// FRESHNESS (G): is a job's output stale? Reports code-drift (the engine
+    /// build commit that ran the job vs this binary's — a STALE result means a
+    /// re-run would re-execute, since every stage cache key includes it). With
     /// `--data-version <v>`, also flags any produced artifact whose recorded
     /// `data_version` (in its metadata `extra`) differs from `<v>`.
     Freshness {
@@ -129,8 +129,39 @@ pub(super) fn run_lineage(id_query: &str, json: bool) -> Result<()> {
 /// default (pipe to `dot -Tsvg` or a sidecar), typed JSON with `--json`. This is
 /// an EXPORT, so clinical/`restricted`-tenant nodes are fail-closed excluded
 /// (ADR 0061) — a graph that is entirely restricted comes back empty.
+/// Resolve a content-hash prefix to the one indexed hash it names. `graph`
+/// and `card` took only the full hash and reported a prefix (which `trace`
+/// accepts) as an unknown artifact.
+fn resolve_indexed_hash(db: &crate::lineage_db::LineageDb, prefix: &str) -> Result<String> {
+    let mut hashes: Vec<String> = db
+        .find_artifacts(prefix)
+        .map_err(|e| anyhow!("{e}"))?
+        .into_iter()
+        .map(|a| a.content_hash)
+        .collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    match hashes.as_slice() {
+        [one] => Ok(one.clone()),
+        // Unknown: keep the input so the caller's "unknown artifact" error
+        // (and a restricted-only lookup) behaves as before.
+        [] => Ok(prefix.to_lowercase()),
+        many => Err(anyhow!(
+            "hash prefix '{prefix}' is ambiguous: {} indexed artifacts match ({}…); give more \
+             characters",
+            many.len(),
+            many.iter()
+                .take(3)
+                .map(|h| h.get(..16).unwrap_or(h))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 pub(super) fn run_lineage_graph(hash: &str, json: bool) -> Result<()> {
     let db = crate::lineage_db::LineageDb::open().map_err(|e| anyhow!("{e}"))?;
+    let hash = &resolve_indexed_hash(&db, hash)?;
     let graph = db.graph_upstream(hash, true).map_err(|e| anyhow!("{e}"))?;
     if graph.nodes.is_empty() {
         return Err(anyhow!(
@@ -156,6 +187,7 @@ pub(super) fn run_lineage_graph(hash: &str, json: bool) -> Result<()> {
 /// An EXPORT — clinical/`restricted` data is fail-closed excluded.
 pub(super) fn run_lineage_card(hash: &str, json: bool) -> Result<()> {
     let db = crate::lineage_db::LineageDb::open().map_err(|e| anyhow!("{e}"))?;
+    let hash = &resolve_indexed_hash(&db, hash)?;
     let card = db
         .model_card(hash, true)
         .map_err(|e| anyhow!("{e}"))?
@@ -247,8 +279,9 @@ pub(super) fn run_lineage_cmd(cmd: LineageCommand) -> Result<()> {
 }
 
 /// FRESHNESS (G): report whether a job's output is stale. Code-drift is
-/// always reported (the run's git SHA vs HEAD — STALE ⇒ a re-run
-/// re-executes because the cache key includes code_sha). With
+/// always reported (the engine build commit recorded at launch vs this
+/// binary's — STALE ⇒ a re-run re-executes because the cache key includes it).
+/// With
 /// `--data-version`, also flag artifacts whose recorded `extra.data_version`
 /// differs from the supplied current value.
 pub(super) fn run_lineage_freshness(
@@ -294,23 +327,29 @@ pub(super) fn run_lineage_freshness(
     }
 
     match &code {
-        crate::lineage_db::CodeFreshness::Fresh { git_sha } => {
-            println!(
-                "job {job_id}: code FRESH (built at HEAD {})",
-                short(git_sha)
-            )
-        }
+        crate::lineage_db::CodeFreshness::Fresh { git_sha } => println!(
+            "job {job_id}: code FRESH (built by engine commit {}, the same as this binary)",
+            short(git_sha)
+        ),
         crate::lineage_db::CodeFreshness::Stale { built_sha, head } => println!(
-            "job {job_id}: code STALE (built at {}, HEAD is {} — a re-run re-executes)",
+            "job {job_id}: code STALE (built by engine commit {}, this binary is {} — a \
+             re-run re-executes)",
             short(built_sha),
             short(head)
         ),
-        crate::lineage_db::CodeFreshness::Unknown => {
-            println!("job {job_id}: code UNKNOWN (no recorded git SHA to compare)")
-        }
+        crate::lineage_db::CodeFreshness::Unknown => println!(
+            "job {job_id}: code UNKNOWN (the run records no engine build commit, or a \
+             binary was built without git)"
+        ),
     }
     if let Some(current) = &data_version {
-        if data_stale.is_empty() {
+        if data_checked == 0 {
+            // Nothing to compare is not the same as nothing stale.
+            println!(
+                "data: UNKNOWN (no produced artifact records a data_version to compare \
+                 with {current})"
+            );
+        } else if data_stale.is_empty() {
             println!("data: FRESH ({data_checked} artifact(s) at data_version {current})");
         } else {
             for (stage, recorded) in &data_stale {
@@ -392,23 +431,45 @@ pub(super) fn run_lineage_trace(hash: &str, json: bool) -> Result<()> {
 pub(super) fn run_lineage_reindex() -> Result<()> {
     let jobs_root = crate::paths::jobs_dir()?;
     let (mut indexed, mut skipped) = (0u32, 0u32);
-    let rd = std::fs::read_dir(&jobs_root)
-        .with_context(|| format!("read jobs dir {}", jobs_root.display()))?;
+    let rd = match std::fs::read_dir(&jobs_root) {
+        Ok(rd) => rd,
+        // No job has ever run: there is nothing to index, which is not an error.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "reindexed 0 run(s), skipped 0 (no jobs under {})",
+                jobs_root.display()
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(anyhow::Error::from(e))
+                .with_context(|| format!("read jobs dir {}", jobs_root.display()));
+        }
+    };
     {
         for e in rd.flatten() {
             let Some(job_id) = e.file_name().to_str().map(String::from) else {
                 continue;
             };
-            // Recipe identity comes from the run marker; legacy/bare-spawn jobs
-            // have none → skip (nothing to attribute the run to).
-            let Ok(marker) = RecipeMarker::read_from(&e.path()) else {
-                skipped += 1;
-                continue;
+            // Recipe identity comes from the run marker. A job launched from a
+            // plan file (`plan run`, `recipe declare --run`) has no marker but
+            // persisted its plan graph, whose name is what the live ingest
+            // recorded; it used to be skipped, so a deleted index could not
+            // be rebuilt for those runs. Legacy/bare-spawn jobs have neither.
+            let name = match RecipeMarker::read_from(&e.path()) {
+                Ok(marker) => marker.name,
+                Err(_) => match crate::framework::PlanGraph::read_from(&e.path()) {
+                    Some(graph) => graph.name,
+                    None => {
+                        skipped += 1;
+                        continue;
+                    }
+                },
             };
             let outcome = crate::jobs::read_state(&job_id)
                 .map(|s| format!("{s:?}").to_lowercase())
                 .unwrap_or_else(|_| "unknown".into());
-            match crate::lineage_db::ingest_job(&job_id, &marker.name, &outcome) {
+            match crate::lineage_db::ingest_job(&job_id, &name, &outcome) {
                 Ok(()) => indexed += 1,
                 Err(err) => {
                     tracing::warn!("reindex {job_id}: {err}");
@@ -419,6 +480,61 @@ pub(super) fn run_lineage_reindex() -> Result<()> {
     }
     eprintln!("reindexed {indexed} run(s), skipped {skipped}");
     Ok(())
+}
+
+#[cfg(test)]
+mod reindex_tests {
+    use super::run_lineage_reindex;
+
+    /// `lineage reindex` failed on a fresh install ("No such file or
+    /// directory"), and skipped every job launched from a plan file, so a
+    /// deleted index could not be rebuilt for them.
+    #[test]
+    fn reindex_handles_no_jobs_and_plan_file_jobs() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let prev: Vec<_> = ["LAMU_TRAIN_JOBS_DIR", "LAMU_TRAIN_DATA_DIR"]
+            .into_iter()
+            .map(|k| (k, std::env::var_os(k)))
+            .collect();
+        // SAFETY: TEST_ENV_LOCK serializes env mutation; restored below.
+        unsafe {
+            std::env::set_var("LAMU_TRAIN_JOBS_DIR", td.path().join("jobs"));
+            std::env::set_var("LAMU_TRAIN_DATA_DIR", td.path().join("data"));
+        }
+        let fresh = run_lineage_reindex();
+        let job = "20261023-000000-000000009";
+        let dir = crate::paths::job_dir(job).unwrap();
+        crate::framework::PlanGraph {
+            name: "spec_from_file".into(),
+            nodes: vec![],
+            edges: vec![],
+            condition_gates: vec![],
+        }
+        .write_to(&dir)
+        .unwrap();
+        crate::jobs::write_state(job, crate::jobs::JobState::Done).unwrap();
+        let indexed = run_lineage_reindex();
+        let row = crate::lineage_db::LineageDb::open()
+            .unwrap()
+            .get_run(job)
+            .unwrap();
+        unsafe {
+            for (k, v) in prev {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        assert!(fresh.is_ok(), "{fresh:?}");
+        assert!(indexed.is_ok(), "{indexed:?}");
+        let row = row.expect("a plan-file job is indexed");
+        assert_eq!(row.recipe, "spec_from_file");
+        assert_eq!(row.outcome.as_deref(), Some("done"));
+    }
 }
 
 #[cfg(test)]

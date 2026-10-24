@@ -223,6 +223,21 @@ pub fn validate_args_against_schema(
     Ok(())
 }
 
+/// The complete set of top-level arg names a recipe's args schema accepts, or
+/// `None` when the schema admits keys it does not list (a flattened map, a
+/// composed schema). Used to refuse a name that can never be an arg before
+/// anything is persisted under it.
+pub(crate) fn closed_arg_names(schema: &serde_json::Value) -> Option<Vec<String>> {
+    let root = schema_root(schema)?;
+    if !closed_object(root) {
+        return None;
+    }
+    let props = root.get("properties")?.as_object()?;
+    let mut names: Vec<String> = props.keys().cloned().collect();
+    names.sort_unstable();
+    Some(names)
+}
+
 /// Whether an object schema lists every key it accepts: no
 /// `additionalProperties` schema/`true`, and no `allOf`/`anyOf`/`oneOf`/`$ref`
 /// that could contribute keys of its own.

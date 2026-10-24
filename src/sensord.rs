@@ -101,6 +101,9 @@ pub async fn run(
         return Ok(());
     }
 
+    if !parsed.trigger.is_empty() {
+        check_cli_resolves(&cli)?;
+    }
     let mut bound = Vec::with_capacity(parsed.trigger.len());
     for binding in &parsed.trigger {
         let trigger = build_trigger(binding, interval)?;
@@ -120,6 +123,9 @@ pub async fn run(
     }
 
     loop {
+        // Dispatch problems in this poll. Daemon mode retries them on the next
+        // poll; `--once` (the smoke run) reports them in its exit status.
+        let mut problems = 0usize;
         for binding in &mut bound {
             let timeout = std::time::Duration::from_secs(parsed.admission_timeout_secs.max(1));
             let dispatcher = crate::trigger::ChildAdmissionDispatcher {
@@ -158,14 +164,18 @@ pub async fn run(
                                     );
                                 }
                             }
-                            crate::trigger::DispatchOutcome::Refused(reason) => eprintln!(
-                                "sensord: '{}' refused for event {} ({reason}) — will retry",
-                                binding.plan, event.source
-                            ),
+                            crate::trigger::DispatchOutcome::Refused(reason) => {
+                                problems += 1;
+                                eprintln!(
+                                    "sensord: '{}' refused for event {} ({reason}) — will retry",
+                                    binding.plan, event.source
+                                )
+                            }
                         }
                     }
                 }
                 Err(error) => {
+                    problems += 1;
                     eprintln!("sensord: poll failed for plan '{}': {error}", binding.plan)
                 }
             }
@@ -182,9 +192,34 @@ pub async fn run(
             );
         }
         if once {
+            // A smoke run whose every dispatch failed used to exit 0.
+            if problems > 0 {
+                bail!("sensord --once: {problems} dispatch(es) refused or failed (see above)");
+            }
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_secs(interval.max(1))).await;
+    }
+}
+
+/// Refuse to start with a `--cli` that cannot be executed. Every fired
+/// trigger launches it; a wrong path made each event fail with "No such file
+/// or directory — will retry", forever, while sensord itself kept running.
+fn check_cli_resolves(cli: &std::path::Path) -> Result<()> {
+    let found = if cli.components().count() > 1 {
+        cli.is_file()
+    } else {
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(cli).is_file()))
+    };
+    if found {
+        Ok(())
+    } else {
+        bail!(
+            "--cli {} is not an executable file or on PATH; pass the cookbook binary that \
+             owns the triggered recipes, e.g. `--cli /usr/local/bin/my-cookbook`",
+            cli.display()
+        )
     }
 }
 
@@ -319,6 +354,16 @@ fn dot_blut() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cli_that_does_not_exist_is_refused_up_front() {
+        let td = tempfile::tempdir().unwrap();
+        let exe = td.path().join("my-cookbook");
+        assert!(check_cli_resolves(&exe).is_err());
+        std::fs::write(&exe, "").unwrap();
+        assert!(check_cli_resolves(&exe).is_ok());
+        assert!(check_cli_resolves(std::path::Path::new("blut-no-such-binary-xyz")).is_err());
+    }
 
     #[test]
     fn rejects_restricted_trigger_without_restricted_classification() {

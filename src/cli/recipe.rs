@@ -43,22 +43,29 @@ pub(super) enum RecipeCommand {
         #[arg(long, default_value_t = false)]
         run: bool,
         /// Promote this run's outputs to the global cache (only with `--run`).
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, requires = "run")]
         shared_cache: bool,
         /// Force-recompute on launch: bypass the stage cache READ so every stage
         /// runs even with a warm entry (only with `--run`). Alias: `--force`.
-        #[arg(long = "no-cache", alias = "force", default_value_t = false)]
+        #[arg(
+            long = "no-cache",
+            alias = "force",
+            default_value_t = false,
+            requires = "run"
+        )]
         no_cache: bool,
         /// Force all declared async-I/O lanes onto their synchronous Inline
-        /// fallback (execution-only; cache identity is unchanged).
-        #[arg(long, default_value_t = false)]
+        /// fallback (execution-only; cache identity is unchanged; only with
+        /// `--run`).
+        #[arg(long, default_value_t = false, requires = "run")]
         sync_io: bool,
         /// Tenant to resolve a `registry://plan@<name>` deploy URI against and,
         /// with `--run`, to own the launched job (ADR 0085/0096).
         #[arg(long, default_value = "default")]
         tenant: String,
-        /// Experiment/campaign name for lineage grouping. Defaults to the recipe.
-        #[arg(long)]
+        /// Experiment/campaign name for lineage grouping. Defaults to the recipe
+        /// (only with `--run`).
+        #[arg(long, requires = "run")]
         experiment: Option<String>,
     },
     /// Execute a recipe, or a config-driven sweep over it.
@@ -157,8 +164,12 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                 emit_json(&arr)?;
                 return Ok(());
             }
+            if sorted.is_empty() {
+                println!("(no recipes registered in this binary)");
+                return Ok(());
+            }
             println!(
-                "{:<32} {:<14} {:<12} {:<24} → output",
+                "{:<32} {:<16} {:<12} {:<24} → output",
                 "name", "category", "backend", "inputs"
             );
             for r in sorted {
@@ -168,7 +179,7 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                     r.input_kinds.join(",")
                 };
                 println!(
-                    "{:<32} {:<14} {:<12} {:<24} → {}",
+                    "{:<32} {:<16} {:<12} {:<24} → {}",
                     r.name,
                     r.category.label(),
                     r.backend_id,
@@ -308,6 +319,8 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                 .map_err(|e| anyhow!("invalid --launcher {launcher:?}: {e}"))?;
             crate::config::launcher::check_launcher_env(launch_target)
                 .map_err(|e| anyhow!("--launcher {launcher}: {e}"))?;
+            crate::config::launcher::check_launcher_tools(launch_target)
+                .map_err(|e| anyhow!("{e}"))?;
             // ADR 0096: parse the tenant up front (same fail-fast discipline).
             let tenant = crate::tenant::Tenant::parse(&tenant)
                 .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
@@ -901,6 +914,26 @@ impl PreparedRecipeLaunch {
             device_index,
         } = self;
 
+        // Admission and the scheduler lock come BEFORE anything is written for
+        // this job. A launch refused here never started: it used to leave a
+        // job directory marked `failed` behind, one per refused attempt, in
+        // `blut jobs` (the same reason `plan resume` takes them first).
+        //
+        // This reservation consumes the same exact footprint and immutable
+        // TenantAdmission snapshot used during profile selection. In
+        // particular, a prepared partition cell cannot silently re-probe or
+        // resolve a second async-I/O candidate before execution.
+        let _tenant_reservation = tenant_admission
+            .reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
+            .map_err(|reason| anyhow!("recipe '{name}' admission refused: {reason}"))?;
+
+        let holder = format!("blut-recipe:{job_id}");
+        let lock = match device_index {
+            Some(dev) => scheduler_lock::acquire_exclusive_device(dev, holder, LockKind::Training),
+            None => scheduler_lock::acquire_exclusive(holder, LockKind::Training),
+        }
+        .map_err(|error| anyhow!("acquire_exclusive: {error}"))?;
+
         // Preparation may wait behind an outer scheduler, so it must not leave
         // an orphan job directory merely by computing an admission witness.
         // Materialize persistent job state only once execution actually owns
@@ -911,6 +944,8 @@ impl PreparedRecipeLaunch {
             .with_context(|| format!("persist tenant for {job_id}"))?;
         crate::jobs::write_experiment(&job_id, experiment.as_deref().unwrap_or(&name))
             .with_context(|| format!("persist experiment for {job_id}"))?;
+        crate::jobs::write_provenance(&job_id, crate::lineage_db::git_head_sha())
+            .with_context(|| format!("persist provenance for {job_id}"))?;
 
         // Mark recipe for plan resume — only for a registry recipe (a
         // declarative `.toml` launch passes `None`: there is no registry recipe
@@ -930,39 +965,6 @@ impl PreparedRecipeLaunch {
         // KILL-3: trap SIGTERM/ctrl-c. On signal, cancel the executor token AND
         // killpg the live child group, then return so the scheduler lock drops.
         install_cancel_handler(ctx.cancel.clone());
-
-        // This reservation consumes the same exact footprint and immutable
-        // TenantAdmission snapshot used during profile selection. In
-        // particular, a prepared partition cell cannot silently re-probe or
-        // resolve a second async-I/O candidate before execution.
-        let _tenant_reservation = match tenant_admission
-            .reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
-        {
-            Ok(reservation) => reservation,
-            Err(reason) => {
-                crate::python_kill::unbind_current_job();
-                if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                    tracing::warn!("write Failed state for {job_id}: {se}");
-                }
-                return Err(anyhow!("recipe '{name}' admission refused: {reason}"));
-            }
-        };
-
-        let holder = format!("blut-recipe:{job_id}");
-        let lock = match device_index {
-            Some(dev) => scheduler_lock::acquire_exclusive_device(dev, holder, LockKind::Training),
-            None => scheduler_lock::acquire_exclusive(holder, LockKind::Training),
-        };
-        let lock = match lock {
-            Ok(lock) => lock,
-            Err(error) => {
-                crate::python_kill::unbind_current_job();
-                if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                    tracing::warn!("write Failed state for {job_id}: {se}");
-                }
-                return Err(anyhow!("acquire_exclusive: {error}"));
-            }
-        };
 
         // Sensord marks an event dispatched only after this exact recipe owns
         // both its tenant reservation and scheduler lock. The durable marker
@@ -1021,15 +1023,34 @@ impl PreparedRecipeLaunch {
                 Ok(job_id)
             }
             Err(error) => {
-                if let Err(state_error) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                    tracing::warn!("write Failed state for {job_id}: {state_error}");
+                let (state, outcome) = terminal_for_error(&error);
+                if let Err(state_error) = crate::jobs::write_state(&job_id, state) {
+                    tracing::warn!("write {outcome} state for {job_id}: {state_error}");
                 }
-                if let Err(index_error) = crate::lineage_db::ingest_job(&job_id, &name, "failed") {
-                    tracing::debug!("lineage index (failed) {job_id}: {index_error}");
+                if let Err(index_error) = crate::lineage_db::ingest_job(&job_id, &name, outcome) {
+                    tracing::debug!("lineage index ({outcome}) {job_id}: {index_error}");
                 }
                 Err(anyhow::Error::from(error).context("plan execution failed"))
             }
         }
+    }
+}
+
+/// The job state and lineage outcome for a plan that ended in `error`. A run
+/// stopped by `blut cancel` or Ctrl-C used to be recorded as `failed` in the
+/// lineage index, beside a `cancelled` job state.
+pub(super) fn terminal_for_error(error: &crate::framework::PlanError) -> (JobState, &'static str) {
+    let cancelled = match error {
+        crate::framework::PlanError::Cancelled => true,
+        crate::framework::PlanError::StageFailed { source, .. } => {
+            matches!(source, crate::framework::StageError::Cancelled)
+        }
+        _ => false,
+    };
+    if cancelled {
+        (JobState::Cancelled, "cancelled")
+    } else {
+        (JobState::Failed, "failed")
     }
 }
 
@@ -1265,17 +1286,32 @@ pub(super) async fn run_recipe_sweep(
     let dir = config_dir.ok_or_else(|| anyhow!("--config-dir is required in config/sweep mode"))?;
     let cfg_name =
         config_name.ok_or_else(|| anyhow!("--config-name is required in config/sweep mode"))?;
-    // Args subtree key (default = recipe name). Overrides/sweeps must be dotted
-    // paths INTO this subtree; dot-less keys are consumed by the compose layer
-    // as defaults-list group selections and silently never reach a config value.
+    // Args subtree key (default = recipe name). When the config nests the
+    // Args under it, overrides must be dotted paths into that subtree.
     let key = config_key.unwrap_or_else(|| name.to_string());
-    warn_dotless_overrides(set, "--set", &key);
-    warn_dotless_overrides(sweep, "--sweep", &key);
 
     let entries = crate::config::expand_and_fingerprint(&dir, &cfg_name, set, sweep)
         .map_err(|e| anyhow!("config compose/expand: {e}"))?;
     if entries.is_empty() {
         return Err(anyhow!("sweep expanded to 0 combos"));
+    }
+    if let Some(first) = entries.first() {
+        warn_overrides_outside_args(&first.config.json, &key, set, sweep);
+    }
+    // Two combos that hand the recipe the same args are one run, launched
+    // twice under different labels: an override did not reach the args.
+    let projected: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| project_args(e.config.json.clone(), &key))
+        .collect();
+    if let Some((i, j)) = first_duplicate(&projected) {
+        return Err(anyhow!(
+            "sweep combos {:?} and {:?} give the recipe identical args, so an override \
+             does not reach them; when the config nests the args under '{key}:', \
+             address them as '{key}.<field>=…'",
+            entries[i].overrides,
+            entries[j].overrides
+        ));
     }
     let total = entries.len();
     eprintln!("sweep: {total} combo(s) for recipe '{name}'");
@@ -1364,8 +1400,7 @@ pub(super) async fn run_recipe_sweep(
 /// nests them under `key` (the recipe name by default) as an object, return
 /// that subtree — so `--set`/`--sweep` dotted paths `<key>.field=v` reach the
 /// Args. Otherwise (a flat config with no such subtree) return the whole config
-/// as-is (it feeds the Args directly, but top-level overrides can't apply — a
-/// compose-grammar limitation; `warn_dotless_overrides` surfaces it).
+/// as-is; it feeds the Args directly and dot-less overrides reach it.
 /// Resolve and compile one sweep combo's args without running anything (the
 /// check `recipe run --dry-run` applies to a single invocation).
 fn check_sweep_combo(
@@ -1391,20 +1426,129 @@ pub(super) fn project_args(mut config: serde_json::Value, key: &str) -> serde_js
     config
 }
 
-/// Warn about `key=val` overrides whose key has no `.` — the compose layer
-/// treats those as defaults-list group selections, NOT config-value overrides,
-/// so they silently don't change a value (and the sweep would collapse to
-/// identical fingerprints). `subtree_key` is the Args subtree to target.
-pub(super) fn warn_dotless_overrides(items: &[String], flag: &str, subtree_key: &str) {
-    for it in items {
-        let key = it.split_once('=').map_or(it.as_str(), |(k, _)| k);
-        if !key.contains('.') {
-            eprintln!(
-                "warning: {flag} '{it}' key is dot-less — it is treated as a \
-                 defaults-list group selection, not a value override; nest Args under \
-                 '{subtree_key}:' and use a dotted path (e.g. '{subtree_key}.{key}=…')."
-            );
+/// The first pair of equal values, by index.
+fn first_duplicate(values: &[serde_json::Value]) -> Option<(usize, usize)> {
+    for (i, a) in values.iter().enumerate() {
+        if let Some(offset) = values[i + 1..].iter().position(|b| b == a) {
+            return Some((i, i + 1 + offset));
         }
+    }
+    None
+}
+
+/// Warn about a dot-less `key=val` override when the composed config nests the
+/// recipe's Args under `subtree_key`: the override sets a top-level value the
+/// recipe never reads. (On a flat config, dot-less keys are value overrides
+/// and reach the Args directly.)
+pub(super) fn warn_overrides_outside_args(
+    composed: &serde_json::Value,
+    subtree_key: &str,
+    set: &[String],
+    sweep: &[String],
+) {
+    if !composed.get(subtree_key).is_some_and(|v| v.is_object()) {
+        return;
+    }
+    for (flag, items) in [("--set", set), ("--sweep", sweep)] {
+        for it in items {
+            let key = it.split_once('=').map_or(it.as_str(), |(k, _)| k);
+            let key = key.trim_start_matches(['+', '~']);
+            if !key.contains('.') && key != subtree_key && composed.get(key).is_some() {
+                eprintln!(
+                    "warning: {flag} '{it}' sets top-level '{key}', but the recipe args are \
+                     read from the '{subtree_key}:' subtree; use '{subtree_key}.{key}=…'."
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod launch_refusal_tests {
+    use super::{JobState, terminal_for_error};
+    use crate::framework::{PlanError, StageError};
+
+    #[test]
+    fn a_cancelled_plan_is_recorded_as_cancelled() {
+        assert_eq!(terminal_for_error(&PlanError::Cancelled).1, "cancelled");
+        let stage = PlanError::StageFailed {
+            idx: 1,
+            stage: "s".into(),
+            source: StageError::Cancelled,
+        };
+        assert_eq!(terminal_for_error(&stage).0, JobState::Cancelled);
+        let failed = PlanError::StageFailed {
+            idx: 1,
+            stage: "s".into(),
+            source: StageError::BadInput("x".into()),
+        };
+        assert_eq!(terminal_for_error(&failed), (JobState::Failed, "failed"));
+    }
+
+    /// A launch refused by the scheduler lock used to leave a `failed` job
+    /// directory behind in `blut jobs`.
+    // The env lock must span the awaited launch: the launch reads these vars.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_launch_refused_by_the_scheduler_lock_leaves_no_job() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let keys = [
+            "LAMU_TRAIN_JOBS_DIR",
+            "LAMU_TRAIN_DATA_DIR",
+            "XDG_DATA_HOME",
+        ];
+        let prev: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        // SAFETY: TEST_ENV_LOCK serializes env mutation; restored below.
+        unsafe {
+            std::env::set_var("LAMU_TRAIN_JOBS_DIR", td.path().join("jobs"));
+            std::env::set_var("LAMU_TRAIN_DATA_DIR", td.path().join("data"));
+            std::env::set_var("XDG_DATA_HOME", td.path().join("xdg"));
+        }
+        let held = crate::scheduler_lock::acquire_exclusive(
+            "test-holder",
+            crate::scheduler_lock::LockKind::Training,
+        );
+        let plan = crate::framework::plan::CompiledPlan::from_components(
+            "refused".into(),
+            serde_json::json!({}),
+            vec![],
+        )
+        .0;
+        let result = super::launch_compiled_plan(
+            "refused",
+            plan,
+            None,
+            None,
+            false,
+            crate::config::launcher::LaunchTarget::Local,
+            None,
+            false,
+            false,
+            crate::tenant::Tenant::default(),
+            None,
+        )
+        .await;
+        let jobs = crate::jobs::list_jobs();
+        drop(held);
+        unsafe {
+            for (k, v) in prev {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let err = result
+            .expect_err("the held lock must refuse the launch")
+            .to_string();
+        assert!(err.contains("acquire_exclusive"), "{err}");
+        assert!(
+            jobs.unwrap().is_empty(),
+            "a refused launch must not create a job"
+        );
     }
 }
 
@@ -1803,6 +1947,50 @@ mod sweep_dry_run_tests {
             .0)
         },
     };
+
+    /// `--sweep seed=1,2` over a flat config ran two identical combos (the
+    /// dot-less key never reached a value), and over a nested config it still
+    /// sets a key the recipe never reads. The first now varies the args; the
+    /// second is caught before anything runs.
+    #[test]
+    fn a_sweep_axis_must_reach_the_recipe_args() {
+        let flat = tempfile::tempdir().unwrap();
+        std::fs::write(flat.path().join("config.yaml"), "steps: 0\n").unwrap();
+        let sweep = ["steps=1,2".to_string()];
+        let entries = crate::config::expand_and_fingerprint(
+            flat.path().to_str().unwrap(),
+            "config",
+            &[],
+            &sweep,
+        )
+        .unwrap();
+        let args: Vec<_> = entries
+            .iter()
+            .map(|e| super::project_args(e.config.json.clone(), "sweep_dry"))
+            .collect();
+        assert_eq!(args[0]["steps"], 1);
+        assert_eq!(args[1]["steps"], 2);
+        assert_eq!(super::first_duplicate(&args), None);
+
+        let nested = tempfile::tempdir().unwrap();
+        std::fs::write(
+            nested.path().join("config.yaml"),
+            "steps: 0\nsweep_dry:\n  steps: 0\n",
+        )
+        .unwrap();
+        let entries = crate::config::expand_and_fingerprint(
+            nested.path().to_str().unwrap(),
+            "config",
+            &[],
+            &sweep,
+        )
+        .unwrap();
+        let args: Vec<_> = entries
+            .iter()
+            .map(|e| super::project_args(e.config.json.clone(), "sweep_dry"))
+            .collect();
+        assert_eq!(super::first_duplicate(&args), Some((0, 1)));
+    }
 
     /// `--sweep count.stpes=1,2 --dry-run` listed both combos as fine; the
     /// real run then failed every one.

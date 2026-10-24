@@ -144,19 +144,29 @@ pub fn job_failure(job_id: &str) -> Result<JobFailureLookup> {
                 continue;
             }
         };
-        if let StageEvent::StageFailed {
-            node_idx,
-            stage_name,
-            error,
-            failure,
-        } = ev
-        {
-            last = Some(JobFailure {
+        match ev {
+            StageEvent::StageFailed {
                 node_idx,
-                stage: stage_name,
+                stage_name,
                 error,
                 failure,
-            });
+            } => {
+                last = Some(JobFailure {
+                    node_idx,
+                    stage: stage_name,
+                    error,
+                    failure,
+                });
+            }
+            // `plan resume` appends a new attempt to the same log. A failure
+            // whose node later completes (re-run or cache hit) was recovered
+            // from, so it is not the job's terminal failure.
+            StageEvent::StageEnd { node_idx, .. } | StageEvent::StageSkipped { node_idx, .. }
+                if last.as_ref().is_some_and(|f| f.node_idx == node_idx) =>
+            {
+                last = None;
+            }
+            _ => {}
         }
     }
     Ok(JobFailureLookup {
@@ -511,6 +521,63 @@ mod tests {
                 None => std::env::remove_var("LAMU_TRAIN_JOBS_DIR"),
             }
         }
+    }
+
+    /// `blut errors show` on a job that failed and was then resumed to
+    /// completion reported the first attempt's failure as the terminal one,
+    /// next to `outcome : done`.
+    #[test]
+    fn a_failure_recovered_by_a_resume_is_not_terminal() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let prev = std::env::var("LAMU_TRAIN_JOBS_DIR").ok();
+        unsafe {
+            std::env::set_var("LAMU_TRAIN_JOBS_DIR", td.path());
+        }
+        let write = |job: &str, lines: &[&str]| {
+            let jdir = td.path().join(job);
+            std::fs::create_dir_all(&jdir).unwrap();
+            std::fs::write(jdir.join("status.jsonl"), lines.join("\n") + "\n").unwrap();
+        };
+        let failed = r#"{"kind":"stage_failed","node_idx":1,"stage_name":"b","error":"boom"}"#;
+        write(
+            "20261023-000000-000000001",
+            &[
+                failed,
+                r#"{"kind":"stage_begin","node_idx":1,"stage_name":"b","input_hash":"abababababababababababababababababababababababababababababababab"}"#,
+                r#"{"kind":"stage_end","node_idx":1,"stage_name":"b","content_id":"abababababababababababababababababababababababababababababababab","elapsed":{"secs":1,"nanos":0}}"#,
+            ],
+        );
+        write(
+            "20261023-000000-000000002",
+            &[
+                failed,
+                r#"{"kind":"stage_skipped","node_idx":1,"stage_name":"b","invocation_key":"abababababababababababababababababababababababababababababababab"}"#,
+            ],
+        );
+        // A different node completing does not clear the failure.
+        write(
+            "20261023-000000-000000003",
+            &[
+                failed,
+                r#"{"kind":"stage_skipped","node_idx":0,"stage_name":"a","invocation_key":"abababababababababababababababababababababababababababababababab"}"#,
+            ],
+        );
+        let recovered = job_failure("20261023-000000-000000001").unwrap();
+        let cached = job_failure("20261023-000000-000000002").unwrap();
+        let still_failed = job_failure("20261023-000000-000000003").unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("LAMU_TRAIN_JOBS_DIR", v),
+                None => std::env::remove_var("LAMU_TRAIN_JOBS_DIR"),
+            }
+        }
+        assert_eq!(recovered.parse_errors + cached.parse_errors, 0);
+        assert!(recovered.failure.is_none());
+        assert!(cached.failure.is_none());
+        assert_eq!(still_failed.failure.map(|f| f.node_idx), Some(1));
     }
 
     /// `blut errors show` (ADR 0072 A4) reads exactly this: a terminal

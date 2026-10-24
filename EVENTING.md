@@ -52,6 +52,10 @@ blut sensord --cli /usr/local/bin/my-cookbook
 blut sensord --cli /usr/local/bin/my-cookbook --once # deterministic smoke
 ```
 
+Sensord refuses to start when `--cli` is neither an executable path nor on
+`PATH`. With `--once` it exits non-zero when any dispatch was refused or a
+poll failed; the daemon loop retries those on the next poll.
+
 Webhook clients send `POST /events/<trigger>` (the `/api/events/<trigger>`
 alias is also supported) with:
 
@@ -76,7 +80,8 @@ web boundary while keeping the event itself Restricted.
 
 Sensord and `blut sla check` call the same evaluator. Rules default to
 `~/.blut/sla.toml` or `$BLUT_SLA_RULES`; breaches append once to
-`$BLUT_SLA_PATH` or `~/.blut/sla.jsonl`.
+`$BLUT_SLA_PATH` or `~/.blut/sla.jsonl`. A rule file named by `--rules` or
+`$BLUT_SLA_RULES` must exist; the default file is optional.
 
 ```toml
 [[rule]]
@@ -91,8 +96,10 @@ freshness_secs = 3600
 ```
 
 `max_runtime_secs`, `deadline_unix`, and `freshness_secs` are positive bounds.
-Freshness uses the newest measured `produced_unix` lineage timestamp and fails
-closed when a matching run has no measurement. `blut sla check` exits nonzero
+Freshness looks at the newest measured `produced_unix` lineage timestamp among
+a rule's matching runs, per tenant: one breach when even that is older than the
+window. It fails closed when none of a tenant's matching runs has a
+measurement. `max_runtime_secs` and `deadline_unix` are judged per run. `blut sla check` exits nonzero
 while any breach is active, even if its durable row was already written.
 
 ## Notification rules

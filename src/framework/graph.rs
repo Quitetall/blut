@@ -238,8 +238,17 @@ fn fold_status(lines: &[String], n_nodes: usize) -> Vec<Obs> {
         let Some(o) = obs.get_mut(idx) else {
             continue;
         };
-        // A terminal state is final — a stray later event can't revive it.
+        // A terminal state is final — a stray later event can't revive it —
+        // with one exception: a FAILED or KILLED node is reopened by a later
+        // attempt. `plan resume` appends a new run of the plan to the same
+        // status.jsonl, so a node that failed and was then re-run to
+        // completion must read as done, not as the failure it recovered from.
+        // A new attempt announces itself with `stage_begin` (re-executed) or
+        // `stage_skipped` (served from cache); a stray `stage_step` does not.
         let terminal = o.status.map(NodeStatus::is_terminal).unwrap_or(false);
+        let reattempt = matches!(kind, "stage_begin" | "stage_skipped")
+            && matches!(o.status, Some(NodeStatus::Failed | NodeStatus::Killed));
+        let terminal = terminal && !reattempt;
         match kind {
             "stage_begin" => {
                 if let Some(h) = ev.get("input_hash").and_then(|v| v.as_str()) {
@@ -472,6 +481,41 @@ mod tests {
             !o[0].cache_hit,
             "late stage_skipped must not flip cache_hit"
         );
+    }
+
+    /// `plan resume` appends a second attempt to the same status.jsonl. A
+    /// node that failed and was then re-run to completion was shown as
+    /// `failed` by `blut dag`, because the first terminal event won.
+    #[test]
+    fn a_resumed_node_that_succeeds_reads_done_not_failed() {
+        let l = lines(&[
+            json!({"kind":"stage_begin","node_idx":0,"stage_name":"a","input_hash":"i0"}),
+            json!({"kind":"stage_end","node_idx":0,"stage_name":"a","content_id":"c0","elapsed":{"secs":1,"nanos":0}}),
+            json!({"kind":"stage_begin","node_idx":1,"stage_name":"b","input_hash":"i1"}),
+            json!({"kind":"stage_failed","node_idx":1,"stage_name":"b","error":"boom"}),
+            // the resume: node 0 is a cache hit, node 1 re-runs and succeeds
+            json!({"kind":"stage_skipped","node_idx":0,"stage_name":"a","invocation_key":"k0"}),
+            json!({"kind":"stage_begin","node_idx":1,"stage_name":"b","input_hash":"i1"}),
+            json!({"kind":"stage_end","node_idx":1,"stage_name":"b","content_id":"c1","elapsed":{"secs":2,"nanos":0}}),
+            // a stray duplicate failure after success still cannot downgrade
+            json!({"kind":"stage_failed","node_idx":1,"stage_name":"b","error":"late"}),
+        ]);
+        let o = fold_status(&l, 2);
+        assert_eq!(o[0].status, Some(NodeStatus::Done), "first success kept");
+        assert_eq!(o[1].status, Some(NodeStatus::Done), "recovered node");
+        assert_eq!(o[1].output_hash.as_deref(), Some("c1"));
+        // A resume served from cache also reopens the failed node.
+        let cached = lines(&[
+            json!({"kind":"stage_failed","node_idx":0,"stage_name":"a","error":"boom"}),
+            json!({"kind":"stage_skipped","node_idx":0,"stage_name":"a","invocation_key":"k"}),
+        ]);
+        assert_eq!(fold_status(&cached, 1)[0].status, Some(NodeStatus::Skipped));
+        // A stray step after a failure is not a new attempt.
+        let stray = lines(&[
+            json!({"kind":"stage_failed","node_idx":0,"stage_name":"a","error":"boom"}),
+            json!({"kind":"stage_step","node_idx":0,"stage_name":"a","update":{"loss":1.0}}),
+        ]);
+        assert_eq!(fold_status(&stray, 1)[0].status, Some(NodeStatus::Failed));
     }
 
     #[test]

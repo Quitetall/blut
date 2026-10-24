@@ -374,8 +374,8 @@ enum PlanCommand {
     Inspect {
         /// Recipe name (as listed by `recipe list`).
         name: String,
-        /// Recipe args as inline JSON.
-        #[arg(long)]
+        /// Recipe args as inline JSON. Defaults to `{}`, as for `recipe run`.
+        #[arg(long, default_value = "{}")]
         args: String,
     },
     /// Typecheck a `.json` PlanSpec against the compiled-in stages WITHOUT
@@ -807,6 +807,23 @@ fn resolve_prune_cap_gb(flag: Option<f64>, env: Option<std::ffi::OsString>) -> R
         ));
     }
     Ok(cap)
+}
+
+/// A byte count in the largest binary unit that keeps it at or above 1.
+/// `cache prune` printed "pruned 0.00 GiB" after deleting a whole small cache.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -1356,6 +1373,80 @@ mod resume_marker_tests {
             .expect("no marker")
             .to_string();
         assert!(err.contains("launched from a plan file"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod artifact_inspect_tests {
+    use super::{InspectTarget, inspect_target};
+    use crate::framework::lineage::ArtifactRecord;
+
+    fn rec(job: &str, byte: u8) -> ArtifactRecord {
+        let meta = serde_json::from_value(serde_json::json!({
+            "kind": "k",
+            "schema": 1,
+            "content_id": format!("{byte:02x}").repeat(32),
+            "identity_scheme": "abir-content-id-v1",
+            "produced_by_stage": "s",
+            "produced_at_unix_secs": 0,
+        }))
+        .unwrap();
+        ArtifactRecord {
+            meta,
+            sidecar_path: std::path::PathBuf::from(format!(
+                "/j/{job}/stages/0-s/output.metadata.json"
+            )),
+            job_id: job.into(),
+        }
+    }
+
+    /// An artifact reused by later cache-hit jobs has one sidecar per job;
+    /// `inspect` refused it as ambiguous even when given the full hash.
+    #[test]
+    fn the_same_content_in_several_jobs_is_one_artifact() {
+        let recs = [
+            rec("20261023-000001-0", 7),
+            rec("20261023-000003-0", 7),
+            rec("20261023-000002-0", 7),
+        ];
+        match inspect_target(&recs) {
+            InspectTarget::One { record, also_in } => {
+                assert_eq!(record.job_id, "20261023-000003-0", "newest job");
+                assert_eq!(also_in, ["20261023-000001-0", "20261023-000002-0"]);
+            }
+            _ => panic!("same hash must resolve to one artifact"),
+        }
+        let mixed = [rec("a", 7), rec("b", 8)];
+        assert!(matches!(
+            inspect_target(&mixed),
+            InspectTarget::Ambiguous(_)
+        ));
+        assert!(matches!(inspect_target(&[]), InspectTarget::None));
+    }
+}
+
+#[cfg(test)]
+mod small_cli_fix_tests {
+    use super::{Cli, Command, PlanCommand, human_bytes};
+    use clap::Parser;
+
+    /// `cache prune` reported "pruned 0.00 GiB" after deleting 2778 bytes.
+    #[test]
+    fn small_sizes_are_not_rounded_to_zero() {
+        assert_eq!(human_bytes(2778), "2.71 KiB");
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(3 << 30), "3.00 GiB");
+    }
+
+    /// `plan inspect <recipe>` demanded `--args` where `recipe run` defaults
+    /// it to `{}`.
+    #[test]
+    fn plan_inspect_args_default_to_an_empty_object() {
+        let cli = Cli::try_parse_from(["blut", "plan", "inspect", "r"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Plan { cmd: PlanCommand::Inspect { args, .. } }) if args == "{}"
+        ));
     }
 }
 
@@ -2035,11 +2126,11 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                     Ok(())
                 }
                 Err(e) => {
-                    if let Err(se) = crate::jobs::write_state(&job_id, JobState::Failed) {
-                        tracing::warn!("write Failed state for {job_id}: {se}");
+                    let (state, outcome) = recipe::terminal_for_error(&e);
+                    if let Err(se) = crate::jobs::write_state(&job_id, state) {
+                        tracing::warn!("write {outcome} state for {job_id}: {se}");
                     }
-                    if let Err(ie) = crate::lineage_db::ingest_job(&job_id, &marker.name, "failed")
-                    {
+                    if let Err(ie) = crate::lineage_db::ingest_job(&job_id, &marker.name, outcome) {
                         tracing::warn!("lineage index {job_id}: {ie}");
                     }
                     // `.context()` (not `anyhow!("...: {e}")`) — preserves `e` as the
@@ -2535,11 +2626,19 @@ fn run_sensor_cmd(cmd: SensorCommand) -> Result<()> {
 fn run_sla_cmd(cmd: SlaCommand) -> Result<()> {
     match cmd {
         SlaCommand::Check { rules, out, json } => {
-            let rules_path = rules.unwrap_or_else(|| {
-                std::env::var_os("BLUT_SLA_RULES")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| dot_blut().join("sla.toml"))
-            });
+            let from_env = std::env::var_os("BLUT_SLA_RULES").map(std::path::PathBuf::from);
+            let explicit = rules.is_some() || from_env.is_some();
+            let rules_path = rules
+                .or(from_env)
+                .unwrap_or_else(|| dot_blut().join("sla.toml"));
+            // A rule file you named that is not there is a typo, not "no
+            // rules": it used to report 0 breaches and exit 0.
+            if explicit && !rules_path.is_file() {
+                return Err(anyhow!(
+                    "SLA rule file {} does not exist (from --rules or $BLUT_SLA_RULES)",
+                    rules_path.display()
+                ));
+            }
             let out_path = out.unwrap_or_else(crate::sla::default_sla_path);
             let report = crate::sla::check_paths(&rules_path, &out_path)
                 .with_context(|| format!("check SLA rules {}", rules_path.display()))?;
@@ -2650,7 +2749,7 @@ fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
                 return Ok(());
             }
             let size = dir_size_bytes(&global)?;
-            println!("size: {:.2} GiB", size as f64 / 1024.0 / 1024.0 / 1024.0);
+            println!("size: {}", human_bytes(size));
             Ok(())
         }
         CacheCommand::Prune { max_gb } => {
@@ -2661,10 +2760,9 @@ fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
             let freed = crate::framework::cache::lru_prune(&global, cap_bytes)
                 .with_context(|| format!("lru_prune {}", global.display()))?;
             println!(
-                "pruned {:.2} GiB from {} (cap {:.2} GiB)",
-                freed as f64 / 1024.0 / 1024.0 / 1024.0,
+                "pruned {} from {} (cap {cap_gb:.2} GiB)",
+                human_bytes(freed),
                 global.display(),
-                cap_gb
             );
             Ok(())
         }
@@ -2739,19 +2837,28 @@ fn run_artifact_cmd(cmd: ArtifactCommand) -> Result<()> {
                 return Err(anyhow!("hash prefix too short — give at least 4 hex chars"));
             }
             let recs = lineage::find_by_hash_prefix(&hash).map_err(|e| anyhow!("{e}"))?;
-            match recs.as_slice() {
-                [] => Err(anyhow!("no artifact with content hash prefix '{hash}'")),
-                [r] => {
+            match inspect_target(&recs) {
+                InspectTarget::None => {
+                    Err(anyhow!("no artifact with content hash prefix '{hash}'"))
+                }
+                InspectTarget::One { record: r, also_in } => {
                     if json {
                         emit_json(&r)?;
                         return Ok(());
                     }
                     println!("sidecar: {}", r.sidecar_path.display());
                     println!("job:     {}", r.job_id);
+                    if !also_in.is_empty() {
+                        println!(
+                            "also in: {} other job(s) (the same content, e.g. a cache hit): {}",
+                            also_in.len(),
+                            also_in.join(", ")
+                        );
+                    }
                     emit_json(&r.meta)?;
                     Ok(())
                 }
-                many => {
+                InspectTarget::Ambiguous(many) => {
                     eprintln!("ambiguous prefix '{hash}' — {} matches:", many.len());
                     for r in many {
                         let hash = r
@@ -2770,6 +2877,47 @@ fn run_artifact_cmd(cmd: ArtifactCommand) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+/// What `artifact inspect <prefix>` resolved to.
+enum InspectTarget<'a> {
+    None,
+    /// One artifact. A content-addressed artifact reused by a cache hit has a
+    /// sidecar in every job that used it; `also_in` names the other jobs.
+    One {
+        record: &'a crate::framework::lineage::ArtifactRecord,
+        also_in: Vec<&'a str>,
+    },
+    /// The prefix matches more than one distinct content hash.
+    Ambiguous(&'a [crate::framework::lineage::ArtifactRecord]),
+}
+
+/// Resolve `artifact inspect` matches. Matches that all carry the SAME hash
+/// are one artifact, not an ambiguity: it used to demand "a longer prefix"
+/// even for the full 64-hex hash of any artifact a later run had reused.
+/// Shows the newest job's sidecar.
+fn inspect_target(recs: &[crate::framework::lineage::ArtifactRecord]) -> InspectTarget<'_> {
+    let hash_of = |r: &crate::framework::lineage::ArtifactRecord| r.meta.display_hash();
+    match recs {
+        [] => InspectTarget::None,
+        [first, rest @ ..] if rest.iter().all(|r| hash_of(r) == hash_of(first)) => {
+            let newest = recs
+                .iter()
+                .max_by(|a, b| a.job_id.cmp(&b.job_id))
+                .unwrap_or(first);
+            let mut also_in: Vec<&str> = recs
+                .iter()
+                .filter(|r| r.job_id != newest.job_id)
+                .map(|r| r.job_id.as_str())
+                .collect();
+            also_in.sort_unstable();
+            InspectTarget::One {
+                record: newest,
+                also_in,
+            }
+        }
+        many => InspectTarget::Ambiguous(many),
     }
 }
 
