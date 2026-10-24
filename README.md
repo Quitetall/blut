@@ -216,7 +216,7 @@ webhook signing contract, SLA rules, notification sinks, and restart semantics.
 | **Linux x86_64 (NVIDIA)** | Primary | Local systemd/cgroup2/rlimit tests and `nvidia-smi` discovery |
 | **Linux x86_64 (AMD)** | Component-tested | `rocm-smi` discovery path; no release-scale training claim |
 | **macOS ARM64** | Compile-gated | CI compile-check is specified; containment degrades off-systemd |
-| **Windows** | CI-gated | Job Object containment (tree-wide commit cap, tree kill, peak) tested on `windows-latest`; the `LocalSystemd` launcher path is still bare |
+| **Windows** | CI-gated | Job Object containment (tree-wide commit cap, tree kill, peak) tested on `windows-latest`, including local stages through `LocalSystemd::spawn_contained`; a CPU training run through BLUT on `windows-latest` is recorded in the validation ledger |
 
 ## Build your own cookbook
 

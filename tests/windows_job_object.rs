@@ -11,11 +11,13 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use blut::config::launcher::LocalSystemd;
 use blut::containment::{
-    Availability, CapSpec, Containment, PeakSource, WrappedRun, spawn_attached,
+    Availability, CapSpec, ContainedChild, Containment, PeakSource, WrappedRun, spawn_attached,
     windows::WindowsJobObject,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio_util::sync::CancellationToken;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
@@ -293,4 +295,167 @@ async fn a_direct_spawn_runs_instead_of_hanging() {
         .expect("wait");
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
+}
+
+// ---- ContainedChild and LocalSystemd::spawn_contained ----
+//
+// The tests above drive the backend by hand. These drive the two entry points
+// a stage runner uses, which must reach the same Job Object.
+
+fn wrap_plain(cwd: &Path, script: &str, caps: &CapSpec) -> WrappedRun {
+    WindowsJobObject
+        .wrap_command(
+            &python(),
+            &["-c".into(), script.into()],
+            cwd,
+            &[],
+            "blut-windows-contained-test",
+            caps,
+        )
+        .expect("wrap_command")
+}
+
+fn piped(c: &mut tokio::process::Command) {
+    c.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+}
+
+/// Read the grandchild pid the child prints first, and falsify the probe:
+/// the grandchild must be alive before any teardown.
+async fn grandchild_of(child: &mut ContainedChild) -> Process {
+    let stdout = child.child_mut().stdout.take().expect("piped stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let line = tokio::time::timeout(Duration::from_secs(60), lines.next_line())
+        .await
+        .expect("child printed the grandchild pid within 60 s")
+        .expect("read stdout")
+        .expect("stdout not closed before the pid line");
+    let pid: u32 = line.trim().parse().expect("grandchild pid");
+    let grandchild = Process::open(pid);
+    assert!(
+        !grandchild.exited_within(500),
+        "grandchild {pid} died before any teardown"
+    );
+    grandchild
+}
+
+#[tokio::test]
+async fn contained_child_reports_the_peak_after_exit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = wrap_plain(
+        tmp.path(),
+        "x = bytearray(64*1024*1024); print(len(x))",
+        &caps(None),
+    );
+    let mut child = ContainedChild::spawn(Box::new(WindowsJobObject), run, "peak", piped)
+        .await
+        .expect("spawn + attach");
+    assert_eq!(child.kind(), "windows-job-object");
+    assert_eq!(child.peak_bytes(), None, "no peak before exit");
+    let status = tokio::time::timeout(Duration::from_secs(120), child.wait())
+        .await
+        .expect("exited within 120 s")
+        .expect("wait");
+    assert!(status.success(), "status {status:?}");
+    let peak = child.peak_bytes().expect("peak after exit");
+    assert!(peak >= 64 * MIB, "peak {peak} below the 64 MiB committed");
+}
+
+#[tokio::test]
+async fn contained_child_cancel_kills_the_whole_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = wrap_plain(tmp.path(), TREE_SCRIPT, &caps(None));
+    let mut child = ContainedChild::spawn(Box::new(WindowsJobObject), run, "cancel", piped)
+        .await
+        .expect("spawn + attach");
+    let grandchild = grandchild_of(&mut child).await;
+
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let outcome = tokio::time::timeout(Duration::from_secs(30), child.wait_or_cancel(&cancel))
+        .await
+        .expect("cancelled within 30 s")
+        .expect("wait_or_cancel");
+    assert!(outcome.is_none(), "reported as cancelled, got {outcome:?}");
+    assert!(
+        grandchild.exited_within(30_000),
+        "grandchild survived the cancel"
+    );
+}
+
+#[tokio::test]
+async fn dropping_a_contained_child_kills_the_whole_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = wrap_plain(tmp.path(), TREE_SCRIPT, &caps(None));
+    let mut child = ContainedChild::spawn(Box::new(WindowsJobObject), run, "drop", piped)
+        .await
+        .expect("spawn + attach");
+    let grandchild = grandchild_of(&mut child).await;
+    // A hard stage timeout drops the stage future, and with it this value.
+    drop(child);
+    assert!(
+        grandchild.exited_within(30_000),
+        "grandchild survived the contained child being dropped"
+    );
+}
+
+/// The launcher path end to end: `LocalSystemd`'s `mem_max` becomes the Job
+/// Object cap. 512 MiB fails under a 128 MiB `mem_max` and fits under 2 GiB.
+#[tokio::test]
+async fn local_systemd_spawn_contained_caps_through_the_job_object() {
+    if std::env::var_os("BLUT_NO_CONTAIN").is_some()
+        || std::env::var_os("BLUT_CONTAINMENT").is_some()
+    {
+        eprintln!("skipped: BLUT_NO_CONTAIN / BLUT_CONTAINMENT set in the environment");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let inner = [
+        "python".to_string(),
+        "-c".to_string(),
+        "x = bytearray(512*1024*1024); print('NO_CAP')".to_string(),
+    ];
+    let run = |mem_max: &str| {
+        let launcher = LocalSystemd {
+            mem_max: mem_max.to_string(),
+            ..LocalSystemd::default()
+        };
+        let inner = inner.clone();
+        let cwd = tmp.path().to_path_buf();
+        async move {
+            let mut child = launcher
+                .spawn_contained("blut-launcher-test", &inner, &cwd, &[], piped)
+                .await
+                .expect("spawn_contained");
+            assert_eq!(child.kind(), "windows-job-object");
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            let mut out_pipe = child.child_mut().stdout.take().unwrap();
+            let mut err_pipe = child.child_mut().stderr.take().unwrap();
+            let (r1, r2) = tokio::join!(
+                tokio::io::AsyncReadExt::read_to_string(&mut out_pipe, &mut stdout),
+                tokio::io::AsyncReadExt::read_to_string(&mut err_pipe, &mut stderr),
+            );
+            r1.unwrap();
+            r2.unwrap();
+            let status = tokio::time::timeout(Duration::from_secs(120), child.wait())
+                .await
+                .expect("exited within 120 s")
+                .expect("wait");
+            (status, stdout, stderr, child.peak_bytes())
+        }
+    };
+
+    let (status, stdout, stderr, _) = run("128M").await;
+    assert!(!status.success(), "512 MiB fit under a 128 MiB mem_max");
+    assert!(!stdout.contains("NO_CAP"));
+    assert!(stderr.contains("MemoryError"), "stderr: {stderr}");
+
+    let (status, stdout, stderr, peak) = run("2G").await;
+    assert!(status.success(), "status {status:?} stderr {stderr}");
+    assert!(stdout.contains("NO_CAP"));
+    let peak = peak.expect("peak reported");
+    assert!(peak >= 512 * MIB, "peak {peak} below the 512 MiB committed");
 }

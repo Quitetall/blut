@@ -4,11 +4,12 @@
 //! sweep job, optionally inside a resource-capped container.
 
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+use crate::containment::{CapSpec, ContainedChild};
 use crate::error::{Result, TrainError};
 
 /// Which launcher produced a [`WrappedCommand`]. Lets a backend pick the right
@@ -256,6 +257,11 @@ fn resolve_run_contained_script() -> Result<PathBuf> {
 /// service by shelling the embedded `run_contained.sh`. The script reads
 /// `UNIT`/`MEMMAX`/`MEMHIGH`/`SWAPMAX` from the environment and execs
 /// `systemd-run --user --unit=$UNIT ... -- "$@"`.
+///
+/// [`wrap`](Launcher::wrap) and [`launch`](Launcher::launch) contain only
+/// where a wrapper command can: with systemd `--user`. To contain a local
+/// stage on any host, Windows included, spawn it with
+/// [`spawn_contained`](Self::spawn_contained).
 #[derive(Clone, Debug)]
 pub struct LocalSystemd {
     /// Hard memory cap (cgroup-OOM if hit). `MEMMAX`.
@@ -277,6 +283,86 @@ impl Default for LocalSystemd {
     }
 }
 
+impl LocalSystemd {
+    /// This launcher's memory knobs as a [`CapSpec`] in bytes. An empty knob
+    /// is left unset; a knob that is not a memory size (`44G`, `512M`, bytes)
+    /// is an error rather than silently uncapped.
+    pub fn cap_spec(&self) -> Result<CapSpec> {
+        let knob = |name: &str, value: &str| -> Result<Option<u64>> {
+            let value = value.trim();
+            if value.is_empty() {
+                return Ok(None);
+            }
+            match crate::containment::memsize::parse_memsize(value) {
+                Some(bytes) if bytes > 0 => Ok(Some(bytes)),
+                _ => Err(TrainError::other(format!(
+                    "LocalSystemd {name}={value:?} is not a memory size (e.g. 44G, 512M)"
+                ))),
+            }
+        };
+        Ok(CapSpec {
+            mem_max: knob("mem_max", &self.mem_max)?,
+            mem_high: knob("mem_high", &self.mem_high)?,
+            swap_max: knob("swap_max", &self.swap_max)?,
+        })
+    }
+
+    /// Spawn `inner` (program, then its arguments) as a local stage process
+    /// under this host's containment backend
+    /// ([`containment_for`](crate::containment::containment_for)), capped by
+    /// this launcher's [`cap_spec`](Self::cap_spec).
+    ///
+    /// This is the contained counterpart of [`Launcher::launch`], and the
+    /// only way a local stage is contained on Windows: there the backend is
+    /// a Job Object, which caps the committed memory of the whole tree,
+    /// reports its peak, and kills the tree on [`ContainedChild::kill_tree`],
+    /// on [`ContainedChild::wait_or_cancel`], or when the returned value is
+    /// dropped. On Linux it is the same backend the factory picks for any
+    /// run (systemd, cgroup v2, or `RLIMIT_AS`, where `mem_max` caps address
+    /// space per process).
+    ///
+    /// `configure` sets pipes, `kill_on_drop` and similar before the spawn.
+    /// `unit` is sanitized to `[A-Za-z0-9_-]`.
+    pub async fn spawn_contained(
+        &self,
+        unit: &str,
+        inner: &[String],
+        cwd: &Path,
+        env: &[(String, String)],
+        configure: impl FnOnce(&mut tokio::process::Command),
+    ) -> Result<ContainedChild> {
+        let Some((program, args)) = inner.split_first() else {
+            return Err(TrainError::other("spawn_contained: empty inner command"));
+        };
+        let unit = sanitize_unit(unit);
+        let caps = self.cap_spec()?;
+        let backend = crate::containment::containment_for();
+        let run = backend.wrap_command(Path::new(program), args, cwd, env, &unit, &caps)?;
+        tracing::info!(
+            "containment: {unit} placed by LocalSystemd under {}, memory cap {}",
+            backend.kind(),
+            caps.mem_max
+                .map_or_else(|| "none".to_string(), |b| format!("{b} bytes")),
+        );
+        ContainedChild::spawn(backend, run, unit, configure).await
+    }
+}
+
+/// A unit name every backend accepts: `[A-Za-z0-9_-]`, anything else `-`.
+fn sanitize_unit(unit: &str) -> String {
+    let s: String = unit
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if s.is_empty() { "blut".to_string() } else { s }
+}
+
 impl Launcher for LocalSystemd {
     fn capacity(&self) -> usize {
         local_gpu_count()
@@ -296,7 +382,16 @@ impl Launcher for LocalSystemd {
             let Some((program, rest)) = inner.split_first() else {
                 return Err(TrainError::other("wrap: empty inner command"));
             };
-            if !crate::config::env_flag("BLUT_NO_CONTAIN") {
+            if crate::config::env_flag("BLUT_NO_CONTAIN") {
+                // Opted out: say nothing.
+            } else if cfg!(windows) {
+                tracing::warn!(
+                    "LocalSystemd::wrap builds a bare command for unit '{unit}' on Windows: a \
+                     Job Object cannot be expressed as a wrapper command, so whoever spawns it \
+                     runs it UNCONTAINED (no memory cap, no tree kill). Spawn through \
+                     LocalSystemd::spawn_contained instead. Set BLUT_NO_CONTAIN=1 to silence."
+                );
+            } else {
                 tracing::warn!(
                     "systemd-run unavailable — running unit '{unit}' UNCONTAINED (no memory cap). \
                      Containment requires Linux + systemd --user. Set BLUT_NO_CONTAIN=1 to silence."
@@ -1563,6 +1658,46 @@ mod tests {
             assert_eq!(cmd.get_program(), "python");
             assert_eq!(&args[..], &["-u", "train.py"]);
         }
+    }
+
+    #[test]
+    fn local_systemd_caps_parse_to_bytes() {
+        const G: u64 = 1024 * 1024 * 1024;
+        let caps = LocalSystemd::default().cap_spec().unwrap();
+        assert_eq!(caps.mem_max, Some(44 * G));
+        assert_eq!(caps.mem_high, Some(40 * G));
+        assert_eq!(caps.swap_max, Some(12 * G));
+
+        let unset = LocalSystemd {
+            mem_high: String::new(),
+            ..LocalSystemd::default()
+        };
+        assert_eq!(unset.cap_spec().unwrap().mem_high, None, "empty is unset");
+
+        for bad in ["lots", "0", "-1G"] {
+            let l = LocalSystemd {
+                mem_max: bad.to_string(),
+                ..LocalSystemd::default()
+            };
+            let err = l.cap_spec().expect_err(bad).to_string();
+            assert!(err.contains("mem_max"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn unit_names_are_sanitized_for_every_backend() {
+        assert_eq!(sanitize_unit("blut-job_1"), "blut-job_1");
+        assert_eq!(sanitize_unit("job 7/train.model"), "job-7-train-model");
+        assert_eq!(sanitize_unit(""), "blut");
+    }
+
+    #[tokio::test]
+    async fn spawn_contained_refuses_an_empty_command() {
+        let err = LocalSystemd::default()
+            .spawn_contained("u", &[], std::path::Path::new("."), &[], |_| {})
+            .await
+            .expect_err("empty inner");
+        assert!(err.to_string().contains("empty inner command"), "{err}");
     }
 
     #[test]

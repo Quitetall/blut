@@ -7,7 +7,7 @@ Evidence ledger for engine `0.2.0-alpha.2`. Status means:
   tested; no scale claim.
 - **Deferred:** unsupported in public preview.
 
-Last updated: 2026-10-23.
+Last updated: 2026-10-24.
 
 Nothing in the table below changed when the crates were published on
 2026-08-27. Publication moves code, not evidence: every row still says exactly
@@ -34,7 +34,7 @@ first if you are deciding whether to depend on this.
 | Network object storage (S3-compatible) | Validated (R2 over public TLS; MinIO) | `s3` feature; cloud round-trip against Cloudflare R2 over public TLS with create-only writes enforced, 2026-10-22; MinIO over HTTP and TLS; Backblaze B2 refused (no conditional writes) — see below |
 | `blut-worker` REST prototype | Deleted (ADR 0083 M3) | Superseded by `src/cloud` + the `blut-web` sidecar |
 | Kubernetes operator | Unsupported | Unpublished prototype; separate Rust 1.89 compile/test lane |
-| Windows containment | CI-gated | `windows-latest` job, Rust 1.88, per push: a 512 MiB allocation fails under a 128 MiB Job Object cap and succeeds under 2 GiB; the reported peak covers the commit; `TerminateJobObject` and closing the job each kill a grandchild that was alive a moment before. Covers the `containment_for()` + `after_spawn` path only: the `LocalSystemd` launcher still spawns bare on Windows, `mem_high`/`swap_max` are not mapped, and no cookbook run on Windows is recorded. The same job runs the full workspace test suite (34 test binaries, 0 failures on 2026-10-20) |
+| Windows containment | Validated (CI) | Engine job on `windows-latest`, Rust 1.88, per push: a 512 MiB allocation fails under a 128 MiB Job Object cap and succeeds under 2 GiB, directly and through `LocalSystemd::spawn_contained`; the reported peak covers the commit; `TerminateJobObject`, closing the job, and `ContainedChild` cancel and drop each kill a grandchild that was alive a moment before. A cookbook run through BLUT on `windows-latest`, 2026-10-24: a CPU `train_from_dataset` with trainer and evaluator each in a Job Object (cap and peak reported), and a stage timeout and a killed driver each taking the training tree down — see below. `mem_high`/`swap_max` are not mapped, and the cap bounds committed memory, not RSS |
 
 ## Recorded run: P2P dispatch across network namespaces (2026-09-19)
 
@@ -786,6 +786,72 @@ certificate. A brand-new account can hit this, and it clears by itself.
 
 **Boundaries.** Static key credentials only; IAM roles and STS were not
 exercised. AWS S3 itself has not been run against.
+
+## Recorded run: training through BLUT on Windows, in Job Objects (2026-10-24)
+
+GitHub Actions `windows-latest` (a Windows Server VM), Rust 1.88, Python 3.12,
+CPU torch 2.14.1, transformers 5.20.2. The standard cookbook
+([blut-cookbooks](https://github.com/Quitetall/blut-cookbooks) `fa1baec`,
+branch `agent/windows-runner`) was built against engine `0c869b9` (branch
+`agent/windows-local`), patched in for crates.io's `blut`. Workflow
+`windows-containment`,
+[run 40053013881](https://github.com/Quitetall/blut-cookbooks/actions/runs/40053013881):
+6 min 38 s in all, of which 1 min 46 s building (warm cache), 1 min 28 s
+installing torch and transformers, and 140 s of checks.
+
+Every local stage process in that cookbook spawns through
+`LocalSystemd::spawn_contained`. `tests/windows_e2e/run.py` in that
+repository drives `blut-core` and checks from outside, confirming every
+process it expects to die is alive first:
+
+1. **Train.** `train_from_dataset` on 64 text rows, `sshleifer/tiny-gpt2`, one
+   epoch on the CPU, then the held-out evaluation:
+
+   ```
+   containment: blut-train_model placed by LocalSystemd under windows-job-object, memory cap 47244640256 bytes
+   containment: blut-train_model attached to windows-job-object (pid 7668)
+   [trainer] epoch 1/1: loss=10.8087
+   containment: blut-train_model exited; peak memory 618266624 bytes (windows-job-object)
+   containment: blut-evaluator placed by LocalSystemd under windows-job-object, memory cap 47244640256 bytes
+   containment: blut-evaluator attached to windows-job-object (pid 7792)
+   containment: blut-evaluator exited; peak memory 601137152 bytes (windows-job-object)
+   ```
+
+   Exit 0, a 421,241-byte checkpoint with its HuggingFace export, and an
+   evaluation report with a held-out loss of 10.7845. The cap is
+   `LocalSystemd`'s default `mem_max` (44G). No "never assigned" and no
+   "UNCONTAINED" warning.
+2. **Stage timeout.** A PlanSpec, `load_dataset` then `train_model`, with a
+   120 s soft timeout on `train_model` and a model ingredient that starts a
+   grandchild process and then hangs. With trainer and grandchild confirmed
+   running:
+
+   ```
+   containment: blut-train_model cancelled; killing its process tree (windows-job-object)
+   plan stage 'train_model' (idx 1) failed: stage timed out after 120.0336577s (limit 120s)
+   ```
+
+   The plan exited 1, and the trainer and the grandchild were gone within
+   30 s.
+3. **Driver killed.** The same plan without a timeout. With trainer and
+   grandchild running, the `blut-core` process was terminated outright
+   (`TerminateProcess`, so no cleanup code ran). The trainer and the
+   grandchild were gone within 30 s: the run's Job Object closed with the
+   driver's handle, and `KILL_ON_JOB_CLOSE` took the tree.
+
+**What it found.** The first run
+([40052362399](https://github.com/Quitetall/blut-cookbooks/actions/runs/40052362399),
+engine `ce98a58`) trained, evaluated and attached both stages, then failed its
+own warning check: the backend's availability probe built a run's job handle
+and dropped it, which logged "no child was ever assigned" once per process.
+Engine `0c869b9` probes with a bare handle.
+
+**Boundaries.** One VM image, the CPU only, a tiny model, one process per
+stage: no GPU, no DDP. The 44G cap was never approached here; that a cap
+refuses an allocation is the engine's Windows tests above. `mem_high` and
+`swap_max` are not mapped. Ctrl-C and `blut cancel` were not exercised, and
+`blut cancel` cannot yet stop a driver from another process on Windows. The
+LamQuant cookbook's runner was not run on Windows.
 
 ## Required evidence before stronger claims
 

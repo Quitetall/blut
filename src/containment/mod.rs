@@ -31,10 +31,16 @@
 //! "which MACHINE runs this" (local / Slurm / Ray); `Containment` answers "how
 //! is THIS-box memory capped". A local run is placed by `LocalSystemd` and
 //! capped by whichever `Containment` the factory selects.
+//!
+//! [`ContainedChild`] is the one-value way to run a wrapped command: it
+//! spawns through [`spawn_attached`] and keeps the backend and teardown handle
+//! until the child exits. `LocalSystemd::spawn_contained` (in
+//! `config::launcher`) builds one from the launcher's memory knobs.
 
 pub mod bare;
 #[cfg(target_os = "linux")]
 pub mod cgroup2;
+mod contained;
 pub mod memsize;
 #[cfg(unix)]
 pub mod rlimit;
@@ -44,6 +50,8 @@ pub mod systemd;
 pub mod windows;
 
 use std::path::{Path, PathBuf};
+
+pub use contained::ContainedChild;
 
 use crate::error::Result;
 
@@ -200,6 +208,10 @@ pub trait Containment: Send + Sync {
 /// reaped here and the error returned, so the caller never holds a child that
 /// is outside its containment. `cleanup` remains the caller's job, exactly as
 /// after any other failed spawn.
+///
+/// A failed `spawn()` is returned as [`TrainError::Io`](crate::error::TrainError::Io)
+/// with the program as `path` and the OS error as `source`, so a caller can
+/// still tell a missing program (`ErrorKind::NotFound`) from other failures.
 pub async fn spawn_attached(
     backend: &dyn Containment,
     command: &mut tokio::process::Command,
@@ -208,7 +220,10 @@ pub async fn spawn_attached(
     backend.before_spawn(command);
     let mut child = command
         .spawn()
-        .map_err(|e| crate::error::TrainError::other(format!("containment spawn: {e}")))?;
+        .map_err(|source| crate::error::TrainError::Io {
+            path: PathBuf::from(command.as_std().get_program()),
+            source,
+        })?;
     if let Err(e) = backend.after_spawn(&child, teardown) {
         let _ = child.start_kill();
         let _ = child.wait().await;
