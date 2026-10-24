@@ -71,6 +71,28 @@ pub(super) enum PartitionCommand {
     },
 }
 
+/// Refuse a partition axis that is not one of the recipe's args, when the
+/// recipe's schema lists every arg it accepts.
+pub(super) fn check_axes_are_args(
+    set: &crate::config::partition::PartitionSet,
+    schema: &serde_json::Value,
+) -> Result<()> {
+    let Some(accepted) = crate::recipes::recipe::closed_arg_names(schema) else {
+        return Ok(());
+    };
+    for dim in &set.dims {
+        if !accepted.iter().any(|a| a == &dim.axis) {
+            return Err(anyhow!(
+                "partition axis '{}' is not an arg of recipe '{}' (accepted: {})",
+                dim.axis,
+                set.recipe,
+                accepted.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Apply a partition cell's `axis=value` overrides onto base recipe args:
 /// `args[axis] = <scalar>` (int / float / bool, else the verbatim string).
 pub(super) fn apply_cell_overrides(
@@ -257,11 +279,11 @@ pub(super) async fn run_partition(
             spec,
             partitions,
         } => {
-            if reg.find(&recipe).is_none() {
+            let Some(def) = reg.find(&recipe) else {
                 return Err(anyhow!(
                     "recipe '{recipe}' not in catalog (see `blut recipe list`)"
                 ));
-            }
+            };
             let dims: Vec<PartitionDim> = if let Some(spec) = spec {
                 let spec: crate::config::partition::PartitionSpec = serde_json::from_str(&spec)
                     .map_err(|e| anyhow!("--spec is not valid PartitionSpec JSON: {e}"))?;
@@ -287,6 +309,20 @@ pub(super) async fn run_partition(
             };
             let set = PartitionSet { name, recipe, dims };
             let cells = set.validate().map_err(|e| anyhow!("{e}"))?;
+            // Each cell sets `args[axis]`; an axis the recipe does not accept
+            // made every cell fail at backfill instead of here.
+            check_axes_are_args(&set, &(def.args_schema_fn)())?;
+            if let Ok(previous) = PartitionSet::load(&set.recipe, &set.name)
+                && previous.dims != set.dims
+            {
+                eprintln!(
+                    "note: replacing the existing definition of '{}/{}' ({} cell(s) → {cells}); \
+                     results of removed cells stay in lineage but leave the matrix",
+                    set.recipe,
+                    set.name,
+                    previous.cells().len()
+                );
+            }
             let path = set.save().map_err(|e| anyhow!("{e}"))?;
             println!(
                 "defined partition '{}/{}' — {cells} cells → {}",
@@ -614,6 +650,53 @@ pub(super) async fn run_partition(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod define_validation_tests {
+    use super::check_axes_are_args;
+    use crate::config::partition::{PartitionDim, PartitionSet};
+
+    #[derive(schemars::JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct Args {
+        seed: u32,
+        epochs: u32,
+    }
+
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct OpenArgs {
+        #[serde(flatten)]
+        rest: std::collections::BTreeMap<String, serde_json::Value>,
+    }
+
+    fn set(axis: &str, values: &[&str]) -> PartitionSet {
+        PartitionSet {
+            name: "grid".into(),
+            recipe: "train".into(),
+            dims: vec![PartitionDim {
+                axis: axis.into(),
+                values: values.iter().map(|v| v.to_string()).collect(),
+            }],
+        }
+    }
+
+    /// `define --dim bogus=1,2` was accepted and every cell then failed at
+    /// backfill; `--dim seed=1,1` defined two cells with one key.
+    #[test]
+    fn define_refuses_an_axis_that_is_not_an_arg_and_duplicate_values() {
+        let closed = crate::recipes::recipe::schema_of::<Args>();
+        assert!(check_axes_are_args(&set("seed", &["1"]), &closed).is_ok());
+        let err = check_axes_are_args(&set("bogus", &["1"]), &closed).unwrap_err();
+        assert!(err.to_string().contains("accepted: epochs, seed"), "{err}");
+        // A schema that admits unlisted keys cannot be checked; allow it.
+        let open = crate::recipes::recipe::schema_of::<OpenArgs>();
+        assert!(check_axes_are_args(&set("anything", &["1"]), &open).is_ok());
+        let dup = set("seed", &["1", "1"]).validate().unwrap_err();
+        assert!(dup.to_string().contains("more than once"), "{dup}");
+    }
 }
 
 #[cfg(test)]
