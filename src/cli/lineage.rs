@@ -33,7 +33,7 @@ pub(super) enum LineageCommand {
     /// default; `--json` emits typed rows. Clinical/`restricted`-tenant nodes are
     /// fail-closed excluded from the export (ADR 0061).
     Graph {
-        /// Output content-hash (full, lowercased — the leaf artifact).
+        /// Output content-hash of the leaf artifact (or a unique prefix).
         hash: String,
         /// Emit typed JSON rows instead of Graphviz DOT.
         #[arg(long)]
@@ -44,7 +44,7 @@ pub(super) enum LineageCommand {
     /// outcome. Rebuilding on the same lineage yields a byte-identical
     /// `card_hash`. Clinical/`restricted` data is fail-closed excluded (export).
     Card {
-        /// The model artifact's content hash (full, lowercased).
+        /// The model artifact's content hash (or a unique prefix).
         hash: String,
         /// Emit the typed JSON card instead of the human summary.
         #[arg(long)]
@@ -129,8 +129,39 @@ pub(super) fn run_lineage(id_query: &str, json: bool) -> Result<()> {
 /// default (pipe to `dot -Tsvg` or a sidecar), typed JSON with `--json`. This is
 /// an EXPORT, so clinical/`restricted`-tenant nodes are fail-closed excluded
 /// (ADR 0061) — a graph that is entirely restricted comes back empty.
+/// Resolve a content-hash prefix to the one indexed hash it names. `graph`
+/// and `card` took only the full hash and reported a prefix (which `trace`
+/// accepts) as an unknown artifact.
+fn resolve_indexed_hash(db: &crate::lineage_db::LineageDb, prefix: &str) -> Result<String> {
+    let mut hashes: Vec<String> = db
+        .find_artifacts(prefix)
+        .map_err(|e| anyhow!("{e}"))?
+        .into_iter()
+        .map(|a| a.content_hash)
+        .collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    match hashes.as_slice() {
+        [one] => Ok(one.clone()),
+        // Unknown: keep the input so the caller's "unknown artifact" error
+        // (and a restricted-only lookup) behaves as before.
+        [] => Ok(prefix.to_lowercase()),
+        many => Err(anyhow!(
+            "hash prefix '{prefix}' is ambiguous: {} indexed artifacts match ({}…); give more \
+             characters",
+            many.len(),
+            many.iter()
+                .take(3)
+                .map(|h| h.get(..16).unwrap_or(h))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 pub(super) fn run_lineage_graph(hash: &str, json: bool) -> Result<()> {
     let db = crate::lineage_db::LineageDb::open().map_err(|e| anyhow!("{e}"))?;
+    let hash = &resolve_indexed_hash(&db, hash)?;
     let graph = db.graph_upstream(hash, true).map_err(|e| anyhow!("{e}"))?;
     if graph.nodes.is_empty() {
         return Err(anyhow!(
@@ -156,6 +187,7 @@ pub(super) fn run_lineage_graph(hash: &str, json: bool) -> Result<()> {
 /// An EXPORT — clinical/`restricted` data is fail-closed excluded.
 pub(super) fn run_lineage_card(hash: &str, json: bool) -> Result<()> {
     let db = crate::lineage_db::LineageDb::open().map_err(|e| anyhow!("{e}"))?;
+    let hash = &resolve_indexed_hash(&db, hash)?;
     let card = db
         .model_card(hash, true)
         .map_err(|e| anyhow!("{e}"))?

@@ -1360,6 +1360,55 @@ mod resume_marker_tests {
 }
 
 #[cfg(test)]
+mod artifact_inspect_tests {
+    use super::{InspectTarget, inspect_target};
+    use crate::framework::lineage::ArtifactRecord;
+
+    fn rec(job: &str, byte: u8) -> ArtifactRecord {
+        let meta = serde_json::from_value(serde_json::json!({
+            "kind": "k",
+            "schema": 1,
+            "content_id": format!("{byte:02x}").repeat(32),
+            "identity_scheme": "abir-content-id-v1",
+            "produced_by_stage": "s",
+            "produced_at_unix_secs": 0,
+        }))
+        .unwrap();
+        ArtifactRecord {
+            meta,
+            sidecar_path: std::path::PathBuf::from(format!(
+                "/j/{job}/stages/0-s/output.metadata.json"
+            )),
+            job_id: job.into(),
+        }
+    }
+
+    /// An artifact reused by later cache-hit jobs has one sidecar per job;
+    /// `inspect` refused it as ambiguous even when given the full hash.
+    #[test]
+    fn the_same_content_in_several_jobs_is_one_artifact() {
+        let recs = [
+            rec("20261023-000001-0", 7),
+            rec("20261023-000003-0", 7),
+            rec("20261023-000002-0", 7),
+        ];
+        match inspect_target(&recs) {
+            InspectTarget::One { record, also_in } => {
+                assert_eq!(record.job_id, "20261023-000003-0", "newest job");
+                assert_eq!(also_in, ["20261023-000001-0", "20261023-000002-0"]);
+            }
+            _ => panic!("same hash must resolve to one artifact"),
+        }
+        let mixed = [rec("a", 7), rec("b", 8)];
+        assert!(matches!(
+            inspect_target(&mixed),
+            InspectTarget::Ambiguous(_)
+        ));
+        assert!(matches!(inspect_target(&[]), InspectTarget::None));
+    }
+}
+
+#[cfg(test)]
 mod cache_prune_cap_tests {
     use super::resolve_prune_cap_gb;
 
@@ -2739,19 +2788,28 @@ fn run_artifact_cmd(cmd: ArtifactCommand) -> Result<()> {
                 return Err(anyhow!("hash prefix too short — give at least 4 hex chars"));
             }
             let recs = lineage::find_by_hash_prefix(&hash).map_err(|e| anyhow!("{e}"))?;
-            match recs.as_slice() {
-                [] => Err(anyhow!("no artifact with content hash prefix '{hash}'")),
-                [r] => {
+            match inspect_target(&recs) {
+                InspectTarget::None => {
+                    Err(anyhow!("no artifact with content hash prefix '{hash}'"))
+                }
+                InspectTarget::One { record: r, also_in } => {
                     if json {
                         emit_json(&r)?;
                         return Ok(());
                     }
                     println!("sidecar: {}", r.sidecar_path.display());
                     println!("job:     {}", r.job_id);
+                    if !also_in.is_empty() {
+                        println!(
+                            "also in: {} other job(s) (the same content, e.g. a cache hit): {}",
+                            also_in.len(),
+                            also_in.join(", ")
+                        );
+                    }
                     emit_json(&r.meta)?;
                     Ok(())
                 }
-                many => {
+                InspectTarget::Ambiguous(many) => {
                     eprintln!("ambiguous prefix '{hash}' — {} matches:", many.len());
                     for r in many {
                         let hash = r
@@ -2770,6 +2828,47 @@ fn run_artifact_cmd(cmd: ArtifactCommand) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+/// What `artifact inspect <prefix>` resolved to.
+enum InspectTarget<'a> {
+    None,
+    /// One artifact. A content-addressed artifact reused by a cache hit has a
+    /// sidecar in every job that used it; `also_in` names the other jobs.
+    One {
+        record: &'a crate::framework::lineage::ArtifactRecord,
+        also_in: Vec<&'a str>,
+    },
+    /// The prefix matches more than one distinct content hash.
+    Ambiguous(&'a [crate::framework::lineage::ArtifactRecord]),
+}
+
+/// Resolve `artifact inspect` matches. Matches that all carry the SAME hash
+/// are one artifact, not an ambiguity: it used to demand "a longer prefix"
+/// even for the full 64-hex hash of any artifact a later run had reused.
+/// Shows the newest job's sidecar.
+fn inspect_target(recs: &[crate::framework::lineage::ArtifactRecord]) -> InspectTarget<'_> {
+    let hash_of = |r: &crate::framework::lineage::ArtifactRecord| r.meta.display_hash();
+    match recs {
+        [] => InspectTarget::None,
+        [first, rest @ ..] if rest.iter().all(|r| hash_of(r) == hash_of(first)) => {
+            let newest = recs
+                .iter()
+                .max_by(|a, b| a.job_id.cmp(&b.job_id))
+                .unwrap_or(first);
+            let mut also_in: Vec<&str> = recs
+                .iter()
+                .filter(|r| r.job_id != newest.job_id)
+                .map(|r| r.job_id.as_str())
+                .collect();
+            also_in.sort_unstable();
+            InspectTarget::One {
+                record: newest,
+                also_in,
+            }
+        }
+        many => InspectTarget::Ambiguous(many),
     }
 }
 
