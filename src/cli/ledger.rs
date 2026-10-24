@@ -51,7 +51,6 @@ pub(super) enum LedgerCommand {
         #[arg(long)]
         commit: bool,
     },
-    /// Structural checks over the ledger.
     /// Compare two configurations on a metric, and refuse to overclaim.
     ///
     /// Groups runs into ARMS by (experiment, config_fingerprint) and asks
@@ -76,6 +75,9 @@ pub(super) enum LedgerCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Structural checks over the ledger: every line parses, every run starts
+    /// once and ends at most once, and curation records refer to real runs.
+    /// Exit non-zero listing each problem.
     Verify {
         /// Also require every TRUTH_LEDGER §2 citation to resolve to a run.
         #[arg(long)]
@@ -136,6 +138,8 @@ pub(super) fn run_ledger_cmd(cmd: LedgerCommand) -> Result<()> {
         LedgerCommand::List { tier, json } => {
             let want = tier.as_deref().map(parse_tier).transpose()?;
             let tiers = ledger.tiers().map_err(|e| anyhow!("{e}"))?;
+            let read = ledger.read().map_err(|e| anyhow!("{e}"))?;
+            let collected = collected_runs(&read.records);
             let rows: Vec<(&String, &Tier)> = tiers
                 .iter()
                 .filter(|(_, t)| want.is_none_or(|w| **t == w))
@@ -143,14 +147,28 @@ pub(super) fn run_ledger_cmd(cmd: LedgerCommand) -> Result<()> {
             if json {
                 let out: Vec<_> = rows
                     .iter()
-                    .map(|(uid, t)| serde_json::json!({ "run_uid": uid, "tier": t }))
+                    .map(|(uid, t)| {
+                        serde_json::json!({
+                            "run_uid": uid,
+                            "tier": t,
+                            "collected": collected.contains(uid.as_str()),
+                        })
+                    })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else if rows.is_empty() {
                 println!("(no runs)");
             } else {
                 for (uid, t) in rows {
-                    println!("{uid}  {t:?}");
+                    // A collected run keeps its tier (its tombstone is what
+                    // citations resolve to); say so instead of listing it as
+                    // a live scratch run.
+                    let note = if collected.contains(uid.as_str()) {
+                        "  (collected)"
+                    } else {
+                        ""
+                    };
+                    println!("{uid}  {}{note}", tier_label(*t));
                 }
             }
         }
@@ -182,14 +200,7 @@ pub(super) fn run_ledger_cmd(cmd: LedgerCommand) -> Result<()> {
             let read = ledger.read().map_err(|e| anyhow!("{e}"))?;
             // Only Scratch is ever collectable, and a run already tombstoned is
             // not collected twice.
-            let already: std::collections::BTreeSet<&str> = read
-                .records
-                .iter()
-                .filter_map(|r| match r {
-                    Record::Cleared { run_uid, .. } => Some(run_uid.as_str()),
-                    _ => None,
-                })
-                .collect();
+            let already = collected_runs(&read.records);
             let summaries = summarize_runs(&read.records);
             let victims: Vec<&String> = tiers
                 .iter()
@@ -238,92 +249,32 @@ pub(super) fn run_ledger_cmd(cmd: LedgerCommand) -> Result<()> {
             json,
         } => {
             let read = ledger.read().map_err(|e| anyhow!("{e}"))?;
-            let arm = |fingerprint: &str| -> Arm {
-                // Collect the metric from every ended run whose start declared
-                // this experiment and whose config fingerprint matches.
-                let uids: Vec<&str> = read
-                    .records
-                    .iter()
-                    .filter_map(|r| match r {
-                        Record::RunStarted {
-                            run_uid,
-                            experiment: e,
-                            identity,
-                            ..
-                        } if e.as_deref() == Some(experiment.as_str())
-                            && identity
-                                .config_fingerprint
-                                .as_deref()
-                                .is_some_and(|c| c.starts_with(fingerprint)) =>
-                        {
-                            Some(run_uid.as_str())
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                let values = read
-                    .records
-                    .iter()
-                    .filter_map(|r| match r {
-                        Record::RunEnded {
-                            run_uid, metrics, ..
-                        } if uids.contains(&run_uid.as_str()) => metrics.get(&metric).copied(),
-                        _ => None,
-                    })
-                    .collect();
-                Arm {
-                    label: fingerprint.to_string(),
-                    values,
-                }
-            };
-
-            let result = compare(&metric, &arm(&baseline), &arm(&candidate), alpha);
+            let (base_arm, cand_arm) = compare_arms(
+                &read.records,
+                &experiment,
+                &baseline,
+                &candidate,
+                &metric,
+                alpha,
+            )?;
+            let result = compare(&metric, &base_arm, &cand_arm, alpha);
             if json {
-                // Hand-rolled: the report is small and adding a Serialize impl
-                // to the comparison types would put a presentation concern in
-                // the analysis module.
-                let verdict = match &result.verdict {
-                    Verdict::Indeterminate {
-                        reason,
-                        seeds_per_arm_needed,
-                    } => format!(
-                        "{{\"kind\":\"indeterminate\",\"reason\":{},\"seeds_per_arm_needed\":{}}}",
-                        serde_json::to_string(reason)?,
-                        seeds_per_arm_needed
-                    ),
-                    Verdict::Decided {
-                        p_value,
-                        significant,
-                    } => format!(
-                        "{{\"kind\":\"decided\",\"p_value\":{p_value},\"significant\":{significant}}}"
-                    ),
-                };
-                println!(
-                    "{{\"metric\":{},\"baseline_n\":{},\"candidate_n\":{},\"delta\":{},\"within_sd\":{},\"min_achievable_p\":{},\"verdict\":{}}}",
-                    serde_json::to_string(&result.metric)?,
-                    result.baseline_n,
-                    result.candidate_n,
-                    result.delta,
-                    result
-                        .within_sd
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "null".into()),
-                    result.min_achievable_p,
-                    verdict
-                );
+                // Built with `json!`, not by string formatting: the formatted
+                // version printed `NaN` for an empty arm, which is not JSON.
+                println!("{}", comparison_json(&result));
             } else {
                 println!("experiment {experiment}  metric {}", result.metric);
                 println!(
                     "  {:<24} n={}  mean {:.6}",
                     result.baseline,
                     result.baseline_n,
-                    arm(&baseline).mean()
+                    base_arm.mean()
                 );
                 println!(
                     "  {:<24} n={}  mean {:.6}",
                     result.candidate,
                     result.candidate_n,
-                    arm(&candidate).mean()
+                    cand_arm.mean()
                 );
                 println!("  delta            {:+.6}", result.delta);
                 match result.within_sd {
@@ -387,6 +338,169 @@ pub(super) fn run_ledger_cmd(cmd: LedgerCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Runs that `ledger gc` has tombstoned.
+fn collected_runs(records: &[Record]) -> std::collections::BTreeSet<&str> {
+    records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Cleared { run_uid, .. } => Some(run_uid.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The tier as `--tier` spells it.
+fn tier_label(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Scratch => "scratch",
+        Tier::Recorded => "recorded",
+        Tier::Canonical => "canonical",
+    }
+}
+
+/// Build the two arms `ledger compare` tests, refusing every input that used
+/// to produce a confident-looking verdict about nothing:
+///
+/// - an `--alpha` outside (0, 1): `--alpha 2` turned an underpowered
+///   comparison into "SIGNIFICANT";
+/// - a fingerprint prefix that matches no arm, or several: an unknown prefix
+///   gave an empty arm and a verdict, and the empty prefix matched every run
+///   in the experiment, the candidate's included;
+/// - baseline and candidate resolving to the same arm;
+/// - an arm none of whose runs recorded `metric` (a typo).
+fn compare_arms(
+    records: &[Record],
+    experiment: &str,
+    baseline: &str,
+    candidate: &str,
+    metric: &str,
+    alpha: f64,
+) -> Result<(Arm, Arm)> {
+    if !(alpha > 0.0 && alpha < 1.0) {
+        return Err(anyhow!(
+            "--alpha must be between 0 and 1 (exclusive), got {alpha}"
+        ));
+    }
+    // config_fingerprint -> the runs that started under it in this experiment.
+    let mut arms: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for r in records {
+        if let Record::RunStarted {
+            run_uid,
+            experiment: Some(e),
+            identity,
+            ..
+        } = r
+            && e == experiment
+            && let Some(fp) = identity.config_fingerprint.as_deref()
+        {
+            arms.entry(fp).or_default().push(run_uid.as_str());
+        }
+    }
+    if arms.is_empty() {
+        return Err(anyhow!(
+            "no run in the ledger declares experiment {experiment:?} with a config_fingerprint"
+        ));
+    }
+    let resolve = |prefix: &str, role: &str| -> Result<&str> {
+        let hits: Vec<&str> = arms
+            .keys()
+            .copied()
+            .filter(|fp| !prefix.is_empty() && fp.starts_with(prefix))
+            .collect();
+        match hits.as_slice() {
+            [one] => Ok(*one),
+            [] => Err(anyhow!(
+                "{role} {prefix:?} matches no config_fingerprint in experiment {experiment:?} \
+                 (known: {})",
+                arms.keys().copied().collect::<Vec<_>>().join(", ")
+            )),
+            many => Err(anyhow!(
+                "{role} {prefix:?} is ambiguous in experiment {experiment:?}: matches {}",
+                many.join(", ")
+            )),
+        }
+    };
+    let base_fp = resolve(baseline, "baseline")?;
+    let cand_fp = resolve(candidate, "candidate")?;
+    if base_fp == cand_fp {
+        return Err(anyhow!(
+            "baseline and candidate are the same arm ({base_fp}); compare two configurations"
+        ));
+    }
+    let arm = |fp: &str| -> Result<Arm> {
+        let uids = &arms[fp];
+        let values: Vec<f64> = records
+            .iter()
+            .filter_map(|r| match r {
+                Record::RunEnded {
+                    run_uid, metrics, ..
+                } if uids.contains(&run_uid.as_str()) => metrics.get(metric).copied(),
+                _ => None,
+            })
+            .collect();
+        if values.is_empty() {
+            let mut recorded: Vec<&str> = records
+                .iter()
+                .filter_map(|r| match r {
+                    Record::RunEnded {
+                        run_uid, metrics, ..
+                    } if uids.contains(&run_uid.as_str()) => Some(metrics.keys()),
+                    _ => None,
+                })
+                .flatten()
+                .map(String::as_str)
+                .collect();
+            recorded.sort_unstable();
+            recorded.dedup();
+            return Err(anyhow!(
+                "arm {fp} has {} run(s) but none ended with metric {metric:?} (recorded: {})",
+                uids.len(),
+                if recorded.is_empty() {
+                    "none".to_string()
+                } else {
+                    recorded.join(", ")
+                }
+            ));
+        }
+        Ok(Arm {
+            label: fp.to_string(),
+            values,
+        })
+    };
+    Ok((arm(base_fp)?, arm(cand_fp)?))
+}
+
+/// `ledger compare --json`. `json!` maps a non-finite number to `null`.
+fn comparison_json(result: &crate::run_ledger::Comparison) -> serde_json::Value {
+    let verdict = match &result.verdict {
+        Verdict::Indeterminate {
+            reason,
+            seeds_per_arm_needed,
+        } => serde_json::json!({
+            "kind": "indeterminate",
+            "reason": reason,
+            "seeds_per_arm_needed": seeds_per_arm_needed,
+        }),
+        Verdict::Decided {
+            p_value,
+            significant,
+        } => serde_json::json!({
+            "kind": "decided",
+            "p_value": p_value,
+            "significant": significant,
+        }),
+    };
+    serde_json::json!({
+        "metric": result.metric,
+        "baseline_n": result.baseline_n,
+        "candidate_n": result.candidate_n,
+        "delta": result.delta,
+        "within_sd": result.within_sd,
+        "min_achievable_p": result.min_achievable_p,
+        "verdict": verdict,
+    })
 }
 
 fn append_promotion(ledger: &RunLedger, uid: &str, reason: String, by: String) -> Result<()> {
@@ -1132,6 +1246,87 @@ mod tests {
         ] {
             assert!(ledger_structure_problems(&records).is_empty());
         }
+    }
+
+    fn arm_run(uid: &str, experiment: &str, fp: &str, value: Option<f64>) -> [Record; 2] {
+        let mut start = started(uid, "t", &[]);
+        if let Record::RunStarted {
+            experiment: e,
+            identity,
+            ..
+        } = &mut start
+        {
+            *e = Some(experiment.into());
+            identity.config_fingerprint = Some(fp.into());
+        }
+        let mut end = ended(uid, &[]);
+        if let (Record::RunEnded { metrics, .. }, Some(v)) = (&mut end, value) {
+            metrics.insert("best_val_r".into(), v);
+        }
+        [start, end]
+    }
+
+    /// `ledger compare` produced a verdict for inputs that name nothing:
+    /// `--alpha 2` reported SIGNIFICANT, an unknown prefix compared an empty
+    /// arm, and the empty prefix pooled every run (the candidate's too).
+    #[test]
+    fn compare_refuses_inputs_that_name_nothing() {
+        let mut records = Vec::new();
+        for (uid, fp, v) in [
+            ("a0", "aaaa1111", 0.50),
+            ("a1", "aaaa1111", 0.52),
+            ("a2", "aaaa1111", 0.51),
+            ("b0", "bbbb2222", 0.60),
+            ("b1", "bbbb2222", 0.61),
+            ("b2", "bbbb2222", 0.62),
+            ("x0", "aaab3333", 0.70),
+        ] {
+            records.extend(arm_run(uid, "E1", fp, Some(v)));
+        }
+        records.extend(arm_run("n0", "E1", "cccc4444", None));
+        let err = |b: &str, c: &str, metric: &str, alpha: f64| {
+            compare_arms(&records, "E1", b, c, metric, alpha)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+        assert!(err("aaaa", "bbbb", "best_val_r", 2.0).contains("--alpha"));
+        assert!(err("aaaa", "bbbb", "best_val_r", 0.0).contains("--alpha"));
+        assert!(err("aaaa", "zzzz", "best_val_r", 0.05).contains("matches no"));
+        assert!(err("", "bbbb", "best_val_r", 0.05).contains("matches no"));
+        assert!(err("aaa", "bbbb", "best_val_r", 0.05).contains("ambiguous"));
+        assert!(err("aaaa", "aaaa1", "best_val_r", 0.05).contains("same arm"));
+        assert!(err("aaaa", "bbbb", "nosuch", 0.05).contains("best_val_r"));
+        assert!(err("aaaa", "cccc", "best_val_r", 0.05).contains("none ended"));
+        assert!(
+            compare_arms(&records, "E9", "aaaa", "bbbb", "best_val_r", 0.05)
+                .unwrap_err()
+                .to_string()
+                .contains("E9")
+        );
+        let (b, c) = compare_arms(&records, "E1", "aaaa", "bbbb", "best_val_r", 0.05).unwrap();
+        assert_eq!((b.values.len(), c.values.len()), (3, 3));
+        assert_eq!(b.label, "aaaa1111");
+    }
+
+    /// The hand-formatted `--json` printed `"delta":NaN`, which no JSON
+    /// parser accepts.
+    #[test]
+    fn comparison_json_is_valid_json_for_non_finite_values() {
+        let empty = Arm {
+            label: "a".into(),
+            values: vec![],
+        };
+        let one = Arm {
+            label: "b".into(),
+            values: vec![1.0],
+        };
+        let result = compare("m", &empty, &one, 0.05);
+        assert!(result.delta.is_nan());
+        let text = comparison_json(&result).to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(parsed["delta"].is_null(), "{text}");
+        assert_eq!(parsed["verdict"]["kind"], "indeterminate");
     }
 
     #[test]
