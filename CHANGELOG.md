@@ -30,6 +30,64 @@ depend on this crate.
   status log won. A later attempt (`stage_begin` or a cache hit) now reopens
   a failed or killed node. `blut errors show` likewise reported the recovered
   failure as the job's terminal failure next to `outcome : done`.
+- The lineage index took a run's git SHA, end time and host from the process
+  that indexed it: `git rev-parse HEAD` of wherever `blut` ran and "now". A
+  `lineage reindex` from another directory rewrote every run's SHA, and no run
+  ever had a start time. A job now records `provenance.json` at launch (launch
+  directory HEAD, engine build commit, start time); the index reads it, and the
+  end time is when the job's state became terminal.
+- `blut sla check` evaluated "0 run(s)" whatever the lineage held, because no
+  run row had a start time, so no SLA rule could breach. It now sees every
+  indexed run. An explicit `--rules` or `$BLUT_SLA_RULES` file that does not
+  exist is an error instead of "0 rules". A freshness rule now judges the
+  newest measured run per tenant: judged per run, every run older than the
+  window breached forever, and one run that failed before producing anything
+  made the rule unmeasured.
+- `blut lineage freshness` (and partition staleness) compared the launch
+  directory's git HEAD with the current directory's and reported `STALE — a
+  re-run re-executes` for runs a re-run then served from cache. It now
+  compares the engine build commit the cache key folds in. `--data-version`
+  with no artifact recording a data version reports `UNKNOWN`, not `FRESH`.
+- `blut ledger compare` accepted `--alpha 2` (an underpowered comparison then
+  read `SIGNIFICANT`), compared an empty arm for an unknown fingerprint
+  prefix, pooled every run for the empty prefix, and printed `NaN` in
+  `--json`. It now refuses an alpha outside (0, 1), a prefix that matches no
+  arm or several, the same arm twice, and a metric no run recorded.
+  `ledger list` marks collected runs and prints tiers as `--tier` spells them;
+  `ledger verify` has help text (it had been attached to `compare`).
+- `recipe run --config-dir … --set lr=1e-3` (the flag's own example) and
+  `--sweep seed=1,2` changed nothing: every dot-less key was taken as a config
+  group selection, so a sweep ran N identical combos. As in Hydra, a dot-less
+  key is a group selection only when it names a config group. A sweep whose
+  combos give the recipe identical args is refused before anything runs.
+- `blut artifact inspect` refused an artifact reused by a cache hit as
+  ambiguous, even given its full hash. `lineage graph` and `lineage card`
+  accept a unique hash prefix, as `lineage trace` does.
+- `blut lineage reindex` failed on a fresh install, and skipped every job
+  launched from a plan file (`plan run`, `recipe declare --run`).
+- A launch refused by tenant admission or the scheduler lock left a `failed`
+  job behind. A job stopped by `blut cancel` was recorded as `failed` in the
+  lineage index beside a `cancelled` job state.
+- `recipe run --launcher slurm` on a host without the Slurm client ran every
+  stage locally and reported success; it now requires `sbatch` and `scontrol`
+  on PATH.
+- `partition define` accepted an axis that is not a recipe arg (every cell
+  then failed at backfill) and repeated values (duplicate cells), and replaced
+  an existing set without a word.
+- `blut sensord` started with a `--cli` that does not exist and retried every
+  event against it forever; it now refuses to start. `--once` exits non-zero
+  when a dispatch was refused or a poll failed.
+- `schedule install` left its unit files behind when systemd refused to enable
+  the timer, so `schedule list` reported it installed; `schedule uninstall` of
+  a recipe with no timer reported "removed timer".
+- Smaller: `plan inspect` defaults `--args` to `{}`; `recipe declare` refuses
+  `--shared-cache`, `--no-cache`, `--sync-io` and `--experiment` without
+  `--run` instead of ignoring them; `cache show`/`prune` print small sizes in
+  bytes or KiB instead of `0.00 GiB`; `runs diff --json` outcomes carry no
+  column padding; `blut jobs` shows the driving `blut` pid of a running
+  in-process job; `results` labels its path as the output sidecar; `recipe
+  list` says when a binary registers no recipes; the scheduler-lock sensor no
+  longer names a nonexistent `--allow-evict` flag.
 
 ## [0.2.0-alpha.2] — 2026-10-09
 

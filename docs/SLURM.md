@@ -10,7 +10,8 @@ the same command runs locally or on the cluster.
   be on a filesystem every node mounts at the same path (NFS, Lustre, GPFS). A
   stage's inputs are passed to the compute nodes by path, not copied.
 - **Slurm client commands on the submit host:** `srun`, `sbatch`, `scontrol`,
-  `scancel`. Accounting (`slurmdbd`, `sacct`) is optional. Without it, a job's
+  `scancel`. `recipe run --launcher slurm` refuses to start when `sbatch` or
+  `scontrol` is not on `PATH`. Accounting (`slurmdbd`, `sacct`) is optional. Without it, a job's
   state can be read until the controller purges the record (`MinJobAge`,
   300 s by default). After that, polling reports that the job is unknown.
 
