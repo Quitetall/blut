@@ -301,9 +301,14 @@ active validation; per-rung status lives in the
 [distributed-validation ledger](https://github.com/Quitetall/blut/blob/blut-v0.2.0-alpha.1/docs/DISTRIBUTED_VALIDATION.md).
 
 Engine integration and property tests run in CI; exact counts live in CI, not
-this README. The standalone fuzz workspace is not yet CI-gated. Deprecated
-worker and experimental operator prototypes are not part of the public preview
-or published packages.
+this README. The standalone fuzz workspace is not yet CI-gated. The deprecated
+worker prototype is not part of the public preview.
+
+**Kubernetes:** `blut-operator` runs `BlutPlan` resources as Jobs and keeps
+`BlutWorkerPool` StatefulSets alive. It is validated on a three-node kind
+cluster with MinIO, including retries, a node drain and an operator restart;
+not on managed Kubernetes or with GPUs. Install, CRD reference and limits:
+[docs/OPERATOR.md](docs/OPERATOR.md).
 
 ## Minimum supported Rust version
 
@@ -313,8 +318,9 @@ asserted.
 
 - An MSRV increase is a **minor** version bump while the crates are `0.x`, and
   will be called out in [CHANGELOG.md](CHANGELOG.md).
-- The unpublished `blut-operator` deliberately requires **1.89** and runs in its
-  own CI lane; it is not part of the published chain.
+- `blut-operator` is a standalone workspace on the same 1.88 floor, gated in
+  its own CI lane. Its MSRV-aware lockfile holds kube at 4.0, the last release
+  that supports 1.88.
 - Newer toolchains are not assumed to be supersets. A lint that fires only on a
   newer clippy is not a release blocker, and one that fires on 1.88 is.
 

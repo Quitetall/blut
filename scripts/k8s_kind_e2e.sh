@@ -302,8 +302,10 @@ spec:
   planSource: { configMapRef: { name: split-recipe, key: split.toml } }
 EOF
 }
-phase() { kubectl -n "$NS" get blutplan "$1" -o jsonpath='{.status.phase}' 2>/dev/null; }
-field() { kubectl -n "$NS" get blutplan "$1" -o jsonpath="{.status.$2}" 2>/dev/null; }
+# Reads tolerate a slow API server (a timed-out GET is retried by the caller's
+# loop, not fatal under `set -e`).
+phase() { kubectl -n "$NS" get blutplan "$1" -o jsonpath='{.status.phase}' 2>/dev/null || true; }
+field() { kubectl -n "$NS" get blutplan "$1" -o jsonpath="{.status.$2}" 2>/dev/null || true; }
 wait_phase() { # NAME PHASE TIMEOUT
   local deadline=$(( $(date +%s) + $3 ))
   until [ "$(phase "$1")" = "$2" ]; do
@@ -561,18 +563,22 @@ log "  2/2 ready, a deleted pod replaced, StatefulSet and Service gone with the 
 log "check 10: the operator's permissions"
 SA="system:serviceaccount:$OPNS:blut-operator"
 kubectl auth can-i --list --as="$SA" | save rbac-can-i.txt
-for allowed in "create jobs.batch -n $NS" "patch blutplans.blut.lamquant.dev/status -n $NS" \
-    "list pods -n $NS" "create configmaps -n $NS"; do
+# Subresources are named with --subresource: `kubectl auth can-i get pods/log`
+# asks about a resource called "pods/log", which nobody has, so a denial check
+# written that way passes whatever the role grants.
+for allowed in "create jobs.batch -n $NS" "patch blutplans.blut.lamquant.dev --subresource=status -n $NS" \
+    "watch pods -n $NS" "create configmaps -n $NS"; do
   kubectl auth can-i ${allowed} --as="$SA" > /dev/null || fail "operator cannot $allowed"
 done
 for denied in "get secrets -n $NS" "list secrets -A" "delete jobs.batch -n $NS" "delete pods -n $NS" \
-    "create pods -n $NS" "create pods/exec -n $NS" "get pods/log -n $NS" "update blutplans.blut.lamquant.dev -n $NS" \
+    "create pods -n $NS" "create pods --subresource=exec -n $NS" "get pods --subresource=log -n $NS" \
+    "update blutplans.blut.lamquant.dev -n $NS" "patch blutworkerpools.blut.lamquant.dev -n $NS" \
     "patch blutplans.blut.lamquant.dev -n $NS" "create deployments.apps -n $NS" "create clusterroles.rbac.authorization.k8s.io"; do
   if kubectl auth can-i ${denied} --as="$SA" > /dev/null 2>&1; then fail "operator can $denied"; fi
   echo "denied: $denied"
 done | save rbac-denied.txt
 kubectl -n "$OPNS" logs deploy/blut-operator --tail=-1 | grep -i forbidden && fail "operator hit a forbidden call"
-log "  allowed 4/4, denied 11/11, no forbidden calls in the operator log"
+log "  allowed 4/4, denied 12/12, no forbidden calls in the operator log"
 
 kubectl -n "$NS" get blutplans | save plans-final.txt
 kubectl -n "$NS" get blutplans
