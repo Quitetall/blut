@@ -374,8 +374,8 @@ enum PlanCommand {
     Inspect {
         /// Recipe name (as listed by `recipe list`).
         name: String,
-        /// Recipe args as inline JSON.
-        #[arg(long)]
+        /// Recipe args as inline JSON. Defaults to `{}`, as for `recipe run`.
+        #[arg(long, default_value = "{}")]
         args: String,
     },
     /// Typecheck a `.json` PlanSpec against the compiled-in stages WITHOUT
@@ -807,6 +807,23 @@ fn resolve_prune_cap_gb(flag: Option<f64>, env: Option<std::ffi::OsString>) -> R
         ));
     }
     Ok(cap)
+}
+
+/// A byte count in the largest binary unit that keeps it at or above 1.
+/// `cache prune` printed "pruned 0.00 GiB" after deleting a whole small cache.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -1405,6 +1422,31 @@ mod artifact_inspect_tests {
             InspectTarget::Ambiguous(_)
         ));
         assert!(matches!(inspect_target(&[]), InspectTarget::None));
+    }
+}
+
+#[cfg(test)]
+mod small_cli_fix_tests {
+    use super::{Cli, Command, PlanCommand, human_bytes};
+    use clap::Parser;
+
+    /// `cache prune` reported "pruned 0.00 GiB" after deleting 2778 bytes.
+    #[test]
+    fn small_sizes_are_not_rounded_to_zero() {
+        assert_eq!(human_bytes(2778), "2.71 KiB");
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(3 << 30), "3.00 GiB");
+    }
+
+    /// `plan inspect <recipe>` demanded `--args` where `recipe run` defaults
+    /// it to `{}`.
+    #[test]
+    fn plan_inspect_args_default_to_an_empty_object() {
+        let cli = Cli::try_parse_from(["blut", "plan", "inspect", "r"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Plan { cmd: PlanCommand::Inspect { args, .. } }) if args == "{}"
+        ));
     }
 }
 
@@ -2584,11 +2626,19 @@ fn run_sensor_cmd(cmd: SensorCommand) -> Result<()> {
 fn run_sla_cmd(cmd: SlaCommand) -> Result<()> {
     match cmd {
         SlaCommand::Check { rules, out, json } => {
-            let rules_path = rules.unwrap_or_else(|| {
-                std::env::var_os("BLUT_SLA_RULES")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| dot_blut().join("sla.toml"))
-            });
+            let from_env = std::env::var_os("BLUT_SLA_RULES").map(std::path::PathBuf::from);
+            let explicit = rules.is_some() || from_env.is_some();
+            let rules_path = rules
+                .or(from_env)
+                .unwrap_or_else(|| dot_blut().join("sla.toml"));
+            // A rule file you named that is not there is a typo, not "no
+            // rules": it used to report 0 breaches and exit 0.
+            if explicit && !rules_path.is_file() {
+                return Err(anyhow!(
+                    "SLA rule file {} does not exist (from --rules or $BLUT_SLA_RULES)",
+                    rules_path.display()
+                ));
+            }
             let out_path = out.unwrap_or_else(crate::sla::default_sla_path);
             let report = crate::sla::check_paths(&rules_path, &out_path)
                 .with_context(|| format!("check SLA rules {}", rules_path.display()))?;
@@ -2699,7 +2749,7 @@ fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
                 return Ok(());
             }
             let size = dir_size_bytes(&global)?;
-            println!("size: {:.2} GiB", size as f64 / 1024.0 / 1024.0 / 1024.0);
+            println!("size: {}", human_bytes(size));
             Ok(())
         }
         CacheCommand::Prune { max_gb } => {
@@ -2710,10 +2760,9 @@ fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
             let freed = crate::framework::cache::lru_prune(&global, cap_bytes)
                 .with_context(|| format!("lru_prune {}", global.display()))?;
             println!(
-                "pruned {:.2} GiB from {} (cap {:.2} GiB)",
-                freed as f64 / 1024.0 / 1024.0 / 1024.0,
+                "pruned {} from {} (cap {cap_gb:.2} GiB)",
+                human_bytes(freed),
                 global.display(),
-                cap_gb
             );
             Ok(())
         }

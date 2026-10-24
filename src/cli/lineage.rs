@@ -431,23 +431,45 @@ pub(super) fn run_lineage_trace(hash: &str, json: bool) -> Result<()> {
 pub(super) fn run_lineage_reindex() -> Result<()> {
     let jobs_root = crate::paths::jobs_dir()?;
     let (mut indexed, mut skipped) = (0u32, 0u32);
-    let rd = std::fs::read_dir(&jobs_root)
-        .with_context(|| format!("read jobs dir {}", jobs_root.display()))?;
+    let rd = match std::fs::read_dir(&jobs_root) {
+        Ok(rd) => rd,
+        // No job has ever run: there is nothing to index, which is not an error.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "reindexed 0 run(s), skipped 0 (no jobs under {})",
+                jobs_root.display()
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(anyhow::Error::from(e))
+                .with_context(|| format!("read jobs dir {}", jobs_root.display()));
+        }
+    };
     {
         for e in rd.flatten() {
             let Some(job_id) = e.file_name().to_str().map(String::from) else {
                 continue;
             };
-            // Recipe identity comes from the run marker; legacy/bare-spawn jobs
-            // have none → skip (nothing to attribute the run to).
-            let Ok(marker) = RecipeMarker::read_from(&e.path()) else {
-                skipped += 1;
-                continue;
+            // Recipe identity comes from the run marker. A job launched from a
+            // plan file (`plan run`, `recipe declare --run`) has no marker but
+            // persisted its plan graph, whose name is what the live ingest
+            // recorded; it used to be skipped, so a deleted index could not
+            // be rebuilt for those runs. Legacy/bare-spawn jobs have neither.
+            let name = match RecipeMarker::read_from(&e.path()) {
+                Ok(marker) => marker.name,
+                Err(_) => match crate::framework::PlanGraph::read_from(&e.path()) {
+                    Some(graph) => graph.name,
+                    None => {
+                        skipped += 1;
+                        continue;
+                    }
+                },
             };
             let outcome = crate::jobs::read_state(&job_id)
                 .map(|s| format!("{s:?}").to_lowercase())
                 .unwrap_or_else(|_| "unknown".into());
-            match crate::lineage_db::ingest_job(&job_id, &marker.name, &outcome) {
+            match crate::lineage_db::ingest_job(&job_id, &name, &outcome) {
                 Ok(()) => indexed += 1,
                 Err(err) => {
                     tracing::warn!("reindex {job_id}: {err}");
@@ -458,6 +480,61 @@ pub(super) fn run_lineage_reindex() -> Result<()> {
     }
     eprintln!("reindexed {indexed} run(s), skipped {skipped}");
     Ok(())
+}
+
+#[cfg(test)]
+mod reindex_tests {
+    use super::run_lineage_reindex;
+
+    /// `lineage reindex` failed on a fresh install ("No such file or
+    /// directory"), and skipped every job launched from a plan file, so a
+    /// deleted index could not be rebuilt for them.
+    #[test]
+    fn reindex_handles_no_jobs_and_plan_file_jobs() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let prev: Vec<_> = ["LAMU_TRAIN_JOBS_DIR", "LAMU_TRAIN_DATA_DIR"]
+            .into_iter()
+            .map(|k| (k, std::env::var_os(k)))
+            .collect();
+        // SAFETY: TEST_ENV_LOCK serializes env mutation; restored below.
+        unsafe {
+            std::env::set_var("LAMU_TRAIN_JOBS_DIR", td.path().join("jobs"));
+            std::env::set_var("LAMU_TRAIN_DATA_DIR", td.path().join("data"));
+        }
+        let fresh = run_lineage_reindex();
+        let job = "20261023-000000-000000009";
+        let dir = crate::paths::job_dir(job).unwrap();
+        crate::framework::PlanGraph {
+            name: "spec_from_file".into(),
+            nodes: vec![],
+            edges: vec![],
+            condition_gates: vec![],
+        }
+        .write_to(&dir)
+        .unwrap();
+        crate::jobs::write_state(job, crate::jobs::JobState::Done).unwrap();
+        let indexed = run_lineage_reindex();
+        let row = crate::lineage_db::LineageDb::open()
+            .unwrap()
+            .get_run(job)
+            .unwrap();
+        unsafe {
+            for (k, v) in prev {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        assert!(fresh.is_ok(), "{fresh:?}");
+        assert!(indexed.is_ok(), "{indexed:?}");
+        let row = row.expect("a plan-file job is indexed");
+        assert_eq!(row.recipe, "spec_from_file");
+        assert_eq!(row.outcome.as_deref(), Some("done"));
+    }
 }
 
 #[cfg(test)]

@@ -209,8 +209,8 @@ pub fn check_unlocked_at(path: &Path) -> Result<()> {
         && pid_alive(existing.pid)
     {
         return Err(Error::Other(format!(
-            "GPU held by '{}' (pid {}, kind {:?}). \
-                 Pass --allow-evict to wait.",
+            "GPU held by '{}' (pid {}, kind {:?}). Wait for it to finish \
+                 (`blut jobs`), or stop it with `blut cancel <job>`.",
             existing.holder, existing.pid, existing.kind
         )));
     }

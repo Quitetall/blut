@@ -43,22 +43,29 @@ pub(super) enum RecipeCommand {
         #[arg(long, default_value_t = false)]
         run: bool,
         /// Promote this run's outputs to the global cache (only with `--run`).
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, requires = "run")]
         shared_cache: bool,
         /// Force-recompute on launch: bypass the stage cache READ so every stage
         /// runs even with a warm entry (only with `--run`). Alias: `--force`.
-        #[arg(long = "no-cache", alias = "force", default_value_t = false)]
+        #[arg(
+            long = "no-cache",
+            alias = "force",
+            default_value_t = false,
+            requires = "run"
+        )]
         no_cache: bool,
         /// Force all declared async-I/O lanes onto their synchronous Inline
-        /// fallback (execution-only; cache identity is unchanged).
-        #[arg(long, default_value_t = false)]
+        /// fallback (execution-only; cache identity is unchanged; only with
+        /// `--run`).
+        #[arg(long, default_value_t = false, requires = "run")]
         sync_io: bool,
         /// Tenant to resolve a `registry://plan@<name>` deploy URI against and,
         /// with `--run`, to own the launched job (ADR 0085/0096).
         #[arg(long, default_value = "default")]
         tenant: String,
-        /// Experiment/campaign name for lineage grouping. Defaults to the recipe.
-        #[arg(long)]
+        /// Experiment/campaign name for lineage grouping. Defaults to the recipe
+        /// (only with `--run`).
+        #[arg(long, requires = "run")]
         experiment: Option<String>,
     },
     /// Execute a recipe, or a config-driven sweep over it.
@@ -157,8 +164,12 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                 emit_json(&arr)?;
                 return Ok(());
             }
+            if sorted.is_empty() {
+                println!("(no recipes registered in this binary)");
+                return Ok(());
+            }
             println!(
-                "{:<32} {:<14} {:<12} {:<24} → output",
+                "{:<32} {:<16} {:<12} {:<24} → output",
                 "name", "category", "backend", "inputs"
             );
             for r in sorted {
@@ -168,7 +179,7 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                     r.input_kinds.join(",")
                 };
                 println!(
-                    "{:<32} {:<14} {:<12} {:<24} → {}",
+                    "{:<32} {:<16} {:<12} {:<24} → {}",
                     r.name,
                     r.category.label(),
                     r.backend_id,
