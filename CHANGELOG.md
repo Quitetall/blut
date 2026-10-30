@@ -245,6 +245,13 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- `recipe run --dry-run` reported "≈ 2.0G" for a stage declaring a 256 MiB
+  envelope: it printed the legacy whole-GiB estimate with the 2 GiB floor
+  applied to every plan, while a launch bills the largest declared envelope
+  byte for byte and the floor only when no stage declares one. The dry run now
+  computes the launch's footprint (before auto-tune) and says its basis:
+  "≈ 256.00 MiB (the largest declared envelope, stage 'x'; …)" or "≈ 2.00 GiB
+  (the compatibility floor: no stage declares an envelope; …)".
 - `blut log` printed the `saved` and `done` paths a trainer reported, which
   name the stage's attempt directory (`stages/.tmp-<idx>-<stage>-<key>`); the
   directory is renamed to `stages/<idx>-<stage>` when the stage commits, so the
