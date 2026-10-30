@@ -336,11 +336,60 @@ pub fn append_status(job_id: &str, update: &StatusUpdate) -> Result<()> {
     })
 }
 
+/// Every trainer [`StatusUpdate`] in a job's `status.jsonl`, in order: bare
+/// update lines, and updates a stage forwarded as a `stage_step` event's
+/// `update` payload. A plan launch only writes the second kind (a trainer
+/// stage relays its trainer's stdout that way), and this read only the first,
+/// so `blut log` printed nothing and `blut jobs` no step or loss for every
+/// job a recipe ran.
 pub fn read_status(job_id: &str) -> Result<Vec<StatusUpdate>> {
+    Ok(read_progress(job_id)?
+        .into_iter()
+        .map(|progress| progress.update)
+        .collect())
+}
+
+/// One trainer update and, when a stage forwarded it, the stage it came from.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Progress {
+    /// `(node_idx, stage_name)` of the forwarding stage; `None` for a bare
+    /// update line.
+    pub(crate) source: Option<(u32, String)>,
+    pub(crate) update: StatusUpdate,
+}
+
+/// [`read_status`], keeping each update's forwarding stage.
+pub(crate) fn read_progress(job_id: &str) -> Result<Vec<Progress>> {
     Ok(read_status_lines(job_id)?
         .iter()
-        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter_map(|line| progress_from_line(line))
         .collect())
+}
+
+/// The trainer update one `status.jsonl` line carries, if any.
+fn progress_from_line(line: &str) -> Option<Progress> {
+    // Cheap test first: most lines of a plan launch are stage events that are
+    // not `stage_step`, and every bare update line parses directly.
+    if !line.contains("\"stage_step\"") {
+        return serde_json::from_str(line).ok().map(|update| Progress {
+            source: None,
+            update,
+        });
+    }
+    let event: serde_json::Value = serde_json::from_str(line).ok()?;
+    if event.get("kind").and_then(|kind| kind.as_str()) != Some("stage_step") {
+        return None;
+    }
+    let update = serde_json::from_value(event.get("update")?.clone()).ok()?;
+    let node_idx = event
+        .get("node_idx")
+        .and_then(|idx| idx.as_u64())
+        .and_then(|idx| u32::try_from(idx).ok())?;
+    let stage_name = event.get("stage_name")?.as_str()?.to_string();
+    Some(Progress {
+        source: Some((node_idx, stage_name)),
+        update,
+    })
 }
 
 /// Raw `status.jsonl` lines (rotation-aware: `.1` generation then the
@@ -1398,6 +1447,108 @@ mod tests {
             let back = read_status(id).unwrap();
             assert_eq!(back.len(), 4);
             assert!(matches!(back[3], StatusUpdate::Done { .. }));
+        });
+    }
+
+    /// A plan launch writes trainer progress only as `stage_step` events (the
+    /// trainer stage forwards each `StatusUpdate`), and `read_status` parsed
+    /// only bare update lines: `blut log` printed nothing and `blut jobs` had
+    /// no step, loss or final loss for any job a recipe ran.
+    #[test]
+    fn read_status_includes_updates_a_stage_forwarded() {
+        use crate::framework::status::{HostedEvent, StageEvent};
+        with_jobs_dir(|| {
+            let id = "20261030-000000-000000001";
+            let dir = paths::job_dir(id).unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            let step = |update: serde_json::Value| {
+                serde_json::to_string(&HostedEvent::wrap(
+                    &None,
+                    StageEvent::StageStep {
+                        node_idx: 2,
+                        stage_name: "train".into(),
+                        update,
+                    },
+                ))
+                .unwrap()
+            };
+            let as_value = |u: &StatusUpdate| serde_json::to_value(u).unwrap();
+            let lines = [
+                "{\"kind\":\"stage_begin\",\"node_idx\":2,\"stage_name\":\"train\",\"input_hash\":\"x\"}"
+                    .to_string(),
+                step(as_value(&StatusUpdate::Heartbeat {
+                    phase: Some("load".into()),
+                    vram_mb: None,
+                })),
+                step(as_value(&StatusUpdate::Step {
+                    step: 1,
+                    total: 2,
+                    loss: 2.0,
+                    lr: 0.001,
+                    vram_mb: 0,
+                })),
+                // Not trainer protocol: metrics, gauges, a cookbook's own kind.
+                step(serde_json::json!({"step": 1, "val_r": 0.4})),
+                step(serde_json::json!({"kind": "gpu_gauge", "gpu_util": 90.0})),
+                step(serde_json::json!({"kind": "hf_step", "step": 1, "loss": 1.0})),
+                // A forwarded peer's line carries a `host` tag.
+                format!(
+                    "{{\"host\":\"ab12\",{}",
+                    &step(as_value(&StatusUpdate::Step {
+                        step: 2,
+                        total: 2,
+                        loss: 1.0,
+                        lr: 0.001,
+                        vram_mb: 0,
+                    }))[1..]
+                ),
+                step(as_value(&StatusUpdate::Done {
+                    final_loss: 0.5,
+                    checkpoint_dir: PathBuf::from("/ckpt"),
+                })),
+                "{\"kind\":\"stage_end\",\"node_idx\":2,\"stage_name\":\"train\"}".to_string(),
+            ];
+            std::fs::write(dir.join("status.jsonl"), lines.join("\n") + "\n").unwrap();
+            // A bare update line (the single-trainer launch's format) still reads.
+            append_status(
+                id,
+                &StatusUpdate::Eval {
+                    step: 2,
+                    eval_loss: 0.7,
+                },
+            )
+            .unwrap();
+
+            let progress = read_progress(id).unwrap();
+            let kinds: Vec<(&str, Option<u32>)> = progress
+                .iter()
+                .map(|p| {
+                    let kind = match p.update {
+                        StatusUpdate::Heartbeat { .. } => "heartbeat",
+                        StatusUpdate::Step { .. } => "step",
+                        StatusUpdate::Done { .. } => "done",
+                        StatusUpdate::Eval { .. } => "eval",
+                        _ => "other",
+                    };
+                    (kind, p.source.as_ref().map(|(idx, _)| *idx))
+                })
+                .collect();
+            assert_eq!(
+                kinds,
+                [
+                    ("heartbeat", Some(2)),
+                    ("step", Some(2)),
+                    ("step", Some(2)),
+                    ("done", Some(2)),
+                    ("eval", None),
+                ]
+            );
+            assert_eq!(read_status(id).unwrap().len(), 5);
+            write_state(id, JobState::Done).unwrap();
+            let summary = list_jobs().unwrap().pop().unwrap();
+            assert_eq!(summary.last_step, Some(2));
+            assert_eq!(summary.last_loss, Some(1.0));
+            assert_eq!(summary.final_loss, Some(0.5));
         });
     }
 

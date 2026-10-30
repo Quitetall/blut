@@ -450,7 +450,7 @@ enum PlanCommand {
     /// Promote a published fingerprint onto a named pointer
     /// (`registry://plan@<name>`), recording the move in the audit trail.
     Promote {
-        /// The deployment fingerprint to promote.
+        /// The deployment fingerprint to promote, or an unambiguous prefix.
         fingerprint: String,
         /// Target pointer, e.g. `registry://plan@prod`.
         pointer: String,
@@ -645,6 +645,12 @@ enum ScheduleCommand {
     /// List installed blut recipe timers.
     List,
     /// Install (or replace) a timer that runs a recipe on a schedule.
+    ///
+    /// The unit runs `recipe run` with the flags given here, from the current
+    /// working directory, with the location, policy, interpreter and device
+    /// variables set in this shell (`blut::schedule::ENVIRONMENT_ALLOWLIST`),
+    /// so a firing reproduces the launch you would run by hand. Nothing else
+    /// from the environment is copied: credentials never go in a unit file.
     Install {
         /// Recipe name (as listed by `recipe list`).
         recipe: String,
@@ -655,6 +661,25 @@ enum ScheduleCommand {
         /// Recipe args as inline JSON. Defaults to `{}`.
         #[arg(long, default_value = "{}")]
         args: String,
+        /// Tenant the scheduled runs are admitted under, as `recipe run
+        /// --tenant`.
+        #[arg(long, default_value = "default")]
+        tenant: String,
+        /// Scheduled runs read and write the global shared cache, as `recipe
+        /// run --shared-cache`.
+        #[arg(long)]
+        shared_cache: bool,
+        /// Scheduled runs bypass the cache, as `recipe run --no-cache`.
+        #[arg(long)]
+        no_cache: bool,
+        /// Scheduled runs use synchronous training I/O, as `recipe run
+        /// --sync-io`.
+        #[arg(long)]
+        sync_io: bool,
+        /// Experiment the scheduled runs group under, as `recipe run
+        /// --experiment`.
+        #[arg(long)]
+        experiment: Option<String>,
     },
     /// Remove a recipe's timer + service.
     Uninstall {
@@ -1574,6 +1599,170 @@ mod default_tenant_tests {
 }
 
 #[cfg(test)]
+mod plan_registry_input_tests {
+    use super::{PlanCommand, run_plan_cmd, toy_plan};
+
+    struct RegistryDbEnv(Option<std::ffi::OsString>);
+    impl RegistryDbEnv {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("BLUT_REGISTRY_DB");
+            // SAFETY: the caller holds TEST_ENV_LOCK for this guard's lifetime.
+            unsafe { std::env::set_var("BLUT_REGISTRY_DB", path) };
+            Self(previous)
+        }
+    }
+    impl Drop for RegistryDbEnv {
+        fn drop(&mut self) {
+            // SAFETY: TEST_ENV_LOCK is still held by the caller.
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("BLUT_REGISTRY_DB", value),
+                    None => std::env::remove_var("BLUT_REGISTRY_DB"),
+                }
+            }
+        }
+    }
+
+    fn write_spec(dir: &std::path::Path, n: u32) -> std::path::PathBuf {
+        let path = dir.join(format!("spec-{n}.json"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&toy_plan::spec_with("toy", n)).unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    /// `plan publish --tenant` stored any string; a deployment published
+    /// under `a b` could never be resolved by a run. It is validated like
+    /// every other tenant input, and stored in canonical form.
+    // The env lock spans the awaited command: it reads BLUT_REGISTRY_DB.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn plan_publish_refuses_an_invalid_tenant() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("registry.db");
+        let _env = RegistryDbEnv::set(&db);
+        let reg = toy_plan::registry();
+        let spec = write_spec(td.path(), 1);
+        for bad in ["a b", "../x", "a/b/c", "x/", ".hidden"] {
+            let err = run_plan_cmd(
+                &reg,
+                PlanCommand::Publish {
+                    spec: spec.clone(),
+                    tenant: bad.into(),
+                },
+            )
+            .await
+            .expect_err(bad);
+            assert!(
+                err.to_string().contains("invalid --tenant"),
+                "{bad:?}: {err}"
+            );
+        }
+        let conn = crate::registry_db::open_at(&db).unwrap();
+        let fp = crate::registry_db::fingerprint(&toy_plan::spec_with("toy", 1));
+        assert_eq!(
+            crate::registry_db::get_deployment(&conn, &fp).unwrap(),
+            None
+        );
+        run_plan_cmd(
+            &reg,
+            PlanCommand::Publish {
+                spec,
+                tenant: " lab/vision ".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let stored = crate::registry_db::get_deployment(&conn, &fp)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.tenant, "lab/vision");
+    }
+
+    /// `plan promote` needed the full fingerprint while other commands take
+    /// prefixes. A unique prefix resolves; an ambiguous one is refused.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn plan_promote_takes_an_unambiguous_fingerprint_prefix() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("registry.db");
+        let _env = RegistryDbEnv::set(&db);
+        let reg = toy_plan::registry();
+        // 17 distinct deployments: at least two share a first hex digit.
+        let mut fps = Vec::new();
+        for n in 0..17 {
+            run_plan_cmd(
+                &reg,
+                PlanCommand::Publish {
+                    spec: write_spec(td.path(), n),
+                    tenant: "default".into(),
+                },
+            )
+            .await
+            .unwrap();
+            fps.push(crate::registry_db::fingerprint(&toy_plan::spec_with(
+                "toy", n,
+            )));
+        }
+        let shortest_unique = |fp: &str| {
+            (1..=fp.len())
+                .map(|len| &fp[..len])
+                .find(|prefix| fps.iter().filter(|o| o.starts_with(prefix)).count() == 1)
+                .unwrap()
+                .to_string()
+        };
+        let promote = |fingerprint: String| {
+            run_plan_cmd(
+                &reg,
+                PlanCommand::Promote {
+                    fingerprint,
+                    pointer: "registry://plan@prod".into(),
+                    tenant: "default".into(),
+                },
+            )
+        };
+        let pointer = || {
+            let conn = crate::registry_db::open_at(&db).unwrap();
+            crate::registry_db::resolve_pointer(&conn, "default", "prod")
+                .unwrap()
+                .expect("pointer")
+        };
+
+        let target = fps[3].clone();
+        promote(shortest_unique(&target)).await.unwrap();
+        assert_eq!(pointer(), target);
+        promote(shortest_unique(&fps[5]).to_ascii_uppercase())
+            .await
+            .unwrap();
+        assert_eq!(pointer(), fps[5]);
+        promote(fps[7].clone()).await.unwrap();
+        assert_eq!(pointer(), fps[7]);
+
+        let shared = fps
+            .iter()
+            .find_map(|fp| {
+                let first = &fp[..1];
+                (fps.iter().filter(|o| o.starts_with(first)).count() > 1).then(|| first.to_string())
+            })
+            .expect("pigeonhole: 17 fingerprints over 16 hex digits");
+        let err = promote(shared).await.expect_err("an ambiguous prefix");
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+        for bad in ["", "zz", "%", "ab_"] {
+            assert!(promote(bad.into()).await.is_err(), "{bad:?}");
+        }
+        assert_eq!(pointer(), fps[7], "a refused promote moves nothing");
+    }
+}
+
+#[cfg(test)]
 mod cache_prune_cap_tests {
     use super::resolve_prune_cap_gb;
 
@@ -2410,6 +2599,7 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             Ok(())
         }
         PlanCommand::Publish { spec, tenant } => {
+            let tenant = parse_plan_tenant(&tenant)?;
             let text = std::fs::read_to_string(&spec)
                 .with_context(|| format!("read PlanSpec {}", spec.display()))?;
             let plan_spec: crate::framework::plan_spec::PlanSpec =
@@ -2433,15 +2623,21 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             pointer,
             tenant,
         } => {
+            let tenant = parse_plan_tenant(&tenant)?;
             let name = crate::registry_db::parse_pointer_uri(&pointer)
                 .ok_or_else(|| anyhow!("not a `registry://plan@<name>` URI: {pointer}"))?;
             let mut conn = crate::registry_db::open().map_err(|e| anyhow!("{e}"))?;
+            // A prefix, as `plan check`/`publish` print and other commands
+            // accept; it used to need the full 64-character fingerprint.
+            let fingerprint = crate::registry_db::resolve_fingerprint(&conn, &fingerprint)
+                .map_err(|e| anyhow!("{e}"))?;
             crate::registry_db::promote(&mut conn, &fingerprint, &tenant, name, now_unix())
                 .map_err(|e| anyhow!("{e}"))?;
             println!("promoted {fingerprint} → registry://plan@{name}");
             Ok(())
         }
         PlanCommand::Rollback { pointer, tenant } => {
+            let tenant = parse_plan_tenant(&tenant)?;
             let name = crate::registry_db::parse_pointer_uri(&pointer)
                 .ok_or_else(|| anyhow!("not a `registry://plan@<name>` URI: {pointer}"))?;
             let mut conn = crate::registry_db::open().map_err(|e| anyhow!("{e}"))?;
@@ -2451,6 +2647,7 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             Ok(())
         }
         PlanCommand::History { pointer, tenant } => {
+            let tenant = parse_plan_tenant(&tenant)?;
             let name = crate::registry_db::parse_pointer_uri(&pointer)
                 .ok_or_else(|| anyhow!("not a `registry://plan@<name>` URI: {pointer}"))?;
             let conn = crate::registry_db::open().map_err(|e| anyhow!("{e}"))?;
@@ -2683,6 +2880,16 @@ fn run_experiment_cmd(cmd: ExperimentCommand) -> Result<()> {
 }
 
 /// The acting user recorded as a deployment's publisher.
+/// A plan registry `--tenant`, parsed as every other tenant input is and
+/// returned in canonical form (the form `recipe declare` resolves pointers
+/// under). `plan publish --tenant` stored any string, so a deployment could be
+/// published under a tenant no run can ever resolve, such as `a b`.
+fn parse_plan_tenant(raw: &str) -> Result<String> {
+    crate::tenant::Tenant::parse(raw)
+        .map(|tenant| tenant.to_string())
+        .ok_or_else(|| anyhow!("invalid --tenant '{raw}'"))
+}
+
 fn acting_user() -> String {
     std::env::var("USER").unwrap_or_else(|_| "unknown".to_string())
 }
@@ -3162,6 +3369,11 @@ fn run_schedule_cmd(reg: &crate::framework::Registry, cmd: ScheduleCommand) -> R
             recipe,
             calendar,
             args,
+            tenant,
+            shared_cache,
+            no_cache,
+            sync_io,
+            experiment,
         } => {
             // Validate the recipe exists + the args parse before touching
             // systemd, so a typo doesn't leave a broken unit behind.
@@ -3184,8 +3396,29 @@ fn run_schedule_cmd(reg: &crate::framework::Registry, cmd: ScheduleCommand) -> R
             // every time it ran, visible only in the journal.
             (def.compile_fn)(parsed)
                 .map_err(|e| anyhow!("recipe '{recipe}' rejects these --args: {e}"))?;
-            schedule::install(&recipe, &calendar, &args).map_err(|e| anyhow!("{e}"))?;
+            // The same up-front tenant checks as `recipe run`: a tenant the
+            // quota policy does not know would refuse every firing.
+            let tenant = crate::tenant::Tenant::parse(&tenant)
+                .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
+            crate::config::tenants::TenantQuotaPolicy::load()?
+                .fraction_for(&tenant)
+                .map_err(|e| anyhow!("{e}"))?;
+            let options = schedule::ScheduleOptions {
+                tenant: Some(tenant.to_string()),
+                shared_cache,
+                no_cache,
+                sync_io,
+                experiment,
+            };
+            let carried = schedule::install_with(&recipe, &calendar, &args, &options)
+                .map_err(|e| anyhow!("{e}"))?;
             eprintln!("installed timer blut-{recipe}.timer (OnCalendar={calendar})");
+            eprintln!("runs as: recipe run {recipe} --tenant {tenant} (and the flags given)");
+            if carried.is_empty() {
+                eprintln!("environment: none of the carried variables is set here");
+            } else {
+                eprintln!("environment: {}", carried.join(", "));
+            }
             eprintln!("inspect: systemctl --user list-timers | grep {recipe}");
             Ok(())
         }
@@ -3234,9 +3467,121 @@ fn dir_size_bytes(path: &std::path::Path) -> Result<u64> {
 /// Persist the plan STRUCTURE for the DAG backend (`blut dag`). Best-effort: a
 /// snapshot write must NEVER fail or delay the actual run, so errors only warn.
 /// Call with `&plan` BEFORE `execute_plan` moves it.
+/// A one-stage cookbook for CLI tests that launch, publish or promote a real
+/// (tiny) plan: one in-process stage producing an inline artifact.
+#[cfg(test)]
+mod toy_plan {
+    use crate::backends::LamuTrainerBackend;
+    use crate::framework::Compatible;
+    use crate::framework::artifact::{Artifact, ContentHash};
+    use crate::framework::cookbook::Cookbook;
+    use crate::framework::error::StageError;
+    use crate::framework::resource::Resource;
+    use crate::framework::stage::{ErasedStageCtor, Stage, StageContext};
+    use crate::recipes::recipe::RecipeDef;
+    use async_trait::async_trait;
+    use serde::{Deserialize, Serialize};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct Unit;
+    impl Artifact for Unit {
+        const KIND: &'static str = "cli_toy.unit";
+        const SCHEMA: u32 = 1;
+        const INLINE: bool = true;
+        fn content_hash(&self) -> ContentHash {
+            ContentHash::of_bytes(b"cli_toy.unit")
+        }
+        fn primary_path(&self) -> &Path {
+            Path::new(".")
+        }
+    }
+
+    #[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+    struct ToyArgs {
+        #[serde(default)]
+        n: u32,
+    }
+
+    struct MakeUnit;
+    impl Compatible<LamuTrainerBackend> for MakeUnit {}
+    #[async_trait]
+    impl Stage for MakeUnit {
+        const NAME: &'static str = "cli_toy_make_unit";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = ();
+        type Output = Unit;
+        type Args = ToyArgs;
+        async fn run(&self, _c: &StageContext, _i: (), _a: &ToyArgs) -> Result<Unit, StageError> {
+            Ok(Unit)
+        }
+    }
+
+    static ERASED: &[(&str, ErasedStageCtor)] = &[("cli_toy_make_unit", || Arc::new(MakeUnit))];
+    static NO_RECIPES: &[&RecipeDef] = &[];
+    struct ToyCookbook;
+    impl Cookbook for ToyCookbook {
+        fn name(&self) -> &'static str {
+            "cli_toy"
+        }
+        fn recipes(&self) -> &'static [&'static RecipeDef] {
+            NO_RECIPES
+        }
+        fn stages_erased(&self) -> &'static [(&'static str, ErasedStageCtor)] {
+            ERASED
+        }
+    }
+
+    /// A registry holding only the toy cookbook.
+    pub(super) fn registry() -> crate::framework::Registry {
+        let mut reg = crate::framework::Registry::new();
+        reg.register(Box::new(ToyCookbook));
+        reg
+    }
+
+    /// A one-node spec named `name`.
+    pub(super) fn spec(name: &str) -> crate::framework::plan_spec::PlanSpec {
+        spec_with(name, 0)
+    }
+
+    /// A one-node spec whose stage arg `n` makes its fingerprint distinct.
+    pub(super) fn spec_with(name: &str, n: u32) -> crate::framework::plan_spec::PlanSpec {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "version": 1,
+            "edges": [],
+            "nodes": [{"stage": "cli_toy_make_unit", "args": {"n": n}}],
+        }))
+        .expect("toy spec")
+    }
+}
+
 fn persist_plan_graph(plan: &crate::framework::CompiledPlan, job_dir: &std::path::Path) {
+    persist_plan_graph_named(plan, job_dir, None);
+}
+
+/// [`persist_plan_graph`], with the graph named `name` (the name the run is
+/// recorded under in the lineage index) instead of the plan's own name.
+fn persist_plan_graph_as(
+    plan: &crate::framework::CompiledPlan,
+    job_dir: &std::path::Path,
+    name: &str,
+) {
+    persist_plan_graph_named(plan, job_dir, Some(name));
+}
+
+fn persist_plan_graph_named(
+    plan: &crate::framework::CompiledPlan,
+    job_dir: &std::path::Path,
+    name: Option<&str>,
+) {
     match plan.graph_structure() {
-        Ok(g) => {
+        Ok(mut g) => {
+            if let Some(name) = name {
+                g.name = name.to_string();
+            }
             if let Err(e) = g.write_to(job_dir) {
                 eprintln!("warning: could not write plan.json (blut dag unavailable): {e}");
             }

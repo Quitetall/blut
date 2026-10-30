@@ -98,8 +98,38 @@ Items 1-5 and 8 were resolved after this pass (owner decisions for 1-3):
 the promotion history), 3 by `f332d70` (runtime and freshness judge the newest
 run per tenant), 4 by `6dcb2c3`, 5 by `934b929` (the contract is documented;
 `JsonlArtifact::from_file` makes the adapter one call) and 8 by `b391db8`
-(every wait in `tests/conditional_execution.rs` is bounded). They are kept
-below as found.
+(every wait in `tests/conditional_execution.rs` is bounded). The rest were
+resolved in a follow-up pass, except 6 (owner decision, open):
+
+- **8, the p2p flake** (`b880856`): not state shared between tests but a
+  dial race inside the test. B and C also gossiped with room for 32 peers,
+  learned D from A's next exchange and dialed it; when B's dial reached D
+  first, D's accept path registered B as `Anonymous`, as it does every inbound
+  peer. B and C now dial only their seed. With 160 concurrent runs the old
+  topology failed 29/160 and 3/160 (all on that assertion), the new one 0/320.
+- **9** (`fc308a6`, `b205d4b`): a scheduled unit carries `--tenant`, the
+  cache and I/O flags given, the installer's working directory, and the
+  allow-listed environment (`schedule::ENVIRONMENT_ALLOWLIST`, no
+  credentials). A throwaway timer was enabled in the real user manager, its
+  service started once (tenant, experiment, working directory, state
+  locations and shared cache as installed; no canary variable), and removed
+  with nothing left behind. A stub Python trainer stage showed `log` and the
+  `jobs` loss columns empty for every plan launch: trainer progress arrives as
+  `stage_step` events, which `read_status` did not read. Both now show it, and
+  the `jobs` output column is the job's recipe. Footprint calibration is still
+  not exercisable through the engine alone: a test stage declares an envelope
+  cheaply, but the engine only reads the measured-peak store; entries are
+  written by a cookbook runner that measures its child's peak, so `footprint
+  list` stays empty.
+- **10** (`c24b889`, `1abc203`, `e54a91f`): `ledger show` renders text;
+  `plan promote` takes an unambiguous fingerprint prefix and refuses an
+  ambiguous one; the plan registry verbs validate `--tenant`; a declared
+  non-portable output (`check_jsonl`, `load_dataset`) is logged at debug.
+- Found while resolving 1: an SLA rule could not name the recipe a pointer
+  launch records, `registry://plan@<name>`, and `lineage reindex` rebuilt
+  such runs under the spec's name. Both fixed (`386d9ac`).
+
+They are kept below as found.
 
 1. **Owner decision — deployment tenant vs run tenant.** `plan publish` and
    `plan promote` default to tenant `shared`; `recipe declare` defaults to

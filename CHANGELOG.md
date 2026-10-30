@@ -11,6 +11,16 @@ depend on this crate.
 ## [Unreleased]
 
 ### Added
+- `schedule install` takes `--tenant`, `--shared-cache`, `--no-cache`,
+  `--sync-io` and `--experiment`, passed to the scheduled `recipe run`; the
+  tenant is checked against the quota policy at install, as `recipe run`
+  checks it. Library: `schedule::install_with` with `ScheduleOptions`, and
+  `schedule::ENVIRONMENT_ALLOWLIST`; `schedule::install` is unchanged in
+  signature.
+- `plan promote` takes an unambiguous prefix of a deployment fingerprint, as
+  other commands take job ids and content hashes; a prefix matching no
+  deployment or several is refused. `registry_db::resolve_fingerprint` does the
+  resolution.
 - `checks::JsonlArtifact::from_file(path)`, and documentation of the checks
   stages' input contract: `check_jsonl` and `assert` take only `checks.jsonl`,
   so a cookbook guards its own JSONL by emitting `JsonlArtifact` or through a
@@ -106,6 +116,17 @@ depend on this crate.
   resume_blocker}`.
 
 ### Changed
+- `blut jobs`' `output` column is now `recipe`: the recipe, deploy pointer or
+  plan name the job ran (from its resume marker or `plan.json`), else a legacy
+  single-trainer job's output name. The output name is set only by that legacy
+  launch, so the column read `-` for every job a recipe ran. `--json` rows gain
+  `recipe`; `output_name` is unchanged.
+- A stage output whose artifact type declares external paths
+  (`ALLOW_EXTERNAL_PATHS`, such as `checks.jsonl` and `dataset.jsonl`) is
+  logged as "not portable and will not be cached" at debug instead of as a
+  warning: it is the type's declared contract, and the warning was printed on
+  every run of `check_jsonl`, `load_dataset` and the like. The output's sidecar
+  still records `persisted: false`.
 - **Behaviour change:** `plan publish`, `plan promote`, `plan rollback` and
   `plan history` default to tenant `default` (was `shared`), the tenant
   `recipe declare`/`recipe run`, `plan run`, the model registry and sensord
@@ -177,6 +198,45 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- A scheduled unit ran a different launch from the interactive one: it carried
+  no tenant, no cache flags, no working directory and none of the installer's
+  environment, so a timer ran under `default`, with a private cache, from the
+  user manager's directory, against the default data, jobs, registry and
+  catalog locations. The service now passes `--tenant` (always) and the
+  launch flags given, sets `WorkingDirectory=` to the installer's directory,
+  and sets `Environment=` for each variable of
+  `schedule::ENVIRONMENT_ALLOWLIST` that is set (state locations such as
+  `LAMU_TRAIN_DATA_DIR`, `LAMU_TRAIN_JOBS_DIR`, `BLUT_CHECKPOINTS_DIR`,
+  `BLUT_REGISTRY_DB` and `BLUT_CATALOG_DB`, the remote cache location, the
+  policy files, the interpreter, device and containment selection). Nothing
+  outside the list is copied, so credentials (`AWS_*`, API keys, tokens) never
+  reach a unit file, and a `BLUT_REMOTE_CACHE` URL with userinfo, a query or a
+  fragment is refused.
+- `blut log` printed only "no trainer progress" and `blut jobs` no step, loss or
+  final loss for every job a recipe ran. A plan launch records trainer progress
+  as `stage_step` events (a trainer stage forwards each `StatusUpdate` its
+  trainer prints), and `jobs::read_status` read only bare update lines. It now
+  also returns the updates stages forwarded, which the TUI's log pane reads
+  too. When more than one stage reported progress, `blut log` prefixes each
+  line with the stage (`[1 train] step 3/10 …`), and `blut log --json` lines
+  carry `node_idx` and `stage_name`.
+- `plan publish --tenant` stored any string, so a deployment could be published
+  under a tenant no run can resolve (`a b`, `../x`). `plan publish`, `promote`,
+  `rollback` and `history` parse `--tenant` like every other tenant input and
+  use its canonical form (` lab/vision ` is `lab/vision`).
+- `ledger show` printed each record as Rust `Debug`
+  (`RunStarted { schema: "blut.run-ledger/v1", … }`). It prints one line per
+  record (time in UTC, recipe, intent, tenant, outcome, tier, duration,
+  promotion reason) with the run identity fields each record adds indented
+  below it; `--json` is unchanged.
+- An SLA rule could not select runs launched from a deploy pointer: such a run
+  is recorded under the recipe `registry://plan@<name>`, and a rule's `recipe`
+  refused that URI, so only a rule with no recipe (matching every run) judged
+  them. A rule's `recipe` may now be the pointer URI. `lineage reindex` also
+  rebuilt such a run under the published spec's name (refusing it as a recipe
+  change when the run was already indexed); a pointer launch's `plan.json` now
+  carries the URI it ran under, so `blut dag` shows it and a rebuilt index
+  matches the live one.
 - `lineage card` and `lineage graph` attributed an artifact to the newest job
   holding it, often a cache-hit job that never produced it, so a model card
   showed none of the training run's metrics. The index records whether each

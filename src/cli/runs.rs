@@ -307,12 +307,39 @@ pub(super) fn run_dag(job: Option<String>, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// What a job ran: its recipe (from the resume marker a registry recipe
+/// writes, else the plan graph every plan launch writes, which is also what
+/// the lineage index records), else a legacy single-trainer job's output name.
+/// The `jobs` column showed only that output name, which no plan launch has,
+/// so it read `-` for every job a recipe ran.
+fn job_recipe(job: &jobs::JobSummary) -> Option<String> {
+    let dir = crate::paths::job_dir(&job.id).ok();
+    dir.as_deref()
+        .and_then(|dir| RecipeMarker::read_from(dir).ok().map(|marker| marker.name))
+        .or_else(|| {
+            dir.as_deref()
+                .and_then(crate::framework::PlanGraph::read_from)
+                .map(|graph| graph.name)
+        })
+        .or_else(|| job.output_name.clone())
+}
+
 pub(super) fn run_jobs(json: bool) -> Result<()> {
     let jobs = jobs::list_jobs()?;
     if json {
-        // JobSummary derives Serialize — emit the array verbatim so a
-        // script/agent gets the same data the table renders.
-        emit_json(&jobs)?;
+        // JobSummary derives Serialize; each object also carries the `recipe`
+        // the table renders, so a script/agent gets the same data.
+        let rows = jobs
+            .iter()
+            .map(|job| {
+                let mut row = serde_json::to_value(job)?;
+                if let Some(object) = row.as_object_mut() {
+                    object.insert("recipe".into(), serde_json::json!(job_recipe(job)));
+                }
+                Ok(row)
+            })
+            .collect::<serde_json::Result<Vec<_>>>()?;
+        emit_json(&rows)?;
         return Ok(());
     }
     if jobs.is_empty() {
@@ -321,7 +348,7 @@ pub(super) fn run_jobs(json: bool) -> Result<()> {
     }
     println!(
         "{:<25} {:<10} {:<8} {:<24} last",
-        "id", "state", "pid", "output"
+        "id", "state", "pid", "recipe"
     );
     for j in jobs {
         let last = match (j.last_step, j.last_loss, j.final_loss) {
@@ -340,13 +367,13 @@ pub(super) fn run_jobs(json: bool) -> Result<()> {
             })
             .map(|p| p.to_string())
             .unwrap_or_else(|| "-".into());
-        let output = j.output_name.unwrap_or_else(|| "-".into());
+        let recipe = job_recipe(&j).unwrap_or_else(|| "-".into());
         println!(
             "{:<25} {:<10} {:<8} {:<24} {}",
             j.id,
             j.state.as_str(),
             pid,
-            output,
+            recipe,
             last
         );
     }
@@ -402,30 +429,60 @@ fn empty_log_hint(id: &str) -> Result<String> {
     })
 }
 
+/// The trainer progress of a job as `blut log` prints it: [`jobs::render_log`]
+/// lines, each prefixed with the stage that forwarded it when more than one
+/// stage did (the trials of an HPO run, say), so interleaved progress stays
+/// attributable.
+fn render_progress(progress: &[jobs::Progress]) -> String {
+    let sources: std::collections::BTreeSet<_> =
+        progress.iter().filter_map(|p| p.source.as_ref()).collect();
+    if sources.len() < 2 {
+        let updates: Vec<_> = progress.iter().map(|p| p.update.clone()).collect();
+        return jobs::render_log(&updates);
+    }
+    let mut out = String::new();
+    for p in progress {
+        let prefix = match &p.source {
+            Some((idx, stage)) => format!("[{idx} {stage}] "),
+            None => String::new(),
+        };
+        for line in jobs::render_log(std::slice::from_ref(&p.update)).lines() {
+            out.push_str(&prefix);
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 pub(super) fn run_log(id_query: &str, tail: usize, json: bool) -> Result<()> {
     let id = jobs::resolve_job_id(id_query)?;
-    let updates = jobs::read_status(&id)?;
-    if updates.is_empty() {
+    let progress = jobs::read_progress(&id)?;
+    if progress.is_empty() {
         eprintln!("{}", empty_log_hint(&id)?);
         return Ok(());
     }
     if json {
-        // Raw status stream as JSON lines (one StatusUpdate per line),
-        // tail-trimmed like the rendered view.
+        // Status stream as JSON lines (one StatusUpdate per line), tail-trimmed
+        // like the rendered view. An update a stage forwarded also names it
+        // (`node_idx`, `stage_name`).
         let start = if tail == 0 {
             0
         } else {
-            updates.len().saturating_sub(tail)
+            progress.len().saturating_sub(tail)
         };
-        for u in &updates[start..] {
-            println!(
-                "{}",
-                serde_json::to_string(u).map_err(|e| anyhow!("serialize status: {e}"))?
-            );
+        for p in &progress[start..] {
+            let mut line =
+                serde_json::to_value(&p.update).map_err(|e| anyhow!("serialize status: {e}"))?;
+            if let (Some((idx, stage)), Some(object)) = (&p.source, line.as_object_mut()) {
+                object.insert("node_idx".into(), serde_json::json!(idx));
+                object.insert("stage_name".into(), serde_json::json!(stage));
+            }
+            println!("{line}");
         }
         return Ok(());
     }
-    let rendered = jobs::render_log(&updates);
+    let rendered = render_progress(&progress);
     if tail == 0 {
         print!("{rendered}");
     } else {
@@ -436,6 +493,110 @@ pub(super) fn run_log(id_query: &str, tail: usize, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod progress_render_tests {
+    use super::{job_recipe, render_progress};
+    use crate::jobs::{JobState, JobSummary, Progress};
+    use crate::protocol::StatusUpdate;
+
+    fn step(source: Option<(u32, &str)>, step: u32, loss: f32) -> Progress {
+        Progress {
+            source: source.map(|(idx, stage)| (idx, stage.to_string())),
+            update: StatusUpdate::Step {
+                step,
+                total: 2,
+                loss,
+                lr: 0.001,
+                vram_mb: 0,
+            },
+        }
+    }
+
+    /// One trainer stage renders as before; the interleaved progress of two
+    /// (the trials of an HPO run) says which stage each line came from.
+    #[test]
+    fn interleaved_progress_names_its_stage() {
+        let one = render_progress(&[step(Some((0, "train")), 1, 2.0), step(None, 2, 1.0)]);
+        assert_eq!(
+            one,
+            "step 1/2  loss=2.0000  lr=1.00e-3  vram=0MB\nstep 2/2  loss=1.0000  lr=1.00e-3  vram=0MB\n"
+        );
+        let two = render_progress(&[
+            step(Some((1, "train")), 1, 2.0),
+            step(Some((2, "train")), 1, 3.0),
+        ]);
+        assert_eq!(
+            two,
+            "[1 train] step 1/2  loss=2.0000  lr=1.00e-3  vram=0MB\n\
+             [2 train] step 1/2  loss=3.0000  lr=1.00e-3  vram=0MB\n"
+        );
+    }
+
+    /// The `jobs` column showed only a legacy single-trainer output name, so
+    /// it read `-` for every job a recipe ran.
+    #[test]
+    fn a_jobs_row_names_the_recipe_the_job_ran() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("LAMU_TRAIN_JOBS_DIR");
+        // SAFETY: TEST_ENV_LOCK serializes env mutation; restored below.
+        unsafe { std::env::set_var("LAMU_TRAIN_JOBS_DIR", td.path()) };
+        let summary = |id: &str, output_name: Option<&str>| JobSummary {
+            id: id.into(),
+            state: JobState::Done,
+            pid: None,
+            output_name: output_name.map(str::to_string),
+            last_loss: None,
+            last_step: None,
+            final_loss: None,
+        };
+        let marked = td.path().join("20261030-000000-000000001");
+        std::fs::create_dir_all(&marked).unwrap();
+        super::RecipeMarker {
+            name: "registry_recipe".into(),
+            args: serde_json::json!({}),
+            source_args: None,
+            resolved_handles: Default::default(),
+            launcher: None,
+        }
+        .write_to(&marked)
+        .unwrap();
+        let planned = td.path().join("20261030-000000-000000002");
+        std::fs::create_dir_all(&planned).unwrap();
+        crate::framework::PlanGraph {
+            name: "registry://plan@prod".into(),
+            nodes: vec![],
+            edges: vec![],
+            condition_gates: vec![],
+        }
+        .write_to(&planned)
+        .unwrap();
+        let got = [
+            job_recipe(&summary("20261030-000000-000000001", None)),
+            job_recipe(&summary("20261030-000000-000000002", None)),
+            job_recipe(&summary("20261030-000000-000000003", Some("legacy-out"))),
+            job_recipe(&summary("20261030-000000-000000004", None)),
+        ];
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("LAMU_TRAIN_JOBS_DIR", v),
+                None => std::env::remove_var("LAMU_TRAIN_JOBS_DIR"),
+            }
+        }
+        assert_eq!(
+            got,
+            [
+                Some("registry_recipe".to_string()),
+                Some("registry://plan@prod".to_string()),
+                Some("legacy-out".to_string()),
+                None,
+            ]
+        );
+    }
 }
 
 #[cfg(test)]

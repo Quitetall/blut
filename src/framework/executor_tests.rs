@@ -1466,6 +1466,78 @@ async fn external_reference_succeeds_without_entering_portable_cache() {
     assert_eq!(rerun.n_cache_misses, 1);
 }
 
+/// Records every event's level and message on the thread it is installed on.
+#[derive(Clone, Default)]
+struct CapturedEvents(Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedEvents {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((*event.metadata().level(), message.0));
+    }
+}
+
+/// A declared external reference (`ALLOW_EXTERNAL_PATHS`) was logged as a
+/// warning on every run: `check_jsonl` and `load_dataset` said "not portable
+/// and will not be cached" each time, for an outcome their artifact types
+/// declare. It is still recorded, at debug.
+#[tokio::test]
+async fn a_declared_external_reference_is_not_a_warning() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let external = tempfile::tempdir().unwrap();
+    let external_path = external.path().join("corpus.bin");
+    std::fs::write(&external_path, b"externally managed corpus").unwrap();
+    let (_job, ctx) = fresh_ctx();
+    let plan = Plan::<(), LamuTrainerBackend>::new("external", serde_json::json!({}))
+        .start(
+            MakeExternalRef,
+            ExternalArgs {
+                path: external_path,
+            },
+        )
+        .finish()
+        .into_compiled();
+    let events = CapturedEvents::default();
+    let subscriber = tracing_subscriber::registry().with(events.clone());
+    let result = {
+        // The test runtime is current-thread, so the executor's events are
+        // emitted on this thread, where the subscriber is installed.
+        let _scope = tracing::subscriber::set_default(subscriber);
+        SequentialExecutor::execute(plan, ctx).await.unwrap()
+    };
+    assert_eq!(result.n_cache_misses, 1);
+    let events = events.0.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let not_portable: Vec<_> = events
+        .iter()
+        .filter(|(_, message)| message.contains("not portable"))
+        .collect();
+    assert_eq!(not_portable.len(), 1, "still recorded once: {events:?}");
+    assert_eq!(not_portable[0].0, tracing::Level::DEBUG, "{events:?}");
+    assert!(
+        events
+            .iter()
+            .all(|(level, _)| *level > tracing::Level::WARN),
+        "no warning for a declared outcome: {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn external_reference_identity_safely_keys_downstream_cache() {
     let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
