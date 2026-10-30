@@ -80,10 +80,13 @@ step 0. Three ways to get there:
   requeued run resumes without waiting for the old heartbeat to go stale.
 - **`plan resume`.** After the BLUT process or its host dies, `blut-core plan
   resume <job>` reruns the plan; finished stages come from the cache and the
-  training stage resumes. Killing only the BLUT process does not stop its
-  `srun` step: the training keeps running, and `plan resume` refuses the slot
-  while that trainer's heartbeat is fresh, naming its PID and host. `scancel`
-  the step (or wait for it) and resume again.
+  training stage resumes. Killing only the BLUT process does not stop the
+  Slurm job its `srun` started: the training keeps running. The job directory
+  records the name of every Slurm job its stages started
+  (`blut-<job id>-<node index>`, from `StageContext::slurm_job_name`), so
+  `plan resume` refuses while one is still queued or running and names it,
+  and `blut cancel <job>` `scancel`s it, also after the BLUT process is gone.
+  Cancel, then resume.
 - **Retry.** `train_attempts: 2` (or more) retries the training stage in the
   same BLUT process. A retry's `srun` waits until enough nodes are back, then
   resumes.
@@ -91,6 +94,11 @@ step 0. Three ways to get there:
 Checkpoints live under `$BLUT_CHECKPOINTS_DIR`, by default beside the jobs
 directory. Only rank 0 reads and writes them, so it needs to be on rank 0's
 node; on a cluster, put it on the shared filesystem with the job directories.
+
+When an attempt fails under `--launcher slurm`, the engine cancels the Slurm
+job of that attempt by name: killing `srun` does not end the job, and a retry
+must not share the nodes with a leftover trainer. A stage that names its job
+some other way should record the name with `jobs::record_slurm_job_name`.
 
 ## What has been run
 

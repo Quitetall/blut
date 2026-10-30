@@ -18,7 +18,7 @@
 //! the same second don't collide. Stable sort order matches start
 //! time when listing.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -158,8 +158,13 @@ pub(crate) struct LaunchProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_sha: Option<String>,
     /// The engine build commit (`BLUT_GIT_HASH`) of the binary that launched
-    /// the job. This is the commit folded into every stage cache key.
+    /// the job.
     pub blut_build: String,
+    /// The code identity folded into every stage cache key: the engine and
+    /// each registered cookbook by name, version, build commit and dirty
+    /// digest. Absent on jobs launched before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_identity: Option<crate::framework::code_identity::CodeIdentity>,
     /// Unix seconds when execution started.
     pub started_unix: i64,
 }
@@ -176,6 +181,7 @@ pub(crate) fn write_provenance(job_id: &str, git_sha: Option<String>) -> Result<
     let record = LaunchProvenance {
         git_sha,
         blut_build: env!("BLUT_GIT_HASH").to_string(),
+        code_identity: Some(crate::framework::code_identity::current().clone()),
         started_unix: chrono::Utc::now().timestamp(),
     };
     let body = serde_json::to_vec_pretty(&record)
@@ -665,16 +671,125 @@ pub async fn cancel_job(job_id: &str, grace: std::time::Duration) -> Result<()> 
         state,
         Some(JobState::Done | JobState::Failed | JobState::Cancelled)
     ) {
+        // Nothing local is left, but a Slurm job its stage started can be.
+        stop_slurm_jobs(job_id);
         return Ok(());
     }
     let pid = read_pid(job_id)?;
     if let Some(pid) = pid {
         crate::python_kill::graceful_kill_pid(pid, grace).await;
     }
+    stop_slurm_jobs(job_id);
     let _ = write_state(job_id, JobState::Cancelled);
     let _ = clear_pid(job_id);
     let _ = clear_driver(job_id);
     Ok(())
+}
+
+/// File listing, one per line, the Slurm job names a job's stages were told
+/// to use ([`slurm_job_name`]).
+const SLURM_JOBS_FILE: &str = "slurm_jobs";
+
+/// The Slurm job name for node `node_idx` of the job in `job_dir`:
+/// `blut-<job id>-<node index>`.
+pub fn slurm_job_name(job_dir: &Path, node_idx: u32) -> String {
+    let job = job_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("blut-{job}-{node_idx}")
+}
+
+/// Record `name` in the job directory, once.
+pub fn record_slurm_job_name(job_dir: &Path, name: &str) -> Result<()> {
+    let path = job_dir.join(SLURM_JOBS_FILE);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|l| l == name) {
+        return Ok(());
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|source| TrainError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    use std::io::Write;
+    writeln!(f, "{name}").map_err(|source| TrainError::Io { path, source })
+}
+
+/// The Slurm job names recorded for `job_id`.
+pub fn slurm_job_names(job_id: &str) -> Result<Vec<String>> {
+    let path = paths::jobs_dir()?.join(job_id).join(SLURM_JOBS_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(body) => Ok(body
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(source) => Err(TrainError::Io { path, source }),
+    }
+}
+
+/// Slurm jobs still queued or running under a name recorded for `job_id`:
+/// `(name, ids)` for each name that has any.
+pub fn live_slurm_jobs(job_id: &str) -> Result<Vec<(String, Vec<String>)>> {
+    let mut live = Vec::new();
+    for name in slurm_job_names(job_id)? {
+        let ids = crate::config::launcher::slurm_jobs_named(&name)?;
+        if !ids.is_empty() {
+            live.push((name, ids));
+        }
+    }
+    Ok(live)
+}
+
+/// Why `plan resume` must not start yet: a Slurm job a stage of `job_id`
+/// started is still queued or running. `None` when there is none.
+pub fn slurm_resume_blocker(job_id: &str) -> Result<Option<String>> {
+    let live = live_slurm_jobs(job_id)?;
+    if live.is_empty() {
+        return Ok(None);
+    }
+    let list = live
+        .iter()
+        .map(|(name, ids)| format!("{} ({name})", ids.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Ok(Some(format!(
+        "job {job_id} still has Slurm job(s) running that its stages started: {list}. \
+         Stop them with `blut cancel {job_id}`, or wait for them to finish, then resume"
+    )))
+}
+
+/// `scancel` every Slurm job still running under a name recorded for
+/// `job_id`. Returns the ids cancelled.
+pub fn cancel_slurm_jobs(job_id: &str) -> Result<Vec<String>> {
+    let mut cancelled = Vec::new();
+    for name in slurm_job_names(job_id)? {
+        cancelled.extend(crate::config::launcher::scancel_named(&name)?);
+    }
+    Ok(cancelled)
+}
+
+/// `scancel` the job's recorded Slurm jobs and say what happened. A Slurm job
+/// keeps running when the process that started it is killed (killing `srun`
+/// does not end the job), so stopping a BLUT job has to stop it too.
+fn stop_slurm_jobs(job_id: &str) {
+    if slurm_job_names(job_id)
+        .map(|n| n.is_empty())
+        .unwrap_or(true)
+    {
+        return;
+    }
+    match cancel_slurm_jobs(job_id) {
+        Ok(ids) if ids.is_empty() => {}
+        Ok(ids) => eprintln!("cancelled Slurm job(s) {} of {job_id}", ids.join(", ")),
+        Err(e) => eprintln!("warning: could not stop the Slurm jobs of {job_id}: {e}"),
+    }
 }
 
 /// File naming the blut process that executes a job in-process.

@@ -551,11 +551,19 @@ enum CacheCommand {
     /// Show the global cache path + current size.
     Show,
     /// LRU-prune the global cache to fit under `max_gb` (or the
-    /// `LAMU_CACHE_MAX_GB` env var, or 50 GiB by default).
+    /// `LAMU_CACHE_MAX_GB` env var, or 50 GiB by default), and delete
+    /// mid-stage checkpoint slots nothing has used for
+    /// `--checkpoint-max-age-hours`. A slot whose stage is running, or whose
+    /// trainer may still be alive, is never deleted.
     Prune {
         /// Cap in GiB. Overrides `LAMU_CACHE_MAX_GB`.
         #[arg(long)]
         max_gb: Option<f64>,
+        /// Delete checkpoint slots unused for this many hours (default one
+        /// week). They hold the progress of stages that failed and were not
+        /// resumed.
+        #[arg(long, default_value_t = 168)]
+        checkpoint_max_age_hours: u64,
     },
     /// Per-ingredient cache hit/miss tally for a job (from its status.jsonl).
     Stats {
@@ -1144,6 +1152,23 @@ pub type ConsoleFn = fn(
     std::sync::Arc<crate::framework::Registry>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>>>>;
 
+/// Fix the code identity every stage cache key folds
+/// ([`crate::framework::code_identity`]) from the registered cookbooks, before
+/// anything computes a key. A cookbook without an identity is named, because
+/// the cache cannot tell its builds apart.
+fn install_code_identity(reg: &crate::framework::Registry) {
+    let identity = reg.code_identity();
+    for name in &identity.unidentified {
+        tracing::warn!(
+            "cookbook '{name}' supplies no build identity (Cookbook::identity), so cached \
+             stage outputs survive changes to its code; rebuilds of it can reuse stale results"
+        );
+    }
+    if let Err(in_force) = crate::framework::code_identity::install(identity) {
+        tracing::warn!("cache code identity was already fixed as {in_force}; keeping it");
+    }
+}
+
 /// BLUT CLI entrypoint. The recipe catalog is supplied by the caller as
 /// a composed [`crate::framework::cookbook::Registry`] (the binary — in a cookbook crate — registers
 /// the cookbooks it ships and passes them here). This is the library seam that
@@ -1165,6 +1190,7 @@ pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>)
     // ADR 0112: the built-in `connectors` cookbook so an integration graph
     // (`blut recipe declare s3_roundtrip.json`) resolves + kind-checks.
     crate::connectors::register(&mut reg);
+    install_code_identity(&reg);
     let cli = Cli::parse();
     let result = match cli.command {
         Some(Command::Jobs { json }) => run_jobs(json),
@@ -2027,6 +2053,12 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                      or stop it with `blut cancel {job_id}`, then resume"
                 ));
             }
+            // A Slurm job its stage started survives the BLUT process that
+            // started it; resuming next to it would put two trainers on one
+            // job's work.
+            if let Ok(Some(why)) = crate::jobs::slurm_resume_blocker(&job_id) {
+                return Err(anyhow!(why));
+            }
             let job_dir =
                 paths::job_dir(&job_id).with_context(|| format!("resolve job dir for {job_id}"))?;
             let marker = RecipeMarker::read_from(&job_dir)?;
@@ -2864,7 +2896,10 @@ fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
             println!("size: {}", human_bytes(size));
             Ok(())
         }
-        CacheCommand::Prune { max_gb } => {
+        CacheCommand::Prune {
+            max_gb,
+            checkpoint_max_age_hours,
+        } => {
             // Resolution order: --max-gb flag → $LAMU_CACHE_MAX_GB →
             // 50 GiB default. The default matches the plan's spec.
             let cap_gb = resolve_prune_cap_gb(max_gb, std::env::var_os("LAMU_CACHE_MAX_GB"))?;
@@ -2875,6 +2910,23 @@ fn run_cache_cmd(cmd: CacheCommand) -> Result<()> {
                 "pruned {} from {} (cap {cap_gb:.2} GiB)",
                 human_bytes(freed),
                 global.display(),
+            );
+            let root =
+                crate::framework::stage_checkpoint::checkpoints_root_for_jobs(&paths::jobs_dir()?);
+            let slots = crate::framework::stage_checkpoint::collect_slots(
+                &root,
+                std::time::Duration::from_secs(checkpoint_max_age_hours.saturating_mul(3600)),
+            )
+            .with_context(|| format!("collect checkpoint slots under {}", root.display()))?;
+            println!(
+                "checkpoint slots: removed {} ({}) from {}; kept {} in use, {} with a live \
+                 trainer, {} used in the last {checkpoint_max_age_hours} h",
+                slots.removed.len(),
+                human_bytes(slots.bytes_freed),
+                root.display(),
+                slots.kept_locked.len(),
+                slots.kept_live.len(),
+                slots.kept_recent.len(),
             );
             Ok(())
         }

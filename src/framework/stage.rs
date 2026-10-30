@@ -365,6 +365,17 @@ pub struct StageContext {
 }
 
 impl StageContext {
+    /// The Slurm job name a stage should give the job it starts
+    /// (`srun --job-name`, `sbatch --job-name`): `blut-<job id>-<node index>`.
+    ///
+    /// The executor records this name with the BLUT job whenever it runs a
+    /// stage under `--launcher slurm`, so `blut cancel` can stop, and
+    /// `plan resume` can see, a Slurm job that outlived the BLUT process that
+    /// started it. A stage that names its job otherwise is invisible to both.
+    pub fn slurm_job_name(&self) -> String {
+        crate::jobs::slurm_job_name(&self.job_dir, self.node_idx)
+    }
+
     /// Test-friendly constructor. `node_idx` defaults to 0 since
     /// most unit tests run a single stage at a time.
     pub fn for_test(job_dir: PathBuf, stage_dir: PathBuf) -> Self {

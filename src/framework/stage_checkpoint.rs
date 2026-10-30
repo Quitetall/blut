@@ -322,11 +322,9 @@ pub fn decide_slot(
             && p.slurm_job_id == me.slurm_job_id
             && p.slurm_restart_count.unwrap_or(0) < me.slurm_restart_count.unwrap_or(0)
     });
-    let same_host = m.host.is_some() && m.host == me.host;
-    let pid_gone = same_host && m.pid != 0 && alive(m.pid) == Some(false);
     let age = now_unix.saturating_sub(m.heartbeat_unix);
-    let stale = age >= stale_after_secs;
-    if !(same_invocation || requeued || pid_gone || stale) {
+    let gone = !writer_may_be_alive(m, me.host.as_deref(), now_unix, stale_after_secs, alive);
+    if !(same_invocation || requeued || gone) {
         return SlotDecision::Busy {
             reason: format!(
                 "trainer pid {} on {} (run {}) wrote a heartbeat {age}s ago; it may still be \
@@ -365,6 +363,153 @@ pub fn checkpoints_root(job_dir: &Path) -> PathBuf {
         }
         _ => job_dir.join(".checkpoints"),
     }
+}
+
+/// [`checkpoints_root`] for jobs kept in `jobs_dir` (what `cache prune`
+/// collects).
+pub fn checkpoints_root_for_jobs(jobs_dir: &Path) -> PathBuf {
+    checkpoints_root(&jobs_dir.join("job"))
+}
+
+/// What [`collect_slots`] found and did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SlotCollection {
+    /// Slots deleted, and the bytes they held.
+    pub removed: Vec<PathBuf>,
+    /// Bytes freed by the deletions.
+    pub bytes_freed: u64,
+    /// Locked by a running BLUT process.
+    pub kept_locked: Vec<PathBuf>,
+    /// Their trainer may still be running (fresh heartbeat, or its PID is
+    /// alive on this host).
+    pub kept_live: Vec<PathBuf>,
+    /// Used more recently than the age bound.
+    pub kept_recent: Vec<PathBuf>,
+}
+
+/// Delete checkpoint slots under `root` that nothing has used for `max_age`.
+///
+/// A slot is left alone while another process holds its lock (a BLUT process
+/// is running that stage), while its trainer may still be alive by the same
+/// rules [`decide_slot`] uses, and while its newest file or heartbeat is
+/// younger than `max_age`. Slots of stages that finished are deleted when
+/// their output is committed, so what this collects is mostly the slots of
+/// stages that failed and were never resumed.
+pub fn collect_slots(root: &Path, max_age: std::time::Duration) -> std::io::Result<SlotCollection> {
+    collect_slots_with(
+        root,
+        max_age.as_secs(),
+        now_unix(),
+        crate::framework::resume::DEFAULT_STALE_AFTER_SECS,
+        hostname().as_deref(),
+        &pid_alive,
+    )
+}
+
+pub(crate) fn collect_slots_with(
+    root: &Path,
+    max_age_secs: u64,
+    now_unix: u64,
+    stale_after_secs: u64,
+    this_host: Option<&str>,
+    alive: &dyn Fn(u32) -> Option<bool>,
+) -> std::io::Result<SlotCollection> {
+    let mut out = SlotCollection::default();
+    let mut slots = Vec::new();
+    find_slots(root, 0, &mut slots)?;
+    slots.sort();
+    for dir in slots {
+        let Some(lease) = SlotLease::try_acquire(&dir)? else {
+            out.kept_locked.push(dir);
+            continue;
+        };
+        if let Some(m) = SlotMarker::read(&dir)
+            && m.status != "finished"
+            && writer_may_be_alive(&m, this_host, now_unix, stale_after_secs, alive)
+        {
+            out.kept_live.push(dir);
+            continue;
+        }
+        let last = last_activity(&dir)?;
+        if now_unix.saturating_sub(last) < max_age_secs {
+            out.kept_recent.push(dir);
+            continue;
+        }
+        let bytes = dir_bytes(&dir);
+        lease.remove()?;
+        out.bytes_freed += bytes;
+        out.removed.push(dir);
+    }
+    Ok(out)
+}
+
+/// Whether the process that wrote `m` may still be running: its heartbeat is
+/// fresh, unless it ran on this host under a PID that no longer exists.
+fn writer_may_be_alive(
+    m: &SlotMarker,
+    this_host: Option<&str>,
+    now_unix: u64,
+    stale_after_secs: u64,
+    alive: &dyn Fn(u32) -> Option<bool>,
+) -> bool {
+    let same_host = m.host.is_some() && m.host.as_deref() == this_host;
+    if same_host && m.pid != 0 && alive(m.pid) == Some(false) {
+        return false;
+    }
+    now_unix.saturating_sub(m.heartbeat_unix) < stale_after_secs
+}
+
+/// A slot is a directory holding the engine's lock or owner record or a
+/// trainer marker. Tenants nest at most two levels (`project/domain`).
+fn find_slots(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if [LOCK_FILE, OWNER_FILE, MARKER_FILE]
+            .iter()
+            .any(|f| path.join(f).exists())
+        {
+            out.push(path);
+        } else if depth < 2 {
+            find_slots(&path, depth + 1, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// The newest modification time among the slot's files, Unix seconds.
+fn last_activity(dir: &Path) -> std::io::Result<u64> {
+    let mut newest = 0u64;
+    for entry in std::fs::read_dir(dir)? {
+        let modified = entry?.metadata()?.modified()?;
+        let secs = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        newest = newest.max(secs);
+    }
+    Ok(newest)
+}
+
+fn dir_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .filter_map(|e| e.metadata().ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 /// The slot for one stage invocation: `<root>/<tenant>/<stage>-<cache key>`.
@@ -825,6 +970,103 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from(OWNER_FILE)]);
+    }
+
+    fn slot_with(root: &Path, name: &str, marker: Option<&SlotMarker>) -> PathBuf {
+        let dir = root.join("default").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("step-0000000010.pt"), vec![0u8; 100]).unwrap();
+        if let Some(m) = marker {
+            std::fs::write(dir.join(MARKER_FILE), serde_json::to_vec(m).unwrap()).unwrap();
+        }
+        dir
+    }
+
+    fn collect(
+        root: &Path,
+        max_age: u64,
+        now: u64,
+        alive: &dyn Fn(u32) -> Option<bool>,
+    ) -> SlotCollection {
+        collect_slots_with(root, max_age, now, STALE, Some("h0"), alive).unwrap()
+    }
+
+    fn file_age_now() -> u64 {
+        now_unix()
+    }
+
+    #[test]
+    fn an_old_abandoned_slot_is_collected_and_a_recent_one_kept() {
+        let td = tempfile::tempdir().unwrap();
+        // A crashed trainer: dead pid, old heartbeat.
+        let mut m = marker(Some(10), 1000, "a");
+        m.pid = 4242;
+        let old = slot_with(td.path(), "train-old", Some(&m));
+        let now = file_age_now();
+        // The files were just written, so with a 1-day bound nothing is old yet.
+        let kept = collect(td.path(), 86_400, now, &dead);
+        assert_eq!(kept.kept_recent, vec![old.clone()]);
+        assert!(old.exists());
+        // A day later, it goes.
+        let gone = collect(td.path(), 86_400, now + 86_400 + 1, &dead);
+        assert_eq!(gone.removed, vec![old.clone()]);
+        assert!(gone.bytes_freed >= 100);
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn a_slot_whose_trainer_may_be_alive_is_never_collected() {
+        let td = tempfile::tempdir().unwrap();
+        let now = file_age_now() + 10 * 86_400;
+        // Fresh heartbeat on another host.
+        let mut fresh = marker(Some(10), now - 5, "a");
+        fresh.host = Some("elsewhere".into());
+        let live = slot_with(td.path(), "train-live", Some(&fresh));
+        // Same host, PID alive, heartbeat fresh.
+        let local = slot_with(
+            td.path(),
+            "train-local",
+            Some(&marker(Some(10), now - 5, "b")),
+        );
+        let r = collect(td.path(), 0, now, &alive);
+        assert_eq!(r.kept_live, vec![live.clone(), local.clone()]);
+        assert!(r.removed.is_empty());
+        // The same host with the PID gone: collectable even with a fresh heartbeat.
+        let r = collect(td.path(), 0, now, &dead);
+        assert_eq!(r.removed, vec![local]);
+        assert_eq!(r.kept_live, vec![live]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_locked_slot_is_never_collected() {
+        let td = tempfile::tempdir().unwrap();
+        let dir = slot_with(td.path(), "train-locked", None);
+        let lease = SlotLease::try_acquire(&dir).unwrap().unwrap();
+        let r = collect(td.path(), 0, file_age_now() + 10 * 86_400, &dead);
+        assert_eq!(r.kept_locked, vec![dir.clone()]);
+        assert!(dir.join("step-0000000010.pt").exists());
+        drop(lease);
+        let r = collect(td.path(), 0, file_age_now() + 10 * 86_400, &dead);
+        assert_eq!(r.removed, vec![dir]);
+    }
+
+    #[test]
+    fn collection_finds_slots_under_nested_tenants_and_ignores_other_dirs() {
+        let td = tempfile::tempdir().unwrap();
+        let nested = td.path().join("lab").join("vision").join("train-x");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join(OWNER_FILE), b"{}").unwrap();
+        let unrelated = td.path().join("default").join("not-a-slot");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        let r = collect(td.path(), 0, file_age_now() + 86_400, &dead);
+        assert_eq!(r.removed, vec![nested]);
+        assert!(unrelated.exists());
+        // A missing root is an empty collection, not an error.
+        assert_eq!(
+            collect(&td.path().join("absent"), 0, 0, &dead),
+            SlotCollection::default()
+        );
     }
 
     #[test]

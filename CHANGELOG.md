@@ -46,8 +46,34 @@ depend on this crate.
   is deleted once the stage's output is in the cache. New module
   `framework::stage_checkpoint`; `ExecCtx::with_checkpoint_root` and
   `$BLUT_CHECKPOINTS_DIR` choose where slots live.
+- Cache keys identify the cookbook code that produced an entry
+  (`framework::code_identity`). A cookbook returns
+  `Some(blut::cookbook_identity!())` from the new `Cookbook::identity`, and
+  every stage key folds the engine's and each registered cookbook's crate
+  name, version, git commit and a digest of uncommitted changes. A cookbook
+  change re-runs its stages without a `SCHEMA` bump; a build from a dirty
+  tree never shares entries with the clean build or with another dirty
+  state; a crates.io build falls back to name and version. `cli::run`
+  installs the identity, warns about a cookbook that supplies none, and job
+  provenance records it. The engine's `build.rs` now stamps
+  `BLUT_GIT_DIRTY`. API.md, "Cache identity", has the `build.rs` contract.
+- `cache prune` also deletes checkpoint slots unused for
+  `--checkpoint-max-age-hours` (default 168), never one whose stage is
+  running or whose trainer may still be alive
+  (`stage_checkpoint::collect_slots`).
+- Slurm jobs a stage starts are named `blut-<job id>-<node index>`
+  (`StageContext::slurm_job_name`) and recorded with the BLUT job
+  (`jobs::record_slurm_job_name`). Killing `srun` does not end its Slurm job,
+  so: `blut cancel` now `scancel`s the job's recorded Slurm jobs, also after
+  the BLUT process that started them died; `plan resume` refuses while any of
+  them still runs and says to cancel them; and when an attempt fails under
+  `--launcher slurm`, the executor cancels the Slurm job of that attempt.
 
 ### Changed
+- Every cache key changes once: the engine build commit alone is replaced by
+  the code identity above. Existing entries miss on the first run.
+- A refused checkpoint slot reads `resume checkpoint busy: stage '<name>':
+  <holder>` instead of saying "busy" twice.
 - `blut-operator` moves to the engine's MSRV, Rust 1.88 (was 1.89), and from
   kube 0.96 to kube 4.0 / k8s-openapi 0.28 (Kubernetes 1.32 API). It is
   publishable (`publish = ["crates-io"]`, 0.2.0-alpha.2) but not yet published.

@@ -511,6 +511,62 @@ impl Launcher for SlurmLauncher {
     }
 }
 
+/// Slurm jobs queued or running under the job name `name`, by id, as
+/// `squeue` reports them.
+///
+/// BLUT names the Slurm job a stage starts after the BLUT job and the stage
+/// ([`crate::framework::stage::StageContext::slurm_job_name`]) and records the
+/// name with the job, so a step that outlived the BLUT process that started
+/// it can be found again ([`crate::jobs::live_slurm_jobs`]).
+pub fn slurm_jobs_named(name: &str) -> Result<Vec<String>> {
+    let out = Command::new("squeue")
+        .args(["--noheader", "--format=%i", &format!("--name={name}")])
+        .output()
+        .map_err(|e| TrainError::other(format!("squeue invocation failed: {e}")))?;
+    if !out.status.success() {
+        return Err(TrainError::other(format!(
+            "squeue --name={name} failed (exit {}): {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(parse_squeue_ids(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// `scancel` every Slurm job named `name`. Returns the ids it found first;
+/// empty when there was nothing to cancel.
+pub fn scancel_named(name: &str) -> Result<Vec<String>> {
+    let ids = slurm_jobs_named(name)?;
+    if ids.is_empty() {
+        return Ok(ids);
+    }
+    let out = Command::new("scancel")
+        .arg(format!("--name={name}"))
+        .output()
+        .map_err(|e| TrainError::other(format!("scancel invocation failed: {e}")))?;
+    if !out.status.success() {
+        return Err(TrainError::other(format!(
+            "scancel --name={name} failed (exit {}): {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(ids)
+}
+
+/// One job id per non-empty line; a step listing (`123.0`) keeps its job id.
+fn parse_squeue_ids(stdout: &str) -> Vec<String> {
+    let mut ids: Vec<String> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| l.split('.').next().unwrap_or(l).to_string())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 /// A handle to a submitted Slurm job, returned by
 /// [`SlurmLauncher::submit_async`]. Supports polling, log streaming, and
 /// cancellation via `scontrol` / `sacct` / `scancel`.
@@ -2026,6 +2082,15 @@ mod tests {
             RayJob::parse_ray_status("something weird"),
             JobState::Unknown(_)
         ));
+    }
+
+    #[test]
+    fn squeue_ids_are_one_per_line_and_steps_fold_into_their_job() {
+        assert_eq!(
+            parse_squeue_ids("  41\n42.0\n\n41\n42\n"),
+            vec!["41".to_string(), "42".to_string()]
+        );
+        assert!(parse_squeue_ids("").is_empty());
     }
 
     // --- sbatch script generation ---

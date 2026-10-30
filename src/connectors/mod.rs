@@ -315,6 +315,9 @@ impl Cookbook for ConnectorsCookbook {
     fn recipes(&self) -> &'static [&'static RecipeDef] {
         &[]
     }
+    fn identity(&self) -> Option<crate::framework::code_identity::BuildIdentity> {
+        Some(crate::framework::code_identity::BuildIdentity::engine())
+    }
     fn stages_erased(&self) -> &'static [(&'static str, ErasedStageCtor)] {
         static S: &[(&str, ErasedStageCtor)] = &[
             (DeclareObject::NAME, || std::sync::Arc::new(DeclareObject)),

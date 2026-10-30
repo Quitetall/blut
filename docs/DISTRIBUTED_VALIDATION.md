@@ -7,7 +7,7 @@ Evidence ledger for engine `0.2.0-alpha.2`. Status means:
   tested; no scale claim.
 - **Deferred:** unsupported in public preview.
 
-Last updated: 2026-10-24.
+Last updated: 2026-10-30.
 
 Nothing in the table below changed when the crates were published on
 2026-08-27. Publication moves code, not evidence: every row still says exactly
@@ -22,7 +22,7 @@ first if you are deciding whether to depend on this.
 | Single-node GPU admission and per-device permits | Component-tested | Deterministic scheduler and executor tests |
 | Single-node `torchrun` argument construction | Component-tested | Launch contract tests; cookbook owns trainer semantics |
 | Ray launcher against a live cluster | Validated | Two-node Ray 2.x, submit + stream + poll to Succeeded, 2026-09-19 |
-| Slurm launcher: `sbatch` submit, stream, poll, cancel; `srun` steps | Validated | Two-node Slurm 21.08 cluster, with and without accounting, 2026-10-20 — see below |
+| Slurm launcher: `sbatch` submit, stream, poll, cancel; `srun` steps | Validated | Two-node Slurm 21.08 cluster, with and without accounting, 2026-10-20; Slurm jobs left by a dead driver found and cancelled by name, 2026-10-30 — see below |
 | Mid-stage checkpoint resume (Slurm requeue, `plan resume`, stage retry) | Validated (CPU) | Two vast.ai VMs on different hosts, Slurm 21.08 over WireGuard, CPU DDP over gloo; each case resumed from its newest checkpoint and recomputed steps matched their losses exactly, 2026-10-24 — see below. No GPU, NCCL or FSDP run |
 | Multi-node NCCL training through Slurm | Validated (cookbook) | Two physical machines, 2× RTX 5090, NCCL over a private network, 2026-10-20 — see below |
 | P2P crypto, policy, transport, and loopback dispatch | Component-tested | Unit and loopback integration tests |
@@ -663,8 +663,9 @@ the output was in the cache. No slot remained after any run.
 **What it found.**
 - Killing the BLUT process does not stop its training step, so a naive
   `plan resume` would have put a second trainer on the same checkpoints. The
-  slot refuses that, and says which process to stop. BLUT does not yet record
-  the step's Slurm job id with the job, so stopping it is `scancel` by hand.
+  slot refuses that, and says which process to stop. At the time BLUT did not
+  record the step's Slurm job with the job, so stopping it was `scancel` by
+  hand; the record below closes that.
 - DDP replicas on different CPU models drift apart bit by bit. An earlier pair
   of these VMs had an Intel Xeon E5-2699 v4 and an AMD Ryzen 9 3900X; after 12
   steps the trainer's replica check failed with two different parameter
@@ -682,6 +683,28 @@ the output was in the cache. No slot remained after any run.
 - Same site, low latency. The requeue case relied on Slurm's restart count;
   a run whose previous owner is on another host and not in the same Slurm job
   waits for the 180 s heartbeat timeout.
+
+## Recorded run: Slurm jobs left behind by a dead driver (2026-10-30)
+
+The containerized two-node cluster from the launcher record above (Slurm
+21.08.5, `slurmctld` and `slurmd` on `n0`, `slurmd` on `n1`, a shared volume).
+`tests/slurm_live.rs` gained two checks, and the suite ran 10 of 10:
+
+- **A Slurm job outlives the process that started it.** A two-node
+  `srun --job-name=blut-<job>-2 sleep 300` was started with no BLUT process
+  behind it, and its name recorded in a BLUT job directory. `plan resume`'s
+  check (`jobs::slurm_resume_blocker`) named the running job and pointed at
+  `blut cancel`; `jobs::cancel_job` `scancel`ed it; the `srun` exited and the
+  check cleared.
+- **A failed attempt does not leave its job running.** A stage under
+  `--launcher slurm` started a detached `srun --job-name=<slurm_job_name>
+  sleep 300` and then failed. The executor recorded the name and cancelled
+  the job by name. With that cancel removed, the same test failed after 60 s
+  with the job still running.
+
+**Boundaries.** One host, containers, no training: the jobs are `sleep`. A
+stage inside a batch allocation names a job step, which `squeue --name`
+does not list; there the batch job ends its steps when the driver exits.
 
 ## Required evidence (Slurm, still open)
 

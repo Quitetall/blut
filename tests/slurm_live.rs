@@ -258,3 +258,183 @@ fn a_previous_jobs_log_under_a_reused_id_is_not_streamed() {
     assert_eq!(r, Ok(()));
     assert_eq!(lines, vec!["fresh"]);
 }
+
+/// A Slurm job that outlived the BLUT process that started it: `srun` keeps
+/// running when its parent dies. With its name recorded in the BLUT job,
+/// `plan resume`'s check sees it and `blut cancel` stops it.
+#[test]
+#[ignore = "needs a live Slurm cluster (BLUT_SLURM_LIVE=1)"]
+fn a_slurm_job_left_by_a_dead_driver_is_found_and_cancelled() {
+    if !live() {
+        return;
+    }
+    let job_id = format!("live-orphan-{}", std::process::id());
+    let job_dir = blut::paths::job_dir(&job_id).unwrap();
+    let name = blut::jobs::slurm_job_name(&job_dir, 2);
+    blut::jobs::record_slurm_job_name(&job_dir, &name).unwrap();
+    blut::jobs::record_slurm_job_name(&job_dir, &name).unwrap();
+    assert_eq!(
+        blut::jobs::slurm_job_names(&job_id).unwrap(),
+        vec![name.clone()]
+    );
+
+    // The orphan: an `srun` with no BLUT process behind it, as after
+    // `kill -9` of the driver.
+    let w = SlurmLauncher {
+        nodes: Some(2),
+        ntasks_per_node: Some(1),
+        ..Default::default()
+    }
+    .wrap(&name, &sh("sleep 300"))
+    .unwrap();
+    let mut srun = std::process::Command::new(&w.program)
+        .args(&w.args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let t = Instant::now();
+    let live = loop {
+        let live = blut::jobs::live_slurm_jobs(&job_id).unwrap();
+        if !live.is_empty() || t.elapsed() > Duration::from_secs(60) {
+            break live;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert_eq!(live.len(), 1, "the named job is found: {live:?}");
+    assert_eq!(live[0].0, name);
+    let why = blut::jobs::slurm_resume_blocker(&job_id)
+        .unwrap()
+        .expect("blocked");
+    assert!(
+        why.contains(&live[0].1[0]) && why.contains(&format!("blut cancel {job_id}")),
+        "{why}"
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(blut::jobs::cancel_job(&job_id, Duration::from_secs(2)))
+        .unwrap();
+    let t = Instant::now();
+    while !blut::jobs::live_slurm_jobs(&job_id).unwrap().is_empty() {
+        assert!(t.elapsed() < Duration::from_secs(60), "scancel took effect");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let status = srun.wait().unwrap();
+    assert!(!status.success(), "srun ends when its job is cancelled");
+    assert_eq!(blut::jobs::slurm_resume_blocker(&job_id).unwrap(), None);
+    let _ = std::fs::remove_dir_all(&job_dir);
+}
+
+/// Under `--launcher slurm` the executor records the name it gives a stage
+/// and, when an attempt fails, cancels the Slurm job of that name, which the
+/// attempt's `srun` may have left running.
+#[test]
+#[ignore = "needs a live Slurm cluster (BLUT_SLURM_LIVE=1)"]
+fn a_failed_attempts_slurm_job_is_cancelled_by_the_executor() {
+    use async_trait::async_trait;
+    use blut::framework::artifact::{Artifact, ContentHash};
+    use blut::framework::stage::{Stage, StageContext};
+
+    if !live() {
+        return;
+    }
+    static LEFT_BEHIND: Mutex<Vec<std::process::Child>> = Mutex::new(Vec::new());
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    struct Out;
+    impl Artifact for Out {
+        const KIND: &'static str = "test.live-out";
+        const SCHEMA: u32 = 1;
+        const INLINE: bool = true;
+        fn content_hash(&self) -> ContentHash {
+            ContentHash::of_bytes(b"out")
+        }
+        fn primary_path(&self) -> &std::path::Path {
+            std::path::Path::new(".")
+        }
+    }
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+    struct NoArgs {}
+    struct LeavesAJob;
+    #[async_trait]
+    impl Stage for LeavesAJob {
+        const NAME: &'static str = "leaves_a_job";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [blut::framework::resource::Resource] =
+            &[blut::framework::resource::Resource::Cpu];
+        type Input = ();
+        type Output = Out;
+        type Args = NoArgs;
+        async fn run(
+            &self,
+            ctx: &StageContext,
+            _: (),
+            _: &NoArgs,
+        ) -> Result<Out, blut::framework::StageError> {
+            let name = ctx.slurm_job_name();
+            let w = SlurmLauncher::default()
+                .wrap(&name, &sh("sleep 300"))
+                .unwrap();
+            // Not waited for here: the attempt "dies" and leaves its Slurm
+            // job behind. The test reaps the `srun` once the job is gone.
+            let srun = std::process::Command::new(&w.program)
+                .args(&w.args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            LEFT_BEHIND.lock().unwrap().push(srun);
+            let t = Instant::now();
+            while blut::config::launcher::slurm_jobs_named(&name)
+                .unwrap()
+                .is_empty()
+            {
+                assert!(t.elapsed() < Duration::from_secs(60), "job started");
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(blut::framework::StageError::Backend(anyhow::anyhow!(
+                "trainer lost"
+            )))
+        }
+    }
+    struct Backend;
+    impl blut::backends::TrainingBackend for Backend {
+        const ID: &'static str = "slurm-live";
+        const DESCRIPTION: &'static str = "slurm live";
+    }
+    impl blut::framework::compat::Compatible<Backend> for LeavesAJob {}
+
+    let job_id = format!("live-failed-{}", std::process::id());
+    let job_dir = blut::paths::job_dir(&job_id).unwrap();
+    let plan = blut::framework::plan::Plan::<(), Backend>::new("live", serde_json::json!({}))
+        .start(LeavesAJob, NoArgs {})
+        .finish()
+        .into_compiled();
+    let ctx = blut::framework::executor::ExecCtx::new(job_dir.clone())
+        .with_launch_target(blut::config::launcher::LaunchTarget::Slurm);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let r = rt.block_on(blut::framework::executor::ParallelExecutor::execute(
+        plan, ctx,
+    ));
+    assert!(r.is_err(), "the stage failed");
+    let names = blut::jobs::slurm_job_names(&job_id).unwrap();
+    assert_eq!(names, vec![format!("blut-{job_id}-0")]);
+    let t = Instant::now();
+    while !blut::jobs::live_slurm_jobs(&job_id).unwrap().is_empty() {
+        assert!(
+            t.elapsed() < Duration::from_secs(60),
+            "the executor cancelled the job the failed attempt left"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    for mut srun in LEFT_BEHIND.lock().unwrap().drain(..) {
+        let status = srun.wait().unwrap();
+        assert!(!status.success(), "srun ends when its job is cancelled");
+    }
+    let _ = std::fs::remove_dir_all(&job_dir);
+}

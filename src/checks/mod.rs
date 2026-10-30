@@ -366,6 +366,9 @@ impl Cookbook for ChecksCookbook {
     fn recipes(&self) -> &'static [&'static RecipeDef] {
         &[]
     }
+    fn identity(&self) -> Option<crate::framework::code_identity::BuildIdentity> {
+        Some(crate::framework::code_identity::BuildIdentity::engine())
+    }
     fn stages_erased(&self) -> &'static [(&'static str, ErasedStageCtor)] {
         static S: &[(&str, ErasedStageCtor)] = &[
             (CHECK_JSONL, || std::sync::Arc::new(CheckJsonl)),
