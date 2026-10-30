@@ -245,6 +245,14 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- `blut log` printed the `saved` and `done` paths a trainer reported, which
+  name the stage's attempt directory (`stages/.tmp-<idx>-<stage>-<key>`); the
+  directory is renamed to `stages/<idx>-<stage>` when the stage commits, so the
+  paths pointed nowhere. A committed attempt's paths are now shown under the
+  committed directory (also with `--json`); a path still in an attempt
+  directory (the stage is running, or the attempt did not commit) is kept and
+  marked "attempt directory; it becomes stages/<idx>-<stage> when the stage
+  commits".
 - `blut-notify`'s default jobs directory was `$HOME/.local/share/lamu/train-jobs`
   even when `$XDG_DATA_HOME` moved the engine's elsewhere, so the daemon tailed
   an empty directory. It now follows `blut::paths::jobs_dir`
