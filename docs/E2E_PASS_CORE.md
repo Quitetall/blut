@@ -124,7 +124,9 @@ carry an open item.
    `unknown` when the engine is built from crates.io without git) plus an
    optional per-stage code fingerprint. A cookbook commit that changes a
    stage's logic without bumping its `SCHEMA` or providing a fingerprint is
-   served the old cached output. Medium.
+   served the old cached output. Medium. (Addressed after this pass: keys now
+   fold every registered cookbook's name, version, commit and dirty digest;
+   see `framework::code_identity`.)
 8. **Test reliability on a loaded host.** Under load (average about 95),
    `tests/conditional_execution.rs` hung twice (16 tests idle behind
    `SPECULATION_TEST_LOCK`, which has no hang guard) and several executor and
