@@ -317,7 +317,10 @@ fractions, mixed modes, and unknown launch tenants.
 
 `broker::{decide, Footprint, FootprintStore}` size a per-stage RAM footprint,
 gate admission against the box-fit budget (`MemTotal − floor`), and calibrate
-the estimate from measured peaks (with an OOM-aware self-heal). This is the
+the estimate from measured peaks (with an OOM-aware self-heal). The engine
+reads the measured-peak store at admission; a cookbook runner that measures
+its child's peak writes it (`FootprintStore::record`), so an engine-only
+cookbook is billed its declared estimate. This is the
 engine behind the containment guarantee: a job that wouldn't fit is refused,
 not admitted-then-killed. The declarative surface is
 `Stage::resource_envelope` → `blut_types::envelope::ResourceEnvelope`

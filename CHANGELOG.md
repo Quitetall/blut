@@ -245,6 +245,11 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- `examples/first_cookbook.rs`, the README and API.md said a stage that
+  declares an envelope is calibrated by the measured-peak store run over run.
+  The engine reads that store at admission but never writes it; a cookbook
+  runner that measures its child's peak does (`FootprintStore::record`), and
+  without one the declared estimate is billed. The text now says so.
 - `recipe run --dry-run` reported "≈ 2.0G" for a stage declaring a 256 MiB
   envelope: it printed the legacy whole-GiB estimate with the 2 GiB floor
   applied to every plan, while a launch bills the largest declared envelope
