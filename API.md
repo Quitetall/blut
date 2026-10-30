@@ -49,12 +49,49 @@ BLUT-owned widgets.
 | `framework::plan::{Plan, CompiledPlan, NodeId, PlanError}` | the typed DAG builder (`.start().then().finish().into_compiled()`) |
 | `framework::executor::{ExecCtx, SequentialExecutor, ParallelExecutor, PlanResult, execute_plan}` | run a `CompiledPlan` with per-`Resource` + memory-admission semaphores |
 | `framework::async_io::{TrainingIoCandidate, TrainingIoHints, TrainingIoProfile, IoMode}` | checked, execution-only retained-I/O admission selected once before execution |
-| `framework::cache::{CacheHandle, CacheHit, lru_prune}` | `(stage, schema, input_hash, args_hash)` → output |
+| `framework::cache::{CacheHandle, CacheHit, lru_prune}` | `(stage, schema, input_hash, args_hash, code identity)` → output |
+| `framework::code_identity::{BuildIdentity, CodeIdentity, install, current}`, `cookbook_identity!` | the engine and cookbook builds every cache key folds |
+| `framework::stage_checkpoint::{CheckpointSlot, collect_slots, …}` | mid-stage checkpoint slots (CONTRACT.md §8) and their collection |
 | `framework::resource::Resource` | `Gpu \| Cpu \| Network \| Disk` capacity declarations |
 | `framework::retry::{RetryPolicy, Backoff, RetryOn, StageTimeout, RetryHook}` | per-stage retry / timeout / backoff |
 | `framework::status::{StatusHub, StageEvent, make_broadcast, spawn_status_writer, spawn_status_writer_checked}` | the `status.jsonl` event stream; the checked writer surfaces flush failures |
 | `framework::cookbook::{Cookbook, Registry, StageDescriptor, ArtifactDescriptor}` | the domain-pack seam |
 | `framework::graph::{PlanGraph, GraphSnapshot, NodeStatus, graph_snapshot}` | DAG inspection |
+
+### Cache identity
+
+A stage's cache key is `(stage name, SCHEMA, input content, canonical args,
+code identity, optional code_fingerprint, optional partition)`. The code
+identity is the engine build (name, version, git commit, digest of uncommitted
+changes) plus the build of every cookbook the binary registered, so a cookbook
+change re-runs its stages even when no `SCHEMA` moved. A cookbook supplies its
+build from `Cookbook::identity`:
+
+```rust
+fn identity(&self) -> Option<blut::framework::code_identity::BuildIdentity> {
+    Some(blut::cookbook_identity!())
+}
+```
+
+`cookbook_identity!` reads the cookbook crate's `CARGO_PKG_NAME` and
+`CARGO_PKG_VERSION` and two variables its `build.rs` sets with
+`cargo:rustc-env`:
+
+| Variable | Value |
+|---|---|
+| `BLUT_COOKBOOK_COMMIT` | the last git commit that touched the cookbook's source; empty without git |
+| `BLUT_COOKBOOK_DIRTY` | a digest of the uncommitted changes (tracked diff and untracked files) in that source; empty when clean |
+
+Without git (a crates.io build) the identity is the name and version. A build
+from a dirty tree keys differently from the clean build and from every other
+dirty state, and the same as a rebuild of the same changes. The standard
+cookbooks' `build.rs` shows the whole recipe. The identity is per binary:
+every stage key folds every registered cookbook, so a change to any of them
+re-runs every stage of that binary. `cli::run` installs the identity before
+it computes any key and warns about a registered cookbook that supplies none;
+a program that executes plans without `cli::run` keys on the engine alone
+unless it calls `code_identity::install` first. Checkpoint slots are keyed by
+the cache key, so they follow.
 
 `StageExecutionBoundary` is fail-closed optimizer metadata. Its default is
 `Opaque`, so an existing or third-party cookbook stage continues to run as an

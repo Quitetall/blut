@@ -382,7 +382,14 @@ async fn a_live_trainer_from_an_earlier_execution_is_not_raced() {
     let err = run(plan(1, TrainArgs::new(MarkerPid::Own), 1), ws.ctx("job-c"))
         .await
         .unwrap_err();
-    assert!(err.contains("busy"), "{err}");
+    assert!(
+        err.contains("resume checkpoint busy: stage 'slot_trainer': trainer pid"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("is busy"),
+        "says busy once per message: {err}"
+    );
     assert_eq!(
         RUNS.load(Ordering::SeqCst),
         1,

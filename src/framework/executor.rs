@@ -2555,21 +2555,40 @@ async fn run_node_with_admission(
                 Ok(slot) => stage_ctx.checkpoint = slot,
                 Err(detail) => {
                     let _ = std::fs::remove_dir_all(&tmp_stage_dir);
-                    let msg = format!("checkpoint slot for '{stage_name}' is busy: {detail}");
+                    // `CheckpointBusy` displays as "resume checkpoint busy: …",
+                    // so the detail names the stage and the holder only.
+                    let source = StageError::CheckpointBusy {
+                        detail: format!("stage '{stage_name}': {detail}"),
+                    };
                     env.status.emit(StageEvent::StageFailed {
                         node_idx: idx,
                         stage_name: stage_name.clone(),
-                        error: msg.clone(),
+                        error: source.to_string(),
                         failure: None,
                     });
                     return Err(NodeFailure::Stage {
                         idx,
                         stage: stage_name,
-                        source: StageError::CheckpointBusy { detail: msg },
+                        source,
                     });
                 }
             }
         }
+
+        // ── Slurm job name (orphan detection) ──────────────────────
+        // Under `--launcher slurm` the stage is told to name its Slurm job
+        // `StageContext::slurm_job_name()`; record that name with the job so
+        // `blut cancel` and `plan resume` can find a Slurm job that outlives
+        // this process.
+        let slurm_name = (env.launch_target == crate::config::launcher::LaunchTarget::Slurm
+            && !is_remote)
+            .then(|| {
+                let name = crate::jobs::slurm_job_name(&env.job_dir, idx);
+                if let Err(e) = crate::jobs::record_slurm_job_name(&env.job_dir, &name) {
+                    tracing::warn!("record Slurm job name for node {idx} ({stage_name}): {e}");
+                }
+                name
+            });
 
         // ── Resource/GPU/memory admission ───────────────────────────
         // Ordinary nodes acquire their own canonical envelope per attempt. A
@@ -2827,6 +2846,12 @@ async fn run_node_with_admission(
         }
         if let Some(slot) = stage_ctx.checkpoint.as_ref() {
             report_checkpoint_outcome(&env, idx, &stage_name, attempt, slot);
+        }
+        // A failed, cancelled or timed-out attempt killed its `srun`, and
+        // killing `srun` does not end the Slurm job. End it, so a retry or a
+        // later run never shares the allocation with a leftover trainer.
+        if let (Some(name), Err(_)) = (slurm_name.clone(), &run_result) {
+            stop_slurm_job(name, idx, &stage_name).await;
         }
         // Preserve the historical ordinary-node boundary: CPU/network/disk
         // permits are available to other work before divergence classification
@@ -3387,6 +3412,22 @@ fn finish_checkpoint_slot(
         step: None,
         detail: Some(detail),
     });
+}
+
+/// `scancel` the Slurm job named `name`, logging what happened.
+async fn stop_slurm_job(name: String, idx: u32, stage_name: &str) {
+    let job = name.clone();
+    match tokio::task::spawn_blocking(move || crate::config::launcher::scancel_named(&job)).await {
+        Ok(Ok(ids)) if ids.is_empty() => {}
+        Ok(Ok(ids)) => tracing::info!(
+            "node {idx} ({stage_name}): cancelled Slurm job(s) {} ({name}) left by the failed attempt",
+            ids.join(", ")
+        ),
+        Ok(Err(e)) => {
+            tracing::warn!("node {idx} ({stage_name}): could not stop Slurm job {name}: {e}")
+        }
+        Err(e) => tracing::warn!("node {idx} ({stage_name}): scancel task failed: {e}"),
+    }
 }
 
 /// A process-unique id for one plan execution.
@@ -4414,17 +4455,17 @@ fn gather_input_hash(
     }
 }
 
-/// Build the `NodeTask` for `node_id`, reading its input + input_hash
-/// from the coordinator's maps and computing the cache key.
-/// The code identity that keys the cache for a node (S4 / P9): the build-time
-/// git hash of THIS binary (catches a committed engine/cookbook change) folded
-/// with the stage's own `code_fingerprint` (the script content hash — catches an
-/// UNCOMMITTED kernel edit the git hash misses). A pure stage with no external
-/// code returns `None` and is keyed on the git hash alone.
+/// The code identity that keys the cache for a node (S4 / P9): the process's
+/// [`code_identity`](crate::framework::code_identity) digest — the engine and
+/// every registered cookbook, each by name, version, build commit and dirty
+/// digest — folded with the stage's own `code_fingerprint` (the content hash
+/// of an external script the binary does not contain). A stage with no
+/// external code is keyed on the code identity alone.
 fn node_code_sha(stage: &dyn StageDyn) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(env!("BLUT_GIT_HASH").as_bytes());
+    h.update(b"blut.code-sha.v3");
+    h.update(crate::framework::code_identity::current_digest());
     if let Some(fp) = stage.code_fingerprint() {
         h.update([0u8]);
         h.update(&fp);

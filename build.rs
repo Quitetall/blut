@@ -57,6 +57,12 @@ fn main() {
         _ => "",
     };
     println!("cargo:rustc-env=BLUT_GIT_HASH={hash}");
+    // The cache key folds this (framework::code_identity): a build with
+    // uncommitted changes must not share cache entries with the clean build of
+    // the same commit, nor with a build of other uncommitted changes. Empty
+    // when the tree is clean or there is no git.
+    let dirty_digest = dirty_digest(&manifest, IDENTITY_SCOPE).unwrap_or_default();
+    println!("cargo:rustc-env=BLUT_GIT_DIRTY={dirty_digest}");
     println!("cargo:rustc-env=BLUT_VERSION={version}");
     println!("cargo:rustc-env=BLUT_SRC_DIR={embedded_src}");
 
@@ -94,6 +100,15 @@ fn main() {
     // Also watch build.rs itself — emitting any rerun-if-changed overrides
     // cargo's default "re-run when the script changes".
     println!("cargo:rerun-if-changed=build.rs");
+    // The dirty digest covers these paths, so an edit to any of them must
+    // re-run this script. Only paths that exist: a packaged (crates.io) build
+    // has no `crates/`, and a missing path would re-run the script every time.
+    for rel in IDENTITY_SCOPE {
+        let p = Path::new(&manifest).join(rel);
+        if p.exists() {
+            println!("cargo:rerun-if-changed={}", p.display());
+        }
+    }
     watch(git(&["rev-parse", "--git-path", "HEAD"]));
     watch(git(&["rev-parse", "--git-path", "logs/HEAD"]));
     watch(git(&["rev-parse", "--git-path", "packed-refs"]));
@@ -103,4 +118,66 @@ fn main() {
     if let Some(branch_ref) = git(&["symbolic-ref", "--quiet", "HEAD"]) {
         watch(git(&["rev-parse", "--git-path", branch_ref.as_str()]));
     }
+}
+
+/// The source the engine's dirty digest covers: everything compiled into the
+/// library, including the path dependency `blut-types` and the script
+/// `launcher.rs` embeds with `include_str!`.
+const IDENTITY_SCOPE: &[&str] = &[
+    "src",
+    "crates/blut-types",
+    "scripts/run_contained.sh",
+    "build.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+];
+
+/// A git object id over the uncommitted state of `scope`: the binary diff of
+/// tracked files against HEAD plus the path and content id of every untracked,
+/// non-ignored file. Equal digests mean the same uncommitted changes. `None`
+/// when the scope is clean or git cannot say.
+fn dirty_digest(dir: &str, scope: &[&str]) -> Option<String> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let run = |args: &[&str]| -> Option<Vec<u8>> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .ok()?;
+        out.status.success().then_some(out.stdout)
+    };
+    let scoped = |head: &[&'static str]| -> Option<Vec<u8>> {
+        let mut args: Vec<&str> = head.to_vec();
+        args.push("--");
+        args.extend_from_slice(scope);
+        run(&args)
+    };
+    let diff = scoped(&["diff", "HEAD", "--binary"])?;
+    let untracked = scoped(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+    if diff.is_empty() && untracked.is_empty() {
+        return None; // clean
+    }
+    let mut manifest = diff;
+    manifest.extend_from_slice(b"\0untracked\0");
+    for path in untracked.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+        let path = String::from_utf8_lossy(path).into_owned();
+        let blob = run(&["hash-object", "--", path.as_str()])?;
+        manifest.extend_from_slice(path.as_bytes());
+        manifest.push(0);
+        manifest.extend_from_slice(&blob);
+    }
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(&manifest).ok()?;
+    let out = child.wait_with_output().ok()?;
+    let id = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (out.status.success() && !id.is_empty()).then_some(id)
 }

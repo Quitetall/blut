@@ -131,6 +131,14 @@ pub trait Cookbook: Send + Sync + 'static {
     fn tui(&self) -> Option<Box<dyn CookbookTui>> {
         None
     }
+    /// The build this cookbook came from, folded into every stage cache key
+    /// ([`crate::framework::code_identity`]). Implement it as
+    /// `Some(blut::cookbook_identity!())`. The default `None` leaves the
+    /// cache unable to tell two builds of this cookbook apart, and the CLI
+    /// warns about it.
+    fn identity(&self) -> Option<crate::framework::code_identity::BuildIdentity> {
+        None
+    }
 }
 
 /// Runtime registry that ingests cookbooks: holds boxed cookbooks and
@@ -151,6 +159,23 @@ impl Registry {
 
     pub fn register(&mut self, c: Box<dyn Cookbook>) {
         self.cookbooks.push(c);
+    }
+
+    /// The code these cookbooks and this engine make up: what
+    /// [`crate::cli::run`] installs as the process's cache identity.
+    pub fn code_identity(&self) -> crate::framework::code_identity::CodeIdentity {
+        use crate::framework::code_identity::{BuildIdentity, CodeIdentity};
+        let engine = BuildIdentity::engine();
+        let mut id = CodeIdentity::with_engine(engine.clone());
+        for c in &self.cookbooks {
+            match c.identity() {
+                // The engine's own cookbooks add nothing the engine does not.
+                Some(b) if b == engine => {}
+                Some(b) => id = id.with_cookbook(b),
+                None => id = id.with_unidentified(c.name()),
+            }
+        }
+        id
     }
 
     pub fn all(&self) -> impl Iterator<Item = &'static RecipeDef> + '_ {

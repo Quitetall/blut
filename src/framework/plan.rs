@@ -747,8 +747,8 @@ impl CompiledPlan {
         }
 
         let mut hasher = Sha256::new();
-        hasher.update(b"blut.plan.execution.v1");
-        hasher.update(env!("BLUT_GIT_HASH").as_bytes());
+        hasher.update(b"blut.plan.execution.v2");
+        hasher.update(crate::framework::code_identity::current_digest());
         for node in &self.nodes {
             add_node(&mut hasher, node);
         }
