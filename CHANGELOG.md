@@ -116,6 +116,10 @@ depend on this crate.
   resume_blocker}`.
 
 ### Changed
+- `blut cloud smoke` without `--store` uses a fresh private temporary
+  directory (`blut-cloud-smoke-*`, mode 0700), names it, and removes it when
+  the smoke ends. The default was the fixed shared path `/tmp/blut-cloud-smoke`,
+  left behind after every run. An explicit `--store` is unchanged.
 - `blut-notify` status summaries name the event kind, the stage and the
   event's error (or a pruned stage's reason), cut to 200 characters with
   control characters replaced: `status event for job J: stage_failed in stage

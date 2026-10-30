@@ -17,6 +17,8 @@ pub(super) enum CloudCommand {
     /// Point `--store` at a durable local or network-mounted directory.
     Smoke {
         /// Object store: a local directory (created if absent), or a URL.
+        /// Default: a fresh private temporary directory, removed when the
+        /// smoke ends (it was the fixed, shared `/tmp/blut-cloud-smoke`).
         ///
         /// `s3://bucket/prefix` reaches AWS S3 or an S3-compatible endpoint
         /// when built with `--features s3`. The endpoint must support
@@ -26,8 +28,8 @@ pub(super) enum CloudCommand {
         /// variables the AWS CLI reads -- never from a flag, because an
         /// argument lands in shell history, the process table, and any log that
         /// records argv.
-        #[arg(long, default_value = "/tmp/blut-cloud-smoke")]
-        store: String,
+        #[arg(long)]
+        store: Option<String>,
         /// Text payload — `p2p-echo` returns it uppercased.
         #[arg(long, default_value = "hello cloud")]
         input: String,
@@ -57,6 +59,8 @@ pub(super) async fn run_cloud_cmd(
 
     match cmd {
         CloudCommand::Smoke { store, input } => {
+            // Held until the smoke returns: a default store is removed then.
+            let (store, _scratch_store) = smoke_store_location(store)?;
             let blob_store = open_smoke_store(&store)?;
             let queue = Arc::new(MemQueue::new());
 
@@ -151,9 +155,10 @@ mod cloud_cli_tests {
             .command
         {
             Some(Command::Cloud {
-                cmd: CloudCommand::Smoke { input, .. },
+                cmd: CloudCommand::Smoke { input, store },
             }) => {
                 assert_eq!(input, "hello cloud");
+                assert_eq!(store, None, "no fixed shared default path");
             }
             other => panic!("expected cloud smoke, got {other:?}"),
         }
@@ -171,7 +176,7 @@ mod cloud_cli_tests {
                 cmd: CloudCommand::Smoke { input, store },
             }) => {
                 assert_eq!(input, "hi");
-                assert_eq!(store, "/tmp/x");
+                assert_eq!(store.as_deref(), Some("/tmp/x"));
             }
             other => panic!("got {other:?}"),
         }
@@ -186,12 +191,46 @@ mod cloud_cli_tests {
         run_cloud_cmd(
             reg,
             CloudCommand::Smoke {
-                store: dir.path().display().to_string(),
+                store: Some(dir.path().display().to_string()),
                 input: "hello cli".to_string(),
             },
         )
         .await
         .expect("cloud smoke handler must round-trip");
+    }
+
+    /// E2E follow-up: the default store was the fixed shared path
+    /// `/tmp/blut-cloud-smoke`. It is a fresh private directory per run,
+    /// removed when the smoke ends, and the handler round-trips over it.
+    #[tokio::test]
+    async fn the_default_smoke_store_is_private_and_removed() {
+        let (a, guard_a) = super::smoke_store_location(None).unwrap();
+        let (b, guard_b) = super::smoke_store_location(None).unwrap();
+        assert_ne!(a, b, "each run gets its own store");
+        assert_ne!(a, "/tmp/blut-cloud-smoke");
+        assert!(std::path::Path::new(&a).is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&a).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "private to the user: {mode:o}");
+        }
+        drop((guard_a, guard_b));
+        assert!(!std::path::Path::new(&a).exists(), "removed afterwards");
+        assert!(!std::path::Path::new(&b).exists());
+        // An explicit store is used as given and never removed.
+        let (given, guard) = super::smoke_store_location(Some("/x/y".into())).unwrap();
+        assert_eq!((given.as_str(), guard.is_none()), ("/x/y", true));
+
+        run_cloud_cmd(
+            crate::framework::Registry::new(),
+            CloudCommand::Smoke {
+                store: None,
+                input: "hello default".to_string(),
+            },
+        )
+        .await
+        .expect("cloud smoke over the default store");
     }
 }
 
@@ -201,6 +240,35 @@ mod cloud_cli_tests {
 #[cfg(feature = "cloud")]
 fn flat_error(what: &str, error: impl std::fmt::Display) -> anyhow::Error {
     anyhow!("{what}: {error}")
+}
+
+/// Where `cloud smoke` keeps its store: `--store` when given, else a fresh
+/// private temporary directory (`blut-cloud-smoke-*`, mode 0700 on Unix),
+/// whose guard the caller holds until the smoke ends and which is removed
+/// then. The default used to be the fixed `/tmp/blut-cloud-smoke`, shared by
+/// every user and run on the machine.
+#[cfg(feature = "cloud")]
+fn smoke_store_location(store: Option<String>) -> Result<(String, Option<tempfile::TempDir>)> {
+    if let Some(store) = store {
+        return Ok((store, None));
+    }
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("blut-cloud-smoke-");
+    // tempfile creates a directory with the process umask (0755 here); the
+    // store holds the job's input and output, so other users get no access.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let dir = builder
+        .tempdir()
+        .context("create a temporary smoke store")?;
+    eprintln!(
+        "store: {} (temporary; removed when the smoke ends; pass --store to keep one)",
+        dir.path().display()
+    );
+    Ok((dir.path().display().to_string(), Some(dir)))
 }
 
 /// Open the smoke store from `--store`: a URL when it has a scheme, otherwise a
