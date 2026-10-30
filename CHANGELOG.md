@@ -233,6 +233,12 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- TPE and multivariate TPE could suggest a value equal to the exclusive upper
+  bound of a `uniform` or `log_uniform` dim (`wd = 1.0` for `uniform(0, 1)`):
+  a candidate jittered past the support was clamped to `high` inclusive. A
+  suggestion is now kept inside `[low, high)` (the largest value below `high`
+  at most). `int_uniform` stays inclusive, `quniform` rounds as the random
+  sampler does, and the grid sampler still evaluates both endpoints by design.
 - A scheduled unit ran a different launch from the interactive one: it carried
   no tenant, no cache flags, no working directory and none of the installer's
   environment, so a timer ran under `default`, with a private cache, from the
