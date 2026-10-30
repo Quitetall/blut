@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # A cookbook image for BlutPlan pods: the standard cookbook's binary built
 # against THIS engine checkout, with the `p2p` and `s3` features, installed as
-# `blut` (the command a BlutPlan runs by default).
+# `blut` (the command a BlutPlan runs by default), and `blut-core`, which adds
+# the core cookbook's registry recipes (`recipe list`).
 #
 # Two build contexts: this repository (`engine`) and a checkout of
 # https://github.com/Quitetall/blut-cookbooks (`cookbook`):
@@ -40,15 +41,17 @@ RUN set -eu; \
     printf '\n[patch.crates-io]\nblut = { path = "/src/engine" }\nblut-types = { path = "/src/engine/crates/blut-types" }\n' >> Cargo.toml
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/target,id=blut-cookbook-target \
-    cargo build --release --bin blut-standard --features p2p,blut/s3 \
- && install -D -m 0755 /target/release/blut-standard /out/blut-standard
+    cargo build --release -p blut-cookbook-standard -p blut-cookbook-core --bins \
+      --features blut-cookbook-standard/p2p,blut/s3 \
+ && install -D -m 0755 /target/release/blut-standard /out/blut-standard \
+ && install -D -m 0755 /target/release/blut-core /out/blut-core
 
 FROM ${RUNTIME_IMAGE}
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --uid 65532 --user-group --home-dir /blut/work --no-create-home blut
-COPY --from=builder /out/blut-standard /usr/local/bin/blut-standard
+COPY --from=builder /out/blut-standard /out/blut-core /usr/local/bin/
 RUN ln -s /usr/local/bin/blut-standard /usr/local/bin/blut
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/blut"]

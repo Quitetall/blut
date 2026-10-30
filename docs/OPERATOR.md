@@ -110,6 +110,8 @@ status without the operator reading logs or files.
 | `planSource.inline.filename` | `plan.json` | The file name the engine sees. The extension selects the format: `.json` (PlanSpec), `.toml` (linear chain) or `.star` (Starlark; the image must also carry `blut-dsl`). |
 | `planSource.configMapRef.name` | | An existing ConfigMap in the plan's namespace, mounted whole at `/blut/plan`. Other keys (small inputs the recipe reads) are mounted beside the recipe. |
 | `planSource.configMapRef.key` | `plan.json` | The key holding the recipe; also its file name. |
+| `planSource.recipe.name` | | A recipe compiled into the cookbook binary (`recipe list`). The pod runs `<command> recipe run <name> --args <args>`. |
+| `planSource.recipe.args` | `{}` | The recipe's args, as a JSON object in a string. |
 | `cookbookImage` | | Image with the cookbook binary. Required, non-empty. |
 | `command` | `blut` | The cookbook binary inside the image. One executable, no arguments. |
 | `dataClassCeiling` | `Internal` | `Public` or `Internal`. `Restricted` is not a value of this type, so a manifest naming it is refused by the API server (ADR 0061). Stamped on the Job and pod as the label `blut.lamquant.dev/data-class` for admission policies; the engine does not read it. |
@@ -159,6 +161,59 @@ a new identity; schedulers that pinned the old key must learn the new one. The
 node prints its public key at start (`kubectl logs`). The Service
 `<pool>-workers` is headless and publishes UDP 9320 (QUIC). `status.readyReplicas`
 mirrors the StatefulSet.
+
+## Submitting from the CLI (`--launcher k8s`)
+
+`recipe run` and `recipe declare --run` submit to the cluster themselves when
+given `--launcher k8s`:
+
+```bash
+export BLUT_K8S_IMAGE=<registry>/blut-cookbook:<tag>
+export BLUT_K8S_STORE=s3://blut-store/runs BLUT_K8S_STORE_SECRET=blut-store-credentials
+blut recipe declare split.toml --run --launcher k8s     # a recipe file, shipped inline
+blut recipe run <name> --args '{...}' --launcher k8s     # a recipe compiled into the cookbook
+```
+
+The CLI checks the recipe first, so a mistake fails before anything is
+submitted: a named recipe's args against its schema (unknown or missing keys,
+wrong types), and a recipe file by compiling it (stage names, kinds). It does
+not compile a named recipe locally, because a cookbook's compile can check
+that the paths in its args exist, and those are paths inside the pod. It then
+creates a `BlutPlan` (`kubectl create`,
+never `apply`, so it cannot overwrite another run), records a local job, and
+follows the plan's status until it is `Succeeded` or `Failed`, printing each
+change. It exits 0 only on `Succeeded`. Ctrl-C, SIGTERM, or `blut cancel <job>`
+from another shell deletes the plan, and owner references take its Job and
+pods with it. Nothing runs on the submitting machine.
+
+| Variable | Meaning |
+|---|---|
+| `BLUT_K8S_IMAGE` | The cookbook image the pod runs. Required. |
+| `BLUT_K8S_COMMAND` | The cookbook binary in the image (default `blut`). |
+| `BLUT_K8S_NAMESPACE` | Namespace (default: the kubectl context's, else `default`). |
+| `BLUT_K8S_CONTEXT` | kubectl context (default: the current one). |
+| `BLUT_K8S_STORE` | `store.url`. Without it, outputs stay in the pod and the CLI warns. |
+| `BLUT_K8S_STORE_SECRET` | `store.credentialsSecret`. Only the Secret's name is sent. |
+| `BLUT_K8S_CPU_MILLIS`, `BLUT_K8S_MEMORY_MIB` | `resources` (both or neither). |
+| `BLUT_K8S_GPUS`, `BLUT_K8S_MAX_RETRIES`, `BLUT_K8S_TIMEOUT_SECS` | `gpus`, `maxRetries`, `timeoutSeconds`. |
+| `BLUT_K8S_PICKUP_SECS` | How long to wait for the operator's first status (default 120). If it never comes, the plan is deleted and the run fails, naming the operator. |
+| `BLUT_KUBECTL` | The kubectl binary (default `kubectl` on PATH). |
+
+The CLI refuses, before submitting anything and without running anything
+locally, when: kubectl is missing; kubectl has no current context; the
+cluster does not answer; the cluster has no `BlutPlan` CRD (the message names
+the install and the `kubectl apply` route); the args name `dataset://` or other
+registry handles, which resolve against the submitting machine's registries;
+the file is a `registry://plan@…` pointer; or a flag the cluster run cannot
+honour is set (config mode and sweeps, `--shared-cache`, `--no-cache`,
+`--sync-io`, a non-default `--tenant`, `--experiment`). `hpo`, `partition` and
+`plan resume` refuse `--launcher k8s` outright. Every local launch path also
+refuses a k8s placement, so none can fall back to running on the submitting
+machine.
+
+The pod runs the same command against the same cookbook, so it compiles the
+same plan, provided the image's cookbook matches the submitting binary's.
+Paths in the recipe (datasets) are paths inside the pod.
 
 ## Credentials
 

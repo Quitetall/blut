@@ -680,6 +680,13 @@ pub async fn cancel_job(job_id: &str, grace: std::time::Duration) -> Result<()> 
         crate::python_kill::graceful_kill_pid(pid, grace).await;
     }
     stop_slurm_jobs(job_id);
+    // A job submitted with `--launcher k8s` runs in a cluster. Its follower
+    // (stopped above) deletes the BlutPlan on SIGTERM; deleting it here too
+    // covers a follower that is already gone. Deletion is idempotent.
+    if let Ok(dir) = job_dir_path(job_id) {
+        crate::config::k8s_cluster::cancel_recorded(&dir)
+            .map_err(|e| TrainError::other(format!("cancel {job_id}: delete its BlutPlan: {e}")))?;
+    }
     let _ = write_state(job_id, JobState::Cancelled);
     let _ = clear_pid(job_id);
     let _ = clear_driver(job_id);

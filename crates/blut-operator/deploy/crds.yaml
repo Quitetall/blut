@@ -110,6 +110,8 @@ spec:
                   - configMapRef
                 - required:
                   - inline
+                - required:
+                  - recipe
                 properties:
                   configMapRef:
                     description: |-
@@ -141,6 +143,22 @@ spec:
                         type: string
                     required:
                     - content
+                    type: object
+                  recipe:
+                    description: |-
+                      A recipe compiled into the cookbook binary, run by name with
+                      `recipe run <name> --args <args>`. What `blut recipe run --launcher
+                      k8s` submits.
+                    properties:
+                      args:
+                        default: '{}'
+                        description: The recipe's args as a JSON object (`{}` by default).
+                        type: string
+                      name:
+                        description: Recipe name, as `recipe list` shows it.
+                        type: string
+                    required:
+                    - name
                     type: object
                 type: object
               resources:

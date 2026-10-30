@@ -16,6 +16,16 @@ depend on this crate.
   so a cookbook guards its own JSONL by emitting `JsonlArtifact` or through a
   one-line adapter stage (a compiled example is in the `checks` module docs).
   `assert` compares the literal `actual` it is given.
+- `--launcher k8s` submits to a cluster. `recipe run <name> --launcher k8s` and
+  `recipe declare <file> --run --launcher k8s` check the recipe locally (a
+  named recipe's args against its schema, a file by compiling it), create a
+  `BlutPlan` for blut-operator (`planSource.recipe` or an inline
+  file), follow its status, and exit with its result; Ctrl-C, SIGTERM and
+  `blut cancel <job>` delete the plan. Settings come from `BLUT_K8S_*`
+  (image, namespace, store and the name of its credentials Secret, resources,
+  retries); credentials never enter the manifest. Without a kubeconfig, or on a
+  cluster without the operator's CRD, the command refuses before submitting.
+  The operator gains `planSource.recipe` (a recipe run by name).
 - `BLUT_REMOTE_CACHE` for `recipe run` and `recipe declare --run`: a directory,
   or with the `s3` feature an `s3://bucket[/prefix]` URL, used as the cache's
   content-addressed remote tier. Stage outputs are written through to it and a
@@ -170,6 +180,10 @@ depend on this crate.
   `systemd-run`'s command line, which any user on the host can read. With
   systemd 250 and later only the names go there; the values travel in the
   client's own environment.
+- `--launcher k8s` used to fall through to the local launcher and run the
+  recipe on the submitting machine. `hpo`, `partition` and `plan resume` now
+  refuse it, and the local launch path refuses any k8s placement that reaches
+  it.
 - `blut dag` showed a node that failed and was then re-run to completion by
   `plan resume` as `failed`, because the first terminal event in the job's
   status log won. A later attempt (`stage_begin` or a cache hit) now reopens

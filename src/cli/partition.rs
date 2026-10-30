@@ -353,6 +353,11 @@ pub(super) async fn run_partition(
                 .map_err(|e| anyhow!("--args is not valid JSON: {e}"))?;
             let launch_target: crate::config::launcher::LaunchTarget =
                 launcher.parse().map_err(|e| anyhow!("{e}"))?;
+            if launch_target == crate::config::launcher::LaunchTarget::K8s {
+                return Err(anyhow!(crate::config::k8s_cluster::refuse_surface(
+                    "`partition` runs"
+                )));
+            }
             let tenant = crate::tenant::Tenant::parse(&tenant)
                 .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
             let (matrix, _) = partition_matrix(reg, &set, &base, &tenant, launch_target)?;
@@ -406,6 +411,11 @@ pub(super) async fn run_partition(
                 .map_err(|e| anyhow!("--args is not valid JSON: {e}"))?;
             let launch_target: crate::config::launcher::LaunchTarget =
                 launcher.parse().map_err(|e| anyhow!("{e}"))?;
+            if launch_target == crate::config::launcher::LaunchTarget::K8s {
+                return Err(anyhow!(crate::config::k8s_cluster::refuse_surface(
+                    "`partition` runs"
+                )));
+            }
             let tenant = crate::tenant::Tenant::parse(&tenant)
                 .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
             let (matrix, evaluated_by_key) =

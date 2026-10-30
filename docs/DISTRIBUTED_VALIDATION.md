@@ -34,7 +34,7 @@ first if you are deciding whether to depend on this.
 | Cloud queue over local object storage | Validated | `blut cloud smoke` round-trip through the shipped cookbook binary, 2026-09-19 |
 | Network object storage (S3-compatible) | Validated (R2 over public TLS; MinIO) | `s3` feature; cloud round-trip against Cloudflare R2 over public TLS with create-only writes enforced, 2026-10-22; MinIO over HTTP and TLS; Backblaze B2 refused (no conditional writes) — see below |
 | `blut-worker` REST prototype | Deleted (ADR 0083 M3) | Superseded by `src/cloud` + the `blut-web` sidecar |
-| Kubernetes operator | Validated (kind) | `blut-operator` on a three-node kind cluster, Kubernetes 1.35.0, with MinIO in the cluster: a real CPU plan to Succeeded with per-stage status, outputs in S3, a rerun and a retry served from the store, bad specs refused, deletion cleaning up, a deleted pod and a drained node retried, an operator restart without duplicate work, least-privilege RBAC, 2026-10-24 — see below. One host; no GPUs, no managed Kubernetes, no mesh traffic between pool pods |
+| Kubernetes operator | Validated (kind) | `blut-operator` on a three-node kind cluster, Kubernetes 1.35.0, with MinIO in the cluster: a real CPU plan to Succeeded with per-stage status, outputs in S3, a rerun and a retry served from the store, bad specs refused, deletion cleaning up, a deleted pod and a drained node retried, an operator restart without duplicate work, least-privilege RBAC, 2026-10-24; `--launcher k8s` from the CLI submits, follows, cancels and refuses, 2026-10-30 — see below. One host; no GPUs, no managed Kubernetes, no mesh traffic between pool pods |
 | Windows containment | Validated (CI) | Engine job on `windows-latest`, Rust 1.88, per push: a 512 MiB allocation fails under a 128 MiB Job Object cap and succeeds under 2 GiB, directly and through `LocalSystemd::spawn_contained`; the reported peak covers the commit; `TerminateJobObject`, closing the job, and `ContainedChild` cancel and drop each kill a grandchild that was alive a moment before. A cookbook run through BLUT on `windows-latest`, 2026-10-24: a CPU `train_from_dataset` with trainer and evaluator each in a Job Object (cap and peak reported), and a stage timeout and a killed driver each taking the training tree down — see below. `mem_high`/`swap_max` are not mapped, and the cap bounds committed memory, not RSS |
 
 ## Recorded run: P2P dispatch across network namespaces (2026-09-19)
@@ -1108,6 +1108,94 @@ PVC cache, no managed Kubernetes, no IAM roles for service accounts, no cluster
 larger than three nodes. A `BlutWorkerPool` was brought up and kept up; mesh
 traffic between its pods was not exercised. Operator restart was a pod deletion
 with the Deployment replacing it, not a crash during a status write.
+
+## Recorded run: `--launcher k8s` from the CLI (2026-10-30)
+
+Until this run, `recipe run --launcher k8s` ran every stage on the submitting
+machine: the k8s target fell through to the local launcher. It now submits a
+`BlutPlan` and follows it (docs/OPERATOR.md, "Submitting from the CLI").
+
+`scripts/k8s_kind_e2e.sh` as committed, all fifteen checks, on a fresh kind
+cluster (kind 0.31.0, Kubernetes 1.35.0, one control plane and two workers),
+459 s with the images prebuilt. Checks 1 to 10 are the operator checks
+recorded above; they passed again with this operator build. Checks 11 to 15
+run the CLI from the cookbook image, the binary a user installs, on the host
+network with the script's kubeconfig and kubectl mounted in:
+
+```
+check 11: the CLI submits a recipe file and reports Succeeded
+  exit 0; done — succeeded: 3 stage(s), 0 from cache, 3 computed
+  (BlutPlan blut-e2e/split-20261030-163324-773990601);
+  s3://blut-store/run11: 3 artifact objects
+check 12: SIGTERM to the following CLI deletes the plan
+  exit 1; BlutPlan, Job and pods of split-20261030-163335-714309565 gone
+check 13: blut cancel <job> from another process deletes the plan
+  blut cancel 20261030-163342-233697062: follower exited 1;
+  BlutPlan split-20261030-163342-233697062 and its pods gone
+check 14: recipe run <name> --launcher k8s submits a registry recipe
+  BlutPlan eval-only-20261030-163352-404603962 ran recipe run eval_only
+  in the pod: Failed, CLI exit 1
+check 15: the CLI refuses without a kubeconfig, and without the CRDs
+  no kubeconfig: exit 1, kubectl has no current context
+  no CRD: exit 1, names blut-operator and kubectl apply
+PASS: all checks
+```
+
+What the CLI printed in check 11, and the two refusals in check 15:
+
+```
+recipe split
+job    20261030-163324-773990601
+plan   blutplan/split-20261030-163324-773990601 in namespace blut-e2e (blut-operator runs it)
+       Ctrl-C or `blut cancel 20261030-163324-773990601` deletes it
+[k8s] Pending waiting for a pod to start
+[k8s] Running running
+[k8s] Running finishing
+[k8s] Succeeded succeeded: 3 stage(s), 0 from cache, 3 computed
+  filter_dataset                   ok
+  materialize_dataset_path         ok
+  split_train_eval                 ok
+done — succeeded: 3 stage(s), 0 from cache, 3 computed (BlutPlan blut-e2e/split-20261030-163324-773990601)
+
+Error: --launcher k8s: kubectl has no current context (error: current-context is not set).
+Point KUBECONFIG at the cluster that runs blut-operator, or set BLUT_K8S_CONTEXT. Nothing
+was submitted and nothing ran locally
+
+Error: --launcher k8s: the cluster has no BlutPlan resource, so blut-operator is not
+installed there; install blut-operator with `kubectl apply -f crates/blut-operator/deploy/crds.yaml
+-f ... operator.yaml -f ... rbac.yaml` (docs/OPERATOR.md), or submit a BlutPlan yourself
+with `kubectl apply`. Nothing was submitted and nothing ran locally
+```
+
+Check 14 ends `Failed` on purpose. The standard cookbook has no registry
+recipes, and the core cookbook's are training and evaluation recipes that
+need a model and a Python trainer. `eval_only` with a checkpoint path that
+does not exist is submitted, the pod runs `recipe run eval_only`, the pod's
+compile refuses the path, and the CLI reports the plan's failure with the
+pod's error and exits 1:
+
+```
+Error: BlutPlan blut-e2e/eval-only-20261030-163352-404603962 failed: out of retries: last pod
+eval-only-20261030-163352-404603962-run-gd6s6 failed: Error, exit 1, recipe compile failed:
+recipe args invalid (checkpoint_path): not found: /nonexistent/ckpt
+```
+
+**What it found.** The first run of check 14 was refused before submission:
+the CLI compiled the named recipe locally, and the cookbook's compile checks
+that `checkpoint_path` exists, which it does in the pod and not on the
+submitting machine. A named recipe's args are now checked against its schema
+on the submitting machine and compiled only in the pod. The follower also
+printed `Pending` between the pod exiting 0 and the Job being marked
+Complete; the operator now reports that as `Running, finishing` (the
+`[k8s] Running finishing` line above).
+
+**Boundaries.** One host, as above, with etcd run with `--unsafe-no-fsync`.
+No named recipe ran to `Succeeded` through the cluster: none that is CPU-only
+and self-contained exists in the cookbooks. The CLI ran in a container on the
+host network, not on a separate workstation; there was no network between it
+and the API server to lose. Two failure paths of the follower were not
+exercised, here or by a test: no operator reporting within
+`BLUT_K8S_PICKUP_SECS`, and losing the API server while following.
 
 ## Required evidence before stronger claims
 

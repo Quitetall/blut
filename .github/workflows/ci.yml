@@ -329,8 +329,8 @@ jobs:
 
   # The operator on a real cluster: kind (one control plane, two workers),
   # MinIO in the cluster, the shipped manifests, and the standard cookbook
-  # built against this engine checkout. scripts/k8s_kind_e2e.sh lists the ten
-  # checks. Image builds dominate the run time.
+  # built against this engine checkout. scripts/k8s_kind_e2e.sh lists the
+  # fifteen checks, the last five driving `--launcher k8s` from the CLI.
   operator-kind-e2e:
     name: operator · kind end-to-end
     needs: operator
@@ -358,9 +358,35 @@ jobs:
           echo "1e9045ec32bea85da43de85f0065358529ea7c7a152eca78154fba5b58c27d82  /tmp/kubectl" | sha256sum -c -
           sudo install /tmp/kind /usr/local/bin/kind
           sudo install /tmp/kubectl /usr/local/bin/kubectl
+      # The two image builds dominate the job. Their layers are cached in the
+      # GitHub Actions cache, so a run whose engine, operator and cookbook
+      # inputs did not change reuses them; a change to one rebuilds only the
+      # image whose layers it touches.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Build the operator image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: docker/Dockerfile.operator
+          tags: blut-operator:e2e
+          load: true
+          cache-from: type=gha,scope=blut-operator
+          cache-to: type=gha,mode=max,scope=blut-operator
+      - name: Build the cookbook image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: docker/Dockerfile.cookbook
+          build-contexts: |
+            engine=.
+            cookbook=cookbooks
+          tags: blut-cookbook:e2e
+          load: true
+          cache-from: type=gha,scope=blut-cookbook
+          cache-to: type=gha,mode=max,scope=blut-cookbook
       - name: kind end-to-end
         env:
-          BLUT_COOKBOOK_DIR: ${{ github.workspace }}/cookbooks
+          SKIP_BUILD: "1"
           EVIDENCE_DIR: ${{ runner.temp }}/k8s-e2e
         run: bash scripts/k8s_kind_e2e.sh
       - name: Keep the evidence

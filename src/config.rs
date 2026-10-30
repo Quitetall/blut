@@ -10,6 +10,7 @@ use crate::error::{Result, TrainError};
 
 pub mod hydra;
 pub mod k8s;
+pub(crate) mod k8s_cluster;
 pub mod launcher;
 pub mod partition;
 pub mod sweep;

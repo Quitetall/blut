@@ -2124,6 +2124,11 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                 .map_err(|e| anyhow!("job {job_id} records an unknown launcher: {e}"))?;
             crate::config::launcher::check_launcher_env(launch_target)
                 .map_err(|e| anyhow!("--launcher {}: {e}", launch_target.as_str()))?;
+            if launch_target == crate::config::launcher::LaunchTarget::K8s {
+                return Err(anyhow!(crate::config::k8s_cluster::refuse_surface(
+                    "`plan resume` of a k8s job"
+                )));
+            }
             if launch_target != crate::config::launcher::LaunchTarget::Local {
                 eprintln!(
                     "resuming {job_id} with --launcher {} (as it was run)",
@@ -3516,6 +3521,9 @@ use recipe::*;
 
 mod run_summary;
 use run_summary::*;
+
+mod k8s_run;
+use k8s_run::*;
 
 mod runs;
 use runs::*;
