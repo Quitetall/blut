@@ -17,17 +17,17 @@
 //! small random population starts the search, and as each trial COMPLETES the
 //! policy tells TPE the result and `Spawn`s a fresh TPE-suggested trial.
 //!
-//! v0.20 boundary: `trial_of_topo` covers the INITIAL fan-out only, so a
-//! `Spawn`'d trial's steps (topo positions beyond it) are unattributed and don't
-//! feed back into the model — TPE/PBT learn from the initial population and the
-//! suggestions explore from it, but spawned trials are not themselves re-told.
-//! A runtime trial-registration channel (attributing new node ranges to trials)
-//! is the follow-up that closes the loop.
+//! Suggested trials are registered in the policy's [`TrialBook`] when the
+//! executor injects them (`ControlPolicy::on_spawned`), so their steps are
+//! attributed like an initial trial's: a suggestion that completes is told to
+//! TPE too, and appears in `hpo.json` for the leaderboard.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+
+use super::book::TrialBook;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -304,9 +304,8 @@ struct TpeState {
 /// The TPE control policy: tracks trial completions, tells the sampler, and
 /// `Spawn`s a fresh suggested trial.
 pub struct TpePolicy {
-    trial_of_topo: Vec<Option<u32>>,
-    /// Per-trial overlay (the config we record when it completes).
-    trial_overlays: Vec<Overlay>,
+    /// Topo → trial and per-trial overlays, initial and spawned.
+    book: Arc<TrialBook>,
     space: SearchSpace,
     cfg: TpePolicyConfig,
     sampler: Mutex<TpeSampler>,
@@ -324,8 +323,7 @@ impl TpePolicy {
         factory: FreshFactory,
     ) -> Self {
         Self {
-            trial_of_topo,
-            trial_overlays,
+            book: Arc::new(TrialBook::from_parts(trial_of_topo, trial_overlays)),
             space,
             cfg,
             sampler: Mutex::new(sampler),
@@ -338,6 +336,14 @@ impl TpePolicy {
                 spawns_done: 0,
             }),
         }
+    }
+
+    /// Share `book` (the HPO job's, bound to its `hpo.json`) instead of the
+    /// private one built from the constructor's initial population. The book
+    /// must already hold that population.
+    pub fn with_trial_book(mut self, book: Arc<TrialBook>) -> Self {
+        self.book = book;
+        self
     }
 
     /// Pure decision core (no `CompiledPlan` — unit-testable): drains a queued
@@ -357,7 +363,7 @@ impl TpePolicy {
             };
             if budget >= self.cfg.max_budget && !st.told.contains(&trial) {
                 st.told.insert(trial);
-                if let Some(overlay) = self.trial_overlays.get(trial as usize).cloned() {
+                if let Some(overlay) = self.book.overlay(trial) {
                     st.observations.push(TrialResult {
                         overlay,
                         objective: best,
@@ -386,12 +392,7 @@ impl TpePolicy {
 
 impl ControlPolicy for TpePolicy {
     fn on_step(&self, m: &StepMetrics) -> Control {
-        let Some(trial) = self
-            .trial_of_topo
-            .get(m.node_idx as usize)
-            .copied()
-            .flatten()
-        else {
+        let Some(trial) = self.book.trial_of(m.node_idx) else {
             return Control::Continue;
         };
         let Some(obj) = dotted_f64(m.update, &self.cfg.metric_key) else {
@@ -403,13 +404,19 @@ impl ControlPolicy for TpePolicy {
             TpeDecision::Spawn(overlay) => match (self.factory)(&overlay) {
                 Ok(subplan) => Control::Spawn(Box::new(SpawnDelta::new(
                     subplan,
-                    Some("tpe-suggest".into()),
+                    Some(self.book.reserve(overlay)),
                 ))),
                 Err(e) => {
                     tracing::warn!("tpe suggest factory failed: {e}");
                     Control::Continue
                 }
             },
+        }
+    }
+
+    fn on_spawned(&self, label: Option<&str>, nodes: &[(u32, &str)]) {
+        if let Some(label) = label {
+            self.book.bind(label, nodes);
         }
     }
 }
@@ -634,5 +641,33 @@ mod tests {
             TpeDecision::Continue,
             "cap 0 → never suggests"
         );
+    }
+
+    #[test]
+    fn a_spawned_suggestion_is_attributed_and_told_once_it_completes() {
+        // E2E follow-up: suggested trials used to be invisible — their steps
+        // carried topo positions past the initial map, so TPE never learned
+        // from them and `hpo show` never listed them.
+        let p = policy(8);
+        let TpeDecision::Spawn(suggestion) = p.decide(0, 0.3, 4) else {
+            panic!("t0's completion suggests");
+        };
+        let label = p.book.reserve(suggestion.clone());
+        p.on_spawned(Some(&label), &[(2, "train")]);
+        assert_eq!(p.book.trial_of(2), Some(2));
+        assert_eq!(p.book.overlay(2), Some(suggestion));
+
+        let update = json!({"val_r": 0.9, "epoch": 4});
+        let _ = p.on_step(&StepMetrics {
+            node_idx: 2,
+            stage_name: "train",
+            update: &update,
+        });
+        let st = p.state.lock();
+        assert!(
+            st.told.contains(&2),
+            "the suggestion's completion is told to TPE"
+        );
+        assert_eq!(st.observations.len(), 2);
     }
 }
