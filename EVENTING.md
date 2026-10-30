@@ -93,7 +93,18 @@ max_runtime_secs = 14400
 name = "fresh-output"
 recipe = "evaluate"
 freshness_secs = 3600
+
+[[rule]]
+name = "prod-deploy-runtime"
+recipe = "registry://plan@prod"
+max_runtime_secs = 7200
 ```
+
+`recipe` scopes a rule to the runs recorded under that recipe; without it the
+rule judges every run. It is a recipe name, or a deploy pointer URI: a run
+launched by `recipe declare registry://plan@<name> --run` (or dispatched by
+sensord from that URI) is recorded under the URI itself, whatever the published
+spec is called, and keeps it through `blut lineage reindex`.
 
 `max_runtime_secs`, `deadline_unix`, and `freshness_secs` are positive bounds.
 Runtime and freshness judge recent runs, per tenant, so an old breach stops

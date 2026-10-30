@@ -21,7 +21,10 @@ use blut_types::trust::DataClass;
 #[serde(deny_unknown_fields)]
 pub struct SlaRule {
     pub name: String,
-    /// Match only runs of this recipe (`None` = any recipe).
+    /// Match only runs of this recipe (`None` = any recipe): a registry
+    /// recipe name, or a deploy pointer URI (`registry://plan@prod`), which is
+    /// the recipe a `recipe declare registry://plan@<name> --run` launch (and
+    /// a sensord dispatch of one) records.
     #[serde(default)]
     pub recipe: Option<String>,
     /// Max wall-clock runtime in seconds before a `MaxRuntime` breach.
@@ -303,6 +306,21 @@ pub fn load_rules(path: &std::path::Path) -> std::io::Result<Vec<SlaRule>> {
     Ok(parsed.rule)
 }
 
+/// A rule's `recipe` scope: a recipe name (`[A-Za-z0-9_.-]`, not starting
+/// with `-`), or a deploy pointer URI. A pointer launch records the URI as its
+/// recipe, and the URI's `:`, `/` and `@` used to fail this check, so no rule
+/// could select those runs.
+fn valid_recipe_scope(recipe: &str) -> bool {
+    if crate::registry_db::parse_pointer_uri(recipe).is_some() {
+        return true;
+    }
+    !recipe.is_empty()
+        && !recipe.starts_with('-')
+        && recipe
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
 fn validate_rules(rules: &[SlaRule]) -> Result<(), String> {
     let mut names = std::collections::HashSet::new();
     for rule in rules {
@@ -317,14 +335,16 @@ fn validate_rules(rules: &[SlaRule]) -> Result<(), String> {
                 rule.name
             ));
         }
-        if rule.recipe.as_ref().is_some_and(|recipe| {
-            recipe.is_empty()
-                || recipe.starts_with('-')
-                || !recipe
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-        }) {
-            return Err(format!("invalid recipe scope in SLA rule {:?}", rule.name));
+        if rule
+            .recipe
+            .as_deref()
+            .is_some_and(|recipe| !valid_recipe_scope(recipe))
+        {
+            return Err(format!(
+                "invalid recipe scope in SLA rule {:?} (expected a recipe name or \
+                 registry://plan@<name>)",
+                rule.name
+            ));
         }
         if rule.max_runtime_secs.is_none()
             && rule.deadline_unix.is_none()
@@ -657,6 +677,53 @@ mod tests {
         let mut valid = invalid;
         valid.max_runtime_secs = Some(1);
         assert!(validate_rules(&[valid.clone(), valid]).is_err());
+    }
+
+    /// A pointer launch records `registry://plan@<name>` as its recipe; the
+    /// URI's `:`, `/` and `@` failed rule validation, so no rule could select
+    /// those runs (a rule with no recipe matched them along with everything).
+    #[test]
+    fn a_rule_can_scope_to_a_deploy_pointer() {
+        let rule = |recipe: &str| SlaRule {
+            name: "r".into(),
+            recipe: Some(recipe.into()),
+            max_runtime_secs: Some(100),
+            deadline_unix: None,
+            freshness_secs: None,
+        };
+        for ok in [
+            "train",
+            "eval-v2.1",
+            "registry://plan@prod",
+            "registry://plan@a_b.c-1",
+        ] {
+            assert!(validate_rules(&[rule(ok)]).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "",
+            "-x",
+            "a/b",
+            "registry://plan@",
+            "registry://plan@a b",
+            "registry://plan@../x",
+            "registry://model@prod",
+            "registry://plan@prod/x",
+        ] {
+            assert!(validate_rules(&[rule(bad)]).is_err(), "{bad:?}");
+        }
+        let run = |job: &str, recipe: &str| {
+            let mut o = obs(recipe, "default", DataClass::Internal, 0, None);
+            o.job_id = job.into();
+            o
+        };
+        let runs = vec![
+            run("pointer", "registry://plan@prod"),
+            run("spec-name", "prod"),
+            run("other-pointer", "registry://plan@staging"),
+        ];
+        let breaches = evaluate(&[rule("registry://plan@prod")], &runs, 500);
+        assert_eq!(breaches.len(), 1, "{breaches:?}");
+        assert_eq!(breaches[0].job_id, "pointer");
     }
 
     #[test]

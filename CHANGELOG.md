@@ -144,6 +144,14 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- An SLA rule could not select runs launched from a deploy pointer: such a run
+  is recorded under the recipe `registry://plan@<name>`, and a rule's `recipe`
+  refused that URI, so only a rule with no recipe (matching every run) judged
+  them. A rule's `recipe` may now be the pointer URI. `lineage reindex` also
+  rebuilt such a run under the published spec's name (refusing it as a recipe
+  change when the run was already indexed); a pointer launch's `plan.json` now
+  carries the URI it ran under, so `blut dag` shows it and a rebuilt index
+  matches the live one.
 - `lineage card` and `lineage graph` attributed an artifact to the newest job
   holding it, often a cache-hit job that never produced it, so a model card
   showed none of the training run's metrics. The index records whether each

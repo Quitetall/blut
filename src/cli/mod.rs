@@ -3224,9 +3224,121 @@ fn dir_size_bytes(path: &std::path::Path) -> Result<u64> {
 /// Persist the plan STRUCTURE for the DAG backend (`blut dag`). Best-effort: a
 /// snapshot write must NEVER fail or delay the actual run, so errors only warn.
 /// Call with `&plan` BEFORE `execute_plan` moves it.
+/// A one-stage cookbook for CLI tests that launch, publish or promote a real
+/// (tiny) plan: one in-process stage producing an inline artifact.
+#[cfg(test)]
+mod toy_plan {
+    use crate::backends::LamuTrainerBackend;
+    use crate::framework::Compatible;
+    use crate::framework::artifact::{Artifact, ContentHash};
+    use crate::framework::cookbook::Cookbook;
+    use crate::framework::error::StageError;
+    use crate::framework::resource::Resource;
+    use crate::framework::stage::{ErasedStageCtor, Stage, StageContext};
+    use crate::recipes::recipe::RecipeDef;
+    use async_trait::async_trait;
+    use serde::{Deserialize, Serialize};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct Unit;
+    impl Artifact for Unit {
+        const KIND: &'static str = "cli_toy.unit";
+        const SCHEMA: u32 = 1;
+        const INLINE: bool = true;
+        fn content_hash(&self) -> ContentHash {
+            ContentHash::of_bytes(b"cli_toy.unit")
+        }
+        fn primary_path(&self) -> &Path {
+            Path::new(".")
+        }
+    }
+
+    #[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+    struct ToyArgs {
+        #[serde(default)]
+        n: u32,
+    }
+
+    struct MakeUnit;
+    impl Compatible<LamuTrainerBackend> for MakeUnit {}
+    #[async_trait]
+    impl Stage for MakeUnit {
+        const NAME: &'static str = "cli_toy_make_unit";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = ();
+        type Output = Unit;
+        type Args = ToyArgs;
+        async fn run(&self, _c: &StageContext, _i: (), _a: &ToyArgs) -> Result<Unit, StageError> {
+            Ok(Unit)
+        }
+    }
+
+    static ERASED: &[(&str, ErasedStageCtor)] = &[("cli_toy_make_unit", || Arc::new(MakeUnit))];
+    static NO_RECIPES: &[&RecipeDef] = &[];
+    struct ToyCookbook;
+    impl Cookbook for ToyCookbook {
+        fn name(&self) -> &'static str {
+            "cli_toy"
+        }
+        fn recipes(&self) -> &'static [&'static RecipeDef] {
+            NO_RECIPES
+        }
+        fn stages_erased(&self) -> &'static [(&'static str, ErasedStageCtor)] {
+            ERASED
+        }
+    }
+
+    /// A registry holding only the toy cookbook.
+    pub(super) fn registry() -> crate::framework::Registry {
+        let mut reg = crate::framework::Registry::new();
+        reg.register(Box::new(ToyCookbook));
+        reg
+    }
+
+    /// A one-node spec named `name`.
+    pub(super) fn spec(name: &str) -> crate::framework::plan_spec::PlanSpec {
+        spec_with(name, 0)
+    }
+
+    /// A one-node spec whose stage arg `n` makes its fingerprint distinct.
+    pub(super) fn spec_with(name: &str, n: u32) -> crate::framework::plan_spec::PlanSpec {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "version": 1,
+            "edges": [],
+            "nodes": [{"stage": "cli_toy_make_unit", "args": {"n": n}}],
+        }))
+        .expect("toy spec")
+    }
+}
+
 fn persist_plan_graph(plan: &crate::framework::CompiledPlan, job_dir: &std::path::Path) {
+    persist_plan_graph_named(plan, job_dir, None);
+}
+
+/// [`persist_plan_graph`], with the graph named `name` (the name the run is
+/// recorded under in the lineage index) instead of the plan's own name.
+fn persist_plan_graph_as(
+    plan: &crate::framework::CompiledPlan,
+    job_dir: &std::path::Path,
+    name: &str,
+) {
+    persist_plan_graph_named(plan, job_dir, Some(name));
+}
+
+fn persist_plan_graph_named(
+    plan: &crate::framework::CompiledPlan,
+    job_dir: &std::path::Path,
+    name: Option<&str>,
+) {
     match plan.graph_structure() {
-        Ok(g) => {
+        Ok(mut g) => {
+            if let Some(name) = name {
+                g.name = name.to_string();
+            }
             if let Err(e) = g.write_to(job_dir) {
                 eprintln!("warning: could not write plan.json (blut dag unavailable): {e}");
             }

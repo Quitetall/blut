@@ -957,6 +957,7 @@ impl PreparedRecipeLaunch {
         }
         let materialized_job_dir = crate::paths::job_dir(&job_id)?;
         debug_assert_eq!(materialized_job_dir, job_dir);
+        let markerless = marker.is_none();
         if let Err(error) = persist_launch_records(&job_id, &job_dir, &tenant, &experiment, marker)
         {
             // Nothing ran: remove the partial job rather than leave one behind.
@@ -992,7 +993,18 @@ impl PreparedRecipeLaunch {
         eprintln!("dir    {}", job_dir.display());
         eprintln!("lock   {}", lock.path().display());
 
-        persist_plan_graph(&plan, &job_dir);
+        // A launch with no recipe marker (a plan file, a declared recipe, a
+        // deploy pointer) is re-indexed from its plan graph, so the graph
+        // carries the name the run is recorded under. A pointer launch is
+        // recorded as `registry://plan@<name>` while its graph kept the
+        // published spec's name: `lineage reindex` then refused the run
+        // ("recipe is immutable"), or on a fresh index recorded the spec name,
+        // so an SLA rule scoped to the pointer stopped matching its runs.
+        if markerless {
+            persist_plan_graph_as(&plan, &job_dir, &name);
+        } else {
+            persist_plan_graph(&plan, &job_dir);
+        }
         // `ctx` owns the private preparation witness, so `execute_plan`
         // dispatches this exact post-DCE plan/profile without resolving again.
         let result = crate::framework::execute_plan(plan, ctx).await;
@@ -1726,6 +1738,128 @@ mod launch_refusal_tests {
             jobs.unwrap().is_empty(),
             "a refused launch must not create a job"
         );
+    }
+}
+
+#[cfg(test)]
+mod pointer_launch_identity_tests {
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..).rev() {
+                // SAFETY: TEST_ENV_LOCK is held for this guard's whole life.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A pointer launch (`recipe declare registry://plan@prod --run`) runs
+    /// under the recipe `registry://plan@prod`. An SLA rule could not name
+    /// that recipe (its URI failed rule validation), and `lineage reindex`
+    /// rebuilt the run under the published spec's name, so a rule scoped to
+    /// the pointer could never select the run, before or after a reindex.
+    // The env lock must span the awaited launch: the launch reads these vars.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn an_sla_rule_selects_a_pointer_launch_before_and_after_reindex() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let vars: [(&'static str, std::path::PathBuf); 6] = [
+            ("LAMU_TRAIN_JOBS_DIR", td.path().join("jobs")),
+            ("LAMU_TRAIN_DATA_DIR", td.path().join("data")),
+            ("XDG_DATA_HOME", td.path().join("xdg-data")),
+            ("XDG_CACHE_HOME", td.path().join("xdg-cache")),
+            ("BLUT_NO_CONTAIN", "1".into()),
+            ("CUDA_VISIBLE_DEVICES", std::path::PathBuf::new()),
+        ];
+        let _env = EnvRestore(
+            vars.iter()
+                .map(|(key, value)| {
+                    let previous = std::env::var_os(key);
+                    // SAFETY: TEST_ENV_LOCK serializes env mutation.
+                    unsafe { std::env::set_var(key, value) };
+                    (*key, previous)
+                })
+                .collect(),
+        );
+
+        let reg = super::super::toy_plan::registry();
+        let spec = super::super::toy_plan::spec("nightly-spec");
+        let plan = spec.compile(&reg).unwrap();
+        let uri = "registry://plan@prod";
+        let job_id = super::launch_compiled_plan(
+            uri,
+            plan,
+            None,
+            None,
+            false,
+            crate::config::launcher::LaunchTarget::Local,
+            None,
+            false,
+            false,
+            crate::tenant::Tenant::default(),
+            Some("plan.prod".into()),
+        )
+        .await
+        .expect("the pointer launch runs");
+
+        let recorded = || {
+            crate::lineage_db::LineageDb::open()
+                .unwrap()
+                .all_runs()
+                .unwrap()
+                .into_iter()
+                .find(|run| run.job_id == job_id)
+                .expect("the run is indexed")
+        };
+        let rules_path = td.path().join("sla.toml");
+        std::fs::write(
+            &rules_path,
+            "[[rule]]\nname = \"prod-runtime\"\nrecipe = \"registry://plan@prod\"\n\
+             max_runtime_secs = 60\n\n\
+             [[rule]]\nname = \"spec-runtime\"\nrecipe = \"nightly-spec\"\n\
+             max_runtime_secs = 60\n",
+        )
+        .unwrap();
+        let rules = crate::sla::load_rules(&rules_path).expect("a pointer URI is a valid scope");
+        // Judge the run as if it were still running long past the cap, so the
+        // only question is whether a rule selects it.
+        let breaches_for = |run: &crate::lineage_db::RunRow| {
+            let mut observation = crate::sla::observation_from_run(run).unwrap();
+            observation.ended_unix = None;
+            let now = observation.started_unix + 3_600;
+            crate::sla::evaluate(&rules, &[observation], now)
+                .into_iter()
+                .map(|breach| breach.rule)
+                .collect::<Vec<_>>()
+        };
+
+        let live = recorded();
+        assert_eq!(live.recipe, uri);
+        assert_eq!(breaches_for(&live), vec!["prod-runtime".to_string()]);
+        let job_dir = crate::paths::job_dir(&job_id).unwrap();
+        assert_eq!(
+            crate::framework::PlanGraph::read_from(&job_dir)
+                .expect("plan.json")
+                .name,
+            uri,
+            "the graph a reindex reads must name what the run is recorded under"
+        );
+
+        // A deleted index is rebuilt from the job dirs: the run keeps its
+        // recipe, so the rule still selects it.
+        std::fs::remove_file(td.path().join("data").join("lineage.db")).unwrap();
+        super::super::lineage::run_lineage_reindex().unwrap();
+        let rebuilt = recorded();
+        assert_eq!(rebuilt.recipe, uri);
+        assert_eq!(breaches_for(&rebuilt), vec!["prod-runtime".to_string()]);
     }
 }
 
