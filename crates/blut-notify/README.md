@@ -42,6 +42,12 @@ blut-notify --config ~/.blut/notify.toml
 blut-notify --config ~/.blut/notify.toml --once   # smoke/CI
 ```
 
+Without `--jobs-dir`, `--sla` and `--cursor` the daemon reads where the engine
+writes (`blut::paths`): jobs from `$LAMU_TRAIN_JOBS_DIR`, else
+`$LAMU_TRAIN_DATA_DIR/train-jobs`, else `$XDG_DATA_HOME/lamu/train-jobs`
+(`~/.local/share/lamu/train-jobs`); the SLA log from `$BLUT_SLA_PATH`, else
+`sla.jsonl` in `$LAMU_TRAIN_DATA_DIR` or `~/.blut`, where the cursors live too.
+
 Every sink implements `NotifySink` and therefore passes through the same
 `deliver` chokepoint. Restricted summaries may reach local sinks; they are
 structurally refused before any off-box sink sees them. The legacy one-envelope

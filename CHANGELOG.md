@@ -237,6 +237,12 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- `blut-notify`'s default jobs directory was `$HOME/.local/share/lamu/train-jobs`
+  even when `$XDG_DATA_HOME` moved the engine's elsewhere, so the daemon tailed
+  an empty directory. It now follows `blut::paths::jobs_dir`
+  (`$LAMU_TRAIN_JOBS_DIR`, `$LAMU_TRAIN_DATA_DIR/train-jobs`, then the platform
+  data directory), and its default SLA log honours `$BLUT_SLA_PATH` like the
+  engine's.
 - TPE and multivariate TPE could suggest a value equal to the exclusive upper
   bound of a `uniform` or `log_uniform` dim (`wd = 1.0` for `uniform(0, 1)`):
   a candidate jittered past the support was clamped to `high` inclusive. A

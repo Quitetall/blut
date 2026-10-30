@@ -334,6 +334,7 @@ dependencies = [
  "anyhow",
  "blut-types",
  "clap",
+ "dirs",
  "lettre",
  "nix 0.29.0",
  "reqwest 0.12.28",
