@@ -458,14 +458,18 @@ enum PlanCommand {
         #[arg(long, default_value = "default")]
         tenant: String,
     },
-    /// Roll a pointer back to its previous target atomically.
+    /// Roll a pointer back one step through its promotion history. Each
+    /// rollback moves one promotion further back (promote A, B, C, then two
+    /// rollbacks land on A); a promotion after a rollback continues from there.
+    /// Refused at the pointer's first promotion.
     Rollback {
         /// Pointer, e.g. `registry://plan@prod`.
         pointer: String,
         #[arg(long, default_value = "default")]
         tenant: String,
     },
-    /// Print a pointer's deployment audit trail (oldest first).
+    /// Print a pointer's deployment audit trail, oldest first: time,
+    /// fingerprint, and whether the move was a promote or a rollback.
     History {
         /// Pointer, e.g. `registry://plan@prod`.
         pointer: String,
@@ -2408,13 +2412,13 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             let name = crate::registry_db::parse_pointer_uri(&pointer)
                 .ok_or_else(|| anyhow!("not a `registry://plan@<name>` URI: {pointer}"))?;
             let conn = crate::registry_db::open().map_err(|e| anyhow!("{e}"))?;
-            let hist =
-                crate::registry_db::history(&conn, &tenant, name).map_err(|e| anyhow!("{e}"))?;
+            let hist = crate::registry_db::history_moves(&conn, &tenant, name)
+                .map_err(|e| anyhow!("{e}"))?;
             if hist.is_empty() {
-                println!("no history for registry://plan@{name}");
+                println!("no history for registry://plan@{name} (tenant {tenant})");
             }
-            for h in &hist {
-                println!("{}  {}", h.moved_at, h.plan_fingerprint);
+            for (h, kind) in &hist {
+                println!("{}  {}  {}", h.moved_at, h.plan_fingerprint, kind.as_str());
             }
             Ok(())
         }

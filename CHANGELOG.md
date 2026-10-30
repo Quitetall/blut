@@ -58,6 +58,13 @@ depend on this crate.
   address them with `--tenant shared`, and a lookup under `default` that misses
   names the tenant holding the pointer. blut-web authorises run and cancel
   against `default`, the tenant the launched run uses.
+- `plan rollback` walks the promotion history like an undo stack: each
+  rollback moves one promotion further back (promote A, B, C, then two
+  rollbacks land on A), a promotion after a rollback continues from there, and
+  a rollback at the first promotion is refused. It used to toggle between the
+  last two targets. The trail records each move's kind, shown by `plan
+  history`; registries created earlier gain the column on open, and their old
+  moves count as promotions.
 - `blut-operator` moves to the engine's MSRV, Rust 1.88 (was 1.89), and from
   kube 0.96 to kube 4.0 / k8s-openapi 0.28 (Kubernetes 1.32 API). It is
   publishable (`publish = ["crates-io"]`, 0.2.0-alpha.2) but not yet published.

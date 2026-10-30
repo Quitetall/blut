@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS pointer_history (
     tenant           TEXT NOT NULL,
     name             TEXT NOT NULL,
     plan_fingerprint TEXT NOT NULL,
-    moved_at         INTEGER NOT NULL
+    moved_at         INTEGER NOT NULL,
+    kind             TEXT NOT NULL DEFAULT 'promote'
 );
 CREATE INDEX IF NOT EXISTS idx_history_ptr ON pointer_history(tenant, name, seq);
 ";
@@ -115,7 +116,100 @@ pub fn open_at(path: &std::path::Path) -> Result<Connection> {
         conn.query_row::<rusqlite::types::Value, _, _>("PRAGMA journal_mode=WAL", [], |r| r.get(0));
     conn.execute_batch(CREATE_SCHEMA)
         .map_err(|e| TrainError::other(format!("create registry schema: {e}")))?;
+    migrate_history_kind(&conn)?;
     Ok(conn)
+}
+
+/// Add `pointer_history.kind` (`promote` | `rollback`) to a registry created
+/// before rollbacks walked the history. Rows written before it are counted as
+/// promotions: the old trail did not record which moves were rollbacks.
+fn migrate_history_kind(conn: &Connection) -> Result<()> {
+    let has_kind = conn
+        .prepare("PRAGMA table_info(pointer_history)")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(|e| TrainError::other(format!("pointer_history columns: {e}")))?
+        .iter()
+        .any(|c| c == "kind");
+    if !has_kind {
+        conn.execute(
+            "ALTER TABLE pointer_history ADD COLUMN kind TEXT NOT NULL DEFAULT 'promote'",
+            [],
+        )
+        .map_err(|e| TrainError::other(format!("add pointer_history.kind: {e}")))?;
+    }
+    Ok(())
+}
+
+/// A pointer's promotion stack, replayed from its audit trail: a promotion
+/// pushes its fingerprint (unless it is already on top), a rollback pops. The
+/// top is what the pointer resolves to; a rollback moves to the entry below.
+fn promotion_stack(conn: &Connection, tenant: &str, name: &str) -> Result<Vec<String>> {
+    let moves = history_moves(conn, tenant, name)?;
+    let mut stack: Vec<String> = Vec::new();
+    for (entry, kind) in moves {
+        match kind {
+            MoveKind::Rollback => {
+                stack.pop();
+            }
+            MoveKind::Promote => {
+                if stack.last() != Some(&entry.plan_fingerprint) {
+                    stack.push(entry.plan_fingerprint);
+                }
+            }
+        }
+    }
+    Ok(stack)
+}
+
+/// How a pointer moved, as recorded in `pointer_history.kind`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MoveKind {
+    Promote,
+    Rollback,
+}
+
+impl MoveKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            MoveKind::Promote => "promote",
+            MoveKind::Rollback => "rollback",
+        }
+    }
+}
+
+/// A pointer's audit trail with the kind of each move, oldest first.
+pub(crate) fn history_moves(
+    conn: &Connection,
+    tenant: &str,
+    name: &str,
+) -> Result<Vec<(HistoryEntry, MoveKind)>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT plan_fingerprint, moved_at, kind FROM pointer_history \
+             WHERE tenant = ?1 AND name = ?2 ORDER BY seq ASC",
+        )
+        .map_err(|e| TrainError::other(format!("history prepare: {e}")))?;
+    let rows = stmt
+        .query_map(params![tenant, name], |row| {
+            let kind: String = row.get(2)?;
+            Ok((
+                HistoryEntry {
+                    plan_fingerprint: row.get(0)?,
+                    moved_at: row.get(1)?,
+                },
+                if kind == "rollback" {
+                    MoveKind::Rollback
+                } else {
+                    MoveKind::Promote
+                },
+            ))
+        })
+        .map_err(|e| TrainError::other(format!("history query: {e}")))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| TrainError::other(format!("history collect: {e}")))
 }
 
 /// The ADR-0078 fingerprint that keys a spec in `deployments` — deterministic
@@ -280,36 +374,42 @@ pub fn promote(
     Ok(())
 }
 
-/// Roll a pointer back to its previous target atomically (a single
-/// transaction): reads the two most-recent history entries, sets the pointer to
-/// the second-most-recent, and records the rollback in the trail. Errors if the
-/// pointer has no prior target. Returns the fingerprint rolled back to.
+/// Roll a pointer back one step through its promotion history, atomically (a
+/// single `BEGIN IMMEDIATE` transaction). Rollbacks walk the history like an
+/// undo stack: each one moves to the promotion before the current one, so
+/// promote A, B, C then roll back twice lands on A. A promotion after a
+/// rollback starts from where the rollback left the pointer (the rolled-back
+/// promotions are not reachable again by rolling back). Errors when the
+/// pointer is at its first promotion: there is nothing earlier. The move is
+/// recorded in the trail as a `rollback`. Returns the fingerprint rolled back
+/// to.
+///
+/// It used to read only the two most recent trail entries, so a second
+/// rollback returned to the target the first one had left: repeated rollbacks
+/// toggled between the last two deployments.
 pub fn rollback(conn: &mut Connection, tenant: &str, name: &str, now_unix: i64) -> Result<String> {
-    // BEGIN IMMEDIATE: take the write lock up front so the two-most-recent read
-    // and the pointer/history writes see ONE consistent snapshot — a concurrent
-    // promote/rollback can't slip between the read and the write and stale `prev`.
+    // BEGIN IMMEDIATE: take the write lock up front so the stack replay and the
+    // pointer/history writes see ONE consistent snapshot — a concurrent
+    // promote/rollback can't slip between the read and the write.
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| TrainError::other(format!("rollback txn: {e}")))?;
-    let recent: Vec<String> = {
-        let mut stmt = tx
-            .prepare(
-                "SELECT plan_fingerprint FROM pointer_history \
-                 WHERE tenant = ?1 AND name = ?2 ORDER BY seq DESC LIMIT 2",
-            )
-            .map_err(|e| TrainError::other(format!("history query: {e}")))?;
-        let rows = stmt
-            .query_map(params![tenant, name], |row| row.get::<_, String>(0))
-            .map_err(|e| TrainError::other(format!("history rows: {e}")))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| TrainError::other(format!("history collect: {e}")))?
+    let stack = promotion_stack(&tx, tenant, name)?;
+    let prev = match stack.as_slice() {
+        [] => {
+            return Err(TrainError::other(format!(
+                "rollback refused — pointer 'registry://plan@{name}' has no deployment for \
+                 tenant '{tenant}'"
+            )));
+        }
+        [only] => {
+            return Err(TrainError::other(format!(
+                "rollback refused — pointer 'registry://plan@{name}' is at its first \
+                 promotion ({only}); there is nothing earlier to roll back to"
+            )));
+        }
+        [.., prev, _current] => prev.clone(),
     };
-    if recent.len() < 2 {
-        return Err(TrainError::other(format!(
-            "rollback refused — pointer 'registry://plan@{name}' has no prior deployment"
-        )));
-    }
-    let prev = recent[1].clone();
     // Defense-in-depth (matches promote): the target must belong to THIS tenant.
     // promote already blocks a foreign fingerprint from entering the trail, so
     // this can only fail on a corrupted/hand-edited DB — fail closed rather than
@@ -329,8 +429,8 @@ pub fn rollback(conn: &mut Connection, tenant: &str, name: &str, now_unix: i64) 
     )
     .map_err(|e| TrainError::other(format!("rollback pointer: {e}")))?;
     tx.execute(
-        "INSERT INTO pointer_history (tenant, name, plan_fingerprint, moved_at) \
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO pointer_history (tenant, name, plan_fingerprint, moved_at, kind) \
+         VALUES (?1, ?2, ?3, ?4, 'rollback')",
         params![tenant, name, prev, now_unix],
     )
     .map_err(|e| TrainError::other(format!("rollback history: {e}")))?;
