@@ -4792,6 +4792,88 @@ async fn canonical_adapter_failure_fails_the_plan() {
     }
     assert_eq!(submit_count.load(Ordering::SeqCst), 1);
 }
+
+/// `--launcher p2p` and `cloud` ran every stage on this machine: no command
+/// installed an execution adapter, and the executor ran the plan locally
+/// anyway. k8s is a whole-plan submission and never runs in-process. Each is
+/// refused before any stage runs, by both executors.
+#[tokio::test]
+async fn a_placement_with_no_way_to_run_there_runs_nothing_here() {
+    use crate::config::launcher::LaunchTarget;
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    for (target, expected) in [
+        (
+            LaunchTarget::P2P,
+            "--launcher p2p cannot place a plan executed without an execution adapter",
+        ),
+        (
+            LaunchTarget::Cloud,
+            "--launcher cloud cannot place a plan executed without an execution adapter",
+        ),
+        (LaunchTarget::K8s, "kubectl apply"),
+    ] {
+        for parallel in [false, true] {
+            MAKE_RUN_COUNT.store(0, Ordering::SeqCst);
+            let (_td, ctx) = fresh_ctx();
+            let ctx = ctx.with_launch_target(target);
+            let plan = Plan::<(), LamuTrainerBackend>::new("unplaced", serde_json::json!({}))
+                .start(MakeOne, EmptyArgs)
+                .finish()
+                .into_compiled();
+            let result = if parallel {
+                ParallelExecutor::execute(plan, ctx).await
+            } else {
+                SequentialExecutor::execute(plan, ctx).await
+            };
+            let err = match result {
+                Err(PlanError::Other(message)) => message,
+                other => panic!("{target:?} (parallel={parallel}) must be refused: {other:?}"),
+            };
+            assert!(
+                err.contains(expected),
+                "{target:?} (parallel={parallel}): {err}"
+            );
+            assert_eq!(
+                MAKE_RUN_COUNT.load(Ordering::SeqCst),
+                0,
+                "{target:?} (parallel={parallel}): the stage ran on this machine"
+            );
+        }
+    }
+}
+
+/// With an execution adapter installed, a p2p or cloud placement is the
+/// library path the refusal points at, and is not refused.
+#[cfg(feature = "p2p")]
+#[tokio::test]
+async fn a_remote_placement_with_an_execution_adapter_runs_through_it() {
+    use crate::config::launcher::LaunchTarget;
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    for target in [LaunchTarget::P2P, LaunchTarget::Cloud] {
+        let (_td, base) = fresh_ctx();
+        let submit_count = Arc::new(AtomicU32::new(0));
+        let adapter = Arc::new(MockExecutionAdapter {
+            outcome: CanonicalAdapterOutcome::Succeeded(Counter { n: 42 }),
+            submit_count: submit_count.clone(),
+        });
+        let policy = Arc::new(MockDispatchPolicy {
+            dispatchable: "dispatchable_thing",
+        });
+        let ctx = base
+            .with_launch_target(target)
+            .with_execution_adapter(policy, adapter);
+        let plan = Plan::<(), LamuTrainerBackend>::new("adapter_placed", serde_json::json!({}))
+            .start(DispatchableStage, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let result = ParallelExecutor::execute(plan, ctx)
+            .await
+            .unwrap_or_else(|e| panic!("{target:?} with an adapter: {e}"));
+        let output: Counter = result.final_output.unwrap().into_typed().unwrap();
+        assert_eq!(output.n, 42, "{target:?}: the adapter's output");
+        assert_eq!(submit_count.load(Ordering::SeqCst), 1, "{target:?}");
+    }
+}
 // ── GPU sampler leaked on panic (audit finding 4) ───────────────────
 //
 // `GpuSamplerHandle` (gpu_sampler.rs) has no `Drop` impl — a bare drop

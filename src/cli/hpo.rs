@@ -81,6 +81,7 @@ pub(super) enum HpoCommand {
         #[arg(long, default_value_t = false)]
         shared_cache: bool,
         /// Placement: local (default) | slurm | ray (per-trial; see `recipe run`).
+        /// k8s, p2p and cloud are refused.
         #[arg(long, default_value = "local")]
         launcher: String,
         /// Force every declaring training stage onto its explicit Inline I/O
@@ -534,6 +535,9 @@ pub(super) async fn run_hpo(
             "`hpo` studies"
         )));
     }
+    // `study run` comes through here too.
+    crate::config::launcher::check_launcher_placeable(launch_target, "`hpo` and `study` trials")
+        .map_err(|e| anyhow!("{e}"))?;
     let tenant = crate::tenant::Tenant::parse(&tenant)
         .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
     // The marker records the UNION of every dataset any trial can reach: the

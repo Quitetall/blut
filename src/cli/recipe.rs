@@ -124,6 +124,9 @@ pub(super) enum RecipeCommand {
         /// (`BLUT_SLURM_*` / `RAY_ADDRESS` env). SHARED-FS CONTRACT: the
         /// content-addressed cache + job dirs must be reachable from the
         /// compute node (NFS/Lustre); local admission still gates (conservative).
+        /// `k8s` submits the whole recipe to blut-operator (docs/OPERATOR.md).
+        /// `p2p` and `cloud` are refused: no command places a run's stages on
+        /// peers or on the cloud queue.
         #[arg(long, default_value = "local")]
         launcher: String,
         /// Tenant (`project[/domain]`, ADR 0096) whose namespace this run's
@@ -231,6 +234,13 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             let declare_target: crate::config::launcher::LaunchTarget = launcher
                 .parse()
                 .map_err(|e| anyhow!("invalid --launcher {launcher:?}: {e}"))?;
+            // Before the arm below, which sends other launchers to `recipe
+            // run`: that refuses p2p and cloud as well.
+            crate::config::launcher::check_launcher_placeable(
+                declare_target,
+                "`recipe declare --run`",
+            )
+            .map_err(|e| anyhow!("{e}"))?;
             match declare_target {
                 crate::config::launcher::LaunchTarget::Local => {}
                 crate::config::launcher::LaunchTarget::K8s => {
@@ -372,6 +382,10 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             crate::config::launcher::check_launcher_env(launch_target)
                 .map_err(|e| anyhow!("--launcher {launcher}: {e}"))?;
             crate::config::launcher::check_launcher_tools(launch_target)
+                .map_err(|e| anyhow!("{e}"))?;
+            // Before `--dry-run` and config mode too: a dry run that reports
+            // OK for a placement the real run refuses would be a lie.
+            crate::config::launcher::check_launcher_placeable(launch_target, "`recipe run`")
                 .map_err(|e| anyhow!("{e}"))?;
             // ADR 0096: parse the tenant up front (same fail-fast discipline).
             let tenant = crate::tenant::Tenant::parse(&tenant)
@@ -1192,18 +1206,22 @@ fn persist_launch_records(
 }
 
 /// Backstop: every local launch passes through `prepare_compiled_plan_launch`.
-/// A k8s placement that reaches it was not submitted to a cluster, and
-/// running it on this machine would claim a placement that did not happen.
-fn refuse_local_k8s_launch(
+/// A k8s placement that reaches it was not submitted to a cluster, and a p2p
+/// or cloud placement has no execution adapter on any command path; running
+/// either on this machine would claim a placement that did not happen. It
+/// refuses before the job directory exists.
+fn refuse_unplaced_local_launch(
     name: &str,
     launch_target: crate::config::launcher::LaunchTarget,
 ) -> Result<()> {
+    let surface = format!("'{name}' on this path");
     if launch_target == crate::config::launcher::LaunchTarget::K8s {
         return Err(anyhow!(crate::config::k8s_cluster::refuse_surface(
-            &format!("'{name}' on this path")
+            &surface
         )));
     }
-    Ok(())
+    crate::config::launcher::check_launcher_placeable(launch_target, &surface)
+        .map_err(|e| anyhow!("{e}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1223,7 +1241,7 @@ pub(super) fn prepare_compiled_plan_launch(
 ) -> Result<PreparedRecipeLaunch> {
     use crate::framework::ExecCtx;
 
-    refuse_local_k8s_launch(name, launch_target)?;
+    refuse_unplaced_local_launch(name, launch_target)?;
 
     let admission_snapshot = tenant_admission.snapshot();
     // One scan: the plan's largest declared envelope feeds auto-tune, the
@@ -2016,13 +2034,36 @@ mod k8s_refusal_tests {
     #[test]
     fn the_local_launch_path_refuses_a_k8s_placement() {
         use crate::config::launcher::LaunchTarget;
-        refuse_local_k8s_launch("demo", LaunchTarget::Local).unwrap();
-        let msg = refuse_local_k8s_launch("demo", LaunchTarget::K8s)
+        refuse_unplaced_local_launch("demo", LaunchTarget::Local).unwrap();
+        let msg = refuse_unplaced_local_launch("demo", LaunchTarget::K8s)
             .unwrap_err()
             .to_string();
         assert!(msg.contains("`recipe run`"), "{msg}");
         assert!(msg.contains("kubectl apply"), "{msg}");
         assert!(msg.contains("Nothing ran locally"), "{msg}");
+    }
+
+    /// `--launcher p2p` and `cloud` fell through to the local launcher the
+    /// same way. The backstop refuses them too, whatever path reached it.
+    #[test]
+    fn the_local_launch_path_refuses_p2p_and_cloud_placements() {
+        use crate::config::launcher::LaunchTarget;
+        for (target, names) in [
+            (LaunchTarget::P2P, "blut p2p node --dispatch-stage"),
+            (LaunchTarget::Cloud, "blut cloud smoke"),
+        ] {
+            let msg = refuse_unplaced_local_launch("demo", target)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                msg.contains(&format!(
+                    "--launcher {} cannot place 'demo' on this path",
+                    target.as_str()
+                )),
+                "{msg}"
+            );
+            assert!(msg.contains(names), "{msg}");
+        }
     }
 }
 

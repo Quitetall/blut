@@ -358,6 +358,8 @@ pub(super) async fn run_partition(
                     "`partition` runs"
                 )));
             }
+            crate::config::launcher::check_launcher_placeable(launch_target, "`partition` runs")
+                .map_err(|e| anyhow!("{e}"))?;
             let tenant = crate::tenant::Tenant::parse(&tenant)
                 .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
             let (matrix, _) = partition_matrix(reg, &set, &base, &tenant, launch_target)?;
@@ -416,6 +418,8 @@ pub(super) async fn run_partition(
                     "`partition` runs"
                 )));
             }
+            crate::config::launcher::check_launcher_placeable(launch_target, "`partition` runs")
+                .map_err(|e| anyhow!("{e}"))?;
             let tenant = crate::tenant::Tenant::parse(&tenant)
                 .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
             let (matrix, evaluated_by_key) =

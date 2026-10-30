@@ -5406,7 +5406,42 @@ pub async fn execute_plan(plan: CompiledPlan, mut ctx: ExecCtx) -> Result<PlanRe
     execute_prepared_plan(plan, ctx).await
 }
 
+/// A placement this executor cannot honour must not run here instead. A k8s
+/// run is a whole plan submitted to blut-operator, never executed in-process;
+/// p2p and cloud place stages only through an installed [`ExecutionAdapter`]
+/// (`ExecCtx::with_execution_adapter`). Without one every stage ran on this
+/// machine while the job recorded the remote placement, which is what `recipe
+/// run --launcher p2p` did. The CLI refuses these targets earlier; this is the
+/// backstop for every path into the executor, library callers included.
+fn refuse_unplaced_target(ctx: &ExecCtx) -> Result<(), PlanError> {
+    use crate::config::launcher::LaunchTarget;
+    match ctx.launch_target {
+        LaunchTarget::K8s => Err(PlanError::Other(
+            crate::config::k8s_cluster::refuse_surface("a plan executed in-process").to_string(),
+        )),
+        LaunchTarget::P2P | LaunchTarget::Cloud if !has_execution_adapter(ctx) => {
+            crate::config::launcher::check_launcher_placeable(
+                ctx.launch_target,
+                "a plan executed without an execution adapter",
+            )
+            .map_err(|error| PlanError::Other(error.to_string()))
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(feature = "p2p")]
+fn has_execution_adapter(ctx: &ExecCtx) -> bool {
+    ctx.execution_adapter.is_some()
+}
+
+#[cfg(not(feature = "p2p"))]
+fn has_execution_adapter(_ctx: &ExecCtx) -> bool {
+    false
+}
+
 async fn execute_prepared_plan(plan: CompiledPlan, ctx: ExecCtx) -> Result<PlanResult, PlanError> {
+    refuse_unplaced_target(&ctx)?;
     let mode = ctx
         .prepared_execution
         .as_ref()

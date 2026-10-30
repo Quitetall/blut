@@ -406,7 +406,7 @@ enum PlanCommand {
     /// so `blut lineage`, `blut log` and `blut dag` all work on the result.
     ///
     /// LOCAL launches only. `recipe run` takes a `--launcher` and can dispatch
-    /// to Slurm, Ray, P2P or k8s; this does not, because none of those paths has
+    /// to Slurm, Ray or k8s; this does not, because none of those paths has
     /// been exercised from a PlanSpec and offering an untested flag is worse
     /// than not offering one.
     ///
@@ -2129,6 +2129,17 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                     "`plan resume` of a k8s job"
                 )));
             }
+            // A job recorded with p2p or cloud ran here before those were
+            // refused; resuming it "as it was run" would repeat the claim.
+            crate::config::launcher::check_launcher_placeable(
+                launch_target,
+                &format!(
+                    "`plan resume` of {job_id}, which recorded it but ran on this machine \
+                     (start it again with `recipe run {}`)",
+                    marker.name
+                ),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
             if launch_target != crate::config::launcher::LaunchTarget::Local {
                 eprintln!(
                     "resuming {job_id} with --launcher {} (as it was run)",
@@ -3532,6 +3543,9 @@ mod registry_export;
 mod stale;
 mod study;
 use stale::*;
+
+#[cfg(test)]
+mod launcher_refusal_tests;
 
 #[cfg(test)]
 mod dataset_cli_tests {
