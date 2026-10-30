@@ -787,12 +787,35 @@ mod tests {
 
     /// A fake kubectl: a shell script that answers by subcommand, so the
     /// refusals are tested without a cluster.
+    ///
+    /// Another test thread that forks while the script is open for writing
+    /// holds a copy of that descriptor until its child execs, and executing
+    /// the script meanwhile fails with ETXTBSY ("Text file busy"). One probe
+    /// run that succeeds proves no such copy is left, so the test's own runs
+    /// cannot hit it.
     #[cfg(unix)]
     fn fake_kubectl(dir: &Path, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
+        const ETXTBSY: i32 = 26;
         let path = dir.join("kubectl");
-        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\n[ -n \"$FAKE_KUBECTL_PROBE\" ] && exit 0\n{script}\n"),
+        )
+        .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for attempt in 0.. {
+            match std::process::Command::new(&path)
+                .env("FAKE_KUBECTL_PROBE", "1")
+                .status()
+            {
+                Ok(_) => break,
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) && attempt < 100 => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("fake kubectl probe: {e}"),
+            }
+        }
         path
     }
 
