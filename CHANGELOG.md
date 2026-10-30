@@ -11,6 +11,47 @@ depend on this crate.
 ## [Unreleased]
 
 ### Added
+- **Recipe-level dispatch over the `p2p node` mesh** (feature `p2p`).
+  `recipe run <name> --launcher p2p` and `recipe declare <file> --run
+  --launcher p2p` join the mesh (`--p2p-seed addr@pubkey`, repeatable, or
+  `BLUT_P2P_SEEDS`; identity `--p2p-key`/`BLUT_P2P_KEY`, default
+  `<data_dir>/p2p/identity.key`; `--p2p-listen`, `--p2p-advertise`,
+  `--p2p-peer-wait`) and run every stage that declares it may leave the
+  machine on a connected peer that runs the same code identity, accepts work
+  from the submitter, holds the trust the stage's data class needs, and has
+  the declared cores and memory. Stages spread over the peers (fewest in
+  flight, then least used). Inputs and outputs move over the mesh's
+  pull-based object plane and are verified on both ends. Stages that do not
+  declare it run on the submitting machine in the same plan, contained as
+  usual, and each such decision is logged. A missing identity, no seed, or no
+  seed answering is refused before a job exists. Library:
+  `p2p::mesh_exec::{MeshExecutionAdapter, MeshStageWorker}`,
+  `MeshNode::{set_stage_worker, record_peer_outcome,
+  peer_trust_and_reputation, shutdown}`.
+- `Stage::placement(&args) -> StagePlacement` (and
+  `StageDyn::placement_erased`): a stage declares whether an invocation may run
+  on another machine and the class of the data it handles
+  (`StagePlacement::remote(DataClassification::…)`). The default is
+  `LocalOnly`. `DispatchPolicy::remote_class` (default: the stage's
+  declaration) is what the executor and the mesh worker ask.
+- `blut p2p node` runs dispatched stages of every registered cookbook for the
+  submitter named by `--coordinator-pubkey`, at most `--max-tasks` at once
+  (default: the CPU count, at most 16), each admitted against free memory as a
+  local run is and run with a local-placement context, so a stage's processes
+  are contained as on the submitting machine. It refuses a stage from a
+  submitter whose code identity differs from its own, an unknown stage, a
+  stage its build declares local-only, and a submitter it was not told to
+  accept. The startup lines name the stage plane and the code identity.
+- `blut cancel <job>` on a `--launcher p2p` run stops the stages running on
+  peers: the submitter sends a cancel and then closes its connections. A
+  worker whose submitter closes the connection, or goes silent past the QUIC
+  idle timeout, stops the stage.
+- `blut p2p peers trust` takes a peer's whole `pubkey` line (as `blut p2p keys
+  show` prints it) and adds the peer if this machine has not registered it,
+  so a dialed or gossip-learned worker can be given the trust an `internal`
+  stage needs.
+- `blut::cli::run_from(registry, args)`: `cli::run` with an explicit command
+  line.
 - `schedule install` takes `--tenant`, `--shared-cache`, `--no-cache`,
   `--sync-io` and `--experiment`, passed to the scheduled `recipe run`; the
   tenant is checked against the quota policy at install, as `recipe run`
@@ -116,6 +157,25 @@ depend on this crate.
   resume_blocker}`.
 
 ### Changed
+- **Behaviour change:** `DefaultDispatchPolicy::new` no longer names any
+  cookbook's stages: the engine shipped a list of one cookbook's stage names
+  as dispatchable, domain code in a domain-neutral engine. Its name list now
+  holds only the built-in `p2p-echo` probe (which itself declares public
+  placement), and serves only the name-based `p2p serve`/`p2p connect` and
+  cloud-smoke paths. The executor, `SharedCacheRunner` and `dispatch_stage`
+  decide by the stage's own declaration. A cookbook whose stages should leave
+  the machine overrides `Stage::placement`.
+- **Behaviour change:** under `--launcher p2p` an eligible stage that no peer
+  can take within the wait fails the run (`EXECUTION_UNAVAILABLE`, not
+  retried), naming each peer seen and why it was passed over. It used to run
+  on the submitting machine with a warning. A library caller that installs an
+  adapter without a remote launch target keeps the local fallback. An
+  eligible stage whose input cannot be packed for transfer also fails under
+  `--launcher p2p`.
+- `--launcher p2p` is no longer refused by `recipe run` and `recipe declare
+  --run` in a build with the `p2p` feature; `hpo`, `study`, `partition` and
+  `plan resume` still refuse it, now saying which commands place it. `--p2p-*`
+  flags with another launcher are refused rather than ignored.
 - `blut jobs`' `output` column is now `recipe`: the recipe, deploy pointer or
   plan name the job ran (from its resume marker or `plan.json`), else a legacy
   single-trainer job's output name. The output name is set only by that legacy
@@ -225,6 +285,17 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- An inbound mesh handshake saved the peer registry (write, `fsync`, rename)
+  while holding the registry lock inside the async accept path; on a loaded
+  disk one save took seconds and dials hit their 10 s handshake timeout. The
+  registry is now marked dirty and saved by one background task on a blocking
+  thread (coalescing saves, the same fsync and rename), and flushed when a
+  node shuts down. Reputation updates after served work use the same path.
+- `blut p2p peers list` showed reputation 0.50 and no completed tasks for
+  peers that had run dispatches: the dispatching side never recorded the
+  outcome. A mesh dispatch (and `p2p node --dispatch-stage` for a registered
+  peer) now counts the worker's completed or failed task and moves its
+  reputation.
 - A scheduled unit ran a different launch from the interactive one: it carried
   no tenant, no cache flags, no working directory and none of the installer's
   environment, so a timer ran under `default`, with a private cache, from the

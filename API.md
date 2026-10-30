@@ -44,6 +44,7 @@ BLUT-owned widgets.
 | Item | Role |
 |---|---|
 | `framework::stage::{Stage, StageContext, StageExecutionBoundary, StageError, StageEvent}` | a typed `Input → Output` unit of work + its run context |
+| `framework::stage::StagePlacement`, `Stage::placement` | whether an invocation may run on another machine (`LocalOnly` by default, or `remote(DataClassification)`); the only thing that sends a stage to a peer |
 | `framework::compat::Compatible<B>` | compile-time gate: a stage may only join a `Plan<_, B>` it is `Compatible` with |
 | `framework::artifact::{Artifact, ArtifactMetadata, ContentHash}` | typed handle to on-disk bytes, content-hashed |
 | `framework::plan::{Plan, CompiledPlan, NodeId, PlanError}` | the typed DAG builder (`.start().then().finish().into_compiled()`) |
@@ -291,8 +292,51 @@ freezes a composed tree to JSON + a content fingerprint; `config::sweep` expands
 a resource-capped systemd unit. `LaunchTarget::P2P` and `LaunchTarget::Cloud`
 have no `Launcher`: stages reach peers or the cloud queue only through an
 `ExecutionAdapter` installed with `ExecCtx::with_execution_adapter` (feature
-`p2p`). The executor refuses either target without one, and every CLI command
-refuses `--launcher p2p` and `--launcher cloud`, because none installs one.
+`p2p`), and the executor refuses either target without one. `recipe run` and
+`recipe declare --run` install the mesh adapter for `--launcher p2p` (below);
+every other command refuses `--launcher p2p`, and every command refuses
+`--launcher cloud`.
+
+### Mesh dispatch (`p2p::mesh_exec`, feature `p2p`)
+
+`recipe run <name> --launcher p2p --p2p-seed <addr@pubkey>` joins the `p2p
+node` mesh with this machine's identity (`<data_dir>/p2p/identity.key`, or
+`--p2p-key`), lets gossip find the rest, and installs
+`MeshExecutionAdapter` on the plan. Which stages leave is the stage's own
+declaration, `Stage::placement(&args)`; the executor asks
+`DispatchPolicy::remote_class`, whose default returns that declaration's data
+class, or `None` for a local-only stage or restricted data. A stage that does
+not leave runs on the submitting machine in the same plan, and the decision is
+logged. A stage that leaves goes to a connected peer that answers on the stage
+plane, runs the same `CodeIdentity`, accepts work from the submitter
+(`p2p node --coordinator-pubkey`), holds the trust its data class needs under
+the `DispatchMatrix` (`blut p2p peers trust`), and has the declared cores and
+memory; among those the fewest in flight, then the least used. If none
+appears within `--p2p-peer-wait` seconds (default 60) the attempt fails as
+`EXECUTION_UNAVAILABLE` and, under `--launcher p2p`, so does the run: an
+eligible stage is never run on the submitting machine instead. Inputs and
+outputs move over the object plane (`MeshObjects`), granted per peer and
+verified chunk by chunk and as a whole; the executor restores and re-verifies
+the output before anything downstream reads it.
+
+`MeshStageWorker` is the worker side, attached with
+`MeshNode::set_stage_worker` (`blut p2p node` does this). It refuses a
+submitter it was not told to accept, a dispatch whose signature does not
+verify, a submitter whose code identity digest differs from its own, an
+unknown stage, a stage its own build declares local-only, and work beyond its
+slots (`--max-tasks`) or memory admission. It runs the stage with a
+local-placement `StageContext`, so processes a stage starts are contained as on
+the submitting machine. The submitter keeps the stage's stream open while it
+runs; a cancel message, a closed connection, or the QUIC idle timeout on a
+silent one cancels the stage on the worker. `blut cancel <job>` reaches it
+that way.
+
+Outcomes count in the submitter's peer registry (`MeshNode::record_peer_outcome`:
+completed and failed tasks, local reputation), which is saved off the async
+path. Library callers build the same thing from a `MeshNode`, its
+`MeshObjects`, a `KeyPair` and a `DispatchPolicy`:
+`MeshExecutionAdapter::new(..).with_peer_wait(..)`, then
+`ExecCtx::with_launch_target(LaunchTarget::P2P).with_execution_adapter(..)`.
 
 `config::tenants::TenantQuotaPolicy` loads `$BLUT_TENANTS_CONFIG` or
 `~/.config/blut/tenants.toml`. One file chooses either static equal shares:
@@ -376,7 +420,8 @@ names resolved only at send time.
 
 ## CLI (`cli`)
 
-`blut::cli::run(registry: Registry).await` — the public entry point. A
+`blut::cli::run(registry: Registry).await` — the public entry point
+(`blut::cli::run_from(registry, args)` takes the command line explicitly). A
 cookbook binary supplies its `Registry` and delegates the whole CLI to it
 (`recipe`, `jobs`, `log`, `cancel`, `plan`, `cache`, `footprint`, `partition`,
 `schedule`, `sensor`, `policy`, …). The cockpit lives in the `crates/blut-tui`
