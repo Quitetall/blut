@@ -1,6 +1,8 @@
 # BLUT Release Procedure
 
-Public preview train: `blut-types` → `blut` → `blut-dsl` → `blut-notify`.
+Public preview train: `blut-types` → `blut` → `blut-dsl` → `blut-notify`, then
+`blut-operator`, which depends on none of them and is published last only so
+it never holds up the engine chain.
 `blut-types` is the single chain ROOT (no in-repo path deps); `blut` depends on
 it, so it must be indexed on crates.io before `blut` will package — otherwise
 `no matching package named 'blut-types' found`. Members share the exact preview
@@ -14,10 +16,12 @@ schedule once its surface settles; it is the newest and fastest-moving crate in
 the repo.
 
 `blut-tui` IS published (0.2.0-alpha.1 is on crates.io) and its manifest now
-says so. The standalone-workspace sidecars `blut-web` and `blut-operator` are
-`publish = false`. The `release.yml` `binaries` job
-attaches those three plus the runnable `blut-notify` member binary to the GitHub
-Release. (`blut-worker` was deleted at ADR 0083 M3 — superseded by `src/cloud`
+says so. The standalone-workspace sidecar `blut-web` is `publish = false`.
+`blut-operator` is publishable (`publish = ["crates-io"]`, first version
+0.2.0-alpha.2) and has never been published. The `release.yml` `binaries` job
+attaches `blut-tui`, `blut-web`, `blut-operator` and the runnable `blut-notify`
+member binary to the GitHub Release. No container images are published: the
+operator and cookbook images are built from `docker/` by whoever deploys them. (`blut-worker` was deleted at ADR 0083 M3 — superseded by `src/cloud`
 and the `blut-web` sidecar.)
 
 ## Automation (ADR 0083 M6)
@@ -35,11 +39,15 @@ Two workflows carry the release; both are reviewable in `.github/workflows/`:
 - **`docs.yml`** — builds the mdBook site (`book.toml` / `book_src`, which
   `{{#include}}`s the top-level docs so there is no drift) and deploys it to
   GitHub Pages on every `main` push that touches a doc.
-- **`scripts/k8s_kind_smoke.sh`** — the operator gate, run by `release.yml` and
-  available locally: installs the
-  `blut-operator` CRDs on an ephemeral `kind` cluster and asserts a `BlutPlan`
-  CR is accepted by the API server (schema valid); reconcile-to-Job is a
-  best-effort extra when the operator image is loaded.
+- **`scripts/k8s_kind_smoke.sh`** — the cheap operator gate, run by
+  `release.yml` and available locally: installs the shipped CRDs on an
+  ephemeral `kind` cluster, asserts a `BlutPlan` is accepted, and that a
+  `Restricted` ceiling and a spec edit are refused.
+- **`scripts/k8s_kind_e2e.sh`** — the operator end to end, run by `ci.yml`
+  (`operator · kind end-to-end`): builds the operator and cookbook images, runs
+  real plans on a three-node kind cluster with MinIO, and checks status, store
+  outputs, cache reuse, bad-spec refusals, deletion, retries, a node drain, an
+  operator restart and RBAC. See [docs/OPERATOR.md](docs/OPERATOR.md).
 
 The step-by-step below is the AUTHORITATIVE manual procedure the automation
 mirrors — run it (or the `release.yml` publish job) at the reviewed tag SHA.
@@ -70,7 +78,8 @@ Also gate detached workspaces:
 (cd crates/blut-dsl && cargo +1.88 fmt --all -- --check && cargo +1.88 clippy --locked --all-targets -- -D warnings && cargo +1.88 test --locked && RUSTDOCFLAGS="-D warnings" cargo +1.88 doc --locked --no-deps)
 (cd crates/blut-web && cargo +1.88 fmt --all -- --check && cargo +1.88 clippy --locked --all-targets -- -D warnings && cargo +1.88 test --locked)
 (cd crates/blut-tui && cargo +1.88 fmt --all -- --check && cargo +1.88 build --locked --all-targets && cargo +1.88 clippy --locked --all-targets -- -D warnings && cargo +1.88 test --locked && ./target/debug/blut-tui --check)
-(cd crates/blut-operator && cargo +1.89 fmt --all -- --check && cargo +1.89 clippy --locked --all-targets -- -D warnings && cargo +1.89 test --locked)
+(cd crates/blut-operator && cargo +1.88 fmt --all -- --check && cargo +1.88 clippy --locked --all-targets -- -D warnings && cargo +1.88 test --locked && RUSTDOCFLAGS="-D warnings" cargo +1.88 doc --locked --no-deps && cargo +1.88 publish --dry-run --locked)
+BLUT_COOKBOOK_DIR=<blut-cookbooks checkout> bash scripts/k8s_kind_e2e.sh
 ```
 
 Required GitHub checks must be green at this exact SHA. Do not infer release
@@ -126,13 +135,19 @@ cargo publish --locked
 
 cargo publish --dry-run --locked -p blut-notify
 cargo publish --locked -p blut-notify
+
+# Independent of the chain; publish only with the owner's go-ahead for this
+# release (its first publish reserves the name):
+(cd crates/blut-operator && cargo publish --dry-run --locked)
+(cd crates/blut-operator && cargo publish --locked)
 ```
 
-Run the kind smoke before tagging (the operator's CRD schemas are part of the
-public contract):
+Run the kind smoke and the operator end to end before tagging (the operator's
+CRD schemas are part of the public contract):
 
 ```bash
 bash scripts/k8s_kind_smoke.sh   # needs kind + kubectl
+BLUT_COOKBOOK_DIR=<blut-cookbooks checkout> bash scripts/k8s_kind_e2e.sh   # also docker
 ```
 
 Then verify from an empty directory and clean Cargo home:

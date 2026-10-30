@@ -11,6 +11,24 @@ depend on this crate.
 ## [Unreleased]
 
 ### Added
+- `BLUT_REMOTE_CACHE` for `recipe run` and `recipe declare --run`: a directory,
+  or with the `s3` feature an `s3://bucket[/prefix]` URL, used as the cache's
+  content-addressed remote tier. Stage outputs are written through to it and a
+  cold machine or pod reads them back instead of recomputing. The store is
+  probed once at launch, so a wrong endpoint or rejected credentials fail the
+  run before any stage starts. Credentials come from `AWS_*` only.
+- `BLUT_RUN_SUMMARY` for the same commands: a file that receives a one-object
+  JSON summary when the run ends (state, per-stage state, cache counts, the
+  error), at most 4096 bytes, including for failures before any stage starts.
+  Without the variable nothing changes.
+- `blut-operator` is supported: it runs `BlutPlan` resources as Jobs with
+  status (phase, per-stage state, cache counts, retries, lost pods), store
+  credentials from a Secret, immutable specs, schema and operator-side
+  validation, and a disruption policy that retries drained or evicted pods
+  without spending a retry. Shipped manifests in `crates/blut-operator/deploy`
+  (CRDs, least-privilege RBAC, Deployment), `docker/Dockerfile.operator` and
+  `docker/Dockerfile.cookbook`, `scripts/k8s_kind_e2e.sh` and a CI job running
+  it, and [docs/OPERATOR.md](docs/OPERATOR.md).
 - `docs/adr/`: the 41 engine-facing architecture decision records, federated
   from the project's decision log with private material redacted inline as
   `[redacted: <category>]`, plus an index. "ADR NNNN" citations in the engine
@@ -30,6 +48,18 @@ depend on this crate.
   `$BLUT_CHECKPOINTS_DIR` choose where slots live.
 
 ### Changed
+- `blut-operator` moves to the engine's MSRV, Rust 1.88 (was 1.89), and from
+  kube 0.96 to kube 4.0 / k8s-openapi 0.28 (Kubernetes 1.32 API). It is
+  publishable (`publish = ["crates-io"]`, 0.2.0-alpha.2) but not yet published.
+  CRD changes since the prototype: `planSource.inline.filename`, `command`,
+  `store`, `resources`, `gpus`, `maxRetries`, `timeoutSeconds`; status gains
+  `attempts`, `pod`, `lastPodFailure`, `cacheHits`, `cacheMisses`,
+  `observedGeneration`; a `configMapRef` is mounted whole; the spec is
+  immutable; `BlutWorkerPool` gains `coordinatorPubkey`. The prototype's Job
+  could not run (it read the recipe from an empty stdin, never mounted the
+  ConfigMap, and set environment variables the engine does not read), a PVC
+  cache was mounted without `--shared-cache`, pool pods crash-looped for want
+  of an identity key, and the pool's mesh port was TCP instead of UDP.
 - Citations of decisions that were not federated (product, codec and platform
   records) are rewritten as the rationale they stood for. Citations written
   before the decision log renumbered two records now use the current numbers:

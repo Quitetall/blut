@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# The blut-operator Deployment. One replica, replaced with Recreate: the
+# operator does not elect a leader, so two must never run at once. (Two would
+# not run a plan twice, since a plan's Job has a fixed name and the second
+# create is refused, but they would race on status.)
+#
+# Set the image to one you built or mirrored:
+#   docker build -f docker/Dockerfile.operator -t <registry>/blut-operator:<tag> .
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: blut-system
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blut-operator
+  namespace: blut-system
+  labels:
+    app.kubernetes.io/name: blut-operator
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: blut-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: blut-operator
+    spec:
+      serviceAccountName: blut-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: blut-operator:dev
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          env:
+            - name: RUST_LOG
+              value: info
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

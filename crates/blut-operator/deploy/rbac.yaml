@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Least-privilege RBAC for blut-operator, watching every namespace.
+#
+# What it can do, and why:
+# - read BlutPlan / BlutWorkerPool and write only their status subresource;
+# - create Jobs (one per plan) and read them back;
+# - create the ConfigMap that holds an inline plan's recipe, and read it back to
+#   check it is the plan's own;
+# - list and watch the pods of its Jobs, to read the run summary in their
+#   termination message and to notice a pod that was deleted or evicted;
+# - server-side-apply a pool's Service and StatefulSet.
+#
+# What it cannot do: delete anything (owner references garbage-collect a plan's
+# or pool's children), read or list Secrets (store credentials are referenced by
+# name in the pod spec and resolved by the kubelet), exec into or read logs of
+# pods, or touch any other kind.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: blut-operator
+  namespace: blut-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: blut-operator
+rules:
+  - apiGroups: ["blut.lamquant.dev"]
+    resources: ["blutplans", "blutworkerpools"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["blut.lamquant.dev"]
+    resources: ["blutplans/status", "blutworkerpools/status"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "patch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: blut-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: blut-operator
+subjects:
+  - kind: ServiceAccount
+    name: blut-operator
+    namespace: blut-system

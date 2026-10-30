@@ -26,5 +26,6 @@ a fix is available.
 
 Security-sensitive surfaces include containment, process launching, artifact
 paths, secret handling, P2P transport, cloud object storage, and cookbook CLI
-integration. Deprecated worker and experimental operator prototypes are not
-part of the supported public preview.
+integration, and the Kubernetes operator (`crates/blut-operator`: its RBAC,
+the pod spec it builds, and how it passes store credentials). The deprecated
+worker prototype is not part of the supported public preview.

@@ -62,8 +62,19 @@ releases, and this repository has shipped a red gate twice because a clean run
 on a newer clippy was mistaken for a clean run on the pinned one.
 
 An MSRV increase is a minor version bump while the crates are `0.x`, and belongs
-in `CHANGELOG.md`. `blut-operator` deliberately requires 1.89 and has its own
-lane.
+in `CHANGELOG.md`. `blut-operator` is a standalone workspace on the same 1.88
+floor with its own CI lanes: `operator · Rust 1.88` (fmt, clippy, tests, docs,
+`cargo publish --dry-run`) and `operator · kind end-to-end`
+(`scripts/k8s_kind_e2e.sh`). Run the e2e locally before changing the operator,
+the CRDs, or the engine flags it relies on (`recipe declare --run`,
+`BLUT_REMOTE_CACHE`, `BLUT_RUN_SUMMARY`, `BLUT_NO_CONTAIN`):
+
+```bash
+BLUT_COOKBOOK_DIR=../blut-cookbooks bash scripts/k8s_kind_e2e.sh
+```
+
+It needs docker, kind and kubectl, builds two images, and creates and deletes a
+three-node cluster.
 
 ## API preview
 
