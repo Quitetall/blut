@@ -819,13 +819,21 @@ pub fn plan_status(plan: &BlutPlan, job: Option<&Job>, pods: &[Pod]) -> BlutPlan
     }
 
     let running = outcomes.iter().any(|o| o.running);
-    status.phase = if running {
+    // The pod has exited 0 but the Job controller has not yet marked the Job
+    // Complete: the plan is finishing, not waiting for a pod.
+    let finishing = !running
+        && outcomes
+            .last()
+            .is_some_and(|o| o.terminated && o.exit_code == Some(0) && !o.deleting);
+    status.phase = if running || finishing {
         PlanPhase::Running
     } else {
         PlanPhase::Pending
     };
     let state = if running {
         "running"
+    } else if finishing {
+        "finishing"
     } else {
         "waiting for a pod to start"
     };

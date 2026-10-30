@@ -930,3 +930,19 @@ fn a_named_recipe_defaults_to_empty_args() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn a_pod_that_exited_0_before_the_job_completes_is_finishing_not_pending() {
+    let s = plan_status(
+        &plan(),
+        Some(&job_with(0, 0, 0, None)),
+        &[pod(
+            "demo-run-a",
+            0,
+            "Succeeded",
+            Some((0, "Completed", OK_SUMMARY)),
+        )],
+    );
+    assert_eq!(s.phase, PlanPhase::Running);
+    assert_eq!(s.message.as_deref(), Some("finishing"));
+}
