@@ -355,6 +355,13 @@ pub struct StageContext {
     /// appends `--resume <dir>` to its trainer argv. `None` = start fresh (first
     /// attempt, a non-resumable stage, or a fresh decision).
     pub resume_from: Option<PathBuf>,
+    /// The mid-stage checkpoint slot for this attempt (CONTRACT.md §8), set by
+    /// the executor when the stage opts in with [`Stage::checkpoint_slot`].
+    /// The stage forwards it to its trainer with
+    /// [`CheckpointSlot::apply_to`](crate::framework::stage_checkpoint::CheckpointSlot::apply_to).
+    /// `None` for stages that do not opt in, remote attempts, and fused or
+    /// pipelined execution.
+    pub checkpoint: Option<crate::framework::stage_checkpoint::CheckpointSlot>,
 }
 
 impl StageContext {
@@ -383,6 +390,7 @@ impl StageContext {
             ),
             attempt: 1,
             resume_from: None,
+            checkpoint: None,
         }
     }
 
@@ -420,6 +428,7 @@ impl StageContext {
             cache_key,
             attempt: 1,
             resume_from: None,
+            checkpoint: None,
         }
     }
 
@@ -822,6 +831,16 @@ pub trait Stage: Send + Sync + 'static {
         None
     }
 
+    /// Opt in to a mid-stage checkpoint slot (CONTRACT.md §8). Return `true`
+    /// for a long-running stage whose trainer can write step checkpoints and
+    /// resume from them. The executor then gives every local attempt a
+    /// durable slot keyed by this invocation's cache key, decides whether the
+    /// attempt resumes, and sets `StageContext::checkpoint`. Default `false`:
+    /// no slot, and the stage restarts from its beginning as before.
+    fn checkpoint_slot(&self, _args: &Self::Args) -> bool {
+        false
+    }
+
     /// Per-step divergence sentinel (P7). Given one `StageStep` update payload,
     /// return `true` if the run has diverged (loss > k·EMA, grad-norm spike, …)
     /// so the executor can stop it early with a typed `Diverged` error instead
@@ -1126,6 +1145,13 @@ pub trait StageDyn: Send + Sync + 'static {
         ctx: &StageContext,
         args: &serde_json::Value,
     ) -> Option<crate::framework::resume::ResumeToken>;
+
+    /// Erased [`Stage::checkpoint_slot`]. A bad-args deserialize is `false`.
+    /// Defaults to `false` so hand-written `StageDyn` implementors keep
+    /// compiling and get no slot.
+    fn checkpoint_slot_erased(&self, _args: &serde_json::Value) -> bool {
+        false
+    }
 
     /// Erased [`Stage::divergence_check`] (the step payload is already erased).
     fn divergence_check(&self, step: &serde_json::Value) -> bool;
@@ -1640,6 +1666,12 @@ impl<S: Stage> StageDyn for S {
     ) -> Option<crate::framework::resume::ResumeToken> {
         let typed: S::Args = serde_json::from_value(args.clone()).ok()?;
         self.resume_handle(ctx, &typed)
+    }
+
+    fn checkpoint_slot_erased(&self, args: &serde_json::Value) -> bool {
+        serde_json::from_value::<S::Args>(args.clone())
+            .map(|typed| self.checkpoint_slot(&typed))
+            .unwrap_or(false)
     }
 
     fn divergence_check(&self, step: &serde_json::Value) -> bool {

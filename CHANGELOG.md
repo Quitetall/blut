@@ -16,6 +16,18 @@ depend on this crate.
   `[redacted: <category>]`, plus an index. "ADR NNNN" citations in the engine
   now resolve to a document in this repository; `book_src/adrs.md` points at
   the index instead of describing the gap.
+- Mid-stage checkpoint slots (CONTRACT.md §8, trainer contract revision 1.1).
+  A stage that returns `true` from the new `Stage::checkpoint_slot` gets a
+  durable directory keyed by its cache key and an engine decision, in
+  `StageContext::checkpoint`, on whether the attempt resumes. The trainer
+  receives `BLUT_CHECKPOINT_DIR`, `BLUT_RESUME`, `BLUT_RUN_ID` and
+  `BLUT_ATTEMPT_ID`. A retry, a `plan resume` and a Slurm requeue that re-runs
+  the recipe all resume from the newest checkpoint instead of step 0; a trainer
+  that may still be running is refused (`CheckpointBusy`) rather than raced.
+  Each decision is a `stage_checkpoint` event in `status.jsonl`, and the slot
+  is deleted once the stage's output is in the cache. New module
+  `framework::stage_checkpoint`; `ExecCtx::with_checkpoint_root` and
+  `$BLUT_CHECKPOINTS_DIR` choose where slots live.
 
 ### Changed
 - Citations of decisions that were not federated (product, codec and platform

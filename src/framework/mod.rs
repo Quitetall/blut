@@ -48,6 +48,7 @@ pub mod resource;
 pub mod resume;
 pub mod retry;
 pub mod stage;
+pub mod stage_checkpoint;
 pub mod status;
 
 pub use artifact::{

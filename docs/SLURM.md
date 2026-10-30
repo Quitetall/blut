@@ -58,11 +58,47 @@ from. BLUT streams that file while the job runs. An `--output` or `--chdir`
 passed through `extra` is honoured. If the `--output` pattern names one file per
 node or task (`%N`, `%t`), BLUT says so and does not stream the log.
 
+## Resuming after a lost node
+
+A training stage that opts in to checkpoint slots (CONTRACT.md §8; the standard
+cookbook's training stages do) resumes from its newest checkpoint instead of
+step 0. Three ways to get there:
+
+- **Requeue.** Submit the whole recipe as a requeueable batch job, so the
+  training step is an `srun` inside its allocation:
+
+  ```sh
+  #!/bin/bash
+  #SBATCH --nodes=2 --ntasks-per-node=1 --requeue --open-mode=append
+  blut-core recipe run train_from_dataset --launcher slurm --args "$ARGS"
+  ```
+
+  When a node fails, Slurm requeues the job and the same command runs again as
+  a new BLUT job. The training stage has the same cache key, so it finds the
+  same slot. The engine reads `SLURM_JOB_ID` and `SLURM_RESTART_COUNT` and
+  treats a slot left by an earlier run of the same job as abandoned, so the
+  requeued run resumes without waiting for the old heartbeat to go stale.
+- **`plan resume`.** After the BLUT process or its host dies, `blut-core plan
+  resume <job>` reruns the plan; finished stages come from the cache and the
+  training stage resumes. Killing only the BLUT process does not stop its
+  `srun` step: the training keeps running, and `plan resume` refuses the slot
+  while that trainer's heartbeat is fresh, naming its PID and host. `scancel`
+  the step (or wait for it) and resume again.
+- **Retry.** `train_attempts: 2` (or more) retries the training stage in the
+  same BLUT process. A retry's `srun` waits until enough nodes are back, then
+  resumes.
+
+Checkpoints live under `$BLUT_CHECKPOINTS_DIR`, by default beside the jobs
+directory. Only rank 0 reads and writes them, so it needs to be on rank 0's
+node; on a cluster, put it on the shared filesystem with the job directories.
+
 ## What has been run
 
 [`DISTRIBUTED_VALIDATION.md`](DISTRIBUTED_VALIDATION.md) records the runs:
 - a two-node Slurm 21.08 cluster, with and without accounting;
-- two-machine NCCL training through the cookbook.
+- two-machine NCCL training through the cookbook;
+- a training stage resuming from its checkpoint after a requeue, a `plan
+  resume`, and a retry, on two machines.
 
 `tests/slurm_live.rs` repeats the cluster checks on any cluster:
 
