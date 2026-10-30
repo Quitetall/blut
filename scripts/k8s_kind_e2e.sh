@@ -27,7 +27,16 @@
 #      pool's status, a deleted pod is replaced, and deleting the pool removes
 #      its StatefulSet and Service (mesh traffic between the pods is not tested);
 #  10. the operator's service account can do exactly what deploy/rbac.yaml
-#      says and nothing else (no Secrets, no deletes, no pods/exec).
+#      says and nothing else (no Secrets, no deletes, no pods/exec);
+#  11. the CLI (`recipe declare <file> --run --launcher k8s`, run from the
+#      cookbook image) submits a plan, follows it, reports Succeeded, and the
+#      outputs are in MinIO;
+#  12. SIGTERM to the following CLI deletes the plan, its Job and pods;
+#  13. `blut cancel <job>` does the same from another process;
+#  14. `recipe run <name> --launcher k8s` submits a named registry recipe that
+#      the pod runs with `recipe run`, and the CLI reports the pod's result;
+#  15. with no kubeconfig, and after the CRDs are removed, the CLI refuses
+#      before submitting anything and names the operator route.
 #
 # Requires: docker (with buildx), kind, kubectl, and a checkout of
 # https://github.com/Quitetall/blut-cookbooks in BLUT_COOKBOOK_DIR.
@@ -46,6 +55,8 @@
 #   KEEP_CLUSTER=1      leave the cluster up afterwards
 #   REUSE_CLUSTER=1     reuse a kept cluster of the same name: its BLUT
 #                       namespaces and CRDs are deleted first (for iterating)
+#   SKIP_DISRUPTION=1   skip checks 5-9 (deletion, retry, drain, restart,
+#                       pool), the slow ones, when iterating on the others
 #   DOCKER_BUILDER      buildx builder (default: the docker driver, `default`)
 #
 # Exits non-zero on the first failed check.
@@ -118,12 +129,22 @@ if [ "${SKIP_BUILD:-0}" != 1 ]; then
 fi
 
 # Test-only image: the cookbook image plus `blut-hold`, which runs the plan
-# and then keeps the pod alive for HOLD seconds. It gives the disruption
-# checks a running pod whose stages have all finished and been written to the
-# store; nothing in the operator knows about it.
+# and then keeps the pod alive for HOLD seconds, and the dataset at /data. It
+# gives the disruption checks a running pod whose stages have all finished and
+# been written to the store, and gives a recipe submitted from the CLI (which
+# ships only the recipe file) an input; nothing in the operator knows about it.
+python3 - "$WORK/train.jsonl" <<'PY'
+import json, sys
+with open(sys.argv[1], "w") as f:
+    for i in range(400):
+        f.write(json.dumps({"messages": [
+            {"role": "user", "content": f"question {i}"},
+            {"role": "assistant", "content": f"answer {i}"}]}) + "\n")
+PY
 cat > "$WORK/Dockerfile.hold" <<EOF
 FROM $COOKBOOK_IMAGE
 USER 0
+COPY train.jsonl /data/train.jsonl
 RUN printf '%s\n' '#!/bin/sh' \
   'trap "exit 143" TERM INT' \
   'blut "\$@"; rc=\$?' \
@@ -259,14 +280,6 @@ mc_run "mc mb --ignore-existing s/blut-store" > /dev/null
 log "MinIO up, bucket created"
 
 # ── the plan: a recipe and its input in one ConfigMap ─────────────────────────
-python3 - "$WORK/train.jsonl" <<'PY'
-import json, sys
-with open(sys.argv[1], "w") as f:
-    for i in range(400):
-        f.write(json.dumps({"messages": [
-            {"role": "user", "content": f"question {i}"},
-            {"role": "assistant", "content": f"answer {i}"}]}) + "\n")
-PY
 cat > "$WORK/split.toml" <<'EOF'
 name = "k8s_e2e_split"
 
@@ -422,6 +435,9 @@ kubectl -n "$NS" get blutplan creds-in-url -o jsonpath='{.status.message}' | gre
   && fail "a credential from the URL was echoed into the status"
 log "  5 refused by the API server, 3 by the operator, no Job for any"
 
+if [ "${SKIP_DISRUPTION:-0}" = 1 ]; then
+  log "checks 5-9 skipped (SKIP_DISRUPTION=1)"
+else
 # 5. delete cleans up ─────────────────────────────────────────────────────────
 log "check 5: deleting a running plan removes its Job, pod and ConfigMap"
 # An inline recipe this time, so the operator's own ConfigMap is exercised.
@@ -559,6 +575,8 @@ while kubectl -n "$NS" get statefulset mesh-workers > /dev/null 2>&1 || kubectl 
 done
 log "  2/2 ready, a deleted pod replaced, StatefulSet and Service gone with the pool"
 
+fi
+
 # 10. RBAC ────────────────────────────────────────────────────────────────────
 log "check 10: the operator's permissions"
 SA="system:serviceaccount:$OPNS:blut-operator"
@@ -580,6 +598,183 @@ done | save rbac-denied.txt
 kubectl -n "$OPNS" logs deploy/blut-operator --tail=-1 | grep -i forbidden && fail "operator hit a forbidden call"
 log "  allowed 4/4, denied 12/12, no forbidden calls in the operator log"
 
+# ── the CLI: `--launcher k8s` from the shipped cookbook binary ───────────────
+# The CLI runs from the cookbook image (the binary a user installs), on the
+# host network so it reaches kind's API server, with this script's kubeconfig
+# and kubectl mounted in.
+kind get kubeconfig --name "$CLUSTER" > "$WORK/kubeconfig"
+chmod 0644 "$WORK/kubeconfig"
+mkdir -p "$WORK/recipes"
+cat > "$WORK/recipes/split.toml" <<'EOF'
+name = "cli_split"
+
+[[stages]]
+stage = "materialize_dataset_path"
+args = { path = "/data/train.jsonl" }
+
+[[stages]]
+stage = "filter_dataset"
+args = { min_turns = 1 }
+
+[[stages]]
+stage = "split_train_eval"
+args = { eval_ratio = 0.25, seed = 11 }
+EOF
+chmod -R a+rX "$WORK/recipes"
+KUBECTL_BIN="$(command -v kubectl)"
+# cli_container NAME DETACH(0|1) [ENV=VALUE ...] -- ENTRYPOINT ARGS...
+cli_container() {
+  local name="$1" detach="$2"; shift 2
+  local envs=()
+  while [ "$1" != "--" ]; do envs+=(-e "$1"); shift; done
+  shift
+  local entry="$1"; shift
+  docker run $([ "$detach" = 1 ] && echo -d) --name "$name" --network host \
+    -v "$WORK/kubeconfig:/kube/config:ro" -v "$KUBECTL_BIN:/usr/local/bin/kubectl:ro" \
+    -v "$WORK/recipes:/work:ro" --tmpfs /blut/work:uid=65532 --tmpfs /tmp:uid=65532 \
+    -e HOME=/blut/work -e XDG_DATA_HOME=/blut/work/data -e BLUT_NO_CONTAIN=1 \
+    -e KUBECONFIG=/kube/config -e BLUT_K8S_IMAGE="$HOLD_IMAGE" -e BLUT_K8S_NAMESPACE="$NS" \
+    -e BLUT_K8S_PICKUP_SECS=600 "${envs[@]}" --entrypoint "$entry" "$HOLD_IMAGE" "$@"
+}
+plans_named() { kubectl -n "$NS" get blutplans -o name | grep -c "$1" || true; }
+
+log "check 11: the CLI submits a recipe file and reports Succeeded"
+set +e
+cli_container cli-ok 0 BLUT_K8S_STORE=s3://blut-store/run11 \
+  BLUT_K8S_STORE_SECRET=blut-store-credentials BLUT_K8S_CPU_MILLIS=500 BLUT_K8S_MEMORY_MIB=512 \
+  -- blut recipe declare /work/split.toml --run --launcher k8s > "$WORK/cli-ok.log" 2>&1
+rc=$?
+set -e
+docker rm cli-ok > /dev/null 2>&1 || true
+save cli-ok.log < "$WORK/cli-ok.log"
+[ "$rc" = 0 ] || { cat "$WORK/cli-ok.log"; fail "the CLI exited $rc"; }
+grep -q '^done — succeeded: 3 stage(s), 0 from cache, 3 computed' "$WORK/cli-ok.log" \
+  || { cat "$WORK/cli-ok.log"; fail "the CLI did not report the plan's success"; }
+cli_plan=$(sed -n 's/^plan   blutplan\/\([^ ]*\) .*/\1/p' "$WORK/cli-ok.log")
+[ -n "$cli_plan" ] || fail "the CLI did not name its BlutPlan"
+[ "$(phase "$cli_plan")" = Succeeded ] || fail "BlutPlan $cli_plan is $(phase "$cli_plan")"
+objects=$(mc_run "mc ls --recursive s/blut-store/run11/")
+echo "$objects" | save store-run11.txt
+n_art=$(echo "$objects" | grep -c ' cache/v1/artifacts/' || true)
+[ "$n_art" -ge 3 ] || fail "the CLI's run left $n_art artifacts in the store"
+log "  exit 0; $(grep '^done' "$WORK/cli-ok.log"); s3://blut-store/run11: $n_art artifact objects"
+
+log "check 12: SIGTERM to the following CLI deletes the plan"
+cli_container cli-term 1 BLUT_K8S_COMMAND=blut-hold -- \
+  blut recipe declare /work/split.toml --run --launcher k8s > /dev/null
+deadline=$(( $(date +%s) + 600 ))
+until docker logs cli-term 2>&1 | grep -q '^\[k8s\] Running'; do
+  [ "$(date +%s)" -lt "$deadline" ] || { docker logs cli-term; fail "the held plan never ran"; }
+  sleep 2
+done
+term_plan=$(docker logs cli-term 2>&1 | sed -n 's/^plan   blutplan\/\([^ ]*\) .*/\1/p')
+docker kill --signal=TERM cli-term > /dev/null
+rc=$(docker wait cli-term)
+docker logs cli-term > "$WORK/cli-term.log" 2>&1
+docker rm cli-term > /dev/null
+save cli-term.log < "$WORK/cli-term.log"
+[ "$rc" != 0 ] || fail "a cancelled CLI exited 0"
+grep -q "cancelled: BlutPlan $NS/$term_plan deleted" "$WORK/cli-term.log" \
+  || { cat "$WORK/cli-term.log"; fail "the CLI did not report deleting its plan"; }
+deadline=$(( $(date +%s) + 300 ))
+while [ "$(plans_named "$term_plan")" != 0 ] || kubectl -n "$NS" get job "$term_plan-run" > /dev/null 2>&1 \
+    || [ -n "$(kubectl -n "$NS" get pods -l "blut.lamquant.dev/plan=$term_plan" -o name)" ]; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "plan $term_plan, its Job or pods outlived the cancel"
+  sleep 2
+done
+log "  exit $rc; BlutPlan, Job and pods of $term_plan gone"
+
+log "check 13: blut cancel <job> from another process deletes the plan"
+# The follower runs under a shell that outlives it, so the container (and the
+# `docker exec` running `blut cancel` in it) is still there when it exits.
+cli_container cli-cancel 1 BLUT_K8S_COMMAND=blut-hold -- sh -c \
+  'blut recipe declare /work/split.toml --run --launcher k8s; echo "follower exited $?"; sleep 600' \
+  > /dev/null
+deadline=$(( $(date +%s) + 600 ))
+until docker logs cli-cancel 2>&1 | grep -q '^\[k8s\] Running'; do
+  [ "$(date +%s)" -lt "$deadline" ] || { docker logs cli-cancel; fail "the held plan never ran"; }
+  sleep 2
+done
+job=$(docker logs cli-cancel 2>&1 | sed -n 's/^job    \(.*\)/\1/p')
+cancel_plan=$(docker logs cli-cancel 2>&1 | sed -n 's/^plan   blutplan\/\([^ ]*\) .*/\1/p')
+docker exec cli-cancel blut cancel "$job" > "$WORK/blut-cancel.log" 2>&1 \
+  || { cat "$WORK/blut-cancel.log"; fail "blut cancel $job failed"; }
+deadline=$(( $(date +%s) + 300 ))
+until docker logs cli-cancel 2>&1 | grep -q '^follower exited'; do
+  [ "$(date +%s)" -lt "$deadline" ] || { docker logs cli-cancel; fail "the follower outlived blut cancel"; }
+  sleep 2
+done
+rc=$(docker logs cli-cancel 2>&1 | sed -n 's/^follower exited //p')
+docker logs cli-cancel > "$WORK/cli-cancel.log" 2>&1
+docker rm -f cli-cancel > /dev/null
+[ "$rc" != 0 ] || fail "a cancelled follower exited 0"
+grep -q "cancelled: BlutPlan $NS/$cancel_plan deleted" "$WORK/cli-cancel.log" \
+  || { cat "$WORK/cli-cancel.log"; fail "the follower did not report deleting its plan"; }
+cat "$WORK/blut-cancel.log" >> "$WORK/cli-cancel.log"
+save cli-cancel.log < "$WORK/cli-cancel.log"
+deadline=$(( $(date +%s) + 300 ))
+while [ "$(plans_named "$cancel_plan")" != 0 ] \
+    || [ -n "$(kubectl -n "$NS" get pods -l "blut.lamquant.dev/plan=$cancel_plan" -o name)" ]; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "plan $cancel_plan outlived blut cancel"
+  sleep 2
+done
+log "  blut cancel $job: follower exited $rc; BlutPlan $cancel_plan and its pods gone"
+
+log "check 14: recipe run <name> --launcher k8s submits a registry recipe"
+set +e
+cli_container cli-named 0 BLUT_K8S_COMMAND=blut-core BLUT_K8S_MAX_RETRIES=0 -- \
+  blut-core recipe run eval_only --launcher k8s \
+  --args '{"dataset_path":"/data/train.jsonl","checkpoint_path":"/nonexistent/ckpt","device":"cpu"}' \
+  > "$WORK/cli-named.log" 2>&1
+rc=$?
+set -e
+docker rm cli-named > /dev/null 2>&1 || true
+save cli-named.log < "$WORK/cli-named.log"
+named_plan=$(sed -n 's/^plan   blutplan\/\([^ ]*\) .*/\1/p' "$WORK/cli-named.log")
+[ -n "$named_plan" ] || { cat "$WORK/cli-named.log"; fail "the named recipe was not submitted"; }
+kubectl -n "$NS" get blutplan "$named_plan" -o jsonpath='{.spec.planSource.recipe.name}' \
+  | grep -qx eval_only || fail "BlutPlan $named_plan does not name the recipe"
+kubectl -n "$NS" get job "$named_plan-run" -o jsonpath='{.spec.template.spec.containers[0].args}' \
+  | grep -q '"recipe","run","eval_only"' || fail "the pod did not run recipe run eval_only"
+pod_phase=$(phase "$named_plan")
+case "$pod_phase" in
+  Succeeded) [ "$rc" = 0 ] || fail "plan Succeeded but the CLI exited $rc" ;;
+  Failed) [ "$rc" != 0 ] || fail "plan Failed but the CLI exited 0"
+          grep -q "BlutPlan $NS/$named_plan failed:" "$WORK/cli-named.log" \
+            || fail "the CLI did not report the plan's failure" ;;
+  *) fail "named plan ended $pod_phase" ;;
+esac
+log "  BlutPlan $named_plan ran recipe run eval_only in the pod: $pod_phase, CLI exit $rc"
+log "  $(grep -E '^(done|Error)' "$WORK/cli-named.log" | head -n1 | cut -c1-200)"
+
 kubectl -n "$NS" get blutplans | save plans-final.txt
 kubectl -n "$NS" get blutplans
+
+log "check 15: the CLI refuses without a kubeconfig, and without the CRDs"
+before=$(kubectl -n "$NS" get blutplans -o name | wc -l)
+set +e
+docker run --rm --network host -v "$KUBECTL_BIN:/usr/local/bin/kubectl:ro" \
+  -v "$WORK/recipes:/work:ro" --tmpfs /blut/work:uid=65532 -e HOME=/blut/work \
+  -e KUBECONFIG=/nonexistent/config -e BLUT_K8S_IMAGE="$HOLD_IMAGE" \
+  --entrypoint blut "$HOLD_IMAGE" recipe declare /work/split.toml --run --launcher k8s \
+  > "$WORK/refuse-no-kubeconfig.log" 2>&1
+rc_noconf=$?
+kubectl delete -f "$DEPLOY/crds.yaml" --wait=true > /dev/null
+cli_container cli-nocrd 0 -- blut recipe declare /work/split.toml --run --launcher k8s \
+  > "$WORK/refuse-no-crd.log" 2>&1
+rc_nocrd=$?
+set -e
+docker rm cli-nocrd > /dev/null 2>&1 || true
+save refuse-no-kubeconfig.log < "$WORK/refuse-no-kubeconfig.log"
+save refuse-no-crd.log < "$WORK/refuse-no-crd.log"
+[ "$rc_noconf" != 0 ] && grep -q 'KUBECONFIG' "$WORK/refuse-no-kubeconfig.log" \
+  && grep -q 'nothing ran locally' "$WORK/refuse-no-kubeconfig.log" \
+  || { cat "$WORK/refuse-no-kubeconfig.log"; fail "no-kubeconfig refusal"; }
+[ "$rc_nocrd" != 0 ] && grep -q 'blut-operator is not installed' "$WORK/refuse-no-crd.log" \
+  && grep -q 'kubectl apply' "$WORK/refuse-no-crd.log" \
+  || { cat "$WORK/refuse-no-crd.log"; fail "no-CRD refusal"; }
+grep -q '^job ' "$WORK/refuse-no-kubeconfig.log" "$WORK/refuse-no-crd.log" \
+  && fail "a refused run recorded a job"
+log "  no kubeconfig: exit $rc_noconf, $(grep -o 'kubectl has no current context[^.]*' "$WORK/refuse-no-kubeconfig.log" | head -n1)"
+log "  no CRD: exit $rc_nocrd, names blut-operator and kubectl apply; $before plans existed before"
 log "PASS: all checks"
