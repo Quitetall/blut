@@ -197,7 +197,11 @@ depend on this crate.
   the `blut::paths` docs. **Migration:** an install that already set
   `$LAMU_TRAIN_DATA_DIR` (it used to hold only materialized training data)
   now sees an empty jobs list and registries; set the per-store variables to
-  the old locations to keep them. The scheduler lock stays machine-wide.
+  the old locations to keep them. `blut` warns once per invocation when that
+  has happened: each store whose own variable is unset, that is empty under
+  the root, and whose old default location holds data is named with the
+  variable that points back at it (`paths::stranded_stores`,
+  `paths::warn_stranded_stores`). The scheduler lock stays machine-wide.
   `blut-web` and `blut-notify` follow the same rule.
 - HPO trials are isolated: a trial whose stage fails (after its retries,
   including an exhausted divergence) is recorded as `failed` with its error

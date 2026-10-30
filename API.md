@@ -411,7 +411,11 @@ footprints, partitions, tenant and recipe config, and the `~/.blut` files)
 lives under that one directory, so two values are two independent installs.
 A store's own variable (`LAMU_TRAIN_JOBS_DIR`, `BLUT_REGISTRY_DB`, …) takes
 precedence; unset, every path is the historical default. `blut::paths` lists
-each store, its variable and its location.
+each store, its variable and its location. When the variable is set, a store
+whose own variable is unset, that is empty under the root, and whose old
+default location holds data is stranded: `blut` warns once per invocation and
+names the variable to set (`BLUT_REGISTRY_DB=~/.blut/registry.db`, …);
+`paths::stranded_stores` returns the same list to a cookbook.
 
 `blut hpo run` and `blut study run` isolate trial failures: a failed trial is
 recorded with its error and the search continues; the job fails only when no

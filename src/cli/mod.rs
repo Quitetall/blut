@@ -1209,6 +1209,7 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
 pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>) -> Result<()> {
     init_tracing();
     warn_if_stale_binary();
+    crate::paths::warn_stranded_stores();
     // The engine owns the built-in `checks` cookbook (ADR 0091): augment the
     // caller's registry so `check_jsonl`/`assert` + the `checks` error domain are
     // available to every binary (like `p2p-smoke` for the p2p path).

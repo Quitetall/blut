@@ -43,8 +43,13 @@
 //! already lived in `$LAMU_TRAIN_DATA_DIR`.
 //!
 //! Setting the variable on an existing install points it at a new, empty
-//! state; set the per-store variables to keep using the old stores.
+//! state; set the per-store variables to keep using the old stores. The CLI
+//! warns once per invocation when that has happened ([`stranded_stores`]):
+//! a store whose own variable is unset, that is empty under the root, and
+//! whose old default location holds data is named with the variable that
+//! points back at it.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, TrainError};
@@ -61,6 +66,206 @@ pub fn state_root() -> Option<PathBuf> {
 /// (the store keeps its historical default).
 pub fn under_state_root(name: &str) -> Option<PathBuf> {
     state_root().map(|root| root.join(name))
+}
+
+/// A store left behind by `$LAMU_TRAIN_DATA_DIR`: its own variable is unset,
+/// it is empty under the root, and its old default location holds data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StrandedStore {
+    /// What the store holds, e.g. `jobs` or `model + plan registry`.
+    pub store: &'static str,
+    /// The store's own variable; set it to [`old`](Self::old) to keep the data.
+    pub variable: &'static str,
+    /// The old default location, which holds data.
+    pub old: PathBuf,
+}
+
+/// Where an old default lives, relative to one of the user's base directories.
+#[derive(Clone, Copy)]
+enum Base {
+    /// `$HOME`.
+    Home,
+    /// `dirs::data_local_dir()` (`$XDG_DATA_HOME`, `~/.local/share`).
+    DataLocal,
+    /// `dirs::config_dir()` (`$XDG_CONFIG_HOME`, `~/.config`).
+    Config,
+}
+
+/// Every store `$LAMU_TRAIN_DATA_DIR` roots (the module table): what it is, its
+/// own variables (the first is the one to suggest), its name under the root,
+/// and its old default as a base directory plus a relative path.
+#[rustfmt::skip]
+const ROOTED_STORES: &[(&str, &[&str], &str, Base, &str)] = &[
+    ("jobs", &["LAMU_TRAIN_JOBS_DIR"], "train-jobs", Base::DataLocal, "lamu/train-jobs"),
+    ("global stage cache", &["LAMU_TRAIN_CACHE_DIR"], "train-cache", Base::DataLocal, "lamu/train-cache"),
+    ("model + plan registry", &["BLUT_REGISTRY_DB"], "registry.db", Base::Home, ".blut/registry.db"),
+    ("dataset catalog tags", &["BLUT_CATALOG_DB"], "catalog.db", Base::Home, ".blut/catalog.db"),
+    ("datasets", &["LAMU_MEMORY_DB"], "conversations.db", Base::DataLocal, "lamu/conversations.db"),
+    ("auto-train policy", &["LAMU_TRAIN_POLICY"], "train-policy.toml", Base::Config, "lamu/train-policy.toml"),
+    ("footprint calibration", &["BLUT_FOOTPRINT_PATH"], "footprints.json", Base::Config, "blut/footprints.json"),
+    ("backend registry config", &["BLUT_REGISTRY_PATH", "LAMU_REGISTRY_PATH"], "registry.yaml", Base::Config, "blut/registry.yaml"),
+    ("partitions", &["BLUT_PARTITIONS_DIR"], "partitions", Base::Config, "blut/partitions"),
+    ("tenant quotas", &["BLUT_TENANTS_CONFIG"], "tenants.toml", Base::Config, "blut/tenants.toml"),
+    ("declarative recipes", &["BLUT_USER_RECIPES_DIR"], "recipes", Base::Config, "blut/recipes"),
+    ("SLA log", &["BLUT_SLA_PATH"], "sla.jsonl", Base::Home, ".blut/sla.jsonl"),
+    ("SLA rules", &["BLUT_SLA_RULES"], "sla.toml", Base::Home, ".blut/sla.toml"),
+    ("cost ledger", &["BLUT_COST_LEDGER"], "cost.jsonl", Base::Home, ".blut/cost.jsonl"),
+    ("budget caps", &["BLUT_BUDGET_CAP"], "budget.toml", Base::Home, ".blut/budget.toml"),
+    ("trigger bindings", &["BLUT_TRIGGERS"], "triggers.toml", Base::Home, ".blut/triggers.toml"),
+    ("trigger events", &["BLUT_EVENTS_DIR"], "events", Base::Home, ".blut/events"),
+];
+
+/// The stores `$LAMU_TRAIN_DATA_DIR` left behind (see [`StrandedStore`]);
+/// empty when the variable is unset. An install that set the variable before
+/// it rooted every store (it used to hold only materialized training data)
+/// otherwise sees empty jobs and registries with no hint of where they went.
+pub fn stranded_stores() -> Vec<StrandedStore> {
+    stranded_stores_in(
+        &|name| std::env::var_os(name),
+        dirs::home_dir().as_deref(),
+        dirs::data_local_dir().as_deref(),
+        dirs::config_dir().as_deref(),
+    )
+}
+
+/// [`stranded_stores`] over an explicit environment and base directories, so
+/// it is testable without touching the process environment.
+fn stranded_stores_in(
+    env: &dyn Fn(&str) -> Option<OsString>,
+    home: Option<&Path>,
+    data_local: Option<&Path>,
+    config: Option<&Path>,
+) -> Vec<StrandedStore> {
+    let Some(root) = env("LAMU_TRAIN_DATA_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for &(store, variables, under_root, base, rel) in ROOTED_STORES {
+        if variables.iter().any(|v| env(v).is_some()) {
+            continue; // the store's own variable decides; the root does not apply
+        }
+        let base = match base {
+            Base::Home => home,
+            Base::DataLocal => data_local,
+            Base::Config => config,
+        };
+        let Some(old) = base.map(|b| b.join(rel)) else {
+            continue;
+        };
+        let new = root.join(under_root);
+        if old != new && holds_data(&old) && !holds_data(&new) {
+            out.push(StrandedStore {
+                store,
+                variable: variables[0],
+                old,
+            });
+        }
+    }
+    out
+}
+
+/// Whether `path` holds user data: a directory with a file somewhere in its
+/// first few levels, a SQLite database with a row in any table, or any other
+/// non-empty file. A database created by an earlier command but never
+/// written to is empty, so the warning does not stop the first time a
+/// command opens the new store.
+fn holds_data(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if meta.is_dir() {
+        return tree_has_file(path, 4);
+    }
+    if meta.len() == 0 {
+        return false;
+    }
+    if path.extension().is_some_and(|e| e == "db") {
+        return sqlite_has_rows(path).unwrap_or(true);
+    }
+    true
+}
+
+fn tree_has_file(dir: &Path, depth: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| match e.file_type() {
+        Ok(t) if t.is_dir() => depth > 0 && tree_has_file(&e.path(), depth - 1),
+        Ok(_) => true,
+        Err(_) => false,
+    })
+}
+
+/// `Some(true)` when any table of the SQLite file at `path` has a row; `None`
+/// when it cannot be read as one (the caller then judges by size).
+fn sqlite_has_rows(path: &Path) -> Option<bool> {
+    use rusqlite::{Connection, OpenFlags};
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .ok()?
+        .query_map([], |r| r.get(0))
+        .ok()?
+        .collect::<rusqlite::Result<_>>()
+        .ok()?;
+    for table in tables {
+        let quoted = table.replace('"', "\"\"");
+        let any: Option<i64> = conn
+            .query_row(&format!("SELECT 1 FROM \"{quoted}\" LIMIT 1"), [], |r| {
+                r.get(0)
+            })
+            .ok();
+        if any.is_some() {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// The warning [`warn_stranded_stores`] prints, or `None` when nothing is
+/// stranded.
+fn stranded_stores_warning(root: &Path, stranded: &[StrandedStore]) -> Option<String> {
+    if stranded.is_empty() {
+        return None;
+    }
+    let mut msg = format!(
+        "$LAMU_TRAIN_DATA_DIR ({}) is the root of every BLUT store, and these stores \
+         are empty under it while their old default locations hold data. To keep \
+         using that data, set:",
+        root.display()
+    );
+    for s in stranded {
+        msg.push_str(&format!(
+            "\n  {}={}  ({})",
+            s.variable,
+            s.old.display(),
+            s.store
+        ));
+    }
+    msg.push_str("\nor move the data under $LAMU_TRAIN_DATA_DIR.");
+    Some(msg)
+}
+
+/// Warn, once per process, about stores `$LAMU_TRAIN_DATA_DIR` left behind
+/// (see [`stranded_stores`]). `blut::cli::run` calls it at startup; the
+/// warning goes to the tracing subscriber (stderr for the CLI).
+pub fn warn_stranded_stores() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Some(root) = state_root() else {
+            return;
+        };
+        if let Some(msg) = stranded_stores_warning(&root, &stranded_stores()) {
+            tracing::warn!("{msg}");
+        }
+    });
 }
 
 /// The directory of BLUT's own state files (SLA log, cost ledger, budget,
@@ -430,6 +635,101 @@ mod tests {
             resolve_trainer_script_with(Some("/some/custom/trainer.py".to_string())).unwrap(),
             PathBuf::from("/some/custom/trainer.py")
         );
+    }
+
+    /// E2E follow-up: an install that already set `$LAMU_TRAIN_DATA_DIR`
+    /// saw empty jobs and registries once the variable rooted every store,
+    /// with no warning. The stores left behind are named with the variable
+    /// that points back at them.
+    #[test]
+    fn stores_left_behind_by_the_state_root_are_named() {
+        let td = tempfile::tempdir().unwrap();
+        let (home, data, config, root) = (
+            td.path().join("home"),
+            td.path().join("data"),
+            td.path().join("config"),
+            td.path().join("root"),
+        );
+        // Old data: a job, a registry with a row, a policy file.
+        std::fs::create_dir_all(data.join("lamu/train-jobs/job-1")).unwrap();
+        std::fs::write(data.join("lamu/train-jobs/job-1/status.jsonl"), "{}\n").unwrap();
+        std::fs::create_dir_all(home.join(".blut")).unwrap();
+        let reg = rusqlite::Connection::open(home.join(".blut/registry.db")).unwrap();
+        reg.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        drop(reg);
+        std::fs::create_dir_all(config.join("lamu")).unwrap();
+        std::fs::write(config.join("lamu/train-policy.toml"), "x = 1\n").unwrap();
+        // The root exists (it held materialized training data) and an earlier
+        // command created an empty registry and an empty jobs tree in it.
+        std::fs::create_dir_all(root.join("train-jobs/empty")).unwrap();
+        let empty = rusqlite::Connection::open(root.join("registry.db")).unwrap();
+        empty.execute_batch("CREATE TABLE t (x);").unwrap();
+        drop(empty);
+
+        let vars = |pairs: &'static [(&'static str, &'static str)], root: PathBuf| {
+            move |name: &str| -> Option<OsString> {
+                if name == "LAMU_TRAIN_DATA_DIR" {
+                    return Some(root.clone().into_os_string());
+                }
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.into())
+            }
+        };
+        let found = |env: &dyn Fn(&str) -> Option<OsString>| {
+            stranded_stores_in(env, Some(&home), Some(&data), Some(&config))
+        };
+
+        let got = found(&vars(&[], root.clone()));
+        let named: Vec<(&str, &Path)> = got.iter().map(|s| (s.variable, s.old.as_path())).collect();
+        assert_eq!(
+            named,
+            vec![
+                (
+                    "LAMU_TRAIN_JOBS_DIR",
+                    data.join("lamu/train-jobs").as_path()
+                ),
+                ("BLUT_REGISTRY_DB", home.join(".blut/registry.db").as_path()),
+                (
+                    "LAMU_TRAIN_POLICY",
+                    config.join("lamu/train-policy.toml").as_path()
+                ),
+            ]
+        );
+        let msg = stranded_stores_warning(&root, &got).unwrap();
+        assert!(
+            msg.contains(&format!(
+                "BLUT_REGISTRY_DB={}",
+                home.join(".blut/registry.db").display()
+            )),
+            "{msg}"
+        );
+
+        // A store's own variable decides for it.
+        let got = found(&vars(
+            &[("LAMU_TRAIN_JOBS_DIR", "/elsewhere")],
+            root.clone(),
+        ));
+        assert!(
+            got.iter().all(|s| s.variable != "LAMU_TRAIN_JOBS_DIR"),
+            "{got:?}"
+        );
+
+        // A store already in use under the root is not stranded.
+        std::fs::write(root.join("train-policy.toml"), "y = 2\n").unwrap();
+        let reg = rusqlite::Connection::open(root.join("registry.db")).unwrap();
+        reg.execute("INSERT INTO t VALUES (2)", []).unwrap();
+        drop(reg);
+        let got = found(&vars(&[], root.clone()));
+        let named: Vec<&str> = got.iter().map(|s| s.variable).collect();
+        assert_eq!(named, vec!["LAMU_TRAIN_JOBS_DIR"]);
+
+        // Unset: nothing to say.
+        let unset = |_: &str| -> Option<OsString> { None };
+        assert!(found(&unset).is_empty());
+        assert!(stranded_stores_warning(&root, &[]).is_none());
     }
 
     /// A non-UTF-8 jobs dir was read with `env::var(..).ok()`, so it was
