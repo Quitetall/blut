@@ -645,6 +645,12 @@ enum ScheduleCommand {
     /// List installed blut recipe timers.
     List,
     /// Install (or replace) a timer that runs a recipe on a schedule.
+    ///
+    /// The unit runs `recipe run` with the flags given here, from the current
+    /// working directory, with the location, policy, interpreter and device
+    /// variables set in this shell (`blut::schedule::ENVIRONMENT_ALLOWLIST`),
+    /// so a firing reproduces the launch you would run by hand. Nothing else
+    /// from the environment is copied: credentials never go in a unit file.
     Install {
         /// Recipe name (as listed by `recipe list`).
         recipe: String,
@@ -655,6 +661,25 @@ enum ScheduleCommand {
         /// Recipe args as inline JSON. Defaults to `{}`.
         #[arg(long, default_value = "{}")]
         args: String,
+        /// Tenant the scheduled runs are admitted under, as `recipe run
+        /// --tenant`.
+        #[arg(long, default_value = "default")]
+        tenant: String,
+        /// Scheduled runs read and write the global shared cache, as `recipe
+        /// run --shared-cache`.
+        #[arg(long)]
+        shared_cache: bool,
+        /// Scheduled runs bypass the cache, as `recipe run --no-cache`.
+        #[arg(long)]
+        no_cache: bool,
+        /// Scheduled runs use synchronous training I/O, as `recipe run
+        /// --sync-io`.
+        #[arg(long)]
+        sync_io: bool,
+        /// Experiment the scheduled runs group under, as `recipe run
+        /// --experiment`.
+        #[arg(long)]
+        experiment: Option<String>,
     },
     /// Remove a recipe's timer + service.
     Uninstall {
@@ -3334,6 +3359,11 @@ fn run_schedule_cmd(reg: &crate::framework::Registry, cmd: ScheduleCommand) -> R
             recipe,
             calendar,
             args,
+            tenant,
+            shared_cache,
+            no_cache,
+            sync_io,
+            experiment,
         } => {
             // Validate the recipe exists + the args parse before touching
             // systemd, so a typo doesn't leave a broken unit behind.
@@ -3356,8 +3386,29 @@ fn run_schedule_cmd(reg: &crate::framework::Registry, cmd: ScheduleCommand) -> R
             // every time it ran, visible only in the journal.
             (def.compile_fn)(parsed)
                 .map_err(|e| anyhow!("recipe '{recipe}' rejects these --args: {e}"))?;
-            schedule::install(&recipe, &calendar, &args).map_err(|e| anyhow!("{e}"))?;
+            // The same up-front tenant checks as `recipe run`: a tenant the
+            // quota policy does not know would refuse every firing.
+            let tenant = crate::tenant::Tenant::parse(&tenant)
+                .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
+            crate::config::tenants::TenantQuotaPolicy::load()?
+                .fraction_for(&tenant)
+                .map_err(|e| anyhow!("{e}"))?;
+            let options = schedule::ScheduleOptions {
+                tenant: Some(tenant.to_string()),
+                shared_cache,
+                no_cache,
+                sync_io,
+                experiment,
+            };
+            let carried = schedule::install_with(&recipe, &calendar, &args, &options)
+                .map_err(|e| anyhow!("{e}"))?;
             eprintln!("installed timer blut-{recipe}.timer (OnCalendar={calendar})");
+            eprintln!("runs as: recipe run {recipe} --tenant {tenant} (and the flags given)");
+            if carried.is_empty() {
+                eprintln!("environment: none of the carried variables is set here");
+            } else {
+                eprintln!("environment: {}", carried.join(", "));
+            }
             eprintln!("inspect: systemctl --user list-timers | grep {recipe}");
             Ok(())
         }

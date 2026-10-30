@@ -11,6 +11,12 @@ depend on this crate.
 ## [Unreleased]
 
 ### Added
+- `schedule install` takes `--tenant`, `--shared-cache`, `--no-cache`,
+  `--sync-io` and `--experiment`, passed to the scheduled `recipe run`; the
+  tenant is checked against the quota policy at install, as `recipe run`
+  checks it. Library: `schedule::install_with` with `ScheduleOptions`, and
+  `schedule::ENVIRONMENT_ALLOWLIST`; `schedule::install` is unchanged in
+  signature.
 - `plan promote` takes an unambiguous prefix of a deployment fingerprint, as
   other commands take job ids and content hashes; a prefix matching no
   deployment or several is refused. `registry_db::resolve_fingerprint` does the
@@ -159,6 +165,20 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- A scheduled unit ran a different launch from the interactive one: it carried
+  no tenant, no cache flags, no working directory and none of the installer's
+  environment, so a timer ran under `default`, with a private cache, from the
+  user manager's directory, against the default data, jobs, registry and
+  catalog locations. The service now passes `--tenant` (always) and the
+  launch flags given, sets `WorkingDirectory=` to the installer's directory,
+  and sets `Environment=` for each variable of
+  `schedule::ENVIRONMENT_ALLOWLIST` that is set (state locations such as
+  `LAMU_TRAIN_DATA_DIR`, `LAMU_TRAIN_JOBS_DIR`, `BLUT_CHECKPOINTS_DIR`,
+  `BLUT_REGISTRY_DB` and `BLUT_CATALOG_DB`, the remote cache location, the
+  policy files, the interpreter, device and containment selection). Nothing
+  outside the list is copied, so credentials (`AWS_*`, API keys, tokens) never
+  reach a unit file, and a `BLUT_REMOTE_CACHE` URL with userinfo, a query or a
+  fragment is refused.
 - `blut log` printed only "no trainer progress" and `blut jobs` no step, loss or
   final loss for every job a recipe ran. A plan launch records trainer progress
   as `stage_step` events (a trainer stage forwards each `StatusUpdate` its
