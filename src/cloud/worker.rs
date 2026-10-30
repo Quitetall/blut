@@ -347,6 +347,8 @@ async fn run_in_dir(
         job.invocation_key,
     );
     ctx.cancel = cancel.clone();
+    // The stage runs under the job's custody namespace, as it would locally.
+    ctx.tenant = job.tenant.clone();
 
     // Download the input pack + unbundle (the four fail-closed gates run here).
     let pack = bounded(
@@ -386,12 +388,16 @@ async fn run_in_dir(
     // Run under the original end-to-end deadline; time ONLY the compute.
     let started = std::time::Instant::now();
     let output = bounded(
-        async {
+        // Contained like a local stage: a process the stage places in a
+        // systemd unit (`LocalSystemd::spawn_contained`) is recorded under
+        // this stage dir before it starts, exactly as the executor records it
+        // under a job dir.
+        crate::jobs::in_job(stage_dir.to_path_buf(), async {
             stage
                 .run_erased(&ctx, input, job.args.clone())
                 .await
                 .map_err(|error| ExecutionFailure::from_stage_error(&job.stage_name, &error))
-        },
+        }),
         cancel,
         job.deadline,
         ExecutionPhase::Running,
@@ -429,6 +435,356 @@ async fn run_in_dir(
     .await?;
 
     Ok((out_blob_key, out_manifest, compute_ms))
+}
+
+/// How a [`serve`] loop behaves.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ServeOptions {
+    /// Lease owner name. Unique per worker process (default `<host>-<pid>`).
+    pub worker_id: String,
+    /// Trust level the dispatch matrix checks jobs against.
+    pub trust: TrustLevel,
+    /// Lease length. The holder renews at a third of it, so a worker that
+    /// dies is replaced about this long after its last renewal.
+    pub lease_secs: u64,
+    /// Idle polling backs off from `poll_min` to `poll_max` while the queue
+    /// is empty, and drops back to `poll_min` after each job.
+    pub poll_min: std::time::Duration,
+    pub poll_max: std::time::Duration,
+    /// How often a running job's state is re-read to notice a cancellation.
+    pub status_interval: std::time::Duration,
+    /// Stop after this many claimed jobs.
+    pub max_jobs: Option<u64>,
+    /// Stop after the queue has been empty this long.
+    pub idle_exit: Option<std::time::Duration>,
+    /// Scratch root; each job gets `<work_root>/<job id>`, removed afterwards.
+    pub work_root: std::path::PathBuf,
+}
+
+impl ServeOptions {
+    pub fn new(worker_id: impl Into<String>, work_root: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            worker_id: worker_id.into(),
+            trust: TrustLevel::Registered,
+            lease_secs: 60,
+            poll_min: std::time::Duration::from_millis(500),
+            poll_max: std::time::Duration::from_secs(5),
+            status_interval: std::time::Duration::from_secs(2),
+            max_jobs: None,
+            idle_exit: None,
+            work_root: work_root.into(),
+        }
+    }
+
+    pub fn with_lease_secs(mut self, lease_secs: u64) -> Self {
+        self.lease_secs = lease_secs.max(1);
+        self
+    }
+
+    pub fn with_poll(mut self, min: std::time::Duration, max: std::time::Duration) -> Self {
+        self.poll_min = min;
+        self.poll_max = max.max(min);
+        self
+    }
+
+    pub fn with_status_interval(mut self, interval: std::time::Duration) -> Self {
+        self.status_interval = interval;
+        self
+    }
+
+    pub fn with_max_jobs(mut self, max_jobs: Option<u64>) -> Self {
+        self.max_jobs = max_jobs;
+        self
+    }
+
+    pub fn with_idle_exit(mut self, idle_exit: Option<std::time::Duration>) -> Self {
+        self.idle_exit = idle_exit;
+        self
+    }
+
+    pub fn with_trust(mut self, trust: TrustLevel) -> Self {
+        self.trust = trust;
+        self
+    }
+}
+
+/// What a [`serve`] loop did, reported as it happens.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum ServeEvent {
+    /// A job was claimed and is starting.
+    Claimed {
+        job_id: String,
+        stage_name: String,
+        assignment: Assignment,
+    },
+    /// The job's result was recorded on the queue.
+    Finished {
+        job_id: String,
+        outcome: JobOutcome,
+        wall_time_ms: u64,
+        detail: Option<String>,
+    },
+    /// The job stopped because the queue no longer assigns it to this worker
+    /// (cancelled, or the lease was lost); nothing was recorded.
+    Abandoned { job_id: String },
+    /// Shutdown: the job was handed back unfinished for another worker.
+    Released { job_id: String },
+    /// A queue call failed; the loop backs off and carries on.
+    QueueError { message: String },
+}
+
+/// Totals for a [`serve`] loop.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct ServeReport {
+    pub claimed: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub abandoned: u64,
+    pub released: u64,
+}
+
+/// Claim and run jobs until `shutdown` fires, `max_jobs` is reached, or the
+/// queue has been idle for `idle_exit`.
+///
+/// While a job runs, its lease is renewed every third of `lease_secs` and its
+/// state re-read every `status_interval`: when the job is cancelled or the
+/// lease goes to another worker, the stage is cancelled and nothing is
+/// recorded. On `shutdown` the running stage is cancelled and the job is
+/// released, so another worker picks it up at once. A failing queue call is
+/// reported and retried after a backoff; it does not end the loop.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve(
+    store: &ObjectStore,
+    queue: &dyn CloudQueue,
+    registry: &Registry,
+    policy: &dyn DispatchPolicy,
+    matrix: &DispatchMatrix,
+    options: &ServeOptions,
+    shutdown: &CancellationToken,
+    ledger: Option<&super::cost::CostLedger>,
+    on_event: &(dyn Fn(&ServeEvent) + Send + Sync),
+) -> ServeReport {
+    let mut report = ServeReport::default();
+    let mut backoff = options.poll_min;
+    let mut idle_since = std::time::Instant::now();
+    let execution = WorkerExecution {
+        store,
+        registry,
+        policy,
+        matrix,
+        worker_trust: options.trust,
+        work_root: &options.work_root,
+    };
+    loop {
+        if shutdown.is_cancelled() || options.max_jobs.is_some_and(|max| report.claimed >= max) {
+            return report;
+        }
+        let claimed = tokio::select! {
+            claimed = queue.claim(&options.worker_id, options.lease_secs) => claimed,
+            _ = shutdown.cancelled() => return report,
+        };
+        let claimed = match claimed {
+            Ok(Some(claimed)) => claimed,
+            Ok(None) => {
+                if options
+                    .idle_exit
+                    .is_some_and(|idle| idle_since.elapsed() >= idle)
+                {
+                    return report;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = shutdown.cancelled() => return report,
+                }
+                backoff = (backoff * 2).min(options.poll_max);
+                continue;
+            }
+            Err(error) => {
+                on_event(&ServeEvent::QueueError {
+                    message: error.to_string(),
+                });
+                tokio::select! {
+                    _ = tokio::time::sleep(options.poll_max) => {}
+                    _ = shutdown.cancelled() => return report,
+                }
+                continue;
+            }
+        };
+        report.claimed += 1;
+        backoff = options.poll_min;
+        let job = claimed.job;
+        let assignment = claimed.assignment;
+        on_event(&ServeEvent::Claimed {
+            job_id: job.id.clone(),
+            stage_name: job.stage_name.clone(),
+            assignment: assignment.clone(),
+        });
+        let started = std::time::Instant::now();
+        let stage_cancel = CancellationToken::new();
+        let mut released_for_shutdown = false;
+        let outcome = {
+            let custody = crate::p2p::trust::custody_allows_off_box(&job.tenant, job.data_class);
+            let run = async {
+                if !custody {
+                    return Err(WorkerFailure::from(ExecutionFailure::protocol(format!(
+                        "cloud execution denied by custody policy for tenant '{}' and {:?} data",
+                        job.tenant, job.data_class
+                    ))));
+                }
+                execute_claimed(&execution, &job, &stage_cancel).await
+            };
+            tokio::pin!(run);
+            let period = std::time::Duration::from_millis(
+                (options.lease_secs.saturating_mul(1000) / 3).max(200),
+            );
+            let mut renew = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            let mut status = tokio::time::interval_at(
+                tokio::time::Instant::now() + options.status_interval,
+                options
+                    .status_interval
+                    .max(std::time::Duration::from_millis(10)),
+            );
+            loop {
+                tokio::select! {
+                    result = &mut run => break result,
+                    _ = renew.tick() => {
+                        match queue.renew(&job.id, &assignment, options.lease_secs).await {
+                            Ok(true) => {}
+                            Ok(false) => stage_cancel.cancel(),
+                            Err(error) => on_event(&ServeEvent::QueueError {
+                                message: format!("renew lease of {}: {error}", job.id),
+                            }),
+                        }
+                    }
+                    _ = status.tick() => {
+                        match tokio::time::timeout(options.status_interval.max(std::time::Duration::from_secs(5)), queue.status(&job.id)).await {
+                            Ok(Ok(super::queue::JobStatus::Running(current))) if current == assignment => {}
+                            // An expired lease reads as queued; it is still
+                            // ours until someone else claims it, and renewal
+                            // decides that. Anything terminal or re-leased is not.
+                            Ok(Ok(super::queue::JobStatus::Queued)) => {}
+                            Ok(Ok(_)) => stage_cancel.cancel(),
+                            // A failed read does not revoke a lease; the
+                            // fenced completion stays authoritative.
+                            Ok(Err(_)) | Err(_) => {}
+                        }
+                    }
+                    _ = shutdown.cancelled(), if !released_for_shutdown => {
+                        released_for_shutdown = true;
+                        stage_cancel.cancel();
+                    }
+                }
+            }
+        };
+        let result = match outcome {
+            Ok((out_blob_key, out_manifest, compute_ms)) => Some(CloudResult {
+                protocol_version: super::job::CLOUD_JOB_PROTOCOL_VERSION,
+                job_id: job.id.clone(),
+                assignment: None,
+                outcome: JobOutcome::Succeeded,
+                content_id: Some(out_manifest.content_id),
+                output_blob_key: Some(out_blob_key),
+                output_manifest: Some(out_manifest),
+                wall_time_ms: compute_ms,
+                failure: None,
+                timeout_phase: None,
+                deadline_unix_ms: None,
+            }),
+            Err(WorkerFailure::Failed(failure)) => Some(CloudResult::failed(
+                job.id.clone(),
+                started.elapsed().as_millis() as u64,
+                *failure,
+            )),
+            Err(WorkerFailure::TimedOut {
+                phase,
+                deadline_unix_ms,
+            }) => Some(CloudResult::timed_out(
+                job.id.clone(),
+                started.elapsed().as_millis() as u64,
+                phase,
+                deadline_unix_ms,
+            )),
+            Err(WorkerFailure::Cancelled) => None,
+        };
+        match result {
+            Some(result) => {
+                let finished = ServeEvent::Finished {
+                    job_id: job.id.clone(),
+                    outcome: result.outcome,
+                    wall_time_ms: result.wall_time_ms,
+                    detail: result.failure.as_ref().map(ToString::to_string),
+                };
+                let billable =
+                    matches!(result.outcome, JobOutcome::Succeeded).then_some(result.wall_time_ms);
+                match complete_if_current(queue, &assignment, result).await {
+                    Ok(true) => {
+                        if billable.is_some() {
+                            report.succeeded += 1;
+                        } else {
+                            report.failed += 1;
+                        }
+                        if let (Some(ledger), Some(compute_ms)) = (ledger, billable) {
+                            ledger.record(&job.id, &job.resources, compute_ms);
+                        }
+                        on_event(&finished);
+                    }
+                    Ok(false) => {
+                        report.abandoned += 1;
+                        on_event(&ServeEvent::Abandoned {
+                            job_id: job.id.clone(),
+                        });
+                    }
+                    Err(error) => {
+                        report.abandoned += 1;
+                        on_event(&ServeEvent::QueueError {
+                            message: format!("record the result of {}: {error}", job.id),
+                        });
+                    }
+                }
+            }
+            None if released_for_shutdown => {
+                match queue
+                    .release(&job.id, &assignment, "the worker was shut down")
+                    .await
+                {
+                    Ok(true) => {
+                        report.released += 1;
+                        on_event(&ServeEvent::Released {
+                            job_id: job.id.clone(),
+                        });
+                    }
+                    Ok(false) => {
+                        report.abandoned += 1;
+                        on_event(&ServeEvent::Abandoned {
+                            job_id: job.id.clone(),
+                        });
+                    }
+                    Err(error) => {
+                        report.abandoned += 1;
+                        on_event(&ServeEvent::QueueError {
+                            message: format!(
+                                "release {}: {error}; it is requeued when its lease runs out",
+                                job.id
+                            ),
+                        });
+                    }
+                }
+            }
+            None => {
+                report.abandoned += 1;
+                on_event(&ServeEvent::Abandoned {
+                    job_id: job.id.clone(),
+                });
+            }
+        }
+        if released_for_shutdown {
+            return report;
+        }
+        idle_since = std::time::Instant::now();
+    }
 }
 
 #[cfg(test)]

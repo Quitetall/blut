@@ -16,7 +16,11 @@
 
 pub mod cost;
 pub mod job;
+pub mod location;
+pub mod object_queue;
+pub mod policy;
 pub mod queue;
+pub mod records;
 pub mod submitter;
 pub mod worker;
 

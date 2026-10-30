@@ -65,6 +65,46 @@ pub struct CloudSubmitter {
     store: ObjectStore,
     queue: Arc<dyn CloudQueue>,
     registry: Arc<Registry>,
+    /// How long an enqueued job may wait for a worker before it is withdrawn
+    /// and the attempt fails (`None`: until the execution deadline).
+    pickup_timeout: Option<std::time::Duration>,
+    /// File that gets one line per cloud job id, written before the job is
+    /// enqueued, so `blut cancel` can find the work after this process is gone.
+    job_record: Option<PathBuf>,
+}
+
+/// How long a cancellation of durable queue work may take after the caller
+/// stopped waiting for it. The request runs in its own task, so a caller's
+/// short acknowledgement budget cannot abort it halfway.
+const QUEUE_CANCEL_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Cancel `job_id` on `queue` in a task of its own, and wait for the answer at
+/// most `wait`. The cancellation carries on after `wait` runs out.
+async fn cancel_detached(
+    queue: &Arc<dyn CloudQueue>,
+    job_id: &str,
+    reason: &str,
+    wait: std::time::Duration,
+) -> Result<Result<bool, CloudError>, tokio::time::error::Elapsed> {
+    let queue = queue.clone();
+    let job_id = job_id.to_string();
+    let reason = reason.to_string();
+    let task = tokio::spawn(async move {
+        tokio::time::timeout(QUEUE_CANCEL_BUDGET, queue.cancel(&job_id, &reason))
+            .await
+            .unwrap_or_else(|_| {
+                Err(CloudError::Dispatch(format!(
+                    "cancel of cloud job '{job_id}' did not finish within {QUEUE_CANCEL_BUDGET:?}"
+                )))
+            })
+    });
+    match tokio::time::timeout(wait, task).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(join)) => Ok(Err(CloudError::Dispatch(format!(
+            "cancel task failed: {join}"
+        )))),
+        Err(elapsed) => Err(elapsed),
+    }
 }
 
 /// What [`CloudJobHandle::poll`] reports.
@@ -89,7 +129,27 @@ impl CloudSubmitter {
             store,
             queue,
             registry,
+            pickup_timeout: None,
+            job_record: None,
         }
+    }
+
+    /// Fail an attempt whose job no worker has claimed for `window` (counted
+    /// from when it was last seen queued: a job requeued after its worker died
+    /// gets a fresh window). The job is withdrawn first, so a worker that
+    /// turns up late cannot run it, and the failure lists why any worker left
+    /// it (`CloudQueue::refusals`). Code `CLOUD_NO_WORKER`, not retryable.
+    pub fn with_pickup_timeout(mut self, window: std::time::Duration) -> Self {
+        self.pickup_timeout = Some(window);
+        self
+    }
+
+    /// Append each cloud job id to `path` before enqueueing it. A job whose id
+    /// cannot be recorded is not enqueued: durable work nobody can find again
+    /// is work nobody can cancel.
+    pub fn with_job_record(mut self, path: impl Into<PathBuf>) -> Self {
+        self.job_record = Some(path.into());
+        self
     }
 
     /// Bundle `spec.input`, upload it, and enqueue the job. Returns a handle to poll.
@@ -155,11 +215,15 @@ struct CloudExecutionHandle {
     store: ObjectStore,
     queue: Arc<dyn CloudQueue>,
     job_id: String,
+    stage_name: String,
     lifecycle: ExecutionLifecycle,
     cancel: CancellationToken,
     enqueued: Arc<AtomicBool>,
     /// Serializes queue refresh and terminal download across concurrent snapshots.
     refresh: Mutex<()>,
+    pickup_timeout: Option<std::time::Duration>,
+    /// When the job was first seen waiting for a worker since it last ran.
+    queued_since: parking_lot::Mutex<Option<std::time::Instant>>,
 }
 
 impl Drop for CloudExecutionHandle {
@@ -172,7 +236,7 @@ impl Drop for CloudExecutionHandle {
             let job_id = self.job_id.clone();
             runtime.spawn(async move {
                 let cancel = queue.cancel(&job_id, "execution handle dropped");
-                let _ = tokio::time::timeout(std::time::Duration::from_millis(250), cancel).await;
+                let _ = tokio::time::timeout(QUEUE_CANCEL_BUDGET, cancel).await;
             });
         }
     }
@@ -197,8 +261,10 @@ impl ExecutionHandle for CloudExecutionHandle {
                 if current.phase == ExecutionPhase::Running {
                     transition(&self.lifecycle, ExecutionPhase::Queued, None)?;
                 }
+                self.check_pickup().await?;
             }
             JobStatus::Running(assignment) => {
+                *self.queued_since.lock() = None;
                 observe_assignment(&self.lifecycle, &assignment)?;
             }
             JobStatus::Done(result) => {
@@ -223,10 +289,11 @@ impl ExecutionHandle for CloudExecutionHandle {
     async fn cancel(&self) -> Result<(), ExecutionFailure> {
         self.cancel.cancel();
         let was_enqueued = self.enqueued.load(Ordering::Acquire);
-        let queue_cancel = tokio::time::timeout(
+        let queue_cancel = cancel_detached(
+            &self.queue,
+            &self.job_id,
+            "execution caller cancelled",
             std::time::Duration::from_millis(250),
-            self.queue
-                .cancel(&self.job_id, "execution caller cancelled"),
         )
         .await;
         let cancellation_won = !was_enqueued || matches!(&queue_cancel, Ok(Ok(true)));
@@ -246,6 +313,57 @@ impl ExecutionHandle for CloudExecutionHandle {
     }
 }
 
+impl CloudExecutionHandle {
+    /// Withdraw a job nobody claimed within the pickup window and fail the
+    /// attempt with the workers' reasons, if any.
+    async fn check_pickup(&self) -> Result<(), ExecutionFailure> {
+        let Some(window) = self.pickup_timeout else {
+            return Ok(());
+        };
+        let since = *self
+            .queued_since
+            .lock()
+            .get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() < window {
+            return Ok(());
+        }
+        let withdrawn = self
+            .queue
+            .cancel(
+                &self.job_id,
+                "no cloud worker claimed it within the pickup window",
+            )
+            .await
+            .map_err(cloud_failure)?;
+        if !withdrawn {
+            // A worker claimed it, or it finished, between the two reads; the
+            // next snapshot sees which.
+            *self.queued_since.lock() = None;
+            return Ok(());
+        }
+        let refusals = self.queue.refusals(&self.job_id).await.unwrap_or_default();
+        let mut message = format!(
+            "no cloud worker claimed stage '{}' (cloud job {}) within {}s. Start one \
+             with `blut cloud worker --queue <the same location>` from a build of the \
+             same code, or allow longer with BLUT_CLOUD_PICKUP_SECS",
+            self.stage_name,
+            self.job_id,
+            window.as_secs()
+        );
+        if !refusals.is_empty() {
+            message.push_str(". Workers that saw the job and left it: ");
+            message.push_str(&refusals.join("; "));
+        }
+        let mut failure = ExecutionFailure::new(
+            ExecutionFailureKind::Unavailable,
+            "CLOUD_NO_WORKER",
+            message,
+        );
+        failure.retryable = false;
+        finish(&self.lifecycle, None, ExecutionTerminal::Failed { failure })
+    }
+}
+
 struct CloudAttempt {
     store: ObjectStore,
     queue: Arc<dyn CloudQueue>,
@@ -253,6 +371,7 @@ struct CloudAttempt {
     cancel: CancellationToken,
     enqueued: Arc<AtomicBool>,
     request: ExecutionRequest,
+    job_record: Option<PathBuf>,
 }
 
 impl CloudAttempt {
@@ -336,6 +455,19 @@ impl CloudAttempt {
             timeout_secs: self.request.deadline.hard_remaining().as_secs().max(1),
             deadline: self.request.deadline,
         };
+        if let Some(record) = &self.job_record {
+            record_job_id(record, &self.request.execution_id).map_err(|error| {
+                ExecutionFailure::new(
+                    ExecutionFailureKind::Storage,
+                    "EXECUTION_STORAGE",
+                    format!(
+                        "record cloud job {} in {} before enqueueing it: {error}",
+                        self.request.execution_id,
+                        record.display()
+                    ),
+                )
+            })?;
+        }
         let enqueue = self.queue.enqueue(job);
         tokio::pin!(enqueue);
         tokio::select! {
@@ -365,7 +497,7 @@ impl CloudAttempt {
         };
         let cancel = self.queue.cancel(&self.request.execution_id, reason);
         if matches!(
-            tokio::time::timeout(std::time::Duration::from_millis(250), cancel).await,
+            tokio::time::timeout(QUEUE_CANCEL_BUDGET, cancel).await,
             Ok(Ok(true))
         ) {
             finish_cancel_or_timeout(&self.lifecycle, self.request.deadline, reason);
@@ -446,6 +578,7 @@ impl ExecutionAdapter for CloudSubmitter {
                 cancel: cancel.clone(),
                 enqueued: enqueued.clone(),
                 request: request.clone(),
+                job_record: self.job_record.clone(),
             }
             .run(),
         );
@@ -453,10 +586,13 @@ impl ExecutionAdapter for CloudSubmitter {
             store: self.store.clone(),
             queue: self.queue.clone(),
             job_id: request.execution_id,
+            stage_name: request.stage_name,
             lifecycle,
             cancel,
             enqueued,
             refresh: Mutex::new(()),
+            pickup_timeout: self.pickup_timeout,
+            queued_since: parking_lot::Mutex::new(None),
         }))
     }
 }
@@ -662,6 +798,25 @@ async fn sleep_optional(duration: Option<std::time::Duration>) {
         Some(duration) => tokio::time::sleep(duration).await,
         None => std::future::pending::<()>().await,
     }
+}
+
+/// Append `job_id` to the record file, one id per line, once.
+fn record_job_id(path: &Path, job_id: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let existing = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    if existing.lines().any(|line| line.trim() == job_id) {
+        return Ok(());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{job_id}")?;
+    file.sync_data()
 }
 
 fn cloud_failure(error: CloudError) -> ExecutionFailure {

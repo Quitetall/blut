@@ -1206,6 +1206,26 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
 
 /// [`run`] with an optional in-process cockpit (see [`TuiHook`]).
 pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>) -> Result<()> {
+    run_parsed(reg, tui, None).await
+}
+
+/// [`run`] with an explicit argument list instead of the process's own
+/// (`args[0]` is the program name, as in `std::env::args`). For binaries that
+/// rewrite their arguments, and for tests that drive the CLI in a child
+/// process.
+pub async fn run_from<I, T>(reg: crate::framework::Registry, args: I) -> Result<()>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    run_parsed(reg, None, Some(args.into_iter().map(Into::into).collect())).await
+}
+
+async fn run_parsed(
+    reg: crate::framework::Registry,
+    tui: Option<TuiHook>,
+    args: Option<Vec<std::ffi::OsString>>,
+) -> Result<()> {
     init_tracing();
     warn_if_stale_binary();
     // The engine owns the built-in `checks` cookbook (ADR 0091): augment the
@@ -1217,7 +1237,10 @@ pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>)
     // (`blut recipe declare s3_roundtrip.json`) resolves + kind-checks.
     crate::connectors::register(&mut reg);
     install_code_identity(&reg);
-    let cli = Cli::parse();
+    let cli = match args {
+        Some(args) => Cli::parse_from(args),
+        None => Cli::parse(),
+    };
     let result = match cli.command {
         Some(Command::Jobs { json }) => run_jobs(json),
         Some(Command::Cancel { id, grace }) => run_cancel(&id, grace).await,
