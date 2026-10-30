@@ -85,12 +85,10 @@ pub(super) async fn run_recipe_on_k8s(
         return Err(anyhow!("--args must be a JSON object for --launcher k8s"));
     }
     refuse_registry_handles(&raw)?;
-    // Compile here so a misspelled recipe or a bad arg fails before anything
-    // reaches the cluster. The plan is discarded; the pod compiles its own.
     let def = reg
         .find(name)
         .ok_or_else(|| anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)"))?;
-    (def.compile_fn)(raw.clone()).map_err(|e| anyhow!("recipe '{name}': {e}"))?;
+    validate_for_cluster(def, &raw)?;
     let source = ClusterSource::Recipe {
         name: name.to_string(),
         args: raw,
@@ -152,6 +150,19 @@ pub(super) async fn run_file_on_k8s(
         .map(|(stem, _)| stem.to_string())
         .unwrap_or(filename);
     submit_and_follow(settings, &label, source, false).await
+}
+
+/// Check a named recipe's args here, before anything reaches the cluster:
+/// a misspelled key or a wrong type fails now. The recipe is NOT compiled
+/// here: compiling can check that paths in the args exist, and those are
+/// paths inside the pod. The pod compiles it, and a failure there is the
+/// plan's failure, reported by the follower.
+fn validate_for_cluster(
+    def: &crate::recipes::recipe::RecipeDef,
+    raw: &serde_json::Value,
+) -> Result<()> {
+    crate::recipes::recipe::validate_args_against_schema(def.name, &(def.args_schema_fn)(), raw)
+        .map_err(|e| anyhow!("recipe '{}': {e}", def.name))
 }
 
 fn refuse_registry_handles(args: &serde_json::Value) -> Result<()> {
@@ -401,7 +412,57 @@ fn print_stages(status: &ClusterStatus) {
 
 #[cfg(test)]
 mod tests {
-    use super::K8sUnsupported;
+    use super::{K8sUnsupported, validate_for_cluster};
+    use crate::recipes::recipe::{RecipeCategory, RecipeDef};
+
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct PathArgs {
+        checkpoint_path: std::path::PathBuf,
+    }
+
+    /// A recipe whose compile checks a path, as cookbook recipes do.
+    static CHECKS_PATHS: RecipeDef = RecipeDef {
+        name: "checks_paths",
+        description: "d",
+        backend_id: "b",
+        category: RecipeCategory::User,
+        input_kinds: &[],
+        output_kind: "k",
+        schedule: None,
+        args_schema_fn: crate::recipes::recipe::schema_of::<PathArgs>,
+        compile_fn: |_| {
+            Err(crate::framework::RecipeError::CompileFailed(
+                "checkpoint_path not found on this machine".into(),
+            ))
+        },
+    };
+
+    #[test]
+    fn args_are_checked_against_the_schema_not_by_compiling_here() {
+        // A path that exists only in the pod must not be refused here.
+        validate_for_cluster(
+            &CHECKS_PATHS,
+            &serde_json::json!({"checkpoint_path": "/only/in/the/pod"}),
+        )
+        .unwrap();
+        // A misspelled or missing key still fails before submission.
+        for (args, needle) in [
+            (
+                serde_json::json!({"checkpoint_pth": "/x"}),
+                "checkpoint_path",
+            ),
+            (
+                serde_json::json!({"checkpoint_path": "/x", "epochz": 2}),
+                "epochz",
+            ),
+        ] {
+            let err = validate_for_cluster(&CHECKS_PATHS, &args)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{err}");
+        }
+    }
 
     fn none() -> K8sUnsupported {
         K8sUnsupported {
