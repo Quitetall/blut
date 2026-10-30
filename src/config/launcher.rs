@@ -1440,12 +1440,14 @@ pub enum LaunchTarget {
     Slurm,
     /// A Ray job (`ray job submit`).
     Ray,
-    /// P2P distributed compute (peer GPUs over QUIC). There is no
+    /// P2P distributed compute over the `p2p node` mesh. There is no
     /// [`Launcher`] for it: a stage reaches a peer only through an
     /// `ExecutionAdapter` installed with `ExecCtx::with_execution_adapter`
-    /// (feature `p2p`). No `blut` command installs one, so every command
-    /// refuses `--launcher p2p`, and the executor refuses this target when no
-    /// adapter is installed.
+    /// (feature `p2p`). `recipe run` and `recipe declare --run` install the
+    /// mesh adapter (`p2p::mesh_exec`); every other command refuses
+    /// `--launcher p2p`, and the executor refuses this target when no adapter
+    /// is installed. A stage that declares it may leave the machine runs on a
+    /// peer with the same code identity, or the run fails; the others run here.
     P2P,
     /// A Kubernetes cluster via a generated `BlutPlan` (`kubectl apply -f -`).
     /// K8s is an adapter (ADR 0037): the engine emits the manifest textually
@@ -1564,11 +1566,10 @@ pub(crate) fn check_launcher_tools(target: LaunchTarget) -> Result<()> {
 pub(crate) fn check_launcher_placeable(target: LaunchTarget, surface: &str) -> Result<()> {
     let detail = match target {
         LaunchTarget::P2P => {
-            "no `blut` command hands a run's stages to peers. Over the mesh today, \
-             `blut p2p node --dispatch-stage p2p-echo --input <file> --to <peer>` (a build \
-             with the `p2p` feature) runs the built-in probe stage on a peer, and a library \
-             caller places stages with `blut::p2p::dispatch_stage` or \
-             `ExecCtx::with_execution_adapter`"
+            "only `recipe run` and `recipe declare --run` place a run's stages on mesh \
+             peers, in a build with the `p2p` feature: `blut recipe run <name> --launcher \
+             p2p --p2p-seed <addr@pubkey>` joins the mesh and fails if no peer can take an \
+             eligible stage. A library caller installs `ExecCtx::with_execution_adapter`"
         }
         LaunchTarget::Cloud => {
             "no `blut` command submits a run's stages to the cloud queue. Its one command, \
@@ -1617,10 +1618,12 @@ pub fn launcher_for(target: LaunchTarget) -> Box<dyn Launcher> {
         // placement: this signature has no error path, so it returns the local
         // launcher. A k8s run is a BlutPlan submitted by `recipe run` (see
         // `k8s_cluster`); p2p and cloud need an ExecutionAdapter
-        // (`ExecCtx::with_execution_adapter`), which no command installs. Every
-        // command refuses the three before a stage could reach this
-        // (`check_launcher_placeable`, `k8s_cluster::refuse_surface`), and the
-        // executor refuses them without an adapter.
+        // (`ExecCtx::with_execution_adapter`). Under p2p the stages that run
+        // here are the ones that declare they must stay, which run contained
+        // like any local stage; a command that installs no adapter refuses the
+        // target first (`check_launcher_placeable`,
+        // `k8s_cluster::refuse_surface`), and the executor refuses it without
+        // an adapter.
         LaunchTarget::P2P | LaunchTarget::K8s | LaunchTarget::Cloud => {
             Box::new(LocalSystemd::default())
         }
@@ -2158,7 +2161,7 @@ mod tests {
             p2p.starts_with("--launcher p2p cannot place `recipe run`"),
             "{p2p}"
         );
-        assert!(p2p.contains("blut p2p node --dispatch-stage"), "{p2p}");
+        assert!(p2p.contains("--launcher p2p --p2p-seed"), "{p2p}");
         assert!(p2p.contains("Nothing ran"), "{p2p}");
         let cloud = check_launcher_placeable(LaunchTarget::Cloud, "`hpo` trials")
             .unwrap_err()

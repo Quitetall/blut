@@ -197,7 +197,7 @@ fn lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 const REMOTE: [(&str, &str); 2] = [
-    ("p2p", "blut p2p node --dispatch-stage"),
+    ("p2p", "--launcher p2p --p2p-seed"),
     ("cloud", "blut cloud smoke"),
 ];
 
@@ -238,11 +238,21 @@ async fn recipe_run_refuses_p2p_and_cloud_before_anything_runs() {
                 .await
                 .expect_err("a placement no command can make must be refused")
                 .to_string();
-            assert!(
-                err.contains(&format!("--launcher {launcher} cannot place `recipe run`")),
-                "{argv:?}: {err}"
-            );
-            assert!(err.contains(names), "{argv:?}: {err}");
+            if placed_on_a_mesh(launcher) {
+                // A p2p build places it, on a mesh this machine has not
+                // joined: no identity yet, so nothing runs.
+                assert!(
+                    err.contains("--launcher p2p needs this machine's mesh identity"),
+                    "{argv:?}: {err}"
+                );
+                assert!(err.contains("Nothing ran"), "{argv:?}: {err}");
+            } else {
+                assert!(
+                    err.contains(&format!("--launcher {launcher} cannot place `recipe run`")),
+                    "{argv:?}: {err}"
+                );
+                assert!(err.contains(names), "{argv:?}: {err}");
+            }
             sandbox.assert_nothing_ran(&format!("{argv:?}"));
         }
     }
@@ -269,15 +279,104 @@ async fn recipe_declare_run_refuses_p2p_and_cloud_without_pointing_at_recipe_run
             .await
             .expect_err("refused")
             .to_string();
-        assert!(
-            err.contains(&format!(
-                "--launcher {launcher} cannot place `recipe declare --run`"
-            )),
-            "{err}"
-        );
-        assert!(err.contains(names), "{err}");
+        if placed_on_a_mesh(launcher) {
+            assert!(
+                err.contains("--launcher p2p needs this machine's mesh identity"),
+                "{err}"
+            );
+        } else {
+            assert!(
+                err.contains(&format!(
+                    "--launcher {launcher} cannot place `recipe declare --run`"
+                )),
+                "{err}"
+            );
+            assert!(err.contains(names), "{err}");
+        }
         sandbox.assert_nothing_ran(launcher);
     }
+}
+
+/// `recipe run` and `recipe declare --run` place `--launcher p2p` on the mesh
+/// in a build with the `p2p` feature; every other command refuses it.
+fn placed_on_a_mesh(launcher: &str) -> bool {
+    cfg!(feature = "p2p") && launcher == "p2p"
+}
+
+/// `--p2p-*` flags with another launcher would be ignored; they are refused.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn mesh_flags_with_another_launcher_are_refused() {
+    let _lock = lock();
+    let reg = registry();
+    let sandbox = Sandbox::new();
+    let args = sandbox.args();
+    let argv = [
+        "blut",
+        "recipe",
+        "run",
+        "launcher_probe",
+        "--args",
+        args.as_str(),
+        "--p2p-seed",
+        "127.0.0.1:9@00",
+    ];
+    let err = super::run_recipe(&reg, recipe_cmd(&argv))
+        .await
+        .expect_err("refused")
+        .to_string();
+    assert!(
+        err.contains("--p2p-seed only apply to --launcher p2p"),
+        "{err}"
+    );
+    sandbox.assert_nothing_ran("stray --p2p-seed");
+}
+
+/// With an identity but a seed that does not answer, `--launcher p2p` stops
+/// before a job exists: there is no mesh to place anything on.
+#[cfg(feature = "p2p")]
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn recipe_run_on_an_unreachable_mesh_runs_nothing() {
+    let _lock = lock();
+    let reg = registry();
+    let sandbox = Sandbox::new();
+    let key = sandbox.dir.path().join("identity.key");
+    std::fs::write(&key, crate::p2p::crypto::KeyPair::generate().to_bytes()).unwrap();
+    let peer = crate::p2p::crypto::KeyPair::generate();
+    // A port nothing listens on.
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let seed = format!(
+        "127.0.0.1:{port}@{}",
+        faster_hex::hex_string(peer.verifying.as_bytes())
+    );
+    let args = sandbox.args();
+    let key_arg = key.display().to_string();
+    let argv = [
+        "blut",
+        "recipe",
+        "run",
+        "launcher_probe",
+        "--args",
+        args.as_str(),
+        "--launcher",
+        "p2p",
+        "--p2p-key",
+        key_arg.as_str(),
+        "--p2p-seed",
+        seed.as_str(),
+    ];
+    let err = super::run_recipe(&reg, recipe_cmd(&argv))
+        .await
+        .expect_err("refused")
+        .to_string();
+    assert!(err.contains("could not reach any seed"), "{err}");
+    assert!(err.contains("Nothing ran"), "{err}");
+    sandbox.assert_nothing_ran("unreachable mesh");
 }
 
 #[allow(clippy::await_holding_lock)]

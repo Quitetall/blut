@@ -67,11 +67,16 @@ pub(super) enum RecipeCommand {
         /// (only with `--run`).
         #[arg(long, requires = "run")]
         experiment: Option<String>,
-        /// Where `--run` executes: `local` (default), or `k8s`, which ships the
+        /// Where `--run` executes: `local` (default); `k8s`, which ships the
         /// file to a Kubernetes cluster as a BlutPlan for blut-operator and
-        /// follows it (settings: `BLUT_K8S_*`, docs/OPERATOR.md).
+        /// follows it (settings: `BLUT_K8S_*`, docs/OPERATOR.md); or `p2p`,
+        /// which joins the `p2p node` mesh (`--p2p-seed`) and runs each stage
+        /// that declares it may leave this machine on a peer with the same
+        /// code identity (a build with the `p2p` feature).
         #[arg(long, default_value = "local")]
         launcher: String,
+        #[command(flatten)]
+        mesh: super::mesh_launch::MeshArgs,
     },
     /// Execute a recipe, or a config-driven sweep over it.
     Run {
@@ -125,8 +130,11 @@ pub(super) enum RecipeCommand {
         /// content-addressed cache + job dirs must be reachable from the
         /// compute node (NFS/Lustre); local admission still gates (conservative).
         /// `k8s` submits the whole recipe to blut-operator (docs/OPERATOR.md).
-        /// `p2p` and `cloud` are refused: no command places a run's stages on
-        /// peers or on the cloud queue.
+        /// `p2p` joins the `p2p node` mesh (`--p2p-seed`, a build with the `p2p`
+        /// feature): each stage that declares it may leave this machine runs on
+        /// a peer with the same code identity, the others run here, and the run
+        /// fails if no peer can take an eligible stage. `cloud` is refused: no
+        /// command places a run's stages on the cloud queue.
         #[arg(long, default_value = "local")]
         launcher: String,
         /// Tenant (`project[/domain]`, ADR 0096) whose namespace this run's
@@ -137,6 +145,8 @@ pub(super) enum RecipeCommand {
         /// Experiment/campaign name for lineage grouping. Defaults to the recipe.
         #[arg(long)]
         experiment: Option<String>,
+        #[command(flatten)]
+        mesh: super::mesh_launch::MeshArgs,
     },
 }
 
@@ -230,19 +240,33 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             tenant,
             experiment,
             launcher,
+            mesh: mesh_args,
         } => {
             let declare_target: crate::config::launcher::LaunchTarget = launcher
                 .parse()
                 .map_err(|e| anyhow!("invalid --launcher {launcher:?}: {e}"))?;
             // Before the arm below, which sends other launchers to `recipe
-            // run`: that refuses p2p and cloud as well.
-            crate::config::launcher::check_launcher_placeable(
-                declare_target,
-                "`recipe declare --run`",
-            )
-            .map_err(|e| anyhow!("{e}"))?;
+            // run`: that refuses cloud as well. p2p is placed here, on a mesh.
+            if declare_target == crate::config::launcher::LaunchTarget::P2P {
+                super::mesh_launch::check(&mesh_args, "`recipe declare --run`")?;
+            } else {
+                super::mesh_launch::refuse_stray(&mesh_args, declare_target)?;
+                crate::config::launcher::check_launcher_placeable(
+                    declare_target,
+                    "`recipe declare --run`",
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
             match declare_target {
                 crate::config::launcher::LaunchTarget::Local => {}
+                crate::config::launcher::LaunchTarget::P2P => {
+                    if file.is_none() || !run {
+                        return Err(anyhow!(
+                            "--launcher p2p runs the recipe on the mesh, so it needs a <file> \
+                             and --run; without --run, `recipe declare` only renders the plan"
+                        ));
+                    }
+                }
                 crate::config::launcher::LaunchTarget::K8s => {
                     let Some(path) = file.as_ref() else {
                         return Err(anyhow!("--launcher k8s needs a <file> and --run"));
@@ -273,8 +297,8 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                 }
                 other => {
                     return Err(anyhow!(
-                        "recipe declare --run takes --launcher local or k8s, not {}; use \
-                         `recipe run` for the other launchers",
+                        "recipe declare --run takes --launcher local, p2p or k8s, not {}; \
+                         use `recipe run` for the other launchers",
                         other.as_str()
                     ));
                 }
@@ -302,7 +326,9 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                 Some(path) => {
                     let tenant = crate::tenant::Tenant::parse(&tenant)
                         .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
-                    let launch_target = crate::config::launcher::LaunchTarget::Local;
+                    // Local, or p2p (which `--run` requires): registry handles
+                    // resolve under the placement the run will use.
+                    let launch_target = declare_target;
                     // A `registry://plan@<name>` deploy URI (ADR 0085) resolves
                     // to a FROZEN PlanSpec from the local registry and dispatches
                     // that exact graph; otherwise `path` is a recipe file
@@ -331,13 +357,21 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                         println!(
                             "✓ '{name}' compiles + kind-checks ({n} ingredient(s)); launching…"
                         );
-                        launch_compiled_plan(
+                        let mesh = if launch_target == crate::config::launcher::LaunchTarget::P2P {
+                            Some(
+                                super::mesh_launch::join(&mesh_args, "`recipe declare --run`")
+                                    .await?,
+                            )
+                        } else {
+                            None
+                        };
+                        let launched = launch_compiled_plan(
                             &name,
                             plan,
                             None,
                             None,
                             shared_cache,
-                            crate::config::launcher::LaunchTarget::Local,
+                            launch_target,
                             None,
                             no_cache,
                             sync_io,
@@ -349,7 +383,11 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                                     .map(|ptr| format!("plan.{ptr}"))
                             }),
                         )
-                        .await?;
+                        .await;
+                        if let Some(mesh) = mesh {
+                            mesh.close().await;
+                        }
+                        launched?;
                     } else {
                         // Render-only (default): print the runnable DAG, no exec.
                         print!("{}", plan.render_ascii().map_err(|e| anyhow!("{e}"))?);
@@ -373,6 +411,7 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             launcher,
             tenant,
             experiment,
+            mesh: mesh_args,
         } => {
             // #3 distributed: parse placement up front so a typo fails the run
             // BEFORE any job dir / state is written (vs deep in the executor).
@@ -384,9 +423,15 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             crate::config::launcher::check_launcher_tools(launch_target)
                 .map_err(|e| anyhow!("{e}"))?;
             // Before `--dry-run` and config mode too: a dry run that reports
-            // OK for a placement the real run refuses would be a lie.
-            crate::config::launcher::check_launcher_placeable(launch_target, "`recipe run`")
-                .map_err(|e| anyhow!("{e}"))?;
+            // OK for a placement the real run refuses would be a lie. p2p is
+            // placed on the mesh; its configuration is checked here.
+            if launch_target == crate::config::launcher::LaunchTarget::P2P {
+                super::mesh_launch::check(&mesh_args, "`recipe run`")?;
+            } else {
+                super::mesh_launch::refuse_stray(&mesh_args, launch_target)?;
+                crate::config::launcher::check_launcher_placeable(launch_target, "`recipe run`")
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
             // ADR 0096: parse the tenant up front (same fail-fast discipline).
             let tenant = crate::tenant::Tenant::parse(&tenant)
                 .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
@@ -427,82 +472,96 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                 || config_key.is_some()
                 || !set.is_empty()
                 || !sweep.is_empty();
-            if config_mode {
-                if args != "{}" {
-                    eprintln!(
-                        "warning: --args is ignored in config mode (args come from the config)"
-                    );
-                }
-                run_recipe_sweep(
-                    reg,
-                    &name,
-                    config_dir,
-                    config_name,
-                    config_key,
-                    &set,
-                    &sweep,
-                    dry_run,
-                    shared_cache,
-                    launch_target,
-                    no_cache,
-                    sync_io,
-                    tenant,
-                    experiment,
-                )
-                .await?;
+            // A real p2p run joins the mesh once; a sweep's combos share it.
+            let mesh = if launch_target == crate::config::launcher::LaunchTarget::P2P && !dry_run {
+                Some(super::mesh_launch::join(&mesh_args, "`recipe run`").await?)
             } else {
-                let raw: serde_json::Value = serde_json::from_str(&args)
-                    .with_context(|| format!("parse --args as JSON: {args}"))?;
-                if dry_run {
-                    let raw =
-                        crate::registry_args::resolve_recipe_args(raw, &tenant, launch_target)
-                            .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
-                    // `--dry-run` is documented as "without running anything". The
-                    // config-mode sweep path honors that (run_recipe_sweep), but the
-                    // single-invocation `--args` path previously fell straight into
-                    // run_one_recipe — which compiled the plan AND executed every
-                    // stage (spawning the warm systemd-run unit + acquiring the
-                    // exclusive GPU lock) before any value was produced. Short-circuit
-                    // here: VALIDATE the args + confirm the plan COMPILES (so a
-                    // dry-run can't report "OK" on invalid args — B/P5), then report
-                    // the resolved RAM footprint and return WITHOUT executing or
-                    // touching any resource (compile builds the plan; it never runs).
-                    let def = reg.find(&name).ok_or_else(|| {
-                        anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)")
-                    })?;
-                    let plan = (def.compile_fn)(raw.clone()).map_err(|e| anyhow!("{e}"))?;
-                    let fp = plan.declared_footprint();
-                    if !plan.has_resource_declarations() {
+                None
+            };
+            let outcome: Result<()> = async {
+                if config_mode {
+                    if args != "{}" {
                         eprintln!(
-                            "warning: no stage in this plan declares a resource \
+                            "warning: --args is ignored in config mode (args come from the config)"
+                        );
+                    }
+                    run_recipe_sweep(
+                        reg,
+                        &name,
+                        config_dir,
+                        config_name,
+                        config_key,
+                        &set,
+                        &sweep,
+                        dry_run,
+                        shared_cache,
+                        launch_target,
+                        no_cache,
+                        sync_io,
+                        tenant,
+                        experiment,
+                    )
+                    .await?;
+                } else {
+                    let raw: serde_json::Value = serde_json::from_str(&args)
+                        .with_context(|| format!("parse --args as JSON: {args}"))?;
+                    if dry_run {
+                        let raw =
+                            crate::registry_args::resolve_recipe_args(raw, &tenant, launch_target)
+                                .map_err(|e| anyhow!("registry arg resolution: {e}"))?;
+                        // `--dry-run` is documented as "without running anything". The
+                        // config-mode sweep path honors that (run_recipe_sweep), but the
+                        // single-invocation `--args` path previously fell straight into
+                        // run_one_recipe — which compiled the plan AND executed every
+                        // stage (spawning the warm systemd-run unit + acquiring the
+                        // exclusive GPU lock) before any value was produced. Short-circuit
+                        // here: VALIDATE the args + confirm the plan COMPILES (so a
+                        // dry-run can't report "OK" on invalid args — B/P5), then report
+                        // the resolved RAM footprint and return WITHOUT executing or
+                        // touching any resource (compile builds the plan; it never runs).
+                        let def = reg.find(&name).ok_or_else(|| {
+                            anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)")
+                        })?;
+                        let plan = (def.compile_fn)(raw.clone()).map_err(|e| anyhow!("{e}"))?;
+                        let fp = plan.declared_footprint();
+                        if !plan.has_resource_declarations() {
+                            eprintln!(
+                                "warning: no stage in this plan declares a resource \
                              envelope — billing the 2G compatibility floor. \
                              Implement Stage::resource_envelope (ADR 0133) for \
                              real admission."
-                        );
-                    }
-                    let gib = fp.ram_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                    println!(
-                        "[dry-run] recipe={name} resolved RAM footprint ≈ {gib:.1}G \
+                            );
+                        }
+                        let gib = fp.ram_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                        println!(
+                            "[dry-run] recipe={name} resolved RAM footprint ≈ {gib:.1}G \
                          (admission would gate this against free RAM + the 6G floor). \
                          No ingredients executed; no GPU/cgroup acquired."
-                    );
-                    return Ok(());
+                        );
+                        return Ok(());
+                    }
+                    run_one_recipe(
+                        reg,
+                        &name,
+                        raw,
+                        None,
+                        shared_cache,
+                        launch_target,
+                        None,
+                        no_cache,
+                        sync_io,
+                        tenant,
+                        experiment,
+                    )
+                    .await?;
                 }
-                run_one_recipe(
-                    reg,
-                    &name,
-                    raw,
-                    None,
-                    shared_cache,
-                    launch_target,
-                    None,
-                    no_cache,
-                    sync_io,
-                    tenant,
-                    experiment,
-                )
-                .await?;
+                Ok(())
             }
+            .await;
+            if let Some(mesh) = mesh {
+                mesh.close().await;
+            }
+            outcome?;
         }
     }
     Ok(())
@@ -1232,6 +1291,13 @@ fn refuse_unplaced_local_launch(
             &surface
         )));
     }
+    // A p2p launch is placed when the command that started it joined a mesh.
+    #[cfg(feature = "p2p")]
+    if launch_target == crate::config::launcher::LaunchTarget::P2P
+        && super::mesh_launch::active().is_some()
+    {
+        return Ok(());
+    }
     crate::config::launcher::check_launcher_placeable(launch_target, &surface)
         .map_err(|e| anyhow!("{e}"))
 }
@@ -1295,6 +1361,10 @@ pub(super) fn prepare_compiled_plan_launch(
     ctx = ctx
         .with_launch_target(launch_target)
         .with_device_index(device_index);
+    #[cfg(feature = "p2p")]
+    if launch_target == crate::config::launcher::LaunchTarget::P2P {
+        ctx = super::mesh_launch::attach(ctx)?;
+    }
     let gpu_pool = crate::config::launcher::launcher_for(launch_target).capacity();
     let gpu_inventory = crate::broker::gpu::GpuInventory::probe();
     let gpu_inventory = if gpu_inventory.len() >= gpu_pool.max(1) {
@@ -2073,6 +2143,7 @@ mod recipe_declare_flag_tests {
                         tenant: _,
                         experiment: _,
                         launcher: _,
+                        mesh: _,
                     },
             }) => (file, run, shared_cache, no_cache, sync_io),
             other => panic!("expected recipe declare, got {other:?}"),

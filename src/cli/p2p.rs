@@ -71,12 +71,20 @@ pub(super) enum P2pCommand {
         /// one transition release).
         #[arg(long, default_value_t = false)]
         allow_legacy_peers: bool,
-        /// Run REAL dispatched stages (not just the smoke echo) via the shared
-        /// content-addressed cache: the Ed25519 pubkey (hex) of the scheduler
-        /// whose signed tasks this worker will execute. Without it, the worker
-        /// runs the connectivity smoke runner.
+        /// Run REAL dispatched stages (not just the smoke echo): the pubkey (hex,
+        /// the `pubkey` line of `blut p2p keys show`) of the submitter whose
+        /// signed stages this worker runs. That covers the stages its `recipe
+        /// run --launcher p2p` sends (registered cookbook stages that declare
+        /// they may leave its machine, from a submitter running the same code
+        /// identity) and `--dispatch-stage`. Without it, the worker runs only
+        /// the connectivity smoke runner and refuses stages.
         #[arg(long)]
         coordinator_pubkey: Option<String>,
+        /// Stages this worker runs at once for `recipe run --launcher p2p`
+        /// (default: the CPU count, at most 16). Each is also admitted against
+        /// free memory, as a local run of the stage would be.
+        #[arg(long)]
+        max_tasks: Option<usize>,
         /// Identity key file (defaults to the standard p2p key path).
         #[arg(long)]
         key: Option<std::path::PathBuf>,
@@ -176,7 +184,11 @@ pub(super) enum P2pPeersCommand {
     },
     /// Set a peer's trust level (anonymous | registered | trusted).
     Trust {
-        /// Peer id (hex, or unique prefix).
+        /// Peer id (hex, or unique prefix), or the peer's whole `pubkey` line
+        /// from `blut p2p keys show` (128 hex), which also adds a peer this
+        /// machine has only dialed or learned by gossip: the mesh registers a
+        /// peer only when it connects in, or once it ran a stage for this
+        /// machine.
         id: String,
         /// New trust level.
         level: String,
@@ -191,7 +203,7 @@ pub(super) enum P2pPeersCommand {
 // ── P2P CLI (behind the `p2p` feature) ───────────────────────────────────────
 
 #[cfg(feature = "p2p")]
-mod p2p_cli {
+pub(super) mod p2p_cli {
     use super::*;
     use crate::p2p::crypto::KeyPair;
     use crate::p2p::peer::PeerId;
@@ -361,6 +373,7 @@ pub(super) async fn run_p2p_cmd(
             no_scheduler,
             allow_legacy_peers,
             coordinator_pubkey,
+            max_tasks,
             key,
             probe,
             advertise,
@@ -404,6 +417,7 @@ pub(super) async fn run_p2p_cmd(
                 scheduler: !no_scheduler,
                 allow_legacy: allow_legacy_peers,
                 coordinator_pubkey,
+                max_tasks,
                 probe,
                 advertise,
                 gossip: !no_gossip,
@@ -456,8 +470,20 @@ pub(super) async fn run_p2p_cmd(
                     Ok(())
                 }
                 P2pPeersCommand::Trust { id, level } => {
-                    let pid = resolve_peer_id(&registry, &id)?;
                     let lvl = parse_trust(&level)?;
+                    let pid = match resolve_peer_id(&registry, &id) {
+                        Ok(pid) => pid,
+                        Err(_) if id.trim().len() == 128 => {
+                            let info = peer_from_pubkey_line(id.trim(), lvl)?;
+                            let pid = info.id.clone();
+                            if registry.get(&pid).is_none() {
+                                registry.upsert(info);
+                                println!("added {}", pid.short());
+                            }
+                            pid
+                        }
+                        Err(e) => return Err(e),
+                    };
                     if registry.set_trust(&pid, lvl) {
                         registry.save().map_err(|e| anyhow!("save registry: {e}"))?;
                         println!("set {} trust = {}", pid.short(), lvl.label());
@@ -479,6 +505,28 @@ pub(super) async fn run_p2p_cmd(
             }
         }
     }
+}
+
+/// A registry entry for the peer whose `pubkey` line (128 hex: Ed25519 ‖
+/// X25519, as `blut p2p keys show` prints it) is `line`.
+#[cfg(feature = "p2p")]
+fn peer_from_pubkey_line(
+    line: &str,
+    trust: crate::p2p::trust::TrustLevel,
+) -> Result<crate::p2p::peer::PeerInfo> {
+    let mut bytes = [0u8; 64];
+    faster_hex::hex_decode(line.as_bytes(), &mut bytes)
+        .map_err(|e| anyhow!("pubkey line hex: {e}"))?;
+    let ed: [u8; 32] = bytes[..32].try_into().expect("32 bytes");
+    let x: [u8; 32] = bytes[32..].try_into().expect("32 bytes");
+    let verifying = ed25519_dalek::VerifyingKey::from_bytes(&ed)
+        .map_err(|e| anyhow!("pubkey line: invalid Ed25519 key: {e}"))?;
+    Ok(crate::p2p::peer::PeerInfo::new(
+        verifying,
+        x25519_dalek::PublicKey::from(x),
+        trust,
+        crate::p2p::peer::PeerCapabilities::default(),
+    ))
 }
 
 /// Hex-encode a keypair's public bytes (64 = Ed25519 ‖ X25519) for sharing.
@@ -724,7 +772,7 @@ pub(super) fn clone_keypair(kp: &crate::p2p::crypto::KeyPair) -> crate::p2p::cry
 /// Parse a `--seed` spec `addr@ed25519-pubkey-hex` into its parts (the pubkey
 /// pins the peer's TLS identity when dialing, A1).
 #[cfg(feature = "p2p")]
-fn parse_seed(spec: &str) -> Result<(std::net::SocketAddr, [u8; 32])> {
+pub(super) fn parse_seed(spec: &str) -> Result<(std::net::SocketAddr, [u8; 32])> {
     let (addr, hex) = spec
         .split_once('@')
         .ok_or_else(|| anyhow!("seed must be 'addr@pubkey-hex', got '{spec}'"))?;
@@ -864,6 +912,7 @@ pub(super) struct NodeOptions {
     scheduler: bool,
     allow_legacy: bool,
     coordinator_pubkey: Option<String>,
+    max_tasks: Option<usize>,
     probe: bool,
     advertise: Option<String>,
     gossip: bool,
@@ -896,7 +945,9 @@ fn parse_ed25519_hex(what: &str, hex: &str) -> Result<ed25519_dalek::VerifyingKe
 
 /// Open the store `--shared-store` names (default: a local directory).
 #[cfg(feature = "p2p")]
-fn open_node_store(spec: Option<&str>) -> Result<crate::framework::object_store::ObjectStore> {
+pub(super) fn open_node_store(
+    spec: Option<&str>,
+) -> Result<crate::framework::object_store::ObjectStore> {
     use crate::framework::object_store::ObjectStore;
     let Some(spec) = spec else {
         return Ok(ObjectStore::filesystem(
@@ -920,7 +971,7 @@ fn open_node_store(spec: Option<&str>) -> Result<crate::framework::object_store:
 
 /// Resolve `--advertise host:port` (an IP literal or a DNS name).
 #[cfg(feature = "p2p")]
-async fn resolve_advertise(spec: &str) -> Result<std::net::SocketAddr> {
+pub(super) async fn resolve_advertise(spec: &str) -> Result<std::net::SocketAddr> {
     resolve_coordinator(spec)
         .await
         .with_context(|| format!("--advertise '{spec}'"))
@@ -928,7 +979,7 @@ async fn resolve_advertise(spec: &str) -> Result<std::net::SocketAddr> {
 
 /// One line describing the mesh view, for the status log.
 #[cfg(feature = "p2p")]
-fn mesh_view_line(view: &[crate::p2p::node::MeshPeerView]) -> String {
+pub(super) fn mesh_view_line(view: &[crate::p2p::node::MeshPeerView]) -> String {
     let connected = view.iter().filter(|p| p.connected).count();
     let peers: Vec<String> = view
         .iter()
@@ -952,7 +1003,7 @@ fn mesh_view_line(view: &[crate::p2p::node::MeshPeerView]) -> String {
 /// Wait up to `window` for gossip to settle: return early once at least one
 /// peer is connected and every known, dialable peer is connected.
 #[cfg(feature = "p2p")]
-async fn discover(node: &crate::p2p::node::MeshNode, window: std::time::Duration) {
+pub(super) async fn discover(node: &crate::p2p::node::MeshNode, window: std::time::Duration) {
     let deadline = tokio::time::Instant::now() + window;
     // Give the first exchanges a moment even when everything is already up.
     let settle = tokio::time::Instant::now() + window.min(std::time::Duration::from_secs(1));
@@ -1045,6 +1096,31 @@ pub(super) async fn run_p2p_node(
     .await
     .map_err(|e| anyhow!("bind mesh node: {e}"))?;
     node.set_objects(objects.clone());
+    // The stage plane: `recipe run --launcher p2p` sends a run's eligible
+    // stages here. Every worker answers on it (so a submitter can say why it
+    // passed this node over); only `--coordinator-pubkey` lets one run them.
+    let stage_plane = if opts.worker {
+        let mut worker = crate::p2p::mesh_exec::MeshStageWorker::new(
+            reg.clone(),
+            objects.clone(),
+            keypair.clone(),
+            paths::data_dir()?.join("p2p").join("stage-work"),
+        );
+        if let Some(hex) = &opts.coordinator_pubkey {
+            worker = worker.accept_from(parse_ed25519_hex("--coordinator-pubkey", hex)?);
+        }
+        if let Some(n) = opts.max_tasks {
+            worker = worker.with_max_tasks(n);
+        }
+        node.set_stage_worker(Arc::new(worker));
+        if opts.coordinator_pubkey.is_some() {
+            "runs `recipe run --launcher p2p` stages for the --coordinator-pubkey submitter"
+        } else {
+            "answers, runs no stages (no --coordinator-pubkey)"
+        }
+    } else {
+        "off (--no-worker)"
+    };
     if let Some(spec) = &opts.advertise {
         node.set_advertise_addr(resolve_advertise(spec).await?);
     }
@@ -1063,6 +1139,11 @@ pub(super) async fn run_p2p_node(
         opts.worker, opts.scheduler, opts.allow_legacy, opts.gossip
     );
     eprintln!("worker runner {runner_mode}");
+    eprintln!("stage plane  {stage_plane}");
+    eprintln!(
+        "code         {}",
+        crate::framework::code_identity::current()
+    );
     if opts.gossip {
         node.start_gossip(
             GossipConfig::default()
