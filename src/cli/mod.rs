@@ -2497,8 +2497,12 @@ async fn run_model_cmd(cmd: ModelCommand) -> Result<()> {
             if hist.is_empty() {
                 println!("no history for model://{name}@{alias}");
             }
-            for h in &hist {
-                println!("{}  {}", h.moved_at, h.model_hash);
+            // Every promote AND every rollback appends a row, so the last row
+            // is always where the alias points now.
+            let last = hist.len().saturating_sub(1);
+            for (i, h) in hist.iter().enumerate() {
+                let current = if i == last { "  (current)" } else { "" };
+                println!("{}  {}{current}", utc_timestamp(h.moved_at), h.model_hash);
             }
             Ok(())
         }
@@ -2609,6 +2613,14 @@ fn run_experiment_cmd(cmd: ExperimentCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// A Unix time as `YYYY-MM-DDTHH:MM:SSZ`, or the raw number when it is out of
+/// range (a hand-edited row must still print).
+fn utc_timestamp(unix: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(unix, 0)
+        .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| unix.to_string())
 }
 
 /// The acting user recorded as a deployment's publisher.
@@ -3544,5 +3556,16 @@ mod external_exit_code_tests {
         assert_eq!(external_exit_code(&from_raw(3 << 8)), Some(3));
         assert_eq!(external_exit_code(&from_raw(2 << 8)), Some(2));
         assert_eq!(external_exit_code(&from_raw(9)), Some(128 + 9), "SIGKILL");
+    }
+}
+
+#[cfg(test)]
+mod utc_timestamp_tests {
+    #[test]
+    fn history_times_read_as_utc_dates() {
+        // E2E follow-up: `model history` printed raw Unix seconds.
+        assert_eq!(super::utc_timestamp(1_792_797_993), "2026-10-23T23:26:33Z");
+        assert_eq!(super::utc_timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(super::utc_timestamp(i64::MAX), i64::MAX.to_string());
     }
 }

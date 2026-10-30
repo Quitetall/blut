@@ -673,6 +673,9 @@ pub(super) async fn run_p2p_connect(
         verifying.to_bytes(),
         x_arr,
     );
+    // The dial can take up to its full timeout before it fails, and printed
+    // nothing meanwhile.
+    eprintln!("connecting to coordinator {coordinator}…");
     let (conn, my_id) = client
         .connect(sockaddr)
         .await
