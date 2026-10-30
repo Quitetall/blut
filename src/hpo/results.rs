@@ -244,6 +244,47 @@ pub(crate) fn trial_errors(manifest: &HpoManifest, status_lines: &[String]) -> V
     errors
 }
 
+/// The trial an HPO job's headline numbers should come from, and the topo
+/// positions of its nodes: the best COMPLETED trial, else (nothing completed
+/// yet) the best trial that reported the objective at all. `None` when no
+/// trial reported it. A job-level "final value" over every node would mix
+/// trials — the max of a loss across trials, the last step of whichever trial
+/// finished last — so per-run comparisons read this trial instead.
+pub(crate) fn headline_trial(
+    manifest: &HpoManifest,
+    status_lines: &[String],
+) -> Option<(u32, Vec<u32>)> {
+    let board = leaderboard(manifest, status_lines);
+    let best = board
+        .iter()
+        .find(|o| o.objective.is_some() && o.status == "done")
+        .or_else(|| board.iter().find(|o| o.objective.is_some()))?;
+    let position = manifest
+        .trials
+        .iter()
+        .position(|t| t.trial_id == best.trial_id)? as u32;
+    let nodes = manifest
+        .trial_of_topo
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| **t == Some(position))
+        .map(|(idx, _)| idx as u32)
+        .collect();
+    Some((best.trial_id, nodes))
+}
+
+/// [`headline_trial`] for the HPO job `job_id`, read from its job directory.
+/// `None` for a job that is not an HPO search.
+pub(crate) fn job_headline_trial(job_id: &str) -> Option<(u32, Vec<u32>)> {
+    let dir = crate::paths::jobs_dir().ok()?.join(job_id);
+    if !dir.join("hpo.json").is_file() {
+        return None;
+    }
+    let manifest = HpoManifest::read_from(&dir)?;
+    let lines = crate::jobs::read_status_lines(job_id).ok()?;
+    headline_trial(&manifest, &lines)
+}
+
 /// Leaderboard: outcomes sorted best-objective-first (per direction); trials
 /// with no objective sink to the bottom.
 pub fn leaderboard(manifest: &HpoManifest, status_lines: &[String]) -> Vec<TrialOutcome> {
@@ -399,5 +440,23 @@ mod tests {
         let board = leaderboard(&m, &lines);
         assert_eq!(board[0].objective, Some(0.4), "min mode keeps the minimum");
         assert_eq!(board[0].trial_id, 0);
+    }
+
+    #[test]
+    fn the_headline_trial_is_the_best_completed_one_with_its_nodes() {
+        let mut m = manifest();
+        m.trial_of_topo = vec![Some(0), Some(1)];
+        let lines: Vec<String> = [
+            // trial 0 completes at 0.5; trial 1 reads 0.9 but is stopped early.
+            json!({"kind":"stage_step","node_idx":0,"stage_name":"t","update":{"val_r":0.5}}),
+            json!({"kind":"stage_end","node_idx":0,"stage_name":"t","output_hash":"h","elapsed":1}),
+            json!({"kind":"stage_step","node_idx":1,"stage_name":"t","update":{"val_r":0.9}}),
+            json!({"kind":"stage_failed","node_idx":1,"stage_name":"t","error":crate::framework::executor::CONTROL_PRUNE_MESSAGE}),
+        ]
+        .iter()
+        .map(|v| v.to_string())
+        .collect();
+        assert_eq!(headline_trial(&m, &lines), Some((0, vec![0])));
+        assert_eq!(headline_trial(&m, &[]), None);
     }
 }

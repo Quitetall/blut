@@ -2560,15 +2560,34 @@ fn run_experiment_cmd(cmd: ExperimentCommand) -> Result<()> {
                 .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
             let comparison = crate::experiment_registry::compare_latest(&db, &name, &tenant)
                 .map_err(|e| anyhow!("{e}"))?;
+            // An HPO search is compared through its best completed trial: say
+            // which, since the metrics are that trial's and not the job's.
+            let headline =
+                |run: &str| crate::hpo::results::job_headline_trial(run).map(|(trial, _)| trial);
+            let (trial_a, trial_b) = (headline(&comparison.run_a), headline(&comparison.run_b));
             if json {
-                emit_json(&comparison)?;
+                let mut value = serde_json::to_value(&comparison)?;
+                if let Some(obj) = value.as_object_mut()
+                    && (trial_a.is_some() || trial_b.is_some())
+                {
+                    obj.insert(
+                        "hpo_headline_trials".into(),
+                        serde_json::json!({ "run_a": trial_a, "run_b": trial_b }),
+                    );
+                }
+                emit_json(&value)?;
             } else {
+                let note = |trial: Option<u32>| {
+                    trial
+                        .map(|t| format!("  (HPO: metrics of best completed trial {t})"))
+                        .unwrap_or_default()
+                };
                 println!(
                     "experiment://{}  tenant={}",
                     comparison.experiment, comparison.tenant
                 );
-                println!("baseline  : {}", comparison.run_a);
-                println!("candidate : {}", comparison.run_b);
+                println!("baseline  : {}{}", comparison.run_a, note(trial_a));
+                println!("candidate : {}{}", comparison.run_b, note(trial_b));
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&comparison.diff)
