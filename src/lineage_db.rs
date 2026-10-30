@@ -75,6 +75,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
     schema_ver    INTEGER NOT NULL,
     sidecar_path  TEXT,
     produced_unix INTEGER,
+    -- 1 when this job served the artifact from cache instead of producing it.
+    reused        INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (job_id, stage_idx)
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_hash ON artifacts(content_hash);
@@ -386,6 +388,14 @@ impl LineageDb {
             .map_err(|e| {
                 TrainError::other(format!("migrate partition_status.input_fingerprint: {e}"))
             })?;
+        }
+        // Additive: rows indexed before it read as produced (0) until reindexed.
+        if !table_has_column(&conn, "artifacts", "reused")? {
+            conn.execute(
+                "ALTER TABLE artifacts ADD COLUMN reused INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| TrainError::other(format!("migrate artifacts.reused: {e}")))?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| TrainError::other(format!("set user_version: {e}")))?;
@@ -727,6 +737,24 @@ impl LineageDb {
         Ok(())
     }
 
+    /// Record whether a job served its `stage_idx` artifact from cache (`true`)
+    /// or produced it. Call after [`record_artifact`](Self::record_artifact),
+    /// whose upsert resets the flag.
+    pub(crate) fn mark_artifact_reused(
+        &self,
+        job_id: &str,
+        stage_idx: i64,
+        reused: bool,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE artifacts SET reused = ?3 WHERE job_id = ?1 AND stage_idx = ?2",
+                params![job_id, stage_idx, i64::from(reused)],
+            )
+            .map_err(|e| TrainError::other(format!("mark artifact reuse: {e}")))?;
+        Ok(())
+    }
+
     /// Idempotent upsert of a lineage edge. Hashes lowercased so the upstream
     /// `trace` walk (which lowercases) matches `artifact_by_hash`'s `=` lookup.
     /// The `input_hash` is a fold of (parent `output_hash`es + data-source
@@ -1015,7 +1043,8 @@ impl LineageDb {
             .prepare(
                 "SELECT job_id, stage_idx, stage_name, content_hash, kind, schema_ver,
                         sidecar_path, produced_unix
-                 FROM artifacts WHERE content_hash LIKE ?1 ORDER BY produced_unix DESC",
+                 FROM artifacts WHERE content_hash LIKE ?1
+                 ORDER BY reused ASC, produced_unix DESC",
             )
             .map_err(|e| TrainError::other(format!("prepare find_artifacts: {e}")))?;
         let rows = stmt
@@ -1181,13 +1210,18 @@ impl LineageDb {
         Ok(out)
     }
 
+    /// The row for a content hash, attributed to a job that PRODUCED it (the
+    /// newest such), falling back to a job that reused it from cache only when
+    /// no producing job is indexed. A cache-hit job also writes a sidecar for
+    /// the artifact, and picking the newest row regardless attributed models
+    /// to runs that never trained them: `lineage card` showed no metrics.
     fn artifact_by_hash(&self, content_hash: &str) -> Result<Option<ArtifactRow>> {
         self.conn
             .query_row(
                 "SELECT job_id, stage_idx, stage_name, content_hash, kind, schema_ver,
                         sidecar_path, produced_unix
                  FROM artifacts WHERE content_hash = ?1
-                 ORDER BY produced_unix DESC LIMIT 1",
+                 ORDER BY reused ASC, produced_unix DESC LIMIT 1",
                 params![content_hash],
                 row_to_artifact,
             )
@@ -1580,13 +1614,15 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
         experiment: Some(experiment),
         args_json,
     })?;
+    let reused = crate::framework::lineage::reused_nodes(job_id)?;
     for rec in crate::framework::lineage::scan_artifacts(job_id)?.into_iter() {
         let Some(content_id) = rec.meta.content_id() else {
             continue;
         };
+        let stage_idx = stage_idx_of(&rec.sidecar_path);
         db.record_artifact(&ArtifactRow {
             job_id: job_id.to_string(),
-            stage_idx: stage_idx_of(&rec.sidecar_path) as i64,
+            stage_idx: stage_idx as i64,
             stage_name: rec.meta.produced_by_stage.clone().unwrap_or_default(),
             content_hash: content_id.to_hex(),
             kind: rec.meta.kind.clone(),
@@ -1594,6 +1630,7 @@ pub fn ingest_job(job_id: &str, recipe: &str, outcome: &str) -> Result<()> {
             sidecar_path: Some(rec.sidecar_path.display().to_string()),
             produced_unix: Some(rec.meta.produced_at_unix_secs as i64),
         })?;
+        db.mark_artifact_reused(job_id, stage_idx as i64, reused.contains(&stage_idx))?;
     }
     for node in crate::framework::lineage::job_lineage(job_id)?.into_iter() {
         let Some(output) = node.output_content_id else {
@@ -1993,6 +2030,54 @@ mod tests {
                 ..RunRow::default()
             })
             .is_err()
+        );
+    }
+
+    /// A cache-hit job writes a sidecar for the artifact it reused, with a
+    /// newer timestamp than the producing run. `lineage card` and `graph`
+    /// attributed the model to that job and showed none of its metrics.
+    #[test]
+    fn an_artifact_is_attributed_to_the_job_that_produced_it() {
+        let db = db();
+        for job in ["producer", "cache-hit"] {
+            db.record_run(&RunRow {
+                job_id: job.into(),
+                recipe: "train".into(),
+                outcome: Some("done".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let mut produced = art("producer", 1, "modelhash");
+        produced.produced_unix = Some(100);
+        let mut reused = art("cache-hit", 1, "modelhash");
+        reused.produced_unix = Some(200);
+        db.record_artifact(&produced).unwrap();
+        db.record_artifact(&reused).unwrap();
+        db.mark_artifact_reused("cache-hit", 1, true).unwrap();
+        db.record_metrics(&[MetricRow {
+            job_id: "producer".into(),
+            node_idx: 1,
+            step: -1,
+            metric: "val_r".into(),
+            value: 0.5,
+            wall_unix: None,
+        }])
+        .unwrap();
+        let card = db.model_card("modelhash", true).unwrap().expect("a card");
+        let rendered = card.render();
+        assert!(rendered.contains("producer"), "{rendered}");
+        assert!(rendered.contains("val_r"), "{rendered}");
+        assert_eq!(
+            db.find_artifacts("modelhash").unwrap()[0].job_id,
+            "producer"
+        );
+        // Re-recording the row (a reindex) resets the flag until marked again.
+        db.record_artifact(&reused).unwrap();
+        assert_eq!(
+            db.find_artifacts("modelhash").unwrap()[0].job_id,
+            "cache-hit",
+            "unmarked, the newer row wins as before"
         );
     }
 

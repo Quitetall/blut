@@ -89,6 +89,11 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- `lineage card` and `lineage graph` attributed an artifact to the newest job
+  holding it, often a cache-hit job that never produced it, so a model card
+  showed none of the training run's metrics. The index records whether each
+  job produced or reused an artifact and prefers the producing job (existing
+  indexes treat every row as produced until `lineage reindex`).
 - `recipe declare registry://plan@<name> --run` defaulted the run's experiment
   to the URI, which is not a valid experiment name, and failed after creating
   the job directory but before its state, leaving a job that read `running`
