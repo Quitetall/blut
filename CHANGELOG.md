@@ -207,6 +207,19 @@ depend on this crate.
   recipe on the submitting machine. `hpo`, `partition` and `plan resume` now
   refuse it, and the local launch path refuses any k8s placement that reaches
   it.
+- `--launcher p2p` and `--launcher cloud` were accepted by `recipe run`
+  (including `--dry-run` and config sweeps), `hpo run`, `study run`,
+  `partition` and `plan resume`, and every stage ran on the submitting machine
+  while the job recorded the remote placement: `launcher_for` mapped both to
+  the local launcher, and no command installs the execution adapter that
+  places stages on peers or on the cloud queue. Each of these commands now
+  refuses both before writing a job, naming what does dispatch there
+  (`blut p2p node --dispatch-stage`, `blut cloud smoke`, or for library callers
+  `ExecCtx::with_execution_adapter`); `recipe declare --run` no longer points
+  them at `recipe run`, and `plan resume` refuses a job recorded with either.
+  The local launch path refuses them too, and the executor refuses a p2p or
+  cloud placement with no execution adapter installed, and any k8s placement,
+  before a stage runs.
 - `blut dag` showed a node that failed and was then re-run to completion by
   `plan resume` as `failed`, because the first terminal event in the job's
   status log won. A later attempt (`stage_begin` or a cache hit) now reopens

@@ -11,7 +11,7 @@ Last updated: 2026-10-30.
 
 Nothing in the table below changed when the crates were published on
 2026-08-27. Publication moves code, not evidence: every row still says exactly
-what was and was not exercised, and the four Deferred rows are the ones to read
+what was and was not exercised, and the Deferred rows are the ones to read
 first if you are deciding whether to depend on this.
 
 | Capability | Status | Evidence boundary |
@@ -33,6 +33,7 @@ first if you are deciding whether to depend on this.
 | P2P mesh across independent hosts (`p2p node`) | Validated (connectivity + signed dispatch) | Four hosts on four continents, every node probing every other, 12/12, 2026-10-20 — see below. Gossip and stage data over the mesh were not part of that run |
 | P2P mesh gossip and stage data without a shared cache | Validated (independent hosts) | Four vast.ai hosts on four continents, each seeded with at most one peer, formed a full mesh by gossip; a fresh identity seeded with one node probed all four, 4/4; 64,640,000 bytes of stage data moved from the US to an empty-cache worker in New Zealand and back, verified, 2026-10-23 — see below. Earlier the same day across network namespaces on one host |
 | Cloud queue over local object storage | Validated | `blut cloud smoke` round-trip through the shipped cookbook binary, 2026-09-19 |
+| `--launcher p2p` and `--launcher cloud` on run commands | Deferred | Refused by `recipe run`, `hpo`, `study`, `partition` and `plan resume`, which used to run every stage on the submitting machine, and by `recipe declare --run`. No command places a run's stages on peers or on the cloud queue; the rows above are `p2p` and `cloud` subcommands and library calls, 2026-10-30 |
 | Network object storage (S3-compatible) | Validated (R2 over public TLS; MinIO) | `s3` feature; cloud round-trip against Cloudflare R2 over public TLS with create-only writes enforced, 2026-10-22; MinIO over HTTP and TLS; Backblaze B2 refused (no conditional writes) — see below |
 | `blut-worker` REST prototype | Deleted (ADR 0083 M3) | Superseded by `src/cloud` + the `blut-web` sidecar |
 | Kubernetes operator | Validated (kind) | `blut-operator` on a three-node kind cluster, Kubernetes 1.35.0, with MinIO in the cluster: a real CPU plan to Succeeded with per-stage status, outputs in S3, a rerun and a retry served from the store, bad specs refused, deletion cleaning up, a deleted pod and a drained node retried, an operator restart without duplicate work, least-privilege RBAC, 2026-10-24; `--launcher k8s` from the CLI submits, follows, cancels and refuses, 2026-10-30 — see below. One host; no GPUs, no managed Kubernetes, no mesh traffic between pool pods |
@@ -205,6 +206,11 @@ line whenever its view changes.
 `--dispatch-stage` builds its input from a file, which only the built-in
 `p2p-echo` stage (UTF-8 text in, uppercase out) accepts. Library callers
 dispatch any stage with `blut::p2p::dispatch_stage`.
+
+The mesh is reached only through `blut p2p` and the library. `recipe run`
+and the other run commands refuse `--launcher p2p` (and `--launcher cloud`):
+nothing hands a run's stages to peers, and those commands used to run them
+all on the submitting machine instead.
 
 ## Recorded run: a four-continent P2P mesh (2026-10-20)
 

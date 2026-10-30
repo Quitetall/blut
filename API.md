@@ -288,7 +288,11 @@ Native, in-tree **Hydra-style config compose** (`config::hydra` —
 freezes a composed tree to JSON + a content fingerprint; `config::sweep` expands
 + fingerprints each combo. The `Launcher` trait (`LocalSystemd` now; `Slurm` /
 `RayJobSubmit` are present but deferred) builds the OS command, optionally inside
-a resource-capped systemd unit.
+a resource-capped systemd unit. `LaunchTarget::P2P` and `LaunchTarget::Cloud`
+have no `Launcher`: stages reach peers or the cloud queue only through an
+`ExecutionAdapter` installed with `ExecCtx::with_execution_adapter` (feature
+`p2p`). The executor refuses either target without one, and every CLI command
+refuses `--launcher p2p` and `--launcher cloud`, because none installs one.
 
 `config::tenants::TenantQuotaPolicy` loads `$BLUT_TENANTS_CONFIG` or
 `~/.config/blut/tenants.toml`. One file chooses either static equal shares:

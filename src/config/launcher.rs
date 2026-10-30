@@ -1440,7 +1440,12 @@ pub enum LaunchTarget {
     Slurm,
     /// A Ray job (`ray job submit`).
     Ray,
-    /// P2P distributed compute (peer GPUs over QUIC).
+    /// P2P distributed compute (peer GPUs over QUIC). There is no
+    /// [`Launcher`] for it: a stage reaches a peer only through an
+    /// `ExecutionAdapter` installed with `ExecCtx::with_execution_adapter`
+    /// (feature `p2p`). No `blut` command installs one, so every command
+    /// refuses `--launcher p2p`, and the executor refuses this target when no
+    /// adapter is installed.
     P2P,
     /// A Kubernetes cluster via a generated `BlutPlan` (`kubectl apply -f -`).
     /// K8s is an adapter (ADR 0037): the engine emits the manifest textually
@@ -1448,6 +1453,9 @@ pub enum LaunchTarget {
     /// owns the reconcile loop.
     K8s,
     /// Cloud compute queue (object-store dispatch, billed on compute — ADR 0082).
+    /// Like [`P2P`](Self::P2P) it has no [`Launcher`] and needs an
+    /// `ExecutionAdapter` (`cloud::submitter::CloudSubmitter`) that no `blut`
+    /// command installs, so every command refuses `--launcher cloud`.
     Cloud,
 }
 
@@ -1547,6 +1555,38 @@ pub(crate) fn check_launcher_tools(target: LaunchTarget) -> Result<()> {
     }
 }
 
+/// Refuse a target that no `blut` command can place work on. `p2p` and
+/// `cloud` parse, because a recorded job or `dataset resolve` may name them,
+/// but nothing hands a run's stages to their execution adapters: `recipe run
+/// --launcher p2p` used to run every stage on this machine and record `p2p`
+/// as the job's placement. `surface` names what was asked for, as in
+/// `refuse_surface` for k8s. Call it before any work starts.
+pub(crate) fn check_launcher_placeable(target: LaunchTarget, surface: &str) -> Result<()> {
+    let detail = match target {
+        LaunchTarget::P2P => {
+            "no `blut` command hands a run's stages to peers. Over the mesh today, \
+             `blut p2p node --dispatch-stage p2p-echo --input <file> --to <peer>` (a build \
+             with the `p2p` feature) runs the built-in probe stage on a peer, and a library \
+             caller places stages with `blut::p2p::dispatch_stage` or \
+             `ExecCtx::with_execution_adapter`"
+        }
+        LaunchTarget::Cloud => {
+            "no `blut` command submits a run's stages to the cloud queue. Its one command, \
+             `blut cloud smoke --store <dir|s3://bucket/prefix>` (a build with the `cloud` \
+             feature, `s3` for an s3:// store), round-trips the built-in `p2p-echo` stage \
+             with the submitter and the worker in one process"
+        }
+        LaunchTarget::Local | LaunchTarget::Slurm | LaunchTarget::Ray | LaunchTarget::K8s => {
+            return Ok(());
+        }
+    };
+    Err(TrainError::other(format!(
+        "--launcher {} cannot place {surface}: {detail}. Nothing ran. Use --launcher local \
+         to run on this machine",
+        target.as_str()
+    )))
+}
+
 /// The configured [`Launcher`] for a target. Slurm/Ray read their cluster
 /// config from env (`BLUT_SLURM_*` / `RAY_ADDRESS` / `BLUT_RAY_RUNTIME_ENV`) so
 /// the DAG itself stays portable — the same recipe runs locally or on a cluster
@@ -1573,16 +1613,17 @@ pub fn launcher_for(target: LaunchTarget) -> Box<dyn Launcher> {
             num_gpus: env_u32("BLUT_RAY_NUM_GPUS"),
             extra: Vec::new(),
         }),
-        // P2P dispatch is handled by the canonical ExecutionAdapter, not Launcher.
-        // Fall through to LocalSystemd for local process management.
-        LaunchTarget::P2P => Box::new(LocalSystemd::default()),
-        // K8s submits a whole BlutPlan manifest (see `k8s::submit_plan`), not a
-        // wrapped local process; fall through to LocalSystemd for any local
-        // process management on the submitting side.
-        LaunchTarget::K8s => Box::new(LocalSystemd::default()),
-        // Cloud dispatch is handled by the cloud submit path (CloudSubmitter +
-        // CloudQueue), not Launcher — same precedent as P2P. Fall through to local.
-        LaunchTarget::Cloud => Box::new(LocalSystemd::default()),
+        // P2P, k8s and cloud have no Launcher, and LocalSystemd here is not a
+        // placement: this signature has no error path, so it returns the local
+        // launcher. A k8s run is a BlutPlan submitted by `recipe run` (see
+        // `k8s_cluster`); p2p and cloud need an ExecutionAdapter
+        // (`ExecCtx::with_execution_adapter`), which no command installs. Every
+        // command refuses the three before a stage could reach this
+        // (`check_launcher_placeable`, `k8s_cluster::refuse_surface`), and the
+        // executor refuses them without an adapter.
+        LaunchTarget::P2P | LaunchTarget::K8s | LaunchTarget::Cloud => {
+            Box::new(LocalSystemd::default())
+        }
     }
 }
 
@@ -2096,6 +2137,38 @@ mod tests {
         ] {
             assert_eq!(t.as_str().parse::<LaunchTarget>().unwrap(), t);
         }
+    }
+
+    /// `p2p` and `cloud` used to fall through `launcher_for` to the local
+    /// launcher and run every stage here. They parse, but cannot be placed.
+    #[test]
+    fn p2p_and_cloud_are_refused_naming_what_does_dispatch() {
+        for t in [
+            LaunchTarget::Local,
+            LaunchTarget::Slurm,
+            LaunchTarget::Ray,
+            LaunchTarget::K8s,
+        ] {
+            check_launcher_placeable(t, "`recipe run`").unwrap();
+        }
+        let p2p = check_launcher_placeable(LaunchTarget::P2P, "`recipe run`")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            p2p.starts_with("--launcher p2p cannot place `recipe run`"),
+            "{p2p}"
+        );
+        assert!(p2p.contains("blut p2p node --dispatch-stage"), "{p2p}");
+        assert!(p2p.contains("Nothing ran"), "{p2p}");
+        let cloud = check_launcher_placeable(LaunchTarget::Cloud, "`hpo` trials")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            cloud.starts_with("--launcher cloud cannot place `hpo` trials"),
+            "{cloud}"
+        );
+        assert!(cloud.contains("blut cloud smoke --store"), "{cloud}");
+        assert!(cloud.contains("Nothing ran"), "{cloud}");
     }
 
     #[test]
