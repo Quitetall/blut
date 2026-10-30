@@ -48,6 +48,14 @@ writes (`blut::paths`): jobs from `$LAMU_TRAIN_JOBS_DIR`, else
 (`~/.local/share/lamu/train-jobs`); the SLA log from `$BLUT_SLA_PATH`, else
 `sla.jsonl` in `$LAMU_TRAIN_DATA_DIR` or `~/.blut`, where the cursors live too.
 
+A status rule's summary names the job, the event kind, the stage, and the
+event's error (or a pruned stage's reason) cut to 200 characters, for example
+`rule 'stage-failed': status event for job 20261030-…: stage_failed in stage
+'train' — CUDA out of memory`. Error text is free-form, so it is included only
+when custody would let the event leave the box: for a restricted tenant or a
+`restricted` line the summary ends `(error withheld: restricted data)` on every
+sink, local ones included.
+
 Every sink implements `NotifySink` and therefore passes through the same
 `deliver` chokepoint. Restricted summaries may reach local sinks; they are
 structurally refused before any off-box sink sees them. The legacy one-envelope

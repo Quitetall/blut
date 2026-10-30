@@ -116,6 +116,14 @@ depend on this crate.
   resume_blocker}`.
 
 ### Changed
+- `blut-notify` status summaries name the event kind, the stage and the
+  event's error (or a pruned stage's reason), cut to 200 characters with
+  control characters replaced: `status event for job J: stage_failed in stage
+  'train' — CUDA out of memory`. They said only "status event for job J". The
+  error is free-form, so it is included only when custody would let the event
+  leave the box; for a restricted tenant or a `restricted` line it is withheld
+  on every sink (`(error withheld: restricted data)`). Before, no summary
+  carried error text for any tenant.
 - `blut jobs`' `output` column is now `recipe`: the recipe, deploy pointer or
   plan name the job ran (from its resume marker or `plan.json`), else a legacy
   single-trainer job's output name. The output name is set only by that legacy
