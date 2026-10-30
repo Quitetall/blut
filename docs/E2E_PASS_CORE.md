@@ -93,6 +93,14 @@ carry an open item.
 
 ## Open items
 
+Items 1-5 and 8 were resolved after this pass (owner decisions for 1-3):
+1 by `efca0f2` (one default tenant, `default`), 2 by `c80cf82` (rollback walks
+the promotion history), 3 by `f332d70` (runtime and freshness judge the newest
+run per tenant), 4 by `6dcb2c3`, 5 by `934b929` (the contract is documented;
+`JsonlArtifact::from_file` makes the adapter one call) and 8 by `b391db8`
+(every wait in `tests/conditional_execution.rs` is bounded). They are kept
+below as found.
+
 1. **Owner decision — deployment tenant vs run tenant.** `plan publish` and
    `plan promote` default to tenant `shared`; `recipe declare` defaults to
    `default`, so `recipe declare registry://plan@prod --run` reports "no
