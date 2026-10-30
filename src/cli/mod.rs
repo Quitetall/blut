@@ -450,7 +450,7 @@ enum PlanCommand {
     /// Promote a published fingerprint onto a named pointer
     /// (`registry://plan@<name>`), recording the move in the audit trail.
     Promote {
-        /// The deployment fingerprint to promote.
+        /// The deployment fingerprint to promote, or an unambiguous prefix.
         fingerprint: String,
         /// Target pointer, e.g. `registry://plan@prod`.
         pointer: String,
@@ -1574,6 +1574,170 @@ mod default_tenant_tests {
 }
 
 #[cfg(test)]
+mod plan_registry_input_tests {
+    use super::{PlanCommand, run_plan_cmd, toy_plan};
+
+    struct RegistryDbEnv(Option<std::ffi::OsString>);
+    impl RegistryDbEnv {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("BLUT_REGISTRY_DB");
+            // SAFETY: the caller holds TEST_ENV_LOCK for this guard's lifetime.
+            unsafe { std::env::set_var("BLUT_REGISTRY_DB", path) };
+            Self(previous)
+        }
+    }
+    impl Drop for RegistryDbEnv {
+        fn drop(&mut self) {
+            // SAFETY: TEST_ENV_LOCK is still held by the caller.
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("BLUT_REGISTRY_DB", value),
+                    None => std::env::remove_var("BLUT_REGISTRY_DB"),
+                }
+            }
+        }
+    }
+
+    fn write_spec(dir: &std::path::Path, n: u32) -> std::path::PathBuf {
+        let path = dir.join(format!("spec-{n}.json"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&toy_plan::spec_with("toy", n)).unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    /// `plan publish --tenant` stored any string; a deployment published
+    /// under `a b` could never be resolved by a run. It is validated like
+    /// every other tenant input, and stored in canonical form.
+    // The env lock spans the awaited command: it reads BLUT_REGISTRY_DB.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn plan_publish_refuses_an_invalid_tenant() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("registry.db");
+        let _env = RegistryDbEnv::set(&db);
+        let reg = toy_plan::registry();
+        let spec = write_spec(td.path(), 1);
+        for bad in ["a b", "../x", "a/b/c", "x/", ".hidden"] {
+            let err = run_plan_cmd(
+                &reg,
+                PlanCommand::Publish {
+                    spec: spec.clone(),
+                    tenant: bad.into(),
+                },
+            )
+            .await
+            .expect_err(bad);
+            assert!(
+                err.to_string().contains("invalid --tenant"),
+                "{bad:?}: {err}"
+            );
+        }
+        let conn = crate::registry_db::open_at(&db).unwrap();
+        let fp = crate::registry_db::fingerprint(&toy_plan::spec_with("toy", 1));
+        assert_eq!(
+            crate::registry_db::get_deployment(&conn, &fp).unwrap(),
+            None
+        );
+        run_plan_cmd(
+            &reg,
+            PlanCommand::Publish {
+                spec,
+                tenant: " lab/vision ".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let stored = crate::registry_db::get_deployment(&conn, &fp)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.tenant, "lab/vision");
+    }
+
+    /// `plan promote` needed the full fingerprint while other commands take
+    /// prefixes. A unique prefix resolves; an ambiguous one is refused.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn plan_promote_takes_an_unambiguous_fingerprint_prefix() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("registry.db");
+        let _env = RegistryDbEnv::set(&db);
+        let reg = toy_plan::registry();
+        // 17 distinct deployments: at least two share a first hex digit.
+        let mut fps = Vec::new();
+        for n in 0..17 {
+            run_plan_cmd(
+                &reg,
+                PlanCommand::Publish {
+                    spec: write_spec(td.path(), n),
+                    tenant: "default".into(),
+                },
+            )
+            .await
+            .unwrap();
+            fps.push(crate::registry_db::fingerprint(&toy_plan::spec_with(
+                "toy", n,
+            )));
+        }
+        let shortest_unique = |fp: &str| {
+            (1..=fp.len())
+                .map(|len| &fp[..len])
+                .find(|prefix| fps.iter().filter(|o| o.starts_with(prefix)).count() == 1)
+                .unwrap()
+                .to_string()
+        };
+        let promote = |fingerprint: String| {
+            run_plan_cmd(
+                &reg,
+                PlanCommand::Promote {
+                    fingerprint,
+                    pointer: "registry://plan@prod".into(),
+                    tenant: "default".into(),
+                },
+            )
+        };
+        let pointer = || {
+            let conn = crate::registry_db::open_at(&db).unwrap();
+            crate::registry_db::resolve_pointer(&conn, "default", "prod")
+                .unwrap()
+                .expect("pointer")
+        };
+
+        let target = fps[3].clone();
+        promote(shortest_unique(&target)).await.unwrap();
+        assert_eq!(pointer(), target);
+        promote(shortest_unique(&fps[5]).to_ascii_uppercase())
+            .await
+            .unwrap();
+        assert_eq!(pointer(), fps[5]);
+        promote(fps[7].clone()).await.unwrap();
+        assert_eq!(pointer(), fps[7]);
+
+        let shared = fps
+            .iter()
+            .find_map(|fp| {
+                let first = &fp[..1];
+                (fps.iter().filter(|o| o.starts_with(first)).count() > 1).then(|| first.to_string())
+            })
+            .expect("pigeonhole: 17 fingerprints over 16 hex digits");
+        let err = promote(shared).await.expect_err("an ambiguous prefix");
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+        for bad in ["", "zz", "%", "ab_"] {
+            assert!(promote(bad.into()).await.is_err(), "{bad:?}");
+        }
+        assert_eq!(pointer(), fps[7], "a refused promote moves nothing");
+    }
+}
+
+#[cfg(test)]
 mod cache_prune_cap_tests {
     use super::resolve_prune_cap_gb;
 
@@ -2400,6 +2564,7 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             Ok(())
         }
         PlanCommand::Publish { spec, tenant } => {
+            let tenant = parse_plan_tenant(&tenant)?;
             let text = std::fs::read_to_string(&spec)
                 .with_context(|| format!("read PlanSpec {}", spec.display()))?;
             let plan_spec: crate::framework::plan_spec::PlanSpec =
@@ -2423,15 +2588,21 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             pointer,
             tenant,
         } => {
+            let tenant = parse_plan_tenant(&tenant)?;
             let name = crate::registry_db::parse_pointer_uri(&pointer)
                 .ok_or_else(|| anyhow!("not a `registry://plan@<name>` URI: {pointer}"))?;
             let mut conn = crate::registry_db::open().map_err(|e| anyhow!("{e}"))?;
+            // A prefix, as `plan check`/`publish` print and other commands
+            // accept; it used to need the full 64-character fingerprint.
+            let fingerprint = crate::registry_db::resolve_fingerprint(&conn, &fingerprint)
+                .map_err(|e| anyhow!("{e}"))?;
             crate::registry_db::promote(&mut conn, &fingerprint, &tenant, name, now_unix())
                 .map_err(|e| anyhow!("{e}"))?;
             println!("promoted {fingerprint} → registry://plan@{name}");
             Ok(())
         }
         PlanCommand::Rollback { pointer, tenant } => {
+            let tenant = parse_plan_tenant(&tenant)?;
             let name = crate::registry_db::parse_pointer_uri(&pointer)
                 .ok_or_else(|| anyhow!("not a `registry://plan@<name>` URI: {pointer}"))?;
             let mut conn = crate::registry_db::open().map_err(|e| anyhow!("{e}"))?;
@@ -2441,6 +2612,7 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             Ok(())
         }
         PlanCommand::History { pointer, tenant } => {
+            let tenant = parse_plan_tenant(&tenant)?;
             let name = crate::registry_db::parse_pointer_uri(&pointer)
                 .ok_or_else(|| anyhow!("not a `registry://plan@<name>` URI: {pointer}"))?;
             let conn = crate::registry_db::open().map_err(|e| anyhow!("{e}"))?;
@@ -2673,6 +2845,16 @@ fn run_experiment_cmd(cmd: ExperimentCommand) -> Result<()> {
 }
 
 /// The acting user recorded as a deployment's publisher.
+/// A plan registry `--tenant`, parsed as every other tenant input is and
+/// returned in canonical form (the form `recipe declare` resolves pointers
+/// under). `plan publish --tenant` stored any string, so a deployment could be
+/// published under a tenant no run can ever resolve, such as `a b`.
+fn parse_plan_tenant(raw: &str) -> Result<String> {
+    crate::tenant::Tenant::parse(raw)
+        .map(|tenant| tenant.to_string())
+        .ok_or_else(|| anyhow!("invalid --tenant '{raw}'"))
+}
+
 fn acting_user() -> String {
     std::env::var("USER").unwrap_or_else(|_| "unknown".to_string())
 }

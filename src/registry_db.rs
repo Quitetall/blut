@@ -330,6 +330,47 @@ pub fn get_deployment(conn: &Connection, fp: &str) -> Result<Option<Deployment>>
     }
 }
 
+/// Resolve a deployment fingerprint from the full id or an unambiguous prefix,
+/// the way other commands take job ids and content hashes. A full id matches
+/// itself; a prefix must match exactly one published deployment (across all
+/// tenants, so a prefix never silently means different deployments for
+/// different tenants). No match, several matches, or a query that is not hex
+/// is refused: guessing here would promote the wrong graph.
+pub fn resolve_fingerprint(conn: &Connection, query: &str) -> Result<String> {
+    let query = query.trim();
+    if query.is_empty() || !query.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(TrainError::other(format!(
+            "'{query}' is not a deployment fingerprint or prefix (expected hex digits)"
+        )));
+    }
+    let query = query.to_ascii_lowercase();
+    if get_deployment(conn, &query)?.is_some() {
+        return Ok(query);
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT plan_fingerprint FROM deployments \
+             WHERE substr(plan_fingerprint, 1, length(?1)) = ?1 \
+             ORDER BY plan_fingerprint LIMIT 2",
+        )
+        .map_err(|e| TrainError::other(format!("fingerprint prefix prepare: {e}")))?;
+    let matches = stmt
+        .query_map(params![query], |row| row.get::<_, String>(0))
+        .map_err(|e| TrainError::other(format!("fingerprint prefix query: {e}")))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| TrainError::other(format!("fingerprint prefix collect: {e}")))?;
+    match matches.as_slice() {
+        [] => Err(TrainError::other(format!(
+            "no deployment matches fingerprint '{query}' (see `blut plan publish`)"
+        ))),
+        [only] => Ok(only.clone()),
+        _ => Err(TrainError::other(format!(
+            "fingerprint prefix '{query}' is ambiguous: more than one deployment matches; \
+             give more characters"
+        ))),
+    }
+}
+
 /// Promote `fp` onto the pointer `(tenant, name)`, appending the move to the
 /// audit trail (single transaction). Fail-closed boundary: the deployment must
 /// exist AND its own tenant must equal `tenant` — a Restricted-tenant

@@ -11,6 +11,10 @@ depend on this crate.
 ## [Unreleased]
 
 ### Added
+- `plan promote` takes an unambiguous prefix of a deployment fingerprint, as
+  other commands take job ids and content hashes; a prefix matching no
+  deployment or several is refused. `registry_db::resolve_fingerprint` does the
+  resolution.
 - `checks::JsonlArtifact::from_file(path)`, and documentation of the checks
   stages' input contract: `check_jsonl` and `assert` take only `checks.jsonl`,
   so a cookbook guards its own JSONL by emitting `JsonlArtifact` or through a
@@ -144,6 +148,10 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- `plan publish --tenant` stored any string, so a deployment could be published
+  under a tenant no run can resolve (`a b`, `../x`). `plan publish`, `promote`,
+  `rollback` and `history` parse `--tenant` like every other tenant input and
+  use its canonical form (` lab/vision ` is `lab/vision`).
 - `ledger show` printed each record as Rust `Debug`
   (`RunStarted { schema: "blut.run-ledger/v1", … }`). It prints one line per
   record (time in UTC, recipe, intent, tenant, outcome, tier, duration,
