@@ -312,17 +312,31 @@ impl LocalSystemd {
     /// ([`containment_for`](crate::containment::containment_for)), capped by
     /// this launcher's [`cap_spec`](Self::cap_spec).
     ///
-    /// This is the contained counterpart of [`Launcher::launch`], and the
-    /// only way a local stage is contained on Windows: there the backend is
-    /// a Job Object, which caps the committed memory of the whole tree,
-    /// reports its peak, and kills the tree on [`ContainedChild::kill_tree`],
-    /// on [`ContainedChild::wait_or_cancel`], or when the returned value is
-    /// dropped. On Linux it is the same backend the factory picks for any
-    /// run (systemd, cgroup v2, or `RLIMIT_AS`, where `mem_max` caps address
-    /// space per process).
+    /// This is the contained counterpart of [`Launcher::launch`]. What each
+    /// backend does with the stage:
     ///
+    /// | Backend | Where | Cap | Peak | Tree kill |
+    /// |---|---|---|---|---|
+    /// | `systemd` | a transient `systemd-run --user` service | `MemoryMax`/`MemoryHigh`/`MemorySwapMax` | `Memory peak:` on stderr, when it is pumped ([`ContainedChild::pump_stderr`]) | `systemctl --user stop` |
+    /// | `cgroup2` | a leaf in a delegated cgroup-v2 subtree | `memory.max` | `memory.peak` | `cgroup.kill` |
+    /// | `windows-job-object` | a Job Object | tree-wide commit | `PeakJobMemoryUsed` | `TerminateJobObject` |
+    /// | `rlimit` | the child itself | none (see below) | none | the caller's process group |
+    /// | `bare` | the child itself | none | none | the caller's process group |
+    ///
+    /// The stage sees the caller's environment plus `env` under every
+    /// backend; for `systemd`, whose services otherwise start from the user
+    /// manager's minimal environment, it is forwarded variable by variable.
+    /// That needs systemd 250 or later, which imports a value by name and so
+    /// keeps values off the world-readable `systemd-run` command line; with an
+    /// older systemd the stage runs under the next backend instead (an
+    /// explicit `BLUT_CONTAINMENT=systemd` is refused there). Under `rlimit`
+    /// no cap is applied: its cap is on virtual address space, and the
+    /// launcher's default would refuse the reservations a CUDA process makes.
+    ///
+    /// One log line names the backend and what it applies. The unit name is
+    /// `unit` (sanitized to `[A-Za-z0-9_-]`) plus this process's pid and a
+    /// sequence number, so concurrent and repeated stages never collide.
     /// `configure` sets pipes, `kill_on_drop` and similar before the spawn.
-    /// `unit` is sanitized to `[A-Za-z0-9_-]`.
     pub async fn spawn_contained(
         &self,
         unit: &str,
@@ -331,21 +345,100 @@ impl LocalSystemd {
         env: &[(String, String)],
         configure: impl FnOnce(&mut tokio::process::Command),
     ) -> Result<ContainedChild> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let Some((program, args)) = inner.split_first() else {
             return Err(TrainError::other("spawn_contained: empty inner command"));
         };
-        let unit = sanitize_unit(unit);
-        let caps = self.cap_spec()?;
-        let backend = crate::containment::containment_for();
-        let run = backend.wrap_command(Path::new(program), args, cwd, env, &unit, &caps)?;
-        tracing::info!(
-            "containment: {unit} placed by LocalSystemd under {}, memory cap {}",
-            backend.kind(),
-            caps.mem_max
-                .map_or_else(|| "none".to_string(), |b| format!("{b} bytes")),
-        );
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let unit = format!("{}-{}-{seq}", sanitize_unit(unit), std::process::id());
+        let (backend, note) = local_stage_backend()?;
+        let mut caps = self.cap_spec()?;
+        let kind = backend.kind();
+        let applied = match kind {
+            "bare" => "no memory cap, no tree teardown".to_string(),
+            "rlimit" => {
+                caps = CapSpec::default();
+                "no memory cap (an address-space cap would refuse CUDA's reservations)".to_string()
+            }
+            _ => format!(
+                "memory cap {}",
+                caps.mem_max
+                    .map_or_else(|| "none".to_string(), |b| format!("{b} bytes"))
+            ),
+        };
+        #[cfg(target_os = "linux")]
+        let env = if kind == "systemd" {
+            crate::containment::systemd::inherited_env(env)
+        } else {
+            env.to_vec()
+        };
+        #[cfg(not(target_os = "linux"))]
+        let env = env.to_vec();
+        let run = backend.wrap_command(Path::new(program), args, cwd, &env, &unit, &caps)?;
+        let line =
+            format!("containment: {unit} placed by LocalSystemd under {kind}, {applied}{note}");
+        if matches!(kind, "bare" | "rlimit") {
+            tracing::warn!("{line}");
+        } else {
+            tracing::info!("{line}");
+        }
         ContainedChild::spawn(backend, run, unit, configure).await
     }
+}
+
+/// The backend for a local stage, and a note for the placement log line
+/// saying why it is not the one [`containment_for`](crate::containment::containment_for)
+/// would pick, when that is so. Refuses an explicitly named backend that is
+/// not usable here, rather than running the stage under a different one.
+fn local_stage_backend() -> Result<(Box<dyn crate::containment::Containment>, String)> {
+    use crate::containment::Availability;
+    let explicit = std::env::var("BLUT_CONTAINMENT")
+        .ok()
+        .filter(|v| !v.is_empty() && v != "auto");
+    let backend = crate::containment::containment_for();
+    if backend.available() != Availability::Present {
+        return Err(TrainError::other(format!(
+            "BLUT_CONTAINMENT={} names a containment backend that is not usable on this host \
+             ({:?}); unset it to let BLUT pick one",
+            explicit.as_deref().unwrap_or(backend.kind()),
+            backend.available()
+        )));
+    }
+    #[cfg(target_os = "linux")]
+    if backend.kind() == "systemd" && !crate::containment::systemd::imports_env_by_name() {
+        let version = crate::containment::systemd::systemd_run_version()
+            .map_or_else(|| "unknown".to_string(), |v| v.to_string());
+        if explicit.is_some() {
+            return Err(TrainError::other(format!(
+                "BLUT_CONTAINMENT=systemd: systemd-run {version} cannot pass a stage its \
+                 environment without putting every value on its command line (needs systemd \
+                 {} or later); unset BLUT_CONTAINMENT to use the next backend",
+                crate::containment::systemd::SETENV_BY_NAME_SINCE
+            )));
+        }
+        return Ok((
+            crate::containment::containment_for_without_systemd(),
+            format!(
+                " (systemd-run {version} is older than {}, which a stage's environment needs)",
+                crate::containment::systemd::SETENV_BY_NAME_SINCE
+            ),
+        ));
+    }
+    let note = if crate::config::env_flag("BLUT_NO_CONTAIN") {
+        " (BLUT_NO_CONTAIN is set)".to_string()
+    } else if let Some(name) = &explicit {
+        format!(" (BLUT_CONTAINMENT={name})")
+    } else {
+        match backend.kind() {
+            "bare" | "rlimit" => {
+                " (no systemd user bus, no cgroup-v2 subtree with the memory controller)"
+            }
+            "cgroup2" => " (no systemd user bus)",
+            _ => "",
+        }
+        .to_string()
+    };
+    Ok((backend, note))
 }
 
 /// A unit name every backend accepts: `[A-Za-z0-9_-]`, anything else `-`.

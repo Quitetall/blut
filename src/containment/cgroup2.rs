@@ -76,10 +76,9 @@ fn probe() -> Availability {
             return Availability::Unavailable;
         }
         // Mounted, but is a subtree writable (delegated)?
-        if writable_base().is_some() {
-            Availability::Present
-        } else {
-            Availability::BusOffline
+        match writable_base() {
+            Some(base) if leaf_gets_memory_controller(&base) => Availability::Present,
+            _ => Availability::BusOffline,
         }
     })
 }
@@ -87,6 +86,23 @@ fn probe() -> Availability {
 /// Ensure the `memory` controller is enabled in the base's `subtree_control`
 /// so child leaves can set `memory.max`. Best-effort: if it's already enabled
 /// (or we lack permission), proceed — the cap write will surface a real error.
+/// Whether a leaf created under `base` gets the memory controller, so that
+/// `memory.max` can be written. A writable base is not enough: the caller's
+/// own cgroup is often writable (a terminal's scope, a service) but holds
+/// processes, and cgroup v2 refuses to enable a controller for the children
+/// of a cgroup with processes in it, so the leaf has no `memory.max` and the
+/// first cap write fails. Probed with a throwaway leaf.
+fn leaf_gets_memory_controller(base: &Path) -> bool {
+    enable_memory_subtree(base);
+    let probe = base.join("blut-probe-memcheck");
+    if std::fs::create_dir(&probe).is_err() {
+        return false;
+    }
+    let ok = probe.join("memory.max").exists();
+    let _ = std::fs::remove_dir(&probe);
+    ok
+}
+
 fn enable_memory_subtree(base: &Path) {
     let f = base.join("cgroup.subtree_control");
     if let Ok(cur) = std::fs::read_to_string(&f)
@@ -304,6 +320,19 @@ fn fmt_i32(n: i32, buf: &mut [u8; 24]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A writable directory whose new children get no `memory.max` (the
+    /// caller's own busy cgroup, or here a plain directory) is not usable:
+    /// the first cap write would fail with EACCES.
+    #[test]
+    fn a_writable_base_without_the_memory_controller_is_not_usable() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(dir_writable(tmp.path()));
+        assert!(!leaf_gets_memory_controller(tmp.path()));
+        assert!(
+            !tmp.path().join("blut-probe-memcheck").exists(),
+            "probe leaf left behind"
+        );
+    }
 
     #[test]
     fn fmt_i32_basic() {

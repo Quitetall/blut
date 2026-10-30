@@ -47,6 +47,102 @@ fn probe() -> Availability {
     })
 }
 
+/// The first systemd release whose `systemd-run --setenv=NAME` (no `=VALUE`)
+/// imports the value from systemd-run's own environment.
+pub(crate) const SETENV_BY_NAME_SINCE: u32 = 250;
+
+/// The installed `systemd-run`'s version (`systemd 262 (262.1-1-arch)` →
+/// 262), probed once. `None` when it cannot be run or parsed.
+pub(crate) fn systemd_run_version() -> Option<u32> {
+    static VERSION: OnceLock<Option<u32>> = OnceLock::new();
+    *VERSION.get_or_init(|| {
+        let out = std::process::Command::new("systemd-run")
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        parse_systemd_version(&String::from_utf8_lossy(&out.stdout))
+    })
+}
+
+fn parse_systemd_version(text: &str) -> Option<u32> {
+    let mut words = text.lines().next()?.split_whitespace();
+    (words.next()? == "systemd").then_some(())?;
+    words.next()?.parse().ok()
+}
+
+/// Whether `systemd-run --setenv=NAME` imports values by name here.
+pub(crate) fn imports_env_by_name() -> bool {
+    systemd_run_version().is_some_and(|v| v >= SETENV_BY_NAME_SINCE)
+}
+
+/// The first systemd release with `systemd-run --expand-environment=`.
+pub(crate) const EXPAND_ENVIRONMENT_SINCE: u32 = 254;
+
+/// Whether this systemd-run can pass a service's arguments unexpanded.
+fn expansion_can_be_disabled() -> bool {
+    systemd_run_version().is_some_and(|v| v >= EXPAND_ENVIRONMENT_SINCE)
+}
+
+/// An argument that survives `ExecStart=` expansion unchanged: every `$`
+/// doubled, which the expansion turns back into one.
+fn escape_dollars(arg: &str) -> String {
+    arg.replace('$', "$$")
+}
+
+/// Variables systemd sets for a service itself, or that describe the
+/// caller's own service: never forwarded.
+const NOT_FORWARDED: &[&str] = &[
+    "INVOCATION_ID",
+    "JOURNAL_STREAM",
+    "LISTEN_FDNAMES",
+    "LISTEN_FDS",
+    "LISTEN_PID",
+    "MAINPID",
+    "MANAGERPID",
+    "MEMORY_PRESSURE_WATCH",
+    "MEMORY_PRESSURE_WRITE",
+    "NOTIFY_SOCKET",
+    "SYSTEMD_EXEC_PID",
+    "WATCHDOG_PID",
+    "WATCHDOG_USEC",
+];
+
+/// This process's environment as a list a transient service can be given,
+/// with `extra` added last (an `extra` name replaces the inherited value).
+///
+/// A `systemd-run --user` service starts from the user manager's minimal
+/// environment, not the caller's; every other backend's child inherits the
+/// caller's. Passing the caller's environment explicitly makes a
+/// systemd-contained stage see what a directly spawned one would. Skipped:
+/// variables that are not valid UTF-8, whose name is not a portable shell
+/// identifier (exported shell functions such as `BASH_FUNC_x%%`), whose
+/// value holds a control character other than tab or newline (systemd refuses
+/// the assignment), and the ones systemd manages ([`NOT_FORWARDED`]).
+pub(crate) fn inherited_env(extra: &[(String, String)]) -> Vec<(String, String)> {
+    let valid_name = |k: &str| {
+        let mut chars = k.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    let valid_value = |v: &str| !v.chars().any(|c| c.is_control() && c != '\t' && c != '\n');
+    let mut out: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .filter(|(k, v)| {
+            valid_name(k)
+                && valid_value(v)
+                && !NOT_FORWARDED.contains(&k.as_str())
+                && !extra.iter().any(|(e, _)| e == k)
+        })
+        .collect();
+    out.sort();
+    out.extend(extra.iter().cloned());
+    out
+}
+
 impl Containment for SystemdCgroup {
     fn kind(&self) -> &'static str {
         "systemd"
@@ -92,21 +188,50 @@ impl Containment for SystemdCgroup {
             .arg("-p")
             .arg(format!("MemorySwapMax={swapmax}"))
             .arg(format!("--working-directory={}", cwd.display()));
-        // Propagate PATH + HOME (minimal --user env otherwise).
-        if let Ok(path) = std::env::var("PATH") {
-            c.arg(format!("--setenv=PATH={path}"));
+        // Propagate PATH + HOME (minimal --user env otherwise), then the
+        // invocation env (incl. PYTHONPATH + BLUT_* identity). Where
+        // systemd-run can import a variable by name, the value is set on the
+        // client's own environment and only the name goes on its command line:
+        // a command line is readable by every user on the host, an
+        // environment only by its owner.
+        let by_name = imports_env_by_name();
+        for key in ["PATH", "HOME"] {
+            if let Ok(value) = std::env::var(key) {
+                if by_name {
+                    c.arg(format!("--setenv={key}"));
+                } else {
+                    c.arg(format!("--setenv={key}={value}"));
+                }
+            }
         }
-        if let Ok(home) = std::env::var("HOME") {
-            c.arg(format!("--setenv=HOME={home}"));
-        }
-        // Cross the invocation env (incl. PYTHONPATH + BLUT_* identity).
         for (k, v) in env {
-            c.arg(format!("--setenv={k}={v}"));
+            if by_name {
+                c.env(k, v);
+                c.arg(format!("--setenv={k}"));
+            } else {
+                c.arg(format!("--setenv={k}={v}"));
+            }
+        }
+        // A service's command line is expanded like `ExecStart=`: `$VAR`,
+        // `${VAR}` and `$$` are rewritten, so an argument holding a `$` (a
+        // JSON spec, a password, a regex) would reach the stage changed.
+        // Turn expansion off where systemd-run can; escape `$` elsewhere.
+        let verbatim = expansion_can_be_disabled();
+        if verbatim {
+            c.arg("--expand-environment=no");
         }
         // Terminator, then the actual kernel command (program + full argv).
-        c.arg("--").arg(program);
+        c.arg("--");
+        match program.to_str() {
+            Some(p) if !verbatim => c.arg(escape_dollars(p)),
+            _ => c.arg(program),
+        };
         for a in args {
-            c.arg(a);
+            if verbatim {
+                c.arg(a);
+            } else {
+                c.arg(escape_dollars(a));
+            }
         }
         Ok(WrappedRun {
             command: c,
@@ -159,12 +284,79 @@ mod tests {
         assert!(argv.contains(&"--user".to_string()));
         assert!(argv.contains(&"--unit=blut-job-stage".to_string()));
         assert!(argv.contains(&"MemoryMax=8G".to_string()));
-        assert!(argv.contains(&"--setenv=PYTHONPATH=/x".to_string()));
+        if imports_env_by_name() {
+            // Name only on the command line; the value rides the client's env.
+            assert!(argv.contains(&"--setenv=PYTHONPATH".to_string()));
+            assert!(
+                !argv.iter().any(|a| a.contains("/x")),
+                "value leaked: {argv:?}"
+            );
+            let env: Vec<_> = std
+                .get_envs()
+                .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+                .collect();
+            assert!(env.contains(&("PYTHONPATH".into(), Some("/x".into()))));
+        } else {
+            assert!(argv.contains(&"--setenv=PYTHONPATH=/x".to_string()));
+        }
+        assert_eq!(
+            argv.contains(&"--expand-environment=no".to_string()),
+            expansion_can_be_disabled()
+        );
         // kernel command comes after `--`.
         let dd = argv.iter().position(|a| a == "--").unwrap();
         assert_eq!(argv[dd + 1], "python3");
         assert_eq!(argv[dd + 2], "train.py");
         assert_eq!(wr.peak_source, PeakSource::StderrLine);
+    }
+
+    #[test]
+    fn dollars_are_escaped_for_execstart_expansion() {
+        assert_eq!(
+            escape_dollars(r#"{"pw":"a$b","x":"$$"}"#),
+            r#"{"pw":"a$$b","x":"$$$$"}"#
+        );
+        assert_eq!(escape_dollars("plain"), "plain");
+    }
+
+    #[test]
+    fn systemd_versions_parse() {
+        assert_eq!(
+            parse_systemd_version("systemd 262 (262.1-1-arch)\n+PAM"),
+            Some(262)
+        );
+        assert_eq!(
+            parse_systemd_version("systemd 249 (249.11-0ubuntu3)"),
+            Some(249)
+        );
+        assert_eq!(parse_systemd_version("not systemd"), None);
+        assert_eq!(parse_systemd_version(""), None);
+    }
+
+    #[test]
+    fn inherited_env_keeps_the_callers_and_lets_extra_win() {
+        // Every test process has PATH; HOME is set on any CI runner.
+        let env = inherited_env(&[
+            ("PATH".into(), "/override".into()),
+            ("BLUT_X".into(), "1".into()),
+        ]);
+        let paths: Vec<_> = env.iter().filter(|(k, _)| k == "PATH").collect();
+        assert_eq!(paths, [&("PATH".to_string(), "/override".to_string())]);
+        assert!(env.iter().any(|(k, v)| k == "BLUT_X" && v == "1"));
+        assert!(
+            env.iter()
+                .all(|(k, _)| !NOT_FORWARDED.contains(&k.as_str()))
+        );
+        assert!(env.iter().all(|(k, _)| !k.contains('%') && !k.is_empty()));
+    }
+
+    #[test]
+    fn parse_peak_reads_the_line_systemd_262_prints() {
+        let be = SystemdCgroup;
+        assert_eq!(
+            be.parse_peak("                   Memory peak: 2.4M (swap: 0B)"),
+            Some((2.4 * 1024.0 * 1024.0) as u64)
+        );
     }
 
     #[test]

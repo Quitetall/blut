@@ -141,13 +141,14 @@ async fn launch_python(mem_max: &str, script: &str) -> (bool, String, &'static s
     )
 }
 
-/// The launcher path: `LocalSystemd`'s `mem_max` reaches the backend the
-/// factory selects. `rlimit` is selected explicitly because it needs no
-/// systemd bus or cgroup delegation, so this runs on any Unix host. The same
-/// 1 GiB allocation fails under a 512 MiB `mem_max` and succeeds under 8 GiB,
-/// so the cap, not the host, is what refused it.
+/// The launcher under the `rlimit` fallback (no systemd bus, no writable
+/// cgroup): the stage runs, and it runs WITHOUT the launcher's cap, because
+/// `RLIMIT_AS` caps virtual address space and the launcher's default would
+/// refuse a CUDA process's reservations. A 1 GiB allocation under a 512 MiB
+/// `mem_max` must succeed. The unit name is the sanitized name plus the
+/// driver pid and a sequence number.
 #[tokio::test]
-async fn local_systemd_mem_max_caps_the_selected_backend() {
+async fn local_systemd_under_rlimit_runs_the_stage_without_a_cap() {
     if which::which("python3").is_err() {
         eprintln!("skipped: python3 not on PATH");
         return;
@@ -159,14 +160,86 @@ async fn local_systemd_mem_max_caps_the_selected_backend() {
         std::env::set_var("BLUT_CONTAINMENT", "rlimit");
     }
     let script = "x = bytearray(1024*1024*1024); print('NO_CAP')";
-
     let (ok, stdout, kind, unit) = launch_python("512M", script).await;
     assert_eq!(kind, "rlimit");
-    assert_eq!(unit, "blut-launcher-test", "unit sanitized");
-    assert!(!ok, "1 GiB fit under a 512 MiB mem_max");
-    assert!(!stdout.contains("NO_CAP"));
-
-    let (ok, stdout, _, _) = launch_python("8G", script).await;
-    assert!(ok, "1 GiB must fit under an 8 GiB mem_max");
+    let pid = std::process::id().to_string();
+    let rest = unit
+        .strip_prefix("blut-launcher-test-")
+        .unwrap_or_else(|| panic!("unit {unit:?} not sanitized and suffixed"));
+    let (unit_pid, seq) = rest.split_once('-').expect("pid-seq suffix");
+    assert_eq!(unit_pid, pid);
+    assert!(seq.parse::<u64>().is_ok(), "sequence in {unit:?}");
+    assert!(ok, "the stage must run uncapped under rlimit");
     assert!(stdout.contains("NO_CAP"));
+
+    // Two stages from one process never share a unit name.
+    let (_, _, _, second) = launch_python("512M", "pass").await;
+    assert_ne!(unit, second);
+}
+
+/// Dropping a `ContainedChild` whose backend has no tree teardown kills the
+/// child's process group, so a grandchild of a group-leading child dies too
+/// (a hard stage timeout drops the stage future, and with it this value).
+#[tokio::test]
+async fn dropping_a_bare_group_leader_kills_its_grandchild() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pidfile = tmp.path().join("grandchild.pid");
+    let run = sh(
+        tmp.path(),
+        &format!("sleep 600 & echo $! > {}; wait", pidfile.display()),
+    );
+    let child = ContainedChild::spawn(Box::new(Bare), run, "drop", |c| {
+        // SAFETY: setsid is async-signal-safe.
+        unsafe {
+            c.pre_exec(|| {
+                nix::unistd::setsid()
+                    .map(|_| ())
+                    .map_err(std::io::Error::from)
+            });
+        }
+    })
+    .await
+    .expect("spawn");
+    let grandchild = read_pid(&pidfile).await;
+    assert!(alive(grandchild), "grandchild {grandchild} was not running");
+    drop(child);
+    wait_dead(grandchild).await;
+}
+
+async fn read_pid(path: &Path) -> i32 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(s) = std::fs::read_to_string(path)
+            && let Ok(pid) = s.trim().parse()
+        {
+            return pid;
+        }
+        assert!(std::time::Instant::now() < deadline, "no pid in {path:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Exists and is not a zombie.
+fn alive(pid: i32) -> bool {
+    if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+        return false;
+    }
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            s.rsplit_once(')')
+                .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+        })
+        .is_none_or(|zombie| !zombie)
+}
+
+async fn wait_dead(pid: i32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while alive(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pid {pid} survived the teardown"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

@@ -374,8 +374,12 @@ tree on cancel; a caller must spawn through `containment::spawn_attached` (or
 call `Containment::after_spawn`). A local stage is contained on any host by
 `LocalSystemd::spawn_contained`, which applies the launcher's caps through
 `containment_for()` and returns a `containment::ContainedChild` (peak after
-exit, `kill_tree`, `wait_or_cancel`). `LocalSystemd::wrap` and `launch` stay
-bare on Windows: a Job Object is not a wrapper command.
+exit, `kill_tree`, `wait_or_cancel`; the tree never outlives it). On Linux
+that is a transient `systemd-run --user` service with `MemoryMax` (systemd 250
+or later; the stage keeps the caller's environment), else a delegated cgroup-v2
+leaf, else `rlimit` with no cap; one log line names the backend.
+`LocalSystemd::wrap` and `launch` stay bare on Windows: a Job Object is not a
+wrapper command.
 
 ---
 

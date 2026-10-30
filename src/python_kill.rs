@@ -333,6 +333,19 @@ pub async fn graceful_kill_pid(_pgid: u32, _grace: Duration) {
     // No-op on non-Unix; cancel is best-effort.
 }
 
+/// SIGKILL every process in group `pgid` now, without waiting or reaping.
+/// For a synchronous teardown (a `Drop`) of a child that leads its own group
+/// (`pre_exec_setsid`). A `pgid` that names no group is a no-op (ESRCH): a
+/// child that does not lead a group has no group with its pid as the id.
+#[cfg(unix)]
+pub(crate) fn kill_group_now(pgid: u32) {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+    if pgid > 1 {
+        let _ = killpg(Pid::from_raw(pgid as i32), Signal::SIGKILL);
+    }
+}
+
 /// Non-Unix counterpart of the group kill: there are no process groups to
 /// signal, so this is the same best-effort no-op as [`graceful_kill_pid`]. On
 /// Windows the hard tree teardown is the Job Object backend's
