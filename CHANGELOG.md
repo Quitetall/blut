@@ -48,6 +48,16 @@ depend on this crate.
   `$BLUT_CHECKPOINTS_DIR` choose where slots live.
 
 ### Changed
+- **Behaviour change:** `plan publish`, `plan promote`, `plan rollback` and
+  `plan history` default to tenant `default` (was `shared`), the tenant
+  `recipe declare`/`recipe run`, `plan run`, the model registry and sensord
+  already used. Publish → promote → `recipe declare registry://plan@prod --run`
+  now works with default configuration; before, the pointer was written under
+  `shared`, looked up under `default`, and `shared` was not an admitted quota
+  tenant. Deployments and pointers made under `shared` stay where they are:
+  address them with `--tenant shared`, and a lookup under `default` that misses
+  names the tenant holding the pointer. blut-web authorises run and cancel
+  against `default`, the tenant the launched run uses.
 - `blut-operator` moves to the engine's MSRV, Rust 1.88 (was 1.89), and from
   kube 0.96 to kube 4.0 / k8s-openapi 0.28 (Kubernetes 1.32 API). It is
   publishable (`publish = ["crates-io"]`, 0.2.0-alpha.2) but not yet published.
@@ -67,6 +77,12 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- `recipe declare registry://plan@<name> --run` defaulted the run's experiment
+  to the URI, which is not a valid experiment name, and failed after creating
+  the job directory but before its state, leaving a job that read `running`
+  forever. Pointer launches group as experiment `plan.<name>`, any launch name
+  becomes a valid label, the label is checked before anything is written, and
+  a failure while writing a starting job's records removes the partial job.
 - `blut dag` showed a node that failed and was then re-run to completion by
   `plan resume` as `failed`, because the first terminal event in the job's
   status log won. A later attempt (`stage_begin` or a cache hit) now reopens

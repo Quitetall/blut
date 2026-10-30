@@ -214,3 +214,36 @@ fn registry_roundtrip() {
     assert_eq!(registry_db::parse_pointer_uri("registry://plan@"), None);
     assert_eq!(registry_db::parse_pointer_uri("/some/file.json"), None);
 }
+
+/// A pointer published under the former `shared` default is not found under
+/// `default` (the tenant every verb now defaults to); the error says which
+/// tenant has it, and never names a restricted one.
+#[test]
+fn a_missing_pointer_names_the_tenant_that_has_it() {
+    let reg = test_registry();
+    let td = tempfile::tempdir().unwrap();
+    let mut conn = registry_db::open_at(&td.path().join("registry.db")).unwrap();
+    let a = registry_db::publish(&conn, &reg, &valid_spec(1), "t", "shared", None, 1).unwrap();
+    registry_db::promote(&mut conn, &a, "shared", "prod", 2).unwrap();
+    let err = registry_db::resolve_spec(&conn, "default", "prod")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("for tenant 'default'"), "{err}");
+    assert!(err.contains("pass --tenant shared"), "{err}");
+
+    let r = registry_db::publish(
+        &conn,
+        &reg,
+        &valid_spec(2),
+        "t",
+        registry_db::RESTRICTED_TENANT,
+        None,
+        3,
+    )
+    .unwrap();
+    registry_db::promote(&mut conn, &r, registry_db::RESTRICTED_TENANT, "clin", 4).unwrap();
+    let err = registry_db::resolve_spec(&conn, "default", "clin")
+        .unwrap_err()
+        .to_string();
+    assert!(!err.contains("restricted"), "{err}");
+}

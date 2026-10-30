@@ -29,7 +29,9 @@ use crate::framework::plan_spec::PlanSpec;
 /// promoted onto a pointer owned by a different tenant (ADR 0061 hard-block).
 /// A minimal stand-in until full multi-tenancy (ADR 0096) lands.
 pub const RESTRICTED_TENANT: &str = "restricted";
-/// The default (non-clinical) tenant.
+/// The tenant deployments were published under by default before the CLI
+/// moved to `default` (the tenant every other verb uses). Records made under it
+/// stay addressable with an explicit `--tenant shared`.
 pub const SHARED_TENANT: &str = "shared";
 
 const CREATE_SCHEMA: &str = "
@@ -351,12 +353,40 @@ pub fn resolve_pointer(conn: &Connection, tenant: &str, name: &str) -> Result<Op
     }
 }
 
+/// The error for a pointer absent under `tenant`. When the same name exists
+/// under another non-restricted tenant (typically `shared`, the former
+/// default), say which and how to address it, instead of a bare "no pointer".
+/// Restricted tenants are never named: that would disclose a clinical record
+/// across the boundary.
+fn missing_pointer(conn: &Connection, tenant: &str, name: &str) -> TrainError {
+    let others: Vec<String> = conn
+        .prepare("SELECT tenant FROM deployment_pointers WHERE name = ?1 AND tenant != ?2")
+        .and_then(|mut stmt| {
+            stmt.query_map(params![name, tenant], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| crate::tenant::Tenant::parse(t).is_some_and(|t| !t.is_restricted()))
+        .collect();
+    match others.as_slice() {
+        [] => TrainError::other(format!(
+            "no deployment pointer 'registry://plan@{name}' for tenant '{tenant}'"
+        )),
+        [other, ..] => TrainError::other(format!(
+            "no deployment pointer 'registry://plan@{name}' for tenant '{tenant}'; tenant \
+             '{other}' has one (pass --tenant {other})"
+        )),
+    }
+}
+
 /// Resolve a pointer all the way to its frozen `PlanSpec` (the run-dispatch
 /// path for `registry://plan@<name>`).
 pub fn resolve_spec(conn: &Connection, tenant: &str, name: &str) -> Result<PlanSpec> {
-    let fp = resolve_pointer(conn, tenant, name)?.ok_or_else(|| {
-        TrainError::other(format!("no deployment pointer 'registry://plan@{name}'"))
-    })?;
+    let fp = match resolve_pointer(conn, tenant, name)? {
+        Some(fp) => fp,
+        None => return Err(missing_pointer(conn, tenant, name)),
+    };
     let bytes: Vec<u8> = conn
         .query_row(
             "SELECT spec_bytes FROM deployments WHERE plan_fingerprint = ?1",

@@ -348,9 +348,9 @@ recursively before cookbook-defined typed args are deserialized. Dataset
 handles become a live hash-verified local path, model handles become the
 immutable checkpoint hash, and experiment handles become the tenant-scoped run
 id. Restricted dataset/model handles refuse every non-local launcher. Model
-commands default to the same `default` tenant as recipe launches; records made
-under the older `shared` default remain reachable with explicit `--tenant
-shared`.
+and plan commands default to the same `default` tenant as recipe launches;
+records made under the older `shared` default remain reachable with explicit
+`--tenant shared`.
 
 `blut partition define` persists a finite set from repeatable `--dim
 axis=v1,v2` flags or a WASM-safe `PartitionSpec` JSON (`time`, `categorical`,

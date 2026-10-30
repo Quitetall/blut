@@ -114,22 +114,22 @@ async fn require_token(
 
 /// Authorise + audit a bridge mutation (`rbac::enforce`): the audit row is
 /// written for allow AND deny BEFORE anything is dispatched, and an audit
-/// write failure is itself a deny. Every bridge mutation targets the SHARED
-/// tenant — the web surface structurally cannot act on a restricted tenant
-/// (same posture as the read side, ADR 0061/0096).
+/// write failure is itself a deny. Every bridge mutation targets the
+/// `default` tenant, the one the launched `recipe run` runs under — the web
+/// surface structurally cannot act on a restricted tenant (same posture as the
+/// read side, ADR 0061/0096).
 #[allow(clippy::result_large_err)] // an axum Response IS the error surface here
 fn enforce_bridge(
     state: &AppState,
     principal: Option<&blut::rbac::Principal>,
     action: blut::rbac::Action,
 ) -> Result<(), Response> {
-    let shared = blut::tenant::Tenant::parse(blut::model_registry::SHARED_TENANT)
-        .expect("the shared tenant name parses");
+    let target = blut::tenant::Tenant::default();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let decision = blut::rbac::enforce(principal, action, &shared, &state.audit_path, now);
+    let decision = blut::rbac::enforce(principal, action, &target, &state.audit_path, now);
     if decision.allowed {
         Ok(())
     } else {
