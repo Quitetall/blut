@@ -84,6 +84,12 @@ depend on this crate.
   Object) or the caller must signal the process group (`rlimit`, `bare`).
 
 ### Changed
+- A stage output whose artifact type declares external paths
+  (`ALLOW_EXTERNAL_PATHS`, such as `checks.jsonl` and `dataset.jsonl`) is
+  logged as "not portable and will not be cached" at debug instead of as a
+  warning: it is the type's declared contract, and the warning was printed on
+  every run of `check_jsonl`, `load_dataset` and the like. The output's sidecar
+  still records `persisted: false`.
 - **Behaviour change:** `plan publish`, `plan promote`, `plan rollback` and
   `plan history` default to tenant `default` (was `shared`), the tenant
   `recipe declare`/`recipe run`, `plan run`, the model registry and sensord

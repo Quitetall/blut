@@ -3105,8 +3105,12 @@ async fn run_node_with_admission(
         Ok(stored) => (stored.manifest.content_id, Some(stored)),
         // A declared external reference is an expected ownership policy outcome,
         // not a failed store write. `capture` has only read the promoted output.
+        // Only an artifact type that opts into `ALLOW_EXTERNAL_PATHS` gets here,
+        // so this is its declared contract, not a fault: it is logged at debug
+        // (the sidecar records `persisted: false`). As a warning it was printed
+        // on every run of `check_jsonl`, `load_dataset` and the like.
         Err(error @ ArtifactStoreError::NonPortable(_)) => {
-            tracing::warn!(
+            tracing::debug!(
                 "executor: output for stage '{stage_name}' is not portable and will not be cached: {error}"
             );
             (
@@ -4135,8 +4139,9 @@ fn publish_speculative_inner(
         None,
     ) {
         Ok(stored) => (stored.manifest.content_id, Some(stored)),
+        // Declared by the artifact type (`ALLOW_EXTERNAL_PATHS`): debug, as above.
         Err(error @ ArtifactStoreError::NonPortable(_)) => {
-            tracing::warn!(
+            tracing::debug!(
                 "executor: speculative output for stage '{stage_name}' is not portable and will not be cached: {error}"
             );
             (
