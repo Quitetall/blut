@@ -179,9 +179,7 @@ pub(super) fn run_ledger_cmd(cmd: LedgerCommand) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&recs)?);
             } else {
-                for r in recs {
-                    println!("{r:?}");
-                }
+                print!("{}", render_show(&uid, &recs));
             }
         }
         LedgerCommand::Promote { uid, reason, by } => {
@@ -352,6 +350,149 @@ fn collected_runs(records: &[Record]) -> std::collections::BTreeSet<&str> {
 }
 
 /// The tier as `--tier` spells it.
+/// `ledger show` as text: one line per record in write order, then the run
+/// identity fields that record adds or changes, indented. It printed each
+/// record's Rust `Debug` form (`RunStarted { schema: "blut.run-ledger/v1", …`).
+fn render_show(uid: &str, records: &[&Record]) -> String {
+    use crate::run_ledger::{Intent, Outcome};
+    use std::fmt::Write as _;
+    fn when(unix: i64) -> String {
+        chrono::DateTime::from_timestamp(unix, 0)
+            .map(|t| t.format("%Y-%m-%d %H:%M:%SZ").to_string())
+            .unwrap_or_else(|| format!("@{unix}"))
+    }
+    fn intent_label(intent: Intent) -> &'static str {
+        match intent {
+            Intent::Smoke => "smoke",
+            Intent::Probe => "probe",
+            Intent::Campaign => "campaign",
+        }
+    }
+    fn outcome_label(outcome: Outcome) -> &'static str {
+        match outcome {
+            Outcome::Completed => "completed",
+            Outcome::Diverged => "diverged",
+            Outcome::Killed => "killed",
+            Outcome::Oom => "oom",
+            Outcome::Failed => "failed",
+        }
+    }
+    let mut out = format!("run {uid}\n");
+    // The identity fields printed so far: a record lists only what it adds or
+    // changes, so the end record does not repeat the start record's identity.
+    let mut shown: std::collections::BTreeMap<&'static str, String> =
+        std::collections::BTreeMap::new();
+    let mut identity_lines = |out: &mut String, id: &crate::run_ledger::RunIdentity| {
+        let fields: [(&'static str, Option<String>); 8] = [
+            (
+                "job",
+                (!id.blut_job_id.is_empty()).then(|| id.blut_job_id.clone()),
+            ),
+            ("trainer run", id.trainer_run_id.clone()),
+            ("git", id.git_sha.clone()),
+            ("config", id.config_fingerprint.clone()),
+            (
+                "checkpoints",
+                (!id.checkpoint_sha256.is_empty()).then(|| id.checkpoint_sha256.join(", ")),
+            ),
+            ("pccp change", id.pccp_change_id.clone()),
+            ("attestation", id.attestation_ref.clone()),
+            (
+                "ledger rows",
+                (!id.ledger_rows.is_empty()).then(|| id.ledger_rows.join(", ")),
+            ),
+        ];
+        for (label, value) in fields {
+            let Some(value) = value else { continue };
+            if shown.get(label) != Some(&value) {
+                let _ = writeln!(out, "    {label:<12} {value}");
+                shown.insert(label, value);
+            }
+        }
+    };
+    for record in records {
+        match record {
+            Record::RunStarted {
+                recipe,
+                intent,
+                started_unix,
+                tenant,
+                experiment,
+                seed,
+                identity,
+                ..
+            } => {
+                let tenant = if tenant.is_empty() { "default" } else { tenant };
+                let _ = write!(
+                    out,
+                    "{}  started   recipe={recipe} intent={} tenant={tenant}",
+                    when(*started_unix),
+                    intent_label(*intent)
+                );
+                if let Some(experiment) = experiment {
+                    let _ = write!(out, " experiment={experiment}");
+                }
+                if let Some(seed) = seed {
+                    let _ = write!(out, " seed={seed}");
+                }
+                out.push('\n');
+                identity_lines(&mut out, identity);
+            }
+            Record::RunEnded {
+                ended_unix,
+                duration_secs,
+                outcome,
+                tier,
+                identity,
+                metrics,
+                ..
+            } => {
+                let _ = writeln!(
+                    out,
+                    "{}  ended     outcome={} tier={} duration={}",
+                    when(*ended_unix),
+                    outcome_label(*outcome),
+                    tier_label(*tier),
+                    humantime::format_duration(std::time::Duration::from_secs(*duration_secs))
+                );
+                if !metrics.is_empty() {
+                    let metrics = metrics
+                        .iter()
+                        .map(|(name, value)| format!("{name}={value}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let _ = writeln!(out, "    {:<12} {metrics}", "metrics");
+                }
+                identity_lines(&mut out, identity);
+            }
+            Record::Promoted {
+                promoted_unix,
+                reason,
+                by,
+                ..
+            } => {
+                let _ = writeln!(
+                    out,
+                    "{}  promoted  canonical by {by}: {reason}",
+                    when(*promoted_unix)
+                );
+            }
+            Record::Cleared {
+                cleared_unix,
+                recipe,
+                ..
+            } => {
+                let _ = writeln!(
+                    out,
+                    "{}  cleared   recipe={recipe} (scratch run collected; this tombstone remains)",
+                    when(*cleared_unix)
+                );
+            }
+        }
+    }
+    out
+}
+
 fn tier_label(tier: Tier) -> &'static str {
     match tier {
         Tier::Scratch => "scratch",
@@ -1012,6 +1153,76 @@ mod tests {
             cleared_unix: 2,
             recipe: "test".into(),
         }
+    }
+
+    /// `ledger show` printed each record's Rust `Debug` form.
+    #[test]
+    fn show_renders_records_as_text_not_debug() {
+        let mut start = started("run-a", "", &["2.6"]);
+        if let Record::RunStarted {
+            started_unix,
+            experiment,
+            seed,
+            identity,
+            ..
+        } = &mut start
+        {
+            *started_unix = 1_790_000_000;
+            *experiment = Some("E1".into());
+            *seed = Some(3);
+            identity.blut_job_id = "20260920-000000-1".into();
+            identity.git_sha = Some("abc123".into());
+        }
+        let mut end = ended("run-a", &["2.6"]);
+        if let Record::RunEnded {
+            ended_unix,
+            duration_secs,
+            metrics,
+            identity,
+            ..
+        } = &mut end
+        {
+            *ended_unix = 1_790_000_090;
+            *duration_secs = 90;
+            metrics.insert("val_r".into(), 0.5);
+            identity.blut_job_id = "20260920-000000-1".into();
+            identity.git_sha = Some("abc123".into());
+            identity.checkpoint_sha256 = vec!["feed".into()];
+        }
+        let records = [start, end, promoted("run-a"), cleared("run-a")];
+        let refs: Vec<&Record> = records.iter().collect();
+        let text = render_show("run-a", &refs);
+        for debug in ["RunStarted", "RunEnded", "schema", "Some(", "{", "\""] {
+            assert!(!text.contains(debug), "Debug residue {debug:?} in:\n{text}");
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "run run-a");
+        assert_eq!(
+            lines[1],
+            "2026-09-21 14:13:20Z  started   recipe=test intent=campaign tenant=default \
+             experiment=E1 seed=3"
+        );
+        assert!(
+            text.contains("    job          20260920-000000-1\n"),
+            "{text}"
+        );
+        assert!(text.contains("    ledger rows  2.6\n"), "{text}");
+        assert!(
+            text.contains(
+                "2026-09-21 14:14:50Z  ended     outcome=completed tier=recorded duration=1m 30s\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("    metrics      val_r=0.5\n"), "{text}");
+        // The end record repeats the start's identity; only what it adds shows.
+        assert_eq!(text.matches("    job ").count(), 1, "{text}");
+        assert_eq!(text.matches("    git ").count(), 1, "{text}");
+        assert!(text.contains("    checkpoints  feed\n"), "{text}");
+        assert!(
+            text.contains("promoted  canonical by test: test\n"),
+            "{text}"
+        );
+        assert!(text.contains("cleared   recipe=test"), "{text}");
     }
 
     #[test]

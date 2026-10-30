@@ -144,6 +144,11 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- `ledger show` printed each record as Rust `Debug`
+  (`RunStarted { schema: "blut.run-ledger/v1", … }`). It prints one line per
+  record (time in UTC, recipe, intent, tenant, outcome, tier, duration,
+  promotion reason) with the run identity fields each record adds indented
+  below it; `--json` is unchanged.
 - An SLA rule could not select runs launched from a deploy pointer: such a run
   is recorded under the recipe `registry://plan@<name>`, and a rule's `recipe`
   refused that URI, so only a rule with no recipe (matching every run) judged
