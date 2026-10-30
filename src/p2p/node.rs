@@ -385,7 +385,9 @@ impl MeshNode {
 
     /// This node's registry trust for a peer, or `None` if it is not in the
     /// registry. Gossip never writes the registry, so learning a peer by
-    /// gossip leaves this `None`.
+    /// gossip, or dialing it, leaves this `None`; a peer that connects TO this
+    /// node is registered by the handshake, as `Anonymous` unless the
+    /// registry already trusts it.
     pub async fn peer_trust(&self, id: &PeerId) -> Option<TrustLevel> {
         self.server.peers.read().await.get(id).map(|p| p.trust)
     }
@@ -1712,11 +1714,19 @@ mod tests {
 
     /// The headline: D seeds only A, learns B and C from A's signed exchange,
     /// dials them (pinning the advertised keys), and can dispatch to C.
+    ///
+    /// B and C dial nobody but their seed (`max_peers` 1), so every connection
+    /// between D and them is D's own dial. They used to gossip at 32 too: B
+    /// then also learned D from A's next exchange and dialed it, and when B's
+    /// dial reached D first, D's accept path registered B as `Anonymous`, as
+    /// it does every inbound peer. The `None` check below then failed whenever
+    /// that race went B's way (about one run in four with 24 of these
+    /// scenarios run at once), which a loaded host made likely.
     #[tokio::test]
     async fn gossip_lets_a_node_seeded_with_one_peer_reach_the_rest() {
         let (a, a_kp) = gossip_node(32).await;
-        let (b, _) = gossip_node(32).await;
-        let (c, c_kp) = gossip_node(32).await;
+        let (b, _) = gossip_node(1).await;
+        let (c, c_kp) = gossip_node(1).await;
         let (d, d_kp) = gossip_node(32).await;
         let a_addr = a.local_addr().unwrap();
         let a_key = a_kp.verifying.to_bytes();
@@ -1741,6 +1751,9 @@ mod tests {
         // Gossip never wrote D's registry: learned peers carry no trust.
         assert_eq!(d.peer_trust(&b_id).await, None);
         assert_eq!(d.peer_trust(&c_id).await, None);
+        // The side that ACCEPTS a connection registers the dialer, as
+        // Anonymous: B's registry holds D because D dialed B.
+        assert_eq!(b.peer_trust(d.node_id()).await, Some(TrustLevel::Anonymous));
         // And D can dispatch to C over the learned connection.
         let conn = d.connection_to(&c_id).await.unwrap();
         let result = tokio::time::timeout(
