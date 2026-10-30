@@ -65,6 +65,11 @@ depend on this crate.
   last two targets. The trail records each move's kind, shown by `plan
   history`; registries created earlier gain the column on open, and their old
   moves count as promotions.
+- SLA `max_runtime_secs` judges the newest matching run per tenant (on its
+  runtime so far if still running), like `freshness_secs`, so an old breach
+  stops failing `sla check` once a newer run meets the rule. It was judged per
+  run: one historical slow run kept `sla check` non-zero forever.
+  `deadline_unix` still judges every run still running.
 - `blut-operator` moves to the engine's MSRV, Rust 1.88 (was 1.89), and from
   kube 0.96 to kube 4.0 / k8s-openapi 0.28 (Kubernetes 1.32 API). It is
   publishable (`publish = ["crates-io"]`, 0.2.0-alpha.2) but not yet published.

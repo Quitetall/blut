@@ -96,11 +96,18 @@ freshness_secs = 3600
 ```
 
 `max_runtime_secs`, `deadline_unix`, and `freshness_secs` are positive bounds.
-Freshness looks at the newest measured `produced_unix` lineage timestamp among
-a rule's matching runs, per tenant: one breach when even that is older than the
-window. It fails closed when none of a tenant's matching runs has a
-measurement. `max_runtime_secs` and `deadline_unix` are judged per run. `blut sla check` exits nonzero
-while any breach is active, even if its durable row was already written.
+Runtime and freshness judge recent runs, per tenant, so an old breach stops
+counting once a newer run meets the rule:
+
+- `max_runtime_secs`: the newest matching run (by start time), on its runtime
+  so far if it is still running.
+- `freshness_secs`: the matching run with the newest measured `produced_unix`
+  lineage timestamp; one breach when even that is older than the window. It
+  fails closed when none of a tenant's matching runs has a measurement.
+- `deadline_unix`: every matching run still running past the deadline.
+
+`blut sla check` exits nonzero while any breach is active, even if its durable
+row was already written.
 
 ## Notification rules
 
