@@ -18,6 +18,7 @@ pub mod dispatch;
 pub mod fedround;
 pub mod gossip;
 pub mod introduction;
+pub mod mesh_exec;
 pub mod mesh_runner;
 pub mod mesh_wire;
 pub mod node;
@@ -39,6 +40,7 @@ pub use dispatch::{DefaultDispatchPolicy, DispatchPolicy, DispatchVerdict};
 pub use fedround::{CollectedDelta, FedRoundConfig, RoundOutcome, finalize_round};
 pub use gossip::{PeerExchange, PeerRecord};
 pub use introduction::{IntroError, Introduction, MAX_INTRODUCED_TRUST};
+pub use mesh_exec::{MeshExecutionAdapter, MeshStageWorker};
 pub use mesh_runner::{MeshDispatch, SharedCacheRunner, dispatch_stage};
 pub use mesh_wire::{
     MeshFrame, MeshHello, PROTOCOL_VERSION, Wire, accept_request, mesh_request, negotiate,

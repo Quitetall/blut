@@ -763,6 +763,46 @@ pub struct P2pServer {
     /// terminal close from a transient per-connection error and stop cleanly
     /// instead of spinning.
     closing: Arc<std::sync::atomic::AtomicBool>,
+    /// Writes the registry off the async path ([`RegistrySaver`]).
+    saver: RegistrySaver,
+}
+
+/// Persists a [`PeerRegistry`] without blocking the task that changed it.
+///
+/// `PeerRegistry::save` fsyncs and renames. Called from an inbound handshake
+/// while holding the registry lock, it stalled every handshake behind the
+/// disk: on a loaded disk a single save took seconds and dials hit their 10 s
+/// timeout. A change now marks the registry dirty and returns; one background
+/// task snapshots it and saves on a blocking thread, one save at a time, and
+/// marks that arrive during a save collapse into one more save. Durability is
+/// unchanged (the same fsync and rename); the save just happens after the
+/// handshake instead of inside it. The last mark is saved when the server is
+/// dropped.
+#[derive(Clone)]
+pub(crate) struct RegistrySaver {
+    dirty: tokio::sync::mpsc::Sender<()>,
+}
+
+impl RegistrySaver {
+    fn spawn(peers: Arc<RwLock<PeerRegistry>>) -> Self {
+        let (dirty, mut marks) = tokio::sync::mpsc::channel::<()>(1);
+        tokio::spawn(async move {
+            while marks.recv().await.is_some() {
+                let snapshot = peers.read().await.clone();
+                match tokio::task::spawn_blocking(move || snapshot.save()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!("p2p: failed to persist the peer registry: {e}"),
+                    Err(e) => tracing::warn!("p2p: peer registry save task failed: {e}"),
+                }
+            }
+        });
+        Self { dirty }
+    }
+
+    /// Mark the registry changed. Never blocks.
+    pub(crate) fn mark_dirty(&self) {
+        let _ = self.dirty.try_send(());
+    }
 }
 
 impl P2pServer {
@@ -790,12 +830,31 @@ impl P2pServer {
         let server_config = Self::make_server_config(&keypair, allow_legacy)?;
         let endpoint = Endpoint::server(server_config, addr)
             .map_err(|e| TrainError::other(format!("bind QUIC endpoint: {e}")))?;
+        let peers = Arc::new(RwLock::new(peers));
         Ok(Self {
             endpoint,
-            peers: Arc::new(RwLock::new(peers)),
+            saver: RegistrySaver::spawn(peers.clone()),
+            peers,
             allow_legacy,
             closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// Persist the peer registry after a change, off the caller's task
+    /// ([`RegistrySaver`]).
+    pub(crate) fn persist_peers(&self) {
+        self.saver.mark_dirty();
+    }
+
+    /// Save the peer registry now, on a blocking thread, and wait for it: for
+    /// a process about to exit, whose background save might not get to run.
+    pub(crate) async fn flush_peers(&self) {
+        let snapshot = self.peers.read().await.clone();
+        match tokio::task::spawn_blocking(move || snapshot.save()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("p2p: failed to persist the peer registry: {e}"),
+            Err(e) => tracing::warn!("p2p: peer registry save task failed: {e}"),
+        }
     }
 
     /// Whether [`shutdown`](Self::shutdown) has been called — a terminal signal
@@ -899,11 +958,10 @@ impl P2pServer {
                     registry.upsert(info);
                     TrustLevel::Anonymous
                 };
-                if let Err(e) = registry.save() {
-                    tracing::warn!(
-                        "p2p: failed to persist peer registry after registering {peer_id}: {e}"
-                    );
-                }
+                drop(registry);
+                // Saved off this task: an fsync here held the handshake (and
+                // the registry lock) behind the disk.
+                self.persist_peers();
 
                 // Send ack.
                 let ack = WireMessage::HandshakeAck {

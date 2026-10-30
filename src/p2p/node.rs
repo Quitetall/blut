@@ -43,6 +43,7 @@ use tokio::sync::RwLock;
 use crate::error::TrainError;
 use crate::p2p::crypto::KeyPair;
 use crate::p2p::gossip::{MAX_RECORDS_PER_EXCHANGE, PeerExchange, PeerRecord};
+use crate::p2p::mesh_exec::{MeshStageWorker, STAGE_STREAM_TAG};
 use crate::p2p::mesh_wire::{MeshFrame, mesh_request, read_frame_after_version, write_frame};
 use crate::p2p::objects::{MeshObjects, OBJECT_STREAM_TAG};
 use crate::p2p::peer::PeerId;
@@ -304,6 +305,9 @@ pub struct MeshNode {
     status_hub: std::sync::Mutex<Option<Arc<crate::framework::status::StatusHub>>>,
     /// Object plane: what this node serves to (and fetches from) peers.
     objects: std::sync::Mutex<Option<Arc<MeshObjects>>>,
+    /// Stage plane: runs stages a submitter's `recipe run --launcher p2p`
+    /// dispatches here ([`crate::p2p::mesh_exec`]).
+    stage_worker: std::sync::Mutex<Option<Arc<MeshStageWorker>>>,
     /// The address advertised in this node's own gossip record.
     advertise: std::sync::Mutex<Option<SocketAddr>>,
     /// Some once gossip runs.
@@ -350,6 +354,7 @@ impl MeshNode {
             addr_book: Arc::new(RwLock::new(HashMap::new())),
             status_hub: std::sync::Mutex::new(None),
             objects: std::sync::Mutex::new(None),
+            stage_worker: std::sync::Mutex::new(None),
             advertise: std::sync::Mutex::new(None),
             gossip: std::sync::Mutex::new(None),
             gossip_rx: std::sync::Mutex::new(HashMap::new()),
@@ -477,6 +482,82 @@ impl MeshNode {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    /// Attach the stage plane: the node then runs stages that submitters'
+    /// `recipe run --launcher p2p` dispatch to it, as `worker` allows. Without
+    /// one, a stage-plane request is refused.
+    pub fn set_stage_worker(&self, worker: Arc<MeshStageWorker>) {
+        *self.stage_worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
+    }
+
+    fn stage_worker(&self) -> Option<Arc<MeshStageWorker>> {
+        self.stage_worker
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// This node's registry trust and local reputation for a peer, or `None`
+    /// if it is not in the registry.
+    pub async fn peer_trust_and_reputation(&self, id: &PeerId) -> Option<(TrustLevel, f64)> {
+        self.server
+            .peers
+            .read()
+            .await
+            .get(id)
+            .map(|p| (p.trust, p.reputation))
+    }
+
+    /// Record the outcome of a stage this node dispatched to a peer: its
+    /// completed or failed count and its local reputation (A6). With the
+    /// peer's X25519 key known, a peer this node only dialed (or learned by
+    /// gossip) is added to the registry first, as `Anonymous`, so `blut p2p
+    /// peers list` shows every peer that ran work for it and an operator can
+    /// raise its trust. The registry is saved off this task.
+    pub async fn record_peer_outcome(
+        &self,
+        pubkey: &VerifyingKey,
+        x25519: Option<[u8; 32]>,
+        ok: bool,
+    ) {
+        let id = PeerId::from_pubkey(pubkey);
+        {
+            let mut peers = self.server.peers.write().await;
+            if peers.get(&id).is_none() {
+                let Some(x25519) = x25519 else {
+                    return;
+                };
+                peers.upsert(crate::p2p::peer::PeerInfo::new(
+                    *pubkey,
+                    x25519_dalek::PublicKey::from(x25519),
+                    TrustLevel::Anonymous,
+                    crate::p2p::peer::PeerCapabilities::default(),
+                ));
+            }
+            peers.update_reputation(&id, ok);
+        }
+        self.server.persist_peers();
+    }
+
+    /// Close every connection (peers see an orderly close, not a timeout) and
+    /// wait at most `drain` for the closes to reach them. A worker running a
+    /// stage for this node stops it when its connection closes.
+    pub async fn shutdown(&self, drain: Duration) {
+        // Connections this node dialed live on their own client endpoints,
+        // which closing the server endpoint does not reach.
+        let conns: Vec<quinn::Connection> =
+            self.connections.read().await.values().cloned().collect();
+        for conn in &conns {
+            conn.close(0u32.into(), b"node shutting down");
+        }
+        self.server.shutdown();
+        self.server.drain(drain).await;
+        // Let the dialed connections' drivers put their close on the wire.
+        tokio::time::sleep(drain.min(Duration::from_millis(250))).await;
+        // Outcomes recorded moments ago may still be waiting for the
+        // background save; the process may exit next.
+        self.server.flush_peers().await;
     }
 
     /// Set the address this node advertises for itself in gossip. Without it
@@ -939,6 +1020,22 @@ impl MeshNode {
             }
             return;
         }
+        if first[0] == STAGE_STREAM_TAG {
+            let score = match self.stage_worker() {
+                Some(worker) => worker.serve_stream(&peer, &conn, send, recv).await,
+                None => {
+                    // Not a stage worker: drop the stream; the submitter
+                    // reads the end of it as "does not run stages".
+                    let _ = send.finish();
+                    None
+                }
+            };
+            if let Some(ok) = score {
+                self.server.peers.write().await.update_reputation(&peer, ok);
+                self.server.persist_peers();
+            }
+            return;
+        }
         let frame = match tokio::time::timeout(
             REQUEST_BODY_TIMEOUT,
             read_frame_after_version(first[0], &mut recv),
@@ -968,11 +1065,9 @@ impl MeshNode {
         // scheduler's doing (e.g. our own missing worker capability).
         // Local-only: no reputation ever crosses the wire (ADR 0079).
         if let Some(ok) = score {
-            let mut peers = self.server.peers.write().await;
-            peers.update_reputation(&peer, ok);
-            if let Err(e) = peers.save() {
-                tracing::warn!("mesh node: persist reputation for {peer} failed: {e}");
-            }
+            self.server.peers.write().await.update_reputation(&peer, ok);
+            // Saved off this task, like the handshake's registration.
+            self.server.persist_peers();
         }
         if let Err(e) = write_frame(&mut send, &response).await {
             tracing::debug!("mesh node: reply to {peer} failed: {e}");

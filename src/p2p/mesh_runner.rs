@@ -458,6 +458,7 @@ pub async fn dispatch_stage(
         ));
     }
     if result.task_id != task_id {
+        node.record_peer_outcome(worker_key, None, false).await;
         return Err(TrainError::other("result is for a different task"));
     }
 
@@ -492,6 +493,9 @@ pub async fn dispatch_stage(
             .map_err(|e| TrainError::other(format!("store fetched output: {e}")))?;
     }
     let output_fetch = started.elapsed();
+    // The worker ran it and its output verified: count it (A6), so `p2p peers
+    // list` no longer shows a peer that did the work as untried.
+    node.record_peer_outcome(worker_key, None, true).await;
     Ok(MeshDispatch {
         result,
         output,
