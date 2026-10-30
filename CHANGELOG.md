@@ -84,6 +84,11 @@ depend on this crate.
   Object) or the caller must signal the process group (`rlimit`, `bare`).
 
 ### Changed
+- `blut jobs`' `output` column is now `recipe`: the recipe, deploy pointer or
+  plan name the job ran (from its resume marker or `plan.json`), else a legacy
+  single-trainer job's output name. The output name is set only by that legacy
+  launch, so the column read `-` for every job a recipe ran. `--json` rows gain
+  `recipe`; `output_name` is unchanged.
 - A stage output whose artifact type declares external paths
   (`ALLOW_EXTERNAL_PATHS`, such as `checks.jsonl` and `dataset.jsonl`) is
   logged as "not portable and will not be cached" at debug instead of as a
@@ -154,6 +159,14 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- `blut log` printed only "no trainer progress" and `blut jobs` no step, loss or
+  final loss for every job a recipe ran. A plan launch records trainer progress
+  as `stage_step` events (a trainer stage forwards each `StatusUpdate` its
+  trainer prints), and `jobs::read_status` read only bare update lines. It now
+  also returns the updates stages forwarded, which the TUI's log pane reads
+  too. When more than one stage reported progress, `blut log` prefixes each
+  line with the stage (`[1 train] step 3/10 …`), and `blut log --json` lines
+  carry `node_idx` and `stage_name`.
 - `plan publish --tenant` stored any string, so a deployment could be published
   under a tenant no run can resolve (`a b`, `../x`). `plan publish`, `promote`,
   `rollback` and `history` parse `--tenant` like every other tenant input and
