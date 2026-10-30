@@ -2776,10 +2776,7 @@ fn run_sla_cmd(cmd: SlaCommand) -> Result<()> {
 
 /// `~/.blut` — the operator state root shared by triggers/sla/secrets configs.
 fn dot_blut() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
-        .join(".blut")
+    crate::paths::blut_home()
 }
 
 fn run_footprint_cmd(cmd: FootprintCommand) -> Result<()> {
@@ -3171,10 +3168,12 @@ fn run_policy(cmd: PolicyCommand) -> Result<()> {
             // cron doesn't run through a shell that expands ~ , so
             // resolve the log path to an absolute string before
             // printing. Falls back to /tmp if XDG resolution fails.
-            let log_path = dirs::data_local_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                .join("lamu")
-                .join("train-auto.log");
+            let log_path = crate::paths::under_state_root("train-auto.log").unwrap_or_else(|| {
+                dirs::data_local_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                    .join("lamu")
+                    .join("train-auto.log")
+            });
             print!(
                 "{}",
                 policy_cron_hint(

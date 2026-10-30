@@ -8,18 +8,85 @@
 //! bundled trainer.py during dev, XDG `data_local_dir/lamu/` for
 //! everything else); the `LAMU_*` env vars below are the real
 //! back-compat override hooks.
+//!
+//! # One root for a separate install: `$LAMU_TRAIN_DATA_DIR`
+//!
+//! When `$LAMU_TRAIN_DATA_DIR` is set, it is the root of ALL of a user's
+//! BLUT state ([`state_root`]), so two values of it are two independent
+//! installs. Each store resolves, in order:
+//!
+//! 1. its own explicit variable, if set (unchanged, e.g. `$BLUT_REGISTRY_DB`);
+//! 2. `$LAMU_TRAIN_DATA_DIR/<name>` (the table below);
+//! 3. its historical default under `$HOME` / XDG.
+//!
+//! With `$LAMU_TRAIN_DATA_DIR` unset, every path is exactly what it was.
+//!
+//! | Store | Explicit variable | Under the root | Default |
+//! |---|---|---|---|
+//! | jobs | `LAMU_TRAIN_JOBS_DIR` | `train-jobs/` | `~/.local/share/lamu/train-jobs/` |
+//! | global stage cache | `LAMU_TRAIN_CACHE_DIR` | `train-cache/` | `~/.local/share/lamu/train-cache/` |
+//! | model + plan registry | `BLUT_REGISTRY_DB` | `registry.db` | `~/.blut/registry.db` |
+//! | dataset catalog tags | `BLUT_CATALOG_DB` | `catalog.db` | `~/.blut/catalog.db` |
+//! | datasets (shared with LAMU memory) | `LAMU_MEMORY_DB` | `conversations.db` | `~/.local/share/lamu/conversations.db` |
+//! | auto-train policy | `LAMU_TRAIN_POLICY` | `train-policy.toml` | `~/.config/lamu/train-policy.toml` |
+//! | footprint calibration | `BLUT_FOOTPRINT_PATH` | `footprints.json` | `~/.config/blut/footprints.json` |
+//! | backend registry config | `BLUT_REGISTRY_PATH` | `registry.yaml` | `~/.config/blut/registry.yaml` |
+//! | partitions | `BLUT_PARTITIONS_DIR` | `partitions/` | `~/.config/blut/partitions/` |
+//! | tenant quotas | `BLUT_TENANTS_CONFIG` | `tenants.toml` | `~/.config/blut/tenants.toml` |
+//! | declarative recipes | `BLUT_USER_RECIPES_DIR` | `recipes/` | `~/.config/blut/recipes/` |
+//! | `~/.blut` files (SLA, cost, budget, triggers, events) | per file | the root itself | `~/.blut/` |
+//!
+//! Not moved: the scheduler lock (it arbitrates the GPU between every
+//! process on the machine, so separate installs must still see one lock),
+//! the systemd timer units of `blut schedule` (systemd reads only
+//! `~/.config/systemd/user`), and the materialized training data, which
+//! already lived in `$LAMU_TRAIN_DATA_DIR`.
+//!
+//! Setting the variable on an existing install points it at a new, empty
+//! state; set the per-store variables to keep using the old stores.
 
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, TrainError};
 
+/// The root of a separate install: `$LAMU_TRAIN_DATA_DIR` when set and
+/// non-empty (see the module docs for what lives under it).
+pub fn state_root() -> Option<PathBuf> {
+    std::env::var_os("LAMU_TRAIN_DATA_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// `<state root>/<name>` when `$LAMU_TRAIN_DATA_DIR` is set, else `None`
+/// (the store keeps its historical default).
+pub fn under_state_root(name: &str) -> Option<PathBuf> {
+    state_root().map(|root| root.join(name))
+}
+
+/// The directory of BLUT's own state files (SLA log, cost ledger, budget,
+/// trigger bindings and events): `$LAMU_TRAIN_DATA_DIR` when set, else
+/// `$HOME/.blut`.
+pub fn blut_home() -> PathBuf {
+    state_root().unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join(".blut")
+    })
+}
+
 /// Directory holding all per-job state. One subdir per job id.
 ///
 /// Default: `~/.local/share/lamu/train-jobs/`
-/// Override: `$LAMU_TRAIN_JOBS_DIR`
+/// Override: `$LAMU_TRAIN_JOBS_DIR`, else `$LAMU_TRAIN_DATA_DIR/train-jobs/`
 pub fn jobs_dir() -> Result<PathBuf> {
     if let Some(p) = utf8_path_env("LAMU_TRAIN_JOBS_DIR")? {
         return Ok(p);
+    }
+    // Job paths are recorded in JSON, so the root must be UTF-8 as well.
+    if let Some(root) = utf8_path_env("LAMU_TRAIN_DATA_DIR")?.filter(|p| !p.as_os_str().is_empty())
+    {
+        return Ok(root.join("train-jobs"));
     }
     let base = dirs::data_local_dir().ok_or_else(|| {
         TrainError::other("data_local_dir() unavailable; set $LAMU_TRAIN_JOBS_DIR")

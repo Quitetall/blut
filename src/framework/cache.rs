@@ -162,6 +162,9 @@ impl CacheHandle {
         if let Some(p) = std::env::var_os("LAMU_TRAIN_CACHE_DIR") {
             return Some(PathBuf::from(p));
         }
+        if let Some(p) = crate::paths::under_state_root("train-cache") {
+            return Some(p);
+        }
         dirs::data_local_dir().map(|d| d.join("lamu").join("train-cache"))
     }
 

@@ -76,10 +76,18 @@ pub struct HistoryEntry {
 }
 
 /// Path to the deployment registry DB (`~/.blut/registry.db`).
-/// `$BLUT_REGISTRY_DB` overrides it (tests, alternate homes).
+/// `$BLUT_REGISTRY_DB` overrides it (tests, alternate homes), else
+/// `$LAMU_TRAIN_DATA_DIR/registry.db` (see [`crate::paths`]).
 pub fn registry_db_path() -> Result<std::path::PathBuf> {
     if let Some(p) = std::env::var_os("BLUT_REGISTRY_DB") {
         return Ok(std::path::PathBuf::from(p));
+    }
+    if let Some(root) = crate::paths::state_root() {
+        std::fs::create_dir_all(&root).map_err(|e| TrainError::Io {
+            path: root.clone(),
+            source: e,
+        })?;
+        return Ok(root.join("registry.db"));
     }
     let dir = dirs::home_dir()
         .ok_or_else(|| TrainError::other("home_dir() unavailable; set $BLUT_REGISTRY_DB"))?

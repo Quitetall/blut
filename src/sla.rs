@@ -404,10 +404,7 @@ pub fn default_sla_path() -> std::path::PathBuf {
     if let Some(p) = std::env::var_os("BLUT_SLA_PATH") {
         return std::path::PathBuf::from(p);
     }
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default();
-    home.join(".blut").join("sla.jsonl")
+    crate::paths::blut_home().join("sla.jsonl")
 }
 
 #[cfg(test)]

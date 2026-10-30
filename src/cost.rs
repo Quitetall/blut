@@ -38,10 +38,7 @@ pub fn default_cap_path() -> std::path::PathBuf {
 /// question a module-ownership decision has to settle, so it is left alone here rather than
 /// refactored mid-ADR.
 fn dot_blut() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
-        .join(".blut")
+    crate::paths::blut_home()
 }
 
 /// One `[cap]` table: a per-tenant ceiling in whole cents.

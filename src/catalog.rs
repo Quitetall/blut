@@ -232,10 +232,17 @@ CREATE TABLE IF NOT EXISTS catalog_tags (
 );";
 
 /// Path to the catalog tags store (`~/.blut/catalog.db`; `$BLUT_CATALOG_DB`
-/// override).
+/// override, else `$LAMU_TRAIN_DATA_DIR/catalog.db`).
 pub fn catalog_db_path() -> Result<std::path::PathBuf> {
     if let Some(p) = std::env::var_os("BLUT_CATALOG_DB") {
         return Ok(std::path::PathBuf::from(p));
+    }
+    if let Some(root) = crate::paths::state_root() {
+        std::fs::create_dir_all(&root).map_err(|e| TrainError::Io {
+            path: root.clone(),
+            source: e,
+        })?;
+        return Ok(root.join("catalog.db"));
     }
     let dir = dirs::home_dir()
         .ok_or_else(|| TrainError::other("home_dir() unavailable; set $BLUT_CATALOG_DB"))?

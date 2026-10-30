@@ -345,10 +345,7 @@ fn launch_and_wait_for_admission(
 }
 
 fn dot_blut() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
-        .join(".blut")
+    crate::paths::blut_home()
 }
 
 #[cfg(test)]

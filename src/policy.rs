@@ -161,6 +161,9 @@ pub fn policy_path() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("LAMU_TRAIN_POLICY") {
         return Ok(PathBuf::from(p));
     }
+    if let Some(p) = crate::paths::under_state_root("train-policy.toml") {
+        return Ok(p);
+    }
     let dir = dirs::config_dir()
         .ok_or_else(|| TrainError::other("config_dir() unavailable; set $LAMU_TRAIN_POLICY"))?
         .join("lamu");
