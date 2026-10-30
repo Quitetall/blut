@@ -214,6 +214,9 @@ pub fn registry_path() -> PathBuf {
     if let Some(p) = std::env::var_os("LAMU_REGISTRY_PATH") {
         return PathBuf::from(p);
     }
+    if let Some(p) = crate::paths::under_state_root("registry.yaml") {
+        return p;
+    }
     dirs::config_dir()
         .unwrap_or_default()
         .join("blut")
@@ -232,6 +235,9 @@ pub fn registry_path() -> PathBuf {
 pub fn footprint_store_path() -> PathBuf {
     if let Some(p) = std::env::var_os("BLUT_FOOTPRINT_PATH") {
         return PathBuf::from(p);
+    }
+    if let Some(p) = crate::paths::under_state_root("footprints.json") {
+        return p;
     }
     dirs::config_dir()
         .unwrap_or_default()

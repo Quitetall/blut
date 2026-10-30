@@ -238,6 +238,12 @@ pub struct ExecCtx {
     training_io_downgrade_reason: Option<crate::framework::async_io::TrainingIoDowngradeReason>,
     /// Select-once witness consumed by the chosen executor implementation.
     prepared_execution: Option<PreparedExecution>,
+    /// Treat a node's terminal stage failure like an advisory one: record it,
+    /// prune the node's descendants and keep running every other branch,
+    /// instead of failing the plan fast. Set for HPO plans, whose trials are
+    /// independent branches: one trial that crashes (or diverges past its
+    /// retries) must not cancel healthy siblings. Parallel executor only.
+    isolate_stage_failures: bool,
     #[cfg(test)]
     status_writer_failure: Option<std::io::ErrorKind>,
     #[cfg(test)]
@@ -324,6 +330,7 @@ impl ExecCtx {
             training_io_whole_job_base_bytes: None,
             training_io_downgrade_reason: None,
             prepared_execution: None,
+            isolate_stage_failures: false,
             #[cfg(test)]
             status_writer_failure: None,
             #[cfg(test)]
@@ -378,6 +385,12 @@ impl ExecCtx {
     /// inline tail. This is execution-only and cache-neutral.
     pub fn with_sync_io(mut self, sync_io: bool) -> Self {
         self.sync_io = sync_io;
+        self
+    }
+
+    /// Isolate terminal stage failures to their own branch (see the field).
+    pub(crate) fn with_isolated_stage_failures(mut self) -> Self {
+        self.isolate_stage_failures = true;
         self
     }
 
@@ -1321,6 +1334,22 @@ fn cancel_failure(
         NodeFailure::Killed { node_id }
     } else {
         NodeFailure::Cancelled
+    }
+}
+
+/// The `StageFailed` error text of a node stopped by a policy's `KillBranch`
+/// prune (HPO early stopping). It keeps the word "cancelled", which every
+/// status reader already treats as a deliberate stop rather than a crash, and
+/// adds "by the control policy" so a reader can tell an early-stopped branch
+/// from a cancelled plan.
+pub(crate) const CONTROL_PRUNE_MESSAGE: &str = "cancelled by the control policy (branch pruned)";
+
+/// The status text for a cancelled node: [`CONTROL_PRUNE_MESSAGE`] for a
+/// targeted prune, `plain` for a plan cancel.
+fn cancel_message(failure: &NodeFailure, plain: &str) -> String {
+    match failure {
+        NodeFailure::Killed { .. } => CONTROL_PRUNE_MESSAGE.to_string(),
+        _ => plain.to_string(),
     }
 }
 
@@ -2378,13 +2407,14 @@ async fn run_node_with_admission(
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
                     _ = cur.cancelled() => {
+                        let failure = cancel_failure(task.node_id, &task.node_cancel, &env.cancel);
                         env.status.emit(StageEvent::StageFailed {
                             node_idx: idx,
                             stage_name: stage_name.clone(),
-                            error: "cancelled during retry backoff".into(),
+                            error: cancel_message(&failure, "cancelled during retry backoff"),
                             failure: None,
                         });
-                        return Err(cancel_failure(task.node_id, &task.node_cancel, &env.cancel));
+                        return Err(failure);
                     }
                     _ = sleep_until_opt(env.deadline) => {
                         return Err(deadline_failure(&env));
@@ -2393,13 +2423,14 @@ async fn run_node_with_admission(
             }
         }
         if task.node_cancel.is_cancelled() {
+            let failure = cancel_failure(task.node_id, &task.node_cancel, &env.cancel);
             env.status.emit(StageEvent::StageFailed {
                 node_idx: idx,
                 stage_name: stage_name.clone(),
-                error: "cancelled before stage attempt".into(),
+                error: cancel_message(&failure, "cancelled before stage attempt"),
                 failure: None,
             });
-            return Err(cancel_failure(task.node_id, &task.node_cancel, &env.cancel));
+            return Err(failure);
         }
 
         // Clean tmp per attempt — each attempt starts from an empty dir.
@@ -2913,17 +2944,15 @@ async fn run_node_with_admission(
                         Some(detail) => StageError::Diverged { detail },
                         // A plain plan cancel / targeted kill: unchanged.
                         None => {
+                            let failure =
+                                cancel_failure(task.node_id, &task.node_cancel, &env.cancel);
                             env.status.emit(StageEvent::StageFailed {
                                 node_idx: idx,
                                 stage_name,
-                                error: "cancelled during stage".into(),
+                                error: cancel_message(&failure, "cancelled during stage"),
                                 failure: None,
                             });
-                            return Err(cancel_failure(
-                                task.node_id,
-                                &task.node_cancel,
-                                &env.cancel,
-                            ));
+                            return Err(failure);
                         }
                     }
                 } else {
@@ -3015,7 +3044,20 @@ async fn run_node_with_admission(
             }
             continue;
         }
-        // Terminal failure.
+        // Terminal failure. A token-fired, NON-diverged node keeps the EXACT
+        // prior outcome (targeted kill → Killed prune; plan cancel or a bare
+        // `Cancelled` error → Cancelled, fail-fast); its status line says which,
+        // so a reader can tell an early-stopped branch from a cancelled plan.
+        if !diverged && (token_fired || matches!(err, StageError::Cancelled)) {
+            let failure = cancel_failure(task.node_id, &task.node_cancel, &env.cancel);
+            env.status.emit(StageEvent::StageFailed {
+                node_idx: idx,
+                stage_name: stage_name.clone(),
+                error: cancel_message(&failure, &format!("{err}")),
+                failure: crate::framework::error_domain::extract_failure_summary(&err),
+            });
+            return Err(failure);
+        }
         env.status.emit(StageEvent::StageFailed {
             node_idx: idx,
             stage_name: stage_name.clone(),
@@ -3036,13 +3078,6 @@ async fn run_node_with_admission(
                 stage: stage_name,
                 source: err,
             });
-        }
-        // A token-fired, NON-diverged node keeps the EXACT prior behaviour:
-        // targeted kill → Killed (prune); plan cancel or a bare Cancelled error
-        // → Cancelled (fail-fast).
-        let cancelled = token_fired || matches!(err, StageError::Cancelled);
-        if cancelled {
-            return Err(cancel_failure(task.node_id, &task.node_cancel, &env.cancel));
         }
         return Err(NodeFailure::Stage {
             idx,
@@ -6092,6 +6127,7 @@ impl ParallelExecutor {
         // → the watcher is never subscribed and the loop is byte-identical to
         // the pre-control path.
         let control = ctx.control.clone();
+        let isolate_stage_failures = ctx.isolate_stage_failures;
         let Prelude {
             writer_handle,
             env,
@@ -6253,6 +6289,8 @@ impl ParallelExecutor {
                                 .chain(appended.iter())
                                 .find_map(|node| node.partition.clone())
                         });
+                    let spawn_label = delta.label.clone();
+                    let order_before = order.len();
                     match inject_spawn(
                         delta,
                         resolved_training_io,
@@ -6270,7 +6308,24 @@ impl ParallelExecutor {
                         &mut outputs,
                         &mut logical_outputs,
                     ) {
-                        Ok(k) => spawns_total += k,
+                        Ok(k) => {
+                            spawns_total += k;
+                            // Tell the policy which topo positions its spawn
+                            // got, so it can attribute their steps (HPO trial
+                            // bookkeeping); `order` grew by exactly these.
+                            if let Some(policy) = control.as_ref() {
+                                let nodes: Vec<(u32, &str)> = order[order_before..]
+                                    .iter()
+                                    .map(|gid| {
+                                        (
+                                            node_idx_of.get(gid).copied().unwrap_or(0),
+                                            node_at(&view, &appended, orig_n, *gid).stage.name(),
+                                        )
+                                    })
+                                    .collect();
+                                policy.on_spawned(spawn_label.as_deref(), &nodes);
+                            }
+                        }
                         Err(SpawnInjectionError::TrainingIo(error)) => {
                             // A child profile/calibration refusal is an
                             // admission failure, not a best-effort HPO shape
@@ -7648,11 +7703,15 @@ impl ParallelExecutor {
                     if let NodeFailure::Stage { idx, stage, source } = &f
                         && let Some(&nid) = order.get(*idx as usize)
                     {
-                        let is_adv = node_stages
-                            .get(&nid)
-                            .map(|s| s.is_advisory())
-                            .unwrap_or(false)
-                            && !strict_advisory();
+                        // An isolated plan (HPO) treats every terminal stage
+                        // failure like an advisory one: the failing branch is
+                        // pruned and its siblings keep running.
+                        let is_adv = isolate_stage_failures
+                            || node_stages
+                                .get(&nid)
+                                .map(|s| s.is_advisory())
+                                .unwrap_or(false)
+                                && !strict_advisory();
                         node_tokens.remove(&nid);
                         node_stages.remove(&nid);
                         ordinary_admission_demands.remove(&nid);
@@ -7665,7 +7724,14 @@ impl ParallelExecutor {
                         // Advisory failure: WARN, prune descendants exactly like a
                         // KILL (their input can't materialize), but do NOT fail the
                         // plan — other branches keep running.
-                        tracing::warn!("advisory stage '{stage}' failed (non-fatal): {reason}");
+                        if isolate_stage_failures {
+                            tracing::warn!(
+                                "stage '{stage}' (node {idx}) failed; its branch is pruned and \
+                                 the rest of the plan continues: {reason}"
+                            );
+                        } else {
+                            tracing::warn!("advisory stage '{stage}' failed (non-fatal): {reason}");
+                        }
                         // No StageFailure downcast happens on this path today
                         // (reason is only stringified above) — nothing to thread
                         // through yet (ADR 0072 B-series wires real origins into

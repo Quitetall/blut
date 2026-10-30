@@ -24,6 +24,7 @@
 //! pushed out by a margin, recomputed as observations arrive.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use rand::SeedableRng;
@@ -95,8 +96,8 @@ struct SurrogateState {
 
 /// The multi-objective search driver.
 pub struct SurrogatePolicy {
-    trial_of_topo: Vec<Option<u32>>,
-    trial_overlays: Vec<Overlay>,
+    /// Topo → trial and per-trial overlays, initial and spawned.
+    book: Arc<super::book::TrialBook>,
     space: SearchSpace,
     cfg: SurrogateConfig,
     factory: FreshFactory,
@@ -134,8 +135,10 @@ impl SurrogatePolicy {
             return Err("surrogate driver: max_spawns is 0, so it could never propose".into());
         }
         Ok(Self {
-            trial_of_topo,
-            trial_overlays,
+            book: Arc::new(super::book::TrialBook::from_parts(
+                trial_of_topo,
+                trial_overlays,
+            )),
             space,
             cfg,
             factory,
@@ -269,7 +272,7 @@ impl SurrogatePolicy {
 
         if budget >= self.cfg.max_budget && complete && !st.told.contains(&trial) {
             st.told.insert(trial);
-            if let Some(overlay) = self.trial_overlays.get(trial as usize).cloned() {
+            if let Some(overlay) = self.book.overlay(trial) {
                 let vector: Vec<f64> = values.iter().map(|v| v.unwrap()).collect();
                 st.observations.push((overlay, vector));
             }
@@ -293,6 +296,14 @@ impl SurrogatePolicy {
         SurrogateDecision::Continue
     }
 
+    /// Share `book` (the HPO job's, bound to its `hpo.json`) instead of the
+    /// private one built from the constructor's initial population. The book
+    /// must already hold that population.
+    pub fn with_trial_book(mut self, book: Arc<super::book::TrialBook>) -> Self {
+        self.book = book;
+        self
+    }
+
     /// Observations gathered so far, for tests and reporting.
     pub fn observations(&self) -> Vec<(Overlay, Vec<f64>)> {
         self.state.lock().observations.clone()
@@ -301,12 +312,7 @@ impl SurrogatePolicy {
 
 impl ControlPolicy for SurrogatePolicy {
     fn on_step(&self, m: &StepMetrics) -> Control {
-        let Some(trial) = self
-            .trial_of_topo
-            .get(m.node_idx as usize)
-            .copied()
-            .flatten()
-        else {
+        let Some(trial) = self.book.trial_of(m.node_idx) else {
             return Control::Continue;
         };
         let budget = dotted_u64(m.update, &self.cfg.budget_key).unwrap_or(0);
@@ -315,13 +321,19 @@ impl ControlPolicy for SurrogatePolicy {
             SurrogateDecision::Spawn(overlay) => match (self.factory)(&overlay) {
                 Ok(subplan) => Control::Spawn(Box::new(SpawnDelta::new(
                     subplan,
-                    Some("surrogate-suggest".into()),
+                    Some(self.book.reserve(overlay)),
                 ))),
                 Err(e) => {
                     tracing::warn!("surrogate driver: sub-plan build failed: {e}");
                     Control::Continue
                 }
             },
+        }
+    }
+
+    fn on_spawned(&self, label: Option<&str>, nodes: &[(u32, &str)]) {
+        if let Some(label) = label {
+            self.book.bind(label, nodes);
         }
     }
 }

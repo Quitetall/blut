@@ -117,6 +117,13 @@ pub fn registry_path() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("LAMU_MEMORY_DB") {
         return Ok(PathBuf::from(p));
     }
+    if let Some(root) = crate::paths::state_root() {
+        std::fs::create_dir_all(&root).map_err(|e| TrainError::Io {
+            path: root.clone(),
+            source: e,
+        })?;
+        return Ok(root.join("conversations.db"));
+    }
     let dir = dirs::data_local_dir()
         .ok_or_else(|| TrainError::other("data_local_dir() unavailable; set $LAMU_MEMORY_DB"))?
         .join("lamu");

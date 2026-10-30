@@ -655,6 +655,9 @@ impl PartitionSet {
         if let Some(p) = std::env::var_os("BLUT_PARTITIONS_DIR") {
             return Ok(PathBuf::from(p));
         }
+        if let Some(p) = crate::paths::under_state_root("partitions") {
+            return Ok(p);
+        }
         let base = dirs::config_dir().ok_or_else(|| {
             TrainError::other("cannot resolve ~/.config (set $BLUT_PARTITIONS_DIR)")
         })?;

@@ -2784,8 +2784,12 @@ async fn run_model_cmd(cmd: ModelCommand) -> Result<()> {
             if hist.is_empty() {
                 println!("no history for model://{name}@{alias}");
             }
-            for h in &hist {
-                println!("{}  {}", h.moved_at, h.model_hash);
+            // Every promote AND every rollback appends a row, so the last row
+            // is always where the alias points now.
+            let last = hist.len().saturating_sub(1);
+            for (i, h) in hist.iter().enumerate() {
+                let current = if i == last { "  (current)" } else { "" };
+                println!("{}  {}{current}", utc_timestamp(h.moved_at), h.model_hash);
             }
             Ok(())
         }
@@ -2847,15 +2851,34 @@ fn run_experiment_cmd(cmd: ExperimentCommand) -> Result<()> {
                 .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
             let comparison = crate::experiment_registry::compare_latest(&db, &name, &tenant)
                 .map_err(|e| anyhow!("{e}"))?;
+            // An HPO search is compared through its best completed trial: say
+            // which, since the metrics are that trial's and not the job's.
+            let headline =
+                |run: &str| crate::hpo::results::job_headline_trial(run).map(|(trial, _)| trial);
+            let (trial_a, trial_b) = (headline(&comparison.run_a), headline(&comparison.run_b));
             if json {
-                emit_json(&comparison)?;
+                let mut value = serde_json::to_value(&comparison)?;
+                if let Some(obj) = value.as_object_mut()
+                    && (trial_a.is_some() || trial_b.is_some())
+                {
+                    obj.insert(
+                        "hpo_headline_trials".into(),
+                        serde_json::json!({ "run_a": trial_a, "run_b": trial_b }),
+                    );
+                }
+                emit_json(&value)?;
             } else {
+                let note = |trial: Option<u32>| {
+                    trial
+                        .map(|t| format!("  (HPO: metrics of best completed trial {t})"))
+                        .unwrap_or_default()
+                };
                 println!(
                     "experiment://{}  tenant={}",
                     comparison.experiment, comparison.tenant
                 );
-                println!("baseline  : {}", comparison.run_a);
-                println!("candidate : {}", comparison.run_b);
+                println!("baseline  : {}{}", comparison.run_a, note(trial_a));
+                println!("candidate : {}{}", comparison.run_b, note(trial_b));
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&comparison.diff)
@@ -2877,6 +2900,14 @@ fn run_experiment_cmd(cmd: ExperimentCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// A Unix time as `YYYY-MM-DDTHH:MM:SSZ`, or the raw number when it is out of
+/// range (a hand-edited row must still print).
+fn utc_timestamp(unix: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(unix, 0)
+        .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| unix.to_string())
 }
 
 /// The acting user recorded as a deployment's publisher.
@@ -3073,10 +3104,7 @@ fn run_sla_cmd(cmd: SlaCommand) -> Result<()> {
 
 /// `~/.blut` — the operator state root shared by triggers/sla/secrets configs.
 fn dot_blut() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
-        .join(".blut")
+    crate::paths::blut_home()
 }
 
 fn run_footprint_cmd(cmd: FootprintCommand) -> Result<()> {
@@ -3626,10 +3654,12 @@ fn run_policy(cmd: PolicyCommand) -> Result<()> {
             // cron doesn't run through a shell that expands ~ , so
             // resolve the log path to an absolute string before
             // printing. Falls back to /tmp if XDG resolution fails.
-            let log_path = dirs::data_local_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                .join("lamu")
-                .join("train-auto.log");
+            let log_path = crate::paths::under_state_root("train-auto.log").unwrap_or_else(|| {
+                dirs::data_local_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                    .join("lamu")
+                    .join("train-auto.log")
+            });
             print!(
                 "{}",
                 policy_cron_hint(
@@ -3987,5 +4017,16 @@ mod external_exit_code_tests {
         assert_eq!(external_exit_code(&from_raw(3 << 8)), Some(3));
         assert_eq!(external_exit_code(&from_raw(2 << 8)), Some(2));
         assert_eq!(external_exit_code(&from_raw(9)), Some(128 + 9), "SIGKILL");
+    }
+}
+
+#[cfg(test)]
+mod utc_timestamp_tests {
+    #[test]
+    fn history_times_read_as_utc_dates() {
+        // E2E follow-up: `model history` printed raw Unix seconds.
+        assert_eq!(super::utc_timestamp(1_792_797_993), "2026-10-23T23:26:33Z");
+        assert_eq!(super::utc_timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(super::utc_timestamp(i64::MAX), i64::MAX.to_string());
     }
 }

@@ -133,10 +133,15 @@ impl TenantQuotaPolicy {
             }
             return Self::load_at(&path);
         }
-        let Some(base) = dirs::config_dir() else {
-            return Ok(Self::default());
+        let path = match crate::paths::under_state_root("tenants.toml") {
+            Some(path) => path,
+            None => {
+                let Some(base) = dirs::config_dir() else {
+                    return Ok(Self::default());
+                };
+                base.join("blut").join("tenants.toml")
+            }
         };
-        let path = base.join("blut").join("tenants.toml");
         if !path.exists() {
             return Ok(Self::default());
         }

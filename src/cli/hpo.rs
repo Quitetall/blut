@@ -641,6 +641,9 @@ pub(super) async fn run_hpo(
         ctx = ctx.with_training_io_selection_budget_bytes(budget_bytes);
     }
     ctx = ctx.with_training_io_node_admission_resolver(node_admission);
+    // Trials are independent branches of one plan: one that crashes is
+    // recorded as failed and pruned, never a reason to cancel its siblings.
+    ctx = ctx.with_isolated_stage_failures();
     if shared_cache && let Some(global) = crate::framework::CacheHandle::default_global_path() {
         std::fs::create_dir_all(&global)
             .with_context(|| format!("create global cache dir {}", global.display()))?;
@@ -701,6 +704,13 @@ pub(super) async fn run_hpo(
             trial_of_topo: trial_of_topo.clone(),
         }
     };
+    // The live trial map a spawning policy (TPE, surrogate, PBT) shares with
+    // `hpo.json`: every trial it spawns is recorded there as it is injected,
+    // so the leaderboard and a study's front rank it like an initial trial.
+    let trial_book = std::sync::Arc::new(crate::hpo::TrialBook::persisted(
+        hpo_manifest.clone(),
+        job_dir.clone(),
+    ));
 
     // Early-stop scheduler. The scheduler maps each StageStep's topo node_idx ->
     // trial, reads the objective + budget, and KillBranch-es underperformers:
@@ -818,7 +828,8 @@ pub(super) async fn run_hpo(
             min_peers: 2,
             max_spawns: (max_trials as usize).saturating_mul(8).max(1),
         };
-        let sched = PbtPolicy::new(trial_of_topo, pbt_trials, sp.clone(), cfg, factory, seed);
+        let sched = PbtPolicy::new(trial_of_topo, pbt_trials, sp.clone(), cfg, factory, seed)
+            .with_trial_book(std::sync::Arc::clone(&trial_book));
         ctx = ctx.with_control(with_nan_safety(std::sync::Arc::new(sched)));
         eprintln!(
             "hpo: pbt rungs={rungs:?} (metric={metric} {mode}, cull<p{percentile}, resume-on-promote)"
@@ -854,7 +865,8 @@ pub(super) async fn run_hpo(
             cfg,
             sampler,
             factory,
-        );
+        )
+        .with_trial_book(std::sync::Arc::clone(&trial_book));
         ctx = ctx.with_control(with_nan_safety(std::sync::Arc::new(sched)));
         eprintln!(
             "hpo: tpe (metric={metric} {mode}, complete@{max_budget}, ≤{max_trials} suggested)"
@@ -903,7 +915,8 @@ pub(super) async fn run_hpo(
             factory,
             follow_up_seed(seed),
         )
-        .map_err(|e| anyhow!("{e}"))?;
+        .map_err(|e| anyhow!("{e}"))?
+        .with_trial_book(std::sync::Arc::clone(&trial_book));
         ctx = ctx.with_control(with_nan_safety(std::sync::Arc::new(sched)));
         eprintln!(
             "hpo: surrogate/EHVI (objectives={}, complete@{max_budget}, ≤{max_trials} suggested)",
@@ -969,23 +982,38 @@ pub(super) async fn run_hpo(
     crate::python_kill::unbind_current_job();
     match result {
         Ok(_) => {
-            crate::jobs::write_state(&job_id, JobState::Done)
-                .with_context(|| format!("write Done state for {job_id}"))?;
-            if let Err(e) = crate::lineage_db::ingest_job(&job_id, &name, "done") {
+            // Trials run isolated: a crashed trial is recorded as failed and the
+            // rest of the search continues, so the plan succeeding says nothing
+            // about the search. It succeeded if at least one trial completed and
+            // reported the objective; a search that ranked nothing (every trial
+            // failed, or a typo'd `--metric`) exits non-zero.
+            let lines = crate::jobs::read_status_lines(&job_id).unwrap_or_default();
+            let manifest_now = crate::hpo::HpoManifest::read_from(&job_dir)
+                .unwrap_or_else(|| hpo_manifest.clone());
+            let outcome = hpo_outcome(&manifest_now, &metric, &lines, &job_id);
+            let state = if outcome.is_ok() {
+                JobState::Done
+            } else {
+                JobState::Failed
+            };
+            crate::jobs::write_state(&job_id, state)
+                .with_context(|| format!("write final state for {job_id}"))?;
+            let ledger_state = if outcome.is_ok() { "done" } else { "failed" };
+            if let Err(e) = crate::lineage_db::ingest_job(&job_id, &name, ledger_state) {
                 tracing::warn!("lineage index {job_id}: {e}");
             }
-            eprintln!(
-                "hpo done: {} trials ran (job {job_id}). Leaderboard: `blut hpo show {job_id}`; \
-                 winning config: `blut hpo best {job_id}`.",
-                trials.len()
-            );
-            // A search whose objective no trial ever reported ranked nothing:
-            // every early-stop decision and the "winner" are meaningless. Say
-            // so and fail, instead of exiting 0 on a typo'd `--metric`.
-            let lines = crate::jobs::read_status_lines(&job_id).unwrap_or_default();
-            if let Some(err) = unreported_metric_error(&metric, &lines, &job_id) {
-                return Err(err);
+            let summary = outcome?;
+            for (trial, err) in &summary.failed {
+                eprintln!("hpo: trial {trial} failed (recorded; the search continued): {err}");
             }
+            eprintln!(
+                "hpo done: {} trials ({} completed, {} stopped early, {} failed; job {job_id}). \
+                 Leaderboard: `blut hpo show {job_id}`; winning config: `blut hpo best {job_id}`.",
+                summary.total,
+                summary.completed,
+                summary.stopped,
+                summary.failed.len()
+            );
             Ok(Some(job_id))
         }
         Err(e) => {
@@ -1091,18 +1119,23 @@ pub(super) fn run_hpo_show(job: Option<String>, json: bool) -> Result<()> {
     let (id, manifest) = resolve_hpo_job(job)?;
     let lines = crate::jobs::read_status_lines(&id).map_err(|e| anyhow!("read status: {e}"))?;
     let board = crate::hpo::leaderboard(&manifest, &lines);
+    let errors = failed_trial_errors(&manifest, &lines);
     if json {
         let arr: Vec<_> = board
             .iter()
             .map(|o| {
-                serde_json::json!({
+                let mut row = serde_json::json!({
                     "trial_id": o.trial_id,
                     "objective": o.objective,
                     "status": o.status,
                     "overlay": serde_json::Map::from_iter(
                         o.overlay.iter().map(|(k, v)| (k.clone(), v.clone())),
                     ),
-                })
+                });
+                if let Some(err) = errors.get(&o.trial_id) {
+                    row["error"] = serde_json::Value::String(err.clone());
+                }
+                row
             })
             .collect();
         emit_json(&serde_json::json!({
@@ -1123,7 +1156,7 @@ pub(super) fn run_hpo_show(job: Option<String>, json: bool) -> Result<()> {
         board.len()
     );
     println!(
-        "{:<6} {:<10} {:<8} overlay",
+        "{:<6} {:<10} {:<10} overlay",
         "trial", manifest.metric, "status"
     );
     for o in &board {
@@ -1137,9 +1170,84 @@ pub(super) fn run_hpo_show(job: Option<String>, json: bool) -> Result<()> {
             .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join(" ");
-        println!("{:<6} {:<10} {:<8} {}", o.trial_id, obj, o.status, overlay);
+        println!("{:<6} {:<10} {:<10} {}", o.trial_id, obj, o.status, overlay);
+    }
+    for o in &board {
+        if let Some(err) = errors.get(&o.trial_id) {
+            println!("trial {} failed: {err}", o.trial_id);
+        }
     }
     Ok(())
+}
+
+/// trial id → error, for every trial that genuinely failed.
+fn failed_trial_errors(
+    manifest: &crate::hpo::HpoManifest,
+    lines: &[String],
+) -> std::collections::BTreeMap<u32, String> {
+    manifest
+        .trials
+        .iter()
+        .zip(crate::hpo::results::trial_errors(manifest, lines))
+        .filter_map(|(rec, err)| err.map(|e| (rec.trial_id, e)))
+        .collect()
+}
+
+/// Decide whether a finished HPO execution produced a result. Trials run
+/// with failure isolation, so the plan itself succeeds even when trials
+/// crash; the job succeeds only when at least one trial COMPLETED and reported
+/// the objective. `Err` carries the message to exit non-zero with.
+fn hpo_outcome(
+    manifest: &crate::hpo::HpoManifest,
+    metric: &str,
+    lines: &[String],
+    job_id: &str,
+) -> std::result::Result<HpoSummary, anyhow::Error> {
+    let board = crate::hpo::leaderboard(manifest, lines);
+    let errors = failed_trial_errors(manifest, lines);
+    let total = board.len();
+    let completed = board
+        .iter()
+        .filter(|o| o.status == "done" && o.objective.is_some())
+        .count();
+    let stopped = board.iter().filter(|o| o.status == "stopped").count();
+    let summary = HpoSummary {
+        total,
+        completed,
+        stopped,
+        failed: errors.into_iter().collect(),
+    };
+    if completed > 0 {
+        return Ok(summary);
+    }
+    if total > 0 && summary.failed.len() == total {
+        let (first_id, first_err) = &summary.failed[0];
+        return Err(anyhow!(
+            "all {total} trials failed (job {job_id}); trial {first_id}: {first_err}"
+        ));
+    }
+    if let Some(err) = unreported_metric_error(metric, lines, job_id) {
+        return Err(if summary.failed.is_empty() {
+            err
+        } else {
+            anyhow!("{err} ({} of {total} trials failed)", summary.failed.len())
+        });
+    }
+    Err(anyhow!(
+        "no trial completed with the objective '{metric}' (job {job_id}): {} of {total} \
+         failed, {stopped} stopped early",
+        summary.failed.len()
+    ))
+}
+
+/// What an HPO execution produced, for the closing summary.
+#[derive(Debug)]
+struct HpoSummary {
+    total: usize,
+    completed: usize,
+    stopped: usize,
+    /// (trial id, error) of every trial that genuinely failed.
+    failed: Vec<(u32, String)>,
 }
 
 /// `blut hpo best [job] [--json]` — the winning trial's overlay.
@@ -1147,10 +1255,20 @@ pub(super) fn run_hpo_best(job: Option<String>, json: bool) -> Result<()> {
     let (id, manifest) = resolve_hpo_job(job)?;
     let lines = crate::jobs::read_status_lines(&id).map_err(|e| anyhow!("read status: {e}"))?;
     let board = crate::hpo::leaderboard(&manifest, &lines);
+    // A completed trial's objective is its result. A stopped, failed or
+    // still-running trial's best is a partial reading at a smaller budget, so
+    // it wins only when nothing has completed yet, and is labelled as such.
     let best = board
         .iter()
-        .find(|o| o.objective.is_some())
+        .find(|o| o.objective.is_some() && o.status == "done")
+        .or_else(|| board.iter().find(|o| o.objective.is_some()))
         .ok_or_else(|| anyhow!("no trial reported metric '{}' yet", manifest.metric))?;
+    if best.status != "done" {
+        eprintln!(
+            "note: no trial has completed yet; trial {} is {} and its {} is a partial reading",
+            best.trial_id, best.status, manifest.metric
+        );
+    }
     let overlay_obj =
         serde_json::Map::from_iter(best.overlay.iter().map(|(k, v)| (k.clone(), v.clone())));
     if json {

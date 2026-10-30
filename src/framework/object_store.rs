@@ -174,6 +174,38 @@ pub enum StoreError {
     Unsupported { operation: &'static str },
 }
 
+/// Refuse a plain-HTTP S3 endpoint up front unless `AWS_ALLOW_HTTP` is true.
+/// The provider refuses it too, but only on the first request and as "URL
+/// scheme is not allowed" at the end of a long chain, which does not say what
+/// to set. Only the endpoint's scheme and host are echoed.
+#[cfg(feature = "s3")]
+fn check_plain_http_endpoint(
+    endpoint: Option<&str>,
+    allow_http: Option<&str>,
+) -> Result<(), StoreError> {
+    let Some(endpoint) = endpoint.map(str::trim) else {
+        return Ok(());
+    };
+    if !endpoint.to_ascii_lowercase().starts_with("http://") {
+        return Ok(());
+    }
+    if allow_http.is_some_and(|v| v.trim().eq_ignore_ascii_case("true")) {
+        return Ok(());
+    }
+    let host = url::Url::parse(endpoint)
+        .ok()
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| u.port().map_or(h.to_string(), |p| format!("{h}:{p}")))
+        })
+        .unwrap_or_else(|| "the endpoint".to_string());
+    Err(StoreError::InvalidAddress(format!(
+        "the S3 endpoint http://{host} is plain HTTP, which is refused unless \
+         AWS_ALLOW_HTTP=true is set (credentials and data then travel unencrypted; \
+         use an https:// endpoint where you can)"
+    )))
+}
+
 impl StoreError {
     #[cfg(feature = "cloud")]
     fn initialization(
@@ -381,6 +413,13 @@ impl ObjectStore {
                 let bucket = parsed.host_str().ok_or_else(|| {
                     StoreError::InvalidAddress(format!("{url}: no bucket in s3 URL"))
                 })?;
+                check_plain_http_endpoint(
+                    std::env::var("AWS_ENDPOINT")
+                        .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+                        .ok()
+                        .as_deref(),
+                    std::env::var("AWS_ALLOW_HTTP").ok().as_deref(),
+                )?;
                 let inner = object_store::aws::AmazonS3Builder::from_env()
                     .with_bucket_name(bucket)
                     .build()
@@ -1162,5 +1201,26 @@ mod tests {
         let decoded = decode_object(key, stored).unwrap();
         assert_eq!(decoded, payload);
         assert_eq!(decoded.as_ptr(), allocation);
+    }
+}
+
+#[cfg(all(test, feature = "s3"))]
+mod plain_http_tests {
+    use super::check_plain_http_endpoint;
+
+    #[test]
+    fn a_plain_http_endpoint_needs_allow_http_and_says_so() {
+        // E2E follow-up: the only hint was "URL scheme is not allowed" at the
+        // end of a five-level chain.
+        let err = check_plain_http_endpoint(Some("http://127.0.0.1:9000"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("AWS_ALLOW_HTTP=true") && err.contains("127.0.0.1:9000"),
+            "{err}"
+        );
+        assert!(check_plain_http_endpoint(Some("http://minio:9000"), Some("true")).is_ok());
+        assert!(check_plain_http_endpoint(Some("https://s3.example"), None).is_ok());
+        assert!(check_plain_http_endpoint(None, None).is_ok());
     }
 }

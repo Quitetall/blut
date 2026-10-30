@@ -179,6 +179,33 @@ depend on this crate.
     SIGTERM lingered that long after a cancel. `ContainedChild` waits up to
     15 s (was 10 s) for the backend's teardown command, so it no longer gives
     up on `systemctl stop` just before the SIGKILL.
+- `$LAMU_TRAIN_DATA_DIR` is now the root of a whole separate install: when set,
+  the jobs directory, the global stage cache, `registry.db`, `catalog.db`, the
+  dataset database, the auto-train policy, the footprint store, partitions,
+  tenant quotas, declarative recipes, the backend registry config and the
+  `~/.blut` files (SLA, cost, budget, triggers, events) resolve under it.
+  Each store's own variable (`LAMU_TRAIN_JOBS_DIR`, `BLUT_REGISTRY_DB`, …)
+  still wins; with the variable unset every path is unchanged. The table is in
+  the `blut::paths` docs. **Migration:** an install that already set
+  `$LAMU_TRAIN_DATA_DIR` (it used to hold only materialized training data)
+  now sees an empty jobs list and registries; set the per-store variables to
+  the old locations to keep them. The scheduler lock stays machine-wide.
+  `blut-web` and `blut-notify` follow the same rule.
+- HPO trials are isolated: a trial whose stage fails (after its retries,
+  including an exhausted divergence) is recorded as `failed` with its error
+  and the search continues; it no longer cancels its siblings and fails the
+  job. `blut hpo run` / `blut study run` succeed when at least one trial
+  completes with the objective and exit non-zero, naming the cause, when none
+  does. `blut hpo show` prints each failed trial's error, and `blut hpo best`
+  prefers a completed trial.
+- `blut hpo show` statuses: `stopped` (early-stopped by the scheduler),
+  `cancelled` (the plan was cancelled) and `failed` replace `killed`, which
+  covered the first two. A policy prune's status line now reads "cancelled by
+  the control policy (branch pruned)".
+- Run comparisons (`blut exp compare`, `LineageDb::run_diff`) of an HPO search
+  use the final metrics of its best completed trial instead of a job-wide
+  aggregate over every trial; `exp compare` names the trial.
+- `blut model history` prints UTC timestamps and marks the current row.
 - `blut-operator` moves to the engine's MSRV, Rust 1.88 (was 1.89), and from
   kube 0.96 to kube 4.0 / k8s-openapi 0.28 (Kubernetes 1.32 API). It is
   publishable (`publish = ["crates-io"]`, 0.2.0-alpha.2) but not yet published.
@@ -280,6 +307,18 @@ depend on this crate.
   The local launch path refuses them too, and the executor refuses a p2p or
   cloud placement with no execution adapter installed, and any k8s placement,
   before a stage runs.
+- Trials spawned during an HPO search (TPE and surrogate suggestions, PBT
+  clones) ran but were never recorded: they are now added to `hpo.json` as
+  they are injected (`ControlPolicy::on_spawned`, `hpo::TrialBook`), ranked by
+  `blut hpo show` / `best` and a study's `pareto.json`, and fed back to the
+  policy that suggested them, so TPE learns from its own suggestions and PBT
+  can exploit a clone.
+- `blut cloud smoke` printed the object store's error once per error layer
+  (an S3 XML body five times); it prints it once. A plain-HTTP S3 endpoint
+  without `AWS_ALLOW_HTTP=true` is refused up front with that hint instead of
+  failing on the first request with "URL scheme is not allowed".
+- `blut p2p connect` printed nothing while it waited up to 30 s for a
+  coordinator; it says it is connecting.
 - `blut dag` showed a node that failed and was then re-run to completion by
   `plan resume` as `failed`, because the first terminal event in the job's
   status log won. A later attempt (`stage_begin` or a cache hit) now reopens

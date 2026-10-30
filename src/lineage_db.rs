@@ -872,6 +872,55 @@ impl LineageDb {
             .map_err(|e| TrainError::other(format!("final_metrics collect: {e}")))
     }
 
+    /// A run's headline metrics for a comparison. For an ordinary run that is
+    /// [`Self::final_metrics`]. For an HPO search it is the final values of the
+    /// best completed trial's nodes only: the job-wide aggregate mixes trials
+    /// (the max of every trial's loss, the cost of a stopped trial), which is
+    /// not a property of the search.
+    pub fn headline_metrics(&self, job_id: &str) -> Result<Vec<(String, f64)>> {
+        match crate::hpo::results::job_headline_trial(job_id) {
+            Some((_, nodes)) => self.final_metrics_for_nodes(job_id, &nodes),
+            None => self.final_metrics(job_id),
+        }
+    }
+
+    /// [`Self::final_metrics`] restricted to the nodes at topo positions
+    /// `nodes` (MAX per metric across them).
+    pub fn final_metrics_for_nodes(
+        &self,
+        job_id: &str,
+        nodes: &[u32],
+    ) -> Result<Vec<(String, f64)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT metric, node_idx, value FROM metrics WHERE job_id=?1 AND step=-1
+                 ORDER BY metric",
+            )
+            .map_err(|e| TrainError::other(format!("final_metrics_for_nodes prepare: {e}")))?;
+        let rows = stmt
+            .query_map(params![job_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, f64>(2)?,
+                ))
+            })
+            .map_err(|e| TrainError::other(format!("final_metrics_for_nodes query: {e}")))?;
+        let mut best: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+        for row in rows {
+            let (metric, node, value) =
+                row.map_err(|e| TrainError::other(format!("final_metrics_for_nodes row: {e}")))?;
+            if !nodes.iter().any(|n| i64::from(*n) == node) {
+                continue;
+            }
+            best.entry(metric)
+                .and_modify(|v| *v = v.max(value))
+                .or_insert(value);
+        }
+        Ok(best.into_iter().collect())
+    }
+
     /// The per-step TRAJECTORY of `metric` for a job (real samples, `step >= 0`),
     /// ordered by step — for `blut results` (ADR 0156 A3). Excludes the `step = -1`
     /// final marker so the series is the live curve, not the headline.
@@ -1454,9 +1503,9 @@ impl LineageDb {
 
         // Metric deltas: union of names, keep only where a and b differ.
         let ma: std::collections::HashMap<String, f64> =
-            self.final_metrics(a)?.into_iter().collect();
+            self.headline_metrics(a)?.into_iter().collect();
         let mb: std::collections::HashMap<String, f64> =
-            self.final_metrics(b)?.into_iter().collect();
+            self.headline_metrics(b)?.into_iter().collect();
         let mut names: Vec<String> = ma.keys().chain(mb.keys()).cloned().collect();
         names.sort();
         names.dedup();
@@ -2387,5 +2436,37 @@ mod tests {
         // is_stale only true for Stale.
         assert!(freshness_verdict(Some("a".into()), Some("b".into())).is_stale());
         assert!(!freshness_verdict(Some("a".into()), Some("a".into())).is_stale());
+    }
+
+    #[test]
+    fn final_metrics_for_nodes_reads_only_the_named_nodes() {
+        // `exp compare` on an HPO job used the job-wide MAX over every
+        // trial's final values; it now reads the headline trial's nodes.
+        let td = tempfile::tempdir().unwrap();
+        let db = LineageDb::open_at(td.path().join("lineage.db")).unwrap();
+        let row = |node: i64, metric: &str, value: f64| MetricRow {
+            job_id: "hpo-1".into(),
+            node_idx: node,
+            step: -1,
+            metric: metric.into(),
+            value,
+            wall_unix: None,
+        };
+        db.record_metrics(&[
+            row(0, "loss", 0.2),
+            row(0, "val_r", 0.8),
+            row(1, "loss", 0.9),
+            row(1, "val_r", 0.1),
+        ])
+        .unwrap();
+        assert_eq!(
+            db.final_metrics_for_nodes("hpo-1", &[0]).unwrap(),
+            vec![("loss".to_string(), 0.2), ("val_r".to_string(), 0.8)]
+        );
+        assert_eq!(
+            db.final_metrics("hpo-1").unwrap(),
+            vec![("loss".to_string(), 0.9), ("val_r".to_string(), 0.8)],
+            "the job-wide aggregate mixes trials"
+        );
     }
 }

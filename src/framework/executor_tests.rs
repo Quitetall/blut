@@ -2925,6 +2925,227 @@ async fn early_stop_kill_on_finite_metric_prunes_without_failing_the_plan() {
     );
 }
 
+static ISO_FAIL_RAN: AtomicU32 = AtomicU32::new(0);
+
+/// A trial that crashes after its sibling has run (so the sibling is never
+/// cancelled by an ordering race). Retries are on, to show an isolated
+/// failure still honours them before it is recorded.
+struct CrashingTrial;
+#[async_trait]
+impl Stage for CrashingTrial {
+    const NAME: &'static str = "crashing_trial";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const RETRY: RetryPolicy = RetryPolicy {
+        max_attempts: 2,
+        backoff: Backoff::None,
+        retry_on: RetryOn::AllErrors,
+    };
+    type Input = Counter;
+    type Output = Counter;
+    type Args = EmptyArgs;
+    async fn run(
+        &self,
+        _ctx: &StageContext,
+        _input: Counter,
+        _args: &EmptyArgs,
+    ) -> Result<Counter, StageError> {
+        until_count(&INC_RUN_COUNT, 1).await;
+        ISO_FAIL_RAN.fetch_add(1, Ordering::SeqCst);
+        Err(StageError::Backend(anyhow::anyhow!("trial crashed")))
+    }
+}
+impl Compatible<LamuTrainerBackend> for CrashingTrial {}
+
+fn crash_fork_plan() -> CompiledPlan {
+    Plan::<(), LamuTrainerBackend>::new("isolated", serde_json::json!({}))
+        .start(MakeOne, EmptyArgs)
+        .fork(CrashingTrial, EmptyArgs, Increment, EmptyArgs)
+        .merge(SumTwo, EmptyArgs)
+        .finish()
+        .into_compiled()
+}
+
+#[tokio::test]
+async fn an_isolated_stage_failure_prunes_only_its_branch() {
+    // HPO trials are independent branches: one crashing trial must be
+    // recorded as failed while its siblings run to completion. Without
+    // isolation the same plan fails fast (the default, unchanged).
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    for isolate in [true, false] {
+        ISO_FAIL_RAN.store(0, Ordering::SeqCst);
+        INC_RUN_COUNT.store(0, Ordering::SeqCst);
+        let (td, base) = fresh_ctx();
+        let ctx = if isolate {
+            base.with_isolated_stage_failures()
+        } else {
+            base
+        };
+        let fut = ParallelExecutor::execute(crash_fork_plan(), ctx);
+        let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
+            .await
+            .expect("plan must finish");
+        assert_eq!(ISO_FAIL_RAN.load(Ordering::SeqCst), 2, "both attempts ran");
+        assert_eq!(INC_RUN_COUNT.load(Ordering::SeqCst), 1, "the sibling ran");
+        if isolate {
+            assert!(
+                result.is_ok(),
+                "an isolated failure must not fail the plan: {result:?}"
+            );
+            let status = std::fs::read_to_string(td.path().join("status.jsonl")).unwrap();
+            assert!(
+                status.contains("\"kind\":\"stage_failed\"") && status.contains("trial crashed"),
+                "the failure is recorded with its error"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(PlanError::StageFailed { ref stage, .. }) if stage == "crashing_trial"),
+                "without isolation the plan fails fast: {result:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_exhausted_divergence_is_isolated_like_any_failure() {
+    // 2414f09 made a divergence retryable and an exhausted one a terminal
+    // `Diverged`. Under isolation that terminal failure prunes the trial and
+    // the sibling still finishes.
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    DIVERGER_RAN.store(0, Ordering::SeqCst);
+    INC_RUN_COUNT.store(0, Ordering::SeqCst);
+    let (td, base) = fresh_ctx();
+    let ctx = base
+        .with_control(std::sync::Arc::new(crate::framework::control::KillOnNaN))
+        .with_isolated_stage_failures();
+    let plan = Plan::<(), LamuTrainerBackend>::new("isolated_div", serde_json::json!({}))
+        .start(MakeOne, EmptyArgs)
+        .fork(DivergeAfterIncrement, EmptyArgs, Increment, EmptyArgs)
+        .merge(SumTwo, EmptyArgs)
+        .finish()
+        .into_compiled();
+    let fut = ParallelExecutor::execute(plan, ctx);
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
+        .await
+        .expect("divergence kill must fire");
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(DIVERGER_RAN.load(Ordering::SeqCst), 1);
+    assert_eq!(INC_RUN_COUNT.load(Ordering::SeqCst), 1);
+    let status = std::fs::read_to_string(td.path().join("status.jsonl")).unwrap();
+    assert!(
+        status.contains("training diverged"),
+        "recorded as a divergence"
+    );
+}
+
+static SLOT_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+static SLOT_CRASH: AtomicBool = AtomicBool::new(true);
+static SLOT_RESUMED: AtomicBool = AtomicBool::new(false);
+
+/// A checkpointing trial: with `SLOT_CRASH` set it writes a checkpoint and
+/// a marker from an exited trainer, then crashes.
+struct SlotTrial;
+#[async_trait]
+impl Stage for SlotTrial {
+    const NAME: &'static str = "slot_trial";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const DETERMINISTIC: bool = false;
+    type Input = Counter;
+    type Output = Counter;
+    type Args = EmptyArgs;
+    fn checkpoint_slot(&self, _: &EmptyArgs) -> bool {
+        true
+    }
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        input: Counter,
+        _args: &EmptyArgs,
+    ) -> Result<Counter, StageError> {
+        SLOT_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+        let slot = ctx.checkpoint.as_ref().expect("opted-in stage gets a slot");
+        if slot.resume {
+            SLOT_RESUMED.store(true, Ordering::SeqCst);
+        }
+        if SLOT_CRASH.load(Ordering::SeqCst) {
+            until_count(&INC_RUN_COUNT, 1).await;
+            std::fs::write(slot.dir.join("step-0000000003.pt"), b"weights").unwrap();
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let dead_pid = child.id();
+            child.wait().unwrap();
+            let marker = serde_json::json!({
+                "status": "running",
+                "run_id": slot.run_id,
+                "pid": dead_pid,
+                "host": crate::framework::stage_checkpoint::hostname(),
+                "heartbeat_unix": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                "step": 3,
+                "epoch": 1,
+                "attempt_id": slot.attempt_id,
+                "resumed_from_step": null,
+            });
+            std::fs::write(slot.dir.join("state.json"), marker.to_string()).unwrap();
+            return Err(StageError::BadInput("trial lost at step 3".into()));
+        }
+        Ok(Counter { n: input.n })
+    }
+}
+impl Compatible<LamuTrainerBackend> for SlotTrial {}
+
+#[tokio::test]
+async fn an_isolated_failure_keeps_its_checkpoint_slot_for_the_rerun() {
+    // Isolation must not change what a failure leaves behind: the failed
+    // trial's slot is released (not left locked) and kept, so re-running the
+    // search resumes that trial from its checkpoint instead of step 0.
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    SLOT_ATTEMPTS.store(0, Ordering::SeqCst);
+    SLOT_CRASH.store(true, Ordering::SeqCst);
+    SLOT_RESUMED.store(false, Ordering::SeqCst);
+    INC_RUN_COUNT.store(0, Ordering::SeqCst);
+    let td = tempfile::tempdir().unwrap();
+    let ckpt_root = td.path().join("checkpoints");
+    let plan = || {
+        Plan::<(), LamuTrainerBackend>::new("isolated_slot", serde_json::json!({}))
+            .start(MakeOne, EmptyArgs)
+            .fork(SlotTrial, EmptyArgs, Increment, EmptyArgs)
+            .merge(SumTwo, EmptyArgs)
+            .finish()
+            .into_compiled()
+    };
+    let first = ExecCtx::new(td.path().join("job-1"))
+        .with_checkpoint_root(ckpt_root.clone())
+        .with_isolated_stage_failures();
+    let result = tokio::time::timeout(
+        crate::TEST_HANG_GUARD,
+        ParallelExecutor::execute(plan(), first),
+    )
+    .await
+    .expect("first run finishes");
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(INC_RUN_COUNT.load(Ordering::SeqCst), 1, "the sibling ran");
+
+    SLOT_CRASH.store(false, Ordering::SeqCst);
+    let second = ExecCtx::new(td.path().join("job-2"))
+        .with_checkpoint_root(ckpt_root)
+        .with_isolated_stage_failures();
+    let result = tokio::time::timeout(
+        crate::TEST_HANG_GUARD,
+        ParallelExecutor::execute(plan(), second),
+    )
+    .await
+    .expect("second run finishes");
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(SLOT_ATTEMPTS.load(Ordering::SeqCst), 2);
+    assert!(
+        SLOT_RESUMED.load(Ordering::SeqCst),
+        "the re-run resumed the failed trial from its kept slot"
+    );
+}
+
 #[tokio::test]
 async fn no_control_policy_is_byte_identical_nan_ignored() {
     let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());

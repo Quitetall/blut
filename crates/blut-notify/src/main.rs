@@ -99,16 +99,28 @@ fn main() -> Result<()> {
     deliver(&mut sink, &envelope).map_err(|error| anyhow!(error))
 }
 
-fn dot_blut() -> std::path::PathBuf {
-    std::env::var_os("HOME")
+/// `$LAMU_TRAIN_DATA_DIR` when set: the root of a separate BLUT install, whose
+/// jobs and `~/.blut` files live under it (the engine's `blut::paths` rule;
+/// this crate does not depend on the engine, so it is restated here).
+fn state_root() -> Option<std::path::PathBuf> {
+    std::env::var_os("LAMU_TRAIN_DATA_DIR")
+        .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
-        .unwrap_or_default()
-        .join(".blut")
+}
+
+fn dot_blut() -> std::path::PathBuf {
+    state_root().unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(".blut")
+    })
 }
 
 fn default_jobs_dir() -> std::path::PathBuf {
     std::env::var_os("LAMU_TRAIN_JOBS_DIR")
         .map(std::path::PathBuf::from)
+        .or_else(|| state_root().map(|root| root.join("train-jobs")))
         .unwrap_or_else(|| {
             std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)

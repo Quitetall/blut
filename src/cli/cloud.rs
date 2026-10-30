@@ -92,7 +92,7 @@ pub(super) async fn run_cloud_cmd(
                     timeout_secs: 30,
                 })
                 .await
-                .context("submit cloud job")?;
+                .map_err(|e| flat_error("submit cloud job", e))?;
 
             // Run one worker pass (Registered trust — the clinical hard-block posture).
             // One matrix instance, shared by the policy and the worker, so a future
@@ -114,13 +114,13 @@ pub(super) async fn run_cloud_cmd(
                 None,
             )
             .await
-            .context("cloud worker")?;
+            .map_err(|e| flat_error("cloud worker", e))?;
 
             let out_dir = tempfile::tempdir()?;
             match handle
                 .poll(out_dir.path())
                 .await
-                .context("poll cloud job")?
+                .map_err(|e| flat_error("poll cloud job", e))?
             {
                 CloudPoll::Succeeded(output) => {
                     let out: SmokeText = output.into_typed().context("decode output")?;
@@ -193,6 +193,14 @@ mod cloud_cli_tests {
         .await
         .expect("cloud smoke handler must round-trip");
     }
+}
+
+/// One line per failure. The cloud and object-store errors each embed their
+/// source's message in their own, so printing the error chain repeated the
+/// provider's response (an S3 XML body appeared five times).
+#[cfg(feature = "cloud")]
+fn flat_error(what: &str, error: impl std::fmt::Display) -> anyhow::Error {
+    anyhow!("{what}: {error}")
 }
 
 /// Open the smoke store from `--store`: a URL when it has a scheme, otherwise a
@@ -276,5 +284,34 @@ mod cloud_file_url_tests {
         let url = format!("file://{}", dir.display());
         super::open_smoke_store(&url).expect("file:// store opens");
         assert!(dir.is_dir());
+    }
+}
+
+#[cfg(all(test, feature = "cloud"))]
+mod flat_error_tests {
+    #[test]
+    fn a_wrapped_error_prints_its_message_once() {
+        #[derive(Debug)]
+        struct Leaf;
+        impl std::fmt::Display for Leaf {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("<Error>NoSuchBucket</Error>")
+            }
+        }
+        impl std::error::Error for Leaf {}
+        #[derive(Debug)]
+        struct Wrapper(Leaf);
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "put failed: {}", self.0)
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let shown = format!("{:?}", super::flat_error("submit cloud job", Wrapper(Leaf)));
+        assert_eq!(shown.matches("NoSuchBucket").count(), 1, "{shown}");
     }
 }
