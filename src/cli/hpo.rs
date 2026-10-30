@@ -529,6 +529,11 @@ pub(super) async fn run_hpo(
 
     let launch_target: crate::config::launcher::LaunchTarget =
         launcher.parse().map_err(|e| anyhow!("{e}"))?;
+    if launch_target == crate::config::launcher::LaunchTarget::K8s {
+        return Err(anyhow!(crate::config::k8s_cluster::refuse_surface(
+            "`hpo` studies"
+        )));
+    }
     let tenant = crate::tenant::Tenant::parse(&tenant)
         .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
     // The marker records the UNION of every dataset any trial can reach: the

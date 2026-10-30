@@ -67,6 +67,11 @@ pub(super) enum RecipeCommand {
         /// (only with `--run`).
         #[arg(long, requires = "run")]
         experiment: Option<String>,
+        /// Where `--run` executes: `local` (default), or `k8s`, which ships the
+        /// file to a Kubernetes cluster as a BlutPlan for blut-operator and
+        /// follows it (settings: `BLUT_K8S_*`, docs/OPERATOR.md).
+        #[arg(long, default_value = "local")]
+        launcher: String,
     },
     /// Execute a recipe, or a config-driven sweep over it.
     Run {
@@ -221,7 +226,49 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             sync_io,
             tenant,
             experiment,
+            launcher,
         } => {
+            let declare_target: crate::config::launcher::LaunchTarget = launcher
+                .parse()
+                .map_err(|e| anyhow!("invalid --launcher {launcher:?}: {e}"))?;
+            match declare_target {
+                crate::config::launcher::LaunchTarget::Local => {}
+                crate::config::launcher::LaunchTarget::K8s => {
+                    let Some(path) = file.as_ref() else {
+                        return Err(anyhow!("--launcher k8s needs a <file> and --run"));
+                    };
+                    if !run {
+                        return Err(anyhow!(
+                            "--launcher k8s submits the recipe, so it needs --run; without \
+                             --run, `recipe declare` only renders the plan, locally"
+                        ));
+                    }
+                    let tenant_is_default = crate::tenant::Tenant::parse(&tenant)
+                        .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?
+                        .is_default();
+                    return run_file_on_k8s(
+                        reg,
+                        path,
+                        &args,
+                        K8sUnsupported {
+                            config_mode: false,
+                            shared_cache,
+                            no_cache,
+                            sync_io,
+                            tenant_is_default,
+                            experiment: experiment.is_some(),
+                        },
+                    )
+                    .await;
+                }
+                other => {
+                    return Err(anyhow!(
+                        "recipe declare --run takes --launcher local or k8s, not {}; use \
+                         `recipe run` for the other launchers",
+                        other.as_str()
+                    ));
+                }
+            }
             use crate::recipes::declarative::{scan_user_recipes, user_recipes_dir};
             match file {
                 None => {
@@ -324,6 +371,29 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
             // ADR 0096: parse the tenant up front (same fail-fast discipline).
             let tenant = crate::tenant::Tenant::parse(&tenant)
                 .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
+            // k8s is not a stage placement: the whole recipe is submitted to the
+            // cluster as a BlutPlan and followed there. Nothing below runs.
+            if launch_target == crate::config::launcher::LaunchTarget::K8s {
+                return run_recipe_on_k8s(
+                    reg,
+                    &name,
+                    &args,
+                    dry_run,
+                    K8sUnsupported {
+                        config_mode: config_dir.is_some()
+                            || config_name.is_some()
+                            || config_key.is_some()
+                            || !set.is_empty()
+                            || !sweep.is_empty(),
+                        shared_cache,
+                        no_cache,
+                        sync_io,
+                        tenant_is_default: tenant.is_default(),
+                        experiment: experiment.is_some(),
+                    },
+                )
+                .await;
+            }
             // M2.1: fail before compilation or job-dir creation when the tenant
             // is unknown to the active quota policy. With no config, only the
             // flat `default` tenant exists and owns 100% of usable RAM.
@@ -665,7 +735,7 @@ async fn run_one_recipe_resolved(
 /// verbatim. All three resolve stage NAMES against the registry (no dynamic
 /// code loading) and are fully kind-checked before returning. Returns
 /// `(plan_name, plan, n_nodes)`.
-fn compile_declared_recipe(
+pub(super) fn compile_declared_recipe(
     reg: &crate::framework::Registry,
     path: &std::path::Path,
     args_json: &str,
@@ -1066,6 +1136,21 @@ pub(super) fn terminal_for_error(error: &crate::framework::PlanError) -> (JobSta
     }
 }
 
+/// Backstop: every local launch passes through `prepare_compiled_plan_launch`.
+/// A k8s placement that reaches it was not submitted to a cluster, and
+/// running it on this machine would claim a placement that did not happen.
+fn refuse_local_k8s_launch(
+    name: &str,
+    launch_target: crate::config::launcher::LaunchTarget,
+) -> Result<()> {
+    if launch_target == crate::config::launcher::LaunchTarget::K8s {
+        return Err(anyhow!(crate::config::k8s_cluster::refuse_surface(
+            &format!("'{name}' on this path")
+        )));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_compiled_plan_launch(
     name: &str,
@@ -1082,6 +1167,8 @@ pub(super) fn prepare_compiled_plan_launch(
     tenant_admission: std::sync::Arc<crate::broker::tenant_quota::TenantAdmission>,
 ) -> Result<PreparedRecipeLaunch> {
     use crate::framework::ExecCtx;
+
+    refuse_local_k8s_launch(name, launch_target)?;
 
     let admission_snapshot = tenant_admission.snapshot();
     // One scan: the plan's largest declared envelope feeds auto-tune, the
@@ -1754,6 +1841,7 @@ mod recipe_declare_flag_tests {
                         sync_io,
                         tenant: _,
                         experiment: _,
+                        launcher: _,
                     },
             }) => (file, run, shared_cache, no_cache, sync_io),
             other => panic!("expected recipe declare, got {other:?}"),
@@ -1811,6 +1899,51 @@ mod recipe_declare_flag_tests {
             }) => assert_eq!(args, r#"{"n":1}"#),
             other => panic!("expected declare, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn declare_launcher_defaults_to_local_and_takes_k8s() {
+        let launcher_of = |argv: &[&str]| match Cli::try_parse_from(argv).expect("parse").command {
+            Some(Command::Recipe {
+                cmd: RecipeCommand::Declare { launcher, .. },
+            }) => launcher,
+            other => panic!("expected declare, got {other:?}"),
+        };
+        assert_eq!(
+            launcher_of(&["blut", "recipe", "declare", "r.toml", "--run"]),
+            "local"
+        );
+        assert_eq!(
+            launcher_of(&[
+                "blut",
+                "recipe",
+                "declare",
+                "r.toml",
+                "--run",
+                "--launcher",
+                "k8s"
+            ]),
+            "k8s"
+        );
+    }
+}
+
+#[cfg(test)]
+mod k8s_refusal_tests {
+    //! `--launcher k8s` must never fall back to running here. Every surface
+    //! that cannot submit to a cluster refuses, naming the operator route.
+    use super::*;
+
+    #[test]
+    fn the_local_launch_path_refuses_a_k8s_placement() {
+        use crate::config::launcher::LaunchTarget;
+        refuse_local_k8s_launch("demo", LaunchTarget::Local).unwrap();
+        let msg = refuse_local_k8s_launch("demo", LaunchTarget::K8s)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("`recipe run`"), "{msg}");
+        assert!(msg.contains("kubectl apply"), "{msg}");
+        assert!(msg.contains("Nothing ran locally"), "{msg}");
     }
 }
 
