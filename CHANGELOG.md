@@ -144,6 +144,14 @@ depend on this crate.
   last two targets. The trail records each move's kind, shown by `plan
   history`; registries created earlier gain the column on open, and their old
   moves count as promotions.
+- `model rollback` walks an alias's promotion history the same way (owner
+  decision): promote A, B, C and two rollbacks land on A, a promotion after a
+  rollback continues from there, re-promoting the current target is not a new
+  step, and a rollback at the first promotion is refused ("nothing earlier to
+  roll back to"). It used to toggle between the last two targets. The model
+  trail records each move's kind, which `model history` prints after the hash
+  (`promote` or `rollback`); a registry created earlier gains the column on
+  open, and its old moves count as promotions.
 - SLA `max_runtime_secs` judges the newest matching run per tenant (on its
   runtime so far if still running), like `freshness_secs`, so an old breach
   stops failing `sla check` once a newer run meets the rule. It was judged per

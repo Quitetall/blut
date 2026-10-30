@@ -132,21 +132,29 @@ pub fn open_at(path: &std::path::Path) -> Result<Connection> {
 /// before rollbacks walked the history. Rows written before it are counted as
 /// promotions: the old trail did not record which moves were rollbacks.
 fn migrate_history_kind(conn: &Connection) -> Result<()> {
+    add_move_kind_column(conn, "pointer_history")
+}
+
+/// Add a `kind TEXT NOT NULL DEFAULT 'promote'` column to an audit-trail
+/// `table` that predates it; a no-op when the column exists. Shared by the plan
+/// trail and the model registry's (`model_pointer_history`), which live in the
+/// same database. `table` is a fixed name from this crate, never user input.
+pub(crate) fn add_move_kind_column(conn: &Connection, table: &'static str) -> Result<()> {
     let has_kind = conn
-        .prepare("PRAGMA table_info(pointer_history)")
+        .prepare(&format!("PRAGMA table_info({table})"))
         .and_then(|mut stmt| {
             stmt.query_map([], |row| row.get::<_, String>(1))?
                 .collect::<rusqlite::Result<Vec<_>>>()
         })
-        .map_err(|e| TrainError::other(format!("pointer_history columns: {e}")))?
+        .map_err(|e| TrainError::other(format!("{table} columns: {e}")))?
         .iter()
         .any(|c| c == "kind");
     if !has_kind {
         conn.execute(
-            "ALTER TABLE pointer_history ADD COLUMN kind TEXT NOT NULL DEFAULT 'promote'",
+            &format!("ALTER TABLE {table} ADD COLUMN kind TEXT NOT NULL DEFAULT 'promote'"),
             [],
         )
-        .map_err(|e| TrainError::other(format!("add pointer_history.kind: {e}")))?;
+        .map_err(|e| TrainError::other(format!("add {table}.kind: {e}")))?;
     }
     Ok(())
 }
@@ -156,20 +164,34 @@ fn migrate_history_kind(conn: &Connection) -> Result<()> {
 /// top is what the pointer resolves to; a rollback moves to the entry below.
 fn promotion_stack(conn: &Connection, tenant: &str, name: &str) -> Result<Vec<String>> {
     let moves = history_moves(conn, tenant, name)?;
+    Ok(replay_promotion_stack(
+        moves
+            .into_iter()
+            .map(|(e, kind)| (e.plan_fingerprint, kind)),
+    ))
+}
+
+/// Replay an audit trail (oldest first) as an undo stack: a promotion pushes
+/// its target unless that target is already on top (re-promoting the current
+/// target is not a new step), a rollback pops. The top is the current target.
+/// Shared by plan pointers and model aliases.
+pub(crate) fn replay_promotion_stack(
+    moves: impl IntoIterator<Item = (String, MoveKind)>,
+) -> Vec<String> {
     let mut stack: Vec<String> = Vec::new();
-    for (entry, kind) in moves {
+    for (target, kind) in moves {
         match kind {
             MoveKind::Rollback => {
                 stack.pop();
             }
             MoveKind::Promote => {
-                if stack.last() != Some(&entry.plan_fingerprint) {
-                    stack.push(entry.plan_fingerprint);
+                if stack.last() != Some(&target) {
+                    stack.push(target);
                 }
             }
         }
     }
-    Ok(stack)
+    stack
 }
 
 /// How a pointer moved, as recorded in `pointer_history.kind`.
@@ -180,6 +202,16 @@ pub(crate) enum MoveKind {
 }
 
 impl MoveKind {
+    /// The kind a trail row's `kind` column names; anything but `rollback`
+    /// (including rows migrated from before the column existed) is a promotion.
+    pub(crate) fn from_column(kind: &str) -> Self {
+        if kind == "rollback" {
+            MoveKind::Rollback
+        } else {
+            MoveKind::Promote
+        }
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             MoveKind::Promote => "promote",
@@ -208,11 +240,7 @@ pub(crate) fn history_moves(
                     plan_fingerprint: row.get(0)?,
                     moved_at: row.get(1)?,
                 },
-                if kind == "rollback" {
-                    MoveKind::Rollback
-                } else {
-                    MoveKind::Promote
-                },
+                MoveKind::from_column(&kind),
             ))
         })
         .map_err(|e| TrainError::other(format!("history query: {e}")))?;
