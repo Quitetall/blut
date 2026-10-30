@@ -11,6 +11,11 @@ depend on this crate.
 ## [Unreleased]
 
 ### Added
+- `checks::JsonlArtifact::from_file(path)`, and documentation of the checks
+  stages' input contract: `check_jsonl` and `assert` take only `checks.jsonl`,
+  so a cookbook guards its own JSONL by emitting `JsonlArtifact` or through a
+  one-line adapter stage (a compiled example is in the `checks` module docs).
+  `assert` compares the literal `actual` it is given.
 - `BLUT_REMOTE_CACHE` for `recipe run` and `recipe declare --run`: a directory,
   or with the `s3` feature an `s3://bucket[/prefix]` URL, used as the cache's
   content-addressed remote tier. Stage outputs are written through to it and a
@@ -75,6 +80,28 @@ depend on this crate.
   Object) or the caller must signal the process group (`rlimit`, `bare`).
 
 ### Changed
+- **Behaviour change:** `plan publish`, `plan promote`, `plan rollback` and
+  `plan history` default to tenant `default` (was `shared`), the tenant
+  `recipe declare`/`recipe run`, `plan run`, the model registry and sensord
+  already used. Publish → promote → `recipe declare registry://plan@prod --run`
+  now works with default configuration; before, the pointer was written under
+  `shared`, looked up under `default`, and `shared` was not an admitted quota
+  tenant. Deployments and pointers made under `shared` stay where they are:
+  address them with `--tenant shared`, and a lookup under `default` that misses
+  names the tenant holding the pointer. blut-web authorises run and cancel
+  against `default`, the tenant the launched run uses.
+- `plan rollback` walks the promotion history like an undo stack: each
+  rollback moves one promotion further back (promote A, B, C, then two
+  rollbacks land on A), a promotion after a rollback continues from there, and
+  a rollback at the first promotion is refused. It used to toggle between the
+  last two targets. The trail records each move's kind, shown by `plan
+  history`; registries created earlier gain the column on open, and their old
+  moves count as promotions.
+- SLA `max_runtime_secs` judges the newest matching run per tenant (on its
+  runtime so far if still running), like `freshness_secs`, so an old breach
+  stops failing `sla check` once a newer run meets the rule. It was judged per
+  run: one historical slow run kept `sla check` non-zero forever.
+  `deadline_unix` still judges every run still running.
 - Every cache key changes once: the engine build commit alone is replaced by
   the code identity above. Existing entries miss on the first run.
 - A refused checkpoint slot reads `resume checkpoint busy: stage '<name>':
@@ -117,6 +144,17 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- `lineage card` and `lineage graph` attributed an artifact to the newest job
+  holding it, often a cache-hit job that never produced it, so a model card
+  showed none of the training run's metrics. The index records whether each
+  job produced or reused an artifact and prefers the producing job (existing
+  indexes treat every row as produced until `lineage reindex`).
+- `recipe declare registry://plan@<name> --run` defaulted the run's experiment
+  to the URI, which is not a valid experiment name, and failed after creating
+  the job directory but before its state, leaving a job that read `running`
+  forever. Pointer launches group as experiment `plan.<name>`, any launch name
+  becomes a valid label, the label is checked before anything is written, and
+  a failure while writing a starting job's records removes the partial job.
 - The systemd containment backend rewrote arguments that contain `$`: a
   `systemd-run` service's command line is expanded like `ExecStart=`, so
   `$VAR`, `${VAR}` and `$$` changed on the way to the stage (a JSON spec, a

@@ -175,6 +175,28 @@ pub fn job_failure(job_id: &str) -> Result<JobFailureLookup> {
     })
 }
 
+/// Nodes whose artifact this job served from cache without producing it: a
+/// `stage_skipped` and no `stage_end` for the node anywhere in the job's log
+/// (a node that ran in an earlier attempt of the same job and was a cache hit
+/// on `plan resume` was still produced by this job).
+pub(crate) fn reused_nodes(job_id: &str) -> Result<std::collections::BTreeSet<u32>> {
+    let id = jobs::resolve_job_id(job_id)?;
+    let mut skipped = std::collections::BTreeSet::new();
+    let mut ended = std::collections::BTreeSet::new();
+    for line in jobs::read_status_lines(&id)? {
+        match serde_json::from_str::<StageEvent>(&line) {
+            Ok(StageEvent::StageSkipped { node_idx, .. }) => {
+                skipped.insert(node_idx);
+            }
+            Ok(StageEvent::StageEnd { node_idx, .. }) => {
+                ended.insert(node_idx);
+            }
+            _ => {}
+        }
+    }
+    Ok(skipped.difference(&ended).copied().collect())
+}
+
 /// Fold a job's `status.jsonl` `StageStep` events into metric rows for the
 /// queryable metric store (E1) — the sibling of [`job_lineage`], NO new writer.
 /// Each finite numeric leaf of a step's `update` payload (`val_r`, `train_loss`,
@@ -521,6 +543,41 @@ mod tests {
                 None => std::env::remove_var("LAMU_TRAIN_JOBS_DIR"),
             }
         }
+    }
+
+    /// The index tells a job that produced an artifact from one that served
+    /// it from cache; a node produced in an earlier attempt of the same job
+    /// and skipped on resume was still produced by this job.
+    #[test]
+    fn reused_nodes_are_skipped_and_never_ended_in_the_job() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let prev = std::env::var("LAMU_TRAIN_JOBS_DIR").ok();
+        unsafe {
+            std::env::set_var("LAMU_TRAIN_JOBS_DIR", td.path());
+        }
+        let job = "20261030-000000-000000001";
+        let jdir = td.path().join(job);
+        std::fs::create_dir_all(&jdir).unwrap();
+        let lines = [
+            // node 0: a cache hit; node 1: produced, then a cache hit on resume
+            r#"{"kind":"stage_skipped","node_idx":0,"stage_name":"a","invocation_key":"HASH"}"#,
+            r#"{"kind":"stage_end","node_idx":1,"stage_name":"b","content_id":"HASH","elapsed":{"secs":1,"nanos":0}}"#,
+            r#"{"kind":"stage_skipped","node_idx":1,"stage_name":"b","invocation_key":"HASH"}"#,
+            r#"{"kind":"stage_end","node_idx":2,"stage_name":"c","content_id":"HASH","elapsed":{"secs":1,"nanos":0}}"#,
+        ]
+        .map(|l| l.replace("HASH", "abababababababababababababababababababababababababababababababab"));
+        std::fs::write(jdir.join("status.jsonl"), lines.join("\n") + "\n").unwrap();
+        let reused = reused_nodes(job);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("LAMU_TRAIN_JOBS_DIR", v),
+                None => std::env::remove_var("LAMU_TRAIN_JOBS_DIR"),
+            }
+        }
+        assert_eq!(reused.unwrap().into_iter().collect::<Vec<_>>(), [0]);
     }
 
     /// `blut errors show` on a job that failed and was then resumed to

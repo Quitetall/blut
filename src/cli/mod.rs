@@ -426,13 +426,8 @@ enum PlanCommand {
         /// Force async-I/O lanes onto their synchronous fallback.
         #[arg(long, default_value_t = false)]
         sync_io: bool,
-        /// Tenant that owns the launched job (ADR 0096).
-        ///
-        /// `default`, NOT `publish`'s `shared`. Two different namespaces wear
-        /// the word "tenant": the deployment registry keys rows under
-        /// `shared`/`restricted`, while the quota policy that admits a RUN
-        /// knows `default` and whatever a config declares. Defaulting this to
-        /// `shared` made the verb fail admission out of the box.
+        /// Tenant that owns the launched job (ADR 0096). Every verb defaults
+        /// to `default`, the tenant the quota policy admits out of the box.
         #[arg(long, default_value = "default")]
         tenant: String,
         /// Validate and compile without running anything: typecheck the spec,
@@ -446,8 +441,10 @@ enum PlanCommand {
     Publish {
         /// Path to a `.json` PlanSpec.
         spec: std::path::PathBuf,
-        /// Owning tenant (default `shared`; `restricted` = clinical/PHI).
-        #[arg(long, default_value = "shared")]
+        /// Owning tenant (`restricted` = clinical/PHI). Defaults to `default`,
+        /// the tenant `recipe declare --run` resolves and runs under; records
+        /// published under the former `shared` default need `--tenant shared`.
+        #[arg(long, default_value = "default")]
         tenant: String,
     },
     /// Promote a published fingerprint onto a named pointer
@@ -458,21 +455,25 @@ enum PlanCommand {
         /// Target pointer, e.g. `registry://plan@prod`.
         pointer: String,
         /// Acting tenant — must match the deployment's tenant.
-        #[arg(long, default_value = "shared")]
+        #[arg(long, default_value = "default")]
         tenant: String,
     },
-    /// Roll a pointer back to its previous target atomically.
+    /// Roll a pointer back one step through its promotion history. Each
+    /// rollback moves one promotion further back (promote A, B, C, then two
+    /// rollbacks land on A); a promotion after a rollback continues from there.
+    /// Refused at the pointer's first promotion.
     Rollback {
         /// Pointer, e.g. `registry://plan@prod`.
         pointer: String,
-        #[arg(long, default_value = "shared")]
+        #[arg(long, default_value = "default")]
         tenant: String,
     },
-    /// Print a pointer's deployment audit trail (oldest first).
+    /// Print a pointer's deployment audit trail, oldest first: time,
+    /// fingerprint, and whether the move was a promote or a rollback.
     History {
         /// Pointer, e.g. `registry://plan@prod`.
         pointer: String,
-        #[arg(long, default_value = "shared")]
+        #[arg(long, default_value = "default")]
         tenant: String,
     },
 }
@@ -1526,6 +1527,53 @@ mod small_cli_fix_tests {
 }
 
 #[cfg(test)]
+mod default_tenant_tests {
+    use super::{Cli, Command, PlanCommand, RecipeCommand};
+    use clap::Parser;
+
+    fn plan_tenant(argv: &[&str]) -> String {
+        match Cli::try_parse_from(argv).unwrap().command {
+            Some(Command::Plan {
+                cmd:
+                    PlanCommand::Publish { tenant, .. }
+                    | PlanCommand::Promote { tenant, .. }
+                    | PlanCommand::Rollback { tenant, .. }
+                    | PlanCommand::History { tenant, .. }
+                    | PlanCommand::Run { tenant, .. },
+            }) => tenant,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// `plan publish`/`promote` defaulted to `shared` while `recipe declare`
+    /// resolved and ran under `default`, so the documented publish → promote →
+    /// `recipe declare registry://plan@prod --run` path found no pointer.
+    #[test]
+    fn every_plan_verb_defaults_to_the_tenant_recipe_declare_uses() {
+        let declare = match Cli::try_parse_from(["blut", "recipe", "declare", "x.json"])
+            .unwrap()
+            .command
+        {
+            Some(Command::Recipe {
+                cmd: RecipeCommand::Declare { tenant, .. },
+            }) => tenant,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(declare, "default");
+        let p = "registry://plan@prod";
+        for argv in [
+            &["blut", "plan", "publish", "x.json"][..],
+            &["blut", "plan", "promote", "abc", p],
+            &["blut", "plan", "rollback", p],
+            &["blut", "plan", "history", p],
+            &["blut", "plan", "run", "x.json"],
+        ] {
+            assert_eq!(plan_tenant(argv), declare, "{argv:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod cache_prune_cap_tests {
     use super::resolve_prune_cap_gb;
 
@@ -2396,13 +2444,13 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             let name = crate::registry_db::parse_pointer_uri(&pointer)
                 .ok_or_else(|| anyhow!("not a `registry://plan@<name>` URI: {pointer}"))?;
             let conn = crate::registry_db::open().map_err(|e| anyhow!("{e}"))?;
-            let hist =
-                crate::registry_db::history(&conn, &tenant, name).map_err(|e| anyhow!("{e}"))?;
+            let hist = crate::registry_db::history_moves(&conn, &tenant, name)
+                .map_err(|e| anyhow!("{e}"))?;
             if hist.is_empty() {
-                println!("no history for registry://plan@{name}");
+                println!("no history for registry://plan@{name} (tenant {tenant})");
             }
-            for h in &hist {
-                println!("{}  {}", h.moved_at, h.plan_fingerprint);
+            for (h, kind) in &hist {
+                println!("{}  {}  {}", h.moved_at, h.plan_fingerprint, kind.as_str());
             }
             Ok(())
         }

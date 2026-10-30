@@ -94,8 +94,11 @@ fn breach(
     }
 }
 
-/// Evaluate every rule against every observation at wall-clock `now` (unix s),
-/// returning the breaches. Pure: no I/O, deterministic in its inputs.
+/// Evaluate every rule at wall-clock `now` (unix s), returning the breaches.
+/// `max_runtime_secs` and `freshness_secs` judge the newest matching run per
+/// tenant (by start time and by measured data age respectively), so an old
+/// breach stops counting once a newer run meets the rule; `deadline_unix`
+/// judges every run still running. Pure: no I/O, deterministic in its inputs.
 pub fn evaluate(rules: &[SlaRule], runs: &[RunObservation], now: i64) -> Vec<SlaBreach> {
     let mut out = Vec::new();
     for obs in runs {
@@ -105,19 +108,26 @@ pub fn evaluate(rules: &[SlaRule], runs: &[RunObservation], now: i64) -> Vec<Sla
             {
                 continue; // rule scoped to a different recipe
             }
-            // MaxRuntime: elapsed = (end or now) − start.
-            if let Some(max) = rule.max_runtime_secs {
-                let elapsed = obs.ended_unix.unwrap_or(now) - obs.started_unix;
-                if elapsed > max {
-                    out.push(breach(rule, SlaKind::MaxRuntime, obs, elapsed, max, now));
-                }
-            }
             // Deadline: a run STILL running past the wall-clock deadline.
             if let Some(deadline) = rule.deadline_unix
                 && obs.ended_unix.is_none()
                 && now > deadline
             {
                 out.push(breach(rule, SlaKind::Deadline, obs, now, deadline, now));
+            }
+        }
+    }
+    // MaxRuntime judges the NEWEST run per tenant: elapsed = (end or now) −
+    // start. Judged per run, one historical slow run kept `sla check` failing
+    // forever, however fast every later run was.
+    for rule in rules {
+        let Some(max) = rule.max_runtime_secs else {
+            continue;
+        };
+        for newest in newest_started_per_tenant(rule, runs) {
+            let elapsed = newest.ended_unix.unwrap_or(now) - newest.started_unix;
+            if elapsed > max {
+                out.push(breach(rule, SlaKind::MaxRuntime, newest, elapsed, max, now));
             }
         }
     }
@@ -139,6 +149,26 @@ pub fn evaluate(rules: &[SlaRule], runs: &[RunObservation], now: i64) -> Vec<Sla
         }
     }
     out
+}
+
+/// For a runtime rule: per tenant, the matching run that started last (ties
+/// broken by job id, which sorts by creation time).
+fn newest_started_per_tenant<'a>(
+    rule: &SlaRule,
+    runs: &'a [RunObservation],
+) -> Vec<&'a RunObservation> {
+    let mut by_tenant: std::collections::BTreeMap<&str, &RunObservation> =
+        std::collections::BTreeMap::new();
+    for obs in runs {
+        if rule.recipe.as_ref().is_some_and(|want| want != &obs.recipe) {
+            continue;
+        }
+        let entry = by_tenant.entry(obs.tenant.as_str()).or_insert(obs);
+        if (obs.started_unix, &obs.job_id) > (entry.started_unix, &entry.job_id) {
+            *entry = obs;
+        }
+    }
+    by_tenant.into_values().collect()
 }
 
 /// For a freshness rule: per tenant, the matching run with the newest
@@ -574,6 +604,44 @@ mod tests {
         assert_eq!(breaches[0].job_id, "stale-b");
         // A tenant whose only runs are unmeasured stays fail-closed.
         assert!(require_freshness_measurements(&rules, &[aged("x", "c", None)]).is_err());
+    }
+
+    /// Runtime was judged per run: one slow run kept `sla check` failing
+    /// forever, however fast every later run was.
+    #[test]
+    fn max_runtime_judges_the_newest_run_per_tenant() {
+        let rules = vec![SlaRule {
+            name: "cap".into(),
+            recipe: Some("train".into()),
+            max_runtime_secs: Some(100),
+            deadline_unix: None,
+            freshness_secs: None,
+        }];
+        let run = |job: &str, tenant: &str, start: i64, end: Option<i64>| {
+            let mut o = obs("train", tenant, DataClass::Internal, start, end);
+            o.job_id = job.into();
+            o
+        };
+        // Tenant a: an old slow run, then a fast one — no breach.
+        // Tenant b: an old fast run, then a slow one — one breach, the new run.
+        let runs = vec![
+            run("a-slow", "a", 0, Some(500)),
+            run("a-fast", "a", 1000, Some(1050)),
+            run("b-fast", "b", 0, Some(50)),
+            run("b-slow", "b", 1000, Some(1300)),
+        ];
+        let breaches = evaluate(&rules, &runs, 2000);
+        assert_eq!(breaches.len(), 1, "{breaches:?}");
+        assert_eq!(breaches[0].job_id, "b-slow");
+        // A newest run still running is judged on its runtime so far.
+        let running = vec![
+            run("a-old", "a", 0, Some(10)),
+            run("a-live", "a", 900, None),
+        ];
+        let breaches = evaluate(&rules, &running, 1200);
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].job_id, "a-live");
+        assert_eq!(breaches[0].observed_secs, 300);
     }
 
     #[test]

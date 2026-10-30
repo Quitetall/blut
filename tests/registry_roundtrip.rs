@@ -214,3 +214,118 @@ fn registry_roundtrip() {
     assert_eq!(registry_db::parse_pointer_uri("registry://plan@"), None);
     assert_eq!(registry_db::parse_pointer_uri("/some/file.json"), None);
 }
+
+/// A pointer published under the former `shared` default is not found under
+/// `default` (the tenant every verb now defaults to); the error says which
+/// tenant has it, and never names a restricted one.
+#[test]
+fn a_missing_pointer_names_the_tenant_that_has_it() {
+    let reg = test_registry();
+    let td = tempfile::tempdir().unwrap();
+    let mut conn = registry_db::open_at(&td.path().join("registry.db")).unwrap();
+    let a = registry_db::publish(&conn, &reg, &valid_spec(1), "t", "shared", None, 1).unwrap();
+    registry_db::promote(&mut conn, &a, "shared", "prod", 2).unwrap();
+    let err = registry_db::resolve_spec(&conn, "default", "prod")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("for tenant 'default'"), "{err}");
+    assert!(err.contains("pass --tenant shared"), "{err}");
+
+    let r = registry_db::publish(
+        &conn,
+        &reg,
+        &valid_spec(2),
+        "t",
+        registry_db::RESTRICTED_TENANT,
+        None,
+        3,
+    )
+    .unwrap();
+    registry_db::promote(&mut conn, &r, registry_db::RESTRICTED_TENANT, "clin", 4).unwrap();
+    let err = registry_db::resolve_spec(&conn, "default", "clin")
+        .unwrap_err()
+        .to_string();
+    assert!(!err.contains("restricted"), "{err}");
+}
+
+/// `plan rollback` walks the promotion history like an undo stack. It used to
+/// read the two most recent trail entries, so repeated rollbacks toggled
+/// between the last two deployments.
+#[test]
+fn rollback_walks_the_promotion_history() {
+    let reg = test_registry();
+    let td = tempfile::tempdir().unwrap();
+    let mut conn = registry_db::open_at(&td.path().join("registry.db")).unwrap();
+    let t = "default";
+    let [a, b, c, d] = [1, 2, 3, 4].map(|n| {
+        registry_db::publish(&conn, &reg, &valid_spec(n), "t", t, None, n as i64).unwrap()
+    });
+    let at = |conn: &rusqlite::Connection| registry_db::resolve_pointer(conn, t, "p").unwrap();
+
+    // Nothing to roll back: no deployment, then a single promotion.
+    let err = registry_db::rollback(&mut conn, t, "p", 10)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no deployment"), "{err}");
+    registry_db::promote(&mut conn, &a, t, "p", 11).unwrap();
+    let err = registry_db::rollback(&mut conn, t, "p", 12)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("nothing earlier"), "{err}");
+    assert_eq!(
+        at(&conn),
+        Some(a.clone()),
+        "a refused rollback moves nothing"
+    );
+
+    // A, B, C then two rollbacks: C → B → A, then refused.
+    registry_db::promote(&mut conn, &b, t, "p", 13).unwrap();
+    registry_db::promote(&mut conn, &c, t, "p", 14).unwrap();
+    assert_eq!(registry_db::rollback(&mut conn, t, "p", 15).unwrap(), b);
+    assert_eq!(registry_db::rollback(&mut conn, t, "p", 16).unwrap(), a);
+    assert_eq!(at(&conn), Some(a.clone()));
+    assert!(registry_db::rollback(&mut conn, t, "p", 17).is_err());
+
+    // A promotion after a rollback continues from there: [A, D]; rolling back
+    // returns to A, and B/C are not reachable by rollback any more.
+    registry_db::promote(&mut conn, &d, t, "p", 18).unwrap();
+    assert_eq!(registry_db::rollback(&mut conn, t, "p", 19).unwrap(), a);
+    assert!(registry_db::rollback(&mut conn, t, "p", 20).is_err());
+
+    // Re-promoting the current target is recorded but is not a new step.
+    registry_db::promote(&mut conn, &b, t, "p", 21).unwrap();
+    registry_db::promote(&mut conn, &b, t, "p", 22).unwrap();
+    assert_eq!(registry_db::rollback(&mut conn, t, "p", 23).unwrap(), a);
+
+    // Every move stays in the audit trail: 6 promotions and 4 rollbacks
+    // (refused rollbacks record nothing).
+    assert_eq!(registry_db::history(&conn, t, "p").unwrap().len(), 10);
+}
+
+/// A registry created before rollbacks were recorded as such gains the column
+/// on open; its old moves count as promotions.
+#[test]
+fn an_old_registry_gains_the_move_kind_on_open() {
+    let td = tempfile::tempdir().unwrap();
+    let path = td.path().join("registry.db");
+    {
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE pointer_history (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT NOT NULL,
+                name TEXT NOT NULL, plan_fingerprint TEXT NOT NULL,
+                moved_at INTEGER NOT NULL);
+             INSERT INTO pointer_history (tenant, name, plan_fingerprint, moved_at)
+                VALUES ('default', 'p', 'aa', 1), ('default', 'p', 'bb', 2);",
+        )
+        .unwrap();
+    }
+    let conn = registry_db::open_at(&path).unwrap();
+    assert_eq!(
+        registry_db::history(&conn, "default", "p").unwrap().len(),
+        2
+    );
+    // Reopening is idempotent.
+    drop(conn);
+    registry_db::open_at(&path).unwrap();
+}

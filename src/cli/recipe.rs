@@ -285,7 +285,12 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                             no_cache,
                             sync_io,
                             tenant,
-                            experiment,
+                            // Runs of one deploy pointer group as one
+                            // experiment, `plan.<pointer>`, unless named.
+                            experiment.or_else(|| {
+                                crate::registry_db::parse_pointer_uri(&name)
+                                    .map(|ptr| format!("plan.{ptr}"))
+                            }),
                         )
                         .await?;
                     } else {
@@ -938,24 +943,26 @@ impl PreparedRecipeLaunch {
         // an orphan job directory merely by computing an admission witness.
         // Materialize persistent job state only once execution actually owns
         // that scheduler permit.
+        //
+        // The experiment label is settled before anything is written. A launch
+        // named by a deploy URI (`registry://plan@prod`) defaulted it to that
+        // URI, which is not a valid experiment name, and failed after the job
+        // directory existed but before its state did: `blut jobs` then listed a
+        // job that read as `running` forever.
+        let experiment = experiment.unwrap_or_else(|| experiment_label(&name));
+        if !crate::experiment_registry::is_safe_experiment_name(&experiment) {
+            return Err(anyhow!(
+                "invalid --experiment '{experiment}' (expected [A-Za-z0-9_.-]+)"
+            ));
+        }
         let materialized_job_dir = crate::paths::job_dir(&job_id)?;
         debug_assert_eq!(materialized_job_dir, job_dir);
-        crate::jobs::write_tenant(&job_id, &tenant)
-            .with_context(|| format!("persist tenant for {job_id}"))?;
-        crate::jobs::write_experiment(&job_id, experiment.as_deref().unwrap_or(&name))
-            .with_context(|| format!("persist experiment for {job_id}"))?;
-        crate::jobs::write_provenance(&job_id, crate::lineage_db::git_head_sha())
-            .with_context(|| format!("persist provenance for {job_id}"))?;
-
-        // Mark recipe for plan resume — only for a registry recipe (a
-        // declarative `.toml` launch passes `None`: there is no registry recipe
-        // to re-compile from on resume, so writing a marker would be dangling).
-        if let Some(marker) = marker {
-            marker.write_to(&job_dir)?;
+        if let Err(error) = persist_launch_records(&job_id, &job_dir, &tenant, &experiment, marker)
+        {
+            // Nothing ran: remove the partial job rather than leave one behind.
+            let _ = std::fs::remove_dir_all(&job_dir);
+            return Err(error);
         }
-
-        crate::jobs::write_state(&job_id, JobState::Running)
-            .with_context(|| format!("write Running state for {job_id}"))?;
         let _driver = crate::jobs::record_driver(&job_id);
 
         // KILL-2/KILL-3: bind this job so backend spawns mirror the python
@@ -1064,6 +1071,54 @@ pub(super) fn terminal_for_error(error: &crate::framework::PlanError) -> (JobSta
     } else {
         (JobState::Failed, "failed")
     }
+}
+
+/// The default experiment label for a launch named `name`: the name itself
+/// when it is a valid experiment name, else the name with every other
+/// character replaced by `_` (a deploy URI, say).
+fn experiment_label(name: &str) -> String {
+    if crate::experiment_registry::is_safe_experiment_name(name) {
+        return name.to_string();
+    }
+    let label: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let label = label.trim_start_matches(['.', '-']).replace("..", "_");
+    if crate::experiment_registry::is_safe_experiment_name(&label) {
+        label
+    } else {
+        "plan".to_string()
+    }
+}
+
+/// Write a starting job's records: tenant, experiment, launch provenance, the
+/// resume marker (registry recipes only — a declared plan has no recipe to
+/// re-compile on resume), and finally `state = running`.
+fn persist_launch_records(
+    job_id: &str,
+    job_dir: &std::path::Path,
+    tenant: &crate::tenant::Tenant,
+    experiment: &str,
+    marker: Option<RecipeMarker>,
+) -> Result<()> {
+    crate::jobs::write_tenant(job_id, tenant)
+        .with_context(|| format!("persist tenant for {job_id}"))?;
+    crate::jobs::write_experiment(job_id, experiment)
+        .with_context(|| format!("persist experiment for {job_id}"))?;
+    crate::jobs::write_provenance(job_id, crate::lineage_db::git_head_sha())
+        .with_context(|| format!("persist provenance for {job_id}"))?;
+    if let Some(marker) = marker {
+        marker.write_to(job_dir)?;
+    }
+    crate::jobs::write_state(job_id, JobState::Running)
+        .with_context(|| format!("write Running state for {job_id}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1557,6 +1612,30 @@ pub(super) fn warn_overrides_outside_args(
                      read from the '{subtree_key}:' subtree; use '{subtree_key}.{key}=…'."
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod experiment_label_tests {
+    use super::experiment_label;
+
+    /// `recipe declare registry://plan@prod --run` defaulted the experiment to
+    /// the URI and failed with "invalid experiment name" after creating the job.
+    #[test]
+    fn a_launch_name_always_yields_a_valid_experiment_label() {
+        assert_eq!(experiment_label("e2e_train"), "e2e_train");
+        assert_eq!(
+            experiment_label("registry://plan@prod"),
+            "registry___plan_prod"
+        );
+        assert_eq!(experiment_label("../x"), "_x");
+        assert_eq!(experiment_label(""), "plan");
+        for name in ["registry://plan@prod", "a b", "-x", ".hidden", "é"] {
+            assert!(
+                crate::experiment_registry::is_safe_experiment_name(&experiment_label(name)),
+                "{name:?}"
+            );
         }
     }
 }

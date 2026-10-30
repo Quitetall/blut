@@ -174,8 +174,9 @@ let result = ParallelExecutor::execute(plan.into_compiled(), ctx).await?;
 
 Registry handles are resolved before typed cookbook/declarative args compile,
 and resumable jobs retain the original handles so datasets are hash-revalidated
-on resume. Model and recipe commands both default to tenant `default`; use
-`--tenant shared` to address model records created under the former default.
+on resume. Model, plan and recipe commands all default to tenant `default`;
+use `--tenant shared` to address model and plan records created under the
+former default.
 
 ### Experimental development surface
 
