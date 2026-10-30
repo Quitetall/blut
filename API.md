@@ -132,6 +132,18 @@ A `RecipeDef` carries `name`, `description`, `backend_id`, `category`,
 `input_kinds`, `output_kind`, an args JSON-schema fn, and a compile fn that
 parses args → a backend-erased `CompiledPlan`.
 
+## Built-in checks (`checks/`, ADR 0091)
+
+Every registry gets two passthrough guard stages: `check_jsonl` (row-count
+bounds) and `assert` (a literal scalar predicate). Both take and return
+`checks::JsonlArtifact`, kind `checks.jsonl`, and edges kind-check by exact
+kind, so a check cannot follow a stage that emits a cookbook's own JSONL kind
+(the standard cookbook's `dataset.jsonl`, for example). Emit `JsonlArtifact`
+from the producing stage, or add an adapter stage whose `run` returns
+`JsonlArtifact::from_file(&input.path)`; the module docs carry a compiled
+example. `assert` compares the `actual` value in its args; the engine does not
+feed a stage's emitted metrics into it.
+
 ## Declared recipes: `.toml` / `.json` / `.star` (ADR 0078)
 
 Beyond compiled `RecipeDef`s, `blut recipe declare <file>` compiles a recipe

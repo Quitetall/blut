@@ -11,6 +11,11 @@ depend on this crate.
 ## [Unreleased]
 
 ### Added
+- `checks::JsonlArtifact::from_file(path)`, and documentation of the checks
+  stages' input contract: `check_jsonl` and `assert` take only `checks.jsonl`,
+  so a cookbook guards its own JSONL by emitting `JsonlArtifact` or through a
+  one-line adapter stage (a compiled example is in the `checks` module docs).
+  `assert` compares the literal `actual` it is given.
 - `BLUT_REMOTE_CACHE` for `recipe run` and `recipe declare --run`: a directory,
   or with the `s3` feature an `s3://bucket[/prefix]` URL, used as the cache's
   content-addressed remote tier. Stage outputs are written through to it and a

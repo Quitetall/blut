@@ -18,6 +18,51 @@
 //! path rides the existing `StageError` → downstream-skip machinery; the
 //! passthrough output keeps cache keys identical. This is the standard `checks`
 //! cookbook the way `p2p-smoke` is a built-in cookbook.
+//!
+//! # The input contract
+//!
+//! Both stages take and return [`JsonlArtifact`] (kind `checks.jsonl`), and a
+//! graph kind-checks edges by exact kind. The engine is domain-agnostic and
+//! cannot know a cookbook's own artifact types, so a check cannot sit directly
+//! after a stage that emits another kind (for example the standard cookbook's
+//! `dataset.jsonl`): `plan check` refuses that edge as a kind break. To guard a
+//! cookbook's JSONL, either emit [`JsonlArtifact`] from the producing stage, or
+//! add a one-line adapter stage that re-labels the file:
+//!
+//! ```
+//! use async_trait::async_trait;
+//! use blut::checks::JsonlArtifact;
+//! use blut::framework::{Resource, Stage, StageContext, StageError};
+//! # use blut::framework::{Artifact, ContentHash};
+//! # #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+//! # struct MyJsonl { path: std::path::PathBuf }
+//! # impl Artifact for MyJsonl {
+//! #     const KIND: &'static str = "my.jsonl";
+//! #     const SCHEMA: u32 = 1;
+//! #     fn content_hash(&self) -> ContentHash { ContentHash::hash_file(&self.path).unwrap() }
+//! #     fn primary_path(&self) -> &std::path::Path { &self.path }
+//! # }
+//!
+//! /// `my.jsonl` -> `checks.jsonl`: the same file, so `check_jsonl` can guard it.
+//! struct ToChecks;
+//!
+//! #[async_trait]
+//! impl Stage for ToChecks {
+//!     const NAME: &'static str = "my_jsonl_to_checks";
+//!     const SCHEMA: u32 = 1;
+//!     const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+//!     type Input = MyJsonl;
+//!     type Output = JsonlArtifact;
+//!     type Args = ();
+//!     async fn run(&self, _: &StageContext, input: MyJsonl, _: &()) -> Result<JsonlArtifact, StageError> {
+//!         JsonlArtifact::from_file(&input.path)
+//!             .map_err(|e| StageError::BadInput(format!("hash {}: {e}", input.path.display())))
+//!     }
+//! }
+//! ```
+//!
+//! [`Assert`] compares the literal `actual` it is given; the engine does not
+//! read a stage's emitted metrics into it.
 
 use std::path::{Path, PathBuf};
 
@@ -132,6 +177,17 @@ fn handle_breach(
 pub struct JsonlArtifact {
     pub path: PathBuf,
     pub content_hash: ContentHash,
+}
+
+impl JsonlArtifact {
+    /// A handle for an existing JSONL file: its path and content hash. What an
+    /// adapter stage returns to put a cookbook's JSONL in front of the checks
+    /// stages (see the module docs).
+    pub fn from_file(path: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let path = path.into();
+        let content_hash = ContentHash::hash_file(&path)?;
+        Ok(Self { path, content_hash })
+    }
 }
 
 impl Artifact for JsonlArtifact {
@@ -285,7 +341,9 @@ impl CmpOp {
 /// Args for [`Assert`]: a scalar predicate `actual <op> expected` (± tolerance).
 #[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AssertArgs {
-    /// The measured value (typically threaded in from an upstream metric).
+    /// The value to test, as a literal arg. The engine does not read an
+    /// upstream stage's emitted metrics into it: whoever builds the plan
+    /// supplies the number.
     pub actual: f64,
     /// The comparison operator.
     #[serde(default)]
@@ -499,6 +557,23 @@ pub fn render_report(breaches: &[Breach]) -> String {
 }
 
 // ── tests ──────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod contract_tests {
+    use super::JsonlArtifact;
+    use crate::framework::{Artifact, ContentHash};
+
+    #[test]
+    fn from_file_hashes_the_bytes_it_points_at() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("rows.jsonl");
+        std::fs::write(&path, "{}\n{}\n").unwrap();
+        let a = JsonlArtifact::from_file(&path).unwrap();
+        assert_eq!(a.primary_path(), path.as_path());
+        assert_eq!(a.content_hash(), ContentHash::hash_file(&path).unwrap());
+        assert!(JsonlArtifact::from_file(td.path().join("missing.jsonl")).is_err());
+    }
+}
 
 #[cfg(test)]
 mod tests {
