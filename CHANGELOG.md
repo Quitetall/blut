@@ -68,12 +68,36 @@ depend on this crate.
   the BLUT process that started them died; `plan resume` refuses while any of
   them still runs and says to cancel them; and when an attempt fails under
   `--launcher slurm`, the executor cancels the Slurm job of that attempt.
+- `ContainedChild::pump_stderr`: relays a contained child's piped stderr to a
+  sink line by line and, for the systemd backend, records the `Memory peak:`
+  line, so `peak_bytes` reports it. `ContainedChild::tears_down_tree` says
+  whether the backend can kill the whole tree itself (systemd, cgroup v2, Job
+  Object) or the caller must signal the process group (`rlimit`, `bare`).
 
 ### Changed
 - Every cache key changes once: the engine build commit alone is replaced by
   the code identity above. Existing entries miss on the first run.
 - A refused checkpoint slot reads `resume checkpoint busy: stage '<name>':
   <holder>` instead of saying "busy" twice.
+- A `ContainedChild` no longer outlives its tree. Under the systemd backend
+  the direct child is the `systemd-run` client, and killing it left the
+  transient service running. The backend's teardown now runs whenever the
+  direct child exits, and again, best-effort, when the value is dropped before
+  that (a hard stage timeout drops the stage future); for `rlimit` and `bare`
+  a drop kills the child's process group.
+- `LocalSystemd::spawn_contained` serves every local stage, not only Windows
+  ones:
+  - Under systemd the stage now gets the caller's environment (a
+    `systemd-run --user` service otherwise starts from the user manager's
+    minimal one), forwarded by name. That needs systemd 250; with an older
+    systemd the stage runs under the next backend, and an explicit
+    `BLUT_CONTAINMENT=systemd` is refused.
+  - Under `rlimit` no cap is applied: an address-space cap at the launcher's
+    default would refuse the reservations a CUDA process makes.
+  - Unit names are `<unit>-<pid>-<seq>`, so concurrent and repeated stages
+    never collide.
+  - One log line names the backend, what it applies, and why it is not
+    systemd when it is not (`BLUT_NO_CONTAIN`, no user bus, an old systemd).
 - `blut-operator` moves to the engine's MSRV, Rust 1.88 (was 1.89), and from
   kube 0.96 to kube 4.0 / k8s-openapi 0.28 (Kubernetes 1.32 API). It is
   publishable (`publish = ["crates-io"]`, 0.2.0-alpha.2) but not yet published.
@@ -93,6 +117,21 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- The systemd containment backend rewrote arguments that contain `$`: a
+  `systemd-run` service's command line is expanded like `ExecStart=`, so
+  `$VAR`, `${VAR}` and `$$` changed on the way to the stage (a JSON spec, a
+  password, a regex). It now passes `--expand-environment=no` (systemd 254 and
+  later) or doubles each `$`.
+- The cgroup-v2 containment backend reported itself usable wherever it could
+  create a directory in its own cgroup. That cgroup is usually a terminal's
+  scope or a service with processes in it, where cgroup v2 will not enable the
+  memory controller for children, so the first `memory.max` write failed and
+  the stage with it. It now probes with a throwaway leaf and is usable only if
+  the leaf gets `memory.max`; otherwise the factory falls through to `rlimit`.
+- The systemd containment backend put every environment value it passed on
+  `systemd-run`'s command line, which any user on the host can read. With
+  systemd 250 and later only the names go there; the values travel in the
+  client's own environment.
 - `blut dag` showed a node that failed and was then re-run to completion by
   `plan resume` as `failed`, because the first terminal event in the job's
   status log won. A later attempt (`stage_begin` or a cache hit) now reopens

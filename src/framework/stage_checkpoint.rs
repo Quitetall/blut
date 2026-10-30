@@ -595,7 +595,8 @@ fn try_lock(file: File) -> std::io::Result<Option<LockGuard>> {
 
 #[cfg(windows)]
 #[derive(Debug)]
-struct LockGuard(File);
+// Never read: holding the file holds the lock, and dropping it unlocks.
+struct LockGuard(#[allow(dead_code)] File);
 
 #[cfg(windows)]
 fn try_lock(file: File) -> std::io::Result<Option<LockGuard>> {

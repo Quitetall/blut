@@ -245,6 +245,21 @@ pub async fn spawn_attached(
 /// the common rented-GPU case) it's `RlimitAddressSpace` — a REAL cap, not
 /// Bare; only a box with none of the above falls to `Bare` with a warning.
 pub fn containment_for() -> Box<dyn Containment> {
+    select_backend(false)
+}
+
+/// [`containment_for`], but the AUTO order never picks the systemd backend:
+/// for a caller that needs something systemd on this host cannot give (see
+/// `LocalSystemd::spawn_contained`). An explicit `BLUT_CONTAINMENT=systemd`
+/// still selects it; the caller decides what to do with that.
+#[cfg(target_os = "linux")]
+pub(crate) fn containment_for_without_systemd() -> Box<dyn Containment> {
+    select_backend(true)
+}
+
+fn select_backend(skip_systemd: bool) -> Box<dyn Containment> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = skip_systemd;
     if crate::config::env_flag("BLUT_NO_CONTAIN") {
         return Box::new(bare::Bare);
     }
@@ -269,7 +284,7 @@ pub fn containment_for() -> Box<dyn Containment> {
     #[cfg(target_os = "linux")]
     {
         let sd = systemd::SystemdCgroup;
-        if sd.available() == Availability::Present {
+        if !skip_systemd && sd.available() == Availability::Present {
             return Box::new(sd);
         }
         let cg = cgroup2::CgroupV2Direct;
