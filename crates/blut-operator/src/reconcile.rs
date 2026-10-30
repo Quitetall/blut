@@ -115,11 +115,12 @@ pub fn plan_configmap_name(plan: &BlutPlan) -> String {
 }
 
 /// The recipe's file name inside the container (its extension picks the
-/// format).
-pub fn plan_file(spec: &BlutPlanSpec) -> &str {
+/// format). `None` for a recipe run by name.
+pub fn plan_file(spec: &BlutPlanSpec) -> Option<&str> {
     match &spec.plan_source {
-        PlanSource::Inline { filename, .. } => filename,
-        PlanSource::ConfigMapRef { key, .. } => key,
+        PlanSource::Inline { filename, .. } => Some(filename),
+        PlanSource::ConfigMapRef { key, .. } => Some(key),
+        PlanSource::Recipe { .. } => None,
     }
 }
 
@@ -149,7 +150,57 @@ pub fn validate_plan(plan: &BlutPlan) -> Result<(), String> {
         ));
     }
     let spec = &plan.spec;
-    let file = plan_file(spec);
+    match plan_file(spec) {
+        Some(file) => validate_recipe_file(spec, file)?,
+        None => validate_named_recipe(spec)?,
+    }
+    if let Some(command) = &spec.command
+        && (command.is_empty() || command.chars().any(char::is_whitespace))
+    {
+        return Err(format!(
+            "command '{command}' must be one executable name or path, without arguments"
+        ));
+    }
+    if let CacheConfig::Pvc { claim_name } = &spec.cache
+        && !is_dns_subdomain(claim_name)
+    {
+        return Err(format!(
+            "cache.pvc.claimName '{claim_name}' is not a valid claim name"
+        ));
+    }
+    if let Some(store) = &spec.store {
+        let url = store.url.as_str();
+        if let Some(rest) = url.strip_prefix("s3://") {
+            let bucket = rest.split('/').next().unwrap_or("");
+            if bucket.is_empty() || bucket.contains('@') || bucket.contains(':') {
+                return Err(
+                    "store.url must be s3://bucket[/prefix]; credentials and the endpoint \
+                     belong in store.credentialsSecret, never in the URL"
+                        .into(),
+                );
+            }
+            if url.contains('?') || url.contains('#') {
+                return Err("store.url must not carry a query or fragment".into());
+            }
+        } else if !url.starts_with('/') {
+            return Err("store.url must be s3://bucket[/prefix] or an absolute path".into());
+        }
+        if let Some(secret) = &store.credentials_secret
+            && !is_dns_subdomain(secret)
+        {
+            return Err(format!(
+                "store.credentialsSecret '{secret}' is not a valid Secret name"
+            ));
+        }
+    }
+    if spec.timeout_seconds == Some(0) {
+        return Err("timeoutSeconds must be positive when set".into());
+    }
+    Ok(())
+}
+
+/// A recipe file (inline or in a ConfigMap): its name, format and args.
+fn validate_recipe_file(spec: &BlutPlanSpec, file: &str) -> Result<(), String> {
     if file.is_empty()
         || file.contains('/')
         || file.starts_with('.')
@@ -198,47 +249,36 @@ pub fn validate_plan(plan: &BlutPlan) -> Result<(), String> {
             return Err("args is not valid JSON".into());
         }
     }
-    if let Some(command) = &spec.command
-        && (command.is_empty() || command.chars().any(char::is_whitespace))
+    Ok(())
+}
+
+/// A recipe run by name: the name the cookbook lists, and a JSON object of
+/// args carried in the source itself.
+fn validate_named_recipe(spec: &BlutPlanSpec) -> Result<(), String> {
+    let PlanSource::Recipe { name, args } = &spec.plan_source else {
+        return Ok(());
+    };
+    if name.is_empty()
+        || name.len() > 200
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
     {
         return Err(format!(
-            "command '{command}' must be one executable name or path, without arguments"
+            "planSource.recipe.name '{name}' must be a recipe name of letters, digits, \
+             '.', '_' or '-'"
         ));
     }
-    if let CacheConfig::Pvc { claim_name } = &spec.cache
-        && !is_dns_subdomain(claim_name)
-    {
-        return Err(format!(
-            "cache.pvc.claimName '{claim_name}' is not a valid claim name"
-        ));
+    match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(serde_json::Value::Object(_)) => {}
+        _ => return Err("planSource.recipe.args must be a JSON object".into()),
     }
-    if let Some(store) = &spec.store {
-        let url = store.url.as_str();
-        if let Some(rest) = url.strip_prefix("s3://") {
-            let bucket = rest.split('/').next().unwrap_or("");
-            if bucket.is_empty() || bucket.contains('@') || bucket.contains(':') {
-                return Err(
-                    "store.url must be s3://bucket[/prefix]; credentials and the endpoint \
-                     belong in store.credentialsSecret, never in the URL"
-                        .into(),
-                );
-            }
-            if url.contains('?') || url.contains('#') {
-                return Err("store.url must not carry a query or fragment".into());
-            }
-        } else if !url.starts_with('/') {
-            return Err("store.url must be s3://bucket[/prefix] or an absolute path".into());
-        }
-        if let Some(secret) = &store.credentials_secret
-            && !is_dns_subdomain(secret)
-        {
-            return Err(format!(
-                "store.credentialsSecret '{secret}' is not a valid Secret name"
-            ));
-        }
-    }
-    if spec.timeout_seconds == Some(0) {
-        return Err("timeoutSeconds must be positive when set".into());
+    if spec.args.is_some() {
+        return Err(
+            "args is only for .star recipes; a named recipe carries its args in \
+             planSource.recipe.args"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -342,8 +382,9 @@ pub fn build_plan_configmap(plan: &BlutPlan) -> Option<ConfigMap> {
 
 /// Build the `Job` that runs a `BlutPlan` to completion.
 ///
-/// The container runs `<command> recipe declare /blut/plan/<file> --run`
-/// directly as PID 1, so a pod deletion's SIGTERM reaches the engine's cancel
+/// The container runs `<command> recipe declare /blut/plan/<file> --run`, or
+/// `<command> recipe run <name> --args <json>` for a named recipe, directly as
+/// PID 1, so a pod deletion's SIGTERM reaches the engine's cancel
 /// handler. The engine writes its run summary to the termination-message file,
 /// which is how per-stage state and cache counts reach the plan's status.
 pub fn build_plan_job(plan: &BlutPlan) -> Job {
@@ -356,28 +397,37 @@ pub fn build_plan_job(plan: &BlutPlan) -> Job {
         );
         l
     };
-    let file = plan_file(spec).to_string();
     // An inline recipe is the only key of the operator's ConfigMap. A
     // referenced ConfigMap is mounted whole, so small inputs the recipe names
-    // (`/blut/plan/<key>`) can travel with it.
-    let (configmap, items) = match &spec.plan_source {
-        PlanSource::Inline { filename, .. } => (
+    // (`/blut/plan/<key>`) can travel with it. A named recipe needs no file.
+    let plan_volume = match &spec.plan_source {
+        PlanSource::Inline { filename, .. } => Some((
             plan_configmap_name(plan),
             Some(vec![KeyToPath {
                 key: filename.clone(),
-                path: file.clone(),
+                path: filename.clone(),
                 ..Default::default()
             }]),
-        ),
-        PlanSource::ConfigMapRef { name, .. } => (name.clone(), None),
+        )),
+        PlanSource::ConfigMapRef { name, .. } => Some((name.clone(), None)),
+        PlanSource::Recipe { .. } => None,
     };
 
-    let mut args = vec![
-        "recipe".to_string(),
-        "declare".to_string(),
-        format!("{PLAN_DIR}/{file}"),
-        "--run".to_string(),
-    ];
+    let mut args = match (&spec.plan_source, plan_file(spec)) {
+        (PlanSource::Recipe { name, args }, _) => vec![
+            "recipe".to_string(),
+            "run".to_string(),
+            name.clone(),
+            "--args".to_string(),
+            args.clone(),
+        ],
+        (_, file) => vec![
+            "recipe".to_string(),
+            "declare".to_string(),
+            format!("{PLAN_DIR}/{}", file.unwrap_or_default()),
+            "--run".to_string(),
+        ],
+    };
     if let Some(a) = &spec.args {
         args.push("--args".into());
         args.push(a.clone());
@@ -385,24 +435,26 @@ pub fn build_plan_job(plan: &BlutPlan) -> Job {
 
     let mut env = engine_env();
     env.push(env_var_summary());
-    let mut volumes = vec![
-        Volume {
-            name: PLAN_VOLUME.into(),
-            config_map: Some(ConfigMapVolumeSource {
-                name: configmap,
-                items,
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        empty_dir(WORK_VOLUME),
-        empty_dir(TMP_VOLUME),
-    ];
+    let mut volumes = vec![empty_dir(WORK_VOLUME), empty_dir(TMP_VOLUME)];
     let mut mounts = vec![
-        mount(PLAN_VOLUME, PLAN_DIR, true),
         mount(WORK_VOLUME, WORK_DIR, false),
         mount(TMP_VOLUME, "/tmp", false),
     ];
+    if let Some((configmap, items)) = plan_volume {
+        volumes.insert(
+            0,
+            Volume {
+                name: PLAN_VOLUME.into(),
+                config_map: Some(ConfigMapVolumeSource {
+                    name: configmap,
+                    items,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        mounts.insert(0, mount(PLAN_VOLUME, PLAN_DIR, true));
+    }
     if let CacheConfig::Pvc { claim_name } = &spec.cache {
         // The engine's global cache tier, used with --shared-cache.
         env.push(self::env("LAMU_TRAIN_CACHE_DIR", CACHE_MOUNT_PATH));

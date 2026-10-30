@@ -846,3 +846,87 @@ fn a_pool_coordinator_key_makes_workers_run_real_stages() {
         .unwrap();
     assert_eq!(args[i + 1], "ab01");
 }
+
+// ── named recipes (what `recipe run --launcher k8s` submits) ──────────────
+
+fn named(name: &str, args: &str) -> PlanSource {
+    PlanSource::Recipe {
+        name: name.into(),
+        args: args.into(),
+    }
+}
+
+#[test]
+fn a_named_recipe_runs_recipe_run_without_a_plan_volume() {
+    let p = plan_with(spec(named("split_dataset", r#"{"eval_ratio":0.25}"#)));
+    assert_eq!(validate_plan(&p), Ok(()));
+    assert!(build_plan_configmap(&p).is_none(), "nothing to copy");
+    let job = build_plan_job(&p);
+    let c = container(&job);
+    assert_eq!(
+        c.args.as_deref().unwrap(),
+        [
+            "recipe",
+            "run",
+            "split_dataset",
+            "--args",
+            r#"{"eval_ratio":0.25}"#
+        ]
+    );
+    let pod = job.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+    assert!(
+        pod.volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|v| v.name != "plan"),
+        "no ConfigMap volume for a named recipe"
+    );
+    assert!(
+        c.volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|m| m.name != "plan")
+    );
+    assert_eq!(
+        env_value(c, "BLUT_RUN_SUMMARY"),
+        Some(TERMINATION_MESSAGE_PATH)
+    );
+}
+
+#[test]
+fn a_named_recipe_with_a_bad_name_or_args_is_refused() {
+    for (source, needle) in [
+        (named("", "{}"), "planSource.recipe.name"),
+        (named("a b", "{}"), "planSource.recipe.name"),
+        (named("../x", "{}"), "planSource.recipe.name"),
+        (named("ok", "[1]"), "must be a JSON object"),
+        (named("ok", "{not json"), "must be a JSON object"),
+    ] {
+        let err = validate_plan(&plan_with(spec(source))).expect_err(needle);
+        assert!(err.contains(needle), "{err:?} should mention {needle:?}");
+    }
+    let both = BlutPlanSpec {
+        args: Some("{}".into()),
+        ..spec(named("ok", "{}"))
+    };
+    let err = validate_plan(&plan_with(both)).unwrap_err();
+    assert!(err.contains("planSource.recipe.args"), "{err}");
+}
+
+#[test]
+fn a_named_recipe_defaults_to_empty_args() {
+    let json = serde_json::json!({
+        "planSource": { "recipe": { "name": "train" } },
+        "cookbookImage": "img:1"
+    });
+    let s: BlutPlanSpec = serde_json::from_value(json).unwrap();
+    match s.plan_source {
+        PlanSource::Recipe { name, args } => {
+            assert_eq!(name, "train");
+            assert_eq!(args, "{}");
+        }
+        other => panic!("{other:?}"),
+    }
+}

@@ -72,6 +72,20 @@ pub enum PlanSource {
         #[serde(default = "default_plan_file")]
         filename: String,
     },
+    /// A recipe compiled into the cookbook binary, run by name with
+    /// `recipe run <name> --args <args>`. What `blut recipe run --launcher
+    /// k8s` submits.
+    Recipe {
+        /// Recipe name, as `recipe list` shows it.
+        name: String,
+        /// The recipe's args as a JSON object (`{}` by default).
+        #[serde(default = "default_recipe_args")]
+        args: String,
+    },
+}
+
+fn default_recipe_args() -> String {
+    "{}".to_string()
 }
 
 /// The default recipe file name.
