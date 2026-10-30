@@ -643,8 +643,14 @@ pub fn resolve_job_id(query: &str) -> Result<String> {
 /// would spawn a new one. With no live driver, the recorded trainer group (a
 /// child orphaned by a crashed driver) is SIGTERMed and then SIGKILLed.
 ///
-/// A job that already finished (`done`/`failed`/`cancelled`) with nothing
-/// left running is left exactly as it is; its state is never rewritten.
+/// Either way, the Slurm jobs ([`cancel_slurm_jobs`]) and systemd user units
+/// ([`cancel_systemd_units`]) recorded for the job that still run are
+/// stopped, and each one stopped is reported on stderr: both outlive a
+/// driver that was SIGKILLed. A unit gets SIGTERM and, 10 s later, SIGKILL
+/// (its own stop timeout); `grace` does not apply to it.
+///
+/// A job that already finished (`done`/`failed`/`cancelled`) has only those
+/// stopped; its state is never rewritten.
 /// Refuses, without signalling anything, when the driver also runs other
 /// jobs (a sweep or backfill), because stopping it would stop them all.
 pub async fn cancel_job(job_id: &str, grace: std::time::Duration) -> Result<()> {
@@ -671,8 +677,10 @@ pub async fn cancel_job(job_id: &str, grace: std::time::Duration) -> Result<()> 
         state,
         Some(JobState::Done | JobState::Failed | JobState::Cancelled)
     ) {
-        // Nothing local is left, but a Slurm job its stage started can be.
+        // Nothing local is left, but a Slurm job or a systemd unit its stage
+        // started can be.
         stop_slurm_jobs(job_id);
+        stop_systemd_units(job_id);
         return Ok(());
     }
     let pid = read_pid(job_id)?;
@@ -680,6 +688,7 @@ pub async fn cancel_job(job_id: &str, grace: std::time::Duration) -> Result<()> 
         crate::python_kill::graceful_kill_pid(pid, grace).await;
     }
     stop_slurm_jobs(job_id);
+    stop_systemd_units(job_id);
     // A job submitted with `--launcher k8s` runs in a cluster. Its follower
     // (stopped above) deletes the BlutPlan on SIGTERM; deleting it here too
     // covers a follower that is already gone. Deletion is idempotent.
@@ -797,6 +806,288 @@ fn stop_slurm_jobs(job_id: &str) {
         Ok(ids) => eprintln!("cancelled Slurm job(s) {} of {job_id}", ids.join(", ")),
         Err(e) => eprintln!("warning: could not stop the Slurm jobs of {job_id}: {e}"),
     }
+}
+
+/// File listing, one per line, the systemd user units a job's stages were
+/// placed in ([`record_systemd_unit`]).
+const SYSTEMD_UNITS_FILE: &str = "systemd_units";
+
+tokio::task_local! {
+    /// The job directory of the work running on this task ([`in_job`]).
+    static JOB_DIR: PathBuf;
+}
+
+/// Run `fut` as work of the job in `job_dir`. While it runs, every process
+/// [`LocalSystemd::spawn_contained`](crate::config::launcher::LocalSystemd::spawn_contained)
+/// places in a systemd user unit from this task is recorded with the job
+/// ([`record_systemd_unit`]) before the process starts, so `blut cancel` and
+/// `plan resume` find the unit even after the BLUT process that started it
+/// was killed.
+///
+/// The executor runs every local stage attempt this way. A stage that spawns
+/// its process from a task of its own (`tokio::spawn`) wraps that task's
+/// future in this too: a task does not inherit it.
+pub async fn in_job<F: std::future::Future>(job_dir: PathBuf, fut: F) -> F::Output {
+    JOB_DIR.scope(job_dir, fut).await
+}
+
+/// The job directory [`in_job`] set for the current task, if any.
+#[cfg(target_os = "linux")]
+pub(crate) fn current_job_dir() -> Option<PathBuf> {
+    JOB_DIR.try_with(Clone::clone).ok()
+}
+
+/// The `Description=` of a systemd unit recorded for the job in `job_dir`:
+/// `blut job <job id>`. A recorded unit is only treated as the job's while
+/// its description says so: a unit name is `<unit>-<pid>-<seq>`, and once the
+/// recorded unit is gone, a later BLUT process given the same pid can start
+/// a unit of the same name for another job.
+pub(crate) fn systemd_unit_description(job_dir: &Path) -> String {
+    let job = job_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("blut job {job}")
+}
+
+/// Record `unit` (a systemd user unit name, with or without `.service`) in
+/// the job directory, once.
+pub fn record_systemd_unit(job_dir: &Path, unit: &str) -> Result<()> {
+    let unit = unit.strip_suffix(".service").unwrap_or(unit);
+    if !valid_unit_name(unit) {
+        return Err(TrainError::other(format!(
+            "not a unit name BLUT gives a stage: {unit:?}"
+        )));
+    }
+    let path = job_dir.join(SYSTEMD_UNITS_FILE);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|l| l == unit) {
+        return Ok(());
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|source| TrainError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    use std::io::Write;
+    writeln!(f, "{unit}").map_err(|source| TrainError::Io { path, source })
+}
+
+/// A unit name as `LocalSystemd::spawn_contained` makes them: `[A-Za-z0-9_-]`
+/// only. Anything else in the record is skipped, never passed to `systemctl`.
+fn valid_unit_name(unit: &str) -> bool {
+    !unit.is_empty()
+        && unit
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The systemd units recorded for `job_id`, without the `.service` suffix.
+pub fn systemd_unit_names(job_id: &str) -> Result<Vec<String>> {
+    let path = paths::jobs_dir()?.join(job_id).join(SYSTEMD_UNITS_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(body) => Ok(body
+            .lines()
+            .map(str::trim)
+            .filter(|l| valid_unit_name(l))
+            .map(String::from)
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(source) => Err(TrainError::Io { path, source }),
+    }
+}
+
+/// The units recorded for `job_id` that are still running for it, as
+/// `<name>.service`.
+///
+/// A unit counts while it is active, starting, stopping or reloading and its
+/// description is the job's, `blut job <job id>`: a unit name is
+/// `<unit>-<pid>-<seq>`, so once the recorded unit is gone a later BLUT
+/// process given the same pid can start one of the same name for another
+/// job. A unit that has stopped is gone (`--collect`) and does not count, so
+/// its record never blocks anything. Errors when `systemctl --user` cannot be
+/// asked (no user bus): then no user unit can be running here either, which
+/// is why the resume check does not block on that error.
+pub fn live_systemd_units(job_id: &str) -> Result<Vec<String>> {
+    let names = systemd_unit_names(job_id)?;
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let description = systemd_unit_description(&paths::jobs_dir()?.join(job_id));
+    let services: Vec<String> = names.iter().map(|n| format!("{n}.service")).collect();
+    let out = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "--property=Id,ActiveState,Description",
+            "--",
+        ])
+        .args(&services)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| TrainError::other(format!("systemctl invocation failed: {e}")))?;
+    if !out.status.success() {
+        return Err(TrainError::other(format!(
+            "systemctl --user show failed (exit {}): {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let shown = parse_systemctl_show(&String::from_utf8_lossy(&out.stdout));
+    Ok(services
+        .into_iter()
+        .filter(|s| shown.iter().any(|u| u.id == *s && u.runs_for(&description)))
+        .collect())
+}
+
+/// One unit of `systemctl show --property=Id,ActiveState,Description`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ShownUnit {
+    id: String,
+    active_state: String,
+    description: String,
+}
+
+impl ShownUnit {
+    /// Whether the unit has processes that may be running and is the one
+    /// whose description is `description`.
+    fn runs_for(&self, description: &str) -> bool {
+        self.description == description
+            && matches!(
+                self.active_state.as_str(),
+                "active" | "activating" | "deactivating" | "reloading" | "refreshing"
+            )
+    }
+}
+
+/// `systemctl show` prints one `Key=Value` block per unit, blocks separated
+/// by an empty line.
+fn parse_systemctl_show(stdout: &str) -> Vec<ShownUnit> {
+    let mut units = Vec::new();
+    let mut unit = ShownUnit::default();
+    for line in stdout.lines().chain(std::iter::once("")) {
+        if line.trim().is_empty() {
+            if !unit.id.is_empty() {
+                units.push(std::mem::take(&mut unit));
+            }
+            unit = ShownUnit::default();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "Id" => unit.id = value.to_string(),
+            "ActiveState" => unit.active_state = value.to_string(),
+            "Description" => unit.description = value.to_string(),
+            _ => {}
+        }
+    }
+    units
+}
+
+/// Why `plan resume` must not start yet: a systemd unit a stage of `job_id`
+/// was placed in still runs. `None` when there is none.
+pub fn systemd_resume_blocker(job_id: &str) -> Result<Option<String>> {
+    let live = live_systemd_units(job_id)?;
+    if live.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "job {job_id} still has systemd unit(s) running that its stages started: {}. \
+         Stop them with `blut cancel {job_id}`, or wait for them to finish, then resume",
+        live.join(", ")
+    )))
+}
+
+/// How long [`cancel_systemd_units`] waits for `systemctl --user stop`. A
+/// unit BLUT starts is SIGKILLed 10 s into its stop; this leaves room for
+/// that and for a unit started without that stop timeout.
+const SYSTEMD_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `systemctl --user stop` every unit recorded for `job_id` that still runs
+/// for it ([`live_systemd_units`]), and wait for them to stop: SIGTERM to
+/// every process in the unit, SIGKILL after the unit's stop timeout. Returns
+/// the units stopped, as `<name>.service`; errors naming any still running.
+pub fn cancel_systemd_units(job_id: &str) -> Result<Vec<String>> {
+    let live = live_systemd_units(job_id)?;
+    if live.is_empty() {
+        return Ok(live);
+    }
+    let mut stop = std::process::Command::new("systemctl")
+        .args(["--user", "stop", "--"])
+        .args(&live)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| TrainError::other(format!("systemctl invocation failed: {e}")))?;
+    // The exit status is not the answer: a unit that stopped by itself
+    // between the check and the stop makes `systemctl stop` fail with "not
+    // loaded". What still runs afterwards is.
+    let deadline = std::time::Instant::now() + SYSTEMD_STOP_WAIT;
+    loop {
+        match stop.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                // The stop job stays queued in the user manager.
+                let _ = stop.kill();
+                let _ = stop.wait();
+                break;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+    let still = live_systemd_units(job_id)?;
+    if !still.is_empty() {
+        return Err(TrainError::other(format!(
+            "systemd unit(s) {} still running {SYSTEMD_STOP_WAIT:?} after `systemctl --user stop`",
+            still.join(", ")
+        )));
+    }
+    Ok(live)
+}
+
+/// Stop the job's recorded systemd units and say what happened. The
+/// transient service a stage runs in keeps running when the BLUT process that
+/// started it is killed, so stopping a BLUT job has to stop it too.
+fn stop_systemd_units(job_id: &str) {
+    if systemd_unit_names(job_id)
+        .map(|n| n.is_empty())
+        .unwrap_or(true)
+    {
+        return;
+    }
+    match cancel_systemd_units(job_id) {
+        Ok(units) if units.is_empty() => {}
+        Ok(units) => eprintln!("stopped systemd unit(s) {} of {job_id}", units.join(", ")),
+        Err(e) => eprintln!("warning: could not stop the systemd units of {job_id}: {e}"),
+    }
+}
+
+/// Why `plan resume` must not start `job_id` yet, or `None`: its BLUT process
+/// is still running, or a Slurm job ([`slurm_resume_blocker`]) or systemd
+/// unit ([`systemd_resume_blocker`]) one of its stages started still runs.
+/// Resuming next to any of them would put two trainers on one job's work. A
+/// check that cannot be made (no `squeue`, no systemd user bus) does not
+/// block.
+pub fn resume_blocker(job_id: &str) -> Option<String> {
+    if let Some(pid) = live_driver(job_id) {
+        return Some(format!(
+            "job {job_id} is still running (blut pid {pid}); wait for it to finish, \
+             or stop it with `blut cancel {job_id}`, then resume"
+        ));
+    }
+    if let Ok(Some(why)) = slurm_resume_blocker(job_id) {
+        return Some(why);
+    }
+    if let Ok(Some(why)) = systemd_resume_blocker(job_id) {
+        return Some(why);
+    }
+    None
 }
 
 /// File naming the blut process that executes a job in-process.
@@ -1514,6 +1805,108 @@ mod tests {
             write_state(id, JobState::Done).unwrap();
             drop(record_driver(id));
             assert!(read_driver(id).unwrap().is_none());
+        });
+    }
+
+    // ── systemd units a job's stages were placed in ─────────────────
+
+    /// The record mirrors the Slurm one: one name per line, recorded once,
+    /// `.service` optional on the way in; a line that is not a unit name BLUT
+    /// gives a stage is never handed to `systemctl`.
+    #[test]
+    fn systemd_units_are_recorded_once_and_read_back() {
+        with_jobs_dir(|| {
+            let id = "20261030-000000-000000001";
+            let dir = paths::job_dir(id).unwrap();
+            assert!(systemd_unit_names(id).unwrap().is_empty());
+            record_systemd_unit(&dir, "blut-train-12-1").unwrap();
+            record_systemd_unit(&dir, "blut-train-12-1.service").unwrap();
+            record_systemd_unit(&dir, "blut-eval-12-2").unwrap();
+            assert!(record_systemd_unit(&dir, "x; rm -rf /").is_err());
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join(SYSTEMD_UNITS_FILE))
+                .unwrap();
+            use std::io::Write;
+            writeln!(f, "planted unit.service\n").unwrap();
+            assert_eq!(
+                systemd_unit_names(id).unwrap(),
+                vec!["blut-train-12-1".to_string(), "blut-eval-12-2".to_string()]
+            );
+        });
+    }
+
+    #[test]
+    fn systemctl_show_blocks_parse_and_only_the_jobs_running_unit_counts() {
+        let out = "Id=blut-a-1-1.service\nDescription=blut job J\nActiveState=active\n\n\
+                   Id=blut-b-1-2.service\nDescription=blut-b-1-2.service\nActiveState=inactive\n\n\
+                   Id=blut-c-1-3.service\nActiveState=deactivating\nDescription=blut job J\n\
+                   \nId=blut-d-1-4.service\nDescription=blut job other\nActiveState=active\n";
+        let units = parse_systemctl_show(out);
+        assert_eq!(units.len(), 4);
+        assert_eq!(
+            units[2],
+            ShownUnit {
+                id: "blut-c-1-3.service".into(),
+                active_state: "deactivating".into(),
+                description: "blut job J".into(),
+            }
+        );
+        let running: Vec<&str> = units
+            .iter()
+            .filter(|u| u.runs_for("blut job J"))
+            .map(|u| u.id.as_str())
+            .collect();
+        // b is gone; d has the name pattern but belongs to another job.
+        assert_eq!(running, ["blut-a-1-1.service", "blut-c-1-3.service"]);
+        for state in ["inactive", "failed", "maintenance", ""] {
+            let u = ShownUnit {
+                id: "x.service".into(),
+                active_state: state.into(),
+                description: "blut job J".into(),
+            };
+            assert!(!u.runs_for("blut job J"), "{state}");
+        }
+    }
+
+    #[test]
+    fn the_unit_description_names_the_job() {
+        assert_eq!(
+            systemd_unit_description(Path::new("/jobs/20261030-000000-000000001")),
+            "blut job 20261030-000000-000000001"
+        );
+    }
+
+    /// No record, no `systemctl` call, nothing to block or stop.
+    #[test]
+    fn a_job_without_units_has_none_live_and_no_blocker() {
+        with_jobs_dir(|| {
+            let id = "20261030-000000-000000002";
+            write_state(id, JobState::Running).unwrap();
+            assert!(live_systemd_units(id).unwrap().is_empty());
+            assert_eq!(systemd_resume_blocker(id).unwrap(), None);
+            assert!(cancel_systemd_units(id).unwrap().is_empty());
+            assert_eq!(resume_blocker(id), None);
+        });
+    }
+
+    /// The job directory reaches code running on the task `in_job` scopes,
+    /// and only there: not outside it, not on a task spawned from it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn in_job_scopes_the_job_dir_to_its_task() {
+        block_on(async {
+            assert_eq!(current_job_dir(), None);
+            let dir = PathBuf::from("/jobs/20261030-000000-000000003");
+            let seen = in_job(dir.clone(), async {
+                tokio::task::yield_now().await;
+                let here = current_job_dir();
+                let spawned = tokio::spawn(async { current_job_dir() }).await.unwrap();
+                (here, spawned)
+            })
+            .await;
+            assert_eq!(seen, (Some(dir), None));
+            assert_eq!(current_job_dir(), None);
         });
     }
 }

@@ -13,6 +13,8 @@
 //   - cancelling kills the whole tree, the grandchild included, and stops the
 //     unit, although the direct child is only the systemd-run client;
 //   - dropping the value stops the unit too;
+//   - a tree that ignores SIGTERM is SIGKILLed 10 s into a cancel
+//     (`TimeoutStopSec=10s` in the unit), not after the manager's default;
 //   - no unit is left behind.
 #![cfg(target_os = "linux")]
 
@@ -100,6 +102,16 @@ async fn read_pids(path: &Path) -> Vec<i32> {
 fn tree_script(pidfile: &Path) -> Vec<String> {
     let script = format!(
         "sleep 600 & echo $$ $! > {}.tmp && mv {0}.tmp {0}; wait",
+        pidfile.display()
+    );
+    vec!["sh".into(), "-c".into(), script]
+}
+
+/// [`tree_script`], but both processes ignore SIGTERM (an ignored signal
+/// stays ignored across `exec`), as a trainer that traps it and hangs does.
+fn stubborn_tree_script(pidfile: &Path) -> Vec<String> {
+    let script = format!(
+        "trap '' TERM; sleep 600 & echo $$ $! > {}.tmp && mv {0}.tmp {0}; wait",
         pidfile.display()
     );
     vec!["sh".into(), "-c".into(), script]
@@ -293,5 +305,57 @@ async fn the_systemd_backend_contains_reports_and_tears_down() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+    wait_unit_gone(&unit).await;
+
+    // 5. A tree that ignores SIGTERM is SIGKILLed 10 s into the cancel, as
+    // under rlimit/bare, not after the user manager's DefaultTimeoutStopSec
+    // (90 s unless configured). The unit itself must say so: the manager on
+    // the host running this may already default to 10 s.
+    std::fs::remove_file(&pidfile).unwrap();
+    let mut child = launcher
+        .spawn_contained(
+            "blut-systemd-test",
+            &stubborn_tree_script(&pidfile),
+            tmp.path(),
+            &[],
+            |_| {},
+        )
+        .await
+        .expect("spawn stubborn tree");
+    let unit = child.unit().to_string();
+    let pids = read_pids(&pidfile).await;
+    let unit_file = std::process::Command::new("systemctl")
+        .args(["--user", "cat", &format!("{unit}.service")])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap();
+    assert!(
+        unit_file.lines().any(|l| l.trim() == "TimeoutStopSec=10s"),
+        "{unit} does not set its stop timeout:\n{unit_file}"
+    );
+    let started = std::time::Instant::now();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let outcome = tokio::time::timeout(Duration::from_secs(60), child.wait_or_cancel(&cancel))
+        .await
+        .expect("cancelled within 60 s")
+        .expect("wait_or_cancel");
+    assert!(outcome.is_none());
+    for &pid in &pids {
+        while alive(pid) {
+            assert!(
+                started.elapsed() < Duration::from_secs(25),
+                "pid {pid} ignored SIGTERM and was still alive {:?} into the cancel",
+                started.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    // It took the SIGKILL: SIGTERM alone did not end the tree.
+    assert!(
+        started.elapsed() >= Duration::from_secs(9),
+        "the tree ended {:?} into the cancel, before the stop timeout",
+        started.elapsed()
+    );
     wait_unit_gone(&unit).await;
 }

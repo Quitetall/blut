@@ -337,6 +337,15 @@ impl LocalSystemd {
     /// `unit` (sanitized to `[A-Za-z0-9_-]`) plus this process's pid and a
     /// sequence number, so concurrent and repeated stages never collide.
     /// `configure` sets pipes, `kill_on_drop` and similar before the spawn.
+    ///
+    /// A `systemd` unit is stopped with SIGTERM and, 10 s later, SIGKILL
+    /// (`TimeoutStopSec=10s`). It is the one placement that outlives this
+    /// process when this process is SIGKILLed, so when called inside a job
+    /// ([`jobs::in_job`](crate::jobs::in_job), which the executor sets up for
+    /// every stage), the unit is recorded in the job directory before it
+    /// starts ([`jobs::record_systemd_unit`](crate::jobs::record_systemd_unit))
+    /// and described as `blut job <job id>`: `blut cancel` stops it and
+    /// `plan resume` refuses while it runs, also after this process died.
     pub async fn spawn_contained(
         &self,
         unit: &str,
@@ -374,6 +383,32 @@ impl LocalSystemd {
         };
         #[cfg(not(target_os = "linux"))]
         let env = env.to_vec();
+        // A systemd unit outlives this process when it is SIGKILLed. Inside a
+        // job the unit is recorded before it starts, so `blut cancel` and
+        // `plan resume` find it, and its description names the job, so they
+        // never take a later unit of the same name for it.
+        #[cfg(target_os = "linux")]
+        let run = match crate::jobs::current_job_dir().filter(|_| kind == "systemd") {
+            Some(job_dir) => {
+                if let Err(e) = crate::jobs::record_systemd_unit(&job_dir, &unit) {
+                    tracing::warn!(
+                        "containment: record {unit} with job {}: {e}",
+                        job_dir.display()
+                    );
+                }
+                crate::containment::systemd::SystemdCgroup.wrap_described(
+                    Path::new(program),
+                    args,
+                    cwd,
+                    &env,
+                    &unit,
+                    &caps,
+                    Some(&crate::jobs::systemd_unit_description(&job_dir)),
+                )?
+            }
+            None => backend.wrap_command(Path::new(program), args, cwd, &env, &unit, &caps)?,
+        };
+        #[cfg(not(target_os = "linux"))]
         let run = backend.wrap_command(Path::new(program), args, cwd, &env, &unit, &caps)?;
         let line =
             format!("containment: {unit} placed by LocalSystemd under {kind}, {applied}{note}");

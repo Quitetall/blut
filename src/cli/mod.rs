@@ -2094,17 +2094,11 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             })?;
             // Resuming a job that is still executing would run a second
             // executor in the same job dir, and the old code then marked the
-            // live job `failed` when the scheduler lock refused.
-            if let Some(pid) = crate::jobs::live_driver(&job_id) {
-                return Err(anyhow!(
-                    "job {job_id} is still running (blut pid {pid}); wait for it to finish, \
-                     or stop it with `blut cancel {job_id}`, then resume"
-                ));
-            }
-            // A Slurm job its stage started survives the BLUT process that
-            // started it; resuming next to it would put two trainers on one
-            // job's work.
-            if let Ok(Some(why)) = crate::jobs::slurm_resume_blocker(&job_id) {
+            // live job `failed` when the scheduler lock refused. A Slurm job
+            // or a systemd unit its stage started survives the BLUT process
+            // that started it; resuming next to it would put two trainers on
+            // one job's work.
+            if let Some(why) = crate::jobs::resume_blocker(&job_id) {
                 return Err(anyhow!(why));
             }
             let job_dir =

@@ -8,6 +8,11 @@
 //! The availability probe (`systemctl --user show-environment`) is the BUS
 //! probe — it is the fix for the old binary-only `which systemd-run` check
 //! that reported "available" on cloud boxes with no user bus and then failed.
+//!
+//! A stopped unit's processes get SIGTERM and, 10 s later, SIGKILL
+//! (`TimeoutStopSec=10s`). The unit survives a SIGKILL of the process that
+//! started it; `LocalSystemd::spawn_contained` records it with the BLUT job so
+//! `blut cancel` can still stop it (`jobs::cancel_systemd_units`).
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -161,6 +166,48 @@ impl Containment for SystemdCgroup {
         unit: &str,
         caps: &CapSpec,
     ) -> Result<WrappedRun> {
+        self.wrap_described(program, args, cwd, env, unit, caps, None)
+    }
+
+    fn parse_peak(&self, line: &str) -> Option<u64> {
+        parse_memory_peak_line(line)
+    }
+
+    fn cancel(&self, unit: &str, _teardown: &TeardownHandle) -> Option<tokio::process::Command> {
+        // Stop the transient unit; the cgroup reaps the whole tree. Processes
+        // that ignore SIGTERM are SIGKILLed after STOP_TIMEOUT.
+        let mut c = tokio::process::Command::new("systemctl");
+        c.arg("--user").arg("stop").arg(format!("{unit}.service"));
+        Some(c)
+    }
+}
+
+/// How long a stopped unit's processes get after SIGTERM before systemd
+/// SIGKILLs them (`TimeoutStopSec=`): the 10 s that the `rlimit`/`bare` path
+/// and `blut cancel` give a process group. Without it a unit inherits the user
+/// manager's `DefaultTimeoutStopSec=` (90 s unless configured otherwise), so
+/// a trainer that ignores SIGTERM lingered that long after a cancel. A
+/// transient service has accepted `TimeoutStopSec=` long before systemd 250,
+/// this backend's floor.
+pub(crate) const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl SystemdCgroup {
+    /// [`Containment::wrap_command`], with the unit's `Description=` set to
+    /// `description` when given (`systemd-run` otherwise describes a unit by
+    /// its command line). `LocalSystemd::spawn_contained` names the BLUT job
+    /// there, which is how `blut cancel` tells the job's unit from a later
+    /// one that got the same name.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wrap_described(
+        &self,
+        program: &Path,
+        args: &[String],
+        cwd: &Path,
+        env: &[(String, String)],
+        unit: &str,
+        caps: &CapSpec,
+        description: Option<&str>,
+    ) -> Result<WrappedRun> {
         if program.as_os_str().is_empty() {
             return Err(TrainError::other("systemd wrap: empty program"));
         }
@@ -187,7 +234,12 @@ impl Containment for SystemdCgroup {
             .arg(format!("MemoryHigh={memhigh}"))
             .arg("-p")
             .arg(format!("MemorySwapMax={swapmax}"))
+            .arg("-p")
+            .arg(format!("TimeoutStopSec={}s", STOP_TIMEOUT.as_secs()))
             .arg(format!("--working-directory={}", cwd.display()));
+        if let Some(description) = description {
+            c.arg(format!("--description={description}"));
+        }
         // Propagate PATH + HOME (minimal --user env otherwise), then the
         // invocation env (incl. PYTHONPATH + BLUT_* identity). Where
         // systemd-run can import a variable by name, the value is set on the
@@ -239,17 +291,6 @@ impl Containment for SystemdCgroup {
             teardown: TeardownHandle::default(),
         })
     }
-
-    fn parse_peak(&self, line: &str) -> Option<u64> {
-        parse_memory_peak_line(line)
-    }
-
-    fn cancel(&self, unit: &str, _teardown: &TeardownHandle) -> Option<tokio::process::Command> {
-        // Stop the transient unit; the cgroup reaps the whole tree.
-        let mut c = tokio::process::Command::new("systemctl");
-        c.arg("--user").arg("stop").arg(format!("{unit}.service"));
-        Some(c)
-    }
 }
 
 #[cfg(test)]
@@ -284,6 +325,14 @@ mod tests {
         assert!(argv.contains(&"--user".to_string()));
         assert!(argv.contains(&"--unit=blut-job-stage".to_string()));
         assert!(argv.contains(&"MemoryMax=8G".to_string()));
+        // A cancel escalates to SIGKILL after 10 s, not the manager's default.
+        let timeout = argv
+            .iter()
+            .position(|a| a == "TimeoutStopSec=10s")
+            .expect("TimeoutStopSec set");
+        assert_eq!(argv[timeout - 1], "-p");
+        // systemd-run's own description (the command line) unless given one.
+        assert!(!argv.iter().any(|a| a.starts_with("--description")));
         if imports_env_by_name() {
             // Name only on the command line; the value rides the client's env.
             assert!(argv.contains(&"--setenv=PYTHONPATH".to_string()));
@@ -308,6 +357,34 @@ mod tests {
         assert_eq!(argv[dd + 1], "python3");
         assert_eq!(argv[dd + 2], "train.py");
         assert_eq!(wr.peak_source, PeakSource::StderrLine);
+    }
+
+    #[test]
+    fn a_description_goes_before_the_command() {
+        let wr = SystemdCgroup
+            .wrap_described(
+                &PathBuf::from("sleep"),
+                &["--description=not-an-option".into()],
+                &PathBuf::from("/tmp/job"),
+                &[],
+                "blut-job-stage",
+                &CapSpec::default(),
+                Some("blut job 20261030-000000-000000001"),
+            )
+            .unwrap();
+        let argv: Vec<String> = wr
+            .command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let dd = argv.iter().position(|a| a == "--").unwrap();
+        let described = argv
+            .iter()
+            .position(|a| a == "--description=blut job 20261030-000000-000000001")
+            .expect("description set");
+        assert!(described < dd, "{argv:?}");
+        assert_eq!(argv[dd + 2], "--description=not-an-option");
     }
 
     #[test]
