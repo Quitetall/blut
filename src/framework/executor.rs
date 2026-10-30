@@ -58,7 +58,9 @@ use crate::framework::execution::{
     ExecutionDeadline, ExecutionRequest, ExecutionResources, LocalExecutionAdapter,
 };
 #[cfg(feature = "p2p")]
-use crate::framework::execution::{ExecutionFailureKind, ExecutionResult, drive_execution};
+use crate::framework::execution::{
+    ExecutionFailure, ExecutionFailureKind, ExecutionResult, drive_execution,
+};
 use crate::framework::plan::{CompiledPlan, NodeId};
 use crate::framework::resource::Resource;
 use crate::framework::stage::{ErasedArtifact, InProcessArtifact, StageContext, StageDyn};
@@ -2189,42 +2191,67 @@ fn build_local_request(task: &NodeTask, env: &NodeEnv, attempt: u32) -> Executio
     }
 }
 
+/// Decide where one attempt of `task` runs when an execution adapter is
+/// installed, and build its portable request if it leaves this machine.
+///
+/// `Ok(None)` keeps the attempt here. That is correct, not a fall-through, for
+/// a stage that declares it must stay ([`Stage::placement`]), restricted data,
+/// a restricted tenant, or a training-I/O node, and each such decision is
+/// logged with its reason. `Err` names an eligible stage whose input could not
+/// be made portable: under `--launcher p2p` that fails the stage, because
+/// running it here would be the silent local run the placement refuses.
+///
+/// [`Stage::placement`]: crate::framework::Stage::placement
 #[cfg(feature = "p2p")]
-fn build_remote_request(task: &NodeTask, env: &NodeEnv, attempt: u32) -> Option<ExecutionRequest> {
-    let (policy, _adapter) = (
-        env.dispatch_policy.as_ref()?,
-        env.execution_adapter.as_ref()?,
-    );
-    if env.tenant.is_restricted()
-        || env.training_io_node(task.node_id).is_some()
-        || !policy.is_dispatchable(task.stage.name())
-    {
-        return None;
+fn build_remote_request(
+    task: &NodeTask,
+    env: &NodeEnv,
+    attempt: u32,
+) -> Result<Option<ExecutionRequest>, String> {
+    let (Some(policy), Some(_adapter)) =
+        (env.dispatch_policy.as_ref(), env.execution_adapter.as_ref())
+    else {
+        return Ok(None);
+    };
+    let stays = |reason: &str| {
+        tracing::info!(
+            "stage {} (node {}) runs on this machine: {reason}",
+            task.stage.name(),
+            task.node_idx
+        );
+        Ok(None)
+    };
+    if env.tenant.is_restricted() {
+        return stays("its tenant is restricted");
     }
-    let input = match capture(
+    if env.training_io_node(task.node_id).is_some() {
+        return stays("it uses this machine's admitted training I/O");
+    }
+    let Some(data_class) = policy.remote_class(task.stage.as_ref(), &task.args) else {
+        return stays(match task.stage.placement_erased(&task.args) {
+            crate::framework::stage::StagePlacement::Remote { .. } => {
+                "its data is restricted, and restricted data never leaves this machine"
+            }
+            _ => "the stage does not declare that it may run on another machine",
+        });
+    };
+    let input = capture(
         task.stage.as_ref(),
         task.input.clone(),
         &env.job_dir,
         ArtifactRole::Input,
         None,
-    ) {
-        Ok(input) => input,
-        Err(error) => {
-            tracing::warn!(
-                "portable input capture failed for node {} ({}), running locally: {error}",
-                task.node_idx,
-                task.stage.name()
-            );
-            return None;
-        }
-    };
-    let data_class = match policy.classify_stage(task.stage.name(), &task.args) {
-        crate::p2p::trust::DataClass::Public => DataClassification::Public,
-        crate::p2p::trust::DataClass::Internal => DataClassification::Internal,
-        crate::p2p::trust::DataClass::Restricted => DataClassification::Restricted,
-    };
+    )
+    .map_err(|error| {
+        format!(
+            "stage {} (node {}) may run on a peer, but its input could not be packed \
+             for transfer: {error}",
+            task.stage.name(),
+            task.node_idx
+        )
+    })?;
     let resources = task.stage.resources();
-    Some(ExecutionRequest {
+    Ok(Some(ExecutionRequest {
         protocol_version: EXECUTION_PROTOCOL_VERSION,
         execution_id: format!(
             "exec-{}-{}-{}",
@@ -2246,9 +2273,9 @@ fn build_remote_request(task: &NodeTask, env: &NodeEnv, attempt: u32) -> Option<
             gpu: resources.contains(&Resource::Gpu),
             gpu_vram_gib: None,
         },
-        data_class,
+        data_class: data_class.into(),
         deadline: execution_deadline(task, env),
-    })
+    }))
 }
 
 async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, NodeFailure> {
@@ -2456,12 +2483,38 @@ async fn run_node_with_admission(
         // attempt starts clean yet stays killable by the coordinator.
         let stage_cancel = task.node_cancel.current().child_token();
         #[cfg(feature = "p2p")]
-        let remote_request = (remote_enabled
+        let remote_request = if remote_enabled
             && shared_admission.is_none()
             && pre_acquired_admission.is_none()
-            && !fused_handoff)
-            .then(|| build_remote_request(&task, &env, attempt))
-            .flatten();
+            && !fused_handoff
+        {
+            match build_remote_request(&task, &env, attempt) {
+                Ok(request) => request,
+                // `--launcher p2p` was asked for: an eligible stage that cannot
+                // be placed fails rather than running here.
+                Err(reason) if env.launch_target == crate::config::launcher::LaunchTarget::P2P => {
+                    let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+                    let source = ExecutionFailure::artifact(reason).into_stage_error();
+                    env.status.emit(StageEvent::StageFailed {
+                        node_idx: idx,
+                        stage_name: stage_name.clone(),
+                        error: source.to_string(),
+                        failure: None,
+                    });
+                    return Err(NodeFailure::Stage {
+                        idx,
+                        stage: stage_name,
+                        source,
+                    });
+                }
+                Err(reason) => {
+                    tracing::warn!("{reason}; running it on this machine");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         #[cfg(feature = "p2p")]
         let is_remote = remote_request.is_some();
         #[cfg(not(feature = "p2p"))]
@@ -2740,8 +2793,13 @@ async fn run_node_with_admission(
                     },
                     Some(content_id),
                 )),
+                // No peer could take it. A library caller that installed an
+                // adapter without asking for a remote placement keeps the
+                // local fallback; `--launcher p2p` fails the stage instead
+                // (the arm below), never running it here in silence.
                 ExecutionResult::Failed(failure)
-                    if failure.kind == ExecutionFailureKind::Unavailable =>
+                    if failure.kind == ExecutionFailureKind::Unavailable
+                        && env.launch_target != crate::config::launcher::LaunchTarget::P2P =>
                 {
                     tracing::warn!(
                         "remote execution unavailable for node {idx} ({stage_name}); running locally"
@@ -5470,6 +5528,11 @@ fn refuse_unplaced_target(ctx: &ExecCtx) -> Result<(), PlanError> {
             )
             .map_err(|error| PlanError::Other(error.to_string()))
         }
+        LaunchTarget::P2P if !p2p_adapter_places_on_peers(ctx) => Err(PlanError::Other(
+            "--launcher p2p needs a peer-to-peer execution adapter; the installed adapter \
+             places stages elsewhere. Nothing ran"
+                .into(),
+        )),
         _ => Ok(()),
     }
 }
@@ -5477,6 +5540,18 @@ fn refuse_unplaced_target(ctx: &ExecCtx) -> Result<(), PlanError> {
 #[cfg(feature = "p2p")]
 fn has_execution_adapter(ctx: &ExecCtx) -> bool {
     ctx.execution_adapter.is_some()
+}
+
+#[cfg(feature = "p2p")]
+fn p2p_adapter_places_on_peers(ctx: &ExecCtx) -> bool {
+    ctx.execution_adapter
+        .as_ref()
+        .is_some_and(|adapter| adapter.mode() == crate::framework::execution::ExecutionMode::P2p)
+}
+
+#[cfg(not(feature = "p2p"))]
+fn p2p_adapter_places_on_peers(_ctx: &ExecCtx) -> bool {
+    false
 }
 
 #[cfg(not(feature = "p2p"))]

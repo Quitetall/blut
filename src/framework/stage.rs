@@ -575,6 +575,55 @@ pub enum StageExecutionBoundary {
     Subprocess,
 }
 
+/// Whether one stage invocation may run on another machine: a mesh peer under
+/// `--launcher p2p`, or a cloud worker. Declared by the stage itself through
+/// [`Stage::placement`]; the engine never infers it from a stage name.
+///
+/// The default is [`LocalOnly`](Self::LocalOnly). Implementing [`Stage`] says
+/// nothing about where the work may go: a stage can read host-local files, a
+/// local registry or database, or data its owner never meant to leave the
+/// machine. A stage opts in with [`Remote`](Self::Remote) only when it reads
+/// nothing but its typed input and args, and writes nothing but its output under
+/// `StageContext::stage_dir`, so the same invocation computes the same result on
+/// any machine running the same code.
+///
+/// `Remote` carries the class of the data the invocation handles. The dispatch
+/// trust matrix decides which peers may receive it: `Public` may go to any peer,
+/// `Internal` only to a registered or trusted one, and `Restricted` to none, so
+/// a `Remote` declaration with `Restricted` data still runs on this machine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "placement", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StagePlacement {
+    /// Runs only on the machine that runs the plan.
+    #[default]
+    LocalOnly,
+    /// May run on another machine whose trust admits `data_class`.
+    Remote {
+        data_class: crate::framework::execution::DataClassification,
+    },
+}
+
+impl StagePlacement {
+    /// A stage that may run elsewhere, handling data of `data_class`.
+    pub const fn remote(data_class: crate::framework::execution::DataClassification) -> Self {
+        Self::Remote { data_class }
+    }
+
+    /// The data class to dispatch with, or `None` when the invocation must stay
+    /// on this machine (declared local, or restricted data).
+    pub fn remote_class(self) -> Option<crate::framework::execution::DataClassification> {
+        match self {
+            Self::Remote { data_class }
+                if data_class != crate::framework::execution::DataClassification::Restricted =>
+            {
+                Some(data_class)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Typed user-facing trait. Implementors are concrete stages.
 ///
 /// Constants:
@@ -872,6 +921,18 @@ pub trait Stage: Send + Sync + 'static {
     fn code_fingerprint(&self) -> Option<Vec<u8>> {
         None
     }
+
+    /// Whether this invocation may run on another machine, and the class of
+    /// the data it handles ([`StagePlacement`]). Default
+    /// [`StagePlacement::LocalOnly`]: under `--launcher p2p` the stage runs on
+    /// the submitting machine as part of the same plan. Override with
+    /// [`StagePlacement::remote`] only for a stage whose result depends on
+    /// nothing but its typed input, its args and the code, and whose output
+    /// lives under `StageContext::stage_dir`. A worker runs it only when its
+    /// own build makes the same declaration for the same args.
+    fn placement(&self, _args: &Self::Args) -> StagePlacement {
+        StagePlacement::LocalOnly
+    }
 }
 
 /// A backend-agnostic constructor for a type-erased stage (Phase G /
@@ -1162,6 +1223,13 @@ pub trait StageDyn: Send + Sync + 'static {
     /// compiling and get no slot.
     fn checkpoint_slot_erased(&self, _args: &serde_json::Value) -> bool {
         false
+    }
+
+    /// Erased [`Stage::placement`]. Args that do not deserialize are
+    /// [`StagePlacement::LocalOnly`]. Defaults to `LocalOnly` so hand-written
+    /// `StageDyn` implementors keep compiling and never leave the machine.
+    fn placement_erased(&self, _args: &serde_json::Value) -> StagePlacement {
+        StagePlacement::LocalOnly
     }
 
     /// Erased [`Stage::divergence_check`] (the step payload is already erased).
@@ -1683,6 +1751,12 @@ impl<S: Stage> StageDyn for S {
         serde_json::from_value::<S::Args>(args.clone())
             .map(|typed| self.checkpoint_slot(&typed))
             .unwrap_or(false)
+    }
+
+    fn placement_erased(&self, args: &serde_json::Value) -> StagePlacement {
+        serde_json::from_value::<S::Args>(args.clone())
+            .map(|typed| Stage::placement(self, &typed))
+            .unwrap_or(StagePlacement::LocalOnly)
     }
 
     fn divergence_check(&self, step: &serde_json::Value) -> bool {

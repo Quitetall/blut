@@ -2,13 +2,22 @@
 // Copyright (C) 2026 Brian Lam
 //! Dispatch policy — decides which DAG nodes go to peers vs run locally.
 //!
-//! The `DispatchPolicy` trait is consulted by the executor before spawning
-//! each DAG node. If the policy returns `Some(peer_id)`, the node is
-//! offloaded to that peer. If it returns `None`, the node runs locally.
+//! The executor asks [`DispatchPolicy::remote_class`] before placing each DAG
+//! node. Its default honours the stage's own declaration
+//! ([`Stage::placement`](crate::framework::Stage::placement)): a stage runs on
+//! a peer only when its author declared it may leave the machine, and the
+//! trust matrix then decides which peers may hold its data. The engine keeps
+//! no list of stage names that may leave: it cannot know a cookbook's stages.
+//!
+//! The name-based methods ([`is_dispatchable`](DispatchPolicy::is_dispatchable),
+//! [`classify_stage`](DispatchPolicy::classify_stage)) remain for the older
+//! coordinator/worker pair (`p2p serve` / `p2p connect`) and the cloud queue's
+//! smoke path, which address a stage by name only.
 
 use std::collections::HashSet;
 
 use crate::framework::artifact::ArtifactContentId;
+use crate::framework::stage::StageDyn;
 use crate::p2p::peer::{PeerId, PeerInfo};
 use crate::p2p::task::{ResourceRequest, TaskResult};
 #[cfg(test)]
@@ -44,6 +53,23 @@ pub trait DispatchPolicy: Send + Sync {
         expected: Option<ArtifactContentId>,
         peer_pubkey: &ed25519_dalek::VerifyingKey,
     ) -> DispatchVerdict;
+
+    /// Whether `stage`, invoked with `args`, may run on a peer, and the class
+    /// of the data that would go with it. `None` keeps the invocation on this
+    /// machine. The executor and the mesh worker ask this, not the name-based
+    /// methods above.
+    ///
+    /// The default honours the stage's own declaration
+    /// ([`Stage::placement`](crate::framework::Stage::placement)): `None` for a
+    /// stage declared local-only and for restricted data. Override it to veto
+    /// or reclassify stages; a policy that admits a stage its author declared
+    /// local-only takes responsibility for that stage's data and host effects.
+    fn remote_class(&self, stage: &dyn StageDyn, args: &serde_json::Value) -> Option<DataClass> {
+        stage
+            .placement_erased(args)
+            .remote_class()
+            .map(DataClass::from)
+    }
 }
 
 /// Verdict on a peer's task result.
@@ -57,12 +83,19 @@ pub enum DispatchVerdict {
     RetryOnDifferentPeer,
 }
 
-/// The default dispatch policy: trust-matrix based, with a hardcoded list
-/// of dispatchable stages.
+/// The default dispatch policy: stage declarations decide what may leave the
+/// machine ([`DispatchPolicy::remote_class`]'s default), and the trust matrix
+/// decides which peers may receive it.
+///
+/// `dispatchable_stages` and `stage_classes` serve only the name-based callers
+/// (the `p2p serve` / `p2p connect` pair and the cloud smoke path). Out of the
+/// box they name the engine's own connectivity probe and nothing else; an
+/// operator names more with [`with_stages`](Self::with_stages) and
+/// [`classify`](Self::classify).
 pub struct DefaultDispatchPolicy {
     /// The trust matrix (data class × trust level → allowed).
     pub matrix: DispatchMatrix,
-    /// Stage names eligible for remote dispatch.
+    /// Stage names the name-based callers may dispatch.
     pub dispatchable_stages: HashSet<String>,
     /// Explicit per-stage data classifications. A stage NOT in this map
     /// classifies as `DataClass::Restricted` (fail-closed): its data remains
@@ -72,19 +105,13 @@ pub struct DefaultDispatchPolicy {
 }
 
 impl DefaultDispatchPolicy {
-    /// Create with the default dispatchable stages (preprocessing, encoding,
-    /// evaluation, export — NOT training).
+    /// Create with `matrix`. The name-based list holds only the engine's own
+    /// connectivity probe; every other stage reaches a peer by declaring it
+    /// may ([`Stage::placement`](crate::framework::Stage::placement)). The
+    /// engine used to ship a list of one cookbook's stage names here, which
+    /// is domain code in a domain-neutral engine.
     pub fn new(matrix: DispatchMatrix) -> Self {
         let dispatchable = HashSet::from([
-            "warm_fb_cache".into(),
-            "precompute_l3".into(),
-            "precompute_fullband".into(),
-            "encode_lma".into(),
-            "pccp_gate_encoder".into(),
-            "pccp_gate_snn".into(),
-            "export_firmware".into(),
-            "build_manifest".into(),
-            "build_split_manifest".into(),
             // Built-in connectivity probe (deterministic, Public, dependency-free).
             // Always dispatchable so `blut p2p serve --smoke-stage` works out of the
             // box on any worker. See crate::p2p::smoke.
@@ -239,17 +266,96 @@ mod tests {
         peer
     }
 
+    /// The engine names no cookbook's stages: the default name list is its
+    /// own connectivity probe and nothing else. It used to hardcode one
+    /// cookbook's stage names (domain code in a domain-neutral engine).
     #[test]
-    fn default_dispatchable_stages() {
+    fn the_default_name_list_is_only_the_engines_own_probe() {
         let policy = DefaultDispatchPolicy::new(DispatchMatrix::default());
-        assert!(policy.is_dispatchable("warm_fb_cache"));
-        assert!(policy.is_dispatchable("precompute_l3"));
-        assert!(policy.is_dispatchable("pccp_gate_encoder"));
-        // Built-in connectivity probe is always dispatchable.
+        assert_eq!(
+            policy.dispatchable_stages,
+            HashSet::from([crate::p2p::smoke::SMOKE_STAGE.to_string()]),
+            "DefaultDispatchPolicy::new must not name any cookbook stage"
+        );
         assert!(policy.is_dispatchable(crate::p2p::smoke::SMOKE_STAGE));
-        assert!(!policy.is_dispatchable("train_joint"));
-        assert!(!policy.is_dispatchable("train_snn"));
-        assert!(!policy.is_dispatchable("train_l3_teacher"));
+        assert!(!policy.is_dispatchable("anything_else"));
+    }
+
+    /// A stage that declares local placement, but whose name an operator put
+    /// in the name list.
+    struct NamedButLocal;
+    #[async_trait::async_trait]
+    impl crate::framework::Stage for NamedButLocal {
+        const NAME: &'static str = "named_but_local";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [crate::framework::Resource] = &[];
+        type Input = ();
+        type Output = ();
+        type Args = serde_json::Value;
+        async fn run(
+            &self,
+            _: &crate::framework::StageContext,
+            _: (),
+            _: &serde_json::Value,
+        ) -> Result<(), crate::framework::StageError> {
+            Ok(())
+        }
+    }
+
+    /// A stage that declares it may leave, with the data class in its args.
+    struct DeclaredRemote;
+    #[async_trait::async_trait]
+    impl crate::framework::Stage for DeclaredRemote {
+        const NAME: &'static str = "declared_remote";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [crate::framework::Resource] = &[];
+        type Input = ();
+        type Output = ();
+        type Args = serde_json::Value;
+        async fn run(
+            &self,
+            _: &crate::framework::StageContext,
+            _: (),
+            _: &serde_json::Value,
+        ) -> Result<(), crate::framework::StageError> {
+            Ok(())
+        }
+        fn placement(&self, args: &serde_json::Value) -> crate::framework::StagePlacement {
+            use crate::framework::execution::DataClassification as C;
+            match args["class"].as_str() {
+                Some("public") => crate::framework::StagePlacement::remote(C::Public),
+                Some("internal") => crate::framework::StagePlacement::remote(C::Internal),
+                Some("restricted") => crate::framework::StagePlacement::remote(C::Restricted),
+                _ => crate::framework::StagePlacement::LocalOnly,
+            }
+        }
+    }
+
+    /// Eligibility follows the stage's declaration, never its name: a name in
+    /// the operator list does not move a local-only stage, and a declared
+    /// stage moves with exactly the class it declared. Restricted never moves.
+    #[test]
+    fn remote_class_follows_the_stage_declaration_not_the_name_list() {
+        let policy = DefaultDispatchPolicy::with_stages(
+            DispatchMatrix::default(),
+            HashSet::from(["named_but_local".to_string()]),
+        )
+        .classify("named_but_local", DataClass::Public);
+        let local: &dyn StageDyn = &NamedButLocal;
+        assert_eq!(policy.remote_class(local, &serde_json::json!({})), None);
+        let remote: &dyn StageDyn = &DeclaredRemote;
+        for (class, want) in [
+            ("public", Some(DataClass::Public)),
+            ("internal", Some(DataClass::Internal)),
+            ("restricted", None),
+            ("unset", None),
+        ] {
+            assert_eq!(
+                policy.remote_class(remote, &serde_json::json!({ "class": class })),
+                want,
+                "{class}"
+            );
+        }
     }
 
     #[test]

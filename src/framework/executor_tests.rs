@@ -4820,6 +4820,9 @@ struct MockDispatchPolicy {
 }
 #[cfg(feature = "p2p")]
 impl crate::p2p::dispatch::DispatchPolicy for MockDispatchPolicy {
+    // The executor asks `remote_class` (default: the stage's own declaration),
+    // never this name list: `a_stage_declared_local_stays_here_whatever_the_name_list_says`
+    // names a local-only stage here and checks that it does not move.
     fn is_dispatchable(&self, stage_name: &str) -> bool {
         stage_name == self.dispatchable
     }
@@ -4853,6 +4856,9 @@ impl crate::p2p::dispatch::DispatchPolicy for MockDispatchPolicy {
 }
 
 #[cfg(feature = "p2p")]
+static DISPATCHABLE_LOCAL_RUNS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(feature = "p2p")]
 struct DispatchableStage;
 #[cfg(feature = "p2p")]
 #[async_trait]
@@ -4869,10 +4875,16 @@ impl Stage for DispatchableStage {
         _input: (),
         _args: &EmptyArgs,
     ) -> Result<Counter, StageError> {
+        DISPATCHABLE_LOCAL_RUNS.fetch_add(1, Ordering::SeqCst);
         // Distinct from `succeed_with` below: if the executor ever fell
         // through to running this LOCALLY instead of honouring the
         // dispatch, this value makes that wiring bug obvious.
         Ok(Counter { n: 999 })
+    }
+    fn placement(&self, _args: &EmptyArgs) -> crate::framework::stage::StagePlacement {
+        crate::framework::stage::StagePlacement::remote(
+            crate::framework::execution::DataClassification::Public,
+        )
     }
 }
 #[cfg(feature = "p2p")]
@@ -5166,6 +5178,95 @@ async fn a_remote_placement_with_an_execution_adapter_runs_through_it() {
         assert_eq!(output.n, 42, "{target:?}: the adapter's output");
         assert_eq!(submit_count.load(Ordering::SeqCst), 1, "{target:?}");
     }
+}
+
+/// `--launcher p2p` with no peer able to take an eligible stage fails that
+/// stage. It used to run it here with a warning: the silent local run the
+/// placement exists to prevent. The local fallback stays for library callers
+/// that installed an adapter without asking for a remote placement
+/// (`unavailable_canonical_adapter_falls_back_before_local_work_starts`).
+#[cfg(feature = "p2p")]
+#[tokio::test]
+async fn no_peer_under_launcher_p2p_fails_the_stage_and_runs_nothing_here() {
+    use crate::config::launcher::LaunchTarget;
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    for parallel in [false, true] {
+        DISPATCHABLE_LOCAL_RUNS.store(0, Ordering::SeqCst);
+        let (_td, base) = fresh_ctx();
+        let submit_count = Arc::new(AtomicU32::new(0));
+        let adapter = Arc::new(MockExecutionAdapter {
+            outcome: CanonicalAdapterOutcome::Unavailable,
+            submit_count: submit_count.clone(),
+        });
+        let policy = Arc::new(MockDispatchPolicy {
+            dispatchable: "dispatchable_thing",
+        });
+        let ctx = base
+            .with_launch_target(LaunchTarget::P2P)
+            .with_execution_adapter(policy, adapter);
+        let plan = Plan::<(), LamuTrainerBackend>::new("no_peer", serde_json::json!({}))
+            .start(DispatchableStage, EmptyArgs)
+            .finish()
+            .into_compiled();
+        let result = if parallel {
+            ParallelExecutor::execute(plan, ctx).await
+        } else {
+            SequentialExecutor::execute(plan, ctx).await
+        };
+        match result {
+            Err(PlanError::StageFailed { stage, source, .. }) => {
+                assert_eq!(stage, "dispatchable_thing");
+                assert!(source.to_string().contains("no mock peer"), "{source}");
+            }
+            other => panic!("parallel={parallel}: no peer must fail the run: {other:?}"),
+        }
+        assert_eq!(
+            submit_count.load(Ordering::SeqCst),
+            1,
+            "parallel={parallel}"
+        );
+        assert_eq!(
+            DISPATCHABLE_LOCAL_RUNS.load(Ordering::SeqCst),
+            0,
+            "parallel={parallel}: the eligible stage ran on this machine"
+        );
+    }
+}
+
+/// Eligibility is the stage's declaration, not a name list: a stage that does
+/// not declare it may leave runs here under `--launcher p2p`, even when the
+/// policy's name list names it, and the adapter never sees it.
+#[cfg(feature = "p2p")]
+#[tokio::test]
+async fn a_stage_declared_local_stays_here_whatever_the_name_list_says() {
+    use crate::config::launcher::LaunchTarget;
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    MAKE_RUN_COUNT.store(0, Ordering::SeqCst);
+    let (_td, base) = fresh_ctx();
+    let submit_count = Arc::new(AtomicU32::new(0));
+    let adapter = Arc::new(MockExecutionAdapter {
+        outcome: CanonicalAdapterOutcome::Succeeded(Counter { n: 42 }),
+        submit_count: submit_count.clone(),
+    });
+    let policy = Arc::new(MockDispatchPolicy {
+        dispatchable: "make_one",
+    });
+    let ctx = base
+        .with_launch_target(LaunchTarget::P2P)
+        .with_execution_adapter(policy, adapter);
+    let plan = Plan::<(), LamuTrainerBackend>::new("declared_local", serde_json::json!({}))
+        .start(MakeOne, EmptyArgs)
+        .finish()
+        .into_compiled();
+    let result = ParallelExecutor::execute(plan, ctx).await.unwrap();
+    let output: Counter = result.final_output.unwrap().into_typed().unwrap();
+    assert_eq!(output.n, 1, "the local stage's own output");
+    assert_eq!(MAKE_RUN_COUNT.load(Ordering::SeqCst), 1, "ran here, once");
+    assert_eq!(
+        submit_count.load(Ordering::SeqCst),
+        0,
+        "a local-only stage never reaches the adapter"
+    );
 }
 // ── GPU sampler leaked on panic (audit finding 4) ───────────────────
 //

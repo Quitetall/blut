@@ -94,6 +94,6 @@ pub use resource::Resource;
 pub use retry::{Backoff, RetryEvent, RetryHook, RetryOn, RetryPolicy, StageTimeout};
 pub use stage::{
     ErasedArtifact, ErasedDecodeError, PipelineManifest, Stage, StageContext, StageDyn,
-    StageExecutionBoundary,
+    StageExecutionBoundary, StagePlacement,
 };
 pub use status::{HostedEvent, StageEvent, StatusHub, make_broadcast, spawn_status_writer};

@@ -186,20 +186,21 @@ impl SharedCacheRunner {
             )));
         }
 
-        // 2. Policy gate (training never leaves home, etc.).
-        if !self.policy.is_dispatchable(&task.stage_name) {
-            return Err(TrainError::other(format!(
-                "stage '{}' is not dispatchable",
-                task.stage_name
-            )));
-        }
-
-        // 3. Resolve the stage (the worker hosts the cookbook).
+        // 2. Resolve the stage (the worker hosts the cookbook).
         let ctor = self
             .registry
             .find_erased_stage(&task.stage_name)
             .ok_or_else(|| TrainError::other(format!("unknown stage '{}'", task.stage_name)))?;
         let stage = ctor();
+
+        // 3. Placement gate: the stage itself must declare that it may leave
+        //    the machine that dispatched it (training never leaves home, etc.).
+        if self.policy.remote_class(&*stage, &task.args).is_none() {
+            return Err(TrainError::other(format!(
+                "stage '{}' does not declare that it may run on another machine",
+                task.stage_name
+            )));
+        }
 
         // 4. Per-task work dir (task_id validated safe above).
         let stage_dir = self.work_root.join(&task.task_id);
@@ -377,26 +378,21 @@ pub async fn dispatch_stage(
 ) -> Result<MeshDispatch, TrainError> {
     use crate::framework::{CacheHandle, ContentHash};
     use crate::p2p::dispatch::{DefaultDispatchPolicy, DispatchPolicy};
-    use crate::p2p::trust::{DataClass, DispatchMatrix};
+    use crate::p2p::trust::DispatchMatrix;
 
-    // The dispatcher applies the same policy the worker will: a stage that
-    // must not leave this host never has its input published for a peer.
-    let policy = DefaultDispatchPolicy::new(DispatchMatrix::default());
-    if !policy.is_dispatchable(stage_name) {
-        return Err(TrainError::other(format!(
-            "stage '{stage_name}' is not dispatchable"
-        )));
-    }
-    let data_class = policy.classify_stage(stage_name, &args);
-    if data_class == DataClass::Restricted {
-        return Err(TrainError::other(format!(
-            "stage '{stage_name}' handles restricted data; it does not leave this host"
-        )));
-    }
     let ctor = registry
         .find_erased_stage(stage_name)
         .ok_or_else(|| TrainError::other(format!("unknown stage '{stage_name}'")))?;
     let stage = ctor();
+    // The dispatcher applies the same policy the worker will: a stage that
+    // must not leave this host never has its input published for a peer.
+    let policy = DefaultDispatchPolicy::new(DispatchMatrix::default());
+    let Some(data_class) = policy.remote_class(&*stage, &args) else {
+        return Err(TrainError::other(format!(
+            "stage '{stage_name}' does not declare that it may run on another machine \
+             with non-restricted data; it does not leave this host"
+        )));
+    };
 
     let started = std::time::Instant::now();
     let input_content_id =
