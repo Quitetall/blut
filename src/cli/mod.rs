@@ -284,7 +284,7 @@ enum Command {
     /// already holds the user's registry configuration.
     Update {
         /// Only report; never offer to install.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "yes")]
         check: bool,
         /// Run the upgrade instead of printing the command.
         #[arg(long)]
@@ -509,7 +509,10 @@ enum ModelCommand {
         #[arg(long)]
         change_id: Option<String>,
         /// Governance gate argv (e.g. `"python …/pccp_gate.py --candidate {hash}
-        /// --model {name} --change-id {change_id}"`). Falls back to
+        /// --model {name} --change-id {change_id}"`). Split on whitespace and run
+        /// with no shell, so it cannot contain quoted arguments or a path with
+        /// spaces; wrap anything more complex in a script. `{hash}`, `{name}`,
+        /// `{alias}` and `{change_id}` are substituted. Falls back to
         /// `$BLUT_MODEL_GATE_CMD`. Required to promote onto a governed alias.
         #[arg(long)]
         gate_cmd: Option<String>,
@@ -517,7 +520,10 @@ enum ModelCommand {
         #[arg(long, default_value = "5m", value_parser = parse_duration)]
         gate_timeout: Duration,
     },
-    /// Roll an alias back to its previous target atomically.
+    /// Roll an alias back to its previous target atomically. "Previous" is
+    /// the entry before the newest one in `history`, so a second rollback
+    /// undoes the first rather than stepping further back; to reach an older
+    /// checkpoint, `promote` it.
     Rollback {
         /// Pointer, e.g. `model://encoder-v1@prod`.
         pointer: String,
@@ -769,13 +775,24 @@ enum PolicyCommand {
 /// line failed every 30 minutes into a log nobody reads. The policy is read
 /// by the `auto-train-policy` sensor; `sensor eval` exits 0 only when every
 /// gate passes, so it chains in front of the recipe the operator picks.
-fn policy_cron_hint(exe: &str, log_path: &str) -> String {
+fn policy_cron_hint(exe: &str, log_path: &str, policy_override: Option<&str>) -> String {
     let exe = update::shell_join(&[exe.to_string()]);
     let log = update::shell_join(&[log_path.to_string()]);
+    // cron starts with a minimal environment: a policy chosen through
+    // `$LAMU_TRAIN_POLICY` must be named on the line, or the sensor reads the
+    // default policy file instead of the one just enabled.
+    let env = policy_override
+        .map(|p| {
+            format!(
+                "LAMU_TRAIN_POLICY={} ",
+                update::shell_join(&[p.to_string()])
+            )
+        })
+        .unwrap_or_default();
     format!(
         "# The policy gates the `auto-train-policy` sensor (exit 0 = run now).\n\
          # To act on it every 30 min, add to crontab with your recipe and args:\n\
-         */30 * * * * {exe} sensor eval auto-train-policy >> {log} 2>&1 && \
+         */30 * * * * {env}{exe} sensor eval auto-train-policy >> {log} 2>&1 && \
          {exe} recipe run <RECIPE> --args '<JSON>' >> {log} 2>&1\n"
     )
 }
@@ -882,13 +899,37 @@ fn run_external(argv: Vec<String>) -> Result<()> {
                  `{bin}` sidecar binary (ADR 0083); install it or check PATH: {e}"
             )
         })?;
-    if !status.success() {
-        return Err(anyhow!(
-            "`{bin}` exited with {}",
-            exit_status_reason(&status)
-        ));
+    // Pass the sidecar's own exit code through, as cargo does for
+    // `cargo-<cmd>`. It used to be collapsed to 1 behind an extra "exited with
+    // status N" line, so a script could not tell a usage error (2) from a
+    // failure, and the sidecar's own message was followed by a second one.
+    if let Some(code) = external_exit_code(&status) {
+        if status.code().is_none() {
+            eprintln!("`{bin}` exited with {}", exit_status_reason(&status));
+        }
+        std::process::exit(code);
     }
     Ok(())
+}
+
+/// The exit code `blut <cmd>` should exit with after the sidecar `blut-<cmd>`
+/// finished: `None` on success, `Some(code)` for a non-zero exit code, and for
+/// a signal death the conventional `128 + signal` (Unix) or 1.
+fn external_exit_code(status: &std::process::ExitStatus) -> Option<i32> {
+    if status.success() {
+        return None;
+    }
+    if let Some(code) = status.code() {
+        return Some(code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return Some(128 + sig);
+        }
+    }
+    Some(1)
 }
 
 /// Human-readable failure reason for a child `ExitStatus` — the code when it
@@ -995,15 +1036,7 @@ fn run_catalog_cmd(cmd: CatalogCommand) -> Result<()> {
             Ok(())
         }
         CatalogCommand::Show { name, json } => {
-            let bare = name.split_once('@').map(|(n, _)| n).unwrap_or(&name);
-            let record = crate::datasets_db::get_by_name(&datasets, &name)
-                .map_err(|e| anyhow!("{e}"))?
-                .or_else(|| {
-                    crate::datasets_db::get_by_name(&datasets, bare)
-                        .ok()
-                        .flatten()
-                })
-                .ok_or_else(|| anyhow!("no dataset '{name}' in the registry"))?;
+            let record = resolve_catalog_record(&datasets, &name)?;
             let entry = catalog::project(&record, &lineage).map_err(|e| anyhow!("{e}"))?;
             // Fail-closed consistency: a drifted schema is an error, not a serve.
             catalog::verify_consistency(&entry, &record).map_err(|e| anyhow!("{e}"))?;
@@ -1053,12 +1086,11 @@ fn run_catalog_cmd(cmd: CatalogCommand) -> Result<()> {
             Ok(())
         }
         CatalogCommand::Tag { name, tag } => {
-            let bare = name
-                .split_once('@')
-                .map(|(n, _)| n.to_string())
-                .unwrap_or(name);
-            catalog::add_tag(&tags, &bare, &tag).map_err(|e| anyhow!("{e}"))?;
-            println!("tagged {bare} += {tag}");
+            // Tag a dataset that exists: a typo used to create a tag on a name
+            // nothing would ever match, and print success.
+            let record = resolve_catalog_record(&datasets, &name)?;
+            catalog::add_tag(&tags, &record.name, &tag).map_err(|e| anyhow!("{e}"))?;
+            println!("tagged {} += {tag}", record.name);
             Ok(())
         }
     }
@@ -1343,7 +1375,7 @@ mod policy_cron_hint_tests {
     /// `blut auto`, which is not a subcommand.
     #[test]
     fn the_cron_line_names_real_verbs_and_quotes_paths() {
-        let hint = policy_cron_hint("/opt/my tools/blut", "/var/log/a b.log");
+        let hint = policy_cron_hint("/opt/my tools/blut", "/var/log/a b.log", None);
         assert!(!hint.contains(" auto "), "{hint}");
         assert!(
             hint.contains("'/opt/my tools/blut' sensor eval auto-train-policy"),
@@ -1355,6 +1387,17 @@ mod policy_cron_hint_tests {
             crate::sensor::registry()
                 .iter()
                 .any(|s| s.name() == "auto-train-policy")
+        );
+    }
+
+    /// E2E regression: with `$LAMU_TRAIN_POLICY` set, the printed cron line
+    /// evaluated the DEFAULT policy, because cron does not inherit the variable.
+    #[test]
+    fn the_cron_line_carries_a_policy_override() {
+        let hint = policy_cron_hint("blut", "/l.log", Some("/srv/my policy.toml"));
+        assert!(
+            hint.contains("LAMU_TRAIN_POLICY='/srv/my policy.toml' blut sensor eval"),
+            "{hint}"
         );
     }
 }
@@ -2372,6 +2415,13 @@ async fn run_model_cmd(cmd: ModelCommand) -> Result<()> {
             gate_timeout,
         } => {
             let (name, alias) = parse(&pointer)?;
+            // Check the candidate BEFORE running any gate: a governance gate can
+            // take minutes (or record an approval), and it used to run in full
+            // for a hash that was never registered, then be refused anyway.
+            {
+                let conn = mr::open().map_err(|e| anyhow!("{e}"))?;
+                promote_precheck(&conn, &hash, &tenant, &name)?;
+            }
             // Governed-alias set: `$BLUT_MODEL_GOVERNED_ALIASES` can only add
             // aliases. The built-in `prod` boundary is never removable.
             let gov_env = std::env::var("BLUT_MODEL_GOVERNED_ALIASES").ok();
@@ -2381,6 +2431,7 @@ async fn run_model_cmd(cmd: ModelCommand) -> Result<()> {
             // governed alias with no gate/change-id yields NotConfigured → refuse.
             let verdict = if mr::is_governed(&alias, &governed) {
                 let gate_spec = gate_cmd.or_else(|| std::env::var("BLUT_MODEL_GATE_CMD").ok());
+                governed_gate_preflight(&alias, gate_spec.as_deref(), change_id.as_deref())?;
                 match (
                     gate_spec.as_deref().and_then(mr::GateCmd::parse),
                     &change_id,
@@ -2538,6 +2589,61 @@ fn run_experiment_cmd(cmd: ExperimentCommand) -> Result<()> {
 /// The acting user recorded as a deployment's publisher.
 fn acting_user() -> String {
     std::env::var("USER").unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Refuse a promotion whose candidate cannot succeed, before any gate runs:
+/// an unregistered hash, or one registered under another tenant or model name.
+fn promote_precheck(
+    conn: &rusqlite::Connection,
+    hash: &str,
+    tenant: &str,
+    name: &str,
+) -> Result<()> {
+    let model = crate::model_registry::get_model(conn, hash)
+        .map_err(|e| anyhow!("{e}"))?
+        .ok_or_else(|| {
+            anyhow!("promote refused — no model {hash} (register it first: `blut model register`)")
+        })?;
+    if model.tenant != tenant {
+        return Err(anyhow!(
+            "promote refused — cross-tenant boundary: model tenant '{}' != pointer tenant '{tenant}'",
+            model.tenant
+        ));
+    }
+    if model.name != name {
+        return Err(anyhow!(
+            "promote refused — checkpoint {hash} is model '{}', not '{name}'",
+            model.name
+        ));
+    }
+    Ok(())
+}
+
+/// Name exactly what a governed promotion is missing. Both "gate given, no
+/// --change-id" and "--change-id given, no gate" used to report "none
+/// configured", which reads as if the gate flag had been ignored. A gate
+/// string with quotes is refused: it is split on whitespace with no shell, so
+/// quotes would reach the gate as literal characters.
+fn governed_gate_preflight(alias: &str, gate: Option<&str>, change_id: Option<&str>) -> Result<()> {
+    let gate = gate.map(str::trim).filter(|g| !g.is_empty());
+    match (gate, change_id) {
+        (None, None) => Err(anyhow!(
+            "promote refused — alias '{alias}' is governed (ADR 0090): it needs a governance \
+             gate (--gate-cmd or $BLUT_MODEL_GATE_CMD) and a --change-id"
+        )),
+        (None, Some(_)) => Err(anyhow!(
+            "promote refused — alias '{alias}' is governed: --change-id is set but no gate is \
+             (pass --gate-cmd or set $BLUT_MODEL_GATE_CMD)"
+        )),
+        (Some(_), None) => Err(anyhow!(
+            "promote refused — alias '{alias}' is governed: a gate is set but --change-id is missing"
+        )),
+        (Some(g), Some(_)) if g.contains(['"', '\'']) => Err(anyhow!(
+            "promote refused — the gate command is split on whitespace and run without a shell, \
+             so quotes would reach it literally: {g}. Put the command in a script and pass its path."
+        )),
+        (Some(_), Some(_)) => Ok(()),
+    }
 }
 
 /// UNIX seconds now (CLI-side; the registry fns take the timestamp explicitly so
@@ -3025,6 +3131,16 @@ fn persist_plan_graph(plan: &crate::framework::CompiledPlan, job_dir: &std::path
 
 fn run_policy(cmd: PolicyCommand) -> Result<()> {
     use crate::policy;
+    let path = policy::policy_path()?;
+    let unknown = policy::unknown_keys_at(&path);
+    if !unknown.is_empty() {
+        eprintln!(
+            "warning: {} has key(s) BLUT does not recognise: {}. They are ignored \
+             (check for typos), and `policy enable`/`disable` rewrite the file without them.",
+            path.display(),
+            unknown.join(", ")
+        );
+    }
     match cmd {
         PolicyCommand::Show => {
             let p = policy::load().context("load policy")?;
@@ -3055,7 +3171,11 @@ fn run_policy(cmd: PolicyCommand) -> Result<()> {
                 .join("train-auto.log");
             print!(
                 "{}",
-                policy_cron_hint(&exe, &log_path.display().to_string())
+                policy_cron_hint(
+                    &exe,
+                    &log_path.display().to_string(),
+                    std::env::var("LAMU_TRAIN_POLICY").ok().as_deref(),
+                )
             );
         }
         PolicyCommand::Disable => {
@@ -3100,6 +3220,7 @@ fn run_dataset_ingest(cmd: DatasetIngestCommand) -> Result<()> {
             n_examples,
             metadata,
         } => {
+            let path = absolute_source_path(&path)?;
             let rec = match n_examples {
                 Some(count) => datasets_db::record_from_file(&name, &path, &kind, count, metadata)?,
                 None => datasets_db::record_from_jsonl(&name, &path, &kind, metadata)?,
@@ -3111,6 +3232,7 @@ fn run_dataset_ingest(cmd: DatasetIngestCommand) -> Result<()> {
             );
         }
         DatasetIngestCommand::Rm { name } => {
+            refuse_if_pinned(&conn, &name)?;
             let removed = datasets_db::remove(&conn, &name)?;
             if removed {
                 println!("removed '{name}'");
@@ -3130,6 +3252,56 @@ fn run_dataset_ingest(cmd: DatasetIngestCommand) -> Result<()> {
         },
     }
     Ok(())
+}
+
+/// `blut dataset ingest rm` must not delete a source record that an immutable
+/// `dataset://` version points at: the version would stop resolving and could
+/// never be pinned again (its manifest stays claimed by the dead binding).
+fn refuse_if_pinned(conn: &rusqlite::Connection, name: &str) -> Result<()> {
+    let Some(rec) = crate::datasets_db::get_by_name(conn, name)? else {
+        return Ok(());
+    };
+    let pins = crate::dataset_registry::pins_of_source(conn, &rec.id)?;
+    if pins.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "refusing to remove '{name}': it backs the immutable version(s) {}. \
+         Removing the source record would leave them unresolvable and impossible \
+         to pin again.",
+        pins.join(", ")
+    ))
+}
+
+/// The source path a dataset record stores. A relative path was stored as
+/// typed, so the record (and every version pinned from it) silently depended
+/// on the directory the command happened to run in.
+fn absolute_source_path(path: &std::path::Path) -> Result<PathBuf> {
+    std::path::absolute(path).with_context(|| format!("resolve dataset path {}", path.display()))
+}
+
+/// Resolve a `dataset catalog show|tag` argument to its raw source record:
+/// `name` is a source name; `name@version` must be a pinned
+/// `dataset://name@version` and resolves to the source behind it. The version
+/// used to be cut off and ignored, so `show ds@v99` printed `ds` as if v99
+/// existed.
+fn resolve_catalog_record(
+    datasets: &rusqlite::Connection,
+    name: &str,
+) -> Result<crate::datasets_db::DatasetRecord> {
+    let source_name = match name.split_once('@') {
+        None => name.to_string(),
+        Some((bare, version)) => {
+            crate::dataset_registry::source_name_for_version(datasets, bare, version)
+                .map_err(|e| anyhow!("{e}"))?
+                .ok_or_else(|| {
+                    anyhow!("no pinned version dataset://{bare}@{version} (see `blut dataset pin`)")
+                })?
+        }
+    };
+    crate::datasets_db::get_by_name(datasets, &source_name)
+        .map_err(|e| anyhow!("{e}"))?
+        .ok_or_else(|| anyhow!("no dataset '{name}' in the registry"))
 }
 
 fn truncate_for_col(s: &str, max: usize) -> String {
@@ -3243,3 +3415,107 @@ mod registry_export;
 mod stale;
 mod study;
 use stale::*;
+
+#[cfg(test)]
+mod dataset_cli_tests {
+    use super::{absolute_source_path, refuse_if_pinned, resolve_catalog_record};
+
+    #[test]
+    fn a_relative_source_path_is_stored_absolute() {
+        // E2E regression: `blut dataset ingest add ds src/a.jsonl` stored
+        // `src/a.jsonl`, so the record broke from any other directory.
+        let abs = absolute_source_path(std::path::Path::new("src/a.jsonl")).unwrap();
+        assert!(abs.is_absolute(), "{}", abs.display());
+        assert!(abs.ends_with("src/a.jsonl"));
+    }
+
+    #[test]
+    fn catalog_names_resolve_through_pins_and_unknown_versions_are_refused() {
+        // E2E regression: `catalog show ds@v99` printed `ds`, and `catalog tag
+        // nope x` tagged a dataset that does not exist.
+        let td = tempfile::tempdir().unwrap();
+        let conn = crate::datasets_db::open_at(&td.path().join("datasets.db")).unwrap();
+        let path = td.path().join("raw.jsonl");
+        std::fs::write(&path, "{\"x\":1}\n").unwrap();
+        let rec = crate::datasets_db::record_from_jsonl("raw", &path, "jsonl", None).unwrap();
+        crate::datasets_db::add(&conn, &rec).unwrap();
+        crate::dataset_registry::pin(
+            &conn,
+            "raw",
+            "dataset://corpus@v1",
+            &crate::tenant::Tenant::default(),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(resolve_catalog_record(&conn, "raw").unwrap().name, "raw");
+        assert_eq!(
+            resolve_catalog_record(&conn, "corpus@v1").unwrap().name,
+            "raw"
+        );
+        assert!(
+            resolve_catalog_record(&conn, "corpus@v99")
+                .unwrap_err()
+                .to_string()
+                .contains("no pinned version dataset://corpus@v99")
+        );
+        assert!(resolve_catalog_record(&conn, "nope").is_err());
+
+        // ...and the pinned source cannot be removed out from under v1.
+        let err = refuse_if_pinned(&conn, "raw").unwrap_err().to_string();
+        assert!(err.contains("dataset://corpus@v1"), "{err}");
+        refuse_if_pinned(&conn, "unpinned-or-absent").expect("nothing to protect");
+    }
+}
+
+#[cfg(test)]
+mod model_promote_cli_tests {
+    use super::{governed_gate_preflight, promote_precheck};
+
+    #[test]
+    fn a_governed_promotion_names_what_is_missing() {
+        // E2E regression: `--gate-cmd true` without `--change-id` said "none
+        // configured", as if the gate had been ignored.
+        let msg = |g, c| {
+            governed_gate_preflight("prod", g, c)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(msg(Some("true"), None).contains("--change-id is missing"));
+        assert!(msg(None, Some("CR-1")).contains("no gate"));
+        assert!(msg(None, None).contains("--gate-cmd"));
+        assert!(msg(Some("gate.sh 'two words'"), Some("CR-1")).contains("quotes"));
+        governed_gate_preflight("prod", Some("gate.sh {hash}"), Some("CR-1")).unwrap();
+    }
+
+    #[test]
+    fn an_unregistered_candidate_is_refused_before_any_gate() {
+        // E2E regression: the gate ran in full for a hash that was never
+        // registered, and only then was the promotion refused.
+        let td = tempfile::tempdir().unwrap();
+        let conn = crate::model_registry::open_at(&td.path().join("r.db")).unwrap();
+        let hash = "a".repeat(64);
+        let err = promote_precheck(&conn, &hash, "default", "demo").unwrap_err();
+        assert!(err.to_string().contains("no model"), "{err}");
+        crate::model_registry::register(&conn, &hash, "demo", "default", None, 1).unwrap();
+        promote_precheck(&conn, &hash, "default", "demo").unwrap();
+        assert!(promote_precheck(&conn, &hash, "t2", "demo").is_err());
+        assert!(promote_precheck(&conn, &hash, "default", "other").is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod external_exit_code_tests {
+    use super::external_exit_code;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn a_sidecar_exit_code_is_passed_through() {
+        // E2E regression: a sidecar exiting 3 made `blut <cmd>` exit 1.
+        let from_raw = |raw| std::process::ExitStatus::from_raw(raw);
+        assert_eq!(external_exit_code(&from_raw(0)), None);
+        assert_eq!(external_exit_code(&from_raw(3 << 8)), Some(3));
+        assert_eq!(external_exit_code(&from_raw(2 << 8)), Some(2));
+        assert_eq!(external_exit_code(&from_raw(9)), Some(128 + 9), "SIGKILL");
+    }
+}

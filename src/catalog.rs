@@ -263,6 +263,12 @@ pub fn open_tags(path: &std::path::Path) -> Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
     )
     .map_err(|e| TrainError::other(format!("open {}: {e}", path.display())))?;
+    // Concurrent CLI invocations (two `dataset catalog tag`s, or a tag racing a
+    // reader) must WAIT for the writer lock, not fail with a raw
+    // "database is locked": without a busy timeout SQLite returns SQLITE_BUSY
+    // immediately, so two writers fail instead of taking turns.
+    conn.busy_timeout(std::time::Duration::from_secs(10))
+        .map_err(|e| TrainError::other(format!("busy_timeout: {e}")))?;
     // WAL — a future `blut-web` sidecar may `tag` concurrently with a CLI reader;
     // best-effort (a failure just leaves the default journal mode).
     let _ =

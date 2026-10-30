@@ -11,8 +11,8 @@
 //! a status strip (the six numbers that matter), the plan pipeline, and a row of
 //! instruments, over a governance footer. The model is populated by loaders from
 //! the artifacts the engine already writes (`status.jsonl`, the peer registry,
-//! the privacy ledger, the broker footprint) — [`ConsoleModel::demo`] stands in
-//! when there is no live run.
+//! the privacy ledger, the broker footprint), starting from the empty
+//! [`ConsoleModel::idle`]; `ConsoleModel::demo` is a test-only showcase.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -83,7 +83,9 @@ pub enum Phase {
     Failed,
 }
 
-/// A peer's local trust level (ADR 0079).
+/// A peer's local trust level (ADR 0079). `Registered` / `Trusted` are only
+/// constructed by the `p2p` mesh loader, so a default build never builds them.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Trust {
     Anonymous,
@@ -159,8 +161,38 @@ pub struct ConsoleModel {
 }
 
 impl ConsoleModel {
-    /// A representative model for when there is no live run yet (or `--demo`).
-    /// Uses real BLUT stage names + concepts so the surface reads true.
+    /// The model before any loader has data: no run, no peers, no budgets.
+    /// This is what the console starts from, so every panel shows only what
+    /// the loaders actually found on this machine.
+    pub fn idle() -> Self {
+        Self {
+            run_id: "-".into(),
+            plan: "no run yet".into(),
+            phase: Phase::Pending,
+            elapsed: "-".into(),
+            stages_done: 0,
+            stages_total: 0,
+            mesh: Vec::new(),
+            dag: Vec::new(),
+            broker: BrokerState {
+                held_gib: 0,
+                budget_gib: 0,
+                top_stage: "system".into(),
+                headroom_gib: 0,
+            },
+            corpora: Vec::new(),
+            cache_hit_pct: 0,
+            cache_mibs: 0,
+            cache: Vec::new(),
+            gov_violations: 0,
+        }
+    }
+
+    /// A representative showcase model with made-up numbers, for screenshots
+    /// and render tests. Never the starting point of a live console: it showed
+    /// a "running" plan, four mesh peers and a 73% cache hit rate on a machine
+    /// with no jobs at all.
+    #[cfg(test)]
     pub fn demo() -> Self {
         Self {
             run_id: "7e72347a".into(),
@@ -1066,6 +1098,46 @@ mod tests {
         assert!(m.mesh.iter().any(|p| p.is_self));
         assert!(m.corpora.iter().any(|c| c.restricted), "a clinical corpus");
         assert_eq!(m.gov_violations, 0);
+    }
+
+    #[test]
+    fn the_idle_console_shows_no_made_up_state() {
+        // E2E regression: on a machine with no jobs the home view showed a
+        // running `train_joint · tier7` plan, four mesh peers and a 73% cache
+        // hit rate — the demo model, presented as live.
+        let _theme = crate::theme::test_lock();
+        theme::detect("always", "unicode");
+        let m = ConsoleModel::idle();
+        assert!(m.mesh.is_empty() && m.dag.is_empty() && m.corpora.is_empty());
+        assert_eq!((m.stages_done, m.stages_total, m.cache_hit_pct), (0, 0, 0));
+        let backend = TestBackend::new(120, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            draw_console(
+                f,
+                f.area(),
+                &m,
+                ConsoleTab::Home,
+                &super::super::builder::DagBuilder::default(),
+                &[],
+                &[],
+            )
+        })
+        .unwrap();
+        let screen: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("no run yet"), "{screen}");
+        for fake in ["train_joint", "tier7", "73%", "node·a1b2"] {
+            assert!(
+                !screen.contains(fake),
+                "idle console shows demo data {fake:?}"
+            );
+        }
     }
 
     #[test]

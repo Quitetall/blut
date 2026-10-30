@@ -2752,6 +2752,101 @@ async fn divergence_kill_lets_concurrent_sibling_finish_before_failfast() {
     );
 }
 
+static PRUNED_RAN: AtomicU32 = AtomicU32::new(0);
+
+/// A HEALTHY trial: emits a finite step metric, then parks on its cancel
+/// token. Retries are enabled so a kill wrongly classified as a divergence
+/// would show up as a second attempt.
+struct HealthyThenPark;
+#[async_trait]
+impl Stage for HealthyThenPark {
+    const NAME: &'static str = "healthy_then_park";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const RETRY: RetryPolicy = RetryPolicy {
+        max_attempts: 3,
+        backoff: Backoff::None,
+        retry_on: RetryOn::AllErrors,
+    };
+    type Input = Counter;
+    type Output = Counter;
+    type Args = EmptyArgs;
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        _input: Counter,
+        _args: &EmptyArgs,
+    ) -> Result<Counter, StageError> {
+        until_count(&INC_RUN_COUNT, 1).await;
+        PRUNED_RAN.fetch_add(1, Ordering::SeqCst);
+        let _ = ctx.status_tx.send(StageEvent::StageStep {
+            node_idx: ctx.node_idx,
+            stage_name: Self::NAME.to_string(),
+            update: serde_json::json!({ "val_r": 0.25, "epoch": 1 }),
+        });
+        ctx.cancel.cancelled().await;
+        Err(StageError::Cancelled)
+    }
+}
+impl Compatible<LamuTrainerBackend> for HealthyThenPark {}
+
+/// An early-stopping policy: prune `healthy_then_park` on its first step,
+/// whatever the (finite) metric says. This is what ASHA / median / percentile
+/// return for an underperforming trial.
+struct EarlyStopHealthy;
+impl crate::framework::control::ControlPolicy for EarlyStopHealthy {
+    fn on_step(
+        &self,
+        m: &crate::framework::control::StepMetrics,
+    ) -> crate::framework::control::Control {
+        if m.stage_name == HealthyThenPark::NAME {
+            crate::framework::control::Control::KillBranch
+        } else {
+            crate::framework::control::Control::Continue
+        }
+    }
+}
+
+#[tokio::test]
+async fn early_stop_kill_on_finite_metric_prunes_without_failing_the_plan() {
+    // E2E regression: `blut hpo run --algo asha` (and median / percentile /
+    // pbt) failed the WHOLE job on its first early stop, because every
+    // `KillBranch` was treated as a divergence → retried → terminal
+    // `Diverged`. A kill on a finite step is a prune: the trial runs once,
+    // the sibling completes, and the plan does not surface `Diverged`.
+    let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    PRUNED_RAN.store(0, Ordering::SeqCst);
+    INC_RUN_COUNT.store(0, Ordering::SeqCst);
+    let (_td, base) = fresh_ctx();
+    let ctx = base.with_control(std::sync::Arc::new(EarlyStopHealthy));
+
+    let plan = Plan::<(), LamuTrainerBackend>::new("early_stop", serde_json::json!({}))
+        .start(MakeOne, EmptyArgs)
+        .fork(HealthyThenPark, EmptyArgs, Increment, EmptyArgs)
+        .merge(SumTwo, EmptyArgs)
+        .finish()
+        .into_compiled();
+    let fut = ParallelExecutor::execute(plan, ctx);
+    let result = tokio::time::timeout(crate::TEST_HANG_GUARD, fut)
+        .await
+        .expect("the early-stop kill must fire — a parked trial would otherwise hang");
+
+    assert!(
+        !matches!(result, Err(PlanError::StageFailed { .. })),
+        "an early stop on a finite metric is a prune, not a stage failure: {result:?}"
+    );
+    assert_eq!(
+        PRUNED_RAN.load(Ordering::SeqCst),
+        1,
+        "a pruned trial must not be retried as if it had diverged"
+    );
+    assert_eq!(
+        INC_RUN_COUNT.load(Ordering::SeqCst),
+        1,
+        "the sibling branch still runs to completion"
+    );
+}
+
 #[tokio::test]
 async fn no_control_policy_is_byte_identical_nan_ignored() {
     let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -3238,7 +3333,7 @@ async fn multi_step_always_diverge_exhausts_exactly_max_attempts() {
 
 static TARGETED_KILL_RAN: AtomicU32 = AtomicU32::new(0);
 
-/// Under S1 every `KillBranch` is a DIVERGENCE kill (it populates the
+/// Under S1 a `KillBranch` on a DIVERGED step is a divergence kill (it populates the
 /// registry), so the only PLAIN (non-divergence) cancel reachable through the
 /// public API is a plan cancel. This node parks WITHOUT emitting a divergence
 /// step, so a plan cancel leaves the registry empty → the prior fail-fast
