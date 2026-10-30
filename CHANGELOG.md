@@ -249,6 +249,10 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- `blut-dsl` turned a Starlark script whose `build(args)` never calls `add()`
+  into an empty PlanSpec and exited 0; the engine refused it only at compile
+  time. It is now an evaluation error naming the script ("build(args) added
+  no stages; a plan needs at least one add() call").
 - `examples/first_cookbook.rs`, the README and API.md said a stage that
   declares an envelope is calibrated by the measured-peak store run over run.
   The engine reads that store at admission but never writes it; a cookbook

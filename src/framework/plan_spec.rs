@@ -860,6 +860,24 @@ mod tests {
         ));
     }
 
+    /// The engine's half of the empty-Starlark-plan fix: a PlanSpec with no
+    /// nodes (what `blut-dsl` emitted for a script that never called `add()`)
+    /// is refused at compile, so a `.json` recipe cannot run an empty plan
+    /// either.
+    #[test]
+    fn an_empty_plan_spec_does_not_compile() {
+        let mut empty = linear_spec();
+        empty.nodes.clear();
+        empty.edges.clear();
+        match empty.compile(&toy_registry()) {
+            Err(e @ PlanSpecError::Plan { .. }) => {
+                assert_eq!(e.to_string(), "plan spec 'chain': plan has no nodes");
+            }
+            Err(e) => panic!("expected an empty-plan error, got {e:?}"),
+            Ok(_) => panic!("an empty PlanSpec compiled"),
+        }
+    }
+
     #[test]
     fn typed_condition_gate_compiles_separately_from_data_edges() {
         let plan = condition_spec("spec_decide", "spec_make_a")
