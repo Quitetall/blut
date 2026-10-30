@@ -418,6 +418,21 @@ leaf, else `rlimit` with no cap; one log line names the backend.
 `LocalSystemd::wrap` and `launch` stay bare on Windows: a Job Object is not a
 wrapper command.
 
+A systemd unit is stopped with SIGTERM and, 10 s later, SIGKILL
+(`TimeoutStopSec=10s`, the same grace as `rlimit`/`bare` and `blut cancel`).
+It is also the one placement that survives a SIGKILL of the BLUT process that
+started it (its direct child is only the `systemd-run` client). So, like a
+Slurm job name, the unit is recorded with the job: `spawn_contained` called
+inside a job (`jobs::in_job`; the executor runs every local stage attempt in
+one) appends the unit name to `<job dir>/systemd_units` before the process
+starts and sets its description to `blut job <job id>`. `blut cancel <job>`
+stops every recorded unit still running for the job (`jobs::cancel_systemd_units`),
+also after its BLUT process died, and prints what it stopped; `plan resume`
+refuses while one runs (`jobs::resume_blocker`). Units that have stopped, or
+whose description names another job, are ignored. A stage that spawns from a
+task of its own wraps that task in `jobs::in_job` too: a task-local does not
+reach a spawned task. Recording is best-effort (a failed write is logged).
+
 ---
 
 ## Preview surface (targeted for the 1.0 contract)

@@ -2796,6 +2796,10 @@ async fn run_node_with_admission(
                             })
                     }
                 };
+                // A systemd unit the stage places a process in is recorded
+                // with the job before the process starts, so `blut cancel`
+                // and `plan resume` find it after this process is killed.
+                let run_fut = crate::jobs::in_job(env.job_dir.clone(), run_fut);
                 let timed_fut = run_with_timeout(
                     run_fut,
                     &stage_cancel,

@@ -370,8 +370,12 @@ pub(super) async fn run_cancel(id_query: &str, grace: Duration) -> Result<()> {
     if let Some(state @ (JobState::Done | JobState::Failed | JobState::Cancelled)) = state
         && jobs::live_driver(&id).is_none()
     {
+        // A Slurm job or a systemd unit one of its stages started can still
+        // run (its BLUT process was killed after recording the state); this
+        // stops and reports those, and leaves the state as it is.
+        jobs::cancel_job(&id, grace).await?;
         eprintln!(
-            "{id} already finished ({}); nothing to cancel.",
+            "{id} already finished ({}); nothing else to cancel.",
             state.as_str()
         );
         return Ok(());

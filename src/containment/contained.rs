@@ -35,8 +35,11 @@ use super::{Containment, PeakSource, TeardownHandle, WrappedRun, spawn_attached}
 use crate::error::{Result, TrainError};
 
 /// How long a backend's out-of-band teardown command (`systemctl --user stop`)
-/// may run before the child is killed directly regardless.
-const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// may run before the child is killed directly regardless. `systemctl stop`
+/// returns once the unit has stopped, which for a process ignoring SIGTERM is
+/// the systemd backend's 10 s stop timeout plus the SIGKILL; this leaves room
+/// for both.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long to wait, after the child exits, for its stderr pump to drain. A
 /// grandchild that keeps the pipe open would otherwise hold the wait forever.

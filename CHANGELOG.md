@@ -73,6 +73,22 @@ depend on this crate.
   line, so `peak_bytes` reports it. `ContainedChild::tears_down_tree` says
   whether the backend can kill the whole tree itself (systemd, cgroup v2, Job
   Object) or the caller must signal the process group (`rlimit`, `bare`).
+- The systemd unit a stage runs in is recorded with the BLUT job, the way
+  Slurm job names are. A transient `systemd-run --user` service keeps running
+  when the BLUT process that started it is SIGKILLed (only its `systemd-run`
+  client dies), and `blut cancel` used to reach nothing but that client. Now
+  `LocalSystemd::spawn_contained`, called inside a job, writes the unit name
+  to `<job dir>/systemd_units` before the process starts and describes the
+  unit as `blut job <job id>`; the executor runs every local stage attempt
+  inside its job (`jobs::in_job`). `blut cancel` stops the recorded units that
+  still run for the job (`systemctl --user stop`), also when its BLUT process
+  is dead or the job already finished, and prints each one it stopped;
+  `plan resume` refuses while one runs, names it and says to cancel. A unit
+  that has stopped, or that now belongs to another job (same name, other
+  description), is ignored, so an old record never blocks a resume. New:
+  `jobs::{in_job, record_systemd_unit, systemd_unit_names,
+  live_systemd_units, systemd_resume_blocker, cancel_systemd_units,
+  resume_blocker}`.
 
 ### Changed
 - Every cache key changes once: the engine build commit alone is replaced by
@@ -98,6 +114,13 @@ depend on this crate.
     never collide.
   - One log line names the backend, what it applies, and why it is not
     systemd when it is not (`BLUT_NO_CONTAIN`, no user bus, an old systemd).
+  - A systemd unit is stopped with SIGTERM and, 10 s later, SIGKILL
+    (`TimeoutStopSec=10s`), the grace `rlimit`, `bare` and `blut cancel`
+    give a process group. It used to inherit the user manager's
+    `DefaultTimeoutStopSec=` (90 s by default), so a trainer that ignored
+    SIGTERM lingered that long after a cancel. `ContainedChild` waits up to
+    15 s (was 10 s) for the backend's teardown command, so it no longer gives
+    up on `systemctl stop` just before the SIGKILL.
 - `blut-operator` moves to the engine's MSRV, Rust 1.88 (was 1.89), and from
   kube 0.96 to kube 4.0 / k8s-openapi 0.28 (Kubernetes 1.32 API). It is
   publishable (`publish = ["crates-io"]`, 0.2.0-alpha.2) but not yet published.
