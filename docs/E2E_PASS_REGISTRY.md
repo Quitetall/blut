@@ -28,9 +28,9 @@ built from `Quitetall/blut-cookbooks` at `6918883`.
   used.
 - **Isolation.** Every command ran with `HOME`, `XDG_CONFIG_HOME`,
   `XDG_DATA_HOME` and `LAMU_TRAIN_DATA_DIR` pointed into a scratch directory.
-  `LAMU_TRAIN_DATA_DIR` alone does not isolate a run: the job directories, the
-  registry and catalog databases, the dataset database and the policy file
-  each have their own location and override variable (see open items).
+  At the time `LAMU_TRAIN_DATA_DIR` alone did not isolate a run: the job
+  directories, the registry and catalog databases, the dataset database and
+  the policy file each had their own location (fixed since, see below).
 - **State checks.** Outputs were compared with the state they describe:
   `model resolve` after each `promote` and `rollback`, `dataset resolve` after
   editing, moving and restoring the pinned file, `hpo show` values recomputed
@@ -103,56 +103,53 @@ Gates for each fix commit, Rust 1.88: `cargo fmt --check`; `cargo clippy
 `scripts/semver_checks.sh` (all six published crates compatible). The
 `blut-tui` and `blut-web` crates: fmt, clippy, tests (79 and 13 passed).
 
+## Follow-ups
+
+Fixed after the pass, on `agent/fu-hpo`:
+
+| Item | Commit | What changed |
+|---|---|---|
+| 1. A failing trial failed the whole HPO job | `a5d6f4e` | Trials run with stage-failure isolation: a failed trial is recorded with its error and its siblings keep running; the job fails only when no trial completes with the objective |
+| 2. Runtime-spawned trials were invisible | `a5d6f4e` | `ControlPolicy::on_spawned` and `hpo::TrialBook` record TPE / surrogate suggestions and PBT clones in `hpo.json` as they start; they are ranked and fed back to the policy |
+| 3. `exp compare` on HPO jobs | `36b4041` | Compared through the best completed trial's nodes, which the output names |
+| 4. `LAMU_TRAIN_DATA_DIR` isolated little | `31d0443` | It is the root of every store of user state; explicit per-store variables still win; unset is unchanged |
+| 6. `killed` meant two things | `a5d6f4e` | `stopped` (early stop), `cancelled` (plan cancel), `failed` |
+| 7. `model history` raw seconds | `4f8d24c` | UTC timestamps, current row marked; a promote and a rollback still look alike (no kind column in the table) |
+| 8. Repeated S3 errors, no `AWS_ALLOW_HTTP` hint | `4f8d24c` | One-line errors; a plain-HTTP endpoint is refused up front with the hint |
+| 10. `p2p connect` silent for 30 s | `4f8d24c` | Prints that it is connecting |
+
+E2E after the fixes (toy CPU objective): 6 trials with 3 failing → exit 0,
+3 completed and 3 failed with their errors; 3 of 3 failing → exit 1 naming
+the first error; asha with failures → 2 completed, 5 stopped, 2 failed; tpe
+→ 12 ranked trials (6 suggested); pbt → 11 (5 clones); a surrogate study's
+front over 12 measured trials; with `LAMU_TRAIN_DATA_DIR` set and a fresh
+`HOME`, a recipe run, an HPO search, model, dataset, catalog and policy
+commands wrote nothing under `HOME`.
+
 ## Open items
 
-Not fixed on this branch, by severity.
-
-**High**
-
-1. **One failing trial fails the whole HPO job.** Trials are nodes of one
-   plan, and the executor fails a plan fast: with `fail_above` set so three of
-   six trials error, `hpo run` exits 1 ("hpo plan execution failed") and a
-   healthy running trial is killed. `hpo show` and `hpo best` still read the
-   finished trials. Search tools usually record a failed trial and continue;
-   whether HPO plans should is a design decision (per-trial failure isolation
-   in the executor).
-2. **Runtime-spawned trials are invisible.** TPE and surrogate suggestions
-   and PBT clones run (12 nodes for a 6-trial TPE job) but are not in
-   `hpo.json`, so `hpo show`, `hpo best` and a study's `pareto.json` only rank
-   the random initial population: the model-based part of the search never
-   reaches the result.
+Still open, by severity.
 
 **Medium**
 
-3. **`exp compare` on HPO jobs** compares the last step of whichever trial
-   finished last, which says nothing about either search.
-4. **`LAMU_TRAIN_DATA_DIR` isolates less than its name suggests.** Job
-   directories (`LAMU_TRAIN_JOBS_DIR`), `~/.blut/registry.db`
-   (`BLUT_REGISTRY_DB`), `~/.blut/catalog.db` (`BLUT_CATALOG_DB`), the dataset
-   database (`LAMU_MEMORY_DB`, a file named `conversations.db`) and the policy
-   file (`LAMU_TRAIN_POLICY`) each have their own default under `$HOME`.
-5. **Timing-sensitive tests on a loaded host.** With load average 60 to 227
-   from other work on the same machine, the suites failed on deadlines that
-   are not about the code under test: p2p tests whose QUIC handshake reply
-   missed its 10 s window, `dag_opt_advanced` 5 s event deadlines, and once a
-   `conditional_execution` run that waited indefinitely at 0% CPU (also seen
-   at the same moment in two other worktrees of this commit). Each passed when
-   re-run. A test that waits on a signal with no hang guard turns a lost race
-   into a hang instead of a failure.
+5. **Timing-sensitive tests on a loaded host.** With load average 45 to 227
+   from other work on the same machine, suites fail on deadlines that are not
+   about the code under test: p2p tests whose QUIC handshake reply missed its
+   10 s window, `dag_opt_advanced` 5 s event deadlines, and
+   `conditional_execution`, whose 500 ms plan-deadline tests wait on signals
+   with no hang guard: when the deadline passes before the stages start, the
+   test waits forever. Seen in base `d297e11` too (2 of 4 runs at load ~100).
+   Each passed when re-run.
+16. **Migration of an existing `LAMU_TRAIN_DATA_DIR`.** An install that
+    already set it (it used to hold only materialized training data) now sees
+    empty jobs and registries until the per-store variables point back at the
+    old ones. Nothing warns about it; whether to detect and warn is an owner
+    decision.
 
 **Low**
 
-6. `hpo show` labels an early-stopped trial `killed`, the same word used for a
-   trial killed because a sibling failed.
-7. `model history` prints raw Unix seconds and does not say whether a row came
-   from a promote or a rollback.
-8. `cloud smoke` errors repeat the provider's message once per error layer
-   (five copies of the S3 XML body), and a plain-HTTP endpoint without
-   `AWS_ALLOW_HTTP=true` ends in "URL scheme is not allowed" with no hint.
 9. `cloud smoke` defaults `--store` to `/tmp/blut-cloud-smoke`, a fixed path
    in a shared directory.
-10. `p2p connect` to an address with no coordinator prints nothing until its
-    30 s timeout.
 11. `p2p peers list` shows reputation 0.50 and zero completed tasks for peers
     that ran smoke dispatches successfully.
 12. `blut-notify` summaries say only "status event for job X", not which
@@ -166,4 +163,8 @@ Not fixed on this branch, by severity.
 15. `blut-standard` registers stages but no recipes, so `hpo` and `study`
     cannot be tried with the standard cookbook alone; the `blut-core` recipes
     start a Python trainer and were not run here.
-
+17. TPE can suggest a value equal to a `uniform` dim's exclusive upper bound
+    (`wd = 1.0` for `uniform(0, 1)`): its candidates are clamped to `high`
+    inclusive.
+18. `blut-notify`'s default jobs directory is `$HOME/.local/share/lamu/
+    train-jobs` even when `$XDG_DATA_HOME` moves the engine's elsewhere.

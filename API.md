@@ -352,6 +352,20 @@ commands default to the same `default` tenant as recipe launches; records made
 under the older `shared` default remain reachable with explicit `--tenant
 shared`.
 
+State locations: with `$LAMU_TRAIN_DATA_DIR` set, every store of user state
+(jobs, stage cache, registries, dataset and catalog databases, policy,
+footprints, partitions, tenant and recipe config, and the `~/.blut` files)
+lives under that one directory, so two values are two independent installs.
+A store's own variable (`LAMU_TRAIN_JOBS_DIR`, `BLUT_REGISTRY_DB`, …) takes
+precedence; unset, every path is the historical default. `blut::paths` lists
+each store, its variable and its location.
+
+`blut hpo run` and `blut study run` isolate trial failures: a failed trial is
+recorded with its error and the search continues; the job fails only when no
+trial completes with the objective. Trials a policy spawns while the search
+runs (TPE and surrogate suggestions, PBT clones) are written to `hpo.json` as
+they start and are ranked with the initial population.
+
 `blut partition define` persists a finite set from repeatable `--dim
 axis=v1,v2` flags or a WASM-safe `PartitionSpec` JSON (`time`, `categorical`,
 or `multi`; time windows are UTC and use `--partitions START:END`). `partition
