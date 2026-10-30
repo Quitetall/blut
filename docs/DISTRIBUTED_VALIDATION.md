@@ -17,6 +17,7 @@ first if you are deciding whether to depend on this.
 | Capability | Status | Evidence boundary |
 |---|---|---|
 | Linux systemd/cgroup2/rlimit containment selection | Validated | Local integration and failure-path tests |
+| Linux systemd unit left by a killed BLUT process | Validated | One host, systemd 262, `sleep` stubs: recorded, found by `plan resume`'s check, stopped by `blut cancel`; SIGKILL 10 s into a stop, 2026-10-30 |
 | macOS build with degraded containment | CI-gated | Compile only; no systemd guarantee |
 | `blut-types` on wasm32 | CI-gated | Rust 1.88 `wasm32-unknown-unknown` check |
 | Single-node GPU admission and per-device permits | Component-tested | Deterministic scheduler and executor tests |
@@ -705,6 +706,49 @@ The containerized two-node cluster from the launcher record above (Slurm
 **Boundaries.** One host, containers, no training: the jobs are `sleep`. A
 stage inside a batch allocation names a job step, which `squeue --name`
 does not list; there the batch job ends its steps when the driver exits.
+
+## Recorded run: a systemd unit left behind by a dead driver (2026-10-30)
+
+The developer box (systemd 262, a user manager, Rust 1.88), the engine at the
+`agent/fu-contain-orphans` branch. Under the systemd backend a stage runs in a
+transient `systemd-run --user` service whose only link to the BLUT process is
+the `systemd-run` client; SIGKILLing the BLUT process (or SIGTERMing the
+client) leaves the service running, which was checked by hand on this systemd
+before the change.
+
+- **Found and stopped after the driver is SIGKILLed**
+  (`tests/systemd_orphans.rs`). The test binary, run again as a child, is the
+  driver: it records itself as the job's driver and runs a one-stage plan
+  through the parallel executor whose stage spawns `sleep 600` through
+  `LocalSystemd::spawn_contained`. The unit appeared in
+  `<job dir>/systemd_units` and ran; the driver was SIGKILLed; one second
+  later the unit was still active. `jobs::resume_blocker` (what `plan resume`
+  runs) named the unit and `blut cancel <job>`; `jobs::cancel_job` printed
+  `stopped systemd unit(s) blut-orphan-test-<pid>-1.service of <job>`, the
+  unit was gone, the job read `cancelled`, and with the record still on disk
+  the resume check returned nothing.
+- **Escalation** (`tests/systemd_containment.rs`, part 5). A `sh` and its
+  `sleep` grandchild, both ignoring SIGTERM, were cancelled through
+  `ContainedChild::wait_or_cancel`; the unit's transient file carried
+  `TimeoutStopSec=10s`, and both processes were gone between 9 s and 25 s
+  into the cancel (the whole test took 10.4 s). This host's user manager
+  already defaults to `DefaultTimeoutStopSec=10s`, so the timing alone does
+  not tell the change apart here; the transient-file check does, and on a
+  stock manager (90 s) the timing check would too.
+- **Planted regressions.** Each was planted alone, run, and restored: the
+  record write removed; the executor's `jobs::in_job` scope removed; the
+  unit's job description removed; the stop in `cancel_job` removed; the
+  `TimeoutStopSec` argument removed. The first two failed after 60 s with no
+  unit recorded, the third and fourth at once (the unit not recognised as the
+  job's; the unit still active after the cancel), and the last failed both
+  the argv unit test and the live test.
+
+**Boundaries.** One host; stubs only, no training. The check runs on the host
+that runs `blut cancel` or `plan resume`: a job directory on a shared
+filesystem, resumed from another host, does not see a unit on the first one.
+A stage that spawns from a task of its own sees no job unless it wraps that
+task in `jobs::in_job`. Units of `LocalSystemd::wrap`/`launch`
+(`run_contained.sh`) and cgroup-v2 leaves are not recorded.
 
 ## Required evidence (Slurm, still open)
 
