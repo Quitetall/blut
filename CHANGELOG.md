@@ -249,6 +249,17 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- A stage placed in a cgroup-v2 leaf (the `cgroup2` backend: a delegated
+  subtree, no systemd user bus) was not recorded with its job, so a SIGKILLed
+  driver left its trainer running where `blut cancel` and `plan resume` could
+  not see it. Inside a job the backend now records the leaf (path and inode,
+  `<job dir>/cgroup_leaves`) before the process starts. `blut cancel` stops a
+  populated recorded leaf (SIGTERM, 10 s, then `cgroup.kill`), removes it and
+  prints it, also for a finished job or a dead driver; `plan resume` refuses
+  while one is populated and names it. A leaf recreated under the same name
+  (another inode) is not the job's. New: `jobs::{record_cgroup_leaf,
+  cgroup_leaf_paths, live_cgroup_leaves, cgroup_resume_blocker,
+  cancel_cgroup_leaves}`.
 - `blut-dsl` turned a Starlark script whose `build(args)` never calls `add()`
   into an empty PlanSpec and exited 0; the engine refused it only at compile
   time. It is now an evaluation error naming the script ("build(args) added
