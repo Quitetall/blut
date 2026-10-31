@@ -1777,11 +1777,31 @@ fn row_to_artifact(row: &rusqlite::Row) -> rusqlite::Result<ArtifactRow> {
 mod tests {
     use super::*;
 
-    fn db() -> LineageDb {
-        let td = tempfile::tempdir().unwrap();
-        // Leak the tempdir for the test's lifetime (db holds an open handle).
-        let path = td.keep().join("lineage.db");
-        LineageDb::open_at(path).unwrap()
+    /// A lineage DB in its own temporary directory, removed when the test
+    /// drops it (the DB first, then the directory). It used to leak the
+    /// directory with `TempDir::keep`, one per test per run.
+    struct TestDb {
+        db: LineageDb,
+        _dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestDb {
+        type Target = LineageDb;
+        fn deref(&self) -> &LineageDb {
+            &self.db
+        }
+    }
+
+    impl std::ops::DerefMut for TestDb {
+        fn deref_mut(&mut self) -> &mut LineageDb {
+            &mut self.db
+        }
+    }
+
+    fn db() -> TestDb {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LineageDb::open_at(dir.path().join("lineage.db")).unwrap();
+        TestDb { db, _dir: dir }
     }
 
     fn art(job: &str, idx: i64, hash: &str) -> ArtifactRow {

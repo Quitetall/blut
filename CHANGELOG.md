@@ -249,6 +249,10 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- Test helpers no longer leave temporary directories behind on every run
+  (`TempDir::keep` / `mem::forget` in the lineage, stage-context, run-ledger,
+  executor-partition and p2p CLI test helpers and one bench): each now holds
+  its guard, so a run with a fresh `TMPDIR` leaves nothing from them.
 - A stage placed in a cgroup-v2 leaf (the `cgroup2` backend: a delegated
   subtree, no systemd user bus) was not recorded with its job, so a SIGKILLed
   driver left its trainer running where `blut cancel` and `plan resume` could

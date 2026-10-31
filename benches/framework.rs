@@ -590,18 +590,17 @@ fn bench_broker_admission(c: &mut Criterion) {
     // FootprintStore::resolve — the calibration-store lookup that maps a key to
     // its measured/OOM-corrected peak (or falls back to the hint). Populate one
     // Measured entry so the hot branch (HashMap hit + Measured) is exercised.
+    // The store's directory lives until the end of this bench group, then is
+    // removed (it used to be leaked with `mem::forget`).
+    let store_dir = tempfile::tempdir().unwrap();
     let store = {
-        let td = tempfile::tempdir().unwrap();
-        let mut s = FootprintStore::load_from(td.path().join("footprints.json"));
+        let mut s = FootprintStore::load_from(store_dir.path().join("footprints.json"));
         // Record through the legacy FootprintKey path; resolve below through
         // the envelope-composed flat key — the byte-equal continuity the ADR
         // 0133 seam guarantees (same store rows, either door).
         let key = blut::broker::footprint::footprint_key("bench_recipe", 4, 32, 3, false);
         s.record(&key, 20 * blut::broker::GIB, 0, FootprintSource::Measured)
             .unwrap();
-        // Keep td alive for the bench duration by leaking it (the bench process
-        // is short-lived; the OS reclaims on exit).
-        std::mem::forget(td);
         s
     };
     let key = blut::broker::footprint::envelope_calibration_key("bench_recipe", &env)
