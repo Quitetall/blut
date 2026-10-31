@@ -1337,9 +1337,12 @@ async fn run_dispatch(
             );
             return;
         }
-        let (candidates, passed_over, busy) = inner.candidates(&request, &excluded).await;
+        let (mut candidates, passed_over, busy) = inner.candidates(&request, &excluded).await;
         let mut accepted = None;
-        for candidate in candidates {
+        // Choose and reserve under one lock, from the counts as they are now:
+        // stages placed concurrently each see the others' reservations, so
+        // they spread instead of all picking the peer that looked idlest.
+        while let Some(candidate) = inner.reserve_best(&mut candidates) {
             inner.objects.grant(&candidate.id, input_id);
             match offer(&candidate, &dispatch, &cancel).await {
                 Offer::Accepted(send, recv) => {
@@ -1347,6 +1350,7 @@ async fn run_dispatch(
                     break;
                 }
                 Offer::Refused(refusal) if refusal.code == RefusalCode::Busy => {
+                    inner.release(&candidate.id, true);
                     inner
                         .peers
                         .lock()
@@ -1355,6 +1359,7 @@ async fn run_dispatch(
                         .busy_until = Some(Instant::now() + BUSY_BACKOFF);
                 }
                 Offer::Refused(refusal) => {
+                    inner.release(&candidate.id, true);
                     tracing::info!(
                         "stage {stage_name}: {} refused it: {}",
                         candidate.id.short(),
@@ -1363,6 +1368,7 @@ async fn run_dispatch(
                     excluded.insert(candidate.id.clone(), refusal.message);
                 }
                 Offer::Lost(reason) => {
+                    inner.release(&candidate.id, true);
                     excluded.insert(candidate.id.clone(), reason);
                 }
             }
@@ -1370,6 +1376,8 @@ async fn run_dispatch(
         if let Some(found) = accepted {
             break found;
         }
+        // Candidates `reserve_best` left behind were full when it looked.
+        let busy = busy + candidates.len();
         let waiting_for_busy = busy > 0 && !request.deadline.hard_remaining().is_zero();
         if !waiting_for_busy && waited.elapsed() >= inner.peer_wait {
             let seen = if passed_over.is_empty() {
@@ -1396,12 +1404,8 @@ async fn run_dispatch(
 
     let generation = inner.generation.fetch_add(1, Ordering::Relaxed) + 1;
     let assignment = Assignment::new(chosen.id.short(), generation);
-    {
-        let mut peers = inner.peers.lock();
-        let state = peers.entry(chosen.id.clone()).or_default();
-        state.in_flight += 1;
-        state.dispatched += 1;
-    }
+    // `reserve_best` counted it; the guard gives the slot back when the
+    // stage ends, however it ends.
     let _guard = InFlight {
         inner: inner.clone(),
         id: chosen.id.clone(),
@@ -1562,6 +1566,46 @@ async fn run_dispatch(
 }
 
 impl AdapterInner {
+    /// Take the best of `candidates` by the current counts (fewest in flight,
+    /// then least used, then reputation), skipping full or busy peers, and
+    /// count it as in flight and used before the lock is released.
+    fn reserve_best(&self, candidates: &mut Vec<Candidate>) -> Option<Candidate> {
+        let mut peers = self.peers.lock();
+        let now = Instant::now();
+        let best = candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                let state = peers.get(&c.id);
+                let in_flight = state.map_or(0, |s| s.in_flight);
+                let busy = state
+                    .and_then(|s| s.busy_until)
+                    .is_some_and(|until| until > now);
+                (in_flight < c.hello.max_tasks && !busy).then(|| {
+                    let dispatched = state.map_or(0, |s| s.dispatched);
+                    ((in_flight, dispatched, c.rank.2, c.id.0), i)
+                })
+            })
+            .min()
+            .map(|(_, i)| i)?;
+        let candidate = candidates.swap_remove(best);
+        let state = peers.entry(candidate.id.clone()).or_default();
+        state.in_flight += 1;
+        state.dispatched += 1;
+        Some(candidate)
+    }
+
+    /// Undo [`reserve_best`](Self::reserve_best) for a peer that did not
+    /// take the stage.
+    fn release(&self, id: &PeerId, unused: bool) {
+        if let Some(state) = self.peers.lock().get_mut(id) {
+            state.in_flight = state.in_flight.saturating_sub(1);
+            if unused {
+                state.dispatched = state.dispatched.saturating_sub(1);
+            }
+        }
+    }
+
     async fn record(&self, candidate: &Candidate, success: bool) {
         self.node
             .record_peer_outcome(&candidate.key, Some(candidate.hello.x25519_pub), success)
@@ -1576,9 +1620,7 @@ struct InFlight {
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        if let Some(state) = self.inner.peers.lock().get_mut(&self.id) {
-            state.in_flight = state.in_flight.saturating_sub(1);
-        }
+        self.inner.release(&self.id, false);
     }
 }
 
@@ -1920,6 +1962,65 @@ mod tests {
             reputation > 0.5,
             "a completed dispatch raises it: {reputation}"
         );
+    }
+
+    /// Stages placed at the same moment go to different workers: the choice
+    /// and the reservation are one step, so the second sees the first.
+    #[tokio::test]
+    async fn concurrent_stages_spread_over_the_workers() {
+        let code = identity("1");
+        let sub_key = Arc::new(KeyPair::generate());
+        let w1 = worker(&code, &sub_key).await;
+        let w2 = worker(&code, &sub_key).await;
+        let s = submitter(sub_key, &[&w1, &w2]).await;
+        let adapter = s.adapter(&code, Duration::from_secs(10));
+        let stage: Arc<dyn StageDyn> = Arc::new(SmokeEcho);
+        let out = tempfile::tempdir().unwrap();
+        let runs = ["one", "two"].map(|text| {
+            let request = s.request(
+                stage.as_ref(),
+                text,
+                serde_json::json!({}),
+                DataClassification::Public,
+            );
+            let (adapter, stage) = (adapter.clone(), stage.clone());
+            let dir = out.path().join(text);
+            tokio::spawn(async move {
+                drive_execution(
+                    &adapter,
+                    request,
+                    &CancellationToken::new(),
+                    stage,
+                    &dir,
+                    Duration::from_millis(20),
+                )
+                .await
+            })
+        });
+        for run in runs {
+            let result = tokio::time::timeout(crate::TEST_HANG_GUARD, run)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(result, ExecutionResult::Succeeded { .. }));
+        }
+        for w in [&w1, &w2] {
+            let id = PeerId::from_pubkey(&w.key.verifying);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some((_, rep)) = s.node.peer_trust_and_reputation(&id).await
+                    && rep > 0.5
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "worker {} ran nothing",
+                    id.short()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
     }
 
     async fn raw_run(s: &Submitter, w: &Worker, dispatch: &StageDispatch) -> StageReply {

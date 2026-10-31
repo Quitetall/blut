@@ -20,14 +20,19 @@
 use super::*;
 
 /// Seeds for `--launcher p2p`, `addr@pubkey`, separated by commas or spaces.
+#[cfg(feature = "p2p")]
 pub(super) const SEEDS_ENV: &str = "BLUT_P2P_SEEDS";
 /// Identity key for `--launcher p2p`.
+#[cfg(feature = "p2p")]
 pub(super) const KEY_ENV: &str = "BLUT_P2P_KEY";
 /// Listen address of the submitting node.
+#[cfg(feature = "p2p")]
 pub(super) const LISTEN_ENV: &str = "BLUT_P2P_LISTEN";
 /// Address the submitting node advertises in gossip.
+#[cfg(feature = "p2p")]
 pub(super) const ADVERTISE_ENV: &str = "BLUT_P2P_ADVERTISE";
 /// Seconds an eligible stage waits for a capable peer.
+#[cfg(feature = "p2p")]
 pub(super) const PEER_WAIT_ENV: &str = "BLUT_P2P_PEER_WAIT";
 
 /// The mesh a `--launcher p2p` run joins. Only meaningful with `--launcher
@@ -62,6 +67,7 @@ pub(super) struct MeshArgs {
     pub(super) peer_wait: Option<u64>,
 }
 
+#[cfg(feature = "p2p")]
 fn env_value(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -91,6 +97,7 @@ impl MeshArgs {
     }
 
     /// Seeds from the flags, else from `BLUT_P2P_SEEDS`.
+    #[cfg(feature = "p2p")]
     fn seed_specs(&self) -> Vec<String> {
         if !self.seeds.is_empty() {
             return self.seeds.clone();
@@ -105,6 +112,7 @@ impl MeshArgs {
             .unwrap_or_default()
     }
 
+    #[cfg(feature = "p2p")]
     fn peer_wait(&self) -> Result<std::time::Duration> {
         let secs = match (self.peer_wait, env_value(PEER_WAIT_ENV)) {
             (Some(secs), _) => secs,
@@ -125,11 +133,6 @@ impl MeshArgs {
 #[cfg(feature = "p2p")]
 fn crate_default_peer_wait_secs() -> u64 {
     crate::p2p::mesh_exec::DEFAULT_PEER_WAIT.as_secs()
-}
-
-#[cfg(not(feature = "p2p"))]
-fn crate_default_peer_wait_secs() -> u64 {
-    60
 }
 
 /// Refuse `--p2p-*` flags given with a launcher that would ignore them.

@@ -12,6 +12,8 @@ use super::*;
 /// `blut p2p` subcommands. Behind the `p2p` feature.
 #[cfg(feature = "p2p")]
 #[derive(Subcommand, Debug)]
+// Parsed once per process; `Node` carries every mesh flag.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum P2pCommand {
     /// Identity key management (Ed25519 + X25519).
     Keys {
