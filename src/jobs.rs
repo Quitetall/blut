@@ -727,10 +727,10 @@ pub async fn cancel_job(job_id: &str, grace: std::time::Duration) -> Result<()> 
         Some(JobState::Done | JobState::Failed | JobState::Cancelled)
     ) {
         // Nothing local is left, but a Slurm job or a systemd unit its stage
-        // started can be.
+        // started can be, and so can a stage it submitted to a cloud queue.
         stop_slurm_jobs(job_id);
         stop_systemd_units(job_id);
-        return Ok(());
+        return stop_cloud_jobs(job_id).await;
     }
     let pid = read_pid(job_id)?;
     if let Some(pid) = pid {
@@ -748,6 +748,39 @@ pub async fn cancel_job(job_id: &str, grace: std::time::Duration) -> Result<()> 
     let _ = write_state(job_id, JobState::Cancelled);
     let _ = clear_pid(job_id);
     let _ = clear_driver(job_id);
+    // Last, so the job reads cancelled even when the queue cannot be reached.
+    stop_cloud_jobs(job_id).await
+}
+
+/// Cancel every stage the job submitted to a cloud queue that is still queued
+/// or running (`--launcher cloud`), and say which. A worker running one stops
+/// it at its next status read. The queue is reopened from the job's record, so
+/// an `s3://` queue needs the `AWS_*` variables the run had; without them this
+/// is an error naming them, not a silent success.
+async fn stop_cloud_jobs(job_id: &str) -> Result<()> {
+    #[cfg(feature = "cloud")]
+    {
+        let Ok(dir) = job_dir_path(job_id) else {
+            return Ok(());
+        };
+        if crate::cloud::records::recorded_jobs(&dir).is_empty() {
+            return Ok(());
+        }
+        match crate::cloud::records::cancel_recorded_jobs(&dir, "cancelled by `blut cancel`").await
+        {
+            Ok(ids) if ids.is_empty() => {}
+            Ok(ids) => eprintln!("cancelled cloud job(s) {} of {job_id}", ids.join(", ")),
+            Err(e) => {
+                return Err(TrainError::other(format!(
+                    "cancel {job_id}: its cloud jobs could not be cancelled: {e}. Run `blut \
+                     cancel {job_id}` again with the queue reachable (for an s3:// queue, the \
+                     AWS_* variables the run used)"
+                )));
+            }
+        }
+    }
+    #[cfg(not(feature = "cloud"))]
+    let _ = job_id;
     Ok(())
 }
 

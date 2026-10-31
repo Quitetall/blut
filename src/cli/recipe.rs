@@ -235,14 +235,26 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                 .parse()
                 .map_err(|e| anyhow!("invalid --launcher {launcher:?}: {e}"))?;
             // Before the arm below, which sends other launchers to `recipe
-            // run`: that refuses p2p and cloud as well.
-            crate::config::launcher::check_launcher_placeable(
-                declare_target,
-                "`recipe declare --run`",
-            )
-            .map_err(|e| anyhow!("{e}"))?;
+            // run`: that refuses p2p as well.
+            if declare_target == crate::config::launcher::LaunchTarget::Cloud {
+                if !run {
+                    return Err(anyhow!(
+                        "--launcher cloud submits the recipe's stages, so it needs --run; \
+                         without --run, `recipe declare` only renders the plan"
+                    ));
+                }
+                crate::config::launcher::check_cloud_launch("`recipe declare --run`")
+                    .map_err(|e| anyhow!("{e}"))?;
+            } else {
+                crate::config::launcher::check_launcher_placeable(
+                    declare_target,
+                    "`recipe declare --run`",
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
             match declare_target {
-                crate::config::launcher::LaunchTarget::Local => {}
+                crate::config::launcher::LaunchTarget::Local
+                | crate::config::launcher::LaunchTarget::Cloud => {}
                 crate::config::launcher::LaunchTarget::K8s => {
                     let Some(path) = file.as_ref() else {
                         return Err(anyhow!("--launcher k8s needs a <file> and --run"));
@@ -273,8 +285,8 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                 }
                 other => {
                     return Err(anyhow!(
-                        "recipe declare --run takes --launcher local or k8s, not {}; use \
-                         `recipe run` for the other launchers",
+                        "recipe declare --run takes --launcher local, cloud or k8s, not {}; \
+                         use `recipe run` for the other launchers",
                         other.as_str()
                     ));
                 }
@@ -302,7 +314,13 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                 Some(path) => {
                     let tenant = crate::tenant::Tenant::parse(&tenant)
                         .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
-                    let launch_target = crate::config::launcher::LaunchTarget::Local;
+                    // Local, or cloud: the arms above sent every other
+                    // launcher elsewhere.
+                    let launch_target = if run {
+                        declare_target
+                    } else {
+                        crate::config::launcher::LaunchTarget::Local
+                    };
                     // A `registry://plan@<name>` deploy URI (ADR 0085) resolves
                     // to a FROZEN PlanSpec from the local registry and dispatches
                     // that exact graph; otherwise `path` is a recipe file
@@ -332,12 +350,13 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                             "✓ '{name}' compiles + kind-checks ({n} ingredient(s)); launching…"
                         );
                         launch_compiled_plan(
+                            reg,
                             &name,
                             plan,
                             None,
                             None,
                             shared_cache,
-                            crate::config::launcher::LaunchTarget::Local,
+                            launch_target,
                             None,
                             no_cache,
                             sync_io,
@@ -385,8 +404,13 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                 .map_err(|e| anyhow!("{e}"))?;
             // Before `--dry-run` and config mode too: a dry run that reports
             // OK for a placement the real run refuses would be a lie.
-            crate::config::launcher::check_launcher_placeable(launch_target, "`recipe run`")
-                .map_err(|e| anyhow!("{e}"))?;
+            if launch_target == crate::config::launcher::LaunchTarget::Cloud {
+                crate::config::launcher::check_cloud_launch("`recipe run`")
+                    .map_err(|e| anyhow!("{e}"))?;
+            } else {
+                crate::config::launcher::check_launcher_placeable(launch_target, "`recipe run`")
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
             // ADR 0096: parse the tenant up front (same fail-fast discipline).
             let tenant = crate::tenant::Tenant::parse(&tenant)
                 .ok_or_else(|| anyhow!("invalid --tenant '{tenant}'"))?;
@@ -664,6 +688,7 @@ pub(super) fn prepare_one_partitioned_recipe(
         &plan.execution_fingerprint(),
     );
     let launch = prepare_compiled_plan_launch(
+        reg,
         name,
         plan,
         Some(RecipeMarker {
@@ -725,6 +750,7 @@ async fn run_one_recipe_resolved(
     // oracle for `blut plan resume`). Declarative `.toml` launches pass `None`
     // (no registry recipe to re-compile from) — see `launch_compiled_plan`.
     launch_compiled_plan(
+        reg,
         name,
         plan,
         Some(RecipeMarker {
@@ -966,6 +992,8 @@ pub(super) struct PreparedRecipeLaunch {
     job_dir: std::path::PathBuf,
     ctx: crate::framework::ExecCtx,
     device_index: Option<usize>,
+    #[cfg(feature = "cloud")]
+    cloud: Option<super::cloud::CloudRun>,
 }
 
 impl PreparedRecipeLaunch {
@@ -1001,7 +1029,16 @@ impl PreparedRecipeLaunch {
             job_dir,
             ctx,
             device_index,
+            #[cfg(feature = "cloud")]
+            cloud,
         } = self;
+
+        // The cloud queue is reached before anything is written for the job,
+        // so a wrong endpoint or rejected credentials leave nothing behind.
+        #[cfg(feature = "cloud")]
+        if let Some(cloud) = &cloud {
+            cloud.probe().await?;
+        }
 
         // Admission and the scheduler lock come BEFORE anything is written for
         // this job. A launch refused here never started: it used to leave a
@@ -1049,6 +1086,13 @@ impl PreparedRecipeLaunch {
             return Err(error);
         }
         let _driver = crate::jobs::record_driver(&job_id);
+        #[cfg(feature = "cloud")]
+        if let Some(cloud) = &cloud
+            && let Err(error) = cloud.record(&job_dir)
+        {
+            let _ = crate::jobs::write_state(&job_id, JobState::Failed);
+            return Err(error);
+        }
 
         // KILL-2/KILL-3: bind this job so backend spawns mirror the python
         // child's PROCESS GROUP id into the job pid file (not blut's own pid).
@@ -1092,6 +1136,10 @@ impl PreparedRecipeLaunch {
         // `ctx` owns the private preparation witness, so `execute_plan`
         // dispatches this exact post-DCE plan/profile without resolving again.
         let result = crate::framework::execute_plan(plan, ctx).await;
+        #[cfg(feature = "cloud")]
+        if let Some(cloud) = &cloud {
+            cloud.sweep(&job_dir).await;
+        }
         drop(lock);
         crate::python_kill::unbind_current_job();
         match result {
@@ -1232,12 +1280,18 @@ fn refuse_unplaced_local_launch(
             &surface
         )));
     }
+    // A cloud launch installs its adapter below; what it needs is checked
+    // there, so a build without the feature still refuses here.
+    if launch_target == crate::config::launcher::LaunchTarget::Cloud {
+        return crate::config::launcher::check_cloud_launch(&surface).map_err(|e| anyhow!("{e}"));
+    }
     crate::config::launcher::check_launcher_placeable(launch_target, &surface)
         .map_err(|e| anyhow!("{e}"))
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_compiled_plan_launch(
+    reg: &crate::framework::Registry,
     name: &str,
     plan: crate::framework::plan::CompiledPlan,
     marker: Option<RecipeMarker>,
@@ -1337,6 +1391,17 @@ pub(super) fn prepare_compiled_plan_launch(
         let cache_handle = (*ctx.cache).clone().with_remote(remote);
         ctx.cache = std::sync::Arc::new(cache_handle);
     }
+    #[cfg(feature = "cloud")]
+    let cloud = if launch_target == crate::config::launcher::LaunchTarget::Cloud {
+        let (with_cloud, cloud) =
+            super::cloud::install_cloud_launch(reg, ctx, &job_dir, &tenant, &format!("'{name}'"))?;
+        ctx = with_cloud;
+        Some(cloud)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "cloud"))]
+    let _ = reg;
 
     Ok(PreparedRecipeLaunch {
         name: name.to_string(),
@@ -1351,6 +1416,8 @@ pub(super) fn prepare_compiled_plan_launch(
         job_dir,
         ctx,
         device_index,
+        #[cfg(feature = "cloud")]
+        cloud,
     })
 }
 
@@ -1438,6 +1505,7 @@ fn redact_store_location(raw: &str) -> String {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn launch_compiled_plan(
+    reg: &crate::framework::Registry,
     name: &str,
     plan: crate::framework::plan::CompiledPlan,
     marker: Option<RecipeMarker>,
@@ -1455,6 +1523,7 @@ pub(super) async fn launch_compiled_plan(
             .map_err(|error| anyhow!("tenant admission: {error}"))?,
     );
     prepare_compiled_plan_launch(
+        reg,
         name,
         plan,
         marker,
@@ -1812,6 +1881,7 @@ mod launch_refusal_tests {
         )
         .0;
         let result = super::launch_compiled_plan(
+            &crate::framework::Registry::new(),
             "refused",
             plan,
             None,
@@ -1900,6 +1970,7 @@ mod pointer_launch_identity_tests {
         let plan = spec.compile(&reg).unwrap();
         let uri = "registry://plan@prod";
         let job_id = super::launch_compiled_plan(
+            &reg,
             uri,
             plan,
             None,
@@ -2178,13 +2249,24 @@ mod k8s_refusal_tests {
     }
 
     /// `--launcher p2p` and `cloud` fell through to the local launcher the
-    /// same way. The backstop refuses them too, whatever path reached it.
+    /// same way. The backstop refuses p2p whatever path reached it, and cloud
+    /// unless the build has the feature and a queue is configured.
     #[test]
     fn the_local_launch_path_refuses_p2p_and_cloud_placements() {
         use crate::config::launcher::LaunchTarget;
+        let _env = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized by TEST_ENV_LOCK.
+        unsafe { std::env::remove_var(crate::config::launcher::CLOUD_QUEUE_ENV) };
+        let cloud = if cfg!(feature = "cloud") {
+            "BLUT_CLOUD_QUEUE"
+        } else {
+            "`cloud` feature"
+        };
         for (target, names) in [
             (LaunchTarget::P2P, "blut p2p node --dispatch-stage"),
-            (LaunchTarget::Cloud, "blut cloud smoke"),
+            (LaunchTarget::Cloud, cloud),
         ] {
             let msg = refuse_unplaced_local_launch("demo", target)
                 .unwrap_err()

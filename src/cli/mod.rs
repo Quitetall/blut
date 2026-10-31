@@ -2335,17 +2335,29 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                     "`plan resume` of a k8s job"
                 )));
             }
-            // A job recorded with p2p or cloud ran here before those were
-            // refused; resuming it "as it was run" would repeat the claim.
-            crate::config::launcher::check_launcher_placeable(
-                launch_target,
-                &format!(
-                    "`plan resume` of {job_id}, which recorded it but ran on this machine \
-                     (start it again with `recipe run {}`)",
-                    marker.name
-                ),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
+            if launch_target == crate::config::launcher::LaunchTarget::Cloud {
+                // A cloud job resumes on the cloud queue: its finished stages
+                // are cache hits, the rest are submitted again. Not while a
+                // stage it submitted is still queued or running.
+                crate::config::launcher::check_cloud_launch(&format!("`plan resume` of {job_id}"))
+                    .map_err(|e| anyhow!("{e}"))?;
+                #[cfg(feature = "cloud")]
+                if let Some(why) = crate::cloud::records::resume_blocker(&job_id, &job_dir).await {
+                    return Err(anyhow!(why));
+                }
+            } else {
+                // A job recorded with p2p ran here before that was refused;
+                // resuming it "as it was run" would repeat the claim.
+                crate::config::launcher::check_launcher_placeable(
+                    launch_target,
+                    &format!(
+                        "`plan resume` of {job_id}, which recorded it but ran on this machine \
+                         (start it again with `recipe run {}`)",
+                        marker.name
+                    ),
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
             if launch_target != crate::config::launcher::LaunchTarget::Local {
                 eprintln!(
                     "resuming {job_id} with --launcher {} (as it was run)",
@@ -2409,6 +2421,22 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                 launch_target,
             )?;
             footprint = prepared_footprint;
+            #[cfg(feature = "cloud")]
+            let cloud = if launch_target == crate::config::launcher::LaunchTarget::Cloud {
+                let (with_cloud, cloud) = cloud::install_cloud_launch(
+                    reg,
+                    ctx,
+                    &job_dir,
+                    &tenant,
+                    &format!("`plan resume` of {job_id}"),
+                )?;
+                ctx = with_cloud;
+                cloud.check_same_queue(&job_id, &job_dir)?;
+                cloud.probe().await?;
+                Some(cloud)
+            } else {
+                None
+            };
             if shared_cache {
                 match CacheHandle::default_global_path() {
                     Some(global) => {
@@ -2450,6 +2478,10 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             crate::jobs::write_state(&job_id, JobState::Running)
                 .with_context(|| format!("write Running state for {job_id}"))?;
             let _driver = crate::jobs::record_driver(&job_id);
+            #[cfg(feature = "cloud")]
+            if let Some(cloud) = &cloud {
+                cloud.record(&job_dir)?;
+            }
             // The same signal discipline as `recipe run`: Ctrl-C / SIGTERM
             // cancels the executor and kills the trainer groups, instead of
             // the default action killing blut and orphaning a setsid trainer.
@@ -2461,6 +2493,10 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             eprintln!("lock     {}", lock.path().display());
             persist_plan_graph(&plan, &job_dir);
             let result = crate::framework::execute_plan(plan, ctx).await;
+            #[cfg(feature = "cloud")]
+            if let Some(cloud) = &cloud {
+                cloud.sweep(&job_dir).await;
+            }
             drop(lock);
             crate::python_kill::unbind_current_job();
             match result {
@@ -2597,6 +2633,7 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                 return Ok(());
             }
             let job_id = recipe::launch_compiled_plan(
+                reg,
                 &accepted.spec.name,
                 // The plan the typecheck produced — not a second compilation of
                 // the same spec. What was checked is what runs.

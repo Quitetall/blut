@@ -6,6 +6,11 @@
 //! handler with a recipe whose only stage writes a marker file, and checks
 //! that the command refuses, names what does dispatch there, writes no job,
 //! and that the stage never ran.
+//!
+//! `recipe run`, `recipe declare --run` and `plan resume` now place cloud
+//! work (a build with the `cloud` feature and `BLUT_CLOUD_QUEUE` set); here,
+//! with no queue configured, they refuse and say what is missing. The other
+//! commands still refuse cloud outright.
 
 use super::{Cli, Command, Parser};
 use serde_json::json;
@@ -136,7 +141,9 @@ struct Sandbox {
 impl Sandbox {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let vars: [(&'static str, std::ffi::OsString); 9] = [
+        let vars: [(&'static str, std::ffi::OsString); 10] = [
+            // No cloud queue configured: the cloud cases below are refusals.
+            ("BLUT_CLOUD_QUEUE", "".into()),
             ("LAMU_TRAIN_JOBS_DIR", dir.path().join("jobs").into()),
             ("LAMU_TRAIN_DATA_DIR", dir.path().join("data").into()),
             ("XDG_DATA_HOME", dir.path().join("xdg-data").into()),
@@ -196,10 +203,26 @@ fn lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Launchers no command here can place, each with what its refusal names.
+/// `recipe run`, `recipe declare --run` and `plan resume` can place cloud
+/// work, so for them [`CLOUD_LAUNCH`] says what is missing instead.
 const REMOTE: [(&str, &str); 2] = [
     ("p2p", "blut p2p node --dispatch-stage"),
-    ("cloud", "blut cloud smoke"),
+    ("cloud", "only `recipe run`"),
 ];
+
+/// What a cloud-capable command names when it cannot launch: the queue
+/// variable in a build that has the feature, the feature in one that has not.
+const CLOUD_LAUNCH: &str = if cfg!(feature = "cloud") {
+    "BLUT_CLOUD_QUEUE"
+} else {
+    "`cloud` feature"
+};
+
+/// [`REMOTE`] as a command that can place cloud work refuses it.
+fn launch_refusals() -> [(&'static str, &'static str); 2] {
+    [REMOTE[0], ("cloud", CLOUD_LAUNCH)]
+}
 
 fn recipe_cmd(argv: &[&str]) -> super::RecipeCommand {
     match Cli::try_parse_from(argv).expect("parse").command {
@@ -214,7 +237,7 @@ fn recipe_cmd(argv: &[&str]) -> super::RecipeCommand {
 async fn recipe_run_refuses_p2p_and_cloud_before_anything_runs() {
     let _lock = lock();
     let reg = registry();
-    for (launcher, names) in REMOTE {
+    for (launcher, names) in launch_refusals() {
         let sandbox = Sandbox::new();
         let args = sandbox.args();
         let config_dir = sandbox.dir.path().join("conf").display().to_string();
@@ -253,7 +276,7 @@ async fn recipe_run_refuses_p2p_and_cloud_before_anything_runs() {
 async fn recipe_declare_run_refuses_p2p_and_cloud_without_pointing_at_recipe_run() {
     let _lock = lock();
     let reg = registry();
-    for (launcher, names) in REMOTE {
+    for (launcher, names) in launch_refusals() {
         let sandbox = Sandbox::new();
         let file = sandbox.dir.path().join("r.toml").display().to_string();
         let argv = [
@@ -421,13 +444,14 @@ async fn partition_backfill_and_status_refuse_p2p_and_cloud() {
 }
 
 /// A job recorded with `--launcher p2p` before the refusal ran here; resuming
-/// it "as it was run" would repeat the false placement.
+/// it "as it was run" would repeat the false placement. A cloud job resumes
+/// on the cloud queue, so without one it is refused for that reason.
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn plan_resume_refuses_a_job_recorded_with_p2p_or_cloud() {
     let _lock = lock();
     let reg = registry();
-    for (launcher, names) in REMOTE {
+    for (launcher, names) in launch_refusals() {
         let sandbox = Sandbox::new();
         let job_id = crate::jobs::new_job_id();
         let job_dir = crate::paths::job_dir(&job_id).unwrap();
@@ -460,7 +484,9 @@ async fn plan_resume_refuses_a_job_recorded_with_p2p_or_cloud() {
             )),
             "{err}"
         );
-        assert!(err.contains("recipe run launcher_probe"), "{err}");
+        if launcher == "p2p" {
+            assert!(err.contains("recipe run launcher_probe"), "{err}");
+        }
         assert!(err.contains(names), "{err}");
         assert!(!sandbox.marker().exists(), "the resumed stage ran here");
         assert_eq!(
@@ -472,16 +498,20 @@ async fn plan_resume_refuses_a_job_recorded_with_p2p_or_cloud() {
 }
 
 /// The local launch path itself refuses, before a job directory exists, when
-/// a caller reaches it with a placement no command can make.
+/// a caller reaches it with a placement it cannot make: p2p always, cloud
+/// without a queue (or without the `cloud` feature).
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn the_local_launch_path_refuses_p2p_and_cloud_before_writing_a_job() {
     use crate::config::launcher::LaunchTarget;
     let _lock = lock();
+    // SAFETY: serialized by TEST_ENV_LOCK (`lock`).
+    unsafe { std::env::remove_var(crate::config::launcher::CLOUD_QUEUE_ENV) };
     for target in [LaunchTarget::P2P, LaunchTarget::Cloud] {
         let sandbox = Sandbox::new();
         let plan = compile_probe(json!({ "marker": sandbox.marker() })).unwrap();
         let err = super::launch_compiled_plan(
+            &crate::framework::Registry::new(),
             "launcher_probe",
             plan,
             None,
