@@ -1664,18 +1664,22 @@ mod tests {
         keypair: std::sync::Arc<crate::p2p::crypto::KeyPair>,
         worker: bool,
         scheduler: bool,
-    ) -> std::sync::Arc<crate::p2p::node::MeshNode> {
+    ) -> (
+        std::sync::Arc<crate::p2p::node::MeshNode>,
+        tempfile::TempDir,
+    ) {
         use crate::p2p::node::{MeshNode, MeshTaskRunner, NodeCapabilities};
+        // The registry directory lives as long as the caller holds it; it used
+        // to be leaked (`mem::forget`) on every run.
         let dir = tempfile::tempdir().unwrap();
         let peers =
             crate::p2p::registry::PeerRegistry::load(&dir.path().join("peers.json")).unwrap();
-        std::mem::forget(dir);
         let runner: Option<std::sync::Arc<dyn MeshTaskRunner>> = worker.then(|| {
             std::sync::Arc::new(SmokeRunner {
                 keypair: keypair.clone(),
             }) as std::sync::Arc<dyn MeshTaskRunner>
         });
-        MeshNode::bind(
+        let node = MeshNode::bind(
             "127.0.0.1:0".parse().unwrap(),
             keypair,
             peers,
@@ -1684,7 +1688,8 @@ mod tests {
             false,
         )
         .await
-        .unwrap()
+        .unwrap();
+        (node, dir)
     }
 
     #[cfg(feature = "p2p")]
@@ -1692,9 +1697,9 @@ mod tests {
     async fn probe_verifies_each_seeds_signed_reply() {
         use crate::p2p::crypto::KeyPair;
         let worker_kp = std::sync::Arc::new(KeyPair::generate());
-        let worker = mesh_node(worker_kp.clone(), true, false).await;
+        let (worker, _worker_dir) = mesh_node(worker_kp.clone(), true, false).await;
         let prober_kp = std::sync::Arc::new(KeyPair::generate());
-        let prober = mesh_node(prober_kp.clone(), false, true).await;
+        let (prober, _prober_dir) = mesh_node(prober_kp.clone(), false, true).await;
         let pin = worker_kp.verifying.to_bytes();
         let conn = prober
             .connect_to(worker.local_addr().unwrap(), pin)

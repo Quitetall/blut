@@ -24,6 +24,11 @@ struct Cli {
     sla: Option<std::path::PathBuf>,
     #[arg(long)]
     cursor: Option<std::path::PathBuf>,
+    /// Put events' error text in status summaries (daemon/config mode). It is
+    /// free-form and can hold paths or credentials; restricted data never
+    /// carries it.
+    #[arg(long, default_value_t = false)]
+    include_error_text: bool,
     /// Custody declaration for one-envelope stdin mode.
     #[arg(long, value_enum, default_value_t = BoundaryArg::OffBox)]
     boundary: BoundaryArg,
@@ -64,12 +69,13 @@ fn main() -> Result<()> {
         let config = blut_notify::config::NotifyConfig::load(&config_path)
             .map_err(|error| anyhow!("load {}: {error}", config_path.display()))?;
         let jobs_dir = cli.jobs_dir.unwrap_or_else(default_jobs_dir);
-        let sla = cli.sla.unwrap_or_else(|| dot_blut().join("sla.jsonl"));
+        let sla = cli.sla.unwrap_or_else(default_sla_path);
         let cursor = cli
             .cursor
             .unwrap_or_else(|| dot_blut().join("notify-cursors.json"));
-        let mut notifier =
-            blut_notify::tailer::Notifier::open(config, cursor).map_err(|error| anyhow!(error))?;
+        let mut notifier = blut_notify::tailer::Notifier::open(config, cursor)
+            .map_err(|error| anyhow!(error))?
+            .include_error_text(cli.include_error_text);
         loop {
             let report = notifier
                 .run_once(&jobs_dir, &sla)
@@ -103,10 +109,18 @@ fn main() -> Result<()> {
 /// jobs and `~/.blut` files live under it (the engine's `blut::paths` rule;
 /// this crate does not depend on the engine, so it is restated here).
 fn state_root() -> Option<std::path::PathBuf> {
-    std::env::var_os("LAMU_TRAIN_DATA_DIR")
+    state_root_from(&|name| std::env::var_os(name))
+}
+
+fn state_root_from(env: &Env<'_>) -> Option<std::path::PathBuf> {
+    env("LAMU_TRAIN_DATA_DIR")
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
 }
+
+/// An environment lookup, so path resolution is testable without mutating
+/// the process environment.
+type Env<'a> = dyn Fn(&str) -> Option<std::ffi::OsString> + 'a;
 
 fn dot_blut() -> std::path::PathBuf {
     state_root().unwrap_or_else(|| {
@@ -117,14 +131,78 @@ fn dot_blut() -> std::path::PathBuf {
     })
 }
 
-fn default_jobs_dir() -> std::path::PathBuf {
-    std::env::var_os("LAMU_TRAIN_JOBS_DIR")
+/// The SLA log the engine writes: `$BLUT_SLA_PATH`, else `sla.jsonl` in the
+/// BLUT home (`blut::sla::default_sla_path`).
+fn default_sla_path() -> std::path::PathBuf {
+    std::env::var_os("BLUT_SLA_PATH")
         .map(std::path::PathBuf::from)
-        .or_else(|| state_root().map(|root| root.join("train-jobs")))
+        .unwrap_or_else(|| dot_blut().join("sla.jsonl"))
+}
+
+fn default_jobs_dir() -> std::path::PathBuf {
+    jobs_dir_from(&|name| std::env::var_os(name), dirs::data_local_dir())
+}
+
+/// The engine's `blut::paths::jobs_dir` rule: `$LAMU_TRAIN_JOBS_DIR`, else
+/// `$LAMU_TRAIN_DATA_DIR/train-jobs`, else `<data_local>/lamu/train-jobs`,
+/// where `data_local` is `dirs::data_local_dir()` (`$XDG_DATA_HOME` when set,
+/// else `~/.local/share` on Linux). It used to be `$HOME/.local/share/...`
+/// regardless of `$XDG_DATA_HOME`, so the notifier tailed an empty directory
+/// while the engine wrote its jobs elsewhere.
+fn jobs_dir_from(env: &Env<'_>, data_local: Option<std::path::PathBuf>) -> std::path::PathBuf {
+    env("LAMU_TRAIN_JOBS_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| state_root_from(env).map(|root| root.join("train-jobs")))
         .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_default()
-                .join(".local/share/lamu/train-jobs")
+            data_local
+                .unwrap_or_else(|| std::path::PathBuf::from(".local/share"))
+                .join("lamu")
+                .join("train-jobs")
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn env(
+        pairs: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.into())
+        }
+    }
+
+    #[test]
+    fn jobs_dir_follows_the_engine_rule() {
+        let xdg = Some(PathBuf::from("/xdg/data"));
+        assert_eq!(
+            jobs_dir_from(&env(&[]), xdg.clone()),
+            PathBuf::from("/xdg/data/lamu/train-jobs"),
+            "the data-local dir ($XDG_DATA_HOME) decides by default"
+        );
+        assert_eq!(
+            jobs_dir_from(&env(&[("LAMU_TRAIN_DATA_DIR", "/root")]), xdg.clone()),
+            PathBuf::from("/root/train-jobs")
+        );
+        assert_eq!(
+            jobs_dir_from(&env(&[("LAMU_TRAIN_DATA_DIR", "")]), xdg.clone()),
+            PathBuf::from("/xdg/data/lamu/train-jobs"),
+            "an empty root is unset"
+        );
+        assert_eq!(
+            jobs_dir_from(
+                &env(&[
+                    ("LAMU_TRAIN_JOBS_DIR", "/jobs"),
+                    ("LAMU_TRAIN_DATA_DIR", "/root")
+                ]),
+                xdg
+            ),
+            PathBuf::from("/jobs")
+        );
+    }
 }

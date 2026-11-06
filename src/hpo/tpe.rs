@@ -128,6 +128,27 @@ pub(super) fn from_t(dist: &Dist, t: f64) -> Value {
     }
 }
 
+/// Decode a model-based suggestion: [`from_t`], kept inside the dim's declared
+/// support. `uniform` and `log_uniform` are half-open, `[low, high)`, but a
+/// candidate clamped to the t-space support can land exactly on `high` (TPE
+/// suggested `wd = 1.0` for `uniform(0, 1)`), and `exp(ln(low))` can round
+/// below `low`; such a value becomes the nearest one inside `[low, high)`.
+/// `int_uniform` is inclusive and `quniform` rounds to its grid, as
+/// [`Dist::sample`] does, so both decode unchanged.
+pub(super) fn suggestion_from_t(dist: &Dist, t: f64) -> Value {
+    let (low, high, decoded) = match dist {
+        Dist::Uniform { low, high } => (*low, *high, t),
+        Dist::LogUniform { low, high } => (*low, *high, t.exp()),
+        _ => return from_t(dist, t),
+    };
+    // `validate` guarantees `low < high`; `max` keeps the bounds ordered even
+    // for a space that skipped it, so `clamp` cannot panic.
+    let below_high = high.next_down().max(low);
+    serde_json::Number::from_f64(decoded.clamp(low, below_high))
+        .map(Value::Number)
+        .unwrap_or(Value::Null)
+}
+
 /// Parzen density at `c`: a uniform prior plus a Gaussian per observation,
 /// normalized so the prior carries the weight of one pseudo-observation.
 fn parzen(c: f64, obs: &[f64], bw: f64, lo: f64, hi: f64) -> f64 {
@@ -191,7 +212,7 @@ impl TpeSampler {
                 best = Some((score, cand));
             }
         }
-        from_t(dist, best.map(|(_, t)| t).unwrap_or((lo + hi) / 2.0))
+        suggestion_from_t(dist, best.map(|(_, t)| t).unwrap_or((lo + hi) / 2.0))
     }
 
     fn suggest_choice(&mut self, choices: &[Value], good: &[&Value], bad: &[&Value]) -> Value {
@@ -458,6 +479,72 @@ mod tests {
             .as_f64()
             .unwrap();
         assert!((0.0..=1.0).contains(&lr));
+    }
+
+    /// E2E follow-up: TPE suggested `wd = 1.0` for `uniform(0, 1)`. A
+    /// candidate jittered past the support was clamped to `high` inclusive,
+    /// and good trials near the bound make that clamped candidate the best.
+    #[test]
+    fn suggestions_stay_below_a_half_open_upper_bound() {
+        let mut hist = vec![];
+        for i in 0..8 {
+            hist.push(tr(0.999 - 0.0001 * i as f64, 0.9)); // good, at the bound
+            hist.push(tr(0.01 * i as f64, 0.1)); // bad
+        }
+        let mut log_space = SearchSpace::default();
+        log_space.dims.insert(
+            "lr".into(),
+            Dist::LogUniform {
+                low: 1e-4,
+                high: 1.0,
+            },
+        );
+        for (space, low) in [(cont_space(), 0.0), (log_space, 1e-4)] {
+            for seed in 0..64 {
+                let mut t = TpeSampler::new(
+                    TpeConfig {
+                        gamma: 0.5,
+                        n_startup: 4,
+                        ..TpeConfig::default()
+                    },
+                    seed,
+                );
+                let o = t.ask(&space, &hist);
+                let lr = o[0].1.as_f64().unwrap();
+                assert!(
+                    (low..1.0).contains(&lr),
+                    "seed {seed}: {lr} is outside [{low}, 1)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn half_open_decoding_keeps_the_declared_support() {
+        let u = Dist::Uniform {
+            low: 0.0,
+            high: 1.0,
+        };
+        assert_eq!(suggestion_from_t(&u, 1.0), json!(1.0f64.next_down()));
+        assert_eq!(suggestion_from_t(&u, 0.5), json!(0.5));
+        assert_eq!(suggestion_from_t(&u, -0.1), json!(0.0));
+        let l = Dist::LogUniform {
+            low: 1e-3,
+            high: 1.0,
+        };
+        let top = suggestion_from_t(&l, 0.0).as_f64().unwrap();
+        assert!(top < 1.0, "{top}");
+        let bottom = suggestion_from_t(&l, 1e-3f64.ln()).as_f64().unwrap();
+        assert!(bottom >= 1e-3, "{bottom}");
+        // Inclusive and gridded dims decode as before.
+        let i = Dist::IntUniform { low: 1, high: 4 };
+        assert_eq!(suggestion_from_t(&i, 4.0), json!(4));
+        let q = Dist::QUniform {
+            low: 0.0,
+            high: 1.0,
+            q: 0.25,
+        };
+        assert_eq!(suggestion_from_t(&q, 1.0), from_t(&q, 1.0));
     }
 
     #[test]

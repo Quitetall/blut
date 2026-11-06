@@ -1030,18 +1030,20 @@ async fn partitioned_plans_do_not_share_cache_entries() {
     let first = SequentialExecutor::execute(plan("tuh"), ctx).await.unwrap();
     assert_eq!(first.n_cache_misses, 1);
 
+    let second_job = tempfile::tempdir().unwrap();
     let second_ctx = ExecCtx {
         cache: cache.clone(),
-        ..ExecCtx::new(tempfile::tempdir().unwrap().keep())
+        ..ExecCtx::new(second_job.path().to_path_buf())
     };
     let second = SequentialExecutor::execute(plan("chb"), second_ctx)
         .await
         .unwrap();
     assert_eq!(second.n_cache_misses, 1, "a different partition is cold");
 
+    let repeat_job = tempfile::tempdir().unwrap();
     let repeat_ctx = ExecCtx {
         cache,
-        ..ExecCtx::new(tempfile::tempdir().unwrap().keep())
+        ..ExecCtx::new(repeat_job.path().to_path_buf())
     };
     let repeat = SequentialExecutor::execute(plan("tuh"), repeat_ctx)
         .await

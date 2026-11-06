@@ -24,7 +24,7 @@ use serde_json::Value;
 
 use super::sampler::Sampler;
 use super::space::{Dist, Overlay, SearchSpace, TrialResult};
-use super::tpe::{from_t, gaussian, support_t, to_t};
+use super::tpe::{from_t, gaussian, suggestion_from_t, support_t, to_t};
 
 // ───────────────────────────── Grid baseline ─────────────────────────────
 
@@ -288,7 +288,7 @@ impl MvTpeSampler {
                             let u2: f64 = self.rng.gen_range(0.0..1.0);
                             (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
                         };
-                        from_t(dist, (to_t(dist, x) + z * bw).clamp(lo, hi))
+                        suggestion_from_t(dist, (to_t(dist, x) + z * bw).clamp(lo, hi))
                     }
                     _ => dist.sample(&mut self.rng),
                 },
@@ -573,6 +573,34 @@ mod tests {
         let o = s.ask(&sp, &hist);
         let v = get(&o, "a").as_f64().unwrap();
         assert!((0.0..=1.0).contains(&v));
+    }
+
+    /// E2E follow-up, as for the univariate sampler: a jittered candidate
+    /// clamped to the support could be exactly the exclusive `high`.
+    #[test]
+    fn mv_tpe_suggestions_stay_below_a_half_open_upper_bound() {
+        let sp = space_of(vec![(
+            "wd",
+            Dist::Uniform {
+                low: 0.0,
+                high: 1.0,
+            },
+        )]);
+        let mut hist = Vec::new();
+        for i in 0..8 {
+            hist.push(tr(vec![("wd", json!(0.999 - 0.0001 * i as f64))], 1.0));
+            hist.push(tr(vec![("wd", json!(0.01 * i as f64))], 0.0));
+        }
+        let cfg = MvTpeConfig {
+            n_startup: 1,
+            gamma: 0.5,
+            ..Default::default()
+        };
+        for seed in 0..64u64 {
+            let mut s = MvTpeSampler::new(cfg.clone(), seed);
+            let wd = get(&s.ask(&sp, &hist), "wd").as_f64().unwrap();
+            assert!((0.0..1.0).contains(&wd), "seed {seed}: wd = {wd}");
+        }
     }
 
     #[test]

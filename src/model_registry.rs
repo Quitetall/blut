@@ -14,8 +14,9 @@
 //!     same (tenant, name) is the idempotent no-op; a cross-tenant or
 //!     rename collision is refused.
 //!   * `model_pointers` — MUTABLE `(tenant, name, alias) → model_hash`.
-//!   * `model_pointer_history` — append-only audit trail, so `rollback` pops a
-//!     pointer to its previous target atomically.
+//!   * `model_pointer_history` — append-only audit trail, each row a
+//!     `promote` or a `rollback` (`kind`), so `rollback` walks an alias back
+//!     through its promotions like an undo stack, atomically.
 //!
 //! `model://<name>@<alias>` resolves a pointer to a checkpoint hash; the hash
 //! then feeds a recipe's typed args (the artifact itself lives in the cache/fs
@@ -63,7 +64,8 @@ CREATE TABLE IF NOT EXISTS model_pointer_history (
     name         TEXT NOT NULL,
     alias        TEXT NOT NULL,
     model_hash   TEXT NOT NULL,
-    moved_at     INTEGER NOT NULL
+    moved_at     INTEGER NOT NULL,
+    kind         TEXT NOT NULL DEFAULT 'promote'
 );
 CREATE INDEX IF NOT EXISTS idx_model_history_ptr
     ON model_pointer_history(tenant, name, alias, seq);
@@ -109,6 +111,10 @@ pub fn open_at(path: &std::path::Path) -> Result<Connection> {
         conn.query_row::<rusqlite::types::Value, _, _>("PRAGMA journal_mode=WAL", [], |r| r.get(0));
     conn.execute_batch(CREATE_SCHEMA)
         .map_err(|e| TrainError::other(format!("create model registry schema: {e}")))?;
+    // A registry created before rollbacks walked the history has no `kind`
+    // column: add it. Its old rows count as promotions, since the old trail did
+    // not record which moves were rollbacks (as the plan trail migrates).
+    crate::registry_db::add_move_kind_column(&conn, "model_pointer_history")?;
     Ok(conn)
 }
 
@@ -311,8 +317,8 @@ fn promote_unchecked(
     )
     .map_err(|e| TrainError::other(format!("upsert model pointer: {e}")))?;
     tx.execute(
-        "INSERT INTO model_pointer_history (tenant, name, alias, model_hash, moved_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO model_pointer_history (tenant, name, alias, model_hash, moved_at, kind) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'promote')",
         params![tenant, name, alias, model_hash, now_unix],
     )
     .map_err(|e| TrainError::other(format!("append model history: {e}")))?;
@@ -494,10 +500,19 @@ pub fn promote_governed(
     promote_unchecked(conn, model_hash, tenant, name, alias, now_unix)
 }
 
-/// Roll an alias back to its previous target atomically (one `BEGIN IMMEDIATE`
-/// transaction): read the two most-recent history entries, set the pointer to
-/// the second-most-recent, record the rollback. Errors if the alias has no prior
-/// target. Returns the hash rolled back to.
+/// Roll an alias back one step through its promotion history, atomically (one
+/// `BEGIN IMMEDIATE` transaction). Rollbacks walk the history like an undo
+/// stack, as `plan rollback` does: each one moves to the promotion before the
+/// current one, so promote A, B, C then roll back twice lands on A. A promotion
+/// after a rollback starts from where the rollback left the alias (the
+/// rolled-back promotions are not reachable again by rolling back), and
+/// re-promoting the current target is recorded but is not a new step. Errors
+/// when the alias has no target or is at its first promotion. The move is
+/// recorded in the trail as a `rollback`. Returns the hash rolled back to.
+///
+/// It used to read only the two most recent trail entries, so a second
+/// rollback returned to the target the first one had left: repeated rollbacks
+/// toggled between the last two checkpoints.
 pub fn rollback(
     conn: &mut Connection,
     tenant: &str,
@@ -505,30 +520,30 @@ pub fn rollback(
     alias: &str,
     now_unix: i64,
 ) -> Result<String> {
-    // Take the write lock up front so the two-most-recent read and the writes see
-    // ONE snapshot — a concurrent promote/rollback can't stale `prev`.
+    // Take the write lock up front so the stack replay and the writes see ONE
+    // snapshot — a concurrent promote/rollback can't stale `prev`.
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| TrainError::other(format!("rollback txn: {e}")))?;
-    let recent: Vec<String> = {
-        let mut stmt = tx
-            .prepare(
-                "SELECT model_hash FROM model_pointer_history \
-                 WHERE tenant = ?1 AND name = ?2 AND alias = ?3 ORDER BY seq DESC LIMIT 2",
-            )
-            .map_err(|e| TrainError::other(format!("model history query: {e}")))?;
-        let rows = stmt
-            .query_map(params![tenant, name, alias], |row| row.get::<_, String>(0))
-            .map_err(|e| TrainError::other(format!("model history rows: {e}")))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| TrainError::other(format!("model history collect: {e}")))?
+    let stack = crate::registry_db::replay_promotion_stack(
+        history_moves(&tx, tenant, name, alias)?
+            .into_iter()
+            .map(|(e, kind)| (e.model_hash, kind)),
+    );
+    let prev = match stack.as_slice() {
+        [] => {
+            return Err(TrainError::other(format!(
+                "rollback refused — 'model://{name}@{alias}' has no target for tenant '{tenant}'"
+            )));
+        }
+        [only] => {
+            return Err(TrainError::other(format!(
+                "rollback refused — 'model://{name}@{alias}' is at its first promotion \
+                 ({only}); there is nothing earlier to roll back to"
+            )));
+        }
+        [.., prev, _current] => prev.clone(),
     };
-    if recent.len() < 2 {
-        return Err(TrainError::other(format!(
-            "rollback refused — 'model://{name}@{alias}' has no prior target"
-        )));
-    }
-    let prev = recent[1].clone();
     // Defense-in-depth (matches promote): the prior target must belong to THIS
     // tenant + model. promote already blocks a foreign hash from the trail, so
     // this only fails on a corrupted/hand-edited DB — fail closed rather than
@@ -548,8 +563,8 @@ pub fn rollback(
     )
     .map_err(|e| TrainError::other(format!("rollback model pointer: {e}")))?;
     tx.execute(
-        "INSERT INTO model_pointer_history (tenant, name, alias, model_hash, moved_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO model_pointer_history (tenant, name, alias, model_hash, moved_at, kind) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'rollback')",
         params![tenant, name, alias, prev, now_unix],
     )
     .map_err(|e| TrainError::other(format!("rollback model history: {e}")))?;
@@ -596,6 +611,37 @@ pub fn history(
                 model_hash: row.get(0)?,
                 moved_at: row.get(1)?,
             })
+        })
+        .map_err(|e| TrainError::other(format!("model history query: {e}")))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| TrainError::other(format!("model history collect: {e}")))
+}
+
+/// An alias's audit trail with the kind of each move (`promote` or
+/// `rollback`), oldest first. Rows from before the trail recorded kinds read
+/// as promotions.
+pub(crate) fn history_moves(
+    conn: &Connection,
+    tenant: &str,
+    name: &str,
+    alias: &str,
+) -> Result<Vec<(HistoryEntry, crate::registry_db::MoveKind)>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT model_hash, moved_at, kind FROM model_pointer_history \
+             WHERE tenant = ?1 AND name = ?2 AND alias = ?3 ORDER BY seq ASC",
+        )
+        .map_err(|e| TrainError::other(format!("model history prepare: {e}")))?;
+    let rows = stmt
+        .query_map(params![tenant, name, alias], |row| {
+            let kind: String = row.get(2)?;
+            Ok((
+                HistoryEntry {
+                    model_hash: row.get(0)?,
+                    moved_at: row.get(1)?,
+                },
+                crate::registry_db::MoveKind::from_column(&kind),
+            ))
         })
         .map_err(|e| TrainError::other(format!("model history query: {e}")))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -747,6 +793,123 @@ mod tests {
         assert!(promote_pass(&mut c, HASH_A, RESTRICTED_TENANT, "other", "prod", 11).is_err());
         // The matching promote succeeds.
         assert!(promote_pass(&mut c, HASH_A, RESTRICTED_TENANT, "enc", "prod", 12).is_ok());
+    }
+
+    /// `model rollback` walks the promotion history like an undo stack, as
+    /// `plan rollback` does. It used to read the two most recent trail
+    /// entries, so repeated rollbacks toggled between the last two targets.
+    #[test]
+    fn rollback_walks_the_promotion_history() {
+        const HASH_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        const HASH_D: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let mut c = db();
+        for (i, h) in [HASH_A, HASH_B, HASH_C, HASH_D].iter().enumerate() {
+            register(&c, h, "enc", SHARED_TENANT, None, i as i64).unwrap();
+        }
+        let t = SHARED_TENANT;
+        let at = |c: &Connection| resolve_pointer(c, t, "enc", "staging").unwrap();
+
+        // Nothing to roll back: no target, then a single promotion.
+        let err = rollback(&mut c, t, "enc", "staging", 10)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no target"), "{err}");
+        promote(&mut c, HASH_A, t, "enc", "staging", 11).unwrap();
+        let err = rollback(&mut c, t, "enc", "staging", 12)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nothing earlier"), "{err}");
+        assert_eq!(
+            at(&c).as_deref(),
+            Some(HASH_A),
+            "a refused rollback moves nothing"
+        );
+
+        // A, B, C then two rollbacks: C → B → A, then refused.
+        promote(&mut c, HASH_B, t, "enc", "staging", 13).unwrap();
+        promote(&mut c, HASH_C, t, "enc", "staging", 14).unwrap();
+        assert_eq!(rollback(&mut c, t, "enc", "staging", 15).unwrap(), HASH_B);
+        assert_eq!(rollback(&mut c, t, "enc", "staging", 16).unwrap(), HASH_A);
+        assert_eq!(at(&c).as_deref(), Some(HASH_A));
+        assert!(rollback(&mut c, t, "enc", "staging", 17).is_err());
+
+        // A promotion after a rollback continues from there: [A, D]; rolling
+        // back returns to A, and B/C are not reachable by rollback any more.
+        promote(&mut c, HASH_D, t, "enc", "staging", 18).unwrap();
+        assert_eq!(rollback(&mut c, t, "enc", "staging", 19).unwrap(), HASH_A);
+        assert!(rollback(&mut c, t, "enc", "staging", 20).is_err());
+
+        // Re-promoting the current target is recorded but is not a new step.
+        promote(&mut c, HASH_B, t, "enc", "staging", 21).unwrap();
+        promote(&mut c, HASH_B, t, "enc", "staging", 22).unwrap();
+        assert_eq!(rollback(&mut c, t, "enc", "staging", 23).unwrap(), HASH_A);
+
+        // Every move stays in the audit trail with its kind: 6 promotions and 4
+        // rollbacks (refused rollbacks record nothing).
+        let kinds: Vec<&str> = history_moves(&c, t, "enc", "staging")
+            .unwrap()
+            .into_iter()
+            .map(|(_, k)| k.as_str())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "promote", "promote", "promote", "rollback", "rollback", "promote", "rollback",
+                "promote", "promote", "rollback"
+            ]
+        );
+        assert_eq!(history(&c, t, "enc", "staging").unwrap().len(), 10);
+    }
+
+    /// A registry created before model moves recorded their kind gains the
+    /// column on open; its old rows count as promotions, and a rollback walks
+    /// them as such.
+    #[test]
+    fn an_old_registry_gains_the_move_kind_on_open() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("registry.db");
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(&format!(
+                "CREATE TABLE models (model_hash TEXT PRIMARY KEY, name TEXT NOT NULL,
+                    tenant TEXT NOT NULL, source TEXT, created_at INTEGER NOT NULL);
+                 CREATE TABLE model_pointers (tenant TEXT NOT NULL, name TEXT NOT NULL,
+                    alias TEXT NOT NULL, model_hash TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL, PRIMARY KEY (tenant, name, alias));
+                 CREATE TABLE model_pointer_history (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT NOT NULL,
+                    name TEXT NOT NULL, alias TEXT NOT NULL, model_hash TEXT NOT NULL,
+                    moved_at INTEGER NOT NULL);
+                 INSERT INTO models VALUES ('{HASH_A}', 'enc', 'default', NULL, 1),
+                    ('{HASH_B}', 'enc', 'default', NULL, 2);
+                 INSERT INTO model_pointers VALUES ('default', 'enc', 'staging', '{HASH_B}', 4);
+                 INSERT INTO model_pointer_history (tenant, name, alias, model_hash, moved_at)
+                    VALUES ('default', 'enc', 'staging', '{HASH_A}', 3),
+                           ('default', 'enc', 'staging', '{HASH_B}', 4);"
+            ))
+            .unwrap();
+        }
+        let mut c = open_at(&path).unwrap();
+        let kinds: Vec<_> = history_moves(&c, "default", "enc", "staging")
+            .unwrap()
+            .into_iter()
+            .map(|(_, k)| k)
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                crate::registry_db::MoveKind::Promote,
+                crate::registry_db::MoveKind::Promote
+            ]
+        );
+        assert_eq!(
+            rollback(&mut c, "default", "enc", "staging", 5).unwrap(),
+            HASH_A
+        );
+        assert!(rollback(&mut c, "default", "enc", "staging", 6).is_err());
+        // Reopening is idempotent.
+        drop(c);
+        open_at(&path).unwrap();
     }
 
     #[test]

@@ -432,27 +432,113 @@ fn empty_log_hint(id: &str) -> Result<String> {
 /// The trainer progress of a job as `blut log` prints it: [`jobs::render_log`]
 /// lines, each prefixed with the stage that forwarded it when more than one
 /// stage did (the trials of an HPO run, say), so interleaved progress stays
-/// attributable.
-fn render_progress(progress: &[jobs::Progress]) -> String {
+/// attributable. `notes[i]`, when present, is appended to update `i`'s lines.
+fn render_progress(progress: &[jobs::Progress], notes: &[Option<String>]) -> String {
     let sources: std::collections::BTreeSet<_> =
         progress.iter().filter_map(|p| p.source.as_ref()).collect();
-    if sources.len() < 2 {
-        let updates: Vec<_> = progress.iter().map(|p| p.update.clone()).collect();
-        return jobs::render_log(&updates);
-    }
+    let attributed = sources.len() >= 2;
     let mut out = String::new();
-    for p in progress {
-        let prefix = match &p.source {
-            Some((idx, stage)) => format!("[{idx} {stage}] "),
-            None => String::new(),
+    for (i, p) in progress.iter().enumerate() {
+        let prefix = match (&p.source, attributed) {
+            (Some((idx, stage)), true) => format!("[{idx} {stage}] "),
+            _ => String::new(),
         };
+        let note = notes.get(i).and_then(Option::as_deref);
         for line in jobs::render_log(std::slice::from_ref(&p.update)).lines() {
             out.push_str(&prefix);
             out.push_str(line);
+            if let Some(note) = note {
+                out.push_str("  (");
+                out.push_str(note);
+                out.push(')');
+            }
             out.push('\n');
         }
     }
     out
+}
+
+/// Where a path a trainer reported lives now. A stage runs in a private
+/// attempt directory, `<job>/stages/.tmp-<idx>-<stage>-<key>`, which is renamed
+/// to `<job>/stages/<idx>-<stage>` when the stage commits, so the `saved` and
+/// `done` paths a trainer prints name a directory that no longer exists.
+#[derive(Debug, PartialEq)]
+enum AttemptPath {
+    /// The attempt committed: the same file under the committed directory.
+    Committed(std::path::PathBuf),
+    /// The path is still in an attempt directory (the stage is running, or
+    /// that attempt did not commit); `stages/<idx>-<stage>` is where it moves
+    /// on commit.
+    Uncommitted { committed_dir: String },
+    /// Not inside one of this job's attempt directories.
+    Other,
+}
+
+fn attempt_path(job_id: &str, path: &std::path::Path) -> AttemptPath {
+    use std::path::{Component, PathBuf};
+    let comps: Vec<Component<'_>> = path.components().collect();
+    let found = comps.windows(3).position(|w| {
+        w[0].as_os_str() == job_id
+            && w[1].as_os_str() == "stages"
+            && w[2].as_os_str().to_string_lossy().starts_with(".tmp-")
+    });
+    let Some(at) = found else {
+        return AttemptPath::Other;
+    };
+    let tmp_name = comps[at + 2].as_os_str().to_string_lossy().into_owned();
+    // `.tmp-<idx>-<stage>-<key hex>` → `<idx>-<stage>`.
+    let Some((committed_name, key)) = tmp_name[".tmp-".len()..].rsplit_once('-') else {
+        return AttemptPath::Other;
+    };
+    if key.is_empty() || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return AttemptPath::Other;
+    }
+    let stages: PathBuf = comps[..at + 2].iter().collect();
+    let tmp_dir = stages.join(&tmp_name);
+    let committed_dir = stages.join(committed_name);
+    if committed_dir.is_dir() && !tmp_dir.exists() {
+        let rest: PathBuf = comps[at + 3..].iter().collect();
+        AttemptPath::Committed(committed_dir.join(rest))
+    } else {
+        AttemptPath::Uncommitted {
+            committed_dir: format!("stages/{committed_name}"),
+        }
+    }
+}
+
+/// [`attempt_path`] applied to the paths in a job's progress: a committed
+/// attempt's `saved` / `done` path is rewritten to the committed directory;
+/// one still in an attempt directory is kept and gets a note saying so.
+fn commit_attempt_paths(
+    job_id: &str,
+    progress: Vec<jobs::Progress>,
+) -> (Vec<jobs::Progress>, Vec<Option<String>>) {
+    let mut notes = Vec::with_capacity(progress.len());
+    let progress = progress
+        .into_iter()
+        .map(|mut p| {
+            let path = match &mut p.update {
+                crate::protocol::StatusUpdate::Saved { path } => Some(path),
+                crate::protocol::StatusUpdate::Done { checkpoint_dir, .. } => Some(checkpoint_dir),
+                _ => None,
+            };
+            let mut note = None;
+            if let Some(path) = path {
+                match attempt_path(job_id, path) {
+                    AttemptPath::Committed(committed) => *path = committed,
+                    AttemptPath::Uncommitted { committed_dir } => {
+                        note = Some(format!(
+                            "attempt directory; it becomes {committed_dir} when the stage commits"
+                        ));
+                    }
+                    AttemptPath::Other => {}
+                }
+            }
+            notes.push(note);
+            p
+        })
+        .collect();
+    (progress, notes)
 }
 
 pub(super) fn run_log(id_query: &str, tail: usize, json: bool) -> Result<()> {
@@ -462,6 +548,7 @@ pub(super) fn run_log(id_query: &str, tail: usize, json: bool) -> Result<()> {
         eprintln!("{}", empty_log_hint(&id)?);
         return Ok(());
     }
+    let (progress, notes) = commit_attempt_paths(&id, progress);
     if json {
         // Status stream as JSON lines (one StatusUpdate per line), tail-trimmed
         // like the rendered view. An update a stage forwarded also names it
@@ -482,7 +569,7 @@ pub(super) fn run_log(id_query: &str, tail: usize, json: bool) -> Result<()> {
         }
         return Ok(());
     }
-    let rendered = render_progress(&progress);
+    let rendered = render_progress(&progress, &notes);
     if tail == 0 {
         print!("{rendered}");
     } else {
@@ -518,19 +605,90 @@ mod progress_render_tests {
     /// (the trials of an HPO run) says which stage each line came from.
     #[test]
     fn interleaved_progress_names_its_stage() {
-        let one = render_progress(&[step(Some((0, "train")), 1, 2.0), step(None, 2, 1.0)]);
+        let one = render_progress(&[step(Some((0, "train")), 1, 2.0), step(None, 2, 1.0)], &[]);
         assert_eq!(
             one,
             "step 1/2  loss=2.0000  lr=1.00e-3  vram=0MB\nstep 2/2  loss=1.0000  lr=1.00e-3  vram=0MB\n"
         );
-        let two = render_progress(&[
-            step(Some((1, "train")), 1, 2.0),
-            step(Some((2, "train")), 1, 3.0),
-        ]);
+        let two = render_progress(
+            &[
+                step(Some((1, "train")), 1, 2.0),
+                step(Some((2, "train")), 1, 3.0),
+            ],
+            &[],
+        );
         assert_eq!(
             two,
             "[1 train] step 1/2  loss=2.0000  lr=1.00e-3  vram=0MB\n\
              [2 train] step 1/2  loss=3.0000  lr=1.00e-3  vram=0MB\n"
+        );
+    }
+
+    /// E2E follow-up: `blut log` showed the `.tmp-…` attempt directory a
+    /// trainer saved into, which is renamed when the stage commits. A
+    /// committed attempt's paths name the committed directory; a path still
+    /// in an attempt directory says so.
+    #[test]
+    fn saved_paths_follow_the_committed_stage_directory() {
+        use crate::protocol::StatusUpdate;
+        use std::path::PathBuf;
+        let td = tempfile::tempdir().unwrap();
+        let id = "20261030-000000-000000002";
+        let stages = td.path().join(id).join("stages");
+        let tmp = stages.join(".tmp-1-train-0a1b2c");
+        let saved = |p: PathBuf| Progress {
+            source: Some((1, "train".into())),
+            update: StatusUpdate::Saved { path: p },
+        };
+        let done = |p: PathBuf| Progress {
+            source: Some((1, "train".into())),
+            update: StatusUpdate::Done {
+                final_loss: 0.5,
+                checkpoint_dir: p,
+            },
+        };
+        let elsewhere = PathBuf::from("/data/ckpt");
+        let progress = || {
+            vec![
+                saved(tmp.join("ckpt/step-10")),
+                done(tmp.join("ckpt")),
+                saved(elsewhere.clone()),
+            ]
+        };
+
+        // Running: the attempt directory exists; the path is kept and noted.
+        std::fs::create_dir_all(tmp.join("ckpt")).unwrap();
+        let (running, notes) = super::commit_attempt_paths(id, progress());
+        assert_eq!(running, progress());
+        let rendered = render_progress(&running, &notes);
+        assert!(
+            rendered
+                .lines()
+                .next()
+                .unwrap()
+                .ends_with("(attempt directory; it becomes stages/1-train when the stage commits)"),
+            "{rendered}"
+        );
+        assert_eq!(notes[2], None, "a path outside the job is left alone");
+
+        // Committed: the attempt directory was renamed.
+        std::fs::rename(&tmp, stages.join("1-train")).unwrap();
+        let (committed, notes) = super::commit_attempt_paths(id, progress());
+        assert_eq!(
+            committed,
+            vec![
+                saved(stages.join("1-train/ckpt/step-10")),
+                done(stages.join("1-train/ckpt")),
+                saved(elsewhere.clone()),
+            ]
+        );
+        assert!(notes.iter().all(Option::is_none), "{notes:?}");
+        assert!(!render_progress(&committed, &notes).contains(".tmp-"));
+
+        // Another job's attempt directory is not this job's.
+        assert_eq!(
+            super::attempt_path("other-job", &stages.join(".tmp-1-train-0a1b2c/x")),
+            super::AttemptPath::Other
         );
     }
 

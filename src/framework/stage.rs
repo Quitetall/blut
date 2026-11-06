@@ -2180,15 +2180,35 @@ mod tests {
         }
     }
 
-    fn ctx() -> StageContext {
-        let td = tempfile::tempdir().unwrap();
-        let job = td.path().to_path_buf();
+    /// A stage context whose job directory is a temporary directory removed
+    /// when the test drops it. It used to leak the directory
+    /// (`mem::forget`), one per test per run.
+    struct TestCtx {
+        ctx: StageContext,
+        _dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestCtx {
+        type Target = StageContext;
+        fn deref(&self) -> &StageContext {
+            &self.ctx
+        }
+    }
+
+    impl std::ops::DerefMut for TestCtx {
+        fn deref_mut(&mut self) -> &mut StageContext {
+            &mut self.ctx
+        }
+    }
+
+    fn ctx() -> TestCtx {
+        let dir = tempfile::tempdir().unwrap();
+        let job = dir.path().to_path_buf();
         let stage = job.join("stages/0-word_count");
-        // Tempdir lives only for the test body; leak the guard so
-        // job_dir paths stay valid for the duration. tests are
-        // throwaway-process so /tmp is cleaned at next reboot.
-        std::mem::forget(td);
-        StageContext::for_test(job, stage)
+        TestCtx {
+            ctx: StageContext::for_test(job, stage),
+            _dir: dir,
+        }
     }
 
     // ── ErasedArtifact round trip ─────────────────────────────────

@@ -154,6 +154,22 @@ impl Containment for CgroupV2Direct {
         // `write_caps_or_cleanup` removes the leaf itself before propagating.
         write_caps_or_cleanup(&cgdir, caps)?;
 
+        // The child runs in its own session inside the leaf, so it keeps
+        // running when this process is SIGKILLed (no drop, no `cleanup`).
+        // Inside a job the leaf is recorded before the child starts, so `blut
+        // cancel` stops it and `plan resume` refuses while it is populated,
+        // also after this process died (`jobs::record_cgroup_leaf`), as a
+        // systemd unit is recorded.
+        if let Some(job_dir) = crate::jobs::current_job_dir()
+            && let Err(e) = crate::jobs::record_cgroup_leaf(&job_dir, &cgdir)
+        {
+            tracing::warn!(
+                "containment: record {} with job {}: {e}",
+                cgdir.display(),
+                job_dir.display()
+            );
+        }
+
         let mut c = tokio::process::Command::new(program);
         for a in args {
             c.arg(a);
@@ -332,6 +348,79 @@ mod tests {
             !tmp.path().join("blut-probe-memcheck").exists(),
             "probe leaf left behind"
         );
+    }
+
+    /// Live: a stage left running in a REAL cgroup-v2 leaf after its driver
+    /// is gone (nothing calls `cleanup`) is recorded with the job when the
+    /// leaf is made, blocks `plan resume` while populated, and is stopped
+    /// and removed by the cancel path. Runs where this backend is usable (a
+    /// delegated subtree with the memory controller, e.g. via
+    /// `$BLUT_CGROUP_PARENT`); elsewhere it says it skipped, and
+    /// `BLUT_REQUIRE_CGROUP2_LIVE=1` turns that skip into a failure.
+    #[tokio::test]
+    async fn live_an_orphaned_leaf_is_recorded_and_cancelled() {
+        let availability = CgroupV2Direct.available();
+        if availability != Availability::Present {
+            assert!(
+                std::env::var_os("BLUT_REQUIRE_CGROUP2_LIVE").is_none(),
+                "BLUT_REQUIRE_CGROUP2_LIVE is set but the cgroup2 backend is {availability:?}"
+            );
+            eprintln!("SKIP live cgroup2 leaf test: backend is {availability:?}");
+            return;
+        }
+        let jobs = tempfile::tempdir().unwrap();
+        let job_dir = jobs.path().join("20261030-000000-000000009");
+        std::fs::create_dir_all(&job_dir).unwrap();
+        let unit = format!("blut-live-orphan-{}-1", std::process::id());
+        let caps = CapSpec {
+            mem_max: Some(256 * 1024 * 1024),
+            mem_high: None,
+            swap_max: None,
+        };
+        let run = crate::jobs::in_job(job_dir.clone(), async {
+            CgroupV2Direct.wrap_command(
+                Path::new("sleep"),
+                &["300".to_string()],
+                Path::new("/"),
+                &[],
+                &unit,
+                &caps,
+            )
+        })
+        .await
+        .expect("wrap in a cgroup2 leaf");
+        let leaf = run.teardown.cgroup_path.clone().expect("a leaf");
+        let mut command = run.command;
+        let child = command.spawn().expect("spawn into the leaf");
+        let pid = child.id().expect("pid");
+        // The driver is gone: no teardown runs for this leaf.
+        drop(child);
+        let procs = std::fs::read_to_string(leaf.join("cgroup.procs")).unwrap();
+        assert!(
+            procs.lines().any(|l| l.trim() == pid.to_string()),
+            "{procs}"
+        );
+
+        assert_eq!(
+            crate::jobs::live_cgroup_leaves_at(&job_dir).unwrap(),
+            vec![leaf.clone()],
+            "the leaf was recorded with the job before the process started"
+        );
+        let why = crate::jobs::cgroup_resume_blocker_at("j", &job_dir)
+            .unwrap()
+            .expect("a populated leaf blocks the resume");
+        assert!(why.contains(&leaf.display().to_string()), "{why}");
+
+        let stopped =
+            crate::jobs::cancel_cgroup_leaves_at(&job_dir, std::time::Duration::from_secs(5))
+                .unwrap();
+        assert_eq!(stopped, vec![leaf.clone()]);
+        assert!(!leaf.exists(), "the emptied leaf is removed");
+        assert_eq!(
+            crate::jobs::cgroup_resume_blocker_at("j", &job_dir).unwrap(),
+            None
+        );
+        eprintln!("live cgroup2 leaf test ran: {} (pid {pid})", leaf.display());
     }
 
     #[test]

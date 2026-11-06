@@ -33,8 +33,8 @@ first if you are deciding whether to depend on this.
 | P2P mesh across independent hosts (`p2p node`) | Validated (connectivity + signed dispatch) | Four hosts on four continents, every node probing every other, 12/12, 2026-10-20 — see below. Gossip and stage data over the mesh were not part of that run |
 | P2P mesh gossip and stage data without a shared cache | Validated (independent hosts) | Four vast.ai hosts on four continents, each seeded with at most one peer, formed a full mesh by gossip; a fresh identity seeded with one node probed all four, 4/4; 64,640,000 bytes of stage data moved from the US to an empty-cache worker in New Zealand and back, verified, 2026-10-23 — see below. Earlier the same day across network namespaces on one host |
 | Cloud queue over local object storage | Validated | `blut cloud smoke` round-trip through the shipped cookbook binary, 2026-09-19 |
+| `--launcher cloud` on run commands | Validated (R2 over public TLS; MinIO; one host) | `recipe run`, `recipe declare --run` and `plan resume` place every stage on `blut cloud worker` processes through a durable queue on object storage. A four-stage standard-cookbook recipe on Cloudflare R2 with two workers as separate processes; claim races, lease expiry, cancellation, code-identity refusal, SIGTERM release, SIGKILL requeue and resume on R2 and MinIO, 2026-11-05 — see below. Workers and submitter on one host; no GPU stage; `hpo`, `study` and `partition` still refuse it |
 | `--launcher p2p` on `recipe run` and `recipe declare --run` | Validated (independent hosts, CPU) | A five-stage cookbook plan from a workstation behind NAT: its four eligible stages ran on vast.ai hosts in Norway, New Zealand and Wisconsin found by gossip from one seed, the local-only stage stayed home, 4.8 MB of stage data moved over the mesh, and the output bytes equalled a local run; an anonymous peer and a peer running other code each failed the run with nothing placed, 2026-11-05 — see below. Cancel and a lost submitter are loopback tests only; no GPU stage, no contained process on a worker. `hpo`, `study`, `partition` and `plan resume` refuse the launcher |
-| `--launcher cloud` on run commands | Deferred | Refused by `recipe run`, `hpo`, `study`, `partition`, `plan resume` and `recipe declare --run`, which used to run every stage on the submitting machine. No command places a run's stages on the cloud queue; the rows above are `cloud` subcommands and library calls, 2026-10-30 |
 | Network object storage (S3-compatible) | Validated (R2 over public TLS; MinIO) | `s3` feature; cloud round-trip against Cloudflare R2 over public TLS with create-only writes enforced, 2026-10-22; MinIO over HTTP and TLS; Backblaze B2 refused (no conditional writes) — see below |
 | `blut-worker` REST prototype | Deleted (ADR 0083 M3) | Superseded by `src/cloud` + the `blut-web` sidecar |
 | Kubernetes operator | Validated (kind) | `blut-operator` on a three-node kind cluster, Kubernetes 1.35.0, with MinIO in the cluster: a real CPU plan to Succeeded with per-stage status, outputs in S3, a rerun and a retry served from the store, bad specs refused, deletion cleaning up, a deleted pod and a drained node retried, an operator restart without duplicate work, least-privilege RBAC, 2026-10-24; `--launcher k8s` from the CLI submits, follows, cancels and refuses, 2026-10-30 — see below. One host; no GPUs, no managed Kubernetes, no mesh traffic between pool pods |
@@ -243,7 +243,7 @@ blut recipe run <name> --args '...' --launcher p2p --p2p-seed <one peer>
   `pubkey` line, which also adds a peer this machine has only dialed or
   learned by gossip.
 - **Other run commands:** `hpo`, `study`, `partition` and `plan resume` still
-  refuse `--launcher p2p`, and every run command refuses `--launcher cloud`.
+  refuse `--launcher p2p`.
 
 ## Recorded run: a four-continent P2P mesh (2026-10-20)
 
@@ -1101,6 +1101,77 @@ certificate. A brand-new account can hit this, and it clears by itself.
 
 **Boundaries.** Static key credentials only; IAM roles and STS were not
 exercised. AWS S3 itself has not been run against.
+
+## Recorded run: `--launcher cloud` against Cloudflare R2 (2026-11-05)
+
+Engine `afa6bd8`, `blut-core` from the standard cookbook (`2e7a77f`) with
+`blut/s3`, Rust 1.88. The bucket was created for the run, with an R2 API token
+scoped to that bucket alone and a six-hour expiry; the derived S3 credentials
+reached the processes through their environment only. Endpoint
+`https://<account>.r2.cloudflarestorage.com`, region `auto`, public TLS.
+
+A four-stage recipe of CPU stages, `materialize_dataset_path` →
+`filter_dataset` → `split_train_eval` → `take_train`, over a 400-line JSONL
+dataset, through `recipe declare chain.toml --run --launcher cloud`. The
+submitter and two `blut cloud worker` processes ran as separate processes with
+separate state roots, on one machine:
+
+```
+cloud  s3://blut-qa-cloud-queue-2026-11-05/… (workers: `blut cloud worker --queue <the same location>`)
+done — 4 ingredients, 0 cache hits, 4 misses, elapsed 23.918921028s
+
+worker r2-w2: claimed materialize_dataset_path, take_train; 2 succeeded
+worker r2-w1: claimed filter_dataset, split_train_eval; 2 succeeded
+0 job(s) on s3://blut-qa-cloud-queue-2026-11-05/…
+```
+
+Nothing ran in the submitter. A local run of the same recipe from the same
+binary produced byte-identical files (`dataset.jsonl`, `filtered.jsonl`,
+`train.jsonl`, `eval.jsonl`, compared by SHA-256). `take_train`'s recorded
+content id differs between the two, by design of portability: locally its
+output is the previous stage's file, outside its stage directory, so it gets the
+unpersisted identity; on a worker the file is inside the stage directory and is
+shipped. The bytes are the same.
+
+The whole test suite then ran on the same bucket:
+
+- queue semantics, 12 of 12: lifecycle, eight workers racing for each job with
+  exactly one winner, lease expiry and fencing of the old holder, renewal,
+  release, cancellation, idempotent completion, the code-identity and GPU
+  refusals, priority order;
+- the process-level tests, 10 of 10: every stage in a worker's pid; no worker
+  fails after the pickup window and withdraws the stage; a worker of other code
+  leaves the job and the submitter reports why; `blut cancel` stops a running
+  stage on a worker after the submitter was SIGKILLed, and withdraws a queued
+  one; `plan resume` refuses while a stage runs and finishes the job afterwards
+  with the first stage from cache; SIGTERM hands a stage to another worker;
+  a SIGKILLed worker's stage is requeued when its lease runs out; two runs
+  overlap on one submitting machine.
+
+On a directory all of them pass. On MinIO the queue semantics and nine of the
+process tests passed; the tenth was added after that pass. Three planted
+regressions were caught: claims written without create-only (six workers won one job), leases
+that never expire, and no code-identity check (both the queue test and the
+process test failed).
+
+R2's latency showed a one-second lease in a test expiring during a single claim
+attempt; the test's lease was too short, and `--lease-secs` defaults to 60. Host
+memory pressure during the same pass found a real defect: a cloud run took local
+RAM admission and the training lock, though nothing runs on the submitter. It no
+longer does.
+
+**Secrets.** All 353 bucket objects, the job directories and the logs kept with
+this record were scanned for the access key, the secret, the Cloudflare API
+token and the account id: 425 files, no hit.
+
+**Cleanup.** Bucket emptied (353 objects, then 0), bucket deleted (lookup 404),
+token revoked (lookup 404), and the old credentials then get `Unauthorized`.
+
+**Boundaries.** One machine, so one clock and no second network path; the
+workers shared the dataset path with the submitter, because a stage reads paths
+on the worker. No GPU stage, no subprocess stage on a worker, nothing large:
+bundles here are kilobytes. Static key credentials only. AWS S3 itself has not
+been run against. Evidence: `/mnt/4tb/artifacts/BLUT/keep/2026-10-30-cloud-queue/`.
 
 ## Recorded run: training through BLUT on Windows, in Job Objects (2026-10-24)
 

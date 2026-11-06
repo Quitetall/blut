@@ -126,6 +126,31 @@ front over 12 measured trials; with `LAMU_TRAIN_DATA_DIR` set and a fresh
 `HOME`, a recipe run, an HPO search, model, dataset, catalog and policy
 commands wrote nothing under `HOME`.
 
+Fixed after that, on `agent/fu-smalls` (open items below are marked with
+their commit):
+
+| Item | Commit | What changed |
+|---|---|---|
+| `model rollback` toggled; `model history` had no kind (follow-up 7) | `9f57d1e` | Rollback walks the promotion history like `plan rollback` (refused at the first promotion; a promotion after a rollback continues from there; re-promoting the current target is not a step); `model history` prints `promote` / `rollback`; old registries gain the column on open, old rows count as promotions |
+| 16. `LAMU_TRAIN_DATA_DIR` migration | `dc4c837` | When it is set, each store whose own variable is unset, that is empty under the root, and whose old default holds data is named in one startup warning with the variable to set (`paths::stranded_stores`) |
+| Temp directories left by test runs | `94524a7` | The lineage, stage-context, run-ledger, executor-partition and p2p-CLI test helpers and one bench hold their guards. Their tests leave 0 entries in a fresh `TMPDIR`; the old lineage helper alone left 12. Whole-suite counts below |
+| 17. TPE suggested a uniform dim's exclusive bound | `0e0d934` | TPE and multivariate TPE keep suggestions in `[low, high)` |
+| 18. `blut-notify` jobs dir ignored `$XDG_DATA_HOME` | `17c48ea` | Follows `blut::paths::jobs_dir`; the SLA log honours `$BLUT_SLA_PATH` |
+| `blut log` showed `.tmp-…` attempt paths | `bea69a0` | A committed attempt's `saved` / `done` paths are shown under `stages/<idx>-<stage>`; a path still in an attempt directory is marked |
+| `recipe run --dry-run` said 2.0G for a 256 MiB envelope | `dad25e4` | 2.0G was the legacy whole-GiB estimate with the floor applied to every plan, not what a launch bills; the dry run now reports the launch's footprint and its basis (declared envelope or compatibility floor) |
+| 13. Empty Starlark plan exited 0 | `10bcbe2` | `blut-dsl` refuses a `build(args)` that adds no stage; the engine already refused an empty PlanSpec at compile (now pinned by a test) |
+| 12. `blut-notify` summaries | `d634b51` | Summaries name the event kind, the stage and the error (200 characters); the error is withheld for restricted data on every sink |
+| 9. `cloud smoke` fixed `/tmp` store | `61efa9a` | Default store is a fresh private temp directory, removed afterwards |
+| Calibration claim in `examples/first_cookbook.rs` | `234d3d4` | Corrected (the engine reads the measured-peak store; a cookbook runner fills it). Recording peaks from the executor was not a small change: the stage owns its child, the key needs the launch context |
+| cgroup-v2 orphan | `7f7f6c5` | Leaves are recorded with the job (path and inode); `blut cancel` stops them (SIGTERM, then `cgroup.kill`) and `plan resume` refuses while one is populated. Live-tested in a delegated user service |
+
+Temp directories, measured with `TMPDIR` set to a fresh empty directory: the
+default suite leaves 0 entries. The `p2p` suite leaves 113, all from test
+helpers under `src/p2p/`, which was being changed on the mesh dispatch branch
+and was left alone (item 19 below): `transport` 10, `node` 39, `mesh_runner`
+25, `objects` 39, and 0 from everything else, integration tests and
+`cli::p2p` included.
+
 ## Open items
 
 Still open, by severity.
@@ -140,7 +165,8 @@ Still open, by severity.
    with no hang guard: when the deadline passes before the stages start, the
    test waits forever. Seen in base `d297e11` too (2 of 4 runs at load ~100).
    Each passed when re-run.
-16. **Migration of an existing `LAMU_TRAIN_DATA_DIR`.** An install that
+16. *(Resolved, `dc4c837`: a startup warning names each stranded store and
+    its variable.)* **Migration of an existing `LAMU_TRAIN_DATA_DIR`.** An install that
     already set it (it used to hold only materialized training data) now sees
     empty jobs and registries until the per-store variables point back at the
     old ones. Nothing warns about it; whether to detect and warn is an owner
@@ -148,13 +174,13 @@ Still open, by severity.
 
 **Low**
 
-9. `cloud smoke` defaults `--store` to `/tmp/blut-cloud-smoke`, a fixed path
+9. *(Resolved, `61efa9a`.)* `cloud smoke` defaults `--store` to `/tmp/blut-cloud-smoke`, a fixed path
    in a shared directory.
 11. `p2p peers list` shows reputation 0.50 and zero completed tasks for peers
     that ran smoke dispatches successfully.
-12. `blut-notify` summaries say only "status event for job X", not which
+12. *(Resolved, `d634b51`.)* `blut-notify` summaries say only "status event for job X", not which
     stage or what error.
-13. A Starlark script that never calls `add()` emits an empty PlanSpec and
+13. *(Resolved, `10bcbe2`.)* A Starlark script that never calls `add()` emits an empty PlanSpec and
     exits 0.
 14. `README.md` ("v0.2.0-alpha.1 — current development preview") and
     `ROADMAP.md` ("between `0.2.0-alpha.1` and a 1.0") still name alpha.1,
@@ -163,8 +189,14 @@ Still open, by severity.
 15. `blut-standard` registers stages but no recipes, so `hpo` and `study`
     cannot be tried with the standard cookbook alone; the `blut-core` recipes
     start a Python trainer and were not run here.
-17. TPE can suggest a value equal to a `uniform` dim's exclusive upper bound
+17. *(Resolved, `0e0d934`.)* TPE can suggest a value equal to a `uniform` dim's exclusive upper bound
     (`wd = 1.0` for `uniform(0, 1)`): its candidates are clamped to `high`
     inclusive.
-18. `blut-notify`'s default jobs directory is `$HOME/.local/share/lamu/
+18. *(Resolved, `17c48ea`.)* `blut-notify`'s default jobs directory is `$HOME/.local/share/lamu/
     train-jobs` even when `$XDG_DATA_HOME` moves the engine's elsewhere.
+19. Test helpers under `src/p2p/` still leak their temp directories
+    (`mem::forget`): `transport.rs` `bind_loopback_server`, `node.rs`
+    `spawn_node`, `gossip_node` and two inline uses, `mesh_runner.rs` two
+    `tmp()`, `objects.rs` `tmp()`. A `p2p` or `s3` suite run leaves 113
+    entries. The fix is the one `cli::p2p`'s `mesh_node` got: hand the guard
+    back to the test.

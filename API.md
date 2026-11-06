@@ -173,7 +173,8 @@ parses args → a backend-erased `CompiledPlan`.
 ## Built-in checks (`checks/`, ADR 0091)
 
 Every registry gets two passthrough guard stages: `check_jsonl` (row-count
-bounds) and `assert` (a literal scalar predicate). Both take and return
+bounds, and optionally a per-row schema and required fields) and `assert` (a
+literal scalar predicate). Both take and return
 `checks::JsonlArtifact`, kind `checks.jsonl`, and edges kind-check by exact
 kind, so a check cannot follow a stage that emits a cookbook's own JSONL kind
 (the standard cookbook's `dataset.jsonl`, for example). Emit `JsonlArtifact`
@@ -181,6 +182,31 @@ from the producing stage, or add an adapter stage whose `run` returns
 `JsonlArtifact::from_file(&input.path)`; the module docs carry a compiled
 example. `assert` compares the `actual` value in its args; the engine does not
 feed a stage's emitted metrics into it.
+
+`check_jsonl` args (`checks::CheckJsonlLinesArgs`, the args of the registered
+stage `checks::CheckJsonlLines`), all optional:
+
+| Arg | Meaning |
+|---|---|
+| `min_rows`, `max_rows` | inclusive bounds on the count of non-blank lines |
+| `schema` | field name → rule: a type name (`string`, `number`, `integer`, `boolean`, `object`, `array`, `null`) or `{"type", "nullable", "optional"}` (`checks::{FieldSpec, FieldType}`); set, even to `{}`, every row must be a JSON object |
+| `required_fields` | keys every row must carry, non-null unless `schema` allows null for that field |
+| `max_reported` | rows each breach code names in its message (default 10, at most 1000; every breaching row is counted) |
+| `on_breach` | `block` (default, fail-closed) or `warn` (record and pass through) |
+
+A breach names the 1-based physical line and the field, never row contents.
+Codes: `DATA_QUALITY_MIN_ROWS`, `DATA_QUALITY_MAX_ROWS`,
+`DATA_QUALITY_INVALID_JSON` (not JSON, or not UTF-8),
+`DATA_QUALITY_MISSING_FIELD` (absent, or null where null is not allowed),
+`DATA_QUALITY_SCHEMA` (not an object, or a wrong type); `blut errors list`
+shows them and `blut checks report <job>` lists each breach. Without
+`schema` and `required_fields` no line is parsed, so row-count-only args
+behave as they always have. Bad line-check args (an unknown type, an empty or
+repeated field name, an unknown rule key) are refused when the plan is built.
+The `checks` module docs give the full rules. `checks::CheckJsonl` and
+`checks::CheckJsonlArgs` remain as the published row-count form for Rust
+callers. ADR 0091's `check_tensor_stats` is not shipped: the engine has no
+tensor artifact type for it to check.
 
 ## Declared recipes: `.toml` / `.json` / `.star` (ADR 0078)
 
@@ -294,8 +320,9 @@ have no `Launcher`: stages reach peers or the cloud queue only through an
 `ExecutionAdapter` installed with `ExecCtx::with_execution_adapter` (feature
 `p2p`), and the executor refuses either target without one. `recipe run` and
 `recipe declare --run` install the mesh adapter for `--launcher p2p` (below);
-every other command refuses `--launcher p2p`, and every command refuses
-`--launcher cloud`.
+`recipe run`, `recipe declare --run` and `plan resume` install the cloud
+adapter (see [Cloud dispatch](#cloud-dispatch)). `hpo`, `study` and `partition`
+refuse both launchers, and `plan resume` refuses `--launcher p2p`.
 
 ### Mesh dispatch (`p2p::mesh_exec`, feature `p2p`)
 
@@ -362,7 +389,10 @@ fractions, mixed modes, and unknown launch tenants.
 
 `broker::{decide, Footprint, FootprintStore}` size a per-stage RAM footprint,
 gate admission against the box-fit budget (`MemTotal − floor`), and calibrate
-the estimate from measured peaks (with an OOM-aware self-heal). This is the
+the estimate from measured peaks (with an OOM-aware self-heal). The engine
+reads the measured-peak store at admission; a cookbook runner that measures
+its child's peak writes it (`FootprintStore::record`), so an engine-only
+cookbook is billed its declared estimate. This is the
 engine behind the containment guarantee: a job that wouldn't fit is refused,
 not admitted-then-killed. The declarative surface is
 `Stage::resource_envelope` → `blut_types::envelope::ResourceEnvelope`
@@ -457,7 +487,11 @@ footprints, partitions, tenant and recipe config, and the `~/.blut` files)
 lives under that one directory, so two values are two independent installs.
 A store's own variable (`LAMU_TRAIN_JOBS_DIR`, `BLUT_REGISTRY_DB`, …) takes
 precedence; unset, every path is the historical default. `blut::paths` lists
-each store, its variable and its location.
+each store, its variable and its location. When the variable is set, a store
+whose own variable is unset, that is empty under the root, and whose old
+default location holds data is stranded: `blut` warns once per invocation and
+names the variable to set (`BLUT_REGISTRY_DB=~/.blut/registry.db`, …);
+`paths::stranded_stores` returns the same list to a cookbook.
 
 `blut hpo run` and `blut study run` isolate trial failures: a failed trial is
 recorded with its error and the search continues; the job fails only when no
@@ -510,6 +544,76 @@ task of its own wraps that task in `jobs::in_job` too: a task-local does not
 reach a spawned task. Recording is best-effort (a failed write is logged).
 
 ---
+
+### Cloud dispatch
+
+`recipe run <name> --launcher cloud` and `recipe declare <file> --run
+--launcher cloud` run a recipe's stages on `blut cloud worker` processes that
+poll a durable queue (feature `cloud`, plus `s3` for a bucket).
+
+```sh
+# on each worker, in any binary with the same cookbooks at the same build
+AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=auto AWS_ENDPOINT=https://… \
+  blut cloud worker --queue s3://bucket/prefix
+# on the submitter, with the same AWS_* variables
+BLUT_CLOUD_QUEUE=s3://bucket/prefix blut recipe run my_recipe --launcher cloud
+```
+
+- **Location.** `BLUT_CLOUD_QUEUE` / `--queue`: `s3://bucket[/prefix]`,
+  `file:///dir` or a directory. Credentials and the endpoint come from the
+  `AWS_*` environment only, never a flag, the URL, a job record or a queue
+  object. The endpoint must support conditional writes (AWS S3, Cloudflare R2
+  and MinIO do; Backblaze B2 does not and is refused). A stage runs in the
+  worker's process tree, so it can read the worker's environment: give workers
+  a token scoped to the queue's bucket.
+- **Queue.** `cloud::object_queue::ObjectQueue` keeps each job as an append-only
+  log, `<prefix>/cloud/queue/v1/jobs/<id>/log/<seq>`. Every transition is a
+  create-only write of the next slot, so whoever fills it first decides: a
+  claim, a completion, a cancellation. The slot of a claim is the assignment
+  generation. Leases are renewed by the holder at a third of their length and
+  need no writer to expire; a late completion finds its slot taken and is
+  refused. Input and output bundles are content-addressed objects beside it.
+  Host clocks must agree to well within a lease; a clock error moves when a dead
+  worker's stage is requeued, and cannot let two completions land.
+- **Every stage is dispatched.** Nothing runs on the submitting machine, and a
+  stage the adapter cannot take fails the run naming the reason: its input has
+  a file outside the job directory, or it was admitted with a training I/O
+  profile. A cache hit runs nothing. A restricted tenant is refused before
+  anything is submitted. Every other stage is classified `Internal`, which a
+  worker (`Registered` trust) may run. `cloud::policy::CloudDispatchPolicy` is
+  this rule.
+- **Workers** claim in priority, then enqueue, order, run the stage contained
+  like a local stage, and upload the output. They only claim jobs of their own
+  code identity (the one cache keys fold: engine and every cookbook), and skip
+  GPU stages unless started with `--gpu`; a job left alone records why, and the
+  submitter reports it. Arguments are paths on the worker, so a stage that
+  reads a path needs that path there. SIGTERM stops the running stage and
+  releases it for another worker at once; a killed worker's stage is requeued
+  when its lease runs out (`--lease-secs`, default 60).
+- **Pickup window.** A stage no worker claims within `BLUT_CLOUD_PICKUP_SECS`
+  (default 300, counted again if the stage is requeued) is withdrawn and fails
+  the run (`CLOUD_NO_WORKER`, not retried). An `Unavailable` result is a failure
+  here, never a local retry.
+- **Cancel and resume.** The job directory records the queue (`cloud_queue`) and
+  each cloud job id before its enqueue (`cloud_jobs`). `blut cancel <job>`
+  cancels what is still queued or running, also after the submitting process is
+  gone, and a worker running one stops it within seconds; an `s3://` queue needs
+  the run's `AWS_*` variables, and without them the command fails saying so. A
+  run withdraws its leftover work when it ends. `plan resume` refuses while a
+  stage it submitted still runs, refuses another queue than the job ran on, and
+  otherwise finishes the job: finished stages are cache hits, the rest are
+  submitted again.
+- **Polling cost.** An idle worker lists the queue every `--poll-ms` (default
+  5 s, backing off from 0.5 s); a running stage costs one state read every few
+  seconds on the worker and about one a second on the submitter.
+- **Retention.** Finished jobs' logs and bundles stay in the store. Nothing
+  deletes them; expire them with a bucket lifecycle rule longer than any run.
+
+`blut cloud queue` lists what a queue holds. Library surface: `cloud::location`,
+`cloud::object_queue`, `cloud::policy`, `cloud::records`, `cloud::worker::serve`,
+the defaulted `CloudQueue::{renew, release, refusals}`, and
+`CloudSubmitter::{with_pickup_timeout, with_job_record}`. `cli::run_from` runs
+the CLI on an explicit argument list.
 
 ## Preview surface (targeted for the 1.0 contract)
 

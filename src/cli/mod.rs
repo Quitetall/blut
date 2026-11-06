@@ -521,10 +521,10 @@ enum ModelCommand {
         #[arg(long, default_value = "5m", value_parser = parse_duration)]
         gate_timeout: Duration,
     },
-    /// Roll an alias back to its previous target atomically. "Previous" is
-    /// the entry before the newest one in `history`, so a second rollback
-    /// undoes the first rather than stepping further back; to reach an older
-    /// checkpoint, `promote` it.
+    /// Roll an alias back one step through its promotion history. Each
+    /// rollback moves one promotion further back (promote A, B, C, then two
+    /// rollbacks land on A); a promotion after a rollback continues from there.
+    /// Refused at the alias's first promotion.
     Rollback {
         /// Pointer, e.g. `model://encoder-v1@prod`.
         pointer: String,
@@ -538,7 +538,8 @@ enum ModelCommand {
         #[arg(long, default_value = "default")]
         tenant: String,
     },
-    /// Print an alias's audit trail (oldest first).
+    /// Print an alias's audit trail, oldest first: UTC time, checkpoint hash,
+    /// whether the move was a promote or a rollback, and which row is current.
     History {
         /// Pointer, e.g. `model://encoder-v1@prod`.
         pointer: String,
@@ -1204,26 +1205,31 @@ pub async fn run(reg: crate::framework::Registry) -> Result<()> {
     run_with_tui(reg, None).await
 }
 
-/// [`run`] with the command line given as `args` (the first item is the
-/// program name, as in `std::env::args_os`) instead of read from the process.
-/// For a binary that builds its own argument list, and for tests that drive
-/// the CLI in a child process.
+/// [`run`] with an optional in-process cockpit (see [`TuiHook`]).
+pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>) -> Result<()> {
+    run_parsed(reg, tui, None).await
+}
+
+/// [`run`] with an explicit argument list instead of the process's own
+/// (`args[0]` is the program name, as in `std::env::args`). For binaries that
+/// rewrite their arguments, and for tests that drive the CLI in a child
+/// process.
 pub async fn run_from<I, T>(reg: crate::framework::Registry, args: I) -> Result<()>
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    run_cli(reg, None, Cli::parse_from(args)).await
+    run_parsed(reg, None, Some(args.into_iter().map(Into::into).collect())).await
 }
 
-/// [`run`] with an optional in-process cockpit (see [`TuiHook`]).
-pub async fn run_with_tui(reg: crate::framework::Registry, tui: Option<TuiHook>) -> Result<()> {
-    run_cli(reg, tui, Cli::parse()).await
-}
-
-async fn run_cli(reg: crate::framework::Registry, tui: Option<TuiHook>, cli: Cli) -> Result<()> {
+async fn run_parsed(
+    reg: crate::framework::Registry,
+    tui: Option<TuiHook>,
+    args: Option<Vec<std::ffi::OsString>>,
+) -> Result<()> {
     init_tracing();
     warn_if_stale_binary();
+    crate::paths::warn_stranded_stores();
     // The engine owns the built-in `checks` cookbook (ADR 0091): augment the
     // caller's registry so `check_jsonl`/`assert` + the `checks` error domain are
     // available to every binary (like `p2p-smoke` for the p2p path).
@@ -1233,6 +1239,10 @@ async fn run_cli(reg: crate::framework::Registry, tui: Option<TuiHook>, cli: Cli
     // (`blut recipe declare s3_roundtrip.json`) resolves + kind-checks.
     crate::connectors::register(&mut reg);
     install_code_identity(&reg);
+    let cli = match args {
+        Some(args) => Cli::parse_from(args),
+        None => Cli::parse(),
+    };
     let result = match cli.command {
         Some(Command::Jobs { json }) => run_jobs(json),
         Some(Command::Cancel { id, grace }) => run_cancel(&id, grace).await,
@@ -2327,17 +2337,29 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                     "`plan resume` of a k8s job"
                 )));
             }
-            // A job recorded with p2p or cloud ran here before those were
-            // refused; resuming it "as it was run" would repeat the claim.
-            crate::config::launcher::check_launcher_placeable(
-                launch_target,
-                &format!(
-                    "`plan resume` of {job_id}, which recorded it but ran on this machine \
-                     (start it again with `recipe run {}`)",
-                    marker.name
-                ),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
+            if launch_target == crate::config::launcher::LaunchTarget::Cloud {
+                // A cloud job resumes on the cloud queue: its finished stages
+                // are cache hits, the rest are submitted again. Not while a
+                // stage it submitted is still queued or running.
+                crate::config::launcher::check_cloud_launch(&format!("`plan resume` of {job_id}"))
+                    .map_err(|e| anyhow!("{e}"))?;
+                #[cfg(feature = "cloud")]
+                if let Some(why) = crate::cloud::records::resume_blocker(&job_id, &job_dir).await {
+                    return Err(anyhow!(why));
+                }
+            } else {
+                // A job recorded with p2p ran here before that was refused;
+                // resuming it "as it was run" would repeat the claim.
+                crate::config::launcher::check_launcher_placeable(
+                    launch_target,
+                    &format!(
+                        "`plan resume` of {job_id}, which recorded it but ran on this machine \
+                         (start it again with `recipe run {}`)",
+                        marker.name
+                    ),
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
             if launch_target != crate::config::launcher::LaunchTarget::Local {
                 eprintln!(
                     "resuming {job_id} with --launcher {} (as it was run)",
@@ -2401,6 +2423,22 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                 launch_target,
             )?;
             footprint = prepared_footprint;
+            #[cfg(feature = "cloud")]
+            let cloud = if launch_target == crate::config::launcher::LaunchTarget::Cloud {
+                let (with_cloud, cloud) = cloud::install_cloud_launch(
+                    reg,
+                    ctx,
+                    &job_dir,
+                    &tenant,
+                    &format!("`plan resume` of {job_id}"),
+                )?;
+                ctx = with_cloud;
+                cloud.check_same_queue(&job_id, &job_dir)?;
+                cloud.probe().await?;
+                Some(cloud)
+            } else {
+                None
+            };
             if shared_cache {
                 match CacheHandle::default_global_path() {
                     Some(global) => {
@@ -2424,24 +2462,45 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             // running: a resume refused here never started, so the job keeps
             // the state it had (a refused resume of a `done` job used to
             // rewrite it as `failed`).
-            let _tenant_reservation = tenant_admission
-                .reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
-                .map_err(|reason| {
-                    anyhow!("resume '{}' admission refused: {reason}", marker.name)
-                })?;
+            // A cloud job takes neither: its stages run on the workers.
+            #[cfg(feature = "cloud")]
+            let runs_here = cloud.is_none();
+            #[cfg(not(feature = "cloud"))]
+            let runs_here = true;
+            let _tenant_reservation = if runs_here {
+                Some(
+                    tenant_admission
+                        .reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
+                        .map_err(|reason| {
+                            anyhow!("resume '{}' admission refused: {reason}", marker.name)
+                        })?,
+                )
+            } else {
+                None
+            };
 
             // GPU lock — same arbitration as initial runs. Without
             // this, two resumes (or a resume + a fresh recipe run)
             // on the same machine could both touch the GPU.
-            let lock = scheduler_lock::acquire_exclusive(
-                format!("blut-resume:{job_id}"),
-                LockKind::Training,
-            )
-            .map_err(|e| anyhow!("acquire_exclusive: {e}"))?;
+            let lock = if runs_here {
+                Some(
+                    scheduler_lock::acquire_exclusive(
+                        format!("blut-resume:{job_id}"),
+                        LockKind::Training,
+                    )
+                    .map_err(|e| anyhow!("acquire_exclusive: {e}"))?,
+                )
+            } else {
+                None
+            };
 
             crate::jobs::write_state(&job_id, JobState::Running)
                 .with_context(|| format!("write Running state for {job_id}"))?;
             let _driver = crate::jobs::record_driver(&job_id);
+            #[cfg(feature = "cloud")]
+            if let Some(cloud) = &cloud {
+                cloud.record(&job_dir)?;
+            }
             // The same signal discipline as `recipe run`: Ctrl-C / SIGTERM
             // cancels the executor and kills the trainer groups, instead of
             // the default action killing blut and orphaning a setsid trainer.
@@ -2450,9 +2509,15 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
 
             eprintln!("resuming {} ({})", marker.name, job_id);
             eprintln!("dir      {}", job_dir.display());
-            eprintln!("lock     {}", lock.path().display());
+            if let Some(lock) = &lock {
+                eprintln!("lock     {}", lock.path().display());
+            }
             persist_plan_graph(&plan, &job_dir);
             let result = crate::framework::execute_plan(plan, ctx).await;
+            #[cfg(feature = "cloud")]
+            if let Some(cloud) = &cloud {
+                cloud.sweep(&job_dir).await;
+            }
             drop(lock);
             crate::python_kill::unbind_current_job();
             match result {
@@ -2589,6 +2654,7 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
                 return Ok(());
             }
             let job_id = recipe::launch_compiled_plan(
+                reg,
                 &accepted.spec.name,
                 // The plan the typecheck produced — not a second compilation of
                 // the same spec. What was checked is what runs.
@@ -2795,20 +2861,42 @@ async fn run_model_cmd(cmd: ModelCommand) -> Result<()> {
         ModelCommand::History { pointer, tenant } => {
             let (name, alias) = parse(&pointer)?;
             let conn = mr::open().map_err(|e| anyhow!("{e}"))?;
-            let hist = mr::history(&conn, &tenant, &name, &alias).map_err(|e| anyhow!("{e}"))?;
+            let hist =
+                mr::history_moves(&conn, &tenant, &name, &alias).map_err(|e| anyhow!("{e}"))?;
             if hist.is_empty() {
-                println!("no history for model://{name}@{alias}");
+                println!("no history for model://{name}@{alias} (tenant {tenant})");
             }
-            // Every promote AND every rollback appends a row, so the last row
-            // is always where the alias points now.
-            let last = hist.len().saturating_sub(1);
-            for (i, h) in hist.iter().enumerate() {
-                let current = if i == last { "  (current)" } else { "" };
-                println!("{}  {}{current}", utc_timestamp(h.moved_at), h.model_hash);
+            for line in model_history_lines(&hist) {
+                println!("{line}");
             }
             Ok(())
         }
     }
+}
+
+/// `model history` rows: UTC time, hash, the move's kind (`promote` or
+/// `rollback`, as `plan history` prints it) and a `(current)` mark on the last
+/// row. Every promote AND every rollback appends a row, so the last row is
+/// always where the alias points now.
+fn model_history_lines(
+    hist: &[(
+        crate::model_registry::HistoryEntry,
+        crate::registry_db::MoveKind,
+    )],
+) -> Vec<String> {
+    let last = hist.len().saturating_sub(1);
+    hist.iter()
+        .enumerate()
+        .map(|(i, (h, kind))| {
+            let current = if i == last { "  (current)" } else { "" };
+            format!(
+                "{}  {}  {}{current}",
+                utc_timestamp(h.moved_at),
+                h.model_hash,
+                kind.as_str()
+            )
+        })
+        .collect()
 }
 
 fn run_dataset_cmd(cmd: DatasetCommand) -> Result<()> {
@@ -4045,5 +4133,34 @@ mod utc_timestamp_tests {
         assert_eq!(super::utc_timestamp(1_792_797_993), "2026-10-23T23:26:33Z");
         assert_eq!(super::utc_timestamp(0), "1970-01-01T00:00:00Z");
         assert_eq!(super::utc_timestamp(i64::MAX), i64::MAX.to_string());
+    }
+
+    #[test]
+    fn model_history_rows_name_the_kind_of_each_move() {
+        // E2E follow-up: a promote and a rollback looked alike in the table.
+        use crate::model_registry::HistoryEntry;
+        use crate::registry_db::MoveKind;
+        let row = |hash: &str, at, kind| {
+            (
+                HistoryEntry {
+                    model_hash: hash.to_string(),
+                    moved_at: at,
+                },
+                kind,
+            )
+        };
+        let lines = super::model_history_lines(&[
+            row("aa", 0, MoveKind::Promote),
+            row("bb", 60, MoveKind::Promote),
+            row("aa", 120, MoveKind::Rollback),
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "1970-01-01T00:00:00Z  aa  promote",
+                "1970-01-01T00:01:00Z  bb  promote",
+                "1970-01-01T00:02:00Z  aa  rollback  (current)",
+            ]
+        );
     }
 }

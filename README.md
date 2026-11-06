@@ -224,12 +224,15 @@ webhook signing contract, SLA rules, notification sinks, and restart semantics.
 ### Declare your resources — one method, the whole stack
 
 Implement `Stage::resource_envelope` and your stage gets BLUT's entire
-resource machinery: the launch gate admits it against real memory, the
-measured-peak store calibrates the estimate run over run (with an OOM-aware
-self-heal), and the engine auto-tunes any dimension you declare a cost term
-for — you enumerate the coefficients and ceilings, the engine owns the
-search. Skip it and your stage still runs, billed a loud 2 GiB
-compatibility floor.
+resource machinery: the launch gate admits it against real memory, and the
+engine auto-tunes any dimension you declare a cost term for — you enumerate
+the coefficients and ceilings, the engine owns the search. The calibration
+dimensions key the measured-peak store: a launch resolves the estimate
+against a peak recorded under the same key (with an OOM-aware self-heal).
+The engine reads that store; a cookbook runner that measures its child's
+peak fills it (`FootprintStore::record`), and without one the declared
+estimate is what is billed. Skip it and your stage still runs, billed a loud
+2 GiB compatibility floor.
 
 ```rust
 fn resource_envelope(&self, args: &Self::Args) -> ResourceEnvelope {
