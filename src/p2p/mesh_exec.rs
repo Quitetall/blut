@@ -4,7 +4,7 @@
 //! `recipe run --launcher p2p` installs, and the worker that runs what it sends.
 //!
 //! **Which stages leave.** The executor asks
-//! [`DispatchPolicy::remote_class`](crate::p2p::dispatch::DispatchPolicy::remote_class),
+//! [`DispatchPolicy::remote_class`],
 //! whose default is the stage's own declaration
 //! ([`Stage::placement`](crate::framework::Stage::placement)). A stage that
 //! does not declare it may leave runs on the submitting machine as part of the
@@ -14,7 +14,7 @@
 //! a connected peer that (a) answers on the stage plane, (b) runs the same
 //! [code identity](crate::framework::code_identity) as the submitter, (c)
 //! accepts work from it, (d) holds the trust the stage's data class needs
-//! ([`DispatchMatrix`](crate::p2p::trust::DispatchMatrix)), and (e) has the
+//! ([`DispatchMatrix`]), and (e) has the
 //! declared cores and memory. Among those it prefers the one with the fewest
 //! of this submitter's stages in flight, then the one it has used least, then
 //! the best local reputation, so a plan's stages spread over the mesh.

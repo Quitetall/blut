@@ -2254,7 +2254,7 @@ mod k8s_refusal_tests {
     fn the_local_launch_path_refuses_p2p_and_cloud_placements() {
         use crate::config::launcher::LaunchTarget;
         for (target, names) in [
-            (LaunchTarget::P2P, "blut p2p node --dispatch-stage"),
+            (LaunchTarget::P2P, "--launcher p2p --p2p-seed"),
             (LaunchTarget::Cloud, "blut cloud smoke"),
         ] {
             let msg = refuse_unplaced_local_launch("demo", target)
