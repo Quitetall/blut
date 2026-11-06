@@ -311,7 +311,17 @@ where
 {
     tokio::pin!(future);
     tokio::select! {
-        result = &mut future => result.map_err(WorkerFailure::from),
+        // A stage that watches `ctx.cancel` ends with an error of its own
+        // when it is stopped. That is the cancellation, not a stage failure:
+        // recording it as one would fail a stage a shutting-down worker is
+        // handing back.
+        result = &mut future => result.map_err(|failure| {
+            if cancel.is_cancelled() {
+                WorkerFailure::Cancelled
+            } else {
+                WorkerFailure::from(failure)
+            }
+        }),
         _ = cancel.cancelled() => Err(WorkerFailure::Cancelled),
         _ = sleep_optional(deadline.soft_remaining()) => Err(WorkerFailure::TimedOut {
             phase,

@@ -421,11 +421,19 @@ impl Drop for Proc {
 const PATIENCE: Duration = Duration::from_secs(240);
 
 fn worker(host: &Host, queue: &Path, id: &str, log: &str) -> Proc {
-    worker_with(host, queue, id, log, false)
+    worker_with(host, queue, id, log, "10", false)
 }
 
-fn worker_with(host: &Host, queue: &Path, id: &str, log: &str, other_code: bool) -> Proc {
+fn worker_with(
+    host: &Host,
+    queue: &Path,
+    id: &str,
+    log: &str,
+    lease_secs: &str,
+    other_code: bool,
+) -> Proc {
     let q = queue.display().to_string();
+    let work = host.path().join(format!("work-{id}")).display().to_string();
     let mut cmd = host.command(
         &[
             "cloud",
@@ -435,9 +443,11 @@ fn worker_with(host: &Host, queue: &Path, id: &str, log: &str, other_code: bool)
             "--id",
             id,
             "--lease-secs",
-            "10",
+            lease_secs,
             "--poll-ms",
             "200",
+            "--work-dir",
+            &work,
         ],
         log,
     );
@@ -495,14 +505,11 @@ fn queue_jobs(queue: &Path) -> Vec<blut::cloud::object_queue::ActiveJob> {
 
 /// Three stages, two workers, one submitter: every stage runs in a worker
 /// process, the result comes back to the submitter's job, and the job records
-/// the queue and its cloud jobs.
-#[test]
-fn every_stage_runs_in_a_worker_process_not_the_submitter() {
-    let submit_host = Host::new();
+/// the queue and its cloud jobs. `queue` is a directory or an `s3://` URL.
+fn every_stage_runs_on_the_workers(submit_host: &Host, queue: &Path) {
     let worker_host = Host::new();
-    let queue = submit_host.path().join("queue");
-    let w1 = worker(&worker_host, &queue, "w1", "w1.log");
-    let w2 = worker(&worker_host, &queue, "w2", "w2.log");
+    let w1 = worker(&worker_host, queue, "w1", "w1.log");
+    let w2 = worker(&worker_host, queue, "w2", "w2.log");
     let workers = [w1.pid(), w2.pid()];
 
     let mut run = Proc::spawn(
@@ -519,7 +526,7 @@ fn every_stage_runs_in_a_worker_process_not_the_submitter() {
                 ],
                 "submit.log",
             )
-            .env("BLUT_CLOUD_QUEUE", &queue)
+            .env("BLUT_CLOUD_QUEUE", queue)
             .env("BLUT_CLOUD_PICKUP_SECS", "120"),
     );
     let submitter = run.pid();
@@ -556,7 +563,6 @@ fn every_stage_runs_in_a_worker_process_not_the_submitter() {
             .trim(),
         queue.display().to_string()
     );
-    assert!(queue_jobs(&queue).is_empty(), "the queue is drained");
     let claimed = worker_host.log("w1.log").matches("claimed ").count()
         + worker_host.log("w2.log").matches("claimed ").count();
     assert_eq!(claimed, 3, "each stage was claimed once");
@@ -572,6 +578,44 @@ fn every_stage_runs_in_a_worker_process_not_the_submitter() {
             worker_host.log(log)
         );
     }
+
+    // `blut cloud queue` sees nothing left.
+    let mut list = Proc::spawn(&mut submit_host.command(
+        &["cloud", "queue", "--queue", &queue.display().to_string()],
+        "queue.log",
+    ));
+    assert!(list.wait(PATIENCE).success());
+    assert!(
+        submit_host.log("queue.log").contains("0 job(s) on"),
+        "{}",
+        submit_host.log("queue.log")
+    );
+}
+
+#[test]
+fn every_stage_runs_in_a_worker_process_not_the_submitter() {
+    let host = Host::new();
+    let queue = host.path().join("queue");
+    every_stage_runs_on_the_workers(&host, &queue);
+    assert!(queue_jobs(&queue).is_empty(), "the queue is drained");
+}
+
+/// The same run over a bucket: `BLUT_TEST_S3_QUEUE=s3://bucket/prefix` and the
+/// `AWS_*` variables (run against MinIO; skipped when unset).
+#[cfg(feature = "s3")]
+#[test]
+fn every_stage_runs_on_the_workers_over_an_s3_queue() {
+    let Ok(base) = std::env::var("BLUT_TEST_S3_QUEUE") else {
+        eprintln!("skipped: BLUT_TEST_S3_QUEUE is not set");
+        return;
+    };
+    let host = Host::new();
+    let queue = format!(
+        "{}/e2e-{}",
+        base.trim_end_matches('/'),
+        uuid::Uuid::new_v4()
+    );
+    every_stage_runs_on_the_workers(&host, Path::new(&queue));
 }
 
 /// No worker: the stage is withdrawn after the pickup window and the run
@@ -620,7 +664,7 @@ fn a_worker_running_other_code_does_not_claim_the_stage() {
     let submit_host = Host::new();
     let worker_host = Host::new();
     let queue = submit_host.path().join("queue");
-    let _other = worker_with(&worker_host, &queue, "stale", "stale.log", true);
+    let _other = worker_with(&worker_host, &queue, "stale", "stale.log", "10", true);
     let mut run = Proc::spawn(
         submit_host
             .command(
@@ -807,5 +851,155 @@ fn plan_resume_finishes_a_cloud_job_whose_submitter_died() {
             .count(),
         3,
         "seed and hold from the first run, hold again from the resume"
+    );
+}
+
+/// A hold-recipe submitter that waits on the queue in `queue`.
+fn submit_hold(host: &Host, queue: &Path, secs: u64, markers: &Path) -> Proc {
+    let args = serde_json::json!({ "secs": secs, "marker_dir": markers }).to_string();
+    Proc::spawn(
+        host.command(
+            &[
+                "recipe",
+                "run",
+                "cloud_e2e_hold",
+                "--args",
+                &args,
+                "--launcher",
+                "cloud",
+            ],
+            "submit.log",
+        )
+        .env("BLUT_CLOUD_QUEUE", queue),
+    )
+}
+
+fn markers_dir(host: &Host) -> PathBuf {
+    let markers = host.path().join("markers");
+    std::fs::create_dir_all(&markers).unwrap();
+    markers
+}
+
+/// SIGTERM stops the running stage and hands it back at once: a second
+/// worker finishes it, long before the first worker's lease could run out.
+#[test]
+fn a_worker_given_sigterm_releases_its_stage_to_another_worker() {
+    let submit_host = Host::new();
+    let worker_host = Host::new();
+    let queue = submit_host.path().join("queue");
+    let markers = markers_dir(&submit_host);
+    let mut first = worker_with(&worker_host, &queue, "first", "first.log", "600", false);
+    let first_pid = first.pid();
+    let mut run = submit_hold(&submit_host, &queue, 3, &markers);
+    let started = markers.join(format!("started-{first_pid}"));
+    wait_for("the first worker to start the stage", PATIENCE, || {
+        started.exists()
+    });
+
+    first.signal(nix::sys::signal::Signal::SIGTERM);
+    assert!(
+        first.wait(PATIENCE).success(),
+        "{}",
+        worker_host.log("first.log")
+    );
+    let log = worker_host.log("first.log");
+    assert!(log.contains("released "), "{log}");
+    assert!(log.contains("1 released"), "{log}");
+    assert!(markers.join(format!("stopped-{first_pid}")).exists());
+    assert!(!markers.join(format!("finished-{first_pid}")).exists());
+
+    let second = worker(&worker_host, &queue, "second", "second.log");
+    assert!(
+        run.wait(PATIENCE).success(),
+        "{}\n--- second:\n{}",
+        submit_host.log("submit.log"),
+        worker_host.log("second.log")
+    );
+    assert!(markers.join(format!("finished-{}", second.pid())).exists());
+    let job_dir = submit_host.jobs_dir().join(submit_host.only_job());
+    let body = std::fs::read_to_string(find_file(&job_dir, "held.txt").unwrap()).unwrap();
+    assert_eq!(pids_in(&body).last(), Some(&second.pid()), "{body}");
+}
+
+/// A worker killed outright releases nothing. Its lease runs out, another
+/// worker claims the stage under a newer generation, and the run succeeds.
+#[test]
+fn a_killed_workers_stage_is_requeued_when_its_lease_runs_out() {
+    let submit_host = Host::new();
+    let worker_host = Host::new();
+    let queue = submit_host.path().join("queue");
+    let markers = markers_dir(&submit_host);
+    let mut doomed = worker_with(&worker_host, &queue, "doomed", "doomed.log", "2", false);
+    let doomed_pid = doomed.pid();
+    let mut run = submit_hold(&submit_host, &queue, 3, &markers);
+    let started = markers.join(format!("started-{doomed_pid}"));
+    wait_for("the worker to start the stage", PATIENCE, || {
+        started.exists()
+    });
+
+    doomed.signal(nix::sys::signal::Signal::SIGKILL);
+    doomed.wait(PATIENCE);
+    assert!(!markers.join(format!("finished-{doomed_pid}")).exists());
+
+    let heir = worker_with(&worker_host, &queue, "heir", "heir.log", "10", false);
+    assert!(
+        run.wait(PATIENCE).success(),
+        "{}\n--- heir:\n{}",
+        submit_host.log("submit.log"),
+        worker_host.log("heir.log")
+    );
+    assert!(markers.join(format!("finished-{}", heir.pid())).exists());
+    let log = worker_host.log("heir.log");
+    assert!(log.contains("(e2e-hold), generation 2"), "{log}");
+}
+
+/// With the submitter alive and no worker, `blut cancel` ends the run and the
+/// queued stage is withdrawn: a worker that turns up later finds nothing.
+#[test]
+fn blut_cancel_withdraws_a_queued_stage_and_ends_the_run() {
+    let submit_host = Host::new();
+    let queue = submit_host.path().join("queue");
+    let markers = markers_dir(&submit_host);
+    let mut run = submit_hold(&submit_host, &queue, 600, &markers);
+    wait_for("the seed stage to be queued", PATIENCE, || {
+        queue.exists() && queue_jobs(&queue).len() == 1
+    });
+    let job = submit_host.only_job();
+
+    let mut cancel = Proc::spawn(&mut submit_host.command(&["cancel", &job], "cancel.log"));
+    assert!(
+        cancel.wait(PATIENCE).success(),
+        "{}",
+        submit_host.log("cancel.log")
+    );
+    run.wait(PATIENCE);
+    assert!(queue_jobs(&queue).is_empty(), "the stage was withdrawn");
+    assert_eq!(
+        std::fs::read_to_string(submit_host.jobs_dir().join(&job).join("state"))
+            .unwrap_or_default()
+            .trim(),
+        "cancelled",
+        "{}",
+        submit_host.log("submit.log")
+    );
+    let latecomer_host = Host::new();
+    let mut latecomer = Proc::spawn(&mut latecomer_host.command(
+        &[
+            "cloud",
+            "worker",
+            "--queue",
+            &queue.display().to_string(),
+            "--idle-exit-secs",
+            "1",
+            "--poll-ms",
+            "100",
+        ],
+        "late.log",
+    ));
+    assert!(latecomer.wait(PATIENCE).success());
+    assert!(
+        latecomer_host.log("late.log").contains("0 claimed"),
+        "{}",
+        latecomer_host.log("late.log")
     );
 }

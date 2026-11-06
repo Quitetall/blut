@@ -1022,7 +1022,7 @@ pub(crate) fn provider_from_url(
             Ok((Arc::new(inner), String::new()))
         }
         other => Err(StoreError::InvalidAddress(format!(
-            "unsupported object-store scheme {other:?} in {url}"
+            "unsupported object-store scheme {other:?}"
         ))),
     }
 }
