@@ -123,14 +123,12 @@ depend on this crate.
   directory (`blut-cloud-smoke-*`, mode 0700), names it, and removes it when
   the smoke ends. The default was the fixed shared path `/tmp/blut-cloud-smoke`,
   left behind after every run. An explicit `--store` is unchanged.
-- `blut-notify` status summaries name the event kind, the stage and the
-  event's error (or a pruned stage's reason), cut to 200 characters with
-  control characters replaced: `status event for job J: stage_failed in stage
-  'train' — CUDA out of memory`. They said only "status event for job J". The
-  error is free-form, so it is included only when custody would let the event
-  leave the box; for a restricted tenant or a `restricted` line it is withheld
-  on every sink (`(error withheld: restricted data)`). Before, no summary
-  carried error text for any tenant.
+- `blut-notify` status summaries name the event kind and the stage: `status
+  event for job J: stage_failed in stage 'train'`. They said only "status event
+  for job J". Error text is free-form and can hold paths or credentials, so it
+  stays out unless the config sets `include_error_text = true`, and even then
+  never for a restricted tenant or a `restricted` line. When on, it is cut to
+  200 characters with control characters replaced.
 - `blut jobs`' `output` column is now `recipe`: the recipe, deploy pointer or
   plan name the job ran (from its resume marker or `plan.json`), else a legacy
   single-trainer job's output name. The output name is set only by that legacy

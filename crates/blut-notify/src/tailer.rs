@@ -50,6 +50,7 @@ pub struct Notifier {
     sinks: std::collections::HashMap<String, Box<dyn NotifySink>>,
     cursors: CursorFile,
     cursor_path: std::path::PathBuf,
+    include_error_text: bool,
     _lock: LockGuard,
 }
 
@@ -59,7 +60,9 @@ impl Notifier {
         for spec in &config.sink {
             sinks.insert(spec.name().to_string(), crate::sinks::build_sink(spec)?);
         }
-        Self::with_sinks(config.rule, sinks, cursor_path)
+        let mut notifier = Self::with_sinks(config.rule, sinks, cursor_path)?;
+        notifier.include_error_text = config.include_error_text;
+        Ok(notifier)
     }
 
     fn with_sinks(
@@ -112,6 +115,7 @@ impl Notifier {
             sinks,
             cursors,
             cursor_path,
+            include_error_text: false,
             _lock: LockGuard { _file: lock_file },
         })
     }
@@ -193,7 +197,8 @@ impl Notifier {
                         data_class: class,
                         summary: String::new(),
                     };
-                    let summary = status_summary(&job_id, &value, &tenant, class);
+                    let summary =
+                        status_summary(&job_id, &value, &tenant, class, self.include_error_text);
                     self.route(
                         NotifySource::Status,
                         &value,
@@ -344,10 +349,11 @@ const SUMMARY_NAME_MAX_CHARS: usize = 64;
 /// [`SUMMARY_ERROR_MAX_CHARS`]. It used to be "status event for job X" and
 /// nothing else.
 ///
-/// Error text is free-form: a trainer's message can name a file, a subject or
-/// a record. It is included only when custody would let the event leave the
-/// box anyway ([`custody_allows_off_box`]); for a restricted tenant or a
-/// `restricted` line it is withheld, so a restricted summary stays the PHI-free
+/// Error text is free-form: a trainer's message can name a file, a subject, a
+/// record or a credential. It is included only when the operator opted in
+/// (`include_error_text`) and custody would let the event leave the box anyway
+/// ([`custody_allows_off_box`]); for a restricted tenant or a `restricted` line
+/// it is withheld regardless, so a restricted summary stays the PHI-free
 /// operational identity (job, kind, stage) on every sink, local ones included.
 /// Control characters are replaced, so a line cannot forge extra lines in a
 /// sink's message.
@@ -358,6 +364,7 @@ fn status_summary(
     value: &serde_json::Value,
     tenant: &Tenant,
     class: DataClass,
+    include_error_text: bool,
 ) -> String {
     let field = |name: &str| value.get(name).and_then(serde_json::Value::as_str);
     let mut summary = format!("status event for job {job_id}");
@@ -371,10 +378,12 @@ fn status_summary(
         ));
     }
     if let Some(error) = field("error").or_else(|| field("reason")) {
-        if blut_types::trust::custody_allows_off_box(tenant, class) {
+        if !blut_types::trust::custody_allows_off_box(tenant, class) {
+            summary.push_str(" (error withheld: restricted data)");
+        } else if include_error_text {
             summary.push_str(&format!(" — {}", excerpt(error, SUMMARY_ERROR_MAX_CHARS)));
         } else {
-            summary.push_str(" (error withheld: restricted data)");
+            summary.push_str(" (error withheld: include_error_text is off)");
         }
     }
     summary
@@ -531,28 +540,36 @@ mod tests {
             "error": "CUDA out of memory\nsecond line",
         });
         assert_eq!(
-            status_summary("j1", &line, &shared, DataClass::Internal),
+            status_summary("j1", &line, &shared, DataClass::Internal, true),
             "status event for job j1: stage_failed in stage 'train' — CUDA out of memory second line"
         );
         // A line marked restricted withholds its error under any tenant.
         assert_eq!(
-            status_summary("j1", &line, &shared, DataClass::Restricted),
+            status_summary("j1", &line, &shared, DataClass::Restricted, true),
             "status event for job j1: stage_failed in stage 'train' (error withheld: restricted data)"
+        );
+        // By default no error text leaves, even for a tenant that may go off box.
+        let summary = status_summary("j1", &line, &shared, DataClass::Internal, false);
+        assert_eq!(
+            summary,
+            "status event for job j1: stage_failed in stage 'train' \
+             (error withheld: include_error_text is off)"
         );
         // A pruned stage's reason is its error; an event with neither says so.
         let pruned =
             serde_json::json!({"kind": "stage_pruned", "stage_name": "eval", "reason": "branch b"});
         assert!(
-            status_summary("j1", &pruned, &shared, DataClass::Internal).ends_with("— branch b")
+            status_summary("j1", &pruned, &shared, DataClass::Internal, true)
+                .ends_with("— branch b")
         );
         let end = serde_json::json!({"kind": "stage_end", "stage_name": "eval"});
         assert_eq!(
-            status_summary("j1", &end, &shared, DataClass::Internal),
+            status_summary("j1", &end, &shared, DataClass::Internal, true),
             "status event for job j1: stage_end in stage 'eval'"
         );
         // The error is bounded.
         let long = serde_json::json!({"kind": "stage_failed", "error": "x".repeat(5000)});
-        let summary = status_summary("j1", &long, &shared, DataClass::Internal);
+        let summary = status_summary("j1", &long, &shared, DataClass::Internal, true);
         let error = summary.split(" — ").nth(1).unwrap();
         assert_eq!(error.chars().count(), SUMMARY_ERROR_MAX_CHARS);
         assert!(error.ends_with('…'));

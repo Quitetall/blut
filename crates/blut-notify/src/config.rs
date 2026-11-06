@@ -14,6 +14,11 @@ pub struct NotifyConfig {
     pub sink: Vec<SinkSpec>,
     #[serde(default)]
     pub rule: Vec<NotifyRule>,
+    /// Put an event's error text in status summaries. Off by default: it is
+    /// free-form, can hold paths or credentials, and a summary can reach an
+    /// off-box sink. Restricted data never carries it, whatever this says.
+    #[serde(default)]
+    pub include_error_text: bool,
 }
 
 impl NotifyConfig {
