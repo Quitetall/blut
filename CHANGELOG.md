@@ -116,6 +116,9 @@ depend on this crate.
   resume_blocker}`.
 
 ### Changed
+- **Breaking:** `HfCheckpoint::final_loss` is `Option<f32>` and the artifact's
+  `SCHEMA` is 2. A trainer that reported no loss used to be recorded as `0.0`,
+  which reads as a perfect run.
 - `blut jobs`' `output` column is now `recipe`: the recipe, deploy pointer or
   plan name the job ran (from its resume marker or `plan.json`), else a legacy
   single-trainer job's output name. The output name is set only by that legacy
