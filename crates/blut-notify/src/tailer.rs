@@ -191,15 +191,14 @@ impl Notifier {
                     let envelope = NotificationEnvelope {
                         tenant: tenant.clone(),
                         data_class: class,
-                        // Never echo status payload/error text: job id + rule
-                        // are the PHI-free operational identity.
                         summary: String::new(),
                     };
+                    let summary = status_summary(&job_id, &value, &tenant, class);
                     self.route(
                         NotifySource::Status,
                         &value,
                         envelope,
-                        &format!("status event for job {job_id}"),
+                        &summary,
                         &mut report,
                     )?;
                 }
@@ -335,6 +334,68 @@ impl Notifier {
     }
 }
 
+/// The longest error excerpt a status summary carries, in characters.
+const SUMMARY_ERROR_MAX_CHARS: usize = 200;
+/// The longest event kind or stage name a status summary carries.
+const SUMMARY_NAME_MAX_CHARS: usize = 64;
+
+/// A status line's summary: the job, the event kind, the stage that emitted
+/// it, and its error (`error`, else `reason`) cut to
+/// [`SUMMARY_ERROR_MAX_CHARS`]. It used to be "status event for job X" and
+/// nothing else.
+///
+/// Error text is free-form: a trainer's message can name a file, a subject or
+/// a record. It is included only when custody would let the event leave the
+/// box anyway ([`custody_allows_off_box`]); for a restricted tenant or a
+/// `restricted` line it is withheld, so a restricted summary stays the PHI-free
+/// operational identity (job, kind, stage) on every sink, local ones included.
+/// Control characters are replaced, so a line cannot forge extra lines in a
+/// sink's message.
+///
+/// [`custody_allows_off_box`]: blut_types::trust::custody_allows_off_box
+fn status_summary(
+    job_id: &str,
+    value: &serde_json::Value,
+    tenant: &Tenant,
+    class: DataClass,
+) -> String {
+    let field = |name: &str| value.get(name).and_then(serde_json::Value::as_str);
+    let mut summary = format!("status event for job {job_id}");
+    if let Some(kind) = field("kind") {
+        summary.push_str(&format!(": {}", excerpt(kind, SUMMARY_NAME_MAX_CHARS)));
+    }
+    if let Some(stage) = field("stage_name") {
+        summary.push_str(&format!(
+            " in stage '{}'",
+            excerpt(stage, SUMMARY_NAME_MAX_CHARS)
+        ));
+    }
+    if let Some(error) = field("error").or_else(|| field("reason")) {
+        if blut_types::trust::custody_allows_off_box(tenant, class) {
+            summary.push_str(&format!(" — {}", excerpt(error, SUMMARY_ERROR_MAX_CHARS)));
+        } else {
+            summary.push_str(" (error withheld: restricted data)");
+        }
+    }
+    summary
+}
+
+/// `text` with control characters replaced by spaces, cut to `max` characters
+/// (an ellipsis marks a cut).
+fn excerpt(text: &str, max: usize) -> String {
+    let clean: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let clean = clean.trim();
+    if clean.chars().count() <= max {
+        return clean.to_string();
+    }
+    let mut cut: String = clean.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
 fn read_tenant(job_dir: &std::path::Path) -> Option<Tenant> {
     match std::fs::read_to_string(job_dir.join("tenant")) {
         Ok(value) => {
@@ -416,15 +477,17 @@ mod tests {
         }
     }
 
+    /// A restricted tenant's error text never reaches a summary, even on a
+    /// local sink: job, event kind and stage are its PHI-free identity.
     #[test]
-    fn status_tail_routes_once_and_never_echoes_payload() {
+    fn status_tail_routes_once_and_never_echoes_restricted_payload() {
         let td = tempfile::tempdir().unwrap();
         let job = td.path().join("jobs/j1");
         std::fs::create_dir_all(&job).unwrap();
-        std::fs::write(job.join("tenant"), "shared").unwrap();
+        std::fs::write(job.join("tenant"), "clinical/prod").unwrap();
         std::fs::write(
             job.join("status.jsonl"),
-            "{\"kind\":\"failed\",\"error\":\"patient Alice\"}\n",
+            "{\"kind\":\"failed\",\"stage_name\":\"train\",\"error\":\"patient Alice\"}\n",
         )
         .unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -443,11 +506,56 @@ mod tests {
             .run_once(&td.path().join("jobs"), &td.path().join("sla.jsonl"))
             .unwrap();
         assert_eq!(first.delivered, 1);
-        assert!(!seen.lock().unwrap()[0].summary.contains("Alice"));
+        let summary = seen.lock().unwrap()[0].summary.clone();
+        assert!(!summary.contains("Alice"), "{summary}");
+        assert_eq!(
+            summary,
+            "rule 'failed': status event for job j1: failed in stage 'train' \
+             (error withheld: restricted data)"
+        );
         let second = notifier
             .run_once(&td.path().join("jobs"), &td.path().join("sla.jsonl"))
             .unwrap();
         assert_eq!(second.delivered, 0);
+    }
+
+    /// E2E follow-up: summaries said only "status event for job X". A
+    /// non-restricted event names its kind, stage and (bounded) error.
+    #[test]
+    fn status_summaries_name_the_stage_and_the_error() {
+        let shared = Tenant::parse("shared").unwrap();
+        let line = serde_json::json!({
+            "kind": "stage_failed",
+            "node_idx": 3,
+            "stage_name": "train",
+            "error": "CUDA out of memory\nsecond line",
+        });
+        assert_eq!(
+            status_summary("j1", &line, &shared, DataClass::Internal),
+            "status event for job j1: stage_failed in stage 'train' — CUDA out of memory second line"
+        );
+        // A line marked restricted withholds its error under any tenant.
+        assert_eq!(
+            status_summary("j1", &line, &shared, DataClass::Restricted),
+            "status event for job j1: stage_failed in stage 'train' (error withheld: restricted data)"
+        );
+        // A pruned stage's reason is its error; an event with neither says so.
+        let pruned =
+            serde_json::json!({"kind": "stage_pruned", "stage_name": "eval", "reason": "branch b"});
+        assert!(
+            status_summary("j1", &pruned, &shared, DataClass::Internal).ends_with("— branch b")
+        );
+        let end = serde_json::json!({"kind": "stage_end", "stage_name": "eval"});
+        assert_eq!(
+            status_summary("j1", &end, &shared, DataClass::Internal),
+            "status event for job j1: stage_end in stage 'eval'"
+        );
+        // The error is bounded.
+        let long = serde_json::json!({"kind": "stage_failed", "error": "x".repeat(5000)});
+        let summary = status_summary("j1", &long, &shared, DataClass::Internal);
+        let error = summary.split(" — ").nth(1).unwrap();
+        assert_eq!(error.chars().count(), SUMMARY_ERROR_MAX_CHARS);
+        assert!(error.ends_with('…'));
     }
 
     #[test]

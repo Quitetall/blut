@@ -119,6 +119,18 @@ depend on this crate.
 - **Breaking:** `HfCheckpoint::final_loss` is `Option<f32>` and the artifact's
   `SCHEMA` is 2. A trainer that reported no loss used to be recorded as `0.0`,
   which reads as a perfect run.
+- `blut cloud smoke` without `--store` uses a fresh private temporary
+  directory (`blut-cloud-smoke-*`, mode 0700), names it, and removes it when
+  the smoke ends. The default was the fixed shared path `/tmp/blut-cloud-smoke`,
+  left behind after every run. An explicit `--store` is unchanged.
+- `blut-notify` status summaries name the event kind, the stage and the
+  event's error (or a pruned stage's reason), cut to 200 characters with
+  control characters replaced: `status event for job J: stage_failed in stage
+  'train' — CUDA out of memory`. They said only "status event for job J". The
+  error is free-form, so it is included only when custody would let the event
+  leave the box; for a restricted tenant or a `restricted` line it is withheld
+  on every sink (`(error withheld: restricted data)`). Before, no summary
+  carried error text for any tenant.
 - `blut jobs`' `output` column is now `recipe`: the recipe, deploy pointer or
   plan name the job ran (from its resume marker or `plan.json`), else a legacy
   single-trainer job's output name. The output name is set only by that legacy
@@ -147,6 +159,14 @@ depend on this crate.
   last two targets. The trail records each move's kind, shown by `plan
   history`; registries created earlier gain the column on open, and their old
   moves count as promotions.
+- `model rollback` walks an alias's promotion history the same way (owner
+  decision): promote A, B, C and two rollbacks land on A, a promotion after a
+  rollback continues from there, re-promoting the current target is not a new
+  step, and a rollback at the first promotion is refused ("nothing earlier to
+  roll back to"). It used to toggle between the last two targets. The model
+  trail records each move's kind, which `model history` prints after the hash
+  (`promote` or `rollback`); a registry created earlier gains the column on
+  open, and its old moves count as promotions.
 - SLA `max_runtime_secs` judges the newest matching run per tenant (on its
   runtime so far if still running), like `freshness_secs`, so an old breach
   stops failing `sla check` once a newer run meets the rule. It was judged per
@@ -192,7 +212,11 @@ depend on this crate.
   the `blut::paths` docs. **Migration:** an install that already set
   `$LAMU_TRAIN_DATA_DIR` (it used to hold only materialized training data)
   now sees an empty jobs list and registries; set the per-store variables to
-  the old locations to keep them. The scheduler lock stays machine-wide.
+  the old locations to keep them. `blut` warns once per invocation when that
+  has happened: each store whose own variable is unset, that is empty under
+  the root, and whose old default location holds data is named with the
+  variable that points back at it (`paths::stranded_stores`,
+  `paths::warn_stranded_stores`). The scheduler lock stays machine-wide.
   `blut-web` and `blut-notify` follow the same rule.
 - HPO trials are isolated: a trial whose stage fails (after its retries,
   including an exhausted divergence) is recorded as `failed` with its error
@@ -228,6 +252,57 @@ depend on this crate.
   (was 0051).
 
 ### Fixed
+- Test helpers no longer leave temporary directories behind on every run
+  (`TempDir::keep` / `mem::forget` in the lineage, stage-context, run-ledger,
+  executor-partition and p2p CLI test helpers and one bench): each now holds
+  its guard, so a run with a fresh `TMPDIR` leaves nothing from them.
+- A stage placed in a cgroup-v2 leaf (the `cgroup2` backend: a delegated
+  subtree, no systemd user bus) was not recorded with its job, so a SIGKILLed
+  driver left its trainer running where `blut cancel` and `plan resume` could
+  not see it. Inside a job the backend now records the leaf (path and inode,
+  `<job dir>/cgroup_leaves`) before the process starts. `blut cancel` stops a
+  populated recorded leaf (SIGTERM, 10 s, then `cgroup.kill`), removes it and
+  prints it, also for a finished job or a dead driver; `plan resume` refuses
+  while one is populated and names it. A leaf recreated under the same name
+  (another inode) is not the job's. New: `jobs::{record_cgroup_leaf,
+  cgroup_leaf_paths, live_cgroup_leaves, cgroup_resume_blocker,
+  cancel_cgroup_leaves}`.
+- `blut-dsl` turned a Starlark script whose `build(args)` never calls `add()`
+  into an empty PlanSpec and exited 0; the engine refused it only at compile
+  time. It is now an evaluation error naming the script ("build(args) added
+  no stages; a plan needs at least one add() call").
+- `examples/first_cookbook.rs`, the README and API.md said a stage that
+  declares an envelope is calibrated by the measured-peak store run over run.
+  The engine reads that store at admission but never writes it; a cookbook
+  runner that measures its child's peak does (`FootprintStore::record`), and
+  without one the declared estimate is billed. The text now says so.
+- `recipe run --dry-run` reported "≈ 2.0G" for a stage declaring a 256 MiB
+  envelope: it printed the legacy whole-GiB estimate with the 2 GiB floor
+  applied to every plan, while a launch bills the largest declared envelope
+  byte for byte and the floor only when no stage declares one. The dry run now
+  computes the launch's footprint (before auto-tune) and says its basis:
+  "≈ 256.00 MiB (the largest declared envelope, stage 'x'; …)" or "≈ 2.00 GiB
+  (the compatibility floor: no stage declares an envelope; …)".
+- `blut log` printed the `saved` and `done` paths a trainer reported, which
+  name the stage's attempt directory (`stages/.tmp-<idx>-<stage>-<key>`); the
+  directory is renamed to `stages/<idx>-<stage>` when the stage commits, so the
+  paths pointed nowhere. A committed attempt's paths are now shown under the
+  committed directory (also with `--json`); a path still in an attempt
+  directory (the stage is running, or the attempt did not commit) is kept and
+  marked "attempt directory; it becomes stages/<idx>-<stage> when the stage
+  commits".
+- `blut-notify`'s default jobs directory was `$HOME/.local/share/lamu/train-jobs`
+  even when `$XDG_DATA_HOME` moved the engine's elsewhere, so the daemon tailed
+  an empty directory. It now follows `blut::paths::jobs_dir`
+  (`$LAMU_TRAIN_JOBS_DIR`, `$LAMU_TRAIN_DATA_DIR/train-jobs`, then the platform
+  data directory), and its default SLA log honours `$BLUT_SLA_PATH` like the
+  engine's.
+- TPE and multivariate TPE could suggest a value equal to the exclusive upper
+  bound of a `uniform` or `log_uniform` dim (`wd = 1.0` for `uniform(0, 1)`):
+  a candidate jittered past the support was clamped to `high` inclusive. A
+  suggestion is now kept inside `[low, high)` (the largest value below `high`
+  at most). `int_uniform` stays inclusive, `quniform` rounds as the random
+  sampler does, and the grid sampler still evaluates both endpoints by design.
 - A scheduled unit ran a different launch from the interactive one: it carried
   no tenant, no cache flags, no working directory and none of the installer's
   environment, so a timer ran under `default`, with a private cache, from the

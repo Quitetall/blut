@@ -120,7 +120,12 @@ resolved in a follow-up pass, except 6 (owner decision, open):
   not exercisable through the engine alone: a test stage declares an envelope
   cheaply, but the engine only reads the measured-peak store; entries are
   written by a cookbook runner that measures its child's peak, so `footprint
-  list` stays empty.
+  list` stays empty. `examples/first_cookbook.rs`, the README and API.md
+  claimed otherwise; they now say this (`234d3d4`, on `agent/fu-smalls`).
+  The same branch made `model rollback` walk the promotion history as `plan
+  rollback` does (`9f57d1e`), and recorded cgroup-v2 leaves so `blut cancel`
+  and `plan resume` see a stage left running by a killed driver under the
+  `cgroup2` backend, as they see systemd units (`7f7f6c5`).
 - **10** (`c24b889`, `1abc203`, `e54a91f`): `ledger show` renders text;
   `plan promote` takes an unambiguous fingerprint prefix and refuses an
   ambiguous one; the plan registry verbs validate `--tenant`; a declared

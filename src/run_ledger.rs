@@ -596,14 +596,26 @@ fn lock_exclusive(file: std::fs::File) -> Result<Box<std::fs::File>> {
 mod tests {
     use super::*;
 
-    fn tmp_ledger(name: &str) -> RunLedger {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "blut-run-ledger-test-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&p);
-        RunLedger::at(p)
+    /// A ledger in its own temporary directory, removed (with any lock file
+    /// beside the ledger) when the test drops it. It used to write
+    /// `blut-run-ledger-test-<name>-<pid>` straight into the temp directory
+    /// and leave it there.
+    struct TmpLedger {
+        ledger: RunLedger,
+        _dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TmpLedger {
+        type Target = RunLedger;
+        fn deref(&self) -> &RunLedger {
+            &self.ledger
+        }
+    }
+
+    fn tmp_ledger(name: &str) -> TmpLedger {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = RunLedger::at(dir.path().join(format!("run-ledger-{name}.jsonl")));
+        TmpLedger { ledger, _dir: dir }
     }
 
     fn started(uid: &str) -> Record {

@@ -317,7 +317,10 @@ fractions, mixed modes, and unknown launch tenants.
 
 `broker::{decide, Footprint, FootprintStore}` size a per-stage RAM footprint,
 gate admission against the box-fit budget (`MemTotal − floor`), and calibrate
-the estimate from measured peaks (with an OOM-aware self-heal). This is the
+the estimate from measured peaks (with an OOM-aware self-heal). The engine
+reads the measured-peak store at admission; a cookbook runner that measures
+its child's peak writes it (`FootprintStore::record`), so an engine-only
+cookbook is billed its declared estimate. This is the
 engine behind the containment guarantee: a job that wouldn't fit is refused,
 not admitted-then-killed. The declarative surface is
 `Stage::resource_envelope` → `blut_types::envelope::ResourceEnvelope`
@@ -411,7 +414,11 @@ footprints, partitions, tenant and recipe config, and the `~/.blut` files)
 lives under that one directory, so two values are two independent installs.
 A store's own variable (`LAMU_TRAIN_JOBS_DIR`, `BLUT_REGISTRY_DB`, …) takes
 precedence; unset, every path is the historical default. `blut::paths` lists
-each store, its variable and its location.
+each store, its variable and its location. When the variable is set, a store
+whose own variable is unset, that is empty under the root, and whose old
+default location holds data is stranded: `blut` warns once per invocation and
+names the variable to set (`BLUT_REGISTRY_DB=~/.blut/registry.db`, …);
+`paths::stranded_stores` returns the same list to a cookbook.
 
 `blut hpo run` and `blut study run` isolate trial failures: a failed trial is
 recorded with its error and the search continues; the job fails only when no

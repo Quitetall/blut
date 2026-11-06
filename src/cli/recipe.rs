@@ -471,21 +471,7 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
                         anyhow!("recipe '{name}' not in catalog (see `blut recipe list`)")
                     })?;
                     let plan = (def.compile_fn)(raw.clone()).map_err(|e| anyhow!("{e}"))?;
-                    let fp = plan.declared_footprint();
-                    if !plan.has_resource_declarations() {
-                        eprintln!(
-                            "warning: no stage in this plan declares a resource \
-                             envelope — billing the 2G compatibility floor. \
-                             Implement Stage::resource_envelope (ADR 0133) for \
-                             real admission."
-                        );
-                    }
-                    let gib = fp.ram_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                    println!(
-                        "[dry-run] recipe={name} resolved RAM footprint ≈ {gib:.1}G \
-                         (admission would gate this against free RAM + the 6G floor). \
-                         No ingredients executed; no GPU/cgroup acquired."
-                    );
+                    println!("{}", dry_run_footprint(&name, &plan)?.1);
                     return Ok(());
                 }
                 run_one_recipe(
@@ -506,6 +492,41 @@ pub(super) async fn run_recipe(reg: &crate::framework::Registry, cmd: RecipeComm
         }
     }
     Ok(())
+}
+
+/// The RAM footprint `recipe run --dry-run` reports, and its report line. It is
+/// the footprint launch admission bills before auto-tuning
+/// ([`prepare_compiled_plan_launch`]): the plan's largest declared envelope at
+/// byte granularity (resolved against the measured-peak store when it declares
+/// calibration dimensions), or the 2 GiB compatibility floor when no stage
+/// declares one ([`footprint_or_floor`] warns, and refuses under
+/// `BLUT_STRICT_DECLARATIONS=1`, as a launch does). The line says which.
+///
+/// It used to report `CompiledPlan::declared_footprint`, whole GiB of the
+/// legacy `memory_gib_for` with the 2 GiB floor applied to every plan, so a
+/// stage declaring 256 MiB read "≈ 2.0G" while the launch billed 256 MiB.
+fn dry_run_footprint(
+    name: &str,
+    plan: &crate::framework::plan::CompiledPlan,
+) -> Result<(crate::broker::Footprint, String)> {
+    let declared = plan.max_declared_envelope();
+    let warm = warm_context(plan.exec_view().recipe_args);
+    let footprint = footprint_or_floor(
+        plan_footprint_declared(declared.as_ref(), name, None, warm),
+        name,
+    )?;
+    let basis = match &declared {
+        Some((stage, _)) => format!("the largest declared envelope, stage '{stage}'"),
+        None => "the compatibility floor: no stage declares an envelope".to_string(),
+    };
+    let line = format!(
+        "[dry-run] recipe={name} resolved RAM footprint ≈ {} ({basis}; before \
+         auto-tune). Admission would gate it against free RAM + the {}G floor. \
+         No ingredients executed; no GPU/cgroup acquired.",
+        human_bytes(footprint.ram_bytes),
+        crate::broker::admission::DEFAULT_FLOOR_GIB
+    );
+    Ok((footprint, line))
 }
 
 /// Run ONE recipe invocation end-to-end: compile → job dir → admission gate →
@@ -2393,6 +2414,72 @@ mod declare_dispatch_tests {
         assert!(
             msg.contains("blut-dsl") && msg.contains(".json"),
             "actionable evaluator-missing error: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dry_run_footprint_tests {
+    use crate::framework::plan::CompiledPlan;
+    use crate::framework::{Resource, Stage, StageContext, StageDyn, StageError};
+    use std::sync::Arc;
+
+    const MIB: u64 = 1024 * 1024;
+
+    struct Declares256Mib;
+
+    #[async_trait::async_trait]
+    impl Stage for Declares256Mib {
+        const NAME: &'static str = "declares_256_mib";
+        const SCHEMA: u32 = 1;
+        const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+        type Input = ();
+        type Output = ();
+        type Args = serde_json::Value;
+
+        fn resource_envelope(
+            &self,
+            _args: &serde_json::Value,
+        ) -> blut_types::envelope::ResourceEnvelope {
+            blut_types::envelope::ResourceEnvelope {
+                ram_bytes: 256 * MIB,
+                ..Default::default()
+            }
+        }
+
+        async fn run(
+            &self,
+            _ctx: &StageContext,
+            _input: (),
+            _args: &serde_json::Value,
+        ) -> Result<(), StageError> {
+            Ok(())
+        }
+    }
+
+    /// E2E follow-up: the dry run showed "≈ 2.0G" for a stage declaring a
+    /// 256 MiB envelope; the launch bills 256 MiB.
+    #[test]
+    fn a_dry_run_reports_the_declared_envelope_not_the_floor() {
+        let stage: Arc<dyn StageDyn> = Arc::new(Declares256Mib);
+        let plan = CompiledPlan::from_erased_chain(
+            "small",
+            serde_json::json!({}),
+            vec![(stage, serde_json::json!({}))],
+        )
+        .unwrap();
+        let (footprint, line) = super::dry_run_footprint("small", &plan).unwrap();
+        assert_eq!(footprint.ram_bytes, 256 * MIB);
+        assert!(line.contains("≈ 256.00 MiB"), "{line}");
+        assert!(line.contains("stage 'declares_256_mib'"), "{line}");
+
+        // An undeclared plan is billed the floor, and the line says so.
+        let empty = CompiledPlan::from_components("empty".into(), serde_json::json!({}), vec![]).0;
+        let (footprint, line) = super::dry_run_footprint("empty", &empty).unwrap();
+        assert_eq!(footprint.ram_bytes, 2 * 1024 * MIB);
+        assert!(
+            line.contains("≈ 2.00 GiB (the compatibility floor"),
+            "{line}"
         );
     }
 }

@@ -726,10 +726,11 @@ pub async fn cancel_job(job_id: &str, grace: std::time::Duration) -> Result<()> 
         state,
         Some(JobState::Done | JobState::Failed | JobState::Cancelled)
     ) {
-        // Nothing local is left, but a Slurm job or a systemd unit its stage
-        // started can be.
+        // Nothing local is left, but a Slurm job, a systemd unit or a cgroup
+        // leaf its stage started can be.
         stop_slurm_jobs(job_id);
         stop_systemd_units(job_id);
+        stop_cgroup_leaves(job_id);
         return Ok(());
     }
     let pid = read_pid(job_id)?;
@@ -738,6 +739,7 @@ pub async fn cancel_job(job_id: &str, grace: std::time::Duration) -> Result<()> 
     }
     stop_slurm_jobs(job_id);
     stop_systemd_units(job_id);
+    stop_cgroup_leaves(job_id);
     // A job submitted with `--launcher k8s` runs in a cluster. Its follower
     // (stopped above) deletes the BlutPlan on SIGTERM; deleting it here too
     // covers a follower that is already gone. Deletion is idempotent.
@@ -1117,12 +1119,271 @@ fn stop_systemd_units(job_id: &str) {
     }
 }
 
+/// File listing the cgroup-v2 leaves a job's stages were placed in
+/// ([`record_cgroup_leaf`]), one `<inode> <path>` per line.
+const CGROUP_LEAVES_FILE: &str = "cgroup_leaves";
+
+/// How long [`cancel_cgroup_leaves`] waits after SIGTERM before it kills the
+/// leaf (`cgroup.kill`): the grace a systemd unit gets (`TimeoutStopSec=10s`).
+const CGROUP_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long it then waits for the killed leaf to empty.
+const CGROUP_KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Record a cgroup-v2 `leaf` a stage of the job in `job_dir` is placed in,
+/// before the stage's process starts, once. Under the `cgroup2` backend (no
+/// systemd user bus) a stage's process runs in its own session inside the
+/// leaf, so it keeps running when the BLUT process that started it is
+/// SIGKILLed; the record is how `blut cancel` and `plan resume` find it.
+///
+/// The leaf's inode is recorded with it: a cgroup's inode is its cgroup id,
+/// never reused while the system runs, so a later leaf of the same name (unit
+/// names are `<unit>-<pid>-<seq>`, and pids are reused) is never taken for
+/// this job's.
+pub fn record_cgroup_leaf(job_dir: &Path, leaf: &Path) -> Result<()> {
+    let leaf_str = leaf.to_str().filter(|s| !s.contains('\n'));
+    let (Some(leaf_str), true) = (leaf_str, valid_leaf_path(leaf)) else {
+        return Err(TrainError::other(format!(
+            "not a cgroup leaf BLUT gives a stage: {}",
+            leaf.display()
+        )));
+    };
+    let inode = leaf_inode(leaf).ok_or_else(|| {
+        TrainError::other(format!("stat cgroup leaf {}: not found", leaf.display()))
+    })?;
+    let line = format!("{inode} {leaf_str}");
+    let path = job_dir.join(CGROUP_LEAVES_FILE);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|l| l == line) {
+        return Ok(());
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|source| TrainError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    use std::io::Write;
+    writeln!(f, "{line}").map_err(|source| TrainError::Io { path, source })
+}
+
+/// A leaf path as the `cgroup2` backend makes them: absolute, no `..`, and
+/// named like a unit (`[A-Za-z0-9_-]`). Anything else in the record is
+/// skipped, never written to or signalled.
+fn valid_leaf_path(leaf: &Path) -> bool {
+    leaf.is_absolute()
+        && !leaf
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        && leaf
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(valid_unit_name)
+}
+
+#[cfg(unix)]
+fn leaf_inode(leaf: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(leaf)
+        .ok()
+        .filter(|m| m.is_dir())
+        .map(|m| m.ino())
+}
+
+#[cfg(not(unix))]
+fn leaf_inode(_leaf: &Path) -> Option<u64> {
+    None
+}
+
+/// The cgroup leaves recorded in `job_dir` with their inodes.
+fn recorded_cgroup_leaves(job_dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    let path = job_dir.join(CGROUP_LEAVES_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(body) => Ok(body
+            .lines()
+            .filter_map(|l| {
+                let (inode, leaf) = l.split_once(' ')?;
+                let leaf = PathBuf::from(leaf);
+                Some((inode.parse().ok()?, leaf)).filter(|(_, leaf)| valid_leaf_path(leaf))
+            })
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(source) => Err(TrainError::Io { path, source }),
+    }
+}
+
+/// The cgroup leaves recorded for `job_id` ([`record_cgroup_leaf`]).
+pub fn cgroup_leaf_paths(job_id: &str) -> Result<Vec<PathBuf>> {
+    Ok(recorded_cgroup_leaves(&paths::jobs_dir()?.join(job_id))?
+        .into_iter()
+        .map(|(_, leaf)| leaf)
+        .collect())
+}
+
+/// The live processes of a leaf: the pids in its `cgroup.procs` that still
+/// exist. A cgroup lists only its members, so this is its whole list there.
+fn leaf_pids(leaf: &Path) -> Vec<u32> {
+    let procs = std::fs::read_to_string(leaf.join("cgroup.procs")).unwrap_or_default();
+    procs
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .filter(|&pid| pid_exists(pid))
+        .collect()
+}
+
+#[cfg(unix)]
+fn pid_exists(pid: u32) -> bool {
+    !matches!(
+        crate::python_kill::pid_alive(pid),
+        crate::python_kill::PidStatus::Gone
+    )
+}
+
+#[cfg(not(unix))]
+fn pid_exists(_pid: u32) -> bool {
+    false
+}
+
+/// The leaves recorded in `job_dir` that still hold processes and are the
+/// ones recorded (same inode). A leaf that is gone, empty, or was recreated
+/// under the same name does not count, so an old record never blocks.
+pub(crate) fn live_cgroup_leaves_at(job_dir: &Path) -> Result<Vec<PathBuf>> {
+    Ok(recorded_cgroup_leaves(job_dir)?
+        .into_iter()
+        .filter(|(inode, leaf)| leaf_inode(leaf) == Some(*inode) && !leaf_pids(leaf).is_empty())
+        .map(|(_, leaf)| leaf)
+        .collect())
+}
+
+/// The cgroup leaves recorded for `job_id` that still hold processes.
+pub fn live_cgroup_leaves(job_id: &str) -> Result<Vec<PathBuf>> {
+    live_cgroup_leaves_at(&paths::jobs_dir()?.join(job_id))
+}
+
+/// Why `plan resume` must not start yet: a cgroup leaf a stage of `job_id`
+/// was placed in still holds processes. `None` when there is none.
+pub fn cgroup_resume_blocker(job_id: &str) -> Result<Option<String>> {
+    cgroup_resume_blocker_at(job_id, &paths::jobs_dir()?.join(job_id))
+}
+
+pub(crate) fn cgroup_resume_blocker_at(job_id: &str, job_dir: &Path) -> Result<Option<String>> {
+    let live = live_cgroup_leaves_at(job_dir)?;
+    if live.is_empty() {
+        return Ok(None);
+    }
+    let names: Vec<String> = live.iter().map(|l| l.display().to_string()).collect();
+    Ok(Some(format!(
+        "job {job_id} still has processes running in cgroup leaf(s) its stages were placed \
+         in: {}. Stop them with `blut cancel {job_id}`, or wait for them to finish, then resume",
+        names.join(", ")
+    )))
+}
+
+/// Stop every process in the leaves recorded for `job_id` that still hold
+/// any: SIGTERM to each, then, after a 10 s grace, `cgroup.kill` (SIGKILL to
+/// the whole leaf at once; each pid when the kernel predates it),
+/// as `systemctl stop` does for a unit. Emptied leaves are removed. Returns
+/// the leaves stopped; errors naming any still populated.
+pub fn cancel_cgroup_leaves(job_id: &str) -> Result<Vec<PathBuf>> {
+    cancel_cgroup_leaves_at(&paths::jobs_dir()?.join(job_id), CGROUP_STOP_GRACE)
+}
+
+pub(crate) fn cancel_cgroup_leaves_at(
+    job_dir: &Path,
+    grace: std::time::Duration,
+) -> Result<Vec<PathBuf>> {
+    let live = live_cgroup_leaves_at(job_dir)?;
+    if live.is_empty() {
+        return Ok(live);
+    }
+    let all_empty = |deadline: std::time::Instant| {
+        wait_until(deadline, || live.iter().all(|l| leaf_pids(l).is_empty()))
+    };
+    for leaf in &live {
+        signal_pids(&leaf_pids(leaf), false);
+    }
+    if !all_empty(std::time::Instant::now() + grace) {
+        for leaf in &live {
+            if std::fs::write(leaf.join("cgroup.kill"), b"1").is_err() {
+                signal_pids(&leaf_pids(leaf), true);
+            }
+        }
+        all_empty(std::time::Instant::now() + CGROUP_KILL_WAIT);
+    }
+    let still: Vec<String> = live
+        .iter()
+        .filter(|l| !leaf_pids(l).is_empty())
+        .map(|l| l.display().to_string())
+        .collect();
+    for leaf in &live {
+        // rmdir succeeds only on an empty cgroup; a leftover is harmless.
+        let _ = std::fs::remove_dir(leaf);
+    }
+    if !still.is_empty() {
+        return Err(TrainError::other(format!(
+            "cgroup leaf(s) {} still hold processes after SIGTERM and cgroup.kill",
+            still.join(", ")
+        )));
+    }
+    Ok(live)
+}
+
+fn wait_until(deadline: std::time::Instant, mut done: impl FnMut() -> bool) -> bool {
+    loop {
+        if done() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+fn signal_pids(pids: &[u32], kill: bool) {
+    use nix::sys::signal::{Signal, kill as send};
+    use nix::unistd::Pid;
+    let signal = if kill {
+        Signal::SIGKILL
+    } else {
+        Signal::SIGTERM
+    };
+    for &pid in pids {
+        let _ = send(Pid::from_raw(pid as i32), signal);
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_pids(_pids: &[u32], _kill: bool) {}
+
+/// Stop the processes left in the job's recorded cgroup leaves and say what
+/// happened. A stage placed in a leaf by the `cgroup2` backend keeps running
+/// when the BLUT process that started it is killed.
+fn stop_cgroup_leaves(job_id: &str) {
+    if cgroup_leaf_paths(job_id)
+        .map(|n| n.is_empty())
+        .unwrap_or(true)
+    {
+        return;
+    }
+    match cancel_cgroup_leaves(job_id) {
+        Ok(leaves) if leaves.is_empty() => {}
+        Ok(leaves) => {
+            let names: Vec<String> = leaves.iter().map(|l| l.display().to_string()).collect();
+            eprintln!("stopped cgroup leaf(s) {} of {job_id}", names.join(", "));
+        }
+        Err(e) => eprintln!("warning: could not stop the cgroup leaves of {job_id}: {e}"),
+    }
+}
+
 /// Why `plan resume` must not start `job_id` yet, or `None`: its BLUT process
-/// is still running, or a Slurm job ([`slurm_resume_blocker`]) or systemd
-/// unit ([`systemd_resume_blocker`]) one of its stages started still runs.
-/// Resuming next to any of them would put two trainers on one job's work. A
-/// check that cannot be made (no `squeue`, no systemd user bus) does not
-/// block.
+/// is still running, or a Slurm job ([`slurm_resume_blocker`]), systemd unit
+/// ([`systemd_resume_blocker`]) or cgroup-v2 leaf ([`cgroup_resume_blocker`])
+/// one of its stages started still runs. Resuming next to any of them would
+/// put two trainers on one job's work. A check that cannot be made (no
+/// `squeue`, no systemd user bus) does not block.
 pub fn resume_blocker(job_id: &str) -> Option<String> {
     if let Some(pid) = live_driver(job_id) {
         return Some(format!(
@@ -1134,6 +1395,9 @@ pub fn resume_blocker(job_id: &str) -> Option<String> {
         return Some(why);
     }
     if let Ok(Some(why)) = systemd_resume_blocker(job_id) {
+        return Some(why);
+    }
+    if let Ok(Some(why)) = cgroup_resume_blocker(job_id) {
         return Some(why);
     }
     None
@@ -2041,7 +2305,110 @@ mod tests {
         });
     }
 
-    /// The job directory reaches code running on the task `in_job` scopes,
+    // ── cgroup-v2 leaves a job's stages were placed in ─────────────
+
+    /// A process standing in for a stage left running in a leaf: reaped by a
+    /// thread as soon as it exits, so its pid stops existing then.
+    #[cfg(unix)]
+    fn orphan_in_fake_leaf(leaf: &Path) -> (u32, std::thread::JoinHandle<Option<i32>>) {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        std::fs::create_dir_all(leaf).unwrap();
+        std::fs::write(leaf.join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        let reaper = std::thread::spawn(move || {
+            use std::os::unix::process::ExitStatusExt as _;
+            child.wait().ok().and_then(|s| s.signal())
+        });
+        (pid, reaper)
+    }
+
+    /// E2E follow-up: a stage contained in a cgroup-v2 leaf (no systemd user
+    /// bus) was not recorded, so a SIGKILLed driver left its trainer running
+    /// where `blut cancel` and `plan resume` could not see it. A plain
+    /// directory stands in for the leaf (`cgroup.procs` lists the process);
+    /// the live test in `containment::cgroup2` uses a real leaf.
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_cgroup_leaf_blocks_resume_until_cancel_stops_it() {
+        with_jobs_dir(|| {
+            let id = "20261030-000000-000000003";
+            let dir = paths::job_dir(id).unwrap();
+            write_state(id, JobState::Running).unwrap();
+            let cg = tempfile::tempdir().unwrap();
+            let leaf = cg.path().join("blut-train-77-1");
+            let (pid, reaper) = orphan_in_fake_leaf(&leaf);
+            record_cgroup_leaf(&dir, &leaf).unwrap();
+            record_cgroup_leaf(&dir, &leaf).unwrap();
+            assert_eq!(
+                cgroup_leaf_paths(id).unwrap(),
+                vec![leaf.clone()],
+                "recorded once"
+            );
+            assert_eq!(live_cgroup_leaves(id).unwrap(), vec![leaf.clone()]);
+
+            let why = resume_blocker(id).expect("a populated leaf blocks the resume");
+            assert!(why.contains(&leaf.display().to_string()), "{why}");
+            assert!(why.contains(&format!("blut cancel {id}")), "{why}");
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(cancel_job(id, std::time::Duration::from_secs(1)))
+                .unwrap();
+            assert_eq!(
+                reaper.join().unwrap(),
+                Some(nix::sys::signal::Signal::SIGTERM as i32),
+                "the orphan was stopped with SIGTERM (pid {pid})"
+            );
+            assert!(live_cgroup_leaves(id).unwrap().is_empty());
+            assert_eq!(resume_blocker(id), None);
+            assert_eq!(read_state(id).unwrap(), JobState::Cancelled);
+        });
+    }
+
+    /// Only the leaf recorded counts: a record that is not a leaf path BLUT
+    /// makes is refused or skipped, and a leaf recreated under the same name
+    /// (another inode) is not the job's.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_recorded_cgroup_leaf_counts() {
+        let job = tempfile::tempdir().unwrap();
+        let cg = tempfile::tempdir().unwrap();
+        assert!(record_cgroup_leaf(job.path(), Path::new("relative/blut-x-1-1")).is_err());
+        assert!(record_cgroup_leaf(job.path(), &cg.path().join("bad name")).is_err());
+        assert!(
+            record_cgroup_leaf(job.path(), &cg.path().join("missing-1-1")).is_err(),
+            "a leaf that does not exist has no inode to record"
+        );
+        let leaf = cg.path().join("blut-eval-9-2");
+        let (pid, reaper) = orphan_in_fake_leaf(&leaf);
+        let wrong_inode = leaf_inode(&leaf).unwrap() + 1;
+        std::fs::write(
+            job.path().join(CGROUP_LEAVES_FILE),
+            format!(
+                "{wrong_inode} {}\nnot-a-number {}\n7 ../escape/blut-x-1-1\n",
+                leaf.display(),
+                leaf.display()
+            ),
+        )
+        .unwrap();
+        assert!(live_cgroup_leaves_at(job.path()).unwrap().is_empty());
+        assert_eq!(cgroup_resume_blocker_at("j", job.path()).unwrap(), None);
+        assert!(
+            cancel_cgroup_leaves_at(job.path(), std::time::Duration::from_secs(1))
+                .unwrap()
+                .is_empty(),
+            "nothing recorded as this job's is signalled"
+        );
+        signal_pids(&[pid], true);
+        assert!(reaper.join().unwrap().is_some());
+    }
+
+    /// The job directory reaches code running on the task `in_job` scopes,    /// The job directory reaches code running on the task `in_job` scopes,
     /// and only there: not outside it, not on a task spawned from it.
     #[cfg(target_os = "linux")]
     #[test]
