@@ -207,10 +207,41 @@ line whenever its view changes.
 `p2p-echo` stage (UTF-8 text in, uppercase out) accepts. Library callers
 dispatch any stage with `blut::p2p::dispatch_stage`.
 
-The mesh is reached only through `blut p2p` and the library. `recipe run`
-and the other run commands refuse `--launcher p2p` (and `--launcher cloud`):
-nothing hands a run's stages to peers, and those commands used to run them
-all on the submitting machine instead.
+**Running a recipe on the mesh.** `recipe run <name> --launcher p2p` and
+`recipe declare <file> --run --launcher p2p` hand a run's stages to peers:
+
+```
+# each worker
+blut p2p keys generate
+blut p2p node --coordinator-pubkey <submitter pubkey> --seed <one peer>
+
+# the submitting machine (its own identity)
+blut p2p keys generate
+blut p2p peers trust <worker pubkey> registered   # only for `internal` stages
+blut recipe run <name> --args '...' --launcher p2p --p2p-seed <one peer>
+```
+
+- **What leaves:** a stage leaves only if it declares so, with
+  `Stage::placement` and the class of its data. The other stages run on the
+  submitting machine in the same plan, and the log says so per stage. A
+  cookbook's stages stay home until its author opts them in.
+- **Where it goes:** to a connected peer that runs the same code identity
+  (the same engine build and the same cookbook builds), accepts this
+  submitter, holds the trust the data class needs (`public` any peer,
+  `internal` registered or trusted, `restricted` none), and has the declared
+  cores and memory. Stages spread: fewest in flight, then least used.
+- **No peer:** if no peer can take an eligible stage within `--p2p-peer-wait`
+  seconds (default 60), the run fails and names each peer it saw and why it was
+  passed over. It never runs the stage on the submitting machine instead. A
+  peer that is only busy is waited for, up to the stage's deadline.
+- **Stopping it:** `blut cancel <job>` and Ctrl-C stop the stages running on
+  peers. A worker whose submitter closes its connection, or goes silent for
+  the QUIC idle timeout (30 s), stops the stage itself.
+- **Trust from the command line:** `blut p2p peers trust` takes a whole
+  `pubkey` line, which also adds a peer this machine has only dialed or
+  learned by gossip.
+- **Other run commands:** `hpo`, `study`, `partition` and `plan resume` still
+  refuse `--launcher p2p`, and every run command refuses `--launcher cloud`.
 
 ## Recorded run: a four-continent P2P mesh (2026-10-20)
 

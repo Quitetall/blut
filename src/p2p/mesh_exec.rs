@@ -203,7 +203,11 @@ enum RefusalCode {
     UnknownStage,
     StaysLocal,
     NotAccepted,
+    /// All slots in use: the stage waits for the worker.
     Busy,
+    /// Memory admission refused it: not waited for past the peer wait, since
+    /// a worker too small for the stage would otherwise hold it forever.
+    NoMemory,
     BadRequest,
 }
 
@@ -297,6 +301,7 @@ pub struct MeshStageWorker {
     slots: Arc<Semaphore>,
     max_tasks: u32,
     running: AtomicU32,
+    memory_gib: u32,
 }
 
 impl MeshStageWorker {
@@ -327,6 +332,11 @@ impl MeshStageWorker {
             slots: Arc::new(Semaphore::new(max_tasks)),
             max_tasks: max_tasks as u32,
             running: AtomicU32::new(0),
+            memory_gib: crate::broker::tenant_quota::TenantAdmission::prepare(
+                crate::tenant::Tenant::default(),
+            )
+            .map(|admission| admission.snapshot().mem_total_gb.max(0.0) as u32)
+            .unwrap_or(0),
         }
     }
 
@@ -360,10 +370,6 @@ impl MeshStageWorker {
     }
 
     fn hello(&self, submitter: Option<[u8; 32]>) -> WorkerHello {
-        let memory_gib =
-            crate::broker::tenant_quota::TenantAdmission::prepare(crate::tenant::Tenant::default())
-                .map(|admission| admission.snapshot().mem_total_gb.max(0.0) as u32)
-                .unwrap_or(0);
         WorkerHello {
             code_identity: self.identity.clone(),
             x25519_pub: self.keypair.x25519_public.to_bytes(),
@@ -371,7 +377,7 @@ impl MeshStageWorker {
             cpu_cores: std::thread::available_parallelism()
                 .map(|n| n.get() as u32)
                 .unwrap_or(1),
-            memory_gib,
+            memory_gib: self.memory_gib,
             max_tasks: self.max_tasks,
             running: self.running.load(Ordering::Relaxed),
         }
@@ -594,17 +600,24 @@ impl MeshStageWorker {
             ram_bytes: envelope.ram_bytes.max(crate::broker::GIB),
             vram_mib: 0,
         };
-        let reservation = match crate::broker::tenant_quota::TenantAdmission::prepare(
-            crate::tenant::Tenant::default(),
-        )
-        .and_then(|admission| {
-            admission.reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
-        }) {
+        // The resource probe reads the host and may start a GPU tool, so it
+        // stays off the task that serves this connection's other streams.
+        let admitted = tokio::task::spawn_blocking(move || {
+            crate::broker::tenant_quota::TenantAdmission::prepare(crate::tenant::Tenant::default())
+                .and_then(|admission| {
+                    admission.reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
+                })
+        })
+        .await;
+        let admitted = admitted
+            .map_err(|e| e.to_string())
+            .and_then(|reserved| reserved.map_err(|e| e.to_string()));
+        let reservation = match admitted {
             Ok(reservation) => reservation,
-            Err(e) => {
+            Err(why) => {
                 let refusal = refuse(StageRefusal::new(
-                    RefusalCode::Busy,
-                    format!("memory admission refused: {e}"),
+                    RefusalCode::NoMemory,
+                    format!("memory admission refused: {why}"),
                 ));
                 let _ = write_msg(&mut send, &StageReply::Refused(refusal)).await;
                 let _ = send.finish();
@@ -1171,7 +1184,9 @@ impl AdapterInner {
                 .select_peer(&request.stage_name, &resources, class, &[info])
                 .is_none()
             {
-                let why = if DispatchMatrix::default().can_dispatch(class, trust) {
+                let why = if resources.gpu {
+                    "the stage needs a GPU, and a mesh worker does not place GPU stages".to_string()
+                } else if DispatchMatrix::default().can_dispatch(class, trust) {
                     format!(
                         "has {} cores and {} GiB, the stage asks for {} and {}",
                         hello.cpu_cores,
@@ -1265,7 +1280,7 @@ async fn offer(
 
 async fn run_dispatch(
     inner: Arc<AdapterInner>,
-    request: ExecutionRequest,
+    mut request: ExecutionRequest,
     lifecycle: ExecutionLifecycle,
     cancel: CancellationToken,
 ) {
@@ -1273,7 +1288,7 @@ async fn run_dispatch(
         let _ = lifecycle.finish(None, ExecutionTerminal::Failed { failure });
     };
     let stage_name = request.stage_name.clone();
-    let input = request.input.clone().expect("checked in submit");
+    let input = request.input.take().expect("checked in submit");
     let input_id = input.manifest.content_id;
 
     // Publish the input where the chosen worker can pull it.
@@ -1742,7 +1757,7 @@ mod tests {
     }
 
     struct Worker {
-        _node: Arc<MeshNode>,
+        node: Arc<MeshNode>,
         key: Arc<KeyPair>,
         addr: SocketAddr,
         _dir: tempfile::TempDir,
@@ -1781,7 +1796,7 @@ mod tests {
         ));
         let addr = node.local_addr().unwrap();
         Worker {
-            _node: node,
+            node,
             key,
             addr,
             _dir: dir,
@@ -2249,6 +2264,33 @@ mod tests {
             wait_for(&markers.path().join("cancelled"), Duration::from_secs(10)).await,
             "the worker's stage saw the cancel"
         );
+    }
+
+    /// A worker lost mid-stage fails the stage as a lost peer, retryable by
+    /// the stage's own policy. Nothing falls back to this machine.
+    #[tokio::test]
+    async fn losing_the_worker_fails_the_stage() {
+        let code = identity("1");
+        let sub_key = Arc::new(KeyPair::generate());
+        let w = worker(&code, &sub_key).await;
+        let s = submitter(sub_key, &[&w]).await;
+        let markers = tempfile::tempdir().unwrap();
+        let run = start_hold(&s, &code, markers.path(), CancellationToken::new()).await;
+        assert!(wait_for(&markers.path().join("started"), Duration::from_secs(30)).await);
+        w.node.shutdown(Duration::from_secs(2)).await;
+        let result = tokio::time::timeout(crate::TEST_HANG_GUARD, run)
+            .await
+            .unwrap()
+            .unwrap();
+        let ExecutionResult::Failed(failure) = result else {
+            panic!("a lost worker must fail the stage");
+        };
+        assert_eq!(
+            failure.kind,
+            ExecutionFailureKind::Disconnected,
+            "{failure}"
+        );
+        assert!(failure.message.contains("lost peer"), "{failure}");
     }
 
     /// A worker whose submitter goes away stops the stage it was running.
