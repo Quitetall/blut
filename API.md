@@ -172,7 +172,8 @@ parses args → a backend-erased `CompiledPlan`.
 ## Built-in checks (`checks/`, ADR 0091)
 
 Every registry gets two passthrough guard stages: `check_jsonl` (row-count
-bounds) and `assert` (a literal scalar predicate). Both take and return
+bounds, and optionally a per-row schema and required fields) and `assert` (a
+literal scalar predicate). Both take and return
 `checks::JsonlArtifact`, kind `checks.jsonl`, and edges kind-check by exact
 kind, so a check cannot follow a stage that emits a cookbook's own JSONL kind
 (the standard cookbook's `dataset.jsonl`, for example). Emit `JsonlArtifact`
@@ -180,6 +181,31 @@ from the producing stage, or add an adapter stage whose `run` returns
 `JsonlArtifact::from_file(&input.path)`; the module docs carry a compiled
 example. `assert` compares the `actual` value in its args; the engine does not
 feed a stage's emitted metrics into it.
+
+`check_jsonl` args (`checks::CheckJsonlLinesArgs`, the args of the registered
+stage `checks::CheckJsonlLines`), all optional:
+
+| Arg | Meaning |
+|---|---|
+| `min_rows`, `max_rows` | inclusive bounds on the count of non-blank lines |
+| `schema` | field name → rule: a type name (`string`, `number`, `integer`, `boolean`, `object`, `array`, `null`) or `{"type", "nullable", "optional"}` (`checks::{FieldSpec, FieldType}`); set, even to `{}`, every row must be a JSON object |
+| `required_fields` | keys every row must carry, non-null unless `schema` allows null for that field |
+| `max_reported` | rows each breach code names in its message (default 10, at most 1000; every breaching row is counted) |
+| `on_breach` | `block` (default, fail-closed) or `warn` (record and pass through) |
+
+A breach names the 1-based physical line and the field, never row contents.
+Codes: `DATA_QUALITY_MIN_ROWS`, `DATA_QUALITY_MAX_ROWS`,
+`DATA_QUALITY_INVALID_JSON` (not JSON, or not UTF-8),
+`DATA_QUALITY_MISSING_FIELD` (absent, or null where null is not allowed),
+`DATA_QUALITY_SCHEMA` (not an object, or a wrong type); `blut errors list`
+shows them and `blut checks report <job>` lists each breach. Without
+`schema` and `required_fields` no line is parsed, so row-count-only args
+behave as they always have. Bad line-check args (an unknown type, an empty or
+repeated field name, an unknown rule key) are refused when the plan is built.
+The `checks` module docs give the full rules. `checks::CheckJsonl` and
+`checks::CheckJsonlArgs` remain as the published row-count form for Rust
+callers. ADR 0091's `check_tensor_stats` is not shipped: the engine has no
+tensor artifact type for it to check.
 
 ## Declared recipes: `.toml` / `.json` / `.star` (ADR 0078)
 

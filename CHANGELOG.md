@@ -26,6 +26,26 @@ depend on this crate.
   so a cookbook guards its own JSONL by emitting `JsonlArtifact` or through a
   one-line adapter stage (a compiled example is in the `checks` module docs).
   `assert` compares the literal `actual` it is given.
+- `check_jsonl` checks rows, not only their count: the `schema` and
+  `required_fields` arguments ADR 0091 decided. `schema` maps a top-level field
+  to a type (`string`, `number`, `integer`, `boolean`, `object`, `array`,
+  `null`) or to `{"type", "nullable", "optional"}`; `required_fields` lists keys
+  every row must carry, non-null unless the schema allows null. A row that is
+  not JSON is `DATA_QUALITY_INVALID_JSON`, an absent or null required field is
+  `DATA_QUALITY_MISSING_FIELD`, a non-object row or a wrong type is
+  `DATA_QUALITY_SCHEMA`; each breach names the line and field (never row
+  contents), `max_reported` (default 10) caps how many rows each code names,
+  and every breaching row is counted. The codes are in the `checks` domain
+  (`blut errors list`) and appear in `blut checks report`. The file is still
+  streamed in constant memory, a pass still returns the input byte-identical,
+  and `block`/`warn` work as for the row bounds. An unknown type, an empty or
+  repeated field name or an unknown rule key is refused when the plan is
+  built. Without the new arguments nothing changes: no line is parsed, and the
+  args serialize to the same three keys. Library: `check_jsonl` now resolves to
+  `checks::CheckJsonlLines` with `checks::{CheckJsonlLinesArgs, FieldSpec,
+  FieldType}`; `checks::{CheckJsonl, CheckJsonlArgs}` are unchanged and count
+  rows only. `check_tensor_stats`, the ADR's other stage, is still not shipped:
+  the engine has no tensor artifact type.
 - `--launcher k8s` submits to a cluster. `recipe run <name> --launcher k8s` and
   `recipe declare <file> --run --launcher k8s` check the recipe locally (a
   named recipe's args against its schema, a file by compiling it), create a

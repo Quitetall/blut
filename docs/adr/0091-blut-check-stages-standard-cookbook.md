@@ -154,6 +154,18 @@ clinical/PHI artifact honors the [0061](0061-blut-p2p-compute.md) hard-block exa
   engine) is the one Deliverable-listed stage not shipped — it is NOT in the
   acceptance gate, so its absence does not block the freeze; it lands when a
   tensor artifact type exists. Status → Complete — frozen 2026-07-10._
+- _2026-11-05 — `check_jsonl` LINE CHECKS LANDED (branch `agent/fu-checks-schema`,
+  off engine `1fc9a46`): the `schema` and `required_fields` arguments of the
+  Decision, which the core increment had not built (only the row count was, so
+  a malformed row that kept the count in bounds passed). Rows are streamed and
+  checked in constant memory; new `checks` codes `DATA_QUALITY_INVALID_JSON` /
+  `DATA_QUALITY_MISSING_FIELD` / `DATA_QUALITY_SCHEMA`, each breach naming its
+  line and field and never row contents, capped by `max_reported`; the same
+  byte-identical PASS, fail-closed BLOCK and recorded WARN, shown by `blut
+  checks report`; bad args refused at plan build. Row-count-only args are
+  unchanged. `check_tensor_stats` stays deferred (no tensor artifact type).
+  The line checks were not part of the acceptance gate, so the verdict below
+  stands as recorded._
 
 ## Completion / Resolution  *(fill once)*
 
