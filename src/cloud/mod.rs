@@ -8,11 +8,11 @@
 //! only the blob transport changes — `crate::p2p::transport::{send_blob,recv_blob}`
 //! over QUIC becomes the canonical [`crate::framework::object_store::ObjectStore`].
 //!
-//! `recipe run --launcher cloud` puts these together: a [`submitter::CloudSubmitter`]
-//! over the durable [`object_queue::ObjectQueue`] on a [`location::CloudLocation`]
+//! `recipe run --launcher cloud` puts these together: a [`crate::cloud::submitter::CloudSubmitter`]
+//! over the durable [`crate::cloud::object_queue::ObjectQueue`] on a [`crate::cloud::location::CloudLocation`]
 //! (a bucket, with the `s3` feature, or a directory), and `blut cloud worker`
-//! ([`worker::serve`]) on any machine that can reach it, running the same code.
-//! [`queue::MemQueue`] remains the in-process queue of the loopback proofs.
+//! ([`crate::cloud::worker::serve`]) on any machine that can reach it, running the same code.
+//! [`crate::cloud::queue::MemQueue`] remains the in-process queue of the loopback proofs.
 //! Clinical/PHI EEG remains hard-blocked: cloud workers are capped at `Registered`
 //! trust, so the reused `DispatchMatrix` refuses `DataClass::Restricted` to every
 //! cloud worker, and a restricted tenant's run is refused before anything is
