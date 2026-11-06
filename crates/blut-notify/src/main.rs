@@ -24,6 +24,11 @@ struct Cli {
     sla: Option<std::path::PathBuf>,
     #[arg(long)]
     cursor: Option<std::path::PathBuf>,
+    /// Put events' error text in status summaries (daemon/config mode). It is
+    /// free-form and can hold paths or credentials; restricted data never
+    /// carries it.
+    #[arg(long, default_value_t = false)]
+    include_error_text: bool,
     /// Custody declaration for one-envelope stdin mode.
     #[arg(long, value_enum, default_value_t = BoundaryArg::OffBox)]
     boundary: BoundaryArg,
@@ -68,8 +73,9 @@ fn main() -> Result<()> {
         let cursor = cli
             .cursor
             .unwrap_or_else(|| dot_blut().join("notify-cursors.json"));
-        let mut notifier =
-            blut_notify::tailer::Notifier::open(config, cursor).map_err(|error| anyhow!(error))?;
+        let mut notifier = blut_notify::tailer::Notifier::open(config, cursor)
+            .map_err(|error| anyhow!(error))?
+            .include_error_text(cli.include_error_text);
         loop {
             let report = notifier
                 .run_once(&jobs_dir, &sla)

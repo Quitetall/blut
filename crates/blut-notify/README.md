@@ -50,7 +50,7 @@ writes (`blut::paths`): jobs from `$LAMU_TRAIN_JOBS_DIR`, else
 
 A status rule's summary names the job, the event kind and the stage. Error
 text is free-form and can hold paths or credentials, so it is off by default.
-With `include_error_text = true` at the top of the config, the summary also
+With `--include-error-text`, the summary also
 carries the event's error (or a pruned stage's reason) cut to 200 characters,
 for example `rule 'stage-failed': status event for job 20261030-…: stage_failed
 in stage 'train' — CUDA out of memory`. For a restricted tenant or a

@@ -146,7 +146,7 @@ depend on this crate.
 - `blut-notify` status summaries name the event kind and the stage: `status
   event for job J: stage_failed in stage 'train'`. They said only "status event
   for job J". Error text is free-form and can hold paths or credentials, so it
-  stays out unless the config sets `include_error_text = true`, and even then
+  stays out unless the daemon runs with `--include-error-text`, and even then
   never for a restricted tenant or a `restricted` line. When on, it is cut to
   200 characters with control characters replaced.
 - `blut jobs`' `output` column is now `recipe`: the recipe, deploy pointer or

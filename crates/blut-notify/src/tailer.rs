@@ -60,9 +60,15 @@ impl Notifier {
         for spec in &config.sink {
             sinks.insert(spec.name().to_string(), crate::sinks::build_sink(spec)?);
         }
-        let mut notifier = Self::with_sinks(config.rule, sinks, cursor_path)?;
-        notifier.include_error_text = config.include_error_text;
-        Ok(notifier)
+        Self::with_sinks(config.rule, sinks, cursor_path)
+    }
+
+    /// Put an event's error text in status summaries. Off by default: it is
+    /// free-form, can hold paths or credentials, and a summary can reach an
+    /// off-box sink. Restricted data never carries it, whatever this says.
+    pub fn include_error_text(mut self, include: bool) -> Self {
+        self.include_error_text = include;
+        self
     }
 
     fn with_sinks(
@@ -351,7 +357,7 @@ const SUMMARY_NAME_MAX_CHARS: usize = 64;
 ///
 /// Error text is free-form: a trainer's message can name a file, a subject, a
 /// record or a credential. It is included only when the operator opted in
-/// (`include_error_text`) and custody would let the event leave the box anyway
+/// (`--include-error-text`) and custody would let the event leave the box anyway
 /// ([`custody_allows_off_box`]); for a restricted tenant or a `restricted` line
 /// it is withheld regardless, so a restricted summary stays the PHI-free
 /// operational identity (job, kind, stage) on every sink, local ones included.
@@ -383,7 +389,7 @@ fn status_summary(
         } else if include_error_text {
             summary.push_str(&format!(" — {}", excerpt(error, SUMMARY_ERROR_MAX_CHARS)));
         } else {
-            summary.push_str(" (error withheld: include_error_text is off)");
+            summary.push_str(" (error withheld: --include-error-text is off)");
         }
     }
     summary
@@ -553,7 +559,7 @@ mod tests {
         assert_eq!(
             summary,
             "status event for job j1: stage_failed in stage 'train' \
-             (error withheld: include_error_text is off)"
+             (error withheld: --include-error-text is off)"
         );
         // A pruned stage's reason is its error; an event with neither says so.
         let pruned =
