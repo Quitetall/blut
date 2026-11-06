@@ -40,8 +40,14 @@ partition have run on a real WAN; the real-WAN runs led to the opt-in BBR
 controller. Peers find each other by gossip, and stage data moves over the
 mesh without a shared cache: on four hosts on four continents, each seeded
 with at most one peer, the mesh formed by gossip and 64 MB of stage data
-reached a worker with an empty cache and came back verified. Still missing:
-BBR measured against competing traffic before it can become the default.
+reached a worker with an empty cache and came back verified. A run's stages now
+reach the mesh: `recipe run --launcher p2p` sends each stage that declares it
+may leave the machine to a peer with the same code identity, and the run fails
+rather than running such a stage at home when no peer can take it. A cookbook
+plan ran that way on three hosts on three continents, with outputs byte-equal
+to a local run. Still missing: BBR measured against competing traffic before it
+can become the default, placement declarations in the published cookbooks, and
+GPU stages on mesh workers.
 
 **3. Network object storage.** Done for static credentials. The `s3` feature
 round-trips through Cloudflare R2 over public TLS, which enforces the

@@ -23,8 +23,9 @@ depend on this crate.
   flight, then least used). Inputs and outputs move over the mesh's
   pull-based object plane and are verified on both ends. Stages that do not
   declare it run on the submitting machine in the same plan, contained as
-  usual, and each such decision is logged. A missing identity, no seed, or no
-  seed answering is refused before a job exists. Library:
+  usual, and each such decision is logged. A stage that needs a GPU is not
+  placed: workers have no GPU admission yet. A missing identity, no seed, or
+  no seed answering is refused before a job exists. Library:
   `p2p::mesh_exec::{MeshExecutionAdapter, MeshStageWorker}`,
   `MeshNode::{set_stage_worker, record_peer_outcome,
   peer_trust_and_reputation, shutdown}`.

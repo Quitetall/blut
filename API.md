@@ -311,7 +311,8 @@ logged. A stage that leaves goes to a connected peer that answers on the stage
 plane, runs the same `CodeIdentity`, accepts work from the submitter
 (`p2p node --coordinator-pubkey`), holds the trust its data class needs under
 the `DispatchMatrix` (`blut p2p peers trust`), and has the declared cores and
-memory; among those the fewest in flight, then the least used. If none
+memory; among those the fewest in flight, then the least used. A stage that
+needs a GPU is not placed: workers have no GPU admission yet. If none
 appears within `--p2p-peer-wait` seconds (default 60) the attempt fails as
 `EXECUTION_UNAVAILABLE` and, under `--launcher p2p`, so does the run: an
 eligible stage is never run on the submitting machine instead. Inputs and

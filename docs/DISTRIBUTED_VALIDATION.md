@@ -7,7 +7,7 @@ Evidence ledger for engine `0.2.0-alpha.2`. Status means:
   tested; no scale claim.
 - **Deferred:** unsupported in public preview.
 
-Last updated: 2026-10-30.
+Last updated: 2026-11-05.
 
 Nothing in the table below changed when the crates were published on
 2026-08-27. Publication moves code, not evidence: every row still says exactly
@@ -33,7 +33,8 @@ first if you are deciding whether to depend on this.
 | P2P mesh across independent hosts (`p2p node`) | Validated (connectivity + signed dispatch) | Four hosts on four continents, every node probing every other, 12/12, 2026-10-20 — see below. Gossip and stage data over the mesh were not part of that run |
 | P2P mesh gossip and stage data without a shared cache | Validated (independent hosts) | Four vast.ai hosts on four continents, each seeded with at most one peer, formed a full mesh by gossip; a fresh identity seeded with one node probed all four, 4/4; 64,640,000 bytes of stage data moved from the US to an empty-cache worker in New Zealand and back, verified, 2026-10-23 — see below. Earlier the same day across network namespaces on one host |
 | Cloud queue over local object storage | Validated | `blut cloud smoke` round-trip through the shipped cookbook binary, 2026-09-19 |
-| `--launcher p2p` and `--launcher cloud` on run commands | Deferred | Refused by `recipe run`, `hpo`, `study`, `partition` and `plan resume`, which used to run every stage on the submitting machine, and by `recipe declare --run`. No command places a run's stages on peers or on the cloud queue; the rows above are `p2p` and `cloud` subcommands and library calls, 2026-10-30 |
+| `--launcher p2p` on `recipe run` and `recipe declare --run` | Validated (independent hosts, CPU) | A five-stage cookbook plan from a workstation behind NAT: its four eligible stages ran on vast.ai hosts in Norway, New Zealand and Wisconsin found by gossip from one seed, the local-only stage stayed home, 4.8 MB of stage data moved over the mesh, and the output bytes equalled a local run; an anonymous peer and a peer running other code each failed the run with nothing placed, 2026-11-05 — see below. Cancel and a lost submitter are loopback tests only; no GPU stage, no contained process on a worker. `hpo`, `study`, `partition` and `plan resume` refuse the launcher |
+| `--launcher cloud` on run commands | Deferred | Refused by `recipe run`, `hpo`, `study`, `partition`, `plan resume` and `recipe declare --run`, which used to run every stage on the submitting machine. No command places a run's stages on the cloud queue; the rows above are `cloud` subcommands and library calls, 2026-10-30 |
 | Network object storage (S3-compatible) | Validated (R2 over public TLS; MinIO) | `s3` feature; cloud round-trip against Cloudflare R2 over public TLS with create-only writes enforced, 2026-10-22; MinIO over HTTP and TLS; Backblaze B2 refused (no conditional writes) — see below |
 | `blut-worker` REST prototype | Deleted (ADR 0083 M3) | Superseded by `src/cloud` + the `blut-web` sidecar |
 | Kubernetes operator | Validated (kind) | `blut-operator` on a three-node kind cluster, Kubernetes 1.35.0, with MinIO in the cluster: a real CPU plan to Succeeded with per-stage status, outputs in S3, a rerun and a retry served from the store, bad specs refused, deletion cleaning up, a deleted pod and a drained node retried, an operator restart without duplicate work, least-privilege RBAC, 2026-10-24; `--launcher k8s` from the CLI submits, follows, cancels and refuses, 2026-10-30 — see below. One host; no GPUs, no managed Kubernetes, no mesh traffic between pool pods |
@@ -229,7 +230,8 @@ blut recipe run <name> --args '...' --launcher p2p --p2p-seed <one peer>
   (the same engine build and the same cookbook builds), accepts this
   submitter, holds the trust the data class needs (`public` any peer,
   `internal` registered or trusted, `restricted` none), and has the declared
-  cores and memory. Stages spread: fewest in flight, then least used.
+  cores and memory. Stages spread: fewest in flight, then least used. A stage
+  that needs a GPU is not placed: workers have no GPU admission yet.
 - **No peer:** if no peer can take an eligible stage within `--p2p-peer-wait`
   seconds (default 60), the run fails and names each peer it saw and why it was
   passed over. It never runs the stage on the submitting machine instead. A
@@ -412,6 +414,93 @@ separately below, for dispatch). `--shared-store s3://` over the mesh was not
 exercised. The probe and the real-stage worker cannot be the same process: a
 worker started with `--coordinator-pubkey` refuses the probe task, so the
 worker was restarted between phases.
+
+## Recorded run: a recipe's stages across independent hosts (2026-11-05)
+
+**Setup.**
+- **Workers:** three vast.ai instances (`ubuntu:22.04`, no GPU used) in Norway,
+  New Zealand and Wisconsin (US), each with its own identity and data directory
+  and a UDP port forward to `9320`. No shared filesystem, no overlay network.
+  Norway had no seed; the other two seeded only Norway.
+- **Submitter:** a workstation behind NAT with no inbound port, running
+  `recipe declare plan.json --run --launcher p2p`, seeded only with Norway. It
+  learned the other two workers by gossip.
+- **Binary:** one static musl `blut-core` from the standard cookbook (candidate
+  `7261d4e`), built against engine commit `68a8797` with the `p2p` feature,
+  sha256 `6a3cdf2e…147e`, the same file everywhere. `BLUT_P2P_CONGESTION=bbr`.
+- **Cookbook patch:** the cookbook's stages do not declare placement yet, so
+  this build carried a local patch (kept with the evidence) declaring
+  `filter_dataset`, `split_train_eval`, `take_train` and `take_eval` remote with
+  `internal` data.
+- **Plan:** a PlanSpec: `materialize_dataset_path` (declares nothing, reads a
+  local path) → `filter_dataset` → `split_train_eval` → `take_train` and
+  `take_eval`, over 4,802,910 bytes of synthetic conversation JSONL.
+- **Workers' launch:** `p2p node --listen 0.0.0.0:9320 --advertise <public
+  ip>:<forwarded port> --gossip-interval 10 --coordinator-pubkey <submitter>`.
+
+**Runs.**
+
+| Run | Conditions | Result |
+|---|---|---|
+| 0 | workers `anonymous` to the submitter, `--p2p-peer-wait 20` | Exit 1: `no mesh peer could take stage 'filter_dataset' within 20s`, naming each worker, its trust and the `peers trust` command. The stage ran nowhere |
+| 1 | workers `registered`, cold, sequential executor | Exit 0, 41.9 s, each worker ran at least one stage |
+| 2 | warm, `--no-cache`, `BLUT_EXECUTOR=parallel` | Exit 0; no worker fetched anything; `take_eval` and `take_train` started 109 ms apart on different workers |
+| 3 | one worker running the previous build (`129688b`), `--p2p-peer-wait 15` | Exit 1: the error names both builds. The stage ran nowhere |
+
+Run 1 stage by stage. "There" is the stage on the worker; "dispatch" runs from
+the worker accepting to the output being back.
+
+| Stage | Ran on | Input fetched by the worker | There | Output back | Dispatch |
+|---|---|---|---|---|---|
+| `materialize_dataset_path` | submitter | | | | |
+| `filter_dataset` | Wisconsin | 4,803,492 bytes, 2,960 ms | 85 ms | 4,422,730 bytes, 1,402 ms | 4,827 ms |
+| `split_train_eval` | New Zealand | 4,423,289 bytes, 5,407 ms | 45 ms | 4,422,749 bytes, 3,042 ms | 8,855 ms |
+| `take_train` | Norway | 4,423,520 bytes, 1,885 ms | 0 ms | 3,549,135 bytes, 3,436 ms | 5,818 ms |
+| `take_eval` | Wisconsin | 4,423,520 bytes, 1,733 ms | 0 ms | 873,614 bytes, 149 ms | 2,135 ms |
+
+**Verification.** Outside BLUT, the sha256 of every output file from runs 1 and
+2 equals a `--launcher local` run of the same plan: `filtered.jsonl`
+`c61c2300…`, `train.jsonl` `784f1133…`, `eval.jsonl` `76ed1e08…`. The content
+ids of `filter_dataset` and `split_train_eval` equal the local run's as well.
+`take_train` and `take_eval` have different ids with the same bytes: locally
+they return a file of the split stage, which is not persisted and gets a
+non-portable id; on a worker the file arrives inside the stage's own directory
+and is packed. Worker logs show one `running stage` line per dispatched stage,
+fetches only in run 1, and no warning or error. After run 2 `p2p peers list` on
+the submitter showed each worker's completed tasks (`ok=4`, `ok=2`, `ok=2`) with
+reputations above 0.50.
+
+**What it found.** An earlier round from commit `129688b` on Korea, Quebec and
+Norway ran the same plan with the same result, but the parallel executor sent
+`take_train` and `take_eval` to one worker: a stage counted its peer as in
+flight only once the worker accepted, a round trip after choosing it. Choosing
+and reserving are now one step. Run 2 above is the rerun.
+
+**Hosts that did not work.** Of the nine instances rented, six were usable:
+a Polish host's UDP forward never answered from three other machines, a
+Korean instance exited on start, and a Vietnamese one never accepted SSH. Each
+was destroyed and replaced. Offers also disappeared between search and create.
+
+**Timing caveat.** Disk pressure on the workstation from other jobs was
+20–30% during these runs. The gaps between stages in run 2, which took 140 s
+end to end, were the workstation's own disk; the stages and transfers inside
+them took seconds. These numbers are one sample each and are not a throughput
+claim.
+
+**Boundaries.**
+- The stages are in-process Rust. No stage started a process on a worker, so
+  containment on a worker was not exercised here, and no GPU stage can reach a
+  worker.
+- `blut cancel` and a lost submitter are covered by the loopback tests
+  (`tests/p2p_mesh_dispatch.rs`), not by this run: these stages finish too fast
+  to interrupt over a WAN.
+- A worker with other code was exercised on the submitter's side. The worker's
+  own refusal, for a submitter that skips that check, is a loopback test.
+- No injected loss or partition. `--shared-store s3://` was not used.
+- The submitting machine's memory admission still bills the whole plan,
+  including stages that run elsewhere.
+- Worker progress events do not reach the submitter's status log.
+- The published cookbook has not declared placement for its stages.
 
 ## Recorded run: hostile conditions on a real WAN (2026-10-20)
 
