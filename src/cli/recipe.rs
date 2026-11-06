@@ -1056,16 +1056,37 @@ impl PreparedRecipeLaunch {
         // TenantAdmission snapshot used during profile selection. In
         // particular, a prepared partition cell cannot silently re-probe or
         // resolve a second async-I/O candidate before execution.
-        let _tenant_reservation = tenant_admission
-            .reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
-            .map_err(|reason| anyhow!("recipe '{name}' admission refused: {reason}"))?;
+        //
+        // A cloud run takes neither: its stages run on the workers, so this
+        // machine's free RAM and its one training slot say nothing about it.
+        #[cfg(feature = "cloud")]
+        let runs_here = cloud.is_none();
+        #[cfg(not(feature = "cloud"))]
+        let runs_here = true;
+        let _tenant_reservation = if runs_here {
+            Some(
+                tenant_admission
+                    .reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
+                    .map_err(|reason| anyhow!("recipe '{name}' admission refused: {reason}"))?,
+            )
+        } else {
+            None
+        };
 
         let holder = format!("blut-recipe:{job_id}");
-        let lock = match device_index {
-            Some(dev) => scheduler_lock::acquire_exclusive_device(dev, holder, LockKind::Training),
-            None => scheduler_lock::acquire_exclusive(holder, LockKind::Training),
-        }
-        .map_err(|error| anyhow!("acquire_exclusive: {error}"))?;
+        let lock = if runs_here {
+            Some(
+                match device_index {
+                    Some(dev) => {
+                        scheduler_lock::acquire_exclusive_device(dev, holder, LockKind::Training)
+                    }
+                    None => scheduler_lock::acquire_exclusive(holder, LockKind::Training),
+                }
+                .map_err(|error| anyhow!("acquire_exclusive: {error}"))?,
+            )
+        } else {
+            None
+        };
 
         // Preparation may wait behind an outer scheduler, so it must not leave
         // an orphan job directory merely by computing an admission witness.
@@ -1126,7 +1147,9 @@ impl PreparedRecipeLaunch {
         eprintln!("recipe {name}");
         eprintln!("job    {job_id}");
         eprintln!("dir    {}", job_dir.display());
-        eprintln!("lock   {}", lock.path().display());
+        if let Some(lock) = &lock {
+            eprintln!("lock   {}", lock.path().display());
+        }
 
         // A launch with no recipe marker (a plan file, a declared recipe, a
         // deploy pointer) is re-indexed from its plan graph, so the graph

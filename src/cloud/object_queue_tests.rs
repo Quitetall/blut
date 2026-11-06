@@ -287,13 +287,14 @@ async fn an_expired_lease_is_requeued_and_its_holder_fenced() {
     for (site_name, site) in sites() {
         let q = site.queue();
         q.enqueue(job("a", 0)).await.unwrap();
-        // w1 claims with a one-second lease and then dies (never renews).
-        let first = q.claim("w1", 1).await.unwrap().expect(site_name);
+        // w1 claims and then dies (never renews). The lease outlasts a claim
+        // attempt over a slow network, or the next assertion would race it.
+        let first = q.claim("w1", 4).await.unwrap().expect(site_name);
         assert!(
             q.claim("w2", 30).await.unwrap().is_none(),
             "{site_name}: a live lease is not claimable"
         );
-        tokio::time::sleep(Duration::from_millis(1300)).await;
+        tokio::time::sleep(Duration::from_millis(4300)).await;
         assert!(
             matches!(q.status("a").await.unwrap(), JobStatus::Queued),
             "{site_name}: an expired lease reads as queued"

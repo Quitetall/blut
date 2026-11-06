@@ -488,16 +488,33 @@ fn pids_in(body: &str) -> Vec<u32> {
         .collect()
 }
 
+/// Where this test's queue lives: a directory of `host`, or, with
+/// `BLUT_TEST_E2E_ON_S3=1`, a fresh prefix of the bucket in
+/// `BLUT_TEST_S3_QUEUE` (with the `AWS_*` variables set). Children inherit
+/// those, and a URL passes through a `Path` unchanged.
+fn queue_for(host: &Host) -> PathBuf {
+    match (
+        std::env::var("BLUT_TEST_E2E_ON_S3").as_deref(),
+        std::env::var("BLUT_TEST_S3_QUEUE"),
+    ) {
+        (Ok("1"), Ok(base)) => PathBuf::from(format!(
+            "{}/e2e-{}",
+            base.trim_end_matches('/'),
+            uuid::Uuid::new_v4()
+        )),
+        _ => host.path().join("queue"),
+    }
+}
+
 fn queue_jobs(queue: &Path) -> Vec<blut::cloud::object_queue::ActiveJob> {
-    let q = blut::cloud::object_queue::ObjectQueue::local(
-        queue,
-        "cloud",
+    let location = blut::cloud::location::CloudLocation::open(
+        &queue.display().to_string(),
         blut::cloud::object_queue::ObjectQueueOptions::default(),
     )
     .unwrap();
     tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(q.list_active())
+        .block_on(location.queue().list_active())
         .unwrap()
 }
 
@@ -595,7 +612,7 @@ fn every_stage_runs_on_the_workers(submit_host: &Host, queue: &Path) {
 #[test]
 fn every_stage_runs_in_a_worker_process_not_the_submitter() {
     let host = Host::new();
-    let queue = host.path().join("queue");
+    let queue = queue_for(&host);
     every_stage_runs_on_the_workers(&host, &queue);
     assert!(queue_jobs(&queue).is_empty(), "the queue is drained");
 }
@@ -623,7 +640,7 @@ fn every_stage_runs_on_the_workers_over_an_s3_queue() {
 #[test]
 fn with_no_worker_the_run_fails_after_the_pickup_window() {
     let host = Host::new();
-    let queue = host.path().join("queue");
+    let queue = queue_for(&host);
     let started = Instant::now();
     let mut run = Proc::spawn(
         host.command(
@@ -663,7 +680,7 @@ fn with_no_worker_the_run_fails_after_the_pickup_window() {
 fn a_worker_running_other_code_does_not_claim_the_stage() {
     let submit_host = Host::new();
     let worker_host = Host::new();
-    let queue = submit_host.path().join("queue");
+    let queue = queue_for(&submit_host);
     let _other = worker_with(&worker_host, &queue, "stale", "stale.log", "10", true);
     let mut run = Proc::spawn(
         submit_host
@@ -701,7 +718,7 @@ fn a_worker_running_other_code_does_not_claim_the_stage() {
 fn blut_cancel_stops_a_running_cloud_stage_after_the_submitter_is_gone() {
     let submit_host = Host::new();
     let worker_host = Host::new();
-    let queue = submit_host.path().join("queue");
+    let queue = queue_for(&submit_host);
     let markers = submit_host.path().join("markers");
     std::fs::create_dir_all(&markers).unwrap();
     let w1 = worker(&worker_host, &queue, "w1", "w1.log");
@@ -783,7 +800,7 @@ fn blut_cancel_stops_a_running_cloud_stage_after_the_submitter_is_gone() {
 fn plan_resume_finishes_a_cloud_job_whose_submitter_died() {
     let submit_host = Host::new();
     let worker_host = Host::new();
-    let queue = submit_host.path().join("queue");
+    let queue = queue_for(&submit_host);
     let markers = submit_host.path().join("markers");
     std::fs::create_dir_all(&markers).unwrap();
     let w1 = worker(&worker_host, &queue, "w1", "w1.log");
@@ -886,7 +903,7 @@ fn markers_dir(host: &Host) -> PathBuf {
 fn a_worker_given_sigterm_releases_its_stage_to_another_worker() {
     let submit_host = Host::new();
     let worker_host = Host::new();
-    let queue = submit_host.path().join("queue");
+    let queue = queue_for(&submit_host);
     let markers = markers_dir(&submit_host);
     let mut first = worker_with(&worker_host, &queue, "first", "first.log", "600", false);
     let first_pid = first.pid();
@@ -927,7 +944,7 @@ fn a_worker_given_sigterm_releases_its_stage_to_another_worker() {
 fn a_killed_workers_stage_is_requeued_when_its_lease_runs_out() {
     let submit_host = Host::new();
     let worker_host = Host::new();
-    let queue = submit_host.path().join("queue");
+    let queue = queue_for(&submit_host);
     let markers = markers_dir(&submit_host);
     let mut doomed = worker_with(&worker_host, &queue, "doomed", "doomed.log", "2", false);
     let doomed_pid = doomed.pid();
@@ -958,11 +975,11 @@ fn a_killed_workers_stage_is_requeued_when_its_lease_runs_out() {
 #[test]
 fn blut_cancel_withdraws_a_queued_stage_and_ends_the_run() {
     let submit_host = Host::new();
-    let queue = submit_host.path().join("queue");
+    let queue = queue_for(&submit_host);
     let markers = markers_dir(&submit_host);
     let mut run = submit_hold(&submit_host, &queue, 600, &markers);
     wait_for("the seed stage to be queued", PATIENCE, || {
-        queue.exists() && queue_jobs(&queue).len() == 1
+        queue_jobs(&queue).len() == 1
     });
     let job = submit_host.only_job();
 
@@ -1001,5 +1018,47 @@ fn blut_cancel_withdraws_a_queued_stage_and_ends_the_run() {
         latecomer_host.log("late.log").contains("0 claimed"),
         "{}",
         latecomer_host.log("late.log")
+    );
+}
+
+/// A cloud run uses nothing of the submitting machine's training slot: a
+/// second run starts while the first is waiting on its worker.
+#[test]
+fn two_cloud_runs_share_one_submitting_machine() {
+    let submit_host = Host::new();
+    let worker_host = Host::new();
+    let queue = queue_for(&submit_host);
+    let markers = markers_dir(&submit_host);
+    let holder = worker(&worker_host, &queue, "holder", "holder.log");
+    let mut first = submit_hold(&submit_host, &queue, 5, &markers);
+    let started = markers.join(format!("started-{}", holder.pid()));
+    wait_for("the first run's held stage", PATIENCE, || started.exists());
+
+    let _chain_worker = worker(&worker_host, &queue, "chain", "chain.log");
+    let mut second = Proc::spawn(
+        submit_host
+            .command(
+                &[
+                    "recipe",
+                    "run",
+                    "cloud_e2e_chain",
+                    "--args",
+                    r#"{"text":"beside the first"}"#,
+                    "--launcher",
+                    "cloud",
+                ],
+                "second.log",
+            )
+            .env("BLUT_CLOUD_QUEUE", &queue),
+    );
+    assert!(
+        second.wait(PATIENCE).success(),
+        "{}",
+        submit_host.log("second.log")
+    );
+    assert!(
+        first.wait(PATIENCE).success(),
+        "{}",
+        submit_host.log("submit.log")
     );
 }

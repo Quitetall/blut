@@ -2460,20 +2460,37 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
             // running: a resume refused here never started, so the job keeps
             // the state it had (a refused resume of a `done` job used to
             // rewrite it as `failed`).
-            let _tenant_reservation = tenant_admission
-                .reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
-                .map_err(|reason| {
-                    anyhow!("resume '{}' admission refused: {reason}", marker.name)
-                })?;
+            // A cloud job takes neither: its stages run on the workers.
+            #[cfg(feature = "cloud")]
+            let runs_here = cloud.is_none();
+            #[cfg(not(feature = "cloud"))]
+            let runs_here = true;
+            let _tenant_reservation = if runs_here {
+                Some(
+                    tenant_admission
+                        .reserve(&footprint, crate::broker::admission::DEFAULT_FLOOR_GIB)
+                        .map_err(|reason| {
+                            anyhow!("resume '{}' admission refused: {reason}", marker.name)
+                        })?,
+                )
+            } else {
+                None
+            };
 
             // GPU lock — same arbitration as initial runs. Without
             // this, two resumes (or a resume + a fresh recipe run)
             // on the same machine could both touch the GPU.
-            let lock = scheduler_lock::acquire_exclusive(
-                format!("blut-resume:{job_id}"),
-                LockKind::Training,
-            )
-            .map_err(|e| anyhow!("acquire_exclusive: {e}"))?;
+            let lock = if runs_here {
+                Some(
+                    scheduler_lock::acquire_exclusive(
+                        format!("blut-resume:{job_id}"),
+                        LockKind::Training,
+                    )
+                    .map_err(|e| anyhow!("acquire_exclusive: {e}"))?,
+                )
+            } else {
+                None
+            };
 
             crate::jobs::write_state(&job_id, JobState::Running)
                 .with_context(|| format!("write Running state for {job_id}"))?;
@@ -2490,7 +2507,9 @@ async fn run_plan_cmd(reg: &crate::framework::Registry, cmd: PlanCommand) -> Res
 
             eprintln!("resuming {} ({})", marker.name, job_id);
             eprintln!("dir      {}", job_dir.display());
-            eprintln!("lock     {}", lock.path().display());
+            if let Some(lock) = &lock {
+                eprintln!("lock     {}", lock.path().display());
+            }
             persist_plan_graph(&plan, &job_dir);
             let result = crate::framework::execute_plan(plan, ctx).await;
             #[cfg(feature = "cloud")]
