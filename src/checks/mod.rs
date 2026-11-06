@@ -66,9 +66,9 @@
 //!
 //! # `check_jsonl` line checks
 //!
-//! Besides the row-count bounds (`min_rows`, `max_rows`), [`CheckJsonl`] can
-//! check every row (ADR 0091's `check_jsonl{schema, min_rows, max_rows,
-//! required_fields}`):
+//! A plan's `check_jsonl` resolves to [`CheckJsonlLines`], which besides the
+//! row-count bounds (`min_rows`, `max_rows`) can check every row (ADR 0091's
+//! `check_jsonl{schema, min_rows, max_rows, required_fields}`):
 //!
 //! ```json
 //! { "min_rows": 1000,
@@ -143,6 +143,17 @@
 //!
 //! `check_tensor_stats` from ADR 0091 is not here: the engine has no tensor
 //! artifact type for it to check yet.
+//!
+//! # Two Rust types, one stage
+//!
+//! [`CheckJsonl`] and [`CheckJsonlArgs`] are the row-count stage as published:
+//! `CheckJsonlArgs` is a struct every field of which a caller may name, so it
+//! cannot gain a field without breaking that caller. They stay as they were,
+//! and delegate to [`CheckJsonlLines`], the stage registered as `check_jsonl`.
+//! New arguments go on [`CheckJsonlLinesArgs`], which is `#[non_exhaustive]`
+//! for that reason. Both stages share a name, schema and artifact kinds, and
+//! args that name only the row bounds mean the same to either. A Rust caller
+//! wanting line checks uses `CheckJsonlLines`: `CheckJsonl` has no such args.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -300,12 +311,29 @@ impl Artifact for JsonlArtifact {
 
 // ── check_jsonl ────────────────────────────────────────────────────
 
-/// Args for [`CheckJsonl`]: row-count bounds, line checks and breach policy.
-/// The module docs describe the `schema` format and the order rows are
-/// checked in. Every line-check argument defaults to "off" and is left out
-/// when the args are serialized, so row-count-only args keep their old shape.
+/// Args for [`CheckJsonl`]: row-count bounds + breach policy.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CheckJsonlArgs {
+    /// Minimum row count (inclusive). `None` = no lower bound.
+    #[serde(default)]
+    pub min_rows: Option<u64>,
+    /// Maximum row count (inclusive). `None` = no upper bound.
+    #[serde(default)]
+    pub max_rows: Option<u64>,
+    /// Breach policy (default: `block` — fail-closed).
+    #[serde(default)]
+    pub on_breach: OnBreach,
+}
+
+/// Args for [`CheckJsonlLines`], the stage a plan's `check_jsonl` resolves to:
+/// row-count bounds, line checks and breach policy. The module docs describe
+/// the `schema` format and the order rows are checked in. Every line-check
+/// argument defaults to "off" and is left out when the args are serialized,
+/// so row-count-only args keep their shape. `#[non_exhaustive]`: start from
+/// `CheckJsonlLinesArgs::default()` and set the fields you want.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CheckJsonlLinesArgs {
     /// Minimum row count (inclusive). `None` = no lower bound.
     #[serde(default)]
     pub min_rows: Option<u64>,
@@ -338,6 +366,23 @@ pub struct CheckJsonlArgs {
     /// so `0` acts as `1`; every breaching row is counted either way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_reported: Option<u32>,
+}
+
+impl From<CheckJsonlArgs> for CheckJsonlLinesArgs {
+    /// The same row bounds and breach policy, with every line check off.
+    fn from(args: CheckJsonlArgs) -> Self {
+        let CheckJsonlArgs {
+            min_rows,
+            max_rows,
+            on_breach,
+        } = args;
+        Self {
+            min_rows,
+            max_rows,
+            on_breach,
+            ..Self::default()
+        }
+    }
 }
 
 /// Rows each line-breach code names when `max_reported` is not set.
@@ -670,7 +715,7 @@ struct LineRules {
 }
 
 impl LineRules {
-    fn from_args(args: &CheckJsonlArgs) -> Option<Self> {
+    fn from_args(args: &CheckJsonlLinesArgs) -> Option<Self> {
         (args.schema.is_some() || !args.required_fields.is_empty()).then(|| Self {
             schema: args.schema.clone(),
             required: args.required_fields.clone(),
@@ -933,10 +978,10 @@ fn handle_line_breaches(
 /// Stage name of the JSONL guard.
 pub const CHECK_JSONL: &str = "check_jsonl";
 
-/// Count the non-blank rows of the input JSONL and enforce `min_rows` /
-/// `max_rows`; with `schema` or `required_fields`, also check every row (see
-/// the module docs). Then pass the input through unchanged (same path +
-/// content hash).
+/// Count non-empty lines of the input JSONL and enforce `min_rows`/`max_rows`,
+/// then pass the input through unchanged (same path + content hash). The
+/// row-count form for Rust callers; see the module docs. It runs
+/// [`CheckJsonlLines`] with every line check off.
 pub struct CheckJsonl;
 
 #[async_trait]
@@ -948,6 +993,32 @@ impl Stage for CheckJsonl {
     type Input = JsonlArtifact;
     type Output = JsonlArtifact;
     type Args = CheckJsonlArgs;
+
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        input: Self::Input,
+        args: &Self::Args,
+    ) -> Result<Self::Output, StageError> {
+        CheckJsonlLines.run(ctx, input, &args.clone().into()).await
+    }
+}
+
+/// The stage registered as `check_jsonl`: count the non-blank rows of the
+/// input JSONL and enforce `min_rows` / `max_rows`; with `schema` or
+/// `required_fields`, also check every row (see the module docs). Then pass
+/// the input through unchanged (same path + content hash).
+pub struct CheckJsonlLines;
+
+#[async_trait]
+impl Stage for CheckJsonlLines {
+    const NAME: &'static str = CHECK_JSONL;
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Cpu];
+    const EXECUTION_BOUNDARY: StageExecutionBoundary = StageExecutionBoundary::InProcess;
+    type Input = JsonlArtifact;
+    type Output = JsonlArtifact;
+    type Args = CheckJsonlLinesArgs;
 
     async fn run(
         &self,
@@ -1137,7 +1208,7 @@ impl Cookbook for ChecksCookbook {
     }
     fn stages_erased(&self) -> &'static [(&'static str, ErasedStageCtor)] {
         static S: &[(&str, ErasedStageCtor)] = &[
-            (CHECK_JSONL, || std::sync::Arc::new(CheckJsonl)),
+            (CHECK_JSONL, || std::sync::Arc::new(CheckJsonlLines)),
             (ASSERT, || std::sync::Arc::new(Assert)),
         ];
         S
@@ -1318,7 +1389,6 @@ mod tests {
             min_rows: Some(1000),
             max_rows: None,
             on_breach: OnBreach::Block,
-            ..Default::default()
         };
         let err = CheckJsonl.run(&ctx, art, &args).await.unwrap_err();
         let StageError::Backend(anyhow_err) = &err else {
@@ -1342,7 +1412,6 @@ mod tests {
             min_rows: Some(1000),
             max_rows: None,
             on_breach: OnBreach::Block,
-            ..Default::default()
         };
         let out = CheckJsonl.run(&ctx, art, &args).await.unwrap();
         assert_eq!(out.path, in_path, "passthrough keeps the path");
@@ -1364,7 +1433,6 @@ mod tests {
             min_rows: Some(1000),
             max_rows: None,
             on_breach: OnBreach::Warn,
-            ..Default::default()
         };
         let out = CheckJsonl.run(&ctx, art, &args).await.unwrap();
         assert_eq!(out.content_hash, in_hash, "warn still passes through");
@@ -1515,6 +1583,16 @@ mod tests {
         run_demo_with(serde_json::json!({ "rows": rows }), check_args).await
     }
 
+    /// The stage a plan's `check_jsonl` gets: the cookbook's own registration.
+    fn registered_check_jsonl() -> Arc<dyn crate::framework::stage::StageDyn> {
+        let (_, ctor) = ChecksCookbook
+            .stages_erased()
+            .iter()
+            .find(|(name, _)| *name == CHECK_JSONL)
+            .expect("the checks cookbook registers check_jsonl");
+        ctor()
+    }
+
     /// The demo DAG with explicit `gen` and `check_jsonl` args.
     async fn run_demo_with(
         gen_args: serde_json::Value,
@@ -1532,7 +1610,7 @@ mod tests {
         let sink_ran = Arc::new(AtomicUsize::new(0));
         let nodes: Vec<(Arc<dyn StageDyn>, serde_json::Value)> = vec![
             (Arc::new(DemoGen), gen_args),
-            (Arc::new(CheckJsonl), check_args),
+            (registered_check_jsonl(), check_args),
             (
                 Arc::new(DemoSink(sink_ran.clone())),
                 serde_json::Value::Null,
@@ -1697,7 +1775,7 @@ mod line_check_tests {
         JsonlArtifact::from_file(&path).unwrap()
     }
 
-    fn args(v: serde_json::Value) -> CheckJsonlArgs {
+    fn args(v: serde_json::Value) -> CheckJsonlLinesArgs {
         serde_json::from_value(v).expect("test args decode")
     }
 
@@ -1706,7 +1784,7 @@ mod line_check_tests {
         let tmp = tempfile::tempdir().unwrap();
         let art = write(tmp.path(), body);
         let ctx = StageContext::for_test(tmp.path().to_path_buf(), tmp.path().to_path_buf());
-        let err = CheckJsonl.run(&ctx, art, &args(a)).await.unwrap_err();
+        let err = CheckJsonlLines.run(&ctx, art, &args(a)).await.unwrap_err();
         let StageError::Backend(e) = &err else {
             panic!("expected a Backend failure, got {err:?}");
         };
@@ -1725,7 +1803,7 @@ mod line_check_tests {
         let art = write(tmp.path(), body);
         let ctx = StageContext::for_test(tmp.path().to_path_buf(), tmp.path().to_path_buf());
         let mut rx = ctx.status_tx.subscribe();
-        let out = CheckJsonl
+        let out = CheckJsonlLines
             .run(&ctx, art.clone(), &args(a))
             .await
             .expect("check passes");
@@ -1947,7 +2025,10 @@ mod line_check_tests {
         let input = write(tmp.path(), body);
         let ctx = StageContext::for_test(tmp.path().to_path_buf(), tmp.path().to_path_buf());
         let mut rx = ctx.status_tx.subscribe();
-        let out = CheckJsonl.run(&ctx, input.clone(), &args(a)).await.unwrap();
+        let out = CheckJsonlLines
+            .run(&ctx, input.clone(), &args(a))
+            .await
+            .unwrap();
         assert_eq!(out.path, input.path, "passthrough keeps the path");
         assert_eq!(out.content_hash, input.content_hash, "and the content hash");
         assert_eq!(
@@ -2132,7 +2213,7 @@ mod line_check_tests {
         let tmp = tempfile::tempdir().unwrap();
         let art = write(tmp.path(), b"{}\n\xff\n");
         let ctx = StageContext::for_test(tmp.path().to_path_buf(), tmp.path().to_path_buf());
-        let err = CheckJsonl
+        let err = CheckJsonlLines
             .run(&ctx, art, &args(serde_json::json!({ "min_rows": 1 })))
             .await
             .unwrap_err();
@@ -2150,6 +2231,48 @@ mod line_check_tests {
         );
     }
 
+    /// The published stage: an exhaustive `CheckJsonlArgs` literal (which is
+    /// why that struct cannot grow) still compiles, and it counts rows and
+    /// nothing else, under the same identity as the registered stage.
+    #[tokio::test]
+    async fn the_published_row_count_stage_is_unchanged() {
+        assert_eq!(
+            <CheckJsonl as Stage>::NAME,
+            <CheckJsonlLines as Stage>::NAME
+        );
+        assert_eq!(
+            <CheckJsonl as Stage>::SCHEMA,
+            <CheckJsonlLines as Stage>::SCHEMA
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let art = write(tmp.path(), b"not json\n[1]\n");
+        let ctx = StageContext::for_test(tmp.path().to_path_buf(), tmp.path().to_path_buf());
+        let bounds = |min_rows| CheckJsonlArgs {
+            min_rows: Some(min_rows),
+            max_rows: None,
+            on_breach: OnBreach::Block,
+        };
+        let out = CheckJsonl.run(&ctx, art.clone(), &bounds(2)).await.unwrap();
+        assert_eq!(out.content_hash, art.content_hash);
+        let err = CheckJsonl.run(&ctx, art, &bounds(3)).await.unwrap_err();
+        let StageError::Backend(e) = &err else {
+            panic!("expected a Backend failure, got {err:?}");
+        };
+        let f = StageFailure::try_extract(e).expect("a checks failure");
+        assert_eq!(f.code, "DATA_QUALITY_MIN_ROWS");
+        assert_eq!(f.message, "row count 2 below min_rows 3");
+        assert_eq!(
+            serde_json::to_value(bounds(2)).unwrap(),
+            serde_json::json!({ "min_rows": 2, "max_rows": null, "on_breach": "block" })
+        );
+        let lines = CheckJsonlLinesArgs::from(bounds(2));
+        assert_eq!(lines.min_rows, Some(2));
+        assert!(
+            LineRules::from_args(&lines).is_none(),
+            "no line check is armed"
+        );
+    }
+
     /// Row-count-only args decode with every line check off, and serialize
     /// to exactly the three keys they always had.
     #[test]
@@ -2162,7 +2285,7 @@ mod line_check_tests {
             serde_json::json!({ "min_rows": 5, "max_rows": 9, "on_breach": "warn" })
         );
         assert_eq!(
-            serde_json::to_value(CheckJsonlArgs::default()).unwrap(),
+            serde_json::to_value(CheckJsonlLinesArgs::default()).unwrap(),
             serde_json::json!({ "min_rows": null, "max_rows": null, "on_breach": "block" })
         );
     }
@@ -2215,7 +2338,7 @@ mod line_check_tests {
     /// with a message naming the problem.
     #[test]
     fn bad_line_args_are_refused_at_plan_build() {
-        let stage: Arc<dyn StageDyn> = Arc::new(CheckJsonl);
+        let stage: Arc<dyn StageDyn> = Arc::new(CheckJsonlLines);
         let refused = |a: serde_json::Value| -> String {
             match stage.check_args(&a) {
                 Ok(()) => panic!("args {a} were accepted"),
@@ -2317,9 +2440,14 @@ mod line_check_tests {
     /// SDK tooling see them, and a rule may be a name or an object.
     #[test]
     fn args_schema_lists_the_line_arguments() {
-        let schema = CheckJsonl.args_schema();
+        let (_, ctor) = ChecksCookbook
+            .stages_erased()
+            .iter()
+            .find(|(name, _)| *name == CHECK_JSONL)
+            .expect("the checks cookbook registers check_jsonl");
+        let schema = ctor().args_schema();
         let defs = &schema["definitions"];
-        let props = &defs["CheckJsonlArgs"]["properties"];
+        let props = &defs["CheckJsonlLinesArgs"]["properties"];
         for key in [
             "min_rows",
             "max_rows",
@@ -2331,7 +2459,7 @@ mod line_check_tests {
             assert!(props.get(key).is_some(), "args schema lacks {key}: {props}");
         }
         assert!(
-            defs["CheckJsonlArgs"].get("required").is_none(),
+            defs["CheckJsonlLinesArgs"].get("required").is_none(),
             "every argument stays optional"
         );
         let rule = defs["FieldSpec"].to_string();
@@ -2409,7 +2537,7 @@ mod line_check_tests {
             std::fs::write("/proc/self/clear_refs", "5").unwrap();
             let before = status_kib("VmRSS:");
             let started = std::time::Instant::now();
-            CheckJsonl
+            CheckJsonlLines
                 .run(&ctx, art, &a)
                 .await
                 .expect("clean rows pass");
