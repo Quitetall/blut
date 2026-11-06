@@ -317,8 +317,11 @@ freezes a composed tree to JSON + a content fingerprint; `config::sweep` expands
 a resource-capped systemd unit. `LaunchTarget::P2P` and `LaunchTarget::Cloud`
 have no `Launcher`: stages reach peers or the cloud queue only through an
 `ExecutionAdapter` installed with `ExecCtx::with_execution_adapter` (feature
-`p2p`). The executor refuses either target without one, and every CLI command
-refuses `--launcher p2p` and `--launcher cloud`, because none installs one.
+`p2p`). The executor refuses either target without one. Every CLI command
+refuses `--launcher p2p`, because none installs one. `recipe run`, `recipe
+declare --run` and `plan resume` install the cloud adapter (see
+[Cloud dispatch](#cloud-dispatch)); `hpo`, `study` and `partition` refuse
+`--launcher cloud`.
 
 `config::tenants::TenantQuotaPolicy` loads `$BLUT_TENANTS_CONFIG` or
 `~/.config/blut/tenants.toml`. One file chooses either static equal shares:
@@ -497,6 +500,76 @@ task of its own wraps that task in `jobs::in_job` too: a task-local does not
 reach a spawned task. Recording is best-effort (a failed write is logged).
 
 ---
+
+### Cloud dispatch
+
+`recipe run <name> --launcher cloud` and `recipe declare <file> --run
+--launcher cloud` run a recipe's stages on `blut cloud worker` processes that
+poll a durable queue (feature `cloud`, plus `s3` for a bucket).
+
+```sh
+# on each worker, in any binary with the same cookbooks at the same build
+AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=auto AWS_ENDPOINT=https://… \
+  blut cloud worker --queue s3://bucket/prefix
+# on the submitter, with the same AWS_* variables
+BLUT_CLOUD_QUEUE=s3://bucket/prefix blut recipe run my_recipe --launcher cloud
+```
+
+- **Location.** `BLUT_CLOUD_QUEUE` / `--queue`: `s3://bucket[/prefix]`,
+  `file:///dir` or a directory. Credentials and the endpoint come from the
+  `AWS_*` environment only, never a flag, the URL, a job record or a queue
+  object. The endpoint must support conditional writes (AWS S3, Cloudflare R2
+  and MinIO do; Backblaze B2 does not and is refused). A stage runs in the
+  worker's process tree, so it can read the worker's environment: give workers
+  a token scoped to the queue's bucket.
+- **Queue.** `cloud::object_queue::ObjectQueue` keeps each job as an append-only
+  log, `<prefix>/cloud/queue/v1/jobs/<id>/log/<seq>`. Every transition is a
+  create-only write of the next slot, so whoever fills it first decides: a
+  claim, a completion, a cancellation. The slot of a claim is the assignment
+  generation. Leases are renewed by the holder at a third of their length and
+  need no writer to expire; a late completion finds its slot taken and is
+  refused. Input and output bundles are content-addressed objects beside it.
+  Host clocks must agree to well within a lease; a clock error moves when a dead
+  worker's stage is requeued, and cannot let two completions land.
+- **Every stage is dispatched.** Nothing runs on the submitting machine, and a
+  stage the adapter cannot take fails the run naming the reason: its input has
+  a file outside the job directory, or it was admitted with a training I/O
+  profile. A cache hit runs nothing. A restricted tenant is refused before
+  anything is submitted. Every other stage is classified `Internal`, which a
+  worker (`Registered` trust) may run. `cloud::policy::CloudDispatchPolicy` is
+  this rule.
+- **Workers** claim in priority, then enqueue, order, run the stage contained
+  like a local stage, and upload the output. They only claim jobs of their own
+  code identity (the one cache keys fold: engine and every cookbook), and skip
+  GPU stages unless started with `--gpu`; a job left alone records why, and the
+  submitter reports it. Arguments are paths on the worker, so a stage that
+  reads a path needs that path there. SIGTERM stops the running stage and
+  releases it for another worker at once; a killed worker's stage is requeued
+  when its lease runs out (`--lease-secs`, default 60).
+- **Pickup window.** A stage no worker claims within `BLUT_CLOUD_PICKUP_SECS`
+  (default 300, counted again if the stage is requeued) is withdrawn and fails
+  the run (`CLOUD_NO_WORKER`, not retried). An `Unavailable` result is a failure
+  here, never a local retry.
+- **Cancel and resume.** The job directory records the queue (`cloud_queue`) and
+  each cloud job id before its enqueue (`cloud_jobs`). `blut cancel <job>`
+  cancels what is still queued or running, also after the submitting process is
+  gone, and a worker running one stops it within seconds; an `s3://` queue needs
+  the run's `AWS_*` variables, and without them the command fails saying so. A
+  run withdraws its leftover work when it ends. `plan resume` refuses while a
+  stage it submitted still runs, refuses another queue than the job ran on, and
+  otherwise finishes the job: finished stages are cache hits, the rest are
+  submitted again.
+- **Polling cost.** An idle worker lists the queue every `--poll-ms` (default
+  5 s, backing off from 0.5 s); a running stage costs one state read every few
+  seconds on the worker and about one a second on the submitter.
+- **Retention.** Finished jobs' logs and bundles stay in the store. Nothing
+  deletes them; expire them with a bucket lifecycle rule longer than any run.
+
+`blut cloud queue` lists what a queue holds. Library surface: `cloud::location`,
+`cloud::object_queue`, `cloud::policy`, `cloud::records`, `cloud::worker::serve`,
+the defaulted `CloudQueue::{renew, release, refusals}`, and
+`CloudSubmitter::{with_pickup_timeout, with_job_record}`. `cli::run_from` runs
+the CLI on an explicit argument list.
 
 ## Preview surface (targeted for the 1.0 contract)
 

@@ -178,6 +178,39 @@ impl Registry {
         id
     }
 
+    /// A registry with the same erased stages and nothing else, owned
+    /// independently of `self`. Every cookbook's stage table is `'static`, so
+    /// this copies pointers; it is what an execution adapter that resolves
+    /// stages by name needs to outlive a borrowed registry.
+    #[cfg(feature = "cloud")]
+    pub(crate) fn stages_only(&self) -> Registry {
+        struct Stages {
+            name: &'static str,
+            stages: &'static [(&'static str, crate::framework::stage::ErasedStageCtor)],
+        }
+        impl Cookbook for Stages {
+            fn name(&self) -> &'static str {
+                self.name
+            }
+            fn recipes(&self) -> &'static [&'static RecipeDef] {
+                &[]
+            }
+            fn stages_erased(
+                &self,
+            ) -> &'static [(&'static str, crate::framework::stage::ErasedStageCtor)] {
+                self.stages
+            }
+        }
+        let mut out = Registry::new();
+        for c in &self.cookbooks {
+            out.register(Box::new(Stages {
+                name: c.name(),
+                stages: c.stages_erased(),
+            }));
+        }
+        out
+    }
+
     pub fn all(&self) -> impl Iterator<Item = &'static RecipeDef> + '_ {
         self.cookbooks
             .iter()

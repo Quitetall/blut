@@ -237,7 +237,7 @@ impl StoreError {
 /// silently overwrite each other's cached result, so there is no fallback.
 #[cfg(feature = "cloud")]
 #[derive(Debug)]
-struct ConditionalPutUnsupported(String);
+pub(crate) struct ConditionalPutUnsupported(pub(crate) String);
 
 #[cfg(feature = "cloud")]
 impl std::fmt::Display for ConditionalPutUnsupported {
@@ -260,7 +260,7 @@ impl std::error::Error for ConditionalPutUnsupported {}
 /// Recognises the S3 `NotImplemented` error code that Backblaze B2 returns
 /// with HTTP 501.
 #[cfg(feature = "cloud")]
-fn rejects_conditional_put(error: &object_store::Error) -> bool {
+pub(crate) fn rejects_conditional_put(error: &object_store::Error) -> bool {
     if matches!(error, object_store::Error::NotImplemented { .. }) {
         return true;
     }
@@ -388,62 +388,11 @@ impl ObjectStore {
     /// is wrapped, never trusted.
     #[cfg(feature = "s3")]
     pub fn from_url(url: &str, prefix: impl AsRef<str>) -> Result<Self, StoreError> {
-        // The raw string is not echoed on a parse failure: it may carry
-        // credentials that were never meant to be printed.
-        let parsed = url::Url::parse(url)
-            .map_err(|error| StoreError::InvalidAddress(format!("object-store URL: {error}")))?;
-        match parsed.scheme() {
-            "s3" => {
-                // Credentials and the endpoint come from the environment only.
-                // A URL that carries userinfo, a port or a query would be
-                // silently half-ignored (and later echoed), so refuse it
-                // without repeating it.
-                if !parsed.username().is_empty()
-                    || parsed.password().is_some()
-                    || parsed.port().is_some()
-                    || parsed.query().is_some()
-                    || parsed.fragment().is_some()
-                {
-                    return Err(StoreError::InvalidAddress(
-                        "s3 URL must be s3://bucket[/prefix]: credentials, port and \
-                         endpoint come from AWS_* environment variables, not the URL"
-                            .to_string(),
-                    ));
-                }
-                let bucket = parsed.host_str().ok_or_else(|| {
-                    StoreError::InvalidAddress(format!("{url}: no bucket in s3 URL"))
-                })?;
-                check_plain_http_endpoint(
-                    std::env::var("AWS_ENDPOINT")
-                        .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
-                        .ok()
-                        .as_deref(),
-                    std::env::var("AWS_ALLOW_HTTP").ok().as_deref(),
-                )?;
-                let inner = object_store::aws::AmazonS3Builder::from_env()
-                    .with_bucket_name(bucket)
-                    .build()
-                    .map_err(|error| StoreError::initialization("s3", error))?;
-                // A path inside the URL prefixes the caller's prefix, so
-                // `s3://bucket/runs` + "cloud" addresses `runs/cloud/…`.
-                let url_prefix = parsed.path().trim_matches('/');
-                let prefix = match (url_prefix, prefix.as_ref().trim_matches('/')) {
-                    ("", p) => p.to_string(),
-                    (u, "") => u.to_string(),
-                    (u, p) => format!("{u}/{p}"),
-                };
-                Self::provider(Arc::new(inner), prefix)
-            }
-            "file" => {
-                let path = parsed.to_file_path().map_err(|()| {
-                    StoreError::InvalidAddress(format!("{url}: not a valid file path"))
-                })?;
-                Self::local_provider(path, prefix)
-            }
-            other => Err(StoreError::InvalidAddress(format!(
-                "unsupported object-store scheme {other:?} in {url}"
-            ))),
-        }
+        let (inner, url_prefix) = provider_from_url(url)?;
+        // A path inside the URL prefixes the caller's prefix, so
+        // `s3://bucket/runs` + "cloud" addresses `runs/cloud/…`.
+        let prefix = join_prefix(&url_prefix, prefix.as_ref());
+        Self::provider(inner, prefix)
     }
 
     /// Local `object_store` provider adapter for development and conformance
@@ -1011,6 +960,81 @@ fn create_file_atomic(
         );
     }
     write_result
+}
+
+/// Build the provider a URL names, and the path the URL carries after its
+/// bucket (or `""`). Shared by [`ObjectStore::from_url`] and the cloud queue,
+/// which must address the same bucket the same way.
+///
+/// | scheme | provider |
+/// |---|---|
+/// | `s3://bucket/prefix` | S3, and any S3-compatible endpoint |
+/// | `file:///abs/path` | local filesystem provider (the directory must exist) |
+///
+/// Credentials and the endpoint come from the environment only (the variables
+/// the AWS CLI reads). The raw URL is never echoed on a parse failure: it may
+/// carry credentials that were never meant to be printed.
+#[cfg(feature = "s3")]
+pub(crate) fn provider_from_url(
+    url: &str,
+) -> Result<(Arc<dyn object_store::ObjectStore>, String), StoreError> {
+    let parsed = url::Url::parse(url)
+        .map_err(|error| StoreError::InvalidAddress(format!("object-store URL: {error}")))?;
+    match parsed.scheme() {
+        "s3" => {
+            // A URL that carries userinfo, a port or a query would be
+            // silently half-ignored (and later echoed), so refuse it
+            // without repeating it.
+            if !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.port().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+            {
+                return Err(StoreError::InvalidAddress(
+                    "s3 URL must be s3://bucket[/prefix]: credentials, port and \
+                     endpoint come from AWS_* environment variables, not the URL"
+                        .to_string(),
+                ));
+            }
+            let bucket = parsed
+                .host_str()
+                .ok_or_else(|| StoreError::InvalidAddress("no bucket in the s3 URL".to_string()))?;
+            check_plain_http_endpoint(
+                std::env::var("AWS_ENDPOINT")
+                    .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+                    .ok()
+                    .as_deref(),
+                std::env::var("AWS_ALLOW_HTTP").ok().as_deref(),
+            )?;
+            let inner = object_store::aws::AmazonS3Builder::from_env()
+                .with_bucket_name(bucket)
+                .build()
+                .map_err(|error| StoreError::initialization("s3", error))?;
+            Ok((Arc::new(inner), parsed.path().trim_matches('/').to_string()))
+        }
+        "file" => {
+            let path = parsed.to_file_path().map_err(|()| {
+                StoreError::InvalidAddress(format!("{url}: not a valid file path"))
+            })?;
+            let inner = object_store::local::LocalFileSystem::new_with_prefix(path)
+                .map_err(|error| StoreError::initialization("local-provider", error))?;
+            Ok((Arc::new(inner), String::new()))
+        }
+        other => Err(StoreError::InvalidAddress(format!(
+            "unsupported object-store scheme {other:?}"
+        ))),
+    }
+}
+
+/// `a/b` + `c` → `a/b/c`, with either side allowed to be empty.
+#[cfg(feature = "cloud")]
+pub(crate) fn join_prefix(outer: &str, inner: &str) -> String {
+    match (outer.trim_matches('/'), inner.trim_matches('/')) {
+        ("", p) => p.to_string(),
+        (u, "") => u.to_string(),
+        (u, p) => format!("{u}/{p}"),
+    }
 }
 
 #[cfg(feature = "cloud")]

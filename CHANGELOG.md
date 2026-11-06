@@ -11,6 +11,23 @@ depend on this crate.
 ## [Unreleased]
 
 ### Added
+- Cloud dispatch. `recipe run <name> --launcher cloud`, `recipe declare <file>
+  --run --launcher cloud` and `plan resume` of such a job run every stage on
+  `blut cloud worker` processes that poll a durable queue in a bucket (S3, R2,
+  MinIO, with the `s3` feature) or a directory, named by `BLUT_CLOUD_QUEUE`.
+  Nothing runs on the submitting machine: a stage the adapter cannot take fails
+  the run, and a stage no worker claims within `BLUT_CLOUD_PICKUP_SECS` (default
+  300) is withdrawn and fails it. A worker only claims stages of its own code
+  identity, renews its lease, and on SIGTERM hands its stage back; a killed
+  worker's stage is requeued when its lease runs out. `blut cancel` stops queued
+  and running cloud stages, also after the submitter is gone. `blut cloud queue`
+  lists a queue. `hpo`, `study` and `partition` still refuse `--launcher cloud`.
+  Library: `cloud::object_queue::ObjectQueue`, `cloud::location`,
+  `cloud::policy::CloudDispatchPolicy`, `cloud::records`,
+  `cloud::worker::serve`; `CloudQueue` gains defaulted `renew`, `release` and
+  `refusals`; `CloudSubmitter` gains `with_pickup_timeout` and
+  `with_job_record`. See API.md, "Cloud dispatch".
+- `cli::run_from` runs the CLI on an explicit argument list.
 - `schedule install` takes `--tenant`, `--shared-cache`, `--no-cache`,
   `--sync-io` and `--experiment`, passed to the scheduled `recipe run`; the
   tenant is checked against the quota policy at install, as `recipe run`

@@ -2251,6 +2251,44 @@ fn build_remote_request(task: &NodeTask, env: &NodeEnv, attempt: u32) -> Option<
     })
 }
 
+/// Why [`build_remote_request`] kept `task` local, for the `--launcher cloud`
+/// refusal. Re-derives the same conditions in the same order; only reached on
+/// that failure path.
+#[cfg(feature = "cloud")]
+fn cloud_unplaceable_reason(task: &NodeTask, env: &NodeEnv) -> String {
+    if env.execution_adapter.is_none() || env.dispatch_policy.is_none() {
+        return "no cloud execution adapter is installed".into();
+    }
+    if env.tenant.is_restricted() {
+        return format!(
+            "tenant '{}' is restricted, and restricted data never leaves this machine",
+            env.tenant
+        );
+    }
+    if env.training_io_node(task.node_id).is_some() {
+        return "it was admitted with a training I/O profile, which is local-only".into();
+    }
+    if env
+        .dispatch_policy
+        .as_ref()
+        .is_some_and(|policy| !policy.is_dispatchable(task.stage.name()))
+    {
+        return "the dispatch policy keeps it local".into();
+    }
+    match capture(
+        task.stage.as_ref(),
+        task.input.clone(),
+        &env.job_dir,
+        ArtifactRole::Input,
+        None,
+    ) {
+        Err(error) => format!(
+            "its input cannot be shipped (every file must be inside the job directory): {error}"
+        ),
+        Ok(_) => "it runs fused with the stage before it".into(),
+    }
+}
+
 async fn run_node(task: NodeTask, env: Arc<NodeEnv>) -> Result<NodeOutcome, NodeFailure> {
     run_node_with_admission(task, env, None, None, false, None).await
 }
@@ -2466,6 +2504,24 @@ async fn run_node_with_admission(
         let is_remote = remote_request.is_some();
         #[cfg(not(feature = "p2p"))]
         let is_remote = false;
+        // `--launcher cloud` promises that stages run on the workers: a stage
+        // the cloud adapter cannot take fails here, named, instead of quietly
+        // running on the submitting machine the way p2p falls back.
+        #[cfg(feature = "cloud")]
+        if !is_remote && env.launch_target == crate::config::launcher::LaunchTarget::Cloud {
+            let _ = std::fs::remove_dir_all(&tmp_stage_dir);
+            return Err(NodeFailure::Stage {
+                idx,
+                stage: stage_name.clone(),
+                source: StageError::Execution(Box::new(
+                    crate::framework::execution::ExecutionFailure::protocol(format!(
+                        "--launcher cloud cannot place stage '{stage_name}' on a worker: {}. \
+                         It was not run here either",
+                        cloud_unplaceable_reason(&task, &env)
+                    )),
+                )),
+            });
+        }
         let local_request = (!is_remote).then(|| build_local_request(&task, &env, attempt));
         let local_attempt = if is_remote {
             None
@@ -2741,7 +2797,8 @@ async fn run_node_with_admission(
                     Some(content_id),
                 )),
                 ExecutionResult::Failed(failure)
-                    if failure.kind == ExecutionFailureKind::Unavailable =>
+                    if failure.kind == ExecutionFailureKind::Unavailable
+                        && env.launch_target != crate::config::launcher::LaunchTarget::Cloud =>
                 {
                     tracing::warn!(
                         "remote execution unavailable for node {idx} ({stage_name}); running locally"

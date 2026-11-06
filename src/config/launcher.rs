@@ -1453,9 +1453,13 @@ pub enum LaunchTarget {
     /// owns the reconcile loop.
     K8s,
     /// Cloud compute queue (object-store dispatch, billed on compute — ADR 0082).
-    /// Like [`P2P`](Self::P2P) it has no [`Launcher`] and needs an
-    /// `ExecutionAdapter` (`cloud::submitter::CloudSubmitter`) that no `blut`
-    /// command installs, so every command refuses `--launcher cloud`.
+    /// Like [`P2P`](Self::P2P) it has no [`Launcher`]: stages reach workers
+    /// through an `ExecutionAdapter` (`cloud::submitter::CloudSubmitter` over
+    /// the durable `cloud::object_queue::ObjectQueue`). `recipe run`, `recipe
+    /// declare --run` and `plan resume` install it (feature `cloud`, queue in
+    /// `BLUT_CLOUD_QUEUE`; see [`check_cloud_launch`]); every other command
+    /// refuses `--launcher cloud`, and the executor refuses it without an
+    /// adapter.
     Cloud,
 }
 
@@ -1571,10 +1575,9 @@ pub(crate) fn check_launcher_placeable(target: LaunchTarget, surface: &str) -> R
              `ExecCtx::with_execution_adapter`"
         }
         LaunchTarget::Cloud => {
-            "no `blut` command submits a run's stages to the cloud queue. Its one command, \
-             `blut cloud smoke --store <dir|s3://bucket/prefix>` (a build with the `cloud` \
-             feature, `s3` for an s3:// store), round-trips the built-in `p2p-echo` stage \
-             with the submitter and the worker in one process"
+            "only `recipe run`, `recipe declare --run` and `plan resume` submit a run's \
+             stages to the cloud queue (a build with the `cloud` feature, the queue in \
+             BLUT_CLOUD_QUEUE, workers started with `blut cloud worker`)"
         }
         LaunchTarget::Local | LaunchTarget::Slurm | LaunchTarget::Ray | LaunchTarget::K8s => {
             return Ok(());
@@ -1585,6 +1588,63 @@ pub(crate) fn check_launcher_placeable(target: LaunchTarget, surface: &str) -> R
          to run on this machine",
         target.as_str()
     )))
+}
+
+/// Environment variable naming the cloud queue `--launcher cloud` submits to:
+/// `s3://bucket[/prefix]` (a build with the `s3` feature; credentials from the
+/// `AWS_*` variables only), `file:///dir`, or a directory. Workers poll the
+/// same location (`blut cloud worker --queue`).
+pub const CLOUD_QUEUE_ENV: &str = "BLUT_CLOUD_QUEUE";
+
+/// Environment variable bounding how long a submitted stage may wait for a
+/// worker to claim it, in seconds ([`DEFAULT_CLOUD_PICKUP_SECS`] when unset).
+pub const CLOUD_PICKUP_ENV: &str = "BLUT_CLOUD_PICKUP_SECS";
+
+/// Pickup window when [`CLOUD_PICKUP_ENV`] is unset.
+pub const DEFAULT_CLOUD_PICKUP_SECS: u64 = 300;
+
+/// The pickup window `--launcher cloud` uses: [`CLOUD_PICKUP_ENV`], or the
+/// default. A value that is not a positive whole number is an error, never
+/// silently the default.
+pub fn cloud_pickup_window() -> Result<std::time::Duration> {
+    match std::env::var(CLOUD_PICKUP_ENV)
+        .map(|v| v.trim().to_string())
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        None => Ok(std::time::Duration::from_secs(DEFAULT_CLOUD_PICKUP_SECS)),
+        Some(value) => match value.parse::<u64>() {
+            Ok(secs) if secs > 0 => Ok(std::time::Duration::from_secs(secs)),
+            _ => Err(TrainError::other(format!(
+                "{CLOUD_PICKUP_ENV}={value:?} is not a positive whole number of seconds; fix \
+                 or unset it"
+            ))),
+        },
+    }
+}
+
+/// Whether `--launcher cloud` can place `surface` (`recipe run`, `recipe
+/// declare --run`, `plan resume`): this binary has the `cloud` feature, and
+/// [`CLOUD_QUEUE_ENV`] names a queue. Says what is missing and that nothing
+/// ran. Call it before any work starts; the queue itself is opened and probed
+/// when the run starts.
+pub fn check_cloud_launch(surface: &str) -> Result<()> {
+    if !cfg!(feature = "cloud") {
+        return Err(TrainError::other(format!(
+            "--launcher cloud cannot place {surface}: this binary was built without the \
+             `cloud` feature (`s3` for an s3:// queue). Nothing ran. Use --launcher local \
+             to run on this machine"
+        )));
+    }
+    let queue = std::env::var(CLOUD_QUEUE_ENV).unwrap_or_default();
+    if queue.trim().is_empty() {
+        return Err(TrainError::other(format!(
+            "--launcher cloud cannot place {surface}: set {CLOUD_QUEUE_ENV} to the queue the \
+             workers poll (s3://bucket[/prefix] or a directory, the value given to \
+             `blut cloud worker --queue`). Nothing ran"
+        )));
+    }
+    cloud_pickup_window().map(|_| ())
 }
 
 /// The configured [`Launcher`] for a target. Slurm/Ray read their cluster
@@ -1617,8 +1677,9 @@ pub fn launcher_for(target: LaunchTarget) -> Box<dyn Launcher> {
         // placement: this signature has no error path, so it returns the local
         // launcher. A k8s run is a BlutPlan submitted by `recipe run` (see
         // `k8s_cluster`); p2p and cloud need an ExecutionAdapter
-        // (`ExecCtx::with_execution_adapter`), which no command installs. Every
-        // command refuses the three before a stage could reach this
+        // (`ExecCtx::with_execution_adapter`), which only the cloud launch of
+        // `recipe run`, `recipe declare --run` and `plan resume` installs.
+        // Every other command refuses them before a stage could reach this
         // (`check_launcher_placeable`, `k8s_cluster::refuse_surface`), and the
         // executor refuses them without an adapter.
         LaunchTarget::P2P | LaunchTarget::K8s | LaunchTarget::Cloud => {
@@ -2167,8 +2228,35 @@ mod tests {
             cloud.starts_with("--launcher cloud cannot place `hpo` trials"),
             "{cloud}"
         );
-        assert!(cloud.contains("blut cloud smoke --store"), "{cloud}");
+        assert!(cloud.contains("only `recipe run`"), "{cloud}");
         assert!(cloud.contains("Nothing ran"), "{cloud}");
+    }
+
+    /// The surfaces that do place cloud work say exactly what is missing.
+    #[test]
+    fn a_cloud_launch_needs_the_feature_and_a_queue() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+        unsafe { std::env::remove_var(CLOUD_QUEUE_ENV) };
+        unsafe { std::env::remove_var(CLOUD_PICKUP_ENV) };
+        let err = check_cloud_launch("`recipe run`").unwrap_err().to_string();
+        assert!(err.contains("Nothing ran"), "{err}");
+        if cfg!(feature = "cloud") {
+            assert!(err.contains(CLOUD_QUEUE_ENV), "{err}");
+            unsafe { std::env::set_var(CLOUD_QUEUE_ENV, "/tmp/q") };
+            check_cloud_launch("`recipe run`").unwrap();
+            unsafe { std::env::set_var(CLOUD_PICKUP_ENV, "soon") };
+            let err = check_cloud_launch("`recipe run`").unwrap_err().to_string();
+            assert!(err.contains(CLOUD_PICKUP_ENV), "{err}");
+            unsafe { std::env::set_var(CLOUD_PICKUP_ENV, "7") };
+            assert_eq!(cloud_pickup_window().unwrap().as_secs(), 7);
+        } else {
+            assert!(err.contains("`cloud` feature"), "{err}");
+        }
+        unsafe { std::env::remove_var(CLOUD_QUEUE_ENV) };
+        unsafe { std::env::remove_var(CLOUD_PICKUP_ENV) };
     }
 
     #[test]

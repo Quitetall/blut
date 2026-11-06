@@ -50,6 +50,13 @@ HTTP and over verified TLS. Backblaze B2 lacks conditional writes and is
 refused with an error that says so. Still missing: IAM-role / STS credentials
 and a run against AWS S3 itself.
 
+Cloud dispatch runs on it: `recipe run --launcher cloud` and `recipe declare
+--run --launcher cloud` place every stage on `blut cloud worker` processes
+through a durable queue on the bucket, validated on R2 with workers as separate
+processes on one host. `blut cancel` and `plan resume` work with the submitter
+gone. Still missing: workers on separate hosts, a GPU stage, a large artifact,
+`hpo`/`study`/`partition` on the cloud launcher, and retention of finished jobs.
+
 **4. A benchmark baseline that exists.** The regression gate
 (`scripts/bench_regression_gate.py`) compares confidence bounds rather than
 raw medians, and `scripts/run_benchmarks.sh compare` names the `release-0.2`
