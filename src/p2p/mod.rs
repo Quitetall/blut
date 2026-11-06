@@ -32,6 +32,22 @@ pub mod task;
 pub mod transport;
 pub mod trust;
 
+/// Test scratch: directories that live as long as the test holding this.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestDirs(std::sync::Mutex<Vec<tempfile::TempDir>>);
+
+#[cfg(test)]
+impl TestDirs {
+    /// A new directory, removed when this value drops.
+    pub(crate) fn dir(&self) -> std::path::PathBuf {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        self.0.lock().unwrap().push(dir);
+        path
+    }
+}
+
 pub use bundle::{BlobDir, BundleError, BundleManifest, bundle, unbundle};
 pub use chunkstore::{ChunkError, ChunkIndex, ChunkStore};
 pub use coordinator::Coordinator;

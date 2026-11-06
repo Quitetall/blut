@@ -789,7 +789,7 @@ impl RegistrySaver {
         tokio::spawn(async move {
             while marks.recv().await.is_some() {
                 let snapshot = peers.read().await.clone();
-                match tokio::task::spawn_blocking(move || snapshot.save()).await {
+                match tokio::task::spawn_blocking(move || snapshot.write_atomic()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => tracing::warn!("p2p: failed to persist the peer registry: {e}"),
                     Err(e) => tracing::warn!("p2p: peer registry save task failed: {e}"),
@@ -830,6 +830,10 @@ impl P2pServer {
         let server_config = Self::make_server_config(&keypair, allow_legacy)?;
         let endpoint = Endpoint::server(server_config, addr)
             .map_err(|e| TrainError::other(format!("bind QUIC endpoint: {e}")))?;
+        // Background saves expect the directory; see `write_atomic`.
+        if let Err(e) = peers.ensure_dir() {
+            tracing::warn!("p2p: peer registry directory: {e}");
+        }
         let peers = Arc::new(RwLock::new(peers));
         Ok(Self {
             endpoint,
@@ -850,7 +854,7 @@ impl P2pServer {
     /// a process about to exit, whose background save might not get to run.
     pub(crate) async fn flush_peers(&self) {
         let snapshot = self.peers.read().await.clone();
-        match tokio::task::spawn_blocking(move || snapshot.save()).await {
+        match tokio::task::spawn_blocking(move || snapshot.write_atomic()).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!("p2p: failed to persist the peer registry: {e}"),
             Err(e) => tracing::warn!("p2p: peer registry save task failed: {e}"),
@@ -1941,16 +1945,14 @@ mod pinned_verifier_tests {
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
-    async fn bind_loopback_server() -> (P2pServer, std::sync::Arc<KeyPair>) {
+    async fn bind_loopback_server() -> (P2pServer, std::sync::Arc<KeyPair>, tempfile::TempDir) {
         let keypair = std::sync::Arc::new(KeyPair::generate());
         let dir = tempfile::tempdir().unwrap();
         let peers = PeerRegistry::load(&dir.path().join("peers.json")).unwrap();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let server = P2pServer::bind(addr, keypair.clone(), peers).await.unwrap();
-        // Keep the tempdir alive for the registry's lifetime by leaking it —
-        // this is a short-lived unit test process, not a long-running one.
-        std::mem::forget(dir);
-        (server, keypair)
+        // The caller holds the directory for the registry's lifetime.
+        (server, keypair, dir)
     }
 
     /// End-to-end companion to the direct unit test above: exercises the
@@ -1959,7 +1961,7 @@ mod pinned_verifier_tests {
     /// the fix holds through the full handshake, not just in isolation.
     #[tokio::test]
     async fn connect_with_correct_pin_succeeds_end_to_end() {
-        let (server, server_keypair) = bind_loopback_server().await;
+        let (server, server_keypair, _registry_dir) = bind_loopback_server().await;
         let addr = server.local_addr().unwrap();
 
         // Drain the app-level handshake so `P2pClient::connect` (which waits
@@ -2000,7 +2002,7 @@ mod pinned_verifier_tests {
         // Found on a real WAN run: a --coordinator-pubkey with the right
         // Ed25519 half but a wrong X25519 half connected, ran the task, sealed
         // the result to a key nobody holds, and exited 0.
-        let (server, server_keypair) = bind_loopback_server().await;
+        let (server, server_keypair, _registry_dir) = bind_loopback_server().await;
         let addr = server.local_addr().unwrap();
         tokio::spawn(async move {
             let _ = server.accept_peer().await;
@@ -2027,7 +2029,7 @@ mod pinned_verifier_tests {
 
     #[tokio::test]
     async fn both_halves_of_the_right_pin_connect() {
-        let (server, server_keypair) = bind_loopback_server().await;
+        let (server, server_keypair, _registry_dir) = bind_loopback_server().await;
         let addr = server.local_addr().unwrap();
         // Hold the accepted connection open, as in the single-pin test: a
         // dropped handle tears QUIC down under the in-flight HandshakeAck.
@@ -2059,7 +2061,7 @@ mod pinned_verifier_tests {
             .unwrap_or_else(|p| p.into_inner());
         // SAFETY: serialized by TEST_ENV_LOCK; removed below.
         unsafe { std::env::set_var(CONGESTION_ENV, "bbr") };
-        let (server, server_keypair) = bind_loopback_server().await;
+        let (server, server_keypair, _registry_dir) = bind_loopback_server().await;
         let addr = server.local_addr().unwrap();
         tokio::spawn(async move {
             if let Ok((_, conn)) = server.accept_peer().await {
@@ -2118,7 +2120,7 @@ mod pinned_verifier_tests {
 
     #[tokio::test]
     async fn connect_with_wrong_pin_fails_end_to_end() {
-        let (server, _server_keypair) = bind_loopback_server().await;
+        let (server, _server_keypair, _registry_dir) = bind_loopback_server().await;
         let addr = server.local_addr().unwrap();
         tokio::spawn(async move {
             let _ = server.accept_peer().await;
@@ -2228,7 +2230,7 @@ mod pinned_verifier_tests {
     /// behind it, so the worker waited out the idle timeout.
     #[tokio::test]
     async fn abandoned_blob_send_is_reset_not_delivered() {
-        let (server, server_keypair) = bind_loopback_server().await;
+        let (server, server_keypair, _registry_dir) = bind_loopback_server().await;
         let blackhole = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let relay = spawn_relay(server.local_addr().unwrap(), blackhole.clone()).await;
         let client = P2pClient::with_coordinator_pin(
@@ -2275,7 +2277,7 @@ mod pinned_verifier_tests {
     /// return promptly and cleanly instead of waiting out the idle timeout.
     #[tokio::test]
     async fn end_session_lets_the_worker_exit_promptly() {
-        let (server, server_keypair) = bind_loopback_server().await;
+        let (server, server_keypair, _registry_dir) = bind_loopback_server().await;
         let addr = server.local_addr().unwrap();
         let client_keypair = std::sync::Arc::new(KeyPair::generate());
         let client =
@@ -2321,7 +2323,7 @@ mod pinned_verifier_tests {
     /// against the client cert, not merely trusted as self-asserted.
     #[tokio::test]
     async fn mutual_auth_binds_peer_id_to_tls_identity() {
-        let (server, server_keypair) = bind_loopback_server().await;
+        let (server, server_keypair, _registry_dir) = bind_loopback_server().await;
         let addr = server.local_addr().unwrap();
 
         let accept = tokio::spawn(async move {
@@ -2369,7 +2371,7 @@ mod pinned_verifier_tests {
         let blob: Vec<u8> = (0..(CHUNK_MAX * 2 + 77)).map(|i| (i % 251) as u8).collect();
 
         for preseed_all in [false, true] {
-            let (server, server_kp) = bind_loopback_server().await;
+            let (server, server_kp, _registry_dir) = bind_loopback_server().await;
             let addr = server.local_addr().unwrap();
 
             let recv_dir = tempfile::tempdir().unwrap();

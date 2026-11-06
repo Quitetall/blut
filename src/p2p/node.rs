@@ -1325,16 +1325,15 @@ mod tests {
     async fn spawn_node(
         caps: NodeCapabilities,
         runner: Option<Arc<dyn MeshTaskRunner>>,
-    ) -> (Arc<MeshNode>, Arc<KeyPair>) {
+    ) -> (Arc<MeshNode>, Arc<KeyPair>, tempfile::TempDir) {
         let keypair = Arc::new(KeyPair::generate());
         let dir = tempfile::tempdir().unwrap();
         let peers = PeerRegistry::load(&dir.path().join("peers.json")).unwrap();
-        std::mem::forget(dir); // keep registry path alive for the test process
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let node = MeshNode::bind(addr, keypair.clone(), peers, caps, runner, false)
             .await
             .unwrap();
-        (node, keypair)
+        (node, keypair, dir)
     }
 
     fn echo_task(from: &PeerId, signer: &KeyPair) -> TaskManifest {
@@ -1375,7 +1374,7 @@ mod tests {
     async fn scheduler_dispatches_to_worker_only_node() {
         // Worker-only node C.
         let c_keypair = Arc::new(KeyPair::generate());
-        let (c, c_id) = {
+        let (c, c_id, _c_dir) = {
             let runner: Arc<dyn MeshTaskRunner> = Arc::new(EchoRunner {
                 keypair: c_keypair.clone(),
             });
@@ -1383,7 +1382,6 @@ mod tests {
             // the node identity.
             let dir = tempfile::tempdir().unwrap();
             let peers = PeerRegistry::load(&dir.path().join("peers.json")).unwrap();
-            std::mem::forget(dir);
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
             let node = MeshNode::bind(
                 addr,
@@ -1399,11 +1397,11 @@ mod tests {
             .await
             .unwrap();
             let id = node.node_id().clone();
-            (node, id)
+            (node, id, dir)
         };
 
         // Scheduler-only node A.
-        let (a, _a_kp) = spawn_node(
+        let (a, _a_kp, _dir) = spawn_node(
             NodeCapabilities {
                 worker: false,
                 scheduler: true,
@@ -1441,7 +1439,7 @@ mod tests {
     /// error, not a panic or hang.
     #[tokio::test]
     async fn worker_capability_gates_task_execution() {
-        let (server, server_kp) = spawn_node(
+        let (server, server_kp, _dir) = spawn_node(
             NodeCapabilities {
                 worker: false,
                 scheduler: true,
@@ -1449,7 +1447,7 @@ mod tests {
             None,
         )
         .await;
-        let (client, client_kp) = spawn_node(NodeCapabilities::default(), {
+        let (client, client_kp, _dir) = spawn_node(NodeCapabilities::default(), {
             let r: Arc<dyn MeshTaskRunner> = Arc::new(EchoRunner {
                 keypair: Arc::new(KeyPair::generate()),
             });
@@ -1480,7 +1478,6 @@ mod tests {
         let c_keypair = Arc::new(KeyPair::generate());
         let dir = tempfile::tempdir().unwrap();
         let peers = PeerRegistry::load(&dir.path().join("peers.json")).unwrap();
-        std::mem::forget(dir);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let runner: Arc<dyn MeshTaskRunner> = Arc::new(EchoRunner {
             keypair: c_keypair.clone(),
@@ -1499,7 +1496,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (a, a_kp) = spawn_node(
+        let (a, a_kp, _dir) = spawn_node(
             NodeCapabilities {
                 worker: false,
                 scheduler: true,
@@ -1543,7 +1540,7 @@ mod tests {
     async fn gossip_learns_addresses_from_known_sender_only() {
         use crate::p2p::gossip::{PeerExchange, PeerRecord};
 
-        let (server, server_kp) = spawn_node(NodeCapabilities::default(), {
+        let (server, server_kp, _dir) = spawn_node(NodeCapabilities::default(), {
             let r: Arc<dyn MeshTaskRunner> = Arc::new(EchoRunner {
                 keypair: Arc::new(KeyPair::generate()),
             });
@@ -1552,7 +1549,7 @@ mod tests {
         .await;
         // Client A dials the server, so the server registers A (mutual TLS) and
         // can therefore verify A's gossip.
-        let (client, client_kp) = spawn_node(
+        let (client, client_kp, _dir) = spawn_node(
             NodeCapabilities {
                 worker: false,
                 scheduler: true,
@@ -1605,7 +1602,7 @@ mod tests {
         use crate::framework::status::{StageEvent, StatusHub, spawn_status_writer};
 
         // Initiator node with a status hub + writer.
-        let (initiator, initiator_kp) = spawn_node(NodeCapabilities::default(), {
+        let (initiator, initiator_kp, _dir) = spawn_node(NodeCapabilities::default(), {
             let r: Arc<dyn MeshTaskRunner> = Arc::new(EchoRunner {
                 keypair: Arc::new(KeyPair::generate()),
             });
@@ -1619,7 +1616,7 @@ mod tests {
         initiator.set_status_hub(hub.clone());
 
         // Worker dials the initiator and forwards a lifecycle event.
-        let (worker, _wkp) = spawn_node(
+        let (worker, _wkp, _dir) = spawn_node(
             NodeCapabilities {
                 worker: true,
                 scheduler: false,
@@ -1668,14 +1665,14 @@ mod tests {
 
     #[tokio::test]
     async fn ping_pong_over_node() {
-        let (server, server_kp) = spawn_node(NodeCapabilities::default(), {
+        let (server, server_kp, _dir) = spawn_node(NodeCapabilities::default(), {
             let r: Arc<dyn MeshTaskRunner> = Arc::new(EchoRunner {
                 keypair: Arc::new(KeyPair::generate()),
             });
             Some(r)
         })
         .await;
-        let (client, _kp) = spawn_node(
+        let (client, _kp, _dir) = spawn_node(
             NodeCapabilities {
                 worker: false,
                 scheduler: true,
@@ -1723,11 +1720,10 @@ mod tests {
 
     /// A full node whose echo runner signs with the node's own key, with gossip
     /// running on a short interval.
-    async fn gossip_node(max_peers: usize) -> (Arc<MeshNode>, Arc<KeyPair>) {
+    async fn gossip_node(max_peers: usize) -> (Arc<MeshNode>, Arc<KeyPair>, tempfile::TempDir) {
         let kp = Arc::new(KeyPair::generate());
         let dir = tempfile::tempdir().unwrap();
         let peers = PeerRegistry::load(&dir.path().join("peers.json")).unwrap();
-        std::mem::forget(dir);
         let runner: Arc<dyn MeshTaskRunner> = Arc::new(EchoRunner {
             keypair: kp.clone(),
         });
@@ -1748,7 +1744,7 @@ mod tests {
             .with_backoff(Duration::from_millis(200), Duration::from_secs(2));
         assert!(node.start_gossip(cfg.clone()));
         assert!(!node.start_gossip(cfg), "second start is a no-op");
-        (node, kp)
+        (node, kp, dir)
     }
 
     async fn wait_until<F, Fut>(what: &str, mut cond: F)
@@ -1785,14 +1781,14 @@ mod tests {
         Arc<KeyPair>,
         quinn::Connection,
     ) {
-        let (s, s_kp) = spawn_node(NodeCapabilities::default(), {
+        let (s, s_kp, _dir) = spawn_node(NodeCapabilities::default(), {
             let r: Arc<dyn MeshTaskRunner> = Arc::new(EchoRunner {
                 keypair: Arc::new(KeyPair::generate()),
             });
             Some(r)
         })
         .await;
-        let (a, a_kp) = spawn_node(
+        let (a, a_kp, _dir) = spawn_node(
             NodeCapabilities {
                 worker: false,
                 scheduler: true,
@@ -1819,10 +1815,10 @@ mod tests {
     /// scenarios run at once), which a loaded host made likely.
     #[tokio::test]
     async fn gossip_lets_a_node_seeded_with_one_peer_reach_the_rest() {
-        let (a, a_kp) = gossip_node(32).await;
-        let (b, _) = gossip_node(1).await;
-        let (c, c_kp) = gossip_node(1).await;
-        let (d, d_kp) = gossip_node(32).await;
+        let (a, a_kp, _dir) = gossip_node(32).await;
+        let (b, _, _dir) = gossip_node(1).await;
+        let (c, c_kp, _dir) = gossip_node(1).await;
+        let (d, d_kp, _dir) = gossip_node(32).await;
         let a_addr = a.local_addr().unwrap();
         let a_key = a_kp.verifying.to_bytes();
         for n in [&b, &c, &d] {
@@ -1871,7 +1867,7 @@ mod tests {
     /// both but, at max_peers = 1, dials neither.
     #[tokio::test]
     async fn gossip_respects_max_peers() {
-        let (a, a_kp) = gossip_node(32).await;
+        let (a, a_kp, _dir) = gossip_node(32).await;
         let quiet = || async {
             spawn_node(NodeCapabilities::default(), {
                 let r: Arc<dyn MeshTaskRunner> = Arc::new(EchoRunner {
@@ -1881,15 +1877,15 @@ mod tests {
             })
             .await
         };
-        let (b, b_kp) = quiet().await;
-        let (c, c_kp) = quiet().await;
+        let (b, b_kp, _dir) = quiet().await;
+        let (c, c_kp, _dir) = quiet().await;
         a.connect_to(b.local_addr().unwrap(), b_kp.verifying.to_bytes())
             .await
             .unwrap();
         a.connect_to(c.local_addr().unwrap(), c_kp.verifying.to_bytes())
             .await
             .unwrap();
-        let (d, _) = gossip_node(1).await;
+        let (d, _, _dir) = gossip_node(1).await;
         let a_addr = a.local_addr().unwrap();
         let a_key = a_kp.verifying.to_bytes();
         d.add_seed(a_addr, a_key).await.unwrap();
@@ -2023,7 +2019,7 @@ mod tests {
     async fn gossip_cannot_move_a_confirmed_peer_or_change_trust() {
         let (s, _s_kp, a, a_kp, conn) = receiver_and_sender().await;
         // S dials Y itself → confirmed.
-        let (y, y_kp) = spawn_node(
+        let (y, y_kp, _dir) = spawn_node(
             NodeCapabilities {
                 worker: false,
                 scheduler: true,
@@ -2048,9 +2044,9 @@ mod tests {
     /// DIFFERENT key: the dial pins the advertised key, fails, and backs off.
     #[tokio::test]
     async fn a_learned_peer_whose_key_does_not_answer_is_not_connected() {
-        let (s, _) = gossip_node(32).await;
-        let (a, a_kp) = gossip_node(32).await;
-        let (y, _) = gossip_node(32).await; // listens, but under its own key
+        let (s, _, _dir) = gossip_node(32).await;
+        let (a, a_kp, _dir) = gossip_node(32).await;
+        let (y, _, _dir) = gossip_node(32).await; // listens, but under its own key
         let impostor = KeyPair::generate();
         let impostor_id = PeerId::from_pubkey(&impostor.verifying);
         let conn = a
@@ -2092,7 +2088,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_node_refuses_to_seed_or_dial_itself() {
-        let (n, kp) = gossip_node(32).await;
+        let (n, kp, _dir) = gossip_node(32).await;
         let addr = n.local_addr().unwrap();
         assert!(n.add_seed(addr, kp.verifying.to_bytes()).await.is_err());
         assert!(n.connect_to(addr, kp.verifying.to_bytes()).await.is_err());

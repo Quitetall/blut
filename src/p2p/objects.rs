@@ -336,6 +336,7 @@ mod tests {
     use super::*;
     use crate::framework::cookbook::Registry;
     use crate::framework::stage::ErasedArtifact;
+    use crate::p2p::TestDirs;
     use crate::p2p::chunkstore::ChunkIndex;
     use crate::p2p::crypto::KeyPair;
     use crate::p2p::mesh_runner::SharedCacheRunner;
@@ -345,16 +346,12 @@ mod tests {
     use crate::p2p::transport::{P2pClient, P2pServer};
     use std::sync::Arc;
 
-    fn tmp() -> PathBuf {
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().to_path_buf();
-        std::mem::forget(d);
-        p
-    }
-
-    async fn scheduler_node(objects: Option<Arc<MeshObjects>>) -> (Arc<MeshNode>, Arc<KeyPair>) {
+    async fn scheduler_node(
+        t: &TestDirs,
+        objects: Option<Arc<MeshObjects>>,
+    ) -> (Arc<MeshNode>, Arc<KeyPair>) {
         let kp = Arc::new(KeyPair::generate());
-        let peers = PeerRegistry::load(&tmp().join("peers.json")).unwrap();
+        let peers = PeerRegistry::load(&t.dir().join("peers.json")).unwrap();
         let node = MeshNode::bind(
             "127.0.0.1:0".parse().unwrap(),
             kp.clone(),
@@ -375,10 +372,10 @@ mod tests {
     }
 
     /// Publish a `p2p-echo` input of `text` into `store`; return its id.
-    async fn publish(store: &ObjectStore, text: &str) -> ArtifactContentId {
+    async fn publish(t: &TestDirs, store: &ObjectStore, text: &str) -> ArtifactContentId {
         let mut registry = Registry::new();
         crate::p2p::smoke::register(&mut registry);
-        let src = tmp();
+        let src = t.dir();
         let path = src.join("p2p-echo-in.txt");
         std::fs::write(&path, text).unwrap();
         let input = SmokeText {
@@ -397,21 +394,23 @@ mod tests {
     }
 
     /// Serving node S (objects attached) + client node C dialed into it.
-    async fn pair() -> (
+    async fn pair(
+        t: &TestDirs,
+    ) -> (
         Arc<MeshNode>,
         Arc<MeshObjects>,
         Arc<MeshNode>,
         MeshObjects,
         quinn::Connection,
     ) {
-        let s_objects = Arc::new(MeshObjects::new(ObjectStore::filesystem(tmp()), tmp()));
-        let (s, s_kp) = scheduler_node(Some(s_objects.clone())).await;
-        let (c, _) = scheduler_node(None).await;
+        let s_objects = Arc::new(MeshObjects::new(ObjectStore::filesystem(t.dir()), t.dir()));
+        let (s, s_kp) = scheduler_node(t, Some(s_objects.clone())).await;
+        let (c, _) = scheduler_node(t, None).await;
         let conn = c
             .connect_to(s.local_addr().unwrap(), s_kp.verifying.to_bytes())
             .await
             .unwrap();
-        let c_objects = MeshObjects::new(ObjectStore::filesystem(tmp()), tmp());
+        let c_objects = MeshObjects::new(ObjectStore::filesystem(t.dir()), t.dir());
         (s, s_objects, c, c_objects, conn)
     }
 
@@ -419,11 +418,12 @@ mod tests {
 
     #[tokio::test]
     async fn only_a_granted_peer_can_fetch_and_the_object_verifies() {
-        let (_s, s_objects, c, c_objects, conn) = pair().await;
+        let t = TestDirs::default();
+        let (_s, s_objects, c, c_objects, conn) = pair(&t).await;
         // 3 MiB spans more than one transfer chunk only if CHUNK_MAX is small;
         // either way the bytes must round-trip exactly.
         let text = "mesh object plane ".repeat(3 * 1024 * 1024 / 18);
-        let id = publish(s_objects.store(), &text).await;
+        let id = publish(&t, s_objects.store(), &text).await;
 
         let err = c_objects.fetch_artifact(&conn, id, DL).await.unwrap_err();
         assert!(format!("{err}").contains("not granted"), "{err}");
@@ -443,9 +443,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_object_that_is_not_the_requested_id_is_rejected() {
-        let (_s, s_objects, c, c_objects, conn) = pair().await;
-        let real = publish(s_objects.store(), "real").await;
-        let other = publish(s_objects.store(), "other").await;
+        let t = TestDirs::default();
+        let (_s, s_objects, c, c_objects, conn) = pair(&t).await;
+        let real = publish(&t, s_objects.store(), "real").await;
+        let other = publish(&t, s_objects.store(), "other").await;
         // Plant `other`'s bytes under `real`'s key on the serving node.
         let other_bytes = s_objects
             .store()
@@ -455,12 +456,13 @@ mod tests {
             .unwrap();
         // The artifact namespace is not payload-addressed, so a corrupted or
         // hostile store can hold the wrong bytes under a key.
-        let bad_store = ObjectStore::filesystem(tmp());
+        let bad_store = ObjectStore::filesystem(t.dir());
         bad_store
             .put(ObjectKey::Artifact(real), other_bytes)
             .await
             .expect("plant mislabelled bytes");
-        let (s2, s2_kp) = scheduler_node(Some(Arc::new(MeshObjects::new(bad_store, tmp())))).await;
+        let (s2, s2_kp) =
+            scheduler_node(&t, Some(Arc::new(MeshObjects::new(bad_store, t.dir())))).await;
         s2.objects().unwrap().grant(c.node_id(), real);
         let conn2 = c
             .connect_to(s2.local_addr().unwrap(), s2_kp.verifying.to_bytes())
@@ -484,24 +486,26 @@ mod tests {
 
     #[tokio::test]
     async fn an_object_over_the_cap_is_refused_before_any_chunk() {
-        let (_s, s_objects, c, _c_objects, conn) = pair().await;
-        let id = publish(s_objects.store(), &"x".repeat(64 * 1024)).await;
+        let t = TestDirs::default();
+        let (_s, s_objects, c, _c_objects, conn) = pair(&t).await;
+        let id = publish(&t, s_objects.store(), &"x".repeat(64 * 1024)).await;
         s_objects.grant(c.node_id(), id);
         let small =
-            MeshObjects::new(ObjectStore::filesystem(tmp()), tmp()).with_max_object_bytes(1024);
+            MeshObjects::new(ObjectStore::filesystem(t.dir()), t.dir()).with_max_object_bytes(1024);
         let err = small.fetch_artifact(&conn, id, DL).await.unwrap_err();
         assert!(format!("{err}").contains("exceeds cap"), "{err}");
     }
 
     #[tokio::test]
     async fn a_node_without_an_object_plane_refuses() {
-        let (s, s_kp) = scheduler_node(None).await;
-        let (c, _) = scheduler_node(None).await;
+        let t = TestDirs::default();
+        let (s, s_kp) = scheduler_node(&t, None).await;
+        let (c, _) = scheduler_node(&t, None).await;
         let conn = c
             .connect_to(s.local_addr().unwrap(), s_kp.verifying.to_bytes())
             .await
             .unwrap();
-        let objects = MeshObjects::new(ObjectStore::filesystem(tmp()), tmp());
+        let objects = MeshObjects::new(ObjectStore::filesystem(t.dir()), t.dir());
         let id = ArtifactContentId::from_digest(ContentHash::of_bytes(b"x"));
         let err = objects.fetch_artifact(&conn, id, DL).await.unwrap_err();
         assert!(format!("{err}").contains("serves no objects"), "{err}");
@@ -516,9 +520,9 @@ mod tests {
 
     /// A raw server that answers one object request with a one-chunk index and
     /// then misbehaves. Returns the client's connection.
-    async fn hostile_server(mode: Hostile) -> quinn::Connection {
+    async fn hostile_server(t: &TestDirs, mode: Hostile) -> quinn::Connection {
         let server_kp = Arc::new(KeyPair::generate());
-        let peers = PeerRegistry::load(&tmp().join("peers.json")).unwrap();
+        let peers = PeerRegistry::load(&t.dir().join("peers.json")).unwrap();
         let server = P2pServer::bind("127.0.0.1:0".parse().unwrap(), server_kp.clone(), peers)
             .await
             .unwrap();
@@ -564,8 +568,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_chunk_that_does_not_match_its_hash_is_rejected() {
-        let conn = hostile_server(Hostile::WrongChunkBytes).await;
-        let objects = MeshObjects::new(ObjectStore::filesystem(tmp()), tmp());
+        let t = TestDirs::default();
+        let conn = hostile_server(&t, Hostile::WrongChunkBytes).await;
+        let objects = MeshObjects::new(ObjectStore::filesystem(t.dir()), t.dir());
         let id = ArtifactContentId::from_digest(ContentHash::of_bytes(b"x"));
         let err = objects.fetch_artifact(&conn, id, DL).await.unwrap_err();
         assert!(format!("{err}").contains("store chunk"), "{err}");
@@ -573,8 +578,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_peer_that_stalls_mid_transfer_times_out() {
-        let conn = hostile_server(Hostile::StallAfterIndex).await;
-        let objects = MeshObjects::new(ObjectStore::filesystem(tmp()), tmp())
+        let t = TestDirs::default();
+        let conn = hostile_server(&t, Hostile::StallAfterIndex).await;
+        let objects = MeshObjects::new(ObjectStore::filesystem(t.dir()), t.dir())
             .with_stall_timeout(Duration::from_millis(500));
         let id = ArtifactContentId::from_digest(ContentHash::of_bytes(b"x"));
         let started = Instant::now();
@@ -585,7 +591,8 @@ mod tests {
 
     #[test]
     fn grants_expire_per_peer_and_are_capped() {
-        let objects = MeshObjects::new(ObjectStore::filesystem(tmp()), tmp());
+        let t = TestDirs::default();
+        let objects = MeshObjects::new(ObjectStore::filesystem(t.dir()), t.dir());
         let a = PeerId::from_pubkey(&KeyPair::generate().verifying);
         let b = PeerId::from_pubkey(&KeyPair::generate().verifying);
         let id = |i: u32| ArtifactContentId::from_digest(ContentHash::of_bytes(&i.to_le_bytes()));

@@ -689,12 +689,7 @@ mod tests {
         use crate::p2p::objects::MeshObjects;
         use crate::p2p::registry::PeerRegistry;
 
-        fn tmp() -> std::path::PathBuf {
-            let d = tempfile::tempdir().unwrap();
-            let p = d.path().to_path_buf();
-            std::mem::forget(d);
-            p
-        }
+        let t = crate::p2p::TestDirs::default();
         let mut registry = Registry::new();
         crate::p2p::smoke::register(&mut registry);
         let registry = Arc::new(registry);
@@ -711,15 +706,15 @@ mod tests {
         let mut workers = Vec::new();
         for _ in 0..3 {
             let kp = Arc::new(KeyPair::generate());
-            let store = ObjectStore::filesystem(tmp());
-            let objects = Arc::new(MeshObjects::new(store.clone(), tmp()));
+            let store = ObjectStore::filesystem(t.dir());
+            let objects = Arc::new(MeshObjects::new(store.clone(), t.dir()));
             let policy: Arc<dyn DispatchPolicy> =
                 Arc::new(DefaultDispatchPolicy::new(DispatchMatrix::default()));
             let runner: Arc<dyn MeshTaskRunner> = Arc::new(
                 SharedCacheRunner::new(
                     registry.clone(),
                     store.clone(),
-                    tmp(),
+                    t.dir(),
                     kp.clone(),
                     policy,
                     d_kp.verifying,
@@ -729,7 +724,7 @@ mod tests {
             let node = MeshNode::bind(
                 "127.0.0.1:0".parse().unwrap(),
                 kp.clone(),
-                PeerRegistry::load(&tmp().join("peers.json")).unwrap(),
+                PeerRegistry::load(&t.dir().join("peers.json")).unwrap(),
                 NodeCapabilities {
                     worker: true,
                     scheduler: false,
@@ -752,11 +747,11 @@ mod tests {
         }
 
         // D: scheduler only, its own store, seeded with A alone.
-        let d_objects = Arc::new(MeshObjects::new(ObjectStore::filesystem(tmp()), tmp()));
+        let d_objects = Arc::new(MeshObjects::new(ObjectStore::filesystem(t.dir()), t.dir()));
         let d = MeshNode::bind(
             "127.0.0.1:0".parse().unwrap(),
             d_kp.clone(),
-            PeerRegistry::load(&tmp().join("peers.json")).unwrap(),
+            PeerRegistry::load(&t.dir().join("peers.json")).unwrap(),
             NodeCapabilities {
                 worker: false,
                 scheduler: true,
@@ -791,7 +786,7 @@ mod tests {
         let text: String = (0..(4 * 1024 * 1024 / 32))
             .map(|i| format!("line {i:>10} of mesh data ...\n"))
             .collect();
-        let src = tmp();
+        let src = t.dir();
         let in_path = src.join("p2p-echo-in.txt");
         std::fs::write(&in_path, &text).unwrap();
         let input = SmokeText {
@@ -799,7 +794,7 @@ mod tests {
             path: in_path,
         };
         let conn = d.connection_to(&c_id).await.unwrap();
-        let out_dir = tmp();
+        let out_dir = t.dir();
         let done = tokio::time::timeout(
             crate::TEST_HANG_GUARD,
             dispatch_stage(
@@ -854,26 +849,21 @@ mod tests {
         use crate::p2p::objects::MeshObjects;
         use crate::p2p::registry::PeerRegistry;
 
-        fn tmp() -> std::path::PathBuf {
-            let d = tempfile::tempdir().unwrap();
-            let p = d.path().to_path_buf();
-            std::mem::forget(d);
-            p
-        }
+        let t = crate::p2p::TestDirs::default();
         let mut registry = Registry::new();
         crate::p2p::smoke::register(&mut registry);
         let registry = Arc::new(registry);
         let d_kp = Arc::new(KeyPair::generate());
         let w_kp = Arc::new(KeyPair::generate());
-        let w_store = ObjectStore::filesystem(tmp());
-        let w_objects = Arc::new(MeshObjects::new(w_store.clone(), tmp()));
+        let w_store = ObjectStore::filesystem(t.dir());
+        let w_objects = Arc::new(MeshObjects::new(w_store.clone(), t.dir()));
         let policy: Arc<dyn DispatchPolicy> =
             Arc::new(DefaultDispatchPolicy::new(DispatchMatrix::default()));
         let runner: Arc<dyn MeshTaskRunner> = Arc::new(
             SharedCacheRunner::new(
                 registry.clone(),
                 w_store,
-                tmp(),
+                t.dir(),
                 w_kp.clone(),
                 policy,
                 d_kp.verifying,
@@ -883,7 +873,7 @@ mod tests {
         let w = MeshNode::bind(
             "127.0.0.1:0".parse().unwrap(),
             w_kp.clone(),
-            PeerRegistry::load(&tmp().join("peers.json")).unwrap(),
+            PeerRegistry::load(&t.dir().join("peers.json")).unwrap(),
             NodeCapabilities {
                 worker: true,
                 scheduler: false,
@@ -894,11 +884,11 @@ mod tests {
         .await
         .unwrap();
         w.set_objects(w_objects);
-        let d_objects = Arc::new(MeshObjects::new(ObjectStore::filesystem(tmp()), tmp()));
+        let d_objects = Arc::new(MeshObjects::new(ObjectStore::filesystem(t.dir()), t.dir()));
         let d = MeshNode::bind(
             "127.0.0.1:0".parse().unwrap(),
             d_kp.clone(),
-            PeerRegistry::load(&tmp().join("peers.json")).unwrap(),
+            PeerRegistry::load(&t.dir().join("peers.json")).unwrap(),
             NodeCapabilities {
                 worker: false,
                 scheduler: true,
@@ -915,7 +905,7 @@ mod tests {
             .unwrap();
 
         // Publish but do NOT grant, then dispatch by hand.
-        let src = tmp();
+        let src = t.dir();
         let in_path = src.join("p2p-echo-in.txt");
         std::fs::write(&in_path, "secret-ish").unwrap();
         let input = SmokeText {
