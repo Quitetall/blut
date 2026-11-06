@@ -58,27 +58,27 @@ Run from a clean checkout at the proposed tag SHA:
 
 ```bash
 bash scripts/scope_guard.sh
-cargo +1.88 fmt --all -- --check
-cargo +1.88 check --locked --workspace --all-targets --all-features
-cargo +1.88 clippy --locked --workspace --all-targets --all-features -- -D warnings
-cargo +1.88 test --locked --workspace --all-targets --all-features
-RUSTDOCFLAGS="-D warnings" cargo +1.88 doc --locked --workspace --all-features --no-deps
-cargo +1.88 check --locked -p blut-types --target wasm32-unknown-unknown
+cargo +1.99.0 fmt --all -- --check
+cargo +1.99.0 check --locked --workspace --all-targets --all-features
+cargo +1.99.0 clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo +1.99.0 test --locked --workspace --all-targets --all-features
+RUSTDOCFLAGS="-D warnings" cargo +1.99.0 doc --locked --workspace --all-features --no-deps
+cargo +1.99.0 check --locked -p blut-types --target wasm32-unknown-unknown
 cargo deny --locked check
 cargo deny --locked --manifest-path crates/blut-dsl/Cargo.toml --config deny.toml check
 cargo deny --locked --manifest-path crates/blut-operator/Cargo.toml --config deny.toml check
 gitleaks git --log-opts="--all"
-cargo +1.88 run --locked --example first_cookbook
+cargo +1.99.0 run --locked --example first_cookbook
 bash scripts/run_benchmarks.sh compare
 ```
 
 Also gate detached workspaces:
 
 ```bash
-(cd crates/blut-dsl && cargo +1.88 fmt --all -- --check && cargo +1.88 clippy --locked --all-targets -- -D warnings && cargo +1.88 test --locked && RUSTDOCFLAGS="-D warnings" cargo +1.88 doc --locked --no-deps)
-(cd crates/blut-web && cargo +1.88 fmt --all -- --check && cargo +1.88 clippy --locked --all-targets -- -D warnings && cargo +1.88 test --locked)
-(cd crates/blut-tui && cargo +1.88 fmt --all -- --check && cargo +1.88 build --locked --all-targets && cargo +1.88 clippy --locked --all-targets -- -D warnings && cargo +1.88 test --locked && ./target/debug/blut-tui --check)
-(cd crates/blut-operator && cargo +1.88 fmt --all -- --check && cargo +1.88 clippy --locked --all-targets -- -D warnings && cargo +1.88 test --locked && RUSTDOCFLAGS="-D warnings" cargo +1.88 doc --locked --no-deps && cargo +1.88 publish --dry-run --locked)
+(cd crates/blut-dsl && cargo +1.99.0 fmt --all -- --check && cargo +1.99.0 clippy --locked --all-targets -- -D warnings && cargo +1.99.0 test --locked && RUSTDOCFLAGS="-D warnings" cargo +1.99.0 doc --locked --no-deps)
+(cd crates/blut-web && cargo +1.99.0 fmt --all -- --check && cargo +1.99.0 clippy --locked --all-targets -- -D warnings && cargo +1.99.0 test --locked)
+(cd crates/blut-tui && cargo +1.99.0 fmt --all -- --check && cargo +1.99.0 build --locked --all-targets && cargo +1.99.0 clippy --locked --all-targets -- -D warnings && cargo +1.99.0 test --locked && ./target/debug/blut-tui --check)
+(cd crates/blut-operator && cargo +1.99.0 fmt --all -- --check && cargo +1.99.0 clippy --locked --all-targets -- -D warnings && cargo +1.99.0 test --locked && RUSTDOCFLAGS="-D warnings" cargo +1.99.0 doc --locked --no-deps && cargo +1.99.0 publish --dry-run --locked)
 BLUT_COOKBOOK_DIR=<blut-cookbooks checkout> bash scripts/k8s_kind_e2e.sh
 ```
 

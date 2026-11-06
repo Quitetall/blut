@@ -4,9 +4,8 @@
 name = "blut-operator"
 version = "0.2.0-alpha.2"
 edition = "2024"
-# The engine's MSRV. kube 4.0 supports it; kube 4.2 needs 1.89, and the
-# MSRV-aware resolver (resolver 3, edition 2024) keeps the lockfile on 4.0.x.
-rust-version = "1.88"
+# The engine's MSRV.
+rust-version = "1.99"
 publish = ["crates-io"]
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"

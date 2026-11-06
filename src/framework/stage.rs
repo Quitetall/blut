@@ -2922,7 +2922,7 @@ mod tests {
         let from = format!("{sep}a{sep}b");
         let to = format!("{sep}new{sep}root");
         rebase_path_strings(&mut v, &from, &to);
-        assert_eq!(v["exact"], json!(format!("{to}")));
+        assert_eq!(v["exact"], json!(to));
         assert_eq!(v["child"], json!(format!("{to}{sep}c{sep}d.txt")));
         assert_eq!(
             v["sibling"],

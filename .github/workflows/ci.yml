@@ -58,7 +58,7 @@ jobs:
       - name: Install MSRV toolchain (clippy + rustfmt)
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
         with:
-          toolchain: 1.88.0
+          toolchain: 1.99.0
           components: clippy, rustfmt
 
       - name: Cache cargo registry + git + target
@@ -305,7 +305,7 @@ jobs:
           python -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['version']==1; assert len(d['nodes'])==5" "$plan"
 
   operator:
-    name: operator · Rust 1.88
+    name: operator · MSRV
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -315,7 +315,7 @@ jobs:
       - name: Install MSRV toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
         with:
-          toolchain: 1.88.0
+          toolchain: 1.99.0
           components: clippy, rustfmt
       - name: Gate the operator
         working-directory: crates/blut-operator
@@ -424,7 +424,7 @@ jobs:
       - name: Install MSRV toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
         with:
-          toolchain: 1.88.0
+          toolchain: 1.99.0
       - name: Cache cargo registry + git + target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -460,7 +460,7 @@ jobs:
       - name: Install MSRV toolchain (clippy)
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
         with:
-          toolchain: 1.88.0
+          toolchain: 1.99.0
           components: clippy
       - name: Cache cargo registry + git + target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -502,7 +502,7 @@ jobs:
       - name: Install MSRV toolchain + wasm32 target
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
         with:
-          toolchain: 1.88.0
+          toolchain: 1.99.0
           targets: wasm32-unknown-unknown
       - name: Cache cargo registry + git + target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -528,10 +528,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Install Rust 1.88
+      - name: Install Rust 1.99
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action
         with:
-          toolchain: 1.88.0
+          toolchain: 1.99.0
       - name: Install cargo-deny
         run: cargo install cargo-deny --version 0.20.2 --locked
       - name: Dependency policy
@@ -630,7 +630,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
-          toolchain: 1.88.0
+          toolchain: 1.99.0
           components: llvm-tools-preview
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

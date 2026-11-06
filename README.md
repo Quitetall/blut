@@ -316,17 +316,16 @@ not on managed Kubernetes or with GPUs. Install, CRD reference and limits:
 
 ## Minimum supported Rust version
 
-**1.88.0.** Every published crate declares `rust-version = "1.88"` and CI builds,
+**1.99.0.** Every published crate declares `rust-version = "1.99"` and CI builds,
 clippies and tests them on exactly that toolchain — the floor is measured, not
 asserted.
 
 - An MSRV increase is a **minor** version bump while the crates are `0.x`, and
   will be called out in [CHANGELOG.md](CHANGELOG.md).
-- `blut-operator` is a standalone workspace on the same 1.88 floor, gated in
-  its own CI lane. Its MSRV-aware lockfile holds kube at 4.0, the last release
-  that supports 1.88.
+- `blut-operator` is a standalone workspace on the same 1.99 floor, gated in
+  its own CI lane.
 - Newer toolchains are not assumed to be supersets. A lint that fires only on a
-  newer clippy is not a release blocker, and one that fires on 1.88 is.
+  newer clippy is not a release blocker, and one that fires on 1.99 is.
 
 ## License
 

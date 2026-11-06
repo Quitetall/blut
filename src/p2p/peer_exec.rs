@@ -559,6 +559,7 @@ fn lifecycle_phase(
 /// Coordinator side of the portable P2P data plane. This module owns task
 /// signing, encrypted transport, peer-result verification, and conversion back
 /// to A09's [`StoredArtifact`]. The executor sees only `ExecutionAdapter`.
+#[allow(clippy::result_large_err)] // Canonical adapter trait fixes ExecutionFailure by value.
 pub async fn dispatch_stored_to_peer(
     conn: &QuinnConnection,
     coordinator_kp: &KeyPair,

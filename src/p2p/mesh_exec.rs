@@ -714,6 +714,7 @@ impl MeshStageWorker {
     }
 
     /// Fetch the input, run the stage, publish the output.
+    #[allow(clippy::result_large_err)] // Canonical adapter trait fixes ExecutionFailure by value.
     async fn execute(
         &self,
         stage: Arc<dyn StageDyn>,

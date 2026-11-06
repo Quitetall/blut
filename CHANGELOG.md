@@ -195,6 +195,10 @@ depend on this crate.
   resume_blocker}`.
 
 ### Changed
+- **MSRV.** Every crate now requires and is tested on Rust 1.99 (was 1.88).
+  `blut-operator` moves to the current kube release, which the old floor held
+  back. The CI lanes `operator · Rust 1.88` and `operator gate (Rust 1.88)` are
+  now `operator · MSRV` and `operator gate (MSRV)`.
 - **Behaviour change:** `DefaultDispatchPolicy::new` no longer names any
   cookbook's stages: the engine shipped a list of one cookbook's stage names
   as dispatchable, domain code in a domain-neutral engine. Its name list now

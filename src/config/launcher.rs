@@ -909,11 +909,11 @@ impl SlurmJob {
             .output()
             .map_err(|e| TrainError::other(format!("scontrol invocation failed: {e}")))?;
         let ctl_stdout = String::from_utf8_lossy(&ctl.stdout);
-        if ctl.status.success() {
-            if let Some(state) = Self::parse_scontrol_state(&ctl_stdout) {
-                let reason = Self::scontrol_field(&ctl_stdout, "Reason");
-                return Ok((state, reason));
-            }
+        if ctl.status.success()
+            && let Some(state) = Self::parse_scontrol_state(&ctl_stdout)
+        {
+            let reason = Self::scontrol_field(&ctl_stdout, "Reason");
+            return Ok((state, reason));
         }
         let ctl_stderr = String::from_utf8_lossy(&ctl.stderr);
         if !ctl_stderr.contains("Invalid job id") {
@@ -1295,16 +1295,16 @@ impl RayJob {
                 break;
             }
             // `Status for job '<id>': <STATE>` — the non-terminal form.
-            if let Some((_, rest)) = line.split_once("Status for job ") {
-                if let Some((_, state)) = rest.rsplit_once(": ") {
-                    return match state.trim() {
-                        "SUCCEEDED" => JobState::Succeeded,
-                        "FAILED" => JobState::Failed("FAILED".to_string()),
-                        "RUNNING" | "PENDING" | "WAITING" | "CONSTRUCTOR" => JobState::Running,
-                        "STOPPED" | "CANCELLED" => JobState::Cancelled,
-                        other => JobState::Unknown(other.to_string()),
-                    };
-                }
+            if let Some((_, rest)) = line.split_once("Status for job ")
+                && let Some((_, state)) = rest.rsplit_once(": ")
+            {
+                return match state.trim() {
+                    "SUCCEEDED" => JobState::Succeeded,
+                    "FAILED" => JobState::Failed("FAILED".to_string()),
+                    "RUNNING" | "PENDING" | "WAITING" | "CONSTRUCTOR" => JobState::Running,
+                    "STOPPED" | "CANCELLED" => JobState::Cancelled,
+                    other => JobState::Unknown(other.to_string()),
+                };
             }
             // Terminal prose.
             if !line.contains("Job '") {

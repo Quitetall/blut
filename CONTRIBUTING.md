@@ -53,8 +53,8 @@ the seam, not the domain.
 
 ## Minimum supported Rust version
 
-**1.88.0**, and CI builds/clippies/tests on exactly that toolchain — so a newer
-compiler is not evidence. `cargo +1.88` before you push, or expect the gate to
+**1.99.0**, and CI builds/clippies/tests on exactly that toolchain — so a newer
+compiler is not evidence. `cargo +1.99.0` before you push, or expect the gate to
 disagree with your stable.
 
 Newer toolchains are not supersets: clippy gains and loses lints between
@@ -62,8 +62,8 @@ releases, and this repository has shipped a red gate twice because a clean run
 on a newer clippy was mistaken for a clean run on the pinned one.
 
 An MSRV increase is a minor version bump while the crates are `0.x`, and belongs
-in `CHANGELOG.md`. `blut-operator` is a standalone workspace on the same 1.88
-floor with its own CI lanes: `operator · Rust 1.88` (fmt, clippy, tests, docs,
+in `CHANGELOG.md`. `blut-operator` is a standalone workspace on the same 1.99
+floor with its own CI lanes: `operator · MSRV` (fmt, clippy, tests, docs,
 `cargo publish --dry-run`) and `operator · kind end-to-end`
 (`scripts/k8s_kind_e2e.sh`). Run the e2e locally before changing the operator,
 the CRDs, or the engine flags it relies on (`recipe declare --run`,

@@ -8,9 +8,9 @@
 #   docker build -f docker/Dockerfile.operator -t blut-operator:dev .
 #
 # The operator crate is a standalone workspace, so only its directory is
-# copied. Rust 1.88 is the operator's MSRV and the engine's.
+# copied. Rust 1.99 is the operator's MSRV and the engine's.
 
-ARG RUST_IMAGE=rust:1.88-bookworm
+ARG RUST_IMAGE=rust:1.99-bookworm
 ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian12:nonroot
 
 FROM ${RUST_IMAGE} AS builder

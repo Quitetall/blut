@@ -321,6 +321,7 @@ impl ExecutionHandle for CloudExecutionHandle {
 impl CloudExecutionHandle {
     /// Withdraw a job nobody claimed within the pickup window and fail the
     /// attempt with the workers' reasons, if any.
+    #[allow(clippy::result_large_err)] // Canonical adapter trait fixes ExecutionFailure by value.
     async fn check_pickup(&self) -> Result<(), ExecutionFailure> {
         let Some(window) = self.pickup_timeout else {
             return Ok(());
@@ -390,6 +391,7 @@ impl CloudAttempt {
         }
     }
 
+    #[allow(clippy::result_large_err)] // Canonical adapter trait fixes ExecutionFailure by value.
     async fn run_inner(&self) -> Result<(), ExecutionFailure> {
         transition(&self.lifecycle, ExecutionPhase::UploadingInput, None)?;
         let Some(input) = self.request.input.as_ref() else {
@@ -624,6 +626,7 @@ fn observe_assignment(
     transition(lifecycle, ExecutionPhase::Running, Some(assignment.clone()))
 }
 
+#[allow(clippy::result_large_err)] // Canonical adapter trait fixes ExecutionFailure by value.
 async fn observe_terminal(
     store: &ObjectStore,
     lifecycle: &ExecutionLifecycle,

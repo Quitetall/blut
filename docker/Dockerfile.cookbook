@@ -16,7 +16,7 @@
 # patches it to the local path. A published image would build from the
 # published crates instead and needs neither step.
 
-ARG RUST_IMAGE=rust:1.88-bookworm
+ARG RUST_IMAGE=rust:1.99-bookworm
 ARG RUNTIME_IMAGE=debian:bookworm-slim
 
 FROM ${RUST_IMAGE} AS builder

@@ -460,7 +460,7 @@ impl MeshNode {
                 });
             }
         }
-        out.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        out.sort_by_key(|p| p.id.0);
         out
     }
 

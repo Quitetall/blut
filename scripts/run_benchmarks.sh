@@ -9,7 +9,7 @@ baseline=${BLUT_BENCH_BASELINE:-release-0.2}
 # more than this fraction even at its confidence interval's lower bound.
 max_regression=${BLUT_BENCH_MAX_REGRESSION:-0.10}
 mode=${1:-compare}
-cargo_cmd=(cargo +1.88)
+cargo_cmd=(cargo +1.99.0)
 
 restore_baseline() {
   local found=0 src rel dst
